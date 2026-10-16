@@ -5,7 +5,12 @@
 
 local ListPicker = require("maki.list_picker")
 
+local RUN_ICON = "· "
+local OK_ICON = "✓ "
+local BAD_ICON = "✗ "
+
 local RUNNING_SECTION = "Running"
+local JOBS_SECTION = "Jobs"
 local FINISHED_SECTION = "Finished"
 local ELAPSED_UNITS = { { 3600, "h" }, { 60, "m" } }
 local UNDER_A_MINUTE = "<1m"
@@ -14,12 +19,14 @@ local M = {}
 
 -- The main chat comes first and has no status. The subagents follow, running
 -- ones above finished ones so a long job never gets buried under the ones that
--- already returned. Within a section, newest first (`tasks` comes in chat
--- order, which is spawn order), so the latest task is the one at hand.
+-- already returned. The Jobs section sits between: the session's command jobs
+-- from any plugin, running ones first. Within a task section, newest first
+-- (`tasks` comes in chat order, which is spawn order), so the latest task is
+-- the one at hand. Jobs stay in list order.
 --
 -- Returns { rows, sections }. A row carries a section header only when it opens
 -- one, and `sections` counts what survived the filter.
-function M.build(tasks, query)
+function M.build(tasks, jobs, query)
   local words = ListPicker.split_words(query)
   local main, running, finished = nil, {}, {}
   for _, task in ipairs(tasks) do
@@ -34,17 +41,69 @@ function M.build(tasks, query)
     end
   end
 
+  local live_jobs, exited_jobs = {}, {}
+  for _, job in ipairs(jobs or {}) do
+    if ListPicker.matches(job.name or job.command, words) then
+      if job.status == "running" then
+        live_jobs[#live_jobs + 1] = job
+      else
+        exited_jobs[#exited_jobs + 1] = job
+      end
+    end
+  end
+
   local rows = {}
   if main then
     rows[#rows + 1] = { task = main }
   end
-  for _, group in ipairs({ { RUNNING_SECTION, running }, { FINISHED_SECTION, finished } }) do
-    local header, tasks_in_section = group[1], group[2]
-    for i = #tasks_in_section, 1, -1 do
-      rows[#rows + 1] = { task = tasks_in_section[i], section = i == #tasks_in_section and header or nil }
+  -- Task sections are newest-first. Job sections keep list order, and an
+  -- exited group repeats the Jobs header only when the live half is empty.
+  local function append_section(header, items, key, newest_first)
+    local n = #items
+    local from, to, step = 1, n, 1
+    if newest_first then
+      from, to, step = n, 1, -1
+    end
+    local first = true
+    for i = from, to, step do
+      rows[#rows + 1] = { [key] = items[i], section = first and header or nil }
+      first = false
     end
   end
-  return { rows = rows, sections = { running = #running, finished = #finished } }
+  append_section(RUNNING_SECTION, running, "task", true)
+  append_section(JOBS_SECTION, live_jobs, "job", false)
+  append_section(#live_jobs == 0 and JOBS_SECTION or nil, exited_jobs, "job", false)
+  append_section(FINISHED_SECTION, finished, "task", true)
+  return {
+    rows = rows,
+    sections = {
+      running = #running,
+      jobs = #live_jobs + #exited_jobs,
+      finished = #finished,
+    },
+  }
+end
+
+-- Same glyph language as the task rows: the live spinner, then check or
+-- cross by exit code.
+function M.job_icon(job)
+  if job.status == "running" then
+    return RUN_ICON, "accent", true
+  elseif job.exit_code == 0 then
+    return OK_ICON, "success"
+  end
+  return BAD_ICON, "error"
+end
+
+function M.row_id(row)
+  return row.task and row.task.id or row.job.id
+end
+
+function M.row_name(row)
+  if row.task then
+    return row.task.name
+  end
+  return row.job.name or row.job.command
 end
 
 -- Minutes are the smallest unit. Seconds would change the text every second,
@@ -96,7 +155,7 @@ end
 -- the cursor with it.
 function M.index_of(rows, id)
   for i, row in ipairs(rows) do
-    if row.task.id == id then
+    if M.row_id(row) == id then
       return i
     end
   end

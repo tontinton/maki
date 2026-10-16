@@ -17,10 +17,10 @@ use maki_agent::tools::{
     ToolContext, ToolFilter, ToolLive, ToolOutputMode,
 };
 use maki_agent::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, DoneReason,
-    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, InputSource, McpSession,
-    RunContext, RunContextBuilder, RunLedger, SessionEvents, SubagentInbox, SubagentInfo,
-    ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
+    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed,
+    DETACHED_RUN_ID, DoneReason, EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History,
+    InputSource, McpSession, RunContext, RunContextBuilder, RunLedger, SessionEvents,
+    SubagentInbox, SubagentInfo, ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -64,6 +64,8 @@ const MCP_REACH_ERR: &str = "mcp reaches whatever its servers do, so a session o
      permission, or pass mcp = false";
 const TASK_REQUIRED_ERR: &str = "maki.agent.session({ session = id }) and its prompts must run \
      in a task: maki.async.spawn, an autocmd callback or a tool handler";
+const SCOPE_ERR: &str = "scope must be \"session\"";
+const SCOPE_NESTED_ERR: &str = "scope = \"session\" is only valid on the main session";
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -637,6 +639,12 @@ async fn call_tool(
 ///     `"max"`), or a budget integer (token count). Inherits the parent
 ///     setting if omitted, and is capped at it otherwise.
 ///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
+///   `scope` (string?) - `"session"` detaches the session from the call that
+///     spawned it: it survives the call returning and the turn ending,
+///     instead of being cancelled the moment either does. Esc on its chat
+///     still cancels it. Keep the returned handle to `prompt` and `close`.
+///     Omit for the default: tied to the call that spawned it. Invalid
+///     inside a subagent.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
 /// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
@@ -661,12 +669,20 @@ async fn session(
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
     // The ctx borrow ends inside its arm, before any wait: a cancel hook
     // firing meanwhile needs `ctx:finish`, which takes it mutably.
-    let (agent_ctx, opts, owner) = match ctx {
-        LuaEither::Left(ctx) => (
-            try_pair!(dispatch_ctx(&ctx, "session")).clone(),
-            required_opts(opts)?,
-            None,
-        ),
+    let (agent_ctx, opts, owner, detached) = match ctx {
+        LuaEither::Left(ctx) => {
+            let agent_ctx = try_pair!(dispatch_ctx(&ctx, "session")).clone();
+            let opts = required_opts(opts)?;
+            let detached: bool = match opts.get::<LuaValue>("scope")? {
+                LuaValue::Nil => false,
+                LuaValue::String(s) if s.to_str()?.as_ref() == "session" => true,
+                _ => return Ok(err_pair(SCOPE_ERR)),
+            };
+            if detached && agent_ctx.task_id.is_some() {
+                return Ok(err_pair(SCOPE_NESTED_ERR));
+            }
+            (agent_ctx, opts, None, detached)
+        }
         LuaEither::Right(opts) => {
             if !perms.is_allowed(Permission::Agent) {
                 return Err(denied_error(Permission::Agent));
@@ -681,7 +697,7 @@ async fn session(
             // entry goes away when the task ends.
             let (cancel, token) = CancelToken::new();
             let (session, agent_ctx) = try_pair!(seed_ctx(&opts, token)?);
-            (agent_ctx, opts, Some((session, task, cancel)))
+            (agent_ctx, opts, Some((session, task, cancel)), false)
         }
     };
     let model_spec: Option<String> = opts.get("model_spec")?;
@@ -789,15 +805,18 @@ async fn session(
     let opts = session_opts(requested_thinking, fast, agent_ctx.opts, &model);
 
     let (stream_guard, sub_events) = event_stream();
-    let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
-    let parent_tx = agent_ctx.event_tx.clone();
-    // A subagent can only ask the user if its parent can. Under `maki -p` or
-    // a background session nobody reads the subagent's chat, so a fresh
-    // channel would leave every prompt waiting until cancel. Without one,
-    // `enforce` denies the call right away.
-    let (answer_tx, answer_rx) = agent_ctx
-        .user_response_rx
-        .is_some()
+    let parent_tx = if detached {
+        agent_ctx.event_tx.with_run_id(DETACHED_RUN_ID)
+    } else {
+        agent_ctx.event_tx.clone()
+    };
+    let sub_event_tx = stream_guard.sender(parent_tx.run_id());
+    // A subagent can only ask the user if its parent can, and a detached
+    // session outlives the turn that could answer it, so it never gets a
+    // channel. Under `maki -p` or a background session nobody reads the
+    // subagent's chat, so a fresh channel would leave every prompt waiting
+    // until cancel. Without one, `enforce` denies the call right away.
+    let (answer_tx, answer_rx) = (!detached && agent_ctx.user_response_rx.is_some())
         .then(flume::unbounded::<String>)
         .map(|(tx, rx)| (tx, Arc::new(AsyncMutex::new(rx))))
         .unzip();
@@ -831,13 +850,20 @@ async fn session(
     .detach();
 
     // Registered before the session runs so the child token does not fire
-    // on drop and kill the subagent at birth.
-    let (child_trigger, child_cancel) = agent_ctx.cancel.child();
+    // on drop and kill the subagent at birth. A detached child stands on
+    // its own token instead of the caller's: it must outlive the call (and
+    // the turn) that spawned it, only stopped by a targeted cancel or
+    // cancel-all from here on.
+    let (child_trigger, child_cancel) = if detached {
+        CancelToken::new()
+    } else {
+        agent_ctx.cancel.child()
+    };
     // Several sessions can share one `ui_id`, so keep the slot and retire
     // only ours on close instead of clearing the whole key.
     let cancel_slot = agent_ctx
         .subagent_cancels
-        .insert(ui_id.clone(), child_trigger);
+        .insert(ui_id.clone(), child_trigger, detached);
 
     let name = name.unwrap_or_default();
     let background = match owner {
@@ -931,6 +957,7 @@ async fn session(
         dones: RunDones::new(done_rx),
         start: Instant::now(),
         closed: false,
+        detached,
         background,
     };
 
@@ -1158,6 +1185,10 @@ struct SessionState {
     cancel_slot: CancelSlot,
     parent_event_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
+    /// Set at creation from `scope = "session"`; echoed on every
+    /// [`SubagentInfo`] so the UI knows to keep the chat cancellable after
+    /// the spawning run ends.
+    detached: bool,
     local_tools: LocalTools,
     name: String,
     dones: RunDones,
@@ -1232,7 +1263,7 @@ impl Drop for PromptSettle {
 }
 
 impl SessionState {
-    fn close(&mut self) {
+    fn close(&mut self, failed: bool) {
         if self.closed {
             return;
         }
@@ -1247,6 +1278,7 @@ impl SessionState {
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
             messages,
+            failed,
         });
         info!(
             name = %self.name,
@@ -1268,12 +1300,12 @@ struct LuaSession {
 impl Drop for LuaSession {
     fn drop(&mut self) {
         match self.inner.try_lock() {
-            Some(mut s) => s.close(),
+            Some(mut s) => s.close(false),
             // Prompt still in flight: close asynchronously so history
             // and cancel entry are never silently leaked.
             None => {
                 let inner = Arc::clone(&self.inner);
-                smol::spawn(async move { inner.lock().await.close() }).detach();
+                smol::spawn(async move { inner.lock().await.close(false) }).detach();
             }
         }
     }
@@ -1354,6 +1386,7 @@ async fn prompt(
             opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
             inbox: Some(Arc::clone(&s.inbox)),
+            detached: s.detached,
         });
     }
 
@@ -1480,12 +1513,17 @@ async fn prompt(
 /// leaves the work to the Lua garbage collector, which may never run while
 /// the VM sits idle, and the subagent's event relay stays alive until it does.
 ///
+/// @param err string? Pass the failure reason when the run failed, so the session's UI item ends as errored even without a following tool result.
 /// On a background session, `close` cancels a running prompt rather than
 /// waiting for it.
 ///
 /// @return
 #[lua_fn]
-async fn close(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
+async fn close(
+    lua: Lua,
+    this: mlua::UserDataRef<LuaSession>,
+    err: Option<String>,
+) -> LuaResult<()> {
     let inner = Arc::clone(&this.inner);
     // Dropping the entry cancels the prompt, so the lock below frees up soon.
     // Taking the lock first would wait on a prompt that may never end. Worst
@@ -1497,7 +1535,7 @@ async fn close(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
     }
     drop(this);
     let mut s = inner.lock().await;
-    s.close();
+    s.close(err.is_some());
     Ok(())
 }
 
@@ -1645,6 +1683,7 @@ mod tests {
             opts: None,
             answer_tx: None,
             inbox: None,
+            detached: false,
         })
         .unwrap();
         info
