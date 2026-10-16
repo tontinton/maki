@@ -7,7 +7,7 @@
 mod agent_events;
 mod btw;
 mod commands;
-mod image_paste;
+pub(crate) mod image_paste;
 pub(crate) mod mode;
 mod mouse;
 mod plan_form;
@@ -581,6 +581,7 @@ pub struct App {
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) paste_rx: Vec<oneshot::Receiver<Result<PastedContent, String>>>,
     pub(crate) mouse_paste_rx: Vec<oneshot::Receiver<Option<String>>>,
+    pub(crate) copy_rx: Vec<oneshot::Receiver<Result<(), String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
@@ -703,7 +704,7 @@ impl App {
             retry_info: None,
             zones: ZoneRegistry::new(),
             selection_state: None,
-            clipboard: ClipboardState::new(),
+            clipboard: ClipboardState::new(ui_config.clipboard_command.clone()),
             last_esc: None,
             quit_copied: false,
             last_quit: None,
@@ -718,6 +719,7 @@ impl App {
             shared_history: None,
             paste_rx: vec![],
             mouse_paste_rx: vec![],
+            copy_rx: vec![],
             storage_writer,
             last_sent: None,
             shell: shell::ShellState::default(),
@@ -2601,6 +2603,7 @@ impl App {
             | self.tick_error_expiry()
             | self.poll_paste()
             | self.poll_mouse_paste()
+            | self.poll_copy()
             | self.btw_modal.poll()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
