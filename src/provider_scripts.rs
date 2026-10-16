@@ -228,9 +228,9 @@ fn warning(dir: &Path, scripts: &[Script]) -> String {
 /// Where the global `init.lua` runs from, since a ported plugin has to be
 /// `require`d by it. Without one yet, the directory holding the scripts.
 fn plugin_dir(providers_dir: &Path) -> PathBuf {
-    paths::config_search_dirs()
-        .into_iter()
-        .find(|dir| dir.join(INIT_FILE).is_file())
+    paths::config_dir()
+        .ok()
+        .filter(|dir| dir.join(INIT_FILE).is_file())
         .unwrap_or_else(|| {
             providers_dir
                 .parent()

@@ -116,7 +116,7 @@ The rules:
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
 | [`maki.async.Task`](#maki-async-Task) | Handle returned by `maki.async.spawn`. |
 | [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
-| [`maki.env`](#maki-env) | Paths to maki's own directories (config, state, logs, legacy). |
+| [`maki.env`](#maki-env) | Paths to maki's own directories (config, state, logs). |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
 | [`maki.image`](#maki-image) | Small building blocks for working with images: probe metadata, decode |
@@ -2092,7 +2092,7 @@ maki.base64.decode("aGVsbG8=") -- "hello"
 
 ## maki.env {#maki-env}
 
-Paths to maki's own directories (config, state, logs, legacy).
+Paths to maki's own directories (config, state, logs).
 
 Use these to locate config files or persistent state without hard-coding paths.
 
@@ -2167,21 +2167,6 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 ```lua
 local dir = maki.env.logs_dir()
 ```
-
----
-
-### `maki.env.legacy_dir()` {#maki-env-legacy_dir}
-
-```lua
-maki.env.legacy_dir()
-```
-
-Return the legacy config path (`~/.maki`), if it exists on disk.
-Useful for migration logic. Returns nil when there is no legacy directory.
-
-Requires the `fs_read` [plugin permission](#plugin-permissions).
-
-**Returns:** (`string?`) Legacy directory path, or nil if not present.
 
 
 ## maki.fn {#maki-fn}

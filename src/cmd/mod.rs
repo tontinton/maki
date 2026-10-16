@@ -253,7 +253,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             acp::run(model, yolo, cli.no_plugins, cli.no_jit, trust_mode)?;
         }
         Some(Command::Migrate { action }) => match action {
-            MigrateAction::Xdg => migrate::xdg()?,
             MigrateAction::Providers => {
                 // A script counts as ported once a plugin registers its slug.
                 let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode)?;

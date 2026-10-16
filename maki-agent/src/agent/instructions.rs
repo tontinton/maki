@@ -118,8 +118,7 @@ fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf
 
 fn collect_instruction_files(
     cwd: &str,
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_dir: Option<&Path>,
     loaded: &LoadedInstructions,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -154,33 +153,29 @@ fn collect_instruction_files(
         }
     }
 
-    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
-        let path = dir.join(GLOBAL_INSTRUCTION_FILE);
-        if let Some((canonical, content)) = read_instruction(&path, loaded) {
-            let label = format!("Global instructions ({})", canonical.display());
-            out.push((label, content));
-            break;
-        }
+    if let Some(dir) = global_dir
+        && let Some((canonical, content)) =
+            read_instruction(&dir.join(GLOBAL_INSTRUCTION_FILE), loaded)
+    {
+        out.push((
+            format!("Global instructions ({})", canonical.display()),
+            content,
+        ));
     }
 
     out
 }
 
 pub fn load_instruction_text(cwd: &str) -> String {
-    load_instruction_text_with_home(
-        cwd,
-        maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
-    )
+    load_instruction_text_with_global_dir(cwd, maki_storage::paths::config_dir().ok().as_deref())
 }
 
-pub(crate) fn load_instruction_text_with_home(
+pub(crate) fn load_instruction_text_with_global_dir(
     cwd: &str,
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_dir: Option<&Path>,
 ) -> String {
     let loaded = LoadedInstructions::new();
-    let files = collect_instruction_files(cwd, home, xdg_config, &loaded);
+    let files = collect_instruction_files(cwd, global_dir, &loaded);
 
     let mut text = String::new();
     for (label, content) in files {
@@ -190,20 +185,15 @@ pub(crate) fn load_instruction_text_with_home(
 }
 
 pub fn load_instructions(cwd: &str) -> Instructions {
-    load_instructions_with_home(
-        cwd,
-        maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
-    )
+    load_instructions_with_global_dir(cwd, maki_storage::paths::config_dir().ok().as_deref())
 }
 
-pub(crate) fn load_instructions_with_home(
+pub(crate) fn load_instructions_with_global_dir(
     cwd: &str,
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_dir: Option<&Path>,
 ) -> Instructions {
     let mut instr = Instructions::default();
-    let files = collect_instruction_files(cwd, home, xdg_config, &instr.loaded);
+    let files = collect_instruction_files(cwd, global_dir, &instr.loaded);
 
     for (label, content) in files {
         instr.text.push_str(&format!("\n\n{label}:\n{content}"));
@@ -258,9 +248,6 @@ mod tests {
 
     use super::*;
 
-    const LEGACY_RULES: &str = "legacy global rules";
-    const XDG_RULES: &str = "xdg global rules";
-
     #[test]
     fn after_instructions_slot_lands_after_instructions() {
         use std::sync::Arc;
@@ -302,7 +289,7 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), "team rules").unwrap();
         fs::write(dir.path().join("AGENTS.local.md"), "my preferences").unwrap();
 
-        let text = &load_instructions_with_home(dir.path().to_str().unwrap(), None, None).text;
+        let text = &load_instructions_with_global_dir(dir.path().to_str().unwrap(), None).text;
         assert!(text.contains("team rules"));
         assert!(text.contains("my preferences"));
         assert!(
@@ -316,7 +303,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("AGENTS.local.md"), "solo preferences").unwrap();
         assert!(
-            load_instructions_with_home(dir.path().to_str().unwrap(), None, None)
+            load_instructions_with_global_dir(dir.path().to_str().unwrap(), None)
                 .text
                 .contains("solo preferences")
         );
@@ -326,56 +313,33 @@ mod tests {
     fn load_instructions_empty_when_no_files() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            load_instructions_with_home(dir.path().to_str().unwrap(), None, None)
+            load_instructions_with_global_dir(dir.path().to_str().unwrap(), None)
                 .text
                 .is_empty()
         );
     }
 
     #[test]
-    fn load_instructions_empty_when_home_has_no_global_file() {
+    fn load_instructions_empty_when_global_dir_has_no_file() {
         let cwd = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
         assert!(
-            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None)
+            load_instructions_with_global_dir(cwd.path().to_str().unwrap(), Some(global.path()))
                 .text
                 .is_empty()
         );
     }
 
     #[test]
-    fn load_instructions_includes_global_from_home() {
+    fn load_instructions_includes_global_from_config_dir() {
         let cwd = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join(".maki")).unwrap();
-        fs::write(home.path().join(".maki").join("AGENTS.md"), "global rules").unwrap();
+        let global = tempfile::tempdir().unwrap();
+        fs::write(global.path().join("AGENTS.md"), "global rules").unwrap();
 
         let text =
-            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None).text;
+            load_instructions_with_global_dir(cwd.path().to_str().unwrap(), Some(global.path()))
+                .text;
         assert!(text.contains("global rules"));
-    }
-
-    #[test_case(false, XDG_RULES, LEGACY_RULES ; "xdg_is_searched_even_though_legacy_dir_exists")]
-    #[test_case(true, LEGACY_RULES, XDG_RULES ; "legacy_wins_when_both_have_a_file")]
-    fn load_instructions_global_search_order(write_legacy: bool, wanted: &str, unwanted: &str) {
-        let cwd = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let xdg = tempfile::tempdir().unwrap();
-        let legacy = home.path().join(".maki");
-        fs::create_dir(&legacy).unwrap();
-        if write_legacy {
-            fs::write(legacy.join(GLOBAL_INSTRUCTION_FILE), LEGACY_RULES).unwrap();
-        }
-        fs::write(xdg.path().join(GLOBAL_INSTRUCTION_FILE), XDG_RULES).unwrap();
-
-        let text = load_instructions_with_home(
-            cwd.path().to_str().unwrap(),
-            Some(home.path()),
-            Some(xdg.path()),
-        )
-        .text;
-        assert!(text.contains(wanted), "got {text}");
-        assert!(!text.contains(unwanted), "got {text}");
     }
 
     #[test]
@@ -389,7 +353,7 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), "root rules").unwrap();
         fs::write(sub.join("AGENTS.md"), "crate rules").unwrap();
 
-        let text = load_instructions_with_home(sub.to_str().unwrap(), None, None).text;
+        let text = load_instructions_with_global_dir(sub.to_str().unwrap(), None).text;
         assert!(
             text.contains("crate rules"),
             "should load instructions from cwd"
@@ -477,7 +441,7 @@ mod tests {
         let agents_path = dir.path().join("AGENTS.md");
         fs::write(&agents_path, "content").unwrap();
 
-        let instr = load_instructions_with_home(dir.path().to_str().unwrap(), None, None);
+        let instr = load_instructions_with_global_dir(dir.path().to_str().unwrap(), None);
         assert!(
             instr
                 .loaded
