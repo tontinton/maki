@@ -1359,8 +1359,8 @@ background session of that chat would have.
   - `workflow` (`boolean?`) use workflow-mode descriptions. Default: `false`.
   - `spec` (`string?`) evaluate capability exclusions against this model spec.
   - `mcp` (`boolean?`) describe tools as if MCP is reachable. Default: `false`.
-    Pass what you pass to `maki.agent.session()`. Otherwise the descriptions
-    advertise MCP tools that the session has no way to call.
+    Match what you pass to `maki.agent.session()`, or the descriptions
+    advertise MCP tools the session cannot call.
 
 **Returns:** (`table?`, `string?`) Array of tool definition tables, or `(nil, err)` on failure.
 
@@ -1496,7 +1496,7 @@ With or without a ctx, the plugin must hold what its tools reach. A prompt
 is no gate under YOLO or an allow rule, and a background session has
 nobody to prompt. A tool declaring a permission (`bash` with `run`, `read`
 with `fs_read`) costs that one. A tool declaring none (`batch`,
-`code_execution`), or `mcp` on a chat with MCP servers, costs every
+`code_execution`), or `mcp = true` on a chat with MCP servers, costs every
 permission except `agent`. `local_tools` cost nothing, they run as the
 plugin. The bundled `task` hands over the whole chat, so it holds all
 five.
@@ -1539,11 +1539,9 @@ no live chat session, so opening one fails with "session not live". The
     model alone, so a script cannot reach it through `code_execution`.
   - `name` (`string?`) display name for logs and UI.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
-  - `mcp` (`boolean?`) give the session access to MCP tools. Their
-    definitions are injected automatically each turn (deferred behind
-    `tool_search`), so don't put MCP definitions in `tools`. The session
-    starts with no loaded tools of its own. Default: `false`. Like `tools`,
-    the session only gets what it asks for.
+  - `mcp` (`boolean?`) give the session MCP tools. Their definitions are
+    injected each turn (deferred behind `tool_search`), so do not put MCP
+    definitions in `tools`. Default: `false`.
   - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, an
     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
     `"max"`), or a budget integer (token count). Inherits the parent

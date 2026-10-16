@@ -155,6 +155,7 @@ local function handler(input, ctx)
   local tool_defs, tools_err = maki.agent.tools(ctx, {
     audience = audience,
     spec = model.spec,
+    mcp = true,
   })
   if tools_err then
     return { llm_output = tools_err, is_error = true }
@@ -194,6 +195,7 @@ local function handler(input, ctx)
       tools = tool_defs,
       local_tools = local_tools,
       audience = audience,
+      mcp = true,
       name = input.description,
       thinking = input.thinking,
     })
