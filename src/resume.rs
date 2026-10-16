@@ -229,7 +229,9 @@ fn copy(
     storage: &StateDir,
 ) -> Result<StoredSession> {
     let id = claim.id();
-    let mut copy = session.fork(id, cwd);
+    let mut copy = session
+        .fork(id, cwd, storage)
+        .map_err(|e| eyre!("failed to fork into session {id}: {e}"))?;
     copy.save(claim, storage)
         .map_err(|e| eyre!("failed to write session {id}: {e}"))?;
     Ok(copy)

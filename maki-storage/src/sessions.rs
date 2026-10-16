@@ -28,7 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::lock::{Lock, LockError};
-use crate::{StateDir, StorageError, atomic_write, now_epoch};
+use crate::{StateDir, StorageError, atomic_write, now_epoch, plans};
 
 const SESSION_VERSION: u32 = 1;
 const LOG_FORMAT_VERSION: u32 = 2;
@@ -1877,14 +1877,30 @@ where
     /// for the turns it runs, and counting the original's again would bill them
     /// twice. The epoch is minted fresh because no append cursor into the file
     /// this was read from says anything about the new one.
-    pub fn fork(mut self, id: MakiId, cwd: &str) -> Self {
+    ///
+    /// The fork runs beside the original, so nothing the original still owns
+    /// can be shared. Queued prompts stay behind, or both would run them. The
+    /// plan is copied into a file of its own, or planning in one would write
+    /// over the other's.
+    pub fn fork(mut self, id: MakiId, cwd: &str, storage: &StateDir) -> Result<Self, StorageError> {
+        self.meta.queued_messages.clear();
+        if let Some(plan_path) = &mut self.meta.plan_path {
+            let own_path = plans::new_plan_path(storage)?;
+            // A plan mode session that has not written its plan yet has no file.
+            if let Err(e) = fs::copy(&*plan_path, &own_path)
+                && e.kind() != ErrorKind::NotFound
+            {
+                return Err(e.into());
+            }
+            *plan_path = own_path.to_string_lossy().into_owned();
+        }
         self.id = id;
         self.cwd = cwd.into();
         self.token_usage = U::default();
         self.usage_by_model.clear();
         self.created_at = now_epoch();
         self.rewrite_messages();
-        self
+        Ok(self)
     }
 
     pub fn push_message(&mut self, msg: M) {
@@ -2306,6 +2322,8 @@ mod tests {
     const READ_UNDER_CLAIM: &str = "the transcript must be read under a claim still held";
     const SHARED_CLAIM_HELD: &str = "a claim is held until its last clone drops";
     const PENDING_DRAFT: &str = "half typed thought";
+    const QUEUED_PROMPT: &str = "and then the tests";
+    const FORK_PLAN: &str = "1. split the parser";
     /// Two of these already break the byte budget.
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
@@ -2634,8 +2652,11 @@ mod tests {
         session.token_usage = Value::from(1_000);
         session.add_model_usage("m", usage(1_000, Some(SONNET_COST)));
         let id = MakiId::generate();
+        let tmp = TempDir::new().unwrap();
 
-        let forked = session.fork(id, FORK_CWD);
+        let forked = session
+            .fork(id, FORK_CWD, &StateDir::from_path(tmp.path().to_path_buf()))
+            .unwrap();
 
         assert_eq!(forked.id, id);
         assert_eq!(forked.cwd, FORK_CWD);
@@ -2643,6 +2664,35 @@ mod tests {
         assert!(forked.tool_outputs().contains_key(TOOL_ID));
         assert_eq!(forked.token_usage, Value::default());
         assert!(forked.usage_by_model().is_empty());
+    }
+
+    /// A fork runs beside the original, so it leaves the queue to the original
+    /// and plans in a file of its own, starting from the plan so far if there
+    /// is one.
+    #[test_case(Some(FORK_PLAN) ; "written_plan_is_copied")]
+    #[test_case(None ; "unwritten_plan_gets_a_fresh_path")]
+    fn fork_shares_neither_the_queue_nor_the_plan_file(plan: Option<&str>) {
+        let tmp = TempDir::new().unwrap();
+        let original_plan = tmp.path().join("original.md");
+        if let Some(plan) = plan {
+            fs::write(&original_plan, plan).unwrap();
+        }
+        let mut session: TestSession = Session::new("m", "/project");
+        session.meta.queued_messages = vec![QUEUED_PROMPT.into()];
+        session.meta.plan_path = Some(original_plan.to_string_lossy().into_owned());
+
+        let forked = session
+            .fork(
+                MakiId::generate(),
+                "/project",
+                &StateDir::from_path(tmp.path().to_path_buf()),
+            )
+            .unwrap();
+
+        assert!(forked.meta.queued_messages.is_empty());
+        let fork_plan = PathBuf::from(forked.meta.plan_path.unwrap());
+        assert_ne!(fork_plan, original_plan);
+        assert_eq!(fs::read_to_string(&fork_plan).ok().as_deref(), plan);
     }
 
     #[test]
