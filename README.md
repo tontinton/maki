@@ -21,7 +21,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 ### User experience
 
 * SUPER fast startup, 60 FPS, and light on memory. Not running any JavaScript, using [ratatui](https://ratatui.rs) for TUI. Even the splash screen animation uses SIMD.
-* Extend with neovim like Lua plugins - [Builtin plugins](https://github.com/tontinton/maki/tree/main/plugins), [User made plugins showcase](https://github.com/tontinton/maki/discussions/452), [Lua API reference](https://maki.sh/docs/lua-api/).
+* Extend with neovim like Lua plugins - [Builtin plugins](https://github.com/tontinton/maki/tree/main/plugins), [Community plugin showcase](#community-plugin-showcase), [Lua API reference](https://maki.sh/docs/lua-api/).
 * Philosophy of not hiding anything - while other coding agents hide information as models improve (e.g. not showing number of lines read), maki leaves you in control.
 * UI fits everything well on my small screen laptop.
 * Full visibility of subagents - each subagent gets their own "chat window" you can easily navigate between using `/tasks` (Ctrl-X).
@@ -155,6 +155,19 @@ More info at the [official docs](https://maki.sh/docs).
 ## Community
 
 [![Discord](https://img.shields.io/discord/1543246528876126218?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/8VKuA4naC3)
+
+### Community plugin showcase
+
+A selection of actively developed and maintained community plugins:
+
+| Plugin | Author | Useful features |
+| --- | --- | --- |
+| [maki-essential-plugins](https://github.com/laudney/maki-essential-plugins) | [laudney](https://github.com/laudney) | Goals, background command monitors, and provider switching |
+| [maki-parallel](https://github.com/bzzimmy/maki-parallel) | [bzzimmy](https://github.com/bzzimmy) | Web search and page extraction through Parallel |
+| [replay](https://github.com/g4bwy/maki-plugins/tree/master/replay) | [g4bwy](https://github.com/g4bwy) | Export sessions for HTML playback through `claude-replay` |
+| [maki-browser-plugin](https://github.com/basvk/maki-browser-plugin) | [basvk](https://github.com/basvk) | Playwright browser automation, screenshots, forms, and browser logs |
+
+See each project for setup and requirements. The [plugin showcase discussion](https://github.com/tontinton/maki/discussions/452) has more plugins and demos.
 
 ## Example config
 
