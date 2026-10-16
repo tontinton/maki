@@ -21,11 +21,14 @@ async fn roundtrip(
 
 /// Lists the focused session's chats in chat order. Entry 1 is always the main
 /// chat, with id `"main"` and no `status`: its work is the session's own, and
-/// `maki.session.live()` already reports that. The rest are subagents, keyed by
-/// the tool call that spawned them.
+/// `maki.session.live()` already reports that. The rest are subagents: one a
+/// tool spawned has its tool call's id, one a plugin opened with
+/// [maki.agent.session](#maki-agent-session) has its session id and a
+/// `plugin` field.
 ///
-/// @return (table|nil, string|nil) Array of `{id, name, focused, status?}` where
-///   `status` is `"working"`, `"done"`, or `"error"`, or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, name, focused, status?, plugin?}`
+///   where `status` is `"working"`, `"idle"` (a plugin task between prompts),
+///   `"done"`, or `"error"`, or nil and an error.
 /// @example
 /// for _, t in ipairs(maki.task.list() or {}) do
 ///   print(t.name, t.status or "main")

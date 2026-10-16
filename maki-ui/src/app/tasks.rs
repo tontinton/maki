@@ -45,20 +45,22 @@ impl TaskOutcome {
     }
 }
 
+/// `Idle` is a plugin task alive but quiet between prompts: neither a spinner
+/// nor "done" would be honest.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum TaskStatus {
     Working,
+    Idle,
     Done,
     Error,
 }
 
-impl From<Option<TaskOutcome>> for TaskStatus {
-    fn from(outcome: Option<TaskOutcome>) -> Self {
+impl From<TaskOutcome> for TaskStatus {
+    fn from(outcome: TaskOutcome) -> Self {
         match outcome {
-            None => Self::Working,
-            Some(TaskOutcome::Error) => Self::Error,
-            Some(TaskOutcome::Unknown | TaskOutcome::Done) => Self::Done,
+            TaskOutcome::Error => Self::Error,
+            TaskOutcome::Unknown | TaskOutcome::Done => Self::Done,
         }
     }
 }
@@ -68,15 +70,19 @@ pub(crate) struct TaskState<'a> {
     pub(crate) id: &'a Arc<str>,
     pub(crate) name: &'a str,
     pub(crate) status: TaskStatus,
+    pub(crate) plugin: Option<&'a Arc<str>>,
 }
 
-/// The wire shape of `maki.task.list()`. The main chat leaves `status` unset.
+/// The wire shape of `maki.task.list()`. The main chat leaves `status` unset,
+/// a tool task `plugin`.
 #[derive(Serialize)]
 pub(crate) struct TaskInfo {
     id: Arc<str>,
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<TaskStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugin: Option<Arc<str>>,
     focused: bool,
 }
 
@@ -88,6 +94,7 @@ impl App {
                 id: chat.task_id()?,
                 name: &chat.name,
                 status: chat.task_status(),
+                plugin: chat.plugin.as_ref(),
             })
         })
     }
@@ -102,6 +109,7 @@ impl App {
                 id: chat.task_id_or_main(),
                 name: chat.name.clone(),
                 status: chat.task_id().map(|_| chat.task_status()),
+                plugin: chat.plugin.clone(),
                 focused: idx == self.active_chat,
             })
             .collect()
@@ -157,7 +165,7 @@ impl App {
 
     /// Tasks are looked up by id, never by position and never through
     /// `chat_index`, a routing cache wiped at the end of every turn.
-    fn chat_of_task(&self, id: &str) -> Result<usize, String> {
+    pub(super) fn chat_of_task(&self, id: &str) -> Result<usize, String> {
         if id == MAIN_TASK_ID {
             return Ok(0);
         }
@@ -197,8 +205,9 @@ mod tests {
     use super::*;
     use crate::app::Msg;
     use crate::app::tests::{
-        RESEARCH_NAME, app_with_subagent_id, cancel_app, close_subagent_transcript, end_turn,
-        error_app, finish_subagent, start_subagent,
+        MONITOR_ID, RESEARCH_NAME, app_with_plugin_task, app_with_subagent_id, cancel_app,
+        close_subagent_transcript, done, end_turn, error_app, finish_subagent, plugin_event,
+        start_subagent,
     };
     use crate::chat::{DONE_TEXT, ERROR_TEXT};
     use test_case::test_case;
@@ -242,6 +251,7 @@ mod tests {
             id,
             name: "task",
             status,
+            plugin: None,
         }
     }
 
@@ -466,6 +476,20 @@ mod tests {
         let mut app = app_with_two_subagents();
         assert!(app.remove_task(id).unwrap_err().starts_with(prefix));
         assert_eq!(app.chats.len(), 3);
+    }
+
+    /// An idle plugin task is alive: its session answers the next prompt.
+    #[test]
+    fn remove_refuses_an_idle_plugin_task() {
+        let mut app = app_with_plugin_task();
+        plugin_event(&mut app, done());
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Idle);
+        assert!(
+            app.remove_task(MONITOR_ID)
+                .unwrap_err()
+                .starts_with(RUNNING_DELETE_ERR)
+        );
+        assert_eq!(app.chats.len(), 2);
     }
 
     /// `chat_index` routes by position, so the chats after the deleted one

@@ -114,6 +114,14 @@ impl Serialize for ImageSource {
     }
 }
 
+/// The verdict is derived from the payload, so two sources with the same
+/// pixels are the same source.
+impl PartialEq for ImageSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.media_type == other.media_type && self.data == other.data
+    }
+}
+
 impl ImageSource {
     pub fn new(media_type: ImageMediaType, data: Arc<str>) -> Self {
         Self {
@@ -242,7 +250,7 @@ fn images_kept(total: usize) -> usize {
     total - over.div_ceil(IMAGE_EVICTION_STEP) * IMAGE_EVICTION_STEP
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     #[default]
@@ -256,7 +264,7 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
@@ -355,7 +363,7 @@ impl ContentBlock {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,

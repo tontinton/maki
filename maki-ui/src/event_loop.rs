@@ -1034,13 +1034,15 @@ impl<'t> EventLoop<'t> {
                     }
                 }
             }
-            UiAction::BackgroundUsage {
+            UiAction::PluginTaskEvent {
                 session,
-                model,
-                usage,
+                plugin,
+                envelope,
             } => {
-                for rt in &mut self.sessions {
-                    rt.app.add_background_usage(session, &model, usage);
+                // A straggler after `/new` finds no tab and is dropped.
+                if let Some(idx) = self.sessions.iter().position(|rt| rt.id() == session) {
+                    let actions = self.sessions[idx].app.deliver(*envelope, Some(plugin));
+                    self.dispatch(idx, actions);
                 }
             }
         }
@@ -1110,15 +1112,16 @@ impl<'t> EventLoop<'t> {
         for rt in &mut self.sessions {
             let session_id = rt.app.state.session.id;
             diff_task_states(&mut rt.last_tasks, rt.app.task_states(), |task| {
-                handle.fire_autocmd(
-                    "TaskStatusChanged",
-                    json!({
-                        "session_id": session_id,
-                        "id": task.id,
-                        "name": task.name,
-                        "status": task.status,
-                    }),
-                );
+                let mut data = json!({
+                    "session_id": session_id,
+                    "id": task.id,
+                    "name": task.name,
+                    "status": task.status,
+                });
+                if let Some(plugin) = task.plugin {
+                    data["plugin"] = json!(plugin);
+                }
+                handle.fire_autocmd("TaskStatusChanged", data);
             });
         }
     }
@@ -1704,6 +1707,9 @@ impl<'t> EventLoop<'t> {
             }
             Action::CancelSubagent { tool_use_id } => {
                 self.sessions[idx].handles.cancel_subagent(tool_use_id);
+            }
+            Action::CancelPluginTask { id } => {
+                self.ctx.lua_event_handle.cancel_plugin_session(&id);
             }
             Action::RestartAgent(history) => self.respawn_agent(idx, history),
             Action::ChangeModel(spec) => {

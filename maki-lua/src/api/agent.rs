@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -19,15 +20,15 @@ use maki_agent::tools::{
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, DoneReason,
-    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, InputSource, McpSession,
-    RunContext, RunContextBuilder, RunLedger, SessionEvents, SubagentInbox, SubagentInfo,
-    ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
+    EMPTY_RESPONSE_MARKER, Envelope, EventSender, EventStreamGuard, History, InputSource,
+    McpSession, RunContext, RunContextBuilder, RunLedger, SessionEvents, SubagentInbox,
+    SubagentInfo, ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, Model, RequestOptions, Role, ThinkingConfig, add_cost,
+    ContentBlock, ContextGauge, Message, Model, RequestOptions, Role, ThinkingConfig, add_cost,
 };
 use maki_storage::id::MakiId;
 use maki_storage::now_epoch;
@@ -52,6 +53,9 @@ use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{CANCELLED_MSG, active_task_cancel, host_ui};
 
 const SESSION_CLOSED_ERR: &str = "session closed";
+/// Esc in the task's tab. Distinct from [`CANCELLED_MSG`], so a loop can tell
+/// user intent from the end of its own task and not reopen.
+pub(crate) const STOPPED_BY_USER_ERR: &str = "stopped by user";
 const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prompt";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 const OUTPUT_MODE_ERR: &str = "output_mode must be 'full' or 'compact'";
@@ -187,34 +191,90 @@ fn parse_scope(scope: Option<String>, task: u64) -> LuaResult<Option<u64>> {
     }
 }
 
-/// A background session reports to a sink nobody reads, so its turns would
-/// never reach the chat's totals on their own. We send each one to the tab the
-/// moment it is paid for. A quit or `/new` in the middle of a long prompt then
-/// loses only the turn still streaming, just like the main chat. The registry
-/// entry adds up the same turns, so `/tasks` matches the chat totals even in
-/// the middle of a long prompt.
-struct TurnBilling {
-    session: MakiId,
-    ui: flume::Sender<UiAction>,
-    registry: BackgroundSessions,
-    id: String,
+/// Where a session's events go. A session opened on a tool ctx reports to the
+/// tool's parent agent. One a plugin opened by chat session id reports to
+/// the chat's tab, which shows it as a task owned by that plugin. Headless
+/// there is no tab, so `ui` is `None` and only the registry keeps the cost
+/// for `maki.agent.list()`.
+#[derive(Clone)]
+enum Upstream {
+    Parent(EventSender),
+    Chat {
+        session: MakiId,
+        plugin: Arc<str>,
+        ui: Option<flume::Sender<UiAction>>,
+        registry: BackgroundSessions,
+        id: String,
+    },
 }
 
-/// Forwards subagent events to the parent, stamped with the subagent identity.
+impl Upstream {
+    fn send(&self, envelope: Envelope) {
+        match self {
+            Self::Parent(tx) => {
+                let _ = tx.send_envelope(envelope);
+            }
+            Self::Chat {
+                session,
+                plugin,
+                ui: Some(ui),
+                ..
+            } => {
+                let _ = ui.try_send(UiAction::PluginTaskEvent {
+                    session: *session,
+                    plugin: Arc::clone(plugin),
+                    envelope: Box::new(envelope),
+                });
+            }
+            Self::Chat { ui: None, .. } => {}
+        }
+    }
+
+    /// A parent drops every run but its own as stale, so the event has to
+    /// carry its run. The tab is not bound to a run at all.
+    fn send_event(&self, event: AgentEvent, subagent: Option<SubagentInfo>) {
+        let run_id = match self {
+            Self::Parent(tx) => tx.run_id(),
+            Self::Chat { .. } => 0,
+        };
+        self.send(Envelope {
+            event,
+            subagent,
+            run_id,
+        });
+    }
+
+    /// The transcript as of now. A plugin task writes it after every prompt,
+    /// so a monitor that dies with the process still leaves what it did.
+    fn send_history(&self, tool_use_id: &str, messages: Vec<Message>) {
+        self.send_event(
+            AgentEvent::SubagentHistory {
+                tool_use_id: tool_use_id.to_owned(),
+                messages,
+            },
+            None,
+        );
+    }
+}
+
+/// Forwards subagent events upstream, stamped with the subagent identity.
 /// Usage goes live on the tool header while the run goes on (last turn's tokens
-/// plus the run's summed cost). `Done` only pings `done_tx`, which tells
-/// `prompt` that every turn of the run has passed through. A background session bills
-/// every turn it sees, compactions and nested subagents too, each under the
-/// model that ran it. Nested relays hand their turns up here instead of billing
-/// them, and `Done` only repeats the run's total, so no turn gets paid twice.
+/// plus the run's summed cost). `Done` pings `done_tx`, which tells `prompt`
+/// that every turn of the run has passed through. A parent agent hears neither
+/// `Done` nor `Error`: it learns both from the tool result. A chat tab hears
+/// both, since nothing else would tell its task the run ended, and hears
+/// `StreamClosed` once the session is gone. The registry adds up every turn
+/// it sees, compactions and nested subagents too, each under the model that
+/// ran it. Nested relays hand their turns up here instead of billing them, and
+/// `Done` only repeats the run's total, so no turn gets paid twice.
 async fn relay_session_events(
     mut sub_events: SessionEvents,
-    parent_tx: EventSender,
+    upstream: Upstream,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     done_tx: flume::Sender<()>,
     live_sink: Option<flume::Sender<ToolLive>>,
-    billing: Option<TurnBilling>,
 ) {
+    let to_chat = matches!(upstream, Upstream::Chat { .. });
     let mut cost = None;
     while let Some(mut envelope) = sub_events.next().await {
         match &envelope.event {
@@ -223,31 +283,29 @@ async fn relay_session_events(
                 if let Some(sink) = &live_sink {
                     let _ = sink.send(ToolLive::Usage(turn.usage.format_sum_cost(cost)));
                 }
-                if let Some(billing) = &billing {
-                    // Before the UI hears of it, so whoever sees the bill also
-                    // sees it in `maki.agent.list()`.
-                    billing.registry.update(&billing.id, |e| e.cost = cost);
-                    let _ = billing.ui.try_send(UiAction::BackgroundUsage {
-                        session: billing.session,
-                        model: turn.model.clone(),
-                        usage: turn
-                            .usage
-                            .billed_with_subsidised_list_cost(turn.cost, turn.subsidised_list_cost),
-                    });
+                // Updated before the tab hears of the turn, so whoever sees
+                // the bill in the chat also sees it in `maki.agent.list()`.
+                if let Upstream::Chat { registry, id, .. } = &upstream {
+                    registry.update(id, |e| e.info.cost = cost);
                 }
             }
             AgentEvent::Done { .. } => {
                 let _ = done_tx.send(());
-                continue;
+                if !to_chat {
+                    continue;
+                }
             }
-            AgentEvent::Error { .. }
-            | AgentEvent::ToolOutput { .. }
+            AgentEvent::Error { .. } if !to_chat => continue,
+            AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolPending { .. }
             | AgentEvent::SubagentHistory { .. } => continue,
             _ => {}
         }
         envelope.subagent = subagent_info.get().cloned();
-        let _ = parent_tx.send_envelope(envelope);
+        upstream.send(envelope);
+    }
+    if to_chat {
+        upstream.send_event(AgentEvent::StreamClosed, subagent_info.get().cloned());
     }
 }
 
@@ -608,10 +666,18 @@ async fn call_tool(
 /// An event-driven one opens once with `scope = "session"`, keeps the handle
 /// and prompts it from autocmd callbacks.
 ///
-/// Its spend counts in the chat's totals after each turn, and `/tasks` lists
-/// it but cannot stop it yet. Setting `plugins.<name>.enabled = false` stops a
-/// plugin's monitors from the next `/reload`. Under `maki -p` and ACP there is
-/// no live chat session, so opening one fails with "session not live". The
+/// Opened by chat session id, it shows up in that chat as a task owned by
+/// the plugin from its first prompt on: a transcript tab, a `plugin` field
+/// in `/tasks` and `maki.task.list()`, `"idle"` between prompts, and its
+/// spend in the chat's totals after each turn. Esc in its tab closes it,
+/// and the pending `:prompt()` returns `"stopped by user"` rather than
+/// `"cancelled"`, so a loop can tell the user's Esc from its own task
+/// ending and stop rather than reopen. Permission prompts stay denied even
+/// though the task has a tab: a prompt in an unfocused tab would stall a
+/// monitor silently, a denial reaches the plugin as an error it can handle.
+/// Setting `plugins.<name>.enabled = false` stops a plugin's monitors from
+/// the next `/reload`. Under `maki -p` and ACP there is no live chat
+/// session, so opening one fails with "session not live". The
 /// [maki.agent](#maki-agent) overview has a full monitor.
 ///
 /// @param ctx LuaCtx|table Agent context, or `opts` when called without one.
@@ -809,22 +875,23 @@ async fn session(
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
-    let billing = owner.as_ref().and_then(|&(session, ..)| {
-        Some(TurnBilling {
-            session,
-            ui: host_ui(&lua)?,
+    let upstream = match &owner {
+        Some((session, ..)) => Upstream::Chat {
+            session: *session,
+            plugin: Arc::clone(&plugin),
+            ui: host_ui(&lua),
             registry: BackgroundSessions::of(&lua),
             id: ui_id.clone(),
-        })
-    });
+        },
+        None => Upstream::Parent(parent_tx),
+    };
 
     smol::spawn(relay_session_events(
         sub_events,
-        parent_tx.clone(),
+        upstream.clone(),
         Arc::clone(&subagent_info),
         done_tx,
         agent_ctx.live_sink.clone(),
-        billing,
     ))
     .detach();
 
@@ -847,6 +914,7 @@ async fn session(
     let background = match owner {
         Some((session, task, cancel)) => {
             let registry = BackgroundSessions::of(&lua);
+            let stopped = Arc::new(AtomicBool::new(false));
             try_pair!(registry.register(BackgroundSession {
                 info: BackgroundInfo {
                     id: cancellation.ui_id.clone(),
@@ -858,11 +926,13 @@ async fn session(
                 },
                 session,
                 task,
+                stopped: Arc::clone(&stopped),
                 _cancel: cancel,
             }));
             Some(Background {
                 registry,
                 session,
+                stopped,
                 thinking: requested_thinking,
                 fast,
             })
@@ -926,7 +996,7 @@ async fn session(
         reauth: agent_ctx.reauth,
         inbox: Arc::new(SubagentInbox::default()),
         cancellation: Arc::clone(&cancellation),
-        parent_event_tx: parent_tx,
+        upstream,
         subagent_info,
         local_tools: Arc::new(local_map),
         name,
@@ -1163,7 +1233,7 @@ struct SessionState {
     /// session can queue messages that its next turn boundary picks up.
     inbox: Arc<SubagentInbox>,
     cancellation: Arc<SessionCancellation>,
-    parent_event_tx: EventSender,
+    upstream: Upstream,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
     name: String,
@@ -1206,6 +1276,7 @@ impl RunDones {
 struct Background {
     registry: BackgroundSessions,
     session: MakiId,
+    stopped: Arc<AtomicBool>,
     /// What the plugin asked for at open. We keep it because every prompt caps
     /// it again against the chat as it is at that moment.
     thinking: Option<ThinkingConfig>,
@@ -1214,7 +1285,7 @@ struct Background {
 
 impl Background {
     fn start_prompt(&self, id: &str) -> PromptSettle {
-        self.registry.update(id, |e| e.running = true);
+        self.registry.update(id, |e| e.info.running = true);
         PromptSettle {
             registry: self.registry.clone(),
             id: id.to_owned(),
@@ -1234,11 +1305,18 @@ struct PromptSettle {
 
 impl Drop for PromptSettle {
     fn drop(&mut self) {
-        self.registry.update(&self.id, |e| e.running = false);
+        self.registry.update(&self.id, |e| e.info.running = false);
     }
 }
 
 impl SessionState {
+    /// Esc in the task's tab, see [`BackgroundSessions::stop`].
+    fn stopped_by_user(&self) -> bool {
+        self.background
+            .as_ref()
+            .is_some_and(|b| b.stopped.load(Ordering::Relaxed))
+    }
+
     fn close(&mut self) {
         if self.closed {
             return;
@@ -1248,10 +1326,8 @@ impl SessionState {
         self.cancellation.cancel();
         let usage = self.params.ledger.totals().usage;
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
-        let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
-            tool_use_id: self.cancellation.ui_id.clone(),
-            messages,
-        });
+        self.upstream
+            .send_history(&self.cancellation.ui_id, messages);
         info!(
             name = %self.name,
             duration_ms = self.start.elapsed().as_millis() as u64,
@@ -1316,7 +1392,10 @@ impl Drop for LuaSession {
 /// @param message string User message to send.
 /// @return (table?, string?) Result table on success, or `(nil, err)` on
 /// failure. A run cut short after streaming some text hands you both: the
-/// error and a `{ text = <what it streamed> }` table.
+/// error and a `{ text = <what it streamed> }` table. `"cancelled"` means the
+/// task that opened or prompted the session ended. `"stopped by user"` means
+/// Esc in its tab closed a session opened by chat session id, and every
+/// later prompt answers the same.
 /// @example
 /// local r, err = sess:prompt("What files are in this project?")
 /// if err then error(err) end
@@ -1355,6 +1434,9 @@ async fn prompt(
     if s.closed {
         return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
     }
+    if s.stopped_by_user() {
+        return Ok(err_pair(STOPPED_BY_USER_ERR));
+    }
     // The user can lower the effort while a monitor sits idle, so we ask the
     // seed again on every prompt. Plan mode is left out on purpose. Each write
     // checks it instead, see `AgentSeed::background_write_block`.
@@ -1385,6 +1467,13 @@ async fn prompt(
             opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
             inbox: Some(Arc::clone(&s.inbox)),
+        });
+    } else if s.background.is_some() {
+        // The first prompt reaches the tab on `SubagentInfo`. Every later one
+        // is shown the way a queued message is.
+        let _ = s.sub_event_tx.send(AgentEvent::QueueItemConsumed {
+            text: message.clone(),
+            images: Vec::new(),
         });
     }
 
@@ -1436,6 +1525,13 @@ async fn prompt(
         s.dones.expect_one();
     }
     let result = finished.unwrap_or(Ok(DoneReason::Cancelled));
+    // Before the run is judged, so a prompt Esc or an error cut short still
+    // leaves what it streamed in the tab's transcript. A monitor nobody closes
+    // would otherwise keep it in memory until the plugin unloads.
+    if s.background.is_some() {
+        s.upstream
+            .send_history(&s.cancellation.ui_id, s.history.as_slice().to_vec());
+    }
     // Only this call's messages count: older turns may hold stale preamble
     // text, and the agent loop's empty-response retry leaves a synthetic
     // "(empty)" assistant marker that must not pass for a real response.
@@ -1448,6 +1544,7 @@ async fn prompt(
     // prompt never reached the model, so an empty answer would be a lie.
     let cut_short = match &result {
         Err(e) => Some(e.to_string()),
+        Ok(DoneReason::Cancelled) if s.stopped_by_user() => Some(STOPPED_BY_USER_ERR.to_owned()),
         Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
         Ok(DoneReason::Dropped) => Some(PROMPT_DROPPED_ERR.to_owned()),
         Ok(
@@ -1927,24 +2024,13 @@ mod tests {
         info
     }
 
-    /// Dropping the guard is what ends the relay: a Lua tool context keeps a
-    /// sender alive past the run, so disconnect never comes. The forwarded
-    /// count also pins down that the close marker itself stays behind, since
-    /// passing it on would end the *parent's* stream at the first subagent.
-    ///
-    /// The first turn plays one handed up by a nested subagent, so it has to
-    /// be billed under that subagent's model, not the session's.
-    #[test]
-    fn relay_session_events_reports_and_bills_each_turn_once() {
-        let session = MakiId::generate();
+    /// Two turns, an error and the run's `Done`, then the guard drops. The
+    /// first turn plays one handed up by a nested subagent, so it has to be
+    /// reported under that subagent's model, not the session's.
+    fn relayed_run() -> SessionEvents {
         let (guard, sub_events) = event_stream();
         let sub_tx = guard.sender(RUN_ID);
-        let (parent_raw_tx, parent_rx) = flume::unbounded();
-        let (done_tx, done_rx) = flume::unbounded();
-        let (live_tx, live_rx) = flume::unbounded();
-        let (ui_tx, ui_rx) = flume::unbounded();
-
-        for event in [
+        let events = [
             turn(NESTED_MODEL, tokens(100, 20), 0.25),
             turn(SESSION_MODEL, tokens(50, 10), 0.5),
             AgentEvent::Error {
@@ -1960,64 +2046,70 @@ mod tests {
                 num_turns: 2,
                 reason: DoneReason::EndTurn,
             },
-        ] {
+        ];
+        for event in events {
             sub_tx.send(event).unwrap();
         }
         drop(guard);
+        sub_events
+    }
 
-        smol::block_on(relay_session_events(
-            sub_events,
-            EventSender::new(parent_raw_tx, RUN_ID),
-            subagent_info(),
-            done_tx,
-            Some(live_tx),
-            Some(TurnBilling {
-                session,
-                ui: ui_tx,
-                registry: BackgroundSessions::default(),
-                id: PARENT_ID.into(),
-            }),
-        ));
-
-        let live = live_rx
-            .drain()
+    fn live_usages(rx: &flume::Receiver<ToolLive>) -> Vec<String> {
+        rx.drain()
             .map(|event| match event {
                 ToolLive::Usage(usage) => usage,
                 _ => panic!("relay must only publish usage"),
             })
-            .collect::<Vec<_>>();
-        let expected = [
+            .collect()
+    }
+
+    fn event_names(events: &[AgentEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| {
+                serde_json::to_value(event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn parent_upstream() -> (Upstream, flume::Receiver<Envelope>) {
+        let (parent_raw_tx, parent_rx) = flume::unbounded();
+        let upstream = Upstream::Parent(EventSender::new(parent_raw_tx, RUN_ID));
+        (upstream, parent_rx)
+    }
+
+    /// Dropping the guard is what ends the relay: a Lua tool context keeps a
+    /// sender alive past the run, so disconnect never comes. The forwarded
+    /// count also pins down that the close marker itself stays behind, since
+    /// passing it on would end the *parent's* stream at the first subagent.
+    /// The parent hears neither `Error` nor `Done`: both reach it through the
+    /// tool result.
+    #[test]
+    fn relay_to_parent_reports_each_turn_and_keeps_run_ends_behind() {
+        let (upstream, parent_rx) = parent_upstream();
+        let (done_tx, done_rx) = flume::unbounded();
+        let (live_tx, live_rx) = flume::unbounded();
+
+        smol::block_on(relay_session_events(
+            relayed_run(),
+            upstream,
+            subagent_info(),
+            done_tx,
+            Some(live_tx),
+        ));
+
+        let expected_live = [
             tokens(100, 20).format_sum_cost(Some(0.25)),
             tokens(50, 10).format_sum_cost(Some(0.75)),
         ];
-        assert_eq!(live, expected);
+        assert_eq!(live_usages(&live_rx), expected_live);
         assert_eq!(done_rx.try_recv(), Ok(()));
 
-        let billed = ui_rx
-            .drain()
-            .map(|action| match action {
-                UiAction::BackgroundUsage {
-                    session: billed_session,
-                    model,
-                    usage,
-                } if billed_session == session => (model, usage),
-                _ => panic!("relay must only bill this chat session"),
-            })
-            .collect::<Vec<_>>();
-        let expected_billed = [
-            (
-                NESTED_MODEL.to_owned(),
-                tokens(100, 20).billed_with_subsidised_list_cost(Some(0.25), None),
-            ),
-            (
-                SESSION_MODEL.to_owned(),
-                tokens(50, 10).billed_with_subsidised_list_cost(Some(0.5), None),
-            ),
-        ];
-        assert_eq!(billed, expected_billed);
-
         let forwarded = parent_rx.drain().collect::<Vec<_>>();
-        assert_eq!(forwarded.len(), expected.len());
+        assert_eq!(forwarded.len(), expected_live.len());
         assert!(forwarded.iter().all(|envelope| {
             matches!(envelope.event, AgentEvent::TurnComplete(_))
                 && envelope
@@ -2025,5 +2117,77 @@ mod tests {
                     .as_ref()
                     .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
         }));
+    }
+
+    /// The parent's stream drops any run but its own, so the transcript a
+    /// close sends has to carry the parent's run like the relayed events do.
+    #[test]
+    fn history_sent_to_the_parent_carries_its_run() {
+        let (upstream, parent_rx) = parent_upstream();
+        upstream.send_history(PARENT_ID, Vec::new());
+        let envelope = parent_rx.try_recv().unwrap();
+        assert_eq!(envelope.run_id, RUN_ID);
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::SubagentHistory { tool_use_id, .. } if tool_use_id == PARENT_ID
+        ));
+    }
+
+    /// A chat tab hears everything a task needs to show itself: the turns,
+    /// the error, the run's `Done` (its task goes idle on it) and, once the
+    /// guard drops, `StreamClosed` (its task is done). Every event names the
+    /// owning plugin and chat session.
+    #[test]
+    fn relay_to_chat_forwards_run_ends_and_closes_the_task() {
+        let session = MakiId::generate();
+        let (done_tx, done_rx) = flume::unbounded();
+        let (ui_tx, ui_rx) = flume::unbounded();
+
+        smol::block_on(relay_session_events(
+            relayed_run(),
+            Upstream::Chat {
+                session,
+                plugin: Arc::from(PLUGIN),
+                ui: Some(ui_tx),
+                registry: BackgroundSessions::default(),
+                id: PARENT_ID.into(),
+            },
+            subagent_info(),
+            done_tx,
+            None,
+        ));
+
+        assert_eq!(done_rx.try_recv(), Ok(()));
+        let forwarded = ui_rx
+            .drain()
+            .map(|action| match action {
+                UiAction::PluginTaskEvent {
+                    session: owner,
+                    plugin,
+                    envelope,
+                } if owner == session && &*plugin == PLUGIN => envelope,
+                _ => panic!("relay must only send task events for this chat session"),
+            })
+            .collect::<Vec<_>>();
+        assert!(forwarded.iter().all(|envelope| {
+            envelope
+                .subagent
+                .as_ref()
+                .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
+        }));
+        let events = forwarded
+            .into_iter()
+            .map(|envelope| envelope.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_names(&events),
+            [
+                "turn_complete",
+                "turn_complete",
+                "error",
+                "done",
+                "stream_closed"
+            ]
+        );
     }
 }

@@ -5,9 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use maki_agent::SharedBuf;
+use maki_agent::{Envelope, SharedBuf};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::StoredTokenUsage;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
@@ -671,13 +670,14 @@ pub enum UiAction {
         depth: u8,
         reply_tx: flume::Sender<Result<(), String>>,
     },
-    /// What one background subagent turn spent. A tab keeps its channels
-    /// across `/new`, so the chat session id is the only way to tell if the
-    /// tab still shows the session that paid.
-    BackgroundUsage {
+    /// An event from a subagent session a plugin opened on a chat session,
+    /// which shows it as a task. A tab keeps its channels across `/new`, so
+    /// the chat session id is the only way to tell if the tab still shows the
+    /// session that owns it.
+    PluginTaskEvent {
         session: MakiId,
-        model: String,
-        usage: StoredTokenUsage,
+        plugin: Arc<str>,
+        envelope: Box<Envelope>,
     },
 }
 

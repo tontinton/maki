@@ -188,9 +188,11 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
 ///   when the title changes (rename or auto-generation).
 /// - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
-///   (`"working"`, `"done"`, or `"error"`), when a subagent starts or
-///   changes status. A task that comes back from disk already finished
-///   stays quiet, so reloading a session does not replay old tasks.
+///   (`"working"`, `"idle"`, `"done"`, or `"error"`), when a subagent starts
+///   or changes status. A task a plugin opened with `maki.agent.session`
+///   carries `data.plugin`, and `"idle"` is such a task between prompts. A
+///   task that comes back from disk already finished stays quiet, so
+///   reloading a session does not replay old tasks.
 /// - `"TaskFocusChanged"`: `data.id`, the task now on screen (`"main"` or a
 ///   subagent's id, what `ctx:task_id()` reports inside a tool). Fires for
 ///   the chat cycling keys, `maki.task.focus`, and a session switch that

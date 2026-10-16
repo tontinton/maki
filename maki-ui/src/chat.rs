@@ -59,6 +59,12 @@ pub enum ChatEventResult {
 
 pub struct Chat {
     pub name: String,
+    /// The plugin that opened this task with `maki.agent.session`. A tool task
+    /// has none: it lives for one turn of the main chat and is swept with it,
+    /// while a plugin task answers only to its plugin and to Esc in its tab.
+    pub(crate) plugin: Option<Arc<str>>,
+    /// A plugin task between prompts: its run ended, its session did not.
+    pub(crate) idle: bool,
     pub cost: Option<f64>,
     /// This chat's slice of the session's list-price reference cost; mirrors
     /// `cost`, but only ever set for subsidised models.
@@ -95,6 +101,8 @@ impl Chat {
         messages_panel.set_chat(session_id, task_id.map(Arc::from));
         Self {
             name,
+            plugin: None,
+            idle: false,
             cost: None,
             list_cost: None,
             context_size: 0,
@@ -123,7 +131,19 @@ impl Chat {
     }
 
     pub(crate) fn task_status(&self) -> TaskStatus {
-        self.finish.map(|(outcome, _)| outcome).into()
+        match self.finish {
+            Some((outcome, _)) => outcome.into(),
+            None if self.idle => TaskStatus::Idle,
+            None => TaskStatus::Working,
+        }
+    }
+
+    /// A plugin task that still answers to its plugin. Its session lives in
+    /// the Lua host, so neither a rewind nor a reload of the chrome ends it.
+    pub(crate) fn is_live_plugin_task_of(&self, session: MakiId) -> bool {
+        self.plugin.is_some()
+            && !self.is_finished()
+            && self.messages_panel.session_id() == Some(session)
     }
 
     pub fn set_pending_turn_usage(&mut self, usage: String) {

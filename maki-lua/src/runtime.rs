@@ -2648,7 +2648,6 @@ impl LuaRuntime {
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(SpawnedTasks::default());
-        lua.set_app_data(BackgroundSessions::default());
         lua.set_app_data(crate::api::top::NotifyHandler::default());
         lua.set_app_data(PluginEnvs::default());
         lua.set_app_data(HostUi(ui_action_tx.clone()));
@@ -4326,6 +4325,9 @@ pub(crate) struct LuaThread {
     /// Shared with the runtime on the Lua thread, so a handle can answer "is
     /// anyone layering this" without a roundtrip.
     pub layered: Arc<LayeredTools>,
+    /// Shared with the runtime too: Esc on a plugin task closes its session
+    /// from the event loop, with no Lua-thread hop.
+    pub background: BackgroundSessions,
     pub join: Option<JoinHandle<()>>,
     pub shutdown: Arc<AtomicBool>,
     pub command_reader: LuaCommandReader,
@@ -4366,6 +4368,8 @@ pub fn spawn(
     let (hint_writer, hint_reader) = HintWriter::new();
     let key_lint = KeyLint::default();
     let key_lint_thread = key_lint.clone();
+    let background = BackgroundSessions::default();
+    let background_thread = background.clone();
     // The file index outlives any one plugin host, so the walks a host
     // rebuilt by `/reload` is waiting on are the ones the old host started.
     publish_walks(EventHandle::from_tx(tx.clone()));
@@ -4389,6 +4393,7 @@ pub fn spawn(
             ) {
                 Ok(r) => {
                     r.lua.set_app_data(key_lint_thread);
+                    r.lua.set_app_data(background_thread);
                     r.lua.set_app_data(ui_waker);
                     let _ = init_tx.send(Ok(()));
                     r
@@ -5023,6 +5028,7 @@ pub fn spawn(
         tx,
         prio_tx,
         layered,
+        background,
         join: Some(handle),
         shutdown,
         command_reader,

@@ -176,6 +176,10 @@ impl MessagesPanel {
         self.task_id = task_id;
     }
 
+    pub(crate) fn session_id(&self) -> Option<MakiId> {
+        self.session_id.as_ref().map(SessionRef::id)
+    }
+
     fn stamp_chat(&self, item: &mut maki_lua::RestoreItem) {
         item.session_id = self.session_id.clone();
         item.task_id = self.task_id.clone();

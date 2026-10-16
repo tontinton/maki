@@ -73,7 +73,6 @@ use maki_lua::{
 use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
-use maki_storage::id::MakiId;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_thinking;
 use maki_storage::sessions::StoredTokenUsage;
@@ -1507,7 +1506,7 @@ impl App {
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.clear();
         self.shell.cancel_all();
-        for chat in &mut self.chats {
+        for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
             chat.flush();
             chat.cancel_in_progress();
         }
@@ -1521,37 +1520,30 @@ impl App {
         }]
     }
 
+    /// A tool task can be cancelled only while its turn still routes to it.
+    /// A plugin task can be cancelled any time it is alive, idle included.
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
-        let tool_use_id = self
-            .chat_index
-            .iter()
-            .find(|&(_, &idx)| idx == self.active_chat)
-            .map(|(id, _)| id.clone());
-
-        let Some(tool_use_id) = tool_use_id else {
+        let chat = &self.chats[self.active_chat];
+        let Some(id) = chat.task_id().cloned() else {
             return vec![];
+        };
+        let action = match chat.plugin {
+            Some(_) if !chat.is_finished() => Action::CancelPluginTask { id: id.to_string() },
+            None if self.chat_index.get(&*id) == Some(&self.active_chat) => {
+                Action::CancelSubagent {
+                    tool_use_id: id.to_string(),
+                }
+            }
+            _ => return vec![],
         };
 
         self.chats[self.active_chat].flush();
         self.chats[self.active_chat].cancel_in_progress();
         self.chats[self.active_chat].mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.remove(&tool_use_id);
-        self.permission_prompt.drop_subagent(&tool_use_id);
+        self.subagent_answers.remove(&*id);
+        self.permission_prompt.drop_subagent(&id);
 
-        vec![Action::CancelSubagent { tool_use_id }]
-    }
-
-    /// A background subagent has no chat of its own, so its cost goes on the
-    /// main chat. That is also where a resumed session shows its whole past bill.
-    pub(crate) fn add_background_usage(
-        &mut self,
-        session: MakiId,
-        model: &str,
-        usage: StoredTokenUsage,
-    ) {
-        if session == self.state.session.id {
-            self.bill(0, model, usage);
-        }
+        vec![action]
     }
 
     fn bill(&mut self, chat_idx: usize, model: &str, usage: StoredTokenUsage) {
@@ -1567,8 +1559,15 @@ impl App {
             usage.subsidised_list_cost,
         );
         self.state.session_mut().add_model_usage(model, usage);
+        // A task's cost outlives it on disk, and nothing else writes the meta
+        // between a plugin task's turns.
+        if chat_idx != MAIN_CHAT {
+            self.sync_subagents();
+        }
     }
 
+    /// Run-scoped delivery for the tab's own agent: restore snapshots fan out
+    /// to every chat, stale runs are dropped, the rest goes to [`Self::deliver`].
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
@@ -1608,7 +1607,14 @@ impl App {
             }
             return vec![];
         }
+        self.deliver(envelope, None)
+    }
 
+    /// `plugin` names the plugin whose session sent the event, which the chat
+    /// shows as a task of that plugin. Those events skip the run gate above:
+    /// the session outlives turns, Esc and rewinds, so the only gate is the
+    /// chat session, which the event loop already matched.
+    pub(crate) fn deliver(&mut self, envelope: Envelope, plugin: Option<Arc<str>>) -> Vec<Action> {
         let task_id = match &envelope.event {
             AgentEvent::SubagentHistory { tool_use_id, .. } => Some(tool_use_id),
             _ => envelope.subagent.as_ref().map(|s| &s.parent_tool_use_id),
@@ -1625,7 +1631,9 @@ impl App {
             // Workflow sessions use synthetic ids that no ToolDone will match,
             // so we finish them here on SubagentHistory. This event only knows
             // that the transcript closed, so say Unknown and leave the verdict
-            // to the ToolDone that follows elsewhere.
+            // to the ToolDone that follows elsewhere. A plugin task is never in
+            // `chat_index`, and rightly stays open here: it writes its
+            // transcript after every prompt, and its close is `StreamClosed`.
             if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
                 self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
             }
@@ -1647,10 +1655,21 @@ impl App {
             .as_ref()
             .map(|s| s.parent_tool_use_id.clone());
 
+        let is_plugin_task = plugin.is_some();
         let chat_idx = match envelope.subagent {
-            Some(ref subagent) => self.resolve_or_create_chat(subagent),
-            None => 0,
+            Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin),
+            // A plugin session that never prompted has no task to show.
+            None if is_plugin_task => return vec![],
+            None => MAIN_CHAT,
         };
+        if is_plugin_task && matches!(envelope.event, AgentEvent::StreamClosed) {
+            // The session is gone. If Esc already ended the task, this `Done`
+            // leaves its `Error` in place. A close mid-prompt leaves tools
+            // without a result, and nothing after this would settle them.
+            self.chats[chat_idx].cancel_in_progress();
+            self.chats[chat_idx].mark_finished(TaskOutcome::Done, DONE_TEXT);
+            return vec![];
+        }
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
             if self.state.mode == Mode::Plan
@@ -1688,7 +1707,10 @@ impl App {
             return vec![];
         }
 
-        self.retry_info = None;
+        // A plugin task streams while the main chat may be mid-retry.
+        if chat_idx == MAIN_CHAT {
+            self.retry_info = None;
+        }
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.bill(
@@ -1728,6 +1750,7 @@ impl App {
             if chat_idx == 0 {
                 self.on_queue_item_consumed(text, images);
             } else {
+                self.chats[chat_idx].idle = false;
                 self.chats[chat_idx].show_user_message(text, images);
             }
             return vec![];
@@ -1757,6 +1780,11 @@ impl App {
                 DisplayRole::Error,
                 AUTH_EXPIRED_MSG.into(),
             ));
+            // No retry is offered for a plugin task. Its plugin hears the
+            // error from `:prompt()` and decides whether to prompt again.
+            if is_plugin_task {
+                return vec![];
+            }
             if chat_idx != 0 {
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Error,
@@ -1764,6 +1792,28 @@ impl App {
                 ));
             }
             self.pending_input = PendingInput::AuthRetry { subagent_id };
+            return vec![];
+        }
+
+        if is_plugin_task {
+            // Either way the prompt has returned, and the session waits for
+            // the next one. A run its Lua task's end cut short mid-tool has no
+            // `handle_cancel` to settle the tool, so it is settled here.
+            match result {
+                ChatEventResult::Done => {
+                    self.chats[chat_idx].cancel_in_progress();
+                    self.chats[chat_idx].idle = true;
+                }
+                ChatEventResult::Error(message) => {
+                    self.chats[chat_idx].cancel_in_progress();
+                    self.chats[chat_idx].idle = true;
+                    self.chats[chat_idx].push(DisplayMessage::new(
+                        DisplayRole::Error,
+                        cap_error_text(&message),
+                    ));
+                }
+                _ => {}
+            }
             return vec![];
         }
 
@@ -1813,19 +1863,32 @@ impl App {
         }
     }
 
-    fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
+    /// A tool task is found through `chat_index`, a plugin task by id: the
+    /// index is wiped every turn, and a plugin task would come back as a
+    /// second chat at the main chat's next turn end.
+    fn resolve_or_create_chat(
+        &mut self,
+        subagent: &SubagentInfo,
+        plugin: &Option<Arc<str>>,
+    ) -> usize {
         let id = &subagent.parent_tool_use_id;
-        if let Some(&idx) = self.chat_index.get(id.as_str()) {
+        let known = match plugin {
+            None => self.chat_index.get(id.as_str()).copied(),
+            Some(_) => self.chat_of_task(id).ok(),
+        };
+        if let Some(idx) = known {
             return idx;
         }
         let idx = self.chats.len();
-        self.chat_index.insert(id.clone(), idx);
+        if plugin.is_none() {
+            self.chat_index.insert(id.clone(), idx);
+            self.chats[MAIN_CHAT].update_tool_summary(id, &subagent.name);
+            if let Some(ref model) = subagent.model {
+                self.chats[MAIN_CHAT].update_tool_model(id, model);
+            }
+        }
         if let Some(ref tx) = subagent.answer_tx {
             self.subagent_answers.insert(id.clone(), tx.clone());
-        }
-        self.chats[MAIN_CHAT].update_tool_summary(id, &subagent.name);
-        if let Some(ref model) = subagent.model {
-            self.chats[MAIN_CHAT].update_tool_model(id, model);
         }
         let mut chat = Chat::new(
             self.state.session.id,
@@ -1835,6 +1898,7 @@ impl App {
             self.lua_event_handle.clone(),
         );
         chat.set_restore_channel(self.restore_event_tx.clone());
+        chat.plugin = plugin.clone();
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;
         chat.inbox = subagent.inbox.clone();
@@ -2422,14 +2486,13 @@ impl App {
     fn terminalize_turn(&mut self, message: &str) {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[MAIN_CHAT].fail_in_progress_except(message.into(), self.shell.active_ids());
-        for chat in self.chats.iter_mut().skip(1) {
+        for chat in self.chats.iter_mut().skip(1).filter(|c| c.plugin.is_none()) {
             chat.fail_in_progress_with_message(message.into());
         }
     }
 
     /// Marks unfinished subagent chats as ended and drops them from
-    /// `chat_index`, so the session records only the children that really
-    /// completed.
+    /// `chat_index`, then mirrors the tabs into the session meta.
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.chat_index.retain(|_, &mut sub_idx| {
             if self.chats[sub_idx].is_finished() {

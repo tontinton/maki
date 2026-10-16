@@ -845,9 +845,11 @@ name the session now running or focused. What each event adds:
 - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
   when the title changes (rename or auto-generation).
 - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
-  (`"working"`, `"done"`, or `"error"`), when a subagent starts or
-  changes status. A task that comes back from disk already finished
-  stays quiet, so reloading a session does not replay old tasks.
+  (`"working"`, `"idle"`, `"done"`, or `"error"`), when a subagent starts
+  or changes status. A task a plugin opened with `maki.agent.session`
+  carries `data.plugin`, and `"idle"` is such a task between prompts. A
+  task that comes back from disk already finished stays quiet, so
+  reloading a session does not replay old tasks.
 - `"TaskFocusChanged"`: `data.id`, the task now on screen (`"main"` or a
   subagent's id, what `ctx:task_id()` reports inside a tool). Fires for
   the chat cycling keys, `maki.task.focus`, and a session switch that
@@ -1541,10 +1543,18 @@ A polling monitor opens one per round inside a `maki.async.spawn` loop.
 An event-driven one opens once with `scope = "session"`, keeps the handle
 and prompts it from autocmd callbacks.
 
-Its spend counts in the chat's totals after each turn, and `/tasks` lists
-it but cannot stop it yet. Setting `plugins.<name>.enabled = false` stops a
-plugin's monitors from the next `/reload`. Under `maki -p` and ACP there is
-no live chat session, so opening one fails with "session not live". The
+Opened by chat session id, it shows up in that chat as a task owned by
+the plugin from its first prompt on: a transcript tab, a `plugin` field
+in `/tasks` and `maki.task.list()`, `"idle"` between prompts, and its
+spend in the chat's totals after each turn. Esc in its tab closes it,
+and the pending `:prompt()` returns `"stopped by user"` rather than
+`"cancelled"`, so a loop can tell the user's Esc from its own task
+ending and stop rather than reopen. Permission prompts stay denied even
+though the task has a tab: a prompt in an unfocused tab would stall a
+monitor silently, a denial reaches the plugin as an error it can handle.
+Setting `plugins.<name>.enabled = false` stops a plugin's monitors from
+the next `/reload`. Under `maki -p` and ACP there is no live chat
+session, so opening one fails with "session not live". The
 [maki.agent](#maki-agent) overview has a full monitor.
 
 **Parameters:**
@@ -1667,7 +1677,10 @@ tools).
 
 **Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
 failure. A run cut short after streaming some text hands you both: the
-error and a `{ text = <what it streamed> }` table.
+error and a `{ text = <what it streamed> }` table. `"cancelled"` means the
+task that opened or prompted the session ended. `"stopped by user"` means
+Esc in its tab closed a session opened by chat session id, and every
+later prompt answers the same.
 
 **Example:**
 
@@ -4883,11 +4896,14 @@ maki.task.list()
 
 Lists the focused session's chats in chat order. Entry 1 is always the main
 chat, with id `"main"` and no `status`: its work is the session's own, and
-`maki.session.live()` already reports that. The rest are subagents, keyed by
-the tool call that spawned them.
+`maki.session.live()` already reports that. The rest are subagents: one a
+tool spawned has its tool call's id, one a plugin opened with
+[maki.agent.session](#maki-agent-session) has its session id and a
+`plugin` field.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, name, focused, status?}` where
-  `status` is `"working"`, `"done"`, or `"error"`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, name, focused, status?, plugin?}`
+  where `status` is `"working"`, `"idle"` (a plugin task between prompts),
+  `"done"`, or `"error"`, or nil and an error.
 
 **Example:**
 

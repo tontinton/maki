@@ -1,10 +1,11 @@
 //! Subagent sessions a plugin opened by chat session id instead of a tool
 //! ctx. One lives until the first of: the Lua task that opened it ends (only
-//! under task scope), its chat session ends, its plugin unloads, or it is
-//! closed.
+//! under task scope), its chat session ends, its plugin unloads, Esc in its
+//! task's tab stops it, or it is closed.
 //! The agent loop never knows about them, so a turn ending or a rewind that
 //! respawns the loop leaves them running.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::AgentSeed;
@@ -19,6 +20,9 @@ pub(crate) struct BackgroundSession {
     pub(crate) session: MakiId,
     /// `None` under session scope: nothing but the chat and the plugin ends it.
     pub(crate) task: Option<u64>,
+    /// Shared with the session handle, so a `:prompt()` cut short can tell
+    /// Esc in the task's tab from the end of its task.
+    pub(crate) stopped: Arc<AtomicBool>,
     /// The subagent's cancel parent. Dropping the entry fires it.
     pub(crate) _cancel: CancelTrigger,
 }
@@ -62,14 +66,21 @@ impl BackgroundSessions {
         Ok(())
     }
 
-    pub(crate) fn update(&self, id: &str, apply: impl FnOnce(&mut BackgroundInfo)) {
+    pub(crate) fn update(&self, id: &str, apply: impl FnOnce(&mut BackgroundSession)) {
         if let Some(entry) = self.locked().iter_mut().find(|e| e.info.id == id) {
-            apply(&mut entry.info);
+            apply(entry);
         }
     }
 
     pub(crate) fn remove(&self, id: &str) {
         self.retire(|e| e.info.id == id);
+    }
+
+    /// Esc in the task's tab. Marked before it is dropped, so the prompt the
+    /// cancel cuts short reads the mark.
+    pub(crate) fn stop(&self, id: &str) {
+        self.update(id, |e| e.stopped.store(true, Ordering::Relaxed));
+        self.remove(id);
     }
 
     pub(crate) fn end_session(&self, session: MakiId) {
@@ -134,6 +145,7 @@ mod tests {
             },
             session,
             task,
+            stopped: Arc::default(),
             _cancel: cancel,
         };
         (entry, token)

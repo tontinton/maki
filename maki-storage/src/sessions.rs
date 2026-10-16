@@ -636,7 +636,7 @@ impl fmt::Display for StoredThinking {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredSubagent {
     pub tool_use_id: String,
     pub name: String,
@@ -648,6 +648,11 @@ pub struct StoredSubagent {
     pub thinking: Option<StoredThinking>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
+    /// The plugin that opened it, absent on a task a tool call spawned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1951,12 +1956,26 @@ where
         }
     }
 
-    pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>) {
-        if self.subagent_messages.insert(id, Arc::new(msgs)).is_some() {
-            self.rewrite();
-        } else {
-            self.touch();
-        }
+    /// A transcript that only grew is appended like the main log. A plugin
+    /// task hands its whole history over after every prompt, so without this
+    /// each prompt would rewrite the session file. Anything else (a
+    /// compaction, a rewritten turn) still starts the file over.
+    pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>)
+    where
+        M: PartialEq,
+    {
+        let grew = match self.subagent_messages.get(&id) {
+            Some(old) if msgs.starts_with(old) => {
+                if msgs.len() == old.len() {
+                    return;
+                }
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+        self.subagent_messages.insert(id, Arc::new(msgs));
+        if grew { self.touch() } else { self.rewrite() }
     }
 
     fn set_token_usage(&mut self, usage: U)
@@ -2053,21 +2072,27 @@ where
     /// After `messages` is truncated (rewind), state keyed by tool_use_id can
     /// point at calls that no longer exist. On restore that shows up as ghost
     /// subagent tabs and leaked tool outputs, so this drops everything not
-    /// reachable from `messages`.
+    /// reachable from `messages`. A plugin task is never reachable from them:
+    /// its plugin runs it beside the chat, so a rewind leaves it alone.
     ///
     /// If you add another field keyed by tool_use_id, prune it here too.
     pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
-        let main_ids: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
-        self.subagent_messages.retain(|id, _| main_ids.contains(id));
-        self.subagents
-            .retain(|sa| main_ids.contains(&sa.tool_use_id));
+        let mut kept: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
+        kept.extend(
+            self.subagents
+                .iter()
+                .filter(|sa| sa.plugin.is_some())
+                .map(|sa| sa.tool_use_id.clone()),
+        );
+        self.subagent_messages.retain(|id, _| kept.contains(id));
+        self.subagents.retain(|sa| kept.contains(&sa.tool_use_id));
 
         let live: HashSet<String> = self
             .subagent_messages
             .values()
             .flat_map(|msgs| msgs.iter())
             .flat_map(&tool_ids)
-            .chain(main_ids)
+            .chain(kept)
             .collect();
         self.tool_outputs.retain(|id, _| live.contains(id));
         self.rewrite();
@@ -2350,44 +2375,58 @@ mod tests {
         fn ids(m: &Value) -> Vec<String> {
             vec![m.as_str().unwrap().to_owned()]
         }
-        fn subagent(id: &str) -> StoredSubagent {
+        fn subagent(id: &str, plugin: Option<&str>) -> StoredSubagent {
             StoredSubagent {
                 tool_use_id: id.into(),
                 name: "sub".into(),
                 model: None,
                 thinking: None,
                 fast: false,
+                plugin: plugin.map(Arc::from),
+                cost: None,
             }
         }
 
         let mut session: TestSession = Session::new("model", "/p");
         session.push_message("task-live".into());
-        session
-            .subagent_messages
-            .insert("task-live".into(), Arc::new(vec!["sub-tool".into()]));
-        session
-            .subagent_messages
-            .insert("task-stale".into(), Arc::new(vec!["stale-sub-tool".into()]));
-        session.set_subagents(vec![subagent("task-live"), subagent("task-stale")]);
-        for id in ["task-live", "sub-tool", "stale-sub-tool", "orphan"] {
+        for (task, tool) in [
+            ("task-live", "sub-tool"),
+            ("task-stale", "stale-sub-tool"),
+            ("session-monitor", "monitor-tool"),
+        ] {
+            session
+                .subagent_messages
+                .insert(task.into(), Arc::new(vec![tool.into()]));
+        }
+        session.set_subagents(vec![
+            subagent("task-live", None),
+            subagent("task-stale", None),
+            subagent("session-monitor", Some("ci")),
+        ]);
+        for id in [
+            "task-live",
+            "sub-tool",
+            "stale-sub-tool",
+            "monitor-tool",
+            "orphan",
+        ] {
             session.insert_tool_output(id.into(), Arc::new(Value::Null));
         }
 
         session.prune_orphans(ids);
 
-        assert_eq!(
-            session.subagent_messages().keys().collect::<Vec<_>>(),
-            ["task-live"]
-        );
+        let mut transcripts: Vec<_> = session.subagent_messages().keys().collect();
+        transcripts.sort();
+        assert_eq!(transcripts, ["session-monitor", "task-live"]);
         let subagent_ids: Vec<_> = session
             .subagents()
             .iter()
             .map(|sa| sa.tool_use_id.as_str())
             .collect();
-        assert_eq!(subagent_ids, ["task-live"]);
+        assert_eq!(subagent_ids, ["task-live", "session-monitor"]);
         let mut outputs: Vec<_> = session.tool_outputs().keys().cloned().collect();
         outputs.sort();
-        assert_eq!(outputs, ["sub-tool", "task-live"]);
+        assert_eq!(outputs, ["monitor-tool", "sub-tool", "task-live"]);
     }
 
     #[test]
@@ -2761,6 +2800,35 @@ mod tests {
         write_through(&mut log, dir, &session);
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    /// The whole transcript comes back after every prompt of a plugin task.
+    /// One that only grew appends its tail; one handed over unchanged is not
+    /// even a write.
+    #[test]
+    fn extending_subagent_messages_appends_to_the_log() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
+        session.set_subagent_messages("sub-1".into(), vec![user_message("first")]);
+        write_through(&mut log, dir, &session);
+        let (rewrites, revision) = (session.rewrites, session.revision);
+
+        session.set_subagent_messages("sub-1".into(), vec![user_message("first")]);
+        assert_eq!(session.revision, revision);
+
+        session.set_subagent_messages(
+            "sub-1".into(),
+            vec![user_message("first"), assistant_message("reply")],
+        );
+        assert_eq!(session.rewrites, rewrites);
+        assert!(session.revision > revision);
+        log.append(&claim_for(dir, &session), &session).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.subagent_messages["sub-1"].len(), 2);
         assert_same_session(&loaded, &session);
     }
 

@@ -197,6 +197,10 @@ pub enum Action {
     CancelSubagent {
         tool_use_id: String,
     },
+    /// Esc in a plugin task's tab: closes the plugin session behind it.
+    CancelPluginTask {
+        id: String,
+    },
     /// The history under this runtime changed (reset, load, rewind), so the
     /// agent has to be respawned on it.
     RestartAgent(Vec<Message>),

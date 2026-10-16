@@ -15,7 +15,10 @@ use maki_agent::tools::{
     ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolReach, ToolRegistry,
     ToolSource, timeout_annotation,
 };
-use maki_agent::{AgentMode, AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput};
+use maki_agent::{
+    AgentEvent, AgentMode, AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput,
+    TurnCompleteEvent,
+};
 use maki_config::{
     AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
     ThinkingLines, ToolKey, ToolOutputLines,
@@ -7267,6 +7270,7 @@ const BACKGROUND_NAME: &str = "ci-monitor";
 const BACKGROUND_PLUGIN: &str = "background_monitor";
 const OPTS_RECORDER: &str = "recorded the request options";
 const CANCELLED_MSG: &str = "cancelled";
+const STOPPED_BY_USER_ERR: &str = "stopped by user";
 const PAID_TOOL_USE_ID: &str = "toolu_paid";
 const PAID_TOOL_NAME: &str = "not_a_tool";
 const PAID_TURN_INPUT: u32 = 1234;
@@ -7352,6 +7356,25 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         sess:close()
+        prompt_settled:acquire():release()
+        return tostring(prompt_err)
+    end,
+}})
+maki.api.register_tool({{
+    name = "background_id",
+    description = "the task id of the open background session",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return maki.agent.list({{ session = "{sid}" }})[1].id
+    end,
+}})
+maki.api.register_tool({{
+    name = "await_prompt",
+    description = "waits for the prompting task and reports how its prompt ended",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
         prompt_settled:acquire():release()
         return tostring(prompt_err)
     end,
@@ -7455,11 +7478,56 @@ impl Provider for TurnThenPark {
     }
 }
 
+/// The paid turns the tab was told about, in order.
+fn billed_turns(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+) -> Vec<TurnCompleteEvent> {
+    ui.drain()
+        .filter_map(|action| match action {
+            maki_lua::UiAction::PluginTaskEvent {
+                session: owner,
+                envelope,
+                ..
+            } if owner == session => match envelope.event {
+                AgentEvent::TurnComplete(turn) => Some(*turn),
+                _ => None,
+            },
+            _ => panic!("only this chat session's task events go to the UI here"),
+        })
+        .collect()
+}
+
+/// The transcript the tab was last handed for task `id`.
+fn handed_over_history(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+    id: &str,
+) -> Option<Vec<Message>> {
+    ui.drain()
+        .filter_map(|action| match action {
+            maki_lua::UiAction::PluginTaskEvent {
+                session: owner,
+                envelope,
+                ..
+            } if owner == session => match envelope.event {
+                AgentEvent::SubagentHistory {
+                    tool_use_id,
+                    messages,
+                } if tool_use_id == id => Some(messages),
+                _ => None,
+            },
+            _ => panic!("only this chat session's task events go to the UI here"),
+        })
+        .last()
+}
+
 /// One task opens the session and stays alive, another prompts it and gets
 /// cancelled. The cancel drops the prompt future mid-run, so nothing after its
 /// `await` runs, yet the entry must still go back to idle. The paid turn has to
-/// be billed before the cancel, because on quit the UI stops listening before
-/// anything gets cancelled. Billing it again on the cancel would count it twice.
+/// reach the tab before the cancel, because on quit the UI stops listening
+/// before anything gets cancelled. Sending it again on the cancel would count
+/// it twice.
 #[test]
 fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     let reg = fresh_registry();
@@ -7483,19 +7551,12 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     parked
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("the prompt must reach its second turn");
-    let action = ui
-        .recv_timeout(CANCEL_TEST_TIMEOUT)
-        .expect("the paid turn must be billed while the prompt still runs");
-    let maki_lua::UiAction::BackgroundUsage {
-        session: billed,
-        usage,
-        ..
-    } = action
-    else {
-        panic!("only background usage goes to the UI here");
+    let turns = billed_turns(&ui, session);
+    let [turn] = turns.as_slice() else {
+        panic!("the paid turn must reach the tab while the prompt still runs");
     };
-    assert_eq!((billed, usage.input), (session, PAID_TURN_INPUT));
-    let billed_cost = usage.cost.expect("the paid turn must have a price");
+    assert_eq!(turn.usage.input, PAID_TURN_INPUT);
+    let billed_cost = turn.cost.expect("the paid turn must have a price");
     let listed_cost = format!("{billed_cost:.COST_DECIMALS$}");
     assert_eq!(
         exec_tool(&reg, "background_cost", json!({})).unwrap(),
@@ -7513,7 +7574,58 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
         exec_tool(&reg, "background_cost", json!({})).unwrap(),
         listed_cost
     );
-    assert!(ui.is_empty(), "the cancel must not bill the turn again");
+    assert!(
+        billed_turns(&ui, session).is_empty(),
+        "the cancel must not bill the turn again"
+    );
+}
+
+/// Esc in the task's tab reaches the session through the handle the event
+/// loop holds, with no Lua-thread hop. The prompt it cuts short says so, not
+/// "cancelled", so a monitor loop knows not to reopen. What it streamed
+/// before the stop still reaches the tab's transcript: the plugin may never
+/// close a stopped session, and nothing else would write it.
+#[test]
+fn stopping_a_plugin_task_from_the_tab_ends_its_prompt_as_stopped_by_user() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = mailbox.publish_seed(stub_seed(session));
+    let parked = TurnThenPark::install(&seed);
+    let ui = host.ui_action_rx();
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+    let id = exec_tool(&reg, "background_id", json!({})).unwrap();
+    exec_tool(&reg, "prompt_in_task", json!({})).unwrap();
+    parked
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the prompt must reach its second turn");
+
+    host.event_handle().cancel_plugin_session(&id);
+
+    let ended = call_on_thread(&reg, "await_prompt", CancelToken::none())
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the stopped prompt must settle");
+    assert_eq!(ended, Ok(STOPPED_BY_USER_ERR.to_owned()));
+    let history = handed_over_history(&ui, session, &id)
+        .expect("the stopped prompt must hand its transcript to the tab");
+    assert!(
+        history.iter().any(|m| matches!(m.role, Role::Assistant)),
+        "the paid turn must be in the transcript"
+    );
+    assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
+    assert_eq!(
+        exec_tool(&reg, "prompt_background", json!({})).unwrap(),
+        STOPPED_BY_USER_ERR
+    );
 }
 
 /// The provider parks the second turn forever, so only a cancel can end this

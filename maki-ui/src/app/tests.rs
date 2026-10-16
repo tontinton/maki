@@ -1,6 +1,7 @@
 use super::*;
 use crate::AppSession;
 use crate::agent::shared_queue;
+use crate::app::tasks::TaskStatus;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
@@ -273,7 +274,7 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
     }))
 }
 
-fn done() -> AgentEvent {
+pub(crate) fn done() -> AgentEvent {
     AgentEvent::Done {
         usage: TokenUsage::default(),
         cost: None,
@@ -2004,8 +2005,7 @@ fn turn_complete_accumulates_usage_by_model() {
     assert_eq!(sub.output, 75);
 }
 
-const BACKGROUND_MODEL: &str = "background-model";
-const BACKGROUND_USAGE: StoredTokenUsage = StoredTokenUsage {
+const MONITOR_TURN: StoredTokenUsage = StoredTokenUsage {
     input: 300,
     output: 40,
     cache_creation: 0,
@@ -2013,21 +2013,245 @@ const BACKGROUND_USAGE: StoredTokenUsage = StoredTokenUsage {
     cost: Some(0.011),
     subsidised_list_cost: None,
 };
+pub(crate) const MONITOR_PLUGIN: &str = "ci";
+pub(crate) const MONITOR_ID: &str = "session-01";
+const MONITOR_NAME: &str = "ci-monitor";
+const MONITOR_PROMPT: &str = "Check CI now.";
+const SECOND_PROMPT: &str = "Check again.";
 
-#[test]
-fn background_usage_bills_only_the_tab_showing_its_session() {
-    let mut app = test_app();
-
-    app.add_background_usage(MakiId::generate(), BACKGROUND_MODEL, BACKGROUND_USAGE);
-    app.add_background_usage(app.state.session.id, BACKGROUND_MODEL, BACKGROUND_USAGE);
-
-    assert_eq!(app.state.cost, BACKGROUND_USAGE.cost);
-    assert_eq!(app.chats[0].cost, BACKGROUND_USAGE.cost);
-    assert_eq!(app.state.token_usage, TokenUsage::from(BACKGROUND_USAGE));
-    assert_eq!(
-        app.state.session.usage_by_model().get(BACKGROUND_MODEL),
-        Some(&BACKGROUND_USAGE)
+/// What the relay of a plugin session sends: every event names the task and
+/// its first prompt, and none is bound to a run of the tab's agent.
+pub(crate) fn plugin_event(app: &mut App, event: AgentEvent) {
+    let mut info = subagent_info(MONITOR_ID, MONITOR_NAME);
+    info.prompt = Some(MONITOR_PROMPT.into());
+    app.deliver(
+        Envelope {
+            event,
+            subagent: Some(info),
+            run_id: 0,
+        },
+        Some(Arc::from(MONITOR_PLUGIN)),
     );
+}
+
+pub(crate) fn app_with_plugin_task() -> App {
+    let mut app = test_app();
+    plugin_event(&mut app, AgentEvent::TextDelta { text: "x".into() });
+    app
+}
+
+fn monitor_turn() -> AgentEvent {
+    turn_complete(
+        TokenUsage::from(MONITOR_TURN),
+        TEST_MODEL_SPEC,
+        MONITOR_TURN.cost,
+    )
+}
+
+fn monitor_history(messages: Vec<Message>) -> AgentEvent {
+    AgentEvent::SubagentHistory {
+        tool_use_id: MONITOR_ID.into(),
+        messages,
+    }
+}
+
+fn next_prompt() -> AgentEvent {
+    AgentEvent::QueueItemConsumed {
+        text: SECOND_PROMPT.into(),
+        images: vec![],
+    }
+}
+
+fn agent_error() -> AgentEvent {
+    AgentEvent::Error {
+        message: AGENT_ERROR_MSG.into(),
+        auth: false,
+    }
+}
+
+/// A plugin task is a chat like a tool task, but routed by id: `chat_index`
+/// is the running turn's map, and the main chat is idle here.
+#[test]
+fn plugin_task_opens_a_chat_by_id_with_its_first_prompt() {
+    let app = app_with_plugin_task();
+
+    assert_eq!(app.chats.len(), 2);
+    assert!(app.chat_index.is_empty());
+    let chat = &app.chats[1];
+    assert_eq!(chat.plugin.as_deref(), Some(MONITOR_PLUGIN));
+    assert_eq!(chat.task_status(), TaskStatus::Working);
+    assert_eq!(chat.message_count(), 1);
+    assert_eq!(chat.last_message_text(), MONITOR_PROMPT);
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert_eq!(tasks[1]["plugin"], MONITOR_PLUGIN);
+    assert_eq!(tasks[0].get("plugin"), None);
+}
+
+/// A plugin session that never prompted has nothing to show, and must not
+/// land in the main chat the way a run-level event does.
+#[test]
+fn plugin_event_without_a_task_shows_nowhere() {
+    let mut app = test_app();
+    app.deliver(
+        Envelope {
+            event: AgentEvent::TextDelta { text: "x".into() },
+            subagent: None,
+            run_id: 0,
+        },
+        Some(Arc::from(MONITOR_PLUGIN)),
+    );
+    assert_eq!(app.chats.len(), 1);
+    assert_eq!(app.chats[0].message_count(), 0);
+}
+
+/// `Done` and `Error` end the prompt, not the session: the task goes idle
+/// with nothing said in the main chat, and the next prompt shows as a user
+/// bubble and brings the spinner back.
+#[test_case(done(),        DisplayRole::Assistant ; "done")]
+#[test_case(agent_error(), DisplayRole::Error     ; "error")]
+fn plugin_task_idles_between_prompts(ending: AgentEvent, shown_as: DisplayRole) {
+    let mut app = app_with_plugin_task();
+
+    plugin_event(&mut app, ending);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Idle);
+    assert_eq!(app.chats[1].last_message_role(), Some(&shown_as));
+    assert_eq!(app.chats[0].last_message_role(), None);
+
+    plugin_event(&mut app, next_prompt());
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    assert_eq!(app.chats[1].last_message_text(), SECOND_PROMPT);
+}
+
+/// A plugin task's run can end mid-tool with no `ToolDone` to follow: its
+/// Lua task got cancelled, or the plugin closed the session. No turn-end
+/// sweep reaches a plugin chat, so the ending itself has to settle the tool,
+/// or it spins forever in an idle or done transcript.
+#[test_case(done()                   ; "run_end")]
+#[test_case(agent_error()            ; "run_error")]
+#[test_case(AgentEvent::StreamClosed ; "session_closed")]
+fn plugin_task_ending_settles_its_tools_in_progress(ending: AgentEvent) {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, tool_start("tool-1", "bash"));
+    assert_eq!(app.chats[1].in_progress_count(), 1);
+
+    plugin_event(&mut app, ending);
+
+    assert_eq!(app.chats[1].in_progress_count(), 0);
+}
+
+/// The main chat's turn end and Esc sweep the tool tasks of that turn, and
+/// leave a plugin task alone: it answers to its plugin, not to the turn.
+/// The cleared `chat_index` must not bring it back as a second chat either.
+#[test_case(end_turn   ; "turn_end")]
+#[test_case(cancel_app ; "main_esc")]
+fn plugin_task_outlives_the_main_chats_turn(sweep: fn(&mut App)) {
+    let mut app = app_with_subagent();
+    plugin_event(&mut app, AgentEvent::TextDelta { text: "x".into() });
+    assert_eq!(app.chats.len(), 3);
+
+    sweep(&mut app);
+
+    assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
+    plugin_event(&mut app, AgentEvent::TextDelta { text: "y".into() });
+    assert_eq!(app.chats.len(), 3);
+}
+
+/// Esc in the task's tab is the one way to stop it from the UI. It closes the
+/// session rather than a run, so it works while idle too, and the
+/// `StreamClosed` of the closing session cannot walk the cancel back.
+#[test]
+fn esc_in_a_plugin_task_tab_stops_its_session() {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, done());
+    app.run_builtin(BuiltinAction::NextChat);
+    app.last_esc = Some(Instant::now());
+
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelPluginTask { id }] if id == MONITOR_ID
+    ));
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+    assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
+    assert_eq!(app.chats[0].last_message_role(), None);
+
+    plugin_event(&mut app, AgentEvent::StreamClosed);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+}
+
+/// The transcript lands after every prompt, so a monitor that dies with the
+/// process leaves what it did, and the close is its own event.
+#[test]
+fn plugin_task_stores_its_transcript_per_prompt_and_finishes_on_close() {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, monitor_history(vec![Message::user("ok".into())]));
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    assert_eq!(app.state.session.subagent_messages()[MONITOR_ID].len(), 1);
+
+    plugin_event(&mut app, AgentEvent::StreamClosed);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Done);
+    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+}
+
+/// What a finished plugin task shows after a reload: who spent it, and how
+/// much. Restored as finished, since no plugin session survives a restart.
+#[test]
+fn plugin_task_restores_with_its_owner_and_cost() {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, monitor_turn());
+    assert_eq!(app.chats[1].cost, MONITOR_TURN.cost);
+    assert_eq!(app.state.cost, MONITOR_TURN.cost);
+    plugin_event(&mut app, monitor_history(vec![]));
+    plugin_event(&mut app, AgentEvent::StreamClosed);
+
+    app.reset_ui_chrome();
+    app.restore_display();
+
+    let chat = &app.chats[1];
+    assert_eq!(chat.plugin.as_deref(), Some(MONITOR_PLUGIN));
+    assert_eq!(chat.cost, MONITOR_TURN.cost);
+    assert_eq!(chat.task_status(), TaskStatus::Done);
+    assert!(app.chat_index.is_empty());
+}
+
+/// A rewind rebuilds the main chat, not the monitor a plugin runs beside it.
+/// The live task keeps its tab, its cost and its status, and a transcript
+/// no tool use in the history anchors is not pruned as an orphan.
+#[test]
+fn rewind_leaves_a_live_plugin_task_alone() {
+    let mut app = build_rewind_app();
+    plugin_event(&mut app, monitor_turn());
+    plugin_event(&mut app, monitor_history(vec![]));
+    plugin_event(&mut app, done());
+
+    app.rewind_to(rewind_to_second_turn());
+
+    assert_eq!(app.chats.len(), 2);
+    let chat = &app.chats[1];
+    assert_eq!(chat.task_status(), TaskStatus::Idle);
+    assert_eq!(chat.cost, MONITOR_TURN.cost);
+    assert!(
+        app.state
+            .session
+            .subagent_messages()
+            .contains_key(MONITOR_ID)
+    );
+    assert_eq!(app.state.session.subagents()[0].cost, MONITOR_TURN.cost);
+    plugin_event(&mut app, next_prompt());
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+}
+
+/// `/new` swaps the session under the tab, and the Lua host ends every
+/// plugin session of the old one. A task still shown as live belongs to
+/// that old session and goes with it.
+#[test]
+fn new_session_drops_the_old_sessions_plugin_task() {
+    let mut app = app_with_plugin_task();
+    app.reset_session();
+    assert_eq!(app.chats.len(), 1);
 }
 
 #[test]
@@ -4659,14 +4883,14 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
             .contains(MISSING_TOOL_COMPLETION)
     );
     app.checkpoint();
-    assert!(app.state.session.subagents().is_empty());
+    assert_eq!(app.state.session.subagents().len(), 1);
     assert_eq!(app.state.session.messages().len(), 2);
     assert!(app.state.session.tool_outputs().is_empty());
     assert_eq!(app.cadence(), Cadence::IDLE);
 }
 
 #[test]
-fn parent_error_refreshes_picker_and_persists_only_completed_children() {
+fn parent_error_refreshes_picker_and_persists_every_child() {
     let mut app = streaming_app_with_history();
     app.update(subagent_msg_with_model(
         AgentEvent::TextDelta { text: "one".into() },
@@ -4714,6 +4938,7 @@ fn parent_error_refreshes_picker_and_persists_only_completed_children() {
         saved,
         vec![
             ("task1", "first", Some("model-a")),
+            ("task2", "second", Some("model-b")),
             ("task3", "third", Some("model-c")),
         ]
     );
@@ -6915,6 +7140,7 @@ const BUMP_TITLE: &str = "title bump ";
 const TOOL_IDS: [&str; 2] = ["tool-a", "tool-b"];
 const FINISHED_TASK_ID: &str = "task-finished";
 const UNFINISHED_TASK_ID: &str = "task-unfinished";
+const LATER_TASK_ID: &str = "task-later";
 
 #[test]
 fn turn_response_normalizes_text_and_truncates_unicode() {
@@ -7542,11 +7768,12 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
     }
 }
 
-/// The `Done` path clears `chat_index` right after pruning it, so nothing can
-/// rebuild the tabs later. Only the `sync_subagents` call inside
-/// `retain_resolved_subagents` carries the survivors over.
+/// The `Done` path clears `chat_index` right after pruning it, so the meta
+/// has to be rebuilt from the chats: the child the turn end terminalized is
+/// still a tab, and a child a later turn spawns must not push the earlier
+/// ones out.
 #[test]
-fn turn_end_keeps_only_the_subagents_that_finished() {
+fn turn_end_keeps_every_subagent_tab_in_the_meta() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -7565,6 +7792,7 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
 
     app.update(done_event());
     assert!(app.chat_index.is_empty());
+    start_subagent(&mut app, LATER_TASK_ID, "later child");
     app.checkpoint();
 
     let ids: Vec<_> = app
@@ -7574,7 +7802,7 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
         .iter()
         .map(|sa| sa.tool_use_id.as_str())
         .collect();
-    assert_eq!(ids, [FINISHED_TASK_ID]);
+    assert_eq!(ids, [FINISHED_TASK_ID, UNFINISHED_TASK_ID, LATER_TASK_ID]);
 }
 
 /// A folder that ships exactly one gated file, plus the question a start in it

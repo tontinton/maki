@@ -18,6 +18,7 @@ use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
 use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
+use crate::background::BackgroundSessions;
 use crate::error::PluginError;
 use crate::pack::{DiscoveredPackage, Interaction};
 use crate::plugin_permissions::{
@@ -999,6 +1000,7 @@ impl PluginHost {
             tx: self.inner.tx.clone(),
             prio_tx: self.inner.prio_tx.clone(),
             layered: Arc::clone(&self.inner.layered),
+            background: self.inner.background.clone(),
         }
     }
 
@@ -1040,6 +1042,7 @@ pub struct EventHandle {
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
     layered: Arc<LayeredTools>,
+    background: BackgroundSessions,
 }
 
 impl EventHandle {
@@ -1048,7 +1051,16 @@ impl EventHandle {
             tx,
             prio_tx: flume::unbounded().0,
             layered: Arc::default(),
+            background: BackgroundSessions::default(),
         }
+    }
+
+    /// Esc in a plugin task's tab. Drops the session's registry entry, which
+    /// fires its cancel, and the plugin's pending `:prompt()` returns
+    /// "stopped by user". Synchronous on purpose: the registry is a mutex the
+    /// Lua thread shares, so a busy Lua thread cannot delay the stop.
+    pub fn cancel_plugin_session(&self, id: &str) {
+        self.background.stop(id);
     }
 
     #[doc(hidden)]
@@ -1130,6 +1142,7 @@ impl EventHandle {
             tx: shared.clone(),
             prio_tx: shared,
             layered: Arc::default(),
+            background: BackgroundSessions::default(),
         }
     }
 
@@ -1466,6 +1479,7 @@ mod tests {
             tx,
             prio_tx,
             layered: Arc::default(),
+            background: BackgroundSessions::default(),
         };
         handle.run_command(
             Arc::from("myplugin"),

@@ -140,23 +140,23 @@ impl App {
         }
     }
 
-    /// Called where the set of subagent tabs changes, not at checkpoint time:
-    /// the turn-end path clears `chat_index` right after pruning it, so a later
-    /// rebuild would only ever find an empty map.
+    /// Mirrors every subagent tab into the session meta. Walks `chats`, not
+    /// `chat_index`: that one is a per-turn routing cache, and a finished
+    /// task dropped from it must still come back on reload.
     pub(super) fn sync_subagents(&mut self) {
-        let mut ordered: Vec<_> = self.chat_index.iter().collect();
-        ordered.sort_by_key(|&(_, chat_index)| chat_index);
-        let subagents = ordered
-            .into_iter()
-            .map(|(tool_id, &chat_index)| {
-                let chat = &self.chats[chat_index];
-                StoredSubagent {
-                    tool_use_id: tool_id.clone(),
+        let subagents = self
+            .chats
+            .iter()
+            .filter_map(|chat| {
+                Some(StoredSubagent {
+                    tool_use_id: chat.task_id()?.to_string(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
                     thinking: chat.opts.map(|o| o.thinking.into()),
                     fast: chat.opts.is_some_and(|o| o.fast),
-                }
+                    plugin: chat.plugin.clone(),
+                    cost: chat.cost,
+                })
             })
             .collect();
         self.state.session_mut().set_subagents(subagents);
@@ -169,11 +169,16 @@ impl App {
     }
 
     /// Call only once `state.session` is final: the chats it builds are
-    /// stamped with that session for life.
+    /// stamped with that session for life. A plugin task of that same session
+    /// stays if it is still running: a rewind rebuilds the main chat, not the
+    /// monitor a plugin runs beside it, and ending it here would leave a task
+    /// shown as done that keeps streaming and that Esc can no longer reach.
     pub(super) fn reset_ui_chrome(&mut self) {
         // Brings the main draft back to the box before the chats holding it go.
         self.set_active_chat(MAIN_CHAT);
-        self.chats.clear();
+        let session = self.state.session.id;
+        self.chats
+            .retain(|chat| chat.is_live_plugin_task_of(session));
         let mut main = Chat::new(
             self.state.session.id,
             None,
@@ -182,7 +187,7 @@ impl App {
             self.lua_event_handle.clone(),
         );
         main.set_restore_channel(self.restore_event_tx.clone());
-        self.chats.push(main);
+        self.chats.insert(MAIN_CHAT, main);
         self.active_chat = MAIN_CHAT;
         self.chat_index.clear();
         self.deleted_tasks.clear();
@@ -237,13 +242,19 @@ impl App {
             let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) else {
                 continue;
             };
+            if self.chat_of_task(&sa.tool_use_id).is_ok() {
+                continue;
+            }
             let (display, items) = history_to_display(
                 messages,
                 self.state.session.tool_outputs(),
                 &self.ui_config.tool_output_lines,
             );
-            self.chat_index
-                .insert(sa.tool_use_id.clone(), self.chats.len());
+            // Plugin tasks are never routed through `chat_index`.
+            if sa.plugin.is_none() {
+                self.chat_index
+                    .insert(sa.tool_use_id.clone(), self.chats.len());
+            }
             let mut chat = Chat::new(
                 self.state.session.id,
                 Some(&sa.tool_use_id),
@@ -252,6 +263,8 @@ impl App {
                 self.lua_event_handle.clone(),
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
+            chat.plugin = sa.plugin;
+            chat.cost = sa.cost;
             chat.model_id = sa.model;
             chat.opts = sa.thinking.map(|thinking| RequestOptions {
                 thinking: thinking.into(),
