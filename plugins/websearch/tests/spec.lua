@@ -127,6 +127,38 @@ case("providers_count_argument_matches_the_backend", function()
   eq(providers.exa.arguments(QUERY, 5).numResults, 5)
   eq(providers.youcom.arguments(QUERY, 5).count, 5)
   eq(providers.youcom.arguments(QUERY, 5).numResults, nil)
+  eq(providers.kagi.arguments(QUERY, 5).limit, 5)
+  eq(providers.kagi.arguments(QUERY, 5).numResults, nil)
+end)
+
+local KAGI_RESULT = table.concat({
+  "### [Tokio vs Smol: The Battle That&#39;s Dividing Rust](https://youtu.be/x)",
+  "**URL:** https://youtu.be/x",
+  "**Published:** 2025-10-15",
+  "",
+  "<strong>Smol</strong> &amp; <strong>async</strong> &lt;3 &#x2014; done",
+}, "\n")
+
+case("kagi_clean_strips_highlights_url_lines_and_entities", function()
+  eq(
+    providers.kagi.clean(KAGI_RESULT),
+    table.concat({
+      "### [Tokio vs Smol: The Battle That's Dividing Rust](https://youtu.be/x)",
+      "**Published:** 2025-10-15",
+      "",
+      "Smol & async <3 \u{2014} done",
+    }, "\n")
+  )
+end)
+
+-- Decoding is one pass, so an escaped entity in a snippet stays readable as
+-- the entity it spells instead of collapsing into the character.
+case("kagi_clean_decodes_once", function()
+  eq(providers.kagi.clean("&amp;#39; &amp;lt;strong&amp;gt;"), "&#39; &lt;strong&gt;")
+end)
+
+case("kagi_clean_keeps_unknown_and_out_of_range_entities", function()
+  eq(providers.kagi.clean("&bogus; &#x110000;"), "&bogus; &#x110000;")
 end)
 
 if #failures > 0 then
