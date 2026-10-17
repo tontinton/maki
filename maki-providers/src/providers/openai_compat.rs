@@ -7,7 +7,7 @@ use flume::Sender;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_storage::id::MakiId;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
@@ -535,7 +535,7 @@ struct ChunkChoice {
     finish_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, Copy)]
 struct PromptTokensDetails {
     #[serde(default)]
     cached_tokens: u32,
@@ -552,20 +552,27 @@ struct ChunkUsage {
     #[serde(default)]
     prompt_cache_hit_tokens: u32,
     /// What the request billed, which routers like OpenRouter attach to usage.
-    #[serde(default, deserialize_with = "lenient_cost")]
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "super::lenient_cost"
+    )]
     cost: Option<f64>,
+    #[serde(default)]
+    cost_details: Option<Value>,
 }
 
-/// No standard covers `cost`, so a gateway may quote it as a string or in a
-/// shape we have never seen. A chunk we cannot parse is dropped whole, and this
-/// is the chunk carrying the turn's token counts, so reading the price has to
-/// be allowed to fail on its own.
-fn lenient_cost<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
-    Ok(match Option::<Value>::deserialize(deserializer)? {
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::String(s)) => s.parse().ok(),
-        _ => None,
-    })
+impl ChunkUsage {
+    fn resolved_cost(&self) -> Option<f64> {
+        self.cost
+            .filter(|c| *c > 0.0)
+            .or_else(|| {
+                self.cost_details
+                    .as_ref()
+                    .and_then(super::parse_cost_details)
+            })
+            .or(self.cost)
+    }
 }
 
 #[derive(Deserialize)]
@@ -573,6 +580,12 @@ struct SseChunk {
     #[serde(default)]
     choices: Vec<ChunkChoice>,
     usage: Option<ChunkUsage>,
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "super::lenient_cost"
+    )]
+    cost: Option<f64>,
     copilot_usage: Option<Value>,
 }
 
@@ -618,8 +631,18 @@ pub async fn parse_sse(
     let mut stop_reason: Option<StopReason> = None;
     let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
+    let mut comment_cost: Option<f64> = None;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
+        if let Some(comment) = line.strip_prefix(':') {
+            if let Some(c) = super::parse_cost_comment(comment)
+                && (c > 0.0 || comment_cost.is_none())
+            {
+                comment_cost = Some(c);
+            }
+            continue;
+        }
+
         let data = match line.strip_prefix("data:") {
             Some(d) => d.trim(),
             None => continue,
@@ -649,14 +672,23 @@ pub async fn parse_sse(
                 .prompt_tokens_details
                 .map_or(0, |d| d.cached_tokens)
                 .max(u.prompt_cache_hit_tokens);
+            let cost = u
+                .resolved_cost()
+                .filter(|c| *c > 0.0)
+                .or_else(|| chunk.cost.filter(|c| *c > 0.0))
+                .or(comment_cost)
+                .or_else(|| u.resolved_cost())
+                .or(chunk.cost);
             usage = TokenUsage {
                 input: u.prompt_tokens.saturating_sub(cached),
                 output: u.completion_tokens,
                 cache_read: cached,
                 cache_creation: 0,
-                cost: u
-                    .cost
-                    .or_else(|| chunk.copilot_usage.as_ref().and_then(copilot_usd)),
+                cost: chunk
+                    .copilot_usage
+                    .as_ref()
+                    .and_then(copilot_usd)
+                    .or(cost),
             };
         }
 
@@ -813,6 +845,12 @@ pub async fn parse_sse(
         content_blocks.push(ContentBlock::tool_use(acc.id, name, input));
     }
 
+    if (usage.cost.is_none() || usage.cost == Some(0.0))
+        && let Some(c) = comment_cost
+    {
+        usage.cost = Some(c);
+    }
+
     Ok(StreamResponse {
         message: Message {
             role: Role::Assistant,
@@ -948,6 +986,7 @@ data: [DONE]\n";
     /// counts have to come through whatever it says the price is.
     #[test_case(json!(0.00045), Some(0.00045)   ; "number")]
     #[test_case(json!("0.00045"), Some(0.00045) ; "quoted_number")]
+    #[test_case(json!({"request_cost_usd": 0.00045}), Some(0.00045) ; "request_cost_usd_object")]
     #[test_case(json!("free"), None             ; "unparsable_string")]
     #[test_case(json!({"usd": 0.00045}), None   ; "unknown_shape")]
     #[test_case(json!(null), None               ; "null")]
@@ -1003,6 +1042,26 @@ data: [DONE]\n";
                 }
             );
             assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+        })
+    }
+
+    #[test]
+    fn parse_sse_cost_comment() {
+        smol::block_on(async {
+            let chunk = json!({
+                "choices": [{"finish_reason": "stop", "delta": {}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10},
+            });
+            let sse = format!(
+                ": cost {{\"request_cost_usd\": 0.00045}}\n\ndata: {chunk}\n\ndata: [DONE]\n"
+            );
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.usage.cost, Some(0.00045));
         })
     }
 

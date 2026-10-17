@@ -282,12 +282,22 @@ pub(crate) async fn parse_sse(
     let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
     let mut current_event = String::new();
+    let mut comment_cost: Option<f64> = None;
 
     while let Some(line) =
         crate::providers::next_sse_line(&mut lines, &mut deadline, stream_timeout).await?
     {
         if let Some(event_type) = line.strip_prefix("event:") {
             current_event = event_type.trim().to_string();
+            continue;
+        }
+
+        if let Some(comment) = line.strip_prefix(':') {
+            if let Some(c) = crate::providers::parse_cost_comment(comment)
+                && (c > 0.0 || comment_cost.is_none())
+            {
+                comment_cost = Some(c);
+            }
             continue;
         }
 
@@ -319,7 +329,7 @@ pub(crate) async fn parse_sse(
         };
 
         match parsed_event.as_str() {
-            "response.output_text.delta" => {
+            "response.output_text.delta" | "response.content_part.delta" => {
                 let parsed: Value = match serde_json::from_str(data) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -496,16 +506,16 @@ pub(crate) async fn parse_sse(
                 reasoning_text.push_str("\n\n");
             }
 
-            "response.completed" => {
+            "response.completed" | "response.done" => {
                 let parsed: Value = match serde_json::from_str(data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let resp = &parsed["response"];
+                let resp = parsed.get("response").unwrap_or(&parsed);
 
-                if let Some(u) = resp.get("usage") {
-                    usage = parse_usage(u);
-                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
+                if let Some(u) = resp.get("usage").or_else(|| parsed.get("usage")) {
+                    usage = parse_usage(u, resp, &parsed, comment_cost);
+                    usage.cost = copilot_usd(&parsed["copilot_usage"]).or(usage.cost);
                 }
 
                 let status = resp["status"].as_str().unwrap_or("completed");
@@ -527,10 +537,10 @@ pub(crate) async fn parse_sse(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let resp = &parsed["response"];
-                if let Some(u) = resp.get("usage") {
-                    usage = parse_usage(u);
-                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
+                let resp = parsed.get("response").unwrap_or(&parsed);
+                if let Some(u) = resp.get("usage").or_else(|| parsed.get("usage")) {
+                    usage = parse_usage(u, resp, &parsed, comment_cost);
+                    usage.cost = copilot_usd(&parsed["copilot_usage"]).or(usage.cost);
                 }
                 stop_reason = Some(StopReason::MaxTokens);
             }
@@ -583,6 +593,12 @@ pub(crate) async fn parse_sse(
         content_blocks.push(ContentBlock::tool_use(acc.call_id, acc.name, input));
     }
 
+    if (usage.cost.is_none() || usage.cost == Some(0.0))
+        && let Some(c) = comment_cost
+    {
+        usage.cost = Some(c);
+    }
+
     Ok(StreamResponse {
         message: Message {
             role: Role::Assistant,
@@ -595,7 +611,7 @@ pub(crate) async fn parse_sse(
     })
 }
 
-fn parse_usage(u: &Value) -> TokenUsage {
+fn parse_usage(u: &Value, resp: &Value, parsed: &Value, comment_cost: Option<f64>) -> TokenUsage {
     let input_tokens = u["input_tokens"].as_u64().unwrap_or(0) as u32;
     let output_tokens = u["output_tokens"].as_u64().unwrap_or(0) as u32;
 
@@ -603,12 +619,37 @@ fn parse_usage(u: &Value) -> TokenUsage {
         .as_u64()
         .unwrap_or(0) as u32;
 
+    let cost = crate::providers::parse_usage_cost(u)
+        .filter(|c| *c > 0.0)
+        .or_else(|| {
+            resp.get("cost")
+                .and_then(crate::providers::parse_cost_value)
+                .filter(|c| *c > 0.0)
+        })
+        .or_else(|| {
+            parsed
+                .get("cost")
+                .and_then(crate::providers::parse_cost_value)
+                .filter(|c| *c > 0.0)
+        })
+        .or(comment_cost)
+        .or_else(|| crate::providers::parse_usage_cost(u))
+        .or_else(|| {
+            resp.get("cost")
+                .and_then(crate::providers::parse_cost_value)
+        })
+        .or_else(|| {
+            parsed
+                .get("cost")
+                .and_then(crate::providers::parse_cost_value)
+        });
+
     TokenUsage {
         input: input_tokens.saturating_sub(cached),
         output: output_tokens,
         cache_read: cached,
         cache_creation: 0,
-        cost: None,
+        cost,
     }
 }
 
@@ -742,6 +783,53 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
                 })
                 .collect();
             assert_eq!(deltas, vec!["Hello", " world"]);
+        })
+    }
+
+    const UPSTREAM_COST: f64 = 0.00042;
+
+    #[test_case(
+        "event: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cost\":0.00042}}}\n\n" ;
+        "usage_cost_field"
+    )]
+    #[test_case(
+        "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_123\",\"object\":\"response\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12,\"cost\":0.00042}}}\n\n" ;
+        "openrouter_response_done"
+    )]
+    #[test_case(
+        "data: {\"type\":\"response.content_part.delta\",\"delta\":\"hello\"}\n\ndata: {\"type\":\"response.done\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cost\":0.00042}}}\n\n" ;
+        "openrouter_content_part_delta"
+    )]
+    #[test_case(
+        "data: {\"type\":\"response.done\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cost_details\":{\"upstream_inference_cost\":0.00042}}}}\n\n" ;
+        "openrouter_cost_details_in_usage"
+    )]
+    #[test_case(
+        "data: {\"type\":\"response.done\",\"id\":\"resp_123\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cost\":0.00042}}\n\n" ;
+        "direct_response_done_without_wrapper"
+    )]
+    #[test_case(
+        "event: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"cost\":{\"request_cost_usd\":0.00042},\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cost\":0}}}\n\n" ;
+        "response_cost_overrides_zero_usage"
+    )]
+    #[test_case(
+        ": cost {\"request_cost_usd\": 0.00042}\n\nevent: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n" ;
+        "comment_cost_before_completed"
+    )]
+    #[test_case(
+        "event: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n: cost 0.00042\n\n" ;
+        "comment_cost_after_completed"
+    )]
+    #[test_case(
+        "event: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cost_details\":{\"upstream_inference_cost\":0.00042}}}}\n\n" ;
+        "cost_details_in_usage"
+    )]
+    fn parse_sse_cost_extraction(completed_frame: &str) {
+        smol::block_on(async {
+            let (resp, _) = run_sse(completed_frame).await;
+            let resp = resp.unwrap();
+            let cost = resp.usage.cost.expect("upstream cost should be captured");
+            assert!((cost - UPSTREAM_COST).abs() < 1e-9);
         })
     }
 

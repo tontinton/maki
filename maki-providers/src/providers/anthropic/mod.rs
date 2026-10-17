@@ -676,6 +676,11 @@ pub(crate) async fn parse_sse(
             continue;
         }
 
+        if let Some(comment) = line.strip_prefix(':') {
+            parser.process_comment(comment);
+            continue;
+        }
+
         let data = match line.strip_prefix("data:") {
             Some(d) => d.strip_prefix(' ').unwrap_or(d),
             None => continue,
@@ -1012,6 +1017,42 @@ data: {{\"type\":\"message_stop\"}}\n"
                 }
             );
             assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+        })
+    }
+
+    const UPSTREAM_COST: f64 = 0.00042;
+
+    #[test_case(
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10,\"cost\":0.00042}}\n\n" ;
+        "delta_usage_cost"
+    )]
+    #[test_case(
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"cost\":{\"request_cost_usd\":0.00042},\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10,\"cost\":0}}\n\n" ;
+        "root_cost_overrides_zero_usage"
+    )]
+    #[test_case(
+        ": cost {\"request_cost_usd\": 0.00042}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10}}\n\n" ;
+        "comment_cost_before_delta"
+    )]
+    #[test_case(
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10}}\n\n: cost 0.00042\n\n" ;
+        "comment_cost_after_delta"
+    )]
+    #[test_case(
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10,\"cost_details\":{\"upstream_inference_cost\":0.00042}}}\n\n" ;
+        "cost_details_in_usage"
+    )]
+    fn parse_sse_cost_extraction(delta_frame: &str) {
+        smol::block_on(async {
+            let sse = format!(
+                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":42}}}}}}\n\n{delta_frame}event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n"
+            );
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(mock_response(sse.into_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+            let cost = resp.usage.cost.expect("upstream cost should be captured");
+            assert!((cost - UPSTREAM_COST).abs() < 1e-9);
         })
     }
 

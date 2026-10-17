@@ -73,6 +73,27 @@ struct Usage {
     cache_creation_input_tokens: u32,
     #[serde(default)]
     cache_read_input_tokens: u32,
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "crate::providers::lenient_cost"
+    )]
+    cost: Option<f64>,
+    #[serde(default)]
+    cost_details: Option<Value>,
+}
+
+impl Usage {
+    fn resolved_cost(&self) -> Option<f64> {
+        self.cost
+            .filter(|c| *c > 0.0)
+            .or_else(|| {
+                self.cost_details
+                    .as_ref()
+                    .and_then(crate::providers::parse_cost_details)
+            })
+            .or(self.cost)
+    }
 }
 
 impl From<Usage> for TokenUsage {
@@ -82,7 +103,7 @@ impl From<Usage> for TokenUsage {
             output: u.output_tokens,
             cache_creation: u.cache_creation_input_tokens,
             cache_read: u.cache_read_input_tokens,
-            ..Default::default()
+            cost: u.resolved_cost(),
         }
     }
 }
@@ -112,6 +133,12 @@ fn lenient_transformations<'de, D: Deserializer<'de>>(
 struct MessagePayload {
     #[serde(default)]
     usage: Option<Usage>,
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "crate::providers::lenient_cost"
+    )]
+    cost: Option<f64>,
     #[serde(default, deserialize_with = "lenient_transformations")]
     input_transformations: Option<Vec<InputTransformation>>,
 }
@@ -119,6 +146,12 @@ struct MessagePayload {
 #[derive(Deserialize)]
 struct MessageStartEvent {
     message: MessagePayload,
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "crate::providers::lenient_cost"
+    )]
+    cost: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +200,12 @@ struct MessageDeltaEvent {
     delta: Option<MessageDeltaPayload>,
     #[serde(default)]
     usage: Option<Usage>,
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "crate::providers::lenient_cost"
+    )]
+    cost: Option<f64>,
     #[serde(default)]
     copilot_usage: Option<Value>,
     /// Only after a server-side fallback, with the serving model's entries.
@@ -424,6 +463,14 @@ impl EventParser {
         }
     }
 
+    pub fn process_comment(&mut self, comment: &str) {
+        if let Some(cost) = crate::providers::parse_cost_comment(comment)
+            && (cost > 0.0 || self.usage.cost.is_none())
+        {
+            self.usage.cost = Some(cost);
+        }
+    }
+
     pub async fn process(
         &mut self,
         event_type: &str,
@@ -433,8 +480,22 @@ impl EventParser {
         match event_type {
             "message_start" => {
                 if let Ok(ev) = serde_json::from_str::<MessageStartEvent>(data) {
+                    let prior_cost = self.usage.cost;
                     if let Some(u) = ev.message.usage {
                         self.usage = TokenUsage::from(u);
+                    }
+                    let explicit_cost = ev
+                        .cost
+                        .filter(|c| *c > 0.0)
+                        .or_else(|| ev.message.cost.filter(|c| *c > 0.0))
+                        .or(ev.cost)
+                        .or(ev.message.cost);
+                    if let Some(c) = explicit_cost {
+                        if c > 0.0 || self.usage.cost.is_none() {
+                            self.usage.cost = Some(c);
+                        }
+                    } else if self.usage.cost.is_none() {
+                        self.usage.cost = prior_cost;
                     }
                     if let Some(t) = ev.message.input_transformations {
                         self.input_transformations = t;
@@ -549,6 +610,16 @@ impl EventParser {
                                 *dst = src;
                             }
                         }
+                        if let Some(c) = u.resolved_cost()
+                            && (c > 0.0 || self.usage.cost.is_none())
+                        {
+                            self.usage.cost = Some(c);
+                        }
+                    }
+                    if let Some(c) = ev.cost
+                        && (c > 0.0 || self.usage.cost.is_none())
+                    {
+                        self.usage.cost = Some(c);
                     }
                     if let Some(usd) = ev.copilot_usage.as_ref().and_then(copilot_usd) {
                         self.usage.cost = Some(usd);
@@ -573,7 +644,16 @@ impl EventParser {
                 return Err(AgentError::api(400, data.to_string()));
             }
             "message_stop" => return Ok(ControlFlow::Break(())),
-            _ => {}
+            _ => {
+                if data.contains("\"cost\"")
+                    && let Ok(val) = serde_json::from_str::<Value>(data)
+                    && let Some(cost_val) = val.get("cost")
+                    && let Some(cost) = crate::providers::parse_cost_value(cost_val)
+                    && (cost > 0.0 || self.usage.cost.is_none())
+                {
+                    self.usage.cost = Some(cost);
+                }
+            }
         }
 
         Ok(ControlFlow::Continue(()))
