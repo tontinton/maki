@@ -1171,6 +1171,30 @@ async fn prompt(
     roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
 }
 
+/// Interrupts the running turn of a live session, the way a double Esc does
+/// in the TUI: the agent stops, in-flight tools are cancelled and queued
+/// prompts are dropped.
+///
+/// @param opts table? Optional fields: session (string) id of a live
+///   session; defaults to the focused one.
+/// @return (string|nil, string|nil) "cancelled" if a turn was interrupted,
+///   "idle" if the session had none running, or nil and an error.
+/// @example
+/// local state, err = maki.session.cancel({ session = id })
+/// if state == "cancelled" then maki.notify("turn stopped") end
+#[lua_fn(guard = [Agent, SessionWrite])]
+async fn cancel(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
+    let id = match opts {
+        Some(opts) => opts.opt("session")?,
+        None => None,
+    };
+    roundtrip(lua, tx, SessionRequest::Cancel { id }).await
+}
+
 /// Reports {text} to a live session without creating a user turn. The
 /// observation waits for the session's next agent run.
 ///
@@ -1280,8 +1304,8 @@ lua_table! {
     DOCS [
         list(tx), live(tx), current(tx), read(tx), export(perms, tx), messages(perms, tx),
         windows(perms, tx), subagents(perms, tx), focus(tx), delete(perms, tx),
-        new(perms, tx, grants), prompt(perms, tx), notify(perms, grants), set_mode(perms, tx),
-        set_title(perms, tx), data_dir(plugin, tx),
+        new(perms, tx, grants), prompt(perms, tx), cancel(perms, tx), notify(perms, grants),
+        set_mode(perms, tx), set_title(perms, tx), data_dir(plugin, tx),
     ]
 }
 
@@ -1310,6 +1334,7 @@ mod tests {
     use crate::api::image::create_image_table;
     use crate::api::json::create_json_table;
     use crate::api::top::add_top_methods;
+    use crate::api::util::command::{CANCEL_CANCELLED, CANCEL_IDLE, PROMPT_QUEUED};
     use crate::plugin_permissions::denied_error;
     use crate::session_snapshot::{MODE_PLAN, STATUS_IDLE, STATUS_STORED};
     use mlua::Value;
@@ -1451,12 +1476,52 @@ mod tests {
             };
             assert_eq!(id, expected_id);
             assert_eq!(text, "hi");
-            reply_tx.send(Ok(json!("queued"))).unwrap();
+            reply_tx.send(Ok(json!(PROMPT_QUEUED))).unwrap();
         });
         let (val, err): (String, Option<String>) = lua.load(code).eval_async().await.unwrap();
         checker.join().unwrap();
         assert_eq!(err, None);
-        assert_eq!(val, "queued");
+        assert_eq!(val, PROMPT_QUEUED);
+    }
+
+    /// Both outcomes are successes a plugin tells apart by the string, so an
+    /// idle session never reads as a failure under `if not ok`.
+    #[test_case("return session.cancel({ session = 'abc' })", Some("abc"), CANCEL_CANCELLED ; "explicit_session_id")]
+    #[test_case("return session.cancel()", None, CANCEL_IDLE ; "defaults_to_focused")]
+    #[tokio::test]
+    async fn cancel_forwards_the_session_id(code: &str, expected_id: Option<&str>, reply: &str) {
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let expected_id = expected_id.map(str::to_owned);
+        let reply = reply.to_owned();
+        let expected_reply = reply.clone();
+        let checker = std::thread::spawn(move || {
+            let Some(UiAction::Session {
+                req: SessionRequest::Cancel { id },
+                reply_tx,
+            }) = rx.blocking_recv()
+            else {
+                panic!("expected cancel request");
+            };
+            assert_eq!(id, expected_id);
+            reply_tx.send(Ok(json!(reply))).unwrap();
+        });
+        let (val, err): (String, Option<String>) = lua.load(code).eval_async().await.unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        assert_eq!(val, expected_reply);
+    }
+
+    #[tokio::test]
+    async fn cancel_needs_the_agent_permission() {
+        let lua = lua_granted(None, PluginPermissions::denied());
+        let err = lua
+            .load("return session.cancel()")
+            .eval_async::<Value>()
+            .await
+            .unwrap_err();
+        let denied = denied_error(Permission::Agent).to_string();
+        assert!(err.to_string().contains(&denied), "{err}");
     }
 
     /// Mode is per session like the plan it drives, so a row handler firing

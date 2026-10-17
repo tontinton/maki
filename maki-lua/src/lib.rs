@@ -31,11 +31,12 @@ pub use api::ui::marks::{
 };
 pub use api::ui::syntax::{SyntaxDoc, SyntaxEdit, SyntaxIndex, SyntaxInput, SyntaxRule};
 pub use api::util::command::{
-    Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch, HintEntry,
-    HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit,
-    LuaCommandInfo, LuaCommandReader, ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow,
-    PlanMenu, PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest, TextEdit, TitlePos,
-    UiAction, UiReply, WinCommand, WinEvent, WinView,
+    Anchor, Axis, Border, BuiltinAction, CANCEL_CANCELLED, CANCEL_IDLE, Dimension, Edge,
+    FloatConfig, FloatConfigPatch, HintEntry, HintReader, HintSnapshot, InputDecorate, InputEdit,
+    InputMarks, InputRequest, InputSubmit, LuaCommandInfo, LuaCommandReader, ModelRequest,
+    NO_UI_ERR, PROMPT_QUEUED, PROMPT_STARTED, PlanActionOutcome, PlanFormRow, PlanMenu,
+    PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest, TextEdit, TitlePos, UiAction,
+    UiReply, WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
