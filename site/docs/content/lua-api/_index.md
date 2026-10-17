@@ -846,8 +846,10 @@ name the session now running or focused. What each event adds:
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
   or `"idle"`), `data.title`, and `data.focused` (boolean).
-- `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
-  when the title changes (rename or auto-generation).
+- `"SessionTitleChanged"`: `data.title`, `data.title_user_set` (boolean,
+  whether the user named the session rather than auto-generation), and
+  `data.focused` (boolean), when the title changes (rename or
+  auto-generation).
 - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
   (`"working"`, `"idle"`, `"done"`, or `"error"`), when a subagent starts
   or changes status. A task a plugin opened with `maki.agent.session`
@@ -4605,6 +4607,7 @@ The returned table:
   cost,
   queue = { count }, -- nil under headless drivers
   title,             -- nil under headless drivers
+  title_user_set,    -- false under headless drivers
 }
 ```
 

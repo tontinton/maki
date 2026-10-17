@@ -468,7 +468,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         push_prompt(&mut track_on(&tmp), MODEL_SPEC, PROMPT);
         let mut stored = load(&tmp);
-        stored.set_title(TITLE.to_owned());
+        stored.set_user_title(TITLE.to_owned());
         stored.meta.plan_path = Some(PLAN_PATH.to_owned());
 
         let mut track = SessionTrack::open(

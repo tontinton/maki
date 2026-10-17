@@ -281,7 +281,7 @@ mod tests {
         let (a_id, b_id) = (a.id, b.id);
         writer.send(Arc::new(a), a_claim);
         writer.send(Arc::new(b.clone()), b_claim.clone());
-        b.set_title("renamed".into());
+        b.set_user_title("renamed".into());
         writer.send(Arc::new(b), b_claim);
         drain(writer);
 
@@ -327,7 +327,7 @@ mod tests {
             TOOL_ID.into(),
             Arc::new(maki_agent::ToolOutput::Plain(TOOL_TEXT.to_string().into())),
         );
-        session.set_title(TITLE.into());
+        session.set_user_title(TITLE.into());
 
         let (second, second_warn_rx) = writer(&dir);
         let claim = SessionClaim::acquire(id, &dir).expect("the first run let go");
