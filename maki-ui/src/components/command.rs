@@ -22,12 +22,23 @@ pub const STARTS_TURNS: PluginAccess = PluginAccess::Needs(Permission::Agent);
 
 /// What a plugin must hold to run a command through `maki.api.run_command`.
 /// Typing a command is the user saying yes, so none of this applies there.
+///
+/// Mirror the guard on the Lua API that does the same thing: looser is a side
+/// door around it, stricter only sends plugins to the API instead. That is why
+/// `/fast` is open, since `maki.model.set` is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PluginAccess {
     Open,
     Needs(Permission),
-    /// These widen what plugins or the model may do, so no grant unlocks them.
+    /// These move a security boundary: what runs without asking, which config
+    /// loads, which code is installed. No grant unlocks them.
     UserOnly,
+}
+
+/// Named, because the plugin is often an alias whose author never thought
+/// about what its target reaches.
+pub(crate) fn missing_refusal(command: &str, missing: &Missing) -> String {
+    format!("{command}: {missing}")
 }
 
 pub struct BuiltinCommand {
@@ -617,14 +628,13 @@ impl CommandPalette {
             CommandType::Lua(i) => {
                 return caller
                     .first_missing(&self.lua_commands[i].reach)
-                    .map(|missing| missing.to_string());
+                    .map(|missing| missing_refusal(&item.name, &missing));
             }
         };
         match access {
             PluginAccess::Open => None,
-            PluginAccess::Needs(perm) => {
-                (!caller.is_allowed(perm)).then(|| Missing::Permission(perm).to_string())
-            }
+            PluginAccess::Needs(perm) => (!caller.is_allowed(perm))
+                .then(|| missing_refusal(&item.name, &Missing::Permission(perm))),
             PluginAccess::UserOnly => Some(format!("{}{USER_ONLY_SUFFIX}", item.name)),
         }
     }

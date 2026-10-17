@@ -119,8 +119,10 @@ Aliasing adds a name, so both stay in the palette. Any command works as a target
 
 `run_command` only runs what the calling plugin's grants cover. Your `init.lua` counts as a plugin, and its grants come from `~/.config/maki/plugin.toml` (see [plugin permissions](/docs/lua-api/#plugin-permissions)). Commands not listed here run for any plugin.
 
+- Needs `fs_read`, `fs_write`: `/memory`.
+- Needs `fs_read`, `fs_write`, `net`, `run`, `env`: `/tasks`.
 - Needs `agent`: `/compact`, `/btw`, custom commands, MCP prompts.
-- Needs what its owner holds: plugin commands, as described below.
+- Needs what its owner holds: every other plugin command, as described below.
 - Only when you type it: `/yolo`, `/trust`, `/packupdate`, `/packdel`. These change permissions, folder trust, or installed packages.
 
 A plugin command's handler runs with the grants of the plugin that registered it. The caller picks the arguments, so it must hold at least the same reach:

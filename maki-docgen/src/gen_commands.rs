@@ -1,9 +1,13 @@
+use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::sync::Arc;
 
+use maki_agent::tools::ToolRegistry;
 use maki_config::Permission;
+use maki_lua::{LuaCommandInfo, PluginHost};
 use maki_ui::{BUILTIN_COMMANDS, PluginAccess, STARTS_TURNS};
 
-use crate::lua_util;
+use crate::lua_util::in_registration_window;
 
 const ALIASING: &str = r#"## Aliasing commands
 
@@ -52,28 +56,52 @@ fn builtin_names(access: PluginAccess) -> Vec<String> {
         .collect()
 }
 
-fn write_plugin_access(out: &mut String) {
+/// Read from booted plugins, so what is listed is the grant `run_command`
+/// actually compares against.
+fn bundled_commands() -> Vec<LuaCommandInfo> {
+    let host = in_registration_window(|| {
+        PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins")
+    });
+    let mut commands = host.command_reader().load().commands.clone();
+    commands.sort_by(|a, b| a.name.cmp(&b.name));
+    commands
+}
+
+fn write_plugin_access(out: &mut String, bundled: &[LuaCommandInfo]) {
     writeln!(out, "{PLUGIN_ACCESS}").unwrap();
     writeln!(out).unwrap();
+    let mut by_needs: BTreeMap<Vec<Permission>, Vec<String>> = BTreeMap::new();
     for &perm in Permission::ALL {
         let access = PluginAccess::Needs(perm);
-        let mut names = builtin_names(access);
+        let names = by_needs.entry(vec![perm]).or_default();
+        names.extend(builtin_names(access));
         if access == STARTS_TURNS {
             names.extend(["custom commands".into(), "MCP prompts".into()]);
         }
-        if !names.is_empty() {
-            writeln!(
-                out,
-                "- Needs `{}`: {}.",
-                perm.manifest_key(),
-                names.join(", ")
-            )
-            .unwrap();
+    }
+    for cmd in bundled {
+        let held: Vec<Permission> = Permission::ALL
+            .iter()
+            .copied()
+            .filter(|&perm| cmd.reach.is_allowed(perm))
+            .collect();
+        if !held.is_empty() {
+            by_needs
+                .entry(held)
+                .or_default()
+                .push(format!("`{}`", cmd.name));
         }
+    }
+    for (perms, names) in by_needs.iter().filter(|(_, names)| !names.is_empty()) {
+        let keys: Vec<String> = perms
+            .iter()
+            .map(|perm| format!("`{}`", perm.manifest_key()))
+            .collect();
+        writeln!(out, "- Needs {}: {}.", keys.join(", "), names.join(", ")).unwrap();
     }
     writeln!(
         out,
-        "- Needs what its owner holds: plugin commands, as described below."
+        "- Needs what its owner holds: every other plugin command, as described below."
     )
     .unwrap();
     writeln!(
@@ -115,7 +143,8 @@ pub fn generate() -> String {
     for cmd in BUILTIN_COMMANDS {
         write_row(&mut out, cmd.name, cmd.description);
     }
-    for cmd in &lua_util::load_builtin_plugin_commands() {
+    let bundled = bundled_commands();
+    for cmd in &bundled {
         write_row(&mut out, &cmd.name, &cmd.description);
     }
 
@@ -248,7 +277,7 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(out, "{ALIASING}").unwrap();
     writeln!(out).unwrap();
-    write_plugin_access(&mut out);
+    write_plugin_access(&mut out, &bundled);
 
     writeln!(out).unwrap();
     writeln!(

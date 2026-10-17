@@ -5,7 +5,7 @@ use crate::agent::shared_queue;
 use crate::app::tasks::TaskStatus;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX};
 use crate::components::btw_modal::BtwEvent;
-use crate::components::command::{ParsedCommand, USER_ONLY_SUFFIX};
+use crate::components::command::{ParsedCommand, USER_ONLY_SUFFIX, missing_refusal};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::messages::ScrollPos;
@@ -4231,7 +4231,10 @@ fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: Permission)
 
     assert_eq!(
         app.run_cmdline(cmdline, 1, &without(needed)).err(),
-        Some(Missing::Permission(needed).to_string())
+        Some(missing_refusal(
+            cmdline.split_whitespace().next().unwrap(),
+            &Missing::Permission(needed)
+        ))
     );
     assert_eq!(app.run_cmdline(cmdline, 1, &only(needed)).err(), None);
 }
