@@ -33,6 +33,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--max-turns` | no | no | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
+| `-w` / `--worktree` | yes | no | no |
 
 ### Shared flags (detail)
 
@@ -61,6 +62,17 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
+
+### Worktree flags (TUI only)
+
+`-w` starts the session in a new git worktree, so parallel sessions edit separate file trees. The worktree branches from your current `HEAD` onto a new branch `worktree-<NAME>`, lives in maki's state directory, and maki changes into it before the session starts. Maki rejects `-w` with a subcommand or in `--print` / SDK mode, because only the TUI cleans the worktree up on exit.
+
+| Flag | Description |
+|------|-------------|
+| `-w`, `--worktree` | Create a worktree and run the TUI inside it |
+| `--worktree-name <NAME>` | Name the worktree and branch. Needs `-w`. Reopens the worktree if it already exists, and fails if only the branch exists. Auto-generates an adjective-noun name when omitted |
+
+On exit, an unnamed worktree with no changes and no new commits is removed, even when the session fails. Maki keeps any other worktree and prints its path with the commands to remove it.
 
 ### Tool name lists
 

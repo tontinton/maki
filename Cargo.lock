@@ -2969,6 +2969,7 @@ version = "0.6.4"
 dependencies = [
  "clap",
  "color-eyre",
+ "fastrand",
  "flume",
  "isahc",
  "maki-acp",
