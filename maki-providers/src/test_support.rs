@@ -227,7 +227,7 @@ pub fn register_bundled(authored: Value, host: &str) {
         decl,
         hooks: ProviderHooks::default(),
     };
-    plugin::register(registration, DeclAuthority::Bundled).expect(BAD_DECLARATION);
+    plugin::register(registration, DeclAuthority::Bundled, &[]).expect(BAD_DECLARATION);
     plugin::commit_load();
 }
 

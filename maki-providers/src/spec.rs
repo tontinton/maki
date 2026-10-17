@@ -277,7 +277,7 @@ impl ProviderRegistry {
 /// knows about a slug: a catalog-backed builtin has a spec row and is still
 /// `Catalog` here.
 pub enum Owner {
-    /// A selected or registered declaration.
+    /// A registered declaration.
     Plugin,
     /// Carries the constructor rather than the spec, so "builtin" and
     /// "buildable" cannot come apart.
@@ -293,7 +293,7 @@ impl Owner {
     pub fn of(slug: &str) -> Self {
         // Registration refuses a built-in slug, so a declaration never
         // shadows a row below.
-        if plugin::owns_slug(slug) {
+        if plugin::is_registered(slug) {
             return Self::Plugin;
         }
         let builtin = ProviderRegistry::compiled(slug);

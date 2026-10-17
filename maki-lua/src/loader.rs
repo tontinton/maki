@@ -41,6 +41,9 @@ pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for 
      tool of the same name, together with any \"always allow\" you saved";
 pub const TRUST_SCOPE_WARNING: &str =
     "trust is only read from the global init.lua; ignoring the trust table in";
+/// Tests assert on this exact text, so a wording tweak here updates them too.
+pub const UNCOVERED_TAKEOVER_WARNING: &str = "which its recorded approval does not cover. Update or reinstall the \
+     package to approve the takeover";
 
 /// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
 /// project folder nobody vouched for stops at the global file.
@@ -711,6 +714,7 @@ impl PluginHost {
         declared: crate::api::pack::Declared,
         package: &DiscoveredPackage,
         permissions: PluginPermissions,
+        granted_providers: Arc<[String]>,
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
         check_plugin_compatibility(&package.name, Some(&package.dir))?;
@@ -722,6 +726,7 @@ impl PluginHost {
                 context: LoadContext {
                     plugin_dir: Some(package.dir.clone()),
                     permissions,
+                    granted_providers,
                     opts,
                     revision_guard: package.revision_guard.clone(),
                     package: true,
@@ -745,7 +750,7 @@ impl PluginHost {
         permissions: PluginPermissions,
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
-        self.load_package_with_guard(name, dir, permissions, opts, None)
+        self.load_package_with_guard(name, dir, permissions, Arc::from(Vec::new()), opts, None)
     }
 
     fn load_package_with_guard(
@@ -753,6 +758,7 @@ impl PluginHost {
         name: &str,
         dir: &Path,
         permissions: PluginPermissions,
+        granted_providers: Arc<[String]>,
         opts: PluginOpts,
         revision_guard: Option<Arc<maki_pack::lock::Lock>>,
     ) -> Result<(), PluginError> {
@@ -799,6 +805,7 @@ impl PluginHost {
             LoadContext {
                 plugin_dir: Some(root),
                 permissions,
+                granted_providers,
                 opts,
                 revision_guard,
                 package: true,
@@ -898,7 +905,31 @@ impl PluginHost {
                     .cloned()
                     .map(Arc::new)
                     .unwrap_or_default();
-                let permissions = crate::pack::effective_permissions(pkg);
+                let (permissions, granted_providers) = crate::pack::effective_grant(pkg);
+                // A takeover the approval does not cover is refused at
+                // `maki.provider.register` with a message about the grant alone,
+                // so say it here too: the approval predates the manifest's
+                // `providers` list, and only an update prompt re-asks.
+                let uncovered: Vec<&str> = pkg
+                    .requested
+                    .providers()
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|slug| !granted_providers.iter().any(|g| g == slug))
+                    .collect();
+                if !uncovered.is_empty() {
+                    tracing::warn!(
+                        package = %pkg.name,
+                        providers = ?uncovered,
+                        "a package load carries a takeover its approval does not cover"
+                    );
+                    warnings.push(format!(
+                        "{}: takes over {}, {UNCOVERED_TAKEOVER_WARNING}",
+                        pkg.name,
+                        uncovered.join(", ")
+                    ));
+                }
+                let granted_providers = Arc::from(granted_providers);
                 loaded.push(&pkg.name);
                 let custom = declared
                     .iter()
@@ -912,13 +943,18 @@ impl PluginHost {
                             )
                     });
                 let result = match custom {
-                    Some(declaration) => {
-                        self.run_pack_loader(declaration.clone(), pkg, permissions, opts)
-                    }
+                    Some(declaration) => self.run_pack_loader(
+                        declaration.clone(),
+                        pkg,
+                        permissions,
+                        granted_providers,
+                        opts,
+                    ),
                     None => self.load_package_with_guard(
                         &pkg.name,
                         &pkg.dir,
                         permissions,
+                        granted_providers,
                         opts,
                         pkg.revision_guard.clone(),
                     ),

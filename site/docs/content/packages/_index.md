@@ -166,6 +166,19 @@ with its approval. An update that widens the list or drops it asks again before
 it loads. An approval from before Maki stored hosts counts as every host, so
 adding a list to that package never prompts.
 
+A package that takes over a [models.dev provider
+name](/docs/providers/#taking-over-a-modelsdev-provider) lists the names at the
+top level of `plugin.toml`:
+
+```toml
+providers = ["greenpt"]
+```
+
+Maki stores the names with the approval, and the install prompt says the
+package will receive the saved key for each. An update that adds a name asks
+again. Only a granted name can be registered, so a load that names one the
+approval never covered refuses it.
+
 An approval applies only to the same package name and source. Maki keeps
 approvals in `<maki-data>/site/pack-approvals.json`, where `<maki-data>` is the
 data directory from the

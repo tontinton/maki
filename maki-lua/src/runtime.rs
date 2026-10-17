@@ -257,6 +257,10 @@ fn load_user_source<'a>(lua: &'a Lua, name: &str, source: &'a str) -> Chunk<'a> 
 pub struct LoadContext {
     pub plugin_dir: Option<PathBuf>,
     pub permissions: PluginPermissions,
+    /// The models.dev names this load may take over: the manifest's `providers`
+    /// list intersected with the user's approval. Everything but a package
+    /// loads with none, so a catalog name stays maki's to serve.
+    pub granted_providers: Arc<[String]>,
     pub opts: PluginOpts,
     /// Shared lock on the revision directory being loaded, held until the
     /// owner is dropped so a prune cannot delete code that is still running.
@@ -280,6 +284,7 @@ impl LoadContext {
         Self {
             plugin_dir,
             permissions,
+            granted_providers: Arc::from(Vec::new()),
             opts: PluginOpts::default(),
             revision_guard: None,
             package: false,
@@ -3014,6 +3019,7 @@ impl LuaRuntime {
         let LoadContext {
             plugin_dir,
             permissions,
+            granted_providers,
             opts,
             revision_guard,
             package,
@@ -3047,6 +3053,7 @@ impl LuaRuntime {
             Owner {
                 name: Arc::clone(&name),
                 authority,
+                granted_providers,
             },
             self.ui_action_tx.clone(),
             &permissions,

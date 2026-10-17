@@ -307,10 +307,13 @@ pub enum RegisterError {
     InvalidSlug(String),
     #[error("provider slug '{0}' is already defined in providers.toml")]
     ConfiguredSlug(String),
-    #[error("provider slug '{0}' is reserved; catalog names require an explicit plugin selection")]
+    #[error("provider slug '{0}' belongs to a provider maki ships")]
     ReservedSlug(String),
-    #[error("provider '{slug}' selects plugin '{owner}' in providers.toml")]
-    SelectedOwner { slug: String, owner: String },
+    #[error(
+        "provider slug '{0}' takes over a models.dev provider the package was not granted: \
+         the package must list it under `providers` in plugin.toml and be approved for it"
+    )]
+    UngrantedTakeover(String),
     #[error("provider '{slug}': {message}")]
     Credentials { slug: String, message: String },
     #[error("provider '{0}' is already registered")]
@@ -439,26 +442,8 @@ struct PluginEntry {
     auth: Arc<AuthState>,
 }
 
-#[derive(Default)]
-struct Registry {
-    entries: BTreeMap<Box<str>, Arc<PluginEntry>>,
-    selected: BTreeMap<Box<str>, String>,
-}
-
-impl Registry {
-    fn for_load() -> Self {
-        let selected = ProvidersConfig::load_or_default()
-            .providers
-            .into_iter()
-            .filter(|(slug, _)| !ProviderRegistry::is_shipped(slug))
-            .filter_map(|(slug, def)| def.plugin.map(|owner| (slug.into(), owner)))
-            .collect();
-        Registry {
-            selected,
-            ..Registry::default()
-        }
-    }
-}
+/// Ordered by slug, so every listing comes out the same each run.
+type Registry = BTreeMap<Box<str>, Arc<PluginEntry>>;
 
 type AuthCell = (Option<Arc<str>>, Arc<AuthState>);
 
@@ -470,7 +455,9 @@ static PROVIDERS: LazyLock<RwLock<Arc<Registry>>> = LazyLock::new(RwLock::defaul
 /// and open at process start so a host that loads plugins without driving the
 /// phases (tests, embedders) still registers.
 static STAGING: LazyLock<Mutex<Option<Registry>>> =
-    LazyLock::new(|| Mutex::new(Some(Registry::for_load())));
+    LazyLock::new(|| Mutex::new(Some(Registry::new())));
+/// One cell of credentials per slug, for the life of the process: see
+/// [`shared_auth`].
 /// The current owner and auth state of each slug: see [`shared_auth`].
 static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLock::default);
 
@@ -481,7 +468,7 @@ static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLoc
 /// long as the load takes, so [`commit_load`] swaps the whole map in one step
 /// instead.
 pub fn begin_load() {
-    *STAGING.lock().unwrap() = Some(Registry::for_load());
+    *STAGING.lock().unwrap() = Some(Registry::new());
 }
 
 /// Publishes what this load registered. A load that registered nothing
@@ -494,7 +481,7 @@ pub fn commit_load() {
     let Some(staged) = STAGING.lock().unwrap().take() else {
         return;
     };
-    for entry in staged.entries.values() {
+    for entry in staged.values() {
         let slug = &entry.decl.slug;
         let api_key_env = entry.decl.api_key_env.clone().filter(|var| !var.is_empty());
         if let Err(error) = entry.auth.redeclare(
@@ -506,11 +493,7 @@ pub fn commit_load() {
             warn!(slug, %error, "provider credentials were not re-declared");
         }
     }
-    let logins = staged
-        .entries
-        .values()
-        .filter_map(|entry| entry.built.login)
-        .collect();
+    let logins = staged.values().filter_map(|e| e.built.login).collect();
     maki_config::providers::set_registered_providers(logins);
     *PROVIDERS.write().unwrap() = Arc::new(staged);
 }
@@ -524,13 +507,12 @@ pub fn discard(plugin: &str) {
         return;
     };
     let dropped: Vec<Box<str>> = staged
-        .entries
         .iter()
         .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin))
         .map(|(slug, _)| slug.clone())
         .collect();
     for slug in &dropped {
-        staged.entries.remove(slug);
+        staged.remove(slug);
     }
     if !dropped.is_empty() {
         debug!(plugin, slugs = ?dropped, "discarded the declarations of a failed plugin load");
@@ -539,8 +521,15 @@ pub fn discard(plugin: &str) {
 
 /// Registers a declaration in the load in progress. A slug is registered once
 /// per load: a second declaration of it is [`RegisterError::DuplicateSlug`].
-pub fn register(reg: Registration, authority: DeclAuthority) -> Result<(), RegisterError> {
-    register_owned(reg, authority, None)
+///
+/// `takeovers` are the models.dev names the trust layer granted this load to
+/// replace; see [`register_owned`].
+pub fn register(
+    reg: Registration,
+    authority: DeclAuthority,
+    takeovers: &[String],
+) -> Result<(), RegisterError> {
+    register_owned(reg, authority, None, takeovers)
 }
 
 /// [`register`] for a Lua plugin, remembered as `plugin`'s so a load of it
@@ -549,21 +538,65 @@ pub fn register_plugin(
     plugin: Arc<str>,
     reg: Registration,
     authority: DeclAuthority,
+    takeovers: &[String],
 ) -> Result<(), RegisterError> {
-    register_owned(reg, authority, Some(plugin))
+    register_owned(reg, authority, Some(plugin), takeovers)
 }
 
 fn register_owned(
     reg: Registration,
     authority: DeclAuthority,
     owner: Option<Arc<str>>,
+    takeovers: &[String],
 ) -> Result<(), RegisterError> {
     let Registration { decl, hooks } = reg;
     let slug = decl.slug.clone();
     if !is_valid_slug(&slug) {
         return Err(RegisterError::InvalidSlug(slug));
     }
-    check_owner(&slug, authority, owner.as_deref())?;
+    // A third party on a slug maki ships would be handed the key the user
+    // saved for that provider, and would take over its models under a name
+    // the picker still labels as maki's own. A slug maki only serves from
+    // models.dev is a default the user never chose, so a plugin may replace
+    // it with the trust layer's say so, and the takeover is logged below. A
+    // bundled slug stays reserved even while its plugin is off, so turning a
+    // plugin off never frees the name.
+    let reserved = match authority {
+        DeclAuthority::Bundled => ProviderRegistry::compiled(&slug).is_some(),
+        DeclAuthority::ThirdParty => ProviderRegistry::is_shipped(&slug),
+    };
+    if reserved {
+        return Err(RegisterError::ReservedSlug(slug));
+    }
+    // Replacing a catalog provider the user already logged into hands the
+    // plugin the key saved for that name, so only a granted takeover may.
+    // A cold catalog cannot be asked, so an offline load stays quiet rather
+    // than guessing: one maki never cached is also one it never offered a
+    // login for, so no key is at stake. A granted takeover is one the
+    // install prompt showed, so it is logged and the catalog listing drops
+    // the name.
+    if authority == DeclAuthority::ThirdParty {
+        let served = catalog::serves_slug(&slug);
+        if served && !takeovers.contains(&slug) {
+            return Err(RegisterError::UngrantedTakeover(slug));
+        }
+        if served {
+            warn!(slug, "third-party plugin replaces the models.dev provider");
+        }
+    }
+    // A `providers.toml` entry only defines a provider when it sets a
+    // `protocol`, and only a third party loses the slug to it. Without one the
+    // entry just tweaks the declaration, like `[deepseek] base_url` pointing at
+    // a gateway. A bundled plugin keeps its slug either way and only gets a
+    // warning, because failing here would abort the whole bundled load and
+    // maki would not start.
+    if authority == DeclAuthority::ThirdParty
+        && ProvidersConfig::load_or_default()
+            .get(&slug)
+            .is_some_and(|def| def.protocol.is_some())
+    {
+        return Err(RegisterError::ConfiguredSlug(slug));
+    }
     if decl.net_hosts.is_empty() {
         return Err(RegisterError::NoNetHosts(slug));
     }
@@ -596,7 +629,7 @@ fn register_owned(
     let Some(staged) = staging.as_mut() else {
         return Err(RegisterError::Closed(slug));
     };
-    let Entry::Vacant(vacant) = staged.entries.entry(slug.as_str().into()) else {
+    let Entry::Vacant(vacant) = staged.entry(slug.as_str().into()) else {
         return Err(RegisterError::DuplicateSlug(slug));
     };
     debug!(
@@ -617,45 +650,6 @@ fn register_owned(
         target,
         hooks,
     }));
-    Ok(())
-}
-
-fn check_owner(
-    slug: &str,
-    authority: DeclAuthority,
-    owner: Option<&str>,
-) -> Result<(), RegisterError> {
-    // Selecting a package is explicit consent to use this name's saved key.
-    // Catalog metadata alone cannot select that package.
-    let reserved = match authority {
-        DeclAuthority::Bundled => ProviderRegistry::compiled(slug).is_some(),
-        DeclAuthority::ThirdParty => ProviderRegistry::is_shipped(slug),
-    };
-    if reserved {
-        return Err(RegisterError::ReservedSlug(slug.into()));
-    }
-    if authority == DeclAuthority::ThirdParty {
-        let config = ProvidersConfig::load_or_default();
-        let def = config.get(slug);
-        let selected = STAGING
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|registry| registry.selected.get(slug).cloned());
-        if let Some(selected) = selected {
-            if owner != Some(selected.as_str()) {
-                return Err(RegisterError::SelectedOwner {
-                    slug: slug.into(),
-                    owner: selected,
-                });
-            }
-        } else if catalog::serves_slug(slug) {
-            return Err(RegisterError::ReservedSlug(slug.into()));
-        }
-        if def.is_some_and(|def| def.protocol.is_some()) {
-            return Err(RegisterError::ConfiguredSlug(slug.into()));
-        }
-    }
     Ok(())
 }
 
@@ -698,8 +692,11 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     Ok(target)
 }
 
-/// Reloading the same owner keeps its token and single-flight gate. Changing
-/// owner replaces the cell, while an in-flight request keeps its old state.
+/// One cell of credentials per slug, for the life of the process. Reusing it
+/// is what carries a token across a reload, and what stops a reload from
+/// minting a second [`RefreshGate`] for a slug whose token is in flight.
+/// Reusing stops at the owner, though: a slug another package took over gets
+/// a fresh cell, so a token one of them minted never serves the other.
 fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
     let mut states = AUTH.write().unwrap();
     let (current_owner, state) = states
@@ -717,15 +714,12 @@ fn entries() -> Arc<Registry> {
 }
 
 fn entry(slug: &str) -> Option<Arc<PluginEntry>> {
-    entries().entries.get(slug).cloned()
+    entries().get(slug).cloned()
 }
 
 fn unknown(slug: &str) -> AgentError {
     AgentError::Config {
-        message: match entries().selected.get(slug) {
-            Some(owner) => format!("selected plugin '{owner}' for provider '{slug}' is not loaded"),
-            None => format!("unknown plugin provider '{slug}'"),
-        },
+        message: format!("unknown plugin provider '{slug}'"),
     }
 }
 
@@ -1501,32 +1495,20 @@ pub fn build_with_auth(
 }
 
 pub fn specs() -> Vec<&'static ProviderSpec> {
-    entries()
-        .entries
-        .values()
-        .map(|entry| entry.built.spec)
-        .collect()
+    entries().values().map(|entry| entry.built.spec).collect()
 }
 
 /// The providers whose `maki auth login` runs a `login` hook.
 pub fn auth_providers() -> Vec<(String, String)> {
     entries()
-        .entries
         .values()
         .filter(|entry| entry.hooks.login.is_some())
         .map(|entry| (entry.decl.slug.clone(), entry.decl.display_name.clone()))
         .collect()
 }
 
-/// Includes selected packages that failed to register, so they cannot fall
-/// back to a catalog client until a reload removes the selection.
-pub fn owns_slug(slug: &str) -> bool {
-    let registry = entries();
-    registry.entries.contains_key(slug) || registry.selected.contains_key(slug)
-}
-
 pub fn is_registered(slug: &str) -> bool {
-    entry(slug).is_some()
+    entries().contains_key(slug)
 }
 
 /// Blocks, so it belongs to the cli thread and never to the plugin host's: the
@@ -1561,7 +1543,7 @@ mod tests {
 
     use futures_lite::future::zip;
     use maki_config::PROVIDER_BUILTINS;
-    use maki_config::providers::{ProviderDef, base_url_env_var};
+    use maki_config::providers::base_url_env_var;
     use maki_storage::auth::{PluginAuthData, save_plugin_auth};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1650,16 +1632,18 @@ mod tests {
 
     /// A test registers the way a plugin load does: open the window, register,
     /// publish. Entries from the previous load go, exactly as on a `/reload`.
+    /// No catalog name is granted, which a test seeds one to cover.
     fn register_loaded(reg: Registration) -> Result<(), RegisterError> {
-        register_loaded_as(reg, DeclAuthority::ThirdParty)
+        register_loaded_as(reg, DeclAuthority::ThirdParty, &[])
     }
 
     fn register_loaded_as(
         reg: Registration,
         authority: DeclAuthority,
+        takeovers: &[String],
     ) -> Result<(), RegisterError> {
         begin_load();
-        let result = register(reg, authority);
+        let result = register(reg, authority, takeovers);
         commit_load();
         result
     }
@@ -1952,6 +1936,9 @@ mod tests {
         );
     }
 
+    /// One package's token must not survive being replaced by another. The
+    /// same owner keeps its gate across the reload, a different one starts a
+    /// fresh cell, and returning to the first does not resurrect its token.
     #[test]
     fn owner_changes_do_not_reuse_another_packages_auth_gate() {
         const SLUG: &str = "owner-auth-test";
@@ -1979,21 +1966,10 @@ mod tests {
             reg.decl.base_url = Some(base.clone());
             reg.decl.net_hosts = vec![HOST.into()];
             reg.hooks.auth = Some(hook.clone());
-            let mut config = ProvidersConfig::default();
-            config.upsert(
-                SLUG.into(),
-                ProviderDef {
-                    plugin: Some(owner.into()),
-                    ..ProviderDef::default()
-                },
-            );
-            config.save().unwrap();
             begin_load();
-            register_plugin(Arc::from(owner), reg, DeclAuthority::ThirdParty).unwrap();
+            register_plugin(Arc::from(owner), reg, DeclAuthority::ThirdParty, &[]).unwrap();
             commit_load();
             let provider = create(SLUG, Timeouts::default()).unwrap();
-            config.providers.get_mut(SLUG).unwrap().plugin = Some(NEXT_OWNER.into());
-            config.save().unwrap();
             smol::block_on(provider.list_models()).unwrap();
         }
         assert_eq!(first.calls(), 1);
@@ -2254,12 +2230,14 @@ mod tests {
             Arc::from(PLUGIN),
             registration(SLUG),
             DeclAuthority::ThirdParty,
+            &[],
         )
         .unwrap();
         register_plugin(
             Arc::from(BYSTANDER),
             registration(BYSTANDER),
             DeclAuthority::ThirdParty,
+            &[],
         )
         .unwrap();
         discard(PLUGIN);
@@ -2407,7 +2385,7 @@ mod tests {
         if let Some(configured) = configured {
             unsafe { std::env::set_var(base_url_env_var(SLUG), configured) };
         }
-        register_loaded_as(registration(SLUG), authority).unwrap();
+        register_loaded_as(registration(SLUG), authority, &[]).unwrap();
 
         let expected = expected.map(|url| Url::parse(url).unwrap());
         assert_eq!(vouched_origin(SLUG), expected);
@@ -2420,7 +2398,7 @@ mod tests {
         if let Some(configured) = configured {
             unsafe { std::env::set_var(base_url_env_var(SLUG), configured) };
         }
-        register_loaded_as(registration(SLUG), DeclAuthority::ThirdParty).unwrap();
+        register_loaded_as(registration(SLUG), DeclAuthority::ThirdParty, &[]).unwrap();
 
         assert_eq!(effective_authority(SLUG).as_deref(), Some(expected));
     }
@@ -2635,7 +2613,7 @@ mod tests {
     }
 
     fn already_registered(reg: &mut Registration) {
-        register(registration(&reg.decl.slug), DeclAuthority::Bundled).unwrap();
+        register(registration(&reg.decl.slug), DeclAuthority::Bundled, &[]).unwrap();
     }
 
     fn codec_and_base(reg: &mut Registration) {
@@ -2719,7 +2697,7 @@ mod tests {
         begin_load();
         let mut reg = registration(SLUG);
         mutate(&mut reg);
-        let error = register(reg, DeclAuthority::Bundled).unwrap_err();
+        let error = register(reg, DeclAuthority::Bundled, &[]).unwrap_err();
         assert!(expected(&error), "{error}");
         commit_load();
     }
@@ -2732,18 +2710,23 @@ mod tests {
     #[test_case(BUILTIN_SLUG, DeclAuthority::Bundled ; "bundled")]
     #[test_case(BUNDLED_SLUG, DeclAuthority::ThirdParty ; "third_party_on_a_bundled_slug")]
     fn a_shipped_slug_is_reserved(slug: &str, authority: DeclAuthority) {
-        let error = register_loaded_as(registration(slug), authority).unwrap_err();
+        let error = register_loaded_as(registration(slug), authority, &[]).unwrap_err();
 
         assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
         assert!(!is_registered(slug), "{RESERVED_SLUG_TAKEN}");
     }
 
-    /// `maki auth login` saves a models.dev provider's key under its slug, so
-    /// a package declaring that slug would be handed the key and take over
-    /// the provider's models.
+    /// Installing a plugin is an explicit act the user reviews, so a slug maki
+    /// only serves from models.dev is a third party's to replace once granted:
+    /// the plugin takes over the slug, and the catalog listing drops it. A
+    /// slug maki ships stays reserved (`a_shipped_slug_is_reserved`), and a
+    /// takeover without its grant is refused
+    /// (`an_ungranted_catalog_takeover_is_refused`).
     #[test]
-    fn a_served_catalog_slug_is_reserved_for_third_parties() {
+    fn a_third_party_plugin_replaces_a_served_catalog_slug() {
         const CATALOG_SLUG: &str = "served-catalog";
+        const TAKEOVER_FAILED: &str = "the registration must have taken the slug";
+        const REPLACED: &str = "the catalog must stop listing the replaced slug";
         let provider = catalog::schema::CatalogProvider {
             name: DISPLAY_NAME.into(),
             env: Vec::new(),
@@ -2756,11 +2739,61 @@ mod tests {
             StateDir::from_path(Default::default()),
         );
 
-        let error =
-            register_loaded_as(registration(CATALOG_SLUG), DeclAuthority::ThirdParty).unwrap_err();
+        let granted = [CATALOG_SLUG.to_owned()];
+        register_loaded_as(
+            registration(CATALOG_SLUG),
+            DeclAuthority::ThirdParty,
+            &granted,
+        )
+        .expect("a granted catalog slug is a third party's to replace");
 
-        assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
-        assert!(!is_registered(CATALOG_SLUG), "{RESERVED_SLUG_TAKEN}");
+        assert!(is_registered(CATALOG_SLUG), "{TAKEOVER_FAILED}");
+        assert!(
+            !catalog::catalog_providers()
+                .iter()
+                .any(|provider| provider.slug == CATALOG_SLUG),
+            "{REPLACED}"
+        );
+    }
+
+    /// Replacing a catalog provider hands the plugin the key saved for that
+    /// name, so the trust layer's grant is the only way in. A bundled plugin
+    /// ships inside the binary: that is maki's own say so, no grant needed.
+    #[test]
+    fn an_ungranted_catalog_takeover_is_refused() {
+        const CATALOG_SLUG: &str = "ungranted-catalog";
+        const NOT_TAKEN: &str = "a refused takeover must not be serving the slug";
+        const STILL_LISTED: &str = "the catalog must keep listing the refused slug";
+        const BUNDLED_TAKEOVER_FAILED: &str = "a bundled plugin replaces without a grant";
+        let provider = catalog::schema::CatalogProvider {
+            name: DISPLAY_NAME.into(),
+            env: Vec::new(),
+            npm: catalog::ALLOWED_NPM[0].into(),
+            api: Some(EXAMPLE_BASE_URL.into()),
+            models: HashMap::new(),
+        };
+        catalog::seed_catalog_for_tests(
+            HashMap::from([(CATALOG_SLUG.into(), provider)]),
+            StateDir::from_path(Default::default()),
+        );
+
+        let error = register_loaded_as(registration(CATALOG_SLUG), DeclAuthority::ThirdParty, &[])
+            .unwrap_err();
+        assert!(
+            matches!(error, RegisterError::UngrantedTakeover(_)),
+            "{error}"
+        );
+        assert!(!is_registered(CATALOG_SLUG), "{NOT_TAKEN}");
+        assert!(
+            catalog::catalog_providers()
+                .iter()
+                .any(|provider| provider.slug == CATALOG_SLUG),
+            "{STILL_LISTED}"
+        );
+
+        register_loaded_as(registration(CATALOG_SLUG), DeclAuthority::Bundled, &[])
+            .expect(BUNDLED_TAKEOVER_FAILED);
+        assert!(is_registered(CATALOG_SLUG), "{BUNDLED_TAKEOVER_FAILED}");
     }
 
     const UPSTREAM_SAID_NO: &str = "upstream said no";

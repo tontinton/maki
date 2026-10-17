@@ -11,16 +11,20 @@
 //! why each test here boots its own host and leans on `cargo nextest` giving
 //! every test its own process.
 
+use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
-use maki_config::providers::{ProviderDef, ProvidersConfig};
-use maki_lua::{PluginHost, PluginPermissions};
+use maki_lua::{
+    DiscoveredPackage, Origin, PluginHost, PluginPermissions, Requested,
+    UNCOVERED_TAKEOVER_WARNING, approvals_path,
+};
+use maki_pack::approvals::{ApprovalKey, Approvals};
 use maki_providers::model::{Model, ModelTier};
-use maki_providers::provider::{Provider, provider_for_slug};
+use maki_providers::provider::Provider;
 use maki_providers::retry::RetryKind;
 use maki_providers::test_support::{Canned, JSON_HEADERS, Recorded, Requests, serve};
 use maki_providers::{
@@ -53,8 +57,6 @@ const RETRY_AFTER: &str = "7";
 /// Every plugin written inline loads under this one name, so loading a second
 /// source is a reload of the first.
 const INLINE_PLUGIN: &str = "acme_inline";
-const OTHER_PLUGIN: &str = "other-package";
-const FAILED_SELECTED_LOAD: &str = "selected load failed";
 
 const RESPONSES_SLUG: &str = "acmeresponses";
 const RESPONSES_MODEL: &str = "acme-r1";
@@ -74,9 +76,22 @@ const RELOADED_SOURCE: &str = "-- the provider plugin, reloaded without its regi
 /// Shipped as a bundled plugin, which this file never loads.
 const BUILTIN_SLUG: &str = "deepseek";
 const BUILTIN_HOST: &str = "api.deepseek.com";
-const RESERVED_SLUG_MESSAGE: &str = "is reserved";
+const RESERVED_SLUG_MESSAGE: &str = "belongs to a provider maki ships";
 const CLAIM_ALLOWED: &str = "a third-party plugin took a built-in slug";
 const BUILTIN_TAKEN: &str = "a refused declaration must not be serving the slug";
+
+/// A name the catalog cache serves, so the takeover gate has a slug to guard.
+/// The cache file is what a load whose catalog never warmed reads.
+const TAKEOVER_SLUG: &str = "catalog-takeover";
+const TAKEOVER_HOST: &str = "api.takeover.example";
+const TAKEOVER_PACKAGE: &str = "takeover-package";
+const TAKEOVER_CACHE_FILE: &str = "models-dev-catalog.json";
+const TAKEOVER_DENIED: &str = "the catalog name was taken without a grant";
+const TAKEOVER_GRANTED: &str = "the granted catalog name was not taken over";
+const TAKEOVER_REFUSED: &str = "was not granted";
+const WRITE_FAILED: &str = "the fixture package could not be written";
+const PARSE_FAILED: &str = "the fixture manifest did not parse";
+const CACHE_DIR_FAILED: &str = "no isolated cache directory";
 
 const PROMPT: &str = "read a.txt";
 const SYSTEM: &str = "You are a test.";
@@ -207,53 +222,6 @@ fn plugin_host() -> PluginHost {
 fn load_inline(host: &PluginHost, source: &str, net_host: &str) {
     host.load_source_with_permissions(INLINE_PLUGIN, source, permissions_for(net_host))
         .expect(LOAD_FAILED);
-}
-
-#[test_case(None, false ; "unselected")]
-#[test_case(Some(OTHER_PLUGIN), false ; "another_package")]
-#[test_case(Some(INLINE_PLUGIN), false ; "selected")]
-#[test_case(Some(INLINE_PLUGIN), true ; "failed_selected_load")]
-fn an_optional_provider_registers_only_for_its_selected_package(
-    owner: Option<&str>,
-    fail_load: bool,
-) {
-    let _state = isolated_state();
-    let mut config = ProvidersConfig::default();
-    config.providers.insert(
-        SLUG.into(),
-        ProviderDef {
-            plugin: owner.map(str::to_owned),
-            ..ProviderDef::default()
-        },
-    );
-    config.save().unwrap();
-    let host = plugin_host();
-    let source = format!(
-        r#"if not maki.provider.is_selected({SLUG:?}) then return end
-maki.provider.register({{
-  slug = {SLUG:?}, display_name = {DISPLAY_NAME:?}, codec = "openai",
-  base_url = "https://{PARKING_HOST}/v1",
-}})
-if {fail_load} then error({FAILED_SELECTED_LOAD:?}) end"#
-    );
-    plugin::begin_load();
-    let loaded =
-        host.load_source_with_permissions(INLINE_PLUGIN, &source, permissions_for(PARKING_HOST));
-    plugin::commit_load();
-    assert_eq!(loaded.is_err(), fail_load, "{loaded:?}");
-    assert_eq!(
-        plugin::is_registered(SLUG),
-        owner == Some(INLINE_PLUGIN) && !fail_load
-    );
-    if owner == Some(INLINE_PLUGIN) && fail_load {
-        assert!(
-            loaded
-                .unwrap_err()
-                .to_string()
-                .contains(FAILED_SELECTED_LOAD)
-        );
-        assert!(provider_for_slug(SLUG, Timeouts::default()).is_err());
-    }
 }
 
 /// The fixture plugin, loaded from disk with the grant its `plugin.toml`
@@ -722,4 +690,161 @@ fn a_third_party_plugin_cannot_take_a_builtin_slug() {
 
     assert!(error.to_string().contains(RESERVED_SLUG_MESSAGE), "{error}");
     assert!(!plugin::is_registered(BUILTIN_SLUG), "{BUILTIN_TAKEN}");
+}
+
+/// Seeds the catalog cache with [`TAKEOVER_SLUG`], the way a maki that once
+/// fetched models.dev would have it on disk.
+fn takeover_catalog_cached() {
+    let cache = maki_storage::paths::cache_dir().expect(CACHE_DIR_FAILED);
+    fs::write(
+        cache.join(TAKEOVER_CACHE_FILE),
+        json!({
+            TAKEOVER_SLUG: {
+                "npm": "@ai-sdk/openai-compatible",
+                "api": format!("https://{TAKEOVER_HOST}/v1"),
+            }
+        })
+        .to_string(),
+    )
+    .expect(WRITE_FAILED);
+}
+
+/// The grant's whole journey, end to end through the Lua API: the manifest's
+/// `providers` list is what a package load hands `maki.provider.register`, and
+/// only that list turns the request into a takeover. A plain plugin load
+/// holds no grant at all.
+#[test]
+fn a_catalog_takeover_needs_the_grant_a_package_load_carries() {
+    let _state = isolated_state();
+    takeover_catalog_cached();
+
+    let site = TempDir::new().expect(TEMPDIR_FAILED);
+    let dir = site.path().join(TAKEOVER_PACKAGE);
+    let manifest = format!(
+        "providers = [{TAKEOVER_SLUG:?}]\n\n[permissions]\nnet = true\nnet_hosts = [\"{TAKEOVER_HOST}\"]\n"
+    );
+    fs::create_dir_all(dir.join("plugin")).expect(WRITE_FAILED);
+    fs::write(dir.join("plugin.toml"), &manifest).expect(WRITE_FAILED);
+    fs::write(
+        dir.join("plugin").join("init.lua"),
+        format!(
+            r#"maki.provider.register({{ slug = "{TAKEOVER_SLUG}", display_name = "Taken Over", codec = "openai", base_url = "https://{TAKEOVER_HOST}/v1" }})"#
+        ),
+    )
+    .expect(WRITE_FAILED);
+    let package = DiscoveredPackage {
+        name: TAKEOVER_PACKAGE.to_owned(),
+        dir,
+        eager: true,
+        requested: Requested::from_manifest(
+            &toml::from_str::<toml::Value>(&manifest).expect(PARSE_FAILED),
+        ),
+        origin: Origin::Manual,
+        revision_guard: None,
+    };
+    let host = plugin_host();
+    plugin::begin_load();
+    host.load_packages(
+        std::slice::from_ref(&package),
+        &maki_config::PluginsConfig {
+            packages: vec![TAKEOVER_PACKAGE.to_owned()],
+            ..Default::default()
+        },
+    );
+    plugin::commit_load();
+    assert!(plugin::is_registered(TAKEOVER_SLUG), "{TAKEOVER_GRANTED}");
+
+    plugin::begin_load();
+    let error = host
+        .load_source_with_permissions(
+            INLINE_PLUGIN,
+            &format!(
+                r#"maki.provider.register({{ slug = "{TAKEOVER_SLUG}", display_name = "Taken", codec = "openai", base_url = "https://{TAKEOVER_HOST}/v1" }})"#
+            ),
+            permissions_for(TAKEOVER_HOST),
+        )
+        .expect_err(TAKEOVER_DENIED);
+    plugin::commit_load();
+
+    assert!(error.to_string().contains(TAKEOVER_REFUSED), "{error}");
+    assert!(!plugin::is_registered(TAKEOVER_SLUG), "{TAKEOVER_DENIED}");
+}
+
+/// An approval recorded before the manifest's `providers` list existed covers
+/// no takeover, and the grant refusal at `maki.provider.register` speaks only
+/// of the grant. The load itself says what the approval predates and how to
+/// be asked again, which is the only migration path for such a package.
+#[test]
+fn a_takeover_the_recorded_approval_predates_warns_at_load() {
+    const SRC: &str = "https://github.com/example/takeover";
+    const NO_STALE_WARNING: &str = "the load did not warn about the uncovered takeover";
+    const NO_APPROVALS_FILE: &str = "the isolated approvals file did not resolve";
+    const SERIALIZE_FAILED: &str = "the stale approval could not be serialized";
+    let _state = isolated_state();
+
+    let site = TempDir::new().expect(TEMPDIR_FAILED);
+    let dir = site.path().join(TAKEOVER_PACKAGE);
+    let manifest = format!(
+        "providers = [{TAKEOVER_SLUG:?}]\n\n[permissions]\nnet = true\nnet_hosts = [\"{TAKEOVER_HOST}\"]\n"
+    );
+    fs::create_dir_all(dir.join("plugin")).expect(WRITE_FAILED);
+    fs::write(dir.join("plugin.toml"), &manifest).expect(WRITE_FAILED);
+    fs::write(
+        dir.join("plugin").join("init.lua"),
+        format!(
+            r#"maki.provider.register({{ slug = "{TAKEOVER_SLUG}", display_name = "Taken Over", codec = "openai", base_url = "https://{TAKEOVER_HOST}/v1" }})"#
+        ),
+    )
+    .expect(WRITE_FAILED);
+    let requested =
+        Requested::from_manifest(&toml::from_str::<toml::Value>(&manifest).expect(PARSE_FAILED));
+    let mut approvals = Approvals::default();
+    approvals.approve(
+        &ApprovalKey::new(TAKEOVER_PACKAGE.to_owned(), SRC),
+        requested.names(),
+        requested.net_hosts().map(<[String]>::to_vec),
+        Vec::new(),
+    );
+    let path = approvals_path().expect(NO_APPROVALS_FILE);
+    fs::create_dir_all(path.parent().expect(NO_APPROVALS_FILE)).expect(WRITE_FAILED);
+    fs::write(
+        &path,
+        serde_json::to_string(&approvals).expect(SERIALIZE_FAILED),
+    )
+    .expect(WRITE_FAILED);
+    let package = DiscoveredPackage {
+        name: TAKEOVER_PACKAGE.to_owned(),
+        dir,
+        eager: true,
+        requested,
+        origin: Origin::Fetched {
+            src: SRC.to_owned(),
+        },
+        revision_guard: None,
+    };
+    let path = approvals_path().expect(NO_APPROVALS_FILE);
+    fs::create_dir_all(path.parent().expect(NO_APPROVALS_FILE)).expect(WRITE_FAILED);
+    fs::write(
+        &path,
+        serde_json::to_string(&approvals).expect(SERIALIZE_FAILED),
+    )
+    .expect(WRITE_FAILED);
+
+    let host = plugin_host();
+    let warnings = host.load_packages(
+        std::slice::from_ref(&package),
+        &maki_config::PluginsConfig {
+            packages: vec![TAKEOVER_PACKAGE.to_owned()],
+            ..Default::default()
+        },
+    );
+
+    let [warning] = warnings
+        .iter()
+        .filter(|w| w.contains(UNCOVERED_TAKEOVER_WARNING))
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("{NO_STALE_WARNING}: {warnings:?}")
+    };
+    assert!(warning.contains(TAKEOVER_SLUG), "{NO_STALE_WARNING}");
 }

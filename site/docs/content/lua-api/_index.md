@@ -4216,6 +4216,11 @@ while the plugin loads. The plugin needs a non-empty `net_hosts` list in its
 `plugin.toml`. The [Providers guide](/docs/providers/#plugin-providers)
 walks through a full example.
 
+A name models.dev serves is only the plugin's once its package was granted
+it: the manifest has to list it under `providers`, and the install approval
+has to cover it. See
+[taking over a models.dev provider](/docs/providers/#taking-over-a-modelsdev-provider).
+
 Set exactly one of `codec` or `base`. An unknown key, or an option the
 chosen codec cannot honour, fails registration.
 
@@ -4371,24 +4376,6 @@ maki.provider.register({
   end,
 })
 ```
-
----
-
-### `maki.provider.is_selected()` {#maki-provider-is_selected}
-
-```lua
-maki.provider.is_selected({slug})
-```
-
-Whether providers.toml selects this package to implement {slug}. A package
-that ships several providers calls it at load time to skip the ones the user
-did not [select](/docs/providers/#select-a-provider-package).
-
-**Parameters:**
-
-- `{slug}` (`string`) Provider name.
-
-**Returns:** boolean
 
 ---
 
