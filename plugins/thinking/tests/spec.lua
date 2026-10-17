@@ -10,6 +10,7 @@ local WIDE = 52
 local NARROW = 30
 local MEDIUM = "medium"
 local RAW_BUDGET = "8192"
+local TOKENS_LABEL = " tokens"
 local REJECTED = "Usage: /thinking [off|adaptive|minimal|low|medium|high|xhigh|max|<budget>]"
 local UNSUPPORTED = "Thinking requires a model that supports it"
 local CUSTOM_ROW_NAME = "custom…"
@@ -34,6 +35,13 @@ local CLAMPED_LADDER = {
   { name = "minimal", tokens = 1024 },
   { name = "low", tokens = 1024 },
   { name = "max", tokens = 1024 },
+}
+local NATIVE_LADDER = {
+  { name = "off" },
+  { name = "adaptive" },
+  { name = "low" },
+  { name = "medium" },
+  { name = "xhigh" },
 }
 
 local function model_with(thinking, options)
@@ -95,6 +103,22 @@ end
 
 case("the_picker_opens_on_the_row_the_session_runs", function()
   eq(press(picker_on(MEDIUM), { "<CR>" }), MEDIUM)
+end)
+
+case("native_levels_skip_unsupported_choices_and_do_not_claim_token_budgets", function()
+  local state = picker_on(MEDIUM, NATIVE_LADDER)
+  eq(press(state, { "<Down>", "<CR>" }), "xhigh")
+  eq(press(state, { "<Up>", "<Up>", "<CR>" }), "low")
+  local lines = Picker.render(state, WIDE)
+  local names = {}
+  for i, row in ipairs(state.rows) do
+    if row.option then
+      names[#names + 1] = row.option.name
+      eq(line_text(lines[i]):find(TOKENS_LABEL, 1, true), nil)
+    end
+  end
+  eq(table.concat(names, ","), "off,adaptive,low,medium,xhigh")
+  eq(#level_lines(state, lines), 0)
 end)
 
 -- The one fallback: a value no row names is a raw token budget.
