@@ -107,6 +107,7 @@ maki.api.register_prompt_hint({
 
 maki.api.register_tool({
   name = "todo_write",
+  host_access = true,
   description = DESCRIPTION,
   schema = {
     type = "object",

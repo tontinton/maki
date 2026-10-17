@@ -40,6 +40,7 @@ end
 maki.api.register_tool({
   name = "websearch",
   kind = "fetch",
+  host_access = true,
   description = "Search the web for real-time information using "
     .. provider.label
     .. ".\n\n"

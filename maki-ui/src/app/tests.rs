@@ -2108,7 +2108,7 @@ fn plugin_event_without_a_task_shows_nowhere() {
 /// `Done` and `Error` end the prompt, not the session: the task goes idle
 /// with nothing said in the main chat, and the next prompt shows as a user
 /// bubble and brings the spinner back.
-#[test_case(done(),        DisplayRole::Assistant ; "done")]
+#[test_case(done(),        DisplayRole::Assistant ; "task_done")]
 #[test_case(agent_error(), DisplayRole::Error     ; "error")]
 fn plugin_task_idles_between_prompts(ending: AgentEvent, shown_as: DisplayRole) {
     let mut app = app_with_plugin_task();
@@ -7972,4 +7972,15 @@ fn ctrl_l_opens_model_picker() {
     };
     app.update(Msg::Key(key));
     assert!(app.model_picker.is_open());
+}
+
+/// Ctrl+I is a terminal alias for Tab, so the sandbox dialog must be bound to
+/// a letter crossterm can actually report.
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+#[test]
+fn ctrl_p_opens_sandbox_dialog() {
+    let mut app = test_app();
+    assert_eq!(kb::SANDBOX.code, KeyCode::Char('p'));
+    app.update(Msg::Key(kb::SANDBOX.to_key_event()));
+    assert!(app.sandbox_modal.is_open());
 }

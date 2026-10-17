@@ -278,6 +278,7 @@ maki.api.register_tool({
   name = "task",
   description = description,
   kind = "execute",
+  host_access = true,
   audiences = { "main", "workflow" },
   examples = examples,
   schema = schema,
