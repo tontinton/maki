@@ -82,6 +82,10 @@ impl WinHandle {
         self.cmd_tx.send(WinCommand::Close);
     }
 
+    pub(crate) fn sender(&self) -> WinSender {
+        self.cmd_tx.clone()
+    }
+
     fn send(&self, cmd: WinCommand) {
         if !self.cmd_tx.send(cmd) {
             self.closed.store(true, Relaxed);

@@ -904,6 +904,13 @@ is nil.
 `"SessionReset"` stays TUI-only (`/new`) and fires on the same path as
 `"SessionEnd"` with `reason = "reset"`.
 
+The bundled `question` tool fires two events of its own, both with
+`data.session_id` and `data.tool_id`, the handle
+`maki.session.answer_question` takes. `"QuestionAsked"` carries
+`data.questions` as the model sent them and fires once the form is on
+screen. `"QuestionResolved"` carries `data.by`: `"user"`, `"plugin"`, or
+`"cancelled"` when the turn was interrupted.
+
 Jobs started inside a callback die with the dispatch unless you await
 them there (`jobwait`) or hand them to a session
 (`scope = { session = ... }`).
@@ -4851,6 +4858,103 @@ Renames a session, live or stored.
 
 ```lua
 local _, err = maki.session.set_title({ id = id, title = "refactor" })
+```
+
+---
+
+### `maki.session.register_question()` {#maki-session-register_question}
+
+```lua
+maki.session.register_question({tool_id}, {win}, {opts?})
+```
+
+Opens the question form {win} shows for the `question` tool call
+{tool_id} to `maki.session.answer_question`. The bundled `question`
+plugin calls this. The form stays the user's: a plugin's answer closes
+{win}, and `settle_question` hands it back.
+
+**Parameters:**
+
+- `{tool_id}` (`string`) The `question` tool call id, `ctx:tool_id()`.
+- `{win}` ([`maki.ui.Win`](#maki-ui-Win)) The open form.
+- `{opts?}` (`table?`) Optional fields: session (string) id of the session
+
+  that asked.
+
+
+**Example:**
+
+```lua
+maki.session.register_question(ctx:tool_id(), win, { session = ctx:session_id() })
+```
+
+---
+
+### `maki.session.settle_question()` {#maki-session-settle_question}
+
+```lua
+maki.session.settle_question({tool_id})
+```
+
+Closes {tool_id} to plugin answers once its form returned.
+
+**Parameters:**
+
+- `{tool_id}` (`string`) The id given to `register_question`.
+
+**Returns:** (`table|nil`) `{type = "submit", answers}` or `{type = "dismiss"}`
+  if a plugin answered first, the way the form reports a result. nil when
+  the user did.
+
+**Example:**
+
+```lua
+local remote = maki.session.settle_question(ctx:tool_id())
+```
+
+---
+
+### `maki.session.answer_question()` {#maki-session-answer_question}
+
+```lua
+maki.session.answer_question({tool_id}, {reply}, {opts?})
+```
+
+Answers an open question form, racing the user at it, as if they had
+submitted or dismissed it. The form closes, and whichever answer lands
+first is the one the agent reads. Answering for the user takes every
+permission in the plugin's `plugin.toml`.
+
+**Parameters:**
+
+- `{tool_id}` (`string`) The `tool_id` of a `QuestionAsked` event.
+- `{reply}` (`table`) `{ answers = { { label, ... }, ... } }`, one list of
+
+  picked labels per question, free text counting as a label, or
+
+
+  `{ dismiss = true }`.
+
+- `{opts?}` (`table?`) Optional fields: session (string) id the question must
+
+  belong to. Tool call ids are unique, so this only guards against a
+
+
+  stale id.
+
+
+**Returns:** (`boolean|nil`, `string|nil`) true if this answer settled the form,
+  false if it is no longer open or someone answered first, or nil and an
+  error.
+
+**Example:**
+
+```lua
+maki.api.create_autocmd("QuestionAsked", {
+  callback = function(ev)
+    maki.session.answer_question(ev.data.tool_id, { answers = { { "Yes" } } })
+  end,
+})
 ```
 
 

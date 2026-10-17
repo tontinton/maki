@@ -247,6 +247,13 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"SessionReset"` stays TUI-only (`/new`) and fires on the same path as
 /// `"SessionEnd"` with `reason = "reset"`.
 ///
+/// The bundled `question` tool fires two events of its own, both with
+/// `data.session_id` and `data.tool_id`, the handle
+/// `maki.session.answer_question` takes. `"QuestionAsked"` carries
+/// `data.questions` as the model sent them and fires once the form is on
+/// screen. `"QuestionResolved"` carries `data.by`: `"user"`, `"plugin"`, or
+/// `"cancelled"` when the turn was interrupted.
+///
 /// Jobs started inside a callback die with the dispatch unless you await
 /// them there (`jobwait`) or hand them to a session
 /// (`scope = { session = ... }`).

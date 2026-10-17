@@ -275,6 +275,13 @@ impl UserData for LuaCtx {
 
         methods.add_method("task_id", |_, this, ()| Ok(this.task_id().to_owned()));
 
+        // The id of the call a handler serves, the one the transcript shows.
+        // Nil outside a handler and for a call nested in batch or
+        // code_execution, which has no id of its own.
+        methods.add_method("tool_id", |_, this, ()| {
+            Ok(this.agent().and_then(|agent| agent.tool_use_id.clone()))
+        });
+
         methods.add_method("restore_reason", |_, this, ()| {
             let Some(reason) = this.restore_reason() else {
                 return Ok(this.cap_err_pair("restore_reason"));
