@@ -406,7 +406,7 @@ fn store_mut(lua: &Lua) -> LuaResult<AppDataRefMut<'_, KeymapStore>> {
 /// logged). If the plugin has too many callbacks in flight, the key goes to
 /// maki's built-in binding rather than to the binding underneath.
 ///
-/// `<C-c>` and `<C-z>` are reserved so quit and suspend always work. Binding
+/// `<C-c>` and `<C-z>` are reserved so cancellation and suspend always work. Binding
 /// either is an error.
 ///
 /// @param mode string Mode letter. Currently only `"n"` is accepted.
@@ -843,7 +843,7 @@ mod tests {
     /// A reserved key binds nowhere. Accepting it publishes a binding with a
     /// `desc` in the keymap list that can never fire, which is a bug report
     /// about maki rather than about the plugin that wrote it.
-    #[test_case("<C-c>" ; "quit")]
+    #[test_case("<C-c>" ; "cancel")]
     #[test_case("<C-z>" ; "suspend")]
     fn a_reserved_key_is_refused_where_the_author_can_see_it(lhs: &str) {
         let err = accept_key(lhs).unwrap_err().to_string();

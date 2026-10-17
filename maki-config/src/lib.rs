@@ -632,6 +632,7 @@ pub struct PluginFileConfig {
 pub struct UiFileConfig {
     pub splash_animation: Option<bool>,
     pub scrollbar: Option<bool>,
+    pub confirm_quit: Option<bool>,
     pub inline_images: Option<bool>,
     pub notifications: Option<NotificationMethod>,
     pub flash_duration_ms: Option<u64>,
@@ -654,6 +655,7 @@ impl UiFileConfig {
             overlay,
             splash_animation,
             scrollbar,
+            confirm_quit,
             inline_images,
             notifications,
             flash_duration_ms,
@@ -1247,6 +1249,12 @@ pub struct UiConfig {
     pub scrollbar: bool,
 
     #[config(
+        default = false,
+        desc = "Ask for confirmation before manually quitting Maki"
+    )]
+    pub confirm_quit: bool,
+
+    #[config(
         default = true,
         desc = "Render inline images in terminals with graphics support, falling back to an [image] line where nothing else names the image"
     )]
@@ -1299,6 +1307,7 @@ impl UiConfig {
         Self {
             splash_animation: f.splash_animation.unwrap_or(true),
             scrollbar: f.scrollbar.unwrap_or(true),
+            confirm_quit: f.confirm_quit.unwrap_or(false),
             inline_images: f.inline_images.unwrap_or(true),
             notifications: f.notifications.unwrap_or_default(),
             flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
@@ -4046,6 +4055,20 @@ mod tests {
 
         let raw: RawConfig = toml::from_str("[ui]\nmax_input_lines = 5\n").unwrap();
         assert_eq!(raw.ui.max_input_lines.unwrap(), 5);
+    }
+
+    #[test]
+    fn quit_confirmation_defaults_off_and_can_be_enabled() {
+        let config = toml::from_str::<RawConfig>("")
+            .unwrap()
+            .into_config(&[])
+            .unwrap();
+        assert!(!config.ui.confirm_quit);
+        let config = toml::from_str::<RawConfig>("[ui]\nconfirm_quit = true\n")
+            .unwrap()
+            .into_config(&[])
+            .unwrap();
+        assert!(config.ui.confirm_quit);
     }
 
     #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]

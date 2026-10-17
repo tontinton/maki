@@ -106,7 +106,7 @@ impl HelpModal {
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
         let close = key_event.code == KeyCode::Esc
             || key::HELP.matches(key_event)
-            || key::QUIT.matches(key_event);
+            || key::CANCEL.matches(key_event);
         if close {
             self.close();
             return true;
@@ -242,7 +242,7 @@ mod tests {
     use test_case::test_case;
 
     #[test_case(key_ev(KeyCode::Esc)       ; "esc_closes")]
-    #[test_case(key::QUIT.to_key_event()    ; "ctrl_c_closes")]
+    #[test_case(key::CANCEL.to_key_event()    ; "ctrl_c_closes")]
     #[test_case(key::HELP.to_key_event()    ; "ctrl_h_closes")]
     fn handle_key_closes(k: KeyEvent) {
         let mut modal = HelpModal::new();

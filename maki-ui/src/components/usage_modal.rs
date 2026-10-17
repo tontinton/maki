@@ -101,7 +101,7 @@ impl UsageModal {
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) {
-        if key_event.code == KeyCode::Esc || key::QUIT.matches(key_event) {
+        if key_event.code == KeyCode::Esc || key::CANCEL.matches(key_event) {
             self.close();
         }
         self.scroll.handle_key(key_event);

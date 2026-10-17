@@ -196,7 +196,7 @@ fn write_overrides(out: &mut String) {
          A plugin's `maki.keymap.del` only removes its own binding.\n\n",
     );
     out.push_str(
-        "`Ctrl+C` and `Ctrl+Z` cannot be rebound, so quit and suspend \
+        "`Ctrl+C` and `Ctrl+Z` cannot be rebound, so cancellation and suspend \
          always work. Only single-key bindings can be overridden. Multi-key \
          combinations and non-key rows (like `Type` to filter) cannot.\n\n",
     );

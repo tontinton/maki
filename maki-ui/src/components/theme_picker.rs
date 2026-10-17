@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[test_case(key(KeyCode::Esc) ; "escape_restores_and_closes")]
-    #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_restores_and_closes")]
+    #[test_case(kb::CANCEL.to_key_event() ; "ctrl_c_restores_and_closes")]
     fn cancel_restores(cancel_key: crossterm::event::KeyEvent) {
         let mut p = ThemePicker::new();
         p.open();

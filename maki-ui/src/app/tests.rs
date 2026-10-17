@@ -442,19 +442,66 @@ fn with_image(app: &mut App) {
 fn ctrl_c_clears_nonempty_input(setup: fn(&mut App)) {
     let mut app = test_app();
     setup(&mut app);
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    let actions = app.update(Msg::Key(kb::CANCEL.to_key_event()));
     assert!(actions.is_empty());
     assert_eq!(app.exit_request, ExitRequest::None);
     assert!(app.input_box.is_empty());
 }
 
 #[test]
-fn ctrl_c_quits_when_input_empty() {
+fn ctrl_c_never_quits_when_input_empty() {
     let mut app = test_app();
     app.status = Status::Idle;
+    for _ in 0..2 {
+        assert!(app.update(Msg::Key(kb::CANCEL.to_key_event())).is_empty());
+    }
+    assert_eq!(app.exit_request, ExitRequest::None);
+}
+
+#[test]
+fn quit_action_can_be_mapped_through_lua_callback() {
+    let mut app = test_app();
+    let actions = app.run_builtin(BuiltinAction::Quit);
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+    assert_eq!(app.exit_request, ExitRequest::Success);
+}
+
+#[test]
+fn ctrl_q_quits_without_confirmation_by_default() {
+    let mut app = test_app();
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert_eq!(app.exit_request, ExitRequest::Success);
     assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+}
+
+#[test]
+fn manual_quit_requires_confirmation_when_configured() {
+    let mut app = test_app();
+    app.ui_config.confirm_quit = true;
+    assert!(app.update(Msg::Key(kb::QUIT.to_key_event())).is_empty());
+    assert!(app.confirm_quit.is_open());
+    assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+    assert!(!app.confirm_quit.is_open());
+    assert!(app.run_cmdline("/exit", 0).unwrap().is_empty());
+    assert!(app.confirm_quit.is_open());
+    assert!(app.update(Msg::Key(kb::CANCEL.to_key_event())).is_empty());
+    assert!(!app.confirm_quit.is_open());
+    assert!(app.run_builtin(BuiltinAction::Quit).is_empty());
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+    assert_eq!(app.exit_request, ExitRequest::Success);
+}
+
+#[test]
+fn automatic_exit_bypasses_confirmation() {
+    let mut app = test_app();
+    app.ui_config.confirm_quit = true;
+    app.exit_on_done = true;
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(done()));
+    assert_eq!(app.exit_request, ExitRequest::Success);
+    assert!(!app.confirm_quit.is_open());
 }
 
 #[test_case(done(), ExitRequest::Success ; "done_exits_success")]
@@ -850,7 +897,7 @@ fn ctrl_c_closes_palette() {
     type_slash(&mut app);
     assert!(palette_open(&mut app));
 
-    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    app.update(Msg::Key(kb::CANCEL.to_key_event()));
     assert!(!palette_open(&mut app));
 }
 
@@ -2727,7 +2774,7 @@ fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
     app.status = Status::Streaming;
     app.run_id = 1;
 
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    let actions = app.update(Msg::Key(kb::CANCEL.to_key_event()));
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
     assert_eq!(app.status, Status::Idle);
     assert_ne!(app.exit_request, ExitRequest::Success);
@@ -3551,7 +3598,7 @@ fn queue_esc_unfocuses_without_removing() {
 }
 
 #[test]
-fn ctrl_q_pops_front() {
+fn alt_q_pops_front() {
     let mut app = app_with_queued_message();
     app.queue_and_notify(queued_msg("second"));
     app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
@@ -5410,22 +5457,19 @@ fn override_shadows_builtin_ctrl_when_no_overlay_open() {
     );
 }
 
-/// A plugin that binds Ctrl+C and then parks, or never answers, would leave
-/// the user with no way out of the app. Quitting is resolved before any
-/// plugin sees the key, the way suspending already was.
 #[test]
-fn override_does_not_shadow_quit() {
+fn override_does_not_shadow_cancel() {
     let mut app = test_app();
     app.status = Status::Idle;
-    let probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
+    let probe = install_override(&mut app, kb::CANCEL.code, kb::CANCEL.modifiers);
 
-    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    app.update(Msg::Key(kb::CANCEL.to_key_event()));
 
     assert!(
         probe.try_recv_keybind().is_none(),
         "{OVERRIDE_NOT_DISPATCHED}"
     );
-    assert_eq!(app.exit_request, ExitRequest::Success);
+    assert_eq!(app.exit_request, ExitRequest::None);
 }
 
 #[test]
@@ -5514,9 +5558,9 @@ fn streaming_cancel_wins_over_quit_override() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
+    let probe = install_override(&mut app, kb::CANCEL.code, kb::CANCEL.modifiers);
 
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    let actions = app.update(Msg::Key(kb::CANCEL.to_key_event()));
 
     assert!(
         matches!(&actions[0], Action::CancelAgent { .. }),
@@ -5804,7 +5848,7 @@ fn the_first_esc_arms_the_streaming_cancel_with_no_popup_up() {
 #[test]
 fn the_keys_a_plugin_cannot_bind_are_the_keys_the_host_answers_itself() {
     let app = test_app();
-    let reserved: Vec<maki_lua::Key> = [kb::QUIT, kb::SUSPEND]
+    let reserved: Vec<maki_lua::Key> = [kb::CANCEL, kb::SUSPEND]
         .iter()
         .map(|b| plugin_key(b.code, b.modifiers))
         .collect();
@@ -5834,7 +5878,7 @@ fn ctrl_c_closes_overlay_instead_of_quitting() {
     app.help_modal.toggle();
     assert!(app.help_modal.is_open());
 
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    let actions = app.update(Msg::Key(kb::CANCEL.to_key_event()));
     assert_eq!(app.exit_request, ExitRequest::None);
     assert!(!app.help_modal.is_open());
     assert!(actions.is_empty());
@@ -6663,7 +6707,7 @@ fn ctrl_c_denies_permission_prompt() {
     );
     assert!(app.permission_prompt.is_open());
 
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    let actions = app.update(Msg::Key(kb::CANCEL.to_key_event()));
     assert_eq!(app.exit_request, ExitRequest::None);
     assert!(!app.permission_prompt.is_open());
     assert!(actions.is_empty());
@@ -7195,11 +7239,11 @@ fn the_session_keeps_the_main_draft_while_a_subagent_chat_is_in_front() {
 fn ctrl_c_in_subagent_chat_discards_draft_before_cancelling() {
     let mut app = app_with_active_subagent();
     app.update(Msg::Key(key(KeyCode::Char('a'))));
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    let actions = app.update(Msg::Key(kb::CANCEL.to_key_event()));
     assert!(actions.is_empty());
     assert!(app.input_box.is_empty());
 
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    let actions = app.update(Msg::Key(kb::CANCEL.to_key_event()));
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
 }
 

@@ -3651,7 +3651,7 @@ A handler that runs consumes the key, even if it raises (the error is
 logged). If the plugin has too many callbacks in flight, the key goes to
 maki's built-in binding rather than to the binding underneath.
 
-`<C-c>` and `<C-z>` are reserved so quit and suspend always work. Binding
+`<C-c>` and `<C-z>` are reserved so cancellation and suspend always work. Binding
 either is an error.
 
 **Parameters:**
@@ -6532,7 +6532,7 @@ and call this from it.
 
 Valid names: `"file_picker"`, `"search"`, `"help"`,
 `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-`"prev_chat"`, `"next_chat"`, `"model_picker"`.
+`"prev_chat"`, `"next_chat"`, `"model_picker"`, `"quit"`.
 
 There is no action for sending the user's message. To take keys like
 `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
@@ -6549,8 +6549,8 @@ For slash commands rather than keybound actions, see
 **Example:**
 
 ```lua
--- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
-maki.keymap.set("n", "<C-q>", function()
+-- Open the built-in file picker with Alt+F instead of Ctrl+S:
+maki.keymap.set("n", "<M-f>", function()
   maki.ui.action("file_picker")
 end)
 ```

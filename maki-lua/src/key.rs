@@ -59,8 +59,8 @@ const NAMEABLE_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
 /// Kitty reports past F12, and `<F13>` is valid vim notation.
 const MAX_FUNCTION_KEY: u8 = 24;
 
-/// Keys the host answers before it looks at any binding, because quit and
-/// suspend have to work whatever a plugin is doing. A binding on one could
+/// Keys the host answers before it looks at any binding, because cancellation
+/// and suspend have to work whatever a plugin is doing. A binding on one could
 /// never fire, so `maki.keymap.set` and a window's `keys` refuse them. The
 /// host, the keymap and the windows all read this one list, so they cannot
 /// drift apart.
