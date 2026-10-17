@@ -198,4 +198,27 @@ maki -r <session-id>
 
 `MAKI_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.
 
+## Background tasks
+
+The [`task`](/docs/tools/#task) tool waits for its subagent by default. With `background: true`,
+it returns a JSON receipt with an `id` and `status` while the subagent works.
+The parent can continue other work and use [`task_result`](/docs/tools/#task_result) with that ID when
+it needs the result. `task_result` waits without the normal tool timeout.
+Cancelling the wait leaves the child running.
+
+A finished task sends its chat a short notice with the ID and status. The
+notice wakes the parent agent to collect the result. The full output stays
+in `task_result`, including validated structured output or partial output
+from an interrupted run. Repeated reads return the same result.
+
+Use [`task_cancel`](/docs/tools/#task_cancel) with the ID to stop queued or running work. Background and
+blocking tasks share `plugins.task.opts.max_concurrent`, which defaults to
+8. Work above that limit waits in the queue.
+
+Background tasks require a live TUI chat. They cannot ask for permission,
+so their tools need existing allow rules or YOLO. Plan mode still blocks
+file writes. Closing the chat or reloading plugins stops its tasks and
+discards the receipts. Headless, SDK, and ACP calls support blocking tasks
+only.
+
 Related: [Token Economy](/docs/token-economy/) for why all this frugality exists, [Configuration](/docs/configuration/) for the knobs.
