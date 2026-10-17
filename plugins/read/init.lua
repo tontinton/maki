@@ -9,7 +9,7 @@ local split_lines = helpers.split_lines
 local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed).
 
 - Supports absolute, relative, and ~/ paths.
-- **offset** and **limit** are required. Use offset=1 to read from the first line.
+- **limit** is required. **offset** is optional and defaults to 1 (the first line).
 - Use limit=0 to read until the end of file (capped at 2000 lines).
 - Use the **index** tool or **grep** tool first to find the offset and limit.
 - Only read the sections you actually need.
@@ -91,7 +91,7 @@ local function read_file(path, offset, limit, ctx)
   local all_lines = split_lines(content)
   local total_lines = #all_lines
 
-  local start = math.max(math.floor(offset), 1)
+  local start = math.max(math.floor(offset or 1), 1)
   local max_output_lines = output_limits.resolve(opts, ctx)
   local max_lines = limit == 0 and total_lines or limit
   if max_output_lines then
@@ -167,8 +167,7 @@ maki.api.register_tool({
       },
       offset = {
         type = "integer",
-        description = "Line number to start from (1-indexed). Use 1 for the first line.",
-        required = true,
+        description = "Line number to start from (1-indexed). Use 1 for the first line (default 1).",
       },
       limit = {
         type = "integer",
