@@ -961,6 +961,11 @@ impl ThinkingConfig {
     /// adaptive knob plus `output_config.effort`; legacy models get a plain
     /// token budget.
     pub fn apply_to_body(self, body: &mut Value, model: &Model) {
+        if let Some(fields) = &model.thinking_fields
+            && self.apply_fields(body, model, fields, ThinkingFallback::None)
+        {
+            return;
+        }
         if requires_adaptive(&model.id) {
             if matches!(self, Self::Off) {
                 return;
@@ -1740,6 +1745,22 @@ mod tests {
         let mut body = json!({});
         config.apply_to_body(&mut body, &thinking_model(model_id));
         assert_eq!(body, expected);
+    }
+
+    #[test_case(ThinkingConfig::Effort(Low), "low" ; "low_spells_low")]
+    #[test_case(ThinkingConfig::Effort(High), "high" ; "high_spells_high")]
+    #[test_case(ThinkingConfig::Effort(Max), "max" ; "max_spells_max")]
+    fn apply_to_body_merges_declared_fields(config: ThinkingConfig, effort: &str) {
+        let adaptive = json!({"thinking": {"type": "adaptive"}});
+        let fields = json!({
+            "low": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}},
+            "high": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}},
+            "max": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}},
+        });
+        let mut body = json!({});
+        config.apply_to_body(&mut body, &native_thinking_model("glm-5-3", fields));
+        assert_eq!(body["thinking"], adaptive["thinking"]);
+        assert_eq!(body["output_config"]["effort"], effort);
     }
 
     #[test_case("claude-opus-4-7", Some(("opus", (4, 7))) ; "anthropic")]

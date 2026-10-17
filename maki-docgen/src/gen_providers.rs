@@ -211,7 +211,7 @@ supports_vision = false
 | `supports_tool_examples` | bool | protocol default | |
 | `supports_thinking` | bool | protocol default | |
 | `requires_thinking` | bool | false | For APIs that reject requests with thinking disabled. Implies `supports_thinking` and raises thinking to minimal effort when off (including compaction). On generic `openai` entries without `thinking_fields` its only wire effect is that the `disabled` block is never sent |
-| `thinking_fields` | table | unset | How this model spells each thinking mode on the wire. The only thinking control on generic `openai` entries, and it implies `supports_thinking`. A typo'd level key fails the parse (exit 2) |
+| `thinking_fields` | table | unset | How this model spells each thinking mode on the wire. The only thinking control on generic `openai` entries; on `anthropic` entries it wins over the built-in thinking spelling, mode by mode. Implies `supports_thinking`. A typo'd level key fails the parse (exit 2) |
 | `supports_vision` | bool | protocol default | When false, image input and `view_image` are off |
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
@@ -236,6 +236,24 @@ max = {{ reasoning_effort = "xhigh" }}
 ```
 
 A mode you left out sends nothing. To get Ollama's own effort words (`low`, `medium`, `high`, and `none` when thinking is off) instead of writing every fragment yourself, use the built-in `ollama` slug: set `[ollama].base_url` (or `OLLAMA_HOST`) and give `[[ollama.models]]` the thinking keys. Only `supports_thinking`, `requires_thinking` and `thinking_fields` overlay onto a built-in slug. The rest of the entry stays ignored, and startup names the keys it dropped.
+
+Custom `anthropic`-protocol models can declare `thinking_fields` too. A mode the table spells merges its fragment ahead of the built-in `thinking` block. A mode left out falls back to the built-in spelling. A litellm-served GLM behind this protocol, for example, spells its effort knob like this:
+
+```toml
+[my-gateway]
+protocol = "anthropic"
+
+[[my-gateway.models]]
+id = "glm-5-3"
+
+[my-gateway.models.thinking_fields.low]
+thinking = {{ type = "adaptive" }}
+output_config = {{ effort = "low" }}
+
+[my-gateway.models.thinking_fields.high]
+thinking = {{ type = "adaptive" }}
+output_config = {{ effort = "high" }}
+```
 
 You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
 

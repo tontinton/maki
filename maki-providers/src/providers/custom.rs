@@ -176,17 +176,19 @@ fn model_from_def(
         // Spelling out how a model thinks is as good as saying that it does.
         .or_else(|| row.thinking_fields.as_ref().map(|_| true))
         .or(Some(base.supports_thinking));
-    // Only the openai chat path merges the fragments into the body: the
-    // responses path has no thinking wiring yet, and anthropic and google spell
-    // thinking their own way. Anywhere else they would vanish without a trace.
+    // Only the openai chat and anthropic paths merge the fragments into the
+    // body: the responses path has no thinking wiring yet, and google spells
+    // thinking its own way. Anywhere else they would vanish without a trace.
     row.thinking_fields = match row.thinking_fields.take() {
-        Some(fields) if def.protocol == Some(Protocol::Openai) => Some(fields),
+        Some(fields) if matches!(def.protocol, Some(Protocol::Openai | Protocol::Anthropic)) => {
+            Some(fields)
+        }
         Some(_) => {
             warn!(
                 slug,
                 model = model_id,
                 protocol = ?def.protocol,
-                "thinking_fields only applies to openai-protocol providers, ignoring"
+                "thinking_fields only applies to openai and anthropic protocol providers, ignoring"
             );
             None
         }
@@ -479,12 +481,13 @@ mod tests {
         assert_eq!(body, expected);
     }
 
-    /// Only the openai chat path merges the fragments, so carrying them
-    /// anywhere else just hides them. Dropping them loudly is how the user
+    /// Only the openai chat and anthropic paths merge the fragments, so
+    /// carrying them anywhere else just hides them. Dropping them loudly is how the user
     /// finds out the keys did nothing.
     #[test_case("openai", true ; "chat_path_reads_them")]
     #[test_case("openai-responses", false ; "responses_path_has_no_thinking_wiring")]
-    #[test_case("anthropic", false ; "anthropic_spells_thinking_its_own_way")]
+    #[test_case("anthropic", true ; "anthropic_path_reads_them")]
+    #[test_case("google", false ; "google_spells_thinking_its_own_way")]
     fn thinking_fields_reach_only_the_path_that_reads_them(protocol: &str, kept: bool) {
         let def: ProviderDef = serde_json::from_str(&format!(
             r#"{{"protocol":"{protocol}","models":[{FIELDS_MODEL}]}}"#
