@@ -12,7 +12,7 @@ use crate::providers::catalog::{
 };
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, NO_CURATED_MODELS, Native,
-    ProviderSpec,
+    ProviderSpec, api_decides,
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -50,6 +50,7 @@ pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: true,
     supports_deferred_tools: false,
+    adaptive_effort: api_decides,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(128_000),
     fallback_context_window: 256_000,
@@ -77,6 +78,7 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
+    adaptive_effort: api_decides,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(64_000),
     fallback_context_window: 128_000,

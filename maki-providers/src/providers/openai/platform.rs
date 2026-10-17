@@ -49,6 +49,8 @@ pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-5.2",
 ];
 
+/// How the chat completions path spells thinking for a model that does not.
+const CHAT_THINKING: ThinkingFallback = ThinkingFallback::Dialect(&dialect::STANDARD);
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -541,6 +543,25 @@ fn plan_dialect(model_id: &str) -> &'static EffortDialect<'static> {
     }
 }
 
+/// The dialect of the Codex backend for a model it serves. `None` sends the
+/// model down the chat completions path.
+fn plan_effort_dialect<'a>(
+    model_id: &str,
+    discovered: Option<&'a PlanModelInfo>,
+) -> Option<EffortDialect<'a>> {
+    discovered
+        .map(PlanModelInfo::dialect)
+        .or_else(|| is_codex_model(model_id).then(|| plan_dialect(model_id).clone()))
+}
+
+pub(super) fn adaptive_effort(model: &Model) -> Option<Effort> {
+    let discovered = model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
+    match plan_effort_dialect(&model.id, discovered.as_deref()) {
+        Some(dialect) => dialect.adaptive_effort(),
+        None => CHAT_THINKING.adaptive_effort(model),
+    }
+}
+
 impl Provider for OpenAi {
     fn stream_message<'a>(
         &'a self,
@@ -559,11 +580,7 @@ impl Provider for OpenAi {
 
             let discovered =
                 model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
-            let plan_dialect = discovered
-                .as_deref()
-                .map(PlanModelInfo::dialect)
-                .or_else(|| is_codex_model(&model.id).then(|| plan_dialect(&model.id).clone()));
-            if let Some(dialect) = plan_dialect {
+            if let Some(dialect) = plan_effort_dialect(&model.id, discovered.as_deref()) {
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_retry(|| async {
@@ -596,11 +613,8 @@ impl Provider for OpenAi {
             let mut body =
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, top_p);
-            opts.thinking.apply_thinking(
-                &mut body,
-                model,
-                ThinkingFallback::Dialect(&dialect::STANDARD),
-            );
+            opts.thinking
+                .apply_thinking(&mut body, model, CHAT_THINKING);
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat
@@ -908,6 +922,26 @@ mod tests {
             supports_fast,
             account_id: Some(ACCOUNT_ID.into()),
         }
+    }
+
+    #[test_case(Some(Effort::Medium), Some(Effort::High) ; "snaps_to_the_listed_levels")]
+    #[test_case(None, None ; "a_listed_adaptive_mode_keeps_adaptive")]
+    fn adaptive_effort_follows_the_plan_listing(
+        adaptive: Option<Effort>,
+        expected: Option<Effort>,
+    ) {
+        let info = PlanModelInfo {
+            adaptive,
+            ..plan_model_info(false)
+        };
+        let listed = ModelInfo {
+            provider_info: Some(Arc::new(info)),
+            ..ModelInfo::id_only(PLAN_MODELS[0].into())
+        };
+        model_registry::set_known_models(&CONFIG.slug, vec![listed]);
+
+        let model = Model::from_spec(&format!("{}/{}", CONFIG.slug, PLAN_MODELS[0])).unwrap();
+        assert_eq!(adaptive_effort(&model), expected);
     }
 
     #[test_case(true, Some(ACCOUNT_ID), None, false, FastSupport::Pending ; "oauth_waits_for_discovery")]

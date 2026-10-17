@@ -167,7 +167,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. New sessions start at the last level you set, in `-p`, SDK and ACP too. Config: `always_thinking` pins a level."
+        "- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. Where maki knows the model's API has no adaptive mode, `adaptive` is not offered, and a session set to it shows and sends the level the provider uses instead. New sessions start at the last level you set, in `-p`, SDK and ACP too. Config: `always_thinking` pins a level."
     )
     .unwrap();
     writeln!(

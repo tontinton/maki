@@ -3,15 +3,15 @@ use std::sync::{Arc, Mutex};
 use maki_config::PROVIDER_BUILTINS;
 use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
 
-use crate::AgentError;
 use crate::manifest;
-use crate::model::{ModelEntry, ModelFamily, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::provider::Provider;
 use crate::providers::{
     ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, google, llama_cpp, ollama,
     openai, opencode, plugin, xai, zai,
 };
+use crate::{AgentError, Effort};
 
 /// The slugs a plugin may name as its `base`, in documentation order. A `base`
 /// borrows a bespoke `impl Provider` whole, so every entry must be a
@@ -58,6 +58,9 @@ pub struct ProviderSpec {
     /// borrows this row's protocol does not inherit it; see
     /// [`crate::Model::supports_deferred_tools`].
     pub supports_deferred_tools: bool,
+    /// See [`Model::adaptive_effort`]. A fn, since one provider can serve both
+    /// kinds of model.
+    pub adaptive_effort: fn(&Model) -> Option<Effort>,
     pub accepts_arbitrary_models: bool,
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,
@@ -80,6 +83,12 @@ pub struct ProviderSpec {
     /// see [`ProviderSpec::config_row`].
     pub login: Option<LoginConfig>,
     pub docs: GeneratedDocs,
+}
+
+/// For a provider whose API has an adaptive mode of its own, or one that
+/// cannot tell what its wire sends, so `adaptive` stays offered.
+pub(crate) fn api_decides(_: &Model) -> Option<Effort> {
+    None
 }
 
 /// For a provider whose ids all come from a live catalog.

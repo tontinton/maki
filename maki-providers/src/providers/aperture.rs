@@ -11,7 +11,7 @@ use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport,
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
-    ProviderRegistry, ProviderSpec,
+    ProviderRegistry, ProviderSpec, api_decides,
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 use maki_storage::id::SessionRef;
@@ -56,6 +56,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
+    adaptive_effort: api_decides,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,

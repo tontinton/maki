@@ -140,9 +140,13 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
 /// when `supports_thinking` is false, so a picker can render the ladder from it
 /// without knowing the levels.
 ///
+/// Where the API has no adaptive mode the ladder leaves `adaptive` out, and
+/// `thinking_shown` names the level a session set to it is sent as. Otherwise
+/// it equals `thinking`.
+///
 /// @return (table|nil, string|nil) `{spec, id, provider, thinking,
-///   thinking_options, fast, supports_thinking, supports_fast}`, or nil and an
-///   error.
+///   thinking_shown, thinking_options, fast, supports_thinking,
+///   supports_fast}`, or nil and an error.
 /// @example
 /// local m = maki.model.get()
 /// if m.spec ~= "anthropic/claude-opus-4-6" then ... end

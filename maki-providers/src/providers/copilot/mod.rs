@@ -14,6 +14,7 @@ use super::anthropic::shared;
 use super::openai::responses;
 use super::openai_compat;
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry};
+use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::{ResolvedAuth, Timeouts};
 use crate::spec::{AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
@@ -46,6 +47,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
+    adaptive_effort,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
@@ -182,12 +184,21 @@ impl Copilot {
 
     /// Merges rather than replaces: `/models` sometimes omits a model it
     /// served a moment ago, and forgetting it would reroute that model to
-    /// a guessed endpoint mid-session.
-    fn remember(&self, models: Vec<CopilotModel>) {
-        self.models
-            .lock()
-            .unwrap()
-            .extend(models.into_iter().map(|model| (model.id.clone(), model)));
+    /// a guessed endpoint mid-session. The registry gets the same merged
+    /// list, so what a request reads there is what the picker read.
+    fn remember(&self, models: Vec<CopilotModel>) -> Vec<ModelInfo> {
+        let mut infos: Vec<ModelInfo> = models.iter().map(CopilotModel::model_info).collect();
+        let mut known = self.models.lock().unwrap();
+        infos.extend(
+            known
+                .values()
+                .filter(|kept| !models.iter().any(|model| model.id == kept.id))
+                .map(CopilotModel::model_info),
+        );
+        known.extend(models.into_iter().map(|model| (model.id.clone(), model)));
+        drop(known);
+        model_registry::set_known_models(SLUG, infos.clone());
+        infos
     }
 
     async fn fetch_models(&self) -> Result<Vec<CopilotModel>, AgentError> {
@@ -283,18 +294,7 @@ impl Copilot {
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
         let mut body = responses::build_body(model, messages, system, tools);
-        let reasoning_info = crate::model_registry::provider_info::<CopilotModelInfo>(
-            "copilot", &model.id,
-        )
-        .or_else(|| {
-            self.models
-                .lock()
-                .unwrap()
-                .get(&model.id)
-                .map(CopilotModel::reasoning_info)
-                .map(Arc::new)
-        });
-        if let Some(info) = reasoning_info {
+        if let Some(info) = model_registry::provider_info::<CopilotModelInfo>(SLUG, &model.id) {
             responses::apply_responses_reasoning(
                 &mut body,
                 thinking,
@@ -488,6 +488,7 @@ impl CopilotModel {
                 .any(|effort| effort == dialect::OFF),
             reasoning_efforts,
             adaptive_thinking: self.capabilities.supports.adaptive_thinking,
+            endpoint: self.endpoint(),
         }
     }
 
@@ -594,6 +595,7 @@ struct CopilotModelInfo {
     reasoning_efforts: Vec<Effort>,
     reasoning_off: bool,
     adaptive_thinking: bool,
+    endpoint: Endpoint,
 }
 
 #[derive(Deserialize)]
@@ -756,6 +758,19 @@ fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
     }
 }
 
+fn adaptive_effort(model: &Model) -> Option<Effort> {
+    model_registry::provider_info::<CopilotModelInfo>(SLUG, &model.id)
+        .and_then(|info| listed_adaptive_effort(&info))
+}
+
+/// Messages spells `adaptive` natively and chat completions sends no reasoning,
+/// so only responses has a fixed level.
+fn listed_adaptive_effort(info: &CopilotModelInfo) -> Option<Effort> {
+    (info.endpoint == Endpoint::Responses)
+        .then(|| effort_dialect(info).adaptive_effort())
+        .flatten()
+}
+
 fn guess_endpoint(model_id: &str) -> Endpoint {
     if model_id.starts_with("claude-") {
         Endpoint::Messages
@@ -811,12 +826,7 @@ impl Provider for Copilot {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
             let models = self.fetch_models().await?;
-            let infos = models
-                .iter()
-                .map(CopilotModel::model_info)
-                .collect::<Vec<_>>();
-            self.remember(models);
-            Ok(infos)
+            Ok(self.remember(models))
         })
     }
 
@@ -838,6 +848,7 @@ mod tests {
     const OPUS_CACHE_WRITE: f64 = 6.25;
     const CLAUDE_SPEC: &str = "copilot/claude-opus-5";
     const REPLY: &str = "reply";
+    const SOL: &str = "gpt-6.1-sol";
 
     #[test]
     fn endpoint_prefers_messages_then_responses_then_chat() {
@@ -947,6 +958,24 @@ mod tests {
 
         assert!(model.is_enabled_chat_model());
         assert_eq!(model.model_info().tier, None);
+    }
+
+    #[test_case(RESPONSES_PATH, json!({"reasoning_effort": ["low", "high", "max"]}), Some(Effort::High); "responses sends a fixed level")]
+    #[test_case(RESPONSES_PATH, json!({"reasoning_effort": ["low", "medium"]}), Some(Effort::Medium); "the level snaps to what the model lists")]
+    #[test_case(RESPONSES_PATH, json!({"reasoning_effort": ["low", "high"], "adaptive_thinking": true}), None; "reported adaptive stays")]
+    #[test_case(MESSAGES_PATH, json!({"max_thinking_budget": 32_000}), None; "messages spells it natively")]
+    fn adaptive_effort_follows_the_endpoint_and_the_listing(
+        endpoint: &str,
+        supports: Value,
+        expected: Option<Effort>,
+    ) {
+        let listed: CopilotModel = serde_json::from_value(json!({
+            "id": SOL,
+            "supported_endpoints": [endpoint],
+            "capabilities": {"type": "chat", "supports": supports}
+        }))
+        .unwrap();
+        assert_eq!(listed_adaptive_effort(&listed.reasoning_info()), expected);
     }
 
     #[test_case(RESPONSES_PATH, true; "responses honors reasoning")]
@@ -1079,6 +1108,7 @@ mod tests {
             reasoning_efforts: vec![Effort::Low, Effort::Medium, Effort::High],
             reasoning_off: true,
             adaptive_thinking: false,
+            endpoint: Endpoint::Responses,
         };
         let dialect = effort_dialect(&info);
 

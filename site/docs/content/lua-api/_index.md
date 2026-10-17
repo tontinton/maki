@@ -3842,9 +3842,13 @@ send for that row and is absent on `off` and `adaptive`. It is empty exactly
 when `supports_thinking` is false, so a picker can render the ladder from it
 without knowing the levels.
 
+Where the API has no adaptive mode the ladder leaves `adaptive` out, and
+`thinking_shown` names the level a session set to it is sent as. Otherwise
+it equals `thinking`.
+
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking,
-  thinking_options, fast, supports_thinking, supports_fast}`, or nil and an
-  error.
+  thinking_shown, thinking_options, fast, supports_thinking,
+  supports_fast}`, or nil and an error.
 
 **Example:**
 

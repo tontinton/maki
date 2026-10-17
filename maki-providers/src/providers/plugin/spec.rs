@@ -11,7 +11,7 @@ use crate::manifest::check_rows;
 use crate::model::ModelEntry;
 use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs,
-    NO_CURATED_MODELS, ProviderSpec,
+    NO_CURATED_MODELS, ProviderSpec, api_decides,
 };
 
 use super::{ProviderDecl, Target};
@@ -82,6 +82,7 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
         family: decl.family.unwrap_or(native.family),
         supports_thinking: native.supports_thinking,
         supports_deferred_tools: false,
+        adaptive_effort: api_decides,
         accepts_arbitrary_models: decl
             .accepts_arbitrary_models
             .unwrap_or(accepts_arbitrary_models),

@@ -38,7 +38,7 @@ use maki_providers::{
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
 use maki_storage::sessions::{
-    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage,
+    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, THINKING_ADAPTIVE,
 };
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
@@ -75,6 +75,8 @@ const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
 const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
 const THINKING_OPTIONS: &str = "thinking_options";
+const THINKING_SHOWN: &str = "thinking_shown";
+const FIXED_ADAPTIVE_PROVIDER: &str = "xai";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
 const INPUT_CHANGED_EVENT: &str = "InputChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
@@ -6072,6 +6074,7 @@ fn model_state_reports_the_model_and_what_it_supports() {
             "id": "qwen3",
             "provider": "ollama",
             "thinking": "off",
+            "thinking_shown": "off",
             "fast": false,
             "supports_thinking": false,
             "supports_fast": false,
@@ -6088,6 +6091,7 @@ fn model_state_reports_the_model_and_what_it_supports() {
             "id": "claude-opus-4-8",
             "provider": "anthropic",
             "thinking": "high",
+            "thinking_shown": "high",
             "fast": true,
             "supports_thinking": true,
             "supports_fast": true,
@@ -6569,6 +6573,18 @@ fn model_state_thinking_round_trips_into_set_thinking(thinking: ThinkingConfig, 
     assert_eq!(reported, expected);
     assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
     assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
+}
+
+#[test]
+fn model_state_shows_the_level_a_hidden_adaptive_is_sent_as() {
+    let mut app = test_app();
+    app.state.model.provider = Arc::from(FIXED_ADAPTIVE_PROVIDER);
+    app.state.model.thinking_override = Some(ThinkingSupport::Yes);
+    app.state.thinking = ThinkingConfig::Adaptive;
+
+    let state = app.model_state();
+    assert_eq!(state[THINKING_SHOWN], Effort::High.as_str());
+    assert_eq!(state["thinking"], THINKING_ADAPTIVE);
 }
 
 #[test]

@@ -30,7 +30,7 @@ end
 
 function M.set(value)
   local model, err = maki.model.set({ thinking = value })
-  maki.ui.flash(err or (FLASH_PREFIX .. model.thinking))
+  maki.ui.flash(err or (FLASH_PREFIX .. model.thinking_shown))
 end
 
 function M.open()
