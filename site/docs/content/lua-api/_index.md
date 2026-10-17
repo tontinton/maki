@@ -1062,6 +1062,24 @@ Maki fires two slots around the plan form, both with
 menu, and `ui.plan_form` asks whether the form opens at all. Both are
 documented under [maki.plan](/docs/lua-api/#maki-plan).
 
+`ui.code_block` renders closed fenced blocks in assistant chat messages.
+Its layer receives `function(prev, ev)` with
+`ev = { language = string, code = string, width = integer }`. Return a
+nonempty array of plain text lines, or call `prev(ev)` to defer. The host
+default returns nil and displays the source. Lines preserve their spacing
+and are not parsed as Markdown. Stored messages and model context retain
+the source. This slot grants no permissions. A renderer process still
+requires `run`.
+
+Rendering is asynchronous and has a two-second deadline. Only source up
+to 32 KiB reaches the slot. Output is limited to 256 lines and 64 KiB,
+cannot contain control characters, and must fit `ev.width` terminal cells
+per line. Nil, invalid output, and errors leave the source visible. The
+host caches the result until width, theme, or slot registrations change.
+Each chat generation admits at most 128 distinct blocks. Additional blocks
+display their source. A resize or closed chat cancels pending work. Plugin
+reload drains pending work and invalidates old replies.
+
 Maki fires two slots per tool itself: `tool.<name>.input` before
 permissions look at the call, and `tool.<name>.output` on the text it
 produced. Both take `function(prev, value, ctx)` and answer with a

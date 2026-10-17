@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use include_dir::{Dir, File, include_dir};
 use maki_agent::SessionEndReason;
+use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
@@ -14,7 +15,7 @@ use maki_providers::plugin::DeclAuthority;
 
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
-use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
+use crate::api::slot::{CODE_BLOCK_SLOT, LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
 use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
@@ -1045,6 +1046,25 @@ pub struct EventHandle {
     background: BackgroundSessions,
 }
 
+/// One display-only rendering request. Dropping it cancels pending work.
+pub struct CodeBlockRender {
+    reply: flume::Receiver<Option<Vec<String>>>,
+    _cancel: CancelTrigger,
+    layered: Arc<LayeredTools>,
+    generation: u64,
+}
+
+impl CodeBlockRender {
+    /// Polls the renderer without waiting. A result from an old plugin
+    /// generation falls back to source, even if it was already queued.
+    pub fn try_recv(&self) -> Result<Option<Vec<String>>, flume::TryRecvError> {
+        let lines = self.reply.try_recv()?;
+        Ok((self.layered.revision() == self.generation)
+            .then_some(lines)
+            .flatten())
+    }
+}
+
 impl EventHandle {
     pub(crate) fn from_tx(tx: flume::Sender<Request>) -> Self {
         Self {
@@ -1075,6 +1095,47 @@ impl EventHandle {
     pub fn plan_form_layered(&self) -> bool {
         self.layered.layers_surface(PLAN_FORM_SLOT)
             || self.layered.layers_surface(PLAN_FORM_ACTIONS_SLOT)
+    }
+
+    /// Revision of the published plugin slots, for display cache invalidation.
+    pub fn code_block_generation(&self) -> u64 {
+        self.layered.revision()
+    }
+
+    /// Whether any plugin can replace a code block's display.
+    pub fn code_block_layered(&self) -> bool {
+        self.layered.layers_surface(CODE_BLOCK_SLOT)
+    }
+
+    /// Starts a bounded, asynchronous `ui.code_block` request. The caller
+    /// keeps the source visible until this request answers with text lines.
+    pub fn render_code_block(&self, language: String, code: String, width: u16) -> CodeBlockRender {
+        let deadline = Instant::now() + runtime::CODE_BLOCK_DEADLINE;
+        let generation = self.code_block_generation();
+        let (reply, rx) = flume::bounded(1);
+        let (trigger, cancel) = CancelToken::new();
+        if width == 0
+            || code.len() > runtime::MAX_CODE_BLOCK_SOURCE_BYTES
+            || !self.code_block_layered()
+        {
+            let _ = reply.send(None);
+        } else {
+            let _ = self.tx.try_send(Request::RenderCodeBlock {
+                language,
+                code,
+                width,
+                generation,
+                cancel,
+                deadline,
+                reply,
+            });
+        }
+        CodeBlockRender {
+            reply: rx,
+            _cancel: trigger,
+            layered: Arc::clone(&self.layered),
+            generation,
+        }
     }
 
     /// Runs the handler behind a plugin row of {session}'s plan form, named
@@ -1333,6 +1394,9 @@ impl EventHandle {
             .is_ok()
     }
 }
+
+#[cfg(test)]
+mod code_block_tests;
 
 #[cfg(test)]
 mod tests {
