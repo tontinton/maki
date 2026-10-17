@@ -241,7 +241,9 @@ fn startup_specs_from(config: &ProvidersConfig, tiers: &[ModelTier]) -> Vec<Stri
     let mut entries: Vec<_> = config
         .providers
         .iter()
-        .filter(|(slug, def)| !is_builtin_slug(slug) && def.protocol.is_some())
+        .filter(|(slug, def)| {
+            !is_builtin_slug(slug) && def.protocol.is_some() && def.auto != Some(false)
+        })
         .collect();
     entries.sort_unstable_by_key(|(slug, _)| *slug);
     entries
@@ -407,6 +409,14 @@ mod tests {
          [alpha]\nprotocol = \"anthropic\"\ndefault_model = \"alpha/a\"",
         &["alpha/a", "zeta/z"]
         ; "providers_come_in_slug_order"
+    )]
+    // Startup is a choice nobody made by hand, so `auto = false` is not on the
+    // shortlist it picks from.
+    #[test_case(
+        "[metered]\nprotocol = \"openai\"\nauto = false\ndefault_model = \"metered/m\"\n\
+         [local]\nprotocol = \"openai\"\ndefault_model = \"local/l\"",
+        &["local/l"]
+        ; "auto_false_is_never_started_on"
     )]
     fn startup_specs_only_name_models_the_user_declared(toml_src: &str, expected: &[&str]) {
         let config: ProvidersConfig = toml::from_str(toml_src).unwrap();

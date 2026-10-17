@@ -138,7 +138,8 @@ fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
 fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {
     for tier in STARTUP_TIERS {
         for &slug in PROVIDER_PRIORITY {
-            if provider_ready(slug).is_ok()
+            if maki_config::providers::auto_selectable(slug)
+                && provider_ready(slug).is_ok()
                 && let Ok(model) = Model::from_tier(slug, tier)
                 && policy.allows(&model.spec())
             {
