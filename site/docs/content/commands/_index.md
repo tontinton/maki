@@ -113,12 +113,22 @@ for _, alias in ipairs(aliases) do
 end
 ```
 
-Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for the commands listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name.
+Aliasing adds a name, so both stay in the palette. Any command works as a target, including MCP prompts and other plugins' commands. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name.
 
-A plugin can only run what its own permissions cover. Every command not listed here runs for any plugin.
+### What a plugin may run {#plugin-access}
+
+`run_command` only runs what the calling plugin's grants cover. Your `init.lua` counts as a plugin, and its grants come from `~/.config/maki/plugin.toml` (see [plugin permissions](/docs/lua-api/#plugin-permissions)). Commands not listed here run for any plugin.
 
 - Needs `agent`: `/compact`, `/btw`, custom commands, MCP prompts.
-- Needs every permission of the plugin that registered it: plugin commands, since the handler runs with them.
-- Only when you type it: `/yolo`, `/trust`, `/packupdate`, `/packdel`. These widen what plugins and the model may do.
+- Needs what its owner holds: plugin commands, as described below.
+- Only when you type it: `/yolo`, `/trust`, `/packupdate`, `/packdel`. These change permissions, folder trust, or installed packages.
+
+A plugin command's handler runs with the grants of the plugin that registered it. The caller picks the arguments, so it must hold at least the same reach:
+
+- Every permission the owner holds.
+- Host access as wide as the owner's. A caller without `net_hosts` has it. A caller with a list needs the owner to have one too, and must contain each of its entries exactly as written, so `*.example.com` does not cover `api.example.com`.
+- Its own provider on the address of each provider the owner registered. That address may be on your LAN, which `net_hosts` cannot grant.
+
+A caller granted `run` skips both address checks, since a process it starts can reach any host.
 
 Related: [CLI](/docs/cli/) for shell flags and subcommands, [Skills](/docs/skills/) for on-demand playbooks.

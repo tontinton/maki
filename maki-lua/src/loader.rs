@@ -1339,6 +1339,7 @@ mod tests {
     use super::*;
     use crate::api::keymap::TAKEN_ERR;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
+    use crate::plugin_permissions::PluginReach;
     use crossterm::event::KeyCode;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, assemble};
     use maki_agent::tools::ToolRegistry;
@@ -1447,7 +1448,7 @@ mod tests {
             name: Arc::from("/test"),
             description: Arc::from("desc"),
             plugin: Arc::from("p"),
-            permissions: PluginPermissions::trusted(),
+            reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
         }]);
         let snap = reader.load();

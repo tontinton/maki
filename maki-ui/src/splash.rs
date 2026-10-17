@@ -587,6 +587,7 @@ mod tests {
     use super::*;
     use crate::components::buffer_text;
     use crate::repaint::expect::{OWED, QUIET};
+    use maki_lua::{PluginPermissions, PluginReach};
     use std::time::Duration;
     use test_case::test_case;
 
@@ -642,7 +643,7 @@ mod tests {
             name: THINKING_COMMAND.into(),
             description: "".into(),
             plugin: "thinking".into(),
-            permissions: maki_lua::PluginPermissions::trusted(),
+            reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
         }];
         let lua_commands: &[LuaCommandInfo] = if loaded { &thinking } else { &[] };

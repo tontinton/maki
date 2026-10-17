@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::command::CustomCommand;
 use maki_agent::{McpPromptInfo, McpSnapshotReader};
-use maki_lua::{LuaCommandInfo, LuaCommandReader, Permission, PluginPermissions, denied_message};
+use maki_lua::{LuaCommandInfo, LuaCommandReader, Missing, Permission, PluginReach};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
@@ -600,11 +600,7 @@ impl CommandPalette {
 
     /// Hands back the registered spelling, because that is the only one
     /// [`crate::app::App`] dispatches on. `Err` goes back to the plugin as is.
-    pub fn resolve_for_plugin(
-        &self,
-        name: &str,
-        caller: &PluginPermissions,
-    ) -> Result<String, String> {
+    pub fn resolve_for_plugin(&self, name: &str, caller: &PluginReach) -> Result<String, String> {
         let item = self
             .find_item(name)
             .ok_or_else(|| format!("unknown command '{name}'"))?;
@@ -614,19 +610,21 @@ impl CommandPalette {
         }
     }
 
-    fn plugin_refusal(&self, item: &CommandItem, caller: &PluginPermissions) -> Option<String> {
+    fn plugin_refusal(&self, item: &CommandItem, caller: &PluginReach) -> Option<String> {
         let access = match item.command_type {
             CommandType::Builtin(cmd) => cmd.plugin_access,
             CommandType::Custom(_) | CommandType::McpPrompt(_) => STARTS_TURNS,
             CommandType::Lua(i) => {
                 return caller
-                    .first_missing(&self.lua_commands[i].permissions)
-                    .map(denied_message);
+                    .first_missing(&self.lua_commands[i].reach)
+                    .map(|missing| missing.to_string());
             }
         };
         match access {
             PluginAccess::Open => None,
-            PluginAccess::Needs(perm) => (!caller.is_allowed(perm)).then(|| denied_message(perm)),
+            PluginAccess::Needs(perm) => {
+                (!caller.is_allowed(perm)).then(|| Missing::Permission(perm).to_string())
+            }
             PluginAccess::UserOnly => Some(format!("{}{USER_ONLY_SUFFIX}", item.name)),
         }
     }
@@ -775,6 +773,7 @@ mod tests {
     use super::*;
     use crate::components::key;
     use maki_agent::{McpPromptArg, McpSnapshot};
+    use maki_lua::PluginPermissions;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use test_case::test_case;
@@ -1100,14 +1099,14 @@ mod tests {
                 name: Arc::from("/memory"),
                 description: Arc::from("View memory files"),
                 plugin: Arc::from("memory"),
-                permissions: PluginPermissions::trusted(),
+                reach: PluginReach::new(PluginPermissions::trusted()),
                 max_args: 0,
             },
             LuaCommandInfo {
                 name: Arc::from("/deploy"),
                 description: Arc::from("Deploy the project"),
                 plugin: Arc::from("deploy_plugin"),
-                permissions: PluginPermissions::trusted(),
+                reach: PluginReach::new(PluginPermissions::trusted()),
                 max_args: 0,
             },
         ])
@@ -1118,7 +1117,7 @@ mod tests {
             name: Arc::from("/rename"),
             description: Arc::from("Rename the current session"),
             plugin: Arc::from("sessions"),
-            permissions: PluginPermissions::trusted(),
+            reach: PluginReach::new(PluginPermissions::trusted()),
             max_args,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
@@ -1206,7 +1205,7 @@ mod tests {
             name: Arc::from("/models"),
             description: Arc::from("List models"),
             plugin: Arc::from("models"),
-            permissions: PluginPermissions::trusted(),
+            reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
         }]);
         let mut palette = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
@@ -1240,7 +1239,7 @@ mod tests {
             name: Arc::from("/old"),
             description: Arc::from("old command"),
             plugin: Arc::from("p"),
-            permissions: PluginPermissions::trusted(),
+            reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
@@ -1257,14 +1256,14 @@ mod tests {
                 name: Arc::from("/new1"),
                 description: Arc::from("new"),
                 plugin: Arc::from("p"),
-                permissions: PluginPermissions::trusted(),
+                reach: PluginReach::new(PluginPermissions::trusted()),
                 max_args: 0,
             },
             LuaCommandInfo {
                 name: Arc::from("/new2"),
                 description: Arc::from("new2"),
                 plugin: Arc::from("p"),
-                permissions: PluginPermissions::trusted(),
+                reach: PluginReach::new(PluginPermissions::trusted()),
                 max_args: 0,
             },
         ]);

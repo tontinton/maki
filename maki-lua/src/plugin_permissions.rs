@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -7,7 +8,7 @@ use maki_providers::plugin;
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
 use semver::Version;
 use tracing::warn;
-use url::Url;
+use url::{Origin, Url};
 
 use crate::error::PluginError;
 
@@ -90,13 +91,42 @@ impl NetEgress {
     /// Whether `url` is on the origin of a provider this plugin registered,
     /// as chosen by the user or by maki. See [`plugin::vouched_origin`].
     pub(crate) fn vouches(&self, url: &Url) -> bool {
-        let origin = url.origin();
+        self.vouched_origins().contains(&url.origin())
+    }
+
+    /// Collected instead of checked under the lock. A command check can compare
+    /// a plugin with itself, and then both sides take this same lock.
+    fn vouched_origins(&self) -> Vec<Origin> {
         self.providers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter_map(|slug| plugin::vouched_origin(slug))
-            .any(|vouched| vouched.origin() == origin)
+            .map(|url| url.origin())
+            .collect()
+    }
+
+    /// What {other} reaches that this egress does not. Hosts compare as plain
+    /// text, so `*.example.com` does not cover `api.example.com`. That can only
+    /// refuse too much.
+    ///
+    /// A provider origin skips the private-address guard, so no `net_hosts`
+    /// entry can stand in for it. Only a provider on the same origin can.
+    fn uncovered(&self, other: &Self) -> Option<Missing> {
+        let hosts_covered = match (&self.declared, &other.declared) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(mine), Some(theirs)) => theirs.iter().all(|host| mine.contains(host)),
+        };
+        if !hosts_covered {
+            return Some(Missing::Hosts);
+        }
+        let mine = self.vouched_origins();
+        let origins_covered = other
+            .vouched_origins()
+            .iter()
+            .all(|origin| mine.contains(origin));
+        (!origins_covered).then_some(Missing::ProviderOrigin)
     }
 
     fn serves(&self, host: &str, port: u16) -> bool {
@@ -171,26 +201,6 @@ impl PluginPermissions {
             .all(|&perm| perm == Permission::Agent || self.is_allowed(perm))
     }
 
-    /// Holding the `net` flag is not enough when {needed} may reach hosts our
-    /// list leaves out, or one plugin could borrow another's wider reach.
-    pub fn first_missing(&self, needed: &Self) -> Option<Permission> {
-        Permission::ALL.iter().copied().find(|&perm| {
-            let held =
-                self.is_allowed(perm) && (perm != Permission::Net || self.net_covers(needed));
-            needed.is_allowed(perm) && !held
-        })
-    }
-
-    /// Hosts compare as plain text, so `*.example.com` does not cover
-    /// `api.example.com`. That only ever refuses too much, never too little.
-    fn net_covers(&self, needed: &Self) -> bool {
-        match (&self.net_hosts, &needed.net_hosts) {
-            (None, _) => true,
-            (Some(_), None) => false,
-            (Some(mine), Some(theirs)) => theirs.iter().all(|host| mine.contains(host)),
-        }
-    }
-
     pub fn from_manifest(manifest: &toml::Value) -> Self {
         let perms = manifest.get("permissions");
         let mut allowed = [true; Permission::COUNT];
@@ -243,6 +253,87 @@ impl PluginPermissions {
             lua.create_function(move |_, _: mlua::MultiValue| -> LuaResult<mlua::Value> {
                 Err(denied_error(perm))
             })
+        }
+    }
+}
+
+/// A plugin's grant plus the egress `maki.net` checks, provider origins and all.
+///
+/// Build it once per `maki` global and clone it from there. The egress learns
+/// about each provider as the plugin registers it, so a command has to carry
+/// this very value. A fresh one would know none of them and let through the
+/// borrowing it is meant to catch.
+#[derive(Clone)]
+pub struct PluginReach {
+    permissions: PluginPermissions,
+    egress: NetEgress,
+}
+
+impl PluginReach {
+    pub fn new(permissions: PluginPermissions) -> Self {
+        let egress = NetEgress::new(permissions.net_hosts());
+        Self {
+            permissions,
+            egress,
+        }
+    }
+
+    pub fn is_allowed(&self, perm: Permission) -> bool {
+        self.permissions.is_allowed(perm)
+    }
+
+    pub(crate) fn permissions(&self) -> &PluginPermissions {
+        &self.permissions
+    }
+
+    pub(crate) fn egress(&self) -> &NetEgress {
+        &self.egress
+    }
+
+    /// Asked when one plugin runs another's command. The handler runs with
+    /// {needed}, so a caller that falls short anywhere could borrow that reach
+    /// and pick the arguments.
+    ///
+    /// A caller with `run` skips the egress check. Any process it starts can
+    /// reach any host anyway, so comparing addresses would only refuse.
+    pub fn first_missing(&self, needed: &Self) -> Option<Missing> {
+        if let Some(perm) = Permission::ALL
+            .iter()
+            .copied()
+            .find(|&perm| needed.is_allowed(perm) && !self.is_allowed(perm))
+        {
+            return Some(Missing::Permission(perm));
+        }
+        if !needed.is_allowed(Permission::Net) || self.is_allowed(Permission::Run) {
+            return None;
+        }
+        self.egress.uncovered(&needed.egress)
+    }
+}
+
+/// Why a plugin may not run something, one variant per fix the author can
+/// make, so the message never points at the wrong one.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Missing {
+    Permission(Permission),
+    Hosts,
+    ProviderOrigin,
+}
+
+impl fmt::Display for Missing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Permission(perm) => write!(
+                f,
+                "permission denied: '{perm}' not granted for this plugin (grant it in {MANIFEST_FILE} next to the plugin file)"
+            ),
+            Self::Hosts => write!(
+                f,
+                "permission denied: the command reaches hosts this plugin's {NET_HOSTS_KEY} leaves out (list them in {MANIFEST_FILE} next to the plugin file)"
+            ),
+            Self::ProviderOrigin => f.write_str(
+                "permission denied: the command reaches a provider address only its own plugin, or one granted 'run', may use",
+            ),
         }
     }
 }
@@ -383,16 +474,10 @@ pub(crate) fn requested_permissions_from_text(
         })
 }
 
-pub fn denied_message(perm: Permission) -> String {
-    let msg = format!(
-        "permission denied: '{perm}' not granted for this plugin (grant it in {MANIFEST_FILE} next to the plugin file)"
-    );
-    warn!(permission = %perm, "{msg}");
-    msg
-}
-
 pub(crate) fn denied_error(perm: Permission) -> LuaError {
-    LuaError::runtime(denied_message(perm))
+    let msg = Missing::Permission(perm).to_string();
+    warn!(permission = %perm, "{msg}");
+    LuaError::runtime(msg)
 }
 
 pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermissions {
@@ -486,6 +571,8 @@ fn check_minimum_version(
 mod tests {
     use std::fs;
 
+    use maki_providers::test_support::register_bundled;
+    use serde_json::json;
     use test_case::test_case;
 
     use super::*;
@@ -494,9 +581,10 @@ mod tests {
     const DECLARED_HOST: &str = "api.example.com";
     const OTHER_HOST: &str = "elsewhere.example";
     const HTTPS_PORT: u16 = 443;
-    /// A slug no load ever registered, which is the state every slug is in
-    /// here: these run without a provider registry.
     const UNREGISTERED_SLUG: &str = "not-a-provider";
+    const LOCAL_PROVIDER_SLUG: &str = "lan-box";
+    const LOCAL_PROVIDER_HOST: &str = "127.0.0.1:11434";
+    const LOCAL_PROVIDER_URL: &str = "http://127.0.0.1:11434/v1";
 
     fn assert_denied(permissions: &PluginPermissions) {
         for &permission in Permission::ALL {
@@ -549,26 +637,58 @@ mod tests {
         assert!(!p.holds_all_reach());
     }
 
-    fn with_hosts(hosts: Option<&[&str]>) -> PluginPermissions {
+    /// Everything but `run`, which would skip the egress comparison.
+    fn with_hosts(hosts: Option<&[&str]>) -> PluginReach {
         let mut p = PluginPermissions::trusted();
+        p.set(Permission::Run, false);
         p.set_net_hosts(hosts.map(|hosts| hosts.iter().map(|h| (*h).to_owned()).collect()));
-        p
+        PluginReach::new(p)
     }
 
-    #[test_case(None, None, None ; "any_host_covers_any_host")]
-    #[test_case(None, Some(&[DECLARED_HOST]), None ; "any_host_covers_a_list")]
-    #[test_case(Some(&[DECLARED_HOST]), None, Some(Permission::Net) ; "a_list_does_not_cover_any_host")]
-    #[test_case(Some(&[DECLARED_HOST]), Some(&[DECLARED_HOST]), None ; "a_list_covers_itself")]
-    #[test_case(Some(&[DECLARED_HOST]), Some(&[OTHER_HOST]), Some(Permission::Net) ; "a_list_does_not_cover_another_host")]
+    fn with_hosts_and_run(hosts: Option<&[&str]>) -> PluginReach {
+        let mut p = with_hosts(hosts).permissions;
+        p.set(Permission::Run, true);
+        PluginReach::new(p)
+    }
+
+    #[test_case(with_hosts(None), with_hosts(None), None ; "any_host_covers_any_host")]
+    #[test_case(with_hosts(None), with_hosts(Some(&[DECLARED_HOST])), None ; "any_host_covers_a_list")]
+    #[test_case(with_hosts(Some(&[DECLARED_HOST])), with_hosts(None), Some(Missing::Hosts) ; "a_list_does_not_cover_any_host")]
+    #[test_case(with_hosts(Some(&[DECLARED_HOST])), with_hosts(Some(&[DECLARED_HOST])), None ; "a_list_covers_itself")]
+    #[test_case(with_hosts(Some(&[DECLARED_HOST])), with_hosts(Some(&[OTHER_HOST])), Some(Missing::Hosts) ; "a_list_does_not_cover_another_host")]
+    #[test_case(with_hosts_and_run(Some(&[DECLARED_HOST])), with_hosts(Some(&[OTHER_HOST])), None ; "a_caller_that_runs_processes_skips_hosts")]
     fn first_missing_compares_net_hosts(
-        caller: Option<&[&str]>,
-        needed: Option<&[&str]>,
-        expected: Option<Permission>,
+        caller: PluginReach,
+        needed: PluginReach,
+        expected: Option<Missing>,
     ) {
-        assert_eq!(
-            with_hosts(caller).first_missing(&with_hosts(needed)),
-            expected
+        assert_eq!(caller.first_missing(&needed), expected);
+    }
+
+    /// A bundled provider's address skips the private-address guard, so even
+    /// a plugin allowed every public host falls short of it. The owner checking
+    /// itself also proves the provider list is not locked twice.
+    #[test_case(|_| with_hosts(None), Some(Missing::ProviderOrigin) ; "another_plugin_falls_short")]
+    #[test_case(|_| with_hosts_and_run(None), None ; "a_caller_that_runs_processes_skips_origins")]
+    #[test_case(PluginReach::clone, None ; "the_owner_covers_itself")]
+    fn first_missing_compares_provider_origins(
+        caller: fn(&PluginReach) -> PluginReach,
+        expected: Option<Missing>,
+    ) {
+        register_bundled(
+            json!({
+                "slug": LOCAL_PROVIDER_SLUG,
+                "display_name": LOCAL_PROVIDER_SLUG,
+                "codec": "openai",
+                "base_url": LOCAL_PROVIDER_URL,
+                "models": [{ "prefixes": [LOCAL_PROVIDER_SLUG], "tier": "strong" }],
+            }),
+            LOCAL_PROVIDER_HOST,
         );
+        let owner = with_hosts(Some(&[LOCAL_PROVIDER_HOST]));
+        owner.egress().owns(LOCAL_PROVIDER_SLUG.to_owned());
+
+        assert_eq!(caller(&owner).first_missing(&owner), expected);
     }
 
     #[test]

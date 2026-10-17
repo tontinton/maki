@@ -4174,7 +4174,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
     .unwrap();
     assert!(
         !host.command_reader().load().commands[0]
-            .permissions
+            .reach
             .is_allowed(maki_lua::Permission::Agent)
     );
     let rx = host.ui_action_rx();

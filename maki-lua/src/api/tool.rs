@@ -37,7 +37,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::pair::{Pair, try_pair};
-use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions};
+use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions, PluginReach};
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, PromptTarget, Request,
     command_depth,
@@ -748,10 +748,10 @@ fn register_prompt(
 fn register_tool(
     lua: &Lua,
     #[ctx] pending: PendingTools,
-    #[ctx] permissions: PluginPermissions,
+    #[ctx] reach: PluginReach,
     spec: Table,
 ) -> LuaResult<()> {
-    register_tool_from_lua(lua, &spec, pending, &permissions)
+    register_tool_from_lua(lua, &spec, pending, reach.permissions())
 }
 
 /// Declare an agent permission rule for a native tool. Use it to pre-allow
@@ -955,10 +955,10 @@ fn allow_is_delegated(
 fn register_command(
     lua: &Lua,
     #[ctx] plugin: Arc<str>,
-    #[ctx] permissions: PluginPermissions,
+    #[ctx] reach: PluginReach,
     spec: Table,
 ) -> LuaResult<()> {
-    register_command_from_lua(lua, &spec, plugin, permissions)
+    register_command_from_lua(lua, &spec, plugin, reach)
 }
 
 /// Runs a slash command by name, exactly as typing it in the input would.
@@ -978,8 +978,8 @@ fn register_command(
 /// finishes, so aliasing something long-running like `/compact` does not
 /// block your handler.
 ///
-/// A plugin can only run what its own permissions cover, and a few commands
-/// only run when you type them. [Commands](/docs/commands/#aliasing-commands)
+/// A command outside the calling plugin's grants returns an error, and a few
+/// only run when you type them. [Commands](/docs/commands/#plugin-access)
 /// lists what each one needs.
 ///
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
@@ -1000,7 +1000,7 @@ fn register_command(
 async fn run_command(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
-    #[ctx] caller: PluginPermissions,
+    #[ctx] caller: PluginReach,
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
     let depth = command_depth(&lua).saturating_add(1);
@@ -1196,8 +1196,8 @@ lua_table! {
     /// maki.api.register_tool({ name = "greet", ... })
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, permissions: PluginPermissions, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending, permissions), register_permission_rule(pending_rules), register_command(plugin, permissions),
+    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, reach: PluginReach, plugin: Arc<str>, opts: PluginOpts), DOCS [
+        register_tool(pending, reach), register_permission_rule(pending_rules), register_command(plugin, reach),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
         get_tools, get_tool,
         manual run_command,
@@ -1208,14 +1208,14 @@ pub(crate) fn create_api_table(
     lua: &Lua,
     pending: PendingTools,
     pending_rules: PendingRules,
-    permissions: PluginPermissions,
+    reach: PluginReach,
     plugin: Arc<str>,
     opts: PluginOpts,
     ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    run_command__register(&t, lua, ui_action_tx, permissions.clone())?;
-    add_tool_fns(&t, lua, pending, pending_rules, permissions, plugin, opts)?;
+    run_command__register(&t, lua, ui_action_tx, reach.clone())?;
+    add_tool_fns(&t, lua, pending, pending_rules, reach, plugin, opts)?;
     Ok(t)
 }
 
@@ -1648,7 +1648,7 @@ fn register_command_from_lua(
     lua: &Lua,
     spec: &Table,
     plugin: Arc<str>,
-    permissions: PluginPermissions,
+    reach: PluginReach,
 ) -> LuaResult<()> {
     let mut name: String = spec
         .get("name")
@@ -1680,7 +1680,7 @@ fn register_command_from_lua(
             CommandEntry {
                 handler: handler_key,
                 description,
-                permissions,
+                reach,
                 max_args,
             },
         );

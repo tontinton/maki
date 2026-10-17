@@ -36,7 +36,9 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 use crate::api::options::PluginOpts;
 use crate::api::tool::{PendingRules, PendingTools};
 use crate::api::util::command::UiAction;
-use crate::plugin_permissions::{NetEgress, Permission, PluginPermissions, warn_invalid_net_hosts};
+use crate::plugin_permissions::{
+    Permission, PluginPermissions, PluginReach, warn_invalid_net_hosts,
+};
 use maki_providers::plugin::DeclAuthority;
 
 /// Who a `maki` global belongs to: the name everything it registers is filed
@@ -62,12 +64,13 @@ pub(crate) fn create_maki_global(
         authority,
     } = owner;
     let maki = lua.create_table()?;
+    let reach = PluginReach::new(permissions.clone());
 
     let api = tool::create_api_table(
         lua,
         pending,
         pending_rules,
-        permissions.clone(),
+        reach.clone(),
         Arc::clone(&plugin),
         opts,
         ui_action_tx.clone(),
@@ -87,12 +90,11 @@ pub(crate) fn create_maki_global(
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
-    let net_hosts = permissions.net_hosts();
-    warn_invalid_net_hosts(&plugin, &net_hosts);
+    warn_invalid_net_hosts(&plugin, reach.egress().declared());
     // One egress value shared by the two namespaces that can open a socket, so
     // a provider registered through `maki.provider` is reachable from
     // `maki.net` without the manifest naming an origin only maki resolves.
-    let egress = NetEgress::new(net_hosts);
+    let egress = reach.egress().clone();
     maki.set(
         "net",
         net::create_net_table(lua, permissions, egress.clone(), Arc::clone(&plugin))?,

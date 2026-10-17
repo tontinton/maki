@@ -770,8 +770,8 @@ This returns as soon as the command has been dispatched, not when it
 finishes, so aliasing something long-running like `/compact` does not
 block your handler.
 
-A plugin can only run what its own permissions cover, and a few commands
-only run when you type them. [Commands](/docs/commands/#aliasing-commands)
+A command outside the calling plugin's grants returns an error, and a few
+only run when you type them. [Commands](/docs/commands/#plugin-access)
 lists what each one needs.
 
 **Parameters:**

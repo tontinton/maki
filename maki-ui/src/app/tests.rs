@@ -28,8 +28,8 @@ use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, Tool
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
     BuiltinAction, Dimension, FloatConfig, HintReader, KeymapReader, LuaCommandInfo,
-    LuaCommandReader, PackCommand, PackPlan, PackPreparation, PackReport, Permission,
-    SessionEndReason, Split, WinCommand, WinEvent, denied_message,
+    LuaCommandReader, Missing, PackCommand, PackPlan, PackPreparation, PackReport, Permission,
+    PluginPermissions, SessionEndReason, Split, WinCommand, WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
@@ -4102,7 +4102,7 @@ fn typed_lua_command_with_args_executes() {
             name: "/rename".into(),
             description: "Rename the current session".into(),
             plugin: "sessions".into(),
-            permissions: PluginPermissions::trusted(),
+            reach: trusted(),
             max_args: usize::MAX,
         }]),
     );
@@ -4127,7 +4127,7 @@ fn run_cmdline_executes_builtin(cmdline: &str) {
     let mut app = test_app();
 
     let actions = app
-        .run_cmdline(cmdline, 0, &PluginPermissions::denied())
+        .run_cmdline(cmdline, 0, &PluginReach::new(PluginPermissions::denied()))
         .unwrap();
 
     assert!(matches!(&actions[..], [Action::RestartAgent(h)] if h.is_empty()));
@@ -4138,7 +4138,7 @@ fn run_cmdline_splits_args_off_the_name() {
     let mut app = test_app();
 
     let actions = app
-        .run_cmdline("/btw what is rust?", 0, &PluginPermissions::trusted())
+        .run_cmdline("/btw what is rust?", 0, &trusted())
         .unwrap();
 
     assert!(matches!(&actions[..], [Action::Btw(q)] if q == "what is rust?"));
@@ -4151,8 +4151,7 @@ fn run_cmdline_keeps_typed_input() {
     let mut app = test_app();
     app.input_box.set_input("half written".into());
 
-    app.run_cmdline("/usage", 0, &PluginPermissions::trusted())
-        .unwrap();
+    app.run_cmdline("/usage", 0, &trusted()).unwrap();
 
     assert_eq!(app.input_box.buffer.value(), "half written");
 }
@@ -4163,7 +4162,7 @@ fn run_cmdline_unknown_name_errors_without_dispatching() {
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    let Err(err) = app.run_cmdline("/nope", 0, &PluginPermissions::trusted()) else {
+    let Err(err) = app.run_cmdline("/nope", 0, &trusted()) else {
         panic!("{RUN_CMDLINE_REJECTED}");
     };
 
@@ -4175,30 +4174,32 @@ fn run_cmdline_unknown_name_errors_without_dispatching() {
 fn run_cmdline_rejects_past_max_depth() {
     let mut app = test_app();
 
-    let Err(err) = app.run_cmdline(
-        "/new",
-        crate::app::MAX_COMMAND_DEPTH + 1,
-        &PluginPermissions::trusted(),
-    ) else {
+    let Err(err) = app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH + 1, &trusted()) else {
         panic!("{RUN_CMDLINE_REJECTED}");
     };
 
     assert_eq!(err, crate::app::COMMAND_DEPTH_MSG);
     assert!(
-        app.run_cmdline(
-            "/new",
-            crate::app::MAX_COMMAND_DEPTH,
-            &PluginPermissions::trusted()
-        )
-        .is_ok(),
+        app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH, &trusted())
+            .is_ok(),
         "the cap itself must still run"
     );
 }
 
-fn without(permission: Permission) -> PluginPermissions {
+fn trusted() -> PluginReach {
+    PluginReach::new(PluginPermissions::trusted())
+}
+
+fn without(permission: Permission) -> PluginReach {
     let mut permissions = PluginPermissions::trusted();
     permissions.set(permission, false);
-    permissions
+    PluginReach::new(permissions)
+}
+
+fn only(permission: Permission) -> PluginReach {
+    PluginReach::new(PluginPermissions::from_approved(
+        [permission.manifest_key()],
+    ))
 }
 
 /// A model turn needs `agent`, and another plugin's command needs whatever
@@ -4223,17 +4224,16 @@ fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: Permission)
             name: RUNNING_PLUGIN_COMMAND.into(),
             description: String::new().into(),
             plugin: RUNNING_PLUGIN.into(),
-            permissions: PluginPermissions::from_approved([Permission::Run.manifest_key()]),
+            reach: only(Permission::Run),
             max_args: 0,
         }]),
     );
 
     assert_eq!(
         app.run_cmdline(cmdline, 1, &without(needed)).err(),
-        Some(denied_message(needed))
+        Some(Missing::Permission(needed).to_string())
     );
-    let only_needed = PluginPermissions::from_approved([needed.manifest_key()]);
-    assert_eq!(app.run_cmdline(cmdline, 1, &only_needed).err(), None);
+    assert_eq!(app.run_cmdline(cmdline, 1, &only(needed)).err(), None);
 }
 
 #[test_case("/yolo" ; "yolo")]
@@ -4244,8 +4244,7 @@ fn run_cmdline_leaves_user_only_commands_to_the_user(cmdline: &str) {
     let mut app = test_app();
 
     assert_eq!(
-        app.run_cmdline(cmdline, 1, &PluginPermissions::trusted())
-            .err(),
+        app.run_cmdline(cmdline, 1, &trusted()).err(),
         Some(format!("{cmdline}{USER_ONLY_SUFFIX}"))
     );
     assert!(!app.permissions.is_yolo());
@@ -4265,15 +4264,14 @@ fn run_cmdline_forwards_depth_to_lua_command() {
             name: "/Sessions".into(),
             description: "Browse sessions".into(),
             plugin: "sessions".into(),
-            permissions: PluginPermissions::trusted(),
+            reach: trusted(),
             max_args: 0,
         }]),
     );
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    app.run_cmdline("/sessions", 3, &PluginPermissions::trusted())
-        .unwrap();
+    app.run_cmdline("/sessions", 3, &trusted()).unwrap();
 
     assert_eq!(
         probe.try_recv_command(),

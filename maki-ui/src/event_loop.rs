@@ -1033,6 +1033,7 @@ impl<'t> EventLoop<'t> {
                         self.dispatch(self.focused, actions);
                     }
                     Err(e) => {
+                        warn!(cmdline, depth, error = %e, "run_command refused");
                         let _ = reply_tx.send(Err(e));
                     }
                 }
