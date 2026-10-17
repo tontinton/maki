@@ -761,7 +761,13 @@ pub fn prompt(
                 .as_deref()
                 .unwrap_or("anthropic/claude-sonnet-4-20250514");
             let model = Model::from_spec(model_spec).context("invalid default model")?;
-            let prompt = build_system_prompt(&vars, &instructions, &slots, &model);
+            let prompt = build_system_prompt(
+                &vars,
+                &instructions,
+                &slots,
+                &model,
+                config.agent.model_in_prompt,
+            );
             // Plan mode reaches the model as a context update after the
             // prompt, so this shows that message too.
             if plan {

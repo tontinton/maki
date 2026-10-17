@@ -3383,6 +3383,21 @@ fn setup_happy_path() {
 }
 
 #[test]
+fn setup_reads_model_in_prompt() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            "maki.setup({ agent = { model_in_prompt = false } })".to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("expected Some(RawConfig)");
+    assert_eq!(raw.agent.model_in_prompt, Some(false));
+}
+
+#[test]
 fn setup_reads_a_negative_thinking_lines() {
     let host = PluginHost::new(fresh_registry()).unwrap();
     let raw = host

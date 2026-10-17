@@ -1458,7 +1458,7 @@ mod tests {
                     make_agent_with(Arc::clone(&provider), default_model(), &mut history);
                 agent.prompt_slots = Arc::clone(&prompts);
                 agent.context = Arc::new(move |model, _| {
-                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default(), true)
                 });
                 agent.run(default_input()).await.unwrap();
                 drop(agent);
@@ -1507,7 +1507,7 @@ mod tests {
             let prompts = Arc::new(prompts);
             let model = default_model();
             let context =
-                RunContext::render(&Vars::new(), "", &prompts, &model, RequestTools::default());
+                RunContext::render(&Vars::new(), "", &prompts, &model, RequestTools::default(), true);
             let mut history = History::new(Vec::new());
             fit_frame(&mut history, context, None, &model);
             let mut stored = history.frame().unwrap().as_ref().clone();
@@ -1518,7 +1518,7 @@ mod tests {
                 &mut history,
             );
             agent.context = Arc::new(move |model, _| {
-                RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+                RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default(), true)
             });
             agent.run(default_input()).await.unwrap();
             drop(agent);
@@ -1564,7 +1564,7 @@ mod tests {
                     make_agent_with(Arc::clone(&provider), default_model(), &mut history);
                 agent.prompt_slots = Arc::clone(&prompts);
                 agent.context = Arc::new(move |model, _| {
-                    RunContext::render(&vars, instructions, &slots, model, RequestTools::default())
+                    RunContext::render(&vars, instructions, &slots, model, RequestTools::default(), true)
                 });
                 agent.run(default_input()).await.unwrap();
                 drop(agent);
@@ -1611,7 +1611,7 @@ mod tests {
                     make_agent_with(Arc::clone(&provider), default_model(), &mut history);
                 agent.prompt_slots = Arc::clone(&prompts);
                 agent.context = Arc::new(move |model, _| {
-                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default(), true)
                 });
                 agent.run(default_input()).await.unwrap();
             }
@@ -1653,7 +1653,7 @@ mod tests {
                     make_agent_with(Arc::clone(&provider), default_model(), &mut history);
                 agent.prompt_slots = Arc::clone(&prompts);
                 agent.context = Arc::new(move |model, _| {
-                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default(), true)
                 });
                 agent
                     .run(AgentInput {
@@ -2150,6 +2150,64 @@ mod tests {
                 .iter()
                 .any(|update| update.contains(&switched.spec()));
             assert_eq!(told, adopted, "{msg}");
+        });
+    }
+
+    #[test]
+    fn model_switched_without_model_in_prompt_emits_no_context_update() {
+        smol::block_on(async {
+            let mock = MockProvider::new(vec![
+                tool_call_response("glob", "t1"),
+                text_response(StopReason::EndTurn),
+            ]);
+            let requests = Arc::clone(&mock.requests);
+            let provider: Arc<dyn Provider> = Arc::new(mock);
+            let start = Model {
+                thinking_override: Some(ThinkingSupport::No),
+                ..default_model()
+            };
+            let switched = Model {
+                id: "claude-opus-4-1-20250805".into(),
+                provider: Arc::clone(&start.provider),
+                thinking_override: Some(ThinkingSupport::No),
+                ..start.clone()
+            };
+            let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+                model: start.clone(),
+                provider: Arc::clone(&provider),
+            }));
+            let picker = Arc::new(ModelPicker {
+                slot: Arc::clone(&slot),
+                provider: Arc::clone(&provider),
+                model: switched.clone(),
+            });
+            let build = move |model: &Model, _: bool| RunContext {
+                system: "system".into(),
+                tools: RequestTools::assembled(
+                    serde_json::json!([{ "name": "glob" }]),
+                    &AgentConfig::default(),
+                    model,
+                ),
+                facts: Some(PromptFacts::default()),
+                authored: String::new(),
+            };
+
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) =
+                make_agent_with(Arc::clone(&provider), start.clone(), &mut history);
+            let mut agent = agent.with_model_sync(slot).with_interrupt_source(picker);
+            agent.context = Arc::new(build);
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests[0].model, start.id);
+            assert_eq!(requests[1].model, switched.id);
+            assert_append_only(&requests[0], &requests[1]);
+            assert!(
+                updates(&history).is_empty(),
+                "no context updates emitted when model is untracked"
+            );
         });
     }
 

@@ -58,15 +58,20 @@ impl RunContext {
         slots: &ResolvedPrompts,
         model: &Model,
         tools: RequestTools,
+        model_in_prompt: bool,
     ) -> Self {
-        let system = build_system_prompt(vars, instructions, slots, model);
+        let system = build_system_prompt(vars, instructions, slots, model, model_in_prompt);
         Self {
             system,
             tools,
             facts: Some(PromptFacts {
                 date: vars.apply("{date}").into_owned(),
                 cwd: vars.apply("{cwd}").into_owned(),
-                model: model.spec(),
+                model: if model_in_prompt {
+                    model.spec()
+                } else {
+                    String::new()
+                },
                 instructions: if slots.renders_instructions(PromptId::System) {
                     instructions.to_owned()
                 } else {
@@ -263,7 +268,9 @@ pub(crate) fn context_update(
     if let Some(date) = &update.date {
         parts.push(format!("Date is now {date}."));
     }
-    if let Some(model) = &update.model {
+    if let Some(model) = &update.model
+        && !model.is_empty()
+    {
         parts.push(format!("You are now running as {model}."));
     }
     if let Some(cwd) = &update.cwd {
@@ -326,6 +333,17 @@ mod tests {
     #[test]
     fn unchanged_facts_tell_nothing() {
         assert!(context_update(&facts(), &facts(), &ResolvedPrompts::default()).is_none());
+    }
+
+    #[test]
+    fn empty_model_tells_nothing() {
+        let mut now = facts();
+        prompt(&mut now).model.clear();
+        assert!(context_update(&facts(), &now, &ResolvedPrompts::default()).is_none());
+
+        let mut told = facts();
+        prompt(&mut told).model.clear();
+        assert!(context_update(&told, &now, &ResolvedPrompts::default()).is_none());
     }
 
     #[test_case(|f: &mut LiveFacts| prompt(f).date = NEXT_DATE.into(), NEXT_DATE ; "date")]

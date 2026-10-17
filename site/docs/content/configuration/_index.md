@@ -131,6 +131,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
 | `rtk` | bool | `true` | - | Rewrite the model's bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
 | `shell` | string | `auto` | - | Shell for string commands on Windows (`jobstart`, UI `!`): `auto` (Git Bash if installed, else `cmd.exe`), `cmd`, or a path to an executable |
+| `model_in_prompt` | bool | `true` | - | Include the model identifier in the system prompt environment and context updates |
 
 ### `provider`
 
