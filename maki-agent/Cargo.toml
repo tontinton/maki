@@ -30,6 +30,8 @@ futures-lite = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 isahc = { workspace = true }
+futures-rustls = { workspace = true }
+rcgen = { workspace = true }
 open = { workspace = true }
 sha2 = { workspace = true }
 serde_yaml = { workspace = true }

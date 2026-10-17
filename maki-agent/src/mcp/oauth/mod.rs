@@ -107,26 +107,10 @@ pub async fn authenticate(
     } = static_client.unwrap_or_default();
     let (path, hostname) = (callback_path.as_deref(), callback_hostname.as_deref());
 
-    // Https has no listener, so the user must paste the redirect URL. Only the
-    // CLI can read stdin, and refusing here (before registration) keeps the TUI
-    // from leaking a fresh dynamic client on every retry.
-    let (callback, redirect_uri) = match (callback_scheme, interaction) {
-        (CallbackScheme::Https, Interaction::Background) => {
-            return Err(wrap(OAuthError::Other(format!(
-                "https callback needs the redirect URL pasted by hand; run 'maki mcp auth {server_name}'"
-            ))));
-        }
-        (CallbackScheme::Https, Interaction::Cli) => {
-            (None, callback::https_redirect_uri(port, path, hostname))
-        }
-        (CallbackScheme::Http, _) => {
-            let server = CallbackServer::bind(port, path, hostname)
-                .await
-                .map_err(|e| wrap(OAuthError::Other(e)))?;
-            let uri = server.redirect_uri();
-            (Some(server), uri)
-        }
-    };
+    let callback = CallbackServer::bind(port, path, hostname, callback_scheme)
+        .await
+        .map_err(|e| wrap(OAuthError::Other(e)))?;
+    let redirect_uri = callback.redirect_uri();
 
     let reg = if let Some(client_id) = client_id {
         registration::ClientRegistration {
@@ -177,13 +161,7 @@ pub async fn authenticate(
     .map_err(wrap)?;
 
     info!(server = server_name, endpoint = %auth_server.authorization_endpoint, "starting OAuth authorization");
-    debug_assert!(callback.is_some() || matches!(interaction, Interaction::Cli));
-    let wait_callback = async {
-        match callback {
-            Some(server) => server.wait_for_callback(&state).await,
-            None => future::pending().await,
-        }
-    };
+    let wait_callback = callback.wait_for_callback(&state);
     let result = match interaction {
         Interaction::Cli => {
             eprintln!("\nOpen this URL in your browser:\n\n  {auth_url}\n");
@@ -197,19 +175,12 @@ pub async fn authenticate(
                 warn!(server = server_name, error = %e, "failed to open browser");
             }
 
-            match callback_scheme {
-                CallbackScheme::Http => {
-                    eprintln!("Waiting for callback on {redirect_uri}...");
-                    eprintln!("If this machine has no browser, log in on another device and paste");
-                    eprintln!("the full redirect URL ({redirect_uri}?...) here:");
-                }
-                CallbackScheme::Https => {
-                    eprintln!(
-                        "After you approve, the browser shows a connection error. That is expected."
-                    );
-                    eprintln!("Copy the full URL from the address bar and paste it here:");
-                }
+            eprintln!("Waiting for callback on {redirect_uri}...");
+            if callback_scheme == CallbackScheme::Https {
+                eprintln!("Your browser will warn about Maki's self-signed certificate for this login; proceed past it.");
             }
+            eprintln!("If this machine has no browser, log in on another device and paste");
+            eprintln!("the full redirect URL ({redirect_uri}?...) here:");
 
             let callback_or_paste = future::race(wait_callback, manual::wait_for_paste(&state));
             future::race(callback_or_paste, auth_timeout()).await

@@ -200,7 +200,7 @@ Servers without dynamic client registration need a client you registered yoursel
 
 Set `callback_port` when the server only accepts exact redirect URIs. Otherwise Maki falls back to its default port, then to any free port, so the redirect URI changes between runs. Set `callback_path` when the server registered a different path (e.g. `/callback`). Set `callback_hostname` to `localhost` when the server registered the name form instead of the IP (the listener still binds to 127.0.0.1).
 
-Set `callback_scheme = "https"` (needs `callback_port`) when the server only accepts https redirect URIs, such as `https://localhost:3119/callback`. Maki runs no https listener, so the login must run in `maki mcp auth <server-name>` (the TUI can't finish it). When the browser shows a connection error, paste the full URL from its address bar into the terminal.
+Set `callback_scheme = "https"` (needs `callback_port`) when the server only accepts https redirect URIs, such as `https://localhost:3119/callback`. Maki serves the callback with a self-signed certificate it makes for each login, so the browser warns once before the redirect lands. Proceed past the warning and the login finishes, in the TUI or in `maki mcp auth <server-name>`.
 
 ### Headless machines
 
