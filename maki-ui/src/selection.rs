@@ -32,7 +32,7 @@ use std::ops::Range;
 use std::time::Instant;
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 
@@ -146,7 +146,7 @@ impl ZoneRegistry {
     }
 
     pub fn zone_at(&self, row: u16, col: u16) -> Option<SelectableZone> {
-        let pos = ratatui::layout::Position::new(col, row);
+        let pos = Position::new(col, row);
         self.entries[..self.len as usize]
             .iter()
             .rev()
@@ -407,6 +407,9 @@ pub struct ContentRegion<'a> {
     pub area: Rect,
     pub raw_text: &'a str,
     pub line_breaks: LineBreaks,
+    /// Screen cells chrome painted over this frame (scrollbar rails). Cells
+    /// inside are skipped no matter what the selection covers.
+    pub exclude: Vec<Rect>,
 }
 
 pub fn inset_border(area: Rect) -> Rect {
@@ -508,6 +511,7 @@ pub(crate) struct RowCarry {
 
 /// Trailing whitespace is trimmed per line. Consecutive blank lines are
 /// collapsed so we don't emit a wall of empty newlines.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn append_rows(
     buf: &Buffer,
     area: Rect,
@@ -515,6 +519,7 @@ pub(crate) fn append_rows(
     rows: Range<u16>,
     out: &mut String,
     breaks: &LineBreaks,
+    excludes: &[Rect],
     carry: &mut RowCarry,
 ) {
     let top = area.y;
@@ -542,6 +547,9 @@ pub(crate) fn append_rows(
         for col in col_start..=col_end {
             if skip_next > 0 {
                 skip_next -= 1;
+                continue;
+            }
+            if excludes.iter().any(|r| r.contains(Position::new(col, row))) {
                 continue;
             }
             let sym = buf[(col, row)].symbol();
@@ -615,6 +623,7 @@ pub fn extract_selected_text(
                 row..chunk_end,
                 &mut out,
                 &region.line_breaks,
+                &region.exclude,
                 &mut RowCarry::default(),
             );
         }
@@ -1167,6 +1176,7 @@ mod tests {
             from..to,
             &mut out,
             &LineBreaks::EveryRow,
+            &[],
             &mut RowCarry::default(),
         );
         assert!(out.is_empty());
@@ -1231,6 +1241,7 @@ mod tests {
             0..1,
             &mut out,
             &LineBreaks::EveryRow,
+            &[],
             &mut RowCarry::default(),
         );
         assert_eq!(out, "好");
