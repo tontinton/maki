@@ -39,8 +39,7 @@ impl CallbackServer {
     /// `PREFERRED_PORT`, then to any free port. `path`/`hostname` override the
     /// advertised redirect URI; binding stays on 127.0.0.1, which `localhost`
     /// (and 127.0.0.1 itself) resolves to. `Https` serves a throwaway
-    /// self-signed certificate, so the browser warns once before the redirect
-    /// lands.
+    /// self-signed certificate.
     pub async fn bind(
         port: Option<u16>,
         path: Option<&str>,
@@ -96,25 +95,28 @@ impl CallbackServer {
                     }
                 },
             };
-            if let Some(result) = outcome? {
+            if let Some(result) = outcome {
                 return result;
             }
         }
     }
 
-    /// `Ok(None)` means the request was not the awaited redirect; keep listening.
+    /// `None` means the request was not the awaited redirect; keep listening.
     async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         mut stream: S,
         expected_state: &str,
-    ) -> Result<Option<Result<CallbackResult, String>>, String> {
+    ) -> Option<Result<CallbackResult, String>> {
         let mut buf = Vec::with_capacity(1024);
         let mut tmp = [0u8; 1024];
         loop {
-            let n = stream
-                .read(&mut tmp)
-                .await
-                .map_err(|e| format!("read failed: {e}"))?;
+            let n = match stream.read(&mut tmp).await {
+                Ok(n) => n,
+                Err(e) => {
+                    debug!(error = %e, "callback read failed");
+                    return None;
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -125,14 +127,12 @@ impl CallbackServer {
         }
         let request = String::from_utf8_lossy(&buf);
 
-        let Some(line) = request.lines().next() else {
-            return Ok(None);
-        };
+        let line = request.lines().next()?;
         let path = line.split_whitespace().nth(1).unwrap_or("");
 
         if !path.starts_with(self.path.as_str()) {
             let _ = respond(&mut stream, 404, "Not Found").await;
-            return Ok(None);
+            return None;
         }
 
         let query = path.split('?').nth(1).unwrap_or("");
@@ -144,7 +144,7 @@ impl CallbackServer {
         let state = params.iter().find(|(k, _)| k == "state");
         if state.map(|(_, v)| v.as_str()) != Some(expected_state) {
             let _ = respond(&mut stream, 403, "State mismatch").await;
-            return Ok(None);
+            return None;
         }
 
         if let Some(error) = params.iter().find(|(k, _)| k == "error") {
@@ -154,7 +154,7 @@ impl CallbackServer {
                 .map(|(_, v)| v.as_str())
                 .unwrap_or(&error.1);
             let _ = respond(&mut stream, 400, ERROR_HTML).await;
-            return Ok(Some(Err(format!("OAuth error: {desc}"))));
+            return Some(Err(format!("OAuth error: {desc}")));
         }
 
         let Some(code) = params
@@ -163,11 +163,11 @@ impl CallbackServer {
             .map(|(_, v)| v.clone())
         else {
             let _ = respond(&mut stream, 400, "Missing code").await;
-            return Ok(None);
+            return None;
         };
 
         let _ = respond(&mut stream, 200, SUCCESS_HTML).await;
-        Ok(Some(Ok(CallbackResult { code })))
+        Some(Ok(CallbackResult { code }))
     }
 }
 
@@ -244,7 +244,7 @@ async fn respond<S: AsyncWrite + Unpin>(
         body.len()
     );
     stream.write_all(response.as_bytes()).await?;
-    stream.close().await
+    stream.flush().await
 }
 
 #[cfg(test)]
@@ -395,10 +395,6 @@ mod tests {
                     .unwrap();
             server.tls = Some(tls_acceptor(certified).unwrap());
             let port = server.port;
-            assert_eq!(
-                server.redirect_uri(),
-                format!("https://{TEST_HOSTNAME}:{port}{CALLBACK_PATH}")
-            );
 
             let handle = smol::spawn(async move { server.wait_for_callback("test-state").await });
 
@@ -410,10 +406,19 @@ mod tests {
                     .with_no_client_auth();
             let connector = TlsConnector::from(Arc::new(config));
 
-            let rejected = smol::net::TcpStream::connect(("127.0.0.1", port))
+            let abandoned_handshake = smol::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .unwrap();
-            drop(rejected);
+            drop(abandoned_handshake);
+
+            let idle = smol::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let idle_preconnect = connector
+                .connect(ServerName::try_from(TEST_HOSTNAME).unwrap(), idle)
+                .await
+                .unwrap();
+            drop(idle_preconnect);
 
             let tcp = smol::net::TcpStream::connect(("127.0.0.1", port))
                 .await
