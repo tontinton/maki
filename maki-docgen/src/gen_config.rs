@@ -235,6 +235,61 @@ fn write_trust_section(out: &mut String) {
     .unwrap();
 }
 
+/// `files` is a list of file names and `projects` a list of tables, which
+/// the `ConfigValue` table cannot describe, so these sections are prose like
+/// `trust`.
+fn write_instructions_section(out: &mut String) {
+    writeln!(out, "### `instructions`\n").unwrap();
+    writeln!(
+        out,
+        "Which instruction files Maki loads from each project directory. Read \
+         from the global `~/.config/maki/init.lua` only, since a project file \
+         that could pick its own instructions would be trusting itself.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "`files` replaces the built-in list (`AGENTS.md`, `CLAUDE.md`, \
+         `.github/copilot-instructions.md`, and friends) with your own, in \
+         priority order. An empty list loads no project instruction files at \
+         all, and `AGENTS.local.md` still loads:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "```lua\nmaki.setup({{\n    instructions = {{ files = {{ \"CLAUDE.md\" }} }},\n}})\n```\n"
+    )
+    .unwrap();
+}
+
+fn write_projects_section(out: &mut String) {
+    writeln!(out, "### `projects`\n").unwrap();
+    writeln!(
+        out,
+        "Per-checkout overrides of the above, for when one repository wants a \
+         different answer. Read from the global `init.lua` only, like \
+         `instructions`.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Each entry matches a checkout by `path` (a glob against the project \
+         root, `~` included, like `trust.paths`) or by `remote` (a glob \
+         against every git remote URL of the project, normalized to \
+         `host/path`: `https://host/a/b.git` and `git@host:a/b.git` both \
+         become `host/a/b`). When both are set, both must match; an entry \
+         with neither matches every project. The first matching entry wins, \
+         and one that sets no `instructions` still ends the search, keeping \
+         the global `files`:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "```lua\nmaki.setup({{\n    projects = {{\n        {{ remote = \"github.com/example/*\", instructions = {{ files = {{}} }} }},\n        {{ path = \"~/src/secret\", instructions = {{ files = {{ \"CLAUDE.md\" }} }} }},\n    }},\n}})\n```\n"
+    )
+    .unwrap();
+}
+
 fn write_telemetry_section(out: &mut String) {
     write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
     writeln!(
@@ -349,6 +404,8 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
     write_net_section(&mut out);
     write_trust_section(&mut out);
+    write_instructions_section(&mut out);
+    write_projects_section(&mut out);
     write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
@@ -433,6 +490,7 @@ On top of the project instruction files Maki loads from the git root down to the
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
+- `instructions.files` in the global `init.lua` to replace the project file list, scoped per checkout with `projects` (see [`instructions`](#instructions))
 
 All of these are added to the system prompt at the start of every session.
 

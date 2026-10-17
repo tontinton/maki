@@ -32,6 +32,26 @@ pub(crate) fn project_ancestor_dirs(cwd: &Path) -> impl Iterator<Item = PathBuf>
     })
 }
 
+/// Every `remote.*.url` configured for the checkout at `root`, or empty when
+/// git cannot answer (not a checkout, git missing). Only feeds `projects`
+/// remote matching, so a failure to read one reads as "no match".
+pub(crate) fn git_remote_urls(root: &Path) -> Vec<String> {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["config", "--null", "--get-regexp", r"^remote\..+\.url$"])
+        .current_dir(root)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\n').map(|(_, url)| url.to_owned()))
+        .collect()
+}
+
 fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
     let content = content.trim_start();
 

@@ -374,7 +374,13 @@ async fn system_prompt(
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
-    let slots = Arc::clone(&try_pair!(dispatch_ctx(&ctx, "system_prompt")).prompt_slots);
+    let (slots, instructions_config) = {
+        let agent_ctx = try_pair!(dispatch_ctx(&ctx, "system_prompt"));
+        (
+            Arc::clone(&agent_ctx.prompt_slots),
+            agent_ctx.config.instructions.clone(),
+        )
+    };
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
     // meanwhile needs `ctx:finish`, which takes it mutably.
     drop(ctx);
@@ -391,7 +397,10 @@ async fn system_prompt(
     let instructions = match instructions_val {
         LuaValue::Boolean(true) => {
             let cwd = vars.apply("{cwd}").into_owned();
-            smol::unblock(move || maki_agent::agent::load_instruction_text(&cwd)).await
+            smol::unblock(move || {
+                maki_agent::agent::load_instruction_text(&cwd, &instructions_config)
+            })
+            .await
         }
         LuaValue::Boolean(false) | LuaValue::Nil => String::new(),
         LuaValue::String(s) => s.to_str()?.to_owned(),
@@ -988,6 +997,7 @@ async fn session(
         history: History::new(Vec::new()),
         gauge: ContextGauge::default(),
         loaded_instructions: LoadedInstructions::new(),
+        instruction_files: Arc::clone(&agent_ctx.instruction_files),
         sub_event_tx,
         stream_guard: Some(stream_guard),
         child_cancel,
@@ -1220,6 +1230,7 @@ struct SessionState {
     /// this model never saw, and a per-run set would inject the same file on
     /// every turn.
     loaded_instructions: LoadedInstructions,
+    instruction_files: Arc<Vec<String>>,
     sub_event_tx: EventSender,
     /// Dropped on close, which ends the relay task. Tool contexts keep
     /// [`EventSender`] clones alive past the run, so the relay cannot key off
@@ -1510,7 +1521,7 @@ async fn prompt(
     )
     .with_reauth(s.reauth)
     .with_interrupt_source(Arc::clone(&s.inbox) as Arc<dyn maki_agent::InterruptSource>)
-    .with_loaded_instructions(s.loaded_instructions.clone())
+    .with_loaded_instructions(s.loaded_instructions.clone(), s.instruction_files.clone())
     .with_cancel(s.child_cancel.clone())
     .with_mcp(s.mcp.clone())
     .with_local_tools(Arc::clone(&s.local_tools));

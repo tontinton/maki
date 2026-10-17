@@ -34,7 +34,7 @@ use jiff::fmt::friendly::{Designator, Spacing, SpanPrinter};
 use maki_config::ProjectConfig;
 use serde_json::Value;
 
-use crate::agent::{CallInstructions, LoadedInstructions};
+use crate::agent::{CallInstructions, LoadedInstructions, default_instruction_files};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
@@ -343,6 +343,9 @@ pub struct ToolContext {
     pub reauth: bool,
     /// Session-wide: a file the model has already seen is never injected again.
     pub loaded_instructions: LoadedInstructions,
+    /// The file list resolved at session start, so a subdirectory walk never
+    /// re-resolves it.
+    pub instruction_files: Arc<Vec<String>>,
     /// Per model call, shared with its nested calls.
     pub call_instructions: CallInstructions,
     pub cancel: CancelToken,
@@ -580,6 +583,7 @@ pub fn interpreter_ctx(
         user_response_rx,
         reauth: false,
         loaded_instructions: LoadedInstructions::new(),
+        instruction_files: Arc::new(default_instruction_files()),
         call_instructions: CallInstructions::default(),
         cancel,
         mcp: None,

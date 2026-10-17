@@ -360,6 +360,7 @@ impl UserData for LuaCtx {
                 };
                 let loaded = agent.loaded_instructions.clone();
                 let call = agent.call_instructions.clone();
+                let files = Arc::clone(&agent.instruction_files);
                 // Nothing may hold the ctx borrow across the wait: a cancel
                 // hook firing meanwhile needs `ctx:finish`, which takes it
                 // mutably.
@@ -367,7 +368,7 @@ impl UserData for LuaCtx {
                 let blocks = smol::unblock(move || {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let abs = resolve_abs_with_cwd(dir_path, &cwd);
-                    maki_agent::find_subdirectory_instructions(&abs, &cwd, &loaded)
+                    maki_agent::find_subdirectory_instructions(&abs, &cwd, &loaded, &files)
                 })
                 .await;
                 call.record(blocks);

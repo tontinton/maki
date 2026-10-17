@@ -164,7 +164,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mode = AgentMode::Build;
     let vars = template::env_vars();
-    let instructions = agent::load_instructions(&vars.apply("{cwd}"));
+    let instructions = agent::load_instructions(&vars.apply("{cwd}"), &params.config.instructions);
     let prompt_slots = Arc::new(params.prompt_slots);
     let spec = ContextSpec::new(
         vars,
@@ -235,7 +235,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
             },
             turn.run_params(event_tx, context),
         )
-        .with_loaded_instructions(instructions.loaded)
+        .with_loaded_instructions(instructions.loaded, instructions.files)
         .with_mcp(mcp);
 
         let result = agent
@@ -306,7 +306,7 @@ pub struct InteractiveHandle {
 
 pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, SessionEvents) {
     let vars = template::env_vars();
-    let instructions = agent::load_instructions(&vars.apply("{cwd}"));
+    let instructions = agent::load_instructions(&vars.apply("{cwd}"), &params.config.instructions);
     let spec = ContextSpec {
         system_override: params.system_prompt_override,
         append_system: params.append_system_prompt,
@@ -425,7 +425,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                 },
                 turn.run_params(event_tx, Arc::clone(&context)),
             )
-            .with_loaded_instructions(instructions.loaded.clone())
+            .with_loaded_instructions(instructions.loaded.clone(), instructions.files.clone())
             .with_user_response_rx(Arc::clone(&answer_rx))
             .with_cancel(cancel)
             .with_local_tools(Arc::clone(&params.local_tools))

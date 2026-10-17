@@ -4,7 +4,7 @@ use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use maki_config_macro::ConfigSection;
 use maki_storage::paths;
 use maki_storage::sessions::{SessionMeta, StoredThinking, ThinkingParseError};
@@ -441,6 +441,12 @@ pub enum ConfigError {
         #[source]
         source: globset::Error,
     },
+    #[error("invalid config: projects contains invalid glob pattern `{pattern}`: {source}")]
+    InvalidProjectPattern {
+        pattern: String,
+        #[source]
+        source: globset::Error,
+    },
 }
 
 fn check(
@@ -529,6 +535,8 @@ pub struct RawConfig {
     pub storage: StorageFileConfig,
     pub net: NetFileConfig,
     pub trust: TrustFileConfig,
+    pub instructions: InstructionsFileConfig,
+    pub projects: Vec<ProjectOverrideFileConfig>,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
 }
@@ -549,6 +557,10 @@ impl RawConfig {
         self.storage.merge(overlay.storage);
         self.net.merge(overlay.net);
         self.trust.merge(overlay.trust);
+        self.instructions.merge(overlay.instructions);
+        if !overlay.projects.is_empty() {
+            self.projects = overlay.projects;
+        }
         self.telemetry.merge(overlay.telemetry);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
@@ -568,6 +580,8 @@ impl RawConfig {
             return Err(ConfigError::RenamedShowThinking);
         }
         self.validate_plugin_tables(packages)?;
+        let mut agent = AgentConfig::from_file(self.agent);
+        agent.instructions = InstructionsConfig::from_file(self.instructions, self.projects)?;
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             session_defaults: SessionDefaults {
@@ -579,7 +593,7 @@ impl RawConfig {
                     .transpose()?,
             },
             ui: UiConfig::from_file(self.ui),
-            agent: AgentConfig::from_file(self.agent),
+            agent,
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
             net: NetConfig::from_file(self.net),
@@ -903,6 +917,43 @@ impl TrustFileConfig {
     pub fn is_set(&self) -> bool {
         self.paths.is_some() || self.prompt.is_some()
     }
+}
+
+/// Which instruction files Maki loads. Only the global `init.lua` may set
+/// this: a project file that could pick its own instructions would be
+/// trusting itself, and `maki-lua` strips the table from every other scope
+/// before it reaches here.
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct InstructionsFileConfig {
+    /// Replaces the built-in file list. An empty list loads no project
+    /// instruction files at all; `AGENTS.local.md` still loads.
+    pub files: Option<Vec<String>>,
+}
+
+impl InstructionsFileConfig {
+    fn merge(&mut self, overlay: InstructionsFileConfig) {
+        merge_option!(self, overlay, files);
+    }
+
+    /// Whether the file mentioned instructions at all, so the scope that is
+    /// not allowed to set them can warn about exactly the configs that tried.
+    pub fn is_set(&self) -> bool {
+        self.files.is_some()
+    }
+}
+
+/// One entry of the global `projects` list: a per-checkout override, matched
+/// by local `path` glob, git `remote` glob, or both.
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectOverrideFileConfig {
+    /// Glob matched against the canonical project root, like `trust.paths`.
+    pub path: Option<String>,
+    /// Glob matched against every git remote URL of the project, normalized
+    /// to `host/path` (scheme, user, port and `.git` suffix removed).
+    pub remote: Option<String>,
+    pub instructions: Option<InstructionsFileConfig>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -1499,6 +1550,13 @@ pub struct AgentConfig {
     /// registers its tool, so its name stays free for another plugin to claim.
     #[config(skip, default = "Vec::new()")]
     pub disabled_tools: Vec<String>,
+
+    /// Which instruction files load, and the per-project overrides. Set from
+    /// the top-level `instructions`/`projects` tables in `into_config`, not
+    /// from the `[agent]` section, because only the global `init.lua` may set
+    /// them.
+    #[config(skip, default = "InstructionsConfig::default()")]
+    pub instructions: InstructionsConfig,
 }
 
 impl AgentConfig {
@@ -1519,6 +1577,7 @@ impl AgentConfig {
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
+            instructions: InstructionsConfig::default(),
         }
     }
 }
@@ -1827,6 +1886,167 @@ fn expand_home(pattern: &str) -> String {
         Some(home) => format!("{}{rest}", home.display()),
         None => pattern.to_owned(),
     }
+}
+
+/// Resolved `instructions` + `projects` config. Carried on [`AgentConfig`]
+/// so every instruction load sees the same answer.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct InstructionsConfig {
+    /// `None` loads the built-in file list.
+    pub files: Option<Vec<String>>,
+    pub projects: Vec<ProjectOverride>,
+}
+
+impl InstructionsConfig {
+    pub fn from_file(
+        file: InstructionsFileConfig,
+        projects: Vec<ProjectOverrideFileConfig>,
+    ) -> Result<Self, ConfigError> {
+        let mut resolved = Vec::with_capacity(projects.len());
+        for entry in projects {
+            resolved.push(ProjectOverride {
+                path_matcher: compiled_matcher(entry.path.as_deref(), compile_path_glob)?,
+                remote_matcher: compiled_matcher(entry.remote.as_deref(), compile_remote_glob)?,
+                path: entry.path,
+                remote: entry.remote,
+                files: entry
+                    .instructions
+                    .and_then(|instructions| instructions.files),
+            });
+        }
+        Ok(Self {
+            files: file.files,
+            projects: resolved,
+        })
+    }
+
+    /// Whether any `projects` entry matches on `remote`, so the caller knows
+    /// it has to read the project's git remotes before resolving.
+    pub fn needs_remotes(&self) -> bool {
+        self.projects.iter().any(|entry| entry.remote.is_some())
+    }
+
+    /// The file list that applies to the project at `project_root`, whose git
+    /// remotes are `remotes`. The first matching `projects` entry wins;
+    /// `default` applies when nothing configured does.
+    pub fn resolve_files(
+        &self,
+        project_root: &Path,
+        remotes: &[String],
+        default: &[&str],
+    ) -> Vec<String> {
+        let mut files = self.files.clone();
+        for entry in &self.projects {
+            if entry.matches(project_root, remotes) {
+                if let Some(entry_files) = &entry.files {
+                    files = Some(entry_files.clone());
+                }
+                break;
+            }
+        }
+        files.unwrap_or_else(|| default.iter().map(|file| file.to_string()).collect())
+    }
+}
+
+/// One `projects` entry, with its matchers precompiled at load.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectOverride {
+    pub path: Option<String>,
+    pub remote: Option<String>,
+    pub files: Option<Vec<String>>,
+    #[serde(skip)]
+    path_matcher: Option<GlobMatcher>,
+    #[serde(skip)]
+    remote_matcher: Option<GlobMatcher>,
+}
+
+fn compiled_matcher(
+    pattern: Option<&str>,
+    compile: fn(&str) -> Result<GlobMatcher, globset::Error>,
+) -> Result<Option<GlobMatcher>, ConfigError> {
+    let Some(pattern) = pattern else {
+        return Ok(None);
+    };
+    compile(pattern)
+        .map(Some)
+        .map_err(|source| ConfigError::InvalidProjectPattern {
+            pattern: pattern.to_owned(),
+            source,
+        })
+}
+
+/// `path` patterns name local directories, so `~` expands like
+/// `trust.paths`; `remote` patterns match the normalized URL instead.
+fn compile_path_glob(pattern: &str) -> Result<GlobMatcher, globset::Error> {
+    GlobBuilder::new(&expand_home(pattern))
+        .literal_separator(true)
+        .build()
+        .map(|glob| glob.compile_matcher())
+}
+
+fn compile_remote_glob(pattern: &str) -> Result<GlobMatcher, globset::Error> {
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .map(|glob| glob.compile_matcher())
+}
+
+impl ProjectOverride {
+    /// Both matchers must match when both are set; an entry with neither
+    /// matches every project.
+    fn matches(&self, project_root: &Path, remotes: &[String]) -> bool {
+        if let Some(matcher) = &self.path_matcher
+            && !matcher.is_match(project_root)
+        {
+            return false;
+        }
+        if let Some(matcher) = &self.remote_matcher
+            && !remotes
+                .iter()
+                .any(|url| matcher.is_match(normalize_remote_url(url)))
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// A remote URL reduced to `host/path`, so a `remote` glob names the project
+/// and not the transport: `https://host/a/b.git`, `ssh://git@host/a/b.git`
+/// and `git@host:a/b.git` all become `host/a/b`.
+fn normalize_remote_url(url: &str) -> String {
+    let mut s = url.trim();
+    if let Some((_, rest)) = s.split_once("://") {
+        s = rest;
+    }
+    // `user@` goes next: `ssh://git@host/...` and scp-like `git@host:...`
+    if let Some((user, rest)) = s.split_once('@')
+        && !user.contains('/')
+        && !user.contains(':')
+    {
+        s = rest;
+    }
+    let mut normalized = s.trim_end_matches('/').to_owned();
+    // What is left is `host/path`, `host:port/path` or scp-like `host:path`.
+    // A drive letter (`C:\...`) is a single character, an intranet host may
+    // have no dot, so only that one stays alone.
+    if let Some((host, rest)) = normalized.split_once(':')
+        && host.len() > 1
+        && !host.contains('/')
+    {
+        match rest.split_once('/') {
+            // `host:port/path`: the port is dropped
+            Some((port, path)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                normalized = format!("{host}/{path}");
+            }
+            // scp-like `host:path`
+            _ => normalized = format!("{host}/{rest}"),
+        }
+    }
+    if let Some(stripped) = normalized.strip_suffix(".git") {
+        normalized = stripped.to_owned();
+    }
+    normalized
 }
 
 /// OpenTelemetry export settings. Every field also has an `OTEL_*` (or
@@ -3180,6 +3400,202 @@ mod tests {
 
         assert!(policy.prompt);
         assert_eq!(policy.matched_pattern(Path::new(ABSOLUTE_PATH)), None);
+    }
+
+    fn instructions_config(
+        files: Option<Vec<String>>,
+        projects: Vec<ProjectOverrideFileConfig>,
+    ) -> InstructionsConfig {
+        InstructionsConfig::from_file(InstructionsFileConfig { files }, projects)
+            .expect("valid patterns")
+    }
+
+    #[test_case("https://github.com/example/repo.git", "github.com/example/repo" ; "https_strips_scheme_and_git_suffix")]
+    #[test_case("git@github.com:example/repo.git", "github.com/example/repo" ; "scp_like_strips_user_and_git_suffix")]
+    #[test_case("ssh://git@github.com/example/repo.git", "github.com/example/repo" ; "ssh_strips_scheme_user_and_git_suffix")]
+    #[test_case("ssh://git@github.com:2222/example/repo.git", "github.com/example/repo" ; "ssh_port_is_dropped")]
+    #[test_case("git://github.com/tontinton/maki", "github.com/tontinton/maki" ; "git_scheme_without_suffix")]
+    #[test_case("https://github.com/tontinton/maki/", "github.com/tontinton/maki" ; "trailing_slash_is_dropped")]
+    #[test_case("https://github.com/tontinton/maki.git/", "github.com/tontinton/maki" ; "trailing_slash_after_git_suffix")]
+    #[test_case("git@localhost:repo.git", "localhost/repo" ; "dotless_host_normalizes_scp_like")]
+    #[test_case("ssh://git@localhost:29418/x.git", "localhost/x" ; "dotless_host_drops_port")]
+    #[test_case("/home/user/src/repo", "/home/user/src/repo" ; "local_path_is_left_alone")]
+    #[test_case("C:\\Users\\repo", "C:\\Users\\repo" ; "drive_letter_is_left_alone")]
+    fn remote_urls_normalize_to_host_and_path(url: &str, expected: &str) {
+        assert_eq!(normalize_remote_url(url), expected);
+    }
+
+    const DEFAULT_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+
+    #[test]
+    fn resolve_files_defaults_to_the_builtin_list() {
+        let config = instructions_config(None, Vec::new());
+        assert_eq!(
+            config.resolve_files(Path::new("/workspace"), &[], DEFAULT_FILES),
+            ["AGENTS.md", "CLAUDE.md"]
+        );
+    }
+
+    #[test]
+    fn resolve_files_global_list_replaces_the_default() {
+        let config = instructions_config(Some(vec!["CLAUDE.md".into()]), Vec::new());
+        assert_eq!(
+            config.resolve_files(Path::new("/workspace"), &[], DEFAULT_FILES),
+            ["CLAUDE.md"]
+        );
+    }
+
+    #[test]
+    fn resolve_files_empty_global_list_loads_nothing() {
+        let config = instructions_config(Some(Vec::new()), Vec::new());
+        assert!(
+            config
+                .resolve_files(Path::new("/workspace"), &[], DEFAULT_FILES)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolve_files_first_matching_project_entry_wins() {
+        let config = instructions_config(
+            Some(vec!["CLAUDE.md".into()]),
+            vec![
+                ProjectOverrideFileConfig {
+                    path: Some("/other/*".into()),
+                    ..Default::default()
+                },
+                ProjectOverrideFileConfig {
+                    path: Some("/workspace".into()),
+                    instructions: Some(InstructionsFileConfig {
+                        files: Some(Vec::new()),
+                    }),
+                    ..Default::default()
+                },
+                ProjectOverrideFileConfig {
+                    path: Some("/workspace".into()),
+                    instructions: Some(InstructionsFileConfig {
+                        files: Some(vec!["GEMINI.md".into()]),
+                    }),
+                    ..Default::default()
+                },
+            ],
+        );
+        assert!(
+            config
+                .resolve_files(Path::new("/workspace"), &[], DEFAULT_FILES)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolve_files_matching_entry_without_files_inherits_the_global_list() {
+        let config = instructions_config(
+            Some(vec!["CLAUDE.md".into()]),
+            vec![ProjectOverrideFileConfig {
+                path: Some("/workspace".into()),
+                ..Default::default()
+            }],
+        );
+        assert_eq!(
+            config.resolve_files(Path::new("/workspace"), &[], DEFAULT_FILES),
+            ["CLAUDE.md"]
+        );
+    }
+
+    #[test]
+    fn resolve_files_matches_a_project_by_remote() {
+        let config = instructions_config(
+            None,
+            vec![ProjectOverrideFileConfig {
+                remote: Some("github.com/example/*".into()),
+                instructions: Some(InstructionsFileConfig {
+                    files: Some(Vec::new()),
+                }),
+                ..Default::default()
+            }],
+        );
+        let remotes = ["git@github.com:example/repo.git".to_owned()];
+        assert!(
+            config
+                .resolve_files(Path::new("/workspace"), &remotes, DEFAULT_FILES)
+                .is_empty()
+        );
+        let other = ["https://github.com/tontinton/maki.git".to_owned()];
+        assert_eq!(
+            config.resolve_files(Path::new("/workspace"), &other, DEFAULT_FILES),
+            ["AGENTS.md", "CLAUDE.md"]
+        );
+    }
+
+    #[test]
+    fn resolve_files_needs_remotes_only_when_a_remote_matcher_is_set() {
+        let by_path = instructions_config(
+            None,
+            vec![ProjectOverrideFileConfig {
+                path: Some("/workspace".into()),
+                ..Default::default()
+            }],
+        );
+        assert!(!by_path.needs_remotes());
+        let by_remote = instructions_config(
+            None,
+            vec![ProjectOverrideFileConfig {
+                remote: Some("github.com/*".into()),
+                ..Default::default()
+            }],
+        );
+        assert!(by_remote.needs_remotes());
+    }
+
+    #[test_case(Some(BROKEN_GLOB), None ; "path_glob_is_a_config_error")]
+    #[test_case(None, Some(BROKEN_GLOB) ; "remote_glob_is_a_config_error")]
+    fn invalid_project_pattern_is_a_config_error(path: Option<&str>, remote: Option<&str>) {
+        let result = RawConfig {
+            projects: vec![ProjectOverrideFileConfig {
+                path: path.map(str::to_owned),
+                remote: remote.map(str::to_owned),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .into_config(&[]);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidProjectPattern { pattern, .. }) if pattern == BROKEN_GLOB
+        ));
+    }
+
+    #[test]
+    fn instructions_merge_and_projects_replace() {
+        let mut base = RawConfig {
+            instructions: InstructionsFileConfig {
+                files: Some(vec!["AGENTS.md".into()]),
+            },
+            projects: vec![ProjectOverrideFileConfig {
+                path: Some("/base".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        base.merge(RawConfig {
+            instructions: InstructionsFileConfig {
+                files: Some(vec!["CLAUDE.md".into()]),
+            },
+            projects: vec![ProjectOverrideFileConfig {
+                path: Some("/overlay".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let agent = base.into_config(&[]).unwrap().agent;
+        assert_eq!(agent.instructions.files, Some(vec!["CLAUDE.md".to_owned()]));
+        assert_eq!(agent.instructions.projects.len(), 1);
+        assert_eq!(
+            agent.instructions.projects[0].path.as_deref(),
+            Some("/overlay")
+        );
     }
 
     #[test]
