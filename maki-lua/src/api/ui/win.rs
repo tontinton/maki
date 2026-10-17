@@ -213,9 +213,9 @@ fn win_extra<M: mlua::UserDataMethods<WinHandle>>(methods: &mut M) {
 ///   - zindex (integer): stacking order.
 ///   - cursor_line (boolean): highlight the focused row.
 ///   - reserved_top (integer): rows reserved at the top of the content area.
-///   - split (string): edge docking, "above", "below", "left", "right", "panel", or "".
-///   - order (integer): paint order among split windows.
+///   - split (string): edge docking, "above", "below", "left", "right", or "".
 ///   - needs_input (boolean): whether the window means the session needs user input.
+///   - hide_input (boolean): whether a docked window displaces the chat input box.
 /// @return
 /// @example
 /// win:set_config({ title = "Updated!", width = "80%" })
@@ -252,10 +252,8 @@ fn set_config(_lua: &Lua, this: &WinHandle, opts: Table) -> LuaResult<()> {
     if let Ok(s) = opts.get::<String>("split") {
         patch.split = Some(Split::parse(&s));
     }
-    if let Ok(o) = opts.get::<u16>("order") {
-        patch.order = Some(o);
-    }
     patch.needs_input = opt_bool(&opts, "needs_input");
+    patch.hide_input = opt_bool(&opts, "hide_input");
     patch.width = try_parse_dimension(&opts, "width");
     patch.height = try_parse_dimension(&opts, "height");
     // A missing key leaves the window where it is. Lua has no way to say
