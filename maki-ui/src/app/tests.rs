@@ -2693,6 +2693,23 @@ fn double_esc_cancels_flushes_and_fails_tools() {
     assert_eq!(app.chats[0].in_progress_count(), 0);
 }
 
+/// A plugin's cancel is the double Esc without the keys: it interrupts a
+/// running turn, and reports an idle session as nothing to cancel.
+#[test]
+fn cancel_turn_interrupts_only_a_running_turn() {
+    let mut app = test_app();
+    assert!(app.cancel_turn().is_none());
+
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let actions = app.cancel_turn().expect("a running turn is cancelled");
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
+    assert_eq!(app.status, Status::Idle);
+    assert!(app.cancel_turn().is_none());
+}
 #[test]
 fn double_esc_idle_opens_rewind_picker() {
     let mut app = test_app();

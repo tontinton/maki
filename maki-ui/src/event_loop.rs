@@ -1344,6 +1344,18 @@ impl<'t> EventLoop<'t> {
                 })();
                 let _ = reply_tx.send(reply);
             }
+            SessionRequest::Cancel { id } => {
+                let reply = self.resolve_session_index(id.as_deref()).map(|idx| {
+                    match self.sessions[idx].app.cancel_turn() {
+                        Some(actions) => {
+                            self.dispatch(idx, actions);
+                            json!(true)
+                        }
+                        None => json!(false),
+                    }
+                });
+                let _ = reply_tx.send(reply);
+            }
         }
     }
 
