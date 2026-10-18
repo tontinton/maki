@@ -39,6 +39,7 @@ static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
     base_url: Cow::Borrowed(BASE_URL),
     max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: false,
+    usage_cost: false,
     provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
