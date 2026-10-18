@@ -11,23 +11,31 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use maki_agent::tools::ToolRegistry;
-use maki_config::providers::builtin_provider;
+use maki_config::providers::{base_url_env_var, builtin_provider};
 use maki_config::{PROVIDER_BUILTINS, PluginsConfig};
 use maki_lua::PluginHost;
+use maki_lua::test_support::runtime;
 use maki_providers::plugin;
-use maki_providers::{Model, ResolvedAuth, ThinkingSupport, Timeouts};
+use maki_providers::test_support::{Canned, serve};
+use maki_providers::{Message, Model, RequestOptions, ResolvedAuth, ThinkingSupport, Timeouts};
+use serde_json::json;
 use tempfile::TempDir;
 use test_case::test_case;
 
 mod golden;
 
 const MISTRAL: &str = "mistral";
+const OPENROUTER: &str = "openrouter";
 const DEEPSEEK: &str = "deepseek";
 const PUBLISHED_PEAK_HOURS: &str = "2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri";
 const MISTRAL_KEY_ENV: &str = "MISTRAL_API_KEY";
 const MISTRAL_KEY: &str = "sk-test";
 const MINISTRAL: &str = "ministral-14b-latest";
 const MEDIUM: &str = "mistral-medium-latest";
+const STREAMED_COST: f64 = 0.00042;
+const COST_SSE: &[Canned] = &[Canned::sse(
+    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"cost\":0.00042}}\n\ndata: [DONE]\n",
+)];
 
 const HOME_VARS: &[&str] = &[
     "HOME",
@@ -46,6 +54,8 @@ const NOT_LISTED_FOR_LOGIN: &str = "a bundled provider plugin is missing from ma
 const NO_SCHEDULE: &str = "deepseek bills by the clock";
 const UNKNOWN_MODEL: &str = "the model spec did not resolve";
 const NOT_BUILT: &str = "mistral did not build from its declaration";
+const STREAM_FAILED: &str = "stream must succeed";
+const PROMPT: &str = "hi";
 
 /// Points every base directory at a throwaway tree, so neither the real
 /// `providers.toml` nor this machine's credentials reach the registration.
@@ -154,4 +164,32 @@ fn only_ministral_is_denied_thinking(adjusted: fn(&str) -> Model, model_id: &str
         !thinks
     );
     assert_eq!(model.supports_thinking(), thinks);
+}
+
+#[test_case(OPENROUTER, "openrouter/openai/gpt-5.5", Some(STREAMED_COST) ; "openrouter_reads_usage_cost")]
+#[test_case(MISTRAL, "mistral/mistral-medium-latest", None ; "mistral_ignores_usage_cost")]
+fn only_opted_in_providers_read_usage_cost(slug: &str, spec: &str, expected: Option<f64>) {
+    let _state = isolated_state();
+    let (base_url, _requests) = serve(COST_SSE);
+    unsafe { std::env::set_var(base_url_env_var(slug), base_url) };
+    let _host = load_bundled(slug);
+    let key_env = plugin::spec(slug).expect(NOT_BUILT).api_key_env;
+    unsafe { std::env::set_var(key_env, MISTRAL_KEY) };
+
+    let provider = plugin::create(slug, Timeouts::default()).expect(NOT_BUILT);
+    let model = Model::from_spec(spec).expect(UNKNOWN_MODEL);
+    let (tx, _rx) = flume::unbounded();
+    let resp = runtime()
+        .block_on(provider.stream_message(
+            &model,
+            &[Message::user(PROMPT.into())],
+            "",
+            &json!([]),
+            &tx,
+            RequestOptions::default(),
+            None,
+        ))
+        .expect(STREAM_FAILED);
+
+    assert_eq!(resp.usage.cost, expected);
 }

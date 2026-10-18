@@ -109,6 +109,7 @@ maki.provider.register({
       .. "e.g. `openrouter/anthropic/claude-sonnet-4`.",
   },
   openai = {
+    usage_cost = true,
     -- `prefer-high` is only for models the listing never described. Each listed
     -- model narrows it with the `effort` on its row.
     thinking = { dialect = "prefer-high", field = "reasoning.effort", requires_support = true },

@@ -273,7 +273,7 @@ impl Copilot {
             .body(serde_json::to_vec(&body)?)
             .build()?;
         super::ok_sse(&self.client, request, |body| {
-            openai_compat::parse_sse(body, event_tx, self.stream_timeout)
+            openai_compat::parse_sse(body, event_tx, self.stream_timeout, false)
         })
         .await
     }
