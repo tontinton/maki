@@ -265,6 +265,7 @@ impl Copilot {
                 BufReader::new(response.into_body()),
                 event_tx,
                 self.stream_timeout,
+                false,
             )
             .await
         } else {

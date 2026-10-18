@@ -701,6 +701,8 @@ fn is_selected(_lua: &Lua, #[ctx] plugin: Arc<str>, slug: String) -> LuaResult<b
 ///             Defaults to `max_tokens`.
 ///     `include_stream_usage` (boolean) Ask for usage on the stream.
 ///             Defaults to `true`.
+///     `usage_cost` (boolean) Price turns from `usage.cost` on the stream
+///             (in USD). Defaults to `false`.
 ///     `thinking` (table) How the API spells reasoning effort. Without it,
 ///             each model's `thinking_fields` decides.
 ///       `dialect` (string) Required. One of `"standard"`, `"codex"`,
