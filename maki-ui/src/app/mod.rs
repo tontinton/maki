@@ -36,7 +36,7 @@ use crate::clipboard::ClipboardState;
 use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{
-    CommandAction, CommandPalette, ParsedCommand, PluginAccess, SUBMITS_PROMPT,
+    CommandAction, CommandListing, CommandPalette, ParsedCommand, PluginAccess, SUBMITS_PROMPT,
 };
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
@@ -2934,6 +2934,10 @@ impl App {
         }
     }
 
+    pub(crate) fn command_listing(&mut self, caller: &PluginReach) -> Vec<CommandListing> {
+        self.command_palette.listing(caller)
+    }
+
     /// Entry point for `maki.api.run_command`: splits a command line into the
     /// name and args the input bar would hand over, leading slash optional.
     /// `Err` means nothing ran at all, so the Lua caller can say why.
@@ -2950,6 +2954,7 @@ impl App {
         let (name, args) = trimmed
             .split_once(char::is_whitespace)
             .unwrap_or((trimmed, ""));
+        self.command_palette.refresh_sources();
         let resolved = self
             .command_palette
             .resolve_for_plugin(&format!("/{}", name.trim_start_matches('/')), caller)?;
