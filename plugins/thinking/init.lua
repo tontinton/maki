@@ -7,6 +7,7 @@ maki.api.register_command({
   name = "/thinking",
   description = "Extended thinking: pick an effort level, or set one directly",
   nargs = "?",
+  interactive = true,
   handler = function(opts)
     if opts.args == "" then
       Window.open()

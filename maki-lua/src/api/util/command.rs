@@ -47,6 +47,9 @@ pub struct LuaCommandInfo {
     /// this plugin's reach and pick the arguments.
     pub reach: PluginReach,
     pub max_args: usize,
+    /// Declared by the plugin: the handler only opens a picker or modal, so
+    /// a front end that cannot show one should not offer it.
+    pub interactive: bool,
 }
 
 #[derive(Clone, Default)]
@@ -183,6 +186,7 @@ pub(crate) struct CommandEntry {
     pub description: Arc<str>,
     pub reach: PluginReach,
     pub max_args: usize,
+    pub interactive: bool,
 }
 
 pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
@@ -197,6 +201,7 @@ pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaComm
                 plugin: Arc::clone(plugin),
                 reach: entry.reach.clone(),
                 max_args: entry.max_args,
+                interactive: entry.interactive,
             })
         })
         .collect();
@@ -854,6 +859,12 @@ pub enum UiAction {
         caller: PluginReach,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Every slash command the focused session's palette offers to `caller`,
+    /// as a JSON array.
+    ListCommands {
+        caller: PluginReach,
+        reply_tx: oneshot::Sender<UiReply>,
+    },
     /// An event from a subagent session a plugin opened on a chat session,
     /// which shows it as a task. A tab keeps its channels across `/new`, so
     /// the chat session id is the only way to tell if the tab still shows the
@@ -965,6 +976,7 @@ mod tests {
             description: Arc::from(desc),
             reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
+            interactive: false,
         }
     }
 
