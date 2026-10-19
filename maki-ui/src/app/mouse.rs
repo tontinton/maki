@@ -236,7 +236,7 @@ impl App {
                     area: input_area,
                     raw_text: &copy_text,
                     line_breaks,
-                    exclude: scrollbar::painted_rails(),
+                    exclude: scrollbar::live_rails(buf, input_area),
                 }];
                 selection::extract_selected_text(buf, &screen_sel, &regions)
             }
@@ -247,7 +247,7 @@ impl App {
                 };
                 let regions = [ContentRegion {
                     area: sel.area,
-                    exclude: scrollbar::painted_rails(),
+                    exclude: scrollbar::live_rails(buf, sel.area),
                     ..Default::default()
                 }];
                 selection::extract_selected_text(buf, &screen_sel, &regions)

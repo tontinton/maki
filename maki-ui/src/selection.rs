@@ -407,7 +407,7 @@ pub struct ContentRegion<'a> {
     pub area: Rect,
     pub raw_text: &'a str,
     pub line_breaks: LineBreaks,
-    /// Screen cells chrome painted over this frame (scrollbar rails). Cells
+    /// Cells chrome still covers this frame (live scrollbar thumbs). Cells
     /// inside are skipped no matter what the selection covers.
     pub exclude: Vec<Rect>,
 }
