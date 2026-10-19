@@ -78,6 +78,7 @@ async fn load_plugins(
     // Includes the names discovery refused, so a package it could not read does
     // not become a config error pointing at the user's `plugins.<name>` table.
     let discovered_names = discovery.known_names();
+    host.record_discovery_problems(&discovery);
     let mut warnings: Vec<String> = discovery
         .problems
         .into_iter()

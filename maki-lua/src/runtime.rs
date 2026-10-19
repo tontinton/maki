@@ -93,6 +93,9 @@ use crate::plugin_permissions::{
     Ceiling, Permission, PluginPermissions, PluginReach, denied_error, grant_hint,
     load_plugin_permissions,
 };
+use crate::plugin_status::{
+    ErrorSeam, PluginKind, PluginStatusStore, record_callback_error, record_error,
+};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
@@ -136,6 +139,7 @@ pub const SLICE_WARN: Duration = Duration::from_secs(1);
 /// caps how long a task runs in total, this caps how long it starves the rest.
 pub(crate) const SLICE_KILL: Duration = Duration::from_secs(5);
 const UNKNOWN_PLUGIN: &str = "<unknown>";
+const HINT_NOT_STRING_MSG: &str = "prompt hint callback returned non-string";
 const UNKNOWN_LOCATION: &str = "?";
 /// Wall clock a cancelled handler gets before the host stops waiting for
 /// it. The watchdog alone never ends a task that parks in an await: it
@@ -1487,11 +1491,10 @@ fn fire_cancel_hooks(lua: &Lua, handle: &TaskHandle, reason: KillReason) {
     }
     let reason = cut_reason(lua, handle, reason);
     for key in hooks {
-        if let Err(e) = lua
-            .registry_value::<Function>(&key)
-            .and_then(|f| f.call::<()>(reason))
+        if let Ok(func) = lua.registry_value::<Function>(&key)
+            && let Err(e) = func.call::<()>(reason)
         {
-            tracing::warn!(error = %strip_traceback(&e), "cancel hook failed");
+            record_callback_error(lua, &func, ErrorSeam::CancelHook, strip_traceback(&e));
         }
         lua.remove_registry_value(key).ok();
     }
@@ -1910,7 +1913,12 @@ fn interrupt_reason(state: *mut ffi::lua_State) -> Option<Cow<'static, str>> {
         Kill::Stuck => {
             let blame = Blame::of(lua, state);
             let msg = stuck_message(&blame.plugin);
-            tracing::warn!(plugin = %blame.plugin, at = %blame.location, task, "{msg}");
+            record_error(
+                lua,
+                &blame.plugin,
+                ErrorSeam::Watchdog,
+                format!("{msg} (at {}, task {task})", blame.location),
+            );
             host_flash(lua, msg.clone());
             msg.into()
         }
@@ -1943,6 +1951,17 @@ pub(crate) fn mark_loaded(lua: &Lua, plugin: &str) {
 pub(crate) fn any_plugin_loaded(lua: &Lua, mut test: impl FnMut(&str) -> bool) -> bool {
     lua.app_data_ref::<PluginEnvs>()
         .is_some_and(|envs| envs.0.keys().any(|plugin| test(plugin)))
+}
+
+/// The plugin whose env {func} closes over, which is the one that defined
+/// it. None for host-made functions.
+pub(crate) fn plugin_of(lua: &Lua, func: &Function) -> Option<Arc<str>> {
+    let env = func.environment()?.to_pointer() as usize;
+    let envs = lua.app_data_ref::<PluginEnvs>()?;
+    envs.0
+        .iter()
+        .find(|(_, ptr)| **ptr == env)
+        .map(|(name, _)| Arc::clone(name))
 }
 
 /// Lets the watchdog tell the user which plugin it stopped. It flashes
@@ -2421,9 +2440,8 @@ async fn deliver_pending(
         let Some((job_id, event)) = next() else {
             return;
         };
-        if let Err(e) = deliver_job_event(lua, job_id, &event).await {
-            tracing::warn!(job_id, error = %strip_traceback(&e), "job callback failed");
-        }
+        // Recorded against the plugin by `deliver_job_event`; the pump goes on.
+        let _ = deliver_job_event(lua, job_id, &event).await;
         // A callback with nothing to await never yields, so a job printing
         // faster than we deliver would hold the executor here forever.
         yield_now().await;
@@ -3273,7 +3291,7 @@ fn spawn_deferred_callback(lua: &Lua, gate: &Rc<InflightGate>, cb: DeferredCallb
         };
         let run = Narrowed::under(&lua, cb.ceiling.clone(), run);
         if let Err(e) = run_detached(&lua, run).await {
-            tracing::warn!(plugin = %cb.plugin, error = %strip_traceback(&e), "defer_fn callback failed");
+            record_error(&lua, &cb.plugin, ErrorSeam::DeferFn, strip_traceback(&e));
         }
         let _ = lua.remove_registry_value(cb.func);
     });
@@ -3333,7 +3351,8 @@ fn spawn_keybind_callback(lua: &Lua, gate: &Rc<InflightGate>, mut ticket: Keybin
     spawn_local(async move {
         let _done = done_tx;
         if let Err(e) = run_command_scoped(&handler_lua, 0, func.call_async::<LuaValue>(ev)).await {
-            tracing::warn!(key = %key.notation(), ticket = id, plugin = %handler_plugin, error = %strip_traceback(&e), "keybind callback failed, key spent");
+            let error = format!("{} (ticket {id}): {}", key.notation(), strip_traceback(&e));
+            record_error(&handler_lua, &handler_plugin, ErrorSeam::Keybind, error);
         }
         spent.store(true, Ordering::Release);
         report_keybind_done(&handler_lua, id);
@@ -3497,9 +3516,10 @@ fn spawn_plugin_task(lua: &Lua, spawned: SpawnedTask, task: PendingAsyncTask) {
         {
             let error = strip_traceback(&e);
             let plugin = &spawned.plugin;
-            tracing::warn!(plugin = %plugin, error = %error, "maki.async.spawn task failed");
-            // The watchdog already flashed this one when it stopped the loop.
+            // The watchdog already flashed and recorded this one when it
+            // stopped the loop.
             if !error.contains(&stuck_message(plugin)) {
+                record_error(&lua, plugin, ErrorSeam::Async, &error);
                 host_flash(&lua, spawn_failed_message(plugin, &error));
             }
         }
@@ -3823,11 +3843,11 @@ impl LuaRuntime {
             Ok(LuaValue::String(s)) => Some(s.to_string_lossy()),
             Ok(LuaValue::Nil) => None,
             Ok(_) => {
-                tracing::warn!(plugin, "prompt hint callback returned non-string");
+                record_error(&self.lua, plugin, ErrorSeam::Hint, HINT_NOT_STRING_MSG);
                 None
             }
             Err(e) => {
-                tracing::warn!(plugin, error = %e, "prompt hint callback failed");
+                record_error(&self.lua, plugin, ErrorSeam::Hint, strip_traceback(&e));
                 None
             }
         }
@@ -4291,7 +4311,12 @@ impl LuaRuntime {
         let result: LuaValue = match run_detached(&self.lua, func.call_async(lua_input)).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(plugin, tool, error = %e, "permission_scopes callback failed");
+                record_error(
+                    &self.lua,
+                    plugin,
+                    ErrorSeam::PermissionScopes,
+                    tool_error(tool, &e),
+                );
                 return None;
             }
         };
@@ -4426,7 +4451,8 @@ impl LuaRuntime {
                 Ok(Ok(LuaValue::Boolean(false))) => PlanActionOutcome::Vetoed,
                 Ok(Ok(_)) => PlanActionOutcome::Proceed,
                 Ok(Err(e)) => {
-                    tracing::warn!(plugin = %plugin, row, error = %strip_traceback(&e), "plan form row handler failed");
+                    let error = format!("row {row}: {}", strip_traceback(&e));
+                    record_error(&lua, &plugin, ErrorSeam::PlanRow, error);
                     PlanActionOutcome::Failed
                 }
                 Err(reason) => {
@@ -4489,7 +4515,8 @@ impl LuaRuntime {
                 ScopedFuture::new(lua.clone(), handle, func.call_async::<()>(arg)),
             );
             if let Err(e) = call.await {
-                tracing::warn!(tool_use_id, error = %e, "live click failed");
+                let error = format!("{tool_use_id}: {}", strip_traceback(&e));
+                record_callback_error(&lua, &func, ErrorSeam::Click, error);
             }
         });
     }
@@ -4560,7 +4587,7 @@ async fn compute_header(
         },
         Ok(_) => HeaderResult::plain(tool.to_string()),
         Err(e) => {
-            tracing::warn!(plugin, tool, error = %e, "header fn call failed");
+            record_error(lua, plugin, ErrorSeam::Header, tool_error(tool, &e));
             HeaderResult::plain(tool.to_string())
         }
     }
@@ -4605,7 +4632,14 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
     let ret = scope
         .scope_future(inner)
         .await
-        .inspect_err(|e| tracing::warn!(tool = &*item.tool, error = %e, "restore callback failed"))
+        .inspect_err(|e| {
+            record_error(
+                lua,
+                &plugin_name,
+                ErrorSeam::Restore,
+                tool_error(&item.tool, e),
+            );
+        })
         .ok()?;
     run_inline_tasks(lua, &scope).await;
 
@@ -4623,7 +4657,12 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
             };
             let _ = data.set("row", row);
             if let Err(e) = scope.scope_future(func.call_async::<()>(data)).await {
-                tracing::warn!(tool = &*item.tool, error = %e, "click replay failed");
+                record_error(
+                    lua,
+                    &plugin_name,
+                    ErrorSeam::Click,
+                    tool_error(&item.tool, &e),
+                );
                 break;
             }
             run_inline_tasks(lua, &scope).await;
@@ -4836,6 +4875,11 @@ async fn dispatch_async(
     }
 }
 
+/// A tool callback's error, prefixed with the tool it belongs to.
+fn tool_error(tool: &str, err: &mlua::Error) -> String {
+    format!("{tool}: {}", strip_traceback(err))
+}
+
 pub(crate) fn strip_traceback(err: &mlua::Error) -> String {
     match err {
         mlua::Error::CallbackError { cause, .. } => {
@@ -4909,7 +4953,7 @@ fn run_describe(
     match func.call::<String>(arg) {
         Ok(s) => Some(s),
         Err(e) => {
-            tracing::warn!(plugin, tool, error = %e, "describe callback failed");
+            record_error(lua, plugin, ErrorSeam::Describe, tool_error(tool, &e));
             None
         }
     }
@@ -5386,6 +5430,7 @@ fn prompt_answer(table: &Table) -> mlua::Result<LayerVerdict> {
 async fn run_tool_start(
     lua: &Lua,
     func: Function,
+    plugin: &str,
     tool: &str,
     input: Value,
     live: LiveCtx,
@@ -5400,7 +5445,7 @@ async fn run_tool_start(
         func.call_async::<LuaValue>((input_lua, ctx_ud)).await
     };
     if let Err(e) = scope.scope_future(run).await {
-        tracing::warn!(tool, error = %e, "start callback failed");
+        record_error(lua, plugin, ErrorSeam::Start, tool_error(tool, &e));
     }
 }
 
@@ -5579,6 +5624,19 @@ async fn run_tool_call(
     reply
 }
 
+fn record_load<T, E: std::fmt::Display>(
+    lua: &Lua,
+    name: &str,
+    kind: PluginKind,
+    path: Option<PathBuf>,
+    res: &Result<T, E>,
+) {
+    if let Some(store) = lua.app_data_ref::<PluginStatusStore>() {
+        let result = res.as_ref().map(|_| ()).map_err(ToString::to_string);
+        store.record_load(name, kind, path, result);
+    }
+}
+
 pub(crate) struct LuaThread {
     pub tx: UnboundedSender<Request>,
     pub prio_tx: UnboundedSender<Request>,
@@ -5600,6 +5658,7 @@ pub(crate) struct LuaThread {
     /// What [`load_user_source`] found on the Lua thread, for the host to
     /// report.
     pub key_lint: KeyLint,
+    pub plugin_status: PluginStatusStore,
 }
 
 /// Lua lives on its own OS thread (no Send needed). A [`LocalSet`] driven
@@ -5632,6 +5691,8 @@ pub fn spawn(
     let (input_rule_store, input_rules_reader) = InputRuleStore::new();
     let key_lint = KeyLint::default();
     let key_lint_thread = key_lint.clone();
+    let plugin_status = PluginStatusStore::default();
+    let plugin_status_thread = plugin_status.clone();
     let background = BackgroundTasks::default();
     let background_thread = background.clone();
     // The file index outlives any one plugin host, so the walks a host
@@ -5661,6 +5722,7 @@ pub fn spawn(
             ) {
                 Ok(r) => {
                     r.lua.set_app_data(key_lint_thread);
+                    r.lua.set_app_data(plugin_status_thread);
                     r.lua.set_app_data(background_thread);
                     r.lua.set_app_data(input_rule_store);
                     r.lua.set_app_data(ui_waker_thread);
@@ -5794,6 +5856,12 @@ pub fn spawn(
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &gate, &mut spawn_rx).await;
+                            let kind = match context.authority {
+                                DeclAuthority::Bundled => PluginKind::Bundled,
+                                DeclAuthority::ThirdParty => PluginKind::Package,
+                                DeclAuthority::Config => PluginKind::Init,
+                            };
+                            let path = context.plugin_dir.clone();
                             let res = rt
                                 .load_source(
                                     Arc::clone(&name),
@@ -5802,6 +5870,7 @@ pub fn spawn(
                                     None,
                                 )
                                 .await;
+                            record_load(&rt.lua, &name, kind, path, &res);
                             let _ = reply.send(res);
                         }
                         Request::CallProviderHook {
@@ -5880,9 +5949,8 @@ pub fn spawn(
                             });
                         }
                         Request::TakePackOps { reply } => {
-                            let ops = with_packs(&rt.lua, |packs| {
-                                std::mem::take(&mut packs.pending)
-                            });
+                            let ops =
+                                with_packs(&rt.lua, |packs| std::mem::take(&mut packs.pending));
                             let _ = reply.send(ops);
                         }
                         Request::SealPackOps { reply } => {
@@ -5898,6 +5966,9 @@ pub fn spawn(
                             // The explicit unload: the one place a package's
                             // grant is released.
                             maki_providers::plugin::release_granted(&plugin);
+                            if let Some(store) = rt.lua.app_data_ref::<PluginStatusStore>() {
+                                store.record_unload(&plugin);
+                            }
                             let _ = reply.send(());
                         }
                         Request::RunPlanAction {
@@ -5960,7 +6031,8 @@ pub fn spawn(
                                         func.call_async::<()>(opts).await
                                     };
                                     if let Err(e) = run_command_scoped(&lua, depth, run).await {
-                                        tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
+                                        let error = format!("{command}: {}", strip_traceback(&e));
+                                        record_error(&lua, &plugin, ErrorSeam::Command, error);
                                     }
                                 });
                             }
@@ -6012,7 +6084,10 @@ pub fn spawn(
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &gate, &mut spawn_rx).await;
+                            let label = scope.label().to_owned();
+                            let path = plugin_dir.clone();
                             let res = rt.run_init_lua(&source, scope, plugin_dir).await;
+                            record_load(&rt.lua, &label, PluginKind::Init, path, &res);
                             let _ = reply.send(res);
                         }
                         Request::CollectPromptSlots { session, reply } => {
@@ -6038,7 +6113,10 @@ pub fn spawn(
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &gate, &mut spawn_rx).await;
+                            let name = declared.spec.name.clone();
+                            let path = context.plugin_dir.clone();
                             let result = rt.run_pack_loader(declared, context).await;
+                            record_load(&rt.lua, &name, PluginKind::Package, path, &result);
                             let _ = reply.send(result);
                         }
                         Request::RestoreToolAsync { item, event_tx } => {
@@ -6064,8 +6142,13 @@ pub fn spawn(
                             dctx,
                             reply,
                         } => {
-                            let _ = reply
-                                .send(run_describe(&rt.lua, &rt.plugins, &plugin, &tool, &dctx));
+                            let _ = reply.send(run_describe(
+                                &rt.lua,
+                                &rt.plugins,
+                                &plugin,
+                                &tool,
+                                &dctx,
+                            ));
                         }
                         Request::StartTool {
                             plugin,
@@ -6097,8 +6180,11 @@ pub fn spawn(
                                     true => None,
                                     false => Some(g.acquire().await),
                                 };
-                                covered(slot, run_tool_start(&lua, func, &tool, input, live, ctx))
-                                    .await;
+                                covered(
+                                    slot,
+                                    run_tool_start(&lua, func, &plugin, &tool, input, live, ctx),
+                                )
+                                .await;
                                 let _ = reply.send(());
                             });
                         }
@@ -6144,6 +6230,7 @@ pub fn spawn(
         ui_action_rx: Mutex::new(Some(ui_action_rx)),
         ui_waker,
         key_lint,
+        plugin_status,
     })
 }
 
@@ -7347,6 +7434,30 @@ mod tests {
     }
 
     const STUCK_PLUGIN: &str = "spinner";
+
+    /// A callback registered without an owner (`buf:on("change")`, a job
+    /// callback) is still charged to the plugin whose env defined it.
+    #[test]
+    fn callback_errors_are_charged_to_the_env_owner() {
+        let lua = Lua::new();
+        let mut envs = PluginEnvs::default();
+        envs.0
+            .insert(Arc::from(STUCK_PLUGIN), lua.globals().to_pointer() as usize);
+        lua.set_app_data(envs);
+        lua.set_app_data(PluginStatusStore::default());
+        let plugin_fn: Function = lua.load("return function() end").eval().unwrap();
+        let host_fn = lua.create_function(|_, ()| Ok(())).unwrap();
+
+        record_callback_error(&lua, &plugin_fn, ErrorSeam::BufChange, "boom");
+        record_callback_error(&lua, &host_fn, ErrorSeam::BufChange, "ignored");
+
+        let statuses = lua.app_data_ref::<PluginStatusStore>().unwrap().snapshot();
+        let errors = &statuses[STUCK_PLUGIN].errors;
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].seam, <&str>::from(ErrorSeam::BufChange));
+        assert_eq!(errors[0].msg, "boom");
+        assert_eq!(statuses.len(), 1);
+    }
 
     /// An autocmd or keymap has no deadline, and a tool handler's is far off.
     /// Neither may save a slice that holds the thread.
