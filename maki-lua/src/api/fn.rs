@@ -28,6 +28,7 @@ use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, require};
+use crate::plugin_status::{ErrorSeam, record_callback_error};
 use crate::runtime::{Narrowed, active_task_id, job_task_id, strip_traceback, with_jobs};
 
 const DEFAULT_TAIL: usize = 20;
@@ -1461,11 +1462,9 @@ async fn jobwait(
             return Ok(err_pair(JOB_WAIT_TIMEOUT_ERR));
         };
         // A failing callback must not abort the wait: the event is already
-        // recorded and the exit still needs collecting. Same policy as the
-        // detached dispatch pump.
-        if let Err(e) = deliver_job_event(&lua, job_id, &event).await {
-            tracing::warn!(job_id, error = %strip_traceback(&e), "jobwait callback failed");
-        }
+        // recorded, the failure too, and the exit still needs collecting.
+        // Same policy as the detached dispatch pump.
+        let _ = deliver_job_event(&lua, job_id, &event).await;
         match event {
             JobEvent::Stdout(line) => stdout_lines.push(line.text),
             JobEvent::Stderr(line) => stderr_lines.push(line.text),
@@ -1507,6 +1506,9 @@ fn wait_result(
 /// `maki.fs.*` helpers park on `spawn_blocking`); resumed inline from a
 /// poll loop it would die with "attempt to yield across metamethod /
 /// C-call boundary" on its first suspension.
+///
+/// A failing callback is recorded against its plugin here, so callers only
+/// decide whether the error also stops them.
 pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) -> LuaResult<()> {
     let (callback, ceiling) = with_jobs(lua, |store| {
         store.record_event(job_id, event);
@@ -1519,7 +1521,7 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
         with_jobs(lua, |store| store.complete(lua, job_id, *code));
     }
     if let Some(callback) = callback {
-        let thread = lua.create_thread(callback)?;
+        let thread = lua.create_thread(callback.clone())?;
         let call = match event {
             JobEvent::Stdout(line) | JobEvent::Stderr(line) => {
                 // The stream name sits third, where Neovim passes it.
@@ -1533,7 +1535,11 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
             }
             JobEvent::Exit(code) => thread.into_async::<()>((job_id, *code))?,
         };
-        Narrowed::under(lua, ceiling, call).await?;
+        if let Err(e) = Narrowed::under(lua, ceiling, call).await {
+            let error = format!("job {job_id}: {}", strip_traceback(&e));
+            record_callback_error(lua, &callback, ErrorSeam::Job, error);
+            return Err(e);
+        }
     }
     Ok(())
 }
