@@ -441,9 +441,14 @@ fn parse_mode(mode: &str) -> Result<Mode, String> {
 }
 
 /// `maki.model.set`'s answer, with whatever model the session is on by now.
-fn apply_settings(app: &mut App, thinking: Option<String>, fast: Option<bool>) -> UiReply {
+fn apply_settings(
+    app: &mut App,
+    thinking: Option<String>,
+    fast: Option<bool>,
+    persist: bool,
+) -> UiReply {
     if let Some(thinking) = thinking {
-        app.set_thinking(&thinking)?;
+        app.set_thinking(&thinking, persist)?;
     }
     if let Some(fast) = fast {
         app.set_fast(fast)?;
@@ -664,7 +669,7 @@ struct PendingFocus {
 /// it has a slot for its model.
 struct OpenedSession(PendingFocus, Result<OpenSession, String>);
 
-/// A model picked for the tab focused at the time.
+/// A model picked for the tab named at the time.
 struct Pick {
     /// The tab's slot cell, which stays the same when `/new` gives the tab
     /// another session while the build is out.
@@ -677,10 +682,12 @@ enum PickOrigin {
     /// The model picker or a login, which flash a failure.
     Picker,
     /// `maki.model.set`, whose thinking and fast go on top of the new model
-    /// before it answers.
+    /// before it answers. `persist` says whether the spec also becomes the
+    /// default the next `maki` starts on and joins the recent list.
     Lua {
         thinking: Option<String>,
         fast: Option<bool>,
+        persist: bool,
         reply_tx: oneshot::Sender<UiReply>,
     },
 }
@@ -1879,11 +1886,14 @@ impl<'t> EventLoop<'t> {
         self.terminal.size().map(Rect::from).unwrap_or_default()
     }
 
-    /// Lua acts on the focused session, the same target the model picker
-    /// writes to.
+    /// Lua acts on the session it names, or the focused one, the same target
+    /// the model picker writes to.
     fn handle_model_request(&mut self, req: ModelRequest, reply_tx: oneshot::Sender<UiReply>) {
         let reply = match req {
-            ModelRequest::Get => Ok(self.focused_app().model_state()),
+            ModelRequest::Get { session } => match self.resolve_session_index(session.as_deref()) {
+                Ok(idx) => Ok(self.sessions[idx].app.model_state()),
+                Err(e) => Err(e),
+            },
             ModelRequest::Available => {
                 let available = self.ctx.available_models.load();
                 Ok(json!(
@@ -1897,19 +1907,34 @@ impl<'t> EventLoop<'t> {
                 spec: Some(spec),
                 thinking,
                 fast,
+                session,
+                persist,
             } => {
+                let idx = match self.resolve_session_index(session.as_deref()) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(e));
+                        return;
+                    }
+                };
                 let origin = PickOrigin::Lua {
                     thinking,
                     fast,
+                    persist,
                     reply_tx,
                 };
-                return self.change_model(spec, origin);
+                return self.change_model(spec, idx, origin);
             }
             ModelRequest::Set {
                 spec: None,
                 thinking,
                 fast,
-            } => apply_settings(self.focused_app(), thinking, fast),
+                session,
+                persist,
+            } => match self.resolve_session_index(session.as_deref()) {
+                Ok(idx) => apply_settings(&mut self.sessions[idx].app, thinking, fast, persist),
+                Err(e) => Err(e),
+            },
         };
         let _ = reply_tx.send(reply);
     }
@@ -2480,7 +2505,7 @@ impl<'t> EventLoop<'t> {
             }
             Action::RestartAgent(history) => self.respawn_agent(idx, history, Respawn::Restart),
             Action::OpenFork(open) => self.open_fork(idx, *open),
-            Action::ChangeModel(spec) => self.change_model(spec, PickOrigin::Picker),
+            Action::ChangeModel(spec) => self.change_model(spec, self.focused, PickOrigin::Picker),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 self.persist_tiers(model_registry::set(spec, tier));
@@ -2558,13 +2583,14 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn change_model(&mut self, spec: String, origin: PickOrigin) {
-        let tab = Arc::downgrade(&self.sessions[self.focused].slot);
+    fn change_model(&mut self, spec: String, idx: usize, origin: PickOrigin) {
+        let tab = Arc::downgrade(&self.sessions[idx].slot);
         self.wait_for_slot(spec, Wanted::Pick(Pick { tab, origin }));
     }
 
     /// The one explicit pick, which is why it alone writes the last-used file.
-    /// Opening an old session must not change what the next `maki` starts on.
+    /// Opening an old session must not change what the next `maki` starts on,
+    /// and neither does a plugin steering a tab with `persist = false`.
     fn apply_pick(&mut self, pick: Pick, spec: String, slot: Arc<ModelSlot>) {
         let Some(idx) = self
             .sessions
@@ -2573,22 +2599,30 @@ impl<'t> EventLoop<'t> {
         else {
             return self.refuse_pick(pick.origin, NOT_LIVE_ERR.to_owned());
         };
+        let persist = match &pick.origin {
+            PickOrigin::Picker => true,
+            PickOrigin::Lua { persist, .. } => *persist,
+        };
         let picked = slot.model.spec();
         self.apply_model(idx, slot);
-        self.ctx
-            .picker_memory
-            .record_recent(&spec, &self.ctx.model_policy);
-        self.ctx.storage_writer.persist(move |dir| {
-            persist_model(dir, &picked);
-            push_recent(dir, &spec);
-        });
+        if persist {
+            self.ctx
+                .picker_memory
+                .record_recent(&spec, &self.ctx.model_policy);
+            self.ctx.storage_writer.persist(move |dir| {
+                persist_model(dir, &picked);
+                push_recent(dir, &spec);
+            });
+        }
         if let PickOrigin::Lua {
             thinking,
             fast,
             reply_tx,
+            ..
         } = pick.origin
         {
-            let _ = reply_tx.send(apply_settings(&mut self.sessions[idx].app, thinking, fast));
+            let _ =
+                reply_tx.send(apply_settings(&mut self.sessions[idx].app, thinking, fast, persist));
         }
     }
 
@@ -2666,7 +2700,7 @@ impl<'t> EventLoop<'t> {
         } else if let Some(default_model) =
             maki_config::providers::builtin_provider(&slug).and_then(|b| b.default_model)
         {
-            self.change_model(default_model.to_owned(), PickOrigin::Picker);
+            self.change_model(default_model.to_owned(), self.focused, PickOrigin::Picker);
         }
     }
 
