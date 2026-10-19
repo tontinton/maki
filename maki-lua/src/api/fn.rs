@@ -294,7 +294,8 @@ impl JobStore {
             on_exit,
         } = spec;
         let built = cmd.build();
-        let mut command = detached_command(built.get_program(), built.get_args());
+        let args: Vec<&std::ffi::OsStr> = built.get_args().collect();
+        let mut command = detached_command(built.get_program(), &args);
         strip_provider_keys(&mut command)
             .stdout(stdout.stdio()?)
             .stderr(stderr.stdio()?)
@@ -785,11 +786,14 @@ fn kill_job(job: &JobMeta) {
     }
     #[cfg(unix)]
     {
-        use rustix::process::{Pid, Signal, kill_process_group};
+        use rustix::process::{Pid, Signal, kill_process, kill_process_group};
         if let Ok(raw) = i32::try_from(job.pid)
             && let Some(pid) = Pid::from_raw(raw)
         {
+            // The group may be empty while the macOS trampoline has not
+            // `setsid`ed yet, so signal the pid itself as well.
             let _ = kill_process_group(pid, Signal::KILL);
+            let _ = kill_process(pid, Signal::KILL);
         }
     }
     #[cfg(windows)]

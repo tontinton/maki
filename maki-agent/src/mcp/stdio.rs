@@ -44,7 +44,8 @@ impl StdioTransport {
         environment: &HashMap<String, String>,
         timeout: Duration,
     ) -> Result<Self, McpError> {
-        let mut std_cmd = detached_command(OsStr::new(program), args);
+        let arg_strs: Vec<&OsStr> = args.iter().map(String::as_str).map(OsStr::new).collect();
+        let mut std_cmd = detached_command(OsStr::new(program), &arg_strs);
         strip_provider_keys(&mut std_cmd).envs(environment);
 
         let mut cmd: smol::process::Command = std_cmd.into();

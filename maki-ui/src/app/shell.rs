@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -216,10 +215,8 @@ async fn run_command(
     shell: &ShellPreference,
 ) -> Result<String, String> {
     let shell_cmd = shell_command(command, shell);
-    let mut std_cmd = detached_command(
-        shell_cmd.get_program(),
-        shell_cmd.get_args().collect::<Vec<_>>(),
-    );
+    let args: Vec<&std::ffi::OsStr> = shell_cmd.get_args().collect();
+    let mut std_cmd = detached_command(shell_cmd.get_program(), &args);
     strip_provider_keys(&mut std_cmd).env("GIT_TERMINAL_PROMPT", "0");
 
     let mut cmd: Command = std_cmd.into();

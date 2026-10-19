@@ -3,14 +3,25 @@
 //! session leader with no controlling terminal — the detach semantics every
 //! spawn site relies on — while the spawn itself never leaves `posix_spawn`.
 //!
-//! Runs on Linux CI; there is no macOS runner.
+//! macOS only: the trampoline only exists there, and CI has no macOS runner,
+//! so this runs when a mac dev remembers to (`cargo nextest run -p maki
+//! --test detached_spawn`).
 
-#![cfg(unix)]
+#![cfg(target_os = "macos")]
 
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use maki_agent::spawn::DETACHED_MARKER;
+use rustix::process::{Pid, getpgid, getsid};
+
+fn raw_pid(pid: i32) -> Pid {
+    Pid::from_raw(pid).expect("valid pid")
+}
+
+fn raw_id(pid: Pid) -> i32 {
+    pid.as_raw_pid()
+}
 
 #[test]
 fn detached_child_leads_its_own_session() {
@@ -34,7 +45,7 @@ fn detached_child_leads_its_own_session() {
     // assuming it already happened.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let sid = unsafe { libc::getsid(pid) };
+        let sid = raw_id(getsid(Some(raw_pid(pid))).expect("getsid"));
         if sid == pid {
             break;
         }
@@ -47,7 +58,7 @@ fn detached_child_leads_its_own_session() {
     // Session leader means no inherited controlling terminal; group
     // leadership keeps the killpg cleanup working.
     assert_eq!(
-        unsafe { libc::getpgid(pid) },
+        raw_id(getpgid(Some(raw_pid(pid))).expect("getpgid")),
         pid,
         "child is not a group leader"
     );
