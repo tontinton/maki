@@ -182,6 +182,24 @@ pub(crate) struct SystemBlock<'a> {
     pub cache_control: Option<CacheControl>,
 }
 
+pub(crate) fn system_blocks(system: &str, boundary: Option<usize>) -> Vec<SystemBlock<'_>> {
+    let block = |text| SystemBlock {
+        r#type: "text",
+        text,
+        cache_control: Some(EPHEMERAL),
+    };
+    match boundary
+        .filter(|&offset| offset > 0 && offset < system.len() && system.is_char_boundary(offset))
+    {
+        Some(offset)
+            if !system[..offset].trim().is_empty() && !system[offset..].trim().is_empty() =>
+        {
+            vec![block(&system[..offset]), block(&system[offset..])]
+        }
+        _ => vec![block(system)],
+    }
+}
+
 #[derive(Serialize)]
 pub(crate) struct WireContentBlock<'a> {
     #[serde(flatten)]
@@ -341,17 +359,25 @@ pub(crate) fn wire_messages<'a>(messages: &'a [Message], tools: &Value) -> Vec<W
 pub(super) fn build_wire_messages<'a>(
     messages: &'a [Message],
     tools: &Value,
+    cache_breakpoints: usize,
 ) -> Vec<WireMessage<'a>> {
     let mut wire = wire_messages(messages, tools);
-    let first_cached = wire.len().saturating_sub(MESSAGE_CACHE_BREAKPOINTS);
+    let first_cached = if cache_breakpoints == MESSAGE_CACHE_BREAKPOINTS {
+        wire.len().saturating_sub(cache_breakpoints)
+    } else {
+        0
+    };
 
     // The API rejects `cache_control` on thinking blocks, so walk back to
     // the last block that can carry it. All thinking means no breakpoint,
     // which beats a fatal one.
-    for msg in &mut wire[first_cached..] {
-        if let Some(block) = msg.content.iter_mut().rfind(|b| !b.inner.is_thinking()) {
-            block.cache_control = Some(EPHEMERAL);
-        }
+    for block in wire[first_cached..]
+        .iter_mut()
+        .rev()
+        .filter_map(|msg| msg.content.iter_mut().rfind(|b| !b.inner.is_thinking()))
+        .take(cache_breakpoints)
+    {
+        block.cache_control = Some(EPHEMERAL);
     }
     wire
 }
@@ -383,7 +409,13 @@ pub(crate) fn build_request_body_with_system(
     thinking: ThinkingConfig,
     top_p: Option<f64>,
 ) -> Value {
-    let wire_messages = build_wire_messages(messages, tools);
+    let system_breakpoints = system_blocks
+        .iter()
+        .filter(|block| block.cache_control.is_some())
+        .count();
+    let message_breakpoints =
+        MESSAGE_CACHE_BREAKPOINTS.saturating_sub(system_breakpoints.saturating_sub(1));
+    let wire_messages = build_wire_messages(messages, tools, message_breakpoints);
     let wire_tools = build_wire_tools(tools);
 
     let mut body = json!({
@@ -602,12 +634,13 @@ mod tests {
 
     use super::{
         LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, SystemBlock, build_request_body_with_system,
-        long_context_window, strip_long_context,
+        long_context_window, strip_long_context, system_blocks,
     };
     use crate::model::{Model, ModelFamily, ModelPricing, ModelTier};
     use crate::{ContentBlock, Message, Role, ThinkingConfig};
 
     const SYSTEM: &str = "sys";
+    const UNICODE_PROMPT: &str = "éabc";
     const TOOL_USE_ID: &str = "toolu_1";
     const TOOL_SEARCH: &str = "tool_search";
     const LOADED_TOOL: &str = "srv__fetch";
@@ -643,6 +676,120 @@ mod tests {
             context_window: 200_000,
             thinking_fields: None,
         }
+    }
+
+    #[test_case(None, 1 ; "legacy")]
+    #[test_case(Some(0), 1 ; "empty_prefix")]
+    #[test_case(Some(1), 1 ; "inside_unicode")]
+    #[test_case(Some(2), 2 ; "unicode_boundary")]
+    #[test_case(Some(5), 1 ; "empty_suffix")]
+    #[test_case(Some(usize::MAX), 1 ; "outside_prompt")]
+    fn system_cache_boundary_preserves_text(boundary: Option<usize>, blocks: usize) {
+        let system = system_blocks(UNICODE_PROMPT, boundary);
+        assert_eq!(system.len(), blocks);
+        assert_eq!(
+            system.iter().map(|block| block.text).collect::<String>(),
+            UNICODE_PROMPT
+        );
+        assert!(system.iter().all(|block| block.cache_control.is_some()));
+    }
+
+    #[test_case(" \nlocal", 2 ; "blank_prefix")]
+    #[test_case("shared \n", 6 ; "blank_suffix")]
+    fn system_cache_boundary_does_not_create_blank_blocks(system: &str, boundary: usize) {
+        let blocks = system_blocks(system, Some(boundary));
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, system);
+    }
+
+    fn cache_markers(value: &Value) -> usize {
+        match value {
+            Value::Object(map) => {
+                usize::from(map.contains_key("cache_control"))
+                    + map.values().map(cache_markers).sum::<usize>()
+            }
+            Value::Array(items) => items.iter().map(cache_markers).sum(),
+            _ => 0,
+        }
+    }
+
+    #[test_case(None, 1, 2 ; "legacy_allocation")]
+    #[test_case(Some(3), 2, 1 ; "split_allocation")]
+    fn system_cache_boundary_respects_marker_budget(
+        boundary: Option<usize>,
+        system_markers: usize,
+        message_markers: usize,
+    ) {
+        let messages = [
+            Message::user("first".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "reply".into(),
+                }],
+                ..Default::default()
+            },
+            Message::user("latest".into()),
+        ];
+        let tools = json!([{"name": "read"}, {"name": "later", "defer_loading": true}]);
+        let body = build_request_body_with_system(
+            &test_model(),
+            &messages,
+            &system_blocks("sys local", boundary),
+            &tools,
+            ThinkingConfig::Off,
+            None,
+        );
+        assert_eq!(cache_markers(&body["system"]), system_markers);
+        assert_eq!(cache_markers(&body["messages"]), message_markers);
+        assert_eq!(cache_markers(&body), 4);
+        assert!(body["tools"][1].get("cache_control").is_none());
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body["messages"][2]["content"][0]
+                .get("cache_control")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn split_system_marks_latest_eligible_message_before_thinking() {
+        let messages = [
+            Message::user("first".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Thinking {
+                    thinking: "reason".into(),
+                    signature: Some("sig".into()),
+                }],
+                ..Default::default()
+            },
+        ];
+        let tools = json!([{"name": "later", "defer_loading": true}]);
+        let body = build_request_body_with_system(
+            &test_model(),
+            &messages,
+            &system_blocks("sys local", Some(3)),
+            &tools,
+            ThinkingConfig::Adaptive,
+            None,
+        );
+        assert_eq!(cache_markers(&body), 3);
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_some()
+        );
+        assert!(
+            body["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
     }
 
     #[test_case("claude-test", ThinkingConfig::Off, true ; "off_sends_top_p")]

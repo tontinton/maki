@@ -14,8 +14,8 @@ use tracing::{debug, warn};
 use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
 
-use crate::AgentError;
 use crate::retry::RetryPolicy;
+use crate::{AgentError, RequestOptions};
 
 pub(crate) mod anthropic;
 pub(crate) mod aperture;
@@ -278,6 +278,23 @@ pub(crate) fn with_prefix<'a>(
         }
         None => system,
     }
+}
+
+pub(crate) fn with_prefix_options<'a>(
+    prefix: &Option<String>,
+    system: &'a str,
+    buf: &'a mut String,
+    opts: &mut RequestOptions,
+) -> &'a str {
+    if let Some(prefix) = prefix {
+        opts.system_cache_boundary = opts
+            .system_cache_boundary
+            .filter(|&offset| {
+                offset > 0 && offset < system.len() && system.is_char_boundary(offset)
+            })
+            .and_then(|offset| offset.checked_add(prefix.len())?.checked_add(2));
+    }
+    with_prefix(prefix, system, buf)
 }
 
 pub(crate) fn urlenc(s: &str) -> String {
@@ -575,6 +592,7 @@ mod tests {
     use futures_lite::io::AsyncBufReadExt;
     use test_case::test_case;
 
+    const UNICODE_PROMPT: &str = "éabcd";
     const ERROR_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const PARSE_FAILED: &str = "SSE error payload should deserialize";
     const UNAVAILABLE_STATUS: u16 = 502;
@@ -587,6 +605,39 @@ mod tests {
     const EXPIRED: u64 = 0;
     const SOONER: u64 = u64::MAX - 1;
     const LATER: u64 = u64::MAX;
+
+    #[test_case(None, Some(2), Some(2) ; "without_prefix")]
+    #[test_case(Some("prefix"), Some(2), Some(10) ; "ascii_prefix")]
+    #[test_case(Some("前缀"), Some(2), Some(10) ; "unicode_prefix")]
+    #[test_case(Some("prefix"), None, None ; "legacy")]
+    #[test_case(Some("prefix"), Some(0), None ; "empty_shared_prefix")]
+    #[test_case(Some("prefix"), Some(1), None ; "invalid_utf8")]
+    #[test_case(Some("prefix"), Some(6), None ; "empty_variable_suffix")]
+    #[test_case(Some("prefix"), Some(usize::MAX), None ; "out_of_range")]
+    fn system_prefix_adjusts_cache_boundary(
+        prefix: Option<&str>,
+        boundary: Option<usize>,
+        expected: Option<usize>,
+    ) {
+        let prefix = prefix.map(str::to_owned);
+        let mut opts = RequestOptions {
+            system_cache_boundary: boundary,
+            ..Default::default()
+        };
+        let mut buffer = String::new();
+        let system = with_prefix_options(&prefix, UNICODE_PROMPT, &mut buffer, &mut opts);
+        assert_eq!(opts.system_cache_boundary, expected);
+        assert_eq!(
+            system,
+            prefix.as_ref().map_or_else(
+                || UNICODE_PROMPT.to_owned(),
+                |prefix| format!("{prefix}\n\n{UNICODE_PROMPT}")
+            )
+        );
+        if let Some(offset) = opts.system_cache_boundary {
+            assert_eq!(&system[offset..], &UNICODE_PROMPT[2..]);
+        }
+    }
 
     fn state_with_tokens(access: &str) -> TempDir {
         let dir = TempDir::new().expect("temp dir");

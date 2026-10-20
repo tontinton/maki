@@ -120,6 +120,7 @@ fn session_opts(
     model: &Model,
 ) -> RequestOptions {
     RequestOptions {
+        system_cache_boundary: None,
         thinking: thinking.map_or(parent.thinking, |t| t.clamp_to(parent.thinking)),
         fast: fast.unwrap_or(parent.fast),
     }

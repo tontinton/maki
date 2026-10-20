@@ -141,13 +141,14 @@ impl App {
     /// disagree with the chat's next prompt.
     pub(crate) fn request_options(&self) -> RequestOptions {
         RequestOptions {
+            system_cache_boundary: None,
             thinking: self.state.thinking,
             fast: self.state.fast,
         }
     }
 
     pub(crate) fn build_agent_input(&self, msg: &QueuedMessage) -> AgentInput {
-        let RequestOptions { thinking, fast } = self.request_options();
+        let RequestOptions { thinking, fast, .. } = self.request_options();
         AgentInput {
             message: msg.text.clone(),
             mode: self.agent_mode(),

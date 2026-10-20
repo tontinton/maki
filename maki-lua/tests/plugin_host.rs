@@ -7775,10 +7775,12 @@ impl Provider for OptsRecorder {
 #[test]
 fn background_prompt_is_capped_by_the_chat_settings_of_that_moment() {
     const OPENED_UNDER: RequestOptions = RequestOptions {
+        system_cache_boundary: None,
         thinking: ThinkingConfig::Adaptive,
         fast: false,
     };
     const LOWERED_TO: RequestOptions = RequestOptions {
+        system_cache_boundary: None,
         thinking: ThinkingConfig::Off,
         fast: false,
     };

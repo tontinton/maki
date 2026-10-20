@@ -3641,6 +3641,7 @@ fn resolve_or_create_chat_sets_subagent_opts() {
     app.status = Status::Streaming;
     app.run_id = 1;
     let opts = RequestOptions {
+        system_cache_boundary: None,
         thinking: ThinkingConfig::Effort(Effort::High),
         fast: true,
     };

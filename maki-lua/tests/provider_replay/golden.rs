@@ -407,6 +407,7 @@ impl Replay {
             &tools,
             &tx,
             RequestOptions {
+                system_cache_boundary: None,
                 thinking: turn.thinking.into(),
                 fast: false,
             },

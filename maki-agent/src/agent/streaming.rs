@@ -414,6 +414,7 @@ mod tests {
 
     fn opts_with(thinking: ThinkingConfig) -> RequestOptions {
         RequestOptions {
+            system_cache_boundary: None,
             thinking,
             fast: false,
         }

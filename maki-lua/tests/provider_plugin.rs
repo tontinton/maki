@@ -331,6 +331,7 @@ fn stream(
         &json!([]),
         &tx,
         RequestOptions {
+            system_cache_boundary: None,
             thinking,
             fast: false,
         },

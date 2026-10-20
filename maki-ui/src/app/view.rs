@@ -342,6 +342,7 @@ impl App {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
         let opts = chat.opts.unwrap_or(RequestOptions {
+            system_cache_boundary: None,
             thinking: self.state.thinking,
             fast: self.state.fast,
         });

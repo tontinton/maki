@@ -287,6 +287,7 @@ impl App {
             chat.cost = sa.cost;
             chat.model_id = sa.model;
             chat.opts = sa.thinking.map(|thinking| RequestOptions {
+                system_cache_boundary: None,
                 thinking: thinking.into(),
                 fast: sa.fast,
             });

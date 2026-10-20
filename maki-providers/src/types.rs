@@ -1162,6 +1162,8 @@ pub struct RequestOptions {
     pub thinking: ThinkingConfig,
     /// Raw user preference, reconciled by [`RequestOptions::clamped`] before use.
     pub fast: bool,
+    /// Byte offset at the end of the shared prefix in the frozen system prompt.
+    pub system_cache_boundary: Option<usize>,
 }
 
 impl RequestOptions {
@@ -1172,6 +1174,7 @@ impl RequestOptions {
         Self {
             thinking: self.thinking.clamped(model),
             fast: self.fast && model.supports_fast(),
+            system_cache_boundary: self.system_cache_boundary,
         }
     }
 }
@@ -1967,6 +1970,7 @@ mod tests {
         let thinking = RequestOptions {
             thinking: ThinkingConfig::Off,
             fast: false,
+            system_cache_boundary: None,
         }
         .clamped(&model)
         .thinking;
@@ -2067,6 +2071,7 @@ mod tests {
         let opts = RequestOptions {
             thinking,
             fast: false,
+            system_cache_boundary: None,
         };
         assert_eq!(opts.clamped(&model).thinking, expected);
     }
@@ -2081,11 +2086,25 @@ mod tests {
     }
 
     #[test]
+    fn request_options_clamped_keeps_system_cache_boundary() {
+        let model = clamp_test_model(google_spec());
+        let opts = RequestOptions {
+            system_cache_boundary: Some(42),
+            ..Default::default()
+        };
+        assert_eq!(
+            opts.clamped(&model).system_cache_boundary,
+            opts.system_cache_boundary
+        );
+    }
+
+    #[test]
     fn request_options_clamped_fast_requires_model_support() {
         let model = clamp_test_model(google_spec());
         let opts = RequestOptions {
             thinking: ThinkingConfig::Off,
             fast: true,
+            system_cache_boundary: None,
         };
         assert!(!opts.clamped(&model).fast);
     }

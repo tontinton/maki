@@ -803,11 +803,7 @@ impl CatalogTransport {
                     .await
             }
             EndpointType::Messages => {
-                let system_blocks = vec![shared::SystemBlock {
-                    r#type: "text",
-                    text: system,
-                    cache_control: Some(shared::EPHEMERAL),
-                }];
+                let system_blocks = shared::system_blocks(system, opts.system_cache_boundary);
                 let mut body = shared::build_request_body_with_system(
                     model,
                     messages,

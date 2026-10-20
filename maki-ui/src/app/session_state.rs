@@ -53,7 +53,12 @@ fn clamp(
     fast: bool,
     model: &Model,
 ) -> (ThinkingConfig, Option<ThinkingConfig>, bool, bool) {
-    let opts = RequestOptions { thinking, fast }.clamped(model);
+    let opts = RequestOptions {
+        thinking,
+        fast,
+        ..Default::default()
+    }
+    .clamped(model);
     (
         opts.thinking,
         (thinking.is_enabled() && !model.supports_thinking()).then_some(thinking),

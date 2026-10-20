@@ -564,11 +564,7 @@ impl Provider for Bedrock {
             let mut body = shared::build_request_body_with_system(
                 model,
                 messages,
-                &[shared::SystemBlock {
-                    r#type: "text",
-                    text: system,
-                    cache_control: Some(shared::EPHEMERAL),
-                }],
+                &shared::system_blocks(system, opts.system_cache_boundary),
                 tools,
                 opts.thinking,
                 self.top_p,

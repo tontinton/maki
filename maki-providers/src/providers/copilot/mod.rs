@@ -323,10 +323,10 @@ impl Copilot {
         system: &str,
         tools: &Value,
         event_tx: &Sender<ProviderEvent>,
-        thinking: ThinkingConfig,
+        opts: RequestOptions,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
-        let body = messages_body(model, messages, system, tools, thinking);
+        let body = messages_body(model, messages, system, tools, opts);
         let request = self
             .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?
             .header("anthropic-version", "2023-06-01")
@@ -730,15 +730,17 @@ fn messages_body(
     messages: &[Message],
     system: &str,
     tools: &Value,
-    thinking: ThinkingConfig,
+    opts: RequestOptions,
 ) -> Value {
-    let system = [shared::SystemBlock {
-        r#type: "text",
-        text: system,
-        cache_control: Some(shared::EPHEMERAL),
-    }];
-    let mut body =
-        shared::build_request_body_with_system(model, messages, &system, tools, thinking, None);
+    let system = shared::system_blocks(system, opts.system_cache_boundary);
+    let mut body = shared::build_request_body_with_system(
+        model,
+        messages,
+        &system,
+        tools,
+        opts.thinking,
+        None,
+    );
     body["model"] = json!(model.id);
     body["stream"] = json!(true);
     body
@@ -788,7 +790,13 @@ impl Provider for Copilot {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut prefixed_system = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut prefixed_system);
+            let mut opts = opts;
+            let system = super::with_prefix_options(
+                &self.system_prefix,
+                system,
+                &mut prefixed_system,
+                &mut opts,
+            );
             let endpoint = self.model_endpoint(&model.id).await?;
             debug!(model = %model.id, ?endpoint, "running Copilot request");
             match endpoint {
@@ -801,7 +809,7 @@ impl Provider for Copilot {
                         .await
                 }
                 Endpoint::Messages => {
-                    self.stream_messages(model, messages, system, tools, event_tx, opts.thinking)
+                    self.stream_messages(model, messages, system, tools, event_tx, opts)
                         .await
                 }
             }
@@ -835,6 +843,7 @@ mod tests {
     use crate::{ContentBlock, Role, TokenUsage};
     use test_case::test_case;
 
+    const SPLIT_SYSTEM: &str = "shared local";
     const OPUS_CACHE_WRITE: f64 = 6.25;
     const CLAUDE_SPEC: &str = "copilot/claude-opus-5";
     const REPLY: &str = "reply";
@@ -1115,7 +1124,13 @@ mod tests {
             ..Default::default()
         }];
 
-        let body = messages_body(&model, &messages, "system", &json!([]), ThinkingConfig::Off);
+        let body = messages_body(
+            &model,
+            &messages,
+            "system",
+            &json!([]),
+            RequestOptions::default(),
+        );
 
         assert_eq!(
             body["messages"],
@@ -1140,7 +1155,13 @@ mod tests {
         let tools =
             json!([{"name": "tool", "description": "test", "input_schema": {"type": "object"}}]);
 
-        let body = messages_body(&model, &messages, "system", &tools, ThinkingConfig::Off);
+        let body = messages_body(
+            &model,
+            &messages,
+            "system",
+            &tools,
+            RequestOptions::default(),
+        );
 
         assert_eq!(
             body["system"][0]["cache_control"],
@@ -1162,6 +1183,47 @@ mod tests {
         assert_eq!(
             body["messages"][2]["content"][0]["cache_control"],
             json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn messages_body_uses_split_system_cache_allocation() {
+        let model = Model::from_spec(CLAUDE_SPEC).unwrap();
+        let messages = [
+            Message::user("first".into()),
+            Message::user("latest".into()),
+        ];
+        let tools = json!([{"name": "read"}]);
+        let body = messages_body(
+            &model,
+            &messages,
+            SPLIT_SYSTEM,
+            &tools,
+            RequestOptions {
+                system_cache_boundary: Some(6),
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["system"].as_array().unwrap().len(), 2);
+        assert_eq!(body["system"][0]["text"], "shared");
+        assert_eq!(body["system"][1]["text"], " local");
+        assert!(
+            body["system"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block.get("cache_control").is_some())
+        );
+        assert!(body["tools"][0].get("cache_control").is_some());
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_some()
         );
     }
 

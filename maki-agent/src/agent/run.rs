@@ -299,7 +299,11 @@ impl<'h> Agent<'h> {
         self.stop_continuations = 0;
         self.mode = mode;
         self.workflow = workflow;
-        self.opts = RequestOptions { thinking, fast };
+        self.opts = RequestOptions {
+            thinking,
+            fast,
+            ..Default::default()
+        };
         // Each message of a burst is judged on its own, and one kept message is
         // enough for the run to go on.
         let burst = earlier

@@ -16,7 +16,7 @@ use crate::spec::{
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
-use super::{ResolvedAuth, Timeouts, with_prefix};
+use super::{ResolvedAuth, Timeouts};
 
 /// Zen lives under the bare `opencode` models.dev entry; Go has its own.
 pub(crate) const ZEN_SLUG: &str = "opencode";
@@ -231,7 +231,9 @@ impl Provider for Opencode {
             let (meta, api_format, auth) = self.lookup(sub_provider, actual_id, session_id).await?;
 
             let mut buf = String::new();
-            let system = with_prefix(&self.system_prefix, system, &mut buf);
+            let mut opts = opts;
+            let system =
+                super::with_prefix_options(&self.system_prefix, system, &mut buf, &mut opts);
 
             let stream_model = Model {
                 id: actual_id.to_string(),

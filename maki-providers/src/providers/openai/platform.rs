@@ -1006,6 +1006,7 @@ mod tests {
         let opts = RequestOptions {
             thinking: ThinkingConfig::Adaptive,
             fast,
+            system_cache_boundary: None,
         };
         assert_eq!(opts.clamped(&model).fast, expected);
         let mut body = responses::build_body(&model, &[], "", &json!([]));

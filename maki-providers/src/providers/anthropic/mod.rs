@@ -503,26 +503,17 @@ impl Provider for Anthropic {
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let system_blocks = if let Some(prefix) = &self.system_prefix {
-                vec![
+            let mut system_blocks = shared::system_blocks(system, opts.system_cache_boundary);
+            if let Some(prefix) = &self.system_prefix {
+                system_blocks.insert(
+                    0,
                     shared::SystemBlock {
                         r#type: "text",
                         text: prefix,
                         cache_control: None,
                     },
-                    shared::SystemBlock {
-                        r#type: "text",
-                        text: system,
-                        cache_control: Some(shared::EPHEMERAL),
-                    },
-                ]
-            } else {
-                vec![shared::SystemBlock {
-                    r#type: "text",
-                    text: system,
-                    cache_control: Some(shared::EPHEMERAL),
-                }]
-            };
+                );
+            }
 
             let (top_p, anthropic_api) = {
                 let auth = self.auth.lock().unwrap();
@@ -1216,7 +1207,12 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         ; "skips_thinking_blocks"
     )]
     fn cache_control_placement(messages: Vec<Message>, expected: &[(usize, usize)]) {
-        let json: Value = serde_json::to_value(build_wire_messages(&messages, &json!([]))).unwrap();
+        let json: Value = serde_json::to_value(build_wire_messages(
+            &messages,
+            &json!([]),
+            shared::MESSAGE_CACHE_BREAKPOINTS,
+        ))
+        .unwrap();
 
         let marked: Vec<(usize, usize)> = json
             .as_array()
@@ -1242,7 +1238,12 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             message(Role::Assistant, vec![text_block(" \n"), text_block("kept")]),
             message(Role::Assistant, vec![text_block("   ")]),
         ];
-        let json: Value = serde_json::to_value(build_wire_messages(&messages, &json!([]))).unwrap();
+        let json: Value = serde_json::to_value(build_wire_messages(
+            &messages,
+            &json!([]),
+            shared::MESSAGE_CACHE_BREAKPOINTS,
+        ))
+        .unwrap();
 
         assert_eq!(json[0]["content"].as_array().unwrap().len(), 1);
         assert_eq!(json[0]["content"][0]["text"], "kept");
@@ -1291,7 +1292,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             ],
             ..Default::default()
         }];
-        let wire = build_wire_messages(&messages, &json!([]));
+        let wire = build_wire_messages(&messages, &json!([]), shared::MESSAGE_CACHE_BREAKPOINTS);
         let json: Value = serde_json::to_value(&wire).unwrap();
 
         assert_eq!(json[0]["content"][0]["type"], "tool_result");
@@ -1335,7 +1336,12 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
     }
 
     fn wire_content(messages: &[Message], tools: &Value) -> Value {
-        let mut json: Value = serde_json::to_value(build_wire_messages(messages, tools)).unwrap();
+        let mut json: Value = serde_json::to_value(build_wire_messages(
+            messages,
+            tools,
+            shared::MESSAGE_CACHE_BREAKPOINTS,
+        ))
+        .unwrap();
         json[0]["content"].take()
     }
 
@@ -1466,8 +1472,12 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         set_result(&mut later, |content, _| *content = LATER_TEXT.into());
         messages.append(&mut later);
 
-        let wire: Value =
-            serde_json::to_value(build_wire_messages(&messages, &deferred_tools())).unwrap();
+        let wire: Value = serde_json::to_value(build_wire_messages(
+            &messages,
+            &deferred_tools(),
+            shared::MESSAGE_CACHE_BREAKPOINTS,
+        ))
+        .unwrap();
         assert_eq!(
             wire[1]["content"],
             json!([{

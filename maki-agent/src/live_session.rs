@@ -253,6 +253,7 @@ mod tests {
     use crate::tools::test_support::{future_mtime, stub_seed};
 
     const CHAT_OPTS: RequestOptions = RequestOptions {
+        system_cache_boundary: None,
         thinking: ThinkingConfig::Adaptive,
         fast: true,
     };
