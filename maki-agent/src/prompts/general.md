@@ -1,7 +1,5 @@
 {{identity}}
 
-{environment}
-
 # Output discipline
 {{tone}}
 
@@ -15,4 +13,6 @@
 
 # When done
 {{completion}}
+
+{environment}
 {{instructions}}

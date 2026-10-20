@@ -2766,6 +2766,7 @@ mod tests {
     fn frame_with_system(system: &str) -> StoredFrame {
         StoredFrame {
             system: system.into(),
+            system_cache_boundary: None,
             fingerprint: "hash".into(),
             facts: Some(PromptFacts {
                 date: "2026-10-02".into(),
@@ -4325,6 +4326,7 @@ mod tests {
             6 => session.prune_orphans(tool_ids),
             7 => session.set_frame(Some(Arc::new(StoredFrame {
                 system: format!("system-{step}"),
+                system_cache_boundary: None,
                 fingerprint: format!("hash-{step}"),
                 facts: Default::default(),
                 mcp_tools: Vec::new(),

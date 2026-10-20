@@ -131,6 +131,9 @@ impl LiveFacts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredFrame {
     pub system: String,
+    /// Rendered byte boundary before variable system content. Old frames stay unsplit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_cache_boundary: Option<usize>,
     /// A hash of what no update can carry. A run whose fingerprint differs
     /// starts a new frame.
     pub fingerprint: String,

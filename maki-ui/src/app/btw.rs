@@ -173,6 +173,7 @@ mod tests {
             let mut snapshot = HistorySnapshot::new(Vec::new());
             snapshot.frame = Some(Arc::new(StoredFrame {
                 system: FRAME_POLICY.into(),
+                system_cache_boundary: None,
                 fingerprint: String::new(),
                 facts: None,
                 mcp_tools: Vec::new(),

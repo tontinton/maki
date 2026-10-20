@@ -35,6 +35,10 @@ impl Vars {
         self
     }
 
+    pub(crate) fn first_expansion(&self, text: &str) -> Option<usize> {
+        self.0.iter().filter_map(|(key, _)| text.find(key)).min()
+    }
+
     pub fn apply<'a>(&self, s: &'a str) -> Cow<'a, str> {
         if self.0.is_empty() || !s.contains('{') {
             return Cow::Borrowed(s);

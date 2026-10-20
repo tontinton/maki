@@ -141,6 +141,12 @@ pub struct SlotEntry {
     pub content: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct RenderedPrompt {
+    pub text: String,
+    pub cache_boundary: Option<usize>,
+}
+
 #[derive(Default)]
 pub struct ResolvedPrompts {
     entries: HashMap<(PromptId, Slot), Vec<SlotEntry>>,
@@ -214,18 +220,41 @@ impl ResolvedPrompts {
     /// Expand only the template's variables and insertion points. Inserted
     /// plugin text and project instructions are never recursively rendered.
     pub fn render(&self, prompt: PromptId, vars: &Vars, instructions: &str) -> String {
+        self.render_with_cache_boundary(prompt, vars, instructions)
+            .text
+    }
+
+    pub fn render_with_cache_boundary(
+        &self,
+        prompt: PromptId,
+        vars: &Vars,
+        instructions: &str,
+    ) -> RenderedPrompt {
         let mut remaining = self.template(prompt);
         let mut out = String::with_capacity(remaining.len());
+        let mut boundary = None;
+        let append = |out: &mut String, boundary: &mut Option<usize>, text: &str| {
+            if boundary.is_none()
+                && let Some(offset) = vars.first_expansion(text)
+            {
+                *boundary = Some(out.len() + offset);
+            }
+            out.push_str(&vars.apply(text));
+        };
         while let Some(open) = remaining.find("{{") {
-            out.push_str(&vars.apply(&remaining[..open]));
+            append(&mut out, &mut boundary, &remaining[..open]);
             let marker = &remaining[open..];
             let Some(close) = marker.find("}}") else {
-                out.push_str(&vars.apply(marker));
-                return out;
+                append(&mut out, &mut boundary, marker);
+                remaining = "";
+                break;
             };
             let name = &marker[2..close];
             remaining = &marker[close + 2..];
             if name == INSTRUCTIONS_MARKER {
+                if boundary.is_none() {
+                    boundary = Some(out.len());
+                }
                 out.push_str(instructions);
             } else if let Ok(slot) = name.parse::<Slot>() {
                 let content = self.section(prompt, slot);
@@ -234,11 +263,14 @@ impl ResolvedPrompts {
                     remaining = remaining.strip_prefix('\n').unwrap_or(remaining);
                 }
             } else {
-                out.push_str(&vars.apply(&marker[..close + 2]));
+                append(&mut out, &mut boundary, &marker[..close + 2]);
             }
         }
-        out.push_str(&vars.apply(remaining));
-        out
+        append(&mut out, &mut boundary, remaining);
+        RenderedPrompt {
+            cache_boundary: boundary.filter(|offset| *offset > 0 && *offset < out.len()),
+            text: out,
+        }
     }
 
     /// Effective section content, including its default and contributions.
@@ -301,6 +333,55 @@ mod tests {
     fn at(out: &str, needle: &str) -> usize {
         out.find(needle)
             .unwrap_or_else(|| panic!("missing: {needle}"))
+    }
+
+    #[test_case(PromptId::System ; "system")]
+    #[test_case(PromptId::General ; "general")]
+    #[test_case(PromptId::Research ; "research")]
+    fn shared_prefix_survives_environment_and_project_changes(prompt: PromptId) {
+        let prompts = ResolvedPrompts::default();
+        let render = |cwd, date, instructions| {
+            let vars = Vars::new()
+                .set("{environment}", "Environment: {cwd} {date}")
+                .set("{cwd}", cwd)
+                .set("{date}", date);
+            prompts.render_with_cache_boundary(prompt, &vars, instructions)
+        };
+        let first = render("/one", "2026-10-01", "\nFirst project");
+        let second = render("/two", "2026-10-02", "\nSecond project");
+        let first_boundary = first.cache_boundary.unwrap();
+        let second_boundary = second.cache_boundary.unwrap();
+        assert_eq!(
+            &first.text[..first_boundary],
+            &second.text[..second_boundary]
+        );
+        assert!(!first.text[..first_boundary].contains("Environment:"));
+        assert!(first.text[first_boundary..].contains("First project"));
+        assert!(second.text[second_boundary..].contains("Second project"));
+    }
+
+    #[test_case("é shared\n{cwd} {{instructions}}", "é shared\n/répo rules", Some("é shared\n".len()) ; "unicode_variable")]
+    #[test_case("Shared{{instructions}}tail", "Sharedrulestail", Some("Shared".len()) ; "instructions")]
+    #[test_case("{cwd} shared {{instructions}}", "/répo shared rules", None ; "variable_first")]
+    #[test_case("{{instructions}}shared", "rulesshared", None ; "instructions_first")]
+    #[test_case("Static unknown {custom}", "Static unknown {custom}", None ; "unknown_variable")]
+    #[test_case("Static text", "Static text", None ; "static_text")]
+    #[test_case("Static {{unfinished", "Static {{unfinished", None ; "unclosed_marker")]
+    fn rendered_boundary_preserves_custom_text(
+        template: &str,
+        expected_text: &str,
+        expected_boundary: Option<usize>,
+    ) {
+        let mut prompts = ResolvedPrompts::default();
+        prompts.set_template(PromptId::System, template.into());
+        let vars = Vars::new().set("{cwd}", "/répo");
+        let rendered = prompts.render_with_cache_boundary(PromptId::System, &vars, "rules");
+        assert_eq!(rendered.cache_boundary, expected_boundary);
+        assert_eq!(rendered.text, expected_text);
+        if let Some(boundary) = rendered.cache_boundary {
+            assert!(rendered.text.is_char_boundary(boundary));
+            assert!(!rendered.text[..boundary].contains("/répo"));
+        }
     }
 
     #[test]
@@ -533,7 +614,7 @@ mod tests {
     #[test_case(PromptId::Research, include_str!("prompts/tests/research.md") ; "research")]
     #[test_case(PromptId::General, include_str!("prompts/tests/general.md") ; "general")]
     #[test_case(PromptId::Plan, include_str!("prompts/tests/plan.md") ; "plan")]
-    fn defaults_preserve_pre_catalogue_bytes(id: PromptId, expected: &str) {
+    fn defaults_match_prompt_fixtures(id: PromptId, expected: &str) {
         let vars = Vars::new()
             .set("{environment}", "Environment:\n- Working directory: /example\n- Platform: example\n- Date: 2000-01-01")
             .set("{plan_path}", "/example/plan.md");

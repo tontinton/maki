@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::InstructionBlock;
 use crate::command::project_ancestor_dirs;
-use crate::prompt::{PromptId, ResolvedPrompts};
+use crate::prompt::{PromptId, RenderedPrompt, ResolvedPrompts};
 use crate::template::Vars;
 use maki_providers::model::Model;
 
@@ -95,14 +95,23 @@ pub fn build_system_prompt(
     slots: &ResolvedPrompts,
     model: &Model,
 ) -> String {
+    render_system_prompt(vars, instructions, slots, model).text
+}
+
+pub(super) fn render_system_prompt(
+    vars: &Vars,
+    instructions: &str,
+    slots: &ResolvedPrompts,
+    model: &Model,
+) -> RenderedPrompt {
     let vars = vars.clone().set("{model}", model.spec());
     if slots.has_template(PromptId::System) {
-        return slots.render(PromptId::System, &vars, instructions);
+        return slots.render_with_cache_boundary(PromptId::System, &vars, instructions);
     }
     let env = vars.apply("\n\n{environment}");
     let env = format!("{env}\n- Model: {}", model.spec());
     let instructions = format!("{env}{instructions}");
-    slots.render(PromptId::System, &vars, &instructions)
+    slots.render_with_cache_boundary(PromptId::System, &vars, &instructions)
 }
 
 fn read_unseen(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
@@ -266,6 +275,38 @@ mod tests {
 
     const LEGACY_RULES: &str = "legacy global rules";
     const XDG_RULES: &str = "xdg global rules";
+
+    #[test]
+    fn system_boundary_precedes_environment_and_preserves_all_text() {
+        let prompts = ResolvedPrompts::default();
+        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let render = |cwd, date, instructions| {
+            let vars = Vars::new()
+                .set("{environment}", "Environment: {cwd} {date}")
+                .set("{cwd}", cwd)
+                .set("{date}", date);
+            render_system_prompt(&vars, instructions, &prompts, &model)
+        };
+        let first = render("/one", "2026-10-01", "\nFirst rules");
+        let second = render("/two", "2026-10-02", "\nSecond rules");
+        let boundary = first.cache_boundary.unwrap();
+        assert_eq!(first.cache_boundary, second.cache_boundary);
+        assert_eq!(&first.text[..boundary], &second.text[..boundary]);
+        assert_eq!(
+            &first.text[boundary..],
+            format!(
+                "\n\nEnvironment: /one 2026-10-01\n- Model: {}\nFirst rules",
+                model.spec()
+            ),
+        );
+        assert_eq!(
+            &second.text[boundary..],
+            format!(
+                "\n\nEnvironment: /two 2026-10-02\n- Model: {}\nSecond rules",
+                model.spec()
+            ),
+        );
+    }
 
     #[test]
     fn after_instructions_slot_lands_after_instructions() {

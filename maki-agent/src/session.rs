@@ -494,6 +494,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let frame = Arc::new(StoredFrame {
             system: FRAME_SYSTEM.into(),
+            system_cache_boundary: Some("system".len()),
             fingerprint: FRAME_FINGERPRINT.into(),
             facts: Some(PromptFacts {
                 cwd: CWD.into(),

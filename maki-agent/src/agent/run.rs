@@ -545,7 +545,13 @@ impl<'h> Agent<'h> {
                 messages: self.history.as_slice(),
                 system,
                 tools,
-                opts: self.opts,
+                opts: RequestOptions {
+                    system_cache_boundary: self
+                        .history
+                        .frame()
+                        .and_then(|frame| frame.system_cache_boundary),
+                    ..self.opts
+                },
                 output_budget: self.config.max_turn_output,
                 session_id: self.session_id.as_ref(),
                 retry: self.timeouts.retry,
@@ -1211,6 +1217,7 @@ mod tests {
     struct CapturedRequest {
         model: String,
         system: String,
+        system_cache_boundary: Option<usize>,
         tools: Value,
         messages: Vec<Value>,
     }
@@ -1220,6 +1227,10 @@ mod tests {
     #[track_caller]
     fn assert_append_only(prev: &CapturedRequest, next: &CapturedRequest) {
         assert_eq!(prev.system, next.system, "system changed");
+        assert_eq!(
+            prev.system_cache_boundary, next.system_cache_boundary,
+            "system cache boundary changed"
+        );
         let (prev_tools, next_tools) = (
             prev.tools.as_array().unwrap(),
             next.tools.as_array().unwrap(),
@@ -1253,13 +1264,14 @@ mod tests {
             system: &'a str,
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
-            _: RequestOptions,
+            opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async {
+            Box::pin(async move {
                 self.requests.lock().unwrap().push(CapturedRequest {
                     model: model.id.clone(),
                     system: system.to_owned(),
+                    system_cache_boundary: opts.system_cache_boundary,
                     tools: tools.clone(),
                     messages: messages
                         .iter()
@@ -1487,6 +1499,62 @@ mod tests {
                 requests[2]
                     .system
                     .contains("Never assume a library is available")
+            );
+        });
+    }
+
+    #[test_case(false ; "saved_boundary")]
+    #[test_case(true ; "legacy_frame")]
+    fn resumed_request_uses_the_saved_system_boundary(legacy: bool) {
+        smol::block_on(async {
+            const TEMPLATE: &str = "Shared guidance\n{cwd}\n{{instructions}}";
+            const OLD_CWD: &str = "/original";
+            const NEW_CWD: &str = "/changed";
+            let mut prompts = ResolvedPrompts::default();
+            prompts.set_template(PromptId::System, TEMPLATE.into());
+            let prompts = Arc::new(prompts);
+            let model = default_model();
+            let mut history = History::new(Vec::new());
+            let context = RunContext::render(
+                &Vars::new().set("{cwd}", OLD_CWD),
+                "project",
+                &prompts,
+                &model,
+                RequestTools::default(),
+            );
+            let original_system = context.system.clone();
+            let expected_boundary = (!legacy).then_some("Shared guidance\n".len());
+            fit_frame(&mut history, context, None, &model);
+            let mut saved = serde_json::to_value(history.frame().unwrap().as_ref()).unwrap();
+            if legacy {
+                saved
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("system_cache_boundary");
+            }
+            let frame = serde_json::from_value(saved).unwrap();
+            let mut history = History::restored(Vec::new()).with_frame(Some(Arc::new(frame)));
+            let mock = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&mock.requests);
+            let (mut agent, _events) = make_agent(mock, &mut history);
+            agent.context = Arc::new(move |model, _| {
+                RunContext::render(
+                    &Vars::new().set("{cwd}", NEW_CWD),
+                    "other project",
+                    &prompts,
+                    model,
+                    RequestTools::default(),
+                )
+            });
+            agent.run(default_input()).await.unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests[0].system, original_system);
+            assert_eq!(requests[0].system_cache_boundary, expected_boundary);
+            assert!(
+                requests[0]
+                    .messages
+                    .iter()
+                    .any(|message| message.to_string().contains(NEW_CWD))
             );
         });
     }
@@ -2123,6 +2191,7 @@ mod tests {
                 };
                 RunContext {
                     system: "system".into(),
+                    system_cache_boundary: None,
                     tools: RequestTools::assembled(
                         serde_json::json!([{ "name": tool }]),
                         &AgentConfig::default(),
@@ -2189,6 +2258,7 @@ mod tests {
                 };
                 RunContext {
                     system: format!("system {facts:?}"),
+                    system_cache_boundary: Some("system ".len()),
                     tools: RequestTools::assembled(
                         serde_json::json!([{ "name": *world.tool.lock().unwrap() }]),
                         &AgentConfig::default(),
@@ -2409,6 +2479,12 @@ mod tests {
         let requests = h.requests.lock().unwrap();
         assert_append_only(&requests[0], &requests[1]);
         assert!(requests.last().unwrap().system.contains(NEXT_DATE));
+        assert_eq!(requests[0].system_cache_boundary, Some("system ".len()));
+        assert_eq!(requests[2].system_cache_boundary, None);
+        assert_eq!(
+            requests.last().unwrap().system_cache_boundary,
+            Some("system ".len())
+        );
         assert!(updates(&h.history).is_empty());
     }
 

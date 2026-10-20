@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator;
 
 use super::history::History;
-use super::instructions::build_system_prompt;
+use super::instructions::render_system_prompt;
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::prompt::{PromptId, ResolvedPrompts, Slot, SlotKind};
 use crate::template::Vars;
@@ -42,6 +42,7 @@ pub(crate) const FRAME_REBUILT: &str =
 /// What a session would start with if it started now, for one model.
 pub struct RunContext {
     pub system: String,
+    pub system_cache_boundary: Option<usize>,
     pub tools: RequestTools,
     /// What `system` states. `None` when the host wrote it: we don't know
     /// which facts it mentions, so we never send updates about any.
@@ -59,9 +60,10 @@ impl RunContext {
         model: &Model,
         tools: RequestTools,
     ) -> Self {
-        let system = build_system_prompt(vars, instructions, slots, model);
+        let rendered = render_system_prompt(vars, instructions, slots, model);
         Self {
-            system,
+            system: rendered.text,
+            system_cache_boundary: rendered.cache_boundary,
             tools,
             facts: Some(PromptFacts {
                 date: vars.apply("{date}").into_owned(),
@@ -84,6 +86,7 @@ impl RunContext {
         Self {
             authored: system.clone(),
             system,
+            system_cache_boundary: None,
             tools,
             facts: None,
         }
@@ -220,6 +223,7 @@ pub(crate) fn fit_frame(
             let live = LiveFrame::build(context.tools, mcp, model);
             let frame = StoredFrame {
                 system: context.system,
+                system_cache_boundary: context.system_cache_boundary,
                 fingerprint,
                 facts: context.facts,
                 mcp_tools: live.mcp_tools().to_vec(),
