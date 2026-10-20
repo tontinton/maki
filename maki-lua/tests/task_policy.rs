@@ -1,16 +1,25 @@
-//! Tests the task plugin's structured-output policy end-to-end: real plugin
-//! source, real `maki.json` / `maki.async`, with model I/O replaced by
-//! scriptable Lua stubs.
+//! Tests the real task plugin with scriptable Lua stubs for output policy
+//! and provider-recorded native sessions for prompt cache boundaries.
 
 use std::sync::Arc;
 
+use maki_agent::prompt::{PromptId, ResolvedPrompts};
 use maki_agent::tools::ToolRegistry;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::{AgentMode, ToolOutput};
 use maki_lua::PluginHost;
+use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::{
+    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+    StopReason, StreamResponse,
+};
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
+use test_case::test_case;
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
+const CACHE_SYSTEM: &str = "Shared child guidance.\n{cwd}";
+const CACHE_PREFIX: &str = "Shared child guidance.\n";
 
 // Mirrors of the plugin's error contracts and policy numbers.
 const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -518,4 +527,79 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
     // Pool is full again (released == acquired), so this cannot block.
     let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
     assert_eq!(out, PLAIN_TEXT);
+}
+
+struct CacheBoundaryProvider(flume::Sender<(String, Option<usize>)>);
+
+impl Provider for CacheBoundaryProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        _: &'a [Message],
+        system: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        options: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            self.0
+                .send((system.to_owned(), options.system_cache_boundary))
+                .unwrap();
+            Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: PLAIN_TEXT.into(),
+                    }],
+                    ..Default::default()
+                },
+                stop_reason: Some(StopReason::EndTurn),
+                ..Default::default()
+            })
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+#[test_case("research", PromptId::Research ; "research")]
+#[test_case("general", PromptId::General ; "general")]
+fn task_preserves_the_native_system_cache_boundary(kind: &str, prompt: PromptId) {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "task_cache_boundary",
+        &format!("maki.agent.resolve_model = function() return {{}} end\n{TASK_PLUGIN_SRC}"),
+    )
+    .unwrap();
+    let (sent, requests) = flume::unbounded();
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.provider = Arc::new(CacheBoundaryProvider(sent));
+    let mut prompts = ResolvedPrompts::default();
+    prompts.set_template(prompt, CACHE_SYSTEM.into());
+    ctx.prompt_slots = Arc::new(prompts);
+    let input = json!({
+        "description": "test cache boundary",
+        "prompt": TASK_PROMPT,
+        "subagent_type": kind,
+    });
+    let inv = reg.get(TASK_TOOL).unwrap().tool.parse(&input).unwrap();
+    let output = smol::block_on(inv.execute(&ctx)).output.unwrap();
+    let output = match output {
+        ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
+        other => panic!("unexpected output: {other:?}"),
+    };
+    assert_eq!(output, PLAIN_TEXT);
+    assert_eq!(
+        requests.try_recv().unwrap(),
+        (
+            maki_agent::template::env_vars()
+                .apply(CACHE_SYSTEM)
+                .into_owned(),
+            Some(CACHE_PREFIX.len()),
+        )
+    );
 }

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
+use maki_agent::prompt::{PromptId, RenderedPrompt, ResolvedPrompts};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
@@ -379,11 +380,19 @@ async fn system_prompt(
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
     // meanwhile needs `ctx:finish`, which takes it mutably.
     drop(ctx);
+    let (prompt, error) = render_system_prompt(&slots, opts).await?;
+    Ok((prompt.map(|prompt| prompt.text), error))
+}
+
+async fn render_system_prompt(
+    slots: &ResolvedPrompts,
+    opts: Table,
+) -> LuaResult<Pair<RenderedPrompt>> {
     let prompt_id_str: String = opts.get("prompt_id")?;
     let prompt_id = match prompt_id_str.as_str() {
-        "research" => maki_agent::prompt::PromptId::Research,
-        "general" => maki_agent::prompt::PromptId::General,
-        "system" => maki_agent::prompt::PromptId::System,
+        "research" => PromptId::Research,
+        "general" => PromptId::General,
+        "system" => PromptId::System,
         other => return Ok(err_pair(format!("unknown prompt_id: {other}"))),
     };
 
@@ -399,7 +408,10 @@ async fn system_prompt(
         _ => return Err(mlua::Error::runtime("instructions must be bool or string")),
     };
 
-    Ok((Some(slots.render(prompt_id, &vars, &instructions)), None))
+    Ok((
+        Some(slots.render_with_cache_boundary(prompt_id, &vars, &instructions)),
+        None,
+    ))
 }
 
 /// Get the list of tool definitions for a given audience. Pass the result
@@ -689,7 +701,11 @@ async fn call_tool(
 ///   `scope` (string?) - only without a ctx: `"task"` (default) or
 ///     `"session"`, see above.
 ///   `model_spec` (string?) - model spec string to use instead of the parent model.
-///   `system` (string?) - system prompt. Defaults to empty.
+///   `system` (string|table?) - system prompt, or a prompt specification.
+///     Set its `prompt_id` to `"research"`, `"general"`, or `"system"`.
+///     Its optional `instructions` takes string|boolean, as in
+///     `maki.agent.system_prompt()`.
+///     The table form preserves prompt cache boundaries. Defaults to empty.
 ///   `tools` (table?) - tool definitions array (from `maki.agent.tools()`).
 ///   `local_tools` (table?) - map of `name -> spec` for Lua-backed tools. Each spec
 ///     requires `description` (string), `input_schema` (table), and
@@ -755,7 +771,24 @@ async fn session(
         }
     };
     let model_spec: Option<String> = opts.get("model_spec")?;
-    let system: Option<String> = opts.get("system")?;
+    let system = match opts.get::<LuaValue>("system")? {
+        LuaValue::Nil => RenderedPrompt {
+            text: String::new(),
+            cache_boundary: None,
+        },
+        LuaValue::String(text) => RenderedPrompt {
+            text: text.to_str()?.to_owned(),
+            cache_boundary: None,
+        },
+        LuaValue::Table(spec) => {
+            let (prompt, error) = render_system_prompt(&agent_ctx.prompt_slots, spec).await?;
+            match prompt {
+                Some(prompt) => prompt,
+                None => return Ok((None, error)),
+            }
+        }
+        _ => return Err(mlua::Error::runtime("system must be string or table")),
+    };
     let tools_val: Option<LuaValue> = opts.get("tools")?;
     let local_tools_tbl: Option<Table> = opts.get("local_tools")?;
     let name: Option<String> = opts.get("name")?;
@@ -951,9 +984,11 @@ async fn session(
     // the caller left out is also a name this session cannot dispatch or bind
     // inside its sandbox.
     let tools = RequestTools::assembled(JsonValue::Array(tools_json), &agent_ctx.config, &model);
-    let system = system.unwrap_or_default();
-    let context: RunContextBuilder =
-        Arc::new(move |_, _| RunContext::fixed(system.clone(), tools.clone()));
+    let context: RunContextBuilder = Arc::new(move |_, _| {
+        let mut context = RunContext::fixed(system.text.clone(), tools.clone());
+        context.system_cache_boundary = system.cache_boundary;
+        context
+    });
 
     let state = SessionState {
         params: AgentParams {
@@ -1853,7 +1888,7 @@ mod tests {
     const CHILD_INSTRUCTIONS: &str = "Keep {{identity}} literal.";
     const CHILD_RESPONSE: &str = "Analysis complete.";
 
-    struct PromptRecorder(Sender<String>);
+    struct PromptRecorder(Sender<(String, Option<usize>)>);
 
     impl Provider for PromptRecorder {
         fn stream_message<'a>(
@@ -1863,11 +1898,13 @@ mod tests {
             system: &'a str,
             _: &'a JsonValue,
             _: &'a Sender<ProviderEvent>,
-            _: RequestOptions,
+            opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
-                self.0.send(system.to_owned()).unwrap();
+                self.0
+                    .send((system.to_owned(), opts.system_cache_boundary))
+                    .unwrap();
                 Ok(StreamResponse {
                     message: Message {
                         role: Role::Assistant,
@@ -1887,9 +1924,17 @@ mod tests {
         }
     }
 
-    #[test_case("research", PromptId::Research ; "research_child")]
-    #[test_case("general", PromptId::General ; "general_child")]
-    fn child_session_receives_the_parent_prompt_policy(name: &str, id: PromptId) {
+    #[test_case("research", PromptId::Research, false ; "research_string")]
+    #[test_case("general", PromptId::General, false ; "general_string")]
+    #[test_case("system", PromptId::System, false ; "system_string")]
+    #[test_case("research", PromptId::Research, true ; "research_spec")]
+    #[test_case("general", PromptId::General, true ; "general_spec")]
+    #[test_case("system", PromptId::System, true ; "system_spec")]
+    fn child_session_receives_the_parent_prompt_policy(
+        name: &str,
+        id: PromptId,
+        specification: bool,
+    ) {
         let lua = Lua::new();
         lua.set_app_data(SpawnedTasks::default());
         lua.set_app_data(Arc::new(ToolRegistry::new()));
@@ -1899,26 +1944,30 @@ mod tests {
         let mut prompts = ResolvedPrompts::default();
         prompts.set_template(id, CHILD_SYSTEM.into());
         ctx.prompt_slots = Arc::new(prompts);
+        let agent =
+            create_agent_table(&lua, Arc::from("test"), PluginPermissions::trusted()).unwrap();
+        lua.globals().set("agent", agent).unwrap();
         smol::block_on(async {
             let ctx = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
-            let opts = lua.create_table().unwrap();
-            opts.set("prompt_id", name).unwrap();
-            opts.set("instructions", CHILD_INSTRUCTIONS).unwrap();
-            let (system, error) = system_prompt(lua.clone(), ctx.borrow().unwrap(), opts)
+            let open: Function = lua
+                .load(
+                    "return function(ctx, name, instructions, specification)
+                       local system = { prompt_id = name, instructions = instructions }
+                       if not specification then
+                         local err
+                         system, err = agent.system_prompt(ctx, system)
+                         assert(not err, err)
+                         assert(type(system) == 'string')
+                       end
+                       return agent.session(ctx, { system = system })
+                     end",
+                )
+                .eval()
+                .unwrap();
+            let (sess, error): Pair<AnyUserData> = open
+                .call_async((ctx, name, CHILD_INSTRUCTIONS, specification))
                 .await
                 .unwrap();
-            assert!(error.is_none(), "{error:?}");
-            let opts = lua.create_table().unwrap();
-            opts.set("system", system.unwrap()).unwrap();
-            let (sess, error) = session(
-                lua.clone(),
-                Arc::from("test"),
-                PluginPermissions::trusted(),
-                LuaEither::Left(ctx.borrow().unwrap()),
-                Some(opts),
-            )
-            .await
-            .unwrap();
             assert!(error.is_none(), "{error:?}");
             let sess = sess.unwrap();
             let (_, error) = prompt(lua.clone(), sess.borrow().unwrap(), CHILD_REQUEST.into())
@@ -1929,7 +1978,10 @@ mod tests {
         });
         assert_eq!(
             requests.recv().unwrap(),
-            format!("You analyse evidence.\n{CHILD_INSTRUCTIONS}")
+            (
+                format!("You analyse evidence.\n{CHILD_INSTRUCTIONS}"),
+                specification.then_some("You analyse evidence.\n".len()),
+            )
         );
     }
 

@@ -149,14 +149,6 @@ local function handler(input, ctx)
 
   local audience = subagent_type == "research" and "research_sub" or "general_sub"
   local prompt_id = subagent_type == "research" and "research" or "general"
-  local system, system_err = maki.agent.system_prompt(ctx, {
-    prompt_id = prompt_id,
-    instructions = true,
-  })
-  if system_err then
-    return { llm_output = system_err, is_error = true }
-  end
-
   local tool_defs, tools_err = maki.agent.tools(ctx, {
     audience = audience,
     spec = model.spec,
@@ -196,7 +188,7 @@ local function handler(input, ctx)
     local sess_err
     sess, sess_err = maki.agent.session(ctx, {
       model_spec = model.spec,
-      system = system,
+      system = { prompt_id = prompt_id, instructions = true },
       tools = tool_defs,
       local_tools = local_tools,
       audience = audience,

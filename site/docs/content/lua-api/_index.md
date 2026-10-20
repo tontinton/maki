@@ -1570,7 +1570,11 @@ session, so opening one fails with "session not live". The
   - `scope` (`string?`) only without a ctx: `"task"` (default) or
     `"session"`, see above.
   - `model_spec` (`string?`) model spec string to use instead of the parent model.
-  - `system` (`string?`) system prompt. Defaults to empty.
+  - `system` (`string|table?`) system prompt, or a prompt specification.
+    Set its `prompt_id` to `"research"`, `"general"`, or `"system"`.
+    Its optional `instructions` takes string|boolean, as in
+    `maki.agent.system_prompt()`.
+    The table form preserves prompt cache boundaries. Defaults to empty.
   - `tools` (`table?`) tool definitions array (from `maki.agent.tools()`).
   - `local_tools` (`table?`) map of `name -> spec` for Lua-backed tools. Each spec
     requires `description` (string), `input_schema` (table), and
