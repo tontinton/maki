@@ -581,8 +581,11 @@ pub(crate) const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
 /// generation early, at 4.7; the other families joined at 5.
 const ADAPTIVE_SINCE: (u32, u32) = (5, 0);
 const ADAPTIVE_SINCE_OPUS: (u32, u32) = (4, 7);
+const GEMINI_LEVEL_SINCE: u32 = 3;
 const OPUS: &str = "opus";
 const CLAUDE: &str = "claude";
+const GEMINI: &str = "gemini";
+const LATEST: &str = "latest";
 const SNAPSHOT_DATE_LEN: usize = "20250514".len();
 
 /// `claude-opus-4.7` -> `("opus", (4, 7))`, `claude-opus-5-1m` -> `("opus", (5, 0))`.
@@ -633,12 +636,33 @@ pub(crate) fn rejects_sampling(model_id: &str) -> bool {
     requires_adaptive(model_id)
 }
 
+/// Gemini 3+ and the `-latest` aliases take `thinkingLevel` (`low`, `medium`,
+/// `high`) in place of `thinkingBudget`. Only the 2.x series speaks budgets;
+/// `minimal` is omitted from the dialect because Pro and Gemini 4 reject it
+/// with a 400.
+fn uses_google_thinking_level(model_id: &str) -> bool {
+    let mut tokens = model_id
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .skip_while(|token| *token != GEMINI)
+        .skip(1);
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if let Some(major) = version_number(first) {
+        major >= GEMINI_LEVEL_SINCE
+    } else {
+        tokens.any(|token| token == LATEST)
+    }
+}
+
 /// How a provider's effort knob speaks: which levels its API accepts, what
 /// `adaptive` means there, and whether "off" needs an explicit string.
 /// New providers add a const in [`dialect`]; providers with dynamic model
 /// listings build one from the model's declared levels (see OpenRouter).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffortDialect<'a> {
+    /// Wire name of a declared dialect; `None` for one built at runtime.
+    pub name: Option<&'static str>,
     /// Accepted levels, non-empty and ascending (checked by test).
     pub supported: &'a [Effort],
     /// What `Adaptive` maps to. `None` means the API has its own adaptive or
@@ -723,6 +747,7 @@ macro_rules! dialects {
         $(
             $(#[$attr])+
             pub const $konst: EffortDialect = EffortDialect {
+                name: Some($name),
                 supported: &[$($level),+],
                 adaptive: $adaptive,
                 off: $off,
@@ -742,17 +767,11 @@ macro_rules! dialects {
 
         /// The name [`by_name`] answers this dialect to, so a declaration can
         /// serialise the dialect it holds instead of keeping the name twice.
-        /// Written as the inverse of `by_name` so the two cannot drift.
-        ///
-        /// Matched by value, not by address: a `const` is inlined at each use
-        /// site, so two `&STANDARD` need not be the same pointer. `None` for a
-        /// dialect built at runtime out of a model's declared levels (see
-        /// OpenRouter), which no declaration can name.
+        /// The macro wrote both from the same literal, so the two cannot
+        /// drift. `None` for a dialect built at runtime out of a model's
+        /// declared levels (see OpenRouter), which no declaration can name.
         pub fn name_of(dialect: &EffortDialect) -> Option<&'static str> {
-            NAMES
-                .iter()
-                .copied()
-                .find(|name| by_name(name).is_some_and(|known| known == dialect))
+            dialect.name
         }
     };
 }
@@ -834,6 +853,12 @@ pub mod dialect {
         /// `output_config.effort` on Anthropic adaptive-thinking models. The API
         /// has native adaptive mode, so Adaptive sends no effort.
         ANTHROPIC_ADAPTIVE "anthropic-adaptive" {
+            supported: [Low, Medium, High],
+            adaptive: None,
+            off: None
+        },
+        /// Gemini 3+ `thinkingLevel`. Pro and Gemini 4 reject `minimal`.
+        GEMINI "gemini" {
             supported: [Low, Medium, High],
             adaptive: None,
             off: None
@@ -1046,13 +1071,25 @@ impl ThinkingConfig {
     /// `max` is Google's own documented ceiling on thinking, which is a
     /// capability and so part of resolving the level, not a trim.
     pub fn apply_google_thinking(self, body: &mut Value, model: &Model, max: u32) {
+        if uses_google_thinking_level(&model.id) {
+            if matches!(self, Self::Off) {
+                return;
+            }
+            let mut config = json!({"includeThoughts": true});
+            if let Some(level) = self.effort_str(&dialect::GEMINI, model) {
+                config["thinkingLevel"] = json!(level);
+            }
+            body["generationConfig"]["thinkingConfig"] = config;
+            return;
+        }
         match self.request_budget(model, Some(max)) {
             Budgeted::Off => {}
             Budgeted::Adaptive => {
                 body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
             }
             Budgeted::Tokens(n) => {
-                body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": n});
+                body["generationConfig"]["thinkingConfig"] =
+                    json!({"includeThoughts": true, "thinkingBudget": n});
             }
         }
     }
@@ -1706,11 +1743,9 @@ mod tests {
         )
     }
 
-    /// `Effort::snap` walks `supported` expecting it sorted, and `name_of`
-    /// matches on field values, so two dialects with identical fields would
-    /// hand a declaration back the wrong name.
+    /// `Effort::snap` walks `supported` expecting it sorted.
     #[test]
-    fn every_dialect_is_well_formed_and_uniquely_named() {
+    fn every_dialect_is_well_formed_and_named() {
         for name in dialect::NAMES {
             let d = dialect::by_name(name).expect(UNKNOWN_DIALECT);
             assert!(!d.supported.is_empty(), "{name} supports nothing");
@@ -1909,22 +1944,29 @@ mod tests {
     /// Roomy enough that the request ceiling is not what binds.
     const ROOMY_OUTPUT: Option<u32> = Some(65_536);
 
-    #[test_case(ThinkingConfig::Off, ROOMY_OUTPUT, json!({})                                                                  ; "off")]
-    #[test_case(ThinkingConfig::Adaptive, ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
-    #[test_case(ThinkingConfig::Budget(4096), ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget")]
-    #[test_case(ThinkingConfig::Budget(10000), ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192}}}) ; "budget_clamped_to_googles_cap")]
+    #[test_case(ThinkingConfig::Off, "gemini-2.5-pro", ROOMY_OUTPUT, json!({})                                                                  ; "off")]
+    #[test_case(ThinkingConfig::Adaptive, "gemini-2.5-pro", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(4096), "gemini-2.5-pro", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingBudget": 4096}}}) ; "budget")]
+    #[test_case(ThinkingConfig::Budget(10000), "gemini-2.5-pro", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingBudget": 8192}}}) ; "budget_clamped_to_googles_cap")]
     // Half the `maxOutputTokens` the same request carries, or the answer has
     // nowhere to land.
-    #[test_case(ThinkingConfig::Budget(10000), Some(GOOGLE_CAP), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget_cut_to_what_the_request_can_house")]
+    #[test_case(ThinkingConfig::Budget(10000), "gemini-2.5-pro", Some(GOOGLE_CAP), json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingBudget": 4096}}}) ; "budget_cut_to_what_the_request_can_house")]
+    #[test_case(ThinkingConfig::Off, "gemini-4-argon", ROOMY_OUTPUT, json!({}) ; "off_level_model")]
+    #[test_case(ThinkingConfig::Adaptive, "gemini-4-argon", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive_level_model")]
+    #[test_case(ThinkingConfig::Effort(Minimal), "gemini-4-argon", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "low"}}}) ; "minimal_snaps_up_to_low_on_level_model")]
+    #[test_case(ThinkingConfig::Effort(High), "gemini-4-argon", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "high"}}}) ; "high_level_model")]
+    #[test_case(ThinkingConfig::Effort(XHigh), "gemini-3.6-flash", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "high"}}}) ; "xhigh_snaps_down_to_high_on_gemini_3")]
+    #[test_case(ThinkingConfig::Budget(32768), "gemini-pro-latest", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "high"}}}) ; "budget_maps_to_level_on_latest_alias")]
     fn thinking_apply_google_thinking(
         config: ThinkingConfig,
+        model_id: &str,
         max_output_tokens: Option<u32>,
         expected: Value,
     ) {
         let mut body = json!({});
         let model = crate::model::Model {
             max_output_tokens,
-            ..thinking_model("gemini-2.5-pro")
+            ..thinking_model(model_id)
         };
         config.apply_google_thinking(&mut body, &model, GOOGLE_CAP);
         assert_eq!(body, expected);

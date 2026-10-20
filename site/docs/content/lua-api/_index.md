@@ -4302,8 +4302,8 @@ it does for a built-in provider.
     - `dialect` (`string`) Required. One of `"standard"`, `"codex"`,
       `"codex-5-1"`, `"coding-plan"`, `"gpt-5-6"`, `"gpt-6"`,
       `"prefer-high"`, `"high-only"`, `"glm"`, `"deepseek"`,
-      `"anthropic-adaptive"`, `"tensorx"`, `"grok"` or
-      `"ollama"`.
+      `"anthropic-adaptive"`, `"gemini"`, `"tensorx"`, `"grok"`
+      or `"ollama"`.
     - `field` (`string`) Body path for the effort. Dots nest, e.g.
       `"reasoning.effort"`. Defaults to `reasoning_effort`.
     - `requires_support` (`boolean`) Send effort only to models that

@@ -746,6 +746,7 @@ fn messages_body(
 
 fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
     EffortDialect {
+        name: None,
         supported: if info.reasoning_efforts.is_empty() {
             dialect::PREFER_HIGH.supported
         } else {

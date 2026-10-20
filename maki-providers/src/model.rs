@@ -122,6 +122,7 @@ impl ModelEffort {
     /// declaration's: a model lists levels, not a default.
     pub fn refine<'a>(&'a self, declared: &EffortDialect<'a>) -> EffortDialect<'a> {
         EffortDialect {
+            name: None,
             supported: match self.supported.as_slice() {
                 [] => declared.supported,
                 listed => listed,

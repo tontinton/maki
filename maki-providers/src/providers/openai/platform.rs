@@ -137,6 +137,7 @@ pub(crate) struct PlanModelInfo {
 impl PlanModelInfo {
     fn dialect(&self) -> EffortDialect<'_> {
         EffortDialect {
+            name: None,
             supported: &self.efforts,
             adaptive: self.adaptive,
             off: self.off.then_some(dialect::OFF),
