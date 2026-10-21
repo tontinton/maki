@@ -25,6 +25,11 @@ pub struct SessionSnapshot {
     /// session id, so a plugin can tell "no title" from a real one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Whether the user named the session, rather than auto-generation.
+    /// Next to `title`, so a plugin can decide how much weight a title
+    /// carries.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub title_user_set: bool,
     /// Model spec as shown in the status bar (`provider/id`).
     pub model: String,
     /// [`MODE_BUILD`] or [`MODE_PLAN`].
@@ -151,6 +156,7 @@ impl HeadlessSnapshot {
                 id: meta.id.clone(),
                 cwd: meta.cwd.clone(),
                 title: None,
+                title_user_set: false,
                 model: meta.model.clone(),
                 mode,
                 status: if totals.working {
