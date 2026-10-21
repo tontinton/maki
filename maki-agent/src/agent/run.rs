@@ -77,7 +77,7 @@ pub async fn resolve_compaction_model(
     model_policy: &ModelPolicy,
 ) -> (Arc<dyn Provider>, Model) {
     if let Some(spec) =
-        maki_providers::model_registry::spec_for_tier_any(maki_providers::ModelTier::Compaction)
+        maki_providers::model_registry::resolve_tier(None, maki_providers::ModelTier::Compaction)
         && model_policy.allows(&spec)
         && let Ok(mut m) = Model::from_spec(&spec)
         && let Ok(p) = maki_providers::provider::from_model_async(&mut m, timeouts)

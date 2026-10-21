@@ -95,9 +95,10 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
 }
 
 /// The model maki uses for a tier, the same one a subagent asking for that
-/// tier gets: your pick from the `/model` picker, else the curated default.
-/// `assigned` tells the two apart. Pass `provider` to prefer its models, the
-/// way subagents prefer the session's provider.
+/// tier gets: user's pick from the `/model` picker for that tier (whatever
+/// provider it names), else the curated default within `provider`, else any
+/// provider. `assigned` tells a pick apart from a default. Pass `provider` to
+/// prefer its models, the way subagents prefer the session's provider.
 ///
 /// @param name string `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
 /// @param provider string|nil Provider slug to resolve within first.
@@ -114,11 +115,9 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
         Ok(tier) => tier,
         Err(e) => return Ok(err_pair(e)),
     };
-    let Some(spec) = provider
-        .and_then(|p| model_registry::spec_for_tier(&p, tier))
-        .or_else(|| model_registry::spec_for_tier_any(tier))
-    else {
-        return Ok((None, None));
+    let spec = match model_registry::resolve_tier(provider.as_deref(), tier) {
+        Some(spec) => spec,
+        None => return Ok((None, None)),
     };
     let model = match Model::from_spec(&spec) {
         Ok(model) => model,

@@ -26,6 +26,7 @@ use maki_agent::{
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
+use maki_providers::model_registry;
 use maki_providers::provider;
 use maki_providers::{
     ContentBlock, ContextGauge, Message, Model, RequestOptions, Role, ThinkingConfig, add_cost,
@@ -80,8 +81,7 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
         return Ok(Model::clone(&ctx.model));
     }
     let slug = &ctx.model.provider;
-    maki_providers::model_registry::spec_for_tier(slug, effective)
-        .or_else(|| maki_providers::model_registry::spec_for_tier_any(effective))
+    model_registry::resolve_tier(Some(slug), effective)
         .filter(|spec| ctx.model_policy.allows(spec))
         .and_then(|s| Model::from_spec(&s).ok())
         .map(Ok)
@@ -337,7 +337,9 @@ async fn relay_session_events(
 /// @param ctx LuaCtx Agent context.
 /// @param opts table? Optional fields:
 ///   `tier` (string?) - target tier, e.g. `"fast"`, `"mid"`, `"best"`. Clamped to
-///     the parent tier so you cannot escalate.
+///     the parent tier so you cannot escalate. Resolved by
+///     `maki.model.tier`, so a `/model` pick for the tier wins over the
+///     session provider's curated default.
 ///   `spec` (string?) - exact model spec string, e.g. `"claude-3-5-haiku-20241022"`.
 ///     Takes precedence over `tier`.
 /// @return (table?, string?) Model table on success, or `(nil, err)` on failure.
@@ -2344,5 +2346,26 @@ mod tests {
             "{:?}",
             event_names(&events)
         );
+    }
+
+    #[test]
+    fn task_model_selection_tier_override_beats_the_session_provider() {
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.model = Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap());
+        let ctx = AgentContext::from(&ctx);
+
+        let same_provider_weak = resolve_model_from_ctx(&ctx, Some("weak")).unwrap().spec();
+        assert!(same_provider_weak.starts_with("anthropic/"));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        maki_providers::model_registry::set_and_persist(
+            "zai/glm-5".into(),
+            ModelTier::Weak,
+            &maki_storage::StateDir::from_path(dir.path().to_path_buf()),
+        );
+
+        let model = resolve_model_from_ctx(&ctx, Some("weak")).unwrap();
+        assert_eq!(model.spec(), "zai/glm-5");
+        assert_ne!(model.spec(), same_provider_weak);
     }
 }

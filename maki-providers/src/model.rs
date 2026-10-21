@@ -910,6 +910,9 @@ impl Model {
         ProviderRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
     }
 
+    /// The model for a tier within given provider. This function only picks a
+    /// model within the given provider. Use `resolve_tier()` when needed to
+    /// resolve a model tier to model spec from any provider.
     pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
         if let Some(spec) = model_registry::spec_for_tier(slug, tier) {
             return Self::from_spec(&spec);

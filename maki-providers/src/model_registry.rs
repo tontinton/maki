@@ -43,8 +43,11 @@ pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {
     read().spec_for_tier(provider, tier)
 }
 
-pub fn spec_for_tier_any(tier: ModelTier) -> Option<String> {
-    read().spec_for_tier_any(tier)
+/// The model a tier resolves to, layering user overrides on top of provider
+/// defaults: the user's pick for the tier (whatever provider it names) first,
+/// then the tier within `provider`, then the tier in any provider.
+pub fn resolve_tier(provider: Option<&str>, tier: ModelTier) -> Option<String> {
+    read().resolve_tier(provider, tier)
 }
 
 pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
@@ -229,16 +232,18 @@ impl ModelRegistry {
         self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
     }
 
+    fn resolve_tier(&self, provider: Option<&str>, tier: ModelTier) -> Option<String> {
+        self.overrides
+            .get(&tier)
+            .cloned()
+            .or_else(|| provider.and_then(|p| self.spec_for_tier(p, tier)))
+            .or_else(|| self.spec_for_tier_any(tier))
+    }
+
     fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
-        if let Some(spec) = self.overrides.get(&tier) {
-            return Some(spec.clone());
-        }
-        for provider in self.known_models.keys() {
-            if let Some(spec) = self.spec_for_tier(provider, tier) {
-                return Some(spec);
-            }
-        }
-        None
+        self.known_models
+            .keys()
+            .find_map(|provider| self.spec_for_tier(provider, tier))
     }
 
     fn override_tiers(&self, spec: &str) -> Vec<ModelTier> {
@@ -458,7 +463,26 @@ mod tests {
     }
 
     #[test]
-    fn spec_for_tier_resolution() {
+    fn resolve_tier_override_beats_the_scoped_provider() {
+        let reg = make_map(&[(ModelTier::Weak, "zai/glm-5")], &["big", "mid", "small"]);
+        assert_eq!(
+            reg.resolve_tier(Some("ollama"), ModelTier::Weak),
+            Some("zai/glm-5".into())
+        );
+        assert_eq!(
+            reg.resolve_tier(Some("ollama"), ModelTier::Medium),
+            Some("ollama/mid".into())
+        );
+        assert_eq!(
+            reg.resolve_tier(None, ModelTier::Weak),
+            Some("zai/glm-5".into())
+        );
+    }
+
+    /// `spec_for_tier` is provider-scoped: an override with another provider is
+    /// invisible to a different provider's lookup.
+    #[test]
+    fn spec_for_tier_is_provider_scoped() {
         let reg = make_map(
             &[(ModelTier::Strong, "ollama/custom")],
             &["big", "mid", "small"],
@@ -474,29 +498,6 @@ mod tests {
 
         let conflict = make_map(&[(ModelTier::Weak, "ollama/big")], &["big", "mid", "small"]);
         assert_eq!(conflict.spec_for_tier("ollama", ModelTier::Strong), None);
-    }
-
-    #[test]
-    fn spec_for_tier_any_cross_provider() {
-        let reg = make_map(
-            &[
-                (ModelTier::Weak, "zai/glm-5"),
-                (ModelTier::Strong, "openai/gpt-foo"),
-            ],
-            &["big", "mid", "small"],
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Strong),
-            Some("openai/gpt-foo".into())
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Weak),
-            Some("zai/glm-5".into())
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Medium),
-            Some("ollama/mid".into())
-        );
     }
 
     #[test]
