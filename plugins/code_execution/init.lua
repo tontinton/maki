@@ -191,10 +191,10 @@ local function interpreter_tools(tools, audience, workflow)
   return out
 end
 
-local function matches_filter(name, dctx)
+local function matches_filter(name, dctx, alias)
   if dctx.only then
     for _, n in ipairs(dctx.only) do
-      if n == name then
+      if n == name or (alias and n == alias) then
         return true
       end
     end
@@ -202,7 +202,7 @@ local function matches_filter(name, dctx)
   end
   if dctx.except then
     for _, n in ipairs(dctx.except) do
-      if n == name then
+      if n == name or (alias and n == alias) then
         return false
       end
     end
@@ -232,7 +232,7 @@ local function signature(t)
     local ptype = PY_TYPES[schema_props[pname].type] or "any"
     params[#params + 1] = required[pname] and (pname .. ": " .. ptype) or (pname .. ": " .. ptype .. " = None")
   end
-  return "- " .. t.name .. "(" .. table.concat(params, ", ") .. ") -> str"
+  return "- " .. (t.alias or t.name) .. "(" .. table.concat(params, ", ") .. ") -> str"
 end
 
 -- Keep cheap: runs on every request build. get_tools skips descriptions
@@ -243,7 +243,7 @@ local function describe(dctx)
   -- Ask as if workflow were on, then hold back what it would unlock: those
   -- names are listed as not callable, so the model stops trying them.
   for _, t in ipairs(interpreter_tools(maki.api.get_tools(), dctx.audience, true)) do
-    if matches_filter(t.name, dctx) then
+    if matches_filter(t.name, dctx, t.alias) then
       if t.workflow_only and not dctx.workflow then
         gated[#gated + 1] = t.name
       else

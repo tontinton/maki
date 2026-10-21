@@ -139,6 +139,19 @@ maki.api.register_tool({{
     schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
     handler = function() return "" end,
 }})
+maki.api.register_tool({{
+    name = "list",
+    description = "list fixture",
+    audiences = {{ "main", "interpreter" }},
+    schema = {{
+        type = "object",
+        required = {{ "path" }},
+        properties = {{
+            path = {{ type = "string" }},
+        }},
+    }},
+    handler = function(input) return "listed:" .. (input.path or "") end,
+}})
 "#
     )
 }
@@ -270,6 +283,30 @@ fn interpreter_calls_advertised_tool_end_to_end() {
     let out = run_code("result = await interp_echo(msg='hi')\nprint(result)")
         .expect("advertised tool must be callable");
     assert!(out.contains(&format!("{ECHO_PREFIX}hi")), "got: {out}");
+}
+
+#[test]
+fn describe_aliases_list_tool_to_list_dir() {
+    let (reg, _host) = setup();
+    let desc = describe(&reg, &ToolFilter::All, ToolAudience::MAIN, false);
+    assert!(
+        desc.lines().any(|l| l.starts_with("- list_dir(")),
+        "expected list_dir in tool signatures: {desc}"
+    );
+    assert!(
+        !desc.lines().any(|l| l.starts_with("- list(")),
+        "list tool must be aliased, not exposed directly: {desc}"
+    );
+}
+
+#[test]
+fn aliased_list_tool_is_callable_and_preserves_builtin_list() {
+    let out = run_code(
+        "res = await list_dir(path='test_path')\nitems = list([1, 2])\nprint(f'{res}')\nprint(f'items: {len(items)}')",
+    )
+    .expect("list_dir must be callable and builtin list must be preserved");
+    assert!(out.contains("listed:test_path"), "got: {out}");
+    assert!(out.contains("items: 2"), "got: {out}");
 }
 
 /// The list form covers a model that forgets the `*`. It must run rather than
