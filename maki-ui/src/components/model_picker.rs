@@ -14,7 +14,7 @@ use maki_providers::spec::{Build, ProviderRegistry};
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
-use crate::repaint::{Cadence, Dirty, Watch};
+use crate::repaint::{Dirty, Watch};
 
 const TITLE: &str = " Models ";
 const RECENT_SECTION: &str = "Recent";
@@ -361,10 +361,6 @@ impl Overlay for ModelPicker {
 
     fn close(&mut self) {
         self.close()
-    }
-
-    fn cadence(&self) -> Cadence {
-        self.picker.cadence()
     }
 }
 
