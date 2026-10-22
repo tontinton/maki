@@ -228,11 +228,18 @@ impl Splash {
     /// The starfield drifts for as long as the splash is up. With it off the
     /// only motion left is the entry fade, which ends, so the loop settles on
     /// the start screen instead of burning a core on a still picture.
+    fn animating(&self) -> bool {
+        self.animate || self.start.elapsed().as_secs_f32() < FADE_DURATION
+    }
+
     pub fn cadence(&self) -> Cadence {
-        Cadence::when(
-            self.animate || self.start.elapsed().as_secs_f32() < FADE_DURATION,
-            Cadence::SMOOTH,
-        )
+        Cadence::when(self.animating(), Cadence::SMOOTH)
+    }
+
+    /// The splash draws from the clock, so its tick only has to report that it
+    /// is still moving; `render` reads the elapsed time.
+    pub fn tick(&self) -> Dirty {
+        Dirty::from(self.animating())
     }
 
     pub fn render(

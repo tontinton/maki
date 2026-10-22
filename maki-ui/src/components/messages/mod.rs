@@ -796,24 +796,44 @@ impl MessagesPanel {
     }
 
     pub fn tick(&mut self) -> Dirty {
-        let mut dirty = self.poll_data();
+        let mut dirty = self.poll_data() | self.tick_streaming() | self.tick_spinners();
         if self.show_idle_splash() {
-            dirty |= self.idle_splash.poll_update(update::latest_version());
+            dirty |= self.idle_splash.tick()
+                | self.idle_splash.poll_update(update::latest_version())
+                | Dirty::from(self.accent.is_animating());
         }
         dirty
     }
 
+    fn tick_streaming(&mut self) -> Dirty {
+        let thinking = if thinking::reveals_text(self.thinking_lines, self.live_thinking_expanded) {
+            self.streaming_thinking.tick()
+        } else {
+            Dirty::NO
+        };
+        self.streaming_text.tick() | thinking
+    }
+
+    fn tick_spinners(&mut self) -> Dirty {
+        if self.in_progress_count() == 0 {
+            return Dirty::NO;
+        }
+        self.update_spinners();
+        Dirty::YES
+    }
+
     pub fn cadence(&self) -> Cadence {
         let smooth = self.streaming_text.is_animating()
-            || self.accent.is_animating()
             || (self.streaming_thinking.is_animating()
                 && thinking::reveals_text(self.thinking_lines, self.live_thinking_expanded));
+        let splash = self.show_idle_splash();
         Cadence::any([
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
             Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
             Cadence::when(smooth, Cadence::SMOOTH),
-            Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
+            Cadence::when(splash, self.idle_splash.cadence()),
+            Cadence::when(splash && self.accent.is_animating(), Cadence::SMOOTH),
         ])
     }
 
@@ -904,9 +924,6 @@ impl MessagesPanel {
             );
         }
         self.rebuild_line_cache();
-        if self.in_progress_count() > 0 {
-            self.update_spinners();
-        }
 
         self.rebuild_live_segments(width);
 

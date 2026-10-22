@@ -262,7 +262,7 @@ fn app_without_splash() -> App {
 /// keeps no handle to it once the picker owns it.
 fn app_with_model_slot() -> (App, Arc<ArcSwapOption<ModelList>>) {
     let models = Arc::new(ArcSwapOption::empty());
-    let mut app = test_app();
+    let mut app = app_without_splash();
     app.model_picker = ModelPicker::new(Arc::clone(&models));
     (app, models)
 }
@@ -273,7 +273,7 @@ fn app_with_model_slot() -> (App, Arc<ArcSwapOption<ModelList>>) {
 /// swap itself.
 fn app_with_hints() -> (App, HintWriterHandle) {
     let (writer, reader) = hint_writer_pair();
-    let mut app = test_app();
+    let mut app = app_without_splash();
     app.hints = Watch::seeded(reader.load_full());
     app.hint_reader = reader;
     (app, writer)
@@ -3078,7 +3078,7 @@ fn assert_owes_one_frame(app: &mut App, arrival: impl FnOnce()) {
 /// some unrelated key.
 #[test]
 fn usage_quota_arriving_in_the_background_owes_a_frame() {
-    let mut app = test_app();
+    let mut app = app_without_splash();
     app.execute_command(cmd("/usage"), 0);
     let slot = Arc::clone(&app.usage_slot);
 
@@ -3123,10 +3123,22 @@ fn tick_drains_live_bufs_of_background_chats() {
         None,
     ));
     assert_eq!(app.active_chat, 0, "the subagent's chat is the hidden one");
+    let sub = app
+        .chats
+        .iter()
+        .position(|chat| chat.task_id().is_some_and(|id| id.as_ref() == TASK_ID))
+        .expect("the subagent chat exists");
 
-    assert_owes_one_frame(&mut app, || {
-        buf.append(maki_agent::SnapshotLine::plain(TOOL_OUTPUT_LINE.into()));
-    });
+    buf.append(maki_agent::SnapshotLine::plain(TOOL_OUTPUT_LINE.into()));
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+    let snapshot = (0..app.chats[sub].message_count())
+        .filter_map(|i| app.chats[sub].message_at(i))
+        .find_map(|msg| msg.render_snapshot.as_ref())
+        .expect("the background tool got its live snapshot");
+    assert!(
+        snapshot.text().contains(TOOL_OUTPUT_LINE),
+        "the hidden chat's live output must drain"
+    );
 }
 
 /// A plugin publishes hints from the Lua thread, and the loop never hears back
