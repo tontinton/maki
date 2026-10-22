@@ -5,6 +5,8 @@ use maki_storage::paths::canonicalize_clean;
 use maki_storage::version::{self, VersionError};
 use maki_storage::{StateDir, StorageError};
 
+use async_compat::Compat;
+
 #[cfg(not(windows))]
 const INSTALLER: Installer = Installer {
     url: "https://maki.sh/install.sh",
@@ -40,7 +42,7 @@ pub enum UpdateError {
     Fetch {
         url: &'static str,
         #[source]
-        source: isahc::Error,
+        source: reqwest::Error,
     },
 
     #[error("failed to determine current binary path: {0}")]
@@ -80,18 +82,19 @@ pub enum UpdateError {
 }
 
 fn fetch_script() -> Result<String, UpdateError> {
-    use isahc::ReadResponseExt;
-    isahc::get(INSTALLER.url)
-        .and_then(|mut r| r.text().map_err(Into::into))
-        .map_err(|source| UpdateError::Fetch {
-            url: INSTALLER.url,
-            source,
-        })
-        .or_else(|e| {
-            version::curl_fetch(INSTALLER.url)
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .map_err(|_| e)
-        })
+    smol::block_on(Compat::new(async {
+        let response = version::client().build()?.get(INSTALLER.url).send().await?;
+        response.text().await
+    }))
+    .map_err(|source| UpdateError::Fetch {
+        url: INSTALLER.url,
+        source,
+    })
+    .or_else(|e| {
+        version::curl_fetch(INSTALLER.url)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .map_err(|_| e)
+    })
 }
 
 /// Where `maki update` keeps the binary it replaced, for `maki rollback`.
@@ -213,7 +216,8 @@ fn prompt_yes(install_dir: &Path) -> bool {
 }
 
 pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
-    let latest = version::fetch_latest()?;
+    let latest = smol::block_on(version::fetch_latest())
+        .or_else(|e| version::curl_fetch_latest().map_err(|_| e))?;
     if !version::is_newer(&latest, version::CURRENT) {
         println!("Already up to date (v{})", version::CURRENT);
         return Ok(());

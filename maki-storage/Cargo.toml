@@ -5,7 +5,8 @@ edition.workspace = true
 
 [dependencies]
 getrandom = { workspace = true }
-isahc = { workspace = true }
+reqwest = { workspace = true }
+async-compat = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
@@ -18,7 +19,6 @@ uuid = { workspace = true }
 [dev-dependencies]
 test-case = { workspace = true }
 tempfile = { workspace = true }
-isahc = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]
