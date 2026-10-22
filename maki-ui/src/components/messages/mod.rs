@@ -788,8 +788,15 @@ impl MessagesPanel {
     /// image decodes. These used to run inside [`Self::view`], which is why a
     /// running tool had to claim it was animating: it was the only way to keep
     /// them fed.
+    ///
+    /// Background chats use this without the clock-driven part, so hidden data
+    /// still reaches its chat while hidden animations stay idle.
+    pub fn poll_data(&mut self) -> Dirty {
+        self.drain_highlights() | self.poll_live_bufs() | self.refresh_images()
+    }
+
     pub fn tick(&mut self) -> Dirty {
-        let mut dirty = self.drain_highlights() | self.poll_live_bufs() | self.refresh_images();
+        let mut dirty = self.poll_data();
         if self.show_idle_splash() {
             dirty |= self.idle_splash.poll_update(update::latest_version());
         }

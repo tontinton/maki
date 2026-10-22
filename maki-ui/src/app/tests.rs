@@ -3209,6 +3209,29 @@ fn waiting_tool_animates_at_the_spinner_rate() {
     assert_eq!(app.cadence(), Cadence::SPINNER);
 }
 
+/// Only the active chat is drawn. A hidden subagent's typewriter must not
+/// keep the focused screen painting; focusing it lets the reveal catch up on
+/// the first tick.
+#[test]
+fn only_the_active_chat_owns_the_frame() {
+    let mut app = app_without_splash();
+    start_subagent(&mut app, TASK_ID, RESEARCH_NAME);
+
+    assert_eq!(app.active_chat, 0, "the main chat is the drawn one");
+    assert_eq!(
+        app.cadence(),
+        Cadence::IDLE,
+        "a hidden reveal must not animate the focused chat"
+    );
+
+    app.set_active_chat(1);
+    assert_eq!(
+        app.cadence(),
+        Cadence::SMOOTH,
+        "focusing makes its reveal the one that animates"
+    );
+}
+
 /// The bar spins for a whole streaming turn, again while a restore is in
 /// flight, and once more for a retry countdown. The old `is_animating` only
 /// knew about the restore, so the other two froze mid turn.
