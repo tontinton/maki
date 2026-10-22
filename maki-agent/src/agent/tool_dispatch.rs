@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
-use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, ToolDeferral, UNKNOWN_MCP, is_wire_name};
+use crate::mcp::{
+    McpSession, TOOL_SEARCH_TOOL_NAME, ToolDeferral, UNKNOWN_MCP, internal_tool_name, is_wire_name,
+};
 use crate::permissions::{LayerAnswer, PromptLayers};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
@@ -35,6 +37,8 @@ const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const MCP_SERVER_GONE: &str =
     "Its MCP server is not connected or no longer offers it, so it cannot be called now.";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
+const MCP_SUMMARY_PREFIX: &str = "mcp: ";
+const SEARCH_QUERY_FIELD: &str = "query";
 
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
@@ -789,6 +793,53 @@ async fn run_native_tool(
     }
 }
 
+/// Header summary and body format of a call the registry cannot describe
+/// (`tool_search`, MCP). Dispatch draws the standalone call from it and
+/// `maki.api.get_tool` hands it to Lua, so a batch child looks the same.
+#[derive(Debug)]
+pub struct RoutedView {
+    pub summary: String,
+    pub markdown: bool,
+}
+
+impl RoutedView {
+    fn tool_search(input: &Value) -> Self {
+        Self {
+            summary: search_query(input).to_owned(),
+            markdown: true,
+        }
+    }
+
+    fn mcp(qualified: &str) -> Self {
+        Self {
+            summary: format!("{MCP_SUMMARY_PREFIX}{qualified}"),
+            markdown: false,
+        }
+    }
+
+    fn output(&self, text: TextOutput) -> ToolOutput {
+        if self.markdown {
+            ToolOutput::Markdown(text)
+        } else {
+            ToolOutput::Plain(text)
+        }
+    }
+}
+
+fn search_query(input: &Value) -> &str {
+    input[SEARCH_QUERY_FIELD].as_str().unwrap_or_default()
+}
+
+pub fn routed_view(name: &str, input: &Value) -> Option<RoutedView> {
+    if name == TOOL_SEARCH_TOOL_NAME {
+        Some(RoutedView::tool_search(input))
+    } else if is_wire_name(name) {
+        Some(RoutedView::mcp(&internal_tool_name(name)))
+    } else {
+        None
+    }
+}
+
 /// MCP, local, and search tools never go through invocation parsing,
 /// so there is no parsed input to show; the UI gets the raw JSON instead.
 fn emit_raw_start(
@@ -825,10 +876,10 @@ fn run_tool_search(
     origin: CallOrigin,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(TOOL_SEARCH_TOOL_NAME);
-    let query = input["query"].as_str().unwrap_or_default();
-    emit_raw_start(ctx, origin, &id, &tool_id, query.to_owned(), input);
+    let view = RoutedView::tool_search(input);
+    emit_raw_start(ctx, origin, &id, &tool_id, view.summary.clone(), input);
     let deferral = ToolDeferral::for_model(&ctx.model);
-    let (output, is_error) = match mcp.search_tools(query, origin, deferral) {
+    let (output, is_error) = match mcp.search_tools(search_query(input), origin, deferral) {
         Ok(found) => (found, false),
         Err(e) => (e.into(), true),
     };
@@ -836,7 +887,7 @@ fn run_tool_search(
         call: None,
         id,
         tool: tool_id,
-        output: Arc::new(ToolOutput::Markdown(output)),
+        output: Arc::new(view.output(output)),
         is_error,
         annotation: None,
         written_path: None,
@@ -992,12 +1043,13 @@ async fn execute_mcp_tool(
     ask: Option<&str>,
     hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
-    emit_raw_start(ctx, origin, id, &tool, format!("mcp: {tool}"), input);
+    let view = RoutedView::mcp(&tool);
+    emit_raw_start(ctx, origin, id, &tool, view.summary.clone(), input);
     let done = |output: TextOutput, is_error: bool| ToolDoneEvent {
         call: None,
         id: id.to_owned(),
         tool: Arc::clone(&tool),
-        output: Arc::new(ToolOutput::Plain(output)),
+        output: Arc::new(view.output(output)),
         is_error,
         annotation: None,
         written_path: None,
@@ -1207,7 +1259,7 @@ mod tests {
     use crate::tools::registry::{ToolRegistry, ToolSource};
     use crate::tools::schema::{JsonPath, ToolInputErrorKind};
     use crate::tools::test_support::{
-        GUARDED_TOOL_NAME, GuardedMock, mock_tool, mock_tool_with_schema, stub_ctx,
+        GUARDED_TOOL_NAME, GuardedMock, mock_tool, mock_tool_with_schema, stub_ctx, stub_ctx_with,
         stub_ctx_with_permissions, stub_seed,
     };
     use crate::tools::{
@@ -2389,6 +2441,37 @@ mod tests {
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), crate::mcp::SEARCH_EMPTY_QUERY);
         });
+    }
+
+    /// Lua draws a batch child from `routed_view`, so the standalone call
+    /// must emit the same summary and body format.
+    #[test_case(TOOL_SEARCH_TOOL_NAME, search_input(), SEARCH_QUERY,     true  ; "tool_search_shows_query_as_markdown")]
+    #[test_case(PROBE_WIRE,            json!({}),      "mcp: srv.probe", false ; "mcp_tool_shows_qualified_name_as_plain")]
+    fn routed_view_matches_the_dispatched_call(
+        name: &str,
+        input: Value,
+        summary: &str,
+        markdown: bool,
+    ) {
+        let view = routed_view(name, &input).expect("routed name");
+        assert_eq!(view.summary, summary);
+        assert_eq!(view.markdown, markdown);
+
+        let (tx, events) = flume::unbounded();
+        let ctx = with_mcp(
+            stub_ctx_with(&AgentMode::Build, Some(&EventSender::new(tx, 0)), None),
+            &stub_mcp(&[PROBE_QUALIFIED]),
+        );
+        let done = smol::block_on(dispatch(&ctx, name, &input));
+        let start = events
+            .try_iter()
+            .find_map(|envelope| match envelope.event {
+                AgentEvent::ToolStart(start) => Some(start),
+                _ => None,
+            })
+            .expect("ToolStart is emitted");
+        assert_eq!(start.summary, view.summary);
+        assert_eq!(done.output.is_markdown(), view.markdown);
     }
 
     #[test]

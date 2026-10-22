@@ -747,6 +747,37 @@ fn restore_with_state_renders_child_header_contract() {
     assert!(text.contains("line two"), "body from state: {text}");
 }
 
+/// `tool_search` and MCP tools have no plugin to ask, yet a child must
+/// still look like the standalone call: its summary as the header (not
+/// the tool name twice) and, for `tool_search`, a markdown body. The stub
+/// host has no MCP at all; the view is a function of name and input alone.
+#[test_case::test_case("tool_search", json!({ "query": "find prs" }), "find prs", "• srv__thing" ; "tool_search_markdown")]
+#[test_case::test_case("srv__thing",  json!({}),                      "mcp: srv.thing", "- `srv__thing`" ; "mcp_plain")]
+fn rust_routed_child_renders_like_standalone(tool: &str, params: Value, header: &str, body: &str) {
+    let (_reg, host) = load_batch_host();
+    let lines = restore_snapshot_lines(
+        &host,
+        json!({ "tool_calls": [{ "tool": tool, "parameters": params }] }),
+        "irrelevant",
+        Some(json!({ "children": [
+            { "tool": tool, "status": "success", "output": "- `srv__thing`" }
+        ] })),
+    );
+    assert_eq!(
+        lines[0][1..],
+        [
+            (
+                format!("{tool}> "),
+                SpanStyle::Named("tool_prefix".to_owned())
+            ),
+            (header.to_owned(), SpanStyle::Named("tool".to_owned())),
+        ]
+    );
+    let rendered: String = lines[1][1..].iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(rendered, body);
+    assert_eq!(lines.len(), 2);
+}
+
 /// Errors render like standalone: red `●` indicator and the plain body,
 /// without the llm-only `[ERROR]` prefix or a red body.
 #[test]

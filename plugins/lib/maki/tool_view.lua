@@ -11,6 +11,11 @@
 local ToolView = {}
 ToolView.__index = ToolView
 
+-- Worst case is a batch child: tool body + batch body indents (2 + 2),
+-- plus the transcript's scrollbar column.
+local BODY_CHROME_COLS = 5
+local MIN_MD_WIDTH = 20
+
 local function format_line_nr(fmt, idx)
   return { string.format(fmt, idx), "line_nr" }
 end
@@ -309,11 +314,12 @@ function ToolView.restore(output, opts)
 end
 
 -- Same, for tools whose live output goes through markdown (`format =
--- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do
--- live.
+-- "markdown"`). {opts.width} is the wrap width and defaults to the body
+-- column of the current terminal. Errors stay plain, as they do live.
 function ToolView.restore_markdown(output, is_error, opts)
   if not is_error then
-    local ok, md_lines = pcall(maki.ui.markdown, output, opts.width)
+    local width = opts.width or math.max(maki.ui.terminal_size().cols - BODY_CHROME_COLS, MIN_MD_WIDTH)
+    local ok, md_lines = pcall(maki.ui.markdown, output, width)
     if ok then
       return ToolView.restore_lines(md_lines, opts)
     end

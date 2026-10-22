@@ -730,11 +730,18 @@ tool does not exist. For Lua-registered tools the returned table also
 includes `header` and `restore` handle functions (wrapped so they never
 throw).
 
+`tool_search` and MCP tools (`server__tool` names) never enter the
+registry. For them the table holds only `name`, `header`, and the
+`format` ("plain" or "markdown") of the standalone call, enough for a
+composing tool like batch to draw a child the same way. Any
+`server__tool` shaped name resolves whether or not a server offers it,
+so this is not an existence check for MCP tools.
+
 **Parameters:**
 
 - `{name}` (`string`) Exact tool name.
 
-**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, header?, restore? }, or nil if not found.
+**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, header?, restore?, format? }, or nil if not found.
 
 **Example:**
 
@@ -7713,8 +7720,8 @@ function ToolView.restore_lines(lines, opts)
 function ToolView.restore(output, opts)
 
 -- Same, for tools whose live output goes through markdown (`format =
--- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do
--- live.
+-- "markdown"`). {opts.width} is the wrap width and defaults to the body
+-- column of the current terminal. Errors stay plain, as they do live.
 function ToolView.restore_markdown(output, is_error, opts)
 ```
 

@@ -7,6 +7,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
+use maki_agent::agent::tool_dispatch::routed_view;
 use maki_agent::permissions::is_universal_scope;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
@@ -1157,8 +1158,15 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 /// includes `header` and `restore` handle functions (wrapped so they never
 /// throw).
 ///
+/// `tool_search` and MCP tools (`server__tool` names) never enter the
+/// registry. For them the table holds only `name`, `header`, and the
+/// `format` ("plain" or "markdown") of the standalone call, enough for a
+/// composing tool like batch to draw a child the same way. Any
+/// `server__tool` shaped name resolves whether or not a server offers it,
+/// so this is not an existence check for MCP tools.
+///
 /// @param name string Exact tool name.
-/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore? }, or nil if not found.
+/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore?, format? }, or nil if not found.
 /// @example
 /// local t = maki.api.get_tool("bash")
 /// if t then
@@ -1171,7 +1179,7 @@ fn get_tool(lua: &Lua, name: String) -> LuaResult<LuaValue> {
         .map(|r| Arc::clone(&r))
         .ok_or_else(|| mlua::Error::runtime("get_tool: tool registry not available"))?;
     let Some(entry) = registry.get(&name) else {
-        return Ok(LuaValue::Nil);
+        return routed_tool_entry(lua, name);
     };
     let t = tool_entry_to_lua(lua, &entry)?;
     if let Some((header, restore)) = local_tool_handles(&name) {
@@ -1227,6 +1235,31 @@ pub(crate) fn audiences_to_lua(lua: &Lua, audience: ToolAudience) -> LuaResult<T
         }
     }
     Ok(out)
+}
+
+fn routed_tool_entry(lua: &Lua, name: String) -> LuaResult<LuaValue> {
+    let Some(view) = routed_view(&name, &Value::Null) else {
+        return Ok(LuaValue::Nil);
+    };
+    let t = lua.create_table()?;
+    t.set("name", name.as_str())?;
+    t.set(
+        "format",
+        if view.markdown {
+            LUA_FORMAT_MARKDOWN
+        } else {
+            LUA_FORMAT_PLAIN
+        },
+    )?;
+    let summary = {
+        let name = name.clone();
+        lua.create_function(move |lua, input: LuaValue| {
+            let input = lua_to_json(lua, &input)?;
+            Ok(routed_view(&name, &input).map(|view| view.summary))
+        })?
+    };
+    t.set("header", wrap_header(lua, name, summary)?)?;
+    Ok(LuaValue::Table(t))
 }
 
 fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
