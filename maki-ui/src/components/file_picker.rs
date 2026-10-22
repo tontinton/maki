@@ -247,18 +247,18 @@ impl FilePickerModal {
 
     pub fn cadence(&self) -> Cadence {
         let Some(s) = self.session.as_ref() else {
-            return Cadence::IDLE;
+            return Cadence::Idle;
         };
         Cadence::any([
-            Cadence::when(s.visible && s.walk == Walk::Running, Cadence::SPINNER),
+            Cadence::when(s.visible && s.walk == Walk::Running, Cadence::Spinner),
             // Results stream in all through the walk, and the spinner above is
             // already bringing the loop back for them. Once it ends, every
-            // keystroke leaves one last answer in flight, and the list sits on
-            // the old query until someone looks.
-            Cadence::when(s.matching && s.walk != Walk::Running, Cadence::PENDING),
+            // keystroke leaves one last answer in flight; a smooth wake keeps
+            // looking, and tick reports Dirty only when the answer lands.
+            Cadence::when(s.matching && s.walk != Walk::Running, Cadence::Smooth),
             // A corpus is handed over a batch per tick, so the loop has to
             // come back for the rest of it however quiet everything else is.
-            Cadence::when(s.injected < s.index.corpus().len(), Cadence::PENDING),
+            Cadence::when(s.injected < s.index.corpus().len(), Cadence::Smooth),
         ])
     }
 
@@ -879,8 +879,8 @@ mod tests {
     /// one that has to claim the spinner. `view` draws nothing until files
     /// arrive, so a hidden walk claiming `SPINNER` would animate pixels that
     /// are not on screen.
-    #[test_case(&[MAIN_PATH] => Cadence::SPINNER ; "on_screen_walk_spins")]
-    #[test_case(&[]          => Cadence::IDLE    ; "hidden_walk_does_not")]
+    #[test_case(&[MAIN_PATH] => Cadence::Spinner ; "on_screen_walk_spins")]
+    #[test_case(&[]          => Cadence::Idle    ; "hidden_walk_does_not")]
     fn walking_picker_spins_only_once_it_is_on_screen(files: &[&str]) -> Cadence {
         let (mut picker, index) = pending_picker();
         walking(&index, files);
@@ -986,13 +986,13 @@ mod tests {
         // The matches can land while the worker is still winding down, and
         // until it does the picker keeps asking to be polled.
         let deadline = Instant::now() + CONVERGE_TIMEOUT;
-        while picker.cadence() != Cadence::IDLE {
+        while picker.cadence() != Cadence::Idle {
             assert!(Instant::now() < deadline, "{NEVER_IDLE}");
             std::thread::yield_now();
         }
 
         assert_eq!(picker.tick(), (Dirty::NO, None), "{QUIET}");
-        assert_eq!(picker.cadence(), Cadence::IDLE);
+        assert_eq!(picker.cadence(), Cadence::Idle);
     }
 
     /// The matcher answers on a worker thread, long after the keypress was
@@ -1018,12 +1018,12 @@ mod tests {
 
     /// Nucleo matches on a worker thread and hands the answer to nobody, long
     /// after the keystroke that started it. Only looking again finds it, so an
-    /// idle cadence here leaves the list on the previous query until some
-    /// unrelated poll comes round. It is not motion either: nothing lands, so
-    /// there is nothing to paint.
-    #[test_case(true,  Walk::Listed  => Cadence::PENDING ; "matching_after_the_walk")]
-    #[test_case(true,  Walk::Running => Cadence::SPINNER ; "walk_spinner_already_comes_back")]
-    #[test_case(false, Walk::Listed  => Cadence::IDLE    ; "settled")]
+    /// idle cadence would leave the list on the previous query until some
+    /// unrelated poll came round. `Smooth` wakes the loop; `tick` reports
+    /// Dirty only when an answer lands, so an empty poll paints nothing.
+    #[test_case(true,  Walk::Listed  => Cadence::Smooth ; "matching_after_the_walk")]
+    #[test_case(true,  Walk::Running => Cadence::Spinner ; "walk_spinner_already_comes_back")]
+    #[test_case(false, Walk::Listed  => Cadence::Idle    ; "settled")]
     fn a_matcher_mid_answer_keeps_the_loop_coming_back(matching: bool, walk: Walk) -> Cadence {
         let (mut picker, _index) = pending_picker();
         let s = picker.session.as_mut().unwrap();
@@ -1072,7 +1072,7 @@ mod tests {
             INJECT_BATCH,
             "one batch, not the whole corpus"
         );
-        assert_ne!(picker.cadence(), Cadence::IDLE, "and the loop comes back");
+        assert_ne!(picker.cadence(), Cadence::Idle, "and the loop comes back");
 
         let _ = picker.tick();
         assert_eq!(

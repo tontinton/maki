@@ -3231,7 +3231,7 @@ impl App {
             ),
             self.selection_state
                 .as_ref()
-                .map_or(Cadence::IDLE, SelectionState::cadence),
+                .map_or(Cadence::Idle, SelectionState::cadence),
             self.chats[self.active_chat].cadence(),
         ])
     }

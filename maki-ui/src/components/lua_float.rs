@@ -353,7 +353,7 @@ impl FloatManager {
     /// Float snapshots bake spinner spans at render time, so an open float has
     /// to keep painting for plugin spinners to turn.
     pub fn cadence(&self) -> Cadence {
-        Cadence::when(self.is_open(), Cadence::SPINNER)
+        Cadence::when(self.is_open(), Cadence::Spinner)
     }
 
     /// Whether a window on screen is waiting on the user. It checks `visible`
@@ -2509,22 +2509,22 @@ mod tests {
     #[test]
     fn cadence_spins_while_any_window_is_open_visible_or_not() {
         let mut mgr = FloatManager::new();
-        assert_eq!(mgr.cadence(), Cadence::IDLE);
+        assert_eq!(mgr.cadence(), Cadence::Idle);
 
         let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
-        assert_eq!(mgr.cadence(), Cadence::SPINNER);
+        assert_eq!(mgr.cadence(), Cadence::Spinner);
 
         cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
         let _ = mgr.tick();
         assert!(!mgr.windows[0].visible);
         assert_eq!(
             mgr.cadence(),
-            Cadence::SPINNER,
+            Cadence::Spinner,
             "an invisible window still counts as open, so the loop keeps draining it"
         );
 
         mgr.close_all();
-        assert_eq!(mgr.cadence(), Cadence::IDLE);
+        assert_eq!(mgr.cadence(), Cadence::Idle);
     }
 
     #[test]

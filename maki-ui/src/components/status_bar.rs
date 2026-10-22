@@ -170,7 +170,7 @@ impl StatusBar {
     }
 
     pub fn cadence(&self, status: &Status, restoring: bool, retrying: bool) -> Cadence {
-        Cadence::when(self.animating(status, restoring, retrying), Cadence::SPINNER)
+        Cadence::when(self.animating(status, restoring, retrying), Cadence::Spinner)
     }
 
     /// `view` reads the elapsed time, so this only has to report whether the
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(bar.flash_text(), Some("disabled"), "{EXPECT_NEWEST}");
         assert_eq!(
             bar.cadence(&Status::Idle, false, false),
-            Cadence::IDLE,
+            Cadence::Idle,
             "{EXPECT_IDLE}"
         );
     }
@@ -724,7 +724,7 @@ mod tests {
         bar.queue_flash(FLASH_MSG.into());
         assert_eq!(
             bar.cadence(&Status::Idle, false, false),
-            Cadence::IDLE,
+            Cadence::Idle,
             "{EXPECT_IDLE}"
         );
 
@@ -732,7 +732,7 @@ mod tests {
 
         assert_eq!(
             bar.cadence(&Status::Idle, false, false),
-            Cadence::SPINNER,
+            Cadence::Spinner,
             "{EXPECT_TICKING}"
         );
     }
@@ -762,7 +762,7 @@ mod tests {
         assert_eq!(bar.flash_text(), None, "{EXPECT_DRAINS}");
         assert_eq!(
             bar.cadence(&Status::Idle, false, false),
-            Cadence::IDLE,
+            Cadence::Idle,
             "{EXPECT_IDLE}"
         );
     }
