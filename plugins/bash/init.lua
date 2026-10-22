@@ -338,7 +338,7 @@ maki.api.register_tool({
   end,
 
   restore = function(input, output, is_error, ctx)
-    local command = input.command
+    local command = parse_cd_hint(input)
     local buf, view = create_bash_view(command, ctx)
     local timeout_secs = output:match("^tool bash timed out after (%d+)s$")
     if timeout_secs then
