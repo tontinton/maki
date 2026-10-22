@@ -74,9 +74,19 @@ pub(crate) fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
-/// Call in raw mode and before the input reader spawns: the probe reads replies
-/// straight from the tty and a running reader would eat them.
+/// Start the probe so its round trip overlaps mcp, provider and model setup.
+/// Call in raw mode; [`wait`] joins it before anything else reads the tty.
 pub(crate) fn init(inline_images: bool) {
+    if inline_images {
+        thread::spawn(|| {
+            PICKER.get_or_init(detect);
+        });
+    }
+}
+
+/// Call before the panels that read [`picker`] are built: until this returns,
+/// the probe is the only reader on the tty.
+pub(crate) fn wait(inline_images: bool) {
     if inline_images {
         PICKER.get_or_init(detect);
     }

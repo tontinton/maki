@@ -667,6 +667,10 @@ impl<'t> EventLoop<'t> {
             trust_question,
         };
 
+        // The probe has been running alongside mcp and provider setup; let it
+        // land before the panels that read the picker are built.
+        crate::terminal_image::wait(ctx.ui_config.inline_images);
+
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
             .map(|open| {
