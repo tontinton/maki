@@ -134,15 +134,14 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(unix)]
 mod probe {
-    use std::fs::File;
-    use std::io::{IsTerminal, Write, stdin, stdout};
-    use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+    use std::io::{Write, stdout};
+    use std::os::fd::AsFd;
     use std::time::{Duration, Instant};
 
-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
     use rustix::io::read;
 
     use super::{da1_answered, decrqss_reply_supports_rgb};
+    use crate::tty;
 
     /// Set an RGB background, query it back with DECRQSS, reset, then DA1.
     const QUERY: &[u8] = b"\x1b[48;2;1;2;3m\x1bP$qm\x1b\\\x1b[0m\x1b[c";
@@ -153,7 +152,7 @@ mod probe {
     }
 
     fn try_probe() -> Option<bool> {
-        let tty = open_tty()?;
+        let tty = tty::open()?;
         let fd = tty.as_fd();
         let mut out = stdout().lock();
         out.write_all(QUERY).ok()?;
@@ -164,7 +163,7 @@ mod probe {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 break;
             };
-            if !wait_readable(fd, remaining) {
+            if !tty::wait_readable(fd, remaining) {
                 break;
             }
             let mut chunk = [0u8; 256];
@@ -175,20 +174,6 @@ mod probe {
             buf.extend_from_slice(&chunk[..n]);
         }
         Some(decrqss_reply_supports_rgb(&buf))
-    }
-
-    fn open_tty() -> Option<OwnedFd> {
-        if stdin().is_terminal() {
-            return stdin().as_fd().try_clone_to_owned().ok();
-        }
-        File::open("/dev/tty").ok().map(OwnedFd::from)
-    }
-
-    fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> bool {
-        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-        let timeout = Timespec::try_from(timeout).ok();
-        poll(&mut fds, timeout.as_ref()).is_ok_and(|ready| ready > 0)
-            && fds[0].revents().contains(PollFlags::IN)
     }
 }
 

@@ -35,6 +35,8 @@ mod event_loop;
 mod input;
 mod terminal;
 mod terminal_image;
+#[cfg(unix)]
+mod tty;
 
 use std::time::Instant;
 
@@ -107,6 +109,7 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
     let report = {
         let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
         color_compat::init();
+        terminal_image::init(params.ui_config.inline_images);
         let el = event_loop::EventLoop::new(&mut terminal, params)?;
         el.run(initial_prompt)?
     };

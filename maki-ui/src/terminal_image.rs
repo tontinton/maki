@@ -1,15 +1,24 @@
 use std::env;
+#[cfg(unix)]
+use std::io::Write;
 use std::io::{Cursor, IsTerminal, stdout};
+#[cfg(unix)]
+use std::os::fd::AsFd;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use color_eyre::eyre::{Result, ensure};
 use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
 use maki_providers::ImageSource;
 use ratatui::layout::Size;
+use ratatui_image::picker::cap_parser::Response;
+#[cfg(unix)]
+use ratatui_image::picker::cap_parser::{Parser, QueryStdioOptions};
 use ratatui_image::{
     FontSize,
     picker::{Picker, ProtocolType},
@@ -21,8 +30,17 @@ use crate::repaint::Dirty;
 
 const MAX_IMAGE_ROWS: u16 = 20;
 const FALLBACK_FONT_SIZE: FontSize = FontSize::new(10, 20);
+const MULTIPLEXER_VARS: [&str; 3] = ["TMUX", "STY", "ZELLIJ"];
+/// The reply ends with a DSR sentinel, so a responsive terminal finishes the
+/// poll far sooner; this only caps one that never answers.
+#[cfg(unix)]
+const QUERY_TIMEOUT: Duration = Duration::from_millis(50);
+/// SSH adds a network round trip to the terminal's sub-millisecond answer.
+#[cfg(unix)]
+const SSH_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
 const DECODE_THREAD: &str = "inline-image";
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+static PICKER: OnceLock<Option<Picker>> = OnceLock::new();
 static DECODE_JOBS: OnceLock<flume::Sender<DecodeJob>> = OnceLock::new();
 
 type DecodeJob = Box<dyn FnOnce() + Send + 'static>;
@@ -55,41 +73,108 @@ pub(crate) fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
+/// Call in raw mode and before the input reader spawns: the probe reads replies
+/// straight from the tty and a running reader would eat them.
+pub(crate) fn init(inline_images: bool) {
+    if inline_images {
+        PICKER.get_or_init(detect);
+    }
+}
+
 pub(crate) fn picker(inline_images: bool) -> Option<Picker> {
-    if !stdout().is_terminal() {
+    if !inline_images {
         return None;
     }
-    let protocol = protocol_from_env(inline_images, |key| env::var(key).ok())?;
-    let font = crossterm::terminal::window_size()
-        .ok()
-        .filter(|size| size.columns > 0 && size.rows > 0)
-        .map(|size| FontSize::new(size.width / size.columns, size.height / size.rows))
-        .filter(|font| font.width > 0 && font.height > 0)
-        .unwrap_or(FALLBACK_FONT_SIZE);
+    PICKER.get().cloned().flatten()
+}
+
+fn detect() -> Option<Picker> {
+    let get = |key: &str| env::var(key).ok();
+    if !stdout().is_terminal() || in_multiplexer(&get) {
+        return None;
+    }
+    let probed = if graphics_denied(&get) { None } else { probe() };
+    let (protocol, font) = match probed {
+        Some((probed, font)) => (env_protocol(&get).unwrap_or(probed), font),
+        None => (env_protocol(&get)?, None),
+    };
+    let font = font.or_else(window_font).unwrap_or(FALLBACK_FONT_SIZE);
     #[allow(deprecated)]
     let mut picker = Picker::from_fontsize(font);
     picker.set_protocol_type(protocol);
     Some(picker)
 }
 
-/// An allowlist rather than trusting what the terminal advertises: one that
-/// claims graphics it does not have paints escape bytes all over the UI. When
-/// the guess is wrong anyway, `ui.inline_images = false` is the way out. An
-/// unrecognized `TERM_PROGRAM` (tmux and some shell configs set it) falls
-/// through to `TERM`, which kitty sets itself and forwards over ssh.
-fn protocol_from_env(
-    inline_images: bool,
-    get: impl Fn(&str) -> Option<String>,
-) -> Option<ProtocolType> {
-    if !inline_images {
-        return None;
+#[cfg(unix)]
+fn query_timeout() -> Duration {
+    if env::var_os("SSH_CONNECTION").is_some() || env::var_os("SSH_CLIENT").is_some() {
+        SSH_QUERY_TIMEOUT
+    } else {
+        QUERY_TIMEOUT
     }
-    if ["TMUX", "STY", "ZELLIJ"]
-        .iter()
-        .any(|key| get(key).is_some())
-    {
-        return None;
+}
+
+/// The terminal answers a kitty graphics probe and a DA1 query (attribute 4 is
+/// sixel) plus `CSI 16 t` for the cell size. Reading replies with a poll
+/// deadline keeps a silent terminal from hanging startup; `ratatui-image`'s
+/// `from_query_stdio` blocks a thread on stdin and can eat the next keypress
+/// when it times out.
+#[cfg(unix)]
+fn probe() -> Option<(ProtocolType, Option<FontSize>)> {
+    let tty = crate::tty::open()?;
+    let query = Parser::query(false, QueryStdioOptions::default());
+    let mut out = stdout().lock();
+    out.write_all(query.as_bytes()).ok()?;
+    out.flush().ok()?;
+    let deadline = Instant::now() + query_timeout();
+    let mut parser = Parser::new();
+    let mut responses = Vec::new();
+    let mut buf = [0u8; 256];
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if !crate::tty::wait_readable(tty.as_fd(), remaining) {
+            break;
+        }
+        let n = match rustix::io::read(tty.as_fd(), &mut buf) {
+            Ok(n) if n > 0 => n,
+            _ => break,
+        };
+        for byte in &buf[..n] {
+            for response in parser.push(char::from(*byte)) {
+                if matches!(response, Response::Status) {
+                    return interpret(responses);
+                }
+                responses.push(response);
+            }
+        }
     }
+    interpret(responses)
+}
+
+#[cfg(not(unix))]
+fn probe() -> Option<(ProtocolType, Option<FontSize>)> {
+    None
+}
+
+fn interpret(responses: Vec<Response>) -> Option<(ProtocolType, Option<FontSize>)> {
+    let mut protocol = None;
+    let mut font = None;
+    for response in responses {
+        match response {
+            Response::Kitty => protocol = Some(ProtocolType::Kitty),
+            Response::Sixel if protocol.is_none() => protocol = Some(ProtocolType::Sixel),
+            Response::CellSize(Some((width, height))) if width > 0 && height > 0 => {
+                font = Some(FontSize::new(width, height));
+            }
+            _ => {}
+        }
+    }
+    protocol.map(|protocol| (protocol, font))
+}
+
+/// Env hints outrank the probe where the advertised sixel renders worse than
+/// the terminal's native protocol. A `TERM_PROGRAM` set by tmux or a nested
+/// shell falls through to `TERM`, which kitty forwards over ssh.
+fn env_protocol(get: &impl Fn(&str) -> Option<String>) -> Option<ProtocolType> {
     match get("TERM_PROGRAM").as_deref() {
         Some("ghostty" | "kitty") => return Some(ProtocolType::Kitty),
         Some("iTerm.app" | "WezTerm") => return Some(ProtocolType::Iterm2),
@@ -99,6 +184,28 @@ fn protocol_from_env(
         Some("xterm-kitty" | "xterm-ghostty") => Some(ProtocolType::Kitty),
         _ => None,
     }
+}
+
+fn in_multiplexer(get: &impl Fn(&str) -> Option<String>) -> bool {
+    MULTIPLEXER_VARS.iter().any(|key| get(key).is_some())
+}
+
+/// Terminals that advertise sixel but paint it wrong: `ratatui-image`'s matrix
+/// has Konsole leaving stale pixels and Contour failing to clear.
+fn graphics_denied(get: &impl Fn(&str) -> Option<String>) -> bool {
+    get("KONSOLE_VERSION").is_some()
+        || get("TERM_PROGRAM").as_deref() == Some("contour")
+        || get("TERM").is_some_and(|term| term.starts_with("contour"))
+}
+
+/// Last resort for a terminal that ignores `CSI 16 t`; usually stdout is the
+/// tty and the ioctl knows the font cell even when the probe does not.
+fn window_font() -> Option<FontSize> {
+    crossterm::terminal::window_size()
+        .ok()
+        .filter(|size| size.columns > 0 && size.rows > 0)
+        .map(|size| FontSize::new(size.width / size.columns, size.height / size.rows))
+        .filter(|font| font.width > 0 && font.height > 0)
 }
 
 enum ImageState {
@@ -273,7 +380,10 @@ mod tests {
     };
     use test_case::test_case;
 
-    use super::{ImageState, InlineImage, encode, protocol_from_env};
+    use super::{
+        ImageState, InlineImage, Response, encode, env_protocol, graphics_denied, in_multiplexer,
+        interpret, picker,
+    };
     use crate::repaint::Dirty;
 
     const EXPECTED_IDLE: &str = "nothing to encode with, so the image must stay idle";
@@ -284,16 +394,15 @@ mod tests {
     const IMAGE_HEIGHT: u16 = 6;
     const TERM_PROGRAM: &str = "TERM_PROGRAM";
     const TERM: &str = "TERM";
-    const KITTY_PROGRAM: &str = "kitty";
     const KITTY_TERM: &str = "xterm-kitty";
     const UNKNOWN_PROGRAM: &str = "unknown";
 
-    fn protocol(inline_images: bool, env: &[(&str, &str)]) -> Option<ProtocolType> {
-        protocol_from_env(inline_images, |key| {
+    fn get<'a>(env: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
             env.iter()
                 .find(|(name, _)| *name == key)
                 .map(|(_, value)| (*value).into())
-        })
+        }
     }
 
     #[test_case(&[(TERM_PROGRAM, "iTerm.app")], Some(ProtocolType::Iterm2); "known_terminal")]
@@ -301,15 +410,44 @@ mod tests {
     #[test_case(&[(TERM_PROGRAM, UNKNOWN_PROGRAM), (TERM, KITTY_TERM)], Some(ProtocolType::Kitty); "unsupported_program_falls_back_to_term")]
     #[test_case(&[(TERM_PROGRAM, UNKNOWN_PROGRAM), (TERM, "xterm-256color")], None; "unsupported_program_and_term")]
     #[test_case(&[], None; "missing_env")]
-    #[test_case(&[(TERM_PROGRAM, KITTY_PROGRAM), ("TMUX", "mux")], None; "multiplexer")]
-    fn protocol_env_uses_safe_fallback(env: &[(&str, &str)], expected: Option<ProtocolType>) {
-        assert_eq!(protocol(true, env), expected);
+    fn env_protocol_prefers_the_native_rendering(
+        env: &[(&str, &str)],
+        expected: Option<ProtocolType>,
+    ) {
+        assert_eq!(env_protocol(&get(env)), expected);
     }
 
-    #[test_case(&[(TERM_PROGRAM, KITTY_PROGRAM)]; "term_program")]
-    #[test_case(&[(TERM, KITTY_TERM)]; "term")]
-    fn disabled_inline_images_yields_no_protocol(env: &[(&str, &str)]) {
-        assert_eq!(protocol(false, env), None);
+    #[test_case(&[("TMUX", "mux")]; "tmux")]
+    #[test_case(&[("STY", "1")]; "screen")]
+    #[test_case(&[("ZELLIJ", "1")]; "zellij")]
+    fn multiplexers_disable_graphics(env: &[(&str, &str)]) {
+        assert!(in_multiplexer(&get(env)));
+    }
+
+    #[test_case(&[("KONSOLE_VERSION", "230800")], true; "konsole")]
+    #[test_case(&[(TERM_PROGRAM, "contour")], true; "contour_program")]
+    #[test_case(&[(TERM, "contour")], true; "contour_term")]
+    #[test_case(&[(TERM, "xterm-256color")], false; "xterm")]
+    fn broken_sixel_terminals_are_denied(env: &[(&str, &str)], expected: bool) {
+        assert_eq!(graphics_denied(&get(env)), expected);
+    }
+
+    #[test_case(&[Response::Sixel, Response::CellSize(Some((9, 18)))], Some((ProtocolType::Sixel, Some((9, 18)))); "sixel_and_cell_size")]
+    #[test_case(&[Response::Sixel, Response::Kitty], Some((ProtocolType::Kitty, None)); "kitty_wins")]
+    #[test_case(&[Response::CellSize(Some((0, 18)))], None; "cell_size_alone_is_not_graphics")]
+    #[test_case(&[], None; "silent_terminal")]
+    fn probe_responses_pick_the_protocol(
+        responses: &[Response],
+        expected: Option<(ProtocolType, Option<(u16, u16)>)>,
+    ) {
+        let actual = interpret(responses.to_vec())
+            .map(|(protocol, font)| (protocol, font.map(|font| (font.width, font.height))));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn disabled_inline_images_yields_no_picker() {
+        assert!(picker(false).is_none());
     }
 
     #[test_case(false; "valid_png")]
