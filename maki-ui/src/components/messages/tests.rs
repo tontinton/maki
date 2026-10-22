@@ -610,6 +610,18 @@ fn splash_stops_driving_cadence_once_a_message_exists() {
     assert_eq!(panel.cadence(), Cadence::IDLE, "the splash is gone");
 }
 
+#[test]
+fn a_fresh_panel_tick_reports_the_splash() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    assert_eq!(panel.tick(), Dirty::YES, "the starfield still drifts");
+}
+
+#[test]
+fn a_running_tool_tick_reports_the_spinner() {
+    let mut panel = panel_with_tools(&[("t1", BASH_TOOL_NAME)]);
+    assert_eq!(panel.tick(), Dirty::YES, "a running tool owes a spinner frame");
+}
+
 /// `drain_highlights` moved out of `view`, so `tick` is the only thing feeding
 /// the worker now. The wait is the worker's own round trip, not a sleep: the
 /// loop ends the moment the result lands, and the deadline only turns a broken

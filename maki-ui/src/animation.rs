@@ -79,11 +79,20 @@ impl Typewriter {
         }
     }
 
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> bool {
+        let before = self.visible_len;
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_tick);
         self.last_tick = now;
         self.advance(elapsed);
+        self.visible_len != before
+    }
+
+    /// Makes the next tick see a full interval, so tests exercise the reveal
+    /// without sleeping.
+    #[cfg(test)]
+    pub(crate) fn rewind_clock_for_test(&mut self, by: Duration) {
+        self.last_tick = Instant::now() - by;
     }
 
     /// A frame can last longer than one char, so counting chars per frame would
@@ -235,6 +244,17 @@ mod tests {
             tw.last_tick, stale,
             "a chunk landing mid reveal must not stall it"
         );
+    }
+
+    #[test]
+    fn tick_reports_whether_text_appeared() {
+        let mut tw = Typewriter::with_speed(MS_PER_CHAR);
+        tw.push("abc");
+        tw.last_tick = Instant::now() - Duration::from_millis(9);
+        assert!(tw.tick(), "a due char owes a frame");
+
+        tw.advance(Duration::from_secs(1));
+        assert!(!tw.tick(), "a settled typewriter owes nothing");
     }
 
     #[test_case(3,   &[9],     2 ; "base_rate_on_a_small_backlog")]

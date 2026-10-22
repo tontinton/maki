@@ -297,6 +297,7 @@ impl FilePickerModal {
             clamp_selection(s);
         }
 
+        let dirty = dirty | Dirty::from(s.visible && s.walk == Walk::Running);
         (dirty, None)
     }
 

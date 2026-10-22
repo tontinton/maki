@@ -104,25 +104,30 @@ impl BtwModal {
     }
 
     pub fn poll(&mut self) -> Dirty {
-        let Some(ref rx) = self.rx else {
-            return Dirty::NO;
-        };
         let mut dirty = Dirty::NO;
-        while let Ok(event) = rx.try_recv() {
-            dirty = Dirty::YES;
-            match event {
-                BtwEvent::TextDelta(text) => self.answer.push(&text),
-                BtwEvent::ThinkingDelta(text) => self.thinking.push(&text),
-                BtwEvent::Done => {
-                    self.rx = None;
-                    break;
+        if let Some(ref rx) = self.rx {
+            while let Ok(event) = rx.try_recv() {
+                dirty = Dirty::YES;
+                match event {
+                    BtwEvent::TextDelta(text) => self.answer.push(&text),
+                    BtwEvent::ThinkingDelta(text) => self.thinking.push(&text),
+                    BtwEvent::Done => {
+                        self.rx = None;
+                        break;
+                    }
+                    BtwEvent::Error(msg) => {
+                        self.answer.clear();
+                        self.answer.push(&msg);
+                        self.rx = None;
+                        break;
+                    }
                 }
-                BtwEvent::Error(msg) => {
-                    self.answer.clear();
-                    self.answer.push(&msg);
-                    self.rx = None;
-                    break;
-                }
+            }
+        }
+        if self.open {
+            dirty |= self.answer.tick();
+            if thinking::reveals_text(self.thinking_lines, CLICK_EXPANDED) {
+                dirty |= self.thinking.tick();
             }
         }
         dirty
@@ -253,9 +258,11 @@ mod tests {
     use crate::markdown::EXPAND_HINT;
     use crossterm::event::KeyCode;
     use ratatui::style::Style;
+    use std::time::Duration;
     use test_case::test_case;
 
     const INSTANT: u64 = 0;
+    const MS_PER_CHAR: u64 = 4;
     const WIDTH: u16 = 80;
     const TAIL_ROWS: usize = 2;
     const IDEA_COUNT: usize = 6;
@@ -429,6 +436,21 @@ mod tests {
         let mut m = modal();
         let _ = m.poll();
         assert!(!m.is_open());
+    }
+
+    /// A stream that has already sent `Done` still has a typewriter to drain.
+    /// Returning early when `rx` is gone used to freeze the reveal.
+    #[test]
+    fn poll_keeps_revealing_after_the_stream_ends() {
+        let mut m = BtwModal::new(MS_PER_CHAR, ThinkingLines::Never);
+        let tx = open_modal(&mut m, "q");
+        tx.send(BtwEvent::TextDelta("abc".into())).unwrap();
+        tx.send(BtwEvent::Done).unwrap();
+        assert_eq!(m.poll(), Dirty::YES, "the deltas arrive");
+
+        m.answer.rewind_clock_for_test(Duration::from_millis(9));
+
+        assert_eq!(m.poll(), Dirty::YES, "a finished stream still reveals");
     }
 
     /// Both deltas used to be pushed into the answer, which left the reasoning

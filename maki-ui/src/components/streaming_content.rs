@@ -1,7 +1,11 @@
 use crate::animation::Typewriter;
 use crate::components::thinking::{self, LiveTail};
 use crate::markdown::paint_semantic;
+use crate::repaint::Dirty;
 use crate::theme;
+
+#[cfg(test)]
+use std::time::Duration;
 
 use maki_markdown::render::Renderer;
 use ratatui::style::Style;
@@ -114,6 +118,16 @@ impl StreamingContent {
         self.typewriter.push(text);
     }
 
+    /// Advances the reveal clock; `Dirty` only when a character appeared.
+    pub fn tick(&mut self) -> Dirty {
+        Dirty::from(self.typewriter.tick())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rewind_clock_for_test(&mut self, by: Duration) {
+        self.typewriter.rewind_clock_for_test(by);
+    }
+
     pub fn clear(&mut self) {
         self.typewriter.clear();
         self.cache.invalidate();
@@ -157,7 +171,6 @@ impl StreamingContent {
     }
 
     pub fn render_lines(&mut self, width: u16) -> &[Line<'static>] {
-        self.typewriter.tick();
         self.cache.get_or_update(
             &mut self.renderer,
             self.typewriter.visible(),
@@ -171,7 +184,6 @@ impl StreamingContent {
 
     /// [`thinking::render_tail`] of what the typewriter has revealed.
     pub fn render_tail(&mut self, rows: usize, width: u16) -> Option<&[Line<'static>]> {
-        self.typewriter.tick();
         let visible = self.typewriter.visible();
         let key = (
             CacheKey::for_text(visible, width, theme::generation()),

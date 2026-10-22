@@ -156,11 +156,18 @@ impl StatusBar {
     ///
     /// A queue claims frames too. Startup fills it and then the UI sits idle,
     /// so without frames the next message would never get its turn.
+    fn animating(&self, status: &Status, restoring: bool, retrying: bool) -> bool {
+        *status == Status::Streaming || restoring || retrying || !self.queued.is_empty()
+    }
+
     pub fn cadence(&self, status: &Status, restoring: bool, retrying: bool) -> Cadence {
-        Cadence::when(
-            *status == Status::Streaming || restoring || retrying || !self.queued.is_empty(),
-            Cadence::SPINNER,
-        )
+        Cadence::when(self.animating(status, restoring, retrying), Cadence::SPINNER)
+    }
+
+    /// `view` reads the elapsed time, so this only has to report whether the
+    /// bar is still moving.
+    pub fn tick(&self, status: &Status, restoring: bool, retrying: bool) -> Dirty {
+        Dirty::from(self.animating(status, restoring, retrying))
     }
 
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
@@ -694,6 +701,18 @@ mod tests {
             Cadence::SPINNER,
             "{EXPECT_TICKING}"
         );
+    }
+
+    #[test_case(Status::Streaming, false, false => Dirty::YES ; "streaming_turn")]
+    #[test_case(Status::Idle, true, false => Dirty::YES ; "restoring_session")]
+    #[test_case(Status::Idle, false, true => Dirty::YES ; "retry_countdown")]
+    #[test_case(Status::Idle, false, false => Dirty::NO ; "nothing_in_flight")]
+    fn tick_reports_what_the_bar_is_doing(
+        status: Status,
+        restoring: bool,
+        retrying: bool,
+    ) -> Dirty {
+        StatusBar::new(FLASH_TTL).tick(&status, restoring, retrying)
     }
 
     #[test]

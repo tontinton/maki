@@ -2334,6 +2334,11 @@ impl App {
             | self.btw_modal.poll()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
+            | self.status_bar.tick(
+                &self.status,
+                self.restoring.load(Ordering::Relaxed),
+                self.retry_info.is_some(),
+            )
             | self.mcp_picker.refresh()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
