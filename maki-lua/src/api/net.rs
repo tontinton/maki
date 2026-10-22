@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use futures_lite::FutureExt;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+use isahc::auth::Authentication;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use isahc::http::HeaderMap;
 use isahc::net::dns::ResolveMap;
@@ -839,7 +840,13 @@ fn build_request(
     headers: &[(String, String)],
     body: Vec<u8>,
 ) -> Result<Request<AsyncBody>, String> {
+    // isahc hands the URL to curl with `Authentication::none()`, erasing curl's
+    // own default of Basic and so its use of the URL userinfo. Asking for Basic
+    // leaves curl to read `user:pass@host` itself, decoding percent-escapes.
     let mut builder = Request::builder().method(method).uri(url);
+    if Url::parse(url).is_ok_and(|parsed| !parsed.username().is_empty()) {
+        builder = builder.authentication(Authentication::basic());
+    }
     // The builder appends rather than replaces, and servers that check the
     // user agent reject a request carrying two.
     if !headers
@@ -1873,6 +1880,56 @@ mod tests {
     fn build_request_invalid_uri_errors() {
         let result = build_request("not a valid uri \x00", "agent", "GET", &[], vec![]);
         assert!(result.is_err());
+    }
+
+    /// `base64("user:p@ss")`, what curl makes of the escaped `p%40ss`.
+    const USER_P_AT_SS_AUTH: &str = "Authorization: Basic dXNlcjpwQHNz";
+    const AUTH_PROBE_PATH: &str = "/search";
+
+    #[test]
+    fn basic_auth_credentials_come_from_the_url_userinfo() {
+        let (listener, port) = loopback_listener();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                let read = conn.read(&mut buf).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+
+        let params = redirect_params(&format!(
+            "http://user:p%40ss@{LOOPBACK_HOST}:{port}{AUTH_PROBE_PATH}"
+        ));
+        // A client of its own instead of the pooled one, whose pool the test
+        // suite shares and counts.
+        let client = build_client(&ClientKey::of(&params)).unwrap();
+        let response = smol::block_on(send_with_retries(&client, &params)).unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+
+        let request = server.join().unwrap();
+        let auth = request
+            .lines()
+            .find(|line| line.starts_with("Authorization:"));
+        assert_eq!(
+            auth.map(str::trim_end),
+            Some(USER_P_AT_SS_AUTH),
+            "{request}"
+        );
+        assert!(
+            request.starts_with(&format!("GET {AUTH_PROBE_PATH} HTTP/1.1")),
+            "{request}"
+        );
     }
 
     #[test_case(r#"net.request("https://127.0.0.1")"# ; "ssrf_blocked")]
