@@ -301,6 +301,7 @@ impl TerminalGuard {
         stdout().execute(EnableMouseCapture)?;
         enable_focus_change();
         push_keyboard_enhancement();
+        stderr::mute();
         Ok((Self, terminal))
     }
 }
@@ -310,6 +311,7 @@ impl Drop for TerminalGuard {
         let started = Instant::now();
         pop_terminal_modes();
         ratatui::restore();
+        stderr::unmute();
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "terminal restored"
@@ -332,6 +334,7 @@ fn teardown() {
     terminal::disable_raw_mode().ok();
     stdout().execute(LeaveAlternateScreen).ok();
     stdout().flush().ok();
+    stderr::unmute();
 }
 
 fn pop_terminal_modes() {
@@ -352,6 +355,7 @@ fn resume(terminal: &mut ratatui::DefaultTerminal) {
     enable_focus_change();
     terminal::enable_raw_mode().ok();
     push_keyboard_enhancement();
+    stderr::mute();
     let _ = terminal.clear();
 }
 
@@ -370,6 +374,55 @@ fn disable_focus_change() {
 
 #[cfg(windows)]
 fn disable_focus_change() {}
+
+/// Once a memory pressure event wakes it up, macOS libmalloc prints
+/// "MallocStackLogging: can't turn off malloc stack logging" inside every
+/// fork(), while the child's fd 2 is still our terminal, so the line lands
+/// right on top of the TUI. Our spawns fork because they need setsid, which
+/// only the fork path gives on stable Rust. So while we own the screen, fd 2
+/// points at /dev/null, and gets the terminal back for teardown and panics.
+#[cfg(not(windows))]
+mod stderr {
+    use std::fs::File;
+    use std::io::stderr;
+    use std::os::fd::{AsFd, OwnedFd};
+    use std::panic;
+    use std::sync::OnceLock;
+
+    use rustix::stdio::dup2_stderr;
+
+    const DEV_NULL: &str = "/dev/null";
+
+    static TERMINAL_STDERR: OnceLock<Option<OwnedFd>> = OnceLock::new();
+
+    pub(super) fn mute() {
+        let saved = TERMINAL_STDERR.get_or_init(|| {
+            let prev = panic::take_hook();
+            panic::set_hook(Box::new(move |info| {
+                unmute();
+                prev(info);
+            }));
+            stderr().as_fd().try_clone_to_owned().ok()
+        });
+        if saved.is_some()
+            && let Ok(null) = File::options().write(true).open(DEV_NULL)
+        {
+            let _ = dup2_stderr(&null);
+        }
+    }
+
+    pub(super) fn unmute() {
+        if let Some(Some(terminal)) = TERMINAL_STDERR.get() {
+            let _ = dup2_stderr(terminal);
+        }
+    }
+}
+
+#[cfg(windows)]
+mod stderr {
+    pub(super) fn mute() {}
+    pub(super) fn unmute() {}
+}
 
 fn push_keyboard_enhancement() {
     if let Err(e) = stdout().execute(PushKeyboardEnhancementFlags(
