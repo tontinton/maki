@@ -161,7 +161,10 @@ impl StatusBar {
     }
 
     pub fn cadence(&self, status: &Status, restoring: bool, retrying: bool) -> Cadence {
-        Cadence::when(self.animating(status, restoring, retrying), Cadence::Spinner)
+        Cadence::when(
+            self.animating(status, restoring, retrying),
+            Cadence::Spinner,
+        )
     }
 
     /// `view` reads the elapsed time, so this only has to report whether the
@@ -174,12 +177,12 @@ impl StatusBar {
         let mut left_spans = Vec::new();
 
         if *ctx.status == Status::Streaming {
-            let ch = spinner_frame(self.started_at.elapsed().as_millis());
+            let ch = spinner_frame(self.started_at.elapsed());
             left_spans.push(Span::styled(format!(" {ch}"), theme::current().spinner));
         }
 
         if ctx.restoring {
-            let ch = spinner_frame(self.started_at.elapsed().as_millis());
+            let ch = spinner_frame(self.started_at.elapsed());
             left_spans.push(Span::styled(
                 format!(" {ch}"),
                 theme::current().status_notice,

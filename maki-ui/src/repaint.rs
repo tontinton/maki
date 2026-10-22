@@ -224,10 +224,7 @@ mod tests {
     fn interval_maps_the_three_rates() {
         assert_eq!(Cadence::Idle.interval(SMOOTH_FRAME), None);
         assert_eq!(Cadence::Smooth.interval(SMOOTH_FRAME), Some(SMOOTH_FRAME));
-        assert_eq!(
-            Cadence::Spinner.interval(SMOOTH_FRAME),
-            Some(SPINNER_FRAME)
-        );
+        assert_eq!(Cadence::Spinner.interval(SMOOTH_FRAME), Some(SPINNER_FRAME));
         assert_eq!(
             Cadence::Spinner.interval(SLOW_FRAME),
             Some(SLOW_FRAME),

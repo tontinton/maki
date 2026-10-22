@@ -1373,7 +1373,7 @@ impl MessagesPanel {
 
     fn update_spinners(&mut self) {
         let spinner_span = Span::styled(
-            spinner_str(self.started_at.elapsed().as_millis()),
+            spinner_str(self.started_at.elapsed()),
             theme::current().spinner,
         );
         for seg in self.cache.segments_mut() {

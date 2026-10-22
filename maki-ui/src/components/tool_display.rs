@@ -10,7 +10,7 @@ use maki_config::{ClockFormat, ToolOutputLines};
 use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthStr;
 
@@ -622,7 +622,7 @@ pub fn build_tool_lines(
         rctx.tool_output_lines.get(tool_name),
         status.into(),
     );
-    let spinner_frame = spinner_str(rctx.started_at.elapsed().as_millis());
+    let spinner_frame = spinner_str(rctx.started_at.elapsed());
     b.apply_output_format(msg.tool_output.as_deref());
     b.push_header(
         tool_name,
@@ -789,8 +789,14 @@ pub fn build_instructions_lines(
         code_view::instruction_limit(expanded),
         Indicator::Success,
     );
-    b.push_header(INSTRUCTIONS_TOOL, header, annotation.as_deref(), None, spinner_str(0));
-    b.prepend_indicator(spinner_str(0));
+    b.push_header(
+        INSTRUCTIONS_TOOL,
+        header,
+        annotation.as_deref(),
+        None,
+        spinner_str(Duration::ZERO),
+    );
+    b.prepend_indicator(spinner_str(Duration::ZERO));
 
     let start = b.lines.len();
     let has_truncation =

@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::animation::{animation_elapsed, spinner_str};
 use crate::components::split_layout::SplitReq;
 use crate::components::{
     Overlay, hint_footer,
@@ -876,7 +876,7 @@ fn snapshot_to_line(sline: &SnapshotLine) -> Line<'_> {
                     if n == SPINNER_STYLE_NAME || n.starts_with(SPINNER_STYLE_PREFIX) =>
                 {
                     Span::styled(
-                        spinner_str(animation_elapsed_ms()),
+                        spinner_str(animation_elapsed()),
                         theme::style_by_name(n.strip_prefix(SPINNER_STYLE_PREFIX).unwrap_or(n)),
                     )
                 }

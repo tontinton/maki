@@ -612,7 +612,7 @@ fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
     let mut spans = vec![super::chevron_span()];
 
     if s.walk == Walk::Running {
-        let ch = spinner_frame(s.started_at.elapsed().as_millis());
+        let ch = spinner_frame(s.started_at.elapsed());
         spans.push(Span::styled(format!("{ch} "), t.item_desc));
     }
 
