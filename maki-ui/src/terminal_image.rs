@@ -5,6 +5,7 @@ use std::io::{Cursor, IsTerminal, stdout};
 #[cfg(unix)]
 use std::os::fd::AsFd;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -30,7 +31,7 @@ use crate::repaint::Dirty;
 
 const MAX_IMAGE_ROWS: u16 = 20;
 const FALLBACK_FONT_SIZE: FontSize = FontSize::new(10, 20);
-const MULTIPLEXER_VARS: [&str; 3] = ["TMUX", "STY", "ZELLIJ"];
+const MIN_ZELLIJ_VERSION: (u32, u32) = (0, 45);
 /// The reply ends with a DSR sentinel, so a responsive terminal finishes the
 /// poll far sooner; this only caps one that never answers.
 #[cfg(unix)]
@@ -90,13 +91,30 @@ pub(crate) fn picker(inline_images: bool) -> Option<Picker> {
 
 fn detect() -> Option<Picker> {
     let get = |key: &str| env::var(key).ok();
-    if !stdout().is_terminal() || in_multiplexer(&get) {
+    if !stdout().is_terminal() {
         return None;
     }
-    let probed = if graphics_denied(&get) { None } else { probe() };
-    let (protocol, font) = match probed {
-        Some((probed, font)) => (env_protocol(&get).unwrap_or(probed), font),
-        None => (env_protocol(&get)?, None),
+    let zellij = in_zellij(&get);
+    if in_tmux_or_screen(&get) || (zellij && !zellij_supports_images(&get)) {
+        return None;
+    }
+    // Zellij 0.45 has no unicode placeholders, and ratatui-image's kitty
+    // renderer is built on them, so ask only for sixel there.
+    let probed = if graphics_denied(&get) {
+        None
+    } else {
+        probe(!zellij)
+    };
+    let (protocol, font) = if zellij {
+        let (ProtocolType::Sixel, font) = probed? else {
+            return None;
+        };
+        (ProtocolType::Sixel, font)
+    } else {
+        match probed {
+            Some((probed, font)) => (env_protocol(&get).unwrap_or(probed), font),
+            None => (env_protocol(&get)?, None),
+        }
     };
     let font = font.or_else(window_font).unwrap_or(FALLBACK_FONT_SIZE);
     #[allow(deprecated)]
@@ -120,9 +138,17 @@ fn query_timeout() -> Duration {
 /// `from_query_stdio` blocks a thread on stdin and can eat the next keypress
 /// when it times out.
 #[cfg(unix)]
-fn probe() -> Option<(ProtocolType, Option<FontSize>)> {
+fn probe(allow_kitty: bool) -> Option<(ProtocolType, Option<FontSize>)> {
     let tty = crate::tty::open()?;
-    let query = Parser::query(false, QueryStdioOptions::default());
+    let options = QueryStdioOptions {
+        blacklist_protocols: if allow_kitty {
+            Vec::new()
+        } else {
+            vec![ProtocolType::Kitty]
+        },
+        ..QueryStdioOptions::default()
+    };
+    let query = Parser::query(false, options);
     let mut out = stdout().lock();
     out.write_all(query.as_bytes()).ok()?;
     out.flush().ok()?;
@@ -151,7 +177,7 @@ fn probe() -> Option<(ProtocolType, Option<FontSize>)> {
 }
 
 #[cfg(not(unix))]
-fn probe() -> Option<(ProtocolType, Option<FontSize>)> {
+fn probe(_allow_kitty: bool) -> Option<(ProtocolType, Option<FontSize>)> {
     None
 }
 
@@ -186,8 +212,42 @@ fn env_protocol(get: &impl Fn(&str) -> Option<String>) -> Option<ProtocolType> {
     }
 }
 
-fn in_multiplexer(get: &impl Fn(&str) -> Option<String>) -> bool {
-    MULTIPLEXER_VARS.iter().any(|key| get(key).is_some())
+fn in_tmux_or_screen(get: &impl Fn(&str) -> Option<String>) -> bool {
+    get("TMUX").is_some() || get("STY").is_some()
+}
+
+fn in_zellij(get: &impl Fn(&str) -> Option<String>) -> bool {
+    get("ZELLIJ").is_some() || get("ZELLIJ_SESSION_NAME").is_some()
+}
+
+/// Zellij before 0.45 advertised sixel even when the host terminal could not
+/// draw it, so the version is part of the capability.
+fn zellij_supports_images(get: &impl Fn(&str) -> Option<String>) -> bool {
+    zellij_version(get).is_some_and(|version| version_at_least(&version, MIN_ZELLIJ_VERSION))
+}
+
+fn zellij_version(get: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    get("ZELLIJ_VERSION")
+        .filter(|version| !version.trim().is_empty())
+        .or_else(|| {
+            let output = Command::new("zellij").arg("--version").output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            String::from_utf8(output.stdout).ok()
+        })
+}
+
+fn version_at_least(version: &str, (min_major, min_minor): (u32, u32)) -> bool {
+    let token = version
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .trim_start_matches('v');
+    let mut parts = token.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
+    matches!((major, minor), (Some(major), Some(minor)) if (major, minor) >= (min_major, min_minor))
 }
 
 /// Terminals that advertise sixel but paint it wrong: `ratatui-image`'s matrix
@@ -381,8 +441,9 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        ImageState, InlineImage, Response, encode, env_protocol, graphics_denied, in_multiplexer,
-        interpret, picker,
+        ImageState, InlineImage, MIN_ZELLIJ_VERSION, Response, encode, env_protocol,
+        graphics_denied, in_tmux_or_screen, in_zellij, interpret, picker, version_at_least,
+        zellij_supports_images,
     };
     use crate::repaint::Dirty;
 
@@ -394,6 +455,9 @@ mod tests {
     const IMAGE_HEIGHT: u16 = 6;
     const TERM_PROGRAM: &str = "TERM_PROGRAM";
     const TERM: &str = "TERM";
+    const ZELLIJ: &str = "ZELLIJ";
+    const ZELLIJ_SESSION_NAME: &str = "ZELLIJ_SESSION_NAME";
+    const ZELLIJ_VERSION: &str = "ZELLIJ_VERSION";
     const KITTY_TERM: &str = "xterm-kitty";
     const UNKNOWN_PROGRAM: &str = "unknown";
 
@@ -417,11 +481,38 @@ mod tests {
         assert_eq!(env_protocol(&get(env)), expected);
     }
 
-    #[test_case(&[("TMUX", "mux")]; "tmux")]
-    #[test_case(&[("STY", "1")]; "screen")]
-    #[test_case(&[("ZELLIJ", "1")]; "zellij")]
-    fn multiplexers_disable_graphics(env: &[(&str, &str)]) {
-        assert!(in_multiplexer(&get(env)));
+    #[test_case(&[("TMUX", "mux")], true; "tmux")]
+    #[test_case(&[("STY", "1")], true; "screen")]
+    #[test_case(&[(ZELLIJ, "0")], false; "zellij")]
+    #[test_case(&[], false; "plain")]
+    fn tmux_and_screen_are_denied(env: &[(&str, &str)], expected: bool) {
+        assert_eq!(in_tmux_or_screen(&get(env)), expected);
+    }
+
+    #[test_case(&[(ZELLIJ, "0")], true; "session")]
+    #[test_case(&[(ZELLIJ_SESSION_NAME, "work")], true; "session_name")]
+    #[test_case(&[], false; "outside")]
+    fn zellij_detection(env: &[(&str, &str)], expected: bool) {
+        assert_eq!(in_zellij(&get(env)), expected);
+    }
+
+    #[test_case("0.45.1", true; "minimum")]
+    #[test_case("0.45", true; "no_patch")]
+    #[test_case("0.44.9", false; "before_sixel_fix")]
+    #[test_case("zellij 0.45.1", true; "command_output")]
+    #[test_case("zellij v0.46.0", true; "leading_v")]
+    #[test_case("garbage", false; "unparseable")]
+    fn zellij_version_gate(version: &str, expected: bool) {
+        assert_eq!(version_at_least(version, MIN_ZELLIJ_VERSION), expected);
+    }
+
+    #[test_case("0.45.1", true; "supported")]
+    #[test_case("0.44.0", false; "too_old")]
+    fn zellij_supports_images_reads_the_env(version: &str, expected: bool) {
+        assert_eq!(
+            zellij_supports_images(&get(&[(ZELLIJ_VERSION, version)])),
+            expected
+        );
     }
 
     #[test_case(&[("KONSOLE_VERSION", "230800")], true; "konsole")]
