@@ -1,7 +1,7 @@
 use super::{DisplayMessage, ToolStatus};
 
 use super::code_view;
-use crate::animation::{spinner_frame, spinner_str};
+use crate::animation::spinner_str;
 use crate::theme;
 use code_view::RenderLimits;
 use code_view::SectionFlags;
@@ -343,6 +343,7 @@ impl ToolLineBuilder {
         header: &str,
         annotation: Option<&str>,
         render_header: Option<&BufferSnapshot>,
+        spinner_frame: &'static str,
     ) {
         let mut spans = vec![Span::styled(
             format!("{tool_name}> "),
@@ -355,7 +356,7 @@ impl ToolLineBuilder {
                 bake_spans(
                     &first_line.spans,
                     &mut spans,
-                    spinner_str(0),
+                    spinner_frame,
                     self.indicator,
                     |span_idx| {
                         spinners.push((line_idx, span_idx));
@@ -374,15 +375,12 @@ impl ToolLineBuilder {
         self.lines.push(Line::from(spans));
     }
 
-    fn prepend_indicator(&mut self, started_at: Instant) {
+    fn prepend_indicator(&mut self, spinner_frame: &'static str) {
         if self.lines.is_empty() {
             return;
         }
         let (text, style) = match self.indicator {
-            Indicator::InProgress => {
-                let ch = spinner_frame(started_at.elapsed().as_millis());
-                (format!("{ch} "), theme::current().spinner)
-            }
+            Indicator::InProgress => (spinner_frame.to_owned(), theme::current().spinner),
             finished => (TOOL_INDICATOR.into(), finished_style(finished)),
         };
         for (line, span) in &mut self.spinner_lines {
@@ -457,13 +455,17 @@ impl ToolLineBuilder {
         }
     }
 
-    fn push_snapshot(&mut self, snapshot: &BufferSnapshot, started_at: Instant) {
+    fn push_snapshot(&mut self, snapshot: &BufferSnapshot, spinner_frame: &'static str) {
         let base = self.lines.len();
         self.snapshot_base = Some(base);
         let total = snapshot.lines.len();
-        let frame = spinner_str(started_at.elapsed().as_millis());
-        let (lines, spinners) =
-            snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, 0..total, frame, self.indicator);
+        let (lines, spinners) = snapshot_to_lines_range(
+            snapshot,
+            TOOL_BODY_INDENT,
+            0..total,
+            spinner_frame,
+            self.indicator,
+        );
         self.lines.extend(lines);
         self.spinner_lines
             .extend(spinners.into_iter().map(|(line, span)| (base + line, span)));
@@ -620,14 +622,16 @@ pub fn build_tool_lines(
         rctx.tool_output_lines.get(tool_name),
         status.into(),
     );
+    let spinner_frame = spinner_str(rctx.started_at.elapsed().as_millis());
     b.apply_output_format(msg.tool_output.as_deref());
     b.push_header(
         tool_name,
         header,
         msg.annotation.as_deref(),
         msg.render_header.as_ref(),
+        spinner_frame,
     );
-    b.prepend_indicator(rctx.started_at);
+    b.prepend_indicator(spinner_frame);
     let has_snapshot = msg.render_snapshot.is_some();
     b.push_code_content(
         msg.tool_input.as_deref(),
@@ -638,7 +642,7 @@ pub fn build_tool_lines(
         },
     );
     let show_output = if let Some(ref snapshot) = msg.render_snapshot {
-        b.push_snapshot(snapshot, rctx.started_at);
+        b.push_snapshot(snapshot, spinner_frame);
         // A denial can land while the snapshot still shows only the
         // pre-permission script preview, so the error goes below it.
         // But a collapsed snapshot keeps just a window of the output,
@@ -785,8 +789,8 @@ pub fn build_instructions_lines(
         code_view::instruction_limit(expanded),
         Indicator::Success,
     );
-    b.push_header(INSTRUCTIONS_TOOL, header, annotation.as_deref(), None);
-    b.prepend_indicator(Instant::now());
+    b.push_header(INSTRUCTIONS_TOOL, header, annotation.as_deref(), None, spinner_str(0));
+    b.prepend_indicator(spinner_str(0));
 
     let start = b.lines.len();
     let has_truncation =
