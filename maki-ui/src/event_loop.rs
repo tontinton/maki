@@ -814,8 +814,7 @@ impl<'t> EventLoop<'t> {
             // timeout only buys another tick; that tick's Dirty decides
             // whether a frame is owed.
             let cadence = self.sessions[self.focused].app.cadence();
-            if let Some(wake) =
-                self.next_wake(cadence.interval(SMOOTH_FRAME).unwrap_or(IDLE_POLL))
+            if let Some(wake) = self.next_wake(cadence.interval(SMOOTH_FRAME).unwrap_or(IDLE_POLL))
             {
                 // Any event can change the screen, so paint after handling it
                 // rather than asking every handler to prove it did.

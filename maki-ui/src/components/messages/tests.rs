@@ -619,7 +619,11 @@ fn a_fresh_panel_tick_reports_the_splash() {
 #[test]
 fn a_running_tool_tick_reports_the_spinner() {
     let mut panel = panel_with_tools(&[("t1", BASH_TOOL_NAME)]);
-    assert_eq!(panel.tick(), Dirty::YES, "a running tool owes a spinner frame");
+    assert_eq!(
+        panel.tick(),
+        Dirty::YES,
+        "a running tool owes a spinner frame"
+    );
 }
 
 /// `drain_highlights` moved out of `view`, so `tick` is the only thing feeding

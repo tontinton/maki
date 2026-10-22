@@ -4,25 +4,28 @@ use std::time::{Duration, Instant};
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SPINNER_STRS: [&str; 10] = ["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "];
-const SPINNER_FRAME_MS: u128 = 80;
 
-/// How long one glyph stays up. [`crate::repaint::Cadence::Spinner`] paints at
-/// exactly this rate, so no two frames show the same glyph.
-pub const SPINNER_FRAME: Duration = Duration::from_millis(SPINNER_FRAME_MS as u64);
+/// How long one glyph stays up. One glyph per 1/12s: the same 12fps grid the
+/// row reveal uses, instead of the old 80ms 12.5fps.
+pub const SPINNER_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 12);
 
-pub fn spinner_frame(elapsed_ms: u128) -> char {
-    SPINNER_FRAMES[(elapsed_ms / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len()]
+fn spinner_index(elapsed: Duration) -> usize {
+    (elapsed.as_nanos() / SPINNER_FRAME.as_nanos()) as usize % SPINNER_FRAMES.len()
 }
 
-pub fn spinner_str(elapsed_ms: u128) -> &'static str {
-    SPINNER_STRS[(elapsed_ms / SPINNER_FRAME_MS) as usize % SPINNER_STRS.len()]
+pub fn spinner_frame(elapsed: Duration) -> char {
+    SPINNER_FRAMES[spinner_index(elapsed)]
+}
+
+pub fn spinner_str(elapsed: Duration) -> &'static str {
+    SPINNER_STRS[spinner_index(elapsed)]
 }
 
 /// Spinners need a consistent time reference. Using a static epoch avoids
 /// passing Instant through every render call.
-pub fn animation_elapsed_ms() -> u128 {
+pub fn animation_elapsed() -> Duration {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
-    EPOCH.get_or_init(Instant::now).elapsed().as_millis()
+    EPOCH.get_or_init(Instant::now).elapsed()
 }
 
 const DEFAULT_MS_PER_CHAR: u64 = 4;
@@ -190,10 +193,10 @@ mod tests {
 
     #[test]
     fn spinner_wraps_around() {
-        let first = spinner_frame(0);
-        let wrapped = spinner_frame(SPINNER_FRAME_MS * SPINNER_FRAMES.len() as u128);
+        let first = spinner_frame(Duration::ZERO);
+        let wrapped = spinner_frame(SPINNER_FRAME * SPINNER_FRAMES.len() as u32);
         assert_eq!(first, wrapped);
-        assert_ne!(first, spinner_frame(SPINNER_FRAME_MS));
+        assert_ne!(first, spinner_frame(SPINNER_FRAME));
     }
 
     #[test]
