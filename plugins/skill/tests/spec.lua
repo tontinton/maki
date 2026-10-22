@@ -1,6 +1,10 @@
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
+local format_output = helpers.format_output
+local parse_output = helpers.parse_output
+
+local LOCATION = "/home/u/.config/maki/skills/release/SKILL.md"
 
 local failures = {}
 
@@ -100,6 +104,31 @@ case("build_skill_list_sorted_alphabetically", function()
   local zebra_pos = result:find("zebra")
   assert(alpha_pos < middle_pos, "alpha should come before middle")
   assert(middle_pos < zebra_pos, "middle should come before zebra")
+end)
+
+-- ── llm text round trip ──
+
+case("format_output_numbers_each_line_under_location", function()
+  eq(format_output(LOCATION, "# Release\nTag it."), LOCATION .. "\n   1 | # Release\n   2 | Tag it.")
+end)
+
+for name, content in pairs({
+  blank_lines = "a\n\n\nb",
+  trailing_newline = "a\nb\n",
+  single_line = "only",
+  looks_like_format = "   1 | nested\n  12 | more",
+  many_lines = string.rep("x\n", 12000) .. "end",
+}) do
+  case("parse_output_inverts_format_output_" .. name, function()
+    local location, parsed = parse_output(format_output(LOCATION, content))
+    eq(location, LOCATION)
+    eq(parsed, content)
+  end)
+end
+
+case("parse_output_rejects_text_that_is_not_a_listing", function()
+  eq(parse_output("error: name is required"), nil)
+  eq(parse_output("skill not found: x\n\n<available_skills>\n- a: b\n</available_skills>"), nil)
 end)
 
 -- ── builtin plugin_dev skill ──

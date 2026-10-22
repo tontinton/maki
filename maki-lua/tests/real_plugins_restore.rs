@@ -337,6 +337,32 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
     }
 }
 
+const SKILL_TOOL: &str = "skill";
+const SKILL_NAME: &str = "release";
+/// Outside any home or cwd, so `shorten_path` leaves it alone.
+const SKILL_LOCATION: &str = "/srv/skills/release/SKILL.md";
+const SKILL_BODY: &str = "1 # Release\n2 Tag it.";
+
+/// Restore (session reload, batch child) must draw the skill like the live
+/// call did: content behind a line-number gutter, with the location in
+/// the header, not the llm's numbered text with the location on top.
+#[test]
+fn skill_restore_renders_content_not_llm_text() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let output = format!("{SKILL_LOCATION}\n   1 | # Release\n   2 | Tag it.");
+    let r = restore(
+        &host,
+        SKILL_TOOL,
+        json!({ "name": SKILL_NAME }),
+        &output,
+        None,
+        Vec::new(),
+    );
+    assert_eq!(r.body, SKILL_BODY);
+    assert_eq!(r.header, SKILL_LOCATION);
+}
+
 /// A directory has no skeleton, so index shows the plain listing. Restore must
 /// rebuild that same listing view instead of the index skeleton view, which
 /// would truncate to the index cap and highlight the entries as code.

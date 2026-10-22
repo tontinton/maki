@@ -46,6 +46,15 @@ local function apply_highlights(view, lines, ext, prefix)
   view:flush()
 end
 
+-- Lines above `start` give the highlighter context, so a window that
+-- opens inside a block comment or string is coloured right.
+local function highlight_prefix(all_lines, start)
+  if start <= 1 then
+    return nil
+  end
+  return table.concat(all_lines, "\n", 1, math.min(start - 1, #all_lines))
+end
+
 local function build_file_view(lines, start_line, total_lines, path, ctx, prefix)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, read_view_opts(ctx))
@@ -128,7 +137,7 @@ local function read_file(path, offset, limit, ctx)
   local annotation = shown < total_lines and string.format("%d of %d lines", shown, total_lines)
     or string.format("%d lines", shown)
 
-  local prefix = start > 1 and table.concat(all_lines, "\n", 1, math.min(start - 1, total_lines)) or nil
+  local prefix = highlight_prefix(all_lines, start)
 
   local basename = path:match("([^/]+)$")
   local parent = maki.fs.dirname(path)
@@ -210,7 +219,13 @@ maki.api.register_tool({
     end
     start_line = start_line or 1
     total_lines = total_lines or (start_line + #lines - 1)
-    return build_file_view(lines, start_line, total_lines, input.path or "", ctx)
+    local path = input.path or ""
+    -- The llm text starts at `offset`, so the context above it can only
+    -- come from the file as it is now; a file edited since the call may
+    -- colour the window differently than the live call did.
+    local content = start_line > 1 and maki.fs.read(path)
+    local prefix = content and highlight_prefix(split_lines(content), start_line)
+    return build_file_view(lines, start_line, total_lines, path, ctx, prefix)
   end,
 
   handler = function(input, ctx)

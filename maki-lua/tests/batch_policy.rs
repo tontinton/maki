@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
-use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
 use maki_agent::{
     AgentEvent, AgentMode, BufferSnapshot, Envelope, EventSender, SpanStyle, ToolOutput,
 };
@@ -660,7 +660,11 @@ fn restore_snapshot_lines_opts(
     );
     handle.wait_restore_complete_for_test();
     barrier(host);
-    snapshot_lines(drain_snapshots(&rx).last().expect("no snapshot emitted"))
+    snapshot_lines(
+        drain_snapshots(&rx, BATCH_ID)
+            .last()
+            .expect("no snapshot emitted"),
+    )
 }
 
 /// The empty LoadSource drains the async gate, so spawned follow-ups
@@ -669,11 +673,11 @@ fn barrier(host: &PluginHost) {
     host.load_source("barrier", "").unwrap();
 }
 
-fn drain_snapshots(rx: &flume::Receiver<Envelope>) -> Vec<BufferSnapshot> {
+fn drain_snapshots(rx: &flume::Receiver<Envelope>, tool_use_id: &str) -> Vec<BufferSnapshot> {
     rx.drain()
         .filter_map(|env| match env.event {
             AgentEvent::ToolSnapshot { id, snapshot, .. } => {
-                assert_eq!(id, BATCH_ID);
+                assert_eq!(id, tool_use_id);
                 Some(snapshot)
             }
             _ => None,
@@ -1140,6 +1144,9 @@ fn child_restore_awaiting_async_api_keeps_its_body() {
 }
 
 const BATCH_ID: &str = "batch_id";
+const SOLO_ID: &str = "solo_id";
+const PROBE_FILE_NAME: &str = "probe.rs";
+const PROBE_SOURCE: &str = "/* a\n b */\nfn main() {\n    println!(\"hi\");\n}\n";
 
 const HL_CHILD_SRC: &str = r#"
 local ToolView = require("maki.tool_view")
@@ -1187,34 +1194,44 @@ maki.api.register_tool({
 })
 "#;
 
-/// Real dispatch, no `call_tool` stub, so children stream their snapshots the
-/// way they do in a session.
+/// Real dispatch with a live event channel, so the tool streams its
+/// snapshots the way it does in a session; the barrier lets async
+/// highlights land before the last snapshot is read.
+fn exec_live(
+    host: &PluginHost,
+    reg: &Arc<ToolRegistry>,
+    tool_use_id: &str,
+    tool: &str,
+    input: &Value,
+) -> (ToolExecResult, Vec<BufferSnapshot>) {
+    let (tx, rx) = flume::unbounded();
+    let event_tx = EventSender::new(tx, 0);
+    let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(tool_use_id));
+    ctx.registry = Arc::clone(reg);
+    let inv = reg
+        .get(tool)
+        .unwrap_or_else(|| panic!("tool {tool} not registered"))
+        .tool
+        .parse(input)
+        .expect("parse failed");
+    let result = smol::block_on(async { inv.execute(&ctx).await });
+    barrier(host);
+    (result, drain_snapshots(&rx, tool_use_id))
+}
+
 fn exec_batch_live(
     host: &PluginHost,
     reg: &Arc<ToolRegistry>,
     tool_calls: Value,
 ) -> (Value, Vec<BufferSnapshot>) {
-    let (tx, rx) = flume::unbounded();
-    let event_tx = EventSender::new(tx, 0);
-    let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));
-    ctx.registry = Arc::clone(reg);
-
-    let input = json!({ "tool_calls": tool_calls });
-    let inv = reg
-        .get(BATCH_TOOL)
-        .expect("batch registered")
-        .tool
-        .parse(&input)
-        .expect("parse failed");
-    let state = smol::block_on(async { inv.execute(&ctx).await })
+    let (result, snapshots) = exec_live(host, reg, BATCH_ID, BATCH_TOOL, &batch_input(tool_calls));
+    let state = result
         .output
         .expect("batch failed")
         .state()
         .cloned()
         .expect("no state on batch output");
-
-    barrier(host);
-    (state, drain_snapshots(&rx))
+    (state, snapshots)
 }
 
 /// Regression: two `edit` children on one file used to interleave their
@@ -1321,4 +1338,36 @@ fn run_live_batch(child_src: &str, tool: &str) -> Vec<BufferSnapshot> {
         ]),
     );
     snapshots
+}
+
+/// A batch child is drawn by its tool's restore, so the only thing a user
+/// should notice is the indent: text and styles must match the standalone
+/// call. `read` opens inside a block comment on purpose: a restore that
+/// drops the lines above the window tokenizes `*/` as two operators.
+#[test_case::test_case("read", |file, _| json!({ "path": file, "offset": 2, "limit": 0 }) ; "read_inside_block_comment")]
+#[test_case::test_case("index", |file, _| json!({ "path": file }) ; "index_file")]
+#[test_case::test_case("grep", |_, dir| json!({ "pattern": "main", "path": dir }) ; "grep_dir")]
+#[test_case::test_case("list", |_, dir| json!({ "path": dir }) ; "list_dir")]
+fn batch_child_body_matches_standalone(tool: &str, input: fn(&str, &str) -> Value) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = dir.path().join(PROBE_FILE_NAME);
+    std::fs::write(&file, PROBE_SOURCE).unwrap();
+    let input = input(file.to_str().unwrap(), dir.path().to_str().unwrap());
+
+    let (reg, host) = real_builtins();
+    let (_, solo) = exec_live(&host, &reg, SOLO_ID, tool, &input);
+    let solo = snapshot_lines(solo.last().expect("no solo snapshot"));
+    let (_state, snapshots) =
+        exec_batch_live(&host, &reg, json!([{ "tool": tool, "parameters": input }]));
+    let batch = snapshot_lines(snapshots.last().expect("no batch snapshot"));
+    let child: Vec<Vec<(String, SpanStyle)>> =
+        batch[1..].iter().map(|line| line[1..].to_vec()).collect();
+
+    assert_eq!(
+        child,
+        solo,
+        "batch child differs from standalone\nbatch:\n{}\nsolo:\n{}",
+        lines_text(&child),
+        lines_text(&solo)
+    );
 }
