@@ -6,7 +6,7 @@ const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 const SPINNER_STRS: [&str; 10] = ["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "];
 const SPINNER_FRAME_MS: u128 = 80;
 
-/// How long one glyph stays up. [`crate::repaint::Cadence::SPINNER`] paints at
+/// How long one glyph stays up. [`crate::repaint::Cadence::Spinner`] paints at
 /// exactly this rate, so no two frames show the same glyph.
 pub const SPINNER_FRAME: Duration = Duration::from_millis(SPINNER_FRAME_MS as u64);
 

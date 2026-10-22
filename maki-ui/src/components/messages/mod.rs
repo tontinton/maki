@@ -830,10 +830,10 @@ impl MessagesPanel {
         Cadence::any([
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
-            Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
-            Cadence::when(smooth, Cadence::SMOOTH),
+            Cadence::when(self.in_progress_count() > 0, Cadence::Spinner),
+            Cadence::when(smooth, Cadence::Smooth),
             Cadence::when(splash, self.idle_splash.cadence()),
-            Cadence::when(splash && self.accent.is_animating(), Cadence::SMOOTH),
+            Cadence::when(splash && self.accent.is_animating(), Cadence::Smooth),
         ])
     }
 

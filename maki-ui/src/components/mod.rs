@@ -61,7 +61,7 @@ pub(crate) trait Overlay {
     /// alone, like a spinner or a reveal. `App::cadence` asks every overlay,
     /// so this is the only place one has to say so.
     fn cadence(&self) -> crate::repaint::Cadence {
-        crate::repaint::Cadence::IDLE
+        crate::repaint::Cadence::Idle
     }
 }
 

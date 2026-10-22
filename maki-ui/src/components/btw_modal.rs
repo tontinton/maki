@@ -96,7 +96,7 @@ impl BtwModal {
         let smooth = self.answer.is_animating()
             || (thinking::reveals_text(self.thinking_lines, CLICK_EXPANDED)
                 && self.thinking.is_animating());
-        Cadence::when(self.open && smooth, Cadence::SMOOTH)
+        Cadence::when(self.open && smooth, Cadence::Smooth)
     }
 
     pub fn is_open(&self) -> bool {
