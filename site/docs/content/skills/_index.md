@@ -13,7 +13,7 @@ Write one for anything you keep explaining: how you cut a release, how you write
 
 ## Where skills live
 
-A skill is a directory with a `SKILL.md` inside. Maki looks for them every time the `skill` tool runs (and once at startup, to build the list). When two skills share a name, the one found last wins:
+A skill is a directory with a `SKILL.md` inside. Maki builds the list of skills once at startup, so a skill added during a session needs `/reload`. When two skills share a name, the one found last wins:
 
 1. The builtin `maki-plugin-dev` (if enabled)
 2. `~/.config/maki/skills/` (Windows: `%APPDATA%\maki\skills\`)
@@ -62,7 +62,8 @@ with the rest of the file. `allowed-tools` does not change Maki's permissions.
 
 ## How it gets used
 
-The `skill` tool lists every skill it found, the agent calls it with a name and gets the full file and its resource directory back. A wrong name errors and reprints the list so the model can pick again.
+The `skill` tool lists the skills found at startup, and is left out when there
+are none. The agent calls it with one of those names and gets the full file and its resource directory back. A wrong name errors and reprints the list so the model can pick again.
 
 Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
 
