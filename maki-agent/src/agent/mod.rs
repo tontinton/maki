@@ -16,6 +16,7 @@ pub use history::{
 pub use hook::{AgentCall, AgentHook, AgentHooks, AgentSlot};
 pub use instructions::{
     CallInstructions, Instructions, LoadedInstructions, build_system_prompt,
-    find_subdirectory_instructions, is_instruction_file, load_instruction_text, load_instructions,
+    default_instruction_files, find_subdirectory_instructions, is_instruction_file,
+    load_instruction_text, load_instructions,
 };
 pub use run::{Agent, AgentParams, AgentRunParams, ModelSlot, resolve_compaction_model};

@@ -750,7 +750,7 @@ pub fn prompt(
     }
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let instructions = load_instruction_text(&cwd.to_string_lossy());
+    let instructions = load_instruction_text(&cwd.to_string_lossy(), &config.agent.instructions);
     let slots = host.event_handle().collect_prompt_slots();
 
     let output = match variant {

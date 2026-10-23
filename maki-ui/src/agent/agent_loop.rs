@@ -337,7 +337,10 @@ impl AgentLoop {
                 context,
             },
         )
-        .with_loaded_instructions(self.instructions.loaded.clone())
+        .with_loaded_instructions(
+            self.instructions.loaded.clone(),
+            self.instructions.files.clone(),
+        )
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_reauth(true)
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
@@ -352,7 +355,13 @@ impl AgentLoop {
 
     async fn reload_instructions(&mut self) {
         let cwd = self.vars.apply("{cwd}").into_owned();
-        self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
+        let config = self.seed.config.instructions.clone();
+        self.instructions = smol::unblock(move || agent::load_instructions(&cwd, &config)).await;
+        // Background sessions started from the seed read its list, so it has
+        // to follow every reload, the startup one included.
+        self.seed
+            .instruction_files
+            .store(Arc::clone(&self.instructions.files));
     }
 
     fn emit_error(&self, run_id: u64, error: AgentError) {

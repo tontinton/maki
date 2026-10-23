@@ -188,6 +188,33 @@ maki.setup({
 
 `paths` is a list of globs matched against the project root, empty by default. `prompt` is a bool, `true` by default. Setting it to `false` drops the startup card and leaves the folder restricted unless a `paths` entry matches. [Folder Trust](/docs/folder-trust/#trust-policy) covers glob syntax and which run modes apply the policy.
 
+### `instructions`
+
+Which instruction files Maki loads from each project directory. Read from the global `~/.config/maki/init.lua` only, since a project file that could pick its own instructions would be trusting itself.
+
+`files` replaces the built-in list (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and friends) with your own, in priority order. An empty list loads no project instruction files at all, and `AGENTS.local.md` still loads:
+
+```lua
+maki.setup({
+    instructions = { files = { "CLAUDE.md" } },
+})
+```
+
+### `projects`
+
+Per-checkout overrides of the above, for when one repository wants a different answer. Read from the global `init.lua` only, like `instructions`.
+
+Each entry matches a checkout by `path` (a glob against the project root, `~` included, like `trust.paths`) or by `remote` (a glob against every git remote URL of the project, normalized to `host/path`: `https://host/a/b.git` and `git@host:a/b.git` both become `host/a/b`). When both are set, both must match; an entry with neither matches every project. The first matching entry wins, and one that sets no `instructions` still ends the search, keeping the global `files`:
+
+```lua
+maki.setup({
+    projects = {
+        { remote = "github.com/example/*", instructions = { files = {} } },
+        { path = "~/src/secret", instructions = { files = { "CLAUDE.md" } } },
+    },
+})
+```
+
 ### `telemetry`
 
 | Field | Type | Default | Env | Description |
@@ -375,6 +402,7 @@ On top of the project instruction files Maki loads from the git root down to the
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
+- `instructions.files` in the global `init.lua` to replace the project file list, scoped per checkout with `projects` (see [`instructions`](#instructions))
 
 All of these are added to the system prompt at the start of every session.
 

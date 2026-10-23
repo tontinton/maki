@@ -7,6 +7,7 @@ use maki_providers::{Message, RequestOptions, Timeouts};
 use maki_storage::id::{MakiId, SessionRef};
 use thiserror::Error;
 
+use crate::agent::default_instruction_files;
 use crate::cancel::CancelToken;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
@@ -56,6 +57,10 @@ pub struct AgentSeed {
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
+    /// The instruction file list background sessions resolve against. Starts
+    /// at the built-in list and is swapped in by the owning loop's
+    /// instruction reload.
+    pub instruction_files: ArcSwap<Vec<String>>,
     pub mcp: Option<McpSession>,
     pub timeouts: Timeouts,
     pub file_access: Arc<FileAccess>,
@@ -179,6 +184,7 @@ impl AgentSeed {
             file_access: FileAccess::fresh(),
             model_policy,
             chat_settings: Mutex::default(),
+            instruction_files: ArcSwap::from_pointee(default_instruction_files()),
         }
     }
 
@@ -228,6 +234,7 @@ impl AgentSeed {
             timeouts: self.timeouts,
             opts: self.chat_opts(),
             model_policy: Arc::clone(&self.model_policy),
+            instruction_files: self.instruction_files.load_full(),
             ..interpreter_ctx(
                 &AgentMode::Build,
                 &EventSender::new(sink, UNATTENDED_RUN_ID),
@@ -411,6 +418,27 @@ mod tests {
         assert_eq!(
             AgentSeed::background_write_block(id).as_deref(),
             Some(BACKGROUND_PLAN_WRITE_DENIED)
+        );
+    }
+
+    /// A background session reads the seed's list: the built-in default until
+    /// the owning loop's instruction reload swaps in the resolved one.
+    #[test]
+    fn tool_context_reads_the_seeds_current_instruction_files() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let seed = mailbox.publish_seed(stub_seed(id));
+
+        assert_eq!(
+            seed.tool_context(CancelToken::none()).instruction_files,
+            Arc::new(default_instruction_files())
+        );
+
+        let resolved = Arc::new(vec!["RULES.md".to_owned()]);
+        seed.instruction_files.store(Arc::clone(&resolved));
+        assert_eq!(
+            seed.tool_context(CancelToken::none()).instruction_files,
+            resolved
         );
     }
 
