@@ -6,7 +6,7 @@ use maki_agent::{McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, M
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
-use crate::repaint::{Cadence, Dirty, Watch};
+use crate::repaint::{Dirty, Watch};
 
 const TITLE: &str = " MCP Servers ";
 
@@ -155,10 +155,6 @@ impl Overlay for McpPicker {
 
     fn close(&mut self) {
         self.picker.close()
-    }
-
-    fn cadence(&self) -> Cadence {
-        self.picker.cadence()
     }
 }
 

@@ -227,7 +227,7 @@ fn app_without_splash() -> App {
 /// keeps no handle to it once the picker owns it.
 fn app_with_model_slot() -> (App, Arc<ArcSwapOption<ModelList>>) {
     let models = Arc::new(ArcSwapOption::empty());
-    let mut app = test_app();
+    let mut app = app_without_splash();
     app.model_picker = ModelPicker::new(Arc::clone(&models));
     (app, models)
 }
@@ -238,7 +238,7 @@ fn app_with_model_slot() -> (App, Arc<ArcSwapOption<ModelList>>) {
 /// swap itself.
 fn app_with_hints() -> (App, HintWriterHandle) {
     let (writer, reader) = hint_writer_pair();
-    let mut app = test_app();
+    let mut app = app_without_splash();
     app.hints = Watch::seeded(reader.load_full());
     app.hint_reader = reader;
     (app, writer)
@@ -2293,7 +2293,7 @@ fn cancel_resets_all_chats_and_indices() {
     assert_eq!(app.chats[1].in_progress_count(), 0);
     assert!(app.chats[1].is_finished());
     assert!(app.chat_index.is_empty());
-    assert_eq!(app.cadence(), Cadence::IDLE);
+    assert_eq!(app.cadence(), Cadence::Idle);
 }
 
 /// What a subagent's own session sends when it closes, which the `task` tool
@@ -2739,7 +2739,7 @@ fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
 fn settled_app_owes_no_frame_and_does_not_animate() {
     let mut app = app_without_splash();
 
-    assert_eq!(app.cadence(), Cadence::IDLE);
+    assert_eq!(app.cadence(), Cadence::Idle);
     assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
 }
 
@@ -2760,7 +2760,7 @@ fn assert_owes_one_frame(app: &mut App, arrival: impl FnOnce()) {
 /// some unrelated key.
 #[test]
 fn usage_quota_arriving_in_the_background_owes_a_frame() {
-    let mut app = test_app();
+    let mut app = app_without_splash();
     app.execute_command(cmd("/usage"), 0);
     let slot = Arc::clone(&app.usage_slot);
 
@@ -2805,10 +2805,22 @@ fn tick_drains_live_bufs_of_background_chats() {
         None,
     ));
     assert_eq!(app.active_chat, 0, "the subagent's chat is the hidden one");
+    let sub = app
+        .chats
+        .iter()
+        .position(|chat| chat.task_id().is_some_and(|id| id.as_ref() == TASK_ID))
+        .expect("the subagent chat exists");
 
-    assert_owes_one_frame(&mut app, || {
-        buf.append(maki_agent::SnapshotLine::plain(TOOL_OUTPUT_LINE.into()));
-    });
+    buf.append(maki_agent::SnapshotLine::plain(TOOL_OUTPUT_LINE.into()));
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+    let snapshot = (0..app.chats[sub].message_count())
+        .filter_map(|i| app.chats[sub].message_at(i))
+        .find_map(|msg| msg.render_snapshot.as_ref())
+        .expect("the background tool got its live snapshot");
+    assert!(
+        snapshot.text().contains(TOOL_OUTPUT_LINE),
+        "the hidden chat's live output must drain"
+    );
 }
 
 /// A plugin publishes hints from the Lua thread, and the loop never hears back
@@ -3206,16 +3218,39 @@ fn waiting_tool_animates_at_the_spinner_rate() {
     let mut app = app_without_splash();
     app.update(agent_msg(tool_start("t1", "bash")));
 
-    assert_eq!(app.cadence(), Cadence::SPINNER);
+    assert_eq!(app.cadence(), Cadence::Spinner);
+}
+
+/// Only the active chat is drawn. A hidden subagent's typewriter must not
+/// keep the focused screen painting; focusing it lets the reveal catch up on
+/// the first tick.
+#[test]
+fn only_the_active_chat_owns_the_frame() {
+    let mut app = app_without_splash();
+    start_subagent(&mut app, TASK_ID, RESEARCH_NAME);
+
+    assert_eq!(app.active_chat, 0, "the main chat is the drawn one");
+    assert_eq!(
+        app.cadence(),
+        Cadence::Idle,
+        "a hidden reveal must not animate the focused chat"
+    );
+
+    app.set_active_chat(1);
+    assert_eq!(
+        app.cadence(),
+        Cadence::Smooth,
+        "focusing makes its reveal the one that animates"
+    );
 }
 
 /// The bar spins for a whole streaming turn, again while a restore is in
 /// flight, and once more for a retry countdown. The old `is_animating` only
 /// knew about the restore, so the other two froze mid turn.
-#[test_case(Status::Streaming, false, false => Cadence::SPINNER ; "streaming_turn")]
-#[test_case(Status::Idle, true, false => Cadence::SPINNER ; "restoring_session")]
-#[test_case(Status::Idle, false, true => Cadence::SPINNER ; "retry_countdown")]
-#[test_case(Status::Idle, false, false => Cadence::IDLE ; "nothing_in_flight")]
+#[test_case(Status::Streaming, false, false => Cadence::Spinner ; "streaming_turn")]
+#[test_case(Status::Idle, true, false => Cadence::Spinner ; "restoring_session")]
+#[test_case(Status::Idle, false, true => Cadence::Spinner ; "retry_countdown")]
+#[test_case(Status::Idle, false, false => Cadence::Idle ; "nothing_in_flight")]
 fn status_bar_motion_reaches_app_cadence(
     status: Status,
     restoring: bool,
@@ -3239,7 +3274,7 @@ fn status_bar_motion_reaches_app_cadence(
 #[test]
 fn open_overlay_motion_reaches_app_cadence() {
     let mut app = app_without_splash();
-    assert_eq!(app.cadence(), Cadence::IDLE);
+    assert_eq!(app.cadence(), Cadence::Idle);
 
     let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
     let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
@@ -3252,18 +3287,18 @@ fn open_overlay_motion_reaches_app_cadence() {
     );
     assert_eq!(
         app.cadence(),
-        Cadence::SPINNER,
+        Cadence::Spinner,
         "an open float's spinners only turn if the app keeps painting"
     );
 
     app.close_all_overlays();
-    assert_eq!(app.cadence(), Cadence::IDLE);
+    assert_eq!(app.cadence(), Cadence::Idle);
 }
 
 #[test]
 fn edge_scroll_makes_app_animating() {
     let mut app = app_without_splash();
-    assert_eq!(app.cadence(), Cadence::IDLE);
+    assert_eq!(app.cadence(), Cadence::Idle);
     let zone = Rect::new(0, 2, 80, 20);
     set_zone(&mut app, SelectionZone::Messages, zone);
     app.active_chat().scroll_to_top();
@@ -3271,7 +3306,7 @@ fn edge_scroll_makes_app_animating() {
     app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 1));
     assert_eq!(
         app.cadence(),
-        Cadence::SMOOTH,
+        Cadence::Smooth,
         "an edge-scrolling drag advances on a timer, with no events to wake us"
     );
 }
@@ -3431,7 +3466,7 @@ fn pending_copy_ignores_drag_and_tick() {
 fn pending_copy_not_animating() {
     let mut app = app_without_splash();
     make_pending_copy(&mut app);
-    assert_eq!(app.cadence(), Cadence::IDLE);
+    assert_eq!(app.cadence(), Cadence::Idle);
 }
 
 #[test]
@@ -4897,10 +4932,10 @@ fn btw_modal_key_routing_and_animation() {
     // A pending stream is data, drained by `poll`. Only the typewriter
     // revealing the answer moves on its own.
     assert!(app.btw_modal.is_streaming());
-    assert_eq!(app.btw_modal.cadence(), Cadence::IDLE);
+    assert_eq!(app.btw_modal.cadence(), Cadence::Idle);
     tx.send(BtwEvent::TextDelta("hi".into())).unwrap();
     assert_eq!(app.btw_modal.poll(), Dirty::YES);
-    assert_eq!(app.btw_modal.cadence(), Cadence::SMOOTH);
+    assert_eq!(app.btw_modal.cadence(), Cadence::Smooth);
 
     let actions = app.update(Msg::Key(key(KeyCode::Char('x'))));
     assert!(actions.is_empty());
@@ -4910,7 +4945,7 @@ fn btw_modal_key_routing_and_animation() {
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
     assert!(!app.btw_modal.is_open());
-    assert_eq!(app.btw_modal.cadence(), Cadence::IDLE);
+    assert_eq!(app.btw_modal.cadence(), Cadence::Idle);
 }
 
 #[test]
@@ -5019,7 +5054,7 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
     assert_eq!(app.state.session.subagents().len(), 1);
     assert_eq!(app.state.session.messages().len(), 2);
     assert!(app.state.session.tool_outputs().is_empty());
-    assert_eq!(app.cadence(), Cadence::IDLE);
+    assert_eq!(app.cadence(), Cadence::Idle);
 }
 
 #[test]

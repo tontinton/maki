@@ -62,7 +62,7 @@ use crate::components::keybindings::key;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
-use crate::repaint::{Dirty, IDLE_POLL};
+use crate::repaint::{Dirty, IDLE_POLL, SMOOTH_FRAME};
 use crate::theme;
 use crate::{AppSession, OpenSession};
 
@@ -794,22 +794,18 @@ impl<'t> EventLoop<'t> {
             }
 
             // Sleeping a whole frame instead of a fraction of one is what
-            // makes a spinner cost 12 paints a second instead of 62.
+            // makes a spinner cost 12 paints a second instead of 62. A
+            // timeout only buys another tick; that tick's Dirty decides
+            // whether a frame is owed.
             let cadence = self.sessions[self.focused].app.cadence();
-            match self.next_wake(cadence.frame().unwrap_or(IDLE_POLL)) {
+            if let Some(wake) = self.next_wake(cadence.interval(SMOOTH_FRAME).unwrap_or(IDLE_POLL))
+            {
                 // Any event can change the screen, so paint after handling it
                 // rather than asking every handler to prove it did.
-                Some(wake) => {
-                    dirty = Dirty::YES;
-                    if let Err(e) = self.handle_wake(wake) {
-                        break Err(e);
-                    }
+                dirty = Dirty::YES;
+                if let Err(e) = self.handle_wake(wake) {
+                    break Err(e);
                 }
-                // Only the clock moved, so motion alone owes the frame. The
-                // cadence is the one from before the sleep, so motion that
-                // just stopped still gets a last paint to clear itself off
-                // the screen.
-                None => dirty |= Dirty::from(cadence.moves()),
             }
         };
         // Fatal errors still save every session, kill MCP process groups,

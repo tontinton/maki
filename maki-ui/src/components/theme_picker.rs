@@ -1,6 +1,5 @@
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction};
-use crate::repaint::Cadence;
 use crate::theme;
 
 use crossterm::event::KeyEvent;
@@ -105,10 +104,6 @@ impl Overlay for ThemePicker {
 
     fn close(&mut self) {
         self.close()
-    }
-
-    fn cadence(&self) -> Cadence {
-        self.picker.cadence()
     }
 }
 
