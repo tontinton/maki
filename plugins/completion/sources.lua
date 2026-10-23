@@ -34,12 +34,13 @@ local function warn_once(msg)
   end
 end
 
--- Free to layer. A layer only appends a table, and each `complete` runs as the
--- plugin that wrote it, with that plugin's own permissions.
+-- Layering costs `session_read`, because each source is handed the draft the
+-- user is typing as its `query`. Each `complete` runs as the plugin that wrote
+-- it, with that plugin's own permissions.
 function Sources.declare()
   collect = maki.api.declare_slot(Sources.SLOT, function(list)
     return list
-  end, { capability = {} })
+  end, { capability = { "session_read" } })
 end
 
 -- What is wrong with {source}, or nil when it can be asked.

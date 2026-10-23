@@ -65,6 +65,7 @@ use maki_agent::{
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
+use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, Key, KeymapReader,
     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
@@ -618,10 +619,10 @@ impl App {
             return;
         }
         let previous_spec = std::mem::replace(&mut self.announced_model_spec, spec);
-        self.fire_session_autocmd(
-            "ModelChanged",
-            serde_json::json!({ "model": self.model_state(), "previous_spec": previous_spec }),
-        );
+        self.fire_session_event(HostEvent::ModelChanged {
+            model: self.model_state(),
+            previous_spec,
+        });
     }
 
     /// Takes the spelling `maki.model.set` accepts, which is what the
@@ -793,16 +794,13 @@ impl App {
     }
 
     fn fire_input_changed(&mut self, source: Option<Arc<str>>, cursor_only: bool) {
-        self.fire_session_autocmd(
-            "InputChanged",
-            serde_json::json!({
-                "text": self.announced_input,
-                "cursor": self.announced_cursor,
-                "version": self.input_box.buffer.version(),
-                "source": source,
-                "cursor_only": cursor_only,
-            }),
-        );
+        self.fire_session_event(HostEvent::InputChanged {
+            text: &self.announced_input,
+            cursor: self.announced_cursor,
+            version: self.input_box.buffer.version(),
+            source: source.as_deref(),
+            cursor_only,
+        });
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
@@ -823,14 +821,9 @@ impl App {
         self.status_bar.queue_flash(msg);
     }
 
-    pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
-        if let Some(map) = data.as_object_mut() {
-            map.insert(
-                "session_id".into(),
-                serde_json::Value::String(self.state.session.id.to_string()),
-            );
-        }
-        self.lua_event_handle.fire_autocmd(event, data);
+    pub(crate) fn fire_session_event(&self, event: HostEvent<'_>) {
+        self.lua_event_handle
+            .fire(Some(&self.state.session.id), event);
     }
 
     pub fn tick_error_expiry(&mut self) -> Dirty {
@@ -2204,12 +2197,9 @@ impl App {
                     self.state
                         .session_mut()
                         .set_cwd(canonical.to_string_lossy().into_owned());
-                    self.fire_session_autocmd(
-                        "SessionCwdChanged",
-                        serde_json::json!({
-                            "cwd": canonical.to_string_lossy(),
-                        }),
-                    );
+                    self.fire_session_event(HostEvent::SessionCwdChanged {
+                        cwd: &canonical.to_string_lossy(),
+                    });
                 }
                 self.status_bar.refresh_cwd();
                 self.flash(format!("cd {}", path.display()))

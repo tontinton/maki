@@ -4,6 +4,7 @@
 use std::borrow::Cow;
 
 use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource};
+use maki_lua::agent_autocmd::HostEvent;
 
 use super::{Action, App, Status};
 
@@ -303,7 +304,7 @@ impl App {
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();
         self.status = Status::Streaming;
-        self.fire_session_autocmd("TurnStart", serde_json::json!({ "text": display }));
+        self.fire_session_event(HostEvent::TurnStart { text: &display });
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()
                 .show_user_message(display, input.images.clone());

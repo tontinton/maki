@@ -240,7 +240,7 @@ fn message_json(message: &Message) -> serde_json::Value {
 /// if last and last.role == "assistant" then
 ///   print(last.content[1].text)
 /// end
-#[lua_fn]
+#[lua_fn(guard = SessionRead)]
 async fn messages(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -299,7 +299,7 @@ async fn focus(
 /// @return (boolean|nil, string|nil) true on success, or nil and an error.
 /// @example
 /// local _, err = maki.session.delete(id)
-#[lua_fn]
+#[lua_fn(guard = SessionWrite)]
 async fn delete(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -317,7 +317,7 @@ async fn delete(
 /// @return (string|nil, string|nil) New session id, or nil and an error.
 /// @example
 /// local id, err = maki.session.new({ prompt = "fix the tests", focus = true })
-#[lua_fn]
+#[lua_fn(guard = SessionWrite)]
 async fn new(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -345,7 +345,7 @@ async fn new(
 /// @return (string|nil, string|nil) "started" or "queued", or nil and an error.
 /// @example
 /// local state, err = maki.session.prompt("run the tests", { session = id })
-#[lua_fn(guard = Agent)]
+#[lua_fn(guard = [Agent, SessionWrite])]
 async fn prompt(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -370,7 +370,7 @@ async fn prompt(
 /// @return (boolean|nil, string|nil) true, or nil and an error.
 /// @example
 /// maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
-#[lua_fn]
+#[lua_fn(guard = SessionWrite)]
 fn notify(
     _lua: &Lua,
     #[ctx] may_run_agents: bool,
@@ -407,7 +407,7 @@ fn notify(
 /// @example
 /// maki.session.set_mode("build", { session = opts.session })
 /// maki.session.prompt("Implement the plan at `" .. opts.path .. "`.", { session = opts.session })
-#[lua_fn]
+#[lua_fn(guard = SessionSettings)]
 async fn set_mode(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -428,7 +428,7 @@ async fn set_mode(
 /// @return (boolean|nil, string|nil) true on success, or nil and an error.
 /// @example
 /// local _, err = maki.session.set_title({ id = id, title = "refactor" })
-#[lua_fn]
+#[lua_fn(guard = SessionSettings)]
 async fn set_title(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -454,8 +454,9 @@ lua_table! {
         may_run_agents: bool,
     ),
     DOCS [
-        list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx),
-        new(tx, may_run_agents), prompt(perms, tx), notify(may_run_agents), set_mode(tx), set_title(tx),
+        list(tx), live(tx), current(tx), read(tx), messages(perms, tx), focus(tx),
+        delete(perms, tx), new(perms, tx, may_run_agents), prompt(perms, tx),
+        notify(perms, may_run_agents), set_mode(perms, tx), set_title(perms, tx),
     ]
 }
 

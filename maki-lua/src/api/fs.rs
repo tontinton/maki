@@ -14,6 +14,7 @@ use maki_agent::{FileQuery, FileReader, Ranked};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 
+use crate::agent_autocmd::HostEvent;
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::loader::EventHandle;
@@ -944,10 +945,6 @@ const MAX_PLUGIN_ROOTS: usize = 4;
 const SUPERSEDED_ERR: &str = "a newer maki.fs.fuzzy_files call took over";
 const OUTSIDE_CWD_ERR: &str =
     "maki.fs.fuzzy_files only indexes the current working directory and below";
-/// The event a walk landing fires, so a plugin ranking files can wait for the
-/// list instead of polling it.
-const WALK_EVENT: &str = "FileIndexReady";
-
 /// The roots one plugin is reading, least recently asked for first.
 type PluginRoots = Vec<(PathBuf, FileReader)>;
 
@@ -1058,14 +1055,14 @@ pub(crate) fn clear_plugin_files(plugin: &str) {
 /// tree. Absent, the comparison fails and the plugin asks again.
 pub(crate) fn publish_walks(handle: EventHandle) {
     maki_agent::on_walk_end(move |walk| {
-        handle.fire_autocmd(
-            WALK_EVENT,
-            serde_json::json!({
-                "root": walk.root.to_str(),
-                "files": walk.files,
-                "crashed": walk.crashed,
-                "truncated": walk.truncated,
-            }),
+        handle.fire(
+            None,
+            HostEvent::FileIndexReady {
+                root: walk.root.to_str(),
+                files: walk.files,
+                crashed: walk.crashed,
+                truncated: walk.truncated,
+            },
         );
     });
 }

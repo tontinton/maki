@@ -53,12 +53,14 @@ pub mod test_support {
 
     use crate::KeymapReader;
     use crate::SessionEndReason;
+    pub use crate::api::autocmd::content_omitted_message;
     use crate::api::keymap::KeymapWriter;
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
     use crate::key::Key;
+    pub use crate::runtime::layer_skipped_message;
     use maki_storage::id::MakiId;
 
     const TEST_PLUGIN: &str = "test-plugin";

@@ -18,18 +18,27 @@ use crate::theme;
 
 const TICK_TIMEOUT_MS: u64 = 10;
 pub(crate) const USER_ONLY_SUFFIX: &str = " can only be run by you";
-pub const STARTS_TURNS: PluginAccess = PluginAccess::Needs(Permission::Agent);
+const STARTS_TURNS: PluginAccess = PluginAccess::Needs(&[Permission::Agent]);
+/// A prompt starts a turn and adds to the transcript, like `maki.session.prompt`.
+pub const SUBMITS_PROMPT: PluginAccess =
+    PluginAccess::Needs(&[Permission::Agent, Permission::SessionWrite]);
+const WRITES_SESSION: PluginAccess = PluginAccess::Needs(&[Permission::SessionWrite]);
+const CHANGES_SETTINGS: PluginAccess = PluginAccess::Needs(&[Permission::SessionSettings]);
 
 /// What a plugin must hold to run a command through `maki.api.run_command`.
 /// Typing a command is the user saying yes, so none of this applies there.
 ///
 /// Mirror the guard on the Lua API that does the same thing: looser is a side
 /// door around it, stricter only sends plugins to the API instead. That is why
-/// `/fast` is open, since `maki.model.set` is.
+/// `/model` and `/fast` need `session_settings`, as `maki.model.set` does.
+/// So do `/cd` and `/workflow`: no API mirrors them, but they change where the
+/// session's tools run and which tools it has.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PluginAccess {
+    /// Only what changes the view, never how a session runs or what it holds.
     Open,
-    Needs(Permission),
+    /// Every one of them.
+    Needs(&'static [Permission]),
     /// These move a security boundary: what runs without asking, which config
     /// loads, which code is installed. No grant unlocks them.
     UserOnly,
@@ -57,21 +66,21 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Summarize and compact conversation history (optional guidance)",
         max_args: usize::MAX,
         bang: false,
-        plugin_access: STARTS_TURNS,
+        plugin_access: SUBMITS_PROMPT,
     },
     BuiltinCommand {
         name: "/new",
         description: "Start a new session",
         max_args: 0,
         bang: false,
-        plugin_access: PluginAccess::Open,
+        plugin_access: WRITES_SESSION,
     },
     BuiltinCommand {
         name: "/fork",
         description: "Fork this session and switch to the copy",
         max_args: 0,
         bang: false,
-        plugin_access: PluginAccess::Open,
+        plugin_access: WRITES_SESSION,
     },
     BuiltinCommand {
         name: "/help",
@@ -99,7 +108,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Switch model",
         max_args: 0,
         bang: false,
-        plugin_access: PluginAccess::Open,
+        plugin_access: CHANGES_SETTINGS,
     },
     BuiltinCommand {
         name: "/theme",
@@ -127,7 +136,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Change working directory",
         max_args: 1,
         bang: false,
-        plugin_access: PluginAccess::Open,
+        plugin_access: CHANGES_SETTINGS,
     },
     BuiltinCommand {
         name: "/btw",
@@ -148,14 +157,14 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Toggle fast mode (Anthropic Opus or Codex subscription models)",
         max_args: 0,
         bang: false,
-        plugin_access: PluginAccess::Open,
+        plugin_access: CHANGES_SETTINGS,
     },
     BuiltinCommand {
         name: "/workflow",
         description: "Toggle workflow mode (task callable inside code_execution)",
         max_args: 0,
         bang: false,
-        plugin_access: PluginAccess::Open,
+        plugin_access: CHANGES_SETTINGS,
     },
     BuiltinCommand {
         name: "/exit",
@@ -624,7 +633,7 @@ impl CommandPalette {
     fn plugin_refusal(&self, item: &CommandItem, caller: &PluginReach) -> Option<String> {
         let access = match item.command_type {
             CommandType::Builtin(cmd) => cmd.plugin_access,
-            CommandType::Custom(_) | CommandType::McpPrompt(_) => STARTS_TURNS,
+            CommandType::Custom(_) | CommandType::McpPrompt(_) => SUBMITS_PROMPT,
             CommandType::Lua(i) => {
                 return caller
                     .first_missing(&self.lua_commands[i].reach)
@@ -633,8 +642,10 @@ impl CommandPalette {
         };
         match access {
             PluginAccess::Open => None,
-            PluginAccess::Needs(perm) => (!caller.is_allowed(perm))
-                .then(|| missing_refusal(&item.name, &Missing::Permission(perm))),
+            PluginAccess::Needs(needed) => needed
+                .iter()
+                .find(|&&perm| !caller.is_allowed(perm))
+                .map(|&perm| missing_refusal(&item.name, &Missing::Permission(perm))),
             PluginAccess::UserOnly => Some(format!("{}{USER_ONLY_SUFFIX}", item.name)),
         }
     }
@@ -821,6 +832,24 @@ mod tests {
                 accepts_args: false,
             },
         ])
+    }
+
+    /// A builtin is open to plugins only when it neither reads nor changes a
+    /// session's content or settings: it opens host UI the user then drives,
+    /// or acts on the process. A new builtin lands outside this list, so
+    /// opening one is a decision someone writes down here, never a default.
+    const OPEN_TO_PLUGINS: &[&str] = &[
+        "/help", "/usage", "/queue", "/theme", "/mcp", "/login", "/exit", "/reload",
+    ];
+
+    #[test]
+    fn only_commands_that_never_touch_a_session_are_open_to_plugins() {
+        let open: Vec<&str> = BUILTIN_COMMANDS
+            .iter()
+            .filter(|cmd| cmd.plugin_access == PluginAccess::Open)
+            .map(|cmd| cmd.name)
+            .collect();
+        assert_eq!(open, OPEN_TO_PLUGINS);
     }
 
     #[test]

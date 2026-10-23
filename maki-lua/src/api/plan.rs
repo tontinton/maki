@@ -14,6 +14,7 @@ use crate::api::util::command::{
 };
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::Pair;
+use crate::plugin_permissions::PluginPermissions;
 
 const ID_KEY: &str = "id";
 const LABEL_KEY: &str = "label";
@@ -404,7 +405,7 @@ pub(crate) fn row_handler_opts(
 /// if plan and plan.ready then
 ///   print(plan.path, plan.content)
 /// end
-#[lua_fn]
+#[lua_fn(guard = SessionRead)]
 async fn read(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -472,9 +473,11 @@ lua_table! {
     ///   return false
     /// end)
     /// ```
-    "maki.plan" => pub(crate) fn create_plan_table(tx: Option<flume::Sender<UiAction>>), DOCS [
-        read(tx),
-    ]
+    "maki.plan" => pub(crate) fn create_plan_table(
+        tx: Option<flume::Sender<UiAction>>,
+        perms: &PluginPermissions,
+    ),
+    DOCS [read(perms, tx)]
 }
 
 #[cfg(test)]
@@ -823,7 +826,7 @@ mod tests {
     #[test]
     fn plan_read_without_ui_returns_error_pair() {
         let lua = Lua::new();
-        let table = create_plan_table(&lua, None).unwrap();
+        let table = create_plan_table(&lua, None, &PluginPermissions::trusted()).unwrap();
         lua.globals().set("plan", table).unwrap();
         let (val, err): (Value, Option<String>) =
             smol::block_on(lua.load("return plan.read()").eval_async()).unwrap();
@@ -837,7 +840,7 @@ mod tests {
     fn the_session_option_travels_to_the_ui(call: &str, expected: Option<&str>) {
         let lua = Lua::new();
         let (tx, rx) = flume::unbounded::<UiAction>();
-        let table = create_plan_table(&lua, Some(tx)).unwrap();
+        let table = create_plan_table(&lua, Some(tx), &PluginPermissions::trusted()).unwrap();
         lua.globals().set("plan", table).unwrap();
         let served = std::thread::spawn(move || {
             let Ok(UiAction::Plan { req, reply_tx }) = rx.recv() else {

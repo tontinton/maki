@@ -26,6 +26,7 @@ use maki_agent::{
 };
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
+use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
     SessionSnapshot,
@@ -1086,14 +1087,13 @@ impl<'t> EventLoop<'t> {
                 continue;
             }
             rt.last_status = status;
-            handle.fire_autocmd(
-                "SessionStatusChanged",
-                json!({
-                    "session_id": rt.id(),
-                    "title": rt.app.state.session.title,
-                    "status": status.as_str(),
-                    "focused": i == self.focused,
-                }),
+            handle.fire(
+                Some(&rt.id()),
+                HostEvent::SessionStatusChanged {
+                    title: &rt.app.state.session.title,
+                    status: status.as_str(),
+                    focused: i == self.focused,
+                },
             );
         }
     }
@@ -1107,13 +1107,12 @@ impl<'t> EventLoop<'t> {
                 continue;
             }
             rt.last_title = rt.app.state.session.title.clone();
-            handle.fire_autocmd(
-                "SessionTitleChanged",
-                json!({
-                    "session_id": rt.id(),
-                    "title": rt.last_title,
-                    "focused": i == self.focused,
-                }),
+            handle.fire(
+                Some(&rt.id()),
+                HostEvent::SessionTitleChanged {
+                    title: &rt.last_title,
+                    focused: i == self.focused,
+                },
             );
         }
     }
@@ -1125,16 +1124,15 @@ impl<'t> EventLoop<'t> {
         for rt in &mut self.sessions {
             let session_id = rt.app.state.session.id;
             diff_task_states(&mut rt.last_tasks, rt.app.task_states(), |task| {
-                let mut data = json!({
-                    "session_id": session_id,
-                    "id": task.id,
-                    "name": task.name,
-                    "status": task.status,
-                });
-                if let Some(plugin) = task.plugin {
-                    data["plugin"] = json!(plugin);
-                }
-                handle.fire_autocmd("TaskStatusChanged", data);
+                handle.fire(
+                    Some(&session_id),
+                    HostEvent::TaskStatusChanged {
+                        id: task.id,
+                        name: task.name,
+                        status: task.status.into(),
+                        plugin: task.plugin.map(|plugin| &**plugin),
+                    },
+                );
             });
         }
     }
@@ -1143,15 +1141,17 @@ impl<'t> EventLoop<'t> {
     /// `maki.agent.list()` already finds a stopped plugin task gone.
     fn emit_task_stopped(&self, idx: usize, id: &str) {
         let app = &self.sessions[idx].app;
-        let mut data = json!({ "session_id": app.state.session.id, "id": id });
-        if let Some(plugin) = app
+        let plugin = app
             .task_states()
             .find(|task| &**task.id == id)
-            .and_then(|task| task.plugin)
-        {
-            data["plugin"] = json!(plugin);
-        }
-        self.ctx.lua_event_handle.fire_autocmd("TaskStopped", data);
+            .and_then(|task| task.plugin);
+        self.ctx.lua_event_handle.fire(
+            Some(&app.state.session.id),
+            HostEvent::TaskStopped {
+                id,
+                plugin: plugin.map(|plugin| &**plugin),
+            },
+        );
     }
 
     fn emit_notifications(&mut self) {
@@ -1195,15 +1195,16 @@ impl<'t> EventLoop<'t> {
         let switched = previous_session.is_some() && previous_session != Some(session_id);
         let eh = &self.ctx.lua_event_handle;
         if previous_session != Some(session_id) {
-            let mut data = json!({ "session_id": session_id });
-            if let Some(id) = previous_session {
-                data["previous_session_id"] = json!(id.to_string());
-            }
-            eh.fire_autocmd("SessionFocusChanged", data);
+            eh.fire(
+                Some(&session_id),
+                HostEvent::SessionFocusChanged {
+                    previous_session_id: previous_session.map(|id| id.to_string()),
+                },
+            );
         }
-        eh.fire_autocmd(
-            "TaskFocusChanged",
-            json!({ "session_id": session_id, "id": task_id }),
+        eh.fire(
+            Some(&session_id),
+            HostEvent::TaskFocusChanged { id: &task_id },
         );
         if switched {
             self.focused_app().announce_input();

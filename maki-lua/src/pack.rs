@@ -1677,10 +1677,11 @@ mod tests {
     /// interesting case: the question is never what it asked for, but whose
     /// word turns the request into a grant.
     fn greedy(name: &str, origin: Origin) -> DiscoveredPackage {
-        let manifest = toml::from_str::<toml::Value>(
-            "[permissions]\nfs_read = true\nfs_write = true\nnet = true\nrun = true\nenv = true\nagent = true\n",
-        )
-        .unwrap();
+        let asks: String = Permission::ALL
+            .iter()
+            .map(|perm| format!("{perm} = true\n"))
+            .collect();
+        let manifest = toml::from_str::<toml::Value>(&format!("[permissions]\n{asks}")).unwrap();
         DiscoveredPackage {
             name: name.to_owned(),
             dir: PathBuf::from("/nowhere"),

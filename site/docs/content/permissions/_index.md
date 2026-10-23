@@ -234,6 +234,20 @@ Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to th
 It runs after [folder trust](/docs/folder-trust/) has let the Lua file load, and
 limits which APIs the file reaches rather than sandboxing the file.
 
+### Session permissions
+
+Three keys cover the session APIs, split by what a call does to the transcript:
+
+- `session_read`: any call that reads what the conversation says, such as `maki.session.messages` and `maki.ui.input`.
+- `session_write`: any call that adds to, removes, or creates conversation content, such as `new`, `prompt`, `notify`, `delete` and `maki.task.remove`.
+- `session_settings`: any call that changes how a session runs without touching its content, such as `set_mode`, `set_title` and `maki.model.set`.
+
+`maki.session.read`, `list`, `live`, `current` and `focus` need none of them. A call that also starts a turn, such as `prompt`, needs `agent` as well. `maki.api.run_command` follows the same rules. The [commands page](/docs/commands/#plugin-access) lists what each command needs.
+
+A plugin without `session_read` still receives events, with only their metadata fields. That leaves out `data.text` on `TurnStart` and `InputChanged`, `data.input` on `ToolDone`, and `data.summary` on `CompactionDone`. Maki warns once per plugin and event, naming the event and the keys left out. Events a plugin fires under its own names arrive as fired.
+
+A layer on a tool call or on `permission.prompt` sees the call, so it needs session permissions as well as the tool's own capability. The [price table](/docs/hooks/#rules) on the hooks page lists them.
+
 ### Plugin egress: net_hosts
 
 `net = true` lets a plugin reach any public host. `net_hosts` in the same

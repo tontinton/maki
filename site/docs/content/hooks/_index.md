@@ -165,13 +165,16 @@ something else. The prompt you see names the rewritten call.
 
 **A layer borrows the tool's capability.** Wrapping `tool.bash.input` decides
 what bash runs, so the plugin holding that layer needs `run`, the capability the
-bash tool declares. A layer from a plugin without it is skipped and the rest of
-the chain still runs. The check happens per call, so a missing grant shows up in
-debug logs rather than as a warning at load.
+bash tool declares. A layer also reads what the model wrote and decides what
+it reads back. An output layer rewrites the result, and an input layer can
+refuse the call with any text or turn a command into `echo`. So every layer
+also needs `session_read` and `session_write`. A layer from a plugin without
+all of it is skipped and the rest of the chain still runs. The check happens per
+call, and the first skip shows a warning naming every missing key.
 
 | Tool | A layer needs |
 | --- | --- |
-| declares a permission, like `bash` | that permission |
+| declares a permission, like `bash` | that permission, `session_read` and `session_write` |
 | declares none: `read`, `batch`, MCP tools, ACP client tools, `tool_search` | every permission |
 
 Declaring no capability does not mean a tool uses none. `batch`,
@@ -340,8 +343,9 @@ result.
 ## Completion sources
 
 The bundled completion plugin offers files after `@`. Other plugins add entries
-through the `completion.sources` slot, which is free to layer. Append your
-sources and pass the list on:
+through the `completion.sources` slot. Layering it needs `session_read`,
+because a source sees what the user is typing. Append your sources and pass
+the list on:
 
 ```lua
 maki.api.set_slot("completion.sources", function(prev, sources)
@@ -383,7 +387,7 @@ true at that point, so a long loop can stop early. `ctx` also carries
 shows no rows, and the error is logged.
 
 `complete` runs with the permissions of the plugin that wrote it, so the example
-needs `run`.
+needs `run` as well.
 
 ## Permission prompt
 
@@ -427,8 +431,8 @@ line, and a call inside `code_execution` puts it on the script's row. A layer
 that throws, answers something the prompt does not offer, or is still running
 after the same 60 second window, leaves the call to the prompt. Where nobody
 can answer a prompt, as with `maki -p`, the default denies, the same as without
-a layer. Wrapping costs the capability the tool declares, the same price a
-`tool.<name>.input` layer pays.
+a layer. Wrapping costs the same as a `tool.<name>.input` layer, see the
+[price table](#rules).
 
 ## Plugin slots
 

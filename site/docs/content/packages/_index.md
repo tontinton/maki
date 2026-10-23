@@ -153,6 +153,9 @@ net = true
 run = true
 env = true
 agent = true
+session_read = true
+session_write = true
+session_settings = true
 ```
 
 The manifest states what the package wants, and Maki asks about new permissions

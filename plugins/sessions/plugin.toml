@@ -1,1 +1,3 @@
 [permissions]
+session_write = true
+session_settings = true

@@ -7,6 +7,7 @@ use std::thread;
 use maki_agent::tools::test_support::stub_seed;
 use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
 use maki_agent::{AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput};
+use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{PluginHost, SessionEndReason};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -227,9 +228,12 @@ fn stop(host: &PluginHost, session: MakiId, id: &str) {
 }
 
 fn fire_task_stopped(host: &PluginHost, session: MakiId, id: &str) {
-    host.event_handle().fire_autocmd(
-        "TaskStopped",
-        json!({ "id": id, "session_id": session.to_string(), "plugin": PLUGIN }),
+    host.event_handle().fire(
+        Some(&session),
+        HostEvent::TaskStopped {
+            id,
+            plugin: Some(PLUGIN),
+        },
     );
 }
 

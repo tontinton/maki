@@ -19,6 +19,7 @@ use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
+use crate::plugin_permissions::{PluginPermissions, denied_error};
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod win;
@@ -404,6 +405,11 @@ fn set_window_title(
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 /// `"prev_chat"`, `"next_chat"`, `"model_picker"`.
 ///
+/// Most actions are free, since they open something the user then sees and
+/// drives. `"pop_queue"` needs `session_write`, because it throws away a
+/// queued prompt. Without it the call raises the usual `permission denied`
+/// error.
+///
 /// There is no action for sending the user's message. To take keys like
 /// `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
 ///
@@ -421,12 +427,16 @@ fn set_window_title(
 fn action(
     _lua: &Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] perms: PluginPermissions,
     name: String,
 ) -> LuaResult<Pair<bool>> {
     let builtin = try_pair!(name.parse::<BuiltinAction>().map_err(|_| format!(
         "unknown action '{name}' (valid: {})",
         BuiltinAction::VARIANTS.join(", ")
     )));
+    if let Some(perm) = perms.first_denied(builtin.needs()) {
+        return Err(denied_error(perm));
+    }
     try_pair!(ui_send(tx.as_ref(), UiAction::Builtin(builtin)));
     Ok((Some(true), None))
 }
@@ -471,7 +481,7 @@ fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
 /// @example
 /// local st = maki.ui.input()
 /// local before = st.text:sub(1, st.cursor)
-#[lua_fn]
+#[lua_fn(guard = SessionRead)]
 async fn input(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -503,6 +513,10 @@ async fn input(
 /// Tabs and carriage returns in {text} become spaces and newlines, and the
 /// other control characters are dropped, the way a paste is rewritten.
 ///
+/// It costs what `maki.ui.input` costs. A plugin keymap sees keys before
+/// the input does, so with this call alone a plugin could note every key and
+/// type it back unseen.
+///
 /// @param opts table Options:
 ///   `start` (integer) byte offset the replaced range starts at.
 ///   `stop` (integer) byte offset it ends at. `start == stop` inserts.
@@ -521,7 +535,7 @@ async fn input(
 ///   version = st.version,
 ///   session_id = st.session_id,
 /// })
-#[lua_fn]
+#[lua_fn(guard = SessionRead)]
 async fn input_edit(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -766,16 +780,17 @@ pub(crate) fn create_ui_table(
     lua: &Lua,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     plugin: Arc<str>,
+    perms: &PluginPermissions,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     add_ui_fns(&t, lua)?;
 
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
-    action__register(&t, lua, ui_action_tx.clone())?;
+    action__register(&t, lua, ui_action_tx.clone(), perms.clone())?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
-    input__register(&t, lua, ui_action_tx.clone())?;
-    input_edit__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
+    input__register(&t, lua, perms, ui_action_tx.clone())?;
+    input_edit__register(&t, lua, perms, ui_action_tx.clone(), Arc::clone(&plugin))?;
     open_win__register(&t, lua, ui_action_tx, Arc::clone(&plugin))?;
 
     let p = Arc::clone(&plugin);
@@ -977,6 +992,7 @@ mod tests {
     use super::*;
     use crate::api::util::command::UiReply;
     use crate::api::util::convert::lua_to_json;
+    use crate::plugin_permissions::{Missing, Permission};
     use maki_highlight::StyledSegment;
     use mlua::Lua;
     use test_case::test_case;
@@ -1751,7 +1767,13 @@ mod tests {
             }
         });
         let lua = Lua::new();
-        let t = create_ui_table(&lua, Some(tx), Arc::from(INPUT_PLUGIN)).unwrap();
+        let t = create_ui_table(
+            &lua,
+            Some(tx),
+            Arc::from(INPUT_PLUGIN),
+            &PluginPermissions::trusted(),
+        )
+        .unwrap();
         lua.globals().set("ui", t).unwrap();
         lua
     }
@@ -1868,5 +1890,36 @@ mod tests {
         let (val, err) = eval(&lua, &edit_script("start = 0, stop = 99, text = \"x\""));
         assert_eq!(val, serde_json::Value::Null);
         assert_eq!(err.as_deref(), Some(STALE_RANGE_ERR));
+    }
+
+    /// An action is priced like the API doing the same thing, so binding a
+    /// key to it cannot reach further than calling that API would.
+    #[test_case("plan_toggle", None ; "plan_toggle_is_free")]
+    #[test_case("pop_queue", Some(Permission::SessionWrite) ; "pop_queue_needs_session_write")]
+    #[test_case("file_picker", None ; "file_picker_is_free")]
+    fn action_charges_what_its_api_would(name: &str, needed: Option<Permission>) {
+        let (tx, _rx) = flume::unbounded();
+        let run = |perms: &PluginPermissions| {
+            let lua = Lua::new();
+            let t =
+                create_ui_table(&lua, Some(tx.clone()), Arc::from(INPUT_PLUGIN), perms).unwrap();
+            lua.globals().set("ui", t).unwrap();
+            lua.load(format!("return ui.action('{name}')"))
+                .eval::<Option<bool>>()
+                .map_err(|e| e.to_string())
+        };
+        let denied = run(&PluginPermissions::denied());
+        let Some(perm) = needed else {
+            assert_eq!(denied, Ok(Some(true)));
+            return;
+        };
+        let err = denied.unwrap_err();
+        assert!(
+            err.contains(&Missing::Permission(perm).to_string()),
+            "{err}"
+        );
+        let mut granted = PluginPermissions::denied();
+        granted.set(perm, true);
+        assert_eq!(run(&granted), Ok(Some(true)));
     }
 }

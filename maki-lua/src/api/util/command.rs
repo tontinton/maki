@@ -13,7 +13,7 @@ use strum::{EnumString, VariantNames};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::key::Key;
-use crate::plugin_permissions::PluginReach;
+use crate::plugin_permissions::{Permission, PluginReach};
 
 pub const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
@@ -627,6 +627,31 @@ pub enum BuiltinAction {
     PrevChat,
     NextChat,
     ModelPicker,
+}
+
+impl BuiltinAction {
+    /// What a plugin needs to run this through `maki.ui.action`, the same
+    /// price as the API that does the same thing. Matched without a fallback,
+    /// so a new action has to be priced before it builds.
+    ///
+    /// Most actions open something the user then sees and drives, or move
+    /// focus like `maki.task.focus`, so they are open. The plan form only
+    /// shows, and the user decides there. Popping the queue throws away a
+    /// prompt the user wrote, with nobody asked.
+    pub fn needs(self) -> &'static [Permission] {
+        match self {
+            Self::FilePicker
+            | Self::Search
+            | Self::Help
+            | Self::PlanToggle
+            | Self::PlanEditor
+            | Self::EditInput
+            | Self::PrevChat
+            | Self::NextChat
+            | Self::ModelPicker => &[],
+            Self::PopQueue => &[Permission::SessionWrite],
+        }
+    }
 }
 
 pub enum UiAction {

@@ -164,6 +164,9 @@ pub enum Permission {
     Run,
     Env,
     Agent,
+    SessionRead,
+    SessionWrite,
+    SessionSettings,
 }
 
 impl Permission {
@@ -197,6 +200,9 @@ impl Permission {
             Permission::Run => "run",
             Permission::Env => "env",
             Permission::Agent => "agent",
+            Permission::SessionRead => "session_read",
+            Permission::SessionWrite => "session_write",
+            Permission::SessionSettings => "session_settings",
         }
     }
 
@@ -212,6 +218,15 @@ impl Permission {
             Permission::Env => "reading the process environment, where secrets live",
             Permission::Agent => {
                 "starting model turns: prompting a chat, or running its own sessions"
+            }
+            Permission::SessionRead => {
+                "reading conversation content: session history, the chat input draft, and the content fields of events"
+            }
+            Permission::SessionWrite => {
+                "adding to, removing, or creating conversation content: new sessions, prompts, notices, and deleting sessions or task transcripts"
+            }
+            Permission::SessionSettings => {
+                "changing how a session runs without touching its content: mode, title, model, thinking, fast mode, working directory, and workflow"
             }
         }
     }

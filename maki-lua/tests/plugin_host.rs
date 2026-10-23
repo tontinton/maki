@@ -24,9 +24,9 @@ use maki_config::{
     ThinkingLines, ToolKey, ToolOutputLines,
 };
 use maki_lua::{
-    InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, NO_UI_ERR, PERMISSION_NAME_WARNING,
-    PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
-    WARM_TOOL_CAP, set_allowed_private_hosts,
+    InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, Missing, NO_UI_ERR,
+    PERMISSION_NAME_WARNING, PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING,
+    SessionEndReason, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -5694,20 +5694,6 @@ fn perm_tool_src(name: &str, handler_body: &str) -> String {
     "agent"
     ; "agent_denied_for_session_prompt"
 )]
-#[test_case::test_case(
-    "wake_deny",
-    r#"local ok, err = pcall(function() maki.session.notify("ci red", { session = "x", wake = true }) end)
-                return tostring(err)"#,
-    "agent"
-    ; "agent_denied_for_a_waking_notify"
-)]
-#[test_case::test_case(
-    "new_prompt_deny",
-    r#"local ok, err = pcall(function() maki.session.new({ prompt = "go" }) end)
-                return tostring(err)"#,
-    "agent"
-    ; "agent_denied_for_new_with_a_prompt"
-)]
 fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_perm: &str) {
     let src = perm_tool_src(tool_name, handler_body);
     let result = exec_tool_with_perms(
@@ -5719,6 +5705,64 @@ fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_pe
     .unwrap();
     assert!(result.contains(PERMISSION_DENIED_MSG), "got: {result}");
     assert!(result.contains(expected_perm), "got: {result}");
+}
+
+const SESSION_GATE_TOOL: &str = "session_gate";
+
+/// Headless, so a call the guard wrongly lets through answers the no-UI error
+/// instead of waiting on a UI loop that is not there.
+fn run_call_with(held: &[Permission], call: &str) -> String {
+    let src = perm_tool_src(
+        SESSION_GATE_TOOL,
+        &format!(
+            r#"local ok, err = pcall(function() return {call} end)
+                return tostring(ok) .. ":" .. tostring(err)"#
+        ),
+    );
+    let reg = fresh_registry();
+    let host = PluginHost::start(Arc::clone(&reg), Interaction::None, true).unwrap();
+    let perms = PluginPermissions::from_approved(held.iter().map(|p| p.manifest_key()));
+    host.load_source_with_permissions(SESSION_GATE_TOOL, &src, perms)
+        .unwrap();
+    exec_tool(&reg, SESSION_GATE_TOOL, json!({})).unwrap()
+}
+
+/// One permission per kind of session call: reading content, changing it,
+/// changing how the session runs. Holding a neighbouring one opens nothing.
+/// A write that also starts a turn takes `agent` on top, even when the turn is
+/// only an option of the call.
+#[test_case::test_case("maki.session.messages()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "messages_with_write_and_settings")]
+#[test_case::test_case("maki.ui.input()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "input_with_write_and_settings")]
+#[test_case::test_case("maki.session.new()", &[Permission::SessionRead, Permission::SessionSettings], Permission::SessionWrite ; "new_with_read_and_settings")]
+#[test_case::test_case(r#"maki.session.delete("x")"#, &[Permission::SessionSettings], Permission::SessionWrite ; "delete_with_only_settings")]
+#[test_case::test_case(r#"maki.session.notify("ci red", { session = "x" })"#, &[Permission::SessionSettings], Permission::SessionWrite ; "notify_with_only_settings")]
+#[test_case::test_case(r#"maki.task.remove("x")"#, &[Permission::SessionSettings], Permission::SessionWrite ; "task_remove_with_only_settings")]
+#[test_case::test_case(r#"maki.session.prompt("go")"#, &[Permission::Agent], Permission::SessionWrite ; "prompt_with_only_agent")]
+#[test_case::test_case(r#"maki.session.prompt("go")"#, &[Permission::SessionWrite], Permission::Agent ; "prompt_with_only_session_write")]
+#[test_case::test_case(r#"maki.session.set_mode("plan")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_mode_with_only_write")]
+#[test_case::test_case(r#"maki.session.set_title({ id = "x", title = "t" })"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_title_with_only_write")]
+#[test_case::test_case(r#"maki.model.set("x")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "model_set_with_only_write")]
+#[test_case::test_case(r#"maki.session.notify("ci red", { session = "x", wake = true })"#, &[Permission::SessionWrite], Permission::Agent ; "waking_notify_with_only_write")]
+#[test_case::test_case(r#"maki.session.new({ prompt = "go" })"#, &[Permission::SessionWrite], Permission::Agent ; "new_with_a_prompt_with_only_write")]
+fn session_calls_need_their_own_permission(call: &str, held: &[Permission], missing: Permission) {
+    let result = run_call_with(held, call);
+    let refusal = Missing::Permission(missing).to_string();
+    assert!(result.contains(&refusal), "got: {result}");
+}
+
+/// Metadata: no transcript content in or out, so nothing is asked of the
+/// plugin. Without a UI they answer an error pair, never a refusal.
+#[test_case::test_case("maki.session.list()" ; "session_list")]
+#[test_case::test_case("maki.session.live()" ; "session_live")]
+#[test_case::test_case("maki.session.read()" ; "session_read")]
+#[test_case::test_case("maki.session.current()" ; "session_current")]
+#[test_case::test_case(r#"maki.session.focus("x")"# ; "session_focus")]
+#[test_case::test_case("maki.task.list()" ; "task_list")]
+#[test_case::test_case(r#"maki.task.focus("main")"# ; "task_focus")]
+#[test_case::test_case("maki.model.get()" ; "model_get")]
+fn session_metadata_needs_no_permission(call: &str) {
+    let result = run_call_with(&[], call);
+    assert!(result.starts_with("true:"), "got: {result}");
 }
 
 #[test]

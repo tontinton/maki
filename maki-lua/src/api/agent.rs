@@ -669,8 +669,8 @@ async fn call_tool(
 /// with `fs_read`) costs that one. A tool declaring none (`batch`,
 /// `code_execution`), or `mcp = true` on a chat with MCP servers, costs every
 /// permission except `agent`. `local_tools` cost nothing, they run as the
-/// plugin. The bundled `task` hands over the whole chat, so it holds all
-/// five.
+/// plugin. The bundled `task` hands over the whole chat, so it holds every
+/// permission.
 ///
 /// `scope` sets the lifetime. `"task"`, the default, ends the session with
 /// the task that opened it: an autocmd callback when it returns, a tool

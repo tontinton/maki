@@ -6,6 +6,7 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::command::{TaskRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::pair::Pair;
+use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::is_user_action;
 
 const USER_ACTION_ERR: &str = "stopping a task requires a user command or keybind";
@@ -65,7 +66,7 @@ async fn focus(
 /// @return (boolean|nil, string|nil) true on success, or nil and an error.
 /// @example
 /// local _, err = maki.task.remove("toolu_01")
-#[lua_fn]
+#[lua_fn(guard = SessionWrite)]
 async fn remove(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -109,8 +110,11 @@ lua_table! {
     /// spawned by the `task` tool and addressed by an id that survives a reload.
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
-    "maki.task" => pub(crate) fn create_task_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), focus(tx), remove(tx), stop(tx)]
+    "maki.task" => pub(crate) fn create_task_table(
+        tx: Option<flume::Sender<UiAction>>,
+        perms: &PluginPermissions,
+    ),
+    DOCS [list(tx), focus(tx), remove(perms, tx), stop(tx)]
 }
 
 #[cfg(test)]
@@ -153,7 +157,7 @@ mod tests {
 
     fn lua_with_task(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
-        let t = create_task_table(&lua, tx).unwrap();
+        let t = create_task_table(&lua, tx, &PluginPermissions::trusted()).unwrap();
         lua.globals().set("task", t).unwrap();
         lua
     }

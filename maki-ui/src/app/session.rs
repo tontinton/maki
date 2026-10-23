@@ -7,6 +7,7 @@ use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::Action;
 use crate::components::rewind_picker::RewindEntry;
 use maki_lua::SessionEndReason;
+use maki_lua::agent_autocmd::HostEvent;
 use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredSubagent};
@@ -381,7 +382,7 @@ impl App {
         // Fire before the swap. A handler cleaning up after the session
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
-        self.fire_session_autocmd("SessionReset", serde_json::json!({}));
+        self.fire_session_event(HostEvent::SessionReset {});
         self.lua_event_handle
             .end_session(self.state.session.id, SessionEndReason::Reset);
         // Swapping the claim is what gives the old session back: the snapshot

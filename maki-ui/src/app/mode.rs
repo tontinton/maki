@@ -5,6 +5,7 @@ use crate::agent::QueuedMessage;
 use crate::components::Status;
 use crate::theme;
 use maki_agent::{AgentInput, AgentMode, InputSource};
+use maki_lua::agent_autocmd::HostEvent;
 use maki_providers::RequestOptions;
 use maki_storage::StateDir;
 use maki_storage::plans;
@@ -89,7 +90,7 @@ impl App {
                 // The path is the whole point here, so with no path we stay
                 // quiet instead of handing a plugin an empty one to open.
                 if let Some(path) = path {
-                    self.fire_session_autocmd("PlanReady", serde_json::json!({ "path": path }));
+                    self.fire_session_event(HostEvent::PlanReady { path: &path });
                 }
             }
             PlanTrigger::InteractivePrompt => {

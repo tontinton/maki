@@ -4168,8 +4168,8 @@ fn typed_lua_command_with_args_executes() {
 
 const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
 
-/// The caller holds nothing at all, because a local command like `/new` runs
-/// for any plugin.
+/// The caller holds only `session_write`, all `/new` needs, as with
+/// `maki.session.new`.
 #[test_case("/new" ; "plain")]
 #[test_case("/NEW" ; "uppercase")]
 #[test_case("  /new  " ; "surrounding_whitespace")]
@@ -4178,7 +4178,7 @@ fn run_cmdline_executes_builtin(cmdline: &str) {
     let mut app = test_app();
 
     let actions = app
-        .run_cmdline(cmdline, 0, &PluginReach::new(PluginPermissions::denied()))
+        .run_cmdline(cmdline, 0, &only(Permission::SessionWrite))
         .unwrap();
 
     assert!(matches!(&actions[..], [Action::RestartAgent(h)] if h.is_empty()));
@@ -4248,19 +4248,25 @@ fn without(permission: Permission) -> PluginReach {
 }
 
 fn only(permission: Permission) -> PluginReach {
+    only_these(&[permission])
+}
+
+fn only_these(permissions: &[Permission]) -> PluginReach {
     PluginReach::new(PluginPermissions::from_approved(
-        [permission.manifest_key()],
+        permissions
+            .iter()
+            .map(|permission| permission.manifest_key()),
     ))
 }
 
-/// A model turn needs `agent`, and another plugin's command needs whatever
-/// its handler runs with. Holding only that one permission is enough, and
-/// holding everything else is not.
-#[test_case("/btw what is rust?", Permission::Agent ; "btw")]
-#[test_case("/compact", Permission::Agent ; "compact")]
-#[test_case("/user:fix the tests", Permission::Agent ; "custom_command")]
-#[test_case(RUNNING_PLUGIN_COMMAND, Permission::Run ; "plugin_command")]
-fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: Permission) {
+/// A model turn needs `agent`, a prompt also `session_write`, and another
+/// plugin's command needs whatever its handler runs with. Holding exactly
+/// those is enough, and lacking any one of them is not.
+#[test_case("/btw what is rust?", &[Permission::Agent] ; "btw")]
+#[test_case("/compact", &[Permission::Agent, Permission::SessionWrite] ; "compact")]
+#[test_case("/user:fix the tests", &[Permission::Agent, Permission::SessionWrite] ; "custom_command")]
+#[test_case(RUNNING_PLUGIN_COMMAND, &[Permission::Run] ; "plugin_command")]
+fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: &[Permission]) {
     let mut app = test_app();
     app.command_palette = CommandPalette::new(
         Arc::from([CustomCommand {
@@ -4280,14 +4286,35 @@ fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: Permission)
         }]),
     );
 
-    assert_eq!(
-        app.run_cmdline(cmdline, 1, &without(needed)).err(),
-        Some(missing_refusal(
-            cmdline.split_whitespace().next().unwrap(),
-            &Missing::Permission(needed)
-        ))
-    );
-    assert_eq!(app.run_cmdline(cmdline, 1, &only(needed)).err(), None);
+    let command = cmdline.split_whitespace().next().unwrap();
+    for &permission in needed {
+        assert_eq!(
+            app.run_cmdline(cmdline, 1, &without(permission)).err(),
+            Some(missing_refusal(command, &Missing::Permission(permission)))
+        );
+    }
+    assert_eq!(app.run_cmdline(cmdline, 1, &only_these(needed)).err(), None);
+}
+
+/// Most of these mirror `maki.session.new` or `maki.model.set`, and `/cd` and
+/// `/workflow` change where tools run and which exist. Holding the other
+/// session permission opens none of them.
+#[test_case("/new", Permission::SessionWrite, Permission::SessionSettings ; "new_with_only_settings")]
+#[test_case("/fork", Permission::SessionWrite, Permission::SessionSettings ; "fork_with_only_settings")]
+#[test_case("/model", Permission::SessionSettings, Permission::SessionWrite ; "model_with_only_write")]
+#[test_case("/fast", Permission::SessionSettings, Permission::SessionWrite ; "fast_with_only_write")]
+#[test_case("/cd", Permission::SessionSettings, Permission::SessionWrite ; "cd_with_only_write")]
+#[test_case("/workflow", Permission::SessionSettings, Permission::SessionWrite ; "workflow_with_only_write")]
+fn run_cmdline_refuses_session_commands_without_their_permission(
+    cmdline: &str,
+    needed: Permission,
+    held: Permission,
+) {
+    let mut app = test_app();
+    let refusal = Some(missing_refusal(cmdline, &Missing::Permission(needed)));
+
+    assert_eq!(app.run_cmdline(cmdline, 1, &without(needed)).err(), refusal);
+    assert_eq!(app.run_cmdline(cmdline, 1, &only(held)).err(), refusal);
 }
 
 #[test_case("/yolo" ; "yolo")]
