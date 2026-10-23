@@ -380,8 +380,9 @@ fn disable_focus_change() {}
 /// fork(), while the child's fd 2 is still our terminal, so the line lands
 /// right on top of the TUI. Our spawns fork because they need setsid, which
 /// only the fork path gives on stable Rust. So while we own the screen, fd 2
-/// points at /dev/null, and gets the terminal back for teardown and panics.
-#[cfg(not(windows))]
+/// writes to a file in the logs dir, where a fatal error still leaves a trace,
+/// and gets the terminal back for teardown and panics.
+#[cfg(target_os = "macos")]
 mod stderr {
     use std::fs::File;
     use std::io::stderr;
@@ -389,36 +390,47 @@ mod stderr {
     use std::panic;
     use std::sync::OnceLock;
 
+    use maki_storage::paths::logs_dir;
     use rustix::stdio::dup2_stderr;
 
-    const DEV_NULL: &str = "/dev/null";
+    const STDERR_LOG_FILE_NAME: &str = "stderr.log";
 
-    static TERMINAL_STDERR: OnceLock<Option<OwnedFd>> = OnceLock::new();
+    struct Fds {
+        terminal: OwnedFd,
+        log: File,
+    }
+
+    static FDS: OnceLock<Option<Fds>> = OnceLock::new();
+
+    fn open() -> Option<Fds> {
+        let log = File::options()
+            .create(true)
+            .append(true)
+            .open(logs_dir().ok()?.join(STDERR_LOG_FILE_NAME))
+            .ok()?;
+        let terminal = stderr().as_fd().try_clone_to_owned().ok()?;
+        let prev = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            unmute();
+            prev(info);
+        }));
+        Some(Fds { terminal, log })
+    }
 
     pub(super) fn mute() {
-        let saved = TERMINAL_STDERR.get_or_init(|| {
-            let prev = panic::take_hook();
-            panic::set_hook(Box::new(move |info| {
-                unmute();
-                prev(info);
-            }));
-            stderr().as_fd().try_clone_to_owned().ok()
-        });
-        if saved.is_some()
-            && let Ok(null) = File::options().write(true).open(DEV_NULL)
-        {
-            let _ = dup2_stderr(&null);
+        if let Some(fds) = FDS.get_or_init(open) {
+            let _ = dup2_stderr(&fds.log);
         }
     }
 
     pub(super) fn unmute() {
-        if let Some(Some(terminal)) = TERMINAL_STDERR.get() {
-            let _ = dup2_stderr(terminal);
+        if let Some(Some(fds)) = FDS.get() {
+            let _ = dup2_stderr(&fds.terminal);
         }
     }
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "macos"))]
 mod stderr {
     pub(super) fn mute() {}
     pub(super) fn unmute() {}
