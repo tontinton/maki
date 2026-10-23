@@ -805,6 +805,39 @@ maki.api.register_command({
 
 ---
 
+### `maki.api.list_commands()` {#maki-api-list_commands}
+
+```lua
+maki.api.list_commands()
+```
+
+Lists every slash command the input bar offers: built-ins, custom
+`/project:` and `/user:` commands, MCP prompts, and plugin commands, in
+the order the palette shows them.
+
+Each entry is `{ name, description, source, plugin?, max_args, bang,
+argument_hint?, interactive }`. `source` is `"builtin"`, `"custom"`,
+`"mcp"` or `"lua"`, and `plugin` names the plugin that registered a
+`"lua"` one. `max_args` is -1 for a command that takes any number of
+arguments. `bang` is true when the command reads a trailing `!`.
+`interactive` marks commands that only open a picker or modal, such as
+`/model`, which do nothing useful when nobody is looking at the terminal.
+
+**Returns:** (`table[]|nil`, `string|nil`) The command entries, or nil and an error when no UI is attached.
+
+**Example:**
+
+```lua
+local cmds = maki.api.list_commands()
+for _, c in ipairs(cmds or {}) do
+  if not c.interactive then
+    print(c.name, c.source, c.description)
+  end
+end
+```
+
+---
+
 ### `maki.api.create_autocmd()` {#maki-api-create_autocmd}
 
 ```lua

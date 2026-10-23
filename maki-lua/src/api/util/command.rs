@@ -680,6 +680,11 @@ pub enum UiAction {
         caller: PluginReach,
         reply_tx: flume::Sender<Result<(), String>>,
     },
+    /// Every slash command the focused session's palette offers, as a JSON
+    /// array.
+    ListCommands {
+        reply_tx: flume::Sender<UiReply>,
+    },
     /// An event from a subagent session a plugin opened on a chat session,
     /// which shows it as a task. A tab keeps its channels across `/new`, so
     /// the chat session id is the only way to tell if the tab still shows the

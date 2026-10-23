@@ -1038,6 +1038,9 @@ impl<'t> EventLoop<'t> {
                     }
                 }
             }
+            UiAction::ListCommands { reply_tx } => {
+                let _ = reply_tx.send(Ok(json!(self.focused_app().command_listing())));
+            }
             UiAction::PluginTaskEvent {
                 session,
                 plugin,

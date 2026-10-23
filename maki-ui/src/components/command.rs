@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::command::CustomCommand;
-use maki_agent::{McpPromptInfo, McpSnapshotReader};
+use maki_agent::{McpPromptArg, McpPromptInfo, McpSnapshotReader};
 use maki_lua::{LuaCommandInfo, LuaCommandReader, Missing, Permission, PluginReach};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
@@ -12,6 +12,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
+use serde::Serialize;
 
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -193,6 +194,58 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         plugin_access: PluginAccess::UserOnly,
     },
 ];
+
+/// Commands that only open a picker or modal, so running them from somewhere
+/// that cannot see the terminal does nothing useful. `/sessions` and
+/// `/thinking` come from bundled Lua plugins.
+const INTERACTIVE_COMMANDS: &[&str] = &[
+    "/model",
+    "/theme",
+    "/mcp",
+    "/login",
+    "/queue",
+    "/help",
+    "/usage",
+    "/sessions",
+    "/thinking",
+];
+
+/// `max_args` for a command that takes any number of arguments: Lua numbers
+/// cannot hold `usize::MAX` exactly.
+const UNBOUNDED_ARGS: i64 = -1;
+
+/// One entry of `maki.api.list_commands`.
+#[derive(Debug, Serialize)]
+pub struct CommandListing {
+    pub name: String,
+    pub description: String,
+    pub source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    pub max_args: i64,
+    pub bang: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+    pub interactive: bool,
+}
+
+/// `<required> [optional]`, the shape markdown commands spell by hand.
+fn mcp_argument_hint(args: &[McpPromptArg]) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+    let words: Vec<String> = args
+        .iter()
+        .map(|a| {
+            if a.required {
+                format!("<{}>", a.name)
+            } else {
+                format!("[{}]", a.name)
+            }
+        })
+        .collect();
+    Some(words.join(" "))
+}
 
 pub struct ParsedCommand {
     pub name: String,
@@ -658,6 +711,50 @@ impl CommandPalette {
         &self.lua_commands
     }
 
+    /// Every command for `maki.api.list_commands`, in palette order. Reads
+    /// the MCP and Lua snapshots afresh, since the palette only catches up
+    /// with them when the user types.
+    pub fn listing(&self) -> Vec<CommandListing> {
+        let mcp = self.mcp_reader.load();
+        let lua = self.lua_reader.load();
+        Self::items(&self.custom, &mcp.prompts, &lua.commands)
+            .map(|item| {
+                let interactive = INTERACTIVE_COMMANDS.contains(&item.name.as_str());
+                let max_args = i64::try_from(item.max_args).unwrap_or(UNBOUNDED_ARGS);
+                let (source, description, plugin, bang, argument_hint) = match item.command_type {
+                    CommandType::Builtin(cmd) => {
+                        ("builtin", cmd.description.to_string(), None, cmd.bang, None)
+                    }
+                    CommandType::Custom(i) => {
+                        let cmd = &self.custom[i];
+                        let hint = cmd.argument_hint.clone();
+                        ("custom", cmd.description.clone(), None, false, hint)
+                    }
+                    CommandType::McpPrompt(i) => {
+                        let prompt = &mcp.prompts[i];
+                        let hint = mcp_argument_hint(&prompt.arguments);
+                        ("mcp", prompt.description.clone(), None, false, hint)
+                    }
+                    CommandType::Lua(i) => {
+                        let cmd = &lua.commands[i];
+                        let plugin = Some(cmd.plugin.to_string());
+                        ("lua", cmd.description.to_string(), plugin, false, None)
+                    }
+                };
+                CommandListing {
+                    name: item.name,
+                    description,
+                    source,
+                    plugin,
+                    max_args,
+                    bang,
+                    argument_hint,
+                    interactive,
+                }
+            })
+            .collect()
+    }
+
     pub fn view(
         &mut self,
         frame: &mut Frame,
@@ -812,6 +909,7 @@ mod tests {
                 content: "Review $ARGUMENTS".into(),
                 scope: maki_agent::command::CommandScope::Project,
                 accepts_args: true,
+                argument_hint: Some("<file>".into()),
             },
             CustomCommand {
                 name: "fix".into(),
@@ -819,8 +917,59 @@ mod tests {
                 content: "Fix the code".into(),
                 scope: maki_agent::command::CommandScope::User,
                 accepts_args: false,
+                argument_hint: None,
             },
         ])
+    }
+
+    #[test]
+    fn listing_covers_every_source_with_its_metadata() {
+        let p = CommandPalette::new(
+            sample_custom(),
+            empty_snapshot(),
+            LuaCommandReader::from_commands(vec![LuaCommandInfo {
+                name: "/sessions".into(),
+                description: "Pick a session".into(),
+                plugin: "sessions".into(),
+                reach: PluginReach::new(PluginPermissions::trusted()),
+                max_args: 0,
+            }]),
+        );
+        let listing = p.listing();
+        let find = |name: &str| listing.iter().find(|c| c.name == name).unwrap();
+
+        let model = find("/model");
+        assert_eq!((model.source, model.interactive), ("builtin", true));
+        let compact = find("/compact");
+        assert_eq!(
+            (compact.max_args, compact.interactive),
+            (UNBOUNDED_ARGS, false)
+        );
+        assert!(find("/packupdate").bang);
+
+        let review = find("/project:review");
+        assert_eq!(review.source, "custom");
+        assert_eq!(review.argument_hint.as_deref(), Some("<file>"));
+
+        let sessions = find("/sessions");
+        assert_eq!(sessions.source, "lua");
+        assert_eq!(sessions.plugin.as_deref(), Some("sessions"));
+        assert!(sessions.interactive);
+        assert_eq!(listing.len(), BUILTIN_COMMANDS.len() + 3);
+    }
+
+    #[test_case(&[], None ; "no_args")]
+    #[test_case(&[("file", true), ("depth", false)], Some("<file> [depth]") ; "required_then_optional")]
+    fn mcp_hint_marks_optional_args(args: &[(&str, bool)], expected: Option<&str>) {
+        let args: Vec<McpPromptArg> = args
+            .iter()
+            .map(|(name, required)| McpPromptArg {
+                name: (*name).into(),
+                description: String::new(),
+                required: *required,
+            })
+            .collect();
+        assert_eq!(mcp_argument_hint(&args).as_deref(), expected);
     }
 
     #[test]
@@ -1313,6 +1462,7 @@ mod tests {
                     content: String::new(),
                     scope: maki_agent::command::CommandScope::User,
                     accepts_args: false,
+                    argument_hint: None,
                 })
                 .collect::<Vec<_>>(),
         )

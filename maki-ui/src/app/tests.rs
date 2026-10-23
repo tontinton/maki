@@ -4268,6 +4268,7 @@ fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: Permission)
             content: CUSTOM_COMMAND_CONTENT.into(),
             scope: CommandScope::User,
             accepts_args: true,
+            argument_hint: None,
         }]),
         McpSnapshotReader::empty(),
         LuaCommandReader::from_commands(vec![LuaCommandInfo {

@@ -4282,6 +4282,43 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         .expect(RUN_COMMAND_NO_ACTION);
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
+/// The UI answers with JSON and the handler sees it as a Lua array.
+#[test]
+fn list_commands_round_trips_through_ui() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/ls",
+            handler = function()
+                local cmds = maki.api.list_commands()
+                local c = cmds[1]
+                maki.ui.flash(c.name .. "|" .. c.source .. "|" .. tostring(c.interactive))
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    host.event_handle()
+        .run_command(Arc::from("p"), Arc::from("/ls"), String::new(), 0);
+
+    let maki_lua::UiAction::ListCommands { reply_tx } = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("list_commands did not reach the UI")
+    else {
+        panic!("expected ListCommands");
+    };
+    reply_tx
+        .send(Ok(serde_json::json!([
+            {"name": "/model", "source": "builtin", "interactive": true}
+        ])))
+        .unwrap();
+    let action = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "/model|builtin|true"));
+}
+
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"

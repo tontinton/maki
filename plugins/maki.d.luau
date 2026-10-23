@@ -26,6 +26,7 @@ declare maki: {
     get_tools: @checked (opts: any) -> (any),
     get_tool: @checked (name: string) -> (any),
     run_command: @checked (cmdline: string) -> (boolean?, string?),
+    list_commands: @checked () -> (any, string?),
     create_autocmd: @checked (event: any, opts: any) -> (number),
     del_autocmd: @checked (id: number) -> (),
     exec_autocmds: @checked (event: any, opts: any) -> (),
