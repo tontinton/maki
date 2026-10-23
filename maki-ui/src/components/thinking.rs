@@ -25,8 +25,8 @@ pub(crate) fn tail_rows(mode: ThinkingLines, expanded: bool) -> Option<usize> {
     }
 }
 
-/// Only drawing moves a typewriter forward, and the header-only view never
-/// draws the text. Waiting on that reveal anyway would spin the loop at full
+/// Only `tick` moves a typewriter forward, and the header-only view never
+/// shows the text. Waiting on that reveal anyway would spin the loop at full
 /// frame rate for as long as the model thinks.
 pub(crate) fn reveals_text(mode: ThinkingLines, expanded: bool) -> bool {
     tail_rows(mode, expanded) != Some(0)
