@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub(crate) mod fuzz;
 mod marks;
 mod rules;
 mod syntax;
@@ -30,7 +32,7 @@ const CHANGE_LOG_LEN: u64 = 256;
 /// would pile up forever without a cap. Nobody presses undo 64 times in a row.
 const MAX_UNDO: usize = 64;
 
-const NOTHING_TO_APPLY_ERR: &str = "nothing to apply: no edits, cursor or marks";
+const NOTHING_TO_APPLY_ERR: &str = "nothing to apply: no edits, cursor, anchor or marks";
 const PAST_END_ERR: &str = "is past the end of the input";
 const INSIDE_CHAR_ERR: &str = "is inside a character";
 const OVERLAPPING_EDITS_ERR: &str = "edits overlap or start at the same offset";
@@ -40,7 +42,7 @@ pub(crate) const EDIT_CONFLICT_ERR: &str =
 pub(crate) const INPUT_REPLACED_ERR: &str =
     "the input was replaced (history, draft, $EDITOR or submit) since the offsets were read";
 pub(crate) const CURSOR_CONFLICT_ERR: &str =
-    "the cursor lands inside text changed since the edit was planned";
+    "the cursor or anchor lands inside text changed since the edit was planned";
 const UNCLEAN_TEXT_ERR: &str = "edit text has tabs, carriage returns or control characters, \
                                 so its offsets would shift; clean the text first";
 
@@ -169,6 +171,8 @@ struct UndoStep {
     /// Undo puts the caret back here, or the user goes looking for the text
     /// that just changed.
     cursor: usize,
+    /// And the selection, so undoing a wrap selects the text it wrapped.
+    anchor: Option<usize>,
     group: Option<EditGroup>,
 }
 
@@ -186,8 +190,14 @@ impl UndoStep {
             return false;
         }
         match group {
+            // A key typed over a selection also removes the selected text,
+            // and a run only grows at its end with no room to keep it. So
+            // that key starts a new run, or undo would lose the text.
             EditGroup::Typing => {
-                if new.start != last.end || text[..new.start].ends_with(char::is_whitespace) {
+                if new.start != last.end
+                    || !new.text.is_empty()
+                    || text[..new.start].ends_with(char::is_whitespace)
+                {
                     return false;
                 }
                 last.end = new.end;
@@ -259,6 +269,15 @@ pub struct TextBuffer {
     line_starts: Vec<usize>,
     raw_x: usize,
     cursor_y: usize,
+    /// The end of the selection the cursor is not on. `None` when nothing is
+    /// selected, and never the cursor itself. Only [`Self::select`] sets one,
+    /// moved out of atomic ranges, though a mark placed later may land around
+    /// it. Plain cursor moves leave it alone, so their callers drop it.
+    ///
+    /// Never mapped through a change: every change either takes the
+    /// selection or says where it goes, see [`Self::edit`] and
+    /// [`Self::apply_edits`].
+    anchor: Option<usize>,
     version: u64,
     /// Oldest first, so `changes_since` can binary search for a version.
     changes: VecDeque<Change>,
@@ -406,6 +425,7 @@ impl TextBuffer {
             line_starts,
             raw_x: 0,
             cursor_y: 0,
+            anchor: None,
             version: 0,
             changes: VecDeque::new(),
             undo: UndoHistory::default(),
@@ -441,6 +461,7 @@ impl TextBuffer {
         self.undo = UndoHistory::default();
         self.raw_x = 0;
         self.cursor_y = 0;
+        self.anchor = None;
     }
 
     /// Runs one action as one undo step, however many edits it makes. Called
@@ -456,6 +477,7 @@ impl TextBuffer {
         self.undo.open = Some(UndoStep {
             inverses: Vec::new(),
             cursor: self.cursor_byte(),
+            anchor: self.anchor,
             group,
         });
         let out = action(self);
@@ -496,10 +518,11 @@ impl TextBuffer {
     }
 
     /// Applies {step} and returns the step that reverts it in turn, which
-    /// leaves the caret where it is now. Each inverse keeps the text it
-    /// replaces, so undo and redo stay O(edit) like the edit itself.
+    /// leaves the caret and the selection where they are now. Each inverse
+    /// keeps the text it replaces, so undo and redo stay O(edit) like the
+    /// edit itself.
     fn revert(&mut self, step: UndoStep) -> UndoStep {
-        let cursor = self.cursor_byte();
+        let (cursor, anchor) = (self.cursor_byte(), self.anchor);
         let inverses = step
             .inverses
             .into_iter()
@@ -516,9 +539,11 @@ impl TextBuffer {
             .collect();
         self.commit();
         self.place_cursor(step.cursor);
+        self.select(step.anchor);
         UndoStep {
             inverses,
             cursor,
+            anchor,
             group: None,
         }
     }
@@ -962,9 +987,16 @@ impl TextBuffer {
         self.changes_since(self.syntax.shown_version()?)
     }
 
-    /// The edits the keys make. One that cuts into an atomic range takes all
-    /// of it, which a plugin edit never does: a plugin asks for exact bytes.
+    /// The edits the keys make. With text selected, every one of them puts
+    /// {text} over the selection instead, so typing replaces it and any
+    /// delete key takes just the selection. One that cuts into an atomic
+    /// range takes all of it, which a plugin edit never does: a plugin asks
+    /// for exact bytes.
     fn edit(&mut self, range: Range<usize>, text: &str, caret: usize) {
+        let (range, caret) = match self.selection() {
+            Some(selected) => (selected.clone(), selected.start + text.len()),
+            None => (range, caret),
+        };
         let whole = self.widen(range.clone());
         let caret = if whole == range {
             caret
@@ -1002,6 +1034,7 @@ impl TextBuffer {
             }
             buf.commit();
             buf.place_cursor(caret);
+            buf.anchor = None;
         });
     }
 
@@ -1032,21 +1065,27 @@ impl TextBuffer {
 
     /// At the start of a line the character before the cursor is the newline,
     /// so removing it joins the two lines with no special case.
+    ///
+    /// At the very start there is nothing to remove, but the edit still runs
+    /// so a selection there is deleted.
     pub fn remove_char(&mut self) {
         let at = self.cursor_byte();
-        if let Some(c) = self.text[..at].chars().next_back() {
-            let from = at - c.len_utf8();
-            self.edit(from..at, "", from);
-        }
+        let from = self.text[..at]
+            .chars()
+            .next_back()
+            .map_or(at, |c| at - c.len_utf8());
+        self.edit(from..at, "", from);
     }
 
     /// At the end of a line the character after the cursor is the newline, so
     /// deleting it pulls the next line up.
     pub fn delete_char(&mut self) {
         let at = self.cursor_byte();
-        if let Some(c) = self.text[at..].chars().next() {
-            self.edit(at..at + c.len_utf8(), "", at);
-        }
+        let end = self.text[at..]
+            .chars()
+            .next()
+            .map_or(at, |c| at + c.len_utf8());
+        self.edit(at..end, "", at);
     }
 
     fn wrap_to_prev_line(&mut self) -> bool {
@@ -1216,31 +1255,36 @@ impl TextBuffer {
     /// transaction leaves nothing half applied.
     ///
     /// The text is sanitized the way typed and pasted text is, so the default
-    /// cursor counts what was really inserted. With {cursor} or {marks}
-    /// given, text sanitizing would change is refused instead: they count
-    /// bytes of the text as sent, which would no longer be there.
+    /// cursor counts what was really inserted. With {cursor}, {anchor} or
+    /// {marks} given, text sanitizing would change is refused instead: they
+    /// count bytes of the text as sent, which would no longer be there.
+    ///
+    /// {anchor} selects from there to the cursor, counted like {cursor} and
+    /// widened over an atomic range it lands in, as a selection made with
+    /// the keys would be. Without it nothing stays selected.
     ///
     /// {marks}, when given, replace what the plugin named first has in their
     /// namespace. They count in the same value as {cursor} and land in the
     /// same change as the text, or refuse it with them. Where marks that
     /// change how rows wrap came or went is returned next to the cursor.
     ///
-    /// No {edits} with a {cursor} or {marks} leaves the text alone, which
-    /// makes neither a version nor an undo step. The cursor then stays where
-    /// it is unless {cursor} moves it.
+    /// No {edits} with a {cursor}, an {anchor} or {marks} leaves the text
+    /// alone, which makes neither a version nor an undo step. The cursor then
+    /// stays where it is unless {cursor} moves it.
     pub fn apply_edits(
         &mut self,
         version: u64,
         mut edits: Vec<TextEdit>,
         cursor: Option<usize>,
+        anchor: Option<usize>,
         mut marks: Option<(&str, InputMarks)>,
     ) -> Result<(usize, Vec<Range<usize>>), String> {
-        if edits.is_empty() && cursor.is_none() && marks.is_none() {
+        if edits.is_empty() && cursor.is_none() && anchor.is_none() && marks.is_none() {
             return Err(NOTHING_TO_APPLY_ERR.into());
         }
         edits.sort_by_key(|edit| edit.start);
         check_ranges(&edits)?;
-        let counts_offsets = cursor.is_some() || marks.is_some();
+        let counts_offsets = cursor.is_some() || anchor.is_some() || marks.is_some();
         for edit in &mut edits {
             let clean = sanitize(&edit.text);
             if counts_offsets && clean != edit.text {
@@ -1249,16 +1293,18 @@ impl TextBuffer {
             edit.text = clean;
         }
         let changes = self.rebase(version, &mut edits)?;
-        let cursor = cursor
-            .map(|caret| {
-                map_offset(&changes, caret).ok_or_else(|| {
+        let mapped = |at: Option<usize>| {
+            at.map(|at| {
+                map_offset(&changes, at).ok_or_else(|| {
                     format!(
                         "{CURSOR_CONFLICT_ERR} (planned on version {version}, now {})",
                         self.version
                     )
                 })
             })
-            .transpose()?;
+            .transpose()
+        };
+        let (cursor, anchor) = (mapped(cursor)?, mapped(anchor)?);
 
         let len = self.text.len();
         for &TextEdit { start, stop, .. } in &edits {
@@ -1279,6 +1325,10 @@ impl TextBuffer {
         }
         .min(new_len);
         check_boundary(self.is_boundary_after(&edits, caret), "cursor", caret)?;
+        let anchor = anchor.map(|anchor| anchor.min(new_len));
+        if let Some(anchor) = anchor {
+            check_boundary(self.is_boundary_after(&edits, anchor), "anchor", anchor)?;
+        }
         if let Some((_, pushed)) = &mut marks {
             fit_marks(&changes, &mut pushed.marks, new_len, |pos| {
                 self.is_boundary_after(&edits, pos)
@@ -1294,6 +1344,7 @@ impl TextBuffer {
         let moved = marks.map_or_else(Vec::new, |(plugin, pushed)| {
             self.marks.set(plugin, &pushed.ns, pushed.marks)
         });
+        self.select(anchor);
         Ok((caret, moved))
     }
 
@@ -1370,7 +1421,7 @@ impl TextBuffer {
             stop,
             text: text.into(),
         };
-        self.apply_edits(self.version, vec![edit], cursor, None)
+        self.apply_edits(self.version, vec![edit], cursor, None, None)
             .map(drop)
     }
 
@@ -1393,29 +1444,65 @@ impl TextBuffer {
         self.edit(from..at, "", from);
     }
 
+    /// A backspace that deletes a selection is a step of its own, like a word
+    /// kill, so it never joins the backspaces around it.
     pub fn handle_key(&mut self, key: KeyEvent) -> EditResult {
-        if self.handle_motion_key(key) == EditResult::Moved {
+        if self.handle_motion_key(key, false) == EditResult::Moved {
             return EditResult::Moved;
         }
         let (ctrl, alt, sup) = modifiers(key);
         let group = match key.code {
             _ if ctrl || alt || sup => None,
             KeyCode::Char(_) => Some(EditGroup::Typing),
-            KeyCode::Backspace => Some(EditGroup::Deleting),
+            KeyCode::Backspace if self.anchor.is_none() => Some(EditGroup::Deleting),
             _ => None,
         };
         self.undo_step(group, |buf| buf.apply_edit_key(key.code, ctrl, alt, sup))
     }
 
     /// Only the keys of [`Self::handle_key`] that move the cursor. Normal mode
-    /// uses this, so the text never changes under a vim plugin.
-    pub fn handle_motion_key(&mut self, key: KeyEvent) -> EditResult {
+    /// uses this, so the text never changes under a vim plugin. With {select}
+    /// the motion stretches the selection from where the cursor was, and
+    /// without it the selection goes.
+    pub fn handle_motion_key(&mut self, key: KeyEvent, select: bool) -> EditResult {
         let (ctrl, alt, sup) = modifiers(key);
         let Some(motion) = motion(key.code, ctrl, alt, sup) else {
             return EditResult::Ignored;
         };
+        let anchor = select.then(|| self.anchor.unwrap_or_else(|| self.cursor_byte()));
         motion(self);
+        self.select(anchor);
         EditResult::Moved
+    }
+
+    pub fn anchor(&self) -> Option<usize> {
+        self.anchor
+    }
+
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let cursor = self.cursor_byte();
+        self.anchor
+            .map(|anchor| anchor.min(cursor)..anchor.max(cursor))
+    }
+
+    /// `false` when nothing was selected.
+    pub fn deselect(&mut self) -> bool {
+        self.anchor.take().is_some()
+    }
+
+    /// Selects from {anchor} to the cursor. An anchor inside an atomic range
+    /// moves to its far edge, so the selection takes the range whole, and an
+    /// anchor on the cursor selects nothing.
+    fn select(&mut self, anchor: Option<usize>) {
+        let cursor = self.cursor_byte();
+        self.anchor = anchor.filter(|&at| at != cursor).map(|anchor| {
+            let whole = self.widen(anchor.min(cursor)..anchor.max(cursor));
+            if anchor < cursor {
+                whole.start
+            } else {
+                whole.end
+            }
+        });
     }
 
     fn apply_edit_key(&mut self, code: KeyCode, ctrl: bool, alt: bool, sup: bool) -> EditResult {
@@ -1941,7 +2028,7 @@ mod tests {
     #[test_case(vec![text_edit(0, 5, "hi")], None, |b| { b.move_to_end(); b.push_char('!') }, "hi world!", 2 ; "typed_after")]
     #[test_case(vec![text_edit(6, 6, "**"), text_edit(11, 11, "**")], Some(13), |b| { b.set_cursor(0, 0); b.insert_text("oh ") }, "oh hello **world**", 16 ; "typed_before_moves_the_cursor_too")]
     #[test_case(vec![text_edit(0, 0, "**"), text_edit(5, 5, "**")], Some(7), |b| { b.set_cursor(0, 7); b.remove_char() }, "**hello** orld", 7 ; "deleted_after_the_cursor")]
-    #[test_case(vec![text_edit(5, 6, "_")], None, |b| { b.apply_edits(b.version(), vec![text_edit(0, 0, "**"), text_edit(11, 11, "**")], None, None).unwrap(); }, "**hello_world**", 8 ; "between_the_ranges_of_one_transaction")]
+    #[test_case(vec![text_edit(5, 6, "_")], None, |b| { b.apply_edits(b.version(), vec![text_edit(0, 0, "**"), text_edit(11, 11, "**")], None, None, None).unwrap(); }, "**hello_world**", 8 ; "between_the_ranges_of_one_transaction")]
     fn a_stale_edit_moves_past_changes_that_do_not_touch_it(
         edits: Vec<TextEdit>,
         cursor: Option<usize>,
@@ -1954,7 +2041,7 @@ mod tests {
         user(&mut buf);
 
         assert_eq!(
-            buf.apply_edits(planned, edits, cursor, None)
+            buf.apply_edits(planned, edits, cursor, None, None)
                 .map(|(caret, _)| caret),
             Ok(expected_cursor)
         );
@@ -1980,7 +2067,9 @@ mod tests {
         user(&mut buf);
         let (value, version) = (buf.value().to_owned(), buf.version());
 
-        let refused = buf.apply_edits(planned, edits, cursor, None).unwrap_err();
+        let refused = buf
+            .apply_edits(planned, edits, cursor, None, None)
+            .unwrap_err();
         assert!(refused.starts_with(err), "{refused}");
         assert_eq!(buf.value(), value);
         assert_eq!(buf.version(), version);
@@ -1999,7 +2088,7 @@ mod tests {
         ];
 
         assert_eq!(
-            buf.apply_edits(before, edits, None, None)
+            buf.apply_edits(before, edits, None, None, None)
                 .map(|(caret, _)| caret),
             Ok(EDITED.len())
         );
@@ -2026,7 +2115,7 @@ mod tests {
         let steps = buf.undo.steps.len();
 
         let (caret, _) = buf
-            .apply_edits(planned, vec![], Some(cursor), None)
+            .apply_edits(planned, vec![], Some(cursor), None, None)
             .unwrap();
         assert_eq!(caret, landed);
         assert_eq!(buf.cursor_byte(), landed);
@@ -2041,7 +2130,9 @@ mod tests {
     fn an_edit_list_without_one_clear_order_is_refused(edits: Vec<TextEdit>, err: &str) {
         let mut buf = TextBuffer::new(PLANNED_ON.into());
         let version = buf.version();
-        let refused = buf.apply_edits(version, edits, None, None).unwrap_err();
+        let refused = buf
+            .apply_edits(version, edits, None, None, None)
+            .unwrap_err();
         assert!(refused.starts_with(err), "{refused}");
         assert_eq!(buf.value(), PLANNED_ON);
     }
@@ -2462,6 +2553,7 @@ mod tests {
             planned,
             vec![text_edit(6, 6, "XY")],
             None,
+            None,
             Some((PLUGIN, marks)),
         )
         .unwrap();
@@ -2484,6 +2576,7 @@ mod tests {
                 version,
                 vec![text_edit(0, 0, text)],
                 None,
+                None,
                 Some((PLUGIN, marks)),
             )
             .unwrap_err();
@@ -2495,9 +2588,14 @@ mod tests {
     /// Offsets passed with the text count its bytes as sent, which cleaning
     /// would move under them. Even no marks at all is refused, so the rule
     /// is just whether any of them was given.
-    #[test_case(Some(1), None ; "a_cursor")]
-    #[test_case(None, Some(Vec::new()) ; "an_empty_mark_list")]
-    fn unclean_text_next_to_offsets_is_refused(cursor: Option<usize>, marks: Option<Vec<Mark>>) {
+    #[test_case(Some(1), None, None ; "a_cursor")]
+    #[test_case(None, Some(0), None ; "an_anchor")]
+    #[test_case(None, None, Some(Vec::new()) ; "an_empty_mark_list")]
+    fn unclean_text_next_to_offsets_is_refused(
+        cursor: Option<usize>,
+        anchor: Option<usize>,
+        marks: Option<Vec<Mark>>,
+    ) {
         let mut buf = TextBuffer::new(String::new());
         let version = buf.version();
         let marks = marks.map(|marks| {
@@ -2510,7 +2608,13 @@ mod tests {
             )
         });
         let refused = buf
-            .apply_edits(version, vec![text_edit(0, 0, "a\tb")], cursor, marks)
+            .apply_edits(
+                version,
+                vec![text_edit(0, 0, "a\tb")],
+                cursor,
+                anchor,
+                marks,
+            )
             .unwrap_err();
         assert!(refused.contains(UNCLEAN_TEXT_ERR), "{refused}");
         assert_eq!((buf.value(), buf.version()), ("", version));
@@ -2531,7 +2635,7 @@ mod tests {
             marks: vec![chip(6..11)],
         };
         let (caret, _) = buf
-            .apply_edits(planned, vec![], None, Some((PLUGIN, marks)))
+            .apply_edits(planned, vec![], None, None, Some((PLUGIN, marks)))
             .unwrap();
 
         assert_eq!(caret, cursor);
@@ -2539,5 +2643,99 @@ mod tests {
         assert_eq!(placed(&buf), vec![9..14]);
         assert_eq!(buf.version(), before);
         assert_eq!(buf.undo.steps.len(), steps);
+    }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        key(code, KeyModifiers::SHIFT)
+    }
+
+    #[test_case(&[shift(KeyCode::Left), shift(KeyCode::Left)] => (Some(11), 9) ; "each_motion_stretches_it")]
+    #[test_case(&[shift(KeyCode::Left), shift(KeyCode::Home)] => (Some(11), 0) ; "the_anchor_stays_put")]
+    #[test_case(&[shift(KeyCode::Home), shift(KeyCode::End)] => (None, 11) ; "back_on_the_anchor_selects_nothing")]
+    #[test_case(&[shift(KeyCode::Left), plain(KeyCode::Left)] => (None, 9) ; "a_plain_motion_drops_it")]
+    fn shift_motions_select_from_where_the_cursor_was(keys: &[KeyEvent]) -> (Option<usize>, usize) {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        buf.move_to_end();
+        for &key in keys {
+            buf.handle_motion_key(key, key.modifiers.contains(KeyModifiers::SHIFT));
+        }
+        (buf.anchor(), buf.cursor_byte())
+    }
+
+    /// Whatever the keys would remove on their own, with text selected they
+    /// take just the selection. One undo brings back the text and the
+    /// selection, even after more typing joined the step.
+    #[test_case(5, plain(KeyCode::Home), &[plain(KeyCode::Char('h')), plain(KeyCode::Char('i'))] => ("hi world".to_owned(), 2) ; "typing_replaces_it")]
+    #[test_case(5, plain(KeyCode::Home), &[plain(KeyCode::Backspace)] => (" world".to_owned(), 0) ; "backspace_at_the_very_start_deletes_it")]
+    #[test_case(6, plain(KeyCode::End), &[plain(KeyCode::Delete)] => ("hello ".to_owned(), 6) ; "delete_at_the_very_end_deletes_it")]
+    #[test_case(11, alt(KeyCode::Left), &[ctrl(KeyCode::Char('w'))] => ("hello ".to_owned(), 6) ; "a_word_kill_takes_only_the_selection")]
+    fn keys_that_edit_replace_the_selection(
+        from: usize,
+        motion: KeyEvent,
+        edits: &[KeyEvent],
+    ) -> (String, usize) {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        buf.place_cursor(from);
+        buf.handle_motion_key(motion, true);
+        let selected = buf.selection();
+        for &edit in edits {
+            buf.handle_key(edit);
+        }
+        let edited = (buf.value().to_owned(), buf.cursor_byte());
+        assert_eq!(buf.selection(), None);
+
+        assert!(buf.undo());
+        assert_eq!((buf.value(), buf.selection()), (PLANNED_ON, selected));
+        assert!(!buf.undo());
+        edited
+    }
+
+    #[test]
+    fn no_edits_with_an_anchor_only_select() {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        buf.move_to_end();
+        let (version, steps) = (buf.version(), buf.undo.steps.len());
+
+        let (caret, _) = buf
+            .apply_edits(version, vec![], None, Some(6), None)
+            .unwrap();
+
+        assert_eq!(caret, PLANNED_ON.len());
+        assert_eq!(buf.selection(), Some(6..PLANNED_ON.len()));
+        assert_eq!((buf.version(), buf.undo.steps.len()), (version, steps));
+    }
+
+    /// Bold around `world`, the selection kept on the word, the way a Ctrl+B
+    /// plugin writes it.
+    #[test_case(Some(8), |_| {} => Ok(Some(8..13)) ; "selects_what_it_names")]
+    #[test_case(Some(8), |b| { b.set_cursor(0, 0); b.insert_text("oh ") } => Ok(Some(11..16)) ; "mapped_past_typing_before_it")]
+    #[test_case(Some(10), |b| b.replace_byte_range(7, 9, "X", None).unwrap() => matches Err(e) if e.starts_with(CURSOR_CONFLICT_ERR) ; "refused_inside_text_changed_since")]
+    #[test_case(None, |b| { b.handle_motion_key(plain(KeyCode::End), true); } => Ok(None) ; "none_drops_the_selection")]
+    fn an_edit_selects_from_its_anchor(
+        anchor: Option<usize>,
+        user: fn(&mut TextBuffer),
+    ) -> Result<Option<Range<usize>>, String> {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let planned = buf.version();
+        user(&mut buf);
+        let wrap = vec![text_edit(6, 6, "**"), text_edit(11, 11, "**")];
+        buf.apply_edits(planned, wrap, Some(13), anchor, None)?;
+        Ok(buf.selection())
+    }
+
+    #[test_case(12 => Some(4..12) ; "anchor_before_the_cursor_goes_to_the_start")]
+    #[test_case(0 => Some(0..8) ; "anchor_after_the_cursor_goes_to_the_end")]
+    fn an_anchor_inside_an_atomic_range_takes_it_whole(cursor: usize) -> Option<Range<usize>> {
+        const INSIDE_CHIP: usize = 6;
+        let mut buf = marked("say CHIP now", 4..8, Kind::Atomic, 0);
+        buf.apply_edits(
+            buf.version(),
+            vec![text_edit(12, 12, "!")],
+            Some(cursor),
+            Some(INSIDE_CHIP),
+            None,
+        )
+        .unwrap();
+        buf.selection()
     }
 }

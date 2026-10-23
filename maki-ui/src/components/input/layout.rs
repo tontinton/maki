@@ -562,13 +562,23 @@ impl RowSums {
 mod tests {
     use super::*;
     use crate::decor_worker;
+    use crate::text_buffer::fuzz::{self, Driver};
     use crate::text_buffer::{Decoration, Mark, Reveal, RuleSet, VirtTextPos};
     use maki_agent::SpanStyle;
-    use maki_lua::{InputRule, SyntaxRule, TextEdit};
+    use maki_lua::{InputRule, PatternRule, SyntaxRule, TextEdit};
     use std::sync::Arc;
     use test_case::test_case;
 
     const WIDTH: usize = 8;
+    const MAX_WIDTH: usize = 20;
+    const FUZZ_SEEDS: u64 = 4;
+    const WIDTH_CHANGE_ODDS: usize = 40;
+    const BURST_ODDS: usize = 150;
+    const LAG_ODDS: usize = 3;
+    const PARSE_ODDS: usize = 4;
+    const POLL_ODDS: usize = 3;
+    const RULE_CHIP: &str = r"@\w+";
+    const RULE_GHOST: &str = r"#\d";
     const SYNTAX_LANG: &str = "markdown";
     const SYNTAX_INLINE_LANG: &str = "markdown_inline";
     /// Fences hidden while the cursor is off them, and each code block a chip
@@ -596,6 +606,22 @@ mod tests {
         (layout.counts.clone(), layout.cursor_row(buffer), rows)
     }
 
+    /// Like [`observe`], but every row in one lookup and every running
+    /// total read on its own, which stays cheap on a long buffer.
+    fn observe_all(layout: &Layout, buffer: &TextBuffer) -> (Observed, Vec<u32>) {
+        let rows = layout
+            .rows(buffer, 0, layout.total_rows())
+            .map(|row| (row.line, row.index, row.bytes, row.text))
+            .collect();
+        let sums = (0..=layout.counts.len())
+            .map(|line| layout.sums.before(line))
+            .collect();
+        (
+            (layout.counts.clone(), layout.cursor_row(buffer), rows),
+            sums,
+        )
+    }
+
     /// Swaps the first match of each `old` for its `new`, all as one version.
     fn swap_all(buffer: &mut TextBuffer, swaps: &[(&str, &str)]) {
         let edits = swaps
@@ -610,7 +636,7 @@ mod tests {
             })
             .collect();
         buffer
-            .apply_edits(buffer.version(), edits, None, None)
+            .apply_edits(buffer.version(), edits, None, None, None)
             .unwrap();
     }
 
@@ -866,6 +892,26 @@ mod tests {
         }
     }
 
+    /// A conceal and inline virtual text from rules, which are matched again
+    /// from the text instead of moved with it.
+    fn chip_rules() -> Arc<RuleSet> {
+        let chip = Decoration {
+            conceal: Some("@".into()),
+            atomic: true,
+            ..Decoration::default()
+        };
+        let ghost = Decoration {
+            virt_text: vec![SnapshotSpan {
+                text: "ghost".into(),
+                style: SpanStyle::Default,
+            }],
+            virt_text_pos: VirtTextPos::Inline,
+            ..Decoration::default()
+        };
+        let rule = |pattern, mark| InputRule::Pattern(PatternRule::new(pattern, mark).unwrap());
+        RuleSet::with_plugins(&[rule(RULE_CHIP, chip), rule(RULE_GHOST, ghost)])
+    }
+
     /// Marks from a tree-sitter parse, which lag behind the text until the
     /// worker is back and move like placed marks meanwhile.
     fn syntax_rules() -> Arc<RuleSet> {
@@ -893,6 +939,72 @@ mod tests {
         )
         .unwrap();
         RuleSet::with_plugins(&[InputRule::Syntax(Arc::new(rule))])
+    }
+
+    /// Random edits, marks, undo, cursor moves and widths. The layout is
+    /// left behind now and then, for a few ops or for about as many versions
+    /// as the log holds, and however it caught up it has to read like one
+    /// built fresh. Any window of rows reads like the same rows of the whole.
+    #[test]
+    fn random_ops_catch_up_like_a_fresh_build() {
+        for seed in fuzz::seeds(FUZZ_SEEDS) {
+            let mut driver = Driver::new(seed);
+            decor_worker::manual();
+            let rule_sets: [fn() -> Option<Arc<RuleSet>>; _] =
+                [|| None, || Some(chip_rules()), || Some(syntax_rules())];
+            if let Some(rules) = rule_sets[seed as usize % rule_sets.len()]() {
+                driver.buffer.set_rules(rules);
+            }
+            let mut width = WIDTH;
+            let mut layout = synced(&driver.buffer, width);
+            for _ in 0..fuzz::OPS_PER_SEED {
+                if driver.rng.one_in(WIDTH_CHANGE_ODDS) {
+                    width = 1 + driver.rng.below(MAX_WIDTH);
+                    driver.note(format!("width {width}"));
+                }
+                if driver.rng.one_in(BURST_ODDS) {
+                    driver.note("burst".into());
+                    driver.text_burst();
+                }
+                let moved = driver.step();
+                layout.relayout(&driver.buffer, &moved);
+                if driver.rng.one_in(POLL_ODDS) {
+                    driver.note("poll_syntax".into());
+                    if let Some(changed) = driver.buffer.poll_syntax() {
+                        layout.relayout(&driver.buffer, &changed);
+                    }
+                }
+                if driver.rng.one_in(PARSE_ODDS) {
+                    driver.note("run_queued".into());
+                    decor_worker::run_queued();
+                }
+                if driver.rng.one_in(LAG_ODDS) {
+                    driver.note("lag".into());
+                    continue;
+                }
+                layout.sync(&driver.buffer, width);
+                let observed = observe_all(&layout, &driver.buffer);
+                assert_eq!(
+                    observed,
+                    observe_all(&synced(&driver.buffer, width), &driver.buffer),
+                    "width {width}, {}",
+                    driver.context()
+                );
+                let ((_, _, rows), _) = &observed;
+                let first = driver.rng.below(rows.len());
+                let count = 1 + driver.rng.below(rows.len() - first);
+                let window: Vec<_> = layout
+                    .rows(&driver.buffer, first as u32, count as u32)
+                    .map(|row| (row.line, row.index, row.bytes, row.text))
+                    .collect();
+                assert_eq!(
+                    window,
+                    rows[first..first + count],
+                    "rows {first}+{count}, width {width}, {}",
+                    driver.context()
+                );
+            }
+        }
     }
 
     /// A parse the worker has not replaced lags further behind with every

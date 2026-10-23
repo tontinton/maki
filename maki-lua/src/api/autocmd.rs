@@ -203,15 +203,20 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
 ///   plus `data.previous_spec`. Picking the model already in use stays
 ///   quiet, and so does startup.
-/// - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
-///   chat input as `maki.ui.input` reports it. `data.source` is the plugin
-///   name when that plugin's `maki.ui.input_edit` was the only writer this
-///   frame, and nil otherwise (including when the user moved the caret), so
-///   ignoring your own name never drops a change. `data.cursor_only` is true
-///   when only the caret moved. Handlers that only care about the text
-///   should return early on it. Fires at most once per frame, and only when
-///   `data.version` or the caret changed. Focusing another session
-///   republishes that session's input.
+/// - `"InputChanged"`: `data.text`, `data.cursor`, `data.anchor`,
+///   `data.version` and `data.session_id`, as
+///   [`maki.ui.input`](#maki-ui-input) reports them. `data.cursor_only` is
+///   true when only the cursor or the selection moved, so a handler that
+///   cares about the text alone returns early on it. `data.source` is the
+///   name of the plugin whose `maki.ui.input_edit` made the only change
+///   since the last `"InputChanged"`, and nil otherwise, so a handler can
+///   skip its own edits without missing anyone else's. A package goes by its
+///   [package name](/docs/packages/#install-from-git), and code in the
+///   global and the project `init.lua` by `"global/init.lua"` and
+///   `"project/init.lua"`. Fires at most once per screen redraw, and again
+///   for the input of a tab that takes focus. Marks alone never fire it, so
+///   a handler can call `maki.ui.input_decorate` without looping. It never
+///   fires without a UI.
 /// - `"ModeChanged"`: `data.old_mode` and `data.new_mode`, each `"n"` or
 ///   `"i"`. Fires whenever `maki.fn.mode()` changes: on `maki.ui.set_mode`,
 ///   and when the chat input gains or loses the keyboard, as when a picker

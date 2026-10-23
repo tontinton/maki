@@ -21,6 +21,7 @@ use crate::components::tool_display::resolve_span_style;
 use crate::decor_worker;
 use crate::highlight;
 use crate::text_buffer::{Change, Concealed, Placed, TextBuffer, VirtTextPos};
+use crate::theme;
 
 /// Longer text is colored on the worker, since coloring it here would hold
 /// up the frame.
@@ -44,12 +45,15 @@ pub(super) struct LineDecor {
 
 impl LineDecor {
     /// {bytes} is where the display line sits in {value}, and {marks} come
-    /// in the order they compose.
+    /// in the order they compose. {selected} is painted last, so no mark
+    /// color hides it. A conceal only takes a paint that covers all of it,
+    /// and a selection always covers an atomic one whole.
     pub fn new(
         value: &str,
         bytes: Range<usize>,
         marks: &[Placed],
         conceals: &[Concealed],
+        selected: Option<&Range<usize>>,
         langs: &mut LangCache,
     ) -> Self {
         let mut decor = Self {
@@ -68,8 +72,7 @@ impl LineDecor {
             .filter(|mark| mark.bytes.start <= bytes.end && mark.bytes.end >= bytes.start)
         {
             let decoration = mark.decoration;
-            let range = mark.bytes.start.max(bytes.start) - bytes.start
-                ..mark.bytes.end.min(bytes.end) - bytes.start;
+            let range = on_line(&mark.bytes, &bytes);
             if !range.is_empty() {
                 if let Some(lang) = &decoration.lang {
                     match langs.range(lang, &mark.bytes, value) {
@@ -111,6 +114,11 @@ impl LineDecor {
                     .push((mark.bytes.start - bytes.start, spans.collect())),
                 VirtTextPos::Eol => decor.eol.extend(spans),
             }
+        }
+        if let Some(range) = selected.map(|selected| on_line(selected, &bytes))
+            && !range.is_empty()
+        {
+            decor.paints.push((range, theme::current().item_selected));
         }
         decor.inline.sort_by_key(|(at, _)| *at);
         decor
@@ -417,6 +425,13 @@ fn highlight_text(lang: &str, text: &str) -> Vec<Paint> {
         line_start += line.len() + 1;
     }
     paints
+}
+
+/// The part of {range} on the display line at {line}, counted from where
+/// the line starts. Empty when it misses the line.
+fn on_line(range: &Range<usize>, line: &Range<usize>) -> Range<usize> {
+    let clamp = |at: usize| at.clamp(line.start, line.end) - line.start;
+    clamp(range.start)..clamp(range.end)
 }
 
 fn shifted(paints: &[Paint], by: usize) -> impl Iterator<Item = Paint> + '_ {

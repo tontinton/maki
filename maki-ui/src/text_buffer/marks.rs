@@ -482,7 +482,7 @@ mod tests {
             text: "**".into(),
         };
         buffer
-            .apply_edits(buffer.version(), vec![wrap(4), wrap(8)], None, None)
+            .apply_edits(buffer.version(), vec![wrap(4), wrap(8)], None, None, None)
             .unwrap();
         assert_eq!(ranges(buffer.marks()), vec![6..10]);
     }

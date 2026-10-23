@@ -109,6 +109,7 @@ pub fn plugin_edit(
             text: text.to_owned(),
         }],
         cursor: None,
+        anchor: None,
         version: app.input_box.buffer.version(),
         strict: false,
         session_id: app.state.session.id.to_string(),

@@ -1,3 +1,4 @@
+use super::mouse::FLASH_COPIED;
 use super::session::{FORK_EMPTY_MSG, FORK_TITLE_PREFIX};
 use super::*;
 use crate::AppSession;
@@ -443,9 +444,10 @@ fn mailbox_wake_starts_without_an_empty_user_bubble() {
     assert!(app.main_chat().segment_search_texts().is_empty());
 }
 
+const TYPED_TEXT: &str = "hi";
+
 fn with_text(app: &mut App) {
-    app.update(Msg::Key(key(KeyCode::Char('h'))));
-    app.update(Msg::Key(key(KeyCode::Char('i'))));
+    type_keys(app, TYPED_TEXT);
 }
 
 fn with_image(app: &mut App) {
@@ -453,24 +455,67 @@ fn with_image(app: &mut App) {
     app.input_box.attach_image(img);
 }
 
-#[test_case(with_text as fn(&mut App)  ; "clears_text")]
-#[test_case(with_image as fn(&mut App) ; "clears_image")]
-fn ctrl_c_clears_nonempty_input(setup: fn(&mut App)) {
-    let mut app = test_app();
-    setup(&mut app);
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(actions.is_empty());
-    assert_eq!(app.exit_request, ExitRequest::None);
-    assert!(app.input_box.is_empty());
+fn with_selection(app: &mut App) {
+    with_text(app);
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
 }
 
-#[test]
-fn ctrl_c_quits_when_input_empty() {
+fn with_nothing(_: &mut App) {}
+
+/// What one `Ctrl+C` in the chat input left behind: the text and whether
+/// the input is empty, and whether it copied, cancelled the turn or quit.
+#[derive(Debug, PartialEq)]
+struct CtrlC {
+    left: String,
+    empty: bool,
+    copied: bool,
+    cancelled: bool,
+    quit: bool,
+}
+
+const CTRL_C_EMPTIED: CtrlC = CtrlC {
+    left: String::new(),
+    empty: true,
+    copied: false,
+    cancelled: false,
+    quit: false,
+};
+
+fn copied_keeping_the_text() -> CtrlC {
+    CtrlC {
+        left: TYPED_TEXT.into(),
+        empty: false,
+        copied: true,
+        ..CTRL_C_EMPTIED
+    }
+}
+
+/// Each press does the first thing that applies: copy a selection, clear
+/// the input, then cancel a running turn or, idle, quit.
+#[test_case(with_selection as fn(&mut App), Status::Idle      => copied_keeping_the_text() ; "selection_copies_and_keeps_the_text")]
+#[test_case(with_selection as fn(&mut App), Status::Streaming => copied_keeping_the_text() ; "selection_copies_while_streaming")]
+#[test_case(with_text as fn(&mut App),      Status::Idle      => CTRL_C_EMPTIED ; "text_clears_the_input")]
+#[test_case(with_image as fn(&mut App),     Status::Idle      => CTRL_C_EMPTIED ; "image_clears_the_input")]
+#[test_case(with_nothing as fn(&mut App),   Status::Idle      => CtrlC { quit: true, ..CTRL_C_EMPTIED } ; "empty_idle_quits")]
+#[test_case(with_nothing as fn(&mut App),   Status::Streaming => CtrlC { cancelled: true, ..CTRL_C_EMPTIED } ; "empty_streaming_cancels_the_turn")]
+fn ctrl_c_in_the_chat_input(setup: fn(&mut App), status: Status) -> CtrlC {
     let mut app = test_app();
-    app.status = Status::Idle;
+    app.clipboard = ClipboardState::terminal_only();
+    setup(&mut app);
+    app.status = status;
+    app.run_id = 1;
+
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert_eq!(app.exit_request, ExitRequest::Success);
-    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+
+    CtrlC {
+        left: app.input_box.buffer.value().to_owned(),
+        empty: app.input_box.is_empty(),
+        copied: app.status_bar.flash_text() == Some(FLASH_COPIED),
+        cancelled: matches!(actions.as_slice(), [Action::CancelAgent { .. }])
+            && app.status == Status::Idle,
+        quit: app.exit_request == ExitRequest::Success
+            && matches!(actions.as_slice(), [Action::ManualExit]),
+    }
 }
 
 #[test_case(done(), ExitRequest::Success ; "done_exits_success")]
@@ -2732,18 +2777,6 @@ fn double_esc_idle_no_user_turns_flashes_error() {
     assert!(!app.rewind_picker.is_open());
 }
 
-#[test]
-fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
-    assert_eq!(app.status, Status::Idle);
-    assert_ne!(app.exit_request, ExitRequest::Success);
-}
-
 /// The whole point of issue 778: a settled session paints nothing at all. Any
 /// poller that starts reporting a change on every tick trips this.
 #[test]
@@ -3157,6 +3190,7 @@ fn input_snapshot_carries_nothing_a_slice_would_give() {
             "session_id": app.state.session.id.to_string(),
             "text": DRAFT,
             "cursor": DRAFT.len(),
+            "anchor": null,
             "version": app.input_box.buffer.version(),
         })
     );
@@ -6519,7 +6553,7 @@ maki.keymap.set("i", "<Paste>", function(ev)
   maki.ui.input_edit({
     start = st.cursor, stop = st.cursor, text = ev.text,
     ns = "paste",
-    marks = { { start = st.cursor, stop = st.cursor + #ev.text, conceal = "[3 lines]" } },
+    marks = { { start = st.cursor, stop = st.cursor + #ev.text, conceal = "[3 lines]", atomic = true } },
     version = st.version, session_id = st.session_id,
   })
 end)
@@ -6643,6 +6677,55 @@ fn held_keys_hop_tabs_with_the_handler_and_land_once() {
 
     assert_eq!(second.input_box.buffer.value(), "abc");
     assert_eq!(first.input_box.buffer.value(), "d");
+}
+
+const BOLD_PLUGIN: &str = r#"
+maki.keymap.set("i", "<C-b>", function(ev)
+  local st = ev.input
+  if not st.anchor then return ev.fallback() end
+  local s, e = math.min(st.anchor, st.cursor), math.max(st.anchor, st.cursor)
+  maki.ui.input_edit({
+    edits = { { start = s, stop = s, text = "**" }, { start = e, stop = e, text = "**" } },
+    cursor = e + 2, anchor = s + 2,
+    version = st.version, session_id = st.session_id,
+  })
+end)
+"#;
+const UNBOLDED: &str = "make it bold";
+const BOLDED: &str = "make it **bold**";
+const BOLD_WORD: &str = "bold";
+
+/// Both `**` land as one version, the word stays selected for the next
+/// keystroke, and one undo takes the wrap back with the selection it had.
+#[test]
+fn ctrl_b_wraps_the_selection_in_one_step() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("bold", BOLD_PLUGIN).unwrap();
+    let (mut app, ui) = hosted_app(&host);
+    type_keys(&mut app, UNBOLDED);
+    for _ in 0..BOLD_WORD.len() {
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
+    }
+    let version = app.input_box.buffer.version();
+
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('b'),
+        KeyModifiers::CONTROL,
+    )));
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(app.input_box.buffer.value(), BOLDED);
+    assert_eq!(app.input_box.buffer.version(), version + 1);
+    assert_eq!(
+        app.input_box.take_selected_text().as_deref(),
+        Some(BOLD_WORD)
+    );
+
+    app.update(Msg::Key(kb::UNDO.to_key_event()));
+    assert_eq!(app.input_box.buffer.value(), UNBOLDED);
+    assert_eq!(
+        app.input_box.take_selected_text().as_deref(),
+        Some(BOLD_WORD)
+    );
 }
 
 /// A source for `$` that answers at once, so the real completion popup opens
@@ -7933,6 +8016,48 @@ fn moving_the_cursor_alone_fires_a_cursor_only_change() {
         None,
         "a frame that moved neither the caret nor the text stays silent"
     );
+}
+
+/// `Esc` drops a selection without moving the caret or the text, and a
+/// plugin drawing on the selection still has to hear it went.
+#[test]
+fn a_selection_alone_fires_a_cursor_only_change() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    type_keys(&mut app, "ab");
+    let _ = app.tick();
+    next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["cursor"], 1);
+    assert_eq!(data["anchor"], 2);
+    assert_eq!(data["cursor_only"], true);
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert!(data["anchor"].is_null());
+    assert_eq!(data["cursor_only"], true);
+}
+
+/// A selection must not cost a turn's cancel a press: during a turn the `Esc`
+/// that drops it arms the cancel too. Idle it only drops it.
+#[test_case(Status::Idle,      None               ; "idle_only_deselects")]
+#[test_case(Status::Streaming, Some(FLASH_CANCEL) ; "streaming_also_arms_cancel")]
+fn esc_with_a_selection(status: Status, expected_flash: Option<&str>) {
+    let mut app = test_app();
+    type_keys(&mut app, "ab");
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
+    app.status = status;
+    app.run_id = 1;
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(app.input_box.buffer.anchor(), None);
+    assert_eq!(app.status_bar.flash_text(), expected_flash);
 }
 
 /// What `model_state` reports has to parse back into the same state, or a
