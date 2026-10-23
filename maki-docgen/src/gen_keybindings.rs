@@ -32,6 +32,10 @@ const PLUGIN_BINDS: &[(&str, &str)] = &[
     ("`Ctrl+P`", "Browse sessions"),
     ("`Ctrl+X`", "Open tasks"),
     ("`Alt+T`", "Thinking effort"),
+    ("`Alt+J`", "Next message"),
+    ("`Alt+K`", "Previous message"),
+    ("`Alt+N`", "Next user prompt"),
+    ("`Alt+P`", "Previous user prompt"),
 ];
 
 const MAIN_CONTEXTS: &[KeybindContext] = &[
@@ -124,6 +128,14 @@ fn write_plugin_binds(out: &mut String) {
     for (key, desc) in PLUGIN_BINDS {
         out.push_str(&format!("| {key} | {desc} |\n"));
     }
+    out.push_str(
+        "\nThe `navigation` plugin moves between user and assistant message headers, \
+         including streaming assistant text. Each jump briefly highlights its target. \
+         At a boundary, it stays in place and highlights the boundary in the error style. \
+         Set `plugins.navigation = { wrap = true }` in `maki.setup()` to wrap instead. \
+         Wrapping is off by default. Set `plugins.navigation = { enabled = false }` \
+         to disable these navigation bindings.\n",
+    );
 }
 
 fn write_inheritance(out: &mut String) {

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use maki_agent::UiWaker;
 use maki_agent::tools::compact_duration;
@@ -16,7 +17,7 @@ use crate::api::util::command::{
     ui_send,
 };
 use crate::api::util::convert::opt_bool;
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
 pub(crate) mod blit;
@@ -749,7 +750,8 @@ lua_table! {
     /// Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
     /// still work. The calls that need a screen behave like this:
     ///
-    /// - `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
+    /// - `action`, `input`, `input_edit`, `transcript_positions`, and
+    ///   `highlight_transcript` return `nil, "no interactive UI attached"`.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
     /// - `open_win`, `set_status_hint`, and `set_window_title` have no effect.
@@ -757,8 +759,72 @@ lua_table! {
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_edit,
+        manual set_window_title, manual input, manual input_edit, manual transcript_positions, manual highlight_transcript,
     ]
+}
+
+/// Read message headers from the last painted transcript without changing render state.
+/// Each entry has `role` (`"user"` or `"assistant"`) and `line` (the one-based,
+/// unclamped transcript row). Includes streaming assistant text. New messages
+/// appear after the next paint.
+///
+/// Read the viewport with `maki.fn.winsaveview()` and scroll with
+/// `maki.fn.winrestview({ topline = line })`, which clamps to the scrollable range.
+///
+/// @return (table[]|nil, string|nil) Message headers in transcript order, or nil and an error if the UI is unavailable.
+/// @example
+/// local positions, err = maki.ui.transcript_positions()
+/// if not positions then
+///   maki.notify(err, "error")
+///   return
+/// end
+/// if positions[1] then
+///   maki.fn.winrestview({ topline = positions[1].line })
+/// end
+#[lua_fn]
+async fn transcript_positions(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+) -> LuaResult<Pair<mlua::Value>> {
+    ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| {
+        UiAction::TranscriptPositions { reply_tx }
+    })
+    .await
+}
+
+/// Highlight a one-based transcript line for `duration_ms` milliseconds.
+/// Uses the same named theme styles as UI spans, such as `"item_selected"`
+/// or `"error"`. Scrolling clears the highlight. A line above the viewport
+/// highlights the first visible row instead.
+/// @param line integer Positive, one-based transcript line.
+/// @param duration_ms integer Highlight duration in milliseconds.
+/// @param style string Named theme style, using the same spelling as a span.
+/// @return (boolean|nil, string|nil) `true` when queued, or nil and an error for a zero line or unavailable UI.
+/// @example
+/// local ok, err = maki.ui.highlight_transcript(1, 180, "item_selected")
+/// if not ok then
+///   maki.notify(err, "error")
+/// end
+#[lua_fn]
+fn highlight_transcript(
+    _lua: &Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    line: u32,
+    duration_ms: u64,
+    style: String,
+) -> LuaResult<Pair<bool>> {
+    let Some(row) = line.checked_sub(1) else {
+        return Ok(err_pair("line must be positive"));
+    };
+    try_pair!(ui_send(
+        tx.as_ref(),
+        UiAction::HighlightTranscript {
+            row,
+            style,
+            duration: Duration::from_millis(duration_ms),
+        }
+    ));
+    Ok((Some(true), None))
 }
 
 pub(crate) fn create_ui_table(
@@ -772,6 +838,8 @@ pub(crate) fn create_ui_table(
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
     action__register(&t, lua, ui_action_tx.clone())?;
+    transcript_positions__register(&t, lua, ui_action_tx.clone())?;
+    highlight_transcript__register(&t, lua, ui_action_tx.clone())?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
     input__register(&t, lua, ui_action_tx.clone())?;
     input_edit__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
@@ -988,6 +1056,48 @@ mod tests {
         t.raw_set(1, key).unwrap();
         t.raw_set(2, label).unwrap();
         t
+    }
+
+    #[test_case("item_selected" ; "destination")]
+    #[test_case("error" ; "boundary")]
+    fn transcript_highlight_forwards_style_and_duration(style: &str) {
+        const LINE: u32 = 3;
+        const DURATION_MS: u64 = 180;
+        let lua = Lua::new();
+        let (tx, rx) = flume::unbounded();
+        let (ok, err) =
+            highlight_transcript(&lua, Some(tx), LINE, DURATION_MS, style.to_owned()).unwrap();
+        assert_eq!(ok, Some(true));
+        assert!(err.is_none());
+        let UiAction::HighlightTranscript {
+            row,
+            style: actual_style,
+            duration,
+        } = rx.recv().unwrap()
+        else {
+            panic!("expected transcript highlight");
+        };
+        assert_eq!(row, LINE - 1);
+        assert_eq!(actual_style, style);
+        assert_eq!(duration, Duration::from_millis(DURATION_MS));
+    }
+
+    #[test]
+    fn transcript_positions_returns_renderer_snapshot() {
+        let lua = Lua::new();
+        let (tx, rx) = flume::unbounded();
+        let snapshot = serde_json::json!([{ "role": "user", "line": 1 }]);
+        let expected = snapshot.clone();
+        let worker = std::thread::spawn(move || {
+            let UiAction::TranscriptPositions { reply_tx } = rx.recv().unwrap() else {
+                panic!("expected transcript positions");
+            };
+            reply_tx.send(Ok(snapshot)).unwrap();
+        });
+        let (value, err) = smol::block_on(transcript_positions(lua.clone(), Some(tx))).unwrap();
+        assert!(err.is_none());
+        assert_eq!(lua_to_json(&lua, &value.unwrap()).unwrap(), expected);
+        worker.join().unwrap();
     }
 
     #[test]

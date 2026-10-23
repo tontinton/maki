@@ -205,6 +205,8 @@ declare maki: {
     set_window_title: @checked (title: string) -> (),
     input: @checked () -> (any, string?),
     input_edit: @checked (opts: any) -> (boolean?, string?),
+    transcript_positions: @checked () -> (any, string?),
+    highlight_transcript: @checked (line: number, duration_ms: number, style: string) -> (boolean?, string?),
   },
   uv: {
     cwd: @checked () -> (string?),
