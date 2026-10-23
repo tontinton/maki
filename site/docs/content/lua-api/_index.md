@@ -3838,11 +3838,11 @@ Without an interactive UI every function returns
 ### `maki.model.get()` {#maki-model-get}
 
 ```lua
-maki.model.get()
+maki.model.get({opts?})
 ```
 
-Reads the focused session's model, thinking level, and fast mode.
-`thinking` comes back in the spelling `set` accepts, so a table from here
+Reads a session's model, thinking level, and fast mode, the focused one
+unless `opts.session` names another. `thinking` comes back in the spelling `set` accepts, so a table from here
 can go straight back in.
 
 `thinking_options` is every thinking value this model accepts, cheapest
@@ -3850,6 +3850,11 @@ first: `{name, tokens?}` per row, where `tokens` is the budget maki would
 send for that row and is absent on `off` and `adaptive`. It is empty exactly
 when `supports_thinking` is false, so a picker can render the ladder from it
 without knowing the levels.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string`) id of a live session, defaults to the focused one.
 
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking,
   thinking_options, fast, supports_thinking, supports_fast}`, or nil and an
@@ -3890,22 +3895,30 @@ local specs = maki.model.available()
 ### `maki.model.set()` {#maki-model-set}
 
 ```lua
-maki.model.set({opts})
+maki.model.set({spec}, {opts?})
 ```
 
-Switches the focused session's model, thinking level, or fast mode. Fields
-you leave out stay as they are, so this doubles as a thinking-only switch.
-Answers with the new state, in the same shape `get` returns.
+Switches a session's model, thinking level, or fast mode, the focused one
+unless `opts.session` names another. Fields you leave out stay as they
+are, so this doubles as a thinking-only switch. Answers with the new
+state, in the same shape `get` returns.
+
+A new spec also becomes the model the next `maki` starts on, like picking
+it in `/model`, unless `opts.persist` is false. Naming a session turns
+that off by default, since steering one tab is not choosing a default.
 
 **Parameters:**
 
-- `{opts}` (`string|table`) A model spec, or a table with any of:
+- `{spec}` (`string|table`) A model spec, or a table with any of:
   - `spec` (`string`) `"provider/id"`, as listed by `available()`;
   - `thinking` (`string|number`) `"off"`, `"adaptive"`, an effort level
 
   (`"minimal"` to `"max"`), a token budget, or `""` to toggle it on and off;
 
   - `fast` (`boolean`) Anthropic fast mode.
+- `{opts?}` (`table?`) Options:
+  - `session` (`string`) id of a live session, defaults to the focused one.
+  - `persist` (`boolean`) remember a new spec as the default; true unless `session` is set.
 
 **Returns:** (`table|nil`, `string|nil`) The new state, or nil and an error.
 
@@ -3915,6 +3928,7 @@ Answers with the new state, in the same shape `get` returns.
 maki.model.set("anthropic/claude-opus-4-6")
 maki.model.set({ spec = "zai/glm-5", thinking = "high" })
 maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+maki.model.set({ thinking = "high" }, { session = id })
 ```
 
 ---

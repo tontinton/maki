@@ -477,13 +477,20 @@ pub enum TaskRequest {
     Remove { id: String },
 }
 
+/// `session` names a live session; `None` is the focused one.
 pub enum ModelRequest {
-    Get,
+    Get {
+        session: Option<String>,
+    },
     Available,
     Set {
         spec: Option<String>,
         thinking: Option<String>,
         fast: Option<bool>,
+        session: Option<String>,
+        /// Whether a new spec also becomes the default the next `maki`
+        /// starts on and joins the recent list.
+        persist: bool,
     },
 }
 
