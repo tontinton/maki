@@ -105,6 +105,19 @@ fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, S
         .ok_or_else(|| ctx.cap_err(&format!("maki.agent.{method}")))
 }
 
+/// What the config and the model take away from `base`, the same for a
+/// subagent's tools as for the hints in its prompt.
+fn config_filter(base: ToolFilter, agent: &AgentContext, model: &Model) -> ToolFilter {
+    let disabled: Vec<&str> = agent
+        .config
+        .disabled_tools
+        .iter()
+        .map(String::as_str)
+        .collect();
+    base.excluding(&disabled)
+        .excluding(maki_agent::tools::capability_exclusions(model))
+}
+
 fn required_opts(opts: Option<Table>) -> LuaResult<Table> {
     opts.ok_or_else(|| mlua::Error::runtime(OPTS_REQUIRED_ERR))
 }
@@ -370,11 +383,13 @@ async fn resolve_model(
 /// if err then error(err) end
 #[lua_fn]
 async fn system_prompt(
-    _lua: Lua,
+    lua: Lua,
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
-    let slots = Arc::clone(&try_pair!(dispatch_ctx(&ctx, "system_prompt")).prompt_slots);
+    let agent = try_pair!(dispatch_ctx(&ctx, "system_prompt"));
+    let slots = Arc::clone(&agent.prompt_slots);
+    let filter = config_filter(ToolFilter::All, agent, &agent.model);
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
     // meanwhile needs `ctx:finish`, which takes it mutably.
     drop(ctx);
@@ -398,6 +413,12 @@ async fn system_prompt(
         _ => return Err(mlua::Error::runtime("instructions must be bool or string")),
     };
 
+    let registry = try_pair!(
+        lua.app_data_ref::<Arc<ToolRegistry>>()
+            .map(|registry| Arc::clone(&registry))
+            .ok_or(NO_REGISTRY_ERR)
+    );
+    let slots = slots.for_tools(&registry, &filter);
     Ok((Some(slots.render(prompt_id, &vars, &instructions)), None))
 }
 
@@ -464,15 +485,7 @@ async fn tools(
         (_, Some(e)) => ToolFilter::AllExcept(e),
         _ => ToolFilter::All,
     };
-    let disabled: Vec<&str> = agent
-        .config
-        .disabled_tools
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let filter = base
-        .excluding(&disabled)
-        .excluding(maki_agent::tools::capability_exclusions(model));
+    let filter = config_filter(base, &agent, model);
 
     let vars = maki_agent::template::env_vars();
     let ctx_desc = DescriptionContext {
@@ -1671,8 +1684,9 @@ fn call_local_tool(
 mod tests {
     use flume::Sender;
     use futures_lite::future::poll_once;
-    use maki_agent::prompt::{PromptId, ResolvedPrompts};
-    use maki_agent::tools::test_support::stub_ctx_with;
+    use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
+    use maki_agent::tools::test_support::{mock_tool, stub_ctx_with};
+    use maki_agent::tools::{ToolAudience, ToolSource};
     use maki_agent::{DoneReason, TurnCompleteEvent};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -1692,6 +1706,8 @@ mod tests {
     const PARTIAL_TEXT: &str = "partial response";
     const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
     const CLOSE_SESSION: &str = "function(sess) sess:close() end";
+    const HINTED_TOOL: &str = "hinted_tool";
+    const TOOL_HINT: &str = "Call hinted_tool first.";
 
     struct PendingProvider(flume::Sender<()>);
 
@@ -1884,6 +1900,41 @@ mod tests {
         fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+    }
+
+    #[test_case(&[], true ; "tool_enabled")]
+    #[test_case(&[HINTED_TOOL], false ; "tool_disabled")]
+    fn subagent_prompt_drops_hints_of_disabled_tools(disabled: &[&str], hinted: bool) {
+        let lua = Lua::new();
+        let registry = ToolRegistry::new();
+        let source = ToolSource::Lua {
+            plugin: PLUGIN.into(),
+        };
+        registry
+            .register(mock_tool(HINTED_TOOL, ToolAudience::all()), source)
+            .unwrap();
+        lua.set_app_data(Arc::new(registry));
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.config.disabled_tools = disabled.iter().map(|name| (*name).to_owned()).collect();
+        let mut prompts = ResolvedPrompts::default();
+        let entry = SlotEntry {
+            plugin: PLUGIN.into(),
+            content: TOOL_HINT.into(),
+        };
+        prompts.insert(PromptId::Research, Slot::ToolUsage, entry);
+        ctx.prompt_slots = Arc::new(prompts);
+
+        let (system, error) = smol::block_on(async {
+            let ctx = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+            let opts = lua.create_table().unwrap();
+            opts.set("prompt_id", "research").unwrap();
+            system_prompt(lua.clone(), ctx.borrow().unwrap(), opts)
+                .await
+                .unwrap()
+        });
+
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(system.unwrap().contains(TOOL_HINT), hinted);
     }
 
     #[test_case("research", PromptId::Research ; "research_child")]

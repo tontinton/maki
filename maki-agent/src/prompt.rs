@@ -1,9 +1,11 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
 use crate::template::Vars;
+use crate::tools::{ToolFilter, ToolRegistry};
 
 pub trait ValidNames: IntoEnumIterator + std::fmt::Display {
     fn valid_names() -> String {
@@ -136,12 +138,13 @@ impl PromptId {
 impl ValidNames for Slot {}
 impl ValidNames for PromptId {}
 
+#[derive(Clone)]
 pub struct SlotEntry {
     pub plugin: Arc<str>,
     pub content: String,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ResolvedPrompts {
     entries: HashMap<(PromptId, Slot), Vec<SlotEntry>>,
     templates: HashMap<PromptId, String>,
@@ -158,6 +161,20 @@ impl ResolvedPrompts {
 
     pub fn insert(&mut self, prompt: PromptId, slot: Slot, entry: SlotEntry) {
         self.entries.entry((prompt, slot)).or_default().push(entry);
+    }
+
+    /// Without the hints of plugins whose every tool `filter` keeps out of the
+    /// run, so the prompt never tells the model to call a tool it can't see.
+    pub fn for_tools(&self, registry: &ToolRegistry, filter: &ToolFilter) -> Cow<'_, Self> {
+        let hidden = registry.plugins_filtered_out(filter);
+        if hidden.is_empty() {
+            return Cow::Borrowed(self);
+        }
+        let mut prompts = self.clone();
+        for entries in prompts.entries.values_mut() {
+            entries.retain(|entry| !hidden.contains(&entry.plugin));
+        }
+        Cow::Owned(prompts)
     }
 
     pub fn set_template(&mut self, prompt: PromptId, content: String) {
@@ -281,6 +298,9 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    use crate::tools::test_support::mock_tool;
+    use crate::tools::{ToolAudience, ToolSource};
+
     const NATIVE_EFFICIENT_LINE: &str = "Most efficient tools: batch, code_execution, task";
 
     fn slots(prompt: PromptId, entries: &[(Slot, &str)]) -> ResolvedPrompts {
@@ -334,6 +354,44 @@ mod tests {
             positions.is_sorted(),
             "sections out of layout order ({positions:?}):\n{out}"
         );
+    }
+
+    const HINTED_PLUGIN: &str = "hinted";
+    const TOOLLESS_PLUGIN: &str = "toolless";
+    const TOOL_A: &str = "tool_a";
+    const TOOL_B: &str = "tool_b";
+    const HINT: &str = "Call tool_a first.";
+    const TOOLLESS_HINT: &str = "Be brief.";
+
+    #[test_case(ToolFilter::All, true ; "all_tools_sent")]
+    #[test_case(ToolFilter::AllExcept(vec![TOOL_A.into()]), true ; "one_tool_still_sent")]
+    #[test_case(ToolFilter::AllExcept(vec![TOOL_A.into(), TOOL_B.into()]), false ; "every_tool_excluded")]
+    #[test_case(ToolFilter::Only(vec!["other".into()]), false ; "not_allowed")]
+    fn hints_follow_their_plugins_tools(filter: ToolFilter, hinted: bool) {
+        let registry = ToolRegistry::new();
+        for name in [TOOL_A, TOOL_B] {
+            let source = ToolSource::Lua {
+                plugin: HINTED_PLUGIN.into(),
+            };
+            registry
+                .register(mock_tool(name, ToolAudience::all()), source)
+                .unwrap();
+        }
+        let mut prompts = ResolvedPrompts::default();
+        for (plugin, content) in [(HINTED_PLUGIN, HINT), (TOOLLESS_PLUGIN, TOOLLESS_HINT)] {
+            let entry = SlotEntry {
+                plugin: plugin.into(),
+                content: content.into(),
+            };
+            prompts.insert(PromptId::System, Slot::ToolUsage, entry);
+        }
+
+        let section = prompts
+            .for_tools(&registry, &filter)
+            .section(PromptId::System, Slot::ToolUsage);
+
+        assert_eq!(section.contains(HINT), hinted);
+        assert!(section.contains(TOOLLESS_HINT));
     }
 
     /// Regression: a `tool_usage` hint must land inside the `# Tool usage`

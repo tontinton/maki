@@ -2,6 +2,7 @@
 //! path, no parallel lists that can drift.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -18,7 +19,7 @@ use crate::{BufferSnapshot, ToolOutput};
 
 use super::hook::ToolHook;
 use super::schema::sanitize_tool_input_schema;
-use super::{DescriptionContext, ToolContext};
+use super::{DescriptionContext, ToolContext, ToolFilter};
 use crate::agent::AgentHook;
 
 bitflags! {
@@ -483,6 +484,22 @@ impl ToolRegistry {
             .and_then(|e| e.try_parse(input))
             .map(|inv| inv.start_header().into_ready().text())
             .unwrap_or_else(|| name.to_owned())
+    }
+
+    /// Plugins that registered tools of which `filter` lets none through.
+    pub fn plugins_filtered_out(&self, filter: &ToolFilter) -> Vec<Arc<str>> {
+        let tools = self.tools.load();
+        let mut visible: BTreeMap<&Arc<str>, bool> = BTreeMap::new();
+        for tool in tools.iter() {
+            if let ToolSource::Lua { plugin } = &tool.source {
+                *visible.entry(plugin).or_default() |= filter.matches(tool.name());
+            }
+        }
+        visible
+            .into_iter()
+            .filter(|(_, visible)| !visible)
+            .map(|(plugin, _)| Arc::clone(plugin))
+            .collect()
     }
 
     pub fn names(&self) -> Vec<Arc<str>> {
