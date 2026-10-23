@@ -11,6 +11,7 @@ pub mod language;
 mod loader;
 mod pack;
 pub(crate) mod plugin_permissions;
+mod plugin_status;
 mod runtime;
 pub mod session_snapshot;
 

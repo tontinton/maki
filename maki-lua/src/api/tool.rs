@@ -1115,6 +1115,28 @@ fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> 
     register_prompt(lua, plugin, prompts, target, content)
 }
 
+/// List every plugin maki knows about, loaded or not, with what each one
+/// registered and the errors it raised recently.
+///
+/// Covers bundled plugins (including disabled ones), installed packages
+/// (including disabled and never-activated `opt/` ones, and ones discovery
+/// refused), and `init.lua` files. `errors` keeps the 20 newest runtime
+/// errors, oldest first; `seam` names where the error surfaced, such as
+/// `"autocmd"`, `"command"`, `"keybind"`, `"defer_fn"`, `"async"`,
+/// `"hint"`, `"header"`, `"describe"`, `"watchdog"` or a slot name.
+///
+/// @return (table[]) Entries sorted by name: { name, source = "bundled"|"package"|"init", path?, enabled, loaded, load_error?, errors = { { t, seam, msg } }, commands = string[], tools = string[], autocmds = integer }.
+/// @example
+/// for _, p in ipairs(maki.api.list_plugins()) do
+///   if p.load_error or #p.errors > 0 then
+///     print(p.name, p.load_error or p.errors[#p.errors].msg)
+///   end
+/// end
+#[lua_fn]
+fn list_plugins(lua: &Lua) -> LuaResult<mlua::Value> {
+    lua.to_value(&crate::plugin_status::plugin_listing(lua))
+}
+
 /// Return a list of all registered tools. Useful for building UI that shows
 /// available tools or for checking which tools are enabled.
 ///
@@ -1207,7 +1229,7 @@ lua_table! {
     extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, reach: PluginReach, plugin: Arc<str>, opts: PluginOpts), DOCS [
         register_tool(pending, reach), register_permission_rule(pending_rules), register_command(plugin, reach),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
-        get_tools, get_tool,
+        get_tools, get_tool, list_plugins,
         manual run_command,
     ]
 }

@@ -332,9 +332,14 @@ fn invoke_chain(
         let prev = make_prev(&chain, idx - 1, &state)?;
         let mut layer_args = args.clone();
         layer_args.push_front(Value::Function(prev));
-        let result =
-            call_swallowing::<MultiValue>(&layer.func, layer_args, &chain.name, &layer.plugin)
-                .await;
+        let result = call_swallowing::<MultiValue>(
+            &chain.lua,
+            &layer.func,
+            layer_args,
+            &chain.name,
+            &layer.plugin,
+        )
+        .await;
         match (result, take_state(&state, PrevState::Expired)) {
             (Some(r), _) => {
                 if let Some(observe) = &chain.observe {

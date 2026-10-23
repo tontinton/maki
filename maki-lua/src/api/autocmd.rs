@@ -108,12 +108,9 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
         })
         .await
         {
-            tracing::warn!(
-                event,
-                plugin = &*plugin,
-                error = %strip_traceback(&e),
-                "plugin callback failed"
-            );
+            let error = strip_traceback(&e);
+            tracing::warn!(event, plugin = &*plugin, error = %error, "plugin callback failed");
+            crate::plugin_status::record_error(&lua, &plugin, "autocmd", error);
         }
     }
 }
