@@ -5,7 +5,7 @@
 //! `AgentHandles::respawn`. Everything else only reads it.
 
 mod btw;
-mod image_paste;
+pub(crate) mod image_paste;
 pub(crate) mod mode;
 mod mouse;
 mod queue;
@@ -555,6 +555,7 @@ pub struct App {
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     pub(crate) primary_paste_rx: Vec<flume::Receiver<Option<String>>>,
+    pub(crate) copy_rx: Vec<flume::Receiver<Result<(), String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
@@ -676,7 +677,7 @@ impl App {
             retry_info: None,
             zones: ZoneRegistry::new(),
             selection_state: None,
-            clipboard: ClipboardState::new(),
+            clipboard: ClipboardState::new(ui_config.clipboard_command.clone()),
             last_esc: None,
             quit_copied: false,
             storage,
@@ -685,6 +686,7 @@ impl App {
             shared_history: None,
             image_paste_rx: vec![],
             primary_paste_rx: vec![],
+            copy_rx: vec![],
             storage_writer,
             last_sent: None,
             shell: shell::ShellState::default(),
@@ -3003,6 +3005,7 @@ impl App {
             | self.tick_error_expiry()
             | self.poll_image_paste()
             | self.poll_primary_paste()
+            | self.poll_copy()
             | self.btw_modal.poll()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
