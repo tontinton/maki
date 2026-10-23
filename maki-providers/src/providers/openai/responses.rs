@@ -94,7 +94,8 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                         }
                         ContentBlock::ToolUse { .. }
                         | ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::Unknown(_) => {}
                     }
                 }
             }
@@ -113,7 +114,8 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
                         | ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::Unknown(_) => {}
                     }
                 }
 

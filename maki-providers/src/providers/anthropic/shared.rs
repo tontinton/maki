@@ -281,11 +281,13 @@ pub(crate) struct WireMessage<'a> {
 }
 
 /// The API rejects blank text blocks and thinking it did not sign (e.g. an
-/// OpenAI reasoning summary from earlier in the session).
+/// OpenAI reasoning summary from earlier in the session). A block this build
+/// does not know is never sent.
 fn is_replayable(block: &ContentBlock) -> bool {
     match block {
         ContentBlock::Text { text } => !text.trim().is_empty(),
         ContentBlock::Thinking { signature, .. } => signature.is_some(),
+        ContentBlock::Unknown(_) => false,
         _ => true,
     }
 }

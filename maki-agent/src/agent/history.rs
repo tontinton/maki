@@ -215,8 +215,11 @@ impl History {
         self.rewrite(|msgs| msgs.truncate(len));
     }
 
-    /// Drops every thinking block, the one edit that leaves later ones valid
-    /// whatever moved under them. Returns how many went.
+    /// Drops every thinking block and thought signature, the one edit that
+    /// leaves later ones valid whatever moved under them. Returns how many
+    /// thinking blocks went. With none, signatures stay too: no provider that
+    /// binds thinking is sent them, so stripping only those would replay the
+    /// same failing request.
     pub(crate) fn strip_thinking(&mut self) -> usize {
         let thinking = self
             .as_slice()
@@ -306,9 +309,19 @@ pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool 
     changed
 }
 
+/// Thought signatures go with the thinking: they are bound to the same
+/// prefix, so whatever voids one voids the other.
 pub(super) fn strip_thinking(messages: &mut [Message]) {
     for msg in messages {
         msg.content.retain(|block| !block.is_thinking());
+        for block in &mut msg.content {
+            if let ContentBlock::ToolUse {
+                thought_signature, ..
+            } = block
+            {
+                *thought_signature = None;
+            }
+        }
     }
 }
 
@@ -391,6 +404,8 @@ mod tests {
     const FIRST: &str = "first";
     const SECOND: &str = "second";
     const GO: &str = "go";
+    const SIGNATURE: &str = "sig";
+    const UNKNOWN_BLOCK_TYPE: &str = "server_tool_use";
 
     #[track_caller]
     fn assert_ends_with_cancel_marker(history: &History) {
@@ -683,6 +698,49 @@ mod tests {
             [ContentBlock::Text { text }] if text == "keep me"
         ));
         assert!(!remove_orphaned_tool_results(&mut messages));
+    }
+
+    /// The count drives the unbound-thinking retry, so it counts only
+    /// thinking blocks: signatures go with them but never earn a retry.
+    #[test_case(true, 1 ; "thinking_and_signature")]
+    #[test_case(false, 0 ; "signature_only")]
+    fn strip_thinking_counts_only_thinking_blocks(with_thinking: bool, expected: usize) {
+        let mut call = make_tool_use_msg(&["t1"]);
+        let ContentBlock::ToolUse {
+            thought_signature, ..
+        } = &mut call.content[0]
+        else {
+            unreachable!()
+        };
+        *thought_signature = Some(SIGNATURE.into());
+        if with_thinking {
+            call.content.insert(
+                0,
+                ContentBlock::Thinking {
+                    thinking: GO.into(),
+                    signature: Some(SIGNATURE.into()),
+                },
+            );
+        }
+        let mut history = History::new(vec![Message::user(GO.into()), call]);
+
+        assert_eq!(history.strip_thinking(), expected);
+        let signature_kept = !with_thinking;
+        assert!(matches!(
+            &history.as_slice()[1].content[..],
+            [ContentBlock::ToolUse { thought_signature, .. }] if thought_signature.is_some() == signature_kept
+        ));
+    }
+
+    /// Dropping an orphaned result must not take a newer build's block with it.
+    #[test]
+    fn sanitize_restored_keeps_unknown_blocks() {
+        let unknown = ContentBlock::Unknown(serde_json::json!({ "type": UNKNOWN_BLOCK_TYPE }));
+        let mut orphaned = make_tool_result_msg(&["orphan"]);
+        orphaned.content.push(unknown.clone());
+        let history = History::restored(vec![Message::user(GO.into()), orphaned]);
+
+        assert_eq!(history.as_slice()[1].content, [unknown]);
     }
 
     #[test]

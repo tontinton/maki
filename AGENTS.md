@@ -63,6 +63,8 @@ Built-in lua plugins in ./plugins: index (return a compact skeleton of a source 
 
 Invariant: requests are append-only. Never rebuild `system`/`tools` or edit earlier messages mid-session: it voids the prompt cache everywhere and invalidates (or 400s) Anthropic thinking blocks bound to the prefix. Use a context update (`context_update` in `maki-agent/src/agent/frame.rs`) or an announced new frame. Contract tests: `assert_append_only` in `maki-agent/src/agent/run.rs`.
 
+Invariant: the serde of `Message`, `ContentBlock`, `FactsUpdate` and `PromptFacts` is public API (session files, `maki session export`, Lua). Fields are only added, with defaults. Variants are only added. Content an older build must not lose goes in a new `ContentBlock` variant, never a field. A new `Role` or `MessageKind` variant also needs a `LOG_FORMAT_VERSION` bump.
+
 ## Docs
 
 Homepage: ./site/. User docs: ./site/docs/.
