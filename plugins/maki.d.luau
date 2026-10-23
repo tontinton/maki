@@ -151,6 +151,7 @@ declare maki: {
     delete: @checked (id: string) -> (boolean?, string?),
     new: @checked (opts: any) -> (string?, string?),
     prompt: @checked (text: string, opts: any) -> (string?, string?),
+    cancel: @checked (opts: any) -> (boolean?, string?),
     notify: @checked (text: string, opts: any) -> (boolean?, string?),
     set_mode: @checked (mode: string, opts: any) -> (boolean?, string?),
     set_title: @checked (opts: any) -> (boolean?, string?),

@@ -469,6 +469,11 @@ pub enum SessionRequest {
         id: String,
         title: String,
     },
+    /// Interrupts the running turn of the live session {id} names, or the
+    /// focused one. The UI replies whether a turn was running.
+    Cancel {
+        id: Option<String>,
+    },
 }
 
 pub enum TaskRequest {

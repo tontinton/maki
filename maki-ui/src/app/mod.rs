@@ -1540,6 +1540,12 @@ impl App {
         }]
     }
 
+    /// A plugin's interrupt, the one a double Esc fires. `None` when no turn
+    /// is running, so there is nothing to cancel.
+    pub(crate) fn cancel_turn(&mut self) -> Option<Vec<Action>> {
+        (self.status == Status::Streaming).then(|| self.handle_cancel())
+    }
+
     /// A tool task can be cancelled only while its turn still routes to it.
     /// A plugin task can be cancelled any time it is alive, idle included.
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
