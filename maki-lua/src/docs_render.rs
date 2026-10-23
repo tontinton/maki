@@ -631,11 +631,21 @@ fn push_fn(out: &mut String, module: &ModuleDoc, f: &FnDoc, classes: &ClassLinks
         out.push('\n');
     }
     if let Some(guard) = f.guard {
+        let keys = guard
+            .iter()
+            .map(|perm| format!("`{perm}`"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let noun = if guard.len() == 1 {
+            "permission"
+        } else {
+            "permissions"
+        };
         if compact {
-            out.push_str(&format!("Requires the `{guard}` plugin permission.\n\n"));
+            out.push_str(&format!("Requires the {keys} plugin {noun}.\n\n"));
         } else {
             out.push_str(&format!(
-                "Requires the `{guard}` [plugin permission](#{PERMISSIONS_ANCHOR}).\n\n"
+                "Requires the {keys} [plugin {noun}](#{PERMISSIONS_ANCHOR}).\n\n"
             ));
         }
     }

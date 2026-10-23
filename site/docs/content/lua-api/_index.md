@@ -64,6 +64,9 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `run`: starting processes
 - `env`: reading the process environment, where secrets live
 - `agent`: starting model turns: prompting a chat, or running its own sessions
+- `session_read`: reading conversation content: session history, the chat input draft, and the content fields of events (`maki.session.read` is metadata and needs nothing)
+- `session_write`: adding to, removing, or creating conversation content: new sessions, prompts, notices, and deleting sessions or task transcripts
+- `session_settings`: changing how a session runs without touching its content: mode, title, model, thinking, and fast mode
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -78,6 +81,9 @@ net = true
 run = true
 env = true
 agent = true
+session_read = true
+session_write = true
+session_settings = true
 ```
 
 The rules:
@@ -942,6 +948,13 @@ name the session now running or focused. What each event adds:
   the two takes an event without a root as a reason to ask again. Asking
   again only ever re-reads the root the plugin passed.
 
+Conversation content needs the `session_read` permission. Without it a
+host event still arrives, carrying only its metadata fields:
+`"TurnStart"` without `data.text`, `"ToolDone"` without `data.input`,
+`"CompactionDone"` without `data.summary`, and `"InputChanged"` without
+`data.text`. The first such event per plugin shows a warning naming what
+was left out. Events a plugin fires under its own names arrive as fired.
+
 `"TurnEnd"` fires once per turn and only for the main session, so
 subagent turns never show up. A manual `/compact` ends its run without
 ending a turn, so it stays quiet too.
@@ -1131,7 +1144,9 @@ table to replace the value, nothing to leave it alone, or
 `value, { ask = reason }` to make the user approve the call. Name the
 tool `*` (`tool.*.input`) to wrap every tool. Wrapping one costs the
 capability the tool declares, and a tool declaring none costs every
-permission.
+permission. A layer also sees what the model wrote, so an input layer
+needs `session_read` on top, and an output layer, which changes what
+the model reads back, needs `session_read` and `session_write`.
 
 The agent loop fires `agent.user_message`, `agent.stop`,
 `agent.compact.before`, and `agent.compact.prepare`, with the same
@@ -1143,7 +1158,8 @@ the prompt as its default. A layer takes `function(prev, req, ctx)` and
 answers `{ decision = "allow" }` or `{ decision = "deny", guidance = … }`,
 or passes the call on with `prev(req, ctx)`. A verdict decides that one call
 and records no rule, and an escalated call (`ask`) is never offered to a
-layer. See [Hooks](/docs/hooks/#permission-prompt).
+layer. It costs what an input layer on the same call does. See
+[Hooks](/docs/hooks/#permission-prompt).
 
 Wrapping a slot another plugin declared steers a chain that plugin's
 callers trust, so it costs whatever the owner priced it at in
@@ -3987,6 +4003,8 @@ Switches the focused session's model, thinking level, or fast mode. Fields
 you leave out stay as they are, so this doubles as a thinking-only switch.
 Answers with the new state, in the same shape `get` returns.
 
+Requires the `session_settings` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{opts}` (`string|table`) A model spec, or a table with any of:
@@ -4758,6 +4776,8 @@ Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no focused
 session, so pass `session` there. Hook and event payloads carry the
 `session_id` to pass.
 
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
@@ -4809,6 +4829,8 @@ maki.session.delete({id})
 Deletes a session and its stored history, cancelling it first if it
 is running. The focused session cannot be deleted.
 
+Requires the `session_write` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{id}` (`string`) Session id to delete.
@@ -4830,6 +4852,8 @@ maki.session.new({opts?})
 ```
 
 Starts a new session in the current project.
+
+Requires the `session_write` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -4859,7 +4883,7 @@ never interpreted: slash commands, `exit`, and `!` shell prefixes are
 all sent to the model verbatim. If the session is currently streaming,
 the prompt is queued and picked up when the agent reaches it.
 
-Requires the `agent` [plugin permission](#plugin-permissions).
+Requires the `agent` and `session_write` [plugin permissions](#plugin-permissions).
 
 **Parameters:**
 
@@ -4887,6 +4911,8 @@ maki.session.notify({text}, {opts?})
 
 Reports {text} to a live session without creating a user turn. The
 observation waits for the session's next agent run.
+
+Requires the `session_write` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -4918,6 +4944,8 @@ allocates the session's plan file if it has none.
 A session that is mid-plan answers the next prompt with another draft of
 the plan. Set `"build"` first and that prompt implements it.
 
+Requires the `session_settings` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{mode}` (`string`) "build" or "plan".
@@ -4942,6 +4970,8 @@ maki.session.set_title({opts})
 ```
 
 Renames a session, live or stored.
+
+Requires the `session_settings` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -5048,6 +5078,8 @@ maki.task.remove({id})
 
 Deletes a finished task and its saved transcript. Refuses the main chat and
 running tasks. Deleting the focused task moves focus to the chat before it.
+
+Requires the `session_write` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -6814,6 +6846,8 @@ them out: with `local before = st.text:sub(1, st.cursor)`,
 
 To put a window on the caret, open it with `anchor = "input_caret"`. The
 host re-places it every frame, so it follows wraps and resizes.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
 
 **Returns:** (`table|nil`, `string|nil`) The input state, or nil and an error.
 

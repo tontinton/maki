@@ -4,3 +4,6 @@ fs_write = true
 net = true
 run = true
 env = true
+session_read = true
+session_write = true
+session_settings = true

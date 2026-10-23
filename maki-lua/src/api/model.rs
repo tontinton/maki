@@ -8,6 +8,7 @@ use mlua::{Error as LuaError, Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::pair::{Pair, err_pair};
+use crate::plugin_permissions::PluginPermissions;
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
 
@@ -180,7 +181,7 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 /// maki.model.set("anthropic/claude-opus-4-6")
 /// maki.model.set({ spec = "zai/glm-5", thinking = "high" })
 /// maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
-#[lua_fn]
+#[lua_fn(guard = SessionSettings)]
 async fn set(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -212,8 +213,11 @@ lua_table! {
     /// between your two go-to models, or lifts thinking for one hard question.
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
-    "maki.model" => pub(crate) fn create_model_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [get(tx), available(tx), set(tx), tier(), info()]
+    "maki.model" => pub(crate) fn create_model_table(
+        tx: Option<flume::Sender<UiAction>>,
+        perms: &PluginPermissions,
+    ),
+    DOCS [get(tx), available(tx), set(perms, tx), tier(), info()]
 }
 
 #[cfg(test)]
@@ -249,7 +253,7 @@ mod tests {
 
     fn lua_with_model(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
-        let t = create_model_table(&lua, tx).unwrap();
+        let t = create_model_table(&lua, tx, &PluginPermissions::trusted()).unwrap();
         lua.globals().set("model", t).unwrap();
         lua
     }

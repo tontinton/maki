@@ -5,7 +5,7 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_config::Permission;
 use maki_lua::{LuaCommandInfo, PluginHost};
-use maki_ui::{BUILTIN_COMMANDS, PluginAccess, STARTS_TURNS};
+use maki_ui::{BUILTIN_COMMANDS, PluginAccess, SUBMITS_PROMPT};
 
 use crate::lua_util::in_registration_window;
 
@@ -71,13 +71,19 @@ fn write_plugin_access(out: &mut String, bundled: &[LuaCommandInfo]) {
     writeln!(out, "{PLUGIN_ACCESS}").unwrap();
     writeln!(out).unwrap();
     let mut by_needs: BTreeMap<Vec<Permission>, Vec<String>> = BTreeMap::new();
-    for &perm in Permission::ALL {
-        let access = PluginAccess::Needs(perm);
-        let names = by_needs.entry(vec![perm]).or_default();
-        names.extend(builtin_names(access));
-        if access == STARTS_TURNS {
-            names.extend(["custom commands".into(), "MCP prompts".into()]);
+    for cmd in BUILTIN_COMMANDS {
+        if let PluginAccess::Needs(needed) = cmd.plugin_access {
+            by_needs
+                .entry(needed.to_vec())
+                .or_default()
+                .push(format!("`{}`", cmd.name));
         }
+    }
+    if let PluginAccess::Needs(needed) = SUBMITS_PROMPT {
+        by_needs
+            .entry(needed.to_vec())
+            .or_default()
+            .extend(["custom commands".into(), "MCP prompts".into()]);
     }
     for cmd in bundled {
         let held: Vec<Permission> = Permission::ALL

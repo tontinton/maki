@@ -191,14 +191,23 @@ impl PluginPermissions {
         self.allowed.iter().all(|&allowed| allowed)
     }
 
+    pub fn lacking(&self) -> impl Iterator<Item = Permission> + '_ {
+        Permission::ALL
+            .iter()
+            .copied()
+            .filter(|&perm| !self.is_allowed(perm))
+    }
+
     /// Reaching what nobody declared costs every capability a tool can reach,
     /// since no narrower price would be honest. `agent` is not one of them:
     /// it is about starting turns, and every tool already runs inside one, so
     /// a plugin that may not start turns can still steer a call in one.
     pub fn holds_all_reach(&self) -> bool {
-        Permission::ALL
-            .iter()
-            .all(|&perm| perm == Permission::Agent || self.is_allowed(perm))
+        self.lacking_reach().next().is_none()
+    }
+
+    pub fn lacking_reach(&self) -> impl Iterator<Item = Permission> + '_ {
+        self.lacking().filter(|&perm| perm != Permission::Agent)
     }
 
     pub fn from_manifest(manifest: &toml::Value) -> Self {
@@ -220,24 +229,28 @@ impl PluginPermissions {
         self.allowed[perm as usize] = value;
     }
 
-    pub fn guard<F, A, R>(&self, perm: Permission, lua: &Lua, f: F) -> LuaResult<Function>
+    /// The first of {needed} this set lacks, in the order the guard lists them.
+    fn first_denied(&self, needed: &[Permission]) -> Option<Permission> {
+        needed.iter().copied().find(|&perm| !self.is_allowed(perm))
+    }
+
+    /// A function that needs every permission in {needed}. Without one of
+    /// them it is replaced by a stub naming the first one missing.
+    pub fn guard<F, A, R>(&self, needed: &[Permission], lua: &Lua, f: F) -> LuaResult<Function>
     where
         F: Fn(&Lua, A) -> LuaResult<R> + Send + 'static,
         A: mlua::FromLuaMulti,
         R: IntoLuaMulti,
     {
-        if self.is_allowed(perm) {
-            lua.create_function(f)
-        } else {
-            lua.create_function(move |_, _: mlua::MultiValue| -> LuaResult<mlua::Value> {
-                Err(denied_error(perm))
-            })
+        match self.first_denied(needed) {
+            None => lua.create_function(f),
+            Some(perm) => denied_stub(lua, perm),
         }
     }
 
     pub fn guard_async<F, Fut, A, R>(
         &self,
-        perm: Permission,
+        needed: &[Permission],
         lua: &Lua,
         f: F,
     ) -> LuaResult<Function>
@@ -247,12 +260,9 @@ impl PluginPermissions {
         A: mlua::FromLuaMulti,
         R: IntoLuaMulti,
     {
-        if self.is_allowed(perm) {
-            lua.create_async_function(f)
-        } else {
-            lua.create_function(move |_, _: mlua::MultiValue| -> LuaResult<mlua::Value> {
-                Err(denied_error(perm))
-            })
+        match self.first_denied(needed) {
+            None => lua.create_async_function(f),
+            Some(perm) => denied_stub(lua, perm),
         }
     }
 }
@@ -472,6 +482,12 @@ pub(crate) fn requested_permissions_from_text(
             path: manifest_path.to_path_buf(),
             message: error.to_string(),
         })
+}
+
+fn denied_stub(lua: &Lua, perm: Permission) -> LuaResult<Function> {
+    lua.create_function(move |_, _: mlua::MultiValue| -> LuaResult<mlua::Value> {
+        Err(denied_error(perm))
+    })
 }
 
 pub(crate) fn denied_error(perm: Permission) -> LuaError {
@@ -764,7 +780,7 @@ mod tests {
         let lua = Lua::new();
         let perms = PluginPermissions::trusted();
         let func = perms
-            .guard(Permission::FsRead, &lua, |_, ()| Ok(42))
+            .guard(&[Permission::FsRead], &lua, |_, ()| Ok(42))
             .unwrap();
         let result: i32 = func.call(()).unwrap();
         assert_eq!(result, 42);
@@ -863,12 +879,40 @@ mod tests {
         let lua = Lua::new();
         let perms = PluginPermissions::denied();
         let func = perms
-            .guard(Permission::FsRead, &lua, |_, ()| Ok(42))
+            .guard(&[Permission::FsRead], &lua, |_, ()| Ok(42))
             .unwrap();
         let err = func.call::<i32>(()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("permission denied"));
         assert!(msg.contains("fs_read"));
+    }
+
+    /// `maki.session.prompt` writes and starts a turn, so either half alone is
+    /// refused, naming the half that is missing.
+    #[test_case(&[Permission::Agent], Some(Permission::SessionWrite) ; "only_agent")]
+    #[test_case(&[Permission::SessionWrite], Some(Permission::Agent) ; "only_session_write")]
+    #[test_case(&[Permission::Agent, Permission::SessionWrite], None ; "both")]
+    fn a_guard_needs_every_permission_it_lists(held: &[Permission], denied: Option<Permission>) {
+        let lua = Lua::new();
+        let perms = PluginPermissions::from_approved(held.iter().map(|p| p.manifest_key()));
+        let func = perms
+            .guard(
+                &[Permission::Agent, Permission::SessionWrite],
+                &lua,
+                |_, ()| Ok(42),
+            )
+            .unwrap();
+        let result = func.call::<i32>(());
+        match denied {
+            None => assert_eq!(result.unwrap(), 42),
+            Some(perm) => {
+                let err = result.unwrap_err().to_string();
+                assert!(
+                    err.contains(&Missing::Permission(perm).to_string()),
+                    "got: {err}"
+                );
+            }
+        }
     }
 
     #[test_case("1.2.2", "1.2.3", true; "lower")]

@@ -10,7 +10,7 @@ mod clipboard;
 mod clock;
 mod color_compat;
 mod components;
-pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand, PluginAccess, STARTS_TURNS};
+pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand, PluginAccess, SUBMITS_PROMPT};
 pub use components::keybindings;
 mod highlight;
 pub use highlight::highlight_ansi;

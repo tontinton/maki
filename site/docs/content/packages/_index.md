@@ -153,6 +153,9 @@ net = true
 run = true
 env = true
 agent = true
+session_read = true
+session_write = true
+session_settings = true
 ```
 
 The manifest states what the package wants, and Maki asks about new permissions
@@ -160,6 +163,8 @@ in a separate prompt. A package with no `plugin.toml` asks for nothing, and
 every guarded call it makes fails. The
 [permission list](/docs/lua-api/#plugin-permissions) covers what each name
 gates.
+
+A package that wraps an `agent.*` slot or a `tool.*` wildcard needs every permission, including the three session ones. A layer on one named tool needs that tool's capability plus `session_read`, and `session_write` too at the output stage ([details](/docs/permissions/#session-permissions)). After an update to maki, a package approved before they existed must list them in its manifest to keep wrapping. The prompt asks about them like any other new permission, and a skipped wrapper shows a warning naming the missing keys.
 
 Maki stores a package's [`net_hosts`](/docs/permissions/#plugin-egress-net-hosts)
 with its approval. An update that widens the list or drops it asks again before

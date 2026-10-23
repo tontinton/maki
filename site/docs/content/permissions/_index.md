@@ -234,6 +234,20 @@ Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to th
 It runs after [folder trust](/docs/folder-trust/) has let the Lua file load, and
 limits which APIs the file reaches rather than sandboxing the file.
 
+### Session permissions
+
+Three keys cover the session APIs, split by what a call does to the transcript:
+
+- `session_read`: any call that reads what the conversation says, such as `maki.session.messages` and `maki.ui.input`.
+- `session_write`: any call that adds to, removes, or creates conversation content, such as `new`, `prompt`, `notify`, `delete` and `maki.task.remove`.
+- `session_settings`: any call that changes how a session runs without touching its content, such as `set_mode`, `set_title` and `maki.model.set`.
+
+`maki.session.read`, `list`, `live`, `current` and `focus` return metadata and need none of them. A call that also starts a turn, such as `prompt`, needs `agent` as well. `maki.api.run_command` follows the same rules, so `/model`, `/cd` and `/workflow` need `session_settings` and `/new` needs `session_write`.
+
+A plugin without `session_read` still receives events, with only their metadata fields. That leaves out `data.text` on `TurnStart` and `InputChanged`, `data.input` on `ToolDone`, and `data.summary` on `CompactionDone`. The first time that happens for a plugin and event, Maki shows a warning naming the event and the keys. Events a plugin fires under its own names arrive as fired.
+
+A layer on a tool call sees the call, so it pays for that on top of the tool's own capability. A `tool.<name>.input` layer and a `permission.prompt` layer need `session_read`. A `tool.<name>.output` layer rewrites what the model reads back, so it needs `session_read` and `session_write`. A layer missing any of them is skipped, with a warning naming every missing key. Granting part of the gap shows a new warning for the rest.
+
 ### Plugin egress: net_hosts
 
 `net = true` lets a plugin reach any public host. `net_hosts` in the same

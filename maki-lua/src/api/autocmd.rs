@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
+use crate::agent_autocmd::host_event_fields;
 use crate::api::util::dispatch::{DepthGuard, Reentry};
-use crate::runtime::{run_detached, strip_traceback};
+use crate::plugin_permissions::Permission;
+use crate::runtime::{quoted_list, run_detached, strip_traceback, warn_plugin_once};
 
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -18,6 +21,9 @@ pub(crate) struct AutocmdEntry {
     pub plugin: Arc<str>,
     pub once: bool,
     pub patterns: Option<Vec<String>>,
+    /// Whether the plugin holds `session_read`, so it gets a host event
+    /// whole rather than only its metadata.
+    pub reads_content: bool,
 }
 
 #[derive(Default)]
@@ -69,13 +75,17 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 ///
 /// `data` is shared across callbacks (nvim does the same), but each callback
 /// gets its own `ev` table, so one plugin's mutation cannot leak into the
-/// next.
+/// next. A callback whose plugin lacks `session_read` shares a second `data`
+/// instead, built once before any callback runs, holding only the keys
+/// [`HostEventKind::fields`](crate::agent_autocmd::HostEventKind::fields)
+/// calls metadata. An event the host never fires is a plugin's own, and
+/// arrives as fired.
 pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, data: Value) {
     let Ok(_guard) = DepthGuard::enter(&lua, "autocmd", &event, Reentry::Vm) else {
         tracing::warn!(event, "autocmd dispatch exceeded max depth, skipping");
         return;
     };
-    let snapshot: Vec<(u64, Arc<str>, Function)> = {
+    let snapshot: Vec<(u64, Arc<str>, Function, bool)> = {
         let Some(mut store) = lua.app_data_mut::<AutocmdStore>() else {
             return;
         };
@@ -88,14 +98,39 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
         entries.retain(|e| {
             let fires = pattern_matches(e.patterns.as_deref(), pattern.as_deref());
             if fires {
-                snapshot.push((e.id, Arc::clone(&e.plugin), e.callback.clone()));
+                snapshot.push((
+                    e.id,
+                    Arc::clone(&e.plugin),
+                    e.callback.clone(),
+                    e.reads_content,
+                ));
             }
             !(fires && e.once)
         });
         snapshot
     };
-    for (id, plugin, callback) in snapshot {
-        let ev = match make_ev_table(&lua, id, &event, pattern.as_deref(), &data) {
+    let redacted = if snapshot.iter().all(|(.., reads_content)| *reads_content) {
+        None
+    } else {
+        match metadata_only(&lua, &event, &data) {
+            Ok(redacted) => redacted,
+            Err(e) => {
+                tracing::warn!(event, error = %e, "failed to build redacted autocmd data");
+                return;
+            }
+        }
+    };
+    for (id, plugin, callback, reads_content) in snapshot {
+        let data = match &redacted {
+            Some((stripped, removed)) if !reads_content => {
+                warn_plugin_once(&lua, &plugin, &event, || {
+                    content_omitted_message(&plugin, &event, removed)
+                });
+                stripped
+            }
+            _ => &data,
+        };
+        let ev = match make_ev_table(&lua, id, &event, pattern.as_deref(), data) {
             Ok(ev) => ev,
             Err(e) => {
                 tracing::warn!(event, error = %e, "failed to build autocmd ev table");
@@ -116,6 +151,42 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
             );
         }
     }
+}
+
+/// {data} cut down to the keys {event} classifies as metadata, and the keys
+/// cut, sorted. `None` when nothing was cut, so the caller shares the
+/// original and warns nobody, and for an event the host never fires.
+///
+/// An allowlist on purpose: a key the host sends but nobody classified is
+/// cut too, so a field that slips past the pin test fails closed.
+fn metadata_only(lua: &Lua, event: &str, data: &Value) -> LuaResult<Option<(Value, Vec<String>)>> {
+    let (Some(fields), Value::Table(table)) = (host_event_fields(event), data) else {
+        return Ok(None);
+    };
+    let stripped = lua.create_table()?;
+    let mut removed = Vec::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        if matches!(&key, Value::String(k) if k.to_str().is_ok_and(|k| fields.is_metadata(&k))) {
+            stripped.raw_set(key, value)?;
+        } else {
+            removed.push(key.to_string()?);
+        }
+    }
+    if removed.is_empty() {
+        return Ok(None);
+    }
+    removed.sort_unstable();
+    stripped.set_metatable(table.metatable())?;
+    Ok(Some((Value::Table(stripped), removed)))
+}
+
+pub fn content_omitted_message(plugin: &str, event: &str, removed: &[impl Display]) -> String {
+    format!(
+        "plugin {plugin}: '{event}' arrives without {}, which needs '{}' (grant it in plugin.toml)",
+        quoted_list(removed),
+        Permission::SessionRead
+    )
 }
 
 fn make_ev_table(
@@ -222,6 +293,13 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   the two takes an event without a root as a reason to ask again. Asking
 ///   again only ever re-reads the root the plugin passed.
 ///
+/// Conversation content needs the `session_read` permission. Without it a
+/// host event still arrives, carrying only its metadata fields:
+/// `"TurnStart"` without `data.text`, `"ToolDone"` without `data.input`,
+/// `"CompactionDone"` without `data.summary`, and `"InputChanged"` without
+/// `data.text`. The first such event per plugin shows a warning naming what
+/// was left out. Events a plugin fires under its own names arrive as fired.
+///
 /// `"TurnEnd"` fires once per turn and only for the main session, so
 /// subagent turns never show up. A manual `/compact` ends its run without
 /// ending a turn, so it stays quiet too.
@@ -266,7 +344,13 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   end,
 /// })
 #[lua_fn]
-fn create_autocmd(lua: &Lua, #[ctx] plugin: Arc<str>, event: Value, opts: Table) -> LuaResult<u64> {
+fn create_autocmd(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] reads_content: bool,
+    event: Value,
+    opts: Table,
+) -> LuaResult<u64> {
     let events = parse_string_or_seq(event, "event")?;
     let callback: Function = opts.get("callback")?;
     let once: bool = opts.get("once").unwrap_or(false);
@@ -287,6 +371,7 @@ fn create_autocmd(lua: &Lua, #[ctx] plugin: Arc<str>, event: Value, opts: Table)
                 plugin: Arc::clone(&plugin),
                 once,
                 patterns: patterns.clone(),
+                reads_content,
             },
         );
     }
@@ -344,8 +429,8 @@ async fn exec_autocmds(lua: Lua, event: Value, opts: Option<Table>) -> LuaResult
 }
 
 lua_table! {
-    extend "maki.api" => pub(crate) fn add_autocmd_methods(plugin: Arc<str>), DOCS [
-        create_autocmd(plugin), del_autocmd, exec_autocmds,
+    extend "maki.api" => pub(crate) fn add_autocmd_methods(plugin: Arc<str>, reads_content: bool), DOCS [
+        create_autocmd(plugin, reads_content), del_autocmd, exec_autocmds,
     ]
 }
 

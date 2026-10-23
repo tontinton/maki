@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use maki_agent::tools::MAIN_TASK_ID;
 use serde::Serialize;
+use strum::IntoStaticStr;
 
 use crate::app::App;
 use crate::components::DisplayRole;
@@ -47,8 +48,9 @@ impl TaskOutcome {
 
 /// `Idle` is a plugin task alive but quiet between prompts: neither a spinner
 /// nor "done" would be honest.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, IntoStaticStr)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum TaskStatus {
     Working,
     Idle,

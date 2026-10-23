@@ -14,14 +14,29 @@ use maki_agent::tools::hook::{Authority, HookCall, HookStage, ToolHook, Verdict}
 use maki_agent::tools::registry::BoxFuture;
 use serde_json::{Value, json};
 
-use crate::api::slot::{ANY_TOOL, LayeredTools, PERMISSION_PROMPT_SLOT, host_slot_name};
+use crate::api::slot::{ANY_TOOL, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, host_slot_name};
 use crate::api::util::ctx::LuaCtx;
+use crate::plugin_permissions::Permission;
 use crate::runtime::{HookRun, PromptRun, Request};
 
 /// Every `agent.*` slot steers what the agent does next: the prompt it
 /// answers, whether it stops, what it remembers after a compaction. No
 /// narrower price would be honest.
-const AGENT_SLOT_AUTHORITY: Authority = Authority::Total;
+const AGENT_SLOT_COST: LayerCost<'static> = LayerCost::TOTAL;
+
+/// What every layer on a tool call pays, `permission.prompt` included: the
+/// call's {authority}, plus conversation content. A layer that sees the call
+/// reads what the model wrote (the file `write` puts on disk, the page
+/// `webfetch` asks for), and an output layer also changes what the model reads
+/// back. Without this a `net`-only plugin could read and ship either, while
+/// `ToolDone` keeps the same input from it.
+fn tool_layer_cost(authority: Authority, stage: HookStage) -> LayerCost<'static> {
+    let content: &[Permission] = match stage {
+        HookStage::Input => &[Permission::SessionRead],
+        HookStage::Output => &[Permission::SessionRead, Permission::SessionWrite],
+    };
+    LayerCost::Host { authority, content }
+}
 
 pub(crate) struct SlotHook {
     pub(crate) tx: Sender<Request>,
@@ -66,7 +81,7 @@ impl ToolHook for SlotHook {
                 host_slot_name(call.tool, stage),
                 host_slot_name(ANY_TOOL, stage),
             ],
-            authority: call.authority,
+            cost: tool_layer_cost(call.authority, stage),
             cancel: call.cancel.clone(),
             deadline: call.deadline,
             value,
@@ -97,8 +112,10 @@ impl ToolHook for SlotHook {
                 return None;
             }
             let (reply, answer) = flume::bounded(1);
+            // The prompt is asked about the input the call is about to run
+            // with, and answers for it, so it is priced as that stage.
             let run = PromptRun {
-                authority: call.authority,
+                cost: tool_layer_cost(call.authority, HookStage::Input),
                 cancel: call.cancel.clone(),
                 deadline: call.deadline,
                 req: json!({
@@ -131,7 +148,7 @@ impl AgentHook for SlotHook {
     ) -> BoxFuture<'a, Verdict> {
         self.send(HookRun {
             slots: vec![slot.name().to_owned()],
-            authority: AGENT_SLOT_AUTHORITY,
+            cost: AGENT_SLOT_COST,
             cancel: call.cancel.clone(),
             deadline: call.deadline,
             value,

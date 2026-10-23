@@ -19,6 +19,7 @@ use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
+use crate::plugin_permissions::PluginPermissions;
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod win;
@@ -471,7 +472,7 @@ fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
 /// @example
 /// local st = maki.ui.input()
 /// local before = st.text:sub(1, st.cursor)
-#[lua_fn]
+#[lua_fn(guard = SessionRead)]
 async fn input(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -766,6 +767,7 @@ pub(crate) fn create_ui_table(
     lua: &Lua,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     plugin: Arc<str>,
+    perms: &PluginPermissions,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     add_ui_fns(&t, lua)?;
@@ -774,7 +776,7 @@ pub(crate) fn create_ui_table(
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
     action__register(&t, lua, ui_action_tx.clone())?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
-    input__register(&t, lua, ui_action_tx.clone())?;
+    input__register(&t, lua, perms, ui_action_tx.clone())?;
     input_edit__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     open_win__register(&t, lua, ui_action_tx, Arc::clone(&plugin))?;
 
@@ -1751,7 +1753,13 @@ mod tests {
             }
         });
         let lua = Lua::new();
-        let t = create_ui_table(&lua, Some(tx), Arc::from(INPUT_PLUGIN)).unwrap();
+        let t = create_ui_table(
+            &lua,
+            Some(tx),
+            Arc::from(INPUT_PLUGIN),
+            &PluginPermissions::trusted(),
+        )
+        .unwrap();
         lua.globals().set("ui", t).unwrap();
         lua
     }
