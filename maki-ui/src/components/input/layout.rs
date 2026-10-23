@@ -604,7 +604,9 @@ mod tests {
                 text_edit(start, start + old.len(), new)
             })
             .collect();
-        buffer.apply_edits(buffer.version(), edits, None).unwrap();
+        buffer
+            .apply_edits(buffer.version(), edits, None, None)
+            .unwrap();
     }
 
     fn synced(buffer: &TextBuffer, width: usize) -> Layout {
@@ -708,7 +710,9 @@ mod tests {
             mark(at("三"), None, &ghost),
             mark(at("to wrap"), Some(at("nd\n")), &chip),
         ];
-        buffer.set_marks(PLUGIN, NS, marks).unwrap()
+        buffer
+            .set_marks(buffer.version(), PLUGIN, NS, marks)
+            .unwrap()
     }
 
     /// Typing into the chip drops it, and with it the ghost text two lines
@@ -759,7 +763,9 @@ mod tests {
                 conceal("", Reveal::Cursor, false),
             ),
         ];
-        buffer.set_marks(PLUGIN, NS, marks).unwrap()
+        buffer
+            .set_marks(buffer.version(), PLUGIN, NS, marks)
+            .unwrap()
     }
 
     #[test]
@@ -834,7 +840,9 @@ mod tests {
         assert_ne!(marked, plain);
         assert_eq!(observe(&layout, &buffer), marked);
 
-        let cleared = buffer.set_marks(PLUGIN, NS, Vec::new()).unwrap();
+        let cleared = buffer
+            .set_marks(buffer.version(), PLUGIN, NS, Vec::new())
+            .unwrap();
         layout.relayout(&buffer, &cleared);
         assert_eq!(observe(&layout, &buffer), plain);
     }

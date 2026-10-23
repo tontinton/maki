@@ -11,12 +11,12 @@ use mlua::{Lua, Result as LuaResult, Table};
 use crate::api::action::run_plugin_action;
 use crate::api::keymap::{InputMode, accept_key, switch_mode};
 use crate::api::util::command::{
-    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
-    InputRequest, Split, TextEdit, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip,
-    ui_roundtrip, ui_send,
+    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputDecorate,
+    InputEdit, InputMarks, InputRequest, Split, TextEdit, TitlePos, UiAction, WinCommand, WinEvent,
+    ui_json_roundtrip, ui_roundtrip, ui_send,
 };
 use crate::api::util::convert::{TableExt, reject_unknown_fields, required};
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
 use crate::plugin_permissions::{PluginReach, require};
@@ -26,18 +26,23 @@ pub(crate) mod marks;
 pub(crate) mod syntax;
 pub(crate) mod win;
 
-use crate::runtime::with_task_bufs;
-use marks::{InputRule, InputRuleStore, PatternRule, parse_mark};
+use crate::runtime::{plugin_loaded, with_task_bufs};
+use marks::{InputRule, InputRuleStore, PatternRule, parse_mark, parse_pushed_mark};
 use syntax::parse_syntax;
 use win::{WinHandle, WinSender};
 
 /// `fg`, `bg` and six modifiers.
 const UI_STYLE_FIELDS: usize = 8;
 const INPUT_EDIT: &str = "input_edit";
+const INPUT_DECORATE: &str = "input_decorate";
 const SINGLE_EDIT_KEYS: [&str; 3] = ["start", "stop", "text"];
 const NOT_A_LIST_ERR: &str = "is a list of tables, so wrap a single one in {}";
 const MIXED_EDIT_SHAPES_ERR: &str =
     "input_edit: pass either 'edits' or 'start'/'stop'/'text', not both";
+const MARKS_HALVES_ERR: &str = "input_edit: 'marks' and 'ns' go together";
+/// A handler can outlive its load, and the unload that clears its marks has
+/// already reached the UI, so marks it pushed then would stay for good.
+const UNLOADED_MARKS_ERR: &str = "the plugin is unloaded, so it can push no marks";
 const EDIT_OPTIONS: &[&str] = &[
     "edits",
     "start",
@@ -47,7 +52,10 @@ const EDIT_OPTIONS: &[&str] = &[
     "session_id",
     "cursor",
     "strict",
+    "marks",
+    "ns",
 ];
+const DECORATE_OPTIONS: &[&str] = &["session_id", "version", "ns", "marks"];
 const INPUT_RULES: &str = "input_rules";
 const RULE_OPTIONS: &[&str] = &["ns", "pattern", "mark", "treesitter"];
 const RULE_HALVES_ERR: &str = "input_rules: 'pattern' and 'mark' go together";
@@ -537,6 +545,13 @@ async fn input_roundtrip(
     ui_json_roundtrip(&lua, tx, |reply_tx| UiAction::Input { req, reply_tx }).await
 }
 
+fn input_marks(func: &str, ns: String, marks: Table) -> LuaResult<InputMarks> {
+    let marks = table_list(marks, func, "marks")?
+        .iter()
+        .map(parse_pushed_mark)
+        .collect::<LuaResult<_>>()?;
+    Ok(InputMarks { ns, marks })
+}
 /// Reads the chat input text and the cursor position.
 ///
 /// Offsets are byte offsets into `text`, the unit the Lua string library
@@ -588,9 +603,10 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 /// one and typed its `text`. All of them land together as one change: one
 /// new version and one undo step.
 ///
-/// With `edits = {}` and a `cursor`, the call only moves the cursor. The
-/// version stays, no undo step is made, and a recalled history entry stays
-/// recalled. An empty list with no cursor is refused, since there is nothing
+/// With `edits = {}` the text stays as it is: the call moves the cursor to
+/// `cursor`, replaces namespace `ns` with `marks`, or both. The version
+/// stays, no undo step is made, and a recalled history entry stays
+/// recalled. An empty list with neither is refused, since there is nothing
 /// to do.
 ///
 /// Every range is planned against the value `maki.ui.input` returned at
@@ -624,13 +640,15 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 ///
 /// Read again and retry on any of them.
 ///
-/// A change needs `input`. What Enter does with text you wrote is in
-/// [chat input](#chat-input).
+/// Enter checks the text you write before it runs it, see
+/// [chat input](#chat-input). For marks alone, use `input_decorate`, which
+/// needs no permission.
 ///
 /// Tabs and carriage returns in `text` become spaces and newlines, and the
 /// other control characters are dropped, the way a paste is rewritten. With
-/// `cursor` given, such text is refused instead, since the cursor counts
-/// bytes that would not land. Clean it first.
+/// `cursor` or `marks` given, such text is refused instead, since their
+/// offsets count bytes that would not land. Clean it first, the way
+/// `ev.text` of `<Paste>` already is.
 ///
 /// It also needs `session_read`, like `maki.ui.input`. Its answer and its
 /// errors tell where the user typed since `version`, so a plugin could
@@ -643,8 +661,10 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 ///   `text` (string) what to put there, `""` to delete the range. Required, so a misspelled key cannot empty it by accident.
 ///   `version` (integer) the version `maki.ui.input` returned, which the offsets were planned against.
 ///   `session_id` (string) the session `maki.ui.input` read the offsets from.
-///   `cursor` (integer|nil) byte offset to leave the cursor at, counted in the value the edits produce, as if no one else had changed it. Default is the end of the text of the edit with the highest `start`, wherever it sits in `edits`.
+///   `cursor` (integer|nil) byte offset to leave the cursor at, counted in the value the edits produce, as if no one else had changed it. Default is the end of the text of the edit with the highest `start`, wherever it sits in `edits`, or where the cursor is now when `edits` is empty.
 ///   `strict` (boolean|nil) refuse any version but the current one instead of moving the edits forward. Default false.
+///   `marks` (table|nil) marks to replace namespace `ns` with, shaped like those of `input_decorate` and counted in the value the edits produce, like `cursor`. They land with the text, so no frame ever shows the text without them. A mark that does not fit refuses the whole edit.
+///   `ns` (string|nil) the namespace `marks` go in. Required with `marks`.
 /// @return (table|nil, string|nil) `{ version, cursor }` of the input after the edit, or nil and an error.
 /// @example
 /// local st = maki.ui.input()
@@ -667,10 +687,24 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 ///   version = st.version,
 ///   session_id = st.session_id,
 /// })
+///
+/// -- Paste text collapsed into a chip, never shown raw for a frame. Each
+/// -- paste gets a namespace of its own, so the next one keeps this chip.
+/// -- Undo takes the text and the chip away, and redo brings the text back
+/// -- without it, see `input_decorate`:
+/// pastes = pastes + 1
+/// maki.ui.input_edit({
+///   start = st.cursor, stop = st.cursor, text = pasted,
+///   ns = "paste" .. pastes,
+///   marks = { { start = st.cursor, stop = st.cursor + #pasted, conceal = "[pasted text]", atomic = true } },
+///   version = st.version,
+///   session_id = st.session_id,
+/// })
 #[lua_fn(guard = [Input, SessionRead])]
 async fn input_edit(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] plugin: Arc<str>,
     #[ctx] caller: PluginReach,
     opts: Table,
 ) -> LuaResult<Pair<mlua::Value>> {
@@ -696,6 +730,14 @@ async fn input_edit(
             })
             .collect::<LuaResult<_>>()?,
     };
+    let marks = match (opts.opt("ns")?, opts.opt("marks")?) {
+        (None, None) => None,
+        (Some(ns), Some(marks)) => Some(input_marks(INPUT_EDIT, ns, marks)?),
+        _ => return Err(mlua::Error::runtime(MARKS_HALVES_ERR)),
+    };
+    if marks.is_some() && !plugin_loaded(&lua, &plugin) {
+        return Ok(err_pair(UNLOADED_MARKS_ERR));
+    }
     let req = InputRequest::Edit(InputEdit {
         edits,
         cursor: opts.opt("cursor")?,
@@ -703,74 +745,100 @@ async fn input_edit(
         strict: opts.opt_bool("strict").unwrap_or_default(),
         session_id: required(&opts, INPUT_EDIT, "session_id")?,
         caller: caller.now(&lua),
+        marks,
     });
     input_roundtrip(lua, tx.as_ref(), req).await
 }
 
-/// Decorates the chat input in every session, from a regex or from a
-/// tree-sitter query. No Lua runs per keystroke.
+/// Replaces all the marks your plugin has in namespace `ns` of the chat
+/// input. Use it for looks that come from plugin state. When the look follows
+/// from the text, a [rule](#maki-ui-input_rules) fits better.
 ///
-/// Each `ns` of a plugin holds one rule. Calling again with the same `ns`
-/// replaces it, and leaving out `pattern`, `mark` and `treesitter` removes
-/// it. Rules go away when the plugin unloads.
+/// Keep a look that tracks something live, like ghost text at the cursor, in
+/// one namespace and replace it on `InputChanged`. Marks placed once, like
+/// the chip over a paste, each need a namespace of their own.
 ///
-/// A regex rule marks every match with `mark`. The UI matches a line the
-/// first time it needs it and keeps the result until the line changes, so
-/// the marks never lag behind the text. The pattern uses
-/// [Rust regex syntax](https://docs.rs/regex/latest/regex/#syntax). It is
-/// matched one line at a time, so a match never spans lines. It still sees
-/// the text before its line: `\A` is the start of the input,
-/// which only the first line can match, while `$` is the end of the line
-/// and `(?m)^` the start of one. An empty match marks a point, which only
-/// `virt_text` shows. In `conceal` and the text of `virt_text`, `$1` is the
-/// text of capture group 1, `$0` the whole match, and `$$` a plain `$`.
+/// A mark that the typing since `version` would have
+/// [dropped](#input-marks) is skipped, so typing alone never fails the call.
 ///
-/// A tree-sitter rule parses the input as `lang` and runs a query per
-/// language. Each capture is marked with the template of the same name in
-/// `captures`, and every capture needs one, except `@injection.content`,
-/// whose template is optional, `@injection.language`, which names the
-/// language of injected code, and names starting with `_`, which only feed
-/// predicates. Templates are drawn as written, `$` included. Conditions are
-/// the predicates of `maki.treesitter.query`, and `#set!` only takes
-/// `injection.language`. Code captured as `@injection.content` is in the
-/// language `@injection.language` caught, or the one
-/// `#set! injection.language` names. When the rule has a query for that
-/// language, the code is parsed again with it and that query runs there.
-/// Otherwise it gets a `lang` mark. Markdown leaves the text of its blocks
-/// to `markdown_inline`, so a `markdown` rule runs its `markdown_inline`
-/// query there by itself.
-///
-/// The parse runs on a worker thread and never holds up typing. Until the
-/// worker catches up with an edit, its marks move with the text, so a bold
-/// or a code block grows with what is typed inside it. Only a conceal or an
-/// `atomic` mark the edit lands inside is gone until then.
-///
-/// A rule whose `ns` was first set later is drawn over one set earlier, and
-/// replacing a rule keeps its place. Within a tree-sitter rule a later
-/// pattern is drawn over an earlier one, and `markdown_inline` over
-/// `markdown`.
-///
-/// maki draws the `!` of a shell command and its bash colors itself, under
-/// every rule.
-///
-/// A mark never edits the text, so a send carries the raw text, concealed
-/// ranges included.
+/// Besides the cases in [offsets and versions](#offsets-and-versions), the
+/// call fails when a mark ends past the end of the text, an offset falls
+/// inside a multi-byte character, or `start` is past `stop`.
 ///
 /// @param opts table Options:
-///   `ns` (string) the name of the rule, unique per plugin. Code in the global and the project `init.lua` runs as plugins `"global/init.lua"` and `"project/init.lua"`.
+///   `ns` (string) the namespace to replace.
+///   `marks` (table) list of [marks](#input-marks), `{}` to clear the namespace.
+///   `version` (integer) the version the offsets were planned against.
+///   `session_id` (string) the tab the offsets were read from.
+/// @return (table|nil, string|nil) `{ version }`, the version the marks were placed on, or nil and an error.
+/// @example
+/// maki.api.create_autocmd("InputChanged", {
+///   callback = function(ev)
+///     maki.ui.input_decorate({
+///       ns = "ghost",
+///       marks = { { start = ev.data.cursor, virt_text = { { "complete this", "dim" } }, virt_text_pos = "inline" } },
+///       version = ev.data.version,
+///       session_id = ev.data.session_id,
+///     })
+///   end,
+/// })
+#[lua_fn]
+async fn input_decorate(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] plugin: Arc<str>,
+    opts: Table,
+) -> LuaResult<Pair<mlua::Value>> {
+    reject_unknown_fields(&opts, DECORATE_OPTIONS, INPUT_DECORATE)?;
+    let decorate = InputDecorate {
+        version: required(&opts, INPUT_DECORATE, "version")?,
+        session_id: required(&opts, INPUT_DECORATE, "session_id")?,
+        marks: input_marks(
+            INPUT_DECORATE,
+            required(&opts, INPUT_DECORATE, "ns")?,
+            required(&opts, INPUT_DECORATE, "marks")?,
+        )?,
+        plugin,
+    };
+    if !plugin_loaded(&lua, &decorate.plugin) {
+        return Ok(err_pair(UNLOADED_MARKS_ERR));
+    }
+    input_roundtrip(lua, tx.as_ref(), InputRequest::Decorate(decorate)).await
+}
+
+/// Sets a rule that marks the chat input in every tab, from a regex or a
+/// tree-sitter query. See [chat input](#chat-input) for when to use one.
+///
+/// Each `ns` of your plugin holds one rule. Calling again with the same
+/// `ns` replaces it, and a call with only `ns` removes it. Rules go away
+/// when the plugin unloads. A bad pattern, query or mark throws. Where
+/// marks overlap, [input marks](#input-marks) says which draws on top.
+///
+/// A regex rule marks every match of `pattern` with `mark`. The pattern
+/// uses [Rust regex syntax](https://docs.rs/regex/latest/regex/#syntax).
+/// Matching runs one line at a time, so a match never spans lines. The
+/// pattern still sees the text before its line: `\A` is the start of the
+/// input, `$` the end of the line and `(?m)^` the start of one. An empty
+/// match marks a point. In `conceal` and the text of `virt_text`, `$1` is
+/// capture group 1, `$0` the whole match and `$$` a plain `$`.
+///
+/// A tree-sitter rule parses the input as `lang` and runs `query` on it, as
+/// the `treesitter` fields below describe. Parsing runs in the background,
+/// and until it catches up with typing, its marks move with the text like
+/// pushed marks.
+///
+/// @param opts table Options:
+///   `ns` (string) the namespace.
 ///   `pattern` (string|nil) the regex to match.
-///   `mark` (table|nil) what each match gets, with the fields below.
-///   `mark.hl` (string|table|nil) a theme style name like `"accent"`, or an inline style `{ fg, bg, bold, italic, underline, dim, strikethrough, reversed }`.
-///   `mark.conceal` (string|nil) text drawn instead of the match, `""` hides it.
-///   `mark.reveal` (string|nil) `"cursor"` shows the raw text while the cursor is inside the match or on its edge.
-///   `mark.atomic` (boolean|nil) the cursor steps over the match, and a delete that cuts into it removes all of it.
-///   `mark.virt_text` (table|nil) spans drawn but never part of the text, `{ { text, hl? }, ... }`.
-///   `mark.virt_text_pos` (string|nil) `"eol"` (default) after the line, or `"inline"` before the match.
-///   `mark.lang` (string|nil) highlight the match as code in this language.
-///   `treesitter` (table|nil) a tree-sitter rule instead of `pattern` and `mark`.
+///   `mark` (table|nil) the [mark](#input-marks) each match gets, without `start` and `stop`. Required with `pattern`.
+///   `treesitter` (table|nil) a tree-sitter rule, in place of `pattern` and `mark`.
 ///   `treesitter.lang` (string) the language the input is parsed as, like `"markdown"`.
-///   `treesitter.query` (string|table) the query for `lang`, or a table of language = query.
-///   `treesitter.captures` (table|nil) capture name = template, with the fields of `mark`.
+///   `treesitter.query` (string|table) the query for `lang`, or a table of language = query that gives each language in the input its own. The predicates are those of `maki.treesitter.query`, and `#set!` only takes `injection.language`.
+///     - Code captured as `@injection.content` is in the language `@injection.language` caught, or the one `#set! injection.language` names. When the rule has a query for that language, the code is parsed again and that query runs there. Otherwise the code gets a `lang` mark.
+///     - A `markdown` rule runs its `markdown_inline` query inside blocks by itself.
+///   `treesitter.captures` (table|nil) capture name = template, with the fields of `mark`. Templates are drawn as written, `$` included.
+///     - Each capture needs a template, and each template a capture.
+///     - `@injection.content` may go without one. `@injection.language` and names starting with `_` take none, since they only name the injected language or feed predicates.
 /// @return
 /// @example
 /// -- Draw `$skill:go` as a ` go ` chip the cursor steps over:
@@ -813,6 +881,12 @@ fn input_rules(lua: &Lua, #[ctx] plugin: Arc<str>, opts: Table) -> LuaResult<()>
         (_, _, Some(_)) => return Err(mlua::Error::runtime(SYNTAX_ALONE_ERR)),
         _ => return Err(mlua::Error::runtime(RULE_HALVES_ERR)),
     };
+    // A handler from a load that is already gone would leave a rule that
+    // nothing ever takes away.
+    if !plugin_loaded(lua, &plugin) {
+        tracing::debug!(ns = %ns, plugin = %plugin, "input rule dropped: plugin unloaded");
+        return Ok(());
+    }
     if let Some(mut store) = lua.app_data_mut::<InputRuleStore>() {
         store.set(plugin, ns, rule);
     }
@@ -1037,8 +1111,9 @@ lua_table! {
     /// Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
     /// still work. The calls that need a screen behave like this:
     ///
-    /// - `input`, `input_edit`, and `action` on a built-in name return
-    ///   `nil, "no interactive UI attached"`. Plugin actions still run.
+    /// - `input`, `input_edit`, `input_decorate`, and `action` on a built-in
+    ///   name return `nil, "no interactive UI attached"`. Plugin actions
+    ///   still run.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
     /// - `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
@@ -1053,12 +1128,17 @@ lua_table! {
     /// | --- | --- |
     /// | Read the text and the cursor | [`input`](#maki-ui-input) |
     /// | Style text by what it says, like a `$skill:go` chip | [`input_rules`](#maki-ui-input_rules) |
+    /// | Style text from plugin state, like ghost text or diagnostics | [`input_decorate`](#maki-ui-input_decorate) |
     /// | Change the text or the cursor | [`input_edit`](#maki-ui-input_edit) |
     /// | React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
     ///
-    /// `input` and `input_edit` wait for the UI to answer. They work from any
-    /// callback, like a key handler, an autocmd or `maki.defer_fn`, but not
-    /// while your plugin loads.
+    /// Prefer `input_rules` when the look follows from the text. A rule runs
+    /// no Lua per keystroke, and its marks are right again after undo, redo,
+    /// a history recall or a chat switch.
+    ///
+    /// `input`, `input_edit` and `input_decorate` wait for the UI to answer.
+    /// They work from any callback, like a key handler, an autocmd or
+    /// `maki.defer_fn`, but not while your plugin loads.
     ///
     /// Changing the chat input needs the `input` permission. That covers its
     /// text and its cursor, since your next Enter sends the text and your
@@ -1066,8 +1146,8 @@ lua_table! {
     /// built-in [actions](#maki-ui-action) that change the input, like
     /// `undo` or a history recall. Without `input` they raise
     /// `permission denied`. A plugin without it can still read the input and
-    /// style it with `input_rules`. Your own `init.lua` needs a `plugin.toml`
-    /// next to it for this, like any plugin, see
+    /// style it with `input_rules` and `input_decorate`. Your own `init.lua`
+    /// needs a `plugin.toml` next to it for this, like any plugin, see
     /// [plugin permissions](#plugin-permissions).
     ///
     /// With `input` you may write any text. Enter then checks every plugin
@@ -1080,23 +1160,101 @@ lua_table! {
     /// | anything else | nothing beyond `input` |
     ///
     /// If one of them falls short, Enter leaves the text where it is and the
-    /// status bar names it. The text becomes the user's again only
-    /// once the input is sent, cleared or replaced.
+    /// status bar names that plugin. The text becomes the user's again once
+    /// it is sent or cleared, once another text replaces it, like a history
+    /// recall, or once the user replaces all of it, like selecting everything
+    /// and typing.
     ///
-    /// A draft restored after a restart and a rewound or forked turn that
-    /// starts with `/` or `!` count as written by `a plugin` that holds
-    /// `agent` and `session_write` at most.
+    /// A draft a plugin wrote, restored after a restart, counts as written by
+    /// an unnamed plugin that holds `agent` and `session_write` at most,
+    /// which the status bar calls `a plugin`. So does a rewound or forked
+    /// turn that starts with `/` or `!`, or is `exit`.
     ///
-    /// Upgrading: `input_edit` needed no permission in earlier releases.
-    /// Plugins and `init.lua` files that call it or an editing built-in
-    /// action need `input` now. A `plugin.toml` you wrote yourself grants it
-    /// unless it sets `input = false`. A package needs its author to add
-    /// `input`, and you to approve the package again.
+    /// Upgrading: `input_edit` needs `input` and `session_read` now, and the
+    /// editing built-in actions need `input`. A binding in `"i"` on a key
+    /// that types text, like `a` or `<Paste>`, needs `session_read`. A
+    /// `plugin.toml` you wrote yourself grants them unless it sets them to
+    /// `false`. A package needs its author to add them, and you to approve
+    /// the package again.
+    ///
+    /// ### Offsets and versions
+    ///
+    /// Offsets count bytes from 0, and a range leaves out `stop`. So the
+    /// range `start, stop` is `text:sub(start + 1, stop)`, and
+    /// `text:sub(1, cursor)` is everything before the cursor. A newline is
+    /// one byte.
+    ///
+    /// A tab is one open session, named by its `session_id`. Its chats, the
+    /// main agent's and each subagent's, share one chat input, and each chat
+    /// keeps its own draft.
+    ///
+    /// The calls work on the input of the focused tab. `input`, the
+    /// `InputChanged` event and `ev.input` of a key handler report its
+    /// `version` and `session_id`, and `input_edit` and `input_decorate` need
+    /// both. Every tab counts versions from zero, so a version alone cannot
+    /// tell two tabs apart.
+    ///
+    /// The user may type between your read and your call. `input_edit` and
+    /// `input_decorate` then move your offsets past what was typed. Both
+    /// refuse when:
+    ///
+    /// - `session_id` names a tab that is not focused.
+    /// - The text was replaced since: a history recall, a chat switch that
+    ///   swapped in another draft, a change made in `$EDITOR`, or a send.
+    /// - So much changed since `version` that the offsets can no longer be
+    ///   moved.
+    ///
+    /// A refusal returns `nil` and an error message. Read the input again
+    /// and retry. Bad arguments, like a missing or an unknown field, throw.
+    ///
+    /// ### Input marks
+    ///
+    /// A mark styles a byte range of the input. `input_rules` puts one on
+    /// every match, and `input_decorate` and `input_edit` push marks at the
+    /// offsets you give. Marks and rules live in namespaces, named by `ns`.
+    /// Each plugin has its own namespaces, so two plugins can use the same
+    /// name. A mark has these fields:
+    ///
+    /// | Field | Type | Effect |
+    /// | --- | --- | --- |
+    /// | `start`, `stop` | integer | The range, for pushed marks only. Without `stop` the mark is a point, which only `virt_text` shows. |
+    /// | `hl` | string or table | A theme style name like `"accent"`, or `{ fg, bg, bold, italic, underline, dim, strikethrough, reversed }`. |
+    /// | `conceal` | string | Text drawn in place of the range. `""` hides it. |
+    /// | `reveal` | string | `"cursor"` shows the raw text while the cursor is inside the range or on its edge. |
+    /// | `atomic` | boolean | The cursor steps over the range, and a delete that cuts into it removes all of it. |
+    /// | `virt_text` | table | Spans drawn but never part of the text, `{ { text, hl? }, ... }`. |
+    /// | `virt_text_pos` | string | `"eol"` (default) draws `virt_text` after the line, `"inline"` before `start`. |
+    /// | `lang` | string | Highlights the range as code in this language. |
+    ///
+    /// The text of `conceal` and `virt_text` must not hold control
+    /// characters, newlines included. A mark never edits the text, so a send
+    /// carries the raw text, concealed ranges included.
+    ///
+    /// Where marks overlap:
+    ///
+    /// - A pushed mark draws over every rule, and a mark pushed later over
+    ///   one pushed earlier.
+    /// - A rule whose `ns` was first set later draws over one set earlier.
+    ///   Replacing a rule keeps its place.
+    /// - Within a tree-sitter rule, a later pattern draws over an earlier
+    ///   one, and `markdown_inline` over `markdown`.
+    /// - Within one pattern, a capture whose name first appears later in the
+    ///   query draws over one that appears earlier. In
+    ///   `(inline_link (link_text) @text) @link`, `@link` draws over `@text`.
+    ///
+    /// Pushed marks move with the text: a range keeps covering the same
+    /// words, and a point stays after text typed at it. A range is dropped
+    /// once its text is gone, or when an edit lands inside it while it
+    /// conceals or is atomic. Undo brings back the text without its marks, so
+    /// undoing the delete of a chip shows its raw text. Marks stay with their
+    /// draft across chat switches, go away when the plugin unloads, and are
+    /// not saved.
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual set_mode, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_edit, manual input_rules,
+        manual set_window_title, manual input, manual input_edit, manual input_decorate,
+        manual input_rules,
     ]
 }
 
@@ -1126,8 +1284,10 @@ pub(crate) fn create_ui_table(
         lua,
         reach.permissions(),
         ui_action_tx.clone(),
+        Arc::clone(&plugin),
         reach.clone(),
     )?;
+    input_decorate__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     input_rules__register(&t, lua, Arc::clone(&plugin))?;
     open_win__register(&t, lua, ui_action_tx, Arc::clone(&plugin))?;
 
@@ -1328,9 +1488,11 @@ fn markdown_lines_to_lua(lua: &Lua, lines: &[maki_markdown::render::Line]) -> Lu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::util::command::UiReply;
-    use crate::api::util::convert::{UNKNOWN_FIELD_ERR, lua_to_json};
+    use crate::api::ui::marks::CONTROL_CHAR_ERR;
+    use crate::api::util::command::{NO_UI_ERR, UiReply};
+    use crate::api::util::convert::{REQUIRED_ERR, UNKNOWN_FIELD_ERR, lua_to_json};
     use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
+    use crate::runtime::mark_loaded;
     use maki_highlight::StyledSegment;
     use mlua::Lua;
     use test_case::test_case;
@@ -2089,6 +2251,13 @@ mod tests {
     /// Stands in for the focused session's input box: reads answer with a
     /// snapshot, edits answer with whatever {edit} decides.
     fn ui_with_input(edit: fn(InputEdit) -> UiReply) -> Lua {
+        let lua = ui_with_input_of_unloaded(edit);
+        mark_loaded(&lua, INPUT_PLUGIN);
+        lua
+    }
+
+    /// [`ui_with_input`] for a plugin whose load is gone.
+    fn ui_with_input_of_unloaded(edit: fn(InputEdit) -> UiReply) -> Lua {
         let (tx, rx) = flume::unbounded::<UiAction>();
         std::thread::spawn(move || {
             while let Ok(UiAction::Input { req, reply_tx }) = rx.recv() {
@@ -2100,6 +2269,12 @@ mod tests {
                         "version": 7,
                     })),
                     InputRequest::Edit(edit_req) => edit(edit_req),
+                    InputRequest::Decorate(req) => Ok(serde_json::json!({
+                        "marks": marks_json(Some(&req.marks)),
+                        "version": req.version,
+                        "session_id": req.session_id,
+                        "plugin": req.plugin,
+                    })),
                 };
                 let _ = reply_tx.send(reply);
             }
@@ -2135,7 +2310,136 @@ mod tests {
             "strict": edit.strict,
             "session_id": edit.session_id,
             "plugin": edit.caller.owner(),
+            "marks": marks_json(edit.marks.as_ref()),
         }))
+    }
+
+    fn marks_json(marks: Option<&InputMarks>) -> serde_json::Value {
+        let Some(InputMarks { ns, marks, .. }) = marks else {
+            return serde_json::Value::Null;
+        };
+        let marks: Vec<_> = marks
+            .iter()
+            .map(|mark| {
+                serde_json::json!({
+                    "start": mark.start,
+                    "stop": mark.stop,
+                    "conceal": mark.decoration.conceal,
+                    "atomic": mark.decoration.atomic,
+                })
+            })
+            .collect();
+        serde_json::json!({ "ns": ns, "marks": marks })
+    }
+
+    const PUSHED_MARKS: &str = r#"ns = "chip", marks = { { start = 5 }, { start = 0, stop = 2, conceal = "[h]", atomic = true } }"#;
+
+    fn decorate_script(fields: &str) -> String {
+        format!(
+            r#"local st = ui.input()
+               return ui.input_decorate({{
+                 {fields},
+                 version = st.version, session_id = st.session_id,
+               }})"#
+        )
+    }
+
+    /// Both guards reach the UI, or a call planned against text that moved on
+    /// lands anyway. The host stamps on the plugin name, so a caller cannot
+    /// claim another plugin's.
+    #[test_case(decorate_script(PUSHED_MARKS) ; "input_decorate")]
+    #[test_case(edit_script(&format!(r#"start = 0, stop = 0, text = "x", {PUSHED_MARKS}"#)) ; "input_edit")]
+    fn marks_reach_the_ui_with_the_guards_and_the_plugin(script: String) {
+        let lua = ui_with_input(echo_edit);
+        let (val, err) = eval(&lua, &script);
+        assert_eq!(err, None);
+        assert_eq!(
+            serde_json::json!({
+                "marks": val["marks"],
+                "version": val["version"],
+                "session_id": val["session_id"],
+                "plugin": val["plugin"],
+            }),
+            serde_json::json!({
+                "marks": {
+                    "ns": "chip",
+                    "marks": [
+                        { "start": 5, "atomic": false },
+                        { "start": 0, "stop": 2, "conceal": "[h]", "atomic": true },
+                    ],
+                },
+                "version": 7,
+                "session_id": READ_SESSION_ID,
+                "plugin": INPUT_PLUGIN,
+            })
+        );
+    }
+
+    /// The unload that clears a plugin's marks has already reached the UI, so
+    /// marks pushed after it would stay for good.
+    #[test_case(decorate_script(PUSHED_MARKS) ; "input_decorate")]
+    #[test_case(edit_script(&format!(r#"start = 0, stop = 0, text = "x", {PUSHED_MARKS}"#)) ; "input_edit")]
+    fn a_plugin_whose_load_is_gone_pushes_no_marks(script: String) {
+        let lua = ui_with_input_of_unloaded(echo_edit);
+        let (val, err) = eval(&lua, &script);
+        assert_eq!(val, serde_json::Value::Null);
+        assert_eq!(err.as_deref(), Some(UNLOADED_MARKS_ERR));
+    }
+
+    /// Each of these would otherwise go quietly wrong. A table read as a list
+    /// keeps only its list part, so a single edit in place of `edits` reads
+    /// as none, and a single mark in place of `marks` wipes `ns`. A misspelled
+    /// option drops what it asks for, like `strict`.
+    #[test_case(decorate_script(r#"ns = "a", marks = {}, strict = true"#), UNKNOWN_FIELD_ERR ; "decorate_an_option_it_does_not_take")]
+    #[test_case(decorate_script(r#"ns = "a", marks = { start = 0, stop = 1 }"#), NOT_A_LIST_ERR ; "decorate_a_single_mark_in_place_of_the_list")]
+    #[test_case(decorate_script(r#"ns = "a", marks = { { stop = 1 } }"#), REQUIRED_ERR ; "decorate_a_mark_without_start")]
+    #[test_case(decorate_script(r#"ns = "a", marks = { { start = 0, stopp = 1 } }"#), UNKNOWN_FIELD_ERR ; "decorate_a_misspelled_mark_field")]
+    #[test_case(decorate_script(r#"ns = "a", marks = { { start = 0, conceal = "a\nb" } }"#), CONTROL_CHAR_ERR ; "decorate_a_control_char_in_drawn_text")]
+    #[test_case(edit_script(r#"start = 0, stop = 0, text = "x", marks = {}"#), MARKS_HALVES_ERR ; "edit_marks_without_ns")]
+    #[test_case(edit_script(r#"start = 0, stop = 0, text = "x", ns = "a""#), MARKS_HALVES_ERR ; "edit_ns_without_marks")]
+    #[test_case(edit_script(r#"edits = { start = 0, stop = 0, text = "x" }, cursor = 1"#), NOT_A_LIST_ERR ; "edit_a_single_edit_in_place_of_the_list")]
+    #[test_case(edit_script(r#"edits = { { start = 0, stop = 0, text = "x" }, cursor = 1 }"#), NOT_A_LIST_ERR ; "edit_an_option_inside_the_list")]
+    #[test_case(edit_script(r#"start = 0, stop = 0, text = "x", ns = "a", marks = { start = 0, stop = 1 }"#), NOT_A_LIST_ERR ; "edit_a_single_mark_in_place_of_the_marks")]
+    #[test_case(edit_script(r#"edits = { { start = 0, stop = 0, text = "a" } }, text = "b""#), MIXED_EDIT_SHAPES_ERR ; "edit_an_edits_list_next_to_a_single_edit")]
+    #[test_case(edit_script(r#"start = 0, stop = 0, text = "x", strcit = true"#), UNKNOWN_FIELD_ERR ; "edit_a_misspelled_option")]
+    #[test_case(edit_script(r#"edits = { { start = 0, stop = 0, text = "x", cursor = 1 } }"#), UNKNOWN_FIELD_ERR ; "edit_an_option_inside_an_edit")]
+    fn input_calls_throw_on(script: String, expected: &str) {
+        let lua = ui_with_input(echo_edit);
+        let err = eval_err(&lua, &script);
+        assert!(err.contains(expected), "{err}");
+    }
+
+    /// Marks without a namespace have nowhere to go, and a namespace alone
+    /// would quietly wipe it.
+    #[test_case(r#"marks = {}"# ; "marks_without_ns")]
+    #[test_case(r#"ns = "a""# ; "ns_without_marks")]
+    fn input_edit_takes_marks_and_ns_together(fields: &str) {
+        let lua = ui_with_input(echo_edit);
+        let err = eval_err(
+            &lua,
+            &edit_script(&format!(r#"start = 0, stop = 0, text = "x", {fields}"#)),
+        );
+        assert!(err.contains(MARKS_HALVES_ERR), "{err}");
+    }
+
+    #[test]
+    fn input_decorate_without_a_ui_answers_the_error_slot() {
+        let lua = Lua::new();
+        mark_loaded(&lua, INPUT_PLUGIN);
+        let t = create_ui_table(
+            &lua,
+            None,
+            Arc::from(INPUT_PLUGIN),
+            PluginReach::new(PluginPermissions::trusted()),
+        )
+        .unwrap();
+        lua.globals().set("ui", t).unwrap();
+        let (val, err) = eval(
+            &lua,
+            r#"return ui.input_decorate({ ns = "a", marks = {}, version = 0, session_id = "s" })"#,
+        );
+        assert_eq!(val, serde_json::Value::Null);
+        assert_eq!(err.as_deref(), Some(NO_UI_ERR));
     }
 
     /// Both guards are required, so a test only ever varies the range.
@@ -2201,41 +2505,9 @@ mod tests {
         );
     }
 
-    /// Only the list part of `edits` is read, so a single edit in its place
-    /// would read as no edits and the call would just move the cursor.
-    #[test_case(r#"edits = { start = 0, stop = 0, text = "x" }, cursor = 1"# ; "a_single_edit_in_place_of_the_list")]
-    #[test_case(r#"edits = { { start = 0, stop = 0, text = "x" }, cursor = 1 }"# ; "an_option_inside_the_list")]
-    fn input_edit_refuses_edits_that_are_not_a_list(fields: &str) {
-        let lua = ui_with_input(echo_edit);
-        let err = eval_err(&lua, &edit_script(fields));
-        assert!(err.contains(NOT_A_LIST_ERR), "{err}");
-    }
-
-    /// Mixing both shapes would leave one of them silently unapplied.
-    #[test]
-    fn input_edit_refuses_an_edits_list_next_to_a_single_edit() {
-        let lua = ui_with_input(echo_edit);
-        let err = eval_err(
-            &lua,
-            &edit_script(r#"edits = { { start = 0, stop = 0, text = "a" } }, text = "b""#),
-        );
-        assert!(err.contains(MIXED_EDIT_SHAPES_ERR), "{err}");
-    }
-
-    /// A misspelled option would quietly drop what it asks for, like
-    /// `strict` keeping a stale edit from landing.
-    #[test_case(r#"start = 0, stop = 0, text = "x", strcit = true"# ; "a_misspelled_option")]
-    #[test_case(r#"edits = { { start = 0, stop = 0, text = "x", cursor = 1 } }"# ; "an_option_inside_an_edit")]
-    fn input_edit_throws_on_an_unknown_field(fields: &str) {
-        let lua = ui_with_input(echo_edit);
-        let err = eval_err(&lua, &edit_script(fields));
-        assert!(err.contains(UNKNOWN_FIELD_ERR), "{err}");
-    }
-
     /// Leaving a required key out has to fail loudly instead of writing
-    /// unguarded, and that includes {text}: the input box has no undo, so a
-    /// misspelled key defaulting to the empty string deletes the range the
-    /// call meant to replace.
+    /// unguarded, and that includes {text}: a misspelled key defaulting to
+    /// the empty string would delete the range the call meant to replace.
     #[test_case("version" ; "version")]
     #[test_case("session_id" ; "session_id")]
     #[test_case("text" ; "text")]

@@ -113,6 +113,7 @@ pub fn plugin_edit(
         strict: false,
         session_id: app.state.session.id.to_string(),
         caller: PluginReach::new(PluginPermissions::trusted()).owned_by(Arc::from(PLUGIN)),
+        marks: None,
     };
     app.apply_input_edit(edit, area).map(drop)
 }
@@ -154,8 +155,9 @@ pub fn decorate(app: &mut App, count: usize) {
             }
         })
         .collect();
+    let version = app.input_box.buffer.version();
     app.input_box
-        .set_marks(PLUGIN, PLUGIN, marks)
+        .set_marks(version, PLUGIN, PLUGIN, marks)
         .expect("marks fit the input");
 }
 

@@ -212,6 +212,7 @@ declare maki: {
     set_window_title: @checked (title: string) -> (),
     input: @checked () -> (any, string?),
     input_edit: @checked (opts: any) -> (any, string?),
+    input_decorate: @checked (opts: any) -> (any, string?),
     input_rules: @checked (opts: any) -> (),
   },
   uv: {

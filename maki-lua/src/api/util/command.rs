@@ -13,6 +13,7 @@ use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
+use crate::api::ui::marks::Mark;
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::key::Key;
@@ -600,7 +601,8 @@ pub struct InputEdit {
     /// one change.
     pub edits: Vec<TextEdit>,
     /// Where to leave the cursor, in the value the edits produce. The end of
-    /// the text of the edit with the highest start when absent.
+    /// the text of the edit with the highest start when absent, or where the
+    /// cursor is now when {edits} is empty.
     pub cursor: Option<usize>,
     /// The value counter the reader was handed. Required, because an optional
     /// guard makes the shortest call the unguarded one.
@@ -614,13 +616,32 @@ pub struct InputEdit {
     /// What the edit may change, checked on the UI side, which alone knows
     /// the text the edits land on. Its owner rides along on the
     /// `InputChanged` this edit fires, so one input plugin can tell another's
-    /// writes from its own.
+    /// writes from its own, and owns {marks}.
     pub caller: PluginReach,
+    /// Counted in the value the edits produce, like {cursor}, and placed in
+    /// the same change as the text, so no frame shows one without the other.
+    pub marks: Option<InputMarks>,
+}
+
+/// Everything a plugin's namespace {ns} holds from now on.
+pub struct InputMarks {
+    pub ns: String,
+    pub marks: Vec<Mark>,
+}
+
+/// Marks planned against the value at {version} of the input of
+/// {session_id}, which guard them like they guard an [`InputEdit`].
+pub struct InputDecorate {
+    pub version: u64,
+    pub session_id: String,
+    pub plugin: Arc<str>,
+    pub marks: InputMarks,
 }
 
 pub enum InputRequest {
     Read,
     Edit(InputEdit),
+    Decorate(InputDecorate),
 }
 
 pub type UiReply = Result<serde_json::Value, String>;
@@ -758,6 +779,9 @@ pub enum UiAction {
     /// `ev.fallback()`: run what the host itself does for that key, before
     /// the keys typed after it.
     KeybindFallback(u64),
+    /// The plugin of this name was unloaded, or a fresh load of it starts, so
+    /// whatever it left in the UI has to go.
+    PluginUnloaded(Arc<str>),
     /// `reply_tx` answers whether {cmdline} resolved to a known command, not
     /// how the command itself went: `/compact` streams for a minute, and the
     /// Lua caller must not park for that long.

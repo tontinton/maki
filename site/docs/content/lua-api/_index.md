@@ -4011,9 +4011,8 @@ reserved for quit and suspend, on a taken key with `unique`, and with
 - `{rhs}` (`function`) Called with an event table `ev`. The return value is ignored. `ev` has:
   - `key` (`string`) the key, in canonical notation.
   - `input` (`table?`) the chat input at the press, as `maki.ui.input` returns it. Pass its `version` and `session_id` to `maki.ui.input_edit`. Only with `session_read`, else nil.
-  - `text` (`string?`) `<Paste>` only: the pasted text, with `\n` line endings. maki does not insert it. Only with `session_read`, else nil.
-  - `fallback` (`function`) runs maki's own handling of the key, as if no plugin had bound it. Call it once, before the handler returns.
-    - It types, moves or sends in the chat input, or hands the key to a focused window's `win:recv`. It never runs another plugin's binding.
+  - `text` (`string?`) `<Paste>` only: the pasted text, with `\n` line endings. maki does not insert it. It is cleaned the way `maki.ui.input_edit` cleans text, so `#ev.text` is what inserting it adds. Only with `session_read`, else nil.
+  - `fallback` (`function`) runs maki's own handling of the key, as if no plugin had bound it (see [Key resolution](/docs/lua-api/#key-resolution)). Call it once, before the handler returns.
     - It lands after the handler's earlier `maki.ui` calls and before the waiting keys.
     - It returns `true` once the key is queued, or `nil` and an error.
     - The key is dropped if the keyboard, the mode, the cursor or the selection moved since the press, your handler's own changes included.
@@ -6806,8 +6805,9 @@ local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 
 Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
 still work. The calls that need a screen behave like this:
 
-- `input`, `input_edit`, and `action` on a built-in name return
-  `nil, "no interactive UI attached"`. Plugin actions still run.
+- `input`, `input_edit`, `input_decorate`, and `action` on a built-in
+  name return `nil, "no interactive UI attached"`. Plugin actions
+  still run.
 - `open_editor` returns -1.
 - `flash` writes to the log.
 - `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
@@ -6822,12 +6822,17 @@ input. Pick the call by the job:
 | --- | --- |
 | Read the text and the cursor | [`input`](#maki-ui-input) |
 | Style text by what it says, like a `$skill:go` chip | [`input_rules`](#maki-ui-input_rules) |
+| Style text from plugin state, like ghost text or diagnostics | [`input_decorate`](#maki-ui-input_decorate) |
 | Change the text or the cursor | [`input_edit`](#maki-ui-input_edit) |
 | React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
 
-`input` and `input_edit` wait for the UI to answer. They work from any
-callback, like a key handler, an autocmd or `maki.defer_fn`, but not
-while your plugin loads.
+Prefer `input_rules` when the look follows from the text. A rule runs
+no Lua per keystroke, and its marks are right again after undo, redo,
+a history recall or a chat switch.
+
+`input`, `input_edit` and `input_decorate` wait for the UI to answer.
+They work from any callback, like a key handler, an autocmd or
+`maki.defer_fn`, but not while your plugin loads.
 
 Changing the chat input needs the `input` permission. That covers its
 text and its cursor, since your next Enter sends the text and your
@@ -6835,8 +6840,8 @@ next key lands at the cursor. It covers `input_edit` and the
 built-in [actions](#maki-ui-action) that change the input, like
 `undo` or a history recall. Without `input` they raise
 `permission denied`. A plugin without it can still read the input and
-style it with `input_rules`. Your own `init.lua` needs a `plugin.toml`
-next to it for this, like any plugin, see
+style it with `input_rules` and `input_decorate`. Your own `init.lua`
+needs a `plugin.toml` next to it for this, like any plugin, see
 [plugin permissions](#plugin-permissions).
 
 With `input` you may write any text. Enter then checks every plugin
@@ -6849,18 +6854,95 @@ that changed it:
 | anything else | nothing beyond `input` |
 
 If one of them falls short, Enter leaves the text where it is and the
-status bar names it. The text becomes the user's again only
-once the input is sent, cleared or replaced.
+status bar names that plugin. The text becomes the user's again once
+it is sent or cleared, once another text replaces it, like a history
+recall, or once the user replaces all of it, like selecting everything
+and typing.
 
-A draft restored after a restart and a rewound or forked turn that
-starts with `/` or `!` count as written by `a plugin` that holds
-`agent` and `session_write` at most.
+A draft a plugin wrote, restored after a restart, counts as written by
+an unnamed plugin that holds `agent` and `session_write` at most,
+which the status bar calls `a plugin`. So does a rewound or forked
+turn that starts with `/` or `!`, or is `exit`.
 
-Upgrading: `input_edit` needed no permission in earlier releases.
-Plugins and `init.lua` files that call it or an editing built-in
-action need `input` now. A `plugin.toml` you wrote yourself grants it
-unless it sets `input = false`. A package needs its author to add
-`input`, and you to approve the package again.
+Upgrading: `input_edit` needs `input` and `session_read` now, and the
+editing built-in actions need `input`. A binding in `"i"` on a key
+that types text, like `a` or `<Paste>`, needs `session_read`. A
+`plugin.toml` you wrote yourself grants them unless it sets them to
+`false`. A package needs its author to add them, and you to approve
+the package again.
+
+### Offsets and versions
+
+Offsets count bytes from 0, and a range leaves out `stop`. So the
+range `start, stop` is `text:sub(start + 1, stop)`, and
+`text:sub(1, cursor)` is everything before the cursor. A newline is
+one byte.
+
+A tab is one open session, named by its `session_id`. Its chats, the
+main agent's and each subagent's, share one chat input, and each chat
+keeps its own draft.
+
+The calls work on the input of the focused tab. `input`, the
+`InputChanged` event and `ev.input` of a key handler report its
+`version` and `session_id`, and `input_edit` and `input_decorate` need
+both. Every tab counts versions from zero, so a version alone cannot
+tell two tabs apart.
+
+The user may type between your read and your call. `input_edit` and
+`input_decorate` then move your offsets past what was typed. Both
+refuse when:
+
+- `session_id` names a tab that is not focused.
+- The text was replaced since: a history recall, a chat switch that
+  swapped in another draft, a change made in `$EDITOR`, or a send.
+- So much changed since `version` that the offsets can no longer be
+  moved.
+
+A refusal returns `nil` and an error message. Read the input again
+and retry. Bad arguments, like a missing or an unknown field, throw.
+
+### Input marks
+
+A mark styles a byte range of the input. `input_rules` puts one on
+every match, and `input_decorate` and `input_edit` push marks at the
+offsets you give. Marks and rules live in namespaces, named by `ns`.
+Each plugin has its own namespaces, so two plugins can use the same
+name. A mark has these fields:
+
+| Field | Type | Effect |
+| --- | --- | --- |
+| `start`, `stop` | integer | The range, for pushed marks only. Without `stop` the mark is a point, which only `virt_text` shows. |
+| `hl` | string or table | A theme style name like `"accent"`, or `{ fg, bg, bold, italic, underline, dim, strikethrough, reversed }`. |
+| `conceal` | string | Text drawn in place of the range. `""` hides it. |
+| `reveal` | string | `"cursor"` shows the raw text while the cursor is inside the range or on its edge. |
+| `atomic` | boolean | The cursor steps over the range, and a delete that cuts into it removes all of it. |
+| `virt_text` | table | Spans drawn but never part of the text, `{ { text, hl? }, ... }`. |
+| `virt_text_pos` | string | `"eol"` (default) draws `virt_text` after the line, `"inline"` before `start`. |
+| `lang` | string | Highlights the range as code in this language. |
+
+The text of `conceal` and `virt_text` must not hold control
+characters, newlines included. A mark never edits the text, so a send
+carries the raw text, concealed ranges included.
+
+Where marks overlap:
+
+- A pushed mark draws over every rule, and a mark pushed later over
+  one pushed earlier.
+- A rule whose `ns` was first set later draws over one set earlier.
+  Replacing a rule keeps its place.
+- Within a tree-sitter rule, a later pattern draws over an earlier
+  one, and `markdown_inline` over `markdown`.
+- Within one pattern, a capture whose name first appears later in the
+  query draws over one that appears earlier. In
+  `(inline_link (link_text) @text) @link`, `@link` draws over `@text`.
+
+Pushed marks move with the text: a range keeps covering the same
+words, and a point stays after text typed at it. A range is dropped
+once its text is gone, or when an edit lands inside it while it
+conceals or is atomic. Undo brings back the text without its marks, so
+undoing the delete of a chip shows its raw text. Marks stay with their
+draft across chat switches, go away when the plugin unloads, and are
+not saved.
 
 ---
 
@@ -7427,9 +7509,10 @@ Replaces byte ranges of the chat input, as if the user had selected each
 one and typed its `text`. All of them land together as one change: one
 new version and one undo step.
 
-With `edits = {}` and a `cursor`, the call only moves the cursor. The
-version stays, no undo step is made, and a recalled history entry stays
-recalled. An empty list with no cursor is refused, since there is nothing
+With `edits = {}` the text stays as it is: the call moves the cursor to
+`cursor`, replaces namespace `ns` with `marks`, or both. The version
+stays, no undo step is made, and a recalled history entry stays
+recalled. An empty list with neither is refused, since there is nothing
 to do.
 
 Every range is planned against the value `maki.ui.input` returned at
@@ -7463,13 +7546,15 @@ start, while typing right where the edit lands does. Edits are refused:
 
 Read again and retry on any of them.
 
-A change needs `input`. What Enter does with text you wrote is in
-[chat input](#chat-input).
+Enter checks the text you write before it runs it, see
+[chat input](#chat-input). For marks alone, use `input_decorate`, which
+needs no permission.
 
 Tabs and carriage returns in `text` become spaces and newlines, and the
 other control characters are dropped, the way a paste is rewritten. With
-`cursor` given, such text is refused instead, since the cursor counts
-bytes that would not land. Clean it first.
+`cursor` or `marks` given, such text is refused instead, since their
+offsets count bytes that would not land. Clean it first, the way
+`ev.text` of `<Paste>` already is.
 
 It also needs `session_read`, like `maki.ui.input`. Its answer and its
 errors tell where the user typed since `version`, so a plugin could
@@ -7486,8 +7571,10 @@ Requires the `input` and `session_read` [plugin permissions](#plugin-permissions
   - `text` (`string`) what to put there, `""` to delete the range. Required, so a misspelled key cannot empty it by accident.
   - `version` (`integer`) the version `maki.ui.input` returned, which the offsets were planned against.
   - `session_id` (`string`) the session `maki.ui.input` read the offsets from.
-  - `cursor` (`integer|nil`) byte offset to leave the cursor at, counted in the value the edits produce, as if no one else had changed it. Default is the end of the text of the edit with the highest `start`, wherever it sits in `edits`.
+  - `cursor` (`integer|nil`) byte offset to leave the cursor at, counted in the value the edits produce, as if no one else had changed it. Default is the end of the text of the edit with the highest `start`, wherever it sits in `edits`, or where the cursor is now when `edits` is empty.
   - `strict` (`boolean|nil`) refuse any version but the current one instead of moving the edits forward. Default false.
+  - `marks` (`table|nil`) marks to replace namespace `ns` with, shaped like those of `input_decorate` and counted in the value the edits produce, like `cursor`. They land with the text, so no frame ever shows the text without them. A mark that does not fit refuses the whole edit.
+  - `ns` (`string|nil`) the namespace `marks` go in. Required with `marks`.
 
 **Returns:** (`table|nil`, `string|nil`) `{ version, cursor }` of the input after the edit, or nil and an error.
 
@@ -7514,6 +7601,67 @@ local r, err = maki.ui.input_edit({
   version = st.version,
   session_id = st.session_id,
 })
+
+-- Paste text collapsed into a chip, never shown raw for a frame. Each
+-- paste gets a namespace of its own, so the next one keeps this chip.
+-- Undo takes the text and the chip away, and redo brings the text back
+-- without it, see `input_decorate`:
+pastes = pastes + 1
+maki.ui.input_edit({
+  start = st.cursor, stop = st.cursor, text = pasted,
+  ns = "paste" .. pastes,
+  marks = { { start = st.cursor, stop = st.cursor + #pasted, conceal = "[pasted text]", atomic = true } },
+  version = st.version,
+  session_id = st.session_id,
+})
+```
+
+---
+
+### `maki.ui.input_decorate()` {#maki-ui-input_decorate}
+
+```lua
+maki.ui.input_decorate({opts})
+```
+
+Replaces all the marks your plugin has in namespace `ns` of the chat
+input. Use it for looks that come from plugin state. When the look follows
+from the text, a [rule](#maki-ui-input_rules) fits better.
+
+Keep a look that tracks something live, like ghost text at the cursor, in
+one namespace and replace it on `InputChanged`. Marks placed once, like
+the chip over a paste, each need a namespace of their own.
+
+A mark that the typing since `version` would have
+[dropped](#input-marks) is skipped, so typing alone never fails the call.
+
+Besides the cases in [offsets and versions](#offsets-and-versions), the
+call fails when a mark ends past the end of the text, an offset falls
+inside a multi-byte character, or `start` is past `stop`.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `ns` (`string`) the namespace to replace.
+  - `marks` (`table`) list of [marks](#input-marks), `{}` to clear the namespace.
+  - `version` (`integer`) the version the offsets were planned against.
+  - `session_id` (`string`) the tab the offsets were read from.
+
+**Returns:** (`table|nil`, `string|nil`) `{ version }`, the version the marks were placed on, or nil and an error.
+
+**Example:**
+
+```lua
+maki.api.create_autocmd("InputChanged", {
+  callback = function(ev)
+    maki.ui.input_decorate({
+      ns = "ghost",
+      marks = { { start = ev.data.cursor, virt_text = { { "complete this", "dim" } }, virt_text_pos = "inline" } },
+      version = ev.data.version,
+      session_id = ev.data.session_id,
+    })
+  end,
+})
 ```
 
 ---
@@ -7524,72 +7672,41 @@ local r, err = maki.ui.input_edit({
 maki.ui.input_rules({opts})
 ```
 
-Decorates the chat input in every session, from a regex or from a
-tree-sitter query. No Lua runs per keystroke.
+Sets a rule that marks the chat input in every tab, from a regex or a
+tree-sitter query. See [chat input](#chat-input) for when to use one.
 
-Each `ns` of a plugin holds one rule. Calling again with the same `ns`
-replaces it, and leaving out `pattern`, `mark` and `treesitter` removes
-it. Rules go away when the plugin unloads.
+Each `ns` of your plugin holds one rule. Calling again with the same
+`ns` replaces it, and a call with only `ns` removes it. Rules go away
+when the plugin unloads. A bad pattern, query or mark throws. Where
+marks overlap, [input marks](#input-marks) says which draws on top.
 
-A regex rule marks every match with `mark`. The UI matches a line the
-first time it needs it and keeps the result until the line changes, so
-the marks never lag behind the text. The pattern uses
-[Rust regex syntax](https://docs.rs/regex/latest/regex/#syntax). It is
-matched one line at a time, so a match never spans lines. It still sees
-the text before its line: `\A` is the start of the input,
-which only the first line can match, while `$` is the end of the line
-and `(?m)^` the start of one. An empty match marks a point, which only
-`virt_text` shows. In `conceal` and the text of `virt_text`, `$1` is the
-text of capture group 1, `$0` the whole match, and `$$` a plain `$`.
+A regex rule marks every match of `pattern` with `mark`. The pattern
+uses [Rust regex syntax](https://docs.rs/regex/latest/regex/#syntax).
+Matching runs one line at a time, so a match never spans lines. The
+pattern still sees the text before its line: `\A` is the start of the
+input, `$` the end of the line and `(?m)^` the start of one. An empty
+match marks a point. In `conceal` and the text of `virt_text`, `$1` is
+capture group 1, `$0` the whole match and `$$` a plain `$`.
 
-A tree-sitter rule parses the input as `lang` and runs a query per
-language. Each capture is marked with the template of the same name in
-`captures`, and every capture needs one, except `@injection.content`,
-whose template is optional, `@injection.language`, which names the
-language of injected code, and names starting with `_`, which only feed
-predicates. Templates are drawn as written, `$` included. Conditions are
-the predicates of `maki.treesitter.query`, and `#set!` only takes
-`injection.language`. Code captured as `@injection.content` is in the
-language `@injection.language` caught, or the one
-`#set! injection.language` names. When the rule has a query for that
-language, the code is parsed again with it and that query runs there.
-Otherwise it gets a `lang` mark. Markdown leaves the text of its blocks
-to `markdown_inline`, so a `markdown` rule runs its `markdown_inline`
-query there by itself.
-
-The parse runs on a worker thread and never holds up typing. Until the
-worker catches up with an edit, its marks move with the text, so a bold
-or a code block grows with what is typed inside it. Only a conceal or an
-`atomic` mark the edit lands inside is gone until then.
-
-A rule whose `ns` was first set later is drawn over one set earlier, and
-replacing a rule keeps its place. Within a tree-sitter rule a later
-pattern is drawn over an earlier one, and `markdown_inline` over
-`markdown`.
-
-maki draws the `!` of a shell command and its bash colors itself, under
-every rule.
-
-A mark never edits the text, so a send carries the raw text, concealed
-ranges included.
+A tree-sitter rule parses the input as `lang` and runs `query` on it, as
+the `treesitter` fields below describe. Parsing runs in the background,
+and until it catches up with typing, its marks move with the text like
+pushed marks.
 
 **Parameters:**
 
 - `{opts}` (`table`) Options:
-  - `ns` (`string`) the name of the rule, unique per plugin. Code in the global and the project `init.lua` runs as plugins `"global/init.lua"` and `"project/init.lua"`.
+  - `ns` (`string`) the namespace.
   - `pattern` (`string|nil`) the regex to match.
-  - `mark` (`table|nil`) what each match gets, with the fields below.
-  - `mark.hl` (`string|table|nil`) a theme style name like `"accent"`, or an inline style `{ fg, bg, bold, italic, underline, dim, strikethrough, reversed }`.
-  - `mark.conceal` (`string|nil`) text drawn instead of the match, `""` hides it.
-  - `mark.reveal` (`string|nil`) `"cursor"` shows the raw text while the cursor is inside the match or on its edge.
-  - `mark.atomic` (`boolean|nil`) the cursor steps over the match, and a delete that cuts into it removes all of it.
-  - `mark.virt_text` (`table|nil`) spans drawn but never part of the text, `{ { text, hl? }, ... }`.
-  - `mark.virt_text_pos` (`string|nil`) `"eol"` (default) after the line, or `"inline"` before the match.
-  - `mark.lang` (`string|nil`) highlight the match as code in this language.
-  - `treesitter` (`table|nil`) a tree-sitter rule instead of `pattern` and `mark`.
+  - `mark` (`table|nil`) the [mark](#input-marks) each match gets, without `start` and `stop`. Required with `pattern`.
+  - `treesitter` (`table|nil`) a tree-sitter rule, in place of `pattern` and `mark`.
   - `treesitter.lang` (`string`) the language the input is parsed as, like `"markdown"`.
-  - `treesitter.query` (`string|table`) the query for `lang`, or a table of language = query.
-  - `treesitter.captures` (`table|nil`) capture name = template, with the fields of `mark`.
+  - `treesitter.query` (`string|table`) the query for `lang`, or a table of language = query that gives each language in the input its own. The predicates are those of `maki.treesitter.query`, and `#set!` only takes `injection.language`.
+    - Code captured as `@injection.content` is in the language `@injection.language` caught, or the one `#set! injection.language` names. When the rule has a query for that language, the code is parsed again and that query runs there. Otherwise the code gets a `lang` mark.
+    - A `markdown` rule runs its `markdown_inline` query inside blocks by itself.
+  - `treesitter.captures` (`table|nil`) capture name = template, with the fields of `mark`. Templates are drawn as written, `$` included.
+    - Each capture needs a template, and each template a capture.
+    - `@injection.content` may go without one. `@injection.language` and names starting with `_` take none, since they only name the injected language or feed predicates.
 
 **Example:**
 

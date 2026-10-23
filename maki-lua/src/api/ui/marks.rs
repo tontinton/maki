@@ -13,9 +13,12 @@ use regex::{Captures, Regex};
 
 use super::buf::{parse_line, parse_style};
 use super::syntax::SyntaxRule;
-use crate::api::util::convert::{TableExt, reject_unknown_fields};
+use crate::api::util::convert::{TableExt, reject_unknown_fields, required};
 
-const MARK_FIELDS: &[&str] = &[
+/// A pushed mark says where it goes, while a rule's mark goes on each match.
+const PUSHED_MARK_FIELDS: &[&str] = &[
+    "start",
+    "stop",
     "hl",
     "conceal",
     "reveal",
@@ -24,12 +27,15 @@ const MARK_FIELDS: &[&str] = &[
     "virt_text_pos",
     "lang",
 ];
+/// `start` and `stop`, which only a pushed mark has.
+const PLACEMENT_FIELDS: usize = 2;
+const MARK_FIELDS: &[&str] = PUSHED_MARK_FIELDS.split_at(PLACEMENT_FIELDS).1;
 const REVEAL_CURSOR: &str = "cursor";
 const POS_EOL: &str = "eol";
 const POS_INLINE: &str = "inline";
 const GROUP_SIGIL: char = '$';
 const MARK: &str = "mark";
-const CONTROL_CHAR_ERR: &str = "holds a control character";
+pub(crate) const CONTROL_CHAR_ERR: &str = "holds a control character";
 const BAD_PATTERN_ERR: &str = "bad pattern";
 const MISSING_GROUP_ERR: &str = "names a group the pattern does not have";
 const FIXED_FIELD_ERR: &str = "`$N` is only filled in inside conceal and virt_text";
@@ -68,6 +74,21 @@ pub struct Decoration {
     pub virt_text: Vec<SnapshotSpan>,
     pub virt_text_pos: VirtTextPos,
     pub lang: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Mark {
+    pub start: usize,
+    /// `None` makes a point mark.
+    pub stop: Option<usize>,
+    /// Shared, so a rule stamping one look over many ranges stores it once.
+    pub decoration: Arc<Decoration>,
+}
+
+impl Mark {
+    pub fn end(&self) -> usize {
+        self.stop.unwrap_or(self.start)
+    }
 }
 
 impl Decoration {
@@ -257,6 +278,25 @@ impl PatternRule {
 
 pub(crate) fn parse_mark(tbl: &Table) -> LuaResult<Decoration> {
     reject_unknown_fields(tbl, MARK_FIELDS, MARK)?;
+    parse_decoration(tbl)
+}
+
+/// Drawn text is checked here, while the offsets can only be checked by the
+/// UI against the text they point into.
+pub(crate) fn parse_pushed_mark(tbl: &Table) -> LuaResult<Mark> {
+    reject_unknown_fields(tbl, PUSHED_MARK_FIELDS, MARK)?;
+    let decoration = parse_decoration(tbl)?;
+    decoration
+        .check_drawn_text()
+        .map_err(|msg| mlua::Error::runtime(format!("{MARK}: {msg}")))?;
+    Ok(Mark {
+        start: required(tbl, MARK, "start")?,
+        stop: tbl.opt("stop")?,
+        decoration: Arc::new(decoration),
+    })
+}
+
+fn parse_decoration(tbl: &Table) -> LuaResult<Decoration> {
     let reveal = match tbl.opt::<String>("reveal")?.as_deref() {
         None => Reveal::Never,
         Some(REVEAL_CURSOR) => Reveal::Cursor,
@@ -370,6 +410,7 @@ mod tests {
     use crate::api::ui::{RULE_HALVES_ERR, SYNTAX_ALONE_ERR, create_ui_table};
     use crate::api::util::convert::{REQUIRED_ERR, UNKNOWN_FIELD_ERR};
     use crate::plugin_permissions::{PluginPermissions, PluginReach};
+    use crate::runtime::mark_loaded;
     use mlua::Lua;
     use test_case::test_case;
 
@@ -384,6 +425,12 @@ mod tests {
     }
 
     fn lua_with_rules() -> (Lua, InputRulesReader) {
+        let (lua, reader) = lua_with_rules_unloaded();
+        mark_loaded(&lua, PLUGIN);
+        (lua, reader)
+    }
+
+    fn lua_with_rules_unloaded() -> (Lua, InputRulesReader) {
         let lua = Lua::new();
         let (store, reader) = InputRuleStore::new();
         lua.set_app_data(store);
@@ -437,6 +484,17 @@ mod tests {
         let (lua, reader) = lua_with_rules();
         lua.load(format!("ui.input_rules({opts})")).exec().unwrap();
         assert_eq!(reader.load_full().len(), 1);
+    }
+
+    /// A handler outliving its load would leave a rule the unload already
+    /// cleared out, with nothing left to take it away.
+    #[test]
+    fn a_rule_from_a_load_that_is_gone_is_dropped() {
+        let (lua, reader) = lua_with_rules_unloaded();
+        lua.load(format!("ui.input_rules({CONCEALING_PATTERN})"))
+            .exec()
+            .unwrap();
+        assert!(reader.load_full().is_empty());
     }
 
     fn found(bytes: Range<usize>, conceal: &str) -> (Range<usize>, Option<String>) {

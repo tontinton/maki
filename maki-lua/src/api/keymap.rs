@@ -163,7 +163,8 @@ impl KeybindTicket {
     }
 
     /// The pasted text of a `<Paste>`, handed to the handler as `ev.text` if
-    /// it may read the session.
+    /// it may read the session. Cleaned by the host the way the chat input
+    /// cleans what lands in it.
     pub fn with_text(self, text: String) -> Self {
         Self {
             text: Some(text),
@@ -699,9 +700,8 @@ fn parse_buffer(opts: Option<&Table>) -> LuaResult<Scope> {
 /// @param rhs function Called with an event table `ev`. The return value is ignored. `ev` has:
 ///   `key` (string) the key, in canonical notation.
 ///   `input` (table?) the chat input at the press, as `maki.ui.input` returns it. Pass its `version` and `session_id` to `maki.ui.input_edit`. Only with `session_read`, else nil.
-///   `text` (string?) `<Paste>` only: the pasted text, with `\n` line endings. maki does not insert it. Only with `session_read`, else nil.
-///   `fallback` (function) runs maki's own handling of the key, as if no plugin had bound it. Call it once, before the handler returns.
-///     - It types, moves or sends in the chat input, or hands the key to a focused window's `win:recv`. It never runs another plugin's binding.
+///   `text` (string?) `<Paste>` only: the pasted text, with `\n` line endings. maki does not insert it. It is cleaned the way `maki.ui.input_edit` cleans text, so `#ev.text` is what inserting it adds. Only with `session_read`, else nil.
+///   `fallback` (function) runs maki's own handling of the key, as if no plugin had bound it (see [Key resolution](/docs/lua-api/#key-resolution)). Call it once, before the handler returns.
 ///     - It lands after the handler's earlier `maki.ui` calls and before the waiting keys.
 ///     - It returns `true` once the key is queued, or `nil` and an error.
 ///     - The key is dropped if the keyboard, the mode, the cursor or the selection moved since the press, your handler's own changes included.
