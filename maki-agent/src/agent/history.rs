@@ -79,15 +79,14 @@ impl History {
         self.live.as_ref()
     }
 
-    /// What the model holds true: the frame's facts with every update in the
+    /// What the model holds true: the frame's facts, with what it inherited
+    /// from the start of the frame it replaced, and every update in the
     /// transcript applied in order. An update from before the frame was built
-    /// still counts, because the model reads it after the prompt.
+    /// still counts, because the model reads it after the prompt. The frame
+    /// never folds updates in itself, so cutting one also takes back what it
+    /// told.
     pub(crate) fn told(&self) -> Option<LiveFacts> {
-        let mut facts = self.frame()?.facts_at_start();
-        for update in self.as_slice().iter().filter_map(Message::facts_update) {
-            facts.apply(update);
-        }
-        Some(facts)
+        Some(facts_told(self.frame()?, self.as_slice()))
     }
 
     /// Late MCP tools go into the stored frame too, so a resumed session sends
@@ -109,7 +108,7 @@ impl History {
 
     pub(crate) fn request_prefix(&self) -> Option<(&str, &Value)> {
         Some((
-            &self.snapshot.frame.as_ref()?.system,
+            self.snapshot.frame.as_ref()?.prefix()?,
             &self.live.as_ref()?.wire,
         ))
     }
@@ -262,6 +261,16 @@ impl History {
     }
 }
 
+/// [`History::told`] for a transcript held anywhere, a stored or exported one
+/// included.
+pub(super) fn facts_told(frame: &StoredFrame, messages: &[Message]) -> LiveFacts {
+    let mut facts = frame.facts_at_start();
+    for update in messages.iter().filter_map(Message::facts_update) {
+        facts.apply(update);
+    }
+    facts
+}
+
 pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool {
     let mut changed = false;
     let mut i = 0;
@@ -346,7 +355,7 @@ fn is_empty_marker(m: &Message) -> bool {
 
 /// Restored sessions can have orphaned tool_results or unclosed tool_uses
 /// (e.g. the process was killed mid-turn). The API returns 400 if it sees those.
-fn sanitize_restored(messages: &mut Vec<Message>) {
+pub(super) fn sanitize_restored(messages: &mut Vec<Message>) {
     let len_before = messages.len();
     let mut changed = remove_orphaned_tool_results(messages);
     close_dangling_tool_calls(messages, UNAVAILABLE_RESULT);

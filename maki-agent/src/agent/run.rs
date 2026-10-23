@@ -1149,7 +1149,7 @@ fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -1159,17 +1159,20 @@ mod tests {
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, ThinkingSupport, TokenUsage,
     };
+    use maki_storage::frame::{FactsUpdate, PlanChange};
     use serde_json::Value;
     use test_case::test_case;
 
     use super::compaction::FIELD_CONTINUE;
     use super::*;
+    use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
     use crate::agent::hook::testing::{Seen, script};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
     use crate::prompt::{PromptId, Slot, SlotEntry};
+    use crate::session::StoredSession;
     use crate::template::Vars;
     use crate::tools::RequestTools;
     use crate::{EarlierInput, Envelope};
@@ -2368,6 +2371,229 @@ mod tests {
         let last = updates.last().unwrap();
         assert!(last.contains(NEXT_DATE));
         assert!(last.contains(PLAN_ENDED));
+    }
+
+    const ORIGIN_DATE: &str = "2026-10-01";
+    const STALE_DATE: &str = "2026-09-30";
+    const ORIGIN_CWD: &str = "/origin";
+    const HERE_CWD: &str = "/here";
+    const ELSEWHERE_CWD: &str = "/elsewhere";
+    const ORIGIN_INSTRUCTIONS: &str = "\n\nProject instructions:\nbe nice";
+    const HERE_INSTRUCTIONS: &str = "\n\nProject instructions:\nbe terse";
+    const ORIGIN_HINT: &str = "tags: a";
+    const STALE_UPDATE: &str = "<context-update>Date is now 2026-10-01.</context-update>";
+    const RELOADED_TOOL: &str = "reloaded";
+    const TOLD_WHAT_MOVED_MSG: &str =
+        "a new frame must be followed by exactly what moved, never instructions or hints";
+    const MESSAGES_KEPT_MSG: &str = "a rebuilt frame must not edit earlier messages";
+
+    /// What the origin machine's prompt stated, with the model this test runs
+    /// on, so only what a case changes differs.
+    fn origin_facts() -> PromptFacts {
+        PromptFacts {
+            date: ORIGIN_DATE.into(),
+            cwd: ORIGIN_CWD.into(),
+            model: default_model().spec(),
+            instructions: ORIGIN_INSTRUCTIONS.into(),
+            hints: BTreeMap::from([(MEMORY_HINT.into(), ORIGIN_HINT.into())]),
+        }
+    }
+
+    fn cwd_moved() -> FactsUpdate {
+        FactsUpdate {
+            cwd: Some(HERE_CWD.into()),
+            ..FactsUpdate::default()
+        }
+    }
+
+    fn date_moved(date: &str) -> FactsUpdate {
+        FactsUpdate {
+            date: Some(date.into()),
+            ..FactsUpdate::default()
+        }
+    }
+
+    fn prior_turn() -> Vec<Message> {
+        vec![
+            Message::user(QUEUED_MESSAGES[0].into()),
+            text_response(StopReason::EndTurn).message,
+        ]
+    }
+
+    /// Stored by `into_session` and opened the way every resume opens one.
+    fn imported(facts: Option<PromptFacts>, messages: Vec<Message>) -> History {
+        let mut session = Transcript {
+            facts,
+            messages,
+            ..Transcript::default()
+        }
+        .into_session(StoredSession::new("", HERE_CWD))
+        .unwrap();
+        History::restored(session.drain_messages()).with_frame(session.frame().cloned())
+    }
+
+    /// The imported facts are older than the update after them, so the model
+    /// holds the update's date and every diff has to start from there.
+    fn after_import(h: &mut Harness) -> usize {
+        let stale_update = Message::context_update(STALE_UPDATE.into(), date_moved(ORIGIN_DATE));
+        let facts = PromptFacts {
+            date: STALE_DATE.into(),
+            ..origin_facts()
+        };
+        h.history = imported(Some(facts), [vec![stale_update], prior_turn()].concat());
+        h.world.change(|f| *f = origin_facts());
+        h.history.len()
+    }
+
+    fn after_rebuild_on_resume(h: &mut Harness) -> usize {
+        h.world.change(|f| *f = origin_facts());
+        h.run_in(AgentMode::Build);
+        let resumed_len = h.history.len();
+        *h.world.tool.lock().unwrap() = RELOADED_TOOL;
+        h.restart(resumed_len);
+        resumed_len
+    }
+
+    fn appended_updates(history: &History, from: usize) -> Vec<FactsUpdate> {
+        history.as_slice()[from..]
+            .iter()
+            .filter_map(Message::facts_update)
+            .cloned()
+            .collect()
+    }
+
+    fn announced_rebuild(events: &[Envelope]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(&e.event, AgentEvent::Notice { text } if text == FRAME_REBUILT))
+    }
+
+    #[test_case(|_: &mut PromptFacts| {}, vec![] ; "facts_match")]
+    #[test_case(|f: &mut PromptFacts| f.cwd = HERE_CWD.into(), vec![cwd_moved()] ; "cwd_moved")]
+    #[test_case(|f: &mut PromptFacts| f.date = NEXT_DATE.into(), vec![date_moved(NEXT_DATE)] ; "date_moved")]
+    #[test_case(|f: &mut PromptFacts| { f.instructions = HERE_INSTRUCTIONS.into(); f.hints.clear(); }, vec![] ; "instructions_and_hints_never")]
+    fn first_run_after_import_tells_what_moved(
+        change: fn(&mut PromptFacts),
+        told: Vec<FactsUpdate>,
+    ) {
+        let mut h = Harness::new(Vec::new());
+        let imported_len = after_import(&mut h);
+        h.world.change(change);
+        let events = h.run_in(AgentMode::Build);
+        h.run_in(AgentMode::Build);
+
+        h.assert_append_only();
+        assert!(!announced_rebuild(&events), "an import loses no cache");
+        assert_eq!(
+            appended_updates(&h.history, imported_len),
+            told,
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+    }
+
+    #[test]
+    fn import_without_facts_tells_nothing() {
+        let mut h = Harness::new(Vec::new());
+        h.history = imported(None, prior_turn());
+        h.world.change(|f| *f = origin_facts());
+        let events = h.run_in(AgentMode::Build);
+
+        assert!(!announced_rebuild(&events));
+        assert!(updates(&h.history).is_empty());
+    }
+
+    /// The same hole as an import: a fact only the old prompt stated used to
+    /// be dropped silently when the frame was rebuilt on resume.
+    #[test_case(|_: &mut PromptFacts| {}, vec![] ; "facts_match")]
+    #[test_case(|f: &mut PromptFacts| f.cwd = HERE_CWD.into(), vec![cwd_moved()] ; "cwd_moved")]
+    #[test_case(|f: &mut PromptFacts| f.date = NEXT_DATE.into(), vec![date_moved(NEXT_DATE)] ; "date_moved")]
+    #[test_case(|f: &mut PromptFacts| { f.instructions = HERE_INSTRUCTIONS.into(); f.hints.clear(); }, vec![] ; "instructions_and_hints_never")]
+    fn rebuilt_frame_on_resume_tells_what_moved(
+        change: fn(&mut PromptFacts),
+        told: Vec<FactsUpdate>,
+    ) {
+        let mut h = Harness::new(Vec::new());
+        let resumed_len = after_rebuild_on_resume(&mut h);
+        h.world.change(change);
+        let events = h.run_in(AgentMode::Build);
+        h.run_in(AgentMode::Build);
+
+        assert!(announced_rebuild(&events));
+        assert_eq!(
+            appended_updates(&h.history, resumed_len),
+            told,
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+        let requests = h.requests.lock().unwrap();
+        assert!(
+            requests[1].messages.starts_with(&requests[0].messages),
+            "{MESSAGES_KEPT_MSG}"
+        );
+        assert_append_only(&requests[1], &requests[2]);
+    }
+
+    /// The correction rides on the update before the first prompt, so editing
+    /// that prompt cuts it. The frame still knows what the transcript says.
+    #[test]
+    fn rewind_past_the_correction_tells_it_again() {
+        let mut h = Harness::new(Vec::new());
+        let imported_len = after_import(&mut h);
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Build);
+        h.requests.lock().unwrap().clear();
+        h.restart(imported_len);
+        h.run_in(AgentMode::Build);
+        h.run_in(AgentMode::Build);
+
+        h.assert_append_only();
+        assert_eq!(
+            appended_updates(&h.history, imported_len),
+            vec![cwd_moved()],
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+    }
+
+    /// A frame rebuilt after an update must not keep what that update told.
+    /// Rewinding past the update leaves only the first frame's cwd in the
+    /// transcript, so moving to the updated cwd again has to be told.
+    #[test]
+    fn rewind_past_an_update_before_a_rebuild_tells_it_again() {
+        let mut h = Harness::new(Vec::new());
+        h.world.change(|f| *f = origin_facts());
+        h.run_in(AgentMode::Build);
+        let before_update = h.history.len();
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Build);
+        *h.world.tool.lock().unwrap() = RELOADED_TOOL;
+        h.world.change(|f| f.cwd = ELSEWHERE_CWD.into());
+        h.run_in(AgentMode::Build);
+        h.restart(before_update);
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Build);
+
+        assert_eq!(
+            appended_updates(&h.history, before_update),
+            vec![cwd_moved()],
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+    }
+
+    /// What moved and what changed since are one update, never two in a row.
+    #[test_case(after_import ; "import")]
+    #[test_case(after_rebuild_on_resume ; "rebuild_on_resume")]
+    fn new_frame_tells_one_update_per_run_start(setup: fn(&mut Harness) -> usize) {
+        let mut h = Harness::new(Vec::new());
+        let from = setup(&mut h);
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Plan(PLAN_FILE.into()));
+
+        assert_eq!(
+            appended_updates(&h.history, from),
+            vec![FactsUpdate {
+                plan: Some(PlanChange::Entered(PLAN_FILE.into())),
+                ..cwd_moved()
+            }]
+        );
     }
 
     /// Which servers are up by now is luck, so a resumed process sends the MCP

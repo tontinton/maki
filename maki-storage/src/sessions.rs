@@ -2789,18 +2789,18 @@ mod tests {
     }
 
     fn frame_with_system(system: &str) -> StoredFrame {
-        StoredFrame {
-            system: system.into(),
-            fingerprint: "hash".into(),
-            facts: Some(PromptFacts {
+        StoredFrame::new(
+            system.into(),
+            "hash".into(),
+            Some(PromptFacts {
                 date: "2026-10-02".into(),
                 cwd: "/project".into(),
                 model: "m".into(),
                 instructions: " \n".into(),
                 hints: BTreeMap::from([("memory/tags".into(), "rust, cache".into())]),
             }),
-            mcp_tools: Vec::new(),
-        }
+            Vec::new(),
+        )
     }
 
     /// The agent sets a frame, or grows it with late MCP tools, without adding
@@ -4359,12 +4359,12 @@ mod tests {
             }
             5 => session.replace_messages(vec![user_message(&format!("fresh-{step}"))]),
             6 => session.prune_orphans(tool_ids),
-            7 => session.set_frame(Some(Arc::new(StoredFrame {
-                system: format!("system-{step}"),
-                fingerprint: format!("hash-{step}"),
-                facts: Default::default(),
-                mcp_tools: Vec::new(),
-            }))),
+            7 => session.set_frame(Some(Arc::new(StoredFrame::new(
+                format!("system-{step}"),
+                format!("hash-{step}"),
+                Default::default(),
+                Vec::new(),
+            )))),
             8 => session.set_frame(None),
             _ => {
                 session.set_title(format!("title-{step}"));

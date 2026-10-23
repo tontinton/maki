@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use maki_providers::{Message, Model};
-use maki_storage::frame::{LiveFacts, PlanChange, PromptFacts, StoredFrame};
+use maki_storage::frame::{FactsUpdate, LiveFacts, PlanChange, PromptFacts, StoredFrame};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator;
@@ -195,6 +195,8 @@ impl LiveFrame {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FrameFit {
     Kept,
+    /// Nothing was lost: there was no frame, or only the facts of an imported
+    /// one, which has no prefix and so no cache.
     Built,
     /// An existing frame was replaced, losing the cache built under it.
     Rebuilt,
@@ -202,6 +204,16 @@ pub(crate) enum FrameFit {
 
 /// The one place a frame is made. Keeps `history`'s frame while `context` still
 /// fits it, else builds a new one from `context`.
+///
+/// A replaced frame takes facts with it that no update ever stated, like the
+/// cwd of the machine a session moved from. The transcript is full of them,
+/// and the model reads its tail more than the new prompt, so the new frame
+/// inherits them and the next update corrects them.
+///
+/// It inherits what the old frame stated at its start, before any update.
+/// [`History::told`] replays every update in the transcript on top anyway,
+/// so this tells the same thing today. A later rewind can cut those updates,
+/// and then the frame must not claim the model still heard them.
 pub(crate) fn fit_frame(
     history: &mut History,
     context: RunContext,
@@ -209,7 +221,11 @@ pub(crate) fn fit_frame(
     model: &Model,
 ) -> FrameFit {
     let fingerprint = fingerprint(&context, mcp, model);
-    match history.frame().cloned() {
+    match history
+        .frame()
+        .filter(|frame| frame.prefix().is_some())
+        .cloned()
+    {
         Some(stored) if stored.fingerprint == fingerprint => {
             if history.live_frame().is_none() {
                 history.adopt_frame(LiveFrame::restore(context.tools, &stored));
@@ -217,13 +233,18 @@ pub(crate) fn fit_frame(
             FrameFit::Kept
         }
         stored => {
+            let inherited = history
+                .frame()
+                .map(|frame| inherited_facts(&frame.facts_at_start(), context.facts.as_ref()))
+                .unwrap_or_default();
             let live = LiveFrame::build(context.tools, mcp, model);
-            let frame = StoredFrame {
-                system: context.system,
+            let mut frame = StoredFrame::new(
+                context.system,
                 fingerprint,
-                facts: context.facts,
-                mcp_tools: live.mcp_tools().to_vec(),
-            };
+                context.facts,
+                live.mcp_tools().to_vec(),
+            );
+            frame.inherited = inherited;
             history.set_frame(frame, live);
             if stored.is_some() {
                 FrameFit::Rebuilt
@@ -231,6 +252,23 @@ pub(crate) fn fit_frame(
                 FrameFit::Built
             }
         }
+    }
+}
+
+/// What the old frame stated at its start that `facts` states otherwise. Instructions and hints
+/// stay out: the new prompt states them in full, nothing in the transcript
+/// points back at them, and they are large. Plan mode is in no prompt, so
+/// updates carry it under any frame.
+fn inherited_facts(start: &LiveFacts, facts: Option<&PromptFacts>) -> FactsUpdate {
+    let (Some(held), Some(stated)) = (&start.prompt, facts) else {
+        return FactsUpdate::default();
+    };
+    let differs = |held: &String, stated: &String| (held != stated).then(|| held.clone());
+    FactsUpdate {
+        date: differs(&held.date, &stated.date),
+        model: differs(&held.model, &stated.model),
+        cwd: differs(&held.cwd, &stated.cwd),
+        ..FactsUpdate::default()
     }
 }
 

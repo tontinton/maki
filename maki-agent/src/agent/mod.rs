@@ -6,6 +6,7 @@ mod instructions;
 mod run;
 mod streaming;
 pub mod tool_dispatch;
+mod transcript;
 
 pub use compaction::compact;
 pub use frame::{RunContext, RunContextBuilder, plan_mode_update};
@@ -19,3 +20,4 @@ pub use instructions::{
     find_subdirectory_instructions, is_instruction_file, load_instruction_text, load_instructions,
 };
 pub use run::{Agent, AgentParams, AgentRunParams, ModelSlot, resolve_compaction_model};
+pub use transcript::{NEWER_FORMAT, SessionExport, Transcript, TranscriptError};

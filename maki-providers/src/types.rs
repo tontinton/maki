@@ -269,8 +269,9 @@ fn images_kept(total: usize) -> usize {
 
 /// A new variant is not skew-safe: an older build drops the whole record, so
 /// it needs a `LOG_FORMAT_VERSION` bump.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum Role {
     #[default]
     User,
@@ -298,7 +299,7 @@ impl Role {
 /// - A new variant may sit beside `ToolUse`/`ToolResult` but never replace
 ///   them. An older build treats it as inert, so a call answered only by a
 ///   new variant would be left unanswered there.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, VariantNames)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, VariantNames, IntoStaticStr)]
 #[serde(remote = "Self", tag = "type", rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ContentBlock {

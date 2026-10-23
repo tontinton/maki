@@ -132,13 +132,25 @@ impl LiveFacts {
 /// newer plugin set dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredFrame {
-    pub system: String,
+    /// `None` for a frame that only holds facts, like an import's. An empty
+    /// string is still a real prompt, a plugin session may run without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
     /// A hash of what no update can carry. A run whose fingerprint differs
     /// starts a new frame.
     pub fingerprint: String,
     /// What `system` says. `None` when the host wrote it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<PromptFacts>,
+    /// What the frame this one replaced stated at its start, where `facts`
+    /// says otherwise. The transcript still reads that way, so it counts
+    /// until an update corrects it, and a rewind can't take that update's
+    /// reason away. Updates stay out of it because they live in the
+    /// transcript, and a rewind that cuts one must take back what it told.
+    /// Only date, cwd and model: the prompt states the rest in full and
+    /// nothing in the transcript points back at it.
+    #[serde(default, skip_serializing_if = "FactsUpdate::is_empty")]
+    pub inherited: FactsUpdate,
     /// The MCP part of `tools`, exactly as sent and grown as servers connect.
     /// Kept whole because what it holds depends on connection timing that a
     /// resumed process cannot reproduce.
@@ -147,12 +159,47 @@ pub struct StoredFrame {
 }
 
 impl StoredFrame {
+    pub fn new(
+        system: String,
+        fingerprint: String,
+        facts: Option<PromptFacts>,
+        mcp_tools: Vec<Value>,
+    ) -> Self {
+        Self {
+            system: Some(system),
+            fingerprint,
+            facts,
+            inherited: FactsUpdate::default(),
+            mcp_tools,
+        }
+    }
+
+    /// What a session holds before its first run builds a real frame, which
+    /// replaces this one without losing any cache.
+    pub fn facts_only(facts: PromptFacts) -> Self {
+        Self {
+            system: None,
+            fingerprint: String::new(),
+            facts: Some(facts),
+            inherited: FactsUpdate::default(),
+            mcp_tools: Vec::new(),
+        }
+    }
+
+    /// The `system` every request of the frame sends. `None` when there is
+    /// none yet, so no reader can send an empty one by mistake.
+    pub fn prefix(&self) -> Option<&str> {
+        self.system.as_deref()
+    }
+
     /// What the model holds true before any update.
     pub fn facts_at_start(&self) -> LiveFacts {
-        LiveFacts {
+        let mut facts = LiveFacts {
             plan: None,
             prompt: self.facts.clone(),
-        }
+        };
+        facts.apply(&self.inherited);
+        facts
     }
 }
 
@@ -163,6 +210,8 @@ mod tests {
 
     const HINT: &str = "memory/after_instructions";
     const PLAN_PATH: &str = "/plans/p.md";
+    const SYSTEM: &str = "you are maki";
+    const OTHER_CWD: &str = "/origin";
 
     fn prompt() -> PromptFacts {
         PromptFacts {
@@ -210,6 +259,26 @@ mod tests {
     #[test_case(host_written(), rendered() ; "host_written_to_rendered")]
     fn untracked_prompt_facts_tell_nothing(told: LiveFacts, now: LiveFacts) {
         assert!(told.changes_to(&now).is_empty());
+    }
+
+    /// Only a facts-only frame lacks a prefix. A plugin session with an
+    /// empty system prompt still sends it, and still keeps its cache.
+    #[test_case(StoredFrame::facts_only(prompt()), None ; "facts_only")]
+    #[test_case(StoredFrame::new(String::new(), String::new(), None, Vec::new()), Some("") ; "empty_system")]
+    fn prefix_survives_a_save(frame: StoredFrame, prefix: Option<&str>) {
+        let stored = serde_json::to_value(&frame).unwrap();
+        let loaded = serde_json::from_value::<StoredFrame>(stored).unwrap();
+        assert_eq!(loaded, frame);
+        assert_eq!(loaded.prefix(), prefix);
+    }
+
+    #[test]
+    fn inherited_facts_hold_until_told() {
+        let mut frame = StoredFrame::new(SYSTEM.into(), String::new(), Some(prompt()), Vec::new());
+        frame.inherited.cwd = Some(OTHER_CWD.into());
+        let mut expected = rendered();
+        expected.prompt.as_mut().unwrap().cwd = OTHER_CWD.into();
+        assert_eq!(frame.facts_at_start(), expected);
     }
 
     #[test]
