@@ -99,15 +99,17 @@ pub struct InputSnapshot {
     pub session_id: String,
     pub text: String,
     pub cursor: usize,
+    pub anchor: Option<usize>,
     pub version: u64,
 }
 
 impl InputSnapshot {
     pub(crate) fn to_lua(&self, lua: &Lua) -> LuaResult<Table> {
-        let table = lua.create_table_with_capacity(0, 4)?;
+        let table = lua.create_table_with_capacity(0, 5)?;
         table.raw_set("session_id", self.session_id.as_str())?;
         table.raw_set("text", self.text.as_str())?;
         table.raw_set("cursor", self.cursor)?;
+        table.raw_set("anchor", self.anchor)?;
         table.raw_set("version", self.version)?;
         Ok(table)
     }

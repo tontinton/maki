@@ -109,6 +109,7 @@ pub enum HostEvent<'a> {
     InputChanged {
         text: &'a str,
         cursor: usize,
+        anchor: Option<usize>,
         version: u64,
         source: Option<&'a str>,
         cursor_only: bool,
@@ -203,7 +204,10 @@ impl HostEventKind {
             Self::TaskStopped => (&[], &["id", "plugin"]),
             Self::TaskFocusChanged => (&[], &["id"]),
             Self::ModelChanged => (&[], &["model", "previous_spec"]),
-            Self::InputChanged => (&["text"], &["cursor", "version", "source", "cursor_only"]),
+            Self::InputChanged => (
+                &["text"],
+                &["cursor", "anchor", "version", "source", "cursor_only"],
+            ),
             Self::ModeChanged => (&[], &["old_mode", "new_mode"]),
             Self::FileIndexReady => (&[], &["root", "files", "crashed", "truncated"]),
         };
@@ -512,6 +516,7 @@ mod tests {
             HostEventKind::InputChanged => HostEvent::InputChanged {
                 text: SAMPLE_TEXT,
                 cursor: 0,
+                anchor: Some(0),
                 version: 0,
                 source: Some(SAMPLE_TEXT),
                 cursor_only: false,

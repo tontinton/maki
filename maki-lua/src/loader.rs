@@ -1881,6 +1881,7 @@ mod tests {
                     session_id: SESSION.into(),
                     text: TEXT.into(),
                     cursor: TEXT.len(),
+                    anchor: None,
                     version: VERSION,
                 });
                 pressed = Some(t.id());
@@ -2025,16 +2026,17 @@ mod tests {
     }
 
     /// `ev.input` and `ev.text` carry the draft, so only a plugin that may
-    /// read the session gets them.
+    /// read the session gets them, even on a key that types nothing.
     #[test_case(&["session_read"] => "true|pasted" ; "with_session_read")]
     #[test_case(&[] => "false|nil" ; "without_session_read")]
     fn a_key_handler_sees_the_draft_only_with_session_read(granted: &[&str]) -> String {
         const PASTED: &str = "pasted";
+        const SHORTCUT: &str = "<C-g>";
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source_with_permissions(
             "peek",
             r#"
-            maki.keymap.set("n", "<Paste>", function(ev)
+            maki.keymap.set("n", "<C-g>", function(ev)
                 maki.ui.flash(tostring(ev.input ~= nil) .. "|" .. tostring(ev.text))
             end)
             "#,
@@ -2043,17 +2045,23 @@ mod tests {
         .unwrap();
         let reader = host.keymap_reader();
         let handle = host.event_handle();
-        assert!(reader.dispatch(PASTE, InputMode::Normal, None, |t| {
-            let t = t
-                .with_input(InputSnapshot {
-                    session_id: String::new(),
-                    text: PASTED.into(),
-                    cursor: 0,
-                    version: 0,
-                })
-                .with_text(PASTED.into());
-            handle.run_keybind_callback(t)
-        }));
+        assert!(reader.dispatch(
+            Key::parse(SHORTCUT).unwrap(),
+            InputMode::Normal,
+            None,
+            |t| {
+                let t = t
+                    .with_input(InputSnapshot {
+                        session_id: String::new(),
+                        text: PASTED.into(),
+                        cursor: 0,
+                        anchor: None,
+                        version: 0,
+                    })
+                    .with_text(PASTED.into());
+                handle.run_keybind_callback(t)
+            }
+        ));
         let Ok(UiAction::Flash(said)) = host.ui_action_rx().recv_timeout(KEYBIND_TIMEOUT) else {
             panic!("{KEYBIND_NEVER_RAN}");
         };

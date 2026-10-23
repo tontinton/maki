@@ -51,6 +51,7 @@ const EDIT_OPTIONS: &[&str] = &[
     "version",
     "session_id",
     "cursor",
+    "anchor",
     "strict",
     "marks",
     "ns",
@@ -552,34 +553,30 @@ fn input_marks(func: &str, ns: String, marks: Table) -> LuaResult<InputMarks> {
         .collect::<LuaResult<_>>()?;
     Ok(InputMarks { ns, marks })
 }
-/// Reads the chat input text and the cursor position.
-///
-/// Offsets are byte offsets into `text`, the unit the Lua string library
-/// indexes by, so `text:sub(1, cursor)` is everything before the cursor. A
-/// newline counts as one byte.
+
+/// Reads the chat input of the focused tab.
 ///
 /// The returned table has:
 ///
-/// - `session_id` (string) the tab the value was read from. Pass it to
-///   `input_edit`, which refuses once another tab is focused.
 /// - `text` (string) the whole value, newlines included.
-/// - `cursor` (integer) byte offset of the cursor into `text`.
-/// - `version` (integer) counter of changes to the value. Pass it to
-///   `input_edit`, which moves the edit past what changed since or refuses
-///   it.
+/// - `cursor` (integer) byte offset of the cursor.
+/// - `anchor` (integer|nil) byte offset of the other end of the selection,
+///   nil when nothing is selected. The selected bytes run from
+///   `math.min(anchor, cursor)` to `math.max(anchor, cursor)`.
+/// - `version` (integer) and `session_id` (string), for the calls that
+///   write. See [offsets and versions](#offsets-and-versions).
 ///
-/// The cursor line and column are a slice of those two, so the table leaves
-/// them out: with `local before = st.text:sub(1, st.cursor)`,
-/// `select(2, before:gsub("\n", ""))` is the 0-based line and
-/// `#before:match("[^\n]*$")` the byte column inside it.
+/// The table has no line or column. The example works them out. To open a
+/// window at the cursor, pass `anchor = "input_caret"` to
+/// [`open_win`](#maki-ui-open_win), an option unrelated to the selection
+/// `anchor` here.
 ///
-/// To put a window on the caret, open it with `anchor = "input_caret"`. The
-/// host re-places it every frame, so it follows wraps and resizes.
-///
-/// @return (table|nil, string|nil) The input state, or nil and an error.
+/// @return (table|nil, string|nil) The input state, or nil and an error without a UI.
 /// @example
 /// local st = maki.ui.input()
 /// local before = st.text:sub(1, st.cursor)
+/// local line = select(2, before:gsub("\n", "")) -- 0-based
+/// local col = #before:match("[^\n]*$") -- in bytes
 #[lua_fn(guard = SessionRead)]
 async fn input(
     lua: Lua,
@@ -600,103 +597,82 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 }
 
 /// Replaces byte ranges of the chat input, as if the user had selected each
-/// one and typed its `text`. All of them land together as one change: one
-/// new version and one undo step.
+/// one and typed its `text`. All edits land as one change, with one new
+/// version and one undo step.
 ///
-/// With `edits = {}` the text stays as it is: the call moves the cursor to
-/// `cursor`, replaces namespace `ns` with `marks`, or both. The version
-/// stays, no undo step is made, and a recalled history entry stays
-/// recalled. An empty list with neither is refused, since there is nothing
-/// to do.
+/// Plan every range against the text at `version`, without counting the
+/// other edits in the list. Ranges must not overlap, and no two may start
+/// at the same offset. With `edits = {}` the call only moves the cursor or
+/// the selection, or replaces the marks in `ns`, so it needs `cursor`,
+/// `anchor` or `marks`. It makes no new version and no undo step.
 ///
-/// Every range is planned against the value `maki.ui.input` returned at
-/// `version`, so offsets never account for the other edits in the list.
-/// Ranges must not overlap, and no two may start at the same offset.
+/// Besides the cases in [offsets and versions](#offsets-and-versions), an
+/// edit fails when:
 ///
-/// A handler runs after the key that woke it, so the user may have typed in
-/// between. An edit planned against an older version is moved past what
-/// changed since, as long as nothing changed at or next to any of its
-/// ranges: typing at the far end of the prompt does not refuse a fix at the
-/// start, while typing right where the edit lands does. Edits are refused:
-///
-/// - When a later change overlaps or touches one of the ranges. Two inserts
-///   at the same offset count, because neither order is right for both.
-/// - When `cursor` lands inside text changed since.
-/// - When the value was replaced since: history recall, a draft restored on
-///   a tab switch, `$EDITOR`, or a submit.
-/// - When the version is so old that the input no longer remembers what
-///   changed since then.
-/// - When the version is not current and `strict` is set.
-/// - When a range ends past the end of the value, or an offset lands inside
-///   a multi-byte character.
-/// - When `session_id` names a tab that is not focused. Both guards are
-///   required and neither substitutes for the other: every tab counts
-///   versions from zero.
-/// - When the user cannot see the chat input, since text written there would
-///   be sent later without ever being read. A permission prompt, the plan
-///   form, a pack review, a `below` split, a finished subagent's chat and a
-///   terminal too short to give the box a text row all take it off screen,
-///   and a picker, a modal or a focused plugin window covers it.
-///
-/// Read again and retry on any of them.
+/// - The user typed at or next to one of its ranges since `version`. Two
+///   inserts at the same offset count, because no order is right for both.
+/// - `cursor` or `anchor` lands inside text changed since `version`.
+/// - `strict` is set and `version` is not current.
+/// - A range ends past the end of the text, or an offset falls inside a
+///   multi-byte character.
+/// - The user cannot see the chat input, so the text would be sent later
+///   without being read. This happens while a permission prompt, the plan
+///   form or a `below` split takes its place, or a picker, a modal or a
+///   focused plugin window covers it.
 ///
 /// Enter checks the text you write before it runs it, see
 /// [chat input](#chat-input). For marks alone, use `input_decorate`, which
 /// needs no permission.
 ///
-/// Tabs and carriage returns in `text` become spaces and newlines, and the
-/// other control characters are dropped, the way a paste is rewritten. With
-/// `cursor` or `marks` given, such text is refused instead, since their
-/// offsets count bytes that would not land. Clean it first, the way
-/// `ev.text` of `<Paste>` already is.
+/// `text` is cleaned the way a paste is: tabs become spaces, carriage
+/// returns become newlines, and other control characters are dropped. With
+/// `cursor`, `anchor` or `marks` given, text that needs cleaning fails
+/// instead, since their offsets would no longer match. `ev.text` of
+/// `<Paste>` is already clean.
 ///
 /// It also needs `session_read`, like `maki.ui.input`. Its answer and its
 /// errors tell where the user typed since `version`, so a plugin could
 /// learn the input from them.
 ///
 /// @param opts table Options:
-///   `edits` (table|nil) list of `{ start, stop, text }` tables, the ranges to replace, `{}` for none. Without it, `start`, `stop` and `text` are read from {opts} itself as a single edit.
-///   `start` (integer) byte offset the replaced range starts at.
-///   `stop` (integer) byte offset it ends at. `start == stop` inserts.
-///   `text` (string) what to put there, `""` to delete the range. Required, so a misspelled key cannot empty it by accident.
-///   `version` (integer) the version `maki.ui.input` returned, which the offsets were planned against.
-///   `session_id` (string) the session `maki.ui.input` read the offsets from.
-///   `cursor` (integer|nil) byte offset to leave the cursor at, counted in the value the edits produce, as if no one else had changed it. Default is the end of the text of the edit with the highest `start`, wherever it sits in `edits`, or where the cursor is now when `edits` is empty.
-///   `strict` (boolean|nil) refuse any version but the current one instead of moving the edits forward. Default false.
-///   `marks` (table|nil) marks to replace namespace `ns` with, shaped like those of `input_decorate` and counted in the value the edits produce, like `cursor`. They land with the text, so no frame ever shows the text without them. A mark that does not fit refuses the whole edit.
-///   `ns` (string|nil) the namespace `marks` go in. Required with `marks`.
-/// @return (table|nil, string|nil) `{ version, cursor }` of the input after the edit, or nil and an error.
+///   `edits` (table|nil) list of `{ start, stop, text }` tables, `{}` for none. Without it, `start`, `stop` and `text` are read from {opts} as one edit.
+///   `start` (integer) byte offset where the range starts.
+///   `stop` (integer) byte offset where it ends. Equal to `start` to insert.
+///   `text` (string) the new text, `""` to delete the range. Required.
+///   `version` (integer) the version the offsets were planned against.
+///   `session_id` (string) the tab the offsets were read from.
+///   `cursor` (integer|nil) byte offset to leave the cursor at, counted in the text the edits produce, as if nobody else had typed. Default is the end of the new text of the edit with the highest `start`, or the cursor as it is when `edits` is empty.
+///   `anchor` (integer|nil) byte offset to select from, up to `cursor`, counted like `cursor`. Without it nothing stays selected.
+///   `strict` (boolean|nil) accept only the current version, instead of moving the edits past newer typing. Default false.
+///   `marks` (table|nil) [marks](#input-marks) to replace namespace `ns` with, counted like `cursor`. They appear together with the text. A mark that does not fit fails the whole edit.
+///   `ns` (string|nil) the namespace for `marks`. Required with `marks`.
+/// @return (table|nil, string|nil) `{ version, cursor }` after the edit, or nil and an error. Pass this `version` to a call that follows.
 /// @example
-/// local st = maki.ui.input()
-/// -- Replace the "@src/ma" before the cursor with a full path:
-/// maki.ui.input_edit({
-///   start = 8,
-///   stop = st.cursor,
-///   text = "src/main.rs",
-///   version = st.version,
-///   session_id = st.session_id,
-/// })
+/// -- Insert each paste under a chip, in a namespace of its own.
+/// local pastes = 0
+/// maki.keymap.set("i", "<Paste>", function(ev)
+///   local st = ev.input
+///   pastes = pastes + 1
+///   local done = maki.ui.input_edit({
+///     start = st.cursor, stop = st.cursor, text = ev.text,
+///     ns = "paste" .. pastes,
+///     marks = { { start = st.cursor, stop = st.cursor + #ev.text, conceal = "[pasted text]", atomic = true } },
+///     version = st.version, session_id = st.session_id,
+///   })
+///   if not done then ev.fallback() end
+/// end)
 ///
-/// -- Wrap bytes s..e in bold, leaving the cursor before the closing "**":
-/// local r, err = maki.ui.input_edit({
+/// -- Wrap the selection in bold and keep the same words selected:
+/// local st = maki.ui.input()
+/// if not st.anchor then return end
+/// local s, e = math.min(st.anchor, st.cursor), math.max(st.anchor, st.cursor)
+/// maki.ui.input_edit({
 ///   edits = {
 ///     { start = s, stop = s, text = "**" },
 ///     { start = e, stop = e, text = "**" },
 ///   },
 ///   cursor = e + 2,
-///   version = st.version,
-///   session_id = st.session_id,
-/// })
-///
-/// -- Paste text collapsed into a chip, never shown raw for a frame. Each
-/// -- paste gets a namespace of its own, so the next one keeps this chip.
-/// -- Undo takes the text and the chip away, and redo brings the text back
-/// -- without it, see `input_decorate`:
-/// pastes = pastes + 1
-/// maki.ui.input_edit({
-///   start = st.cursor, stop = st.cursor, text = pasted,
-///   ns = "paste" .. pastes,
-///   marks = { { start = st.cursor, stop = st.cursor + #pasted, conceal = "[pasted text]", atomic = true } },
+///   anchor = s + 2,
 ///   version = st.version,
 ///   session_id = st.session_id,
 /// })
@@ -741,6 +717,7 @@ async fn input_edit(
     let req = InputRequest::Edit(InputEdit {
         edits,
         cursor: opts.opt("cursor")?,
+        anchor: opts.opt("anchor")?,
         version: required(&opts, INPUT_EDIT, "version")?,
         strict: opts.opt_bool("strict").unwrap_or_default(),
         session_id: required(&opts, INPUT_EDIT, "session_id")?,
@@ -954,7 +931,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 ///   - height (integer|string): window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
 ///   - row (integer?): row offset from the anchor corner. Negative values move up.
 ///   - col (integer?): column offset from the anchor corner.
-///   - anchor (string): corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE". Or "input_caret", which sits the window beside the chat input caret: the host takes the roomier side of the caret, trims the height to what fits there, keeps the whole width on screen, and re-places it every frame, so it follows wraps, resizes and any modal taking focus. `row` and `col` shift the window off that spot, and `stack` grows the next one away from the caret. With no caret on screen, because a form, a permission prompt or a `below` split has taken the input box, it falls back to the centred default, `row` and `col` still applying.
+///   - anchor (string): corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE". Or "input_caret", which sits the window beside the chat input cursor: the host takes the roomier side of the cursor, trims the height to what fits there, keeps the whole width on screen, and re-places it on every redraw, so it follows wraps, resizes and any modal taking focus. `row` and `col` shift the window off that spot, and `stack` grows the next one away from the cursor. With no cursor on screen, because a form, a permission prompt or a `below` split has taken the input box, it falls back to the centred default, `row` and `col` still applying.
 ///   - border (string): border style. One of "rounded" (default), "single", "double", "none".
 ///   - title (string): text shown in the top border. Default "".
 ///   - title_pos (string): title alignment. One of "left" (default), "center", "right".
@@ -1126,10 +1103,10 @@ lua_table! {
     ///
     /// | Job | Call |
     /// | --- | --- |
-    /// | Read the text and the cursor | [`input`](#maki-ui-input) |
+    /// | Read the text, the cursor and the selection | [`input`](#maki-ui-input) |
     /// | Style text by what it says, like a `$skill:go` chip | [`input_rules`](#maki-ui-input_rules) |
     /// | Style text from plugin state, like ghost text or diagnostics | [`input_decorate`](#maki-ui-input_decorate) |
-    /// | Change the text or the cursor | [`input_edit`](#maki-ui-input_edit) |
+    /// | Change the text, the cursor or the selection | [`input_edit`](#maki-ui-input_edit) |
     /// | React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
     ///
     /// Prefer `input_rules` when the look follows from the text. A rule runs
@@ -1141,9 +1118,9 @@ lua_table! {
     /// `maki.defer_fn`, but not while your plugin loads.
     ///
     /// Changing the chat input needs the `input` permission. That covers its
-    /// text and its cursor, since your next Enter sends the text and your
-    /// next key lands at the cursor. It covers `input_edit` and the
-    /// built-in [actions](#maki-ui-action) that change the input, like
+    /// text, its cursor and its selection, since your next Enter sends the
+    /// text and your next key lands at the cursor. It covers `input_edit` and
+    /// the built-in [actions](#maki-ui-action) that change the input, like
     /// `undo` or a history recall. Without `input` they raise
     /// `permission denied`. A plugin without it can still read the input and
     /// style it with `input_rules` and `input_decorate`. Your own `init.lua`
@@ -1221,7 +1198,7 @@ lua_table! {
     /// | `hl` | string or table | A theme style name like `"accent"`, or `{ fg, bg, bold, italic, underline, dim, strikethrough, reversed }`. |
     /// | `conceal` | string | Text drawn in place of the range. `""` hides it. |
     /// | `reveal` | string | `"cursor"` shows the raw text while the cursor is inside the range or on its edge. |
-    /// | `atomic` | boolean | The cursor steps over the range, and a delete that cuts into it removes all of it. |
+    /// | `atomic` | boolean | The cursor steps over the range, a selection takes it whole, and a delete that cuts into it removes all of it. |
     /// | `virt_text` | table | Spans drawn but never part of the text, `{ { text, hl? }, ... }`. |
     /// | `virt_text_pos` | string | `"eol"` (default) draws `virt_text` after the line, `"inline"` before `start`. |
     /// | `lang` | string | Highlights the range as code in this language. |

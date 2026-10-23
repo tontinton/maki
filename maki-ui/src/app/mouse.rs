@@ -17,6 +17,7 @@ use super::{App, InputWriter, Msg};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(super) const FLASH_COPIED: &str = "Copied selection";
 
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
@@ -248,12 +249,16 @@ impl App {
             }
         };
 
-        match self.clipboard.copy_text(&text) {
+        self.copy(&text);
+        self.selection_state = None;
+    }
+
+    pub(super) fn copy(&mut self, text: &str) {
+        match self.clipboard.copy_text(text) {
             Ok(CopyResult::Noop) => {}
-            Ok(CopyResult::Copied) => self.status_bar.flash("Copied selection".into()),
+            Ok(CopyResult::Copied) => self.status_bar.flash(FLASH_COPIED.into()),
             Err(e) => self.status_bar.flash(format!("Copy failed: {e}")),
         }
-        self.selection_state = None;
     }
 
     pub(super) fn zone_at(&self, row: u16, col: u16) -> Option<selection::SelectableZone> {

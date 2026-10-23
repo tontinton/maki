@@ -604,6 +604,9 @@ pub struct InputEdit {
     /// the text of the edit with the highest start when absent, or where the
     /// cursor is now when {edits} is empty.
     pub cursor: Option<usize>,
+    /// Selects from here to the cursor, counted like {cursor}. Nothing stays
+    /// selected when absent.
+    pub anchor: Option<usize>,
     /// The value counter the reader was handed. Required, because an optional
     /// guard makes the shortest call the unguarded one.
     pub version: u64,

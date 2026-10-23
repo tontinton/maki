@@ -1,3 +1,4 @@
+use super::mouse::FLASH_COPIED;
 use super::session::{FORK_EMPTY_MSG, FORK_TITLE_PREFIX};
 use super::*;
 use crate::AppSession;
@@ -591,9 +592,10 @@ fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedSte
     assert_eq!(shown, notice_and_prompt_rows(restored.iter()));
 }
 
+const TYPED_TEXT: &str = "hi";
+
 fn with_text(app: &mut App) {
-    app.update(Msg::Key(key(KeyCode::Char('h'))));
-    app.update(Msg::Key(key(KeyCode::Char('i'))));
+    type_keys(app, TYPED_TEXT);
 }
 
 fn with_image(app: &mut App) {
@@ -601,24 +603,94 @@ fn with_image(app: &mut App) {
     app.input_box.attach_image(img);
 }
 
-#[test_case(with_text as fn(&mut App)  ; "clears_text")]
-#[test_case(with_image as fn(&mut App) ; "clears_image")]
-fn ctrl_c_clears_nonempty_input(setup: fn(&mut App)) {
-    let mut app = test_app();
-    setup(&mut app);
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(actions.is_empty());
-    assert_eq!(app.exit_request, ExitRequest::None);
-    assert!(app.input_box.is_empty());
+fn with_selection(app: &mut App) {
+    with_text(app);
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
 }
 
-#[test]
-fn ctrl_c_quits_when_input_empty() {
+fn with_nothing(_: &mut App) {}
+
+/// What one `Ctrl+C` in the chat input left behind: the text and whether
+/// the input is empty, and whether it copied, cancelled the turn or quit.
+#[derive(Debug, PartialEq)]
+struct CtrlC {
+    left: String,
+    empty: bool,
+    copied: bool,
+    cancelled: bool,
+    quit: bool,
+}
+
+const CTRL_C_EMPTIED: CtrlC = CtrlC {
+    left: String::new(),
+    empty: true,
+    copied: false,
+    cancelled: false,
+    quit: false,
+};
+
+fn copied_keeping_the_text() -> CtrlC {
+    CtrlC {
+        left: TYPED_TEXT.into(),
+        empty: false,
+        copied: true,
+        ..CTRL_C_EMPTIED
+    }
+}
+
+/// Each press does the first thing that applies: copy a selection, clear
+/// the input, then cancel a running turn or, idle, quit.
+#[test_case(with_selection as fn(&mut App), Status::Idle      => copied_keeping_the_text() ; "selection_copies_and_keeps_the_text")]
+#[test_case(with_selection as fn(&mut App), Status::Streaming => copied_keeping_the_text() ; "selection_copies_while_streaming")]
+#[test_case(with_text as fn(&mut App),      Status::Idle      => CTRL_C_EMPTIED ; "text_clears_the_input")]
+#[test_case(with_image as fn(&mut App),     Status::Idle      => CTRL_C_EMPTIED ; "image_clears_the_input")]
+#[test_case(with_nothing as fn(&mut App),   Status::Idle      => CtrlC { quit: true, ..CTRL_C_EMPTIED } ; "empty_idle_quits")]
+#[test_case(with_nothing as fn(&mut App),   Status::Streaming => CtrlC { cancelled: true, ..CTRL_C_EMPTIED } ; "empty_streaming_cancels_the_turn")]
+fn ctrl_c_in_the_chat_input(setup: fn(&mut App), status: Status) -> CtrlC {
     let mut app = test_app();
-    app.status = Status::Idle;
+    app.clipboard = ClipboardState::terminal_only();
+    setup(&mut app);
+    app.status = status;
+    app.run_id = 1;
+    press_ctrl_c(&mut app)
+}
+
+fn press_ctrl_c(app: &mut App) -> CtrlC {
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert_eq!(app.exit_request, ExitRequest::Success);
-    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+    CtrlC {
+        left: app.input_box.buffer.value().to_owned(),
+        empty: app.input_box.is_empty(),
+        copied: app.status_bar.flash_text() == Some(FLASH_COPIED),
+        cancelled: matches!(actions.as_slice(), [Action::CancelAgent { .. }])
+            && app.status == Status::Idle,
+        quit: app.exit_request == ExitRequest::Success
+            && matches!(actions.as_slice(), [Action::ManualExit]),
+    }
+}
+
+/// A plugin that selects the text again after every change cannot keep
+/// `Ctrl+C` copying: the press right after a copy goes on to clear the input.
+/// Any other key in between lets the next press copy again.
+#[test_case(&[]                => CTRL_C_EMPTIED             ; "a_press_right_after_a_copy_clears")]
+#[test_case(&[KeyCode::Right] => copied_keeping_the_text() ; "a_key_in_between_copies_again")]
+fn ctrl_c_after_a_copy(between: &[KeyCode]) -> CtrlC {
+    let mut app = test_app();
+    app.clipboard = ClipboardState::terminal_only();
+    with_selection(&mut app);
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    for code in between {
+        app.update(Msg::Key(key(*code)));
+    }
+    app.status_bar.clear_flash();
+    let end = app.input_box.buffer.value().len();
+    let reselect = InputEdit {
+        edits: vec![],
+        cursor: Some(end - 1),
+        anchor: Some(end),
+        ..planned_edit(&app, 0, 0, "")
+    };
+    apply_edit(&mut app, reselect).unwrap();
+    press_ctrl_c(&mut app)
 }
 
 #[test_case(done(), ExitRequest::Success ; "done_exits_success")]
@@ -2979,18 +3051,6 @@ fn double_esc_idle_no_user_turns_flashes_error() {
     assert!(!app.rewind_picker.is_open());
 }
 
-#[test]
-fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
-    assert_eq!(app.status, Status::Idle);
-    assert_ne!(app.exit_request, ExitRequest::Success);
-}
-
 /// The whole point of issue 778: a settled session paints nothing at all. Any
 /// poller that starts reporting a change on every tick trips this.
 #[test]
@@ -3393,6 +3453,7 @@ fn input_snapshot_carries_nothing_a_slice_would_give() {
             "session_id": app.state.session.id.to_string(),
             "text": DRAFT,
             "cursor": DRAFT.len(),
+            "anchor": null,
             "version": app.input_box.buffer.version(),
         })
     );
@@ -3416,6 +3477,7 @@ fn edit_planned_on(st: &serde_json::Value, start: usize, stop: usize, text: &str
         session_id: st["session_id"].as_str().unwrap().into(),
         caller: trusted().owned_by(Arc::from(EDIT_PLUGIN)),
         cursor: None,
+        anchor: None,
         strict: false,
         marks: None,
     }
@@ -7314,8 +7376,8 @@ fn a_plugin_that_wrote_twice_is_named_once() {
     );
 }
 
-/// What a line may do is weighed at Enter, so a vim mode moves and edits
-/// on a `/` or `!` line with `input` alone.
+/// What a line may do is weighed at Enter, so a vim mode moves, selects
+/// and edits on a `/` or `!` line with `input` alone.
 #[test_case("/c", vec![TextEdit { start: 2, stop: 2, text: "ompact".into() }], "/compact" ; "an_edit_on_a_command")]
 #[test_case("!x", vec![TextEdit { start: 1, stop: 2, text: "ls".into() }],     "!ls"      ; "an_edit_on_a_shell_line")]
 #[test_case("/c", Vec::new(),                                                  "/c"       ; "a_move_on_a_command")]
@@ -7326,13 +7388,43 @@ fn a_plugin_with_input_edits_any_line(typed: &str, edits: Vec<TextEdit>, left: &
     let edit = InputEdit {
         edits,
         cursor: Some(0),
+        anchor: Some(1),
         caller: only(Permission::Input),
         ..planned_edit(&app, 0, 0, "")
     };
     apply_edit(&mut app, edit).unwrap();
     let buffer = &app.input_box.buffer;
-    assert_eq!((buffer.value(), buffer.cursor_byte()), (left, 0));
+    assert_eq!(
+        (buffer.value(), buffer.cursor_byte(), buffer.anchor()),
+        (left, 0, Some(1))
+    );
     assert_eq!(app.status_bar.flash_text(), None);
+}
+
+/// Marks alone leave the selection where it is, the way `input_decorate`
+/// does.
+#[test]
+fn marks_alone_keep_the_selection() {
+    let mut app = test_app();
+    type_keys(&mut app, PLAIN_LINE);
+    let select = InputEdit {
+        edits: Vec::new(),
+        cursor: Some(0),
+        anchor: Some(3),
+        ..planned_edit(&app, 0, 0, "")
+    };
+    apply_edit(&mut app, select).unwrap();
+    let marks = InputEdit {
+        edits: Vec::new(),
+        caller: holding(&[]),
+        marks: Some(InputMarks {
+            ns: EDIT_PLUGIN.into(),
+            marks: Vec::new(),
+        }),
+        ..planned_edit(&app, 0, 0, "")
+    };
+    apply_edit(&mut app, marks).unwrap();
+    assert_eq!(app.input_box.buffer.anchor(), Some(3));
 }
 
 fn sent_a_shell_line(app: &mut App) {
@@ -7346,11 +7438,25 @@ fn deleted_the_bang(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Delete)));
 }
 
+/// "x!ls" with the "x" selected, which a new line would take the place of.
+fn selected_the_words_before(app: &mut App) {
+    type_keys(app, "x");
+    type_keys(app, SHELL_LINE);
+    let select = InputEdit {
+        edits: Vec::new(),
+        cursor: Some(0),
+        anchor: Some(1),
+        ..planned_edit(app, 0, 0, "")
+    };
+    apply_edit(app, select).unwrap();
+}
+
 /// The text an editing built-in leaves is the plugin's that ran it, like
 /// an edit, so a recall or an undo cannot set up a `!` line for the
 /// user's next Enter. Run by the user it stays theirs.
 #[test_case(BuiltinAction::HistoryPrev, sent_a_shell_line,         true  ; "a_recall_by_a_plugin")]
 #[test_case(BuiltinAction::Undo,        deleted_the_bang,          true  ; "an_undo_by_a_plugin")]
+#[test_case(BuiltinAction::Newline,     selected_the_words_before, true  ; "a_newline_by_a_plugin")]
 #[test_case(BuiltinAction::Undo,        deleted_the_bang,          false ; "an_undo_by_the_user")]
 fn a_shell_line_a_builtin_left(action: BuiltinAction, setup: fn(&mut App), by_plugin: bool) {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
@@ -7557,7 +7663,7 @@ maki.keymap.set("i", "<Paste>", function(ev)
   maki.ui.input_edit({
     start = st.cursor, stop = st.cursor, text = ev.text,
     ns = "paste",
-    marks = { { start = st.cursor, stop = st.cursor + #ev.text, conceal = "[3 lines]" } },
+    marks = { { start = st.cursor, stop = st.cursor + #ev.text, conceal = "[3 lines]", atomic = true } },
     version = st.version, session_id = st.session_id,
   })
 end)
@@ -7674,28 +7780,80 @@ fn held_keys_hop_tabs_with_the_handler_and_land_once() {
     assert_eq!(first.input_box.buffer.value(), "d");
 }
 
-const DRAFT: &str = "ls -la";
-
-/// A `!` key that puts the cursor at the start of the input before it
-/// hands the key back. The user's `!` would land there and make their
-/// draft a shell line.
-const STEERING_BANG: &str = r#"
-maki.keymap.set("i", "!", function(ev)
-    pcall(maki.ui.input_edit, {
-        edits = {}, cursor = 0,
-        version = ev.input.version, session_id = ev.input.session_id,
-    })
-    ev.fallback()
+const BOLD_PLUGIN: &str = r#"
+maki.keymap.set("i", "<C-b>", function(ev)
+  local st = ev.input
+  if not st.anchor then return ev.fallback() end
+  local s, e = math.min(st.anchor, st.cursor), math.max(st.anchor, st.cursor)
+  maki.ui.input_edit({
+    edits = { { start = s, stop = s, text = "**" }, { start = e, stop = e, text = "**" } },
+    cursor = e + 2, anchor = s + 2,
+    version = st.version, session_id = st.session_id,
+  })
 end)
 "#;
+const UNBOLDED: &str = "make it bold";
+const BOLDED: &str = "make it **bold**";
+const BOLD_WORD: &str = "bold";
+
+/// Both `**` land as one version, the word stays selected for the next
+/// keystroke, and one undo takes the wrap back with the selection it had.
+#[test]
+fn ctrl_b_wraps_the_selection_in_one_step() {
+    let (_host, mut app, ui) = plugin_app("bold", BOLD_PLUGIN);
+    type_keys(&mut app, UNBOLDED);
+    for _ in 0..BOLD_WORD.len() {
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
+    }
+    let version = app.input_box.buffer.version();
+
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('b'),
+        KeyModifiers::CONTROL,
+    )));
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(app.input_box.buffer.value(), BOLDED);
+    assert_eq!(app.input_box.buffer.version(), version + 1);
+    assert_eq!(
+        app.input_box.take_selected_text().as_deref(),
+        Some(BOLD_WORD)
+    );
+
+    app.update(Msg::Key(kb::UNDO.to_key_event()));
+    assert_eq!(app.input_box.buffer.value(), UNBOLDED);
+    assert_eq!(
+        app.input_box.take_selected_text().as_deref(),
+        Some(BOLD_WORD)
+    );
+}
+
+const DRAFT: &str = "ls -la";
+
+/// A `!` key that puts the cursor at the start of the input, or selects the
+/// first two bytes, before it hands the key back. The user's `!` would
+/// land there and make their draft a shell line.
+fn steering_bang(anchor: &str) -> String {
+    format!(
+        r#"
+maki.keymap.set("i", "!", function(ev)
+    pcall(maki.ui.input_edit, {{
+        edits = {{}}, cursor = 0, anchor = {anchor},
+        version = ev.input.version, session_id = ev.input.session_id,
+    }})
+    ev.fallback()
+end)
+"#
+    )
+}
 
 /// Without `input` the move raises, so the key lands where the user
-/// typed. With it the cursor moved since the press, so the key is dropped
+/// typed. With it the caret moved since the press, so the key is dropped
 /// instead of landing somewhere the user never aimed it.
-#[test_case(&[],                        "ls -la!" ; "a_cursor_moved_without_input")]
-#[test_case(&["input", "session_read"], DRAFT     ; "a_cursor_moved_with_input")]
-fn a_fallback_lands_where_the_user_typed(grants: &[&str], left: &str) {
-    let host = granted_host(STEERING_BANG, grants);
+#[test_case("nil", &["session_read"],          "ls -la!" ; "a_cursor_moved_without_input")]
+#[test_case("nil", &["input", "session_read"], DRAFT     ; "a_cursor_moved_with_input")]
+#[test_case("2",   &["input", "session_read"], DRAFT     ; "a_selection_made_with_input")]
+fn a_fallback_lands_where_the_user_typed(anchor: &str, grants: &[&str], left: &str) {
+    let host = granted_host(&steering_bang(anchor), grants);
     let (mut app, ui) = hosted_app(&host);
     type_keys(&mut app, DRAFT);
 
@@ -9108,6 +9266,47 @@ fn moving_the_cursor_alone_fires_a_cursor_only_change() {
         None,
         "a frame that moved neither the caret nor the text stays silent"
     );
+}
+
+/// `Esc` drops a selection without moving the caret or the text, and a
+/// plugin drawing on the selection still has to hear it went.
+#[test]
+fn a_selection_alone_fires_a_cursor_only_change() {
+    let mut app = test_app();
+    let probe = probe_events(&mut app);
+    type_keys(&mut app, "ab");
+    let _ = app.tick();
+    next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["cursor"], 1);
+    assert_eq!(data["anchor"], 2);
+    assert_eq!(data["cursor_only"], true);
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert!(data["anchor"].is_null());
+    assert_eq!(data["cursor_only"], true);
+}
+
+/// A selection must not cost a turn's cancel a press: during a turn the `Esc`
+/// that drops it arms the cancel too. Idle it only drops it.
+#[test_case(Status::Idle,      None               ; "idle_only_deselects")]
+#[test_case(Status::Streaming, Some(FLASH_CANCEL) ; "streaming_also_arms_cancel")]
+fn esc_with_a_selection(status: Status, expected_flash: Option<&str>) {
+    let mut app = test_app();
+    type_keys(&mut app, "ab");
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
+    app.status = status;
+    app.run_id = 1;
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(app.input_box.buffer.anchor(), None);
+    assert_eq!(app.status_bar.flash_text(), expected_flash);
 }
 
 /// What `model_state` reports has to parse back into the same state, or a

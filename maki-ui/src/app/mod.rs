@@ -501,6 +501,8 @@ pub struct App {
     pub(super) selection_state: Option<SelectionState>,
     pub(super) clipboard: ClipboardState,
     pub(super) last_esc: Option<Instant>,
+    /// The last key was a `Ctrl+C` that copied, see [`Self::handle_ctrl`].
+    quit_copied: bool,
 
     pub(crate) storage: StateDir,
     /// The folder trust question this run was started with, `None` when the
@@ -523,14 +525,12 @@ pub struct App {
     /// than the session's stored one: a restored session may name another
     /// model, and the event loop swaps the live one in on the first tick.
     announced_model_spec: String,
-    /// The version of the value Lua was last told about. A fast typist would
-    /// otherwise wake every handler once per keystroke. Comparing versions
-    /// instead of text keeps an idle tick from touching the whole value.
-    announced_version: u64,
-    /// The caret Lua was last told about, diffed alongside the version so a
-    /// caret that moved on its own is reported once and a frame that moved
-    /// neither is silent.
-    announced_cursor: usize,
+    /// The input Lua was last told about. A fast typist would otherwise wake
+    /// every handler once per keystroke. A caret or a selection that moved on
+    /// its own is reported once, and a frame that moved nothing is silent.
+    /// The version stands in for the text, so an idle tick never compares
+    /// the whole value.
+    announced_input: InputAt,
     input_writer: InputWriter,
     /// Whether this frame's tick already fired `InputChanged`, so the focus
     /// announcement drained below it does not repeat that value. A tab that
@@ -637,6 +637,7 @@ impl App {
             selection_state: None,
             clipboard: ClipboardState::new(),
             last_esc: None,
+            quit_copied: false,
             storage,
             trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
@@ -651,8 +652,7 @@ impl App {
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             announced_model_spec: model.spec(),
-            announced_version: 0,
-            announced_cursor: 0,
+            announced_input: InputAt::default(),
             input_writer: InputWriter::Untouched,
             input_fired_this_frame: false,
             hints: Watch::seeded(hint_reader.load_full()),
@@ -868,6 +868,7 @@ impl App {
             session_id: self.state.session.id.to_string(),
             text: buffer.value().to_owned(),
             cursor: buffer.cursor_byte(),
+            anchor: buffer.anchor(),
             version: buffer.version(),
         }
     }
@@ -912,7 +913,7 @@ impl App {
         let marks = edit.marks.map(|marks| (&*plugin, marks));
         let cursor = self.write_for(&edit.caller, |app| {
             app.input_box
-                .apply_edits(edit.version, edit.edits, edit.cursor, marks)
+                .apply_edits(edit.version, edit.edits, edit.cursor, edit.anchor, marks)
         })?;
         let version = self.input_box.buffer.version();
         self.input_changed(InputWriter::Plugin(plugin, version));
@@ -957,27 +958,24 @@ impl App {
         self.input_writer = mem::take(&mut self.input_writer).merge(writer);
     }
 
-    /// One event per frame at most, and only when the version or the caret
-    /// changed, so holding a key down wakes a handler once and a frame that
-    /// changed neither leaves it asleep.
+    /// One event per frame at most, and only when the version, the caret or
+    /// the selection changed, so holding a key down wakes a handler once and
+    /// a frame that changed none of them leaves it asleep.
     ///
-    /// A caret that moved on its own fires too, with `cursor_only` set. An
-    /// input plugin anchored to what the caret is sitting in has no other way
-    /// to learn it left: a popup on an `@` mention would stay up holding
-    /// `<CR>` for a mention the user has arrowed out of.
+    /// A caret or a selection that moved on its own fires too, with
+    /// `cursor_only` set. An input plugin anchored to what the caret is
+    /// sitting in has no other way to learn it left: a popup on an `@`
+    /// mention would stay up holding `<CR>` for a mention the user has
+    /// arrowed out of.
     fn tick_input_changed(&mut self) -> Dirty {
-        let version = self.input_box.buffer.version();
-        let cursor = self.input_box.buffer.cursor_byte();
-        self.input_fired_this_frame =
-            version != self.announced_version || cursor != self.announced_cursor;
+        let now = self.input_at();
+        self.input_fired_this_frame = now != self.announced_input;
         if !self.input_fired_this_frame {
             self.input_writer = InputWriter::Untouched;
             return Dirty::NO;
         }
-        let source = mem::take(&mut self.input_writer).into_source(version);
-        let cursor_only = version == self.announced_version;
-        self.announced_version = version;
-        self.announced_cursor = cursor;
+        let source = mem::take(&mut self.input_writer).into_source(now.version);
+        let cursor_only = now.version == self.announced_input.version;
         self.fire_input_changed(source, cursor_only);
         Dirty::NO
     }
@@ -1002,19 +1000,20 @@ impl App {
         if mem::take(&mut self.input_fired_this_frame) {
             return;
         }
-        self.announced_version = self.input_box.buffer.version();
-        self.announced_cursor = self.input_box.buffer.cursor_byte();
         self.fire_input_changed(None, false);
     }
 
     fn fire_input_changed(&mut self, source: Option<Arc<str>>, cursor_only: bool) {
+        let now = self.input_at();
         self.fire_session_event(HostEvent::InputChanged {
             text: self.input_box.buffer.value(),
-            cursor: self.announced_cursor,
-            version: self.input_box.buffer.version(),
+            cursor: now.cursor,
+            anchor: now.anchor,
+            version: now.version,
             source: source.as_deref(),
             cursor_only,
         });
+        self.announced_input = now;
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
@@ -1170,6 +1169,18 @@ impl App {
         }
         if key::QUIT.matches(key) {
             self.command_palette.close();
+            // Copying lets go of the selection, so the next press clears the
+            // input and the one after quits, just like without one. A press
+            // right after a copy never copies, or a plugin that selects again
+            // after every change could keep the user from leaving.
+            if !mem::take(&mut self.quit_copied)
+                && self.chat_accepts_input()
+                && let Some(text) = self.input_box.take_selected_text()
+            {
+                self.copy(&text);
+                self.quit_copied = true;
+                return Some(vec![]);
+            }
             return Some(if !self.chat_accepts_input() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
                     return Some(self.handle_cancel());
@@ -1607,6 +1618,9 @@ impl App {
     /// `recv` for its own buffer's binding, while the keys after it still wait.
     fn handle_key(&mut self, key: KeyEvent, sight: Sight, turn: &Turn) -> Vec<Action> {
         self.clear_selection_unless_pending_copy();
+        if !key::QUIT.matches(key) {
+            self.quit_copied = false;
+        }
 
         if key::SUSPEND.matches(key) && cfg!(unix) {
             return vec![Action::Suspend];
@@ -1792,7 +1806,7 @@ impl App {
         let Some(pressed) = self.typeahead.take_fallback(ticket, focus, mode, &input) else {
             tracing::debug!(
                 ticket,
-                "ev.fallback() dropped: its key no longer holds the keys after it, or the keyboard, the mode or the cursor moved"
+                "ev.fallback() dropped: its key no longer holds the keys after it, or the keyboard, the mode, the cursor or the selection moved"
             );
             return vec![];
         };
@@ -1815,6 +1829,7 @@ impl App {
         InputAt {
             version: buffer.version(),
             cursor: buffer.cursor_byte(),
+            anchor: buffer.anchor(),
         }
     }
 
@@ -1872,6 +1887,12 @@ impl App {
     /// alone. A finished subagent's chat has no input, so only the mode
     /// toggle answers there.
     ///
+    /// While a turn runs, `Esc` drops a selection and arms the cancel in the
+    /// same press, for the reason [`Self::reserved_by_host`] gives: a plugin
+    /// that keeps setting a selection must not be able to keep the user from
+    /// stopping. Idle, it only drops the selection, so it never arms the
+    /// rewind.
+    ///
     /// {mode} is the one the key was pressed in. A fallback must not type in
     /// insert mode a key a plugin matched in normal mode.
     fn handle_chat_key(&mut self, key: KeyEvent, sight: Sight, mode: InputMode) -> Vec<Action> {
@@ -1911,6 +1932,10 @@ impl App {
         }
 
         let streaming = self.status == Status::Streaming;
+        if streaming && key.code == KeyCode::Esc {
+            self.input_box.buffer.deselect();
+            return self.handle_esc(streaming);
+        }
         match self.input_box.handle_key(key, mode) {
             InputAction::Submit => self.send_input(sight).unwrap_or_else(|refusal| {
                 self.flash(refusal);

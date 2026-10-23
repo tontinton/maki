@@ -13,7 +13,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+C` | Quit / clear input |
+| `Ctrl+C` | Quit / clear input / copy selection |
 | `Ctrl+H` | Show keybindings |
 | `Ctrl+F` | Search messages |
 | `Ctrl+S` | File picker |
@@ -31,6 +31,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `/command` | Open command palette |
 | `Ctrl+W` | Delete word backward |
 | `Alt+←` / `Alt+→` | Move word left / right |
+| `Shift+motion` | Select text |
 | `Ctrl+A` | Jump to start of line |
 | `Home` / `End` | Jump to start/end of line |
 | `Ctrl+U` / `Ctrl+D` | Scroll half page up / down |

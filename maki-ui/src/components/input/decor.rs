@@ -21,6 +21,7 @@ use crate::components::tool_display::resolve_span_style;
 use crate::decor_worker;
 use crate::highlight;
 use crate::text_buffer::{Change, Concealed, Placed, TextBuffer, VirtTextPos};
+use crate::theme;
 
 /// Longer text is colored on the worker, since coloring it here would hold
 /// up the frame.
@@ -48,12 +49,15 @@ pub(super) struct LineDecor {
 
 impl LineDecor {
     /// {bytes} is where the display line sits in {value}, and {marks} come
-    /// in the order they compose.
+    /// in the order they compose. {selected} is painted last, so no mark
+    /// color hides it. A conceal only takes a paint that covers all of it,
+    /// and a selection always covers an atomic one whole.
     pub fn new(
         value: &str,
         bytes: Range<usize>,
         marks: &[Placed],
         conceals: &[Concealed],
+        selected: Option<&Range<usize>>,
         langs: &mut LangCache,
     ) -> Self {
         let mut decor = Self {
@@ -74,8 +78,7 @@ impl LineDecor {
             .filter(|mark| mark.bytes.start <= bytes.end && mark.bytes.end >= bytes.start)
         {
             let decoration = mark.decoration;
-            let range = mark.bytes.start.max(bytes.start) - bytes.start
-                ..mark.bytes.end.min(bytes.end) - bytes.start;
+            let range = on_line(&mark.bytes, &bytes);
             if !range.is_empty() {
                 if let Some(lang) = &decoration.lang {
                     match langs.range(lang, &mark.bytes, value) {
@@ -112,6 +115,11 @@ impl LineDecor {
                     .push((mark.bytes.start - bytes.start, spans.collect())),
                 VirtTextPos::Eol => decor.eol.extend(spans),
             }
+        }
+        if let Some(range) = selected.map(|selected| on_line(selected, &bytes))
+            && !range.is_empty()
+        {
+            paints.push((range, theme::current().item_selected));
         }
         decor.inline.sort_by_key(|(at, _)| *at);
         decor.styles = compose(&paints, &mut decor.conceals);
@@ -489,6 +497,13 @@ fn highlight_text(lang: &str, text: &str) -> Vec<Paint> {
     paints
 }
 
+/// The part of {range} on the display line at {line}, counted from where
+/// the line starts. Empty when it misses the line.
+fn on_line(range: &Range<usize>, line: &Range<usize>) -> Range<usize> {
+    let clamp = |at: usize| at.clamp(line.start, line.end) - line.start;
+    clamp(range.start)..clamp(range.end)
+}
+
 fn shifted(paints: &[Paint], by: usize) -> impl Iterator<Item = Paint> + '_ {
     paints
         .iter()
@@ -520,5 +535,146 @@ fn mark_style(style: &SpanStyle) -> Style {
     match style {
         SpanStyle::Default => Style::default(),
         other => resolve_span_style(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use maki_agent::types::InlineStyle;
+    use maki_agent::{SnapshotSpan, SpanColor, SpanStyle};
+    use maki_lua::{InputRule, PatternRule, SyntaxRule};
+    use test_case::test_case;
+
+    use super::{LangCache, LineDecor, mark_style};
+    use crate::components::input::layout::Layout;
+    use crate::decor_worker;
+    use crate::text_buffer::test_support::settle_syntax;
+    use crate::text_buffer::{Decoration, Mark, RuleSet, TextBuffer, VirtTextPos};
+
+    const PLUGIN: &str = "test";
+    const NS: &str = "ghosts";
+    const GHOST: &str = "XY";
+    const CHIP_PATTERN: &str = r"\$s:(\w+)";
+    const CHIP_CONCEAL: &str = "[$1]";
+    const CHIP_TEXT: &str = "abcdefgh $s:go";
+    const SYNTAX_LANG: &str = "markdown";
+    const SYNTAX_INLINE_LANG: &str = "markdown_inline";
+    const LINK_QUERY: &str = "(inline_link (link_text) @text) @link";
+    const TEXT_RGB: (u8, u8, u8) = (255, 0, 0);
+    const LINK_RGB: (u8, u8, u8) = (0, 0, 255);
+    /// The `t` of a link `[t](...)` at the start of the text.
+    const LINK_TEXT_BYTE: usize = 1;
+    /// Makes the whole link a mark looked up with the long ones.
+    const LONG_URL: usize = 300;
+
+    /// The text every row of {buffer} draws at {width} text columns.
+    fn drawn_rows(buffer: &TextBuffer, width: usize) -> Vec<String> {
+        let mut layout = Layout::default();
+        layout.sync(buffer, width);
+        let window = 0..=buffer.value().len();
+        let marks = buffer.overlapping(window.clone());
+        let conceals = buffer.concealed(window);
+        let mut langs = LangCache::default();
+        layout
+            .rows(buffer, 0, layout.total_rows())
+            .map(|row| {
+                let text = row.text.clone();
+                let decor = LineDecor::new(
+                    buffer.value(),
+                    text.clone(),
+                    &marks,
+                    &conceals,
+                    None,
+                    &mut langs,
+                );
+                let (spans, _) = decor.draw(&buffer.value()[text], &row, None);
+                spans.iter().map(|span| span.content.as_ref()).collect()
+            })
+            .collect()
+    }
+
+    #[test_case(11 => vec!["abcdefgh ", "[go]"] ; "a_conceal_that_does_not_fit_is_drawn_on_the_next_row_only")]
+    #[test_case(14 => vec!["abcdefgh [go]"] ; "a_conceal_that_fits_is_drawn_on_its_row")]
+    fn wrapped_conceal(width: usize) -> Vec<String> {
+        let chip = Decoration {
+            conceal: Some(CHIP_CONCEAL.into()),
+            atomic: true,
+            ..Decoration::default()
+        };
+        let rule = InputRule::Pattern(PatternRule::new(CHIP_PATTERN, chip).unwrap());
+        let mut buffer = TextBuffer::new(CHIP_TEXT.into());
+        buffer.set_rules(RuleSet::with_plugins(&[rule]));
+        drawn_rows(&buffer, width)
+    }
+
+    #[test_case("abcdefg", 3, 5 => vec!["abc", "XYdef", "g"] ; "virtual_text_moving_down_with_the_char_after_it_is_drawn_there_only")]
+    #[test_case("abc", 3, 4 => vec!["abc", "XY"] ; "virtual_text_at_the_end_moving_down_alone_is_drawn_on_the_last_row")]
+    fn wrapped_virtual_text(text: &str, at: usize, width: usize) -> Vec<String> {
+        let ghost = Arc::new(Decoration {
+            virt_text: vec![SnapshotSpan {
+                text: GHOST.into(),
+                style: SpanStyle::Default,
+            }],
+            virt_text_pos: VirtTextPos::Inline,
+            ..Decoration::default()
+        });
+        let mut buffer = TextBuffer::new(text.into());
+        let mark = Mark {
+            start: at,
+            stop: None,
+            decoration: ghost,
+        };
+        buffer
+            .set_marks(buffer.version(), PLUGIN, NS, vec![mark])
+            .unwrap();
+        drawn_rows(&buffer, width)
+    }
+
+    fn fg(rgb: (u8, u8, u8)) -> SpanStyle {
+        SpanStyle::Inline(InlineStyle {
+            fg: Some(SpanColor::Rgb(rgb)),
+            ..InlineStyle::default()
+        })
+    }
+
+    fn colored(style: SpanStyle) -> Decoration {
+        Decoration {
+            hl: Some(style),
+            ..Decoration::default()
+        }
+    }
+
+    /// Short and long marks are looked up apart, so the marks of one match
+    /// come back in an order that depends on how long they are.
+    #[test_case(1 ; "a_short_link")]
+    #[test_case(LONG_URL ; "a_long_link")]
+    fn a_later_capture_of_a_pattern_draws_over_an_earlier_one(url_len: usize) {
+        decor_worker::manual();
+        let rule = SyntaxRule::new(
+            SYNTAX_LANG,
+            vec![(SYNTAX_INLINE_LANG.into(), LINK_QUERY.into())],
+            vec![
+                ("text".into(), colored(fg(TEXT_RGB))),
+                ("link".into(), colored(fg(LINK_RGB))),
+            ],
+        )
+        .unwrap();
+        let mut buffer = TextBuffer::new(String::new());
+        buffer.set_rules(RuleSet::with_plugins(&[InputRule::Syntax(Arc::new(rule))]));
+        buffer.set_value(&format!("[t]({})", "u".repeat(url_len)));
+        settle_syntax(&mut buffer);
+        let text = 0..buffer.value().len();
+        let marks = buffer.overlapping(0..=text.end);
+        let decor = LineDecor::new(
+            buffer.value(),
+            text,
+            &marks,
+            &[],
+            None,
+            &mut LangCache::default(),
+        );
+        assert_eq!(decor.style_at(LINK_TEXT_BYTE), mark_style(&fg(LINK_RGB)));
     }
 }

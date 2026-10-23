@@ -236,15 +236,16 @@ fn map_back<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use maki_agent::SpanStyle;
-    use maki_lua::{SyntaxRule, TextEdit};
+    use maki_lua::{SyntaxInput, SyntaxRule};
     use test_case::test_case;
 
-    use super::super::TextBuffer;
-    use super::*;
+    use super::{State, SyntaxMarks, SyntaxRules};
+    use crate::decor_worker;
     use crate::text_buffer::Decoration;
 
-    const DIGITS: &str = "0123456789";
     const LANG: &str = "markdown";
     const TEXT: &str = "# title\n\nbody";
     const VERSION: u64 = 1;
@@ -252,36 +253,6 @@ mod tests {
     const HEADING: &str = "(atx_heading) @styled";
     const PARAGRAPH: &str = "(paragraph) @styled";
     const STYLE: &str = "accent";
-
-    /// The worker gets one edit for everything since its last parse, so
-    /// splicing that edit's span of the new text into the old text has to
-    /// give the new text back.
-    #[test_case(&[(2, 2, "x"), (8, 8, "y")]   ; "an_insert_then_one_after_it")]
-    #[test_case(&[(8, 8, "y"), (2, 2, "x")]   ; "an_insert_then_one_before_it")]
-    #[test_case(&[(2, 6, ""), (1, 3, "zz")]   ; "a_delete_then_an_edit_over_its_edge")]
-    #[test_case(&[(4, 4, "abc"), (5, 6, "")]  ; "a_delete_inside_an_insert")]
-    fn changes_since_a_version_read_as_one_edit(edits: &[(usize, usize, &str)]) {
-        let mut buffer = TextBuffer::new(DIGITS.into());
-        for &(start, stop, text) in edits {
-            let edit = TextEdit {
-                start,
-                stop,
-                text: text.into(),
-            };
-            buffer
-                .apply_edits(buffer.version(), vec![edit], None, None)
-                .unwrap();
-        }
-        let edit = edit_since(buffer.changes_since(0).unwrap()).unwrap();
-        let new = buffer.value();
-        let spliced = format!(
-            "{}{}{}",
-            &DIGITS[..edit.start],
-            &new[edit.start..edit.new_end],
-            &DIGITS[edit.old_end..]
-        );
-        assert_eq!(spliced, new);
-    }
 
     fn rule(query: &str) -> Arc<SyntaxRule> {
         let styled = Decoration {

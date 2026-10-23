@@ -3523,6 +3523,7 @@ dependencies = [
  "color-eyre",
  "criterion",
  "crossterm",
+ "fastrand",
  "flume",
  "futures-lite",
  "getrandom 0.4.3",

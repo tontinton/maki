@@ -38,6 +38,13 @@ impl ClipboardState {
         }
     }
 
+    /// Copies through the terminal alone, so a test never writes to the
+    /// desktop's clipboard.
+    #[cfg(test)]
+    pub(crate) fn terminal_only() -> Self {
+        Self { native: None }
+    }
+
     pub(crate) fn copy_text(&mut self, text: &str) -> Result<CopyResult, String> {
         Self::copy_text_impl(text, |t| self.copy_native(t), terminal::copy_to_clipboard)
     }

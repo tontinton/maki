@@ -9,7 +9,7 @@ use self::layout::{Layout, Piece, Row};
 use crate::text_buffer::{EditResult, Mark, Marks, Prompt, TextBuffer, Writers, is_newline_key};
 use crate::theme;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_lua::{InputMarks, InputMode, TextEdit};
 use maki_storage::input_history::InputHistory;
 use std::mem;
@@ -129,11 +129,22 @@ impl InputBox {
     /// In normal mode a key never types or deletes. It still moves the
     /// cursor, walks the history and sends, and `Enter` always sends, since a
     /// `\` before the cursor only means a new line while typing.
+    ///
+    /// Shift with a motion selects in either mode, since selecting edits
+    /// nothing. It runs before the history keys, so Shift+Up on the first
+    /// line never swaps out the text being selected. `Esc` with a selection
+    /// only drops it, so it never arms the rewind.
     pub fn handle_key(&mut self, key: KeyEvent, mode: InputMode) -> InputAction {
         self.follow_cursor = true;
         let insert = mode == InputMode::Insert;
 
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && self.buffer.handle_motion_key(key, true) == EditResult::Moved
+        {
+            return InputAction::None;
+        }
         match key.code {
+            KeyCode::Esc if self.buffer.deselect() => return InputAction::None,
             KeyCode::Up if self.is_at_first_line() => {
                 self.history_up();
                 return InputAction::None;
@@ -161,7 +172,7 @@ impl InputBox {
         let result = if insert {
             self.buffer.handle_key(key)
         } else {
-            self.buffer.handle_motion_key(key)
+            self.buffer.handle_motion_key(key, false)
         };
         match result {
             EditResult::Changed => InputAction::Changed,
@@ -259,6 +270,14 @@ impl InputBox {
             .join("\n")
     }
 
+    /// The selected source text, never what a conceal draws over it, and
+    /// the selection goes with it.
+    pub fn take_selected_text(&mut self) -> Option<String> {
+        let selected = self.buffer.selection()?;
+        self.buffer.deselect();
+        Some(self.buffer.value()[selected].to_owned())
+    }
+
     fn layout(&self, width: u16) -> RefMut<'_, Layout> {
         let mut layout = self.layout.borrow_mut();
         layout.sync(&self.buffer, effective_width(width.into()));
@@ -330,6 +349,7 @@ impl InputBox {
 
     pub fn continue_line(&mut self) {
         self.buffer.undoable(|buf| {
+            buf.deselect();
             buf.remove_char();
             buf.add_line();
         });
@@ -469,10 +489,13 @@ impl InputBox {
         version: u64,
         edits: Vec<TextEdit>,
         cursor: Option<usize>,
+        anchor: Option<usize>,
         marks: Option<(&str, InputMarks)>,
     ) -> Result<usize, String> {
         let before = self.buffer.version();
-        let (caret, moved) = self.buffer.apply_edits(version, edits, cursor, marks)?;
+        let (caret, moved) = self
+            .buffer
+            .apply_edits(version, edits, cursor, anchor, marks)?;
         self.layout.get_mut().relayout(&self.buffer, &moved);
         self.follow_cursor = true;
         if self.buffer.version() != before {
@@ -629,6 +652,7 @@ impl InputBox {
             let conceals = self.buffer.concealed(window);
             self.langs.next_frame(&self.buffer);
             let caret = self.buffer.cursor_byte();
+            let selected = self.buffer.selection();
             let mut lines = Vec::with_capacity(rows.len() + 1);
             for line_rows in rows.chunk_by(|a, b| a.line == b.line) {
                 let text = line_rows[0].text.clone();
@@ -638,6 +662,7 @@ impl InputBox {
                     text.clone(),
                     &marks,
                     &conceals,
+                    selected.as_ref(),
                     &mut self.langs,
                 );
                 for row in line_rows {
@@ -716,11 +741,14 @@ impl InputBox {
 
     /// Move the text cursor to the position corresponding to a mouse click at
     /// the terminal coordinates (row, col) within the input content area.
+    /// A drag from there is the screen's copy selection, never the input's,
+    /// so the click drops the input's selection like any plain motion.
     pub fn handle_click(&mut self, area: Rect, row: u16, col: u16) {
         let Some((y, x)) = self.click_position(area, row, col) else {
             return;
         };
         self.buffer.set_cursor(y, x);
+        self.buffer.deselect();
         self.follow_cursor = true;
     }
 
@@ -912,7 +940,7 @@ mod tests {
     use crate::components::tool_display::resolve_span_style;
     use crate::decor_worker;
     use crate::text_buffer::test_support::{mark_ranges, text_edit};
-    use crate::text_buffer::{Decoration, Reveal, RuleSet, VirtTextPos};
+    use crate::text_buffer::{Decoration, INPUT_REPLACED_ERR, Reveal, RuleSet, VirtTextPos};
     use maki_agent::types::InlineStyle;
     use maki_agent::{SnapshotSpan, SpanColor, SpanStyle};
     use maki_lua::{InputRule, PatternRule, SyntaxRule};
@@ -954,22 +982,22 @@ mod tests {
         assert_eq!(input.submit().unwrap().text, "line1\nline2");
     }
 
-    #[test]
-    fn backslash_continuation() {
+    #[test_case("hello\\",  0, false => "hello\n"  ; "at_the_end")]
+    #[test_case("asd\\asd", 3, false => "asd\nasd" ; "mid_line")]
+    #[test_case("hello\\",  0, true  => "hello\n"  ; "over_a_selection")]
+    fn backslash_continuation(text: &str, left: usize, select_line: bool) -> String {
         let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, "hello\\");
-        assert!(input.char_before_cursor_is_backslash());
-        input.continue_line();
-        assert_eq!(input.buffer.value(), "hello\n");
-
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, "asd\\asd");
-        for _ in 0..3 {
+        type_text(&mut input, text);
+        for _ in 0..left {
             input.buffer.move_left();
         }
+        if select_line {
+            input.handle_key(KeyCode::Home.into(), InputMode::Insert);
+            input.handle_key(shift(KeyCode::End), InputMode::Insert);
+        }
         assert!(input.char_before_cursor_is_backslash());
-        input.continue_line();
-        assert_eq!(input.buffer.value(), "asd\nasd");
+        input.handle_key(KeyCode::Enter.into(), InputMode::Insert);
+        input.buffer.value().to_owned()
     }
 
     const TEST_WIDTH: u16 = 80;
@@ -1104,7 +1132,9 @@ mod tests {
         input.history_up();
 
         let version = input.buffer.version();
-        input.apply_edits(version, edits, cursor, None).unwrap();
+        input
+            .apply_edits(version, edits, cursor, None, None)
+            .unwrap();
 
         assert_eq!(input.draft_text(), parked);
     }
@@ -1719,7 +1749,9 @@ mod tests {
     fn plugin_write(input: &mut InputBox, range: Range<usize>, text: &str) {
         let edit = text_edit(range.start, range.end, text);
         let version = input.buffer.version();
-        input.apply_edits(version, vec![edit], None, None).unwrap();
+        input
+            .apply_edits(version, vec![edit], None, None, None)
+            .unwrap();
     }
 
     /// A plugin edit lands on a recalled history entry, so the value is the
@@ -1944,6 +1976,23 @@ mod tests {
         assert_eq!(mark_ranges(&input.buffer), vec![0..5]);
     }
 
+    /// Two chats with empty drafts read the same, yet an edit a plugin
+    /// planned on the one left behind must not land in the one in front.
+    #[test]
+    fn a_stale_edit_is_refused_after_swapping_in_a_draft_that_reads_the_same() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        let planned = input.buffer.version();
+
+        input.swap_draft(Draft::default());
+
+        assert_ne!(input.buffer.version(), planned, "a strict edit compares it");
+        let refused = input
+            .apply_edits(planned, vec![text_edit(0, 0, DRAFT)], None, None, None)
+            .unwrap_err();
+        assert!(refused.starts_with(INPUT_REPLACED_ERR), "{refused}");
+        assert!(input.buffer.is_empty());
+    }
+
     #[test_case(|input| { input.submit(); } ; "submit")]
     #[test_case(InputBox::discard           ; "discard")]
     fn ghost_text_goes_with_the_prompt(put_away: fn(&mut InputBox)) {
@@ -2054,6 +2103,66 @@ mod tests {
             end_col,
         };
         input.selected_text(Rect::new(0, 1, CURSOR_WIDTH, CURSOR_HEIGHT - 2), &selection)
+    }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    /// Shift+Right over `a`, the space and the chip takes the chip whole. It
+    /// still draws as `[go]`, now in the selection colors over the red of the
+    /// mark, and copies as its source.
+    #[test]
+    fn a_selection_paints_over_marks_and_copies_the_source() {
+        const SELECTED: &str = "a $s:go";
+        const SELECTED_DRAWN: &str = "a [go]";
+        const RIGHTS_OVER_THE_CHIP: usize = 3;
+        let mut input = chip(Reveal::Never);
+        let red = mark(0..CHIP_TEXT.len(), hl(fg(RED)));
+        input
+            .set_marks(input.buffer.version(), MARKS_PLUGIN, "red", vec![red])
+            .unwrap();
+        input.buffer.set_cursor(0, 0);
+        for _ in 0..RIGHTS_OVER_THE_CHIP {
+            input.handle_key(shift(KeyCode::Right), InputMode::Insert);
+        }
+
+        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}{CHIP_DRAWN}"));
+        let selected = theme::current().item_selected;
+        let is_selected = |x| {
+            let cell = text_cell(&terminal, x, 1);
+            (cell.fg, cell.bg) == (selected.fg.unwrap(), selected.bg.unwrap())
+        };
+        let selected_end = SELECTED_DRAWN.len() as u16;
+        assert!((0..selected_end).all(is_selected));
+        assert!(!is_selected(selected_end));
+        assert_eq!(input.take_selected_text().as_deref(), Some(SELECTED));
+        assert_eq!(input.buffer.selection(), None);
+    }
+
+    /// Up on the first line has nothing to move over, so Shift+Up must not
+    /// fall through to the history and swap out the text being selected.
+    #[test]
+    fn shift_selects_before_history_and_esc_drops_it_first() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, RECALLED);
+        type_text(&mut input, DRAFT);
+        input.handle_key(shift(KeyCode::Up), InputMode::Insert);
+        input.handle_key(shift(KeyCode::Home), InputMode::Normal);
+        assert_eq!(input.buffer.value(), DRAFT);
+        assert_eq!(input.buffer.selection(), Some(0..DRAFT.len()));
+
+        let esc = KeyCode::Esc.into();
+        assert!(matches!(
+            input.handle_key(esc, InputMode::Insert),
+            InputAction::None
+        ));
+        assert_eq!(input.buffer.selection(), None);
+        assert!(matches!(
+            input.handle_key(esc, InputMode::Insert),
+            InputAction::Passthrough(_)
+        ));
     }
 
     const SHELL_WIDTH: u16 = 30;
@@ -2242,7 +2351,7 @@ mod tests {
         edits.sort_by_key(|edit| edit.start);
         let cursor = Some(x + "z".len());
         input
-            .apply_edits(input.buffer.version(), edits, cursor, None)
+            .apply_edits(input.buffer.version(), edits, cursor, None, None)
             .unwrap();
         let (terminal, rows) = draw(&mut input);
         assert_eq!(rows, STALE);
@@ -2271,7 +2380,7 @@ mod tests {
 
         let fence = text_edit("top\n".len(), "top\n".len(), "```\n");
         input
-            .apply_edits(input.buffer.version(), vec![fence], None, None)
+            .apply_edits(input.buffer.version(), vec![fence], None, None, None)
             .unwrap();
         assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), 2 + LINES);
 
@@ -2305,7 +2414,7 @@ mod tests {
         let b = DOC.find('b').unwrap();
         let edit = text_edit(b, b, "z");
         input
-            .apply_edits(input.buffer.version(), vec![edit], None, None)
+            .apply_edits(input.buffer.version(), vec![edit], None, None, None)
             .unwrap();
         assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), LINES);
     }
@@ -2353,7 +2462,7 @@ mod tests {
         };
         let edit = text_edit(at, at, "z");
         input
-            .apply_edits(input.buffer.version(), vec![edit], None, None)
+            .apply_edits(input.buffer.version(), vec![edit], None, None, None)
             .unwrap();
     }
 

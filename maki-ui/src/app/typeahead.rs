@@ -62,18 +62,19 @@ impl Pressed {
     }
 }
 
-/// The chat input as a press found it: the version of its text, and where
-/// the cursor was.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The chat input at one moment: the version of its text, and where the
+/// cursor and the selection were.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct InputAt {
     pub version: u64,
     pub cursor: usize,
+    pub anchor: Option<usize>,
 }
 
 impl InputAt {
     /// Whether a key pressed at this lands somewhere else at {now}.
     fn caret_moved(&self, now: &Self) -> bool {
-        self.cursor != now.cursor
+        self.cursor != now.cursor || self.anchor != now.anchor
     }
 }
 
@@ -198,7 +199,8 @@ impl Typeahead {
 
     /// The press behind {ticket}, while it still holds the keys after it,
     /// the keyboard is still at {focus} and in {mode}, where the user
-    /// pressed it, and the cursor of {input} is still where it was. A key
+    /// pressed it, and the cursor and the selection of {input} are still
+    /// where they were. A key
     /// would otherwise land somewhere the user never aimed it. When the text
     /// is no longer at the press's version, whoever wrote it, the key was
     /// pressed on text the user no longer sees, so it sends nothing.
@@ -237,9 +239,10 @@ impl Typeahead {
         }
     }
 
-    /// {input} is the chat input now. When its text or its cursor changed
-    /// while the keys waited, whoever changed them, or the keyboard moved,
-    /// they were typed blind to the change, see [`Sight::blind`].
+    /// {input} is the chat input now. When its text, its cursor or its
+    /// selection changed while the keys waited, whoever changed them, or the
+    /// keyboard moved, they were typed blind to the change, see
+    /// [`Sight::blind`].
     ///
     /// The keys follow the keyboard to {focus}, a window or a picker the
     /// handler opened included, except while a modal or a prompt is up that
@@ -348,6 +351,7 @@ mod tests {
                 input: InputAt {
                     version: 0,
                     cursor: 0,
+                    anchor: None,
                 },
             }),
             queue: VecDeque::new(),
