@@ -106,6 +106,15 @@ maki.provider.register({
       pricing = { input = 0.15, output = 0.6, cache_write = 0.0, cache_read = 0.0 },
     },
     {
+      prefixes = { "zai-glm-5-3-flash" },
+      tier = "weak",
+      family = "glm",
+      supports_vision = true,
+      max_output_tokens = 131072,
+      context_window = 1000000,
+      pricing = { input = 0.15, output = 0.5, cache_write = 0.0, cache_read = 0.03 },
+    },
+    {
       prefixes = { "ministral-14b-latest", "ministral-14b-2512" },
       tier = "weak",
       default = true,
