@@ -822,7 +822,7 @@ pub enum UiAction {
     },
     HighlightTranscript {
         row: u32,
-        error: bool,
+        style: String,
         duration: Duration,
     },
     TranscriptPositions {
