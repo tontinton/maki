@@ -10,6 +10,8 @@ Our goal is to let plugin authors have as much freedom as possible, that's why d
 
 Long-lived work is a `maki.async.spawn` task, and a repeating timer is a `maki.async.sleep` loop inside one.
 
+Read optional keys with `TableExt::opt` / `opt_bool` (`util/convert.rs`), never `get::<Option<T>>` or `get::<bool>`, so the `maki.NIL` that `maki.json.decode` gives for null counts as absent.
+
 ## Lua thread
 
 All plugins share one Lua thread. Code that holds it for 5s without yielding is killed, warned at 1s.

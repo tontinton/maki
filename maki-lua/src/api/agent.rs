@@ -45,7 +45,7 @@ use crate::api::session::{not_live, required_session};
 use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::command::UiAction;
-use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
+use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::background::{BackgroundInfo, BackgroundSession, BackgroundSessions};
@@ -354,10 +354,10 @@ async fn resolve_model(
     let agent = try_pair!(dispatch_ctx(&ctx, "resolve_model"));
     let tier_str = opts
         .as_ref()
-        .and_then(|t| t.get::<Option<String>>("tier").ok().flatten());
+        .and_then(|t| t.opt::<String>("tier").ok().flatten());
     let spec_str = opts
         .as_ref()
-        .and_then(|t| t.get::<Option<String>>("spec").ok().flatten());
+        .and_then(|t| t.opt::<String>("spec").ok().flatten());
 
     let model = match spec_str {
         Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
@@ -466,11 +466,11 @@ async fn tools(
             .ok_or_else(|| format!("unknown audience: {audience_str}"))
     );
 
-    let only: Option<Vec<String>> = opts.get("only")?;
-    let except: Option<Vec<String>> = opts.get("except")?;
-    let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
-    let spec_str: Option<String> = opts.get("spec")?;
-    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(false);
+    let only: Option<Vec<String>> = opts.opt("only")?;
+    let except: Option<Vec<String>> = opts.opt("except")?;
+    let workflow: bool = opts.opt::<bool>("workflow")?.unwrap_or(false);
+    let spec_str: Option<String> = opts.opt("spec")?;
+    let mcp_enabled: bool = opts.opt::<bool>("mcp")?.unwrap_or(false);
 
     let parsed = spec_str
         .as_deref()
@@ -606,18 +606,18 @@ async fn call_tool(
     tctx.live_sink = Some(live_tx);
     let (mut on_buf, mut on_ann, mut on_usage) = (None, None, None);
     if let Some(o) = opts {
-        if let Some(mode) = o.get::<Option<String>>("output_mode")? {
+        if let Some(mode) = o.opt::<String>("output_mode")? {
             let Some(mode) = ToolOutputMode::parse(&mode) else {
                 return Ok(err_pair(OUTPUT_MODE_ERR));
             };
             tctx.output_mode = mode;
         }
-        if let Some(secs) = o.get::<Option<u64>>("timeout")? {
+        if let Some(secs) = o.opt::<u64>("timeout")? {
             tctx.deadline = Deadline::after(Duration::from_secs(secs));
         }
-        on_buf = o.get::<Option<Function>>("on_live_buf")?;
-        on_ann = o.get::<Option<Function>>("on_annotation")?;
-        on_usage = o.get::<Option<Function>>("on_usage")?;
+        on_buf = o.opt::<Function>("on_live_buf")?;
+        on_ann = o.opt::<Function>("on_annotation")?;
+        on_usage = o.opt::<Function>("on_usage")?;
     }
     let cbs = LiveCallbacks {
         tool: &name,
@@ -761,7 +761,7 @@ async fn session(
             let Some((task, _)) = active_task_cancel(&lua) else {
                 return Ok(err_pair(TASK_REQUIRED_ERR));
             };
-            let task = parse_scope(opts.get("scope")?, task)?;
+            let task = parse_scope(opts.opt("scope")?, task)?;
             // A child of the task's token would leave a watcher waiting on it
             // until it fires. An autocmd's token never fires, so every open
             // would leak one. The entry keeps this trigger instead, and the
@@ -771,20 +771,20 @@ async fn session(
             (agent_ctx, opts, Some((session, task, cancel)))
         }
     };
-    let model_spec: Option<String> = opts.get("model_spec")?;
-    let system: Option<String> = opts.get("system")?;
-    let tools_val: Option<LuaValue> = opts.get("tools")?;
-    let local_tools_tbl: Option<Table> = opts.get("local_tools")?;
-    let name: Option<String> = opts.get("name")?;
-    let thinking_val: Option<LuaValue> = opts.get("thinking")?;
-    let audience = match opts.get::<Option<String>>("audience")? {
+    let model_spec: Option<String> = opts.opt("model_spec")?;
+    let system: Option<String> = opts.opt("system")?;
+    let tools_val: Option<LuaValue> = opts.opt("tools")?;
+    let local_tools_tbl: Option<Table> = opts.opt("local_tools")?;
+    let name: Option<String> = opts.opt("name")?;
+    let thinking_val: Option<LuaValue> = opts.opt("thinking")?;
+    let audience = match opts.opt::<String>("audience")? {
         Some(s) => {
             try_pair!(ToolAudience::parse_name(&s).ok_or_else(|| format!("unknown audience: {s}")))
         }
         None => DEFAULT_SESSION_AUDIENCE,
     };
-    let fast: Option<bool> = opts.get("fast")?;
-    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(false);
+    let fast: Option<bool> = opts.opt("fast")?;
+    let mcp_enabled: bool = opts.opt::<bool>("mcp")?.unwrap_or(false);
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
     {
@@ -832,8 +832,7 @@ async fn session(
                 "description": description,
                 "input_schema": sanitized_schema,
             }));
-            let audience =
-                parse_audience(spec.get::<Option<Table>>("audiences")?, ToolAudience::MODEL)?;
+            let audience = parse_audience(spec.opt::<Table>("audiences")?, ToolAudience::MODEL)?;
             let weak = lua.weak();
             local_map.insert(
                 name,

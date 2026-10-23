@@ -3,6 +3,7 @@
 //! `notify` (a one-line notice whose default any plugin can swap via
 //! `maki.set_notify_handler`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +13,15 @@ use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
 use crate::api::util::command::{UiAction, ui_send};
+use crate::api::util::convert::TableExt;
+use crate::docs::FnDoc;
 use crate::runtime::{DeferQueue, DeferredCallback};
+
+/// How deep `maki.deepcopy` follows nested tables before it gives up, so it
+/// never overflows the stack. With `noref` set, this is also where a cycle
+/// stops. Matches Lua's own limit on nested C calls.
+const MAX_DEEPCOPY_DEPTH: usize = 200;
+const DEEPCOPY_TOO_DEEP_ERR: &str = "deepcopy: tables nested deeper than";
 
 /// The one `maki.notify` override for the whole process. `create_maki_global`
 /// runs per plugin load, so an override stored on the `maki` table itself would
@@ -123,7 +132,7 @@ fn notify(
     opts: Option<Table>,
 ) -> LuaResult<()> {
     let title = match &opts {
-        Some(t) => t.get::<Option<String>>("title")?,
+        Some(t) => t.opt::<String>("title")?,
         None => None,
     };
     let handler_fn = lua.app_data_ref::<NotifyHandler>().and_then(|slot| {
@@ -212,11 +221,84 @@ pub(crate) fn clear_notify_handler(lua: &Lua, plugin: &str) {
     }
 }
 
+/// Copy {orig} and every table inside it, keeping each table's metatable.
+/// That is what lets a copied empty array still encode as `[]` instead of
+/// `{}`. Use it instead of a hand-rolled copy for anything you pass back to
+/// maki. Table keys are copied too. Functions, userdata (including
+/// `maki.NIL`) and other non-table values are shared, not copied.
+///
+/// A table reachable twice is copied once, so shared references and cycles
+/// survive. Pass {noref} to copy such a table every time it is reached. That
+/// is faster for trees, but a cycle then fails with an error.
+///
+/// @param orig any Value to copy.
+/// @param noref boolean? Optional. When true, shared references are not tracked.
+/// @return (any) The copy.
+/// @example
+/// local input = maki.json.decode('{"files": []}')
+/// local copy = maki.deepcopy(input)
+/// copy.mode = "strict"
+/// print(maki.json.encode(copy)) -- {"files":[],"mode":"strict"}
+#[lua_fn]
+fn deepcopy(lua: &Lua, orig: Value, noref: Option<bool>) -> LuaResult<Value> {
+    let seen = (noref != Some(true)).then(HashMap::new);
+    DeepCopy { lua, seen }.copy(orig, 0)
+}
+
+struct DeepCopy<'lua> {
+    lua: &'lua Lua,
+    seen: Option<HashMap<usize, Table>>,
+}
+
+impl DeepCopy<'_> {
+    fn copy(&mut self, value: Value, depth: usize) -> LuaResult<Value> {
+        let Value::Table(source) = value else {
+            return Ok(value);
+        };
+        let identity = source.to_pointer() as usize;
+        if let Some(done) = self.seen.as_ref().and_then(|seen| seen.get(&identity)) {
+            return Ok(Value::Table(done.clone()));
+        }
+        if depth >= MAX_DEEPCOPY_DEPTH {
+            return Err(mlua::Error::runtime(format!(
+                "{DEEPCOPY_TOO_DEEP_ERR} {MAX_DEEPCOPY_DEPTH} (with noref set a cycle never ends)"
+            )));
+        }
+        let copy = self.lua.create_table()?;
+        if let Some(seen) = &mut self.seen {
+            seen.insert(identity, copy.clone());
+        }
+        for pair in source.pairs::<Value, Value>() {
+            let (key, val) = pair?;
+            copy.raw_set(self.copy(key, depth + 1)?, self.copy(val, depth + 1)?)?;
+        }
+        copy.set_metatable(source.metatable())?;
+        Ok(Value::Table(copy))
+    }
+}
+
+#[allow(non_upper_case_globals)]
+const NIL__doc: FnDoc = FnDoc {
+    name: "NIL",
+    args: "",
+    desc: "`maki.NIL` is a value that stands for JSON null, like `vim.NIL`. \
+`maki.json.decode` returns it for every null unless `luanil` says otherwise. \
+Every conversion to JSON turns it back into null. So a decode, change, \
+encode pass loses no key. It is truthy and not equal to nil, so test \
+`x == maki.NIL` for null. Tool handler arguments and event payloads use nil \
+for null instead, never `maki.NIL`.",
+    params: &[],
+    returns: "",
+    guard: None,
+    value: true,
+    example: "local t = maki.json.decode('{\"a\": null}')\nassert(t.a == maki.NIL)\nprint(maki.json.encode(t)) -- {\"a\":null}",
+};
+
 lua_table! {
     extend "maki" => pub(crate) fn add_top_methods(
         plugin: Arc<str>,
     ), DOCS [
-        defer_fn(plugin), manual notify, set_notify_handler(plugin),
+        defer_fn(plugin), manual notify, set_notify_handler(plugin), deepcopy, manual NIL,
     ]
 }
 
@@ -377,5 +459,85 @@ mod tests {
         assert!(!cancel.load(Ordering::Acquire));
         lua.load(r#"H:stop()"#).exec().unwrap();
         assert!(cancel.load(Ordering::Acquire));
+    }
+
+    mod deep_copy {
+        use serde_json::json;
+        use test_case::test_case;
+
+        use super::*;
+        use crate::api::util::convert::{json_to_lua_exact, lua_to_json};
+
+        const SOURCE: &str = "source";
+
+        fn lua_with_maki() -> Lua {
+            let lua = Lua::new();
+            install(&lua, None, "maki");
+            lua
+        }
+
+        #[test]
+        fn empty_arrays_and_sentinel_nulls_survive_the_copy() {
+            let lua = lua_with_maki();
+            let doc = json!({"files": [], "nested": [[], {}], "limit": null, "tags": [null, "x"]});
+            lua.globals()
+                .set(SOURCE, json_to_lua_exact(&lua, &doc).unwrap())
+                .unwrap();
+            let copy: Value = lua
+                .load(format!("return maki.deepcopy({SOURCE})"))
+                .eval()
+                .unwrap();
+            assert_eq!(lua_to_json(&lua, &copy).unwrap(), doc);
+        }
+
+        #[test_case(
+            "local orig = { inner = { 1, 2 } }
+            local copy = maki.deepcopy(orig)
+            copy.inner[1] = 99
+            return copy.inner ~= orig.inner and orig.inner[1] == 1"
+            ; "copy_is_independent_of_the_original"
+        )]
+        #[test_case(
+            "local mt = {}
+            local key = setmetatable({ id = 1 }, mt)
+            local new_key = next(maki.deepcopy({ [key] = true }))
+            return new_key ~= key and new_key.id == 1 and getmetatable(new_key) == mt"
+            ; "metatables_and_table_keys_are_copied"
+        )]
+        #[test_case(
+            "local shared = {}
+            local orig = { a = shared, b = shared }
+            orig.self = orig
+            local copy = maki.deepcopy(orig)
+            return copy ~= orig and copy.self == copy and copy.a == copy.b and copy.a ~= shared"
+            ; "cycles_and_shared_references_are_kept_by_default"
+        )]
+        #[test_case(
+            "local shared = {}
+            local copy = maki.deepcopy({ a = shared, b = shared }, true)
+            return copy.a ~= copy.b"
+            ; "noref_copies_a_shared_table_each_time_it_is_reached"
+        )]
+        #[test_case(
+            "local f = function() end
+            return maki.deepcopy(f) == f and maki.deepcopy('s') == 's' and maki.deepcopy(nil) == nil"
+            ; "non_tables_are_returned_as_they_are"
+        )]
+        fn deepcopy_contract(chunk: &str) {
+            let holds: bool = lua_with_maki().load(chunk).eval().unwrap();
+            assert!(holds);
+        }
+
+        #[test]
+        fn noref_cycle_is_an_error_not_a_stack_overflow() {
+            let err = lua_with_maki()
+                .load("local t = {} t.self = t maki.deepcopy(t, true)")
+                .exec()
+                .expect_err("a cycle without reference tracking must fail");
+            assert!(
+                err.to_string().contains(DEEPCOPY_TOO_DEEP_ERR),
+                "got: {err}"
+            );
+        }
     }
 }

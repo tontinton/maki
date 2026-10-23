@@ -141,6 +141,7 @@ pub(crate) fn create_maki_global(
     )?;
     split::split__register(&maki, lua)?;
     top::add_top_methods(&maki, lua, Arc::clone(&plugin))?;
+    maki.set("NIL", Value::NULL)?;
     maki.set(
         "async",
         r#async::create_async_table(lua, Arc::clone(&plugin))?,

@@ -1,7 +1,11 @@
-local NO_RESULTS_MSG = require("constants").NO_RESULTS_MSG
+local constants = require("constants")
+local NO_RESULTS_MSG = constants.NO_RESULTS_MSG
+local NOT_AN_OBJECT_MSG = constants.NOT_AN_OBJECT_MSG
 local MCP_ERROR_PREFIX = "MCP error: "
 local MCP_TOOL_ERROR_PREFIX = "MCP tool error: "
 local UNKNOWN_ERROR_MSG = "unknown error"
+-- Null fields read as absent, so `parsed.error ~= nil` means a real error.
+local DECODE_OPTS = { luanil = { object = true, array = true } }
 
 local function extract_text(parsed)
   local content = parsed.result and parsed.result.content
@@ -29,9 +33,9 @@ local function parse_sse_response(body)
   for line in body:gmatch("[^\n]+") do
     local data = line:match("^data: (.+)")
     if data then
-      local parsed, parse_err = maki.json.decode(data)
-      if not parsed then
-        return nil, "SSE JSON parse error: " .. parse_err
+      local parsed, parse_err = maki.json.decode(data, DECODE_OPTS)
+      if type(parsed) ~= "table" then
+        return nil, "SSE JSON parse error: " .. (parse_err or NOT_AN_OBJECT_MSG)
       end
       local failure = failure_message(parsed)
       if failure then

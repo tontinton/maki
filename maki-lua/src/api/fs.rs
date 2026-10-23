@@ -14,7 +14,7 @@ use maki_agent::{FileQuery, FileReader, Ranked};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 
-use crate::api::util::convert::opt_bool;
+use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::loader::EventHandle;
 use crate::plugin_permissions::PluginPermissions;
@@ -251,8 +251,8 @@ async fn read(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<St
             String::from_utf8(bytes).map_err(|_| NON_UTF8_CONTENT_ERR),
         ));
     };
-    let offset: i64 = opts.get::<Option<i64>>("offset")?.unwrap_or(1);
-    let limit: Option<u64> = opts.get::<Option<u64>>("limit")?.filter(|l| *l > 0);
+    let offset: i64 = opts.opt::<i64>("offset")?.unwrap_or(1);
+    let limit: Option<u64> = opts.opt::<u64>("limit")?.filter(|l| *l > 0);
     let text = smol::unblock(move || read_line_window(&abs, offset, limit, TAIL_SCAN_CHUNK)).await;
     Ok(pair(text))
 }
@@ -275,8 +275,8 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
     let abs = try_pair!(make_absolute(&path));
     let bytes = match opts.as_ref() {
         Some(opts) => {
-            let offset: i64 = opts.get::<Option<i64>>("offset")?.unwrap_or(0);
-            let len: Option<u64> = opts.get("len")?;
+            let offset: i64 = opts.opt::<i64>("offset")?.unwrap_or(0);
+            let len: Option<u64> = opts.opt("len")?;
             try_pair!(smol::unblock(move || read_byte_window(&abs, offset, len)).await)
         }
         None => try_pair!(read_file(abs, MAX_READ_BYTES).await),
@@ -641,11 +641,11 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
     let abs = try_pair!(make_absolute(&path));
     let recursive = opts
         .as_ref()
-        .and_then(|t| opt_bool(t, "recursive"))
+        .and_then(|t| t.opt_bool("recursive"))
         .unwrap_or(false);
     let force = opts
         .as_ref()
-        .and_then(|t| opt_bool(t, "force"))
+        .and_then(|t| t.opt_bool("force"))
         .unwrap_or(false);
     let removed = abs.clone();
     let result = smol::unblock(move || -> std::io::Result<()> {
@@ -685,7 +685,7 @@ async fn mkdir(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<b
     let abs = try_pair!(make_absolute(&path));
     let parents = opts
         .as_ref()
-        .and_then(|t| opt_bool(t, "parents"))
+        .and_then(|t| t.opt_bool("parents"))
         .unwrap_or(false);
     let result = if parents {
         smol::fs::create_dir_all(&abs).await
@@ -808,7 +808,7 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
     let limit = opts.as_ref().and_then(|t| t.get::<usize>("limit").ok());
     let gitignore = opts
         .as_ref()
-        .and_then(|t| opt_bool(t, "gitignore"))
+        .and_then(|t| t.opt_bool("gitignore"))
         .unwrap_or(true);
     let sort = opts.as_ref().and_then(|t| t.get::<String>("sort").ok());
     let sort_mtime = sort.as_deref() == Some("mtime");
@@ -1142,7 +1142,7 @@ async fn fuzzy_files(
         .min(MAX_FILE_RESULTS);
     let highlights = opts
         .as_ref()
-        .and_then(|o| opt_bool(o, "highlights"))
+        .and_then(|o| o.opt_bool("highlights"))
         .unwrap_or(false);
     let path = opts.as_ref().and_then(|o| o.get::<String>("path").ok());
 

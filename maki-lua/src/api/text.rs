@@ -6,6 +6,7 @@ use mlua::{Lua, LuaString, Result as LuaResult, Table};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
+use super::util::convert::TableExt;
 use super::util::pair::{Pair, pair, try_pair};
 
 thread_local! {
@@ -54,7 +55,7 @@ fn compile(needle: &str) -> Pattern {
 }
 
 fn want(opts: Option<&Table>, key: &str) -> bool {
-    opts.and_then(|o| o.get::<bool>(key).ok()).unwrap_or(false)
+    opts.and_then(|o| o.opt_bool(key)).unwrap_or(false)
 }
 
 /// Where the match landed in {text}, in the shape `maki.fs.fuzzy_files`

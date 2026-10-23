@@ -59,7 +59,7 @@ use crate::api::util::command::{
     LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
     UiAttachment, install_ui_attachment, ui_send,
 };
-use crate::api::util::convert::{json_to_lua, lua_to_json_within};
+use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
 use crate::api::{Owner, create_maki_global};
@@ -1164,7 +1164,7 @@ impl ModuleLoader {
             return Ok(cached);
         }
 
-        if self.loading.get::<bool>(modname).unwrap_or(false) {
+        if self.loading.opt_bool(modname).unwrap_or(false) {
             return Ok(LuaValue::Boolean(true));
         }
 
@@ -3314,7 +3314,7 @@ impl LuaRuntime {
         if scopes.is_empty() {
             return None;
         }
-        let force_prompt: bool = table.get("force_prompt").unwrap_or(false);
+        let force_prompt: bool = table.opt_bool("force_prompt").unwrap_or(false);
         Some(PermissionScopes {
             scopes,
             force_prompt,
@@ -4028,7 +4028,7 @@ async fn run_hook(
     let mut returned = returned.into_iter();
     let first = returned.next();
     let ask = match returned.next() {
-        Some(LuaValue::Table(second)) => match second.get::<Option<String>>(ASK_FIELD) {
+        Some(LuaValue::Table(second)) => match second.opt::<String>(ASK_FIELD) {
             Ok(reason) => reason,
             Err(e) => {
                 tracing::warn!(slot, error = %e, "slot answered `ask` with something other than a string");
@@ -4167,7 +4167,7 @@ async fn run_prompt(
 /// own answers like `allow_session` are refused, see [`LayerVerdict`] for why.
 fn prompt_answer(table: &Table) -> mlua::Result<LayerVerdict> {
     let decision: String = table.get("decision")?;
-    let guidance: Option<String> = table.get("guidance")?;
+    let guidance: Option<String> = table.opt("guidance")?;
     match decision.as_str() {
         "allow" => Ok(LayerVerdict::Allow),
         "deny" => Ok(LayerVerdict::Deny {

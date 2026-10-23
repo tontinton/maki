@@ -7,6 +7,8 @@ declare maki: {
   defer_fn: @checked (callback: any, ms: number) -> (any),
   notify: @checked (msg: string, level: string?, opts: any) -> (),
   set_notify_handler: @checked (handler: any) -> (),
+  deepcopy: @checked (orig: any, noref: boolean?) -> (any),
+  NIL: any,
   agent: {
     resolve_model: @checked (ctx: any, opts: any) -> (any, string?),
     system_prompt: @checked (ctx: any, opts: any) -> (string?, string?),
@@ -99,7 +101,7 @@ declare maki: {
   },
   json: {
     encode: @checked (value: any) -> (string?, string?),
-    decode: @checked (str: string) -> (any, string?),
+    decode: @checked (str: string, opts: any) -> (any, string?),
     schema_validator: @checked (schema: any) -> (any, string?),
   },
   keymap: {

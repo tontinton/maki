@@ -11,7 +11,7 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 use serde_json::json;
 
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip, ui_roundtrip};
-use crate::api::util::convert::json_to_lua;
+use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 
@@ -36,7 +36,7 @@ pub(crate) fn not_live(session: MakiId) -> String {
 /// make them follow the user from tab to tab.
 pub(crate) fn required_session(opts: Option<&Table>) -> LuaResult<Result<MakiId, String>> {
     let Some(raw) = opts
-        .map(|t| t.get::<Option<String>>("session"))
+        .map(|t| t.opt::<String>("session"))
         .transpose()?
         .flatten()
     else {
@@ -117,7 +117,7 @@ async fn read(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
     let id = match opts {
-        Some(t) => t.get::<Option<String>>("session")?,
+        Some(t) => t.opt::<String>("session")?,
         None => None,
     };
     // Headless drivers install a provider, the UI leaves the slot empty and
@@ -247,10 +247,7 @@ async fn messages(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let (id, last) = match &opts {
-        Some(opts) => (
-            opts.get::<Option<String>>("session")?,
-            opts.get::<Option<usize>>("last")?,
-        ),
+        Some(opts) => (opts.opt::<String>("session")?, opts.opt::<usize>("last")?),
         None => (None, None),
     };
     let raw = match id {
@@ -328,7 +325,7 @@ async fn new(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
     let (prompt, focus): (Option<String>, bool) = match opts {
-        Some(opts) => (opts.get("prompt")?, opts.get("focus").unwrap_or(false)),
+        Some(opts) => (opts.opt("prompt")?, opts.opt_bool("focus").unwrap_or(false)),
         None => (None, false),
     };
     if prompt.is_some() && !may_run_agents {
@@ -356,7 +353,7 @@ async fn prompt(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
     let id = match opts {
-        Some(opts) => opts.get("session")?,
+        Some(opts) => opts.opt("session")?,
         None => None,
     };
     roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
@@ -382,7 +379,7 @@ fn notify(
 ) -> LuaResult<Pair<bool>> {
     let wake = opts
         .as_ref()
-        .and_then(|t| t.get("wake").ok())
+        .and_then(|t| t.opt_bool("wake"))
         .unwrap_or(false);
     if wake && !may_run_agents {
         return Err(denied_error(Permission::Agent));
@@ -418,7 +415,7 @@ async fn set_mode(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
     let id = match opts {
-        Some(opts) => opts.get("session")?,
+        Some(opts) => opts.opt("session")?,
         None => None,
     };
     roundtrip(lua, tx, SessionRequest::SetMode { id, mode }).await

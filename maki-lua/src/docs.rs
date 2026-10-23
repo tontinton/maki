@@ -39,6 +39,8 @@ pub struct FnDoc {
     /// `guard =` attribute. Rendered into the docs so the reference can
     /// never drift from the actual gate.
     pub guard: Option<&'static str>,
+    /// A plain value such as `maki.NIL`, documented without a call signature.
+    pub value: bool,
 }
 
 pub struct ParamDoc {

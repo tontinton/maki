@@ -23,8 +23,8 @@ local function normalize(questions)
   return questions
 end
 
--- The form leaves a hole for every skipped question, and a sparse array
--- round-trips through JSON as an object, which restore cannot index.
+-- The form leaves a hole for every skipped question. A very sparse array
+-- round-trips through JSON as an object, and restore cannot index that.
 local function dense(questions, answers)
   local out = {}
   for i = 1, #questions do

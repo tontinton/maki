@@ -20,6 +20,7 @@ use shell_words::join as shell_join;
 
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
+use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
@@ -875,7 +876,7 @@ fn jobstart(
     let mut tail = None;
 
     if let Some(ref opts) = opts {
-        spec.cwd = opts.get("cwd").ok();
+        spec.cwd = opts.opt("cwd").ok().flatten();
         spec.env = opts
             .get::<Table>("env")
             .ok()
@@ -886,7 +887,7 @@ fn jobstart(
         spec.on_exit = callback_key(lua, opts, "on_exit")?;
         spec.stdout = parse_redirect(opts, "stdout", spec.on_stdout.is_some(), fs_write)?;
         spec.stderr = parse_redirect(opts, "stderr", spec.on_stderr.is_some(), fs_write)?;
-        tail = opts.get("tail").ok();
+        tail = opts.opt("tail").ok().flatten();
         if let Some(n) = tail
             && n > MAX_TAIL_LINES
         {
@@ -962,7 +963,7 @@ fn callback_key(lua: &Lua, opts: &Table, key: &str) -> LuaResult<Option<Registry
 }
 
 fn job_name(opts: &Table) -> LuaResult<Option<String>> {
-    let name = opts.get::<Option<String>>("name")?;
+    let name = opts.opt::<String>("name")?;
     if name.as_deref().is_some_and(|name| name.trim().is_empty()) {
         return Err(mlua::Error::runtime(BLANK_NAME_ERR));
     }
@@ -1387,7 +1388,7 @@ fn winrestview(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     view: Table,
 ) -> LuaResult<Pair<bool>> {
-    let topline = view.get::<Option<i64>>("topline")?.unwrap_or(1);
+    let topline = view.opt::<i64>("topline")?.unwrap_or(1);
     let scroll_top = topline.saturating_sub(1).clamp(0, i64::from(u32::MAX)) as u32;
     try_pair!(ui_send(tx.as_ref(), UiAction::WinRestView { scroll_top }));
     Ok((Some(true), None))

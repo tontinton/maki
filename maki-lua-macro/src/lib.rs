@@ -121,6 +121,18 @@ fn last_segment_is(ty: &Type, name: &str) -> bool {
     }
 }
 
+fn option_inner(ty: &Type) -> Option<&Type> {
+    let Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last().filter(|s| s.ident == "Option")?;
+    let syn::PathArguments::AngleBracketed(ab) = &seg.arguments else {
+        return None;
+    };
+    match ab.args.first() {
+        Some(syn::GenericArgument::Type(inner)) => Some(inner),
+        _ => None,
+    }
+}
+
 struct LuaFnArgs {
     guard: Option<Path>,
     name: Option<String>,
@@ -256,7 +268,7 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
             let ident = ident.unraw();
             if last_segment_is(ty, "Variadic") {
                 "{...}".to_owned()
-            } else if last_segment_is(ty, "Option") {
+            } else if option_inner(ty).is_some() {
                 format!("{{{ident}?}}")
             } else {
                 format!("{{{ident}}}")
@@ -292,6 +304,7 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
             returns: #returns,
             example: #example,
             guard: #guard_doc,
+            value: false,
         };
     };
 
@@ -299,8 +312,20 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
     let ctx_tys: Vec<&Type> = ctx.iter().map(|(_, t)| t).collect();
     // Fresh binding names so closure params can never shadow the target fn.
     let arg_idents: Vec<Ident> = (0..real.len()).map(|i| format_ident!("__arg{i}")).collect();
-    let real_tys: Vec<&Type> = real.iter().map(|(_, t)| t).collect();
-    let arg_pat = quote!((#(#arg_idents,)*): (#(#real_tys,)*));
+    // An optional parameter reads `maki.NIL` as absent, like `TableExt::opt`
+    // does for option tables, so a value straight from `maki.json.decode` works.
+    let (arg_tys, arg_vals): (Vec<TokenStream2>, Vec<TokenStream2>) = real
+        .iter()
+        .zip(&arg_idents)
+        .map(|((_, ty), arg)| match option_inner(ty) {
+            Some(inner) => (
+                quote!(crate::api::util::convert::NilAsNone<#inner>),
+                quote!(#arg.0),
+            ),
+            None => (quote!(#ty), quote!(#arg)),
+        })
+        .unzip();
+    let arg_pat = quote!((#(#arg_idents,)*): (#(#arg_tys,)*));
 
     if let Some((self_ty, add_fn)) = method {
         if args.guard.is_some() || !ctx.is_empty() {
@@ -309,7 +334,7 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
                 "guard and #[ctx] are not supported on methods",
             ));
         }
-        let closure = quote!(move |lua, this, #arg_pat| #fn_ident(lua, this #(, #arg_idents)*));
+        let closure = quote!(move |lua, this, #arg_pat| #fn_ident(lua, this #(, #arg_vals)*));
         return Ok(quote! {
             #func
             #doc_const
@@ -320,7 +345,7 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
     }
 
     let closure =
-        quote!(move |lua, #arg_pat| #fn_ident(lua #(, #ctx_idents.clone())* #(, #arg_idents)*));
+        quote!(move |lua, #arg_pat| #fn_ident(lua #(, #ctx_idents.clone())* #(, #arg_vals)*));
     let create = match (&args.guard, is_async) {
         (Some(g), false) => {
             quote!(perms.guard(crate::plugin_permissions::Permission::#g, lua, #closure)?)

@@ -15,7 +15,7 @@ use crate::api::util::command::{
     InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip,
     ui_send,
 };
-use crate::api::util::convert::opt_bool;
+use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
@@ -142,7 +142,7 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
 /// toast:line("copied!")
 #[lua_fn]
 fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
-    let scratch = opts.and_then(|t| opt_bool(&t, "scratch")).unwrap_or(false);
+    let scratch = opts.and_then(|t| t.opt_bool("scratch")).unwrap_or(false);
     Ok(with_task_bufs(lua, |store| {
         if scratch {
             store.create()
@@ -241,7 +241,7 @@ fn theme_style(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
 async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) -> LuaResult<Table> {
     let independent = opts
         .as_ref()
-        .and_then(|t| opt_bool(t, "independent"))
+        .and_then(|t| t.opt_bool("independent"))
         .unwrap_or(false);
     let prefix = opts
         .and_then(|t| t.get::<String>("prefix").ok())
@@ -440,7 +440,7 @@ async fn input_roundtrip(
 }
 
 fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
-    opts.get::<Option<T>>(key)?
+    opts.opt::<T>(key)?
         .ok_or_else(|| mlua::Error::runtime(format!("input_edit: '{key}' is required")))
 }
 
@@ -532,7 +532,7 @@ async fn input_edit(
         start: opts.get("start")?,
         stop: opts.get("stop")?,
         text: required(&opts, "text")?,
-        cursor: opts.get("cursor")?,
+        cursor: opts.opt("cursor")?,
         version: required(&opts, "version")?,
         session_id: required(&opts, "session_id")?,
         plugin,
@@ -572,7 +572,7 @@ async fn open_editor(
 /// Every key is parsed before the window is opened, so a typo leaves the
 /// plugin with no window rather than a window holding half a list.
 fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
-    let Some(keys) = opts.get::<Option<Table>>("keys")? else {
+    let Some(keys) = opts.opt::<Table>("keys")? else {
         return Ok(Vec::new());
     };
     if focus {
@@ -630,26 +630,26 @@ fn open_win(
 ) -> LuaResult<WinHandle> {
     let buf_handle = buf.borrow::<buf::BufHandle>()?;
     let title: String = opts.get("title").unwrap_or_default();
-    let cursor_line = opt_bool(&opts, "cursor_line").unwrap_or(false);
+    let cursor_line = opts.opt_bool("cursor_line").unwrap_or(false);
     let footer = parse_footer(&opts)?;
     let reserved_bottom: usize = opts.get("reserved_bottom").unwrap_or(0);
     let reserved_top: usize = opts.get("reserved_top").unwrap_or(0);
-    let focus = opt_bool(&opts, "focus").unwrap_or(true);
+    let focus = opts.opt_bool("focus").unwrap_or(true);
     let keys = parse_claimed_keys(&opts, focus)?;
     let zindex: u16 = opts.get("zindex").unwrap_or(50);
 
     let width = parse_dimension(&opts, "width", Dimension::Percent(60));
     let height = parse_dimension(&opts, "height", Dimension::Percent(70));
-    let row: Option<i16> = opts.get("row").ok();
-    let col: Option<i16> = opts.get("col").ok();
+    let row: Option<i16> = opts.opt("row").ok().flatten();
+    let col: Option<i16> = opts.opt("col").ok().flatten();
     let anchor = parse_anchor(&opts);
     let border = parse_border(&opts);
     let title_pos = parse_title_pos(&opts);
     let split = parse_split(&opts);
     let order: u16 = opts.get("order").unwrap_or(50);
-    let visible = opt_bool(&opts, "visible").unwrap_or(true);
-    let needs_input = opt_bool(&opts, "needs_input").unwrap_or(false);
-    let stack = opt_bool(&opts, "stack").unwrap_or(false);
+    let visible = opts.opt_bool("visible").unwrap_or(true);
+    let needs_input = opts.opt_bool("needs_input").unwrap_or(false);
+    let stack = opts.opt_bool("stack").unwrap_or(false);
 
     let config = FloatConfig {
         width,
@@ -732,6 +732,7 @@ pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
     }],
     returns: "",
     guard: None,
+    value: false,
     example: "maki.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)",
 };
 

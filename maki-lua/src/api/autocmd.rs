@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
+use crate::api::util::convert::TableExt;
 use crate::api::util::dispatch::{DepthGuard, Reentry};
 use crate::runtime::{run_detached, strip_traceback};
 
@@ -275,7 +276,7 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 fn create_autocmd(lua: &Lua, #[ctx] plugin: Arc<str>, event: Value, opts: Table) -> LuaResult<u64> {
     let events = parse_string_or_seq(event, "event")?;
     let callback: Function = opts.get("callback")?;
-    let once: bool = opts.get("once").unwrap_or(false);
+    let once: bool = opts.opt_bool("once").unwrap_or(false);
     let patterns = match opts.get::<Value>("pattern")? {
         Value::Nil => None,
         v => Some(parse_string_or_seq(v, "pattern")?),

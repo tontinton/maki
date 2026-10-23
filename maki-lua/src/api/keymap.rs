@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{AppDataRefMut, Lua, RegistryKey, Result as LuaResult, Table};
 
-use crate::api::util::convert::opt_bool;
+use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, pair};
 use crate::key::Key;
 
@@ -441,7 +441,7 @@ fn set(
         .unwrap_or_default();
     let unique = opts
         .as_ref()
-        .and_then(|o| opt_bool(o, "unique"))
+        .and_then(|o| o.opt_bool("unique"))
         .unwrap_or(false);
     let registry_key = lua.create_registry_value(rhs)?;
     match store_mut(lua)?.set(key, registry_key, Arc::clone(&plugin), desc, unique) {

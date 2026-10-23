@@ -10,7 +10,7 @@ use super::{parse_footer, try_parse_dimension};
 use crate::api::util::command::{
     Anchor, Border, FloatConfigPatch, Split, TitlePos, WinCommand, WinEvent,
 };
-use crate::api::util::convert::opt_bool;
+use crate::api::util::convert::TableExt;
 use crate::docs::{FnDoc, ParamDoc};
 
 /// A window's command channel that also wakes the UI. The UI drains these on a
@@ -146,6 +146,7 @@ const recv__doc: FnDoc = FnDoc {
     }],
     returns: "(table|nil) Event table, or nil if the window has closed.",
     guard: None,
+    value: false,
     example: "while true do\n  local ev = win:recv()\n  if not ev or ev.key == \"q\" then break end\n  if ev.type == \"key\" and ev.key == \"<Down>\" then\n    -- move cursor down\n  end\nend\nwin:close()",
 };
 
@@ -245,7 +246,7 @@ fn set_config(_lua: &Lua, this: &WinHandle, opts: Table) -> LuaResult<()> {
     if let Ok(z) = opts.get::<u16>("zindex") {
         patch.zindex = Some(z);
     }
-    patch.cursor_line = opt_bool(&opts, "cursor_line");
+    patch.cursor_line = opts.opt_bool("cursor_line");
     if let Ok(rt) = opts.get::<usize>("reserved_top") {
         patch.reserved_top = Some(rt);
     }
@@ -255,13 +256,13 @@ fn set_config(_lua: &Lua, this: &WinHandle, opts: Table) -> LuaResult<()> {
     if let Ok(o) = opts.get::<u16>("order") {
         patch.order = Some(o);
     }
-    patch.needs_input = opt_bool(&opts, "needs_input");
+    patch.needs_input = opts.opt_bool("needs_input");
     patch.width = try_parse_dimension(&opts, "width");
     patch.height = try_parse_dimension(&opts, "height");
     // A missing key leaves the window where it is. Lua has no way to say
     // "clear this back to the centre", since a table cannot hold a nil.
-    patch.row = opts.get::<Option<i16>>("row")?.map(Some);
-    patch.col = opts.get::<Option<i16>>("col")?.map(Some);
+    patch.row = opts.opt::<i16>("row")?.map(Some);
+    patch.col = opts.opt::<i16>("col")?.map(Some);
     this.send(WinCommand::SetConfig(patch));
     Ok(())
 }

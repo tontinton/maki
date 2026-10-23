@@ -27,7 +27,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::api::net::{self, NetError, ResponseData};
-use crate::api::util::convert::{json_to_lua, lua_to_json, lua_to_json_within};
+use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_to_json_within};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{NetEgress, OwnedSlugs, Permission, PluginPermissions};
 use crate::runtime::{DeferredCallback, Request, host_senders};
@@ -527,7 +527,7 @@ fn add_stdio(lua: &Lua, ctx: &Table) -> LuaResult<()> {
         "prompt",
         lua.create_async_function(|_, opts: Table| async move {
             let label: String = opts.get("label").unwrap_or_default();
-            let secret = opts.get::<Option<bool>>("secret")?.unwrap_or(false);
+            let secret = opts.opt::<bool>("secret")?.unwrap_or(false);
             Ok(smol::unblock(move || read_answer(&label, secret)).await)
         })?,
     )?;
@@ -900,7 +900,7 @@ fn http_error(_lua: &Lua, res: Table) -> LuaResult<ProviderError> {
     let status: u16 = res.get(STATUS_FIELD).map_err(malformed)?;
     let body: String = res.get(BODY_FIELD).map_err(malformed)?;
     let headers: HashMap<String, String> = res
-        .get::<Option<HashMap<String, String>>>(HEADERS)
+        .opt::<HashMap<String, String>>(HEADERS)
         .map_err(malformed)?
         .unwrap_or_default()
         .into_iter()

@@ -7,6 +7,7 @@ use maki_providers::{Model, ModelTier, model_registry};
 use mlua::{Error as LuaError, Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
+use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair};
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
@@ -203,9 +204,9 @@ async fn set(
             fast: None,
         },
         Value::Table(opts) => ModelRequest::Set {
-            spec: opts.get("spec")?,
-            thinking: opts.get("thinking")?,
-            fast: opts.get("fast")?,
+            spec: opts.opt("spec")?,
+            thinking: opts.opt("thinking")?,
+            fast: opts.opt("fast")?,
         },
         other => {
             return Err(LuaError::runtime(format!(

@@ -6,7 +6,7 @@ use maki_lua_macro::lua_fn;
 use mlua::{Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::api::util::convert::json_to_lua;
+use crate::api::util::convert::{TableExt, json_to_lua};
 
 /// The user's `plugins.<name>` table from `maki.setup`, passed through opaquely.
 pub(crate) type PluginOpts = Arc<JsonMap<String, JsonValue>>;
@@ -140,7 +140,7 @@ fn parse_spec(name: &str, spec: &Table) -> LuaResult<OptionSpec> {
     }
 
     let default = default_to_json(name, spec.get("default")?)?;
-    let ty = match spec.get::<Option<String>>("type")? {
+    let ty = match spec.opt::<String>("type")? {
         Some(s) => OptionType::parse(&s).ok_or_else(|| {
             spec_error(
                 name,
@@ -169,7 +169,7 @@ fn parse_spec(name: &str, spec: &Table) -> LuaResult<OptionSpec> {
         ));
     }
 
-    let min: Option<f64> = spec.get("min")?;
+    let min: Option<f64> = spec.opt("min")?;
     if let Some(min) = min {
         if !ty.is_numeric() {
             return Err(spec_error(
@@ -188,7 +188,7 @@ fn parse_spec(name: &str, spec: &Table) -> LuaResult<OptionSpec> {
     }
 
     let desc: String = spec
-        .get::<Option<String>>("desc")?
+        .opt::<String>("desc")?
         .filter(|d| !d.is_empty())
         .ok_or_else(|| spec_error(name, "desc is required"))?;
 

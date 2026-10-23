@@ -8,6 +8,7 @@ use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value as LuaValue};
 
 use super::{blit, segment_color_to_lua};
+use crate::api::util::convert::TableExt;
 use crate::runtime::{TaskHandle, lock_cell};
 
 /// `live_buf` tracks the first buffer a handler creates, the one
@@ -435,12 +436,12 @@ fn parse_style(val: &LuaValue) -> LuaResult<SpanStyle> {
             if let Ok(LuaValue::String(s)) = t.raw_get::<LuaValue>("bg") {
                 inline.bg = parse_span_color(&s.to_str().map_err(mlua::Error::external)?);
             }
-            inline.bold = t.raw_get::<bool>("bold").unwrap_or(false);
-            inline.italic = t.raw_get::<bool>("italic").unwrap_or(false);
-            inline.underline = t.raw_get::<bool>("underline").unwrap_or(false);
-            inline.dim = t.raw_get::<bool>("dim").unwrap_or(false);
-            inline.strikethrough = t.raw_get::<bool>("strikethrough").unwrap_or(false);
-            inline.reversed = t.raw_get::<bool>("reversed").unwrap_or(false);
+            inline.bold = t.opt_bool("bold").unwrap_or(false);
+            inline.italic = t.opt_bool("italic").unwrap_or(false);
+            inline.underline = t.opt_bool("underline").unwrap_or(false);
+            inline.dim = t.opt_bool("dim").unwrap_or(false);
+            inline.strikethrough = t.opt_bool("strikethrough").unwrap_or(false);
+            inline.reversed = t.opt_bool("reversed").unwrap_or(false);
             Ok(SpanStyle::Inline(inline))
         }
         _ => Err(mlua::Error::runtime(

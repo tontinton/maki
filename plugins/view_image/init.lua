@@ -56,8 +56,7 @@ local function load_image(path)
   if not info then
     return fail(path .. " is not an image (" .. (probe_err or "unrecognized format") .. ")")
   end
-  local media_type = MEDIA_TYPES[info.format]
-  if not media_type then
+  if not MEDIA_TYPES[info.format] then
     return fail("unsupported image format " .. info.format .. ": only png, jpeg, gif, and webp can be viewed")
   end
 
@@ -71,7 +70,7 @@ local function load_image(path)
   if size <= MAX_RAW_BYTES and math.max(info.width, info.height) <= MAX_EDGE then
     return {
       llm_output = caption(path, size, info.width, info.height),
-      image = { media_type = media_type, data = maki.base64.encode(bytes) },
+      image = img,
     }
   end
 
