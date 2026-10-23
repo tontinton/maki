@@ -469,7 +469,7 @@ mod tests {
     }
 
     /// The count comes off the full buffer, not the typewriter's visible slice,
-    /// which never advances here because nothing draws it.
+    /// which never advances here because the modal never ticks it.
     #[test]
     fn hidden_thinking_is_summarised_not_printed() {
         let mut m = BtwModal::new(INSTANT, ThinkingLines::Tail(0));

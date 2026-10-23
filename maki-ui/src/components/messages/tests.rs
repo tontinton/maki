@@ -555,8 +555,8 @@ const STEP_COUNT: usize = 10;
 const HIGHLIGHTED_CODE: &str = "fn main() {}";
 const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Only `view` advances a typewriter, and thinking collapsed to its header
-/// never draws the text, so its reveal can never finish. Believing it would
+/// Only `tick` advances a typewriter, and thinking collapsed to its header
+/// never shows the text, so its reveal can never finish. Believing it would
 /// hold the loop at full frame rate for as long as the model reasons.
 #[test_case(ThinkingLines::Never   => Cadence::Smooth ; "expanded_thinking_reveals")]
 #[test_case(ThinkingLines::Tail(3) => Cadence::Smooth ; "the_tail_reveals")]

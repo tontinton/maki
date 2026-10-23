@@ -78,6 +78,8 @@ pub struct StatusBar {
     /// stops notify's event thread and closes the inotify fd. Every session
     /// builds its own bar, so a watcher that outlives it leaks a thread.
     _branch_watcher: Option<RecommendedWatcher>,
+    /// Whether the previous tick was moving, so the stop still paints.
+    was_animating: bool,
 }
 
 impl StatusBar {
@@ -91,6 +93,7 @@ impl StatusBar {
             flash_duration,
             branch_update_rx,
             _branch_watcher: branch_watcher,
+            was_animating: false,
         }
     }
 
@@ -176,10 +179,13 @@ impl StatusBar {
         )
     }
 
-    /// `view` reads the elapsed time, so this only has to report whether the
-    /// bar is still moving.
-    pub fn tick(&self, status: &Status, restoring: bool, retrying: bool) -> Dirty {
-        Dirty::from(self.animating(status, restoring, retrying))
+    /// `view` reads the elapsed time, so this reports whether the bar is
+    /// moving, including the tick that stops and clears the spinner.
+    pub fn tick(&mut self, status: &Status, restoring: bool, retrying: bool) -> Dirty {
+        let animating = self.animating(status, restoring, retrying);
+        let dirty = Dirty::from(animating || self.was_animating);
+        self.was_animating = animating;
+        dirty
     }
 
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
@@ -750,6 +756,16 @@ mod tests {
         retrying: bool,
     ) -> Dirty {
         StatusBar::new(FLASH_TTL).tick(&status, restoring, retrying)
+    }
+
+    /// The Lua thread clears `restoring` with no event, so the tick that sees
+    /// the stop is the only chance to clear the glyph.
+    #[test]
+    fn tick_reports_the_frame_that_stops_the_spinner() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        assert_eq!(bar.tick(&Status::Idle, true, false), Dirty::YES);
+        assert_eq!(bar.tick(&Status::Idle, false, false), Dirty::YES);
+        assert_eq!(bar.tick(&Status::Idle, false, false), Dirty::NO);
     }
 
     #[test]
