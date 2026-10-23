@@ -5,6 +5,7 @@ local build_skill_list = helpers.build_skill_list
 local format_output = helpers.format_output
 local parse_output = helpers.parse_output
 
+local UTF8_BOM = "\239\187\191"
 local LOCATION = "/home/u/.config/maki/skills/release/SKILL.md"
 
 local failures = {}
@@ -32,35 +33,27 @@ case("frontmatter_with_name_and_description", function()
   assert(body:find("Instructions"), "body should contain content after closing ---")
 end)
 
-case("no_frontmatter_returns_content_as_body", function()
-  local fm, body = parse_frontmatter("Just content without frontmatter")
-  eq(fm.name, nil)
-  eq(body, "Just content without frontmatter")
-end)
-
 case("frontmatter_with_leading_whitespace", function()
   local fm, body = parse_frontmatter("  \n---\nname: trimmed\n---\nBody here")
   eq(fm.name, "trimmed")
   eq(body, "Body here")
 end)
 
-case("frontmatter_no_closing_delimiter", function()
-  local input = "---\nname: oops\nThis never closes"
-  local fm, body = parse_frontmatter(input)
-  eq(fm.name, nil)
-  eq(body, input)
-end)
-
-case("frontmatter_invalid_yaml_falls_back", function()
-  local fm, body = parse_frontmatter("---\n: invalid: yaml: [[\n---\nBody")
-  eq(fm.name, nil)
-  eq(body, "Body")
-end)
-
-case("frontmatter_that_is_not_a_mapping_reads_as_empty", function()
-  local fm, body = parse_frontmatter("---\n42\n---\nBody")
-  eq(next(fm), nil)
-  eq(body, "Body")
+case("invalid_frontmatter_returns_a_diagnostic", function()
+  for _, input in ipairs({
+    "Plain instructions",
+    "---\nname: missing-close",
+    "---\n: invalid: yaml: [[\n---\nBody",
+    "---\n123\n---\nBody",
+    "---\nname: {nested: value}\n---\nBody",
+    "---\nname: valid\ndescription: [wrong]\n---\nBody",
+    "---\nname: valid\nmetadata: { .nan: broken }\n---\nBody",
+  }) do
+    local fm, body, err = parse_frontmatter(input)
+    eq(fm, nil)
+    eq(body, nil)
+    assert(type(err) == "string" and #err > 0, "invalid files need a diagnostic")
+  end
 end)
 
 case("frontmatter_empty_body_after_close", function()
@@ -75,24 +68,30 @@ case("frontmatter_body_with_embedded_triple_dashes", function()
   assert(body:find("Some text"), "body should start after first closing ---")
 end)
 
-case("frontmatter_only_dashes_no_yaml", function()
-  local _, body = parse_frontmatter("---\n\n---\nBody")
-  eq(body, "Body")
+case("frontmatter_accepts_crlf_bom_and_complete_delimiters", function()
+  for _, prefix in ipairs({ "", UTF8_BOM }) do
+    for _, newline in ipairs({ "\n", "\r\n" }) do
+      local input = prefix
+        .. table.concat({
+          "---",
+          "name: portable",
+          "description: Windows file",
+          "---extra: value",
+          "---",
+          "Body",
+        }, newline)
+      local fm, body = parse_frontmatter(input)
+      eq(fm.name, "portable")
+      eq(fm["---extra"], "value")
+      eq(body, "Body")
+    end
+  end
 end)
 
-case("frontmatter_accepts_crlf_and_complete_delimiters", function()
-  for _, newline in ipairs({ "\n", "\r\n" }) do
-    local input = table.concat({
-      "---",
-      "name: portable",
-      "description: Windows file",
-      "---extra: value",
-      "---",
-      "Body",
-    }, newline)
+case("frontmatter_only_dashes_no_yaml", function()
+  for _, input in ipairs({ "---\n---\nBody", "---\n\n---\nBody" }) do
     local fm, body = parse_frontmatter(input)
-    eq(fm.name, "portable")
-    eq(fm["---extra"], "value")
+    eq(next(fm), nil)
     eq(body, "Body")
   end
 end)
