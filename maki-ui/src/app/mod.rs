@@ -59,7 +59,7 @@ use crate::components::{
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
-use crate::text_buffer::RuleSet;
+use crate::text_buffer::{RuleSet, normalize_line_endings, sanitize};
 use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
@@ -70,10 +70,10 @@ use maki_agent::{
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, InputMode, InputRule,
-    InputRulesReader, Key, KeymapReader, LuaCommandReader, PLAN_FORM_SLOT_DEADLINE,
-    PLAN_ROW_HANDLER_DEADLINE, PackCommand, PackPreparation, Permission, PlanActionOutcome,
-    PlanMenu, PlanRowAction, PluginReach, WinView, is_reserved,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks,
+    InputMode, InputRule, InputRulesReader, Key, KeymapReader, LuaCommandReader,
+    PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand, PackPreparation, Permission,
+    PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView, is_reserved,
 };
 use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
@@ -803,13 +803,7 @@ impl App {
         edit: InputEdit,
         area: Rect,
     ) -> Result<serde_json::Value, String> {
-        let focused = self.state.session.id.to_string();
-        if edit.session_id != focused {
-            return Err(format!(
-                "input of session {} is not focused (session {focused} is)",
-                edit.session_id
-            ));
-        }
+        self.check_input_session(&edit.session_id)?;
         if !self.input_live(area) {
             return Err(INPUT_NOT_LIVE_ERR.to_string());
         }
@@ -820,12 +814,46 @@ impl App {
                 edit.version
             ));
         }
+        let marks = edit.marks.map(|marks| (&*edit.plugin, marks));
         let cursor = self
             .input_box
-            .apply_edits(edit.version, edit.edits, edit.cursor)?;
+            .apply_edits(edit.version, edit.edits, edit.cursor, marks)?;
         let version = self.input_box.buffer.version();
         self.input_changed(InputWriter::Plugin(edit.plugin, version));
         Ok(serde_json::json!({ "version": version, "cursor": cursor }))
+    }
+
+    /// Places a plugin's marks with the same session guard as an edit. An
+    /// input the user cannot see is fine here, since marks never reach the
+    /// model. Answers the version the marks were mapped to.
+    pub(crate) fn decorate_input(
+        &mut self,
+        req: InputDecorate,
+    ) -> Result<serde_json::Value, String> {
+        self.check_input_session(&req.session_id)?;
+        let InputMarks { ns, marks } = req.marks;
+        self.input_box
+            .set_marks(req.version, &req.plugin, &ns, marks)?;
+        Ok(serde_json::json!({ "version": self.input_box.buffer.version() }))
+    }
+
+    /// The drafts parked in other chats hold marks too, and would bring them
+    /// back on the next switch.
+    pub(crate) fn clear_plugin_marks(&mut self, plugin: &str) {
+        self.input_box.clear_plugin_marks(plugin);
+        for chat in &mut self.chats {
+            chat.draft.clear_plugin_marks(plugin);
+        }
+    }
+
+    fn check_input_session(&self, session_id: &str) -> Result<(), String> {
+        let focused = self.state.session.id.to_string();
+        if session_id != focused {
+            return Err(format!(
+                "input of session {session_id} is not focused (session {focused} is)"
+            ));
+        }
+        Ok(())
     }
 
     /// The only paths that can name a writer. Submit, discard, history recall
@@ -2920,13 +2948,16 @@ impl App {
 
     /// A paste walks the steps of [`Self::handle_key`] as the `<Paste>` key.
     /// The host's prompts and pickers have no bindings, they just take the
-    /// text. Line endings become `\n` first, because `ev.text` promises that.
+    /// text. Every route gets `\n` line endings. Only the chat input's routes
+    /// get the text cleaned the way the input cleans what lands in it, so a
+    /// global `<Paste>` handler counting offsets over `ev.text` counts what
+    /// it inserts, while a prompt, a picker or a plugin window keeps its tabs.
     ///
     /// The first step that owns the keyboard owns the paste as well, and one
     /// with no field for it drops it. The chat input and the bindings under a
     /// modal get none of its keys, so they get none of its pastes either.
     pub(super) fn route_text_paste(&mut self, text: &str) {
-        let text = &text.replace("\r\n", "\n").replace('\r', "\n");
+        let text = &normalize_line_endings(text);
         if self.alert_modal.is_open() || self.permission_prompt.handle_paste(text) {
             return;
         }
@@ -2963,10 +2994,14 @@ impl App {
         try_picker!(self.model_picker);
         try_picker!(self.login_picker);
         try_picker!(self.mcp_picker);
-        if self.dispatch_on_screen_windows(&pressed) || self.dispatch_binding(None, &pressed) {
+        if self.dispatch_on_screen_windows(&pressed) {
             return;
         }
-        self.builtin_paste(text);
+        let text = sanitize(text);
+        if self.dispatch_binding(None, &Pressed::Paste(text.clone())) {
+            return;
+        }
+        self.builtin_paste(&text);
     }
 
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {

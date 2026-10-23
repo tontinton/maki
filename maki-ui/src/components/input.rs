@@ -10,7 +10,7 @@ use crate::text_buffer::{EditResult, Mark, Marks, TextBuffer, is_newline_key};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_lua::{InputMode, TextEdit};
+use maki_lua::{InputMarks, InputMode, TextEdit};
 use maki_storage::input_history::InputHistory;
 use std::mem;
 
@@ -82,6 +82,12 @@ pub struct Draft {
     pub text: String,
     pub images: Vec<ImageSource>,
     marks: Marks,
+}
+
+impl Draft {
+    pub fn clear_plugin_marks(&mut self, plugin: &str) {
+        self.marks.clear_plugin(plugin);
+    }
 }
 
 pub struct InputBox {
@@ -379,11 +385,22 @@ impl InputBox {
 
     /// Marks leave the text and its version alone, so the layout would never
     /// notice a line growing or shrinking by its virtual text or conceals. It
-    /// is told here.
-    pub fn set_marks(&mut self, plugin: &str, ns: &str, marks: Vec<Mark>) -> Result<(), String> {
-        let moved = self.buffer.set_marks(plugin, ns, marks)?;
+    /// is told here. See [`TextBuffer::set_marks`] for {version}.
+    pub fn set_marks(
+        &mut self,
+        version: u64,
+        plugin: &str,
+        ns: &str,
+        marks: Vec<Mark>,
+    ) -> Result<(), String> {
+        let moved = self.buffer.set_marks(version, plugin, ns, marks)?;
         self.layout.get_mut().relayout(&self.buffer, &moved);
         Ok(())
+    }
+
+    pub fn clear_plugin_marks(&mut self, plugin: &str) {
+        let moved = self.buffer.clear_plugin_marks(plugin);
+        self.layout.get_mut().relayout(&self.buffer, &moved);
     }
 
     pub fn toggle_raw(&mut self) {
@@ -407,8 +424,8 @@ impl InputBox {
     /// The way a plugin writes to the input. It carries the box's own state
     /// the way the paste path does: the view follows the cursor again, and a
     /// value the edits changed stops counting as a recalled history entry, so
-    /// the next history key does not throw the edit away. A call that only
-    /// moves the cursor leaves the recall and the draft under it alone.
+    /// the next history key does not throw the edit away. A call that changes
+    /// no text leaves the recall and the draft under it alone.
     ///
     /// See [`TextBuffer::apply_edits`] for what the offsets refuse.
     pub fn apply_edits(
@@ -416,9 +433,11 @@ impl InputBox {
         version: u64,
         edits: Vec<TextEdit>,
         cursor: Option<usize>,
+        marks: Option<(&str, InputMarks)>,
     ) -> Result<usize, String> {
         let before = self.buffer.version();
-        let caret = self.buffer.apply_edits(version, edits, cursor)?;
+        let (caret, moved) = self.buffer.apply_edits(version, edits, cursor, marks)?;
+        self.layout.get_mut().relayout(&self.buffer, &moved);
         self.follow_cursor = true;
         if self.buffer.version() != before {
             self.history_index = None;
@@ -1023,7 +1042,7 @@ mod tests {
         input.history_up();
 
         let version = input.buffer.version();
-        input.apply_edits(version, edits, cursor).unwrap();
+        input.apply_edits(version, edits, cursor, None).unwrap();
 
         assert_eq!(input.draft_text(), parked);
     }
@@ -1632,7 +1651,7 @@ mod tests {
             text: text.into(),
         };
         let version = input.buffer.version();
-        input.apply_edits(version, vec![edit], None).unwrap();
+        input.apply_edits(version, vec![edit], None, None).unwrap();
     }
 
     /// A plugin edit lands on a recalled history entry, so the value is the
@@ -1734,7 +1753,9 @@ mod tests {
         let mut input = InputBox::new(InputHistory::default(), 20);
         input.set_input(text);
         input.buffer.move_to_end();
-        input.set_marks(MARKS_PLUGIN, MARKS_NS, marks).unwrap();
+        input
+            .set_marks(input.buffer.version(), MARKS_PLUGIN, MARKS_NS, marks)
+            .unwrap();
         input
     }
 
@@ -1783,7 +1804,12 @@ mod tests {
         };
         let mut input = marked("xy", marks(first));
         input
-            .set_marks(MARKS_PLUGIN, "second", marks(second))
+            .set_marks(
+                input.buffer.version(),
+                MARKS_PLUGIN,
+                "second",
+                marks(second),
+            )
             .unwrap();
         let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
         let drawn = text_cell(&terminal, 0, 1).fg;
@@ -1930,7 +1956,9 @@ mod tests {
     fn copying_part_of_a_chip_row_copies_the_source(start_col: u16, end_col: u16) -> String {
         let mut input = chip(Reveal::Never);
         let ghost = mark(8..8, virt("XY", VirtTextPos::Inline));
-        input.set_marks(MARKS_PLUGIN, "ghost", vec![ghost]).unwrap();
+        input
+            .set_marks(input.buffer.version(), MARKS_PLUGIN, "ghost", vec![ghost])
+            .unwrap();
         let selection = ScreenSelection {
             start_row: 1,
             start_col,
@@ -2134,7 +2162,7 @@ mod tests {
         edits.sort_by_key(|edit| edit.start);
         let cursor = Some(x + "z".len());
         input
-            .apply_edits(input.buffer.version(), edits, cursor)
+            .apply_edits(input.buffer.version(), edits, cursor, None)
             .unwrap();
         let (terminal, rows) = draw(&mut input);
         assert_eq!(rows, STALE);
@@ -2167,7 +2195,7 @@ mod tests {
             text: "```\n".into(),
         };
         input
-            .apply_edits(input.buffer.version(), vec![fence], None)
+            .apply_edits(input.buffer.version(), vec![fence], None, None)
             .unwrap();
         assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), 2 + LINES);
 
@@ -2208,7 +2236,7 @@ mod tests {
             text: "z".into(),
         };
         input
-            .apply_edits(input.buffer.version(), vec![edit], None)
+            .apply_edits(input.buffer.version(), vec![edit], None, None)
             .unwrap();
         assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), LINES);
     }
@@ -2236,7 +2264,12 @@ mod tests {
         input.set_input(&format!("{ABOVE_CODE}{code}"));
         let range = ABOVE_CODE.len()..ABOVE_CODE.len() + code.len();
         input
-            .set_marks(MARKS_PLUGIN, MARKS_NS, vec![mark(range, rust)])
+            .set_marks(
+                input.buffer.version(),
+                MARKS_PLUGIN,
+                MARKS_NS,
+                vec![mark(range, rust)],
+            )
             .unwrap();
         input.buffer.set_cursor(0, 0);
         input
@@ -2255,7 +2288,7 @@ mod tests {
             text: "z".into(),
         };
         input
-            .apply_edits(input.buffer.version(), vec![edit], None)
+            .apply_edits(input.buffer.version(), vec![edit], None, None)
             .unwrap();
     }
 

@@ -230,7 +230,7 @@ mod tests {
                 text: text.into(),
             };
             buffer
-                .apply_edits(buffer.version(), vec![edit], None)
+                .apply_edits(buffer.version(), vec![edit], None, None)
                 .unwrap();
         }
         let edit = edit_since(buffer.changes_since(0).unwrap()).unwrap();

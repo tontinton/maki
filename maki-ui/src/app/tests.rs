@@ -13,6 +13,7 @@ use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::decor_worker;
+use crate::highlight::TAB_SPACES;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use crate::text_buffer::{EDIT_CONFLICT_ERR, INPUT_REPLACED_ERR};
@@ -6217,6 +6218,49 @@ fn a_modal_drops_a_paste_it_has_no_field_for(open: fn(&mut App)) {
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
+const TABBED_PASTE: &str = "a\tb\r\nc";
+const TABBED_PASTE_LF: &str = "a\tb\nc";
+
+/// Only a paste headed for the chat input is cleaned the way the input
+/// cleans text. A window's own `<Paste>` binding gets the tabs as pasted,
+/// with `\n` line endings, whether the window has focus or not.
+#[test_case(true  ; "focused_window")]
+#[test_case(false ; "unfocused_window")]
+fn a_window_paste_binding_keeps_the_tabs(focus: bool) {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let _window = open_window(&mut app, &buf, focus, WINDOW_Z);
+    app.keymap_reader = maki_lua::test_support::keymap_reader_from(&[TestBinding {
+        plugin: FOCUSED_PLUGIN,
+        modes: EVERY_MODE,
+        key: maki_lua::PASTE,
+        buffer: Some(&buf),
+    }]);
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.update(Msg::Paste(TABBED_PASTE.into()));
+
+    let ticket = probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED);
+    assert_eq!(ticket.text(), Some(TABBED_PASTE_LF));
+}
+
+/// A focused window with no `<Paste>` binding gets the paste in `recv`, also
+/// with its tabs.
+#[test]
+fn a_focused_window_receives_the_paste_with_its_tabs() {
+    let mut app = test_app();
+    let (events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+
+    app.update(Msg::Paste(TABBED_PASTE.into()));
+
+    assert!(
+        events
+            .drain()
+            .any(|e| matches!(e, WinEvent::Paste { text } if text == TABBED_PASTE_LF))
+    );
+}
+
 /// The `\` + Enter continuation, written as a plugin. The built-in editor
 /// already does this, so the test also has to check which path ran.
 const CONTINUATION_PLUGIN: &str = r#"
@@ -6393,6 +6437,138 @@ fn an_enter_held_behind_a_handler_sends_what_the_handler_may(
     assert_eq!(app.input_box.buffer.value(), left);
     assert_eq!(app.status_bar.flash_text(), refusal.as_deref());
     assert!(!app.permissions.is_yolo());
+}
+
+const GHOST_PLUGIN: &str = r#"
+maki.api.create_autocmd("InputChanged", {
+  callback = function(ev)
+    maki.ui.input_decorate({
+      ns = "ghost",
+      marks = { { start = ev.data.cursor, virt_text = { { "complete this", "dim" } }, virt_text_pos = "inline" } },
+      version = ev.data.version,
+      session_id = ev.data.session_id,
+    })
+  end,
+})
+"#;
+const GHOST_PLUGIN_NAME: &str = "ghost";
+const GHOST: &str = "complete this";
+const DECORATE_NEVER_CAME: &str = "the plugin never pushed its marks";
+const UNLOAD_NEVER_CAME: &str = "the UI never heard of the unload";
+
+/// Plays the event loop until the plugin pushes marks, and answers them.
+fn serve_decorate(app: &mut App, ui: &flume::Receiver<UiAction>) -> serde_json::Value {
+    loop {
+        if let UiAction::Input {
+            req: InputRequest::Decorate(req),
+            reply_tx,
+        } = ui.recv_timeout(HANDLER_TIMEOUT).expect(DECORATE_NEVER_CAME)
+        {
+            let reply = app.decorate_input(req);
+            let _ = reply_tx.send(reply.clone());
+            return reply.unwrap();
+        }
+    }
+}
+
+fn assert_one_ghost_after(app: &mut App, typed: &str) {
+    let screen = rendered(app);
+    assert_eq!(screen.matches(GHOST).count(), 1, "{screen}");
+    assert!(screen.contains(&format!("{typed}{GHOST}")), "{screen}");
+}
+
+/// The plugin hears about the text a frame late, and the user keeps typing
+/// while it works. Still, no frame should show the ghost anywhere but at the
+/// caret. In the end only the unload can take it away, because no edit ever
+/// drops a point mark.
+#[test]
+fn ghost_text_follows_typing_and_leaves_with_its_plugin() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(GHOST_PLUGIN_NAME, GHOST_PLUGIN).unwrap();
+    let (mut app, ui) = hosted_app(&host);
+
+    type_keys(&mut app, "ab");
+    let _ = app.tick();
+    type_keys(&mut app, "c");
+    let reply = serve_decorate(&mut app, &ui);
+    assert_eq!(reply["version"], app.input_box.buffer.version());
+    assert_one_ghost_after(&mut app, "abc");
+
+    type_keys(&mut app, "d");
+    assert_one_ghost_after(&mut app, "abcd");
+    let _ = app.tick();
+    serve_decorate(&mut app, &ui);
+    assert_one_ghost_after(&mut app, "abcd");
+
+    host.unload(GHOST_PLUGIN_NAME).unwrap();
+    loop {
+        if let UiAction::PluginUnloaded(plugin) =
+            ui.recv_timeout(HANDLER_TIMEOUT).expect(UNLOAD_NEVER_CAME)
+        {
+            app.clear_plugin_marks(&plugin);
+            break;
+        }
+    }
+    let screen = rendered(&mut app);
+    assert!(!screen.contains(GHOST), "{screen}");
+}
+
+const COLLAPSED_PASTE_PLUGIN: &str = r#"
+maki.keymap.set("i", "<Paste>", function(ev)
+  local st = ev.input
+  maki.ui.input_edit({
+    start = st.cursor, stop = st.cursor, text = ev.text,
+    ns = "paste",
+    marks = { { start = st.cursor, stop = st.cursor + #ev.text, conceal = "[3 lines]" } },
+    version = st.version, session_id = st.session_id,
+  })
+end)
+"#;
+const PASTED_WORD: &str = "pasted";
+const PASTED_LINES: &str = "pasted 1\npasted 2\npasted 3";
+const PASTE_CHIP: &str = "see [3 lines]";
+
+/// The text and its chip come in one request, so the first frame that could
+/// show the raw lines shows the chip instead.
+#[test]
+fn a_collapsed_paste_shows_its_chip_in_the_first_frame() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("collapse", COLLAPSED_PASTE_PLUGIN)
+        .unwrap();
+    let (mut app, ui) = hosted_app(&host);
+    type_keys(&mut app, "see ");
+
+    app.update(Msg::Paste(PASTED_LINES.into()));
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    let screen = rendered(&mut app);
+    assert!(screen.contains(PASTE_CHIP), "{screen}");
+    assert!(!screen.contains(PASTED_WORD), "{screen}");
+    assert_eq!(app.input_box.buffer.value(), format!("see {PASTED_LINES}"));
+}
+
+/// `ev.text` comes in cleaned, so a chip counted over it covers exactly the
+/// paste and never the user's text after it.
+#[test]
+fn a_paste_chip_counted_over_ev_text_covers_exactly_the_paste() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("collapse", COLLAPSED_PASTE_PLUGIN)
+        .unwrap();
+    let (mut app, ui) = hosted_app(&host);
+    let typed = "see ";
+    type_keys(&mut app, typed);
+
+    app.update(Msg::Paste(TABBED_PASTE.into()));
+    serve_handler(&mut app, &ui);
+    let landed = format!("a{TAB_SPACES}b\nc");
+    let buffer = &app.input_box.buffer;
+    assert_eq!(buffer.value(), format!("{typed}{landed}"));
+    let chips: Vec<_> = buffer
+        .marks()
+        .touching(0..=usize::MAX)
+        .map(|mark| mark.bytes)
+        .collect();
+    let paste = typed.len()..typed.len() + landed.len();
+    assert_eq!(chips, [paste]);
 }
 
 const BURST_PLUGIN: &str = "burst";

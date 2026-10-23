@@ -15,7 +15,12 @@ use super::buf::{parse_line, parse_style};
 use super::syntax::SyntaxRule;
 use crate::api::util::convert::reject_unknown_fields;
 
-const MARK_FIELDS: &[&str] = &[
+/// A pushed mark says where it goes and whether text typed at its edges
+/// joins it, while a rule's mark goes on each match.
+const PUSHED_MARK_FIELDS: &[&str] = &[
+    "start",
+    "stop",
+    "inclusive",
     "hl",
     "conceal",
     "reveal",
@@ -25,16 +30,20 @@ const MARK_FIELDS: &[&str] = &[
     "lang",
     "priority",
 ];
+/// `start`, `stop` and `inclusive`, which only a pushed mark has.
+const PLACEMENT_FIELDS: usize = 3;
+const MARK_FIELDS: &[&str] = PUSHED_MARK_FIELDS.split_at(PLACEMENT_FIELDS).1;
 const REVEAL_CURSOR: &str = "cursor";
 const POS_EOL: &str = "eol";
 const POS_INLINE: &str = "inline";
 const GROUP_SIGIL: char = '$';
-const CONTROL_CHAR_ERR: &str = "holds a control character";
+pub(crate) const CONTROL_CHAR_ERR: &str = "holds a control character";
 const BAD_PATTERN_ERR: &str = "bad pattern";
 const MISSING_GROUP_ERR: &str = "names a group the pattern does not have";
 const FIXED_FIELD_ERR: &str = "`$N` is only filled in inside conceal and virt_text";
 const RULE_INCLUSIVE_ERR: &str =
     "mark: a rule's range is always its match, so it takes no 'inclusive'";
+pub(crate) const MARK_START_REQUIRED_ERR: &str = "mark: 'start' is required";
 pub(crate) const NO_GROUPS_ERR: &str =
     "means nothing in a tree-sitter rule, which has no groups (`$$` is a plain `$`)";
 
@@ -76,6 +85,21 @@ pub struct Decoration {
     pub priority: i32,
     /// Text typed right at either edge joins the range.
     pub inclusive: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Mark {
+    pub start: usize,
+    /// `None` makes a point mark.
+    pub stop: Option<usize>,
+    /// Shared, so a rule stamping one look over many ranges stores it once.
+    pub decoration: Arc<Decoration>,
+}
+
+impl Mark {
+    pub fn end(&self) -> usize {
+        self.stop.unwrap_or(self.start)
+    }
 }
 
 impl Decoration {
@@ -291,6 +315,27 @@ pub(crate) fn parse_mark(tbl: &Table) -> LuaResult<Decoration> {
         return Err(mlua::Error::runtime(RULE_INCLUSIVE_ERR));
     }
     reject_unknown_fields(tbl, MARK_FIELDS, "mark")?;
+    parse_decoration(tbl)
+}
+
+/// Drawn text is checked here, while the offsets can only be checked by the
+/// UI against the text they point into.
+pub(crate) fn parse_pushed_mark(tbl: &Table) -> LuaResult<Mark> {
+    reject_unknown_fields(tbl, PUSHED_MARK_FIELDS, "mark")?;
+    let decoration = parse_decoration(tbl)?;
+    decoration
+        .check_drawn_text()
+        .map_err(|msg| mlua::Error::runtime(format!("mark: {msg}")))?;
+    Ok(Mark {
+        start: tbl
+            .get::<Option<usize>>("start")?
+            .ok_or_else(|| mlua::Error::runtime(MARK_START_REQUIRED_ERR))?,
+        stop: tbl.get("stop")?,
+        decoration: Arc::new(decoration),
+    })
+}
+
+fn parse_decoration(tbl: &Table) -> LuaResult<Decoration> {
     let reveal = match tbl.get::<Option<String>>("reveal")?.as_deref() {
         None => Reveal::Never,
         Some(REVEAL_CURSOR) => Reveal::Cursor,
@@ -326,7 +371,7 @@ pub(crate) fn parse_mark(tbl: &Table) -> LuaResult<Decoration> {
         virt_text_pos,
         lang: tbl.get("lang")?,
         priority: tbl.get::<Option<i32>>("priority")?.unwrap_or_default(),
-        inclusive: false,
+        inclusive: tbl.get::<Option<bool>>("inclusive")?.unwrap_or_default(),
     })
 }
 

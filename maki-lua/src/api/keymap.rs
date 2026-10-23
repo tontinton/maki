@@ -645,7 +645,7 @@ fn parse_buffer(opts: Option<&Table>) -> LuaResult<Scope> {
 /// @param rhs function Called with an event table `ev`. The return value is ignored. `ev` has:
 ///   `key` (string) the key, in canonical notation.
 ///   `input` (table) the chat input at the press, as `maki.ui.input` returns it. Pass its `version` and `session_id` to `maki.ui.input_edit`.
-///   `text` (string?) `<Paste>` only: the pasted text, with `\n` line endings. maki does not insert it.
+///   `text` (string?) `<Paste>` only: the pasted text, with `\n` line endings. maki does not insert it. A global binding gets it cleaned the way `maki.ui.input_edit` cleans text, so `#ev.text` is what inserting it adds. A `buffer` binding gets it as pasted, tabs included.
 ///   `fallback` (function) runs maki's own handling of the key, as if no plugin had bound it. Call it once, before the handler returns.
 ///     - It types, moves or sends in the chat input, or hands the key to a focused window's `win:recv`. It never runs another plugin's binding.
 ///     - It lands after the handler's earlier `maki.ui` calls and before the waiting keys.

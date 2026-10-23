@@ -1333,6 +1333,15 @@ pub(crate) fn plugin_loaded(lua: &Lua, plugin: &str) -> bool {
         .is_some_and(|envs| envs.0.contains_key(plugin))
 }
 
+/// Puts a load of {plugin} in place on a VM no host runs.
+#[cfg(test)]
+pub(crate) fn mark_loaded(lua: &Lua, plugin: &str) {
+    let mut envs = lua.remove_app_data::<PluginEnvs>().unwrap_or_default();
+    envs.0
+        .insert(Arc::from(plugin), lua.globals().to_pointer() as usize);
+    lua.set_app_data(envs);
+}
+
 /// Whether any plugin with a load in place passes {test}.
 pub(crate) fn any_plugin_loaded(lua: &Lua, mut test: impl FnMut(&str) -> bool) -> bool {
     lua.app_data_ref::<PluginEnvs>()
@@ -1356,6 +1365,13 @@ fn host_ui_send(lua: &Lua, action: UiAction) {
 /// For host code that has the VM but no `#[ctx]` sender of its own.
 pub(crate) fn host_ui(lua: &Lua) -> Option<flume::Sender<UiAction>> {
     lua.app_data_ref::<HostUi>()?.0.clone()
+}
+
+/// No edit ever drops a point mark, so the ghost text of a plugin that is
+/// gone would stay for good unless the UI hears about it. A load that failed
+/// is announced too, since it may have pushed marks before it failed.
+fn unload_ui(lua: &Lua, plugin: &str) {
+    host_ui_send(lua, UiAction::PluginUnloaded(Arc::from(plugin)));
 }
 
 /// Who to name for the code a watchdog interrupt caught running.
@@ -2828,6 +2844,7 @@ impl LuaRuntime {
         release_mode(&self.lua, name);
         let mut revision_guard = None;
         if let Some(owner) = self.plugins.borrow_mut().remove(name) {
+            unload_ui(&self.lua, name);
             revision_guard = owner.revision_guard;
             for (_, tk) in owner.tools {
                 if let Err(e) = self.lua.remove_registry_value(tk.handler) {
@@ -3282,6 +3299,7 @@ impl LuaRuntime {
         self.discard_pending(pending);
         with_packs(&self.lua, |packs| packs.pending.truncate(pack_ops));
         self.clear_plugin(plugin);
+        unload_ui(&self.lua, plugin);
     }
 
     fn clear_plugin(&mut self, plugin: &str) {

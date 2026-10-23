@@ -1049,6 +1049,11 @@ impl<'t> EventLoop<'t> {
                 let actions = self.focused_app().keybind_fallback(ticket);
                 self.dispatch(self.focused, actions);
             }
+            UiAction::PluginUnloaded(plugin) => {
+                for rt in &mut self.sessions {
+                    rt.app.clear_plugin_marks(&plugin);
+                }
+            }
             UiAction::RunCommand {
                 cmdline,
                 depth,
@@ -1391,6 +1396,7 @@ impl<'t> EventLoop<'t> {
                 let area = self.terminal.size().map(Rect::from).unwrap_or_default();
                 self.focused_app().apply_input_edit(edit, area)
             }
+            InputRequest::Decorate(req) => self.focused_app().decorate_input(req),
         }
     }
 

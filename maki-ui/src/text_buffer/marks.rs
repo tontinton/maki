@@ -21,9 +21,8 @@ use std::cmp::Reverse;
 use std::iter;
 use std::mem;
 use std::ops::{Range, RangeInclusive};
-use std::sync::Arc;
 
-pub use maki_lua::{Decoration, Reveal, VirtTextPos};
+pub use maki_lua::{Decoration, Mark, Reveal, VirtTextPos};
 
 use super::Change;
 
@@ -34,15 +33,6 @@ const CHUNK_LEN: usize = 256;
 /// placed marks start above every such place, so at the same priority a mark
 /// a plugin placed by hand draws over one a rule made.
 const LAST_RULE_RANK: u64 = u32::MAX as u64;
-
-#[derive(Debug, Clone)]
-pub struct Mark {
-    pub start: usize,
-    /// `None` makes a point mark.
-    pub stop: Option<usize>,
-    /// Shared, so a rule stamping one look over many ranges stores it once.
-    pub decoration: Arc<Decoration>,
-}
 
 /// A mark where it sits now. A point mark has an empty range.
 pub struct Placed<'a> {
@@ -92,6 +82,16 @@ impl Marks {
         if !ns.is_empty() {
             moved.extend(ns.shaping_ranges());
             self.namespaces.push(ns);
+        }
+        moved
+    }
+
+    /// Drops every namespace of {plugin}. Returns where marks that change
+    /// how rows wrap went.
+    pub fn clear_plugin(&mut self, plugin: &str) -> Vec<Range<usize>> {
+        let mut moved = Vec::new();
+        for ns in self.namespaces.extract_if(.., |ns| ns.plugin == plugin) {
+            moved.extend(ns.shaping_ranges());
         }
         moved
     }
@@ -316,7 +316,7 @@ impl Chunk {
             mark.start = shifted(mark.start, shift);
             mark.stop = mark.stop.map(|stop| shifted(stop, shift));
             let bytes = mark.start..mark.end();
-            let kept = mark.remap(change);
+            let kept = remap_mark(mark, change);
             if !kept {
                 dropped.push(change.map_range(bytes));
             }
@@ -344,22 +344,6 @@ struct Entry {
     rank: u64,
 }
 
-impl Mark {
-    fn end(&self) -> usize {
-        self.stop.unwrap_or(self.start)
-    }
-
-    /// [`remap`] for a placed mark, `false` when it has to go.
-    fn remap(&mut self, change: &Change) -> bool {
-        let Some(bytes) = remap(self.start..self.end(), &self.decoration, change) else {
-            return false;
-        };
-        self.start = bytes.start;
-        self.stop = self.stop.map(|_| bytes.end);
-        true
-    }
-}
-
 /// Where a mark with {decoration} over {bytes} sits after {change}, `None`
 /// when it has to go. Placed marks and the marks of a parse that has not
 /// caught up both move this way. An empty range is a point mark, which stays
@@ -384,11 +368,22 @@ pub(super) fn remap(
     (start < end).then_some(start..end)
 }
 
+/// [`remap`] for a placed mark, `false` when it has to go.
+pub(super) fn remap_mark(mark: &mut Mark, change: &Change) -> bool {
+    let Some(bytes) = remap(mark.start..mark.end(), &mark.decoration, change) else {
+        return false;
+    };
+    mark.start = bytes.start;
+    mark.stop = mark.stop.map(|_| bytes.end);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::text_buffer::TextBuffer;
     use maki_lua::TextEdit;
+    use std::sync::Arc;
     use test_case::test_case;
 
     const PLUGIN: &str = "test";
@@ -458,7 +453,9 @@ mod tests {
             stop,
             decoration: decoration(kind),
         };
-        buffer.set_marks(PLUGIN, NS, vec![mark]).unwrap();
+        buffer
+            .set_marks(buffer.version(), PLUGIN, NS, vec![mark])
+            .unwrap();
         buffer.replace_byte_range(from, to, text, None).unwrap();
         let mut mapped = ranges(buffer.marks());
         assert!(mapped.len() <= 1);
@@ -476,14 +473,16 @@ mod tests {
             stop: Some(8),
             decoration: decoration(Kind::Plain),
         };
-        buffer.set_marks(PLUGIN, NS, vec![mark]).unwrap();
+        buffer
+            .set_marks(buffer.version(), PLUGIN, NS, vec![mark])
+            .unwrap();
         let wrap = |at| TextEdit {
             start: at,
             stop: at,
             text: "**".into(),
         };
         buffer
-            .apply_edits(buffer.version(), vec![wrap(4), wrap(8)], None)
+            .apply_edits(buffer.version(), vec![wrap(4), wrap(8)], None, None)
             .unwrap();
         assert_eq!(ranges(buffer.marks()), vec![6..10]);
     }
@@ -519,7 +518,9 @@ mod tests {
                 decoration: decoration(kinds[roll(kinds.len())]),
             });
         }
-        buffer.set_marks(PLUGIN, NS, marks.clone()).unwrap();
+        buffer
+            .set_marks(buffer.version(), PLUGIN, NS, marks.clone())
+            .unwrap();
         let first_rank = placed(buffer.marks())[0].0;
         let mut expected: Vec<(u64, Mark)> = (first_rank..).zip(marks).collect();
 
@@ -541,7 +542,7 @@ mod tests {
             let seen = buffer.version();
             buffer.replace_byte_range(start, stop, text, None).unwrap();
             for change in buffer.changes_since(seen).unwrap() {
-                expected.retain_mut(|(_, mark)| mark.remap(change));
+                expected.retain_mut(|(_, mark)| remap_mark(mark, change));
             }
             let expected: Vec<_> = expected
                 .iter()
