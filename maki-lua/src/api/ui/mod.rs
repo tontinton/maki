@@ -1220,7 +1220,8 @@ lua_table! {
     /// Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
     /// still work. The calls that need a screen behave like this:
     ///
-    /// - `input`, `input_edit`, `input_decorate`, `input_submit`, and `action`
+    /// - `input`, `input_edit`, `input_decorate`, `input_submit`,
+    ///   `transcript_positions`, `highlight_transcript`, and `action`
     ///   on a built-in name return `nil, "no interactive UI attached"`.
     ///   Plugin actions still run.
     /// - `open_editor` returns -1.
@@ -1391,10 +1392,24 @@ lua_table! {
     ]
 }
 
-/// Read the focused transcript's rendered conversation positions. Returns
-/// `{topline, positions}`, with one-based, bottom-clamped `topline` values and
-/// `role` (user or assistant) for each position, including streaming text.
-/// Each position also has `line`, its unclamped one-based header row.
+/// Read message headers from the last painted transcript without changing render state.
+/// Each entry has `role` (`"user"` or `"assistant"`) and `line` (the one-based,
+/// unclamped transcript row). Includes streaming assistant text. New messages
+/// appear after the next paint.
+///
+/// Read the viewport with `maki.fn.winsaveview()` and scroll with
+/// `maki.fn.winrestview({ topline = line })`, which clamps to the scrollable range.
+///
+/// @return (table[]|nil, string|nil) Message headers in transcript order, or nil and an error if the UI is unavailable.
+/// @example
+/// local positions, err = maki.ui.transcript_positions()
+/// if not positions then
+///   maki.notify(err, "error")
+///   return
+/// end
+/// if positions[1] then
+///   maki.fn.winrestview({ topline = positions[1].line })
+/// end
 #[lua_fn]
 async fn transcript_positions(
     lua: Lua,
@@ -1407,17 +1422,25 @@ async fn transcript_positions(
 }
 
 /// Highlight a one-based transcript line for `duration_ms` milliseconds.
-/// `error` selects error feedback instead of the selected-item style.
-/// @param line integer One-based transcript line.
+/// Uses the same named theme styles as UI spans, such as `"item_selected"`
+/// or `"error"`. Scrolling clears the highlight. A line above the viewport
+/// highlights the first visible row instead.
+/// @param line integer Positive, one-based transcript line.
 /// @param duration_ms integer Highlight duration in milliseconds.
-/// @param error boolean? Use error feedback styling.
+/// @param style string Named theme style, using the same spelling as a span.
+/// @return (boolean|nil, string|nil) `true` when queued, or nil and an error for a zero line or unavailable UI.
+/// @example
+/// local ok, err = maki.ui.highlight_transcript(1, 180, "item_selected")
+/// if not ok then
+///   maki.notify(err, "error")
+/// end
 #[lua_fn]
 fn highlight_transcript(
     _lua: &Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     line: u32,
     duration_ms: u64,
-    error: Option<bool>,
+    style: String,
 ) -> LuaResult<Pair<bool>> {
     let Some(row) = line.checked_sub(1) else {
         return Ok(err_pair("line must be positive"));
@@ -1426,7 +1449,7 @@ fn highlight_transcript(
         tx.as_ref(),
         UiAction::HighlightTranscript {
             row,
-            error: error.unwrap_or(false),
+            style,
             duration: Duration::from_millis(duration_ms),
         }
     ));
@@ -1686,27 +1709,27 @@ mod tests {
         t
     }
 
-    #[test_case(false ; "destination")]
-    #[test_case(true ; "boundary")]
-    fn transcript_highlight_forwards_style_and_duration(error: bool) {
+    #[test_case("item_selected" ; "destination")]
+    #[test_case("error" ; "boundary")]
+    fn transcript_highlight_forwards_style_and_duration(style: &str) {
         const LINE: u32 = 3;
         const DURATION_MS: u64 = 180;
         let lua = Lua::new();
         let (tx, rx) = flume::unbounded();
         let (ok, err) =
-            highlight_transcript(&lua, Some(tx), LINE, DURATION_MS, Some(error)).unwrap();
+            highlight_transcript(&lua, Some(tx), LINE, DURATION_MS, style.to_owned()).unwrap();
         assert_eq!(ok, Some(true));
         assert!(err.is_none());
         let UiAction::HighlightTranscript {
             row,
-            error: actual_error,
+            style: actual_style,
             duration,
         } = rx.recv().unwrap()
         else {
             panic!("expected transcript highlight");
         };
         assert_eq!(row, LINE - 1);
-        assert_eq!(actual_error, error);
+        assert_eq!(actual_style, style);
         assert_eq!(duration, Duration::from_millis(DURATION_MS));
     }
 
@@ -1714,10 +1737,7 @@ mod tests {
     fn transcript_positions_returns_renderer_snapshot() {
         let lua = Lua::new();
         let (tx, rx) = flume::unbounded();
-        let snapshot = serde_json::json!({
-            "topline": 1,
-            "positions": [{ "role": "user", "topline": 1 }],
-        });
+        let snapshot = serde_json::json!([{ "role": "user", "line": 1 }]);
         let expected = snapshot.clone();
         let worker = std::thread::spawn(move || {
             let UiAction::TranscriptPositions { reply_tx } = rx.recv().unwrap() else {

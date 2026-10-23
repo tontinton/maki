@@ -3,9 +3,9 @@ local th = require("maki.test_helpers")
 
 local USER = "user"
 local ASSISTANT = "assistant"
-local FIRST = { segment = 1, role = USER, topline = 1 }
-local SECOND = { segment = 3, role = ASSISTANT, topline = 20 }
-local LAST = { segment = 5, role = USER, topline = 40 }
+local FIRST = { role = USER, line = 1 }
+local SECOND = { role = ASSISTANT, line = 20 }
+local LAST = { role = USER, line = 40 }
 
 for _, test in ipairs({
   { "next_message", 1, true, false, false, SECOND, false },
@@ -21,6 +21,8 @@ for _, test in ipairs({
   th.case(test[1], function()
     local target, boundary = Navigation.target({
       topline = test[2],
+      line_count = 60,
+      height = 5,
       positions = { FIRST, SECOND, LAST },
     }, test[3], test[4], test[5])
     th.eq(target, test[6])
@@ -29,13 +31,15 @@ for _, test in ipairs({
 end
 
 th.case("empty_transcript", function()
-  th.eq(Navigation.target({ topline = 1, positions = {} }, true, false, false), nil)
+  th.eq(Navigation.target({ topline = 1, line_count = 0, height = 5, positions = {} }, true, false, false), nil)
 end)
 
 th.case("clamped_destinations", function()
-  local last = { segment = LAST.segment, role = USER, topline = SECOND.topline }
+  local last = { role = USER, line = 23 }
   local target, boundary = Navigation.target({
-    topline = SECOND.topline,
+    topline = SECOND.line,
+    line_count = 24,
+    height = 5,
     positions = { FIRST, SECOND, last },
   }, true, false, false)
   th.eq(target, last)

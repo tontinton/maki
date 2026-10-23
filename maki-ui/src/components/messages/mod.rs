@@ -85,7 +85,7 @@ pub struct PromptProgress {
 
 struct TranscriptHighlight {
     target: ScrollPos,
-    error: bool,
+    style: String,
     expires: Instant,
 }
 
@@ -746,15 +746,8 @@ impl MessagesPanel {
         self.auto_scroll = true;
     }
 
-    pub fn transcript_positions(&mut self) -> serde_json::Value {
-        self.rebuild_line_cache();
+    pub fn transcript_positions(&self) -> serde_json::Value {
         let layout = self.layout();
-        let bottom = layout.bottom(self.viewport_height);
-        let current = if self.auto_scroll {
-            bottom
-        } else {
-            self.scroll.min(bottom)
-        };
         let messages = self
             .cache
             .segments()
@@ -782,27 +775,22 @@ impl MessagesPanel {
         let positions: Vec<_> = messages
             .chain(streaming)
             .map(|(seg, role)| {
-                let landing = ScrollPos { seg, row: 0 }.min(bottom);
                 serde_json::json!({
                     "role": role,
                     "line": u64::from(layout.doc_row(ScrollPos { seg, row: 0 })) + 1,
-                    "topline": u64::from(layout.doc_row(landing)) + 1,
                 })
             })
             .collect();
-        serde_json::json!({
-            "topline": u64::from(layout.doc_row(current)) + 1,
-            "positions": positions,
-        })
+        serde_json::json!(positions)
     }
 
-    pub fn highlight_transcript(&mut self, row: u32, error: bool, duration: Duration) {
+    pub fn highlight_transcript(&mut self, row: u32, style: String, duration: Duration) {
         let Some(expires) = Instant::now().checked_add(duration) else {
             return;
         };
         self.transcript_highlight = Some(TranscriptHighlight {
             target: self.layout().at_row(row),
-            error,
+            style,
             expires,
         });
     }
@@ -1158,16 +1146,11 @@ impl MessagesPanel {
                 col: 0,
             }) {
                 RowPos::At(row) => Some(row),
-                RowPos::Above if highlight.error => Some(0),
+                RowPos::Above => Some(0),
                 _ => None,
             };
             if let Some(row) = row {
-                let theme = theme::current();
-                let style = if highlight.error {
-                    Style::new().bg(theme.error.fg.unwrap_or(Color::Reset))
-                } else {
-                    theme.item_selected
-                };
+                let style = theme::style_by_name(&highlight.style);
                 frame.buffer_mut().set_style(
                     Rect::new(viewport.x, viewport.y + row, viewport.width, 1),
                     style,

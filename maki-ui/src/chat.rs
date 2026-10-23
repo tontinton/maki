@@ -383,12 +383,12 @@ impl Chat {
         self.messages_panel.scroll(delta);
     }
 
-    pub(crate) fn highlight_transcript(&mut self, row: u32, error: bool, duration: Duration) {
+    pub(crate) fn highlight_transcript(&mut self, row: u32, style: String, duration: Duration) {
         self.messages_panel
-            .highlight_transcript(row, error, duration);
+            .highlight_transcript(row, style, duration);
     }
 
-    pub fn transcript_positions(&mut self) -> serde_json::Value {
+    pub fn transcript_positions(&self) -> serde_json::Value {
         self.messages_panel.transcript_positions()
     }
 

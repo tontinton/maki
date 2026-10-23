@@ -217,6 +217,8 @@ declare maki: {
     input_decorate: @checked (opts: any) -> (any, string?),
     input_edit: @checked (opts: any) -> (any, string?),
     input_submit: @checked (opts: any) -> (boolean?, string?),
+    transcript_positions: @checked () -> (any, string?),
+    highlight_transcript: @checked (line: number, duration_ms: number, style: string) -> (boolean?, string?),
   },
   uv: {
     cwd: @checked () -> (string?),

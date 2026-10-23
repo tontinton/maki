@@ -1283,13 +1283,13 @@ impl App {
         self.chats[self.active_chat].win_view()
     }
 
-    pub(crate) fn highlight_transcript(&mut self, row: u32, error: bool, duration: Duration) {
+    pub(crate) fn highlight_transcript(&mut self, row: u32, style: String, duration: Duration) {
         self.active_chat()
-            .highlight_transcript(row, error, duration);
+            .highlight_transcript(row, style, duration);
     }
 
-    pub(crate) fn transcript_positions(&mut self) -> serde_json::Value {
-        self.active_chat().transcript_positions()
+    pub(crate) fn transcript_positions(&self) -> serde_json::Value {
+        self.chats[self.active_chat].transcript_positions()
     }
 
     pub(crate) fn scroll_to_row(&mut self, doc_row: u32) {

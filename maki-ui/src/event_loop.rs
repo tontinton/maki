@@ -1121,11 +1121,11 @@ impl<'t> EventLoop<'t> {
             }
             UiAction::HighlightTranscript {
                 row,
-                error,
+                style,
                 duration,
             } => {
                 self.focused_app()
-                    .highlight_transcript(row, error, duration);
+                    .highlight_transcript(row, style, duration);
             }
             UiAction::TranscriptPositions { reply_tx } => {
                 let _ = reply_tx.send(Ok(self.focused_app().transcript_positions()));
