@@ -11,12 +11,13 @@ use crate::animation::spinner_frame;
 use crate::theme;
 
 use maki_providers::format_tokens;
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use tracing::warn;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::repaint::{Cadence, Dirty};
@@ -408,17 +409,30 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Access events are left out. Reading `HEAD` is one, so a watcher that
+/// took them would wake the poll that reads it, and that read would wake
+/// it again, every tick for as long as the app runs.
 fn watch_branch() -> Option<(flume::Receiver<()>, RecommendedWatcher)> {
     let cwd = env::current_dir().ok()?;
     let git_dir = find_git_dir(&cwd)?;
     let (tx, rx) = flume::bounded(1);
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
+    let on_event = move |res: Result<Event, _>| {
         if res.is_ok_and(|e| e.paths.iter().any(|p| p.ends_with("HEAD"))) {
             let _ = tx.try_send(());
         }
-    })
-    .ok()?;
-    watcher.watch(&git_dir, RecursiveMode::NonRecursive).ok()?;
+    };
+    let config = Config::default().with_event_kinds(EventKindMask::CORE);
+    let mut watcher = RecommendedWatcher::new(on_event, config)
+        .inspect_err(
+            |e| warn!(error = %e, git_dir = %git_dir.display(), "git branch watcher unavailable"),
+        )
+        .ok()?;
+    watcher
+        .watch(&git_dir, RecursiveMode::NonRecursive)
+        .inspect_err(
+            |e| warn!(error = %e, git_dir = %git_dir.display(), "git branch watcher unavailable"),
+        )
+        .ok()?;
     Some((rx, watcher))
 }
 
