@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use maki_agent::{Envelope, SharedBuf, SubagentInfo};
+use maki_agent::agent::SessionExport;
+use maki_agent::{Envelope, SharedBuf, SubagentInfo, Transcript};
 use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
@@ -439,12 +440,18 @@ pub enum SessionRequest {
     Current,
     /// UI-mode fallback for `maki.session.read` when no snapshot slot is
     /// installed — the UI resolves the id and returns a `session_snapshot_json`
-    /// payload. Headless drivers install a `SessionSnapshotSlot` instead
-    /// so `read` doesn't need a UI.
+    /// payload, or [`crate::SessionSnapshot::stored`] for an id no tab has
+    /// open. Headless drivers install a `SessionSnapshotSlot` instead so
+    /// `read` doesn't need a UI.
     Read {
         id: Option<String>,
     },
+    /// {transcript} is parsed but not validated yet. The UI lays it over the
+    /// focused tab's blank session, the one place that decides a new
+    /// session's defaults, and answers what is wrong with it. Without
+    /// {prompt} or {focus} it is only stored, otherwise it opens in a tab.
     New {
+        transcript: Box<Transcript>,
         prompt: Option<String>,
         focus: bool,
     },
@@ -672,6 +679,14 @@ pub enum UiAction {
         req: SessionRequest,
         reply_tx: flume::Sender<UiReply>,
     },
+    /// `maki.session.export` and `messages`: a live tab answers from memory,
+    /// unsaved messages included, any other id from disk. Typed rather than
+    /// JSON, with the messages shared, so neither the UI thread nor the Lua
+    /// thread copies them.
+    ExportSession {
+        id: MakiId,
+        reply_tx: flume::Sender<Result<SessionExport, String>>,
+    },
     Model {
         req: ModelRequest,
         reply_tx: flume::Sender<UiReply>,
@@ -781,6 +796,12 @@ pub(crate) fn ui_send(
         return Err(NO_UI_ERR);
     }
     tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
+}
+
+/// Whether an action sent now would reach an event loop, for a call that must
+/// refuse before doing anything a missing UI would leave half done.
+pub(crate) fn ui_reachable(tx: Option<&flume::Sender<UiAction>>) -> bool {
+    ui_attached() && tx.is_some_and(|tx| !tx.is_disconnected())
 }
 
 /// Send an action carrying a reply channel and await the answer. Only

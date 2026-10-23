@@ -6,21 +6,55 @@ use arc_swap::ArcSwap;
 use maki_providers::{ContextGauge, Message, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::frame::StoredFrame;
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{
     SAVE_FAILED, Session, SessionClaim, SessionError, StoredMode, StoredThinking,
 };
+use thiserror::Error;
 use tracing::warn;
 
 use crate::agent::{
-    History, HistorySnapshot, RunContextBuilder, SharedMessages, publish_live_history,
+    History, HistorySnapshot, RunContextBuilder, SharedHeader, SharedMessages, publish_live_session,
 };
 use crate::types::EventSender;
-use crate::{AgentRunParams, ToolOutput};
+use crate::{AgentInput, AgentMode, AgentRunParams, RunLedger, ToolOutput};
+
+pub const NOTHING_TO_STORE: &str = "session has no messages, nothing to store";
 
 /// The one spelling of a persisted maki session. It cannot live in
 /// maki-storage: [`ToolOutput`] is ours, and maki-storage must not depend on us.
 pub type StoredSession = Session<Message, TokenUsage, ToolOutput>;
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("{NOTHING_TO_STORE}")]
+    Empty,
+    #[error(transparent)]
+    Session(#[from] SessionError),
+}
+
+/// Writes a session nobody holds yet, under its own claim, which drops once
+/// it is on disk.
+pub fn store_new(session: StoredSession, dir: &StateDir) -> Result<MakiId, StoreError> {
+    let claim = SessionClaim::acquire(session.id, dir)?;
+    save_new(session, &claim, dir)
+}
+
+/// Every new session reaches the disk through here. One with no messages is
+/// refused, since the picker and `--continue` would offer it as a dead entry.
+/// The check runs on what is about to be written, so a history that repaired
+/// down to nothing is caught too.
+pub fn save_new(
+    mut session: StoredSession,
+    claim: &SessionClaim,
+    dir: &StateDir,
+) -> Result<MakiId, StoreError> {
+    if session.messages().is_empty() {
+        return Err(StoreError::Empty);
+    }
+    session.save(claim, dir)?;
+    Ok(session.id)
+}
 
 /// What a session says about itself besides its transcript: what export and
 /// `maki.session.read` answer with.
@@ -131,13 +165,15 @@ impl SessionTrack {
     /// Takes the claim by value, so nobody else can write the session for as
     /// long as this track can.
     ///
-    /// Publishes the transcript under the session's id, so
-    /// `maki.session.messages` works under a headless driver too.
+    /// Publishes the transcript and the settings under the session's id, so
+    /// `maki.session.messages`, `export` and `read` work under a headless
+    /// driver too, before anything is saved.
     pub fn open(resumed: Resumed, claim: SessionClaim, storage: StateDir, cwd: &str) -> Self {
         let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
-        publish_live_history(resumed.id.id(), &mirror);
+        let store = SessionStore::open(storage, claim, resumed.session, cwd);
+        publish_live_session(resumed.id.id(), &mirror, &store.header);
         Self {
-            store: SessionStore::open(storage, claim, resumed.session, cwd),
+            store,
             history: History::restored(resumed.history)
                 .with_frame(resumed.frame)
                 .with_mirror(mirror),
@@ -153,24 +189,49 @@ impl SessionTrack {
     /// The spec lands here rather than at the end because a driver picks its
     /// model before it builds the agent. Since this is the only path to a
     /// write, no stored session can carry a spec no turn ran on.
-    pub fn turn(&mut self, model_spec: String) -> SessionTurn<'_> {
-        self.store.session.set_model(model_spec);
-        SessionTurn(self)
+    ///
+    /// The settings come from `input` for the same reason: they are what the
+    /// turn really runs under, so readers and the saved file never report a
+    /// mode the driver switched away from.
+    pub fn turn(&mut self, model_spec: String, input: &AgentInput) -> SessionTurn<'_> {
+        let session = &mut self.store.session;
+        session.set_model(model_spec);
+        session.meta.mode = Some(match input.mode {
+            AgentMode::Build => StoredMode::Build,
+            AgentMode::Plan(_) => StoredMode::Plan,
+        });
+        session.meta.thinking = Some(input.thinking.into());
+        session.meta.fast = input.fast;
+        session.meta.workflow = input.workflow;
+        self.store.publish_header(true);
+        SessionTurn {
+            track: self,
+            ledger: Arc::default(),
+        }
     }
 }
 
 /// A turn in progress. See [`SessionTrack::turn`].
-pub struct SessionTurn<'a>(&'a mut SessionTrack);
+pub struct SessionTurn<'a> {
+    track: &'a mut SessionTrack,
+    ledger: Arc<RunLedger>,
+}
 
 impl SessionTurn<'_> {
+    /// What the turn's agent bills to. The turn adds it to the session's
+    /// usage when it ends, so the agent must be built with this one.
+    pub fn ledger(&self) -> Arc<RunLedger> {
+        Arc::clone(&self.ledger)
+    }
+
     pub fn run_params(
         &mut self,
         event_tx: EventSender,
         context: RunContextBuilder,
     ) -> AgentRunParams<'_> {
         AgentRunParams {
-            history: &mut self.0.history,
-            gauge: &mut self.0.gauge,
+            history: &mut self.track.history,
+            gauge: &mut self.track.gauge,
             event_tx,
             context,
         }
@@ -187,19 +248,20 @@ impl Drop for SessionTurn<'_> {
             history,
             gauge,
             store,
-        } = &mut *self.0;
-        if !history.has_unsaved() {
-            return;
-        }
-        match store.record_turn(history.as_slice(), history.frame(), gauge.size()) {
-            Ok(()) => history.mark_saved(),
-            // Only headless runs save through here (the TUI has its own
-            // writer), so printing cannot tear a drawn frame.
-            Err(e) => {
-                warn!(error = %e, session_id = %store.session.id, "failed to persist session");
-                eprintln!("{SAVE_FAILED}{}: {e}", store.session.id);
+        } = &mut *self.track;
+        store.session.token_usage += self.ledger.totals().usage;
+        if history.has_unsaved() {
+            match store.record_turn(history.as_slice(), history.frame(), gauge.size()) {
+                Ok(()) => history.mark_saved(),
+                // Only headless runs save through here (the TUI has its own
+                // writer), so printing cannot tear a drawn frame.
+                Err(e) => {
+                    warn!(error = %e, session_id = %store.session.id, "failed to persist session");
+                    eprintln!("{SAVE_FAILED}{}: {e}", store.session.id);
+                }
             }
         }
+        store.publish_header(false);
     }
 }
 
@@ -207,6 +269,8 @@ struct SessionStore {
     dir: StateDir,
     claim: SessionClaim,
     session: StoredSession,
+    /// `session`'s header as readers see it, republished whenever it moves.
+    header: SharedHeader,
 }
 
 impl SessionStore {
@@ -224,16 +288,24 @@ impl SessionStore {
         Self {
             dir,
             claim,
+            header: Arc::new(ArcSwap::from_pointee(SessionHeader::of(&session))),
             session,
         }
+    }
+
+    fn publish_header(&self, working: bool) {
+        self.header.store(Arc::new(SessionHeader {
+            working,
+            ..SessionHeader::of(&self.session)
+        }));
     }
 
     /// `context_size` travels with the messages, since a resumed session seeds
     /// its gauge from it. Stored without one, the next process is back to
     /// estimating a transcript this one had measured.
     ///
-    /// An empty transcript is not a session, and this is the one place that
-    /// decides so. An empty log is one the picker offers and `--continue`
+    /// An empty transcript is not a session, the same rule [`save_new`]
+    /// holds a new one to. An empty log is one the picker offers and `--continue`
     /// resolves to, so a run killed before its first turn would leave a dead
     /// entry behind for good. The same guard stops a history that sanitized
     /// down to nothing from replacing the copy it was restored from.
@@ -265,11 +337,11 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
-    use crate::RunContext;
     use crate::tools::RequestTools;
+    use crate::{InputSource, RunContext, SessionDefaults};
 
     use super::*;
-    use crate::agent::live_history;
+    use crate::agent::{live_header, live_history};
 
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const CWD: &str = "/project";
@@ -292,6 +364,12 @@ mod tests {
     const FRAME_FINGERPRINT: &str = "0123456789abcdef";
     const FRAME_MCP_TOOL: &str = "srv__tool";
     const FRAME_KEPT: &str = "a resumed process must send the prefix the transcript was sent under";
+    const THINKING: StoredThinking = StoredThinking::Adaptive;
+    const TURN_INPUT_TOKENS: u32 = 1_000;
+    const TURNS: u32 = 2;
+    const SETTINGS_TRACKED: &str = "readers and the file must report what the last turn ran under";
+    const USAGE_SUMMED: &str =
+        "every turn's bill must add up on the session, in memory and on disk";
 
     fn session_id() -> MakiId {
         SESSION_ID.parse().unwrap()
@@ -349,12 +427,31 @@ mod tests {
         SessionTrack::open(resumed(), claim(tmp), state_dir(tmp), CWD)
     }
 
-    fn push_turn(track: &mut SessionTrack, spec: &str, edit: impl FnOnce(AgentRunParams<'_>)) {
-        let mut turn = track.turn(spec.to_owned());
-        edit(turn.run_params(
+    fn input(mode: AgentMode) -> AgentInput {
+        let defaults = SessionDefaults {
+            fast: true,
+            workflow: false,
+            thinking: Some(THINKING),
+        };
+        AgentInput::from_defaults(
+            PROMPT.into(),
+            mode,
+            Vec::new(),
+            defaults,
+            InputSource::Headless,
+        )
+    }
+
+    fn run_params<'a>(turn: &'a mut SessionTurn<'_>) -> AgentRunParams<'a> {
+        turn.run_params(
             EventSender::new(flume::unbounded().0, 0),
             Arc::new(|_, _| RunContext::fixed(String::new(), RequestTools::default())),
-        ));
+        )
+    }
+
+    fn push_turn(track: &mut SessionTrack, spec: &str, edit: impl FnOnce(AgentRunParams<'_>)) {
+        let mut turn = track.turn(spec.to_owned(), &input(AgentMode::Build));
+        edit(run_params(&mut turn));
     }
 
     fn push_prompt(track: &mut SessionTrack, spec: &str, text: &str) {
@@ -584,5 +681,82 @@ mod tests {
 
         drop(track);
         assert!(live_history(id).is_none());
+    }
+
+    /// Export and `read` of a headless session answer from this before the
+    /// first save, so it has to follow the turn: the model it runs on, the
+    /// title it earned, and whether one is running.
+    #[test]
+    fn open_publishes_the_header_and_each_turn_moves_it() {
+        let tmp = TempDir::new().unwrap();
+        let id = MakiId::generate();
+        let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
+        let mut track = SessionTrack::open(
+            Resumed::empty(SessionRef::from(id)),
+            claim,
+            state_dir(&tmp),
+            CWD,
+        );
+
+        let opened = live_header(id).expect("an open track publishes its header");
+        assert_eq!(opened.cwd, CWD);
+        assert!(!opened.working);
+
+        let turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+        let running = live_header(id).unwrap();
+        assert_eq!(running.model, MODEL_SPEC);
+        assert!(running.working);
+        drop(turn);
+
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        let finished = live_header(id).unwrap();
+        assert!(!finished.working);
+        assert_eq!(
+            finished.title,
+            generate_title(&[Message::user(PROMPT.into())])
+        );
+
+        drop(track);
+        assert!(live_header(id).is_none());
+    }
+
+    /// A headless driver keeps no other record of its settings or its spend,
+    /// so the turn has to put them on the session, where `read`, `export` and
+    /// the next resume look.
+    #[test]
+    fn each_turn_records_its_settings_and_adds_its_usage() {
+        let tmp = TempDir::new().unwrap();
+        let id = MakiId::generate();
+        let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
+        let mut track = SessionTrack::open(
+            Resumed::empty(SessionRef::from(id)),
+            claim,
+            state_dir(&tmp),
+            CWD,
+        );
+        let usage = TokenUsage {
+            input: TURN_INPUT_TOKENS,
+            ..Default::default()
+        };
+        for _ in 0..TURNS {
+            let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Plan(PLAN_PATH.into())));
+            turn.ledger().add(usage, None, None);
+            run_params(&mut turn)
+                .history
+                .push(Message::user(PROMPT.into()));
+        }
+
+        let header = live_header(id).unwrap();
+        let stored = SessionHeader::of(&StoredSession::load(id, &state_dir(&tmp)).unwrap());
+        for header in [&*header, &stored] {
+            assert_eq!(header.mode, Some(StoredMode::Plan), "{SETTINGS_TRACKED}");
+            assert_eq!(header.thinking, Some(THINKING), "{SETTINGS_TRACKED}");
+            assert!(header.fast, "{SETTINGS_TRACKED}");
+            assert_eq!(
+                header.usage.input,
+                TURN_INPUT_TOKENS * TURNS,
+                "{USAGE_SUMMED}"
+            );
+        }
     }
 }

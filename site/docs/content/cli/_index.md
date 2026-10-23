@@ -109,10 +109,64 @@ maki session list            # sessions for the current directory
 maki session list --global   # sessions from all projects
 maki session list --json     # machine-readable JSON array
 maki session delete <id>     # asks first, -f skips
+maki session export <id>     # JSON transcript to stdout
+maki session import [FILE|-] # store a transcript, print the new id
 ```
 
-Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. `--json` prints one JSON array of the same summaries instead, for scripts. A listed id works with `maki --resume <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`; without a terminal to ask on it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
+Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. `--json` prints one JSON array of the same summaries instead, for scripts. A listed id works with `maki -r <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`. Without a terminal to ask on, it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
 
+#### Export and import
+
+`export <SESSION_ID>` prints one JSON document to stdout. It reads the session without claiming it, so it also works for a session whose model this machine cannot run. When another maki has the session open, you get the session as last saved, and a notice on stderr says so.
+
+`import` reads the document from `FILE`, or from stdin when `FILE` is omitted or `-`. It stores the result as a new session in the current directory's project. It prints only the new id on stdout, so `id=$(maki session import < file.json)` works. Continue it with `maki -r <id>`.
+
+On failure, `import` stores nothing and exits non-zero. The error names the place in the document, such as `messages[12].content[2]`. Indexes start at 0, as in the JSON. A document with no messages left after repair is refused, such as one whose only message holds an orphan tool result.
+
+The document has these fields:
+
+| Field | Meaning |
+|-------|---------|
+| `format` | Version of the document format, currently `1` |
+| `model` | Model spec as stored. Import keeps any string and resolves it when the session opens. When it is missing or blank, no model is stored and the session opens on the default model. In the TUI, `maki.session.new` uses the focused tab's model instead |
+| `mode` | `build` or `plan` |
+| `thinking` | Thinking setting, spelled as in `/thinking` |
+| `fast` | Fast mode on or off. Off when missing |
+| `title` | Session title. Import keeps a given title and only collapses its whitespace to single spaces. When it is missing or blank, import generates one from the history |
+| `facts` | The date, working directory, model, instructions and hints the model was last told. On import the model is told what changed |
+| `messages` | The conversation in the same shape [`maki.session.messages`](/docs/lua-api/#maki-session-messages) returns |
+
+Import drops top-level fields it does not know, so keep your own metadata outside the document. A `format` newer than the importer supports fails with "exported by a newer maki". Thinking blocks and their signatures are dropped on import, because they are bound to a system prompt the new session will not have. Orphan tool results and a dangling final tool call are repaired the way a resume repairs them. A content block of a known type that does not parse, or one without a `type`, is refused. A block of a type this maki does not know is kept as it is.
+
+#### Move a session
+
+To continue a session on another machine, export it and import the file there:
+
+```bash
+maki session export <id> > session.json
+scp session.json server:
+ssh -t server 'cd ~/code/my-app && id=$(maki session import ~/session.json) && maki -r "$id"'
+```
+
+The import stores the session under the directory you run it in, with a new id. The first run there tells the model the new working directory and date, so it does not keep acting on the old ones. If the `model` in the file is not available on the target machine, the session opens with a warning and falls back like any other resume.
+
+A plugin can do the same without the CLI. `maki.session.export` returns the document as a table, and `maki.session.new` takes it back. This sends the focused session to a server and pulls it back later, with the `upload` and `download` helpers left to you:
+
+```lua
+-- hand off from the focused session
+local id = maki.session.current()
+local doc = assert(maki.session.export({ session = id }))
+doc.messages = redact(doc.messages)
+local url = assert(upload(maki.json.encode(doc)))
+maki.notify("continued at " .. url)
+
+-- pull it back
+local back = maki.json.decode(assert(download(url)))
+back.focus = true
+assert(maki.session.new(back))
+```
+
+`export` needs the `session_read` permission and `new` needs `session_write`. Let `redact` edit a copy made with [`maki.deepcopy`](/docs/lua-api/#maki-deepcopy), which keeps `maki.NIL` and empty arrays intact. Without `prompt` or `focus`, `new` only stores the session. Where settings come from and which frontends can open it are in the [`maki.session.new` reference](/docs/lua-api/#maki-session-new).
 ### `maki mcp`
 
 ```bash

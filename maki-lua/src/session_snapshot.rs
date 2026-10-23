@@ -4,8 +4,11 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use maki_agent::session::{SessionHeader, StoredSession};
 use maki_agent::{AgentEvent, Envelope};
 use maki_providers::{TokenUsage, add_cost};
+use maki_storage::id::MakiId;
+use maki_storage::sessions::StoredMode;
 use serde::Serialize;
 
 use crate::EventHandle;
@@ -15,6 +18,8 @@ pub const MODE_PLAN: &str = "plan";
 pub const STATUS_IDLE: &str = "idle";
 pub const STATUS_WORKING: &str = "working";
 pub const STATUS_NEEDS_INPUT: &str = "needs_input";
+/// A session no runtime here has open, read from disk.
+pub const STATUS_STORED: &str = "stored";
 
 #[derive(Serialize)]
 pub struct SessionSnapshot {
@@ -29,7 +34,14 @@ pub struct SessionSnapshot {
     pub model: String,
     /// [`MODE_BUILD`] or [`MODE_PLAN`].
     pub mode: &'static str,
-    /// [`STATUS_IDLE`], [`STATUS_WORKING`], or [`STATUS_NEEDS_INPUT`].
+    /// Spelled like the thinking setting. Left out by hosts that do not
+    /// track it (the headless drivers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
+    /// [`STATUS_IDLE`], [`STATUS_WORKING`], [`STATUS_NEEDS_INPUT`], or
+    /// [`STATUS_STORED`].
     pub status: &'static str,
     /// Whether this is the session the user is looking at. Always true
     /// for the single-session headless drivers.
@@ -46,12 +58,58 @@ pub struct SessionSnapshot {
     pub usage: TokenUsage,
     /// Main session only. A subagent fills its own window, not ours.
     pub context_size: u32,
-    pub context_window: u32,
+    /// Left out for a stored session: the window belongs to a model that is
+    /// only resolved when the session opens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
     /// What the session bills, `None` on an unpriced model. No list price
     /// twin here, because `cost` is re-settled from stored usage when a
     /// session resumes and list price is not stored. Per turn list price
     /// lives on the `TurnEnd` autocmd instead.
     pub cost: Option<f64>,
+}
+
+impl SessionSnapshot {
+    /// What the file says. Nothing runs it here, so no cost: that is settled
+    /// against the model's rates when the session opens.
+    pub fn stored(session: &StoredSession) -> Self {
+        Self::unhosted(session.id, SessionHeader::of(session), STATUS_STORED)
+    }
+
+    /// A session a headless driver runs, answered from what it publishes
+    /// rather than from a file it may not have written yet.
+    pub fn live_headless(id: MakiId, header: SessionHeader) -> Self {
+        let status = if header.working {
+            STATUS_WORKING
+        } else {
+            STATUS_IDLE
+        };
+        Self::unhosted(id, header, status)
+    }
+
+    /// A session this host holds no runtime for: no window, cost or queue.
+    fn unhosted(id: MakiId, header: SessionHeader, status: &'static str) -> Self {
+        Self {
+            id: id.to_string(),
+            cwd: header.cwd,
+            title: Some(header.title),
+            model: header.model,
+            mode: match header.mode {
+                Some(StoredMode::Plan) => MODE_PLAN,
+                _ => MODE_BUILD,
+            },
+            thinking: header.thinking.map(|thinking| thinking.to_string()),
+            fast: Some(header.fast),
+            status,
+            focused: false,
+            updated_at: header.updated_at,
+            queue: None,
+            usage: header.usage,
+            context_size: header.context_size,
+            context_window: None,
+            cost: None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -153,6 +211,8 @@ impl HeadlessSnapshot {
                 title: None,
                 model: meta.model.clone(),
                 mode,
+                thinking: None,
+                fast: None,
                 status: if totals.working {
                     STATUS_WORKING
                 } else {
@@ -163,7 +223,7 @@ impl HeadlessSnapshot {
                 queue: None,
                 usage: totals.usage,
                 context_size: totals.context_size,
-                context_window: totals.context_window,
+                context_window: Some(totals.context_window),
                 cost: totals.cost,
             })
             .map_err(|e| e.to_string())

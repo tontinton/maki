@@ -226,6 +226,14 @@ impl SessionClaim {
         })
     }
 
+    /// Whether a writer holds `id` right now. Unlike [`Self::acquire`] it
+    /// never waits and never takes the claim, so a reader asking is never
+    /// slowed down and never gets in a writer's way.
+    pub fn is_held(id: MakiId, dir: &StateDir) -> bool {
+        let path = lock_path(&dir.path().join(SESSIONS_DIR), id);
+        matches!(Lock::acquire_shared(&path), Err(LockError::Held { .. }))
+    }
+
     pub fn id(&self) -> MakiId {
         self.0.id
     }
@@ -685,8 +693,15 @@ pub trait TitleSource {
 
 /// A pasted code block bakes `\n` into a title and skews width-based padding
 /// in single-line UI like the picker, so every title entry point calls this.
+/// Titles reach terminals as they are (`maki session list`), and an imported
+/// one may hold anything, so control characters split words too. An ESC or
+/// BEL left in could write the clipboard (OSC 52) or fake a link.
 pub fn normalize_title(title: &str) -> String {
-    title.split_whitespace().collect::<Vec<_>>().join(" ")
+    title
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
@@ -1818,6 +1833,12 @@ where
     }
 
     pub fn messages(&self) -> &[M] {
+        &self.messages
+    }
+
+    /// The transcript itself rather than a copy, for a reader that keeps it
+    /// past the borrow.
+    pub fn shared_messages(&self) -> &Arc<Vec<M>> {
         &self.messages
     }
 
@@ -3459,6 +3480,7 @@ mod tests {
         ; "long_truncates_at_word"
     )]
     #[test_case("one\n\ntwo\t three", "one two three" ; "whitespace_collapses")]
+    #[test_case("a\u{1b}]52;c;eA==\u{7}b\u{9b}c", "a ]52;c;eA== b c" ; "control_characters_never_reach_a_terminal")]
     fn title_extraction(input: &str, expected: &str) {
         let messages: Vec<Value> = if input.is_empty() {
             vec![]

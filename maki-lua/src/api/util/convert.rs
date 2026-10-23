@@ -117,7 +117,6 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
 
 /// [`json_to_lua`], except every null becomes `maki.NIL`, so a Lua → JSON
 /// round trip gives back the same JSON.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn json_to_lua_exact(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
     json_to_lua_with(lua, value, &Luanil::NONE)
 }

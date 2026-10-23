@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
@@ -11,33 +11,73 @@ use tracing::warn;
 
 use super::frame::LiveFrame;
 use crate::mcp::{McpSession, ToolDeferral};
+use crate::session::SessionHeader;
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
 pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
 pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
+pub type SharedHeader = Arc<ArcSwap<SessionHeader>>;
+
+struct LiveEntry {
+    history: Weak<ArcSwap<HistorySnapshot>>,
+    /// Only a driver whose settings live nowhere else publishes one: the TUI
+    /// answers for its tabs itself.
+    header: Option<Weak<ArcSwap<SessionHeader>>>,
+}
+
+impl LiveEntry {
+    fn header(&self) -> Option<Arc<SessionHeader>> {
+        Some(self.header.as_ref()?.upgrade()?.load_full())
+    }
+}
 
 /// Weak, so a session that ends takes its transcript with it. The dead entries
 /// it leaves behind get swept on the next publish.
-static LIVE_HISTORIES: LazyLock<Mutex<HashMap<MakiId, Weak<ArcSwap<HistorySnapshot>>>>> =
-    LazyLock::new(Mutex::default);
+static LIVE_HISTORIES: LazyLock<Mutex<HashMap<MakiId, LiveEntry>>> = LazyLock::new(Mutex::default);
+
+fn live_entries() -> MutexGuard<'static, HashMap<MakiId, LiveEntry>> {
+    LIVE_HISTORIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn publish(session: MakiId, mirror: &SharedMessages, header: Option<&SharedHeader>) {
+    let mut live = live_entries();
+    live.retain(|_, entry| entry.history.strong_count() > 0);
+    let entry = LiveEntry {
+        history: Arc::downgrade(mirror),
+        header: header.map(Arc::downgrade),
+    };
+    live.insert(session, entry);
+}
 
 /// A second publish for the same id wins, which is what a reloaded tab wants.
 pub fn publish_live_history(session: MakiId, mirror: &SharedMessages) {
-    let mut live = LIVE_HISTORIES
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    live.retain(|_, mirror| mirror.strong_count() > 0);
-    live.insert(session, Arc::downgrade(mirror));
+    publish(session, mirror, None);
+}
+
+/// [`publish_live_history`] with the session's settings next to it, so a
+/// reader answers for a session nothing has saved yet without the disk.
+pub fn publish_live_session(session: MakiId, mirror: &SharedMessages, header: &SharedHeader) {
+    publish(session, mirror, Some(header));
 }
 
 pub fn live_history(session: MakiId) -> Option<Arc<Vec<Message>>> {
-    let live = LIVE_HISTORIES
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let mirror = live.get(&session)?.upgrade()?;
-    Some(Arc::clone(&mirror.load().messages))
+    live_snapshot(session).map(|snapshot| Arc::clone(&snapshot.messages))
+}
+
+/// The messages together with the frame they were sent under, for a reader
+/// that has to know what the model was told.
+pub fn live_snapshot(session: MakiId) -> Option<Arc<HistorySnapshot>> {
+    let mirror = live_entries().get(&session)?.history.upgrade()?;
+    Some(mirror.load_full())
+}
+
+/// The settings of a live session a headless driver runs.
+pub fn live_header(session: MakiId) -> Option<Arc<SessionHeader>> {
+    live_entries().get(&session)?.header()
 }
 
 pub struct History {

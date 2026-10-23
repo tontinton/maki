@@ -17,12 +17,14 @@ use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use maki_agent::agent::TranscriptError;
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
+use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::{
-    AgentMode, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
-    McpSnapshot, McpSnapshotReader, SharedBuf, SubagentInbox, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent,
+    AgentMode, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors, McpServerInfo,
+    McpServerStatus, McpSnapshot, McpSnapshotReader, SharedBuf, SubagentInbox, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -39,6 +41,7 @@ use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
 use maki_storage::sessions::{
     SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, THINKING_ADAPTIVE,
+    ThinkingParseError,
 };
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
@@ -102,6 +105,8 @@ const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so n
 const MEASURED_CONTEXT: u32 = 100_000;
 const TEST_MODEL_SPEC: &str = "test-model";
 const TEST_CWD: &str = "/tmp/test";
+const DOCUMENT_TEXT: &str = "moved in from another maki";
+const UNKNOWN_THINKING: &str = "lukewarm";
 const PERMISSIONS_CWD: &str = "/tmp";
 /// The rewind fixture holds a few dozen bytes of chat, far below this, so it
 /// doubles as the window the gauge is allowed to land in.
@@ -964,6 +969,110 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
     assert!(session.messages().is_empty());
     assert_eq!(session.model, app.state.model.spec());
     assert_eq!(session.cwd, app.state.session.cwd);
+}
+
+/// `maki.session.new` lays its document over this same blank session, so a
+/// plugin's "new session" starts where `Ctrl-N` would. A blank one keeps the
+/// tab's yolo like `Ctrl-N` does, and a conversation never brings it along.
+#[test_case(Vec::new(), Some(true) ; "blank_keeps_yolo")]
+#[test_case(vec![Message::user(DOCUMENT_TEXT.into())], None ; "conversation_drops_yolo")]
+fn a_plugin_made_session_starts_from_the_focused_tab(messages: Vec<Message>, yolo: Option<bool>) {
+    let mut app = test_app();
+    app.state.fast = true;
+    app.state.workflow = true;
+    app.permissions.set_session_yolo(Some(true));
+    let transcript = Transcript {
+        messages,
+        ..Default::default()
+    };
+
+    let session = app.session_from(transcript).unwrap().session;
+
+    assert_eq!(session.cwd, app.state.session.cwd);
+    assert_eq!(session.model, app.state.model.spec());
+    assert!(session.meta.fast);
+    assert!(session.meta.workflow);
+    assert_eq!(session.meta.yolo, yolo);
+}
+
+/// Without `prompt` or `focus`, `maki.session.new` only stores, and a bad
+/// document has to fail before anything reaches the disk.
+#[test_case(None ; "a_valid_document_is_stored")]
+#[test_case(Some(UNKNOWN_THINKING) ; "an_invalid_document_answers_its_error_and_stores_nothing")]
+fn a_plugin_made_session_is_stored_only_when_valid(thinking: Option<&str>) {
+    let (_tmp, dir, _writer, app) = tempdir_app();
+    let transcript = Transcript {
+        thinking: thinking.map(str::to_owned),
+        messages: vec![Message::user(DOCUMENT_TEXT.into())],
+        ..Default::default()
+    };
+
+    let stored = app
+        .session_from(transcript)
+        .map(|open| open.store(&dir).unwrap());
+
+    let listed: Vec<MakiId> = AppSession::list_all(&dir)
+        .unwrap()
+        .into_iter()
+        .map(|summary| summary.id)
+        .collect();
+    match (thinking, stored) {
+        (None, Ok(id)) => assert_eq!(listed, [id]),
+        (Some(bad), Err(e)) => {
+            let expected = TranscriptError::from(ThinkingParseError::Unknown(bad.into()));
+            assert_eq!(e, expected.to_string());
+            assert!(listed.is_empty());
+        }
+        (_, stored) => panic!("unexpected outcome {stored:?}"),
+    }
+}
+
+/// A history that repairs down to nothing would be a dead entry in the
+/// picker, so it is refused at the write rather than stored empty.
+#[test]
+fn a_plugin_made_session_without_messages_is_not_stored() {
+    let (_tmp, dir, _writer, app) = tempdir_app();
+    let emptied = Message {
+        content: Vec::new(),
+        ..Message::user(DOCUMENT_TEXT.into())
+    };
+    let transcript = Transcript {
+        messages: vec![emptied],
+        ..Default::default()
+    };
+
+    let error = app
+        .session_from(transcript)
+        .unwrap()
+        .store(&dir)
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), NOTHING_TO_STORE);
+    assert!(AppSession::list_all(&dir).unwrap().is_empty());
+}
+
+/// `maki.session.export` answers an open tab from memory, so a turn that has
+/// not reached disk and a setting changed since the last checkpoint both
+/// travel.
+#[test_case(true ; "from_the_agents_mirror")]
+#[test_case(false ; "from_a_tab_whose_agent_never_started")]
+fn a_tab_exports_its_unsaved_messages_and_live_settings(agent_started: bool) {
+    let mut app = test_app();
+    let unsaved = vec![Message::user(DOCUMENT_TEXT.into())];
+    if agent_started {
+        let mirror = HistorySnapshot::new(unsaved.clone());
+        app.shared_history = Some(Arc::new(ArcSwap::from_pointee(mirror)));
+    } else {
+        app.state.session_mut().push_message(unsaved[0].clone());
+    }
+    app.state.fast = true;
+    app.state.mode = Mode::Plan;
+
+    let export = app.export();
+
+    assert_eq!(*export.messages, unsaved);
+    assert!(export.header.fast);
+    assert_eq!(export.header.mode, Some(StoredMode::Plan));
 }
 
 /// A setting written into the meta but never read back still opens the tab
