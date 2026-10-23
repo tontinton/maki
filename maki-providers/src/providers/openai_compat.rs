@@ -8,7 +8,7 @@ use flume::Sender;
 use maki_storage::id::MakiId;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, Method, RequestBuilder};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::{debug, warn};
@@ -601,8 +601,14 @@ pub async fn parse_sse(
     let mut stop_reason: Option<StopReason> = None;
     let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
+    let mut comment_cost: Option<f64> = None;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
+        if let Some(cost) = super::parse_cost_comment(&line) {
+            comment_cost = Some(cost);
+            continue;
+        }
+
         let data = match line.strip_prefix("data:") {
             Some(d) => d.trim(),
             None => continue,
@@ -797,6 +803,8 @@ pub async fn parse_sse(
         content_blocks.push(ContentBlock::tool_use(acc.id, name, input));
     }
 
+    usage.cost = usage.cost.or(comment_cost);
+
     Ok(StreamResponse {
         message: Message {
             role: Role::Assistant,
@@ -974,28 +982,50 @@ data: [DONE]\n";
     #[test_case(json!({"cost": 0}), None ; "zero_is_no_bill")]
     #[tokio::test]
     async fn parse_sse_billed_cost_shapes(billing: Value, expected: Option<f64>) {
-            let mut usage = json!({"prompt_tokens": 100, "completion_tokens": 10});
-            usage
-                .as_object_mut()
-                .unwrap()
-                .extend(billing.as_object().unwrap().clone());
-            let chunk = json!({
-                "choices": [{"finish_reason": "stop", "delta": {}}],
-                "usage": usage,
-            });
-            let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
+        let mut usage = json!({"prompt_tokens": 100, "completion_tokens": 10});
+        usage
+            .as_object_mut()
+            .unwrap()
+            .extend(billing.as_object().unwrap().clone());
+        let chunk = json!({
+            "choices": [{"finish_reason": "stop", "delta": {}}],
+            "usage": usage,
+        });
+        let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
 
-            let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
 
-            assert_eq!(resp.usage.input, 100, "{COUNTS_SURVIVE_A_BAD_COST}");
-            assert_eq!(resp.usage.output, 10, "{COUNTS_SURVIVE_A_BAD_COST}");
-            match (resp.usage.cost, expected) {
-                (Some(got), Some(want)) => assert!((got - want).abs() < 1e-9),
-                (got, want) => assert_eq!(got, want),
-            }
+        assert_eq!(resp.usage.input, 100, "{COUNTS_SURVIVE_A_BAD_COST}");
+        assert_eq!(resp.usage.output, 10, "{COUNTS_SURVIVE_A_BAD_COST}");
+        match (resp.usage.cost, expected) {
+            (Some(got), Some(want)) => assert!((got - want).abs() < 1e-9),
+            (got, want) => assert_eq!(got, want),
+        }
+    }
+
+    #[test_case(None, Some(0.0000104) ; "comment_prices_the_turn")]
+    #[test_case(Some(0.5), Some(0.5) ; "usage_cost_wins")]
+    #[tokio::test]
+    async fn parse_sse_cost_comment(usage_cost: Option<f64>, expected: Option<f64>) {
+        let mut usage = json!({"prompt_tokens": 100, "completion_tokens": 10});
+        if let Some(cost) = usage_cost {
+            usage["cost"] = json!(cost);
+        }
+        let chunk = json!({"choices": [], "usage": usage});
+        let sse = format!(
+            "data: {chunk}\n\n: energy {{\"energy_joules\": 4.99}}\n\n: cost {{\"request_cost_usd\": 1.04e-05}}\n\ndata: [DONE]\n"
+        );
+
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.usage.input, 100);
+        assert_eq!(resp.usage.cost, expected);
     }
 
     const COPILOT_NANO_AIU: u64 = 375_000;

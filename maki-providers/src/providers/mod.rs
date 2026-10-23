@@ -47,6 +47,8 @@ const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
 const UPSTREAM_COST_KEY: &str = "upstream_inference_cost";
+const COST_COMMENT_TAG: &str = "cost";
+const COMMENT_COST_KEY: &str = "request_cost_usd";
 
 /// What a gateway billed for one turn, read from its `usage` object. Only the
 /// shapes a gateway documents are read: OpenRouter's `cost` and
@@ -77,6 +79,19 @@ impl BilledCost {
             (cost, upstream) => Some(cost.unwrap_or(0.0) + upstream.unwrap_or(0.0)),
         }
     }
+}
+
+/// Neuralwatt sends its bill as an SSE comment just before `data: [DONE]`:
+/// `: cost {"request_cost_usd": 1.04e-05, ...}`
+/// (<https://docs.neuralwatt.com/guides/streaming>). Comments are invisible to
+/// strict `data:` consumers, which is why it chose them.
+pub(crate) fn parse_cost_comment(line: &str) -> Option<f64> {
+    let payload = line
+        .strip_prefix(':')?
+        .trim_start()
+        .strip_prefix(COST_COMMENT_TAG)?;
+    let cost: Value = serde_json::from_str(payload).ok()?;
+    cost.get(COMMENT_COST_KEY).and_then(cost_from_value)
 }
 
 fn cost_from_value(value: &Value) -> Option<f64> {
@@ -1286,5 +1301,16 @@ mod tests {
             (Some(got), Some(want)) => assert!((got - want).abs() < 1e-9, "{got} vs {want}"),
             (got, want) => assert_eq!(got, want),
         }
+    }
+
+    #[test_case(r#": cost {"request_cost_usd": 1.04e-05, "cache_savings_usd": 0.0}"#, Some(1.04e-05) ; "neuralwatt_documented")]
+    #[test_case(r#":cost {"request_cost_usd": 0.5}"#, Some(0.5) ; "no_space_after_colon")]
+    #[test_case(r#": cost {"request_cost_usd": 0}"#, None ; "free_request")]
+    #[test_case(r#": cost {"amount": 0.5}"#, None ; "undocumented_key")]
+    #[test_case(r#": energy {"request_cost_usd": 0.5}"#, None ; "other_comment")]
+    #[test_case(": cost 0.5", None ; "not_an_object")]
+    #[test_case(": keepalive", None ; "keepalive")]
+    fn cost_comment(line: &str, expected: Option<f64>) {
+        assert_eq!(parse_cost_comment(line), expected);
     }
 }

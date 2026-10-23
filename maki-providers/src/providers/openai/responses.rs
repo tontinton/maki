@@ -752,16 +752,15 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
     #[test_case("\"cost\":0.00002,\"cost_details\":{\"upstream_inference_cost\":0.0004}" ; "byok")]
     #[tokio::test]
     async fn parse_sse_billed_cost(cost_fields: &str) {
-            let frame = format!(
-                "event: response.completed\ndata: {{\"response\":{{\"status\":\"completed\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,{cost_fields}}}}}}}\n\n"
-            );
-            let (resp, _) = run_sse(&frame).await;
-            let resp = resp.unwrap();
-            let cost = resp.usage.cost.expect("billed cost should be captured");
-            assert!((cost - BILLED_COST).abs() < 1e-9);
-            assert_eq!(resp.usage.input, 10);
-            assert_eq!(resp.usage.output, 2);
-
+        let frame = format!(
+            "event: response.completed\ndata: {{\"response\":{{\"status\":\"completed\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,{cost_fields}}}}}}}\n\n"
+        );
+        let (resp, _) = run_sse(&frame).await;
+        let resp = resp.unwrap();
+        let cost = resp.usage.cost.expect("billed cost should be captured");
+        assert!((cost - BILLED_COST).abs() < 1e-9);
+        assert_eq!(resp.usage.input, 10);
+        assert_eq!(resp.usage.output, 2);
     }
 
     #[tokio::test]
