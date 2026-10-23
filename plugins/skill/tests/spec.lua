@@ -73,6 +73,29 @@ case("frontmatter_only_dashes_no_yaml", function()
   eq(body, "Body")
 end)
 
+case("frontmatter_accepts_crlf_and_complete_delimiters", function()
+  for _, newline in ipairs({ "\n", "\r\n" }) do
+    local input = table.concat({
+      "---",
+      "name: portable",
+      "description: Windows file",
+      "---extra: value",
+      "---",
+      "Body",
+    }, newline)
+    local fm, body = parse_frontmatter(input)
+    eq(fm.name, "portable")
+    eq(fm["---extra"], "value")
+    eq(body, "Body")
+  end
+end)
+
+case("frontmatter_closing_delimiter_at_eof", function()
+  local fm, body = parse_frontmatter("---\nname: portable\ndescription: Example\n---")
+  eq(fm.name, "portable")
+  eq(body, "")
+end)
+
 -- ── build_skill_list ──
 
 case("build_skill_list_empty", function()

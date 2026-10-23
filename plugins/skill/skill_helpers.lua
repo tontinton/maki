@@ -4,16 +4,16 @@ local LINE_PAT = "^%s*%d+ | (.*)$"
 local M = {}
 
 function M.parse_frontmatter(content)
-  local rest = content:match("^%s*%-%-%-\n(.*)")
+  local rest = content:match("^%s*%-%-%-[ \t]*\r?\n(.*)")
   if not rest then
     return {}, content
   end
-  local end_pos = rest:find("\n%-%-%-")
+  local end_pos, end_line = (rest .. "\n"):find("\n%-%-%-[ \t]*\r?\n")
   if not end_pos then
     return {}, content
   end
   local yaml_str = rest:sub(1, end_pos)
-  local body = rest:sub(end_pos + 4):match("^%s*(.-)%s*$")
+  local body = rest:sub(end_line + 1):match("^%s*(.-)%s*$")
   local fm, _ = maki.yaml.decode(yaml_str)
   if not fm then
     fm = {}
