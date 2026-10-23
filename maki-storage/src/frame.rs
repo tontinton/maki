@@ -35,6 +35,8 @@ pub struct LiveFacts {
     pub prompt: Option<PromptFacts>,
 }
 
+/// A new variant is not skew-safe: an older build drops the whole message
+/// holding it, so it needs a `LOG_FORMAT_VERSION` bump.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanChange {

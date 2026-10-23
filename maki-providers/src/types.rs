@@ -15,16 +15,30 @@ use maki_storage::frame::FactsUpdate;
 use maki_storage::intern;
 pub use maki_storage::sessions::Effort;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, THINKING_ADAPTIVE, TitleSource};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
-use strum::{Display, IntoStaticStr};
-use tracing::warn;
+use strum::{Display, IntoStaticStr, VariantNames};
+use tracing::{debug, warn};
 
 use crate::TokenUsage;
 use crate::image::{Fix, IMAGE_EVICTION_STEP, MAX_IMAGES, fix_for_wire};
 use crate::model::Model;
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
+const BLOCK_TYPE_KEY: &str = "type";
+/// Every `type` the derived impl parses. Taken from the enum so a new variant
+/// is never missing, minus `Unknown`, which is never parsed and so stays last.
+const KNOWN_BLOCK_TYPES: &[&str] = match ContentBlock::VARIANTS.split_last() {
+    Some((_unknown, known)) => known,
+    None => &[],
+};
+pub const UNTYPED_BLOCK: &str = "a content block must be an object with a string `type`";
+pub const CONTEXT_UPDATE_WITHOUT_FACTS: &str = "a context_update message must carry its facts";
+/// Facts are only ever written beside a context update, so anywhere else
+/// they are a fabricated or corrupted message, not something to drop.
+pub const FACTS_WITHOUT_CONTEXT_UPDATE: &str = "only a context_update message carries facts";
+pub const UNKNOWN_IMAGE_MEDIA_TYPE: &str = "unknown image media type";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -63,7 +77,7 @@ impl<'de> Deserialize<'de> for ImageMediaType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         Self::from_mime(&s)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown image media type '{s}'")))
+            .ok_or_else(|| serde::de::Error::custom(format!("{UNKNOWN_IMAGE_MEDIA_TYPE} '{s}'")))
     }
 }
 
@@ -91,21 +105,24 @@ impl fmt::Debug for ImageSource {
 
 impl<'de> Deserialize<'de> for ImageSource {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Borrowed so a block read from its buffered `Value` copies the
+        // payload once, into the final `Arc`. A reader that cannot lend
+        // strings hands over an owned one instead.
         #[derive(Deserialize)]
-        struct Wire {
+        struct Wire<'a> {
             media_type: ImageMediaType,
-            data: String,
+            #[serde(borrow)]
+            data: Cow<'a, str>,
         }
         let wire = Wire::deserialize(deserializer)?;
         // Base64 image payloads are the largest strings a session holds, and a
         // load decodes each one once per record that carries it.
-        Ok(Self::new(wire.media_type, intern::shared_str(wire.data)))
+        Ok(Self::new(wire.media_type, intern::shared_str(&wire.data)))
     }
 }
 
 impl Serialize for ImageSource {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("ImageSource", 3)?;
         state.serialize_field("type", "base64")?;
         state.serialize_field("media_type", &self.media_type)?;
@@ -250,6 +267,8 @@ fn images_kept(total: usize) -> usize {
     total - over.div_ceil(IMAGE_EVICTION_STEP) * IMAGE_EVICTION_STEP
 }
 
+/// A new variant is not skew-safe: an older build drops the whole record, so
+/// it needs a `LOG_FORMAT_VERSION` bump.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -264,8 +283,24 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Part of the frozen session surface (disk, exports, Lua), so it only grows:
+///
+/// - Fields and variants are only added, fields always with a default.
+///   Neither needs a log format bump.
+/// - An older build keeps a variant it does not know as [`Self::Unknown`],
+///   but drops a field it does not know on its next rewrite. So data an older
+///   build must not lose goes in a new variant, never in a new field. A field
+///   is for something whose loss falls back to a default (`loaded_tools`, a
+///   flag).
+/// - A known block holding a value an older build cannot read (a new media
+///   type, a new image source) is kept whole as [`Self::Unknown`] too, so
+///   loading never fails on a block. Strict readers ask [`Self::strict_error`].
+/// - A new variant may sit beside `ToolUse`/`ToolResult` but never replace
+///   them. An older build treats it as inert, so a call answered only by a
+///   new variant would be left unanswered there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, VariantNames)]
+#[serde(remote = "Self", tag = "type", rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ContentBlock {
     Text {
         text: String,
@@ -300,11 +335,71 @@ pub enum ContentBlock {
     Image {
         source: ImageSource,
     },
+    /// A block this build cannot read, most likely written by a newer one.
+    /// Kept as raw JSON and written back unchanged, never sent to a provider.
+    /// Must stay the last variant (see [`KNOWN_BLOCK_TYPES`]).
+    #[serde(skip)]
+    Unknown(Value),
+}
+
+fn block_type(raw: &Value) -> Option<&str> {
+    raw.get(BLOCK_TYPE_KEY)?.as_str()
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Value::deserialize(deserializer)?;
+        match block_type(&raw) {
+            None => warn!("keeping a content block without a string type as unknown"),
+            Some(known) if KNOWN_BLOCK_TYPES.contains(&known) => match Self::deserialize(&raw) {
+                Ok(block) => return Ok(block),
+                // Expected under version skew and nothing the user can fix,
+                // and loads are frequent. A strict import reports it loudly.
+                Err(error) => debug!(
+                    block_type = known,
+                    %error,
+                    "keeping a content block this build cannot read as unknown"
+                ),
+            },
+            Some(newer) => debug!(
+                block_type = newer,
+                "keeping a content block of a type this build does not know"
+            ),
+        }
+        Ok(Self::Unknown(raw))
+    }
+}
+
+impl Serialize for ContentBlock {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unknown(raw) => raw.serialize(serializer),
+            known => Self::serialize(known, serializer),
+        }
+    }
 }
 
 impl ContentBlock {
     pub fn is_thinking(&self) -> bool {
         matches!(self, Self::Thinking { .. } | Self::RedactedThinking { .. })
+    }
+
+    /// Why a strict reader (transcript import) must refuse this block, or
+    /// `None` if it may keep it. An [`Self::Unknown`] of a type this build
+    /// does not know is a newer build's block and passes. One without a
+    /// string `type` gets [`UNTYPED_BLOCK`], and one of a known type gets the
+    /// serde error that kept it from parsing.
+    pub fn strict_error(&self) -> Option<String> {
+        let Self::Unknown(raw) = self else {
+            return None;
+        };
+        match block_type(raw) {
+            None => Some(UNTYPED_BLOCK.to_owned()),
+            Some(known) if KNOWN_BLOCK_TYPES.contains(&known) => {
+                Self::deserialize(raw).err().map(|error| error.to_string())
+            }
+            Some(_) => None,
+        }
     }
 }
 
@@ -313,7 +408,13 @@ impl ContentBlock {
 /// travel as a user message, and without this there is no way to tell it
 /// apart from the user actually typing. A prefix in the text would not do:
 /// a log line can print one.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr)]
+///
+/// `Deserialize` reads a bare tag, or the nested `{"context_update": facts}`
+/// that logs held before [`Message`] went flat. Nothing writes that anymore.
+///
+/// A new variant is not skew-safe: an older build drops the whole record, so
+/// it needs a `LOG_FORMAT_VERSION` bump.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum MessageKind {
@@ -363,16 +464,96 @@ impl ContentBlock {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+/// Part of the frozen session surface (disk, exports, Lua), written flat:
+/// `{"role", "content", "display_text"?, "kind"?, "facts"?}`, with `kind` as
+/// a bare tag and `facts` beside a `context_update`. Older logs nest it as
+/// `{"kind": {"context_update": facts}}`. Those still load, and are not
+/// rewritten just for that.
+///
+/// It only grows, by the same rules as [`ContentBlock`].
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "RawMessage")]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
-    /// Skipped when it is `Turn`, so sessions written before this existed
-    /// load unchanged.
-    #[serde(default, skip_serializing_if = "MessageKind::is_turn")]
     pub kind: MessageKind,
+}
+
+/// [`Message`] as stored, before `kind` and `facts` are paired up.
+#[derive(Deserialize)]
+struct RawMessage {
+    role: Role,
+    content: Vec<ContentBlock>,
+    #[serde(default)]
+    display_text: Option<String>,
+    #[serde(default)]
+    kind: Option<RawKind>,
+    #[serde(default)]
+    facts: Option<Arc<FactsUpdate>>,
+}
+
+/// [`MessageKind`] reads every kind but the flat `context_update` tag, whose
+/// facts sit beside it.
+#[derive(Deserialize)]
+#[serde(
+    untagged,
+    expecting = "a message kind: a tag, or a nested context_update"
+)]
+enum RawKind {
+    Kind(MessageKind),
+    ContextUpdateTag(ContextUpdateTag),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ContextUpdateTag {
+    ContextUpdate,
+}
+
+impl TryFrom<RawMessage> for Message {
+    type Error = &'static str;
+
+    fn try_from(raw: RawMessage) -> Result<Self, Self::Error> {
+        let kind = match (raw.kind, raw.facts) {
+            (Some(RawKind::ContextUpdateTag(_)), Some(facts)) => MessageKind::ContextUpdate(facts),
+            (Some(RawKind::ContextUpdateTag(_)), None) => return Err(CONTEXT_UPDATE_WITHOUT_FACTS),
+            (_, Some(_)) => return Err(FACTS_WITHOUT_CONTEXT_UPDATE),
+            (Some(RawKind::Kind(kind)), None) => kind,
+            (None, None) => MessageKind::Turn,
+        };
+        Ok(Self {
+            role: raw.role,
+            content: raw.content,
+            display_text: raw.display_text,
+            kind,
+        })
+    }
+}
+
+/// By hand rather than `into = "RawMessage"`, which clones the message first,
+/// and every rewrite serializes the whole history.
+impl Serialize for Message {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let facts = self.facts_update();
+        let len = 2
+            + usize::from(self.display_text.is_some())
+            + usize::from(!self.kind.is_turn())
+            + usize::from(facts.is_some());
+        let mut state = serializer.serialize_struct("Message", len)?;
+        state.serialize_field("role", &self.role)?;
+        state.serialize_field("content", &self.content)?;
+        if let Some(display_text) = &self.display_text {
+            state.serialize_field("display_text", display_text)?;
+        }
+        if !self.kind.is_turn() {
+            state.serialize_field("kind", <&'static str>::from(&self.kind))?;
+        }
+        if let Some(facts) = facts {
+            state.serialize_field("facts", facts)?;
+        }
+        state.end()
+    }
 }
 
 impl Message {
@@ -415,6 +596,15 @@ impl Message {
 
     pub fn is_context_update(&self) -> bool {
         self.facts_update().is_some()
+    }
+
+    /// Exactly what [`Self::context_update`] builds. Anything else tagged as
+    /// one is not the host's, and a compaction would drop real content with it.
+    pub fn is_host_context_update(&self) -> bool {
+        self.is_context_update()
+            && self.role == Role::User
+            && self.display_text.is_none()
+            && matches!(&self.content[..], [ContentBlock::Text { .. }])
     }
 
     pub fn facts_update(&self) -> Option<&FactsUpdate> {
@@ -1410,6 +1600,12 @@ mod tests {
     const UPDATE_HINT_SLOT: &str = "memory/tags";
     const GONE_HINT_SLOT: &str = "todo/after_instructions";
     const UPDATE_HINT: &str = "rust, cache";
+    const UNKNOWN_BLOCK_TYPE: &str = "server_tool_use";
+    const NEWER_MEDIA_TYPE: &str = "image/heic";
+    const UNKNOWN_VARIANT_NAME: &str = "unknown";
+    const SERDE_UNKNOWN_VARIANT: &str = "unknown variant";
+    const SERDE_INVALID_TYPE: &str = "invalid type";
+    const SERDE_MISSING_ID: &str = "missing field `id`";
 
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]
@@ -1476,25 +1672,98 @@ mod tests {
         }
     }
 
+    fn plan_mode_facts_json() -> Value {
+        json!({
+            "date": UPDATE_DATE,
+            "plan": { "entered": UPDATE_PLAN },
+            "hints": { UPDATE_HINT_SLOT: UPDATE_HINT, GONE_HINT_SLOT: null }
+        })
+    }
+
     /// A resume reads what the model holds true from the stored updates, so
     /// the format is pinned. If it drifts, a resumed session forgets plan mode
     /// or the hints.
     #[test]
-    fn context_update_keeps_its_stored_format() {
+    fn context_update_writes_the_flat_shape() {
         let stored = json!({
             "role": "user",
             "content": [{ "type": "text", "text": UPDATE_TEXT }],
-            "kind": { "context_update": {
-                "date": UPDATE_DATE,
-                "plan": { "entered": UPDATE_PLAN },
-                "hints": { UPDATE_HINT_SLOT: UPDATE_HINT, GONE_HINT_SLOT: null }
-            } }
+            "kind": "context_update",
+            "facts": plan_mode_facts_json()
         });
         let update = Message::context_update(UPDATE_TEXT.into(), plan_mode_facts());
         assert_eq!(serde_json::to_value(&update).unwrap(), stored);
 
         let loaded: Message = serde_json::from_value(stored).unwrap();
-        assert_eq!(loaded.facts_update(), Some(&plan_mode_facts()));
+        assert_eq!(loaded, update);
+    }
+
+    #[test]
+    fn context_update_reads_the_old_nested_shape() {
+        let stored = json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": UPDATE_TEXT }],
+            "kind": { "context_update": plan_mode_facts_json() }
+        });
+        let loaded: Message = serde_json::from_value(stored).unwrap();
+        assert_eq!(
+            loaded,
+            Message::context_update(UPDATE_TEXT.into(), plan_mode_facts())
+        );
+    }
+
+    #[test_case(json!({ "role": "user", "content": [], "kind": "context_update" }), CONTEXT_UPDATE_WITHOUT_FACTS ; "tag_without_facts")]
+    #[test_case(json!({ "role": "user", "content": [], "facts": plan_mode_facts_json() }), FACTS_WITHOUT_CONTEXT_UPDATE ; "facts_without_tag")]
+    fn unpaired_context_update_is_an_error(stored: Value, expected: &str) {
+        let err = serde_json::from_value::<Message>(stored).unwrap_err();
+        assert!(err.to_string().contains(expected), "{err}");
+    }
+
+    #[test_case(|_: &mut Message| {}, true ; "as_built")]
+    #[test_case(|m: &mut Message| m.role = Role::Assistant, false ; "from_assistant")]
+    #[test_case(|m: &mut Message| m.display_text = Some(PROMPT.into()), false ; "visible")]
+    #[test_case(|m: &mut Message| m.content = vec![ContentBlock::tool_result("t1", PROMPT, false)], false ; "tool_result")]
+    #[test_case(|m: &mut Message| m.content.push(ContentBlock::Text { text: PROMPT.into() }), false ; "two_blocks")]
+    #[test_case(|m: &mut Message| m.kind = MessageKind::Turn, false ; "not_an_update")]
+    fn host_context_update_is_the_constructed_shape(change: fn(&mut Message), expected: bool) {
+        let mut message = Message::context_update(UPDATE_TEXT.into(), plan_mode_facts());
+        change(&mut message);
+        assert_eq!(message.is_host_context_update(), expected);
+    }
+
+    /// A block this build cannot read may hold a newer build's data, so it
+    /// loads and writes back untouched. A strict import refuses it with the
+    /// detail, unless only its type is new.
+    #[test_case(json!({ "type": UNKNOWN_BLOCK_TYPE, "id": "srvtoolu_1" }), None                 ; "newer_type")]
+    #[test_case(json!({ "type": "text", "text": 42 }), Some(SERDE_INVALID_TYPE)                     ; "text_wrong_type")]
+    #[test_case(json!({ "type": "tool_use", "name": "read", "input": {} }), Some(SERDE_MISSING_ID) ; "tool_use_missing_id")]
+    #[test_case(json!({ "type": "image", "source": { "type": "base64", "media_type": NEWER_MEDIA_TYPE, "data": INTERNED_DATA } }), Some(UNKNOWN_IMAGE_MEDIA_TYPE) ; "image_newer_media_type")]
+    #[test_case(json!({ "text": PROMPT }), Some(UNTYPED_BLOCK)                                      ; "missing_type")]
+    #[test_case(json!({ "type": 7, "text": PROMPT }), Some(UNTYPED_BLOCK)                           ; "non_string_type")]
+    #[test_case(json!(PROMPT), Some(UNTYPED_BLOCK)                                                  ; "not_an_object")]
+    fn unreadable_block_is_kept_as_written(stored: Value, strict_detail: Option<&str>) {
+        let loaded: ContentBlock = serde_json::from_value(stored.clone()).unwrap();
+        assert!(matches!(&loaded, ContentBlock::Unknown(raw) if *raw == stored));
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), stored);
+        match (loaded.strict_error(), strict_detail) {
+            (None, None) => {}
+            (Some(error), Some(detail)) => assert!(error.contains(detail), "{error}"),
+            (error, detail) => panic!("strict error {error:?}, expected {detail:?}"),
+        }
+    }
+
+    /// A name strum derives but serde does not parse would turn every block
+    /// of that type into `Unknown`. Such a block may fail on its fields,
+    /// never on the tag.
+    #[test]
+    fn every_derived_block_type_is_a_serde_tag() {
+        assert_eq!(ContentBlock::VARIANTS.last(), Some(&UNKNOWN_VARIANT_NAME));
+        for &name in KNOWN_BLOCK_TYPES {
+            if let Err(error) = ContentBlock::deserialize(json!({ BLOCK_TYPE_KEY: name })) {
+                let error = error.to_string();
+                assert!(!error.contains(SERDE_UNKNOWN_VARIANT), "{name}: {error}");
+            }
+        }
     }
 
     /// A first run in plan mode tells the model before the user's prompt, and
@@ -1756,6 +2025,27 @@ mod tests {
         let deserialized: ImageSource = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.media_type, ImageMediaType::Png);
         assert_eq!(&*deserialized.data, "abc123");
+    }
+
+    fn image_block_source(wire: &[u8]) -> ImageSource {
+        match serde_json::from_slice(wire).unwrap() {
+            ContentBlock::Image { source } => source,
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    fn image_source_from_reader(wire: &[u8]) -> ImageSource {
+        serde_json::from_reader(wire).unwrap()
+    }
+
+    /// A block borrows the payload from its buffered `Value`, while a reader
+    /// cannot lend strings at all. Both must yield the same image.
+    #[test_case(json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": INTERNED_DATA } }), image_block_source ; "block_borrowed_from_value")]
+    #[test_case(json!({ "type": "base64", "media_type": "image/png", "data": INTERNED_DATA }), image_source_from_reader ; "source_owned_from_reader")]
+    fn image_source_deserializes_borrowed_or_owned(stored: Value, read: fn(&[u8]) -> ImageSource) {
+        let source = read(stored.to_string().as_bytes());
+        assert_eq!(source.media_type, ImageMediaType::Png);
+        assert_eq!(&*source.data, INTERNED_DATA);
     }
 
     /// The payloads a session repeats across records collapse to one

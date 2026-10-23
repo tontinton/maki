@@ -381,7 +381,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     }
                     parts.push(part);
                 }
-                ContentBlock::RedactedThinking { .. } => {}
+                ContentBlock::RedactedThinking { .. } | ContentBlock::Unknown(_) => {}
                 ContentBlock::ToolUse {
                     id: _,
                     name,

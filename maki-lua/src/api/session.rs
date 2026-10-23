@@ -188,6 +188,7 @@ fn block_json(block: &ContentBlock) -> Option<serde_json::Value> {
         ContentBlock::Image { source } => {
             json!({ "type": "image", "media_type": source.media_type })
         }
+        ContentBlock::Unknown(raw) => raw.clone(),
     })
 }
 

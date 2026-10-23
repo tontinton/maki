@@ -712,6 +712,7 @@ mod tests {
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
     const THINKING_SIGNATURE: &str = "sig";
+    const UNKNOWN_BLOCK_TYPE: &str = "server_tool_use";
 
     const USAGE_BODY: &str = r#"{
         "five_hour": {"utilization": 14.0, "resets_at": "2026-02-06T22:00:00+00:00"},
@@ -1272,6 +1273,30 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         ; "only_unsigned_thinking_falls_back"
     )]
     fn wire_messages_replay_only_signed_thinking(content: Vec<ContentBlock>, expected: Value) {
+        let messages = vec![message(Role::Assistant, content)];
+        let json: Value =
+            serde_json::to_value(shared::wire_messages(&messages, &json!([]))).unwrap();
+
+        assert_eq!(json[0]["content"], expected);
+    }
+
+    fn unknown_block() -> ContentBlock {
+        ContentBlock::Unknown(json!({"type": UNKNOWN_BLOCK_TYPE, "id": "srvtoolu_1"}))
+    }
+
+    /// A newer build's block is kept in history but never sent, and a message
+    /// left with nothing else becomes the stand-in, never a request error.
+    #[test_case(
+        vec![unknown_block(), text_block("reply")],
+        json!([{"type": "text", "text": "reply"}])
+        ; "unknown_skipped"
+    )]
+    #[test_case(
+        vec![unknown_block()],
+        json!([{"type": "text", "text": EMPTY_RESPONSE_MARKER}])
+        ; "only_unknown_falls_back"
+    )]
+    fn unknown_blocks_never_reach_the_wire(content: Vec<ContentBlock>, expected: Value) {
         let messages = vec![message(Role::Assistant, content)];
         let json: Value =
             serde_json::to_value(shared::wire_messages(&messages, &json!([]))).unwrap();

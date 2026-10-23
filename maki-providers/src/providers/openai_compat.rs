@@ -378,7 +378,8 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                         }
                         ContentBlock::ToolUse { .. }
                         | ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::Unknown(_) => {}
                     }
                 }
 
@@ -420,7 +421,8 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                         }
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::Unknown(_) => {}
                     }
                 }
 

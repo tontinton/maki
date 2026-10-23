@@ -45,12 +45,12 @@ impl Drop for Scope {
 
 /// A shared handle to `data`, reusing an identical payload already seen in this
 /// scope. Outside a scope this is a plain allocation.
-pub fn shared_str(data: String) -> Arc<str> {
+pub fn shared_str(data: &str) -> Arc<str> {
     TABLE.with_borrow_mut(|table| {
         let Some(table) = table.as_mut() else {
             return Arc::from(data);
         };
-        if let Some(hit) = table.get(data.as_str()) {
+        if let Some(hit) = table.get(data) {
             return Arc::clone(hit);
         }
         let shared: Arc<str> = Arc::from(data);
@@ -74,9 +74,9 @@ mod tests {
     fn scope_exit_releases_every_payload_it_interned() {
         let kept = {
             let _scope = Scope::enter();
-            let first = shared_str(PAYLOAD.to_owned());
-            let second = shared_str(PAYLOAD.to_owned());
-            let other = shared_str(OTHER.to_owned());
+            let first = shared_str(PAYLOAD);
+            let second = shared_str(PAYLOAD);
+            let other = shared_str(OTHER);
 
             assert!(
                 Arc::ptr_eq(&first, &second),
@@ -105,8 +105,8 @@ mod tests {
 
     #[test]
     fn outside_a_scope_nothing_is_interned() {
-        let first = shared_str(PAYLOAD.to_owned());
-        let second = shared_str(PAYLOAD.to_owned());
+        let first = shared_str(PAYLOAD);
+        let second = shared_str(PAYLOAD);
 
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(Arc::strong_count(&first), 1);
@@ -116,9 +116,9 @@ mod tests {
     fn interning_stops_when_the_scope_ends() {
         let interned = {
             let _scope = Scope::enter();
-            shared_str(PAYLOAD.to_owned())
+            shared_str(PAYLOAD)
         };
 
-        assert!(!Arc::ptr_eq(&interned, &shared_str(PAYLOAD.to_owned())));
+        assert!(!Arc::ptr_eq(&interned, &shared_str(PAYLOAD)));
     }
 }
