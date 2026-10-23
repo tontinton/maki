@@ -167,9 +167,7 @@ end)
 
 case("build_skill_list_empty", function()
   local result = build_skill_list({})
-  assert(result:find("No skills available"), "empty list should say no skills available")
-  assert(result:find("<available_skills>"), "should have opening tag")
-  assert(result:find("</available_skills>"), "should have closing tag")
+  eq(result, "")
 end)
 
 case("build_skill_list_single_skill", function()

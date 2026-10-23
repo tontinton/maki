@@ -144,8 +144,11 @@ local boot_skills = discover_skills(skipped)
 for _, diagnostic in ipairs(skipped) do
   maki.notify(diagnostic, "warn", { title = "Skipped skill" })
 end
-local description = "Load a skill that provides instructions and workflows for specific tasks."
-  .. build_skill_list(boot_skills)
+local names = helpers.skill_names(boot_skills)
+if #names == 0 then
+  return
+end
+local description = "When a task matches a listed skill, load it before proceeding." .. build_skill_list(boot_skills)
 
 maki.api.register_tool({
   name = "skill",
@@ -157,7 +160,7 @@ maki.api.register_tool({
   schema = {
     type = "object",
     properties = {
-      name = { type = "string", description = "Name of the skill to load", required = true },
+      name = { type = "string", enum = names, description = "Name of the skill to load", required = true },
     },
   },
 

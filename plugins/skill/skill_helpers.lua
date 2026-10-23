@@ -124,22 +124,24 @@ function M.scan_skill_dir(dir, skills)
   return diagnostics, skipped
 end
 
+function M.skill_names(skills)
+  local names = {}
+  for name in pairs(skills) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  return names
+end
+
 function M.build_skill_list(skills)
-  local sorted = {}
-  for _, s in pairs(skills) do
-    sorted[#sorted + 1] = s
+  local names = M.skill_names(skills)
+  if #names == 0 then
+    return ""
   end
-  table.sort(sorted, function(a, b)
-    return a.name < b.name
-  end)
-
-  if #sorted == 0 then
-    return "\n\n<available_skills>\nNo skills available.\n</available_skills>"
-  end
-
   local lines = {}
-  for _, s in ipairs(sorted) do
-    lines[#lines + 1] = "- " .. s.name .. ": " .. s.description
+  for _, name in ipairs(names) do
+    local skill = skills[name]
+    lines[#lines + 1] = "- " .. skill.name .. ": " .. skill.description
   end
   return "\n\n<available_skills>\n" .. table.concat(lines, "\n") .. "\n</available_skills>"
 end
