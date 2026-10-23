@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::providers::copilot::copilot_usd;
-use crate::types::{is_deferred_tool, rejects_sampling};
+use crate::types::{ThinkingFallback, is_deferred_tool, rejects_sampling};
 use crate::{
     AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, Message, ProviderEvent,
     Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
@@ -399,7 +399,7 @@ pub(crate) fn build_request_body_with_system(
         body["top_p"] = json!(top_p);
     }
 
-    thinking.apply_to_body(&mut body, model);
+    thinking.apply_thinking(&mut body, model, ThinkingFallback::Anthropic);
     body
 }
 

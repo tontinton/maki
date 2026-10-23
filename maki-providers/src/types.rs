@@ -665,6 +665,8 @@ pub enum ThinkingFallback {
     Dialect(&'static EffortDialect<'static>),
     /// llama.cpp's token budget field.
     BudgetField,
+    /// Anthropic's built-in adaptive / `budget_tokens` spelling.
+    Anthropic,
 }
 
 /// The fragment that spells `thinking` for this model, if it has one. Effort
@@ -957,32 +959,6 @@ impl ThinkingConfig {
         }
     }
 
-    /// Anthropic messages API body. Adaptive-thinking models get the native
-    /// adaptive knob plus `output_config.effort`; legacy models get a plain
-    /// token budget.
-    pub fn apply_to_body(self, body: &mut Value, model: &Model) {
-        if requires_adaptive(&model.id) {
-            if matches!(self, Self::Off) {
-                return;
-            }
-            // These models default `display` to "omitted", so thinking arrives
-            // empty and tool calls pop up out of nowhere in the UI. Asking for
-            // the summary back costs nothing: thinking tokens bill the same.
-            body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
-            if let Some(effort) = self.effort_str(&dialect::ANTHROPIC_ADAPTIVE, model) {
-                body["output_config"]["effort"] = json!(effort);
-            }
-            return;
-        }
-        match self.request_budget(model, model.max_thinking_budget()) {
-            Budgeted::Off => {}
-            Budgeted::Adaptive => body["thinking"] = json!({"type": "adaptive"}),
-            Budgeted::Tokens(n) => {
-                body["thinking"] = json!({"type": "enabled", "budget_tokens": n});
-            }
-        }
-    }
-
     pub fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model) {
         if let Some(effort) = self.effort_str(dialect, model) {
             body["reasoning_effort"] = json!(effort);
@@ -1013,6 +989,31 @@ impl ThinkingConfig {
                     Budgeted::Tokens(n) => i64::from(n),
                 };
                 body[LOCAL_BUDGET_FIELD] = json!(budget);
+            }
+            // Adaptive-thinking models get the native adaptive knob plus
+            // `output_config.effort`; legacy models get a plain token budget.
+            ThinkingFallback::Anthropic => {
+                if requires_adaptive(&model.id) {
+                    if matches!(self, Self::Off) {
+                        return;
+                    }
+                    // These models default `display` to "omitted", so thinking
+                    // arrives empty and tool calls pop up out of nowhere in the
+                    // UI. Asking for the summary back costs nothing: thinking
+                    // tokens bill the same.
+                    body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+                    if let Some(effort) = self.effort_str(&dialect::ANTHROPIC_ADAPTIVE, model) {
+                        body["output_config"]["effort"] = json!(effort);
+                    }
+                    return;
+                }
+                match self.request_budget(model, model.max_thinking_budget()) {
+                    Budgeted::Off => {}
+                    Budgeted::Adaptive => body["thinking"] = json!({"type": "adaptive"}),
+                    Budgeted::Tokens(n) => {
+                        body["thinking"] = json!({"type": "enabled", "budget_tokens": n});
+                    }
+                }
             }
         }
     }
@@ -1736,9 +1737,49 @@ mod tests {
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_7")]
     #[test_case(ThinkingConfig::Effort(Low), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_sonnet_5")]
-    fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
+    fn thinking_apply_thinking_anthropic(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
-        config.apply_to_body(&mut body, &thinking_model(model_id));
+        config.apply_thinking(
+            &mut body,
+            &thinking_model(model_id),
+            ThinkingFallback::Anthropic,
+        );
+        assert_eq!(body, expected);
+    }
+
+    #[test_case(ThinkingConfig::Effort(Low), "low" ; "low_spells_low")]
+    #[test_case(ThinkingConfig::Effort(High), "high" ; "high_spells_high")]
+    #[test_case(ThinkingConfig::Effort(Max), "max" ; "max_spells_max")]
+    fn apply_thinking_merges_declared_fields(config: ThinkingConfig, effort: &str) {
+        let adaptive = json!({"thinking": {"type": "adaptive"}});
+        let fields = json!({
+            "low": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}},
+            "high": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}},
+            "max": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}},
+        });
+        let mut body = json!({});
+        config.apply_thinking(
+            &mut body,
+            &native_thinking_model("glm-5-3", fields),
+            ThinkingFallback::Anthropic,
+        );
+        assert_eq!(body["thinking"], adaptive["thinking"]);
+        assert_eq!(body["output_config"]["effort"], effort);
+    }
+
+    #[test_case(ThinkingConfig::Adaptive, json!({"thinking": {"type": "adaptive"}}) ; "adaptive_falls_back_to_built_in")]
+    #[test_case(ThinkingConfig::Off, json!({}) ; "off_sends_nothing_without_a_key")]
+    fn apply_thinking_left_out_modes_fall_back(config: ThinkingConfig, expected: Value) {
+        let fields = json!({
+            "low": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}},
+            "high": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}},
+        });
+        let mut body = json!({});
+        config.apply_thinking(
+            &mut body,
+            &native_thinking_model("glm-5-3", fields),
+            ThinkingFallback::Anthropic,
+        );
         assert_eq!(body, expected);
     }
 
