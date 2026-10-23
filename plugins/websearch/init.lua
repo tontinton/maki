@@ -1,5 +1,7 @@
 local REQUEST_TIMEOUT_SECS = 25
 local DEFAULT_NUM_RESULTS = 8
+-- Null fields read as absent: `data.error or data.message` and friends test truthiness.
+local DECODE_OPTS = { luanil = { object = true, array = true } }
 
 local parse_sse_response = require("parse_sse")
 local providers = require("providers")
@@ -129,7 +131,7 @@ local function search_searxng(query, num_results, time_range)
   if not resp then
     return nil, err
   end
-  local data, decode_err = maki.json.decode(resp.body)
+  local data, decode_err = maki.json.decode(resp.body, DECODE_OPTS)
   if not data then
     -- format=json disabled answers 200 + html; the preview is the clue.
     return nil, "SearXNG returned invalid JSON: " .. tostring(decode_err) .. " (body: " .. resp.body:sub(1, 200) .. ")"

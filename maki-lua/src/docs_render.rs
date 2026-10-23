@@ -611,11 +611,16 @@ fn push_fn(out: &mut String, module: &ModuleDoc, f: &FnDoc, classes: &ClassLinks
         DocKind::Table => (module.name, '.'),
         DocKind::Class => (instance_name(module), ':'),
     };
-    let sig = format!("{owner}{sep}{}({})", f.name, f.args);
+    let path = format!("{owner}{sep}{}", f.name);
+    let sig = if f.value {
+        path.clone()
+    } else {
+        format!("{path}({})", f.args)
+    };
     if compact {
         out.push_str(&format!("### `{sig}`\n\n"));
     } else {
-        let title = format!("{owner}{sep}{}()", f.name);
+        let title = if f.value { path } else { format!("{path}()") };
         let id = slug(&title);
         out.push_str(&format!(
             "### `{title}` {{#{id}}}\n\n```lua\n{sig}\n```\n\n"

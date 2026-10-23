@@ -29,6 +29,7 @@ use mlua::{
 };
 use serde_json::{Value, json};
 
+use crate::api::image::LuaImage;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
@@ -711,7 +712,7 @@ fn register_prompt(
 ///                                diff_path   (string)  Path for a diff output block.
 ///                                diff_before (string)  Before text of the diff.
 ///                                diff_after  (string)  After text of the diff.
-///                                image       (table)   { media_type: string, data: string } base64 image.
+///                                image       (maki.image.Image|table) An Image, or { media_type: string, data: string } base64 image.
 ///                                state       (any)     Serializable state forwarded to restore.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
@@ -1757,8 +1758,9 @@ pub(crate) struct ToolCallReply {
     pub annotation: Option<String>,
     pub written_path: Option<String>,
     pub diff: Option<DiffPayload>,
-    /// Set via `image = { media_type = "image/png", data = <base64> }` in the
-    /// handler return; becomes `ToolOutput::Image` with `llm_output` as caption.
+    /// Set via `image = <maki.image.Image>` or
+    /// `image = { media_type = "image/png", data = <base64> }` in the handler
+    /// return. It becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
 }
@@ -1866,9 +1868,13 @@ fn extract_image(t: &mlua::Table) -> Result<Option<ImageSource>, String> {
     let entry = match t.get::<LuaValue>("image") {
         Ok(LuaValue::Table(entry)) => entry,
         Ok(LuaValue::Nil) | Err(_) => return Ok(None),
+        Ok(LuaValue::UserData(ud)) if ud.is::<LuaImage>() => {
+            let image = ud.borrow::<LuaImage>().map_err(|e| e.to_string())?;
+            return Ok(Some(image.to_source()));
+        }
         Ok(other) => {
             return Err(format!(
-                "tool 'image' field must be a table {{ media_type, data }}, got {}",
+                "tool 'image' field must be a table {{ media_type, data }} or a maki.image.Image, got {}",
                 other.type_name()
             ));
         }
@@ -1968,6 +1974,23 @@ mod tests {
         assert!(reply.image.is_none());
         let err = reply.result.expect_err("malformed image must error");
         assert!(err.contains(expected), "got: {err}");
+    }
+
+    #[test]
+    fn image_handle_reply_shares_its_payload() {
+        const CAPTION: &str = "c";
+        let source = ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8="));
+        let lua = Lua::new();
+        let reply_table = lua.create_table().unwrap();
+        reply_table.set("llm_output", CAPTION).unwrap();
+        reply_table
+            .set("image", LuaImage::from_source(source.clone()))
+            .unwrap();
+        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(reply_table));
+        assert_eq!(reply.result.as_deref(), Ok(CAPTION));
+        let image = reply.image.expect("an Image return must carry the image");
+        assert!(Arc::ptr_eq(&image.data, &source.data));
+        assert_eq!(image.media_type, ImageMediaType::Png);
     }
 
     fn invocation(input: Value) -> LuaToolInvocation {

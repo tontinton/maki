@@ -146,6 +146,7 @@ const recv__doc: FnDoc = FnDoc {
     }],
     returns: "(table|nil) Event table, or nil if the window has closed.",
     guard: None,
+    value: false,
     example: "while true do\n  local ev = win:recv()\n  if not ev or ev.key == \"q\" then break end\n  if ev.type == \"key\" and ev.key == \"<Down>\" then\n    -- move cursor down\n  end\nend\nwin:close()",
 };
 

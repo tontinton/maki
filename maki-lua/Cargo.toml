@@ -10,7 +10,7 @@ rust-version.workspace = true
 [dependencies]
 arc-swap = { workspace = true }
 base64 = { workspace = true }
-image = { workspace = true, features = ["jpeg", "gif", "webp"] }
+image = { workspace = true, features = ["jpeg", "gif", "webp", "bmp"] }
 crossterm = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }

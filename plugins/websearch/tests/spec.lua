@@ -106,6 +106,17 @@ case("parse_sse_tool_is_error_is_error", function()
   assert(err and err:find(RATE_LIMIT_MSG, 1, true), "should surface the tool message, got: " .. tostring(err))
 end)
 
+case("parse_sse_null_error_is_not_an_error", function()
+  local body = 'data: {"jsonrpc":"2.0","error":null,"result":{"isError":null,"content":[{"text":"found"}]}}'
+  eq(parse_sse_response(body), "found")
+end)
+
+case("parse_sse_non_object_json_is_error", function()
+  local text, err = parse_sse_response("data: null")
+  eq(text, nil)
+  assert(err and err:find("SSE JSON parse error", 1, true), "got: " .. tostring(err))
+end)
+
 -- ── providers ──
 
 local providers = require("providers")

@@ -306,6 +306,43 @@ fn register_echo_tool() {
     assert_eq!(out, "hello");
 }
 
+const NULL_PROBE_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "null_probe",
+    description = "reports how null arrives",
+    schema = {
+        type = "object",
+        properties = { opts = { type = "object", additionalProperties = true } },
+    },
+    audiences = { "main" },
+    handler = function(input)
+        return table.concat({
+            tostring(input.opts.depth == nil),
+            tostring(input.opts.tags[2] == nil),
+            tostring(#input.opts.tags),
+        }, ",")
+    end,
+})
+"#;
+
+/// A truthy sentinel in `if opts.limit then` would silently break every tool
+/// handler, so JSON the host hands a handler stays nil for null.
+#[test]
+fn tool_handler_receives_nil_for_json_null() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("null_probe", NULL_PROBE_PLUGIN).unwrap();
+
+    let out = exec_tool(
+        &reg,
+        "null_probe",
+        json!({"opts": {"depth": null, "tags": ["a", null]}}),
+    )
+    .unwrap();
+
+    assert_eq!(out, "true,true,1");
+}
+
 const SESSION_PLUGIN: &str = r#"
 maki.api.register_tool({
     name = "whoami",

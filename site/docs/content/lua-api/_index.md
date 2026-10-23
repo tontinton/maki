@@ -120,7 +120,7 @@ The rules:
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
 | [`maki.image`](#maki-image) | Small building blocks for working with images: probe metadata, decode |
-| [`maki.image.Image`](#maki-image-Image) | A decoded image you can inspect, resize, and re-encode. |
+| [`maki.image.Image`](#maki-image-Image) | An image you can inspect, resize, and re-encode. |
 | [`maki.interpreter`](#maki-interpreter) | Run Python code in a memory-safe, time-limited sandbox. |
 | [`maki.json`](#maki-json) | JSON encoding, decoding, and schema validation. |
 | [`maki.json.SchemaValidator`](#maki-json-SchemaValidator) | A compiled JSON Schema validator. |
@@ -327,6 +327,58 @@ maki.set_notify_handler(function(msg, level, opts)
 end)
 ```
 
+---
+
+### `maki.deepcopy()` {#maki-deepcopy}
+
+```lua
+maki.deepcopy({orig}, {noref?})
+```
+
+Copy {orig} and every table inside it, keeping each table's metatable.
+That is what lets a copied empty array still encode as `[]` instead of
+`{}`, so use this, not a hand-rolled copy, for anything that goes back to
+the host. Table keys are copied too. Functions, userdata (including
+`maki.NIL`) and other non-table values are shared, not copied.
+
+A table reachable twice is copied once, so shared references and cycles
+survive. Pass {noref} to copy such a table every time it is reached. That
+is faster for trees, but a cycle then fails with an error.
+
+**Parameters:**
+
+- `{orig}` (`any`) Value to copy.
+- `{noref?}` (`boolean?`) Optional. When true, shared references are not tracked.
+
+**Returns:** (`any`) The copy.
+
+**Example:**
+
+```lua
+local input = maki.json.decode('{"files": []}')
+local copy = maki.deepcopy(input)
+copy.mode = "strict"
+print(maki.json.encode(copy)) -- {"files":[],"mode":"strict"}
+```
+
+---
+
+### `maki.NIL` {#maki-NIL}
+
+```lua
+maki.NIL
+```
+
+A value, not a function: the sentinel for JSON null, like `vim.NIL`. `maki.json.decode` returns it for every null unless `luanil` says otherwise, and every conversion to JSON turns it back into null, so a decode, change, encode pass loses no key. It is truthy and not equal to nil, so test `x == maki.NIL` for null. Tool handler arguments and event payloads use nil for null instead, never `maki.NIL`.
+
+**Example:**
+
+```lua
+local t = maki.json.decode('{"a": null}')
+assert(t.a == maki.NIL)
+print(maki.json.encode(t)) -- {"a":null}
+```
+
 
 ## maki.pack {#maki-pack}
 
@@ -432,7 +484,7 @@ only in compact mode.
     - `diff_path` (`string`) Path for a diff output block.
     - `diff_before` (`string`) Before text of the diff.
     - `diff_after` (`string`) After text of the diff.
-    - `image` (`table`) { media_type: string, data: string } base64 image.
+    - `image` (`maki.image.Image|table`) An Image, or { media_type: string, data: string } base64 image.
     - `state` (`any`) Serializable state forwarded to restore.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
@@ -3293,7 +3345,10 @@ maki.image.decode({data})
 ```
 
 Decode raw image bytes into an Image handle you can resize and re-encode.
-Images larger than 50 megapixels are rejected to prevent memory bombs.
+The whole image is decoded up front, so corrupt input fails here rather
+than later. Images larger than 50 megapixels are rejected to prevent
+memory bombs. Formats other than png, jpeg, gif, and webp (like bmp) are
+converted to png, so the image can go into a message.
 
 **Parameters:**
 
@@ -3312,9 +3367,12 @@ print(img:width() .. "x" .. img:height())
 
 ## maki.image.Image {#maki-image-Image}
 
-A decoded image you can inspect, resize, and re-encode.
+An image you can inspect, resize, and re-encode.
 
-Get one from `maki.image.decode()`. The image data lives in memory
+Get one from `maki.image.decode()`. It always holds encoded bytes as
+png, jpeg, gif, or webp, and decodes the pixels on first use. As a
+message image source or through `maki.json.encode` it becomes
+`{ type = "base64", media_type, data }`. The data lives in memory
 until the handle is garbage collected.
 
 ---
@@ -3325,7 +3383,8 @@ until the handle is garbage collected.
 Image:width()
 ```
 
-Get the width of the image in pixels.
+Get the width of the image in pixels. Reads only the header when the
+pixels are not decoded yet.
 
 **Returns:** (`integer`) Width in pixels.
 
@@ -3337,7 +3396,8 @@ Get the width of the image in pixels.
 Image:height()
 ```
 
-Get the height of the image in pixels.
+Get the height of the image in pixels. Reads only the header when the
+pixels are not decoded yet.
 
 **Returns:** (`integer`) Height in pixels.
 
@@ -3351,6 +3411,8 @@ Image:resize({max_w}, {max_h})
 
 Shrink the image to fit inside {max_w} x {max_h}, keeping the aspect
 ratio. If the image already fits, it is returned as-is. Never upscales.
+A resized image is JPEG if the source was JPEG and PNG otherwise, which
+decides its `media_type` when placed into a message.
 
 **Parameters:**
 
@@ -3376,7 +3438,9 @@ Image:encode({format})
 ```
 
 Encode the image into raw bytes in the given format. Use this to prepare
-images for sending over the network or writing to disk.
+images for sending over the network or writing to disk. Bytes that came
+from outside are always re-encoded, so this can shrink an oversized file.
+An image from `resize` asked for its own format comes back as is.
 
 **Parameters:**
 
@@ -3485,8 +3549,14 @@ maki.json.encode({value})
 ```
 
 Turn a Lua value into a JSON string. Tables, strings, numbers,
-booleans, and nil all work. Functions and userdata cannot be
-serialized.
+booleans, nil, and `maki.NIL` (which becomes null) all work. A
+`maki.image.Image` becomes `{ type = "base64", media_type, data }`.
+Functions, threads, other userdata, and tables that contain themselves
+cannot be encoded.
+
+A table is an array when its keys are exactly 1..n, or when it came from
+a JSON array (`maki.json.decode`, `maki.deepcopy` of one). Any other table
+is an object, with number and boolean keys written as strings.
 
 **Parameters:**
 
@@ -3506,23 +3576,34 @@ print(s) -- {"name":"maki","version":1}
 ### `maki.json.decode()` {#maki-json-decode}
 
 ```lua
-maki.json.decode({str})
+maki.json.decode({str}, {opts?})
 ```
 
 Parse a JSON string into a Lua value. Objects become tables and
-arrays become 1-indexed sequences.
+arrays become 1-indexed sequences. Every JSON null becomes `maki.NIL`, so
+a key holding null is still there and encoding the result gives the same
+JSON back. The sentinel is truthy, so test for null with `x == maki.NIL`.
+
+Pass `opts.luanil` to get plain nil instead, like `vim.json.decode`.
+`luanil.object` does so for nulls inside objects and `luanil.array` for
+nulls inside arrays. A null at the top level is always `maki.NIL`.
 
 **Parameters:**
 
 - `{str}` (`string`) JSON string to decode.
+- `{opts?}` (`table?`) Optional. `luanil` (table with boolean `object` and `array`) turns those nulls into nil.
 
 **Returns:** (`any?`, `string?`) Decoded value, or nil plus an error.
 
 **Example:**
 
 ```lua
-local t, err = maki.json.decode('{"x": 42}')
+local t, err = maki.json.decode('{"x": 42, "y": null}')
 print(t.x) -- 42
+print(t.y == maki.NIL) -- true
+
+local u = maki.json.decode('{"y": null}', { luanil = { object = true } })
+print(u.y) -- nil
 ```
 
 ---

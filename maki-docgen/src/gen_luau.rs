@@ -32,11 +32,12 @@ fn push_table(out: &mut String, path: &str, docs: &[&ModuleDoc]) {
     let indent = INDENT.repeat(depth + 1);
     out.push_str("{\n");
     for f in docs.iter().filter(|m| m.name == path).flat_map(|m| m.fns) {
-        out.push_str(&format!(
-            "{indent}{}: @checked {},\n",
-            f.name,
-            signature(path, f, docs)
-        ));
+        let ty = if f.value {
+            ANY.to_owned()
+        } else {
+            format!("@checked {}", signature(path, f, docs))
+        };
+        out.push_str(&format!("{indent}{}: {ty},\n", f.name));
     }
     let children: BTreeSet<&str> = docs
         .iter()

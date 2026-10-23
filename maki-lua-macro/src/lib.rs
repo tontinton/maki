@@ -292,6 +292,7 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
             returns: #returns,
             example: #example,
             guard: #guard_doc,
+            value: false,
         };
     };
 
