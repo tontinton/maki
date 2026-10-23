@@ -33,6 +33,9 @@ const RETRY_AFTER_HEADER: &str = "retry-after";
 /// Responses implementation spells the rejection with a different `code`, so
 /// the field is the only stable part of the answer.
 const REASONING_SUMMARY_PARAM: &str = "reasoning.summary";
+/// OpenAI, Azure and LiteLLM refuse a field with a 400. Servers that validate
+/// with pydantic, like vLLM, answer 422 instead.
+const REJECTED_PARAM_STATUSES: [u16; 2] = [400, 422];
 
 /// Why a provider refused a request for size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +331,23 @@ impl AgentError {
         self.non_login_error().is_some_and(|error| error.is_quota)
     }
 
+    /// Every server words the refusal its own way (`parameters: ['thinking']`,
+    /// `argument supplied: thinking`, `["body","thinking"]`), so we look for
+    /// the name as a whole word. `-` and `_` count as part of a word, or the
+    /// `kimi-k2-thinking` model id that servers echo back would match too.
+    pub fn rejects_param(&self, param: &str) -> bool {
+        let Self::Api {
+            status, message, ..
+        } = self
+        else {
+            return false;
+        };
+        REJECTED_PARAM_STATUSES.contains(status)
+            && message
+                .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+                .any(|word| word == param)
+    }
+
     pub fn is_unsupported_reasoning_summary(&self) -> bool {
         let Self::Api { message, .. } = self else {
             return false;
@@ -539,6 +559,21 @@ mod tests {
             expected
         );
         assert!(!api(400).is_unsupported_reasoning_summary());
+    }
+
+    const THINKING_PARAM: &str = "thinking";
+
+    #[test_case(400, r#"{"error":{"message":"litellm.UnsupportedParamsError: azure does not support parameters: ['thinking'], for model=gpt-5.6-terra."}}"#, true ; "litellm")]
+    #[test_case(400, r#"{"error":{"message":"Unrecognized request argument supplied: thinking","param":null}}"#, true ; "azure_openai")]
+    #[test_case(422, r#"{"detail":[{"type":"extra_forbidden","loc":["body","thinking"]}]}"#, true ; "pydantic_extra_forbidden")]
+    #[test_case(400, r#"{"error":{"message":"model kimi-k2-thinking does not exist"}}"#, false ; "model_id_containing_the_name")]
+    #[test_case(400, r#"{"error":{"message":"unknown field reasoning_thinking_budget"}}"#, false ; "longer_field_name")]
+    #[test_case(500, r#"{"error":{"message":"unsupported parameter: thinking"}}"#, false ; "server_error")]
+    fn rejects_param_finds_the_name_as_a_token(status: u16, body: &str, expected: bool) {
+        assert_eq!(
+            api_msg(status, body).rejects_param(THINKING_PARAM),
+            expected
+        );
     }
 
     fn opencode_body(error_type: &str, message: &str) -> String {

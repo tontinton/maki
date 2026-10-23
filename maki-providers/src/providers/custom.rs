@@ -4,7 +4,7 @@ use maki_config::providers::{
     ModelDef, Protocol, ProviderDef, ProvidersConfig, ThinkingFields, resolve_api_key_env,
     resolve_base_url, resolve_protocol,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::warn;
 
 use super::ResolvedAuth;
@@ -17,17 +17,33 @@ use crate::provider::Provider;
 use crate::providers::Timeouts;
 use crate::spec::{ProviderRegistry, ProviderSpec};
 
+pub(crate) const THINKING_FIELD: &str = "thinking";
+
 /// What an `openai` model without `thinking_fields` spells, which is what the
 /// chat path sent before the fields existed. GLM and Kimi style gateways reason
 /// unless told otherwise, and this is how they are told. The model carries it
 /// as its own fields, so the codec's one thinking pass sends it and a config
 /// that declares fields replaces it wholesale.
 static UNDECLARED_THINKING_FIELDS: LazyLock<ThinkingFields> = LazyLock::new(|| ThinkingFields {
-    off: json!({"thinking": {"type": "disabled"}})
+    off: json!({THINKING_FIELD: {"type": "disabled"}})
         .as_object()
         .cloned(),
     ..ThinkingFields::default()
 });
+
+/// Only the block maki adds on its own is ours to drop when a gateway refuses
+/// it. Whatever a user or a plugin put there goes out as they wrote it.
+pub(crate) fn carries_undeclared_thinking(model: &Model, body: &Value) -> bool {
+    let undeclared = &*UNDECLARED_THINKING_FIELDS;
+    let maki_sends = undeclared
+        .off
+        .as_ref()
+        .and_then(|off| off.get(THINKING_FIELD));
+    model.thinking_fields.as_deref() == Some(undeclared)
+        && body
+            .get(THINKING_FIELD)
+            .is_some_and(|sent| maki_sends == Some(sent))
+}
 
 /// Built-in and plugin slugs win in `from_spec` and `create`, so every custom
 /// path skips them. Ask the spec registry, not `builtin_provider`, which
@@ -352,11 +368,12 @@ fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
 #[cfg(test)]
 mod tests {
     use maki_storage::sessions::Effort::High;
-    use serde_json::Value;
     use test_case::test_case;
 
     use super::*;
+    use crate::test_support::{Canned, Requests, serve};
     use crate::types::{ThinkingConfig, ThinkingFallback};
+    use crate::{Message, RequestOptions, StreamResponse};
 
     const FIELDS_MODEL: &str =
         r#"{"id":"m","thinking_fields":{"high":{"reasoning_effort":"xhigh"}}}"#;
@@ -501,6 +518,104 @@ mod tests {
         let base = protocol_spec(def.protocol.unwrap());
         let model = model_from_def(&def, base, "custom-gw", "m");
         assert_eq!(model.thinking_fields.is_some(), kept);
+    }
+
+    const GATEWAY_SLUG: &str = "litellm";
+    const GATEWAY_MODEL: &str = "gpt-5.6-terra";
+    const PROMPT: &str = "hi";
+    const LITELLM_REFUSAL: Canned = Canned::json(
+        400,
+        r#"{"error":{"message":"litellm.UnsupportedParamsError: azure does not support parameters: ['thinking'], for model=gpt-5.6-terra.","code":"400"}}"#,
+    );
+    const UNRELATED_REFUSAL: Canned = Canned::json(
+        400,
+        r#"{"error":{"message":"messages.0: thinking is not allowed in a user turn"}}"#,
+    );
+    const UNAVAILABLE: Canned =
+        Canned::json(503, r#"{"error":{"message":"upstream unavailable"}}"#);
+    const ANSWER: Canned = Canned::sse(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n",
+    );
+
+    struct Gateway {
+        provider: Box<dyn Provider>,
+        model: Model,
+        requests: Requests,
+    }
+
+    impl Gateway {
+        fn serve(thinking_fields: Value, script: &'static [Canned]) -> Self {
+            let (base_url, requests) = serve(script);
+            let def: ProviderDef = serde_json::from_value(json!({
+                "protocol": "openai",
+                "models": [{"id": GATEWAY_MODEL, "thinking_fields": thinking_fields}],
+            }))
+            .unwrap();
+            let auth = ResolvedAuth::new(GATEWAY_SLUG, Vec::new())
+                .unwrap()
+                .with_base_url(Some(base_url));
+            Self {
+                provider: super::super::codec::build(
+                    CodecOptions::new(Protocol::Openai, GATEWAY_SLUG),
+                    Arc::new(Mutex::new(auth)),
+                    Timeouts::default(),
+                ),
+                model: model_from_def(&def, openai_spec(), GATEWAY_SLUG, GATEWAY_MODEL),
+                requests,
+            }
+        }
+
+        fn ask(&self) -> Result<StreamResponse, AgentError> {
+            let (tx, _rx) = flume::unbounded();
+            smol::block_on(self.provider.stream_message(
+                &self.model,
+                &[Message::user(PROMPT.to_owned())],
+                "",
+                &json!([]),
+                &tx,
+                RequestOptions::default(),
+                None,
+            ))
+        }
+
+        fn sent_thinking(&self) -> Vec<bool> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.json().get(THINKING_FIELD).is_some())
+                .collect()
+        }
+    }
+
+    /// #1302. The last refusal fails the test if the block ever goes out again.
+    #[test]
+    fn a_refused_default_thinking_block_is_dropped_and_remembered() {
+        const SCRIPT: &[Canned] = &[LITELLM_REFUSAL, ANSWER, ANSWER, LITELLM_REFUSAL];
+        let gateway = Gateway::serve(Value::Null, SCRIPT);
+
+        assert!(gateway.ask().is_ok());
+        assert!(gateway.ask().is_ok());
+        assert_eq!(gateway.sent_thinking(), [true, false, false]);
+    }
+
+    #[test_case(&[LITELLM_REFUSAL, UNAVAILABLE, LITELLM_REFUSAL, ANSWER] ; "replay_unavailable")]
+    #[test_case(&[UNRELATED_REFUSAL, UNRELATED_REFUSAL, LITELLM_REFUSAL, ANSWER] ; "refusal_that_only_mentions_thinking")]
+    fn a_failed_replay_is_not_remembered(script: &'static [Canned]) {
+        let gateway = Gateway::serve(Value::Null, script);
+
+        assert!(gateway.ask().is_err());
+        assert!(gateway.ask().is_ok());
+        assert_eq!(gateway.sent_thinking(), [true, false, true, false]);
+    }
+
+    #[test]
+    fn a_declared_thinking_block_is_never_dropped() {
+        const SCRIPT: &[Canned] = &[LITELLM_REFUSAL; 2];
+        let gateway = Gateway::serve(json!({"off": {THINKING_FIELD: {"type": "off"}}}), SCRIPT);
+
+        assert!(gateway.ask().is_err());
+        assert_eq!(gateway.sent_thinking(), [true]);
     }
 
     use crate::TokenUsage;
