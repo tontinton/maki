@@ -628,10 +628,21 @@ pub struct InputDecorate {
     pub marks: InputMarks,
 }
 
+/// Sends the input of {session_id} the way Enter does, only while it still
+/// holds {version}.
+pub struct InputSubmit {
+    pub version: u64,
+    pub session_id: String,
+    /// What the send may reach, checked on the UI side, which alone knows
+    /// what Enter would do with the text.
+    pub caller: PluginReach,
+}
+
 pub enum InputRequest {
     Read,
     Edit(InputEdit),
     Decorate(InputDecorate),
+    Submit(InputSubmit),
 }
 
 pub type UiReply = Result<serde_json::Value, String>;

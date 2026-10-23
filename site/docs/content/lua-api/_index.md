@@ -3852,11 +3852,10 @@ permission prompt or a question opens meanwhile, the waiting keys are
 dropped so they cannot answer it, and the status bar says so.
 
 When your handler changed the input and a waiting `<CR>` or
-`ev.fallback()` then sends it, the send needs your
-[plugin permissions](/docs/lua-api/#plugin-permissions): `agent` for a
-message, `run` for a `!` shell line, and for a `/` command what
-`maki.api.run_command` needs. Without them the input stays as it is and
-the status bar shows the refusal.
+`ev.fallback()` then sends it, the send needs the permissions
+[`maki.ui.input_submit`](/docs/lua-api/#maki-ui-input_submit) lists.
+Without them the input stays as it is and the status bar shows the
+refusal.
 
 Throws on an invalid mode or key, on `<C-c>` and `<C-z>`, which stay
 reserved for quit and suspend, and on a taken key with `unique`.
@@ -6480,9 +6479,9 @@ local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 
 Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
 still work. The calls that need a screen behave like this:
 
-- `input`, `input_edit`, `input_decorate`, and `action` on a built-in
-  name return `nil, "no interactive UI attached"`. Plugin actions
-  still run.
+- `input`, `input_edit`, `input_decorate`, `input_submit`, and `action`
+  on a built-in name return `nil, "no interactive UI attached"`.
+  Plugin actions still run.
 - `open_editor` returns -1.
 - `flash` writes to the log.
 - `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
@@ -6490,8 +6489,8 @@ still work. The calls that need a screen behave like this:
 
 ### Chat input
 
-Plugins can read, change and style what the user types in the chat
-input. Pick the call by the job:
+Plugins can read, change, style and send what the user types in the
+chat input. Pick the call by the job:
 
 | Job | Call |
 | --- | --- |
@@ -6499,15 +6498,16 @@ input. Pick the call by the job:
 | Style text by what it says, like a `$skill:go` chip | [`input_rules`](#maki-ui-input_rules) |
 | Style text from plugin state, like ghost text or diagnostics | [`input_decorate`](#maki-ui-input_decorate) |
 | Change the text, the cursor or the selection | [`input_edit`](#maki-ui-input_edit) |
+| Send the input, as Enter does | [`input_submit`](#maki-ui-input_submit) |
 | React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
 
 Prefer `input_rules` when the look follows from the text. A rule runs
 no Lua per keystroke, and its marks are right again after undo, redo,
 a history recall or a chat switch.
 
-`input`, `input_edit` and `input_decorate` wait for the UI to answer.
-They work from any callback, like a key handler, an autocmd or
-`maki.defer_fn`, but not while your plugin loads.
+`input`, `input_edit`, `input_decorate` and `input_submit` wait for
+the UI to answer. They work from any callback, like a key handler, an
+autocmd or `maki.defer_fn`, but not while your plugin loads.
 
 ### Offsets and versions
 
@@ -6522,13 +6522,13 @@ keeps its own draft.
 
 The calls work on the input of the focused tab. `input`, the
 `InputChanged` event and `ev.input` of a key handler report its
-`version` and `session_id`, and `input_edit` and `input_decorate` need
-both. Every tab counts versions from zero, so a version alone cannot
-tell two tabs apart.
+`version` and `session_id`, and `input_edit`, `input_decorate` and
+`input_submit` need both. Every tab counts versions from zero, so a
+version alone cannot tell two tabs apart.
 
 The user may type between your read and your call. `input_edit` and
-`input_decorate` then move your offsets past what was typed. Both
-refuse when:
+`input_decorate` then move your offsets past what was typed, and
+`input_submit` refuses. All three refuse when:
 
 - `session_id` names a tab that is not focused.
 - The text was replaced since: a history recall, a chat switch that
@@ -6945,8 +6945,8 @@ It throws on a name that cannot be right: no dot and not a built-in, or
 one its loaded plugin never registered.
 
 To try several actions on one key, see
-[Composing keys](/docs/keybindings/#composing-keys). For slash commands,
-see `maki.api.run_command`.
+[Composing keys](/docs/keybindings/#composing-keys). To send the input,
+use `maki.ui.input_submit`. For slash commands, see `maki.api.run_command`.
 
 **Parameters:**
 
@@ -7265,6 +7265,73 @@ maki.api.create_autocmd("InputChanged", {
     })
   end,
 })
+```
+
+---
+
+### `maki.ui.input_submit()` {#maki-ui-input_submit}
+
+```lua
+maki.ui.input_submit({opts})
+```
+
+Sends the chat input the way Enter does, so `/` commands, `!` shell
+lines, images, the queue and the history all work as usual. The one
+difference is a `\` before the cursor: Enter turns it into a new line,
+and `input_submit` sends it as it is.
+
+A send is never moved past newer typing. It goes out only while the
+input still holds `version`, so the user has seen what is sent. After an
+edit, pass the version `input_edit` returned. In a key handler, keys
+typed meanwhile wait for the handler, so `ev.input.version` stays
+current unless the handler runs longer than 1 second (see
+[`maki.keymap.set`](/docs/lua-api/#maki-keymap-set)).
+
+A send needs the [plugin permissions](/docs/lua-api/#plugin-permissions)
+that doing the same thing directly needs:
+
+- A message needs `agent`, also when it waits in the queue or is the
+  retry Enter sends after a login.
+- A `!` or `!!` line needs `run`.
+- A `/` command needs what `maki.api.run_command` needs for it, so
+  `/yolo`, `/trust`, `/packupdate` and `/packdel` are always refused.
+
+The call is refused, and the input left as it is, when:
+
+- The version is not current, or `session_id` names a tab that is not
+  focused.
+- Enter would not reach the input: it is hidden or covered, as for
+  `input_edit`, or the message queue has the keyboard after `/queue`.
+- There is nothing to send, or the command palette is open with no
+  command to run.
+- Your plugin lacks a permission listed above.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `version` (`integer`) the version of the text to send, from `maki.ui.input`, `ev.input` or `input_edit`.
+  - `session_id` (`string`) the tab the version was read from.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` once sent, or nil and an error.
+
+**Example:**
+
+```lua
+-- Spell out `lgtm` before sending:
+maki.keymap.set("i", "<CR>", function(ev)
+  local st = ev.input
+  local s, e = st.text:find("lgtm", 1, true)
+  local version = st.version
+  if s then
+    local r = maki.ui.input_edit({
+      start = s - 1, stop = e, text = "looks good to me",
+      version = st.version, session_id = st.session_id,
+    })
+    if not r then return end
+    version = r.version
+  end
+  maki.ui.input_submit({ version = version, session_id = st.session_id })
+end)
 ```
 
 ---

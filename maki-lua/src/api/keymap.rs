@@ -631,11 +631,10 @@ fn parse_buffer(opts: Option<&Table>) -> LuaResult<Scope> {
 /// dropped so they cannot answer it, and the status bar says so.
 ///
 /// When your handler changed the input and a waiting `<CR>` or
-/// `ev.fallback()` then sends it, the send needs your
-/// [plugin permissions](/docs/lua-api/#plugin-permissions): `agent` for a
-/// message, `run` for a `!` shell line, and for a `/` command what
-/// `maki.api.run_command` needs. Without them the input stays as it is and
-/// the status bar shows the refusal.
+/// `ev.fallback()` then sends it, the send needs the permissions
+/// [`maki.ui.input_submit`](/docs/lua-api/#maki-ui-input_submit) lists.
+/// Without them the input stays as it is and the status bar shows the
+/// refusal.
 ///
 /// Throws on an invalid mode or key, on `<C-c>` and `<C-z>`, which stay
 /// reserved for quit and suspend, and on a taken key with `unique`.

@@ -71,7 +71,7 @@ use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks,
-    InputMode, InputRule, InputRulesReader, Key, KeymapReader, LuaCommandReader,
+    InputMode, InputRule, InputRulesReader, InputSubmit, Key, KeymapReader, LuaCommandReader,
     PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand, PackPreparation, Permission,
     PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView, is_reserved,
 };
@@ -163,9 +163,25 @@ pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (ali
 pub(crate) const INPUT_NOT_LIVE_ERR: &str =
     "the chat input is not on screen, so it cannot be edited";
 pub(crate) const STALE_VERSION_ERR: &str = "input changed since version";
+const SUBMIT_NOT_LIVE_ERR: &str =
+    "Enter would not reach the chat input right now, so it cannot be sent";
+const NOTHING_TO_SEND_ERR: &str = "the chat input is empty, so there is nothing to send";
+const NO_COMMAND_MATCHED_ERR: &str =
+    "the command palette is open but matches no command, so nothing was sent";
 pub(crate) const SEND_MESSAGE: &str = "sending a chat message";
 pub(crate) const RUN_SHELL_LINE: &str = "running a shell line";
 const RUNS_SHELL: PluginAccess = PluginAccess::Needs(Permission::Run);
+
+/// For a typed key `Swallowed` and `Handled` mean the same thing, the key is
+/// used up. A plugin's submit has to tell them apart, because a swallowed
+/// Enter ran nothing and sent nothing.
+enum PaletteKey {
+    Passthrough,
+    Swallowed,
+    Handled(Vec<Action>),
+    /// Enter would run a command a sender may not, and left it in the input.
+    Refused(String),
+}
 
 /// What Enter does with the input once the command palette passed it on.
 /// The send and the check a plugin's send passes first both read it here,
@@ -812,12 +828,8 @@ impl App {
         if !self.input_live(area) {
             return Err(INPUT_NOT_LIVE_ERR.to_string());
         }
-        let current = self.input_box.buffer.version();
-        if edit.strict && edit.version != current {
-            return Err(format!(
-                "{STALE_VERSION_ERR} {} (it is now {current})",
-                edit.version
-            ));
+        if edit.strict {
+            self.check_input_version(edit.version)?;
         }
         let marks = edit.marks.map(|marks| (&*edit.plugin, marks));
         let cursor = self.input_box.apply_edits(
@@ -853,6 +865,78 @@ impl App {
         for chat in &mut self.chats {
             chat.draft.clear_plugin_marks(plugin);
         }
+    }
+
+    /// Runs the same code as a typed Enter, so a plugin can never send
+    /// something Enter would have handled another way. The `\` continuation
+    /// is the one part left out, because the plugin asked to send.
+    ///
+    /// An edit gets moved past the typing since its version, but a send does
+    /// not. That would send text the plugin never planned against and the user
+    /// may not have read yet. An empty input still goes out while a login
+    /// retry is pending, because Enter sends the retry then.
+    ///
+    /// The plugin gets no further than its own grants would take it: a
+    /// command is held to what `maki.api.run_command` lets it run, and a send
+    /// to [`Sending::refusal`]. A refused send leaves the input as it was.
+    pub(crate) fn submit_input(
+        &mut self,
+        req: InputSubmit,
+        area: Rect,
+    ) -> Result<Vec<Action>, String> {
+        self.check_input_session(&req.session_id)?;
+        if !self.input_live(area) || !self.input_focused() {
+            return Err(SUBMIT_NOT_LIVE_ERR.to_string());
+        }
+        self.check_input_version(req.version)?;
+        match self.dispatch_command_palette(KeyEvent::from(KeyCode::Enter), Some(&req.caller)) {
+            PaletteKey::Handled(actions) => return Ok(actions),
+            PaletteKey::Swallowed => return Err(NO_COMMAND_MATCHED_ERR.to_string()),
+            PaletteKey::Refused(refusal) => return Err(refusal),
+            PaletteKey::Passthrough => {}
+        }
+        let input = &self.input_box;
+        if matches!(
+            self.sending(input.buffer.value().trim(), input.has_images()),
+            Sending::Nothing
+        ) {
+            return Err(NOTHING_TO_SEND_ERR.to_string());
+        }
+        self.send_input(Some(&req.caller))
+    }
+
+    /// The plugins a send is held to: {caller} when one asked for it, and
+    /// those whose edit the user's keys were typed blind to, see
+    /// [`Typeahead`]. The user's own Enter on what they saw needs no grant.
+    fn senders<'a>(
+        &'a self,
+        caller: Option<&'a PluginReach>,
+    ) -> impl Iterator<Item = &'a PluginReach> {
+        caller.into_iter().chain(self.typeahead.blind_to())
+    }
+
+    /// Sends the input the way Enter does, once every sender may.
+    fn send_input(&mut self, caller: Option<&PluginReach>) -> Result<Vec<Action>, String> {
+        let input = &self.input_box;
+        let sending = self.sending(input.buffer.value().trim(), input.has_images());
+        if let Some(refusal) = self
+            .senders(caller)
+            .find_map(|sender| sending.refusal(sender))
+        {
+            return Err(refusal);
+        }
+        let sub = self.input_box.submit().unwrap_or_default();
+        Ok(self.handle_submit(sub))
+    }
+
+    fn check_input_version(&self, version: u64) -> Result<(), String> {
+        let current = self.input_box.buffer.version();
+        if version != current {
+            return Err(format!(
+                "{STALE_VERSION_ERR} {version} (it is now {current})"
+            ));
+        }
+        Ok(())
     }
 
     fn check_input_session(&self, session_id: &str) -> Result<(), String> {
@@ -1331,46 +1415,56 @@ impl App {
         // a plugin holding `<Tab>` or `<CR>` must not take them from the `/`
         // command the user is typing into. Last in the pass, because every
         // modal above is drawn over it.
-        //
-        // Ctrl keys pass it by, as they always did: `Ctrl+C` closes it and the
-        // rest belong to the input box and the built-in bindings.
-        if self.chat_accepts_input() && !is_ctrl(&key) {
-            if key.code == KeyCode::Enter
-                && let Some(refusal) = self.palette_refusal()
-            {
+        match self.dispatch_command_palette(key, None) {
+            PaletteKey::Passthrough => None,
+            PaletteKey::Swallowed => Some(vec![]),
+            PaletteKey::Handled(actions) => Some(actions),
+            PaletteKey::Refused(refusal) => {
                 self.flash(refusal);
-                return Some(vec![]);
-            }
-            match self.command_palette.handle_key(key, &self.input_box.buffer) {
-                CommandAction::Consumed => return Some(vec![]),
-                CommandAction::Execute(cmd) => {
-                    // Commands act on the session, so the main chat comes to
-                    // front. Clear the box first, or the command would stay
-                    // behind as the subagent chat's draft.
-                    self.input_box.discard();
-                    self.set_active_chat(MAIN_CHAT);
-                    return Some(self.execute_command(cmd, 0));
-                }
-                CommandAction::Complete(text) => {
-                    self.input_box.set_input(&text);
-                    self.input_box.buffer.move_to_end();
-                    self.input_changed(InputWriter::Anyone);
-                    return Some(vec![]);
-                }
-                CommandAction::Passthrough => {}
+                Some(vec![])
             }
         }
-
-        None
     }
 
-    /// The command Enter would run, checked for every sender the way
-    /// `maki.api.run_command` checks it, see [`Self::senders`].
-    fn palette_refusal(&mut self) -> Option<String> {
-        let name = self.command_palette.enter_target(&self.input_box.buffer)?;
-        self.senders()
-            .iter()
-            .find_map(|sender| self.command_palette.resolve_for_plugin(&name, sender).err())
+    /// Ctrl keys pass the palette by, as they always did: `Ctrl+C` closes it
+    /// and the rest belong to the input box and the built-in bindings.
+    ///
+    /// The command an Enter would run is checked for every sender first, the
+    /// way `maki.api.run_command` checks it, see [`Self::senders`].
+    fn dispatch_command_palette(
+        &mut self,
+        key: KeyEvent,
+        caller: Option<&PluginReach>,
+    ) -> PaletteKey {
+        if !self.chat_accepts_input() || is_ctrl(&key) {
+            return PaletteKey::Passthrough;
+        }
+        if key.code == KeyCode::Enter
+            && let Some(name) = self.command_palette.enter_target(&self.input_box.buffer)
+            && let Some(refusal) = self
+                .senders(caller)
+                .find_map(|sender| self.command_palette.resolve_for_plugin(&name, sender).err())
+        {
+            return PaletteKey::Refused(refusal);
+        }
+        match self.command_palette.handle_key(key, &self.input_box.buffer) {
+            CommandAction::Consumed => PaletteKey::Swallowed,
+            CommandAction::Execute(cmd) => {
+                // Commands act on the session, so the main chat comes to
+                // front. Clear the box first, or the command would stay
+                // behind as the subagent chat's draft.
+                self.input_box.discard();
+                self.set_active_chat(MAIN_CHAT);
+                PaletteKey::Handled(self.execute_command(cmd, 0))
+            }
+            CommandAction::Complete(text) => {
+                self.input_box.set_input(&text);
+                self.input_box.buffer.move_to_end();
+                self.input_changed(InputWriter::Anyone);
+                PaletteKey::Handled(vec![])
+            }
+            CommandAction::Passthrough => PaletteKey::Passthrough,
+        }
     }
 
     fn plan_toggle_ready(&self) -> bool {
@@ -1771,7 +1865,7 @@ impl App {
             return self.handle_esc(streaming);
         }
         match self.input_box.handle_key(key, mode) {
-            InputAction::Submit => self.send_input().unwrap_or_else(|refusal| {
+            InputAction::Submit => self.send_input(None).unwrap_or_else(|refusal| {
                 self.flash(refusal);
                 vec![]
             }),
@@ -1854,28 +1948,6 @@ impl App {
 
     pub(crate) fn clear_exit_request(&mut self) {
         self.exit_request = ExitRequest::None;
-    }
-
-    /// The plugins a send is held to: those whose edit the user's keys were
-    /// typed blind to, see [`Typeahead`]. The user's own Enter on what they
-    /// saw needs no grant.
-    fn senders(&self) -> &[PluginReach] {
-        self.typeahead.blind_to()
-    }
-
-    /// Sends the input the way Enter does, once every sender may.
-    fn send_input(&mut self) -> Result<Vec<Action>, String> {
-        let input = &self.input_box;
-        let sending = self.sending(input.buffer.value().trim(), input.has_images());
-        if let Some(refusal) = self
-            .senders()
-            .iter()
-            .find_map(|sender| sending.refusal(sender))
-        {
-            return Err(refusal);
-        }
-        let sub = self.input_box.submit().unwrap_or_default();
-        Ok(self.handle_submit(sub))
     }
 
     fn sending(&self, text: &str, has_images: bool) -> Sending {

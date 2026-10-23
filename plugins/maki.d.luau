@@ -209,6 +209,7 @@ declare maki: {
     input: @checked () -> (any, string?),
     input_edit: @checked (opts: any) -> (any, string?),
     input_decorate: @checked (opts: any) -> (any, string?),
+    input_submit: @checked (opts: any) -> (boolean?, string?),
     input_rules: @checked (opts: any) -> (),
   },
   uv: {

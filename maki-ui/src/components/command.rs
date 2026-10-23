@@ -412,6 +412,15 @@ impl CommandPalette {
         !self.filtered.is_empty()
     }
 
+    /// `sync` always leaves a row picked, so a test that wants an Enter the
+    /// palette swallows has to catch up with {input} and take the pick away
+    /// by hand.
+    #[cfg(test)]
+    pub(crate) fn unselect(&mut self, input: &TextBuffer) {
+        self.follow(input);
+        self.selected = self.filtered.len();
+    }
+
     /// The box keeps one buffer for life and its version only climbs, so a
     /// version we have seen means text we already matched.
     fn follow(&mut self, input: &TextBuffer) {
