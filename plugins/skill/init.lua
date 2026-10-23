@@ -32,7 +32,10 @@ local function scan_skill_dir(dir, skills)
       local skill_path = maki.fs.joinpath(dir, entry[1], SKILL_FILE)
       local content = maki.fs.read(skill_path)
       if content then
-        local fm, body = parse_frontmatter(content)
+        local fm, body, err = parse_frontmatter(content)
+        if err then
+          maki.log.warn(skill_path .. ": " .. err)
+        end
         if body and #body > 0 then
           local name = (fm and fm.name) or entry[1]
           skills[name] = {

@@ -3,20 +3,36 @@ local LINE_PAT = "^%s*%d+ | (.*)$"
 
 local M = {}
 
+local function decode_yaml(yaml)
+  local ok, fm, err = pcall(maki.yaml.decode, yaml)
+  if not ok then
+    return nil, tostring(fm)
+  end
+  return fm, err
+end
+
 function M.parse_frontmatter(content)
   local rest = content:match("^%s*%-%-%-[ \t]*\r?\n(.*)")
   if not rest then
-    return {}, content
+    return nil, nil, "missing YAML frontmatter"
   end
   local end_pos, end_line = (rest .. "\n"):find("\n%-%-%-[ \t]*\r?\n")
   if not end_pos then
-    return {}, content
+    return nil, nil, "missing closing frontmatter delimiter"
   end
   local yaml_str = rest:sub(1, end_pos)
   local body = rest:sub(end_line + 1):match("^%s*(.-)%s*$")
-  local fm, _ = maki.yaml.decode(yaml_str)
-  if not fm then
-    fm = {}
+  local fm, err = decode_yaml(yaml_str)
+  if err then
+    return nil, nil, "invalid YAML: " .. err
+  end
+  if type(fm) ~= "table" then
+    return nil, nil, "frontmatter must be a mapping"
+  end
+  for _, field in ipairs({ "name", "description" }) do
+    if fm[field] ~= nil and type(fm[field]) ~= "string" then
+      return nil, nil, field .. " must be a string"
+    end
   end
   return fm, body
 end

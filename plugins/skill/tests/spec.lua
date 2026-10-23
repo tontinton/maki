@@ -31,29 +31,27 @@ case("frontmatter_with_name_and_description", function()
   assert(body:find("Instructions"), "body should contain content after closing ---")
 end)
 
-case("no_frontmatter_returns_content_as_body", function()
-  local fm, body = parse_frontmatter("Just content without frontmatter")
-  eq(fm.name, nil)
-  eq(body, "Just content without frontmatter")
-end)
-
 case("frontmatter_with_leading_whitespace", function()
   local fm, body = parse_frontmatter("  \n---\nname: trimmed\n---\nBody here")
   eq(fm.name, "trimmed")
   eq(body, "Body here")
 end)
 
-case("frontmatter_no_closing_delimiter", function()
-  local input = "---\nname: oops\nThis never closes"
-  local fm, body = parse_frontmatter(input)
-  eq(fm.name, nil)
-  eq(body, input)
-end)
-
-case("frontmatter_invalid_yaml_falls_back", function()
-  local fm, body = parse_frontmatter("---\n: invalid: yaml: [[\n---\nBody")
-  eq(fm.name, nil)
-  eq(body, "Body")
+case("invalid_frontmatter_returns_a_diagnostic", function()
+  for _, input in ipairs({
+    "Plain instructions",
+    "---\nname: missing-close",
+    "---\n: invalid: yaml: [[\n---\nBody",
+    "---\n123\n---\nBody",
+    "---\nname: {nested: value}\n---\nBody",
+    "---\nname: valid\ndescription: [wrong]\n---\nBody",
+    "---\nname: valid\nmetadata: { .nan: broken }\n---\nBody",
+  }) do
+    local fm, body, err = parse_frontmatter(input)
+    eq(fm, nil)
+    eq(body, nil)
+    assert(type(err) == "string" and #err > 0, "invalid files need a diagnostic")
+  end
 end)
 
 case("frontmatter_empty_body_after_close", function()
@@ -66,11 +64,6 @@ case("frontmatter_body_with_embedded_triple_dashes", function()
   local fm, body = parse_frontmatter("---\nname: tricky\n---\nSome text\n---\nMore text")
   eq(fm.name, "tricky")
   assert(body:find("Some text"), "body should start after first closing ---")
-end)
-
-case("frontmatter_only_dashes_no_yaml", function()
-  local fm, body = parse_frontmatter("---\n\n---\nBody")
-  eq(body, "Body")
 end)
 
 case("frontmatter_accepts_crlf_and_complete_delimiters", function()
