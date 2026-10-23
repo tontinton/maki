@@ -24,18 +24,18 @@ local DESCRIPTION = [[Create or update a structured todo list to track tasks.
 - Use ONLY for multi-step work (3+ steps).
 - Skip for trivial tasks.]]
 
-local DOCK_EDGES = { "above", "below", "left", "right" }
+local DOCK_EDGES = { "above", "below" }
 
 local opts = maki.api.register_options({
   position = {
     default = "below",
-    desc = "Edge the todo panel docks to: above, below, left or right.",
+    desc = "Edge the todo panel docks to: above or below.",
   },
 })
 
--- A value outside the four edges would parse as a float in `open_win`, so the
--- panel would leave the dock and float in the middle of the screen. Fall back
--- to the default instead.
+-- A value outside the allowed edges would parse as a float in `open_win`, so
+-- the panel would leave the dock and float in the middle of the screen. Fall
+-- back to the default instead.
 local function dock_edge()
   for _, edge in ipairs(DOCK_EDGES) do
     if opts.position == edge then

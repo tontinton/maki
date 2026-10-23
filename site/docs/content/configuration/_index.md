@@ -324,7 +324,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `position` | string | `"below"` | - | Edge the todo panel docks to: above, below, left or right. |
+| `position` | string | `"below"` | - | Edge the todo panel docks to: above or below. |
 
 ### `plugins.webfetch`
 

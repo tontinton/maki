@@ -214,7 +214,7 @@ fn win_extra<M: mlua::UserDataMethods<WinHandle>>(methods: &mut M) {
 ///   - cursor_line (boolean): highlight the focused row.
 ///   - reserved_top (integer): rows reserved at the top of the content area.
 ///   - split (string): edge docking, "above", "below", "left", "right", or "".
-///   - order (integer): paint order among split windows.
+///   - order (integer): stacking order among split windows; a lower value sits closer to the screen edge.
 ///   - needs_input (boolean): whether the window means the session needs user input.
 ///   - hide_input (boolean): whether a docked window displaces the chat input box.
 /// @return
