@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 
 use maki_config::AgentConfig;
+use maki_fs::search::truncate_bytes;
 use maki_providers::retry::RetryPolicy;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
@@ -17,7 +18,6 @@ use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry
 use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
-use crate::tools::truncate_bytes;
 use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";

@@ -35,6 +35,8 @@ struct Stack {
     commands: Vec<CustomCommand>,
     model: Model,
     needs_login: bool,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    sandbox: Option<Arc<maki_sandbox::Sandbox>>,
 }
 
 impl Stack {
@@ -99,6 +101,19 @@ fn load_config(
 
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
+    }
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    if cli.sandbox {
+        maki_sandbox::namespace::probe()
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))
+            .context("sandbox preflight check failed -- cannot start with --sandbox")?;
+        config.agent.sandbox_enabled = true;
+    }
+    #[cfg(not(all(feature = "sandbox", target_os = "linux")))]
+    if cli.sandbox {
+        return Err(color_eyre::eyre::eyre!(
+            "--sandbox is only supported on Linux"
+        ));
     }
     if !cli.allowed_tools.is_empty() {
         config.agent.allowed_tools = cli
@@ -180,6 +195,9 @@ fn build_stack(
         },
     )?;
 
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    let sandbox = setup_sandbox(&mut plugin_host, &config.agent)?;
+
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
     setup::remember_thinking(&mut config.session_defaults, launch.storage);
@@ -207,9 +225,45 @@ fn build_stack(
             commands,
             model,
             needs_login,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox,
         },
         super::sanitize_warnings(&warnings),
     ))
+}
+
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+fn setup_sandbox(
+    plugin_host: &mut PluginHost,
+    agent_config: &maki_agent::AgentConfig,
+) -> Result<Option<Arc<maki_sandbox::Sandbox>>> {
+    if agent_config.sandbox_enabled {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let workspace_name = cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ns_config = {
+            let mut cfg = maki_sandbox::namespace::NamespaceConfig::from_agent_config(
+                agent_config.sandbox_allowed_env.clone(),
+                &agent_config.sandbox_allowed_paths,
+                &agent_config.sandbox_extra_dirs,
+                &maki_sandbox::profiles::select_profiles(&agent_config.sandbox_profiles),
+                cwd,
+                workspace_name,
+            );
+            cfg.prune_missing_mounts();
+            cfg
+        };
+        let sandbox = maki_sandbox::Sandbox::new(ns_config).context("initialize sandbox")?;
+        let fs: Arc<maki_sandbox::fs_backend::SandboxFs> = Arc::new(
+            maki_sandbox::fs_backend::SandboxFs::new(Arc::clone(&sandbox)),
+        );
+        plugin_host.set_sandbox_backend(fs)?;
+        Ok(Some(sandbox))
+    } else {
+        Ok(None)
+    }
 }
 
 /// The tab a run opens on. Which session that is lives in [`crate::resume`],
@@ -501,6 +555,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),
                 trust_question: trust.state.question().cloned(),
+                #[cfg(all(feature = "sandbox", target_os = "linux"))]
+                sandbox: stack.sandbox.as_ref().map(Arc::clone),
             },
             initial_prompt.take(),
         )

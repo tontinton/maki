@@ -33,6 +33,8 @@ Type `/` in the input box to open the command palette.
 | `/trust` | Trust this folder and load its shared project config |
 | `/packupdate` | Update packages (++lockfile, ! skips review) |
 | `/packdel` | Remove undeclared packages (++all, or a name) |
+| `/sandbox` | Open sandbox environment info, file browser, and shell |
+| `/add-dir` | Bind-mount a host directory into the sandbox workspace |
 | `/memory` | View, edit, and delete memory files |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
@@ -123,7 +125,7 @@ Aliasing adds a name, so both stay in the palette. Any command works as a target
 - Needs `fs_read`, `fs_write`, `net`, `run`, `env`: `/tasks`.
 - Needs `agent`: `/compact`, `/btw`, custom commands, MCP prompts.
 - Needs what its owner holds: every other plugin command, as described below.
-- Only when you type it: `/yolo`, `/trust`, `/packupdate`, `/packdel`. These change permissions, folder trust, or installed packages.
+- Only when you type it: `/yolo`, `/trust`, `/packupdate`, `/packdel`, `/sandbox`, `/add-dir`. These change permissions, folder trust, or installed packages.
 
 A plugin command's handler runs with the grants of the plugin that registered it. The caller picks the arguments, so it must hold at least the same reach:
 

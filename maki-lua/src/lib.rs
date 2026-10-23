@@ -1,5 +1,6 @@
 pub mod agent_autocmd;
 mod api;
+mod backend;
 mod background;
 pub mod docs;
 pub mod docs_render;
@@ -14,7 +15,6 @@ pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;
 
-pub use api::r#fn::set_shell_preference;
 pub use api::keymap::{KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
@@ -27,6 +27,7 @@ pub use api::util::command::{
     SessionRequest, Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand,
     WinEvent, WinView,
 };
+pub use api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
 pub use key::{Key, RESERVED_KEYS, is_reserved};
@@ -35,6 +36,7 @@ pub use loader::{
     EventHandle, InitFiles, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING,
 };
 pub use maki_agent::SessionEndReason;
+pub use maki_agent::fs_backend::set_shell_preference;
 pub use pack::{
     DeleteTarget, DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin,
     PackCommand, PackContext, PackPlan, PackPreparation, PackReport, PlannedOp, UpdateOptions,
