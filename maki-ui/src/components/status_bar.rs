@@ -11,6 +11,7 @@ use crate::animation::spinner_frame;
 use crate::theme;
 
 use maki_providers::format_tokens;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -72,17 +73,23 @@ pub struct StatusBar {
     cwd_branch: String,
     pub flash_duration: Duration,
     branch_update_rx: Option<flume::Receiver<()>>,
+    /// Nobody reads this. It is here so it dies with the bar, and dropping it
+    /// stops notify's event thread and closes the inotify fd. Every session
+    /// builds its own bar, so a watcher that outlives it leaks a thread.
+    _branch_watcher: Option<RecommendedWatcher>,
 }
 
 impl StatusBar {
     pub fn new(flash_duration: Duration) -> Self {
+        let (branch_update_rx, branch_watcher) = watch_branch().unzip();
         Self {
             flash: None,
             queued: VecDeque::new(),
             started_at: Instant::now(),
             cwd_branch: cwd_branch_label(),
             flash_duration,
-            branch_update_rx: spawn_branch_watcher(),
+            branch_update_rx,
+            _branch_watcher: branch_watcher,
         }
     }
 
@@ -110,6 +117,7 @@ impl StatusBar {
 
     pub fn refresh_cwd(&mut self) {
         self.cwd_branch = cwd_branch_label();
+        (self.branch_update_rx, self._branch_watcher) = watch_branch().unzip();
     }
 
     pub fn poll_branch_update(&mut self) -> Dirty {
@@ -400,27 +408,18 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
-fn spawn_branch_watcher() -> Option<flume::Receiver<()>> {
-    use notify::{RecursiveMode, Watcher};
-
+fn watch_branch() -> Option<(flume::Receiver<()>, RecommendedWatcher)> {
     let cwd = env::current_dir().ok()?;
     let git_dir = find_git_dir(&cwd)?;
     let (tx, rx) = flume::bounded(1);
-
-    std::thread::spawn(move || {
-        let Ok(mut watcher) = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
-            if res.is_ok_and(|e| e.paths.iter().any(|p| p.ends_with("HEAD"))) {
-                let _ = tx.try_send(());
-            }
-        }) else {
-            return;
-        };
-        if watcher.watch(&git_dir, RecursiveMode::NonRecursive).is_ok() {
-            std::thread::park();
+    let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
+        if res.is_ok_and(|e| e.paths.iter().any(|p| p.ends_with("HEAD"))) {
+            let _ = tx.try_send(());
         }
-    });
-
-    Some(rx)
+    })
+    .ok()?;
+    watcher.watch(&git_dir, RecursiveMode::NonRecursive).ok()?;
+    Some((rx, watcher))
 }
 
 #[cfg(test)]
