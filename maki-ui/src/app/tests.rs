@@ -302,7 +302,7 @@ pub(crate) fn end_turn(app: &mut App) {
     app.update(done_event());
 }
 
-fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
+pub(crate) fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
     subagent_info_with_tx(parent_id, name, None)
 }
 
@@ -2409,10 +2409,10 @@ fn tasks_report_main_chat_then_subagent_outcomes() {
     assert_eq!(
         tasks,
         serde_json::json!([
-            { "id": "main", "name": "Main", "focused": true },
-            { "id": "task1", "name": "research", "status": "done", "focused": false },
-            { "id": "task2", "name": "build", "status": "error", "focused": false },
-            { "id": "task3", "name": "deploy", "status": "working", "focused": false },
+            { "session": app.state.session.id, "id": "main", "name": "Main", "focused": true },
+            { "session": app.state.session.id, "id": "task1", "name": "research", "status": "done", "focused": false },
+            { "session": app.state.session.id, "id": "task2", "name": "build", "status": "error", "focused": false },
+            { "session": app.state.session.id, "id": "task3", "name": "deploy", "status": "working", "focused": false },
         ])
     );
 }

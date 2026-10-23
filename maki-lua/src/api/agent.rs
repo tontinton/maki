@@ -244,6 +244,24 @@ impl Upstream {
         });
     }
 
+    /// A plugin task shows up in its chat as soon as it opens, so the user can
+    /// find it in `/tasks` and stop it even before its first prompt.
+    fn open_task(&self, info: SubagentInfo) {
+        if let Self::Chat {
+            session,
+            plugin,
+            ui: Some(ui),
+            ..
+        } = self
+        {
+            let _ = ui.try_send(UiAction::PluginTaskOpened {
+                session: *session,
+                plugin: Arc::clone(plugin),
+                info: Box::new(info),
+            });
+        }
+    }
+
     /// The transcript as of now. A plugin task writes it after every prompt,
     /// so a monitor that dies with the process still leaves what it did.
     fn send_history(&self, tool_use_id: &str, messages: Vec<Message>) {
@@ -667,12 +685,12 @@ async fn call_tool(
 /// and prompts it from autocmd callbacks.
 ///
 /// Opened by chat session id, it shows up in that chat as a task owned by
-/// the plugin from its first prompt on: a transcript tab, a `plugin` field
-/// in `/tasks` and `maki.task.list()`, `"idle"` between prompts, and its
-/// spend in the chat's totals after each turn. Esc in its tab closes it,
-/// and the pending `:prompt()` returns `"stopped by user"` rather than
-/// `"cancelled"`, so a loop can tell the user's Esc from its own task
-/// ending and stop rather than reopen. Permission prompts stay denied even
+/// the plugin as soon as it opens: a transcript tab, a `plugin` field in
+/// `/tasks` and `maki.task.list()`, `"idle"` before and between prompts, and
+/// its spend in the chat's totals after each turn. Esc in its tab or Ctrl+S in
+/// `/tasks` closes it, and the pending `:prompt()` returns `"stopped by user"`
+/// rather than `"cancelled"`, so a loop can tell the user's stop from its own
+/// task ending and stop rather than reopen. Permission prompts stay denied even
 /// though the task has a tab: a prompt in an unfocused tab would stall a
 /// monitor silently, a denial reaches the plugin as an error it can handle.
 /// Setting `plugins.<name>.enabled = false` stops a plugin's monitors from
@@ -1005,6 +1023,20 @@ async fn session(
         closed: false,
         background,
     };
+
+    if state.background.is_some() {
+        let info = SubagentInfo {
+            parent_tool_use_id: state.cancellation.ui_id.clone(),
+            name: state.name.clone(),
+            prompt: None,
+            model: Some(state.params.model.spec()),
+            opts: Some(state.opts),
+            answer_tx: None,
+            inbox: Some(Arc::clone(&state.inbox)),
+        };
+        state.upstream.open_task(info.clone());
+        let _ = state.subagent_info.set(info);
+    }
 
     let sess = lua.create_userdata(LuaSession {
         inner: Arc::new(AsyncMutex::new(state)),
@@ -1453,6 +1485,13 @@ async fn prompt(
     if s.stopped_by_user() {
         return Ok(err_pair(STOPPED_BY_USER_ERR));
     }
+    // Its chat session or its plugin may have ended while the plugin kept the
+    // handle. Refuse here, before the prompt reaches the model or the tab.
+    if let Some(background) = &s.background
+        && !background.registry.contains(&s.cancellation.ui_id)
+    {
+        return Ok(err_pair(CANCELLED_MSG));
+    }
     // The user can lower the effort while a monitor sits idle, so we ask the
     // seed again on every prompt. Plan mode is left out on purpose. Each write
     // checks it instead, see `AgentSeed::background_write_block`.
@@ -1474,7 +1513,14 @@ async fn prompt(
         }
         _ => None,
     };
-    if s.subagent_info.get().is_none() {
+    if s.background.is_some() {
+        // The tab opened with the session, so every prompt shows up the way a
+        // queued message does.
+        let _ = s.sub_event_tx.send(AgentEvent::QueueItemConsumed {
+            text: message.clone(),
+            images: Vec::new(),
+        });
+    } else if s.subagent_info.get().is_none() {
         let _ = s.subagent_info.set(SubagentInfo {
             parent_tool_use_id: s.cancellation.ui_id.clone(),
             name: s.name.clone(),
@@ -1483,13 +1529,6 @@ async fn prompt(
             opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
             inbox: Some(Arc::clone(&s.inbox)),
-        });
-    } else if s.background.is_some() {
-        // The first prompt reaches the tab on `SubagentInfo`. Every later one
-        // is shown the way a queued message is.
-        let _ = s.sub_event_tx.send(AgentEvent::QueueItemConsumed {
-            text: message.clone(),
-            images: Vec::new(),
         });
     }
 
@@ -1642,6 +1681,16 @@ async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> 
     Ok(())
 }
 
+/// The task id of this session. A session opened by chat session id goes by
+/// this id in `maki.task.list()` and the `"TaskStopped"` event, so a plugin
+/// can tell which of those are its own.
+///
+/// @return (string) Session task id.
+#[lua_fn]
+fn id(_lua: &Lua, this: &LuaSession) -> LuaResult<String> {
+    Ok(this.cancellation.ui_id.clone())
+}
+
 lua_class! {
     /// A subagent session with its own conversation history.
     ///
@@ -1652,7 +1701,7 @@ lua_class! {
     /// Always call `:close()` when you are done, on error paths too. The
     /// garbage collector is a fallback that may never run while the VM sits
     /// idle, so a session you only drop can stay open for the rest of the run.
-    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close]
+    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close, id]
 }
 
 /// Weak Lua ref avoids a reference cycle when the session is stored in userdata.

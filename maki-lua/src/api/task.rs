@@ -2,10 +2,13 @@
 //! to list the tasks and show one.
 
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Value};
+use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::command::{TaskRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::pair::Pair;
+use crate::runtime::is_user_action;
+
+const USER_ACTION_ERR: &str = "stopping a task requires a user command or keybind";
 
 async fn roundtrip(
     lua: Lua,
@@ -26,9 +29,10 @@ async fn roundtrip(
 /// [maki.agent.session](#maki-agent-session) has its session id and a
 /// `plugin` field.
 ///
-/// @return (table|nil, string|nil) Array of `{id, name, focused, status?, plugin?}`
+/// @return (table|nil, string|nil) Array of `{id, session, name, focused, status?, plugin?}`
 ///   where `status` is `"working"`, `"idle"` (a plugin task between prompts),
-///   `"done"`, or `"error"`, or nil and an error.
+///   `"done"`, or `"error"`, and `session` is the chat session that `stop()`
+///   asks for. Or nil and an error.
 /// @example
 /// for _, t in ipairs(maki.task.list() or {}) do
 ///   print(t.name, t.status or "main")
@@ -70,23 +74,55 @@ async fn remove(
     roundtrip(lua, tx, TaskRequest::Remove { id }).await
 }
 
+/// Stops a task in the focused session, the same way Esc in its tab does. A
+/// plugin task can be stopped while idle, even before its first prompt. The
+/// main chat, a finished task, or an unknown id returns an error.
+///
+/// Only the user may stop a task, so this works in a command the user typed
+/// or a key they pressed. Tools, hooks, autocmds, `maki.async` tasks, and
+/// commands run through `maki.api.run_command` get an error instead, or any
+/// plugin could stop work that is not its own.
+///
+/// @param id string Task id, as returned by `list()`.
+/// @param opts table `session` (string), the chat session of the `list()`
+///   row. If the user switched sessions since, this returns an error rather
+///   than stopping a task with the same id in the other session.
+/// @return (boolean|nil, string|nil) true on success, or nil and an error.
+/// @example
+/// local _, err = maki.task.stop(task.id, { session = task.session })
+#[lua_fn]
+async fn stop(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    id: String,
+    opts: Table,
+) -> LuaResult<Pair<Value>> {
+    if !is_user_action(&lua) {
+        return Ok((None, Some(USER_ACTION_ERR.to_owned())));
+    }
+    let session = opts.get::<String>("session")?;
+    roundtrip(lua, tx, TaskRequest::Stop { id, session }).await
+}
+
 lua_table! {
     /// The subagents of the focused session and their transcripts. Tasks are
     /// spawned by the `task` tool and addressed by an id that survives a reload.
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
     "maki.task" => pub(crate) fn create_task_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), focus(tx), remove(tx)]
+    DOCS [list(tx), focus(tx), remove(tx), stop(tx)]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, UiReply};
-    use mlua::Table;
     use serde_json::json;
     use std::thread::JoinHandle;
     use test_case::test_case;
+
+    use crate::runtime::{TaskCell, TaskScope, run_command_scoped};
+    use maki_agent::cancel::CancelToken;
 
     const TASK_ID: &str = "toolu_01";
     const DONE_ID: &str = "toolu_02";
@@ -98,11 +134,13 @@ mod tests {
     const DONE_STATUS: &str = "done";
     const ERROR_STATUS: &str = "error";
     const NIL_STATUS: &str = "nil";
+    const CHAT_SESSION: &str = "chat-session";
     const UNKNOWN_TASK_ERR: &str = "unknown task: toolu_01";
     const NO_REQUEST_ERR: &str = "expected a task request";
     const LIST_CALL: &str = "return task.list()";
     const FOCUS_CALL: &str = "return task.focus('toolu_01')";
     const REMOVE_CALL: &str = "return task.remove('toolu_01')";
+    const STOP_CALL: &str = "return task.stop('toolu_01', {session='chat-session'})";
     const LIST_SCRIPT: &str = "
         local tasks = task.list()
         local ids, statuses = {}, {}
@@ -228,5 +266,160 @@ mod tests {
 
         drop(lua);
         assert!(matches!(host.join().unwrap(), TaskRequest::Remove { id } if id == TASK_ID));
+    }
+
+    #[test]
+    fn stop_from_a_user_command_roundtrips_through_ui_channel() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_task(Some(tx));
+        let host = spawn_host(rx, Ok(json!(true)));
+
+        let (val, err): (bool, Option<String>) = smol::block_on(run_command_scoped(
+            &lua,
+            0,
+            lua.load(STOP_CALL).eval_async(),
+        ))
+        .unwrap();
+        assert!(val);
+        assert_eq!(err, None);
+
+        drop(lua);
+        assert!(matches!(
+            host.join().unwrap(),
+            TaskRequest::Stop { id, session } if id == TASK_ID && session == CHAT_SESSION
+        ));
+    }
+
+    enum Caller {
+        Hook,
+        CommandAlias,
+        ChildOfUserCommand,
+    }
+
+    #[test_case(Caller::Hook ; "hook_outside_any_command")]
+    #[test_case(Caller::CommandAlias ; "command_run_by_run_command")]
+    #[test_case(Caller::ChildOfUserCommand ; "task_nested_in_a_user_command")]
+    fn stop_without_user_authority_never_reaches_the_host(caller: Caller) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_task(Some(tx));
+        let stop = lua.load(STOP_CALL).eval_async();
+        let (val, err): (Value, Option<String>) = smol::block_on(async {
+            match caller {
+                Caller::Hook => stop.await,
+                Caller::CommandAlias => run_command_scoped(&lua, 1, stop).await,
+                Caller::ChildOfUserCommand => {
+                    run_command_scoped(&lua, 0, async {
+                        let child =
+                            TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
+                        child.scope_future(stop).await
+                    })
+                    .await
+                }
+            }
+        })
+        .unwrap();
+        assert!(val.is_nil());
+        assert_eq!(err.as_deref(), Some(USER_ACTION_ERR));
+        assert!(rx.is_empty());
+    }
+
+    /// A refusal means the rows on screen are stale, so the picker flashes it
+    /// and lists again either way.
+    #[test_case(None ; "stopped")]
+    #[test_case(Some(UNKNOWN_TASK_ERR) ; "refused")]
+    fn tasks_picker_stops_the_selected_row_and_refreshes(stop_error: Option<&str>) {
+        let lua = picker_lua(stop_error);
+        lua.load("open_tasks()").exec().unwrap();
+
+        let globals = lua.globals();
+        assert_eq!(globals.get::<String>("stopped_id").unwrap(), TASK_ID);
+        assert_eq!(
+            globals.get::<String>("stopped_session").unwrap(),
+            CHAT_SESSION
+        );
+        assert_eq!(globals.get::<u32>("list_calls").unwrap(), 2);
+        assert_eq!(
+            globals.get::<Option<String>>("flashed").unwrap().as_deref(),
+            stop_error
+        );
+    }
+
+    /// Runs `plugins/task/picker.lua` against a fake `maki` that lists the main
+    /// chat and one task, then presses Down, Ctrl+S and Esc.
+    fn picker_lua(stop_error: Option<&str>) -> Lua {
+        let lua = Lua::new();
+        let globals = lua.globals();
+        globals.set("task_id", TASK_ID).unwrap();
+        globals.set("chat_session", CHAT_SESSION).unwrap();
+        globals.set("stop_error", stop_error).unwrap();
+        lua.load(
+            r#"
+            local modules = {}
+            function require(name) return assert(modules[name], name) end
+            function install_module(name, source) modules[name] = assert(loadstring(source))() end
+            local keys = {'<Down>', '<C-s>', '<Esc>'}
+            local tasks = {
+                {id = 'main', session = chat_session, name = 'chat', focused = true},
+                {id = task_id, session = chat_session, name = 'work', status = 'working'},
+            }
+            list_calls = 0
+            local win = {width = 80, height = 20}
+            function win:set_config(_) end
+            function win:set_cursor(_) end
+            function win:close() end
+            function win:recv(_)
+                return {type = 'key', key = assert(table.remove(keys, 1), 'picker did not close')}
+            end
+            maki = {
+                task = {
+                    list = function() list_calls = list_calls + 1; return tasks end,
+                    focus = function() return true end,
+                    stop = function(id, opts)
+                        stopped_id, stopped_session = id, opts.session
+                        if stop_error then return nil, stop_error end
+                        return true
+                    end,
+                },
+                ui = {
+                    buf = function() return {set_lines = function() end} end,
+                    open_win = function() return win end,
+                    display_width = function(s) return #s end,
+                    flash = function(s) flashed = s end,
+                },
+                api = {
+                    create_autocmd = function() end,
+                    register_command = function(opts) open_tasks = opts.handler end,
+                },
+                keymap = {set = function() end},
+            }
+        "#,
+        )
+        .exec()
+        .unwrap();
+        let install: mlua::Function = globals.get("install_module").unwrap();
+        for (name, source) in [
+            (
+                "maki.text_input",
+                include_str!("../../../plugins/lib/maki/text_input.lua"),
+            ),
+            (
+                "maki.color",
+                include_str!("../../../plugins/lib/maki/color.lua"),
+            ),
+            (
+                "maki.list_picker",
+                include_str!("../../../plugins/lib/maki/list_picker.lua"),
+            ),
+            (
+                "picker_rows",
+                include_str!("../../../plugins/task/picker_rows.lua"),
+            ),
+        ] {
+            install.call::<()>((name, source)).unwrap();
+        }
+        lua.load(include_str!("../../../plugins/task/picker.lua"))
+            .exec()
+            .unwrap();
+        lua
     }
 }

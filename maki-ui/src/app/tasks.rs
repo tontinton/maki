@@ -8,14 +8,19 @@
 use std::sync::Arc;
 
 use maki_agent::tools::MAIN_TASK_ID;
+use maki_storage::id::MakiId;
 use serde::Serialize;
 
 use crate::app::App;
-use crate::components::DisplayRole;
+use crate::chat::CANCELLED_TEXT;
+use crate::components::{Action, DisplayRole};
 
 const UNKNOWN_TASK_ERR: &str = "unknown task: ";
 const MAIN_DELETE_ERR: &str = "cannot delete the main chat";
 const RUNNING_DELETE_ERR: &str = "task is still running: ";
+const MAIN_STOP_ERR: &str = "cannot stop the main chat";
+const NOT_RUNNING_ERR: &str = "task is not running: ";
+const SESSION_CHANGED_ERR: &str = "task session is no longer focused: ";
 
 /// How a chat ended, from the vaguest to the most specific. `SubagentHistory`
 /// only sees the transcript close, and the `ToolDone` carrying `is_error`
@@ -78,6 +83,7 @@ pub(crate) struct TaskState<'a> {
 #[derive(Serialize)]
 pub(crate) struct TaskInfo {
     id: Arc<str>,
+    session: MakiId,
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<TaskStatus>,
@@ -107,6 +113,7 @@ impl App {
             .enumerate()
             .map(|(idx, chat)| TaskInfo {
                 id: chat.task_id_or_main(),
+                session: self.state.session.id,
                 name: chat.name.clone(),
                 status: chat.task_id().map(|_| chat.task_status()),
                 plugin: chat.plugin.clone(),
@@ -124,6 +131,44 @@ impl App {
         let idx = self.chat_of_task(id)?;
         self.set_active_chat(idx);
         Ok(())
+    }
+
+    /// A tool task can be stopped only while its turn still routes to it. A
+    /// plugin task can be stopped any time it is alive, idle included.
+    pub(crate) fn stop_task(&mut self, id: &str) -> Result<Action, String> {
+        let idx = self.chat_of_task(id)?;
+        if idx == 0 {
+            return Err(MAIN_STOP_ERR.to_owned());
+        }
+        let chat = &mut self.chats[idx];
+        let live = !chat.is_finished();
+        let action = match chat.plugin {
+            Some(_) if live => Action::CancelPluginTask { id: id.to_owned() },
+            None if live && self.chat_index.get(id) == Some(&idx) => Action::CancelSubagent {
+                tool_use_id: id.to_owned(),
+            },
+            _ => return Err(format!("{NOT_RUNNING_ERR}{id}")),
+        };
+        chat.flush();
+        chat.cancel_in_progress();
+        chat.mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
+        self.subagent_answers.remove(id);
+        self.permission_prompt.drop_subagent(id);
+        Ok(action)
+    }
+
+    /// The picker sends the session its row came from. By the time the stop
+    /// lands the user may have switched to another session, where the same
+    /// task id can name a different task.
+    pub(crate) fn stop_task_in_session(
+        &mut self,
+        id: &str,
+        session: &str,
+    ) -> Result<Action, String> {
+        if self.state.session.id.to_string() != session {
+            return Err(format!("{SESSION_CHANGED_ERR}{session}"));
+        }
+        self.stop_task(id)
     }
 
     /// Drops a finished subagent chat and its stored transcript, so a reload
@@ -176,7 +221,7 @@ impl App {
     }
 }
 
-/// Fires when a known task changes status, or when a new one shows up working.
+/// Fires when a known task changes status, or when a new live task appears.
 /// A task first seen already finished is recorded quietly, so a restored
 /// session does not replay yesterday's tasks.
 ///
@@ -190,7 +235,7 @@ pub(crate) fn diff_task_states<'a>(
     for task in current {
         let announce = match previous.iter().find(|(id, _)| id == task.id) {
             Some((_, status)) => *status != task.status,
-            None => task.status == TaskStatus::Working,
+            None => matches!(task.status, TaskStatus::Working | TaskStatus::Idle),
         };
         if announce {
             emit(task);
@@ -205,9 +250,9 @@ mod tests {
     use super::*;
     use crate::app::Msg;
     use crate::app::tests::{
-        MONITOR_ID, RESEARCH_NAME, app_with_plugin_task, app_with_subagent_id, cancel_app,
-        close_subagent_transcript, done, end_turn, error_app, finish_subagent, plugin_event,
-        start_subagent,
+        MONITOR_ID, MONITOR_PLUGIN, RESEARCH_NAME, app_with_plugin_task, app_with_subagent_id,
+        cancel_app, close_subagent_transcript, done, end_turn, error_app, finish_subagent,
+        plugin_event, start_subagent, subagent_info, test_app,
     };
     use crate::chat::{DONE_TEXT, ERROR_TEXT};
     use test_case::test_case;
@@ -229,6 +274,78 @@ mod tests {
         close_subagent_transcript(&mut app, TASK_ID);
         close_subagent_transcript(&mut app, OTHER_ID);
         app
+    }
+
+    #[test]
+    fn stop_tool_task_routes_cancellation_without_changing_focus_or_siblings() {
+        let mut app = app_with_two_subagents();
+        assert!(matches!(
+            app.stop_task(TASK_ID),
+            Ok(Action::CancelSubagent { tool_use_id }) if tool_use_id == TASK_ID
+        ));
+        assert_eq!(app.active_task_id().as_ref(), MAIN_TASK_ID);
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+        assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
+        assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
+    }
+
+    #[test_case(false ; "running")]
+    #[test_case(true ; "idle")]
+    fn stop_plugin_task_routes_to_its_native_session(idle: bool) {
+        let mut app = app_with_plugin_task();
+        if idle {
+            plugin_event(&mut app, done());
+        }
+        assert!(matches!(
+            app.stop_task(MONITOR_ID),
+            Ok(Action::CancelPluginTask { id }) if id == MONITOR_ID
+        ));
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+        assert_eq!(app.active_task_id().as_ref(), MAIN_TASK_ID);
+    }
+
+    #[test]
+    fn plugin_task_is_listed_and_stoppable_before_its_first_prompt() {
+        let mut app = test_app();
+        let info = subagent_info(MONITOR_ID, BUILD_NAME);
+        app.open_plugin_task(&info, Arc::from(MONITOR_PLUGIN));
+        let tasks = serde_json::to_value(app.tasks()).unwrap();
+        assert_eq!(tasks[1]["id"], MONITOR_ID);
+        assert_eq!(tasks[1]["status"], "idle");
+        assert_eq!(tasks[1]["plugin"], MONITOR_PLUGIN);
+
+        assert!(app.stop_task(MONITOR_ID).is_ok());
+        app.open_plugin_task(&info, Arc::from(MONITOR_PLUGIN));
+        assert_eq!(app.chats.len(), 2);
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+    }
+
+    /// `chat_index` is wiped at the end of every turn, so a tool task that
+    /// lost its route has no agent left to cancel.
+    #[test_case(MAIN_TASK_ID, |_| {}, MAIN_STOP_ERR.to_owned() ; "main")]
+    #[test_case(MISSING_ID, |_| {}, format!("{UNKNOWN_TASK_ERR}{MISSING_ID}") ; "unknown")]
+    #[test_case(TASK_ID, |app| close_subagent_transcript(app, TASK_ID), format!("{NOT_RUNNING_ERR}{TASK_ID}") ; "finished")]
+    #[test_case(TASK_ID, |app| app.chat_index.clear(), format!("{NOT_RUNNING_ERR}{TASK_ID}") ; "turn_ended")]
+    fn stop_refuses_without_touching_any_task(id: &str, setup: fn(&mut App), expected: String) {
+        let mut app = app_with_two_subagents();
+        setup(&mut app);
+        let before = serde_json::to_value(app.tasks()).unwrap();
+        assert_eq!(app.stop_task(id).err(), Some(expected));
+        assert_eq!(serde_json::to_value(app.tasks()).unwrap(), before);
+    }
+
+    #[test]
+    fn stop_refuses_a_session_that_lost_focus() {
+        let mut app = app_with_two_subagents();
+        let stale = MakiId::generate().to_string();
+        assert_eq!(
+            app.stop_task_in_session(TASK_ID, &stale).err(),
+            Some(format!("{SESSION_CHANGED_ERR}{stale}"))
+        );
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+
+        let own = app.state.session.id.to_string();
+        assert!(app.stop_task_in_session(TASK_ID, &own).is_ok());
     }
 
     /// Restores the two subagents in the reverse of the order their ids
@@ -519,6 +636,18 @@ mod tests {
 
         assert_eq!(app.active_chat, 0);
         assert_eq!(app.main_draft(), MAIN_DRAFT);
+    }
+
+    /// A plugin task shows up idle the moment it opens, long before its first
+    /// prompt, and has to announce itself just like a working one.
+    #[test_case(TaskStatus::Working ; "working")]
+    #[test_case(TaskStatus::Idle ; "idle")]
+    fn diff_announces_a_live_task_on_first_sight(status: TaskStatus) {
+        let mut previous = Vec::new();
+        assert_eq!(
+            collect(&mut previous, &[(Arc::from(TASK_ID), status)]),
+            vec![(TASK_ID.to_owned(), status)]
+        );
     }
 
     /// A task first seen already finished stays quiet, so a reload does not

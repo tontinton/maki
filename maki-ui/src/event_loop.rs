@@ -1049,6 +1049,15 @@ impl<'t> EventLoop<'t> {
                     self.dispatch(idx, actions);
                 }
             }
+            UiAction::PluginTaskOpened {
+                session,
+                plugin,
+                info,
+            } => {
+                if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
+                    rt.app.open_plugin_task(&info, plugin);
+                }
+            }
         }
     }
 
@@ -1128,6 +1137,21 @@ impl<'t> EventLoop<'t> {
                 handle.fire_autocmd("TaskStatusChanged", data);
             });
         }
+    }
+
+    /// Called only after the cancel went out, so a handler that checks
+    /// `maki.agent.list()` already finds a stopped plugin task gone.
+    fn emit_task_stopped(&self, idx: usize, id: &str) {
+        let app = &self.sessions[idx].app;
+        let mut data = json!({ "session_id": app.state.session.id, "id": id });
+        if let Some(plugin) = app
+            .task_states()
+            .find(|task| &**task.id == id)
+            .and_then(|task| task.plugin)
+        {
+            data["plugin"] = json!(plugin);
+        }
+        self.ctx.lua_event_handle.fire_autocmd("TaskStopped", data);
     }
 
     fn emit_notifications(&mut self) {
@@ -1413,6 +1437,11 @@ impl<'t> EventLoop<'t> {
             TaskRequest::List => Ok(json!(self.focused_app().tasks())),
             TaskRequest::Focus { id } => self.focused_app().focus_task(&id).map(|()| json!(true)),
             TaskRequest::Remove { id } => self.focused_app().remove_task(&id).map(|()| json!(true)),
+            TaskRequest::Stop { id, session } => {
+                let action = self.focused_app().stop_task_in_session(&id, &session)?;
+                self.dispatch(self.focused, vec![action]);
+                Ok(json!(true))
+            }
         }
     }
 
@@ -1721,10 +1750,14 @@ impl<'t> EventLoop<'t> {
                 rt.handles.cancel_run(run_id);
             }
             Action::CancelSubagent { tool_use_id } => {
-                self.sessions[idx].handles.cancel_subagent(tool_use_id);
+                self.sessions[idx]
+                    .handles
+                    .cancel_subagent(tool_use_id.clone());
+                self.emit_task_stopped(idx, &tool_use_id);
             }
             Action::CancelPluginTask { id } => {
                 self.ctx.lua_event_handle.cancel_plugin_session(&id);
+                self.emit_task_stopped(idx, &id);
             }
             Action::RestartAgent(history) => self.respawn_agent(idx, history),
             Action::OpenFork(open) => self.open_fork(idx, *open),

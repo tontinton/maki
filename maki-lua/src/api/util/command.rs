@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use maki_agent::{Envelope, SharedBuf};
+use maki_agent::{Envelope, SharedBuf, SubagentInfo};
 use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
@@ -475,6 +475,7 @@ pub enum TaskRequest {
     List,
     Focus { id: String },
     Remove { id: String },
+    Stop { id: String, session: String },
 }
 
 pub enum ModelRequest {
@@ -688,6 +689,11 @@ pub enum UiAction {
         session: MakiId,
         plugin: Arc<str>,
         envelope: Box<Envelope>,
+    },
+    PluginTaskOpened {
+        session: MakiId,
+        plugin: Arc<str>,
+        info: Box<SubagentInfo>,
     },
 }
 

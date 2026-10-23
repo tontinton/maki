@@ -150,7 +150,7 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 /// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
-/// `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
+/// `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
 /// and `"FileIndexReady"`. Plugins can also fire their own events with
 /// `exec_autocmds`.
 ///
@@ -195,6 +195,12 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   carries `data.plugin`, and `"idle"` is such a task between prompts. A
 ///   task that comes back from disk already finished stays quiet, so
 ///   reloading a session does not replay old tasks.
+/// - `"TaskStopped"`: `data.id`, when the user stops a task with Esc in its
+///   tab or through `maki.task.stop`. A plugin task carries `data.plugin`,
+///   and by then it is already gone from `maki.agent.list()`.
+///   `"TaskStatusChanged"` compares tasks once per frame, so it can miss a
+///   task that opened and stopped in the same frame. This event never does,
+///   so an owner can rely on it to drop work it still has queued.
 /// - `"TaskFocusChanged"`: `data.id`, the task now on screen (`"main"` or a
 ///   subagent's id, what `ctx:task_id()` reports inside a tool). Fires for
 ///   the chat cycling keys, `maki.task.focus`, and a session switch that

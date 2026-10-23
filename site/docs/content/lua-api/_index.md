@@ -818,7 +818,7 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
-`"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
+`"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
 and `"FileIndexReady"`. Plugins can also fire their own events with
 `exec_autocmds`.
 
@@ -863,6 +863,12 @@ name the session now running or focused. What each event adds:
   carries `data.plugin`, and `"idle"` is such a task between prompts. A
   task that comes back from disk already finished stays quiet, so
   reloading a session does not replay old tasks.
+- `"TaskStopped"`: `data.id`, when the user stops a task with Esc in its
+  tab or through `maki.task.stop`. A plugin task carries `data.plugin`,
+  and by then it is already gone from `maki.agent.list()`.
+  `"TaskStatusChanged"` compares tasks once per frame, so it can miss a
+  task that opened and stopped in the same frame. This event never does,
+  so an owner can rely on it to drop work it still has queued.
 - `"TaskFocusChanged"`: `data.id`, the task now on screen (`"main"` or a
   subagent's id, what `ctx:task_id()` reports inside a tool). Fires for
   the chat cycling keys, `maki.task.focus`, and a session switch that
@@ -1556,12 +1562,12 @@ An event-driven one opens once with `scope = "session"`, keeps the handle
 and prompts it from autocmd callbacks.
 
 Opened by chat session id, it shows up in that chat as a task owned by
-the plugin from its first prompt on: a transcript tab, a `plugin` field
-in `/tasks` and `maki.task.list()`, `"idle"` between prompts, and its
-spend in the chat's totals after each turn. Esc in its tab closes it,
-and the pending `:prompt()` returns `"stopped by user"` rather than
-`"cancelled"`, so a loop can tell the user's Esc from its own task
-ending and stop rather than reopen. Permission prompts stay denied even
+the plugin as soon as it opens: a transcript tab, a `plugin` field in
+`/tasks` and `maki.task.list()`, `"idle"` before and between prompts, and
+its spend in the chat's totals after each turn. Esc in its tab or Ctrl+S in
+`/tasks` closes it, and the pending `:prompt()` returns `"stopped by user"`
+rather than `"cancelled"`, so a loop can tell the user's stop from its own
+task ending and stop rather than reopen. Permission prompts stay denied even
 though the task has a tab: a prompt in an unfocused tab would stall a
 monitor silently, a denial reaches the plugin as an error it can handle.
 Setting `plugins.<name>.enabled = false` stops a plugin's monitors from
@@ -1720,6 +1726,20 @@ the VM sits idle, and the subagent's event relay stays alive until it does.
 
 Close cancels a running prompt before waiting to flush its history. That
 prompt returns a cancelled error and any partial text.
+
+---
+
+### `Session:id()` {#Session-id}
+
+```lua
+Session:id()
+```
+
+The task id of this session. A session opened by chat session id goes by
+this id in `maki.task.list()` and the `"TaskStopped"` event, so a plugin
+can tell which of those are its own.
+
+**Returns:** (`string`) Session task id.
 
 
 ## maki.async {#maki-async}
@@ -4927,9 +4947,10 @@ tool spawned has its tool call's id, one a plugin opened with
 [maki.agent.session](#maki-agent-session) has its session id and a
 `plugin` field.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, name, focused, status?, plugin?}`
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, focused, status?, plugin?}`
   where `status` is `"working"`, `"idle"` (a plugin task between prompts),
-  `"done"`, or `"error"`, or nil and an error.
+  `"done"`, or `"error"`, and `session` is the chat session that `stop()`
+  asks for. Or nil and an error.
 
 **Example:**
 
@@ -4983,6 +5004,42 @@ running tasks. Deleting the focused task moves focus to the chat before it.
 
 ```lua
 local _, err = maki.task.remove("toolu_01")
+```
+
+---
+
+### `maki.task.stop()` {#maki-task-stop}
+
+```lua
+maki.task.stop({id}, {opts})
+```
+
+Stops a task in the focused session, the same way Esc in its tab does. A
+plugin task can be stopped while idle, even before its first prompt. The
+main chat, a finished task, or an unknown id returns an error.
+
+Only the user may stop a task, so this works in a command the user typed
+or a key they pressed. Tools, hooks, autocmds, `maki.async` tasks, and
+commands run through `maki.api.run_command` get an error instead, or any
+plugin could stop work that is not its own.
+
+**Parameters:**
+
+- `{id}` (`string`) Task id, as returned by `list()`.
+- `{opts}` (`table`) `session` (string), the chat session of the `list()`
+
+  row. If the user switched sessions since, this returns an error rather
+
+
+  than stopping a task with the same id in the other session.
+
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+local _, err = maki.task.stop(task.id, { session = task.session })
 ```
 
 

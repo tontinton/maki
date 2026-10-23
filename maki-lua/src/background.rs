@@ -66,6 +66,10 @@ impl BackgroundSessions {
         Ok(())
     }
 
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.locked().iter().any(|entry| entry.info.id == id)
+    }
+
     pub(crate) fn update(&self, id: &str, apply: impl FnOnce(&mut BackgroundSession)) {
         if let Some(entry) = self.locked().iter_mut().find(|e| e.info.id == id) {
             apply(entry);

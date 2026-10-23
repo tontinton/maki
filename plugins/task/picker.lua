@@ -24,7 +24,7 @@ local IDLE_ICON = "◌ "
 local NO_MATCHES_HINT = "  No matches"
 local CONFIRM_HINT = "  Ctrl+D again to delete"
 local MAIN_TASK_ID = "main"
-local FOOTER_KEYS = { { "Enter", "open" }, { "Ctrl+D", "delete" }, { "Esc", "cancel" } }
+local FOOTER_KEYS = { { "Enter", "open" }, { "Ctrl+S", "stop" }, { "Ctrl+D", "delete" }, { "Esc", "cancel" } }
 local HINT_KEY = "Ctrl+X"
 -- The main chat has no status, so it falls through to MAIN.
 local ICONS = {
@@ -222,6 +222,24 @@ local function open_selected()
   finish(true)
 end
 
+local function stop_selected()
+  local idx = Rows.index_of(board.rows, board.sel_id)
+  if not idx then
+    return
+  end
+  local task = board.rows[idx].task
+  local this_board = board
+  board.confirm = nil
+  local _, err = maki.task.stop(task.id, { session = task.session })
+  if board ~= this_board then
+    return
+  end
+  if err then
+    maki.ui.flash(err)
+  end
+  refresh()
+end
+
 -- Ctrl+D asks first and deletes on the second press. A row that can never go
 -- (main, or a task still running) skips the question and goes straight to the
 -- host, which owns the refusal and its wording, so we only flash what it says.
@@ -290,6 +308,8 @@ local function handle_key(key)
     open_selected()
   elseif key == "<C-d>" then
     delete_selected()
+  elseif key == "<C-s>" then
+    stop_selected()
   elseif board.input:handle_key(key) ~= "ignored" then
     board.confirm = nil
     rebuild()

@@ -1540,30 +1540,9 @@ impl App {
         }]
     }
 
-    /// A tool task can be cancelled only while its turn still routes to it.
-    /// A plugin task can be cancelled any time it is alive, idle included.
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
-        let chat = &self.chats[self.active_chat];
-        let Some(id) = chat.task_id().cloned() else {
-            return vec![];
-        };
-        let action = match chat.plugin {
-            Some(_) if !chat.is_finished() => Action::CancelPluginTask { id: id.to_string() },
-            None if self.chat_index.get(&*id) == Some(&self.active_chat) => {
-                Action::CancelSubagent {
-                    tool_use_id: id.to_string(),
-                }
-            }
-            _ => return vec![],
-        };
-
-        self.chats[self.active_chat].flush();
-        self.chats[self.active_chat].cancel_in_progress();
-        self.chats[self.active_chat].mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.remove(&*id);
-        self.permission_prompt.drop_subagent(&id);
-
-        vec![action]
+        let id = self.active_task_id();
+        self.stop_task(&id).into_iter().collect()
     }
 
     fn bill(&mut self, chat_idx: usize, model: &str, usage: StoredTokenUsage) {
@@ -1678,7 +1657,7 @@ impl App {
         let is_plugin_task = plugin.is_some();
         let chat_idx = match envelope.subagent {
             Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin),
-            // A plugin session that never prompted has no task to show.
+            // A plugin event without its task must never land in the main chat.
             None if is_plugin_task => return vec![],
             None => MAIN_CHAT,
         };
@@ -1932,6 +1911,17 @@ impl App {
         self.chats.push(chat);
         self.sync_subagents();
         idx
+    }
+
+    /// A chat this task already has, maybe one the user just stopped, stays as
+    /// it is rather than turning idle again.
+    pub(crate) fn open_plugin_task(&mut self, info: &SubagentInfo, plugin: Arc<str>) {
+        let id = &info.parent_tool_use_id;
+        if self.deleted_tasks.contains(id) || self.chat_of_task(id).is_ok() {
+            return;
+        }
+        let idx = self.resolve_or_create_chat(info, &Some(plugin));
+        self.chats[idx].idle = true;
     }
 
     /// Entry point for `maki.api.run_command`: splits a command line into the

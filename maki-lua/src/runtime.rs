@@ -722,6 +722,11 @@ pub(crate) struct TaskCell {
     /// can refuse to extend a chain that never ends. Inherited by
     /// `maki.async.run` tasks, or a cycle could hop through one and reset it.
     pub(crate) command_depth: u8,
+    /// True while running a command the user typed or a key they pressed, so
+    /// `maki.task.stop` knows a person asked for it. `maki.async` tasks start
+    /// without it, since they can run long after the keypress. So do commands
+    /// run through `maki.api.run_command`, which any plugin code can call.
+    user_action: bool,
     /// Set under a `maki.async.spawn` task and passed down to the runs it
     /// queues. [`TaskLifetime::Detached`] says why.
     detached: bool,
@@ -751,6 +756,7 @@ impl TaskCell {
             bufs_claim: Weak::new(),
             owns_jobs: true,
             command_depth: 0,
+            user_action: false,
             detached: false,
         }
     }
@@ -1548,11 +1554,16 @@ async fn run_abandonable<F: Future>(
     until_abandoned(run_scoped(lua, scope, fut), &handle).await
 }
 
-/// [`run_detached`] for a slash-command handler, seeding the hop count that
-/// `maki.api.run_command` checks before extending the chain.
+/// [`run_detached`] for a slash-command handler or a keybind callback, seeding
+/// the hop count that `maki.api.run_command` checks before extending the chain.
+/// Depth 0 means the user acted directly, see [`TaskCell::user_action`].
 pub(crate) async fn run_command_scoped<F: Future>(lua: &Lua, depth: u8, fut: F) -> F::Output {
     let scope = TaskScope::detached(lua);
-    lock_cell(scope.handle()).command_depth = depth;
+    {
+        let mut cell = lock_cell(scope.handle());
+        cell.command_depth = depth;
+        cell.user_action = depth == 0;
+    }
     run_scoped(lua, scope, fut).await
 }
 
@@ -1751,6 +1762,11 @@ pub(crate) fn active_task_cancel(lua: &Lua) -> Option<(u64, CancelToken)> {
 pub(crate) fn command_depth(lua: &Lua) -> u8 {
     lua.app_data_ref::<TaskHandle>()
         .map_or(0, |handle| lock_cell(&handle).command_depth)
+}
+
+pub(crate) fn is_user_action(lua: &Lua) -> bool {
+    lua.app_data_ref::<TaskHandle>()
+        .is_some_and(|handle| lock_cell(&handle).user_action)
 }
 
 /// Task id for job ownership; `None` under a delivery scope.
@@ -2397,7 +2413,7 @@ fn spawn_keybind_callback(
     let plugin = Arc::clone(ticket.plugin());
     ex.spawn(async move {
         let _done = done_tx;
-        if let Err(e) = run_detached(&handler_lua, func.call_async::<LuaValue>(())).await {
+        if let Err(e) = run_command_scoped(&handler_lua, 0, func.call_async::<LuaValue>(())).await {
             tracing::warn!(?key, plugin = %plugin, error = %strip_traceback(&e), "keybind callback failed, key spent");
         }
     })

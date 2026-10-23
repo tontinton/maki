@@ -7571,22 +7571,32 @@ impl Provider for TurnThenPark {
     }
 }
 
+/// What this chat session's task tabs were sent since the last drain. The
+/// notice that opens a tab carries no event, so it is skipped.
+fn task_events(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+) -> impl Iterator<Item = AgentEvent> {
+    ui.drain().filter_map(move |action| match action {
+        maki_lua::UiAction::PluginTaskEvent {
+            session: owner,
+            envelope,
+            ..
+        } if owner == session => Some(envelope.event),
+        maki_lua::UiAction::PluginTaskOpened { session: owner, .. } if owner == session => None,
+        _ => panic!("only this chat session's task events go to the UI here"),
+    })
+}
+
 /// The paid turns the tab was told about, in order.
 fn billed_turns(
     ui: &flume::Receiver<maki_lua::UiAction>,
     session: MakiId,
 ) -> Vec<TurnCompleteEvent> {
-    ui.drain()
-        .filter_map(|action| match action {
-            maki_lua::UiAction::PluginTaskEvent {
-                session: owner,
-                envelope,
-                ..
-            } if owner == session => match envelope.event {
-                AgentEvent::TurnComplete(turn) => Some(*turn),
-                _ => None,
-            },
-            _ => panic!("only this chat session's task events go to the UI here"),
+    task_events(ui, session)
+        .filter_map(|event| match event {
+            AgentEvent::TurnComplete(turn) => Some(*turn),
+            _ => None,
         })
         .collect()
 }
@@ -7597,20 +7607,13 @@ fn handed_over_history(
     session: MakiId,
     id: &str,
 ) -> Option<Vec<Message>> {
-    ui.drain()
-        .filter_map(|action| match action {
-            maki_lua::UiAction::PluginTaskEvent {
-                session: owner,
-                envelope,
-                ..
-            } if owner == session => match envelope.event {
-                AgentEvent::SubagentHistory {
-                    tool_use_id,
-                    messages,
-                } if tool_use_id == id => Some(messages),
-                _ => None,
-            },
-            _ => panic!("only this chat session's task events go to the UI here"),
+    task_events(ui, session)
+        .filter_map(|event| match event {
+            AgentEvent::SubagentHistory {
+                tool_use_id,
+                messages,
+            } if tool_use_id == id => Some(messages),
+            _ => None,
         })
         .last()
 }
@@ -7719,6 +7722,75 @@ fn stopping_a_plugin_task_from_the_tab_ends_its_prompt_as_stopped_by_user() {
         exec_tool(&reg, "prompt_background", json!({})).unwrap(),
         STOPPED_BY_USER_ERR
     );
+}
+
+/// The tab opens with the session, so the user can find and stop a monitor
+/// that has not prompted yet.
+#[test]
+fn opening_a_background_session_shows_its_task_before_any_prompt() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let _seed = mailbox.publish_seed(stub_seed(session));
+    let ui = host.ui_action_rx();
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+    let id = exec_tool(&reg, "background_id", json!({})).unwrap();
+    let opened: Vec<_> = ui.drain().collect();
+    let [
+        maki_lua::UiAction::PluginTaskOpened {
+            session: owner,
+            plugin,
+            info,
+        },
+    ] = opened.as_slice()
+    else {
+        panic!("opening must announce exactly one task");
+    };
+    assert_eq!(*owner, session);
+    assert_eq!(&**plugin, BACKGROUND_PLUGIN);
+    assert_eq!(info.parent_tool_use_id, id);
+    assert_eq!(info.prompt, None);
+}
+
+/// Ending the chat session retires the monitor, but the plugin still holds
+/// its handle. A prompt on it must stop before the model or the tab hears of
+/// it, or a task queued behind it would run for a chat that is gone.
+#[test]
+fn a_retired_background_session_refuses_later_prompts() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = mailbox.publish_seed(stub_seed(session));
+    let parked = TurnThenPark::install(&seed);
+    let ui = host.ui_action_rx();
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+    host.event_handle()
+        .end_sessions_blocking([session], maki_lua::SessionEndReason::Delete);
+    let reply = call_on_thread(&reg, "prompt_background", CancelToken::none())
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("a retired session must reject its next prompt");
+    assert_eq!(reply, Ok(CANCELLED_MSG.to_owned()));
+    assert!(parked.try_recv().is_err());
+    assert_eq!(task_events(&ui, session).count(), 0);
+    assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
 /// The provider parks the second turn forever, so only a cancel can end this
