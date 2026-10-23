@@ -144,14 +144,6 @@ function Runner.prepare(input, ctx)
 
   local audience = subagent_type == "research" and "research_sub" or "general_sub"
   local prompt_id = subagent_type == "research" and "research" or "general"
-  local system, system_err = maki.agent.system_prompt(ctx, {
-    prompt_id = prompt_id,
-    instructions = true,
-  })
-  if system_err then
-    return nil, system_err
-  end
-
   local tool_defs, tools_err = maki.agent.tools(ctx, {
     audience = audience,
     spec = model.spec,
@@ -159,6 +151,15 @@ function Runner.prepare(input, ctx)
   })
   if tools_err then
     return nil, tools_err
+  end
+
+  local system, system_err = maki.agent.system_prompt(ctx, {
+    prompt_id = prompt_id,
+    instructions = true,
+    tools = tool_defs,
+  })
+  if system_err then
+    return nil, system_err
   end
 
   local capture = validator and {} or nil

@@ -1518,6 +1518,9 @@ prompt for a subagent session.
     `{{instructions}}` marker.
     `true` loads project instruction files.
     `false` or nil omits them.
+  - `tools` (`table[]?`) the definitions the session will get, as returned
+    by `maki.agent.tools`. A plugin's hints are dropped when none of its
+    tools are in it. Without it, the hints follow the config.
 
 **Returns:** (`string?`, `string?`) The assembled prompt string, or `(nil, err)` on failure.
 
@@ -1527,6 +1530,7 @@ prompt for a subagent session.
 local prompt, err = maki.agent.system_prompt(ctx, {
   prompt_id = "research",
   instructions = true,
+  tools = tool_defs,
 })
 if err then error(err) end
 ```
