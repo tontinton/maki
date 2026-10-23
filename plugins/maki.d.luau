@@ -148,6 +148,7 @@ declare maki: {
     live: @checked () -> (any, string?),
     current: @checked () -> (string?, string?),
     read: @checked (opts: any) -> (any, string?),
+    export: @checked (opts: any) -> (any, string?),
     messages: @checked (opts: any) -> (any, string?),
     focus: @checked (id: string) -> (boolean?, string?),
     delete: @checked (id: string) -> (boolean?, string?),

@@ -109,9 +109,32 @@ maki session list            # sessions for the current directory
 maki session list --global   # sessions from all projects
 maki session list --json     # machine-readable JSON array
 maki session delete <id>     # asks first, -f skips
+maki session export <id>     # JSON transcript to stdout
+maki session import [FILE|-] # store a transcript, print the new id
 ```
 
 Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. `--json` prints one JSON array of the same summaries instead, for scripts. A listed id works with `maki --resume <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`; without a terminal to ask on it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
+
+#### Export and import
+
+`export <SESSION_ID>` prints one JSON document to stdout. It reads the session without claiming it, so it also works for a session whose model this machine cannot run. When another maki has the session open, you get what that maki last flushed to disk, and a notice on stderr says so.
+
+`import` reads the document from `FILE`, or from stdin when `FILE` is omitted or `-`. It stores the result as a new session in the current directory's project and prints only the new id on stdout, so `id=$(maki session import < file.json)` works. Continue it with `maki -r <id>`. On failure, `import` prints an error that names the place in the document, such as `messages[12].content[2]` (0-based, as in the JSON document), exits non-zero, and stores nothing. A document without messages is refused.
+
+The document has these fields:
+
+| Field | Meaning |
+|-------|---------|
+| `format` | Version of the document envelope, currently `1` |
+| `model` | Model spec as stored. Import keeps any string and resolves it when the session opens |
+| `mode` | `build` or `plan` |
+| `thinking` | Thinking setting, spelled as in `/thinking` |
+| `fast` | Fast mode on or off. Off when missing |
+| `title` | Session title. Import generates one from the history when it is missing |
+| `facts` | What the model last held true: date, cwd, model, instructions, hints |
+| `messages` | The conversation in the same shape [`maki.session.messages`](/docs/lua-api/#maki-session-messages) returns |
+
+Import drops top-level fields it does not know, so keep your own metadata outside the document. A `format` newer than the importer supports fails with "exported by a newer maki". Thinking blocks and their signatures are dropped on import, because they are bound to a system prompt the new session will not have. Orphan tool results and a dangling final tool call are repaired the way a resume repairs them. A content block of a known type that does not parse, or one without a `type`, is refused. A block of a type this maki does not know is kept as it is. For a walk-through, see [Move a session](/docs/headless/#move-a-session).
 
 ### `maki mcp`
 

@@ -234,6 +234,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 SessionAction::Delete { session_id, force } => {
                     session::delete(&session_id, force, &storage)?
                 }
+                SessionAction::Export { session_id } => session::export(&session_id, &storage)?,
+                SessionAction::Import { file } => session::import(file.as_deref(), &storage)?,
             }
         }
         Some(Command::Mcp { action }) => {

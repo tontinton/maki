@@ -190,7 +190,6 @@ pub(crate) struct LuaImage(Arc<ImageState>);
 
 impl LuaImage {
     /// O(1): the payload is shared and nothing is decoded until asked for.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn from_source(source: ImageSource) -> Self {
         Self(Arc::new(ImageState {
             source,

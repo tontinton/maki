@@ -319,6 +319,18 @@ pub enum SessionAction {
         #[arg(short, long)]
         force: bool,
     },
+    /// Write a session as a portable JSON transcript to stdout
+    Export {
+        /// Session ID (see `maki session list`)
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+    },
+    /// Store a JSON transcript as a new session in this directory and print its ID
+    Import {
+        /// Transcript file, or stdin when omitted or `-`
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]

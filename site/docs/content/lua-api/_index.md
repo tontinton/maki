@@ -4639,7 +4639,8 @@ at once. These functions list, create, focus, rename, and delete them.
 
 Without a UI, most functions return `nil, "no interactive UI attached"`.
 `current` and `read` still work under `maki -p` and the sdk.
-`messages` and `notify` work everywhere, ACP included.
+`export`, `messages`, `notify`, `read` of a stored session and `new`
+without `prompt` or `focus` work everywhere, ACP included.
 
 ---
 
@@ -4708,22 +4709,33 @@ maki.session.read({opts?})
 ```
 
 One-call snapshot of a session: queue, usage, context, cost, mode, and
-status. Reads the focused session, or the one you name in `session` when
-you act on a background tab.
+status. Reads the focused session, or the one you name in `session`: a
+background tab, or a stored session nothing has open.
+
+Metadata only, so it needs no permission. Not to be confused with the
+`session_read` permission, which guards transcript content
+(`maki.session.export`, `maki.session.messages`).
 
 The returned table:
 ```text
 {
   id, cwd, model, mode = "build" | "plan",
-  status = "idle" | "working" | "needs_input",
+  thinking, fast,    -- nil under headless drivers
+  status = "idle" | "working" | "needs_input" | "stored",
   focused, updated_at,
   usage = { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens },
-  context_size, context_window,
-  cost,
-  queue = { count }, -- nil under headless drivers
+  context_size,
+  context_window,    -- nil for a stored session
+  cost,              -- nil for a stored session
+  queue = { count }, -- nil under headless drivers and for a stored session
   title,             -- nil under headless drivers
 }
 ```
+
+`status` is `"stored"` for a session nothing here runs. Its `model` is the
+one it was saved with, resolved only when it opens. A session another
+headless driver in this process runs (an ACP session) reports
+`"working"` or `"idle"`, saved or not.
 
 `usage` and `cost` include subagent spend. `context_size` is the main
 session's own, since a subagent runs its own window. There is no
@@ -4732,7 +4744,7 @@ session's own, since a subagent runs its own window. There is no
 
 **Parameters:**
 
-- `{opts?}` (`table?`) `session` (string?) Session id; defaults to focused.
+- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the focused one.
 
 **Returns:** (`table|nil`, `string|nil`) Snapshot table, or nil and an error.
 
@@ -4747,41 +4759,93 @@ end
 
 ---
 
+### `maki.session.export()` {#maki-session-export}
+
+```lua
+maki.session.export({opts?})
+```
+
+Reads a session as the document `maki session export` prints, the same
+table `maki.session.new` takes back:
+
+```text
+{ format, model, mode, thinking, fast, title, facts, messages }
+```
+
+`messages` is what `maki.session.messages` returns. `facts` is what the
+model last held true (date, cwd, model, instructions, hints), nil when the
+session never ran. A live session is read from memory, unsaved messages
+included, any other from disk without claiming it, so a session another
+maki has open can be read too.
+
+JSON null comes back as `maki.NIL` and arrays are tagged, so
+`maki.json.encode(maki.session.export(...))` is exactly the CLI file. Copy
+it with `maki.deepcopy` before editing, which keeps both intact.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the focused one.
+
+**Returns:** (`table|nil`, `string|nil`) The document, or nil and an error.
+
+**Example:**
+
+```lua
+local doc = assert(maki.session.export({ session = maki.session.current() }))
+maki.fs.write("/tmp/session.json", maki.json.encode(doc))
+```
+
+---
+
 ### `maki.session.messages()` {#maki-session-messages}
 
 ```lua
 maki.session.messages({opts?})
 ```
 
-Reads a live session's transcript, oldest first: everything the model has
+Reads a session's transcript, oldest first: everything the model has
 been sent so far, tool calls and results included. Read only.
 
-Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
-`"assistant"`. `kind` is `"turn"` for something the user or the model said,
+Each message is the serde shape sessions are stored in:
+
+```text
+{ role = "user" | "assistant", kind, facts?, display_text?, content = { blocks } }
+```
+
+`kind` is `"turn"` for something the user or the model said,
 `"observation"` for a report sent to the model as a user message, like
 `maki.session.notify`, and `"context_update"` for a change since the
-system prompt was built (date, model, plan mode, ...). `hidden` marks a
-message only the model sees, such as a nudge or a compaction note.
-`content` lists blocks:
+system prompt was built (date, model, plan mode, ...), which carries the
+changed `facts`. `display_text` is what the UI shows instead of the
+content: nil shows the content, `""` hides the message (a nudge, a
+compaction note). `content` lists blocks:
 
 ```text
 { type = "text", text }
-{ type = "thinking", text }
-{ type = "tool_use", id, name, input }
-{ type = "tool_result", tool_use_id, content, is_error }
-{ type = "image", media_type }
+{ type = "thinking", thinking, signature? }
+{ type = "redacted_thinking", data }
+{ type = "tool_use", id, name, input, thought_signature? }
+{ type = "tool_result", tool_use_id, content, is_error?, loaded_tools? }
+{ type = "image", source = maki.image.Image }
 ```
 
-Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no focused
-session, so pass `session` there. Hook and event payloads carry the
-`session_id` to pass.
+`signature`, `thought_signature`, `data` and `loaded_tools` are opaque:
+pass them through untouched. A block type this build does not know comes
+as its raw table. JSON null is `maki.NIL`.
+
+A live session is read from memory, unsaved messages included, any other
+from disk. Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no
+focused session, so pass `session` there. Hook and event payloads carry
+the `session_id` to pass.
 
 Requires the `session_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
-  - `session` (`string?`) id of a live session, defaults to the focused one.
+  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
   - `last` (`integer?`) only the newest `last` messages.
 
 **Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and an error.
@@ -4791,7 +4855,7 @@ Requires the `session_read` [plugin permission](#plugin-permissions).
 ```lua
 local msgs = maki.session.messages({ last = 1 })
 local last = msgs and msgs[1]
-if last and last.role == "assistant" then
+if last and last.role == "assistant" and last.content[1].type == "text" then
   print(last.content[1].text)
 end
 ```
@@ -4851,13 +4915,48 @@ local _, err = maki.session.delete(id)
 maki.session.new({opts?})
 ```
 
-Starts a new session in the current project.
+Creates a session from the document `maki.session.export` returns, or
+from nothing.
+
+Whatever the document leaves out is what a new tab would get: in the TUI
+the focused tab's project, model, mode, thinking, fast and workflow, under
+a headless driver the project of the session it runs. Permissions (`yolo`,
+session rules) are never carried, from either side.
+
+Without `prompt` or `focus` the session is only stored:
+`maki.session.focus(id)` opens it later, and a bulk import starts no agent
+loops. With either it opens in a tab. Headless drivers (`maki -p`, ACP)
+have nothing to open it in, so there `prompt` and `focus` answer
+`nil, "no interactive UI attached"` and store nothing.
+
+History is repaired the way a resume repairs it (orphan tool results go,
+a dangling final tool call is closed) and anything else wrong is refused
+with where it sits, like `messages[12].content[2]: ...` (0-based, as in
+the JSON document). A block of a known type that does not parse, or one
+without a `type`, is refused too, while one of a type this build does not
+know is kept. Thinking blocks and `thought_signature` are dropped: they
+are bound to a system prompt the new session will not have. `model` is
+stored as given and resolved when the session opens, falling back with a
+warning like any resume.
+
+Image sources may be a `maki.image.Image` or the
+`{ type = "base64", media_type, data }` table `maki.json` gives. An empty
+table where a list belongs (`messages`, a message's `content`) is refused,
+since nothing tells it from an empty object: copy with `maki.deepcopy`,
+which keeps the tag. Fields `new` does not know are ignored.
 
 Requires the `session_write` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
 - `{opts?}` (`table?`) Optional fields:
+  - `messages` (`table`) what `export` or `messages` return.
+  - `facts` (`table`) what `export` returns: what the model last held true.
+  - `model` (`string`) model spec.
+  - `mode` (`string`) "build" or "plan".
+  - `thinking` (`string`) spelled like the thinking setting.
+  - `fast` (`boolean`) fast output mode, where the model supports it.
+  - `title` (`string`) else generated from the history.
   - `prompt` (`string`) first user message to submit right away. Needs the
     `agent` permission.
   - `focus` (`boolean`) switch the UI to the new session.
@@ -4867,6 +4966,11 @@ Requires the `session_write` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
+-- copy a session, keeping it in the background
+local doc = assert(maki.session.export({ session = id }))
+local copy, err = maki.session.new(doc)
+
+-- start a fresh one right away
 local id, err = maki.session.new({ prompt = "fix the tests", focus = true })
 ```
 

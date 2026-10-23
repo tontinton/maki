@@ -5732,6 +5732,7 @@ fn run_call_with(held: &[Permission], call: &str) -> String {
 /// A write that also starts a turn takes `agent` on top, even when the turn is
 /// only an option of the call.
 #[test_case::test_case("maki.session.messages()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "messages_with_write_and_settings")]
+#[test_case::test_case("maki.session.export()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "export_with_write_and_settings")]
 #[test_case::test_case("maki.ui.input()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "input_with_write_and_settings")]
 #[test_case::test_case("maki.session.new()", &[Permission::SessionRead, Permission::SessionSettings], Permission::SessionWrite ; "new_with_read_and_settings")]
 #[test_case::test_case(r#"maki.session.delete("x")"#, &[Permission::SessionSettings], Permission::SessionWrite ; "delete_with_only_settings")]

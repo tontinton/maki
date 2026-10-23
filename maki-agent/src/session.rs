@@ -13,7 +13,7 @@ use maki_storage::sessions::{
 use tracing::warn;
 
 use crate::agent::{
-    History, HistorySnapshot, RunContextBuilder, SharedMessages, publish_live_history,
+    History, HistorySnapshot, RunContextBuilder, SharedHeader, SharedMessages, publish_live_session,
 };
 use crate::types::EventSender;
 use crate::{AgentRunParams, ToolOutput};
@@ -131,13 +131,15 @@ impl SessionTrack {
     /// Takes the claim by value, so nobody else can write the session for as
     /// long as this track can.
     ///
-    /// Publishes the transcript under the session's id, so
-    /// `maki.session.messages` works under a headless driver too.
+    /// Publishes the transcript and the settings under the session's id, so
+    /// `maki.session.messages`, `export` and `read` work under a headless
+    /// driver too, before anything is saved.
     pub fn open(resumed: Resumed, claim: SessionClaim, storage: StateDir, cwd: &str) -> Self {
         let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
-        publish_live_history(resumed.id.id(), &mirror);
+        let store = SessionStore::open(storage, claim, resumed.session, cwd);
+        publish_live_session(resumed.id.id(), &mirror, &store.header);
         Self {
-            store: SessionStore::open(storage, claim, resumed.session, cwd),
+            store,
             history: History::restored(resumed.history)
                 .with_frame(resumed.frame)
                 .with_mirror(mirror),
@@ -155,6 +157,7 @@ impl SessionTrack {
     /// write, no stored session can carry a spec no turn ran on.
     pub fn turn(&mut self, model_spec: String) -> SessionTurn<'_> {
         self.store.session.set_model(model_spec);
+        self.store.publish_header(true);
         SessionTurn(self)
     }
 }
@@ -188,18 +191,18 @@ impl Drop for SessionTurn<'_> {
             gauge,
             store,
         } = &mut *self.0;
-        if !history.has_unsaved() {
-            return;
-        }
-        match store.record_turn(history.as_slice(), history.frame(), gauge.size()) {
-            Ok(()) => history.mark_saved(),
-            // Only headless runs save through here (the TUI has its own
-            // writer), so printing cannot tear a drawn frame.
-            Err(e) => {
-                warn!(error = %e, session_id = %store.session.id, "failed to persist session");
-                eprintln!("{SAVE_FAILED}{}: {e}", store.session.id);
+        if history.has_unsaved() {
+            match store.record_turn(history.as_slice(), history.frame(), gauge.size()) {
+                Ok(()) => history.mark_saved(),
+                // Only headless runs save through here (the TUI has its own
+                // writer), so printing cannot tear a drawn frame.
+                Err(e) => {
+                    warn!(error = %e, session_id = %store.session.id, "failed to persist session");
+                    eprintln!("{SAVE_FAILED}{}: {e}", store.session.id);
+                }
             }
         }
+        store.publish_header(false);
     }
 }
 
@@ -207,6 +210,8 @@ struct SessionStore {
     dir: StateDir,
     claim: SessionClaim,
     session: StoredSession,
+    /// `session`'s header as readers see it, republished whenever it moves.
+    header: SharedHeader,
 }
 
 impl SessionStore {
@@ -224,8 +229,16 @@ impl SessionStore {
         Self {
             dir,
             claim,
+            header: Arc::new(ArcSwap::from_pointee(SessionHeader::of(&session))),
             session,
         }
+    }
+
+    fn publish_header(&self, working: bool) {
+        self.header.store(Arc::new(SessionHeader {
+            working,
+            ..SessionHeader::of(&self.session)
+        }));
     }
 
     /// `context_size` travels with the messages, since a resumed session seeds
@@ -269,7 +282,7 @@ mod tests {
     use crate::tools::RequestTools;
 
     use super::*;
-    use crate::agent::live_history;
+    use crate::agent::{live_header, live_history};
 
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const CWD: &str = "/project";
@@ -584,5 +597,42 @@ mod tests {
 
         drop(track);
         assert!(live_history(id).is_none());
+    }
+
+    /// Export and `read` of a headless session answer from this before the
+    /// first save, so it has to follow the turn: the model it runs on, the
+    /// title it earned, and whether one is running.
+    #[test]
+    fn open_publishes_the_header_and_each_turn_moves_it() {
+        let tmp = TempDir::new().unwrap();
+        let id = MakiId::generate();
+        let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
+        let mut track = SessionTrack::open(
+            Resumed::empty(SessionRef::from(id)),
+            claim,
+            state_dir(&tmp),
+            CWD,
+        );
+
+        let opened = live_header(id).expect("an open track publishes its header");
+        assert_eq!(opened.cwd, CWD);
+        assert!(!opened.working);
+
+        let turn = track.turn(MODEL_SPEC.into());
+        let running = live_header(id).unwrap();
+        assert_eq!(running.model, MODEL_SPEC);
+        assert!(running.working);
+        drop(turn);
+
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        let finished = live_header(id).unwrap();
+        assert!(!finished.working);
+        assert_eq!(
+            finished.title,
+            generate_title(&[Message::user(PROMPT.into())])
+        );
+
+        drop(track);
+        assert!(live_header(id).is_none());
     }
 }

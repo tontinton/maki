@@ -22,7 +22,7 @@ use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
     AgentMode, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
     McpSnapshot, McpSnapshotReader, SharedBuf, SubagentInbox, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent,
+    ToolStartEvent, Transcript, TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -961,6 +961,27 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
     assert!(session.messages().is_empty());
     assert_eq!(session.model, app.state.model.spec());
     assert_eq!(session.cwd, app.state.session.cwd);
+}
+
+/// `maki.session.new` lays its document over this same blank session, so a
+/// plugin's "new session" starts where `Ctrl-N` would, minus the yolo a
+/// transcript never brings along.
+#[test]
+fn a_plugin_made_session_starts_from_the_focused_tab() {
+    let mut app = test_app();
+    app.state.fast = true;
+    app.state.workflow = true;
+    app.permissions.set_session_yolo(Some(true));
+
+    let session = Transcript::default()
+        .into_session(app.blank_session().session)
+        .unwrap();
+
+    assert_eq!(session.cwd, app.state.session.cwd);
+    assert_eq!(session.model, app.state.model.spec());
+    assert!(session.meta.fast);
+    assert!(session.meta.workflow);
+    assert_eq!(session.meta.yolo, None);
 }
 
 /// A setting written into the meta but never read back still opens the tab

@@ -86,6 +86,36 @@ The lock is released when the process exits, even after a crash. On a filesystem
 without file locks, such as some NFS mounts, Maki logs a warning and runs
 unlocked.
 
+### Move a session
+
+To continue a session on another machine, or from a server, export it and import the file there:
+
+```bash
+maki session export <id> > session.json
+scp session.json server:
+ssh server 'cd ~/code/my-app && id=$(maki session import < session.json) && maki -r "$id"'
+```
+
+The import stores the session under the directory you run it in, with a new id. The first run there tells the model the new working directory and date, so it does not keep acting on the old ones. If the `model` in the file is not available on the target machine, the session opens with a warning and falls back like any other resume. The fields of the document and the failure rules are in the [CLI reference](/docs/cli/#export-and-import).
+
+A plugin can do the same without the CLI. `maki.session.export` returns the document as a table, and `maki.session.new` takes it back. This sends the focused session to a server and pulls it back later, with the `upload` and `download` helpers left to you:
+
+```lua
+-- hand off from the focused session
+local id = maki.session.current()
+local doc = assert(maki.session.export({ session = id }))
+doc.messages = redact(doc.messages)
+local url = assert(upload(maki.json.encode(doc)))
+maki.ui.notify("continued at " .. url)
+
+-- pull it back
+local back = maki.json.decode(assert(download(url)))
+back.focus = true
+assert(maki.session.new(back))
+```
+
+`export` needs the `session_read` permission and `new` needs `session_write`. Write `redact` with [`maki.deepcopy`](/docs/lua-api/#maki-deepcopy), which keeps `maki.NIL` and the empty-array tags that a hand-rolled copy loses. `maki.json.decode` returns `maki.NIL` for JSON null, so decoding and encoding again changes nothing. Pass `luanil` to get plain nil instead. Without `prompt` or `focus`, `new` only stores the session. With either, it needs a frontend that opens sessions, so `maki -p` and ACP refuse it and store nothing. Settings the document leaves out come from where the call runs. In the TUI that is the focused tab, with its project, model, mode, thinking, fast mode and workflow. Under `maki -p` and ACP the session goes to the project of the session the plugin runs in. Permissions such as yolo and session rules never carry over. `export` works on a headless session before its first save, such as from a `TurnEnd` hook under `maki -p`.
+
 ## Claude Code Compatibility
 
 Maki's `--print` is a drop-in replacement for Claude Code:

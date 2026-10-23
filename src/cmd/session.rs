@@ -1,12 +1,15 @@
 use std::borrow::Cow;
 use std::env;
 use std::fmt::Write as _;
-use std::io::{self, IsTerminal, Write as _};
+use std::fs::File;
+use std::io::{self, IsTerminal, Read, Write as _};
+use std::path::Path;
 
 use color_eyre::Result;
-use color_eyre::eyre::{Context, bail, eyre};
+use color_eyre::eyre::{Context, Report, bail, eyre};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use maki_agent::Transcript;
 use maki_storage::id::MakiId;
 use maki_storage::paths;
 use maki_storage::sessions::{SessionClaim, SessionSummary};
@@ -34,6 +37,13 @@ const NO_SESSIONS: &str = "No sessions found";
 const NO_SESSIONS_HERE: &str = "No sessions found in this directory (try --global)";
 const NEEDS_TTY: &str = "refusing to delete without a terminal to confirm on, pass --force";
 const CANCELLED: &str = "Cancelled";
+const STDIN_MARKER: &str = "-";
+const LIVE_SESSION_NOTICE: &str =
+    "session is open in a running maki; exported as last flushed to disk";
+const EMPTY_TRANSCRIPT: &str = "transcript has no messages, nothing to import";
+const INVALID_TRANSCRIPT: &str = "invalid transcript";
+const CONTINUE_HINT: &str = "continue with: maki -r";
+const NOT_FOUND: &str = "not found";
 
 pub fn list(global: bool, json: bool, storage: &StateDir) -> Result<()> {
     let summaries = if global {
@@ -66,9 +76,7 @@ pub fn list(global: bool, json: bool, storage: &StateDir) -> Result<()> {
 }
 
 pub fn delete(session_id: &str, force: bool, storage: &StateDir) -> Result<()> {
-    let id: MakiId = session_id
-        .parse()
-        .map_err(|e| eyre!("invalid session id {session_id:?}: {e}"))?;
+    let id = parse_id(session_id)?;
     if !force && !confirm(id)? {
         println!("{CANCELLED}");
         return Ok(());
@@ -82,6 +90,70 @@ pub fn delete(session_id: &str, force: bool, storage: &StateDir) -> Result<()> {
         Err(e) => return Err(e).context("delete session"),
     }
     Ok(())
+}
+
+pub fn export(session_id: &str, storage: &StateDir) -> Result<()> {
+    let id = parse_id(session_id)?;
+    let (json, live) = export_json(id, storage)?;
+    if live {
+        eprintln!("{LIVE_SESSION_NOTICE}");
+    }
+    writeln!(io::stdout().lock(), "{json}").context("write transcript")
+}
+
+pub fn import(file: Option<&Path>, storage: &StateDir) -> Result<()> {
+    let cwd = env::current_dir().context("read current directory")?;
+    let cwd = cwd.to_string_lossy();
+    let id = match file.filter(|path| path != &Path::new(STDIN_MARKER)) {
+        Some(path) => {
+            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            import_from(file, &cwd, storage)?
+        }
+        None => import_from(io::stdin().lock(), &cwd, storage)?,
+    };
+    println!("{id}");
+    eprintln!("{CONTINUE_HINT} {id}");
+    Ok(())
+}
+
+fn parse_id(session_id: &str) -> Result<MakiId> {
+    session_id
+        .parse()
+        .map_err(|e| eyre!("invalid session id {session_id:?}: {e}"))
+}
+
+/// Reads without a claim, so it also works for a session a running maki
+/// holds, and without resolving the model, so it works for one this machine
+/// cannot run. The flag says whether that session is held right now.
+fn export_json(id: MakiId, storage: &StateDir) -> Result<(String, bool)> {
+    let session = AppSession::read_only(id, storage).map_err(|e| {
+        if e.is_not_found() {
+            eyre!("session {id} {NOT_FOUND}")
+        } else {
+            Report::new(e).wrap_err("read session")
+        }
+    })?;
+    let live = SessionClaim::acquire(id, storage).is_err_and(|e| e.is_busy());
+    let json = serde_json::to_string(&Transcript::from_session(&session))
+        .context("serialize transcript")?;
+    Ok((json, live))
+}
+
+fn import_from(mut reader: impl Read, cwd: &str, storage: &StateDir) -> Result<MakiId> {
+    let mut document = String::new();
+    reader
+        .read_to_string(&mut document)
+        .context("read transcript")?;
+    let transcript: Transcript = serde_json::from_str(&document).context(INVALID_TRANSCRIPT)?;
+    if transcript.messages.is_empty() {
+        bail!(EMPTY_TRANSCRIPT);
+    }
+    let mut session = transcript
+        .into_session(AppSession::new("", cwd))
+        .context(INVALID_TRANSCRIPT)?;
+    let claim = SessionClaim::acquire(session.id, storage).context("claim session")?;
+    session.save(&claim, storage).context("store session")?;
+    Ok(session.id)
 }
 
 /// A maki that already has the session open cannot notice the delete: it holds
@@ -234,8 +306,168 @@ fn format_row(cells: [&str; 4], widths: &[usize; 4]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use maki_providers::Message;
+    use serde_json::{Value, json};
+    use tempfile::{TempDir, tempdir};
+
     use super::*;
     use test_case::test_case;
+
+    const ORIGIN_CWD: &str = "/origin";
+    const IMPORT_CWD: &str = "/imported";
+    const MODEL: &str = "anthropic/claude-opus-5";
+    const PROMPT: &str = "fix the bug";
+    const NEWER_FORMAT_VERSION: u32 = u32::MAX;
+    const UNKNOWN_FIELD: &str = "origin_host";
+    const DANGLING_TOOL_ID: &str = "t1";
+    const NOT_JSON: &str = "{ not json";
+
+    fn storage() -> (TempDir, StateDir) {
+        let dir = tempdir().expect("tempdir");
+        let storage = StateDir::from_path(dir.path().join("state"));
+        (dir, storage)
+    }
+
+    fn seed(storage: &StateDir, messages: Vec<Message>) -> MakiId {
+        let mut session = AppSession::new(MODEL, ORIGIN_CWD);
+        session.replace_messages(messages);
+        let claim = SessionClaim::acquire(session.id, storage).unwrap();
+        session.save(&claim, storage).unwrap();
+        session.id
+    }
+
+    fn document(overrides: Value) -> String {
+        let mut document = json!({
+            "messages": [{ "role": "user", "content": [{ "type": "text", "text": PROMPT }] }]
+        });
+        document
+            .as_object_mut()
+            .unwrap()
+            .extend(overrides.as_object().unwrap().clone());
+        document.to_string()
+    }
+
+    fn import_text(text: &str, storage: &StateDir) -> Result<MakiId> {
+        import_from(text.as_bytes(), IMPORT_CWD, storage)
+    }
+
+    fn error_chain(error: &Report) -> String {
+        error
+            .chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ")
+    }
+
+    #[test]
+    fn export_then_import_round_trips_into_a_new_session_in_the_import_cwd() {
+        let (_dir, storage) = storage();
+        let origin = seed(&storage, vec![Message::user(PROMPT.into())]);
+
+        let (json, live) = export_json(origin, &storage).unwrap();
+        let imported = import_text(&json, &storage).unwrap();
+
+        assert!(!live);
+        assert_ne!(imported, origin);
+        let copy = AppSession::load(imported, &storage).unwrap();
+        assert_eq!(copy.cwd, IMPORT_CWD);
+        assert_eq!(copy.messages(), [Message::user(PROMPT.into())]);
+        assert_eq!(copy.model, MODEL);
+        assert_eq!(AppSession::load(origin, &storage).unwrap().cwd, ORIGIN_CWD);
+    }
+
+    #[test]
+    fn export_of_a_held_session_reads_it_as_flushed_and_says_so() {
+        let (_dir, storage) = storage();
+        let id = seed(&storage, vec![Message::user(PROMPT.into())]);
+        let _holder = SessionClaim::acquire(id, &storage).unwrap();
+
+        let (json, live) = export_json(id, &storage).unwrap();
+
+        assert!(live);
+        assert!(json.contains(PROMPT));
+    }
+
+    #[test]
+    fn export_of_a_missing_session_reports_not_found() {
+        let (_dir, storage) = storage();
+
+        let error = export_json(MakiId::generate(), &storage).unwrap_err();
+
+        assert!(error.to_string().contains(NOT_FOUND), "{error}");
+    }
+
+    #[test]
+    fn import_rejects_a_newer_format_and_stores_nothing() {
+        let (_dir, storage) = storage();
+
+        let error = import_text(
+            &document(json!({ "format": NEWER_FORMAT_VERSION })),
+            &storage,
+        )
+        .unwrap_err();
+
+        assert!(
+            error_chain(&error).contains(maki_agent::agent::NEWER_FORMAT),
+            "{error:?}"
+        );
+        assert!(AppSession::list_all(&storage).unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_drops_unknown_envelope_fields() {
+        let (_dir, storage) = storage();
+        let id = import_text(
+            &document(json!({ UNKNOWN_FIELD: { "host": ORIGIN_CWD } })),
+            &storage,
+        )
+        .unwrap();
+
+        let (json, _) = export_json(id, &storage).unwrap();
+
+        assert!(!json.contains(UNKNOWN_FIELD));
+    }
+
+    #[test_case(NOT_JSON ; "malformed json")]
+    #[test_case(r#"{"thinking":"sideways","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"# ; "unparsable thinking")]
+    fn invalid_transcript_stores_nothing_and_names_the_problem(text: &str) {
+        let (_dir, storage) = storage();
+
+        let error = import_text(text, &storage).unwrap_err();
+
+        assert_eq!(error.to_string(), INVALID_TRANSCRIPT);
+        assert!(error.chain().count() > 1);
+        assert!(AppSession::list_all(&storage).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dangling_tool_call_error_is_located() {
+        let (_dir, storage) = storage();
+        let prompt = json!({ "role": "user", "content": [{ "type": "text", "text": "hi" }] });
+        let text = json!({ "messages": [prompt, {
+            "role": "assistant",
+            "content": [{ "type": "tool_use", "id": DANGLING_TOOL_ID, "name": "read", "input": {} }]
+        }, prompt] })
+        .to_string();
+
+        let error = import_text(&text, &storage).unwrap_err();
+
+        assert!(
+            error_chain(&error).contains("messages[1].content[0]"),
+            "{error:?}"
+        );
+    }
+
+    #[test_case(r#"{"messages":[]}"# ; "empty messages")]
+    #[test_case("{}" ; "no messages key at all")]
+    fn empty_transcript_is_refused(text: &str) {
+        let (_dir, storage) = storage();
+
+        let error = import_text(text, &storage).unwrap_err();
+
+        assert_eq!(error.to_string(), EMPTY_TRANSCRIPT);
+        assert!(AppSession::list_all(&storage).unwrap().is_empty());
+    }
 
     fn summary(title: &str, cwd: &str, updated_at: u64) -> SessionSummary {
         SessionSummary {

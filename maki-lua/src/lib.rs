@@ -19,7 +19,7 @@ pub use api::keymap::{KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
-pub use api::session::SessionSnapshotFn;
+pub use api::session::{SessionSnapshotFn, store_session};
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
     HintReader, HintSnapshot, InputEdit, InputRequest, LuaCommandInfo, LuaCommandReader,

@@ -18,11 +18,13 @@ use color_eyre::eyre::{Context, eyre};
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
+use maki_agent::agent::{SessionExport, live_snapshot};
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
-use maki_agent::session::Resumed;
+use maki_agent::session::{Resumed, SessionHeader};
 use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
+    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
+    Transcript, mcp,
 };
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
@@ -998,6 +1000,13 @@ impl<'t> EventLoop<'t> {
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);
             }
+            UiAction::ExportSession { id, reply_tx } => match self.position(id) {
+                Some(idx) => {
+                    let _ = reply_tx.send(Ok(self.live_export(idx)));
+                }
+                None => self
+                    .answer_from_disk(id, reply_tx, |session| Ok(SessionExport::stored(session))),
+            },
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
             }
@@ -1276,32 +1285,34 @@ impl<'t> EventLoop<'t> {
             SessionRequest::Current => {
                 let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
             }
+            // A stored session is read from disk, off the loop like `List`.
             SessionRequest::Read { id } => {
-                let reply = match self.resolve_session_index(id.as_deref()) {
-                    Ok(idx) => Ok(self.session_snapshot_json(idx)),
-                    Err(e) => Err(e),
+                let id = match id.as_deref().map(parse_session_id).transpose() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(e));
+                        return;
+                    }
                 };
-                let _ = reply_tx.send(reply);
-            }
-            SessionRequest::New { prompt, focus } => {
-                let open = self.focused_app().blank_session();
-                // A blank session inherits the focused tab's model, whose slot
-                // is already built and sitting right here.
-                let slot = self.sessions[self.focused].slot.load_full();
-                let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
-                let id = self.sessions[idx].id();
-                maki_otel::emit::session_started(
-                    maki_otel::emit::START_FRESH,
-                    Some(&id.to_string()),
-                );
-                if let Some(prompt) = prompt {
-                    let _ = self.submit_text(idx, prompt);
+                let live = match id {
+                    None => Ok(self.focused),
+                    Some(id) => self.position(id).ok_or(id),
+                };
+                match live {
+                    Ok(idx) => {
+                        let _ = reply_tx.send(Ok(self.session_snapshot_json(idx)));
+                    }
+                    Err(id) => self.answer_from_disk(id, reply_tx, |session| {
+                        serde_json::to_value(SessionSnapshot::stored(&session))
+                            .map_err(|e| e.to_string())
+                    }),
                 }
-                if focus {
-                    self.focused = idx;
-                }
-                let _ = reply_tx.send(Ok(json!(id)));
             }
+            SessionRequest::New {
+                transcript,
+                prompt,
+                focus,
+            } => self.create_session(*transcript, prompt, focus, reply_tx),
             SessionRequest::Prompt { id, text } => {
                 let idx = match id {
                     None => Ok(self.focused),
@@ -1430,6 +1441,98 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// The transcript is laid over the focused tab's blank session, so it
+    /// starts where a new tab would: same project, model, mode, thinking, fast
+    /// and workflow, for whatever the document leaves out. Without `prompt`
+    /// or `focus` the session is only stored, and the reply waits for the
+    /// write, so a `list` after it already finds the session. Otherwise it
+    /// opens in a tab, which saves it on its first checkpoint.
+    fn create_session(
+        &mut self,
+        transcript: Transcript,
+        prompt: Option<String>,
+        focus: bool,
+        reply_tx: flume::Sender<UiReply>,
+    ) {
+        let inherits_model = transcript.model.is_none();
+        let OpenSession {
+            session: base,
+            claim,
+        } = self.sessions[self.focused].app.blank_session();
+        let mut session = match transcript.into_session(base) {
+            Ok(session) => session,
+            Err(e) => {
+                let _ = reply_tx.send(Err(e.to_string()));
+                return;
+            }
+        };
+        if prompt.is_none() && !focus {
+            let storage = self.ctx.storage.clone();
+            smol::unblock(move || {
+                let reply = session
+                    .save(&claim, &storage)
+                    .map(|()| json!(session.id))
+                    .map_err(|e| e.to_string());
+                let _ = reply_tx.send(reply);
+            })
+            .detach();
+            return;
+        }
+        // An inherited model's slot is already built and sitting right here.
+        let (slot, fallback) = if inherits_model {
+            (self.sessions[self.focused].slot.load_full(), None)
+        } else {
+            self.slots.get_or_fallback(&session.model)
+        };
+        let idx = self.push_runtime(self.ctx.spawn_runtime(OpenSession { session, claim }, slot));
+        let id = self.sessions[idx].id();
+        maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
+        if let Some(reason) = fallback {
+            self.sessions[idx].app.flash(reason);
+        }
+        if let Some(prompt) = prompt {
+            let _ = self.submit_text(idx, prompt);
+        }
+        if focus {
+            self.focused = idx;
+        }
+        let _ = reply_tx.send(Ok(json!(id)));
+    }
+
+    /// The tab's settings with its agent's transcript, which runs ahead of
+    /// what the tab last mirrored and is shared, not copied. A tab whose agent
+    /// never started has only its own copy to give.
+    fn live_export(&self, idx: usize) -> SessionExport {
+        let rt = &self.sessions[idx];
+        let session = &rt.app.state.session;
+        match live_snapshot(rt.id()) {
+            Some(live) => SessionExport::live(SessionHeader::of(session), &live),
+            None => SessionExport {
+                header: SessionHeader::of(session),
+                messages: Arc::new(session.messages().to_vec()),
+                frame: session.frame().cloned(),
+            },
+        }
+    }
+
+    /// Reads a session no tab has open off the loop, without claiming it, so
+    /// one another maki holds still answers.
+    fn answer_from_disk<T: Send + 'static>(
+        &self,
+        id: MakiId,
+        reply_tx: flume::Sender<Result<T, String>>,
+        answer: impl FnOnce(AppSession) -> Result<T, String> + Send + 'static,
+    ) {
+        let storage = self.ctx.storage.clone();
+        smol::unblock(move || {
+            let reply = AppSession::read_only(id, &storage)
+                .map_err(|e| e.to_string())
+                .and_then(answer);
+            let _ = reply_tx.send(reply);
+        })
+        .detach();
+    }
+
     fn position(&self, id: MakiId) -> Option<usize> {
         self.sessions.iter().position(|rt| rt.id() == id)
     }
@@ -1459,6 +1562,8 @@ impl<'t> EventLoop<'t> {
             } else {
                 MODE_BUILD
             },
+            thinking: Some(app.state.thinking.to_string()),
+            fast: Some(app.state.fast),
             status: SessionStatus::of(app).as_str(),
             focused: idx == self.focused,
             updated_at: app.state.session.updated_at,
@@ -1467,7 +1572,7 @@ impl<'t> EventLoop<'t> {
             }),
             usage: app.state.token_usage,
             context_size: app.state.context_size,
-            context_window: app.state.model.context_window,
+            context_window: Some(app.state.model.context_window),
             cost: app.state.cost,
         };
         json!(snapshot)

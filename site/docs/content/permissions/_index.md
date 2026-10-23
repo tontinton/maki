@@ -238,7 +238,7 @@ limits which APIs the file reaches rather than sandboxing the file.
 
 Three keys cover the session APIs, split by what a call does to the transcript:
 
-- `session_read`: any call that reads what the conversation says, such as `maki.session.messages` and `maki.ui.input`.
+- `session_read`: any call that reads what the conversation says, such as `maki.session.export`, `maki.session.messages` and `maki.ui.input`.
 - `session_write`: any call that adds to, removes, or creates conversation content, such as `new`, `prompt`, `notify`, `delete` and `maki.task.remove`.
 - `session_settings`: any call that changes how a session runs without touching its content, such as `set_mode`, `set_title` and `maki.model.set`.
 
