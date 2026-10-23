@@ -402,7 +402,7 @@ fn set_window_title(
 ///
 /// Valid names: `"file_picker"`, `"search"`, `"help"`,
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-/// `"prev_chat"`, `"next_chat"`, `"model_picker"`.
+/// `"prev_chat"`, `"next_chat"`, `"model_picker"`, `"quit"`.
 ///
 /// There is no action for sending the user's message. To take keys like
 /// `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
@@ -413,8 +413,8 @@ fn set_window_title(
 /// @param name string Action name, e.g. `"file_picker"`.
 /// @return (boolean|nil, string|nil) `true` on success, or nil and an error for an unknown name or a missing UI.
 /// @example
-/// -- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
-/// maki.keymap.set("n", "<C-q>", function()
+/// -- Open the built-in file picker with Alt+F instead of Ctrl+S:
+/// maki.keymap.set("n", "<M-f>", function()
 ///   maki.ui.action("file_picker")
 /// end)
 #[lua_fn]
@@ -1086,7 +1086,7 @@ mod tests {
     /// The same two keys `maki.keymap.set` refuses, from the same list. A
     /// window claiming one would publish a key the host answers first, which
     /// is a popup that never sees it and a user who cannot quit.
-    #[test_case("<C-c>" ; "quit")]
+    #[test_case("<C-c>" ; "cancel")]
     #[test_case("<C-z>" ; "suspend")]
     fn a_window_cannot_claim_a_key_the_host_reserves(lhs: &str) {
         let lua = Lua::new();

@@ -358,7 +358,7 @@ impl<T: PickerItem> ListPicker<T> {
             .as_mut()
             .expect("handle_ready_key called without state");
 
-        if key::QUIT.matches(key) {
+        if key::CANCEL.matches(key) {
             self.state = None;
             return PickerAction::Close;
         }
@@ -1031,7 +1031,7 @@ mod tests {
     }
 
     #[test_case(key(KeyCode::Esc) ; "esc_returns_close")]
-    #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_returns_close")]
+    #[test_case(kb::CANCEL.to_key_event() ; "ctrl_c_returns_close")]
     fn cancel_returns_close(cancel_key: KeyEvent) {
         let mut p = ListPicker::new();
         p.open(entries(&["A", "B"]), " Test ");

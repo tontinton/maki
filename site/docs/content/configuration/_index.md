@@ -74,6 +74,7 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-----|-------------|
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
+| `confirm_quit` | bool | `false` | - | Ask for confirmation before manually quitting Maki |
 | `inline_images` | bool | `true` | - | Render inline images in terminals with graphics support, falling back to an [image] line where nothing else names the image |
 | `notifications` | string | `auto` | - | Notification method: auto, osc9, bell, notify, or off |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
@@ -82,6 +83,10 @@ All fields are optional. Typos in field names cause an error right away.
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `thinking_lines` | integer | `3` | - | Collapse model reasoning to its header and last N lines. Click to toggle. 0 shows only the header, -1 never collapses |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
+
+### Quitting Maki
+
+`Ctrl+C` clears a draft or cancels a running turn. It never quits Maki, so repeating it after cancellation cannot accidentally exit. Use `Ctrl+Q` or `/exit` to quit. The queue's remove-front shortcut is `Alt+Q`. Remap the quit shortcut in `init.lua` with `maki.keymap.set("n", "<M-x>", function() maki.ui.action("quit") end)`. Set `ui.confirm_quit = true` to show a Yes/No confirmation for manual quits from the shortcut, a remapped binding, or `/exit`. Enter or y confirms, while Esc, n, or Ctrl+C returns to Maki. Automatic exits, including `--exit-on-done`, do not ask for confirmation.
 
 ### `ui.theme`
 

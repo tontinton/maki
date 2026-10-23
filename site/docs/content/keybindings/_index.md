@@ -13,7 +13,8 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+C` | Quit / clear input |
+| `Ctrl+C` | Clear input / cancel running task |
+| `Ctrl+Q` | Quit (rebind with maki.keymap.set) |
 | `Ctrl+H` | Show keybindings |
 | `Ctrl+F` | Search messages |
 | `Ctrl+S` | File picker |
@@ -38,7 +39,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+E` | Jump to end of line |
 | `Ctrl+G` | Scroll to top |
 | `Ctrl+B` | Scroll to bottom |
-| `Ctrl+Q` | Pop queue |
+| `Alt+Q` | Pop queue |
 | `Esc Esc` | Rewind |
 | `Alt+O` | Edit input in external editor |
 | `Alt+Z` | Undo typing / paste |
@@ -123,7 +124,7 @@ Precedence, high to low:
 3. **Lua overrides** from `maki.keymap.set`. The last set wins. Shadowing another plugin's binding logs a warning, and the shadowed binding returns when the plugin on top deletes it or unloads.
 4. **Built-in defaults.** Any override on the same key shadows them, and the default returns once every override on it is gone. A plugin's `maki.keymap.del` only removes its own binding.
 
-`Ctrl+C` and `Ctrl+Z` cannot be rebound, so quit and suspend always work. Only single-key bindings can be overridden. Multi-key combinations and non-key rows (like `Type` to filter) cannot.
+`Ctrl+C` and `Ctrl+Z` cannot be rebound, so cancellation and suspend always work. Only single-key bindings can be overridden. Multi-key combinations and non-key rows (like `Type` to filter) cannot.
 
 The `/help` modal and the splash show default labels, not live overrides, but pressing the key still runs the override.
 

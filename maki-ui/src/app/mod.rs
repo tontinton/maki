@@ -33,6 +33,7 @@ use crate::clipboard::ClipboardState;
 use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+use crate::components::confirm_quit::ConfirmQuit;
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
@@ -369,6 +370,7 @@ pub struct App {
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) alert_modal: AlertModal,
+    pub(super) confirm_quit: ConfirmQuit,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
@@ -495,6 +497,7 @@ impl App {
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
             alert_modal: AlertModal::new(),
+            confirm_quit: ConfirmQuit::default(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(typewriter, ui_config.thinking_lines),
@@ -942,15 +945,15 @@ impl App {
         if !is_ctrl(&key) {
             return None;
         }
-        if key::QUIT.matches(key) {
+        if key::CANCEL.matches(key) {
             self.command_palette.close();
-            return Some(if !self.chat_accepts_input() || self.input_box.is_empty() {
-                if self.status == Status::Streaming {
-                    return Some(self.handle_cancel());
-                }
-                self.quit()
-            } else {
+            return Some(if self.chat_accepts_input() && !self.input_box.is_empty() {
                 self.input_box.discard();
+                self.input_changed(InputWriter::Anyone);
+                vec![]
+            } else if self.status == Status::Streaming {
+                self.handle_cancel()
+            } else {
                 vec![]
             });
         }
@@ -979,6 +982,13 @@ impl App {
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        if self.confirm_quit.is_open() {
+            return Some(if self.confirm_quit.handle_key(key) {
+                self.quit_with(ExitRequest::Success)
+            } else {
+                vec![]
+            });
+        }
         // Drawn above everything else, so it answers keys before anything else.
         if self.alert_modal.is_open() {
             self.alert_modal.handle_key(key);
@@ -1092,7 +1102,7 @@ impl App {
                     self.queue.remove_focused();
                 }
                 KeyCode::Esc => self.queue.unfocus(),
-                _ if key::QUIT.matches(key) => self.queue.unfocus(),
+                _ if key::CANCEL.matches(key) => self.queue.unfocus(),
                 _ if key::POP_QUEUE.matches(key) => {
                     self.queue.remove(0);
                 }
@@ -1228,6 +1238,7 @@ impl App {
                     .open(chat.scroll_pos(), chat.auto_scroll());
             }
             BuiltinAction::Help => self.help_modal.toggle(),
+            BuiltinAction::Quit => return self.quit(),
             BuiltinAction::PlanToggle => {
                 if self.plan_toggle_ready() {
                     self.plan_form.toggle();
@@ -1295,6 +1306,10 @@ impl App {
             return actions;
         }
 
+        if key::QUIT.matches(key) {
+            return self.run_builtin(BuiltinAction::Quit);
+        }
+
         if key::SCROLL_PAGE_UP.matches(key) {
             let page = self.chats[self.active_chat].page();
             self.active_chat().scroll(page);
@@ -1311,18 +1326,17 @@ impl App {
 
     /// The keys the host answers before any plugin *binding* sees them.
     ///
-    /// `Ctrl+C` is how the user leaves, and the app has to stay leavable
-    /// whatever a plugin bound or how badly its handler is stuck. `Ctrl+Z` is
-    /// resolved above every step of the chain, for the same reason. Both come
+    /// `Ctrl+C` clears input or cancels work regardless of plugin bindings.
+    /// `Ctrl+Z` suspends before any other step of the chain. Both come
     /// from [`maki_lua::RESERVED_KEYS`], the list `maki.keymap.set` refuses
     /// and the list a window's `keys` refuses, so neither can be bound nor
     /// claimed.
     ///
     /// A focused plugin window is handed `Ctrl+C` all the same, before this
     /// runs: being handed every key is what focus is, and the bundled pickers
-    /// answer it by closing, which is how the user gets back to a chat they
-    /// can quit from. `Ctrl+Z` is the one key not even a focused window sees,
-    /// because suspending cannot wait on a plugin reading its events.
+    /// answer it by closing, returning the user to the chat. `Ctrl+Z` is the
+    /// one key not even a focused window sees, because suspending cannot wait
+    /// on a plugin reading its events.
     ///
     /// `Esc` joins them while the agent runs, because stopping a turn is the
     /// other thing a user cannot be made to wait for. A popup that put
@@ -1363,6 +1377,9 @@ impl App {
                 _ => vec![],
             };
         }
+        if key::POP_QUEUE.matches(key) {
+            return self.run_builtin(BuiltinAction::PopQueue);
+        }
         if key::EDIT_INPUT.matches(key) {
             return self.run_builtin(BuiltinAction::EditInput);
         }
@@ -1376,9 +1393,7 @@ impl App {
             return vec![];
         }
         if is_ctrl(&key) {
-            if key::POP_QUEUE.matches(key) {
-                return self.run_builtin(BuiltinAction::PopQueue);
-            } else if key::OPEN_EDITOR.matches(key) {
+            if key::OPEN_EDITOR.matches(key) {
                 return self.run_builtin(BuiltinAction::PlanEditor);
             } else if key::SEARCH.matches(key) {
                 return self.run_builtin(BuiltinAction::Search);
@@ -1447,7 +1462,12 @@ impl App {
     }
 
     fn quit(&mut self) -> Vec<Action> {
-        self.quit_with(ExitRequest::Success)
+        if self.ui_config.confirm_quit {
+            self.confirm_quit.open();
+            vec![]
+        } else {
+            self.quit_with(ExitRequest::Success)
+        }
     }
 
     /// `maki trust` lives outside the TUI, so without this a "not now" or a
@@ -2228,8 +2248,9 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 15] {
         [
+            &self.confirm_quit,
             &self.alert_modal,
             &self.help_modal,
             &self.usage_modal,
@@ -2247,8 +2268,9 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 15] {
         [
+            &mut self.confirm_quit,
             &mut self.alert_modal,
             &mut self.help_modal,
             &mut self.usage_modal,

@@ -126,7 +126,8 @@ pub mod key {
     use super::Bind;
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    pub const QUIT: Bind = ctrl_bind!('c');
+    pub const CANCEL: Bind = ctrl_bind!('c');
+    pub const QUIT: Bind = ctrl_bind!('q');
     pub const HELP: Bind = ctrl_bind!('h');
     pub const SESSIONS: Bind = ctrl_bind!('p');
     pub const TASKS: Bind = ctrl_bind!('x');
@@ -146,7 +147,11 @@ pub mod key {
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
     pub const SCROLL_BOTTOM: Bind = ctrl_bind!('b');
-    pub const POP_QUEUE: Bind = ctrl_bind!('q');
+    pub const POP_QUEUE: Bind = Bind {
+        code: KeyCode::Char('q'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+Q",
+    };
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
     pub const FORK: Bind = ctrl_bind!('f');
@@ -316,8 +321,14 @@ pub struct Keybind {
 
 pub const KEYBINDS: &[Keybind] = &[
     Keybind {
+        label: KeyLabel::Single(key::CANCEL.label),
+        description: "Clear input / cancel running task",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single(key::QUIT.label),
-        description: "Quit / clear input",
+        description: "Quit (rebind with maki.keymap.set)",
         context: KeybindContext::General,
         platform: Platform::All,
     },

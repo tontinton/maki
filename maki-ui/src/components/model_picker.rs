@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test_case(key(KeyCode::Esc)          ; "esc_closes")]
-    #[test_case(kb::QUIT.to_key_event()    ; "ctrl_c_closes")]
+    #[test_case(kb::CANCEL.to_key_event()    ; "ctrl_c_closes")]
     fn close_keys(cancel_key: KeyEvent) {
         let mut p = ModelPicker::new(test_models());
         p.open("");

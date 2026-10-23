@@ -342,6 +342,8 @@ All fields are optional. Typos in field names cause an error right away.
     writeln!(out).unwrap();
 
     write_section(&mut out, "[ui]", UiConfig::FIELDS);
+    writeln!(out, "### Quitting Maki\n").unwrap();
+    writeln!(out, "`Ctrl+C` clears a draft or cancels a running turn. It never quits Maki, so repeating it after cancellation cannot accidentally exit. Use `Ctrl+Q` or `/exit` to quit. The queue's remove-front shortcut is `Alt+Q`. Remap the quit shortcut in `init.lua` with `maki.keymap.set(\"n\", \"<M-x>\", function() maki.ui.action(\"quit\") end)`. Set `ui.confirm_quit = true` to show a Yes/No confirmation for manual quits from the shortcut, a remapped binding, or `/exit`. Enter or y confirms, while Esc, n, or Ctrl+C returns to Maki. Automatic exits, including `--exit-on-done`, do not ask for confirmation.\n").unwrap();
     write_theme_section(&mut out);
     write_tool_output_section(&mut out);
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
