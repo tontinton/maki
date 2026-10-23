@@ -1,16 +1,20 @@
-//! Tests the task plugin's structured-output policy end-to-end: real plugin
+//! Tests the task plugin's delegation policy end-to-end: real plugin
 //! source, real `maki.json` / `maki.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
 use std::sync::Arc;
 
-use maki_agent::tools::ToolRegistry;
+use futures_lite::future::poll_once;
 use maki_agent::tools::test_support::stub_ctx;
-use maki_agent::{AgentMode, ToolOutput};
-use maki_lua::PluginHost;
+use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::{AgentMode, CancelToken, ToolOutput};
+use maki_lua::{PluginHost, SessionEndReason};
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
+const TASK_RUNNER_SRC: &str = include_str!("../../plugins/task/runner.lua");
+const TASK_BACKGROUND_SRC: &str = include_str!("../../plugins/task/background.lua");
 
 // Mirrors of the plugin's error contracts and policy numbers.
 const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -26,6 +30,8 @@ const SUB_AGENT_ERROR_PREFIX: &str = "sub-agent error: ";
 
 const TASK_TOOL: &str = "task";
 const PROBE_TOOL: &str = "probe";
+const WAIT_TOOL: &str = "wait";
+const RELEASE_TOOL: &str = "release";
 const TASK_PROMPT: &str = "do the thing";
 const PLAIN_TEXT: &str = "plain text result";
 const RECOVERED_TEXT: &str = "summary after nudge";
@@ -35,6 +41,11 @@ const PROMPT_ERR_MSG: &str = "model exploded";
 const RAISE_MSG: &str = "stub prompt kaboom";
 const PARTIAL_TEXT: &str = "half a transcript";
 const CANCELLED_ERR: &str = "cancelled";
+const BACKGROUND_STARTED: &str = "Background task started";
+const BACKGROUND_CANCELLED_ERR: &str = "background task cancelled";
+const SESSION_OPEN_ERR: &str = "session admission failed";
+const FINISHED: &str = "finished";
+const FAILED: &str = "failed";
 /// Mirrors the task plugin's `max_concurrent` default.
 const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 
@@ -48,11 +59,38 @@ const SCENARIO_PARTIAL_ERROR: &str = "partial_error";
 const SCENARIO_RAISE: &str = "raise";
 const SCENARIO_NO_SUMMARY: &str = "no_summary";
 const SCENARIO_NO_SUMMARY_THEN_RECOVER: &str = "no_summary_then_recover";
+const SCENARIO_PARKED: &str = "parked";
+const SCENARIO_PARKED_SECOND: &str = "parked_second";
+const SCENARIO_SESSION_ERROR: &str = "session_error";
+const SCENARIO_OPEN_PARKED: &str = "open_parked";
 
 /// Stubs keyed by `opts.name` (the task's `description`). `maki.json` and
 /// `maki.async` stay real so schema validation and semaphore behavior are tested.
 const STUB_PRELUDE: &str = r#"
-recorder = { prompts = {}, closed = 0, sessions = 0, acquired = 0, released = 0 }
+recorder = {
+  prompts = {}, closed = 0, sessions = 0, acquired = 0, released = 0,
+  notices = {}, acquire_attempts = 0,
+}
+local sessions = {}
+local parked = {}
+local waiters = {}
+
+-- Every `wait` call rechecks its condition after any recorded step.
+local function changed()
+  local woken = waiters
+  waiters = {}
+  for _, done in ipairs(woken) do
+    done()
+  end
+end
+
+-- Parks the caller until the `release` tool resumes it by name.
+local function park(name)
+  return maki.async.await(1, function(done)
+    parked[name] = done
+    changed()
+  end)
+end
 
 -- Spy wrapper: the real semaphore does the work, counters track that every
 -- permit is explicitly released (gc would silently hide a leak).
@@ -62,6 +100,8 @@ maki.async.semaphore = function(n)
   local sem = real_semaphore(n)
   return {
     acquire = function(self)
+      recorder.acquire_attempts = recorder.acquire_attempts + 1
+      changed()
       local permit = sem:acquire()
       recorder.acquired = recorder.acquired + 1
       return {
@@ -92,6 +132,7 @@ local behaviors = {}
 behaviors.plain = function(sess, msg)
   return { text = "@PLAIN_TEXT@" }
 end
+behaviors.open_parked = behaviors.plain
 
 behaviors.happy = function(sess, msg)
   local h = sess.opts.local_tools.structured_output.handler
@@ -139,20 +180,98 @@ behaviors.raise = function(sess, msg)
   error("@RAISE_MSG@")
 end
 
+behaviors.parked = function(sess, msg)
+  return park(sess.opts.name)
+end
+behaviors.parked_second = behaviors.parked
+
 maki.agent.session = function(ctx, opts)
+  if opts == nil then
+    opts = ctx
+    recorder.scope = opts.scope
+    recorder.owner = opts.session
+  end
   recorder.sessions = recorder.sessions + 1
+  if opts.name == "@SESSION_ERROR_SCENARIO@" then
+    return nil, "@SESSION_OPEN_ERR@"
+  end
   recorder.has_local_tools = opts.local_tools ~= nil
   recorder.thinking = opts.thinking
   local sess = { opts = opts }
+  sessions[opts.name] = sess
+  function sess:id() return opts.name end
   function sess:prompt(msg)
     recorder.prompts[#recorder.prompts + 1] = msg
     return behaviors[opts.name](self, msg)
   end
   function sess:close()
+    if self.closed then return end
+    self.closed = true
     recorder.closed = recorder.closed + 1
+  end
+  if opts.name == "@OPEN_PARKED_SCENARIO@" then
+    park(opts.name)
   end
   return sess
 end
+
+maki.agent.list = function(opts)
+  local out = {}
+  for name, session in pairs(sessions) do
+    if session.opts.session == opts.session and not session.closed then
+      out[#out + 1] = { id = name }
+    end
+  end
+  return out
+end
+
+maki.session.notify = function(text, opts)
+  recorder.notices[#recorder.notices + 1] = {
+    text = text, session = opts.session, wake = opts.wake,
+  }
+  changed()
+  return true
+end
+
+maki.api.register_tool({
+  name = "wait",
+  description = "wait until a step is parked and enough acquires and notices happened",
+  schema = {
+    type = "object",
+    properties = {
+      parked = { type = "string" },
+      acquires = { type = "integer" },
+      notices = { type = "integer" },
+    },
+  },
+  audiences = { "main" },
+  handler = function(input)
+    local function ready()
+      return (not input.parked or parked[input.parked] ~= nil)
+        and recorder.acquire_attempts >= (input.acquires or 0)
+        and #recorder.notices >= (input.notices or 0)
+    end
+    while not ready() do
+      maki.async.await(1, function(done)
+        waiters[#waiters + 1] = done
+      end)
+    end
+    return "ready"
+  end,
+})
+
+maki.api.register_tool({
+  name = "release",
+  description = "resume a parked prompt or session open",
+  schema = { type = "object", properties = { name = { type = "string" } } },
+  audiences = { "main" },
+  handler = function(input)
+    local done = assert(parked[input.name], "nothing parked")
+    parked[input.name] = nil
+    done({ text = "@PLAIN_TEXT@" })
+    return "released"
+  end,
+})
 
 maki.api.register_tool({
   name = "probe",
@@ -173,6 +292,10 @@ maki.api.register_tool({
       acquired = recorder.acquired,
       released = recorder.released,
       sem_size = recorder.sem_size,
+      notices = recorder.notices,
+      notice_count = #recorder.notices,
+      scope = recorder.scope,
+      owner = recorder.owner,
     }
     if recorder.resolve_opts then
       snap.resolve_opts = recorder.resolve_opts
@@ -189,6 +312,12 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
     load_task_host_with_opts(serde_json::Map::new())
 }
 
+fn load_background_host() -> (Arc<ToolRegistry>, PluginHost) {
+    let mut opts = serde_json::Map::new();
+    opts.insert("allow_background".into(), json!(true));
+    load_task_host_with_opts(opts)
+}
+
 fn load_task_host_with_opts(
     opts: serde_json::Map<String, serde_json::Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
@@ -200,28 +329,100 @@ fn load_task_host_with_opts(
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
         .replace("@RAISE_MSG@", RAISE_MSG)
         .replace("@PARTIAL_TEXT@", PARTIAL_TEXT)
-        .replace("@CANCELLED_ERR@", CANCELLED_ERR);
-    host.load_source_with_opts(
-        "task_policy",
-        &format!("{prelude}\n{TASK_PLUGIN_SRC}"),
-        opts,
-    )
-    .unwrap();
+        .replace("@CANCELLED_ERR@", CANCELLED_ERR)
+        .replace("@SESSION_ERROR_SCENARIO@", SCENARIO_SESSION_ERROR)
+        .replace("@OPEN_PARKED_SCENARIO@", SCENARIO_OPEN_PARKED)
+        .replace("@SESSION_OPEN_ERR@", SESSION_OPEN_ERR);
+    let source = format!(
+        r#"{prelude}
+local builtin_require = require
+local runner
+local background
+local function require(name)
+  if name == "runner" then
+    if runner == nil then
+      runner = (function()
+{TASK_RUNNER_SRC}
+      end)()
+    end
+    return runner
+  end
+  if name == "background" then
+    if background == nil then
+      background = (function()
+{TASK_BACKGROUND_SRC}
+      end)()
+    end
+    return background
+  end
+  return builtin_require(name)
+end
+{TASK_PLUGIN_SRC}
+"#
+    );
+    host.load_source_with_opts("task_policy", &source, opts)
+        .unwrap();
     (reg, host)
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str, input: Value) -> Result<String, String> {
+    exec_tool_with_ctx(reg, name, input, &stub_ctx(&AgentMode::Build))
+}
+
+fn exec_tool_with_ctx(
+    reg: &ToolRegistry,
+    name: &str,
+    input: Value,
+    ctx: &ToolContext,
+) -> Result<String, String> {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let ctx = stub_ctx(&AgentMode::Build);
-    smol::block_on(async { inv.execute(&ctx).await })
+    smol::block_on(inv.execute(ctx))
         .output
         .map(|out| match out {
             ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
             other => panic!("unexpected output: {other:?}"),
         })
+}
+
+fn session_ctx(session: &SessionRef) -> ToolContext {
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.session_id = Some(session.clone());
+    ctx
+}
+
+fn background_input(scenario: &str, output_schema: Option<Value>) -> Value {
+    let mut input = task_input(scenario, output_schema);
+    input["background"] = json!(true);
+    input
+}
+
+fn start_background(
+    reg: &ToolRegistry,
+    ctx: &ToolContext,
+    scenario: &str,
+    output_schema: Option<Value>,
+) {
+    let out = exec_tool_with_ctx(
+        reg,
+        TASK_TOOL,
+        background_input(scenario, output_schema),
+        ctx,
+    )
+    .expect("background task admission failed");
+    assert!(out.starts_with(BACKGROUND_STARTED), "{out}");
+}
+
+/// Blocks until every condition holds: `parked` (a scenario name),
+/// `acquires` and `notices` (minimum counts).
+fn wait(reg: &ToolRegistry, conditions: Value) {
+    exec_tool(reg, WAIT_TOOL, conditions).expect("wait failed");
+}
+
+fn release(reg: &ToolRegistry, scenario: &str) {
+    exec_tool(reg, RELEASE_TOOL, json!({ "name": scenario })).expect("release failed");
 }
 
 fn probe(reg: &ToolRegistry) -> Value {
@@ -518,4 +719,155 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
     // Pool is full again (released == acquired), so this cannot block.
     let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
     assert_eq!(out, PLAIN_TEXT);
+}
+
+#[test]
+fn background_input_is_opt_in() {
+    let advertised = |reg: &ToolRegistry| {
+        reg.get(TASK_TOOL).unwrap().tool.schema()["properties"]["background"].is_object()
+    };
+    assert!(!advertised(&load_task_host().0));
+    assert!(advertised(&load_background_host().0));
+}
+
+#[test_case::test_case(SCENARIO_PLAIN, None, PLAIN_TEXT, FINISHED ; "plain")]
+#[test_case::test_case(SCENARIO_HAPPY, Some(answer_schema()), "{\"answer\":\"42\"}", FINISHED ; "structured")]
+#[test_case::test_case(SCENARIO_PROMPT_ERROR, None, PROMPT_ERR_MSG, FAILED ; "model_error")]
+#[test_case::test_case(SCENARIO_RAISE, None, RAISE_MSG, FAILED ; "exception")]
+fn background_delivers_the_result_in_one_waking_notice(
+    scenario: &str,
+    schema: Option<Value>,
+    expected: &str,
+    status: &str,
+) {
+    let (reg, _host) = load_background_host();
+    let session = SessionRef::generate();
+    start_background(&reg, &session_ctx(&session), scenario, schema);
+    wait(&reg, json!({ "notices": 1 }));
+    let snap = probe(&reg);
+    assert_eq!(snap["scope"], json!("session"));
+    assert_eq!(snap["owner"], json!(session.as_str()));
+    assert_eq!(snap["closed"], json!(1));
+    assert_eq!(snap["released"], json!(1));
+    let notices = snap["notices"].as_array().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["session"], json!(session.as_str()));
+    assert_eq!(notices[0]["wake"], json!(true));
+    let text = notices[0]["text"].as_str().unwrap();
+    for part in [scenario, status, expected] {
+        assert!(text.contains(part), "{part} missing from {text}");
+    }
+}
+
+#[test]
+fn background_open_error_returns_inline() {
+    let (reg, _host) = load_background_host();
+    let ctx = session_ctx(&SessionRef::generate());
+    let input = background_input(SCENARIO_SESSION_ERROR, None);
+    assert_eq!(
+        exec_tool_with_ctx(&reg, TASK_TOOL, input, &ctx).unwrap_err(),
+        SESSION_OPEN_ERR
+    );
+    let snap = probe(&reg);
+    assert_eq!(snap["acquired"], json!(0));
+    assert_eq!(snap["notice_count"], json!(0));
+}
+
+#[test]
+fn background_without_a_chat_session_runs_blocking() {
+    let (reg, _host) = load_background_host();
+    let out = exec_tool(&reg, TASK_TOOL, background_input(SCENARIO_PLAIN, None)).unwrap();
+    assert_eq!(out, PLAIN_TEXT);
+    let snap = probe(&reg);
+    assert_eq!(snap["scope"], Value::Null);
+    assert_eq!(snap["released"], json!(1));
+    assert_eq!(snap["notice_count"], json!(0));
+}
+
+#[test]
+fn background_and_blocking_tasks_share_one_concurrency_limit() {
+    let mut opts = serde_json::Map::new();
+    opts.insert("max_concurrent".into(), json!(1));
+    opts.insert("allow_background".into(), json!(true));
+    let (reg, _host) = load_task_host_with_opts(opts);
+    let ctx = session_ctx(&SessionRef::generate());
+    start_background(&reg, &ctx, SCENARIO_PARKED, None);
+    wait(&reg, json!({ "parked": SCENARIO_PARKED }));
+    let invocation = reg
+        .get(TASK_TOOL)
+        .unwrap()
+        .tool
+        .parse(&task_input(SCENARIO_PARKED_SECOND, None))
+        .unwrap();
+    smol::block_on(async {
+        let mut blocking = invocation.execute(&ctx);
+        assert!(poll_once(&mut blocking).await.is_none());
+        wait(&reg, json!({ "acquires": 2 }));
+        assert_eq!(probe(&reg)["acquired"], json!(1));
+        release(&reg, SCENARIO_PARKED);
+        wait(&reg, json!({ "parked": SCENARIO_PARKED_SECOND }));
+        release(&reg, SCENARIO_PARKED_SECOND);
+        assert!(blocking.await.output.is_ok());
+    });
+    wait(&reg, json!({ "notices": 1 }));
+    assert_eq!(probe(&reg)["released"], json!(2));
+}
+
+#[test]
+fn session_end_stops_only_that_chats_work() {
+    let (reg, host) = load_background_host();
+    let ending = SessionRef::generate();
+    start_background(&reg, &session_ctx(&ending), SCENARIO_PARKED, None);
+    let kept = SessionRef::generate();
+    start_background(&reg, &session_ctx(&kept), SCENARIO_PARKED_SECOND, None);
+    wait(&reg, json!({ "parked": SCENARIO_PARKED }));
+    wait(&reg, json!({ "parked": SCENARIO_PARKED_SECOND }));
+    host.event_handle()
+        .end_sessions_blocking([ending.id()], SessionEndReason::Delete);
+    let snap = probe(&reg);
+    assert_eq!(snap["closed"], json!(1));
+    assert_eq!(snap["released"], json!(1));
+    release(&reg, SCENARIO_PARKED_SECOND);
+    wait(&reg, json!({ "notices": 1 }));
+    let snap = probe(&reg);
+    assert_eq!(snap["notice_count"], json!(1));
+    assert_eq!(snap["notices"][0]["session"], json!(kept.as_str()));
+}
+
+#[test_case::test_case(true ; "session_end")]
+#[test_case::test_case(false ; "foreground_cancel")]
+fn cancellation_during_background_admission_closes_the_session(session_end: bool) {
+    let (reg, host) = load_background_host();
+    let session = SessionRef::generate();
+    let mut ctx = session_ctx(&session);
+    let (cancel, token) = CancelToken::new();
+    ctx.cancel = token;
+    let entry = reg.get(TASK_TOOL).unwrap();
+    let invocation = entry
+        .tool
+        .parse(&background_input(SCENARIO_OPEN_PARKED, None))
+        .unwrap();
+    smol::block_on(async {
+        let mut admission = invocation.execute(&ctx);
+        assert!(poll_once(&mut admission).await.is_none());
+        wait(&reg, json!({ "parked": SCENARIO_OPEN_PARKED }));
+        if session_end {
+            host.event_handle()
+                .end_sessions_blocking([session.id()], SessionEndReason::Delete);
+        } else {
+            cancel.cancel();
+        }
+        release(&reg, SCENARIO_OPEN_PARKED);
+        assert_eq!(
+            admission.await.output.unwrap_err(),
+            BACKGROUND_CANCELLED_ERR
+        );
+    });
+    let snap = probe(&reg);
+    assert_eq!(snap["sessions"], json!(1));
+    assert_eq!(snap["closed"], json!(1));
+    assert_eq!(snap["prompt_count"], json!(0));
+    assert_eq!(snap["acquired"], json!(0));
+    assert_eq!(snap["released"], json!(0));
+    assert_eq!(snap["notice_count"], json!(0));
 }

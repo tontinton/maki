@@ -4,3 +4,4 @@ fs_write = true
 net = true
 run = true
 env = true
+agent = true

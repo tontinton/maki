@@ -198,4 +198,22 @@ maki -r <session-id>
 
 `MAKI_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.
 
+## Background tasks
+
+By default the [`task`](/docs/tools/#task) tool waits for its subagent. Turn on `allow_background` and the model gets a `background` input:
+
+```lua
+maki.setup({
+    plugins = {
+        task = { allow_background = true },
+    },
+})
+```
+
+With `background = true` the tool answers right away and the parent keeps working. To wait, the parent ends its turn. When the subagent is done, its result arrives as a notice that wakes the parent. Structured output and the partial output of an interrupted run come back the same way.
+
+To stop a task, open `/tasks`, select it, and press Ctrl+S. The parent still gets the result on its next turn, but the notice does not wake it.
+
+Background and blocking tasks share `plugins.task.max_concurrent`. A background task cannot ask for permission, so its tools need [allow rules](/docs/permissions/) or YOLO. Plan mode still blocks its file writes. Closing the chat or reloading plugins stops the chat's background tasks. Headless, SDK, and ACP runs have no live chat to deliver to, so there the call blocks as usual.
+
 Related: [Token Economy](/docs/token-economy/) for why all this frugality exists, [Configuration](/docs/configuration/) for the knobs.
