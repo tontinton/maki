@@ -45,7 +45,9 @@ impl App {
         let system = snapshot
             .as_ref()
             .and_then(|s| s.frame.as_ref())
-            .map_or_else(|| BTW_FALLBACK_SYSTEM.to_string(), |f| f.system.clone());
+            .and_then(|f| f.prefix())
+            .unwrap_or(BTW_FALLBACK_SYSTEM)
+            .to_owned();
         messages.push(btw_question(&question));
 
         let (tx, rx) = flume::bounded(64);
@@ -121,7 +123,7 @@ mod tests {
     use maki_lua::PluginHost;
     use maki_providers::provider::BoxFuture;
     use maki_providers::{AgentError, ModelInfo, StreamResponse};
-    use maki_storage::frame::StoredFrame;
+    use maki_storage::frame::{PromptFacts, StoredFrame};
     use std::future;
     use test_case::test_case;
 
@@ -152,9 +154,16 @@ mod tests {
         }
     }
 
-    #[test_case(false, BTW_FALLBACK_SYSTEM ; "native_fallback")]
-    #[test_case(true, FRAME_POLICY ; "stored_frame_precedence")]
-    fn side_question_uses_the_selected_policy(with_frame: bool, expected: &str) {
+    fn rendered_frame() -> StoredFrame {
+        StoredFrame::new(FRAME_POLICY.into(), String::new(), None, Vec::new())
+    }
+
+    /// An imported session holds a frame with facts and no prompt until its
+    /// first run, and an empty system is a 400 on Anthropic.
+    #[test_case(None, BTW_FALLBACK_SYSTEM ; "native_fallback")]
+    #[test_case(Some(rendered_frame()), FRAME_POLICY ; "stored_frame_precedence")]
+    #[test_case(Some(StoredFrame::facts_only(PromptFacts::default())), BTW_FALLBACK_SYSTEM ; "imported_before_first_run")]
+    fn side_question_uses_the_selected_policy(frame: Option<StoredFrame>, expected: &str) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "persona",
@@ -169,14 +178,9 @@ mod tests {
         .unwrap();
         let mut app = crate::app::tests::test_app();
         app.lua_event_handle = host.event_handle();
-        if with_frame {
+        if let Some(frame) = frame {
             let mut snapshot = HistorySnapshot::new(Vec::new());
-            snapshot.frame = Some(Arc::new(StoredFrame {
-                system: FRAME_POLICY.into(),
-                fingerprint: String::new(),
-                facts: None,
-                mcp_tools: Vec::new(),
-            }));
+            snapshot.frame = Some(Arc::new(frame));
             app.shared_history = Some(Arc::new(ArcSwap::from_pointee(snapshot)));
         }
         let (sent, requests) = flume::unbounded();

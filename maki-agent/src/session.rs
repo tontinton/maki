@@ -7,7 +7,9 @@ use maki_providers::{ContextGauge, Message, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::frame::StoredFrame;
 use maki_storage::id::SessionRef;
-use maki_storage::sessions::{SAVE_FAILED, Session, SessionClaim, SessionError};
+use maki_storage::sessions::{
+    SAVE_FAILED, Session, SessionClaim, SessionError, StoredMode, StoredThinking,
+};
 use tracing::warn;
 
 use crate::agent::{
@@ -19,6 +21,41 @@ use crate::{AgentRunParams, ToolOutput};
 /// The one spelling of a persisted maki session. It cannot live in
 /// maki-storage: [`ToolOutput`] is ours, and maki-storage must not depend on us.
 pub type StoredSession = Session<Message, TokenUsage, ToolOutput>;
+
+/// What a session says about itself besides its transcript: what export and
+/// `maki.session.read` answer with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionHeader {
+    pub cwd: String,
+    /// Empty until a turn picks one.
+    pub model: String,
+    pub title: String,
+    pub mode: Option<StoredMode>,
+    pub thinking: Option<StoredThinking>,
+    pub fast: bool,
+    pub usage: TokenUsage,
+    pub context_size: u32,
+    pub updated_at: u64,
+    /// A turn is running. Always false for a session read from disk.
+    pub working: bool,
+}
+
+impl SessionHeader {
+    pub fn of(session: &StoredSession) -> Self {
+        Self {
+            cwd: session.cwd.clone(),
+            model: session.model.clone(),
+            title: session.title.clone(),
+            mode: session.meta.mode,
+            thinking: session.meta.thinking,
+            fast: session.meta.fast,
+            usage: session.token_usage,
+            context_size: session.meta.context_size,
+            updated_at: session.updated_at,
+            working: false,
+        }
+    }
+}
 
 /// A transcript a driver starts from. The id comes from the caller, because
 /// every entry point resolves one and reports it before the run starts, and a
@@ -492,15 +529,15 @@ mod tests {
     #[test]
     fn the_frame_survives_a_resume_and_the_next_turn() {
         let tmp = TempDir::new().unwrap();
-        let frame = Arc::new(StoredFrame {
-            system: FRAME_SYSTEM.into(),
-            fingerprint: FRAME_FINGERPRINT.into(),
-            facts: Some(PromptFacts {
+        let frame = Arc::new(StoredFrame::new(
+            FRAME_SYSTEM.into(),
+            FRAME_FINGERPRINT.into(),
+            Some(PromptFacts {
                 cwd: CWD.into(),
                 ..Default::default()
             }),
-            mcp_tools: vec![serde_json::json!({ "name": FRAME_MCP_TOOL })],
-        });
+            vec![serde_json::json!({ "name": FRAME_MCP_TOOL })],
+        ));
         let resumed = Resumed {
             history: vec![Message::user(PROMPT.into())],
             frame: Some(Arc::clone(&frame)),
