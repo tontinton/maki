@@ -1,3 +1,5 @@
+providers = ["acmelua"]
+
 [permissions]
 net = true
 net_hosts = ["api.acme.example"]

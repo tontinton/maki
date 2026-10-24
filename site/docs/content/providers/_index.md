@@ -382,7 +382,6 @@ New models start at the **medium** tier until you assign one in the picker.
 
 1. Tweak a built-in (pick a plan, change its base URL, set `enable_free_models` for Opencode).
 2. Declare a custom provider that speaks OpenAI, Anthropic, or Google wire format.
-3. [Pick the plugin package](#select-a-provider-package) that implements a provider.
 
 ```toml
 # Point a built-in at a proxy. Env vars still win over this file.
@@ -421,7 +420,6 @@ supports_vision = false
 |-------|------|-------|
 | `display_name` | string | Shown in pickers and auth status |
 | `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs |
-| `plugin` | string | [Package](#select-a-provider-package) that implements this provider. Not allowed with `protocol` |
 | `base_url` | string | Origin of the API. Maki appends the protocol paths |
 | `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
@@ -536,9 +534,11 @@ maki.provider.register({
 })
 ```
 
-The plugin's `plugin.toml` must grant `net` and list the provider's hosts in `net_hosts`. `api_key_env` also needs `env`:
+The plugin's `plugin.toml` must grant `net`, list the provider's hosts in `net_hosts`, and list the slug under `providers` when models.dev serves that name. `api_key_env` also needs `env`:
 
 ```toml
+providers = ["acme"]
+
 [permissions]
 net = true
 env = true
@@ -549,29 +549,25 @@ Maki sends the provider's credentials only to those hosts, plus any origin you s
 
 The [Lua API](/docs/lua-api/#maki-provider-register) lists every field. This section explains the choices.
 
-### Select a provider package
+### Granted slugs
 
-Maki builds a generic client for each [models.dev](https://models.dev/) provider it has no built-in support for. To have a plugin implement one instead, select its [package](/docs/packages/) in `providers.toml`:
+A third-party plugin that registers a slug models.dev serves has to be granted it: the manifest lists the slug at the top level of its `plugin.toml`, and the install approval covers it. The install approval prompt shows that the package will receive your saved key for each name models.dev serves.
 
 ```toml
-[acme]
-plugin = "acme-provider"
+providers = ["acme"]
+
+[permissions]
+net = true
+net_hosts = ["api.acme.com"]
 ```
 
-Only that package can then register `acme`, and it receives the credentials already saved for `acme`. Built-in names stay [reserved](#slug-rules).
+Maki checks the list against the names models.dev serves today. A load that registers such a slug the manifest does not list, or the approval never covered, is refused. List every slug the package registers, so a name the catalog adds later is already approved and the generic catalog client can never take over a working package's slug and receive the key you saved for it.
 
-The package still needs its usual permission approval. If it is missing, fails to load, or does not register `acme`, the provider is unavailable. Maki does not fall back to the generic client.
+Names Maki ships, built in or as a bundled plugin, stay [reserved](#slug-rules) regardless of this list.
 
-Run `/reload` or restart after changing `plugin`. Remove it to go back to the generic client.
+An approval recorded before this list existed covers no slug. The startup approval check asks again, so update or reinstall the package and answer the prompt to grant the names.
 
-A package that ships several providers can skip the ones you did not select:
-
-```lua
-if not maki.provider.is_selected("acme") then
-  return
-end
--- Register the provider here.
-```
+This replaces the `plugin = "..."` selection field an older release had in `providers.toml`. Maki still reads it: while it is set, the slug stays owned by the named package so the catalog client cannot take it over, and a warning tells you to list the slug under `providers` in the package's `plugin.toml` and remove the `plugin =` line.
 
 ### codec or base
 
@@ -655,7 +651,7 @@ The value is any JSON object. Each slug gets its own file at `~/.local/state/mak
 
 - Starts with a letter or digit, then only letters, digits, `_` and `-`
 - Not a slug Maki ships, built in or as a bundled plugin, even one you turned off. Your plugin would otherwise get the API key saved for that provider
-- Not a models.dev provider name, unless you [selected](#select-a-provider-package) the package for it
+- Listed under `providers` in the package's `plugin.toml` and covered by its install approval when models.dev serves the slug. List every slug the package registers, so a name models.dev adds later cannot break a working package
 - Not a custom provider from `providers.toml` or a slug another plugin registered
 
 ### Migrating from provider scripts
@@ -722,6 +718,8 @@ Maki's tests load this plugin, so it matches the current API. It uses `codec = "
 `plugin.toml`:
 
 ```toml
+providers = ["acmelua"]
+
 [permissions]
 net = true
 net_hosts = ["api.acme.example"]

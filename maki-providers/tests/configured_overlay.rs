@@ -5,15 +5,13 @@
 //! needs its own, and `cargo nextest` is what gives a test its own process.
 
 use std::fs;
-use std::sync::Arc;
 
-use maki_config::providers::{Protocol, ProvidersConfig};
+use maki_config::providers::Protocol;
+use maki_providers::Timeouts;
 use maki_providers::plugin::{
     self, DeclAuthority, PlanDecl, ProviderDecl, RegisterError, Registration,
 };
-use maki_providers::provider::provider_for_slug;
 use maki_providers::spec::Owner;
-use maki_providers::{Timeouts, catalog_provider_if_available, warm_catalog};
 use maki_storage::StateDir;
 use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
 use serde_json::json;
@@ -54,14 +52,6 @@ const BUILT_DESPITE_BAD_HEADER: &str = "a bad [<slug>.headers] must fail the bui
 const PLAN_KEY: &str = "coding";
 const PLAN_HOST: &str = "plan.overlaid.example";
 const PLAN_KEY_ENV: &str = "MAKI_TEST_PLANNED_PROVIDER_KEY";
-const CATALOG_SLUG: &str = "selected-catalog";
-const CATALOG_FILE: &str = "models-dev-catalog.json";
-const SELECTED_OWNER: &str = "selected-package";
-const OTHER_OWNER: &str = "other-package";
-const SAVED_KEY: &str = "sk-selected-catalog";
-const SAVED_BEARER: &str = "Bearer sk-selected-catalog";
-const KEY_ENV: &str = "MAKI_TEST_SELECTED_CATALOG_KEY";
-const STALE_MODEL: &str = "stale-model";
 
 /// Points every base directory at a throwaway tree holding `providers.toml`,
 /// so no case reads this machine's config. The file goes wherever maki's own
@@ -100,6 +90,7 @@ fn load_bundled() {
     plugin::register(
         declaration(DECLARED_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST),
         DeclAuthority::Bundled,
+        &[],
     )
     .expect(PROVIDER_LOST);
     plugin::commit_load();
@@ -155,6 +146,7 @@ fn a_bad_header_on_a_bundled_slug_fails_only_its_build() {
 /// With `plan = "..."` the user picks, but the plugin wrote every origin on
 /// the menu. So the origin is only trusted when maki itself wrote it.
 #[test_case(DeclAuthority::ThirdParty, false ; "third_party")]
+#[test_case(DeclAuthority::Config, false ; "config")]
 #[test_case(DeclAuthority::Bundled, true ; "bundled")]
 fn a_planned_origin_is_vouched_only_for_a_bundled_declaration(
     authority: DeclAuthority,
@@ -173,7 +165,11 @@ fn a_planned_origin_is_vouched_only_for_a_bundled_declaration(
         login_url: None,
     }];
     plugin::begin_load();
-    plugin::register(reg, authority).expect(PROVIDER_LOST);
+    let grant = match authority {
+        DeclAuthority::ThirdParty => vec![DECLARED_SLUG.to_owned()],
+        DeclAuthority::Bundled | DeclAuthority::Config => Vec::new(),
+    };
+    plugin::register(reg, authority, &grant).expect(PROVIDER_LOST);
     plugin::commit_load();
 
     assert_eq!(
@@ -192,6 +188,7 @@ fn a_slug_providers_toml_defines_is_still_refused() {
     let error = plugin::register(
         declaration(OWN_SLUG, OWN_DISPLAY_NAME, OWN_HOST),
         DeclAuthority::ThirdParty,
+        &[OWN_SLUG.to_owned()],
     )
     .unwrap_err();
     plugin::commit_load();
@@ -199,18 +196,24 @@ fn a_slug_providers_toml_defines_is_still_refused() {
     assert!(matches!(error, RegisterError::ConfiguredSlug(_)), "{error}");
 }
 
-fn selected_catalog() -> TempDir {
-    let home = isolated(&format!("[{CATALOG_SLUG}]\nplugin = {SELECTED_OWNER:?}\n"));
+const CATALOG_SLUG: &str = "takeover-catalog";
+const CATALOG_FILE: &str = "models-dev-catalog.json";
+const SAVED_KEY: &str = "sk-takeover";
+const SAVED_BEARER: &str = "Bearer sk-takeover";
+const KEY_ENV: &str = "MAKI_TEST_TAKEOVER_CATALOG_KEY";
+const CREDENTIALS_LOST: &str = "the takeover must hand the plugin the saved key";
+
+/// The takeover's whole point, and its risk: `maki auth login` saved the key
+/// under the slug, and the plugin that replaced the catalog provider sends it.
+fn saved_catalog_key() -> TempDir {
+    let home = isolated("");
     let cache = maki_storage::paths::cache_dir().unwrap();
     fs::write(
         cache.join(CATALOG_FILE),
         json!({
             CATALOG_SLUG: {
-                "name": DECLARED_DISPLAY_NAME,
                 "npm": "@ai-sdk/openai-compatible",
                 "api": DECLARED_URL,
-                "env": [],
-                "models": { STALE_MODEL: {} },
             }
         })
         .to_string(),
@@ -229,163 +232,46 @@ fn selected_catalog() -> TempDir {
     home
 }
 
-fn select_owner(owner: Option<&str>) {
-    let mut config = ProvidersConfig::load();
-    config.providers.get_mut(CATALOG_SLUG).unwrap().plugin = owner.map(str::to_owned);
-    config.save().unwrap();
-}
-
-fn register_selected() {
+#[test]
+fn a_taken_over_slugs_saved_key_becomes_the_plugins() {
+    let _home = saved_catalog_key();
     let mut reg = declaration(CATALOG_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST);
-    reg.decl.api_key_env = Some(KEY_ENV.into());
-    plugin::register_plugin(Arc::from(SELECTED_OWNER), reg, DeclAuthority::ThirdParty).unwrap();
+    reg.decl.api_key_env = Some(KEY_ENV.to_owned());
+    plugin::begin_load();
+    plugin::register(reg, DeclAuthority::ThirdParty, &[CATALOG_SLUG.to_owned()])
+        .expect(CREDENTIALS_LOST);
+    plugin::commit_load();
+
+    let auth = plugin::resolved_auth(CATALOG_SLUG).expect(CREDENTIALS_LOST);
+    assert!(
+        auth.headers.iter().any(|(name, value)| (name, value)
+            == (&"authorization".to_owned(), &SAVED_BEARER.to_owned())),
+        "{:?}",
+        auth.headers
+    );
 }
 
-#[test_case(None ; "unowned")]
-#[test_case(Some(OTHER_OWNER) ; "another_package")]
-fn a_selected_catalog_name_refuses_other_owners(owner: Option<&str>) {
-    let _home = selected_catalog();
-    plugin::begin_load();
-    let reg = declaration(CATALOG_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST);
-    let result = match owner {
-        Some(owner) => plugin::register_plugin(Arc::from(owner), reg, DeclAuthority::ThirdParty),
-        None => plugin::register(reg, DeclAuthority::ThirdParty),
-    };
-    let error = result.unwrap_err();
-    plugin::commit_load();
-    assert!(
-        matches!(error, RegisterError::SelectedOwner { .. }),
-        "{error}"
-    );
-    assert!(!plugin::is_registered(CATALOG_SLUG));
-    assert!(plugin::resolved_auth(CATALOG_SLUG).is_none());
-}
+/// A v0.6.4 `plugin =` selection in `providers.toml` keeps the slug owned by
+/// the named package, so the catalog client cannot take it over and receive
+/// the saved key. The load warns the user to migrate.
+const LEGACY_SLUG: &str = "legacy-selected";
+const LEGACY_PACKAGE: &str = "legacy-package";
+const LEGACY_OWNED: &str = "a legacy selection keeps its slug owned";
+const LEGACY_WARNED: &str = "a legacy selection warns the user to migrate";
 
 #[test]
-fn selection_changes_take_effect_only_after_reload() {
-    let _home = selected_catalog();
-    plugin::begin_load();
-    register_selected();
-    plugin::commit_load();
-    provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
-    assert!(matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
-    assert_eq!(
-        plugin::resolved_auth(CATALOG_SLUG).unwrap().headers,
-        [("authorization".into(), SAVED_BEARER.into())]
-    );
+fn a_legacy_plugin_selection_keeps_the_slug_owned() {
+    let _home = isolated(&format!("[{LEGACY_SLUG}]\nplugin = \"{LEGACY_PACKAGE}\"\n"));
 
-    select_owner(Some(OTHER_OWNER));
-    assert!(plugin::spec(CATALOG_SLUG).is_some());
-    assert!(plugin::resolved_auth(CATALOG_SLUG).is_some());
-    provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
     plugin::begin_load();
-    assert!(plugin::is_registered(CATALOG_SLUG));
+    let warnings = plugin::keep_legacy_selections();
     plugin::commit_load();
-    assert!(!plugin::is_registered(CATALOG_SLUG));
-    let error = provider_for_slug(CATALOG_SLUG, Timeouts::default())
-        .err()
-        .unwrap();
-    assert!(error.to_string().contains(OTHER_OWNER), "{error}");
 
-    select_owner(None);
-    assert!(matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
-    assert!(provider_for_slug(CATALOG_SLUG, Timeouts::default()).is_err());
-    plugin::begin_load();
-    plugin::commit_load();
-    assert!(!matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
-    let fallback = provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
-    let models = smol::block_on(fallback.list_models()).unwrap();
-    assert_eq!(
-        models
+    assert!(plugin::owns_slug(LEGACY_SLUG), "{LEGACY_OWNED}");
+    assert!(
+        warnings
             .iter()
-            .map(|model| model.id.as_str())
-            .collect::<Vec<_>>(),
-        [STALE_MODEL]
+            .any(|w| w.contains(LEGACY_SLUG) && w.contains(LEGACY_PACKAGE)),
+        "{LEGACY_WARNED}: {warnings:?}"
     );
-}
-
-#[test_case(false ; "missing")]
-#[test_case(true ; "failed_load")]
-fn an_unavailable_selected_owner_cannot_fall_back_to_catalog_requests(failed: bool) {
-    let _home = selected_catalog();
-    plugin::begin_load();
-    if failed {
-        register_selected();
-        plugin::discard(SELECTED_OWNER);
-    }
-    plugin::commit_load();
-    assert!(!plugin::is_registered(CATALOG_SLUG));
-    assert!(matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
-    let error = provider_for_slug(CATALOG_SLUG, Timeouts::default())
-        .err()
-        .unwrap();
-    assert!(error.to_string().contains(SELECTED_OWNER), "{error}");
-}
-
-#[test]
-fn an_owner_changed_during_load_takes_effect_on_the_next_load() {
-    let _home = selected_catalog();
-    plugin::begin_load();
-    select_owner(Some(OTHER_OWNER));
-    register_selected();
-    plugin::commit_load();
-    assert!(plugin::resolved_auth(CATALOG_SLUG).is_some());
-    provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
-    plugin::begin_load();
-    let error = plugin::register_plugin(
-        Arc::from(SELECTED_OWNER),
-        declaration(CATALOG_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST),
-        DeclAuthority::ThirdParty,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(error, RegisterError::SelectedOwner { .. }),
-        "{error}"
-    );
-    plugin::commit_load();
-    assert!(provider_for_slug(CATALOG_SLUG, Timeouts::default()).is_err());
-}
-
-#[test_case("anthropic" ; "compiled")]
-#[test_case("deepseek" ; "bundled")]
-fn selecting_a_package_does_not_release_a_shipped_name(slug: &str) {
-    let _home = isolated(&format!("[{slug}]\nplugin = {SELECTED_OWNER:?}\n"));
-    plugin::begin_load();
-    let error = plugin::register_plugin(
-        Arc::from(SELECTED_OWNER),
-        declaration(slug, DECLARED_DISPLAY_NAME, DECLARED_HOST),
-        DeclAuthority::ThirdParty,
-    )
-    .unwrap_err();
-    plugin::commit_load();
-    assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
-}
-
-#[test]
-fn warming_a_new_catalog_does_not_revoke_a_loaded_provider() {
-    let _home = selected_catalog();
-    select_owner(None);
-    let cache = maki_storage::paths::cache_dir().unwrap().join(CATALOG_FILE);
-    let catalog_json = fs::read_to_string(&cache).unwrap();
-    fs::write(&cache, "{}").unwrap();
-    plugin::begin_load();
-    register_selected();
-    plugin::commit_load();
-    fs::write(&cache, catalog_json).unwrap();
-    warm_catalog();
-    assert!(catalog_provider_if_available(CATALOG_SLUG).is_some());
-    provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
-    assert!(plugin::spec(CATALOG_SLUG).is_some());
-    assert!(plugin::resolved_auth(CATALOG_SLUG).is_some());
-
-    plugin::begin_load();
-    let error = plugin::register_plugin(
-        Arc::from(SELECTED_OWNER),
-        declaration(CATALOG_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST),
-        DeclAuthority::ThirdParty,
-    )
-    .unwrap_err();
-    assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
-    plugin::commit_load();
-    assert!(!plugin::is_registered(CATALOG_SLUG));
 }
