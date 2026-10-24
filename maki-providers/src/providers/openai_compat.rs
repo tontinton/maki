@@ -284,27 +284,20 @@ impl OpenAiCompatProvider {
         let supports_vision = m["input_modalities"]
             .as_array()
             .map(|mods| mods.iter().any(|v| v.as_str() == Some("image")));
-        // Gateways spell the rates `prompt`/`completion` or `input`/`output`,
-        // and quote them as strings or as JSON numbers.
-        let rate = |value: Option<&Value>| {
-            value.and_then(|v| {
-                v.as_f64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            })
-        };
         let pricing = m["pricing"].as_object().and_then(|p| {
-            let input = rate(p.get("prompt").or_else(|| p.get("input")))?;
-            let output = rate(p.get("completion").or_else(|| p.get("output")))?;
-            let cache_write = rate(p.get("cache_creation"));
-            // Some endpoints quote the cache-read rate at the top level, per
-            // million tokens, instead of inside `pricing`.
-            let cache_read = rate(p.get("cache_read"))
-                .or_else(|| rate(m.get("cached_input_price_usd_per_mtok")));
             Some(crate::model::ModelPricing::per_million(
-                input,
-                output,
-                cache_write.unwrap_or(0.0),
-                cache_read.unwrap_or(0.0),
+                p.get("prompt")?.as_str()?.parse().ok()?,
+                p.get("completion")?.as_str()?.parse().ok()?,
+                p.get("cache_creation")?
+                    .as_str()?
+                    .parse::<f64>()
+                    .ok()
+                    .unwrap_or(0.0),
+                p.get("cache_read")?
+                    .as_str()?
+                    .parse::<f64>()
+                    .ok()
+                    .unwrap_or(0.0),
             ))
         });
         Some(crate::model::ModelInfo {
@@ -920,41 +913,6 @@ data: [DONE]\n";
     fn default_model_parser_missing_pricing_stays_none() {
         let info = OpenAiCompatProvider::default_model_parser(&json!({"id": "m"})).unwrap();
         assert!(info.pricing.is_none());
-    }
-
-    // Endpoints that publish rates usually quote input and output only, so the
-    // cache keys default to zero instead of voiding the whole price.
-    #[test]
-    fn default_model_parser_prices_without_cache_rates() {
-        let info = OpenAiCompatProvider::default_model_parser(&json!({
-            "id": "m",
-            "pricing": {"prompt": "1.5", "completion": "6.0"}
-        }))
-        .unwrap();
-
-        let pricing = info
-            .pricing
-            .expect("input and output rates price the model");
-        assert_eq!(pricing.input, 1.5);
-        assert_eq!(pricing.output, 6.0);
-        assert_eq!(pricing.cache_write, 0.0);
-        assert_eq!(pricing.cache_read, 0.0);
-    }
-
-    #[test]
-    fn default_model_parser_reads_numeric_rates_and_top_level_cache_price() {
-        let info = OpenAiCompatProvider::default_model_parser(&json!({
-            "id": "m",
-            "pricing": {"input": 0.2, "output": 0.8},
-            "cached_input_price_usd_per_mtok": 0.05
-        }))
-        .unwrap();
-
-        let pricing = info.pricing.expect("numeric rates price the model");
-        assert_eq!(pricing.input, 0.2);
-        assert_eq!(pricing.output, 0.8);
-        assert_eq!(pricing.cache_write, 0.0);
-        assert_eq!(pricing.cache_read, 0.05);
     }
 
     #[test_case(json!({"id": "m", "input_modalities": ["text", "image"]}), Some(true) ; "image_modality_enables_vision")]
