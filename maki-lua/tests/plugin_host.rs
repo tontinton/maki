@@ -1107,6 +1107,25 @@ fn examples_table_flows_to_trait() {
 }
 
 #[test]
+fn memory_command_guidance_parses() {
+    let (reg, _host) = builtins_host();
+    let entry = reg.get("memory").expect("memory tool not registered");
+    let schema = entry.tool.schema();
+    let description = schema["properties"]["command"]["description"]
+        .as_str()
+        .expect("command guidance missing");
+    for command in schema["properties"]["command"]["enum"].as_array().unwrap() {
+        let command = command.as_str().unwrap();
+        assert!(description.contains(&format!("- `{command}`:")));
+        let input = json!({"command": command});
+        entry
+            .tool
+            .parse(&input)
+            .unwrap_or_else(|err| panic!("advertised memory input {input} must parse: {err}"));
+    }
+}
+
+#[test]
 fn interrupt_kills_infinite_loop_and_vm_recovers() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();

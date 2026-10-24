@@ -196,7 +196,7 @@ case_tmp("format_list_caps_oversized_output", function(dir)
   local result = format_list(dir)
   assert(#result <= h.MAX_FILE_BYTES + 200, "list output stays near the cap")
   assert(result:find("truncated at", 1, true), "oversized list is capped")
-  assert(result:find(h.CAP_HINT_FILTER, 1, true), "cap hint suggests tag filtering")
+  assert(result:find('command="list", tags=[...]', 1, true), "cap hint separates the command from the tags filter")
 
   local complete = format_list(dir, nil, FULL_CTX)
   assert(#complete > h.MAX_FILE_BYTES, "programmatic list exceeds the presentation cap")
