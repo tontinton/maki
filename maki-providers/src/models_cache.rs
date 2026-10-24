@@ -246,6 +246,20 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
     );
 }
 
+/// Returns the specs from the on-disk cache if it exists, belongs to the
+/// current credentials, and is not past [`MAX_AGE_MS`].
+pub fn cached_model_specs(policy: &ModelPolicy) -> Vec<String> {
+    let Some(path) = cache_path() else {
+        return Vec::new();
+    };
+    replay(
+        &path,
+        policy,
+        &fingerprint(),
+        maki_storage::auth::now_millis(),
+    )
+}
+
 /// Like [`fetch_all_models`], but the first `on_update` comes straight from
 /// the on-disk cache. Every call carries the whole list to show, not a delta,
 /// plus the warnings of the batch that changed it. The last call has
@@ -257,10 +271,7 @@ pub async fn fetch_all_models_cached(
     let path = cache_path();
     let fingerprint = fingerprint();
     let mut listing = Listing {
-        replayed: path
-            .as_deref()
-            .map(|p| replay(p, policy, &fingerprint, maki_storage::auth::now_millis()))
-            .unwrap_or_default(),
+        replayed: cached_model_specs(policy),
         ..Listing::default()
     };
     on_update(listing.snapshot(), Vec::new());
