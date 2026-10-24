@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 use crate::model::Model;
 use crate::providers::copilot::copilot_usd;
 use crate::providers::openai_compat::tool_parameters;
-use crate::providers::{ResolvedAuth, sse_error_status};
+use crate::providers::{BilledCost, ResolvedAuth, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -505,7 +505,7 @@ pub(crate) async fn parse_sse(
 
                 if let Some(u) = resp.get("usage") {
                     usage = parse_usage(u);
-                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
+                    usage.cost = usage.cost.or_else(|| copilot_usd(&parsed["copilot_usage"]));
                 }
 
                 let status = resp["status"].as_str().unwrap_or("completed");
@@ -530,7 +530,7 @@ pub(crate) async fn parse_sse(
                 let resp = &parsed["response"];
                 if let Some(u) = resp.get("usage") {
                     usage = parse_usage(u);
-                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
+                    usage.cost = usage.cost.or_else(|| copilot_usd(&parsed["copilot_usage"]));
                 }
                 stop_reason = Some(StopReason::MaxTokens);
             }
@@ -608,7 +608,7 @@ fn parse_usage(u: &Value) -> TokenUsage {
         output: output_tokens,
         cache_read: cached,
         cache_creation: 0,
-        cost: None,
+        cost: BilledCost::from_usage(u).total(),
     }
 }
 
@@ -742,6 +742,26 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
                 })
                 .collect();
             assert_eq!(deltas, vec!["Hello", " world"]);
+        })
+    }
+
+    const BILLED_COST: f64 = 0.00042;
+
+    #[test_case("\"cost\":0.00042" ; "cost")]
+    #[test_case("\"response_cost\":0.00042" ; "response_cost")]
+    #[test_case("\"cost\":0.00042,\"response_cost\":0.5" ; "cost_and_response_cost")]
+    #[test_case("\"cost\":0.00002,\"cost_details\":{\"upstream_inference_cost\":0.0004}" ; "byok")]
+    fn parse_sse_billed_cost(cost_fields: &str) {
+        smol::block_on(async {
+            let frame = format!(
+                "event: response.completed\ndata: {{\"response\":{{\"status\":\"completed\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,{cost_fields}}}}}}}\n\n"
+            );
+            let (resp, _) = run_sse(&frame).await;
+            let resp = resp.unwrap();
+            let cost = resp.usage.cost.expect("billed cost should be captured");
+            assert!((cost - BILLED_COST).abs() < 1e-9);
+            assert_eq!(resp.usage.input, 10);
+            assert_eq!(resp.usage.output, 2);
         })
     }
 

@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
+use crate::providers::BilledCost;
 use crate::providers::copilot::copilot_usd;
 use crate::types::{is_deferred_tool, rejects_sampling};
 use crate::{
@@ -73,6 +74,9 @@ struct Usage {
     cache_creation_input_tokens: u32,
     #[serde(default)]
     cache_read_input_tokens: u32,
+    /// What a gateway in front of the API billed.
+    #[serde(flatten)]
+    billed: BilledCost,
 }
 
 impl From<Usage> for TokenUsage {
@@ -82,7 +86,7 @@ impl From<Usage> for TokenUsage {
             output: u.output_tokens,
             cache_creation: u.cache_creation_input_tokens,
             cache_read: u.cache_read_input_tokens,
-            ..Default::default()
+            cost: u.billed.total(),
         }
     }
 }
@@ -548,6 +552,9 @@ impl EventParser {
                             if src > 0 {
                                 *dst = src;
                             }
+                        }
+                        if let Some(cost) = u.billed.total() {
+                            self.usage.cost = Some(cost);
                         }
                     }
                     if let Some(usd) = ev.copilot_usage.as_ref().and_then(copilot_usd) {
