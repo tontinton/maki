@@ -95,6 +95,18 @@ impl App {
         dirty
     }
 
+    pub fn poll_copy(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
+        while let Some(result) = take_ready(&mut self.copy_rx) {
+            dirty = Dirty::YES;
+            match result {
+                Ok(()) => self.status_bar.flash("Copied selection".into()),
+                Err(e) => self.status_bar.flash(format!("Copy failed: {e}")),
+            }
+        }
+        dirty
+    }
+
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
         let drag_zone = match self.selection_state {
             Some(SelectionState::Dragging { ref sel, .. }) => Some(sel.zone),
@@ -254,6 +266,7 @@ impl App {
         match self.clipboard.copy_text(&text) {
             Ok(CopyResult::Noop) => {}
             Ok(CopyResult::Copied) => self.status_bar.flash("Copied selection".into()),
+            Ok(CopyResult::Pending(rx)) => self.copy_rx.push(rx),
             Err(e) => self.status_bar.flash(format!("Copy failed: {e}")),
         }
         self.selection_state = None;

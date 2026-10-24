@@ -645,6 +645,7 @@ pub struct UiFileConfig {
     pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
+    pub clipboard_command: Option<String>,
 }
 
 impl UiFileConfig {
@@ -663,7 +664,8 @@ impl UiFileConfig {
             show_thinking,
             theme,
             clock_format,
-            max_input_lines
+            max_input_lines,
+            clipboard_command
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -1283,6 +1285,13 @@ pub struct UiConfig {
     #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
     pub clock_format: ClockFormat,
 
+    #[config(
+        ty = "String",
+        default = "None",
+        desc = "Command that receives the selection on stdin (e.g. `wl-copy`). When set it is the only way Maki copies, so failures are reported instead of falling back to the native clipboard or OSC 52"
+    )]
+    pub clipboard_command: Option<String>,
+
     #[config(skip, default = "None")]
     pub theme: Option<String>,
 
@@ -1311,6 +1320,7 @@ impl UiConfig {
                 .thinking_lines
                 .unwrap_or(ThinkingLines::Tail(DEFAULT_THINKING_LINES)),
             clock_format: f.clock_format.unwrap_or_default(),
+            clipboard_command: f.clipboard_command,
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
         }
@@ -2911,6 +2921,15 @@ mod tests {
             config.storage.max_log_bytes,
             DEFAULT_MAX_LOG_BYTES_MB * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn clipboard_command_is_read_from_ui_section() {
+        let raw: RawConfig = toml::from_str("[ui]\nclipboard_command = \"wl-copy\"\n").unwrap();
+        let config = raw.into_config(&[]).unwrap();
+        assert_eq!(config.ui.clipboard_command.as_deref(), Some("wl-copy"));
+        let default = RawConfig::default().into_config(&[]).unwrap();
+        assert_eq!(default.ui.clipboard_command, None);
     }
 
     #[test_case("auto", NotificationMethod::Auto ; "auto")]
