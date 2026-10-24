@@ -234,6 +234,7 @@ pub async fn adapt_images_for_model<'a>(
             role: message.role.clone(),
             content,
             display_text: message.display_text.clone(),
+            durable: message.durable.clone(),
             kind: message.kind.clone(),
         });
     }
@@ -363,12 +364,22 @@ impl ContentBlock {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableContent {
+    pub key: String,
+    pub text: String,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
+    /// Host metadata for content carried verbatim across compaction.
+    /// Provider encoders omit this marker from requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable: Option<DurableContent>,
     /// Skipped when it is `Turn`, so sessions written before this existed
     /// load unchanged.
     #[serde(default, skip_serializing_if = "MessageKind::is_turn")]
@@ -1477,6 +1488,21 @@ mod tests {
             generate_title(&[host, Message::user(PROMPT.into())]),
             PROMPT
         );
+    }
+
+    #[test]
+    fn durable_message_metadata_is_backward_compatible_and_round_trips() {
+        let stored =
+            json!({ "role": "user", "content": [{ "type": "text", "text": "instructions" }] });
+        let old: Message = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(old.durable, None);
+        assert_eq!(serde_json::to_value(old).unwrap(), stored);
+        let marked = json!({
+            "role": "user", "content": [{ "type": "text", "text": "instructions" }],
+            "durable": { "key": "remember:release", "text": "instructions" },
+        });
+        let restored: Message = serde_json::from_value(marked.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), marked);
     }
 
     /// A result that loaded nothing must serialize to the same bytes as

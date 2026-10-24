@@ -39,6 +39,7 @@ pub fn run(
         no_plugins,
         super::BuiltinFailure::Fatal,
         Interaction::None,
+        &trust.project_config,
         |host, names, warnings| {
             warnings.extend(trust.warning.clone());
             let config = host

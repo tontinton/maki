@@ -444,6 +444,7 @@ only in compact mode.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
   - `permission` (`string`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
+  - `durable` (`string`) Optional string field in the recorded tool input that identifies this result. Core retains the latest non-empty successful result text per tool and field value verbatim across compaction, including results restored from older sessions. The key uses the recorded input, before any input-hook rewrite.
   - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 
@@ -2258,6 +2259,22 @@ Useful for migration logic. Returns nil when there is no legacy directory.
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) Legacy directory path, or nil if not present.
+
+---
+
+### `maki.env.project_dirs()` {#maki-env-project_dirs}
+
+```lua
+maki.env.project_dirs()
+```
+
+Return canonical directories from the working directory to the project root,
+nearest first. Empty when project content is disabled, including an
+unconfigured host. Session-only trust grants are included.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Returns:** (`string[]`) Trusted project directories.
 
 
 ## maki.fn {#maki-fn}

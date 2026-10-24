@@ -365,6 +365,9 @@ pub enum Request {
     SealPackOps {
         reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
     },
+    SetProjectDirs {
+        dirs: Vec<PathBuf>,
+    },
     LoadSource {
         name: Arc<str>,
         chunks: Vec<LoadChunk>,
@@ -3162,6 +3165,7 @@ impl LuaRuntime {
                     has_start_fn: t.start_key.is_some(),
                     permission: t.permission.as_ref().map(ToolPermission::kind),
                     mutable_path_field: t.mutable_path_field.clone(),
+                    durable_field: t.durable_field.clone(),
                     timeout: t.timeout,
                     start_annotation: t.start_annotation.clone(),
                     examples: t.examples.clone(),
@@ -4539,6 +4543,9 @@ pub fn spawn(
                         Request::InstallSessionSnapshot { provider } => {
                             rt.lua
                                 .set_app_data(crate::api::session::SessionSnapshotSlot(provider));
+                        }
+                        Request::SetProjectDirs { dirs } => {
+                            rt.lua.set_app_data(crate::api::env::TrustedProjectDirs(dirs));
                         }
                         Request::LoadSource {
                             name,

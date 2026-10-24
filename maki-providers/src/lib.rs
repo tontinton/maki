@@ -39,7 +39,7 @@ pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 pub use providers::{Timeouts, user_agent};
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
-    ContentBlock, DEFER_LOADING_KEY, EMPTY_RESPONSE_MARKER, Effort, EffortDialect,
+    ContentBlock, DEFER_LOADING_KEY, DurableContent, EMPTY_RESPONSE_MARKER, Effort, EffortDialect,
     IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE, IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType,
     ImageSource, InputTransformation, Message, MessageKind, ModelUsageRow, ProviderEvent,
     ProviderUsage, RequestOptions, Role, StopReason, StreamResponse, THINKING_USAGE,

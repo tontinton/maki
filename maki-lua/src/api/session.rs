@@ -820,6 +820,7 @@ mod tests {
         let message = Message {
             role,
             kind,
+            durable: None,
             display_text: display_text.map(str::to_owned),
             content: vec![
                 ContentBlock::Text { text: TEXT.into() },

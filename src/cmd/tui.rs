@@ -166,6 +166,7 @@ fn build_stack(
             super::BuiltinFailure::Fatal
         },
         launch.interaction,
+        &trust.project_config,
         |host, names, warnings| {
             warnings.extend(trust.warning.clone());
             let loaded = load_config(

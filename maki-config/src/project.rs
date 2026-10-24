@@ -31,7 +31,14 @@ const HOW_TO_TRUST: &str =
 const CLEAR_THE_REJECTION: &str = "or `maki trust remove PATH` to clear the decision";
 const REJECTION_NOT_SAVED: &str = "folder rejection was not saved";
 
-/// A file under `.maki/` that only a trusted folder may hand to Maki.
+const PROJECT_SKILL_DIRS: &[&str] = &[
+    ".maki/skills",
+    ".claude/skills",
+    ".opencode/skills",
+    ".agents/skills",
+];
+
+/// A kind of project content that requires folder trust.
 ///
 /// `config.toml` is deliberately absent. Maki stopped reading it, so it can do
 /// nothing, and asking about a file that has no powers is a question with no
@@ -42,6 +49,7 @@ pub enum GatedFile {
     Permissions,
     InitLua,
     Mcp,
+    Skills,
 }
 
 impl GatedFile {
@@ -59,6 +67,7 @@ impl GatedFile {
             GatedFile::Permissions => "permissions.toml",
             GatedFile::InitLua => "init.lua",
             GatedFile::Mcp => "mcp.toml",
+            GatedFile::Skills => "skills",
         }
     }
 
@@ -71,19 +80,25 @@ impl GatedFile {
             GatedFile::Permissions => "decides which tools run without asking",
             GatedFile::InitLua => "runs Lua inside Maki's own process at startup",
             GatedFile::Mcp => "starts MCP servers as child processes",
+            GatedFile::Skills => "adds agent instructions from project skill directories",
         }
     }
 }
 
 impl std::fmt::Display for GatedFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{PROJECT_DIR}/{}", self.file_name())
+        if matches!(self, Self::Skills) {
+            f.write_str("project skills")
+        } else {
+            write!(f, "{PROJECT_DIR}/{}", self.file_name())
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectConfig {
     config_root: PathBuf,
+    project_dirs: Vec<PathBuf>,
     /// The home directory is the one folder that is never a project of its own,
     /// see [`ProjectConfig::rooted`].
     at_home: bool,
@@ -108,8 +123,15 @@ impl ProjectConfig {
     pub(crate) fn rooted(cwd: &Path, home: Option<&Path>) -> Self {
         let cwd = canonicalize_clean(cwd);
         let at_home = home == Some(cwd.as_path());
+        let config_root = git_checkout_boundary(&cwd, home).unwrap_or_else(|| cwd.clone());
+        let project_dirs = cwd
+            .ancestors()
+            .take_while(|path| !at_home && path.starts_with(&config_root))
+            .map(Path::to_path_buf)
+            .collect();
         Self {
-            config_root: git_checkout_boundary(&cwd, home).unwrap_or(cwd),
+            config_root,
+            project_dirs,
             at_home,
             trusted: false,
             trust_store: None,
@@ -130,6 +152,15 @@ impl ProjectConfig {
 
     pub fn is_trusted(&self) -> bool {
         self.trusted
+    }
+
+    /// Canonical directories covered by the trust check, nearest first.
+    pub fn project_dirs(&self) -> &[PathBuf] {
+        if self.trusted {
+            &self.project_dirs
+        } else {
+            &[]
+        }
     }
 
     /// The only route to a gated project file. `None` unless the folder is
@@ -367,7 +398,7 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
         Err(error) => return ProjectDecision::inert(project_config, format!("{error}; {SKIPPED}")),
     };
     let trusted_folders = TrustedFolders::new(storage);
-    let present = gated_files(project_config.config_root());
+    let present = gated_files_in(project_config.config_root(), &project_config.project_dirs);
     let decision = match trusted_folders.decide(&folder, &store_names(&present), &project_root) {
         Ok(decision) => decision,
         Err(error) => return ProjectDecision::inert(project_config, format!("{error}; {SKIPPED}")),
@@ -564,15 +595,25 @@ pub fn confirm_trust(
     Ok(trusted)
 }
 
-/// Which gated files a project ships right now. This is the set a trust answer
-/// is recorded against, so `maki trust add` and `resolve` agree on what an
-/// answer covers.
+/// Root-level content for an explicit grant. Startup also inventories skill
+/// directories between its working directory and this root.
 pub fn gated_files(config_root: &Path) -> Vec<GatedFile> {
+    gated_files_in(config_root, &[config_root.to_path_buf()])
+}
+
+fn gated_files_in(config_root: &Path, project_dirs: &[PathBuf]) -> Vec<GatedFile> {
     let project_dir = config_root.join(PROJECT_DIR);
     GatedFile::ALL
         .iter()
         .copied()
-        .filter(|file| project_dir.join(file.file_name()).exists())
+        .filter(|file| match file {
+            GatedFile::Skills => project_dirs.iter().any(|ancestor| {
+                PROJECT_SKILL_DIRS
+                    .iter()
+                    .any(|dir| ancestor.join(dir).is_dir())
+            }),
+            _ => project_dir.join(file.file_name()).exists(),
+        })
         .collect()
 }
 
@@ -596,7 +637,13 @@ fn from_store_names(names: &[String]) -> Vec<GatedFile> {
 fn name_list<'a>(files: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let names: Vec<String> = files
         .into_iter()
-        .map(|file| format!("{PROJECT_DIR}/{file}"))
+        .map(|file| {
+            if file == GatedFile::Skills.file_name() {
+                "project skills".to_owned()
+            } else {
+                format!("{PROJECT_DIR}/{file}")
+            }
+        })
         .collect();
     match names.split_last()? {
         (last, []) => Some(last.clone()),
@@ -627,6 +674,9 @@ fn git_checkout_boundary(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     use maki_storage::sessions::{SESSIONS_DIR, Session, SessionClaim, TitleSource};
     use maki_storage::trusted_folders::TrustStatus;
     use serde::{Deserialize, Serialize};
@@ -664,6 +714,9 @@ mod tests {
     const NESTED_REPO: &str = "work";
     const NESTED_CWD: &str = "work/src";
     const SOURCE_DIR: &str = "src";
+    const SKILL_DIR: &str = ".agents/skills";
+    #[cfg(unix)]
+    const ALIAS_DIR: &str = "alias";
     const NO_FILES: &[&str] = &[];
     /// The documented blanket form: every folder trusted, spelled out.
     const BLANKET_GLOB: &str = "**";
@@ -696,6 +749,137 @@ mod tests {
     #[test_case(GatedFile::Mcp, "mcp.toml" ; "mcp")]
     fn gated_file_names_are_the_wire_format(file: GatedFile, expected: &str) {
         assert_eq!(file.file_name(), expected);
+    }
+
+    #[test_case(".maki/skills" ; "maki")]
+    #[test_case(".claude/skills" ; "claude")]
+    #[test_case(".opencode/skills" ; "opencode")]
+    #[test_case(".agents/skills" ; "agents")]
+    fn skill_directories_are_in_the_trust_question(relative: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(relative)).unwrap();
+        let folder = CanonicalFolder::resolve(dir.path()).unwrap();
+        let question = TrustQuestion::for_folder(&folder);
+        assert_eq!(question.present, [GatedFile::Skills]);
+        assert!(
+            trust_question_lines(&question)
+                .iter()
+                .any(|line| line.contains("project skills"))
+        );
+    }
+
+    #[test]
+    fn adding_skills_requires_a_new_trust_decision() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let folder = CanonicalFolder::resolve(root.path()).unwrap();
+        TrustedFolders::new(&storage).add(&folder, &[]).unwrap();
+        fs::create_dir_all(root.path().join(SKILL_DIR)).unwrap();
+        let decision = resolve(&storage, root.path(), TrustMode::Consult);
+        assert!(!decision.project_config.is_trusted());
+        assert_eq!(
+            decision.state.question().unwrap().added,
+            [GatedFile::Skills]
+        );
+    }
+
+    #[test_case(".maki/skills" ; "maki")]
+    #[test_case(".claude/skills" ; "claude")]
+    #[test_case(".opencode/skills" ; "opencode")]
+    #[test_case(".agents/skills" ; "agents")]
+    fn nested_only_skills_are_in_the_project_trust_question(relative: &str) {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join(NESTED_CWD);
+        fs::create_dir(root.path().join(GIT_DIR)).unwrap();
+        fs::create_dir_all(cwd.join(relative)).unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let folder = CanonicalFolder::resolve(root.path()).unwrap();
+        TrustedFolders::new(&storage).add(&folder, &[]).unwrap();
+
+        let decision = resolve(&storage, &cwd, TrustMode::Consult);
+
+        assert!(!decision.project_config.is_trusted());
+        let question = decision.state.question().expect("nested skills need trust");
+        assert_eq!(question.folder, folder);
+        assert_eq!(question.present, [GatedFile::Skills]);
+        assert_eq!(question.added, [GatedFile::Skills]);
+    }
+
+    #[test]
+    fn project_directories_are_trusted_and_stop_at_the_checkout_root() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join(NESTED_REPO);
+        let cwd = project.join(SOURCE_DIR);
+        fs::create_dir_all(project.join(GIT_DIR)).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(root.path().join(SKILL_DIR)).unwrap();
+        let discovered = ProjectConfig::discover(&cwd);
+        assert!(discovered.project_dirs().is_empty());
+        let trusted = discovered.with_trust(true);
+        assert_eq!(
+            trusted.project_dirs(),
+            [canonicalize_clean(&cwd), canonicalize_clean(&project)]
+        );
+        assert!(gated_files_in(trusted.config_root(), &trusted.project_dirs).is_empty());
+    }
+
+    #[test]
+    fn home_and_non_checkout_paths_do_not_scan_their_parents() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join(SOURCE_DIR);
+        fs::create_dir(&cwd).unwrap();
+        let home_path = canonicalize_clean(home.path());
+        assert!(
+            ProjectConfig::rooted(&home_path, Some(&home_path))
+                .with_trust(true)
+                .project_dirs()
+                .is_empty()
+        );
+        assert_eq!(
+            ProjectConfig::rooted(&cwd, Some(&home_path))
+                .with_trust(true)
+                .project_dirs(),
+            [canonicalize_clean(&cwd)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_project_directories_resolve_a_symlinked_working_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join(NESTED_REPO);
+        let cwd = project.join(SOURCE_DIR);
+        let alias = root.path().join(ALIAS_DIR);
+        fs::create_dir_all(project.join(GIT_DIR)).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        symlink(&project, &alias).unwrap();
+        let via_alias = ProjectConfig::discover(&alias.join(SOURCE_DIR)).with_trust(true);
+        let direct = ProjectConfig::discover(&cwd).with_trust(true);
+        assert_eq!(via_alias.project_dirs(), direct.project_dirs());
+        assert_eq!(via_alias.config_root(), direct.config_root());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_project_directories_ignore_drive_letter_case() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(GIT_DIR)).unwrap();
+        let cwd = root.path().join(SOURCE_DIR);
+        fs::create_dir(&cwd).unwrap();
+        let mut spelling = cwd.to_str().unwrap().to_owned();
+        assert_eq!(spelling.as_bytes()[1], b':');
+        let letter = spelling.as_bytes()[0];
+        let alternate = if letter.is_ascii_uppercase() {
+            letter.to_ascii_lowercase()
+        } else {
+            letter.to_ascii_uppercase()
+        };
+        spelling.replace_range(..1, &(alternate as char).to_string());
+        let direct = ProjectConfig::discover(&cwd).with_trust(true);
+        let alternate = ProjectConfig::discover(Path::new(&spelling)).with_trust(true);
+        assert_eq!(alternate.project_dirs(), direct.project_dirs());
     }
 
     #[derive(Clone, Copy, Debug)]

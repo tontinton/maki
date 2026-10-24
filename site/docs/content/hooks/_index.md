@@ -267,6 +267,11 @@ the transcript marks it as rewritten. Return `nil, reason` to drop it: the model
 never sees it, the user sees `reason`, and `TurnEnd` reports `"dropped"`. A
 rewrite with no text and no images also drops it.
 
+A rewrite may also return `durable = { key = "identity", text = "instructions" }`.
+The non-empty text must occur verbatim in the delivered message. Core keeps
+only the latest value for that key across compaction and resume. Use the
+`tool-name:input-value` key to share an identity with a tool declared durable.
+
 ```lua
 maki.api.set_slot("agent.user_message", function(prev, msg, ctx)
   if msg.text:find("AKIA%u%u%u%u") then
@@ -300,7 +305,9 @@ A run continues at most 3 times in a row, so a layer that always answers
 `reason` is `"auto"` (the context crossed its threshold), `"overflow"` (the
 provider rejected the prompt as too long), or `"manual"` (`/compact`). `usable`
 is the token budget `context_size` is measured against. `request_instructions`
-is what the user typed after `/compact`.
+is what the user typed after `/compact`. The hook receives control fields,
+not the transcript. Core carries results declared durable by their tool
+verbatim across compaction.
 
 Return a table with any of:
 

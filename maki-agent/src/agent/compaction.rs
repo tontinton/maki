@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 
 use maki_config::AgentConfig;
 use maki_providers::retry::RetryPolicy;
 use maki_providers::{
-    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
-    StreamResponse, TokenUsage,
+    ContentBlock, ContextGauge, DurableContent, IMAGE_PLACEHOLDER, Message, Model, RequestOptions,
+    Role, StreamResponse, TokenUsage,
 };
 use serde_json::{Value, json};
 use tracing::info;
@@ -17,7 +17,7 @@ use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry
 use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
-use crate::tools::truncate_bytes;
+use crate::tools::{ToolRegistry, truncate_bytes};
 use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
@@ -139,6 +139,61 @@ pub(super) async fn steer_compaction(
     })
 }
 
+fn durable_content(
+    messages: &[Message],
+    registry: &ToolRegistry,
+) -> BTreeMap<String, (usize, usize, DurableContent)> {
+    let mut calls = HashMap::new();
+    let mut retained = BTreeMap::new();
+    for (at, message) in messages.iter().enumerate() {
+        if let Some(content) = &message.durable
+            && !content.key.trim().is_empty()
+            && !content.text.trim().is_empty()
+        {
+            retained.insert(content.key.clone(), (at, 0, content.clone()));
+        }
+        for (block_at, block) in message.content.iter().enumerate() {
+            match block {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
+                    calls.remove(id.as_str());
+                    if let Some(tool) = registry.get(name)
+                        && let Some(key) = tool.tool.durable_key(input)
+                    {
+                        calls.insert(id.as_str(), format!("{name}:{key}"));
+                    }
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    if let Some(key) = calls.remove(tool_use_id.as_str())
+                        && !is_error
+                        && !content.trim().is_empty()
+                    {
+                        retained.insert(
+                            key.clone(),
+                            (
+                                at,
+                                block_at + 1,
+                                DurableContent {
+                                    key,
+                                    text: content.clone(),
+                                },
+                            ),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    retained
+}
+
 fn percent_of(tokens: u32, percent: u32) -> u32 {
     (u64::from(tokens) * u64::from(percent) / 100) as u32
 }
@@ -200,6 +255,12 @@ pub(super) async fn compact_history(
 ) -> Result<Compacted, AgentError> {
     let compact_start = std::time::Instant::now();
     let summarized = history.len().saturating_sub(carry_len);
+    let mut durable = durable_content(history.as_slice(), hooks.registry)
+        .into_values()
+        .filter(|(at, _, _)| *at < summarized)
+        .collect::<Vec<_>>();
+    durable.sort_by_key(|(at, block, _)| (*at, *block));
+    let durable = durable.into_iter().map(|(_, _, content)| content).collect();
     let mut compaction_history: Vec<Message> = history.as_slice()[..summarized].to_vec();
     remove_orphaned_tool_results(&mut compaction_history);
     strip_images(&mut compaction_history);
@@ -242,6 +303,7 @@ pub(super) async fn compact_history(
                     response,
                     history,
                     summarized,
+                    durable,
                     event_tx,
                     compact_start,
                     model,
@@ -268,6 +330,7 @@ fn finish_compact(
     response: StreamResponse,
     history: &mut History,
     summarized: usize,
+    durable: Vec<DurableContent>,
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
@@ -292,7 +355,11 @@ fn finish_compact(
         Message::user("What did we do so far?".into()),
         response.message,
     ];
-    let summary_len = new_history.len();
+    new_history.extend(durable.into_iter().map(|content| Message {
+        durable: Some(content.clone()),
+        ..Message::observation(content.text)
+    }));
+    let carried = history.len().saturating_sub(summarized);
     new_history.extend_from_slice(&history.as_slice()[summarized..]);
     history.restart(new_history);
     info!(
@@ -304,7 +371,7 @@ fn finish_compact(
     Ok(Compacted {
         usage: response.usage,
         summary,
-        carried: history.len() - summary_len,
+        carried,
     })
 }
 
@@ -610,7 +677,8 @@ pub(super) fn auto_compact_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::borrow::Cow;
+    use std::sync::{Arc, Mutex};
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -625,7 +693,9 @@ mod tests {
     use crate::AgentConfig;
     use crate::agent::hook::testing::script;
     use crate::cancel::CancelToken;
-    use crate::tools::{RequestTools, ToolRegistry};
+    use crate::tools::registry::{ParseError, Tool, ToolInvocation, ToolSource};
+    use crate::tools::test_support::mock_tool;
+    use crate::tools::{DescriptionContext, RequestTools, ToolAudience, ToolRegistry};
     use maki_config::CompactionBuffer;
 
     const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
@@ -1114,6 +1184,220 @@ mod tests {
             let request_at = prompt.find(REQUEST_EXTRA).expect(prompt);
             let layer_at = prompt.find(LAYER_EXTRA).expect(prompt);
             assert!(request_at < layer_at, "{prompt}");
+        });
+    }
+
+    #[test]
+    fn compaction_hook_keeps_the_transcript_out_of_its_payload() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+            let (result, _) = summarize_steered(&provider, &mut history, None, |slot, value| {
+                if slot == AgentSlot::CompactBefore {
+                    assert!(value.get("messages").is_none());
+                    Verdict::Replaced(json!({ FIELD_CONTINUE: KEPT_TEXT }))
+                } else {
+                    Verdict::Unchanged
+                }
+            })
+            .await;
+            result.unwrap();
+            assert_eq!(
+                history.as_slice().last().unwrap().first_text_content(),
+                Some(KEPT_TEXT)
+            );
+        });
+    }
+
+    #[test]
+    fn durable_metadata_survives_repeated_compaction_and_resume() {
+        smol::block_on(async {
+            let message: Message = serde_json::from_value(json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": "Run the release once" }],
+                "durable": { "key": "release:workflow", "text": KEPT_TEXT },
+            }))
+            .unwrap();
+            let mut history = History::new(vec![message]);
+            for _ in 0..2 {
+                let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+                summarize_history(&provider, &mut history, 0, None).await;
+                assert_eq!(
+                    history
+                        .as_slice()
+                        .iter()
+                        .filter(|message| message.first_text_content() == Some(KEPT_TEXT))
+                        .count(),
+                    1,
+                );
+                assert!(!history.as_slice().iter().any(|message| message.first_text_content() == Some("Run the release once")));
+                let saved = serde_json::to_value(history.as_slice()).unwrap();
+                history = History::restored(serde_json::from_value(saved).unwrap());
+            }
+        });
+    }
+
+    struct DurableTestTool;
+
+    impl Tool for DurableTestTool {
+        fn name(&self) -> &str {
+            "retain"
+        }
+
+        fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+            Cow::Borrowed("Retain named instructions")
+        }
+
+        fn schema(&self) -> Value {
+            json!({ "type": "object", "properties": { "name": { "type": "string" } } })
+        }
+
+        fn durable_key<'a>(&self, input: &'a Value) -> Option<&'a str> {
+            input["name"].as_str()
+        }
+
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            mock_tool(self.name(), ToolAudience::default()).parse(input)
+        }
+    }
+
+    #[test_case(false ; "reverse_key_order_in_one_result_message")]
+    #[test_case(true ; "latest_replacement_moves_after_the_other_key")]
+    fn durable_results_keep_their_latest_activation_order(replace_first: bool) {
+        smol::block_on(async {
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(DurableTestTool),
+                    ToolSource::Lua {
+                        plugin: Arc::from("retention"),
+                    },
+                )
+                .unwrap();
+            let mut history = History::new(vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::tool_use("first", "retain", json!({ "name": "z" })),
+                        ContentBlock::tool_use("second", "retain", json!({ "name": "a" })),
+                    ],
+                    ..Default::default()
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::tool_result("first", OLD_RESULT, false),
+                        ContentBlock::tool_result("second", KEPT_TEXT, false),
+                    ],
+                    ..Default::default()
+                },
+            ]);
+            if replace_first {
+                history.push(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::tool_use(
+                        "replacement",
+                        "retain",
+                        json!({ "name": "z" }),
+                    )],
+                    ..Default::default()
+                });
+                history.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::tool_result("replacement", NEW_RESULT, false)],
+                    ..Default::default()
+                });
+            }
+            let expected = if replace_first {
+                [("retain:a", KEPT_TEXT), ("retain:z", NEW_RESULT)]
+            } else {
+                [("retain:z", OLD_RESULT), ("retain:a", KEPT_TEXT)]
+            };
+            let model = default_model();
+            let cancel = CancelToken::none();
+            let (tx, _rx) = flume::unbounded();
+            for _ in 0..2 {
+                let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+                compact_history(
+                    &provider,
+                    &model,
+                    &mut history,
+                    &EventSender::new(tx.clone(), 0),
+                    &test_hooks(&registry, None, &model, &cancel),
+                    &AgentConfig::default(),
+                    None,
+                    0,
+                    RetryPolicy::default(),
+                )
+                .await
+                .unwrap();
+                let retained: Vec<_> = history
+                    .as_slice()
+                    .iter()
+                    .filter_map(|message| {
+                        let durable = message.durable.as_ref()?;
+                        Some((durable.key.as_str(), durable.text.as_str()))
+                    })
+                    .collect();
+                assert_eq!(retained, expected);
+            }
+        });
+    }
+
+    #[test_case(0 ; "answered_input_becomes_retained_instructions")]
+    #[test_case(1 ; "unanswered_input_is_carried_without_duplicate_instructions")]
+    fn durable_content_is_not_counted_as_unanswered_input(carry_len: usize) {
+        smol::block_on(async {
+            let mut history = History::new(vec![
+                Message {
+                    durable: Some(DurableContent {
+                        key: "remember:release".into(),
+                        text: OLD_RESULT.into(),
+                    }),
+                    ..Message::user(OLD_RESULT.into())
+                },
+                Message {
+                    durable: Some(DurableContent {
+                        key: "remember:release".into(),
+                        text: KEPT_TEXT.into(),
+                    }),
+                    ..Message::user(format!("{KEPT_TEXT}\nRun once"))
+                },
+            ]);
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let registry = ToolRegistry::new();
+            let model = default_model();
+            let cancel = CancelToken::none();
+            let (tx, _rx) = flume::unbounded();
+            let done = compact_history(
+                &provider,
+                &model,
+                &mut history,
+                &EventSender::new(tx, 0),
+                &test_hooks(&registry, None, &model, &cancel),
+                &AgentConfig::default(),
+                None,
+                carry_len,
+                RetryPolicy::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(done.carried, carry_len);
+            let retained: Vec<_> = history
+                .as_slice()
+                .iter()
+                .filter_map(|m| m.durable.as_ref())
+                .collect();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].text, KEPT_TEXT);
+            assert_eq!(
+                history
+                    .as_slice()
+                    .iter()
+                    .filter(|m| m.first_text_content() == Some(KEPT_TEXT))
+                    .count(),
+                usize::from(carry_len == 0)
+            );
         });
     }
 
