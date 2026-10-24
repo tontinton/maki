@@ -53,6 +53,7 @@ const NO_TASK_SCOPE_ERR: &str =
     "jobstart: no active task; use scope = \"plugin\" or { session = ... }";
 const TABLE_SCOPE_ERR: &str = "jobstart: table scope must be { session = <id> }";
 const SCOPE_TYPE_ERR: &str = "jobstart: scope must be \"task\", \"plugin\", or { session = <id> }";
+const SHARED_SCOPE_ERR: &str = "jobstart: shared requires a session scope";
 const JOB_NOT_FOUND_ERR: &str = "job: not found";
 const JOB_UNWAITABLE_ERR: &str = "jobwait: unknown job id or already waited";
 const JOB_WAIT_TIMEOUT_ERR: &str = "jobwait: timed out";
@@ -204,6 +205,9 @@ pub(crate) struct JobSpec {
     pub on_stdout: Option<RegistryKey>,
     pub on_stderr: Option<RegistryKey>,
     pub on_exit: Option<RegistryKey>,
+    /// Other plugins may list and stop this job, so it can appear in a job
+    /// picker it does not own. Session scope only.
+    pub shared: bool,
     /// The [`Ceiling`] the job was started under, which its callbacks run
     /// under too.
     pub ceiling: Option<Ceiling>,
@@ -225,6 +229,7 @@ impl JobSpec {
             on_stdout: None,
             on_stderr: None,
             on_exit: None,
+            shared: false,
             ceiling: None,
             max_line_bytes: MAX_READ_BYTES,
         }
@@ -237,6 +242,9 @@ struct JobMeta {
     /// A reloaded plugin looks its job up by this instead of matching on the
     /// command string. See [`JobStore::find_named`].
     name: Option<String>,
+    /// Session jobs only: lets [`JobStore::list`] answer plugins other than
+    /// the owner.
+    shared: bool,
     pid: u32,
     started: Instant,
     on_stdout: Option<RegistryKey>,
@@ -279,6 +287,12 @@ impl JobMeta {
             JobOwner::Session { plugin, .. } => Some(plugin),
             _ => None,
         }
+    }
+
+    /// Listed by plugins other than the owner. A session filter always has to
+    /// name the job's own session, so sharing never reaches past it.
+    fn shared_in(&self, session: Option<MakiId>) -> bool {
+        self.shared && session.is_some_and(|s| self.session() == Some(s))
     }
 
     fn lifecycle_started(&self, job_id: u32) -> Option<(&MakiId, HostEvent<'_>)> {
@@ -373,6 +387,9 @@ impl JobStore {
     }
 
     pub fn start(&mut self, spec: JobSpec) -> Result<u32, String> {
+        if spec.shared && !matches!(spec.owner, JobOwner::Session { .. }) {
+            return Err(SHARED_SCOPE_ERR.to_string());
+        }
         let JobSpec {
             owner,
             cmd,
@@ -384,6 +401,7 @@ impl JobStore {
             on_stdout,
             on_stderr,
             on_exit,
+            shared,
             ceiling,
             max_line_bytes,
         } = spec;
@@ -480,6 +498,7 @@ impl JobStore {
                 owner,
                 command: cmd.display(),
                 name,
+                shared,
                 pid,
                 started: Instant::now(),
                 on_stdout,
@@ -744,9 +763,9 @@ impl JobStore {
     /// on `snapshot` / `jobinfo`.
     ///
     /// List jobs this plugin can see, narrowed to one session when asked.
-    /// Jobs stay private to the plugin that started them: a session filter
-    /// narrows, it does not widen, so one plugin can never read another's
-    /// command lines.
+    /// Jobs stay private to the plugin that started them unless they opted
+    /// into sharing: a session filter only ever widens to the session's shared
+    /// jobs, so a plugin still never reads another's private command lines.
     pub fn list(
         &self,
         session: Option<MakiId>,
@@ -755,7 +774,7 @@ impl JobStore {
     ) -> Vec<JobSnapshot> {
         self.jobs
             .iter()
-            .filter(|(_, job)| job.can_access(task_id, plugin))
+            .filter(|(_, job)| job.can_access(task_id, plugin) || job.shared_in(session))
             .filter(|(_, job)| session.is_none_or(|s| job.session() == Some(s)))
             .map(|(&id, job)| JobSnapshot::from_job(id, job, false))
             .collect()
@@ -774,7 +793,7 @@ impl JobStore {
 
     pub fn kill(&mut self, job_id: u32, task_id: Option<u64>, plugin: &str) {
         if let Some(job) = self.jobs.get(&job_id)
-            && job.can_access(task_id, plugin)
+            && (job.can_access(task_id, plugin) || job.shared)
         {
             kill_job(job);
         }
@@ -1106,6 +1125,9 @@ fn kill_job(job: &JobMeta) {
 ///     with the current call. `"plugin"` keeps it alive until the plugin
 ///     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
 ///     session ends, and survives plugin reload.
+///   `shared` (boolean?) session jobs only: let other plugins list and stop
+///     this job, the way `JobStart` already announces it. Defaults to false,
+///     which keeps the job private to the plugin that started it.
 ///   `tail` (integer?) trailing lines per stream kept for `jobinfo`
 ///     (default 20, 0 disables, max 1024).
 ///   `max_line_bytes` (integer?) longest line delivered, in bytes. A longer
@@ -1143,6 +1165,7 @@ fn jobstart(
 
     if let Some(ref opts) = opts {
         spec.cwd = opts.opt("cwd").ok().flatten();
+        spec.shared = opts.opt_bool("shared").unwrap_or(false);
         spec.env = opts
             .get::<Table>("env")
             .ok()
@@ -1373,8 +1396,10 @@ fn callback_update(lua: &Lua, opts: &Table, key: &str) -> LuaResult<CallbackUpda
 
 /// List jobs this plugin can see, including exited session-owned jobs (so an
 /// id started before a reload stays findable). Rows identify the job; call
-/// `jobinfo` for tails. Pass a session id to list only that session's jobs.
-/// Plugin and task jobs carry no session, so a filter never matches them.
+/// `jobinfo` for tails. Pass a session id to list only that session's jobs:
+/// its shared jobs from other plugins come with it, while their private ones
+/// stay out. Plugin and task jobs carry no session, so a filter never matches
+/// them.
 ///
 /// @param session string? Session id filter.
 /// @return (table) array of `{ id, command, name, pid, session, status,
@@ -1432,7 +1457,9 @@ fn snapshot_table(lua: &Lua, snap: &JobSnapshot, tails: bool) -> LuaResult<Table
 }
 
 /// Kill a running job immediately (SIGKILL on Unix). Safe to call on
-/// jobs that already exited or on unknown ids.
+/// jobs that already exited or on unknown ids. A session job started with
+/// `shared = true` can be killed by any plugin, which is how a job picker
+/// stops a job it did not start.
 ///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @return
@@ -1784,6 +1811,7 @@ mod tests {
             owner,
             command: String::new(),
             name: None,
+            shared: false,
             pid: 0,
             started: Instant::now(),
             on_stdout,
@@ -2245,6 +2273,98 @@ mod tests {
             .collect();
         assert_eq!(live, [plugin]);
         assert!(store.snapshot(task, Some(1), TEST_PLUGIN).is_none());
+    }
+
+    fn listed(store: &JobStore, session: Option<MakiId>, plugin: &str) -> Vec<u32> {
+        let mut ids: Vec<u32> = store
+            .list(session, None, plugin)
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn shared_session_jobs_reach_other_plugins_but_private_ones_do_not() {
+        const OTHER_PLUGIN: &str = "other-plugin";
+        let session = MakiId::generate();
+        let elsewhere = MakiId::generate();
+        let mut store = make_store();
+        let shared = store
+            .start(JobSpec {
+                shared: true,
+                ..JobSpec::new(session_owner(session), "echo shared")
+            })
+            .unwrap();
+        let private = store
+            .start(JobSpec::new(session_owner(session), "echo private"))
+            .unwrap();
+
+        assert_eq!(listed(&store, Some(session), OTHER_PLUGIN), [shared]);
+        assert!(
+            listed(&store, None, OTHER_PLUGIN).is_empty(),
+            "sharing needs the session named, an absent filter never widens"
+        );
+        assert!(listed(&store, Some(elsewhere), OTHER_PLUGIN).is_empty());
+        assert_eq!(
+            listed(&store, Some(session), TEST_PLUGIN),
+            [shared, private],
+            "the owner still sees both"
+        );
+    }
+
+    #[test]
+    fn shared_outside_a_session_scope_is_rejected() {
+        let mut store = make_store();
+        let err = store
+            .start(JobSpec {
+                shared: true,
+                ..JobSpec::new(plugin_owner(), "echo hi")
+            })
+            .unwrap_err();
+        assert_eq!(err, SHARED_SCOPE_ERR);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_session_job_can_be_stopped_by_another_plugin() {
+        const OTHER_PLUGIN: &str = "other-plugin";
+        let session = MakiId::generate();
+        let mut store = make_store();
+        let shared = store
+            .start(JobSpec {
+                shared: true,
+                ..JobSpec::new(session_owner(session), "sleep 30")
+            })
+            .unwrap();
+        let private = store
+            .start(JobSpec::new(session_owner(session), "sleep 30"))
+            .unwrap();
+        let pid_of = |store: &JobStore, id: u32, plugin: &str| {
+            store
+                .list(Some(session), None, plugin)
+                .iter()
+                .find(|snap| snap.id == id)
+                .unwrap()
+                .pid
+        };
+        let shared_pid = pid_of(&store, shared, OTHER_PLUGIN);
+        let private_pid = pid_of(&store, private, TEST_PLUGIN);
+
+        store.kill(private, None, OTHER_PLUGIN);
+        assert!(
+            group_alive(private_pid),
+            "a private job ignores plugins that do not own it"
+        );
+        store.kill(shared, None, OTHER_PLUGIN);
+        assert!(
+            wait_for_group_exit(shared_pid),
+            "a shared job stops for the picker that listed it"
+        );
+
+        store.kill(private, None, TEST_PLUGIN);
+        assert!(wait_for_group_exit(private_pid));
     }
 
     #[cfg(unix)]

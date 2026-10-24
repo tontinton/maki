@@ -2999,6 +2999,96 @@ maki.api.register_tool({{
 
 #[cfg(unix)]
 #[test]
+fn a_shared_session_job_is_listed_and_stopped_by_another_plugin() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = maki_storage::id::MakiId::generate();
+    let _mailbox = maki_agent::SessionMailbox::register(session);
+    let sid = session.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("job.pid");
+    let owner = format!(
+        r#"
+local shared, private
+maki.api.register_tool({{
+    name = "start_session_jobs",
+    description = "starts a shared and a private session job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        shared = maki.fn.jobstart("printf %s $$ > '{pid}'; exec sleep 30", {{
+            scope = {{ session = "{sid}" }},
+            shared = true,
+        }})
+        private = maki.fn.jobstart("exec sleep 30", {{
+            scope = {{ session = "{sid}" }},
+        }})
+        return shared .. " " .. private
+    end,
+}})
+"#,
+        pid = pid_path.display(),
+        sid = sid,
+    );
+    host.load_source("job_owner", &owner).unwrap();
+    let ids = exec_tool(&reg, "start_session_jobs", json!({})).unwrap();
+    let (shared, _private) = ids.split_once(' ').expect("two job ids");
+
+    let watcher = format!(
+        r#"
+maki.api.register_tool({{
+    name = "list_shared_jobs",
+    description = "lists and stops the session's shared jobs",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local listed = {{}}
+        for _, row in ipairs(maki.fn.joblist("{sid}")) do
+            listed[#listed + 1] = tostring(row.id)
+            maki.fn.jobstop(row.id)
+        end
+        return table.concat(listed, ",")
+    end,
+}})
+"#
+    );
+    host.load_source("job_watcher", &watcher).unwrap();
+
+    let listed = exec_tool(&reg, "list_shared_jobs", json!({})).unwrap();
+    assert_eq!(
+        listed, shared,
+        "only the shared job crosses the plugin boundary"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_path)
+            .unwrap_or_default()
+            .parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shared job did not publish its process id"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let pid = Pid::from_raw(pid).unwrap();
+    while test_kill_process_group(pid).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a shared job must stop for the plugin that listed it"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+}
+
+#[cfg(unix)]
+#[test]
 fn jobattach_re_arms_session_jobs_a_reload_dropped() {
     const EXIT_CODE: i32 = 3;
     const ATTACHED: &str = "attached";
