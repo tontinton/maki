@@ -136,22 +136,23 @@ fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
 }
 
 fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {
+    let config = maki_config::providers::ProvidersConfig::load_or_default();
+    let allowed =
+        |model: &Model| policy.allows(&model.spec()) && config.auto_selectable(&model.provider);
     for tier in STARTUP_TIERS {
         for &slug in PROVIDER_PRIORITY {
             if provider_ready(slug).is_ok()
                 && let Ok(model) = Model::from_tier(slug, tier)
-                && policy.allows(&model.spec())
+                && allowed(&model)
             {
                 return Some(model);
             }
         }
     }
     let mut checked = HashSet::new();
-    user_provider_models()
-        .filter(|model| policy.allows(&model.spec()))
-        .find(|model| {
-            checked.insert(Arc::clone(&model.provider)) && provider_ready(&model.provider).is_ok()
-        })
+    user_provider_models().filter(allowed).find(|model| {
+        checked.insert(Arc::clone(&model.provider)) && provider_ready(&model.provider).is_ok()
+    })
 }
 
 /// Lua plugin providers, then `providers.toml` entries. They come after the

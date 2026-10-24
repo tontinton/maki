@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use maki_config::providers::ProvidersConfig;
 use maki_storage::{StateDir, atomic_write};
 use tracing::warn;
 
@@ -44,7 +45,8 @@ pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {
 }
 
 pub fn spec_for_tier_any(tier: ModelTier) -> Option<String> {
-    read().spec_for_tier_any(tier)
+    let config = ProvidersConfig::load_or_default();
+    read().spec_for_tier_any(tier, |slug| config.auto_selectable(slug))
 }
 
 pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
@@ -229,11 +231,22 @@ impl ModelRegistry {
         self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
     }
 
-    fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
+    /// An override is a choice someone made by hand, so it stands whatever
+    /// `providers.toml` says about picking the provider on its own. The walk
+    /// below is the part nobody asked for, and that is where
+    /// `auto_select = false` takes a provider out.
+    fn spec_for_tier_any(
+        &self,
+        tier: ModelTier,
+        auto_selectable: impl Fn(&str) -> bool,
+    ) -> Option<String> {
         if let Some(spec) = self.overrides.get(&tier) {
             return Some(spec.clone());
         }
         for provider in self.known_models.keys() {
+            if !auto_selectable(provider) {
+                continue;
+            }
             if let Some(spec) = self.spec_for_tier(provider, tier) {
                 return Some(spec);
             }
@@ -486,17 +499,30 @@ mod tests {
             &["big", "mid", "small"],
         );
         assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Strong),
+            reg.spec_for_tier_any(ModelTier::Strong, |_| true),
             Some("openai/gpt-foo".into())
         );
         assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Weak),
+            reg.spec_for_tier_any(ModelTier::Weak, |_| true),
             Some("zai/glm-5".into())
         );
         assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Medium),
+            reg.spec_for_tier_any(ModelTier::Medium, |_| true),
             Some("ollama/mid".into())
         );
+    }
+
+    #[test]
+    fn spec_for_tier_any_walk_skips_what_is_not_auto_selectable() {
+        let reg = make_map(
+            &[(ModelTier::Strong, "ollama/big")],
+            &["big", "mid", "small"],
+        );
+        assert_eq!(
+            reg.spec_for_tier_any(ModelTier::Strong, |_| false),
+            Some("ollama/big".into())
+        );
+        assert_eq!(reg.spec_for_tier_any(ModelTier::Medium, |_| false), None);
     }
 
     #[test]

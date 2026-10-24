@@ -357,6 +357,13 @@ pub struct ProviderDef {
     /// entirely. Defaults to `false` when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_free_models: Option<bool>,
+    /// Whether maki may reach for this provider when nobody named it: the
+    /// model it starts on, a subagent's tier, the compaction model. `false`
+    /// leaves it listed, nameable and switchable to by hand, and takes it out
+    /// of every choice made on the user's behalf. A metered provider beside
+    /// free local ones is the case it exists for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_select: Option<bool>,
     /// Aperture-only: per-gateway-provider overrides for the routed native
     /// providers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -440,6 +447,13 @@ impl ProvidersConfig {
 
     pub fn get(&self, slug: &str) -> Option<&ProviderDef> {
         self.providers.get(slug)
+    }
+
+    /// Whether `slug` may be picked without the user naming it. Only an
+    /// explicit `auto_select = false` ever takes a provider out, so an unknown
+    /// slug, a built-in and a config that says nothing are all fair game.
+    pub fn auto_selectable(&self, slug: &str) -> bool {
+        self.get(slug).and_then(|def| def.auto_select) != Some(false)
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -724,6 +738,15 @@ mod tests {
         .unwrap();
         assert_eq!(def.headers.len(), 2);
         assert_eq!(def.headers["CF-Access-Client-Id"], "${CF_ID}");
+    }
+
+    #[test_case("[p]\nauto_select = false", false ; "opted_out")]
+    #[test_case("[p]\nauto_select = true", true ; "opted_in")]
+    #[test_case("[p]\nbase_url = \"https://x\"", true ; "silence_is_consent")]
+    #[test_case("", true ; "unlisted")]
+    fn auto_select_only_ever_takes_a_provider_out(toml_src: &str, selectable: bool) {
+        let config: ProvidersConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(config.auto_selectable("p"), selectable);
     }
 
     #[test]
