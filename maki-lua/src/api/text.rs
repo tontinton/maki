@@ -29,9 +29,14 @@ thread_local! {
 async fn html_to_markdown(_lua: Lua, html: LuaString) -> LuaResult<Pair<String>> {
     let html = try_pair!(html.to_str()).to_owned();
     Ok(pair(
-        smol::unblock(move || htmd::convert(&html))
-            .await
-            .map_err(|e| format!("html_to_markdown: {e}")),
+        smol::unblock(move || {
+            htmd::HtmlToMarkdown::builder()
+                .skip_tags(vec!["script", "style", "noscript"])
+                .build()
+                .convert(&html)
+        })
+        .await
+        .map_err(|e| format!("html_to_markdown: {e}")),
     ))
 }
 
@@ -449,5 +454,21 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(plain, again);
+    }
+
+    const STRIP_HTML: &str = "<html><head><style>body{color:red}</style></head><body><h1>Title</h1><script>var x=1;</script><noscript>enable js</noscript><p>Hello</p></body></html>";
+
+    #[test]
+    fn html_to_markdown_strips_script_style_and_noscript() {
+        let lua = lua_with_text();
+        lua.globals().set("html", STRIP_HTML).unwrap();
+        let (md, err): (String, Option<String>) =
+            smol::block_on(lua.load("return text.html_to_markdown(html)").eval_async()).unwrap();
+        assert_eq!(err, None);
+        assert!(md.contains("Title"), "heading content is preserved");
+        assert!(md.contains("Hello"), "paragraph content is preserved");
+        assert!(!md.contains("color:red"), "style content is stripped");
+        assert!(!md.contains("var x=1"), "script content is stripped");
+        assert!(!md.contains("enable js"), "noscript content is stripped");
     }
 }
