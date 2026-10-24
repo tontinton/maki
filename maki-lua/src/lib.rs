@@ -32,7 +32,8 @@ pub use error::PluginError;
 pub use key::{Key, RESERVED_KEYS, is_reserved};
 pub use key_lint::KEY_WARNING;
 pub use loader::{
-    EventHandle, InitFiles, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING,
+    CodeBlockRender, EventHandle, InitFiles, PERMISSION_NAME_WARNING, PluginHost,
+    SKIPPED_PLUGIN_WARNING,
 };
 pub use maki_agent::SessionEndReason;
 pub use pack::{
@@ -43,8 +44,8 @@ pub use pack::{
 };
 pub use plugin_permissions::{Missing, Permission, PluginPermissions, PluginReach, Requested};
 pub use runtime::{
-    KILL_GRACE, MAX_INFLIGHT_TOOLS, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
-    RestoreItem, RestoreReason, WARM_TOOL_CAP,
+    KILL_GRACE, MAX_CODE_BLOCK_SOURCE_BYTES, MAX_INFLIGHT_TOOLS, PLAN_FORM_SLOT_DEADLINE,
+    PLAN_ROW_HANDLER_DEADLINE, RestoreItem, RestoreReason, WARM_TOOL_CAP,
 };
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
@@ -59,6 +60,7 @@ pub mod test_support {
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
     use crate::key::Key;
+    use maki_agent::cancel::CancelToken;
     use maki_storage::id::MakiId;
 
     const TEST_PLUGIN: &str = "test-plugin";
@@ -93,6 +95,14 @@ pub mod test_support {
     /// Observes which requests an [`crate::EventHandle`] sends, without a
     /// running plugin host.
     pub struct RequestProbe(flume::Receiver<crate::runtime::Request>);
+
+    pub type CodeBlockRequest = (
+        String,
+        String,
+        u16,
+        flume::Sender<Option<Vec<String>>>,
+        CancelToken,
+    );
 
     impl RequestProbe {
         /// Next request as `(kind, clicks)`: `"click"` carries no clicks,
@@ -152,6 +162,25 @@ pub mod test_support {
             None
         }
 
+        /// Next code-block request and the controls for completing or
+        /// observing cancellation of it, skipping unrelated requests.
+        pub fn try_recv_code_block(&self) -> Option<CodeBlockRequest> {
+            while let Ok(req) = self.0.try_recv() {
+                if let crate::runtime::Request::RenderCodeBlock {
+                    language,
+                    code,
+                    width,
+                    reply,
+                    cancel,
+                    ..
+                } = req
+                {
+                    return Some((language, code, width, reply, cancel));
+                }
+            }
+            None
+        }
+
         /// Next fired autocmd as `(event, data)`, skipping other requests.
         pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
             use crate::runtime::Request;
@@ -185,6 +214,18 @@ pub mod test_support {
     pub fn probed_event_handle_layering_plan_form() -> (crate::EventHandle, RequestProbe) {
         let (handle, probe) = probed_event_handle();
         (handle.layering(&[crate::api::slot::PLAN_FORM_SLOT]), probe)
+    }
+
+    pub fn probed_event_handle_layering_code_block(
+        languages: &[&str],
+    ) -> (crate::EventHandle, RequestProbe) {
+        let (handle, probe) = probed_event_handle();
+        let slots: Vec<String> = languages
+            .iter()
+            .map(|language| crate::api::slot::code_block_slot(language))
+            .collect();
+        let names: Vec<&str> = slots.iter().map(String::as_str).collect();
+        (handle.layering(&names), probe)
     }
 
     /// Publishes {binds} as one plugin's global keymap. The Lua state the

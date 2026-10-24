@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -38,8 +39,11 @@ pub(crate) const PLAN_FORM_SLOT: &str = "ui.plan_form";
 /// Fired just before the plan form opens. The default answers with the
 /// built-in rows.
 pub(crate) const PLAN_FORM_ACTIONS_SLOT: &str = "ui.plan_form.actions";
-
 const SEAM: &str = "slot";
+
+pub(crate) fn code_block_slot(language: &str) -> String {
+    format!("ui.code_block.{language}")
+}
 
 #[derive(Clone)]
 pub(crate) struct SlotLayer {
@@ -124,6 +128,7 @@ impl SlotStore {
         }
         self.layered.stages.store(Arc::new(stages));
         self.layered.surfaces.store(Arc::new(surfaces));
+        self.layered.revision.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -145,6 +150,7 @@ pub struct LayeredTools {
     /// roundtrip. The agent loop reads it too, so it never leaves its thread for
     /// a slot nobody wrapped.
     surfaces: ArcSwap<HashSet<Arc<str>>>,
+    revision: AtomicU64,
 }
 
 impl LayeredTools {
@@ -156,6 +162,10 @@ impl LayeredTools {
     /// Whether any plugin is layering the host surface {slot}.
     pub fn layers_surface(&self, slot: &str) -> bool {
         self.surfaces.load().contains(slot)
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
 
     /// Stands in for a plugin host with {slots} layered, for tests that drive
@@ -627,6 +637,29 @@ fn parse_slot_capability(
 /// `ev = { path, session }`. `ui.plan_form.actions` asks for the form's
 /// menu, and `ui.plan_form` asks whether the form opens at all. Both are
 /// documented under [maki.plan](/docs/lua-api/#maki-plan).
+///
+/// `ui.code_block.<language>` renders closed fenced blocks in assistant chat
+/// messages for that language, for example `ui.code_block.mermaid`. Other
+/// languages display their source without calling a renderer. There is no
+/// catch-all slot.
+/// Its layer receives `function(prev, ev)` with
+/// `ev = { language = string, code = string, width = integer }`. Return a
+/// nonempty array of plain text lines, or call `prev(ev)` to defer. The host
+/// default returns nil and displays the source. Lines preserve their spacing
+/// and are not parsed as Markdown. Stored messages and model context retain
+/// the source. This slot grants no permissions. A renderer process still
+/// requires `run`.
+///
+/// Rendering is asynchronous, with a two-second deadline starting when Lua
+/// begins the request. Only source up to 32 KiB reaches the slot. Output is
+/// limited to 256 lines and 64 KiB,
+/// cannot contain control characters, and must fit `ev.width` terminal cells
+/// per line. Nil, invalid output, and errors leave the source visible. The
+/// host caches the result until width, theme, or slot registrations change.
+/// The cache holds the 128 newest distinct claimed blocks. Older evicted
+/// blocks display their source until the layout or slots change. A resize or
+/// closed chat cancels pending work. Plugin reload drains pending work and
+/// invalidates old replies.
 ///
 /// Maki fires two slots per tool itself: `tool.<name>.input` before
 /// permissions look at the call, and `tool.<name>.output` on the text it

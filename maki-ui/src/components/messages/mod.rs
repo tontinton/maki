@@ -1,3 +1,4 @@
+mod code_blocks;
 mod render;
 mod scroll;
 mod segment;
@@ -7,6 +8,7 @@ mod tests;
 
 pub use self::scroll::ScrollPos;
 
+use self::code_blocks::CodeBlockRenders;
 use self::render::RenderCursor;
 use self::scroll::Layout;
 use self::segment::{Segment, SegmentCache};
@@ -22,7 +24,9 @@ use super::{
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
-use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
+use crate::markdown::{
+    hr_line, plain_lines, text_to_lines, text_to_lines_with_code_blocks, truncate_output,
+};
 use crate::render_worker::RenderWorker;
 use crate::selection::{DocPos, RowPos, Selection};
 use crate::splash::{ColorTransition, Splash};
@@ -78,6 +82,7 @@ pub struct MessagesPanel {
     viewport_height: u16,
     viewport_width: u16,
     cache: SegmentCache,
+    code_blocks: CodeBlockRenders,
     hl_worker: RenderWorker,
     image_picker: Option<Picker>,
     inline_images: bool,
@@ -141,6 +146,7 @@ impl MessagesPanel {
             viewport_height: 24,
             viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
             cache: SegmentCache::new(),
+            code_blocks: CodeBlockRenders::new(&lua_event_handle),
             hl_worker: RenderWorker::new(),
             image_picker: terminal_image::picker(ui_config.inline_images),
             inline_images: ui_config.inline_images,
@@ -223,6 +229,8 @@ impl MessagesPanel {
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.messages = msgs;
         self.cache.clear();
+        self.code_blocks.clear();
+        self.streaming_text.invalidate_render();
         self.expanded_tools.clear();
         self.lua_clicks.clear();
         self.live_bufs.clear();
@@ -790,6 +798,13 @@ impl MessagesPanel {
     /// them fed.
     pub fn tick(&mut self) -> Dirty {
         let mut dirty = self.drain_highlights() | self.poll_live_bufs() | self.refresh_images();
+        let layout_changed = self
+            .code_blocks
+            .set_layout(self.viewport_width, theme::generation());
+        if self.code_blocks.poll(&self.lua_event_handle) || layout_changed {
+            self.invalidate_code_blocks();
+            dirty |= Dirty::YES;
+        }
         if self.show_idle_splash() {
             dirty |= self.idle_splash.poll_update(update::latest_version());
         }
@@ -806,6 +821,7 @@ impl MessagesPanel {
             // `tick` reports that separately.
             Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
             Cadence::when(smooth, Cadence::SMOOTH),
+            Cadence::when(self.code_blocks.has_pending(), Cadence::PENDING),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
         ])
     }
@@ -814,6 +830,19 @@ impl MessagesPanel {
         self.messages.is_empty()
             && self.streaming_thinking.is_empty()
             && self.streaming_text.is_empty()
+    }
+
+    fn invalidate_code_blocks(&mut self) {
+        for seg in self.cache.segments_mut() {
+            if seg
+                .msg_index
+                .and_then(|i| self.messages.get(i))
+                .is_some_and(|msg| matches!(msg.role, DisplayRole::Assistant))
+            {
+                seg.stale = true;
+            }
+        }
+        self.streaming_text.invalidate_render();
     }
 
     /// A resume can come back to a terminal whose font size changed while we
@@ -863,6 +892,9 @@ impl MessagesPanel {
         let theme_gen = theme::generation();
         let theme_changed = self.theme_generation != theme_gen;
         let needs_reflow = self.viewport_width != width || theme_changed;
+        if self.code_blocks.set_layout(width, theme_gen) {
+            self.invalidate_code_blocks();
+        }
         if needs_reflow {
             self.viewport_width = width;
             self.theme_generation = theme_gen;
@@ -993,7 +1025,22 @@ impl MessagesPanel {
             self.push_live_segment(lines, drawn_collapsed);
         }
         if !self.streaming_text.is_empty() {
-            let lines = self.streaming_text.render_lines(width).to_vec();
+            let mut block_index = 0;
+            let message_index = self.messages.len();
+            let lines = self
+                .streaming_text
+                .render_lines_with_code_blocks(width, |language, source, width| {
+                    let position = (message_index, block_index);
+                    block_index += 1;
+                    self.code_blocks.render(
+                        &self.lua_event_handle,
+                        position,
+                        language,
+                        source,
+                        width,
+                    )
+                })
+                .to_vec();
             self.push_live_segment(lines, false);
         }
     }
@@ -1438,8 +1485,14 @@ impl MessagesPanel {
                     self.upsert_instruction_segment(&id, &blocks);
                 }
             } else {
-                let (lines, truncated) =
-                    message_view(msg, self.thinking_lines, self.viewport_width);
+                let (lines, truncated) = message_view(
+                    msg,
+                    i,
+                    self.thinking_lines,
+                    self.viewport_width,
+                    &mut self.code_blocks,
+                    &self.lua_event_handle,
+                );
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_lines(lines, Some(i));
                 seg.truncation.output = truncated;
@@ -1536,7 +1589,14 @@ impl MessagesPanel {
         let Some(msg) = self.messages.get(msg_idx) else {
             return;
         };
-        let (lines, truncated) = message_view(msg, self.thinking_lines, width);
+        let (lines, truncated) = message_view(
+            msg,
+            msg_idx,
+            self.thinking_lines,
+            width,
+            &mut self.code_blocks,
+            &self.lua_event_handle,
+        );
         let Some(seg) = self.cache.get_mut(seg_idx) else {
             return;
         };
@@ -1593,8 +1653,11 @@ fn message_search_text(msg: &DisplayMessage) -> String {
 /// collapsed, which is what makes a click on them expand it.
 fn message_view(
     msg: &DisplayMessage,
+    message_index: usize,
     mode: ThinkingLines,
     width: u16,
+    code_blocks: &mut CodeBlockRenders,
+    handle: &EventHandle,
 ) -> (Vec<Line<'static>>, bool) {
     if matches!(msg.role, DisplayRole::Thinking)
         && let Some(lines) = thinking::collapsed_view(
@@ -1606,14 +1669,23 @@ fn message_view(
     {
         return (lines, true);
     }
-    (build_message_lines(msg, width), false)
+    (
+        build_message_lines(msg, message_index, width, code_blocks, handle),
+        false,
+    )
 }
 
 /// Builds ratatui lines for a non-Tool message shown in full at the given
 /// width. Shared by `rebuild_line_cache` (new messages) and
 /// `reflow_text_segment` (stale-on-resize messages) so both paths produce
 /// identical segments.
-fn build_message_lines(msg: &DisplayMessage, width: u16) -> Vec<Line<'static>> {
+fn build_message_lines(
+    msg: &DisplayMessage,
+    message_index: usize,
+    width: u16,
+    code_blocks: &mut CodeBlockRenders,
+    handle: &EventHandle,
+) -> Vec<Line<'static>> {
     let style = message_style(&msg.role);
     let prefix = message_prefix(msg, &style);
     let text = if !msg.images.is_empty() && msg.text == IMAGE_PLACEHOLDER {
@@ -1621,7 +1693,22 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> Vec<Line<'static>> {
     } else {
         &msg.text
     };
-    let mut lines = if style.use_markdown {
+    let mut lines = if matches!(msg.role, DisplayRole::Assistant) {
+        let mut block_index = 0;
+        text_to_lines_with_code_blocks(
+            text,
+            prefix,
+            style.text_style,
+            style.prefix_style,
+            width,
+            style.max_line_bytes,
+            |language, source, width| {
+                let position = (message_index, block_index);
+                block_index += 1;
+                code_blocks.render(handle, position, language, source, width)
+            },
+        )
+    } else if style.use_markdown {
         text_to_lines(
             text,
             prefix,
