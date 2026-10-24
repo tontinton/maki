@@ -11,6 +11,7 @@ local ARROW_PREFIX = "    → "
 local ARROW_PREFIX_W = 6
 local SEPARATOR_CHAR = "─"
 local LABEL_MAX_RATIO = 0.5
+local BOTTOM_ORDER = 0
 
 local MODE = {
   SELECTING = "selecting",
@@ -609,6 +610,8 @@ function QuestionForm.open(questions)
     focus = true,
     needs_input = true,
     split = "below",
+    hide_input = true,
+    order = BOTTOM_ORDER,
   })
 
   local width = win.width

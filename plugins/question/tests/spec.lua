@@ -1,6 +1,8 @@
 local QuestionForm = require("question_form")
 local QuestionHelpers = require("question_helpers")
 
+local BOTTOM_ORDER = 0
+
 local failures = {}
 
 local function case(name, fn)
@@ -682,6 +684,8 @@ case("open_requests_bottom_split", function()
   assert(ok, "open must not error: " .. tostring(err))
   assert(captured, "open_win must be called")
   eq(captured.split, "below", "form must request a bottom split")
+  eq(captured.order, BOTTOM_ORDER, "form must take the bottom band")
+  eq(captured.hide_input, true, "form must hide the input box")
   eq(captured.needs_input, true, "form must mark the session as needing input")
 end)
 

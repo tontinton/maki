@@ -440,7 +440,7 @@ fn todo_load_restore_leaves_the_panel_closed() {
     host.load_source("barrier", "").unwrap();
 
     let opened = host.ui_action_rx().drain().any(
-        |action| matches!(action, UiAction::OpenWin { config, .. } if config.split == Split::Panel),
+        |action| matches!(action, UiAction::OpenWin { config, .. } if config.split == Split::Below),
     );
     assert!(!opened, "a load restore must not refill the panel");
 }

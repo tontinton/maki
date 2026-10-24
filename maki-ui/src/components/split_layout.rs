@@ -15,51 +15,51 @@ pub struct SplitReq {
     pub extent: u16,
 }
 
-/// The inner rect left for the chat, plus the rect granted to each carved
-/// split. A split that clamped out to nothing simply does not appear, so
-/// callers never have to handle an invalid rect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The inner rect left for the chat, plus one rect per request in the order
+/// they were passed to [`carve`]. A request that clamped out to nothing is
+/// `None`, so callers never handle an invalid rect.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitLayout {
     pub inner: Rect,
-    rects: [Option<Rect>; 4],
+    rects: Vec<Option<Rect>>,
 }
 
 impl SplitLayout {
-    pub fn rect(&self, split: Split) -> Option<Rect> {
-        Split::ALL
-            .iter()
-            .position(|s| *s == split)
-            .and_then(|i| self.rects[i])
+    /// One rect per request, parallel to the slice given to [`carve`].
+    pub fn rects(&self) -> &[Option<Rect>] {
+        &self.rects
     }
 }
 
-/// Carve every requested split off `area`, clamped so the interior keeps at
-/// least [`MIN_CHAT_COLS`] x [`MIN_CHAT_ROWS`]. [`Split::ALL`] fixes the order
-/// (columns before rows) so geometry stays the same no matter what opened first.
+/// Carve every request off `area`. Edges are laid out in [`Split::ALL`] order
+/// (columns before rows) so geometry is stable no matter what opened first;
+/// requests sharing an edge stack in the order they are given, each clamping
+/// against the shrinking interior. That clamp keeps at least
+/// [`MIN_CHAT_COLS`] x [`MIN_CHAT_ROWS`], so the chat never vanishes.
 pub fn carve(area: Rect, reqs: &[SplitReq]) -> SplitLayout {
     let mut inner = area;
-    let mut rects = [None; 4];
+    let mut rects = vec![None; reqs.len()];
 
-    for (i, dir) in Split::ALL.iter().enumerate() {
-        let Some(req) = reqs.iter().find(|r| r.split == *dir) else {
-            continue;
-        };
+    for dir in Split::ALL {
         let Some(edge) = dir.edge() else {
             continue;
         };
-
-        let (available, min) = match edge.axis {
-            Axis::Vertical => (inner.height, MIN_CHAT_ROWS),
-            Axis::Horizontal => (inner.width, MIN_CHAT_COLS),
-        };
-        let band = req.extent.min(available.saturating_sub(min));
-        if band == 0 {
-            continue;
+        for (i, req) in reqs.iter().enumerate() {
+            if req.split != dir {
+                continue;
+            }
+            let (available, min) = match edge.axis {
+                Axis::Vertical => (inner.height, MIN_CHAT_ROWS),
+                Axis::Horizontal => (inner.width, MIN_CHAT_COLS),
+            };
+            let band = req.extent.min(available.saturating_sub(min));
+            if band == 0 {
+                continue;
+            }
+            let (granted, rest) = split_edge(inner, edge.axis, edge.at_start, band);
+            rects[i] = Some(granted);
+            inner = rest;
         }
-
-        let (granted, rest) = split_edge(inner, edge.axis, edge.at_start, band);
-        rects[i] = Some(granted);
-        inner = rest;
     }
 
     SplitLayout { inner, rects }
@@ -120,16 +120,14 @@ mod tests {
     fn empty_reqs_leave_inner_equal_to_area() {
         let layout = carve(AREA, &[]);
         assert_eq!(layout.inner, AREA, "{EXPECT_INNER}");
-        for dir in Split::ALL {
-            assert!(layout.rect(dir).is_none(), "{EXPECT_NO_RECT}");
-        }
+        assert!(layout.rects().is_empty());
     }
 
     #[test_case(Split::Above ; "above_reserves_top_rows")]
     #[test_case(Split::Below ; "below_reserves_bottom_rows")]
     fn vertical_split_reserves_rows(dir: Split) {
         let layout = carve(AREA, &[req(dir, 10)]);
-        let band = layout.rect(dir).expect("band must exist");
+        let band = layout.rects()[0].expect("band must exist");
         assert_eq!(band.height, 10);
         assert_eq!(band.width, AREA.width);
         assert_eq!(layout.inner.height, AREA.height - 10);
@@ -146,7 +144,7 @@ mod tests {
     #[test_case(Split::Right ; "right_reserves_columns")]
     fn horizontal_split_reserves_columns(dir: Split) {
         let layout = carve(AREA, &[req(dir, 30)]);
-        let band = layout.rect(dir).expect("band must exist");
+        let band = layout.rects()[0].expect("band must exist");
         assert_eq!(band.width, 30);
         assert_eq!(band.height, AREA.height);
         assert_eq!(layout.inner.width, AREA.width - 30);
@@ -162,7 +160,7 @@ mod tests {
     #[test]
     fn oversize_row_request_clamps_to_chat_minimum() {
         let layout = carve(AREA, &[req(Split::Below, 1000)]);
-        let band = layout.rect(Split::Below).expect("band must exist");
+        let band = layout.rects()[0].expect("band must exist");
         assert_eq!(layout.inner.height, MIN_CHAT_ROWS);
         assert_eq!(band.height, AREA.height - MIN_CHAT_ROWS);
     }
@@ -170,7 +168,7 @@ mod tests {
     #[test]
     fn oversize_column_request_clamps_to_chat_minimum() {
         let layout = carve(AREA, &[req(Split::Left, 1000)]);
-        let band = layout.rect(Split::Left).expect("band must exist");
+        let band = layout.rects()[0].expect("band must exist");
         assert_eq!(layout.inner.width, MIN_CHAT_COLS);
         assert_eq!(band.width, AREA.width - MIN_CHAT_COLS);
     }
@@ -178,7 +176,7 @@ mod tests {
     #[test]
     fn zero_extent_request_yields_no_rect() {
         let layout = carve(AREA, &[req(Split::Below, 0)]);
-        assert!(layout.rect(Split::Below).is_none(), "{EXPECT_NO_RECT}");
+        assert!(layout.rects()[0].is_none(), "{EXPECT_NO_RECT}");
         assert_eq!(layout.inner, AREA, "{EXPECT_INNER}");
     }
 
@@ -186,32 +184,59 @@ mod tests {
     fn request_with_no_room_clamps_to_none() {
         let tight = Rect::new(0, 0, MIN_CHAT_COLS, 40);
         let layout = carve(tight, &[req(Split::Left, 10)]);
-        assert!(layout.rect(Split::Left).is_none(), "{EXPECT_NO_RECT}");
+        assert!(layout.rects()[0].is_none(), "{EXPECT_NO_RECT}");
         assert_eq!(layout.inner, tight, "{EXPECT_INNER}");
     }
 
     #[test]
     fn coexisting_left_and_below_shrink_both_axes() {
-        let left = carve(AREA, &[req(Split::Left, 20), req(Split::Below, 10)]);
-        assert_eq!(left.inner.width, AREA.width - 20);
-        assert_eq!(left.inner.height, AREA.height - 10);
-        let l = left.rect(Split::Left).expect("left band");
-        let b = left.rect(Split::Below).expect("below band");
+        let layout = carve(AREA, &[req(Split::Left, 20), req(Split::Below, 10)]);
+        assert_eq!(layout.inner.width, AREA.width - 20);
+        assert_eq!(layout.inner.height, AREA.height - 10);
+        let l = layout.rects()[0].expect("left band");
+        let b = layout.rects()[1].expect("below band");
         assert_eq!(l.width, 20);
         assert_eq!(b.height, 10);
         assert!(
-            l.x + l.width <= left.inner.x || b.y >= left.inner.y + left.inner.height,
+            l.x + l.width <= layout.inner.x || b.y >= layout.inner.y + layout.inner.height,
             "{EXPECT_DISJOINT}",
         );
     }
 
+    /// Two requests on one edge stack: the first takes the screen edge, the
+    /// second sits just inside it, and both extents are reserved.
     #[test]
-    fn open_order_does_not_change_geometry() {
+    fn same_edge_requests_stack_in_request_order() {
+        let layout = carve(AREA, &[req(Split::Below, 4), req(Split::Below, 6)]);
+        let first = layout.rects()[0].expect("first band");
+        let second = layout.rects()[1].expect("second band");
+        assert_eq!(first.height, 4);
+        assert_eq!(second.height, 6);
+        assert_eq!(first.y + first.height, AREA.height, "first hugs the bottom");
+        assert_eq!(
+            second.y + second.height,
+            first.y,
+            "second sits above the first"
+        );
+        assert_eq!(layout.inner.height, AREA.height - 10);
+    }
+
+    /// Edge order is fixed by `Split::ALL`, so request order only changes which
+    /// rect slot a band lands in, never the geometry.
+    #[test]
+    fn edge_order_is_independent_of_request_order() {
         let a = carve(AREA, &[req(Split::Left, 20), req(Split::Below, 10)]);
         let b = carve(AREA, &[req(Split::Below, 10), req(Split::Left, 20)]);
+        assert_eq!(a.inner, b.inner);
         assert_eq!(
-            a, b,
-            "carve order is fixed by Split::ALL, not request order"
+            a.rects()[0],
+            b.rects()[1],
+            "left band lands the same either way"
+        );
+        assert_eq!(
+            a.rects()[1],
+            b.rects()[0],
+            "below band lands the same either way"
         );
     }
 }
