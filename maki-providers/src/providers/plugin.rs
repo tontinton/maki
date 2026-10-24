@@ -1489,6 +1489,24 @@ pub fn base_spec(slug: &str) -> Option<&'static ProviderSpec> {
     }
 }
 
+pub(crate) fn uses_thinking_fields(model: &Model) -> bool {
+    if let Some(entry) = entry(&model.provider) {
+        return match entry.target {
+            Target::Codec(Protocol::Openai) => entry
+                .decl
+                .openai
+                .as_ref()
+                .is_none_or(|wire| wire.thinking.is_none()),
+            Target::Codec(Protocol::OpenaiResponses | Protocol::Anthropic | Protocol::Google) => {
+                false
+            }
+            Target::Base(spec) => super::native_uses_thinking_fields(spec, model),
+        };
+    }
+    ProviderRegistry::compiled(&model.provider)
+        .is_none_or(|spec| super::native_uses_thinking_fields(spec, model))
+}
+
 /// A provider for `slug` built against auth the caller resolved, for a caller
 /// that routes a request onto another provider's wire rather than owning the
 /// credentials. `None` when no declaration drives a codec for the slug, which
@@ -1580,6 +1598,7 @@ mod tests {
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
     use super::*;
+    use crate::ThinkingConfig;
     use crate::model::ModelTier;
     use crate::model_registry;
     use crate::retry::RetryKind;
@@ -1604,6 +1623,8 @@ mod tests {
     const INNER_UNUSED: &str = "the inner provider is not exercised here";
 
     const DISPLAY_NAME: &str = "Plugin";
+    const THINKING_ROUTE: &str = "thinking-fields-route";
+    const THINKING_GATEWAY: &str = "thinking-fields-gateway";
     const SOME_SYSTEM_PREFIX: &str = "You are X.";
     const MODEL_ID: &str = "plug-1";
     const MODEL_ALIAS: &str = "plug";
@@ -2514,6 +2535,228 @@ mod tests {
 
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         assert_eq!(model.adaptive_effort(), expected);
+    }
+
+    #[test_case(false, false, false ; "native_fields_without_a_dialect")]
+    #[test_case(false, true, false ; "toggle_fields_without_a_dialect")]
+    #[test_case(true, false, false ; "dialect_overrides_native_levels")]
+    #[test_case(true, true, false ; "dialect_overrides_toggle_fields")]
+    #[test_case(true, true, true ; "required_dialect_keeps_enabled_choices")]
+    fn codec_dialect_owns_the_effective_thinking_choices(
+        dialect: bool,
+        toggle_only: bool,
+        required: bool,
+    ) {
+        let slug = format!("effective-thinking-{dialect}-{toggle_only}-{required}");
+        let mut reg = registration(&slug);
+        let fields = if toggle_only {
+            serde_json::json!({"adaptive": {"enable_thinking": true}})
+        } else {
+            serde_json::json!({"max": {"reasoning_effort": "xhigh"}})
+        };
+        reg.decl.models[0].supports_thinking = Some(true);
+        reg.decl.models[0].requires_thinking = required;
+        reg.decl.models[0].thinking_fields = Some(serde_json::from_value(fields).unwrap());
+        if dialect {
+            reg.decl.openai = Some(
+                serde_json::from_value(serde_json::json!({"thinking": {"dialect": "standard"}}))
+                    .unwrap(),
+            );
+        }
+        let wire = reg.decl.openai.clone().unwrap_or_default();
+        register_loaded(reg).unwrap();
+
+        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
+        assert_eq!(model.effective_thinking_fields().is_none(), dialect);
+        let requested = ThinkingConfig::Effort(Effort::Low);
+        let expected = if dialect {
+            ThinkingConfig::Effort(Effort::Low)
+        } else if toggle_only {
+            ThinkingConfig::Adaptive
+        } else {
+            ThinkingConfig::Effort(Effort::Max)
+        };
+        assert_eq!(requested.clamped(&model), requested);
+        assert_eq!(requested.shown(&model), expected);
+        assert!(!model.thinking_options().is_empty());
+
+        let ctx = RequestCtx {
+            model: &model,
+            opts: RequestOptions {
+                thinking: requested,
+                fast: false,
+            }
+            .clamped(&model),
+            session: None,
+            discovered: None,
+        };
+        let mut body = serde_json::json!({});
+        wire.apply_body(&mut body, &ctx);
+        let expected_body = if dialect {
+            serde_json::json!({"reasoning_effort": "low"})
+        } else if toggle_only {
+            serde_json::json!({"enable_thinking": true})
+        } else {
+            serde_json::json!({"reasoning_effort": "xhigh"})
+        };
+        assert_eq!(body, expected_body);
+    }
+
+    #[test_case(Protocol::Anthropic ; "anthropic_codec_ignores_fields")]
+    #[test_case(Protocol::Google ; "google_codec_ignores_fields")]
+    #[test_case(Protocol::OpenaiResponses ; "responses_codec_ignores_fields")]
+    fn inactive_codec_fields_do_not_change_thinking(protocol: Protocol) {
+        let slug = format!("inactive-thinking-{protocol:?}").to_lowercase();
+        let mut reg = registration(&slug);
+        reg.decl.codec = Some(protocol);
+        reg.decl.models[0].supports_thinking = Some(true);
+        reg.decl.models[0].thinking_fields = Some(
+            serde_json::from_value(serde_json::json!({
+                "max": {"reasoning_effort": "xhigh"}
+            }))
+            .unwrap(),
+        );
+        register_loaded(reg).unwrap();
+
+        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
+        let requested = ThinkingConfig::Effort(Effort::Low);
+        assert!(model.effective_thinking_fields().is_none());
+        assert_eq!(requested.clamped(&model), requested);
+        assert!(
+            model
+                .thinking_options()
+                .iter()
+                .any(|option| option.name == Effort::Low.as_str())
+        );
+    }
+
+    #[test_case("anthropic", MODEL_ID, false ; "anthropic_ignores_fields")]
+    #[test_case("google", MODEL_ID, false ; "google_ignores_fields")]
+    #[test_case("copilot", MODEL_ID, false ; "copilot_ignores_fields")]
+    #[test_case("zai", MODEL_ID, false ; "zai_ignores_fields")]
+    #[test_case("xai", MODEL_ID, false ; "xai_ignores_fields")]
+    #[test_case("opencode", MODEL_ID, false ; "opencode_ignores_fields")]
+    #[test_case("ollama", MODEL_ID, true ; "ollama_honours_fields")]
+    #[test_case("llama-cpp", MODEL_ID, true ; "llama_cpp_honours_fields")]
+    #[test_case("openai", MODEL_ID, true ; "openai_chat_honours_fields")]
+    #[test_case("openai", "gpt-6.1-sol", false ; "openai_plan_ignores_fields")]
+    #[test_case("openai", "gpt-5.3-codex", false ; "openai_codex_ignores_fields")]
+    #[test_case("aperture", "zai/glm-5.2", false ; "aperture_native_zai_ignores_fields")]
+    #[test_case("aperture", "llama-cpp/example-model", true ; "aperture_local_honours_fields")]
+    #[test_case("aperture", "ollama/qwen3", true ; "aperture_ollama_honours_fields")]
+    #[test_case("aperture", "unrouted/example-model", false ; "aperture_fallback_ignores_fields")]
+    fn native_base_picker_uses_only_effective_fields(
+        base: &str,
+        model_id: &str,
+        uses_fields: bool,
+    ) {
+        for required in [false, true] {
+            for toggle_only in [false, true] {
+                let slug = format!("native-fields-{base}-{required}-{toggle_only}");
+                let mut reg = based(&slug, base);
+                let row = &mut reg.decl.models[0];
+                row.prefixes = vec![model_id.into()];
+                row.supports_thinking = Some(true);
+                row.requires_thinking = required;
+                row.thinking_fields = Some(
+                    serde_json::from_value(if toggle_only {
+                        serde_json::json!({"adaptive": {"enable_thinking": true}})
+                    } else {
+                        serde_json::json!({"max": {"reasoning_effort": "xhigh"}})
+                    })
+                    .unwrap(),
+                );
+                register_loaded(reg).unwrap();
+
+                let model = Model::from_spec(&format!("{slug}/{model_id}")).unwrap();
+                assert_eq!(model.effective_thinking_fields().is_some(), uses_fields);
+                let options = model.thinking_options();
+                assert!(!options.is_empty());
+                assert_eq!(options.iter().any(|o| o.name == "off"), !required);
+                let requested = ThinkingConfig::Effort(Effort::Low);
+                assert_eq!(requested.clamped(&model), requested);
+                if uses_fields {
+                    let names: Vec<_> = options.iter().map(|o| o.name).collect();
+                    let expected: Vec<_> = [
+                        (!required).then_some("off"),
+                        Some("adaptive"),
+                        (!toggle_only).then_some("max"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    assert_eq!(names, expected);
+                    assert!(options.iter().all(|o| o.tokens.is_none()));
+                    assert_eq!(
+                        requested.shown(&model),
+                        if toggle_only {
+                            ThinkingConfig::Adaptive
+                        } else {
+                            ThinkingConfig::Effort(Effort::Max)
+                        }
+                    );
+                } else {
+                    let mut without_fields = model.clone();
+                    without_fields.thinking_fields = None;
+                    assert_eq!(options, without_fields.thinking_options());
+                    for thinking in [requested, ThinkingConfig::Adaptive] {
+                        assert_eq!(thinking.shown(&model), thinking.shown(&without_fields));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test_case(None, false, true ; "openai_codec_honours_fields")]
+    #[test_case(None, true, false ; "explicit_dialect_ignores_fields")]
+    #[test_case(Some("google"), false, false ; "native_google_ignores_fields")]
+    #[test_case(Some("llama-cpp"), false, false ; "declared_base_has_no_aperture_constructor")]
+    #[test_case(Some("aperture"), false, false ; "declared_aperture_base_falls_back_without_recursing")]
+    fn aperture_picker_follows_its_routed_adapter(
+        base: Option<&str>,
+        dialect: bool,
+        uses_fields: bool,
+    ) {
+        let mut route = base.map_or_else(
+            || registration(THINKING_ROUTE),
+            |base| based(THINKING_ROUTE, base),
+        );
+        route.decl.aperture = Some(ApertureDecl {
+            path_prefix: super::super::aperture::DEFAULT_PATH_PREFIX.into(),
+        });
+        if dialect {
+            route.decl.openai = Some(
+                serde_json::from_value(serde_json::json!({"thinking": {"dialect": "standard"}}))
+                    .unwrap(),
+            );
+        }
+        let mut gateway = based(THINKING_GATEWAY, super::super::aperture::SLUG);
+        let model_id = format!("{THINKING_ROUTE}/{MODEL_ID}");
+        gateway.decl.models[0].prefixes = vec![model_id.clone()];
+        gateway.decl.models[0].supports_thinking = Some(true);
+        gateway.decl.models[0].requires_thinking = true;
+        gateway.decl.models[0].thinking_fields = Some(
+            serde_json::from_value(serde_json::json!({"adaptive": {"enable_thinking": true}}))
+                .unwrap(),
+        );
+        begin_load();
+        register(route, DeclAuthority::ThirdParty).unwrap();
+        register(gateway, DeclAuthority::ThirdParty).unwrap();
+        commit_load();
+
+        let model = Model::from_spec(&format!("{THINKING_GATEWAY}/{model_id}")).unwrap();
+        assert_eq!(model.effective_thinking_fields().is_some(), uses_fields);
+        assert!(!model.thinking_options().is_empty());
+        if uses_fields {
+            assert_eq!(
+                model
+                    .thinking_options()
+                    .iter()
+                    .map(|option| option.name)
+                    .collect::<Vec<_>>(),
+                ["adaptive"]
+            );
+        }
     }
 
     #[test_case("zai", Some(Effort::High) ; "base_with_a_fixed_level")]

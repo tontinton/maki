@@ -27,7 +27,7 @@ pub(crate) const GEMINI_PATH_PREFIX: &str = "/v1beta";
 /// For upstreams whose base url already carries its own path.
 pub(crate) const NO_PATH_PREFIX: &str = "";
 
-const SLUG: &str = "aperture";
+pub(super) const SLUG: &str = "aperture";
 const DISPLAY_NAME: &str = "Aperture";
 /// Tailscale handles auth, so there is no key and no login URL.
 const NO_ENV_VAR: &str = "";
@@ -123,16 +123,33 @@ fn adaptive_effort(model: &Model) -> Option<Effort> {
 /// its own: a plugin codec finds its declaration and discovery by its slug.
 /// A model that routes nowhere takes the generic path, which sends no effort.
 fn routed_adaptive_effort(overrides: &Overrides, model: &Model) -> Option<Effort> {
+    let (spec, routed) = routed_model(overrides, model)?;
+    (spec.adaptive_effort)(&routed)
+}
+
+pub(super) fn uses_thinking_fields(model: &Model) -> bool {
+    let config = ProvidersConfig::load_or_default();
+    let overrides = config.get(SLUG).map(|def| &def.overrides);
+    let Some((_, routed)) = routed_model(overrides.unwrap_or(&Overrides::new()), model) else {
+        return false;
+    };
+    plugin::uses_thinking_fields(&routed)
+}
+
+fn routed_model(overrides: &Overrides, model: &Model) -> Option<(&'static ProviderSpec, Model)> {
     let (provider_id, model_id) = model.id.split_once('/')?;
     let spec = routed_spec(
         provider_id,
         &merged_override(overrides, provider_id, model_id),
     )?;
+    if spec.native().is_none() && plugin::base_spec(spec.slug).is_some() {
+        return None;
+    }
     let routed = Model {
         provider: Arc::from(spec.slug),
         ..native_route_model(model, spec, model_id)
     };
-    (spec.adaptive_effort)(&routed)
+    Some((spec, routed))
 }
 
 /// Warn about `base` values that don't name an OpenAI-compatible provider, so a

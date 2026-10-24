@@ -6194,6 +6194,66 @@ fn set_thinking_clamps_to_what_the_model_will_run() {
     assert_eq!(app.state.thinking, lifted);
 }
 
+#[test_case(ThinkingConfig::Off, true, false, "low" ; "required_native_starts_at_low")]
+#[test_case(ThinkingConfig::Effort(Effort::Minimal), false, false, "low" ; "minimal_snaps_to_low")]
+#[test_case(ThinkingConfig::Effort(Effort::High), false, false, "medium" ; "high_snaps_to_medium")]
+#[test_case(ThinkingConfig::Effort(Effort::Max), false, false, "xhigh" ; "max_snaps_to_xhigh")]
+#[test_case(ThinkingConfig::Effort(Effort::High), false, true, "adaptive" ; "effort_on_toggle_uses_adaptive")]
+#[test_case(ThinkingConfig::Off, true, true, "adaptive" ; "required_toggle_enables_thinking")]
+fn restored_and_switched_thinking_selects_a_declared_picker_row(
+    thinking: ThinkingConfig,
+    required: bool,
+    toggle_only: bool,
+    expected: &str,
+) {
+    let (_tmp, storage, _writer, mut app) = tempdir_app();
+    let mut model = test_model();
+    model.provider = Arc::from("llama-cpp");
+    model.thinking_override = Some(if required {
+        ThinkingSupport::Required
+    } else {
+        ThinkingSupport::Yes
+    });
+    let mut fields = serde_json::json!({
+        "off": {"reasoning_effort": "none"},
+        "adaptive": {"reasoning_effort": "medium"}
+    });
+    if !toggle_only {
+        fields["low"] = serde_json::json!({"reasoning_effort": "low"});
+        fields["medium"] = serde_json::json!({"reasoning_effort": "medium"});
+        fields["xhigh"] = serde_json::json!({"reasoning_effort": "xhigh"});
+    }
+    model.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
+
+    for restored in [false, true] {
+        if restored {
+            let mut session = AppSession::new(&model.spec(), TEST_CWD);
+            session.meta.thinking = Some(thinking.into());
+            app.apply_loaded_session(OpenSession::claimed(session, &storage), &model);
+        } else {
+            app.state.thinking = thinking;
+            app.state.update_model(&model);
+        }
+        let state = app.model_state();
+        let intent = if required && thinking == ThinkingConfig::Off {
+            ThinkingConfig::Effort(Effort::Minimal)
+        } else {
+            thinking
+        };
+        assert_eq!(state["thinking"], intent.to_string());
+        assert_eq!(state[THINKING_SHOWN], expected);
+        assert!(
+            state[THINKING_OPTIONS]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option["name"] == expected)
+        );
+        assert_eq!(app.set_thinking(&intent.to_string()).unwrap(), intent);
+        assert_eq!(app.model_state(), state);
+    }
+}
+
 #[test_case("off", ThinkingConfig::Off)]
 #[test_case("low", ThinkingConfig::Effort(Effort::Low))]
 fn explicit_thinking_choice_replaces_pending_level(input: &str, expected: ThinkingConfig) {

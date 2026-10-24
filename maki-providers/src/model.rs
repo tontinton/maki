@@ -16,6 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::debug;
 
+use crate::ThinkingConfig;
 use crate::model_registry;
 use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, plugin};
@@ -563,6 +564,13 @@ pub struct Model {
 }
 
 impl Model {
+    /// Authored fields only describe picker choices when the selected request
+    /// path consumes them. Native bases may select different endpoint formats.
+    pub(crate) fn effective_thinking_fields(&self) -> Option<&ThinkingFields> {
+        let fields = self.thinking_fields.as_deref()?;
+        plugin::uses_thinking_fields(self).then_some(fields)
+    }
+
     /// Rates and limits come from the most specific source that names this
     /// model: live discovery, then [`ModelSources`], then provider defaults.
     /// Family and tier are about which dialect a model speaks and what role it
@@ -734,14 +742,16 @@ impl Model {
             .map(|n| (n / 2).max(MIN_THINKING_BUDGET))
     }
 
-    /// Every thinking value this model accepts, cheapest first, with the budget
-    /// each effort level resolves to here. Empty exactly when the model has no
-    /// thinking support, so an empty list is the one check a caller needs
-    /// before offering the ladder.
+    /// Named thinking choices, cheapest first. Explicit wire-level names take
+    /// precedence over the generic budget ladder and carry no invented token
+    /// counts. Empty exactly when the model has no thinking support.
     pub fn thinking_options(&self) -> Vec<ThinkingOption> {
         if !self.supports_thinking() {
             return Vec::new();
         }
+        let declared = self
+            .effective_thinking_fields()
+            .filter(|fields| !fields.levels.is_empty() || fields.adaptive.is_some());
         let max = self
             .max_thinking_budget()
             .unwrap_or(FALLBACK_MAX_THINKING_BUDGET);
@@ -749,15 +759,19 @@ impl Model {
             .then_some(THINKING_OFF)
             .into_iter()
             .chain(
-                self.adaptive_effort()
-                    .is_none()
+                (ThinkingConfig::Adaptive.shown(self) == ThinkingConfig::Adaptive)
                     .then_some(THINKING_ADAPTIVE),
             )
             .map(|name| ThinkingOption { name, tokens: None })
-            .chain(Effort::ALL.map(|level| ThinkingOption {
-                name: level.as_str(),
-                tokens: Some(level.budget(max)),
-            }))
+            .chain(
+                Effort::ALL
+                    .into_iter()
+                    .filter(|level| declared.is_none_or(|fields| fields.levels.contains_key(level)))
+                    .map(|level| ThinkingOption {
+                        name: level.as_str(),
+                        tokens: declared.is_none().then(|| level.budget(max)),
+                    }),
+            )
             .collect()
     }
 
@@ -1149,10 +1163,12 @@ impl AddAssign for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ThinkingConfig;
     use crate::test_support::register_bundled;
     use serde_json::json;
     use test_case::test_case;
+
+    const NATIVE_LADDER: [&str; 5] = ["off", "adaptive", "low", "medium", "xhigh"];
+    const TOGGLE_LADDER: [&str; 2] = ["off", "adaptive"];
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
         ModelPolicy::new(
@@ -1989,6 +2005,78 @@ mod tests {
     #[test_case("zai/glm-5.3", Some(Effort::High) ; "zai_sends_high")]
     fn adaptive_effort_is_the_level_the_provider_sends(spec: &str, expected: Option<Effort>) {
         assert_eq!(Model::from_spec(spec).unwrap().adaptive_effort(), expected);
+    }
+
+    #[test_case(ThinkingSupport::No, &[] ; "no_support_no_rows")]
+    #[test_case(ThinkingSupport::Yes, &NATIVE_LADDER ; "declared_names_only")]
+    #[test_case(ThinkingSupport::Required, &NATIVE_LADDER[1..] ; "required_thinking_drops_off")]
+    fn thinking_options_use_declared_levels(support: ThinkingSupport, expected: &[&str]) {
+        let mut model = ladder_model(support, Some(ROOMY_OUTPUT));
+        model.provider = Arc::from("llama-cpp");
+        model.thinking_fields = Some(Box::new(
+            serde_json::from_value(json!({
+                "off": {"reasoning_effort": "none"},
+                "adaptive": {"reasoning_effort": "medium"},
+                "low": {"reasoning_effort": "low"},
+                "medium": {"reasoning_effort": "medium"},
+                "xhigh": {"reasoning_effort": "xhigh"},
+            }))
+            .unwrap(),
+        ));
+
+        let options = model.thinking_options();
+        let names: Vec<&str> = options.iter().map(|option| option.name).collect();
+        assert_eq!(names, expected);
+        assert!(options.iter().all(|option| option.tokens.is_none()));
+    }
+
+    #[test_case(json!({}) ; "empty_fields")]
+    #[test_case(json!({"off": {"enable_thinking": false}}) ; "off_only_fields")]
+    fn thinking_options_without_declared_levels_keep_budget_fallback(fields: Value) {
+        let mut model = ladder_model(ThinkingSupport::Yes, Some(ROOMY_OUTPUT));
+        model.provider = Arc::from("llama-cpp");
+        let expected = model.thinking_options();
+        model.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
+        assert_eq!(model.thinking_options(), expected);
+    }
+
+    #[test_case(ThinkingSupport::No, &[] ; "unsupported")]
+    #[test_case(ThinkingSupport::Yes, &TOGGLE_LADDER ; "toggle_modes_only")]
+    #[test_case(ThinkingSupport::Required, &TOGGLE_LADDER[1..] ; "required_toggle_omits_off")]
+    fn thinking_options_for_toggle_fields_have_no_effort_budgets(
+        support: ThinkingSupport,
+        expected: &[&str],
+    ) {
+        let mut model = ladder_model(support, Some(ROOMY_OUTPUT));
+        model.provider = Arc::from("llama-cpp");
+        model.thinking_fields = Some(Box::new(
+            serde_json::from_value(json!({
+                "off": {"enable_thinking": false},
+                "adaptive": {"enable_thinking": true}
+            }))
+            .unwrap(),
+        ));
+
+        let options = model.thinking_options();
+        let names: Vec<&str> = options.iter().map(|option| option.name).collect();
+        assert_eq!(names, expected);
+        assert!(options.iter().all(|option| option.tokens.is_none()));
+    }
+
+    #[test_case(json!({"high": {"reasoning_effort": "high"}}), "high" ; "fallback_level_not_declared")]
+    #[test_case(json!({"medium": {"reasoning_effort": "xhigh"}}), "medium" ; "matching_name_has_a_different_fragment")]
+    fn partial_thinking_fields_keep_adaptive_as_a_separate_choice(fields: Value, level: &str) {
+        let mut model = ladder_model(ThinkingSupport::Yes, Some(ROOMY_OUTPUT));
+        model.provider = Arc::from("ollama");
+        model.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
+
+        let options = model.thinking_options();
+        let names: Vec<&str> = options.iter().map(|option| option.name).collect();
+        assert_eq!(names, [THINKING_OFF, THINKING_ADAPTIVE, level]);
+        assert_eq!(
+            ThinkingConfig::Adaptive.shown(&model),
+            ThinkingConfig::Adaptive
+        );
     }
 
     /// The numbers are [`Effort::budget`]'s, so what this pins is which ceiling

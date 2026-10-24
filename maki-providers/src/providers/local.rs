@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use maki_config::providers::Protocol;
+use maki_config::providers::{Protocol, ProvidersConfig};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
@@ -43,6 +43,11 @@ fn resolve_protocol_for_local(slug: &str) -> Option<Protocol> {
         slug,
         maki_config::providers::ProvidersConfig::load().get(slug),
     )
+}
+
+pub(super) fn uses_thinking_fields(slug: &str) -> bool {
+    maki_config::providers::resolve_protocol(slug, ProvidersConfig::load_or_default().get(slug))
+        != Some(Protocol::OpenaiResponses)
 }
 
 pub(crate) struct LocalEndpoint {
