@@ -40,6 +40,9 @@ use tracing::warn;
 
 use crate::cli::Cli;
 
+/// An accepted observation's line, such as a background result. It goes out
+/// live only, since the SDK has no history replay.
+const NOTICE_SUBTYPE: &str = "notice";
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("bash", "Bash"),
     ("read", "Read"),
@@ -1073,6 +1076,11 @@ impl EventPump {
                 text,
             } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
             AgentEvent::Steered { .. } => {}
+            AgentEvent::ObservationLine { text } if parent_tool_use_id.is_none() => {
+                self.writer
+                    .emit_system(NOTICE_SUBTYPE, serde_json::json!({ "text": text }))?;
+            }
+            AgentEvent::ObservationLine { .. } => {}
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -1210,6 +1218,7 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use flume::Receiver;
+    use maki_agent::SubagentInfo;
     use maki_config::ToolKey;
     use test_case::test_case;
 
@@ -1603,6 +1612,12 @@ mod tests {
     const TEST_TOOL_WIRE_NAME: &str = "Bash";
     const TEST_TOOL_USE_ID: &str = "toolu_1";
     const CONTROL_REQUEST_TYPE: &str = "control_request";
+    const SYSTEM_TYPE: &str = "system";
+    const RESULT_TYPE: &str = "result";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const CHILD_NOTICE_LINE: &str = "a child's own notice";
+    const HOST_NOTICE: &str = "the prompt changed, so the cache starts over";
+    const NOTICE_CHILD: &str = "child-1";
     const NO_CONTROL_REQUEST: &str = "a request nobody can answer must not go on the wire";
     const NO_ANSWER: &str = "answer sent with nobody parked on it";
     const SOURCE_OPEN: &str = "a turn end must not close the answer source";
@@ -1832,5 +1847,61 @@ mod tests {
         let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
         assert_eq!(wire["is_error"], true);
         assert_eq!(wire["result"], DROP_REASON);
+    }
+
+    /// The SDK has no history replay, so the line goes out live as a system
+    /// message. A host notice and a child's line stay out.
+    #[test]
+    fn an_accepted_notice_is_a_live_system_message() {
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+
+        pump.handle(top_level(AgentEvent::ObservationLine {
+            text: NOTICE_LINE.into(),
+        }))
+        .unwrap();
+        pump.handle(top_level(AgentEvent::Notice {
+            text: HOST_NOTICE.into(),
+        }))
+        .unwrap();
+        pump.handle(Envelope {
+            event: AgentEvent::ObservationLine {
+                text: CHILD_NOTICE_LINE.into(),
+            },
+            subagent: Some(SubagentInfo {
+                parent_tool_use_id: NOTICE_CHILD.into(),
+                name: NOTICE_CHILD.into(),
+                prompt: None,
+                model: None,
+                opts: None,
+                answer_tx: None,
+                inbox: None,
+            }),
+            run_id: 0,
+        })
+        .unwrap();
+        pump.handle(top_level(AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }))
+        .unwrap();
+
+        let wire: Vec<Value> = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(wire.len(), 2, "{wire:?}");
+        assert_eq!(wire[0]["type"], SYSTEM_TYPE);
+        assert_eq!(wire[0]["subtype"], NOTICE_SUBTYPE);
+        assert_eq!(wire[0]["text"], NOTICE_LINE);
+        assert_eq!(
+            wire[0]["session_id"],
+            pump.writer.session_id.to_string().as_str()
+        );
+        assert_eq!(wire[1]["type"], RESULT_TYPE);
     }
 }

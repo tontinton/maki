@@ -26,6 +26,9 @@ const STOPPED_BY_USER_ERR: &str = "stopped by user";
 const STARTED: &str = "Background task started";
 const FINISHED: &str = "finished";
 const FAILED: &str = "failed";
+const FIRST_FINISHED_LINE: &str = "Background agent finished: first background task";
+const FIRST_CANCELLED_LINE: &str = "Background agent cancelled: first background task";
+const SECOND_CANCELLED_LINE: &str = "Background agent cancelled: second background task";
 const PROMPT: &str = "Find the answer";
 const PLUGIN: &str = "background_task_test";
 const INIT: &str = include_str!("../../plugins/task/init.lua");
@@ -209,15 +212,22 @@ fn session_id<'a>(tasks: &'a [Value], name: &str) -> &'a str {
         .unwrap()
 }
 
-/// The next notice the plugin sends, and whether it woke the chat.
-fn next_notice(reg: &ToolRegistry, ctx: &ToolContext, mailbox: &SessionMailbox) -> (String, bool) {
+/// The next notice the plugin sends, its transcript line, and whether it
+/// woke the chat.
+fn next_notice(
+    reg: &ToolRegistry,
+    ctx: &ToolContext,
+    mailbox: &SessionMailbox,
+) -> (String, Option<String>, bool) {
     let (output, failed) = text(exec(reg, NOTICE_TOOL, json!({}), ctx));
     assert!(!failed, "{output}");
     let woken = mailbox.claim_wake();
     let woke = !woken.is_empty();
-    let notices = if woke { woken } else { mailbox.drain() };
+    let mut notices = if woke { woken } else { mailbox.drain() };
     assert_eq!(notices.len(), 1);
-    (notices[0].first_text_content().unwrap().to_owned(), woke)
+    let notice = notices.remove(0);
+    let body = notice.first_text_content().unwrap().to_owned();
+    (body, notice.display_text, woke)
 }
 
 /// What `maki.task.stop` does: cancel natively, then tell the owner.
@@ -245,11 +255,12 @@ fn background_result_outlives_the_calling_turn_and_wakes_the_chat() {
     started.recv().unwrap();
     foreground.cancel();
     release.send(()).unwrap();
-    let (text, woke) = next_notice(&reg, &ctx, &mailbox);
+    let (text, line, woke) = next_notice(&reg, &ctx, &mailbox);
     assert!(woke);
     assert!(text.contains(FIRST), "{text}");
     assert!(text.contains(FINISHED), "{text}");
     assert!(text.contains(RESULT), "{text}");
+    assert_eq!(line.as_deref(), Some(FIRST_FINISHED_LINE));
     assert!(sessions(&reg, &ctx).is_empty());
 }
 
@@ -263,10 +274,11 @@ fn user_stop_of_a_running_task_queues_a_failure_and_frees_its_slot() {
     start(&reg, &ctx, FIRST);
     started.recv().unwrap();
     stop(&host, session, session_id(&sessions(&reg, &ctx), FIRST));
-    let (text, woke) = next_notice(&reg, &ctx, &mailbox);
+    let (text, line, woke) = next_notice(&reg, &ctx, &mailbox);
     assert!(!woke, "user stop woke the chat");
     assert!(text.contains(STOPPED_BY_USER_ERR), "{text}");
     assert!(text.contains(FAILED), "{text}");
+    assert_eq!(line.as_deref(), Some(FIRST_CANCELLED_LINE));
     start(&reg, &ctx, SECOND);
     started.recv().unwrap();
     release.send(()).unwrap();
@@ -284,10 +296,11 @@ fn user_stop_of_a_queued_task_skips_the_provider() {
     started.recv().unwrap();
     start(&reg, &ctx, SECOND);
     stop(&host, session, session_id(&sessions(&reg, &ctx), SECOND));
-    let (text, woke) = next_notice(&reg, &ctx, &mailbox);
+    let (text, line, woke) = next_notice(&reg, &ctx, &mailbox);
     assert!(!woke, "user stop woke the chat");
     assert!(text.contains(SECOND), "{text}");
     assert!(text.contains(STOPPED_BY_USER_ERR), "{text}");
+    assert_eq!(line.as_deref(), Some(SECOND_CANCELLED_LINE));
     release.send(()).unwrap();
     assert!(next_notice(&reg, &ctx, &mailbox).0.contains(FIRST));
     assert!(started.try_recv().is_err());
@@ -310,7 +323,7 @@ fn a_spoofed_stop_event_leaves_a_queued_task_alone() {
     assert!(next_notice(&reg, &ctx, &mailbox).0.contains(FIRST));
     started.recv().unwrap();
     release.send(()).unwrap();
-    let (text, woke) = next_notice(&reg, &ctx, &mailbox);
+    let (text, _, woke) = next_notice(&reg, &ctx, &mailbox);
     assert!(woke);
     assert!(text.contains(SECOND), "{text}");
     assert!(text.contains(RESULT), "{text}");

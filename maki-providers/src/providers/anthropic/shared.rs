@@ -611,6 +611,8 @@ mod tests {
     const TOOL_USE_ID: &str = "toolu_1";
     const TOOL_SEARCH: &str = "tool_search";
     const LOADED_TOOL: &str = "srv__fetch";
+    const OBSERVATION_BODY: &str = "Background task find auth finished:\n\nok";
+    const OBSERVATION_LINE: &str = "Background agent finished: find auth";
 
     #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
     #[test_case("claude-opus-4-8", "claude-opus-4-8" ; "leaves_plain_id")]
@@ -698,6 +700,20 @@ mod tests {
         );
         strip_cache_control(&mut body);
         body
+    }
+
+    /// The transcript line is the reader's, so the model sees one request
+    /// with or without it.
+    #[test]
+    fn an_observation_line_never_reaches_the_wire() {
+        let plain = Message::observation(OBSERVATION_BODY.into());
+        let mut labelled = plain.clone();
+        labelled.display_text = Some(OBSERVATION_LINE.into());
+
+        assert_eq!(
+            encode(&[labelled], &json!([])),
+            encode(&[plain], &json!([]))
+        );
     }
 
     /// Cache breakpoints move every turn and the cache ignores them. Everything

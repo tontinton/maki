@@ -16,6 +16,7 @@ use crate::{AgentConfig, AgentMode, EventSender, ModelSlot, ToolOutputLines};
 pub const BACKGROUND_PLAN_WRITE_DENIED: &str =
     "the chat is in plan mode, so background sessions can't change files";
 const MAILBOX_CAPACITY: usize = 100;
+const NOTICE_DISPLAY_MAX_BYTES: usize = 256;
 /// Nobody listens on an unattended context's events, so its run id is never read.
 const UNATTENDED_RUN_ID: u64 = 0;
 
@@ -72,6 +73,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// One line, cut on a character boundary, or `None` when nothing is left.
+fn notice_label(text: &str) -> Option<String> {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let label = line[..line.floor_char_boundary(NOTICE_DISPLAY_MAX_BYTES)].trim_end();
+    (!label.is_empty()).then(|| label.to_owned())
+}
+
 impl SessionMailbox {
     pub fn register(session_id: MakiId) -> Self {
         let mut sessions = lock(&LIVE_SESSIONS);
@@ -84,7 +92,14 @@ impl SessionMailbox {
         Self { session_id, live }
     }
 
-    pub fn notify(session_id: MakiId, text: String, wake: bool) -> Result<(), MailboxError> {
+    /// `display` becomes the observation's transcript line, shown and saved
+    /// once an agent run accepts it. The model only ever reads `text`.
+    pub fn notify(
+        session_id: MakiId,
+        text: String,
+        display: Option<&str>,
+        wake: bool,
+    ) -> Result<(), MailboxError> {
         let live = {
             let mut sessions = lock(&LIVE_SESSIONS);
             let Some(live) = sessions.get(&session_id).and_then(Weak::upgrade) else {
@@ -93,11 +108,13 @@ impl SessionMailbox {
             };
             live
         };
+        let mut message = Message::observation(text);
+        message.display_text = display.and_then(notice_label);
         let mut mailbox = lock(&live.mailbox);
         if mailbox.pending.len() == MAILBOX_CAPACITY {
             mailbox.pending.pop_front();
         }
-        mailbox.pending.push_back(Message::observation(text));
+        mailbox.pending.push_back(message);
         mailbox.wake |= wake;
         Ok(())
     }
@@ -247,6 +264,7 @@ mod tests {
 
     use futures_lite::future::poll_once;
     use maki_providers::ThinkingConfig;
+    use test_case::test_case;
 
     use super::*;
     use crate::tools::FileKey;
@@ -258,17 +276,54 @@ mod tests {
     };
     const PLAN_FILE: &str = "/tmp/plan.md";
     const EDITED_FILE: &str = "foo.rs";
+    const NOTICE_BODY: &str = "child finished";
+    const LABEL_HEAD: &str = "Background agent finished:";
+    const WIDE_CHAR: &str = "é";
 
     fn text(message: &Message) -> &str {
-        message.user_text().unwrap()
+        message.first_text_content().unwrap()
+    }
+
+    #[test]
+    fn notify_cuts_the_label_to_one_line_on_a_char_boundary() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let wide = WIDE_CHAR.repeat(NOTICE_DISPLAY_MAX_BYTES);
+        let kept = (NOTICE_DISPLAY_MAX_BYTES - LABEL_HEAD.len() - 1) / WIDE_CHAR.len();
+        let expected = format!("{LABEL_HEAD} {}", WIDE_CHAR.repeat(kept));
+        assert_eq!(
+            expected.len(),
+            NOTICE_DISPLAY_MAX_BYTES - 1,
+            "the byte limit must fall inside a character"
+        );
+        let label = format!("{LABEL_HEAD}\n {wide}");
+
+        SessionMailbox::notify(id, NOTICE_BODY.into(), Some(&label), false).unwrap();
+
+        let message = mailbox.drain().remove(0);
+        assert_eq!(message.display_text, Some(expected));
+        assert_eq!(text(&message), NOTICE_BODY);
+    }
+
+    #[test_case(None ; "absent")]
+    #[test_case(Some(" \n ") ; "blank")]
+    fn notify_leaves_a_notice_without_a_label_unlabelled(label: Option<&str>) {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+
+        SessionMailbox::notify(id, NOTICE_BODY.into(), label, false).unwrap();
+
+        let message = mailbox.drain().remove(0);
+        assert_eq!(message.display_text, None);
+        assert_eq!(text(&message), NOTICE_BODY);
     }
 
     #[test]
     fn notifications_drain_in_order_and_clear_wake() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "first".into(), true).unwrap();
-        SessionMailbox::notify(id, "second".into(), true).unwrap();
+        SessionMailbox::notify(id, "first".into(), None, true).unwrap();
+        SessionMailbox::notify(id, "second".into(), None, true).unwrap();
 
         let messages = mailbox.drain();
         assert_eq!(
@@ -283,7 +338,7 @@ mod tests {
     fn quiet_notifications_do_not_claim_a_wake() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "built".into(), false).unwrap();
+        SessionMailbox::notify(id, "built".into(), None, false).unwrap();
 
         assert!(mailbox.claim_wake().is_empty());
         assert_eq!(mailbox.drain().len(), 1);
@@ -293,8 +348,8 @@ mod tests {
     fn waking_notification_claims_all_pending_messages() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "quiet".into(), false).unwrap();
-        SessionMailbox::notify(id, "wake".into(), true).unwrap();
+        SessionMailbox::notify(id, "quiet".into(), None, false).unwrap();
+        SessionMailbox::notify(id, "wake".into(), None, true).unwrap();
 
         let messages = mailbox.claim_wake();
         assert_eq!(
@@ -309,7 +364,7 @@ mod tests {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
         for index in 0..=MAILBOX_CAPACITY {
-            SessionMailbox::notify(id, index.to_string(), false).unwrap();
+            SessionMailbox::notify(id, index.to_string(), None, false).unwrap();
         }
 
         let messages = mailbox.drain();
@@ -323,7 +378,7 @@ mod tests {
         let id = MakiId::generate();
         let first = SessionMailbox::register(id);
         let second = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "built".into(), false).unwrap();
+        SessionMailbox::notify(id, "built".into(), None, false).unwrap();
 
         assert_eq!(second.drain().len(), 1);
         assert!(first.drain().is_empty());
@@ -335,7 +390,7 @@ mod tests {
         drop(SessionMailbox::register(id));
 
         assert!(!lock(&LIVE_SESSIONS).contains_key(&id));
-        assert!(SessionMailbox::notify(id, "late".into(), false).is_err());
+        assert!(SessionMailbox::notify(id, "late".into(), None, false).is_err());
     }
 
     #[test]
@@ -347,7 +402,7 @@ mod tests {
         drop(first);
 
         assert!(lock(&LIVE_SESSIONS).contains_key(&id));
-        SessionMailbox::notify(id, "built".into(), false).unwrap();
+        SessionMailbox::notify(id, "built".into(), None, false).unwrap();
         assert_eq!(second.drain().len(), 1);
     }
 
@@ -362,7 +417,7 @@ mod tests {
         lock(&LIVE_SESSIONS).insert(id, Arc::downgrade(&replacement.live));
 
         drop(stale);
-        SessionMailbox::notify(id, "built".into(), false).unwrap();
+        SessionMailbox::notify(id, "built".into(), None, false).unwrap();
 
         assert_eq!(replacement.drain().len(), 1);
     }
@@ -372,7 +427,7 @@ mod tests {
         let legacy: MakiId = "01965087-4c71-7f00-8000-000000000001".parse().unwrap();
         let canonical: MakiId = legacy.to_string().parse().unwrap();
         let mailbox = SessionMailbox::register(legacy);
-        SessionMailbox::notify(canonical, "built".into(), false).unwrap();
+        SessionMailbox::notify(canonical, "built".into(), None, false).unwrap();
 
         assert_eq!(mailbox.drain().len(), 1);
     }
@@ -388,7 +443,7 @@ mod tests {
 
         drop(owned);
         assert!(AgentSeed::live(id).is_none());
-        SessionMailbox::notify(id, "built".into(), true).unwrap();
+        SessionMailbox::notify(id, "built".into(), None, true).unwrap();
         assert_eq!(mailbox.claim_wake().len(), 1);
     }
 

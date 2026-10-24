@@ -6,9 +6,9 @@ use agent_client_protocol_schema::v1::{
     TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
-use maki_agent::DoneReason;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
+use maki_agent::{DoneReason, TranscriptItem, display_order};
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
 
 const MIN_FENCE_LEN: usize = 3;
@@ -18,6 +18,7 @@ const WRITE_TOOL: &str = "write";
 const MAX_DIFF_OLD_TEXT_BYTES: u64 = 256 * 1024;
 /// Model pricing is quoted in US dollars, so that is the reported currency.
 const CURRENCY: &str = "USD";
+const NOTICE_ID_PREFIX: &str = "notice-";
 
 /// File-level tools report a location so the client can follow along. Directory
 /// scoped tools (glob, grep, list) and commands (bash) target no single file.
@@ -76,6 +77,20 @@ pub fn text_delta(text: &str) -> SessionUpdate {
     SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
         text.to_string(),
     ))))
+}
+
+/// An accepted observation's line, such as a background result, as a
+/// finished card, so it stands apart from the reply. The card has no
+/// content: the body the model read is never shown.
+pub fn notice(id: &str, line: &str) -> SessionUpdate {
+    SessionUpdate::ToolCall(
+        ToolCall::new(
+            ToolCallId::from(format!("{NOTICE_ID_PREFIX}{id}")),
+            line.to_owned(),
+        )
+        .kind(ToolKind::Other)
+        .status(ToolCallStatus::Completed),
+    )
 }
 
 pub fn thinking_delta(text: &str) -> SessionUpdate {
@@ -372,12 +387,19 @@ pub fn usage_update(event: &TurnCompleteEvent, cost_total: Option<f64>) -> Sessi
     SessionUpdate::UsageUpdate(update)
 }
 
+/// A replayed card is named by its observation's place in history, which
+/// a live card's random id can never take.
 pub fn replay_history(messages: &[Message], cwd: &Path, home: Option<&Path>) -> Vec<SessionUpdate> {
     let mut updates = Vec::new();
-    for msg in messages {
-        match msg.role {
-            MsgRole::User => replay_user(msg, &mut updates),
-            MsgRole::Assistant => replay_assistant(msg, &mut updates, cwd, home),
+    for item in display_order(messages) {
+        match item {
+            TranscriptItem::ObservationLine { index, text } => {
+                updates.push(notice(&index.to_string(), text));
+            }
+            TranscriptItem::Message(msg) => match msg.role {
+                MsgRole::User => replay_user(msg, &mut updates),
+                MsgRole::Assistant => replay_assistant(msg, &mut updates, cwd, home),
+            },
         }
     }
     updates
@@ -496,6 +518,9 @@ mod tests {
     const OLD_TEXT: &str = "fn main() {}\n";
     const NEW_TEXT: &str = "fn main() { run() }\n";
     const MONITOR_NOTE: &str = "[monitor] build failed";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const PROMPT: &str = "what changed";
+    const REPLY: &str = "the build is green";
     const CONTEXT_UPDATE_TEXT: &str = "<context-update>date: tomorrow</context-update>";
 
     #[test_case("1: mod render\n2: mod segment", "```\n1: mod render\n2: mod segment\n```" ; "plain_text_gets_default_fence")]
@@ -583,6 +608,42 @@ mod tests {
         let json = updates_json(&[msg]);
         assert_eq!(json.len(), 1);
         assert_eq!(json[0]["content"]["text"], "what user typed");
+    }
+
+    fn observation_with(line: Option<&str>) -> Message {
+        let mut observation = Message::observation(MONITOR_NOTE.into());
+        observation.display_text = line.map(str::to_owned);
+        observation
+    }
+
+    /// A restored result line replays as the same finished card the client
+    /// saw live, named by its observation's place in history, and the body
+    /// the model read never reaches the client. Where it goes is
+    /// `display_order`'s call.
+    #[test]
+    fn replay_shows_an_observation_line_as_a_finished_card() {
+        let messages = [
+            observation_with(Some(NOTICE_LINE)),
+            Message::user(PROMPT.into()),
+            assistant(vec![MsgBlock::Text { text: REPLY.into() }]),
+        ];
+
+        let json = updates_json(&messages);
+
+        assert_eq!(json.len(), 3);
+        assert_eq!(json[0]["sessionUpdate"], "user_message_chunk");
+        assert_eq!(json[1]["sessionUpdate"], "tool_call");
+        assert_eq!(json[1]["toolCallId"], format!("{NOTICE_ID_PREFIX}0"));
+        assert_eq!(json[1]["title"], NOTICE_LINE);
+        assert_eq!(json[1]["status"], "completed");
+        assert_eq!(json[2], serde_json::to_value(text_delta(REPLY)).unwrap());
+        assert!(!serde_json::to_string(&json).unwrap().contains(MONITOR_NOTE));
+    }
+
+    #[test_case(None ; "absent")]
+    #[test_case(Some("") ; "blank")]
+    fn replay_hides_an_observation_without_a_line(line: Option<&str>) {
+        assert!(updates_json(&[observation_with(line)]).is_empty());
     }
 
     #[test]

@@ -4839,6 +4839,10 @@ observation waits for the session's next agent run.
   - `session` (`string`) id of a live session.
   - `wake` (`boolean`) start a TUI turn when it next becomes idle (default
     false). Needs the `agent` permission.
+  - `display` (`string?`) one-line note for the transcript, shown and saved
+    when the session's agent run accepts the report. Whitespace collapses
+    to single spaces and the note is cut to 256 bytes. Defaults to
+    nothing; the model reads only {text}.
 
 **Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
 

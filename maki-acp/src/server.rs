@@ -993,6 +993,9 @@ fn start_event_pump(
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
+                AgentEvent::ObservationLine { text } => {
+                    translate::notice(&MakiId::generate().to_string(), &text)
+                }
                 AgentEvent::Done { reason, .. } => {
                     tool_inputs.clear();
                     if let Some(id) = finish_turn(&pending) {
@@ -1424,6 +1427,9 @@ mod tests {
 
     const PUMP_CWD: &str = "/project";
     const QUEUED_TEXT: &str = "queued before close";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const CHILD_NOTICE_LINE: &str = "a child's own notice";
+    const HOST_NOTICE: &str = "the prompt changed, so the cache starts over";
     const PROMPT_ID: i64 = 7;
     const SUBAGENT_COST: f64 = 0.25;
     const TURN_COST: f64 = 0.5;
@@ -1765,6 +1771,65 @@ mod tests {
         assert_eq!(answer["id"], PROMPT_ID);
         assert_eq!(answer["result"]["stopReason"], "end_turn");
         assert!(pending(&srv).lock().unwrap().prompt.is_none());
+    }
+
+    /// An accepted observation's line arrives as a finished card, in the order
+    /// the agent sent it, and the turn's permission and answer routing stay as
+    /// they were. A host notice is not sent, and a child's line stays in the
+    /// child, like the rest of its stream.
+    #[test]
+    fn an_accepted_notice_reaches_the_client_in_stream_order() {
+        let (srv, .., out_rx) = test_server();
+        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(AgentEvent::ObservationLine {
+                    text: NOTICE_LINE.to_owned(),
+                })
+                .unwrap();
+            sender
+                .send(AgentEvent::Notice {
+                    text: HOST_NOTICE.to_owned(),
+                })
+                .unwrap();
+            sender
+                .send_envelope(Envelope {
+                    event: AgentEvent::ObservationLine {
+                        text: CHILD_NOTICE_LINE.to_owned(),
+                    },
+                    subagent: Some(subagent(None)),
+                    run_id: 0,
+                })
+                .unwrap();
+            sender
+                .send(AgentEvent::TextDelta {
+                    text: QUEUED_TEXT.to_owned(),
+                })
+                .unwrap();
+            sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
+            sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
+            sender.send(done_event()).unwrap();
+        });
+
+        let wire: Vec<Value> = out_rx.try_iter().collect();
+        let text = serde_json::to_value(translate::text_delta(QUEUED_TEXT)).unwrap();
+        assert_eq!(wire.len(), 5, "{wire:?}");
+        let card = &wire[0]["params"]["update"];
+        assert_eq!(card["sessionUpdate"], "tool_call");
+        assert_eq!(card["title"], NOTICE_LINE);
+        assert_eq!(card["status"], "completed");
+        assert_eq!(wire[1]["params"]["update"], text);
+        assert_eq!(
+            wire[2]["params"]["update"]["sessionUpdate"],
+            "tool_call_update"
+        );
+        assert_eq!(wire[3]["method"], "session/request_permission");
+        assert_eq!(
+            wire[3]["params"]["toolCall"]["title"],
+            MAIN_PERMISSION_TITLE
+        );
+        assert_eq!(wire[4]["id"], PROMPT_ID);
+        assert_eq!(wire[4]["result"]["stopReason"], "end_turn");
     }
 
     /// Clients only prompt a login on `auth_required`, so a rejected credential

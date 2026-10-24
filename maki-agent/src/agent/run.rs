@@ -22,6 +22,7 @@ use super::hook::{AgentHooks, AgentSlot};
 use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
+use super::transcript::observation_line;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::permissions::PermissionManager;
@@ -326,7 +327,7 @@ impl<'h> Agent<'h> {
                 prompt = Some(text.clone());
                 Message::user_with_images(text, images)
             });
-            self.land_input(preamble, kept)?;
+            self.land_input(preamble, kept, true)?;
         }
         let Some(message) = prompt else {
             self.emit_done(DoneReason::Dropped)?;
@@ -385,27 +386,41 @@ impl<'h> Agent<'h> {
     /// user already ran (a `!cmd` result), and that is not a layer's to judge.
     /// The mailbox waits for a kept message. Draining it for a dropped one
     /// would bury its notes in a run that ends right away, and eat the wake
-    /// they would have caused. Whatever changed goes right before the message,
-    /// so the model reads the change first and a rewind takes both.
+    /// they would have caused. A caller that draws the burst's prompts one by
+    /// one drains it only with the last, so a note's line comes after every
+    /// prompt it was saved ahead of. Whatever changed goes right before the
+    /// message, so the model reads the change first and a rewind takes both.
     fn land_input(
         &mut self,
         preamble: Vec<Message>,
         message: Option<Message>,
+        drain_mailbox: bool,
     ) -> Result<(), AgentError> {
         for message in preamble {
-            self.history.push(message);
+            self.land_observation(message)?;
         }
         let Some(message) = message else {
             return Ok(());
         };
-        if let Some(mailbox) = &self.mailbox {
+        if drain_mailbox && let Some(mailbox) = &self.mailbox {
             for message in mailbox.drain() {
-                self.history.push(message);
+                self.land_observation(message)?;
             }
         }
         self.tell_changes();
         if !message.content.is_empty() {
             self.history.push(message);
+        }
+        Ok(())
+    }
+
+    /// The line follows the observation into history, so frontends draw it
+    /// once and a restore draws it too.
+    fn land_observation(&mut self, message: Message) -> Result<(), AgentError> {
+        let line = observation_line(&message).map(str::to_owned);
+        self.history.push(message);
+        if let Some(text) = line {
+            self.event_tx.send(AgentEvent::ObservationLine { text })?;
         }
         Ok(())
     }
@@ -1091,7 +1106,8 @@ impl<'h> Agent<'h> {
             // carries all of it.
             ExtractedCommand::Interrupt(inputs) => {
                 let mut kept_any = false;
-                for input in inputs {
+                let last = inputs.len().saturating_sub(1);
+                for (index, input) in inputs.into_iter().enumerate() {
                     self.event_tx.send(AgentEvent::QueueItemConsumed {
                         text: input.message.clone(),
                         images: input.images.clone(),
@@ -1107,7 +1123,9 @@ impl<'h> Agent<'h> {
                         self.stop_continuations = 0;
                         kept_any = true;
                     }
-                    self.land_input(input.preamble, message)?;
+                    // Each prompt is drawn as it is consumed, so a note
+                    // drained earlier would show up between them.
+                    self.land_input(input.preamble, message, index == last)?;
                 }
                 Ok(kept_any)
             }
@@ -1185,6 +1203,8 @@ mod tests {
     const DEFAULT_IDENTITY_PREFIX: &str = "You are Maki, an interactive CLI coding agent.";
     const ONE_GAUGE_MSG: &str =
         "TurnComplete, Done, and the compaction trigger must read one context gauge";
+    const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -1693,7 +1713,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
+            SessionMailbox::notify(id, "mailbox".into(), None, false).unwrap();
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
@@ -1717,7 +1737,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
+            SessionMailbox::notify(id, "mailbox".into(), None, false).unwrap();
             let mut input = default_input();
             input.preamble = vec![Message::observation("preamble".into())];
             let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
@@ -1745,7 +1765,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "failed".into(), true).unwrap();
+            SessionMailbox::notify(id, "failed".into(), None, true).unwrap();
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
@@ -1761,6 +1781,157 @@ mod tests {
             assert_eq!(history.as_slice().len(), 2);
             assert!(history.as_slice()[0].is_observation());
             assert!(matches!(history.as_slice()[1].role, Role::Assistant));
+        });
+    }
+
+    /// Where an accepted notice enters the loop.
+    #[derive(Clone, Copy)]
+    enum NoticePath {
+        WakePreamble,
+        WakeBatchedWithPrompt,
+        PromptPreamble,
+        NextPrompt,
+        Interrupt,
+    }
+
+    fn notice_lines(events: &[Envelope]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                AgentEvent::ObservationLine { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn observations(history: &History) -> Vec<&Message> {
+        history
+            .as_slice()
+            .iter()
+            .filter(|message| message.is_observation())
+            .collect()
+    }
+
+    #[test_case(NoticePath::WakePreamble ; "wake_preamble")]
+    #[test_case(NoticePath::WakeBatchedWithPrompt ; "wake_batched_with_prompt")]
+    #[test_case(NoticePath::PromptPreamble ; "prompt_preamble")]
+    #[test_case(NoticePath::NextPrompt ; "next_prompt")]
+    #[test_case(NoticePath::Interrupt ; "interrupt")]
+    fn an_accepted_notice_draws_its_line_once(path: NoticePath) {
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, NOTICE_BODY.into(), Some(NOTICE_LINE), true).unwrap();
+            let mut input = default_input();
+            match path {
+                NoticePath::WakePreamble => {
+                    input.message.clear();
+                    input.preamble = mailbox.claim_wake();
+                }
+                NoticePath::WakeBatchedWithPrompt => {
+                    input.earlier = vec![EarlierInput {
+                        message: String::new(),
+                        images: Vec::new(),
+                        preamble: mailbox.claim_wake(),
+                    }];
+                }
+                NoticePath::PromptPreamble => input.preamble = mailbox.drain(),
+                NoticePath::NextPrompt | NoticePath::Interrupt => {}
+            }
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+
+            if let NoticePath::Interrupt = path {
+                let source =
+                    MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
+                let mut agent = agent.with_interrupt_source(source);
+                assert!(agent.handle_queued_command().await.unwrap());
+            } else {
+                agent.run(input).await.unwrap();
+            }
+
+            assert_eq!(notice_lines(&drain_events(&event_rx)), [NOTICE_LINE]);
+            let landed = observations(&history);
+            assert_eq!(landed.len(), 1);
+            assert_eq!(landed[0].display_text.as_deref(), Some(NOTICE_LINE));
+            assert_eq!(landed[0].first_text_content(), Some(NOTICE_BODY));
+        });
+    }
+
+    /// An interrupt burst is drawn prompt by prompt, so its notices land with
+    /// the last prompt, or wait for the next landing when that one is dropped.
+    #[test_case(false ; "last_kept")]
+    #[test_case(true ; "last_dropped")]
+    fn an_interrupt_burst_lands_notices_with_its_last_prompt(drop_last: bool) {
+        const LATER: &str = "later prompt";
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, NOTICE_BODY.into(), Some(NOTICE_LINE), false).unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![
+                ExtractedCommand::Interrupt(vec![
+                    default_input(),
+                    AgentInput {
+                        message: LATER.into(),
+                        ..default_input()
+                    },
+                ]),
+            ]));
+            agent.mailbox = Some(mailbox.clone());
+            script(&agent.registry, move |slot, value| match slot {
+                AgentSlot::UserMessage if drop_last && value[FIELD_TEXT] == LATER => {
+                    Verdict::Denied(LATER.into())
+                }
+                _ => Verdict::Unchanged,
+            });
+
+            assert!(agent.handle_queued_command().await.unwrap());
+            drop(agent);
+
+            let kinds: Vec<_> = history
+                .as_slice()
+                .iter()
+                .map(Message::is_observation)
+                .collect();
+            let events = drain_events(&event_rx);
+            let lines = notice_lines(&events);
+            if drop_last {
+                assert_eq!(kinds, [false]);
+                assert!(lines.is_empty());
+                assert_eq!(mailbox.drain().len(), 1);
+            } else {
+                assert_eq!(kinds, [false, true, false]);
+                assert_eq!(lines, [NOTICE_LINE]);
+            }
+        });
+    }
+
+    #[test]
+    fn an_unlabelled_notice_lands_without_a_line() {
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, NOTICE_BODY.into(), None, false).unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert!(notice_lines(&drain_events(&event_rx)).is_empty());
+            let landed = observations(&history);
+            assert_eq!(landed.len(), 1);
+            assert_eq!(landed[0].display_text, None);
         });
     }
 

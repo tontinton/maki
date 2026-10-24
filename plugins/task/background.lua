@@ -12,6 +12,7 @@ local Runner = require("runner")
 local NOT_LIVE_PREFIX = "session not live: "
 local CANCELLED = "background task cancelled"
 local STOPPED = { llm_output = "sub-agent error: stopped by user", is_error = true }
+local LINE = "Background agent %s: %s"
 
 local entries = {}
 local Background = {}
@@ -40,9 +41,11 @@ local function finish(entry, result, wake)
   end
   entries[entry] = nil
   local status = result.is_error and "failed" or "finished"
+  -- Only a user stop keeps the chat asleep, so a quiet error is a cancel.
+  local verb = result.is_error and not wake and "cancelled" or status
   local _, err = maki.session.notify(
     "Background task " .. entry.name .. " " .. status .. ":\n\n" .. result.llm_output,
-    { session = entry.chat, wake = wake }
+    { session = entry.chat, wake = wake, display = LINE:format(verb, entry.name) }
   )
   if err then
     maki.log.warn("background task notification failed: " .. err)

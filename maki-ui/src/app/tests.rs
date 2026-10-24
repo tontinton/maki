@@ -21,7 +21,7 @@ use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
     AgentMode, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
-    McpSnapshot, McpSnapshotReader, SharedBuf, SubagentInbox, ToolDoneEvent, ToolOutput,
+    McpSnapshot, McpSnapshotReader, SharedBuf, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput,
     ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
@@ -69,6 +69,14 @@ const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
 const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
+const NOTICE_LINE: &str = "Background agent finished: find auth";
+const SECOND_NOTICE_LINE: &str = "Background agent failed: lint";
+const NOTICE_PROMPT: &str = "what changed";
+const QUEUED_PROMPT: &str = "and then";
+const LAST_QUEUED_PROMPT: &str = "one more";
+const NOTICE_REPLY: &str = "the build is green";
+const STEERED_TEXT: &str = "rewritten by a plugin";
 const MISSING_DIR: &str = "gone";
 const RESUMED_PROMPT: &str = "carry me over";
 const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
@@ -427,6 +435,136 @@ fn mailbox_wake_starts_without_an_empty_user_bubble() {
     ));
     assert_eq!(app.status, Status::Streaming);
     assert!(app.main_chat().segment_search_texts().is_empty());
+}
+
+fn labelled_notice(line: &str) -> Message {
+    let mut message = Message::observation(NOTICE_BODY.into());
+    message.display_text = Some(line.into());
+    message
+}
+
+#[test]
+fn a_notice_line_appears_when_the_loop_accepts_it() {
+    let mut app = test_app();
+    app.start_mailbox_run(vec![labelled_notice(NOTICE_LINE)]);
+    assert!(
+        app.main_chat().segment_search_texts().is_empty(),
+        "the line waits for the loop to accept the notice"
+    );
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::ObservationLine {
+            text: NOTICE_LINE.into(),
+        },
+        app.run_id,
+    ));
+
+    assert_eq!(
+        app.main_chat().last_message_role(),
+        Some(&DisplayRole::Notice)
+    );
+    assert_eq!(app.main_chat().last_message_text(), NOTICE_LINE);
+    assert_eq!(app.chats.len(), 1, "a notice must not open a chat");
+}
+
+/// What the TUI sees during a notice scenario, in order.
+#[derive(Clone, Copy)]
+enum LiveStep {
+    Submit(&'static str),
+    Consumed(&'static str),
+    Reply,
+    Steered,
+    Accepted(&'static str),
+    Done,
+    Wake,
+}
+
+/// The saved history the same scenario leaves behind.
+#[derive(Clone, Copy)]
+enum SavedStep {
+    Notice(&'static str),
+    Prompt(&'static str),
+    Reply,
+}
+
+fn notice_and_prompt_rows<'a>(
+    rows: impl Iterator<Item = &'a DisplayMessage>,
+) -> Vec<(DisplayRole, String)> {
+    rows.filter(|row| matches!(row.role, DisplayRole::Notice | DisplayRole::User))
+        .map(|row| (row.role.clone(), row.text.clone()))
+        .collect()
+}
+
+/// History keeps a notice ahead of the prompts it landed with, while the live
+/// transcript drew them first. A restore must still show notices and prompts
+/// in the order the user watched them arrive.
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply] ; "single_prompt")]
+#[test_case(&[LiveStep::Consumed(NOTICE_PROMPT), LiveStep::Consumed(QUEUED_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Prompt(QUEUED_PROMPT), SavedStep::Reply] ; "batched_prompts")]
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Steered, LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply] ; "steered_prompt")]
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Accepted(NOTICE_LINE), LiveStep::Accepted(SECOND_NOTICE_LINE)],
+    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Notice(SECOND_NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply] ; "two_notices")]
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Reply, LiveStep::Consumed(QUEUED_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply, SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(QUEUED_PROMPT), SavedStep::Reply] ; "interrupt")]
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Reply, LiveStep::Consumed(QUEUED_PROMPT), LiveStep::Consumed(LAST_QUEUED_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply, SavedStep::Prompt(QUEUED_PROMPT), SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(LAST_QUEUED_PROMPT), SavedStep::Reply] ; "interrupt_burst")]
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Done, LiveStep::Wake, LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply, SavedStep::Notice(NOTICE_LINE), SavedStep::Reply] ; "wake_without_prompt")]
+fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedStep]) {
+    let mut app = test_app();
+    for step in live {
+        let event = match *step {
+            LiveStep::Submit(text) => {
+                type_and_submit(&mut app, text);
+                continue;
+            }
+            LiveStep::Wake => {
+                app.start_mailbox_run(Vec::new());
+                continue;
+            }
+            LiveStep::Consumed(text) => AgentEvent::QueueItemConsumed {
+                text: text.into(),
+                images: Vec::new(),
+            },
+            LiveStep::Reply => AgentEvent::TextDelta {
+                text: NOTICE_REPLY.into(),
+            },
+            LiveStep::Steered => AgentEvent::Steered {
+                kind: SteerKind::MessageRewritten,
+                text: STEERED_TEXT.into(),
+            },
+            LiveStep::Accepted(text) => AgentEvent::ObservationLine { text: text.into() },
+            LiveStep::Done => done(),
+        };
+        app.update(agent_msg_with_run_id(event, app.run_id));
+    }
+    let history: Vec<Message> = saved
+        .iter()
+        .map(|step| match *step {
+            SavedStep::Notice(line) => labelled_notice(line),
+            SavedStep::Prompt(text) => Message::user(text.into()),
+            SavedStep::Reply => Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: NOTICE_REPLY.into(),
+                }],
+                ..Default::default()
+            },
+        })
+        .collect();
+    let (restored, _) = crate::chat::history_to_display(
+        &history,
+        &HashMap::new(),
+        &app.ui_config.tool_output_lines,
+    );
+
+    let chat = app.main_chat();
+    let shown = notice_and_prompt_rows(
+        (0..chat.message_count()).filter_map(|index| chat.message_at(index)),
+    );
+    assert_eq!(shown, notice_and_prompt_rows(restored.iter()));
 }
 
 fn with_text(app: &mut App) {

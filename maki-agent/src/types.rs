@@ -726,6 +726,12 @@ pub enum AgentEvent {
     Notice {
         text: String,
     },
+    /// The transcript line of an observation the loop just accepted, such as
+    /// a background result. History keeps the observation, so a restore
+    /// shows the same line.
+    ObservationLine {
+        text: String,
+    },
     /// A plugin changed the run in a way the transcript alone would not show.
     /// `text` is the message as sent, the reason for a drop, or the message
     /// that kept the run going.

@@ -16,7 +16,8 @@ use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
-    AgentEvent, BufferSnapshot, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, BufferSnapshot, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, TranscriptItem, display_order,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
@@ -278,7 +279,7 @@ impl Chat {
                     ));
                 }
             }
-            AgentEvent::Notice { text } => {
+            AgentEvent::Notice { text } | AgentEvent::ObservationLine { text } => {
                 self.messages_panel.flush();
                 self.messages_panel
                     .push(DisplayMessage::new(DisplayRole::Notice, text));
@@ -569,7 +570,14 @@ pub fn history_to_display(
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
-    for msg in messages {
+    for item in display_order(messages) {
+        let msg = match item {
+            TranscriptItem::Message(msg) => msg,
+            TranscriptItem::ObservationLine { text, .. } => {
+                display.push(DisplayMessage::new(DisplayRole::Notice, text.to_owned()));
+                continue;
+            }
+        };
         if msg.is_context_update() || msg.is_observation() {
             continue;
         }
@@ -986,6 +994,8 @@ mod tests {
     const TASK_ID: &str = "toolu_01";
     const USER_TEXT: &str = "one more thing";
     const REPLY_TEXT: &str = "on it";
+    const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
 
     fn chat() -> Chat {
         Chat::new(
@@ -1133,6 +1143,31 @@ mod tests {
             .map(|d| (d.role.clone(), d.text.as_str()))
             .collect();
         assert_eq!(shown, [(DisplayRole::User, USER_TEXT)]);
+    }
+
+    /// The line is saved with the observation, so a restored session shows
+    /// it as a notice row, and the body stays the model's alone. Where the
+    /// row goes is `display_order`'s call.
+    #[test_case(Some(NOTICE_LINE), &[(DisplayRole::User, USER_TEXT), (DisplayRole::Notice, NOTICE_LINE)] ; "labelled")]
+    #[test_case(None, &[(DisplayRole::User, USER_TEXT)] ; "unlabelled")]
+    fn a_restored_observation_shows_only_its_line(
+        line: Option<&str>,
+        expected: &[(DisplayRole, &str)],
+    ) {
+        let mut observation = Message::observation(NOTICE_BODY.into());
+        observation.display_text = line.map(str::to_owned);
+        let next = Message::user(USER_TEXT.into());
+        let saved = serde_json::to_string(&[observation, next]).unwrap();
+        let restored: Vec<Message> = serde_json::from_str(&saved).unwrap();
+
+        let display =
+            history_to_display(&restored, &empty_outputs(), &ToolOutputLines::default()).0;
+
+        let shown: Vec<(DisplayRole, &str)> = display
+            .iter()
+            .map(|d| (d.role.clone(), d.text.as_str()))
+            .collect();
+        assert_eq!(shown, expected);
     }
 
     fn tool_use_pair(

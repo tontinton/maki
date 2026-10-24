@@ -318,6 +318,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
             | AgentEvent::Notice { .. }
+            | AgentEvent::ObservationLine { .. }
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::StreamClosed => {}
             AgentEvent::Steered { .. } => {

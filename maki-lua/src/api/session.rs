@@ -369,6 +369,10 @@ async fn prompt(
 ///   `session` (string) id of a live session.
 ///   `wake` (boolean) start a TUI turn when it next becomes idle (default
 ///     false). Needs the `agent` permission.
+///   `display` (string?) one-line note for the transcript, shown and saved
+///     when the session's agent run accepts the report. Whitespace collapses
+///     to single spaces and the note is cut to 256 bytes. Defaults to
+///     nothing; the model reads only {text}.
 /// @return (boolean|nil, string|nil) true, or nil and an error.
 /// @example
 /// maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
@@ -390,7 +394,12 @@ fn notify(
         return Ok(err_pair(BLANK_NOTIFY_ERR));
     }
     let session_id = try_pair!(required_session(opts.as_ref())?);
-    if let Err(error) = SessionMailbox::notify(session_id, text, wake) {
+    let display = opts
+        .as_ref()
+        .map(|t| t.get::<Option<String>>("display"))
+        .transpose()?
+        .flatten();
+    if let Err(error) = SessionMailbox::notify(session_id, text, display.as_deref(), wake) {
         return Ok(err_pair(error));
     }
     Ok((Some(true), None))
@@ -596,8 +605,38 @@ mod tests {
         let messages = mailbox.drain();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].is_observation());
-        assert_eq!(messages[0].user_text(), Some("built"));
+        assert_eq!(messages[0].first_text_content(), Some("built"));
+        assert_eq!(messages[0].display_text, None);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test_case(" agent-1 finished ", Some("agent-1 finished"); "trimmed")]
+    #[test_case("agent-1\n finished", Some("agent-1 finished"); "single_line")]
+    #[test_case("   ", None; "blank")]
+    fn notify_normalizes_display_notes_without_changing_model_text(
+        display: &str,
+        expected: Option<&str>,
+    ) {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let lua = lua_with_session(None);
+        lua.globals().set("session_id", id.to_string()).unwrap();
+        lua.globals().set("notice_text", TEXT).unwrap();
+        lua.globals().set("display_note", display).unwrap();
+
+        let (value, error): (bool, Option<String>) = lua
+            .load(concat!(
+                "return session.notify(notice_text, { session = session_id, ",
+                "wake = true, display = display_note })"
+            ))
+            .eval()
+            .unwrap();
+
+        assert!(value);
+        assert_eq!(error, None);
+        let messages = mailbox.claim_wake();
+        assert_eq!(messages[0].display_text.as_deref(), expected);
+        assert_eq!(messages[0].first_text_content(), Some(TEXT));
     }
 
     #[test]
