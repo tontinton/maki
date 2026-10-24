@@ -119,6 +119,7 @@ fn jobstart(
         spec.on_stdout = callback_key(lua, opts, "on_stdout")?;
         spec.on_stderr = callback_key(lua, opts, "on_stderr")?;
         spec.on_exit = callback_key(lua, opts, "on_exit")?;
+        spec.shared = opts.opt_bool("shared").unwrap_or(false);
         spec.ceiling = Ceiling::current_for(lua, &plugin);
         spec.stdout = parse_redirect(lua, opts, "stdout", spec.on_stdout.is_some(), &grants)?;
         spec.stderr = parse_redirect(lua, opts, "stderr", spec.on_stderr.is_some(), &grants)?;
