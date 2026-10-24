@@ -51,6 +51,7 @@ pub(crate) struct OpenAiCompatConfig {
     pub base_url: Cow<'static, str>,
     pub max_tokens_field: Cow<'static, str>,
     pub include_stream_usage: bool,
+    pub usage_cost: bool,
     pub provider_name: Cow<'static, str>,
 }
 
@@ -265,6 +266,7 @@ impl OpenAiCompatProvider {
                 BufReader::new(response.into_body()),
                 event_tx,
                 self.stream_timeout,
+                self.config.usage_cost,
             )
             .await
         } else {
@@ -608,6 +610,7 @@ pub async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
+    usage_cost: bool,
 ) -> Result<StreamResponse, AgentError> {
     let mut lines = reader.lines();
 
@@ -656,6 +659,7 @@ pub async fn parse_sse(
                 cache_creation: 0,
                 cost: u
                     .cost
+                    .filter(|_| usage_cost)
                     .or_else(|| chunk.copilot_usage.as_ref().and_then(copilot_usd)),
             };
         }
@@ -913,7 +917,7 @@ data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prom
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap();
 
@@ -945,7 +949,7 @@ data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prom
 data: [DONE]\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap();
 
@@ -957,12 +961,13 @@ data: [DONE]\n";
 
     /// OpenRouter quotes the bill on the same chunk as the token counts, so the
     /// counts have to come through whatever it says the price is.
-    #[test_case(json!(0.00045), Some(0.00045)   ; "number")]
-    #[test_case(json!("0.00045"), Some(0.00045) ; "quoted_number")]
-    #[test_case(json!("free"), None             ; "unparsable_string")]
-    #[test_case(json!({"usd": 0.00045}), None   ; "unknown_shape")]
-    #[test_case(json!(null), None               ; "null")]
-    fn parse_sse_cost_from_usage(cost: Value, expected: Option<f64>) {
+    #[test_case(json!(0.00045), true, Some(0.00045)   ; "number")]
+    #[test_case(json!("0.00045"), true, Some(0.00045) ; "quoted_number")]
+    #[test_case(json!(67807), false, None             ; "ignored_when_disabled")]
+    #[test_case(json!("free"), true, None             ; "unparsable_string")]
+    #[test_case(json!({"usd": 0.00045}), true, None   ; "unknown_shape")]
+    #[test_case(json!(null), true, None               ; "null")]
+    fn parse_sse_cost_from_usage(cost: Value, usage_cost: bool, expected: Option<f64>) {
         smol::block_on(async {
             let chunk = json!({
                 "choices": [{"finish_reason": "stop", "delta": {}}],
@@ -971,9 +976,14 @@ data: [DONE]\n";
             let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                Cursor::new(sse.as_bytes()),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                usage_cost,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(resp.usage.input, 100, "{COUNTS_SURVIVE_A_BAD_COST}");
             assert_eq!(resp.usage.output, 10, "{COUNTS_SURVIVE_A_BAD_COST}");
@@ -999,7 +1009,7 @@ data: [DONE]\n";
             let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap();
 
@@ -1032,7 +1042,7 @@ data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prom
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap();
 
@@ -1066,7 +1076,7 @@ data: [DONE]\n";
             let sse = format!("data: {{\"choices\":[{{\"delta\":{delta}}}]}}\n\ndata: [DONE]\n");
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap();
 
@@ -1174,7 +1184,7 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap();
 
@@ -1209,7 +1219,7 @@ data: [DONE]\n";
 data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\"}}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let err = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let err = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap_err();
 
@@ -1236,7 +1246,7 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap();
 
@@ -1257,6 +1267,7 @@ data: [DONE]\n";
                     Cursor::new(TWO_UNNAMED_TOOL_CALLS_SSE.as_bytes()),
                     &tx,
                     TEST_STREAM_TIMEOUT,
+                    false,
                 )
                 .await
                 .unwrap();
@@ -1315,7 +1326,7 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap();
 
@@ -1343,7 +1354,7 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap();
 
@@ -1447,7 +1458,7 @@ data: [DONE]\n";
         smol::block_on(async {
             let sse = "data: [DONE]\n";
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap();
             assert!(resp.message.content.is_empty());
@@ -1470,7 +1481,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
                 .await
                 .unwrap();
 
@@ -1504,6 +1515,7 @@ data: [DONE]\n";
         base_url: Cow::Borrowed("https://example.test/v1"),
         max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
         include_stream_usage: true,
+        usage_cost: false,
         provider_name: Cow::Borrowed("test"),
     };
 
