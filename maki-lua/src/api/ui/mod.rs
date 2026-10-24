@@ -431,6 +431,76 @@ fn action(
     Ok((Some(true), None))
 }
 
+/// Scrolls the focused chat to the entry at {position} of
+/// `maki.ui.transcript_outline()`, counting from 1. The outline is the list
+/// of what can be jumped to, and this call takes a position in it: a pane
+/// jumps straight to the entry it showed, with no counting of its own.
+///
+/// The entry kinds the outline lists are the items a contents pane shows:
+///
+/// - `"turn"`: a visible user message. A turn starts where the user spoke;
+///   everything the model answered with sits under it. Nudges, observations
+///   and other entries the transcript never shows are not listed.
+/// - `"thinking"`: a non-empty thinking block, in order.
+/// - `"reply"`: a non-empty assistant text block, in order.
+///
+/// Tool calls and results show in the transcript but are not jumpable
+/// entries. A collapsed thinking block jumps to its indicator line;
+/// expanding it is a click in the chat, not this call.
+///
+/// The scroll releases the bottom pin, so streaming output stops dragging
+/// the view away from the block you jumped to.
+///
+/// @param position integer 1-based position in `maki.ui.transcript_outline()`.
+/// @return (boolean|nil, string|nil) `true` on success, or nil and an error when the position is past the outline or there is no UI.
+/// @example
+/// -- A pane that lists the outline, one entry per line, jumps on click:
+/// win:recv() -- {type = "click", row} for a painted line
+/// local ok, err = maki.ui.scroll_to_block(row)
+#[lua_fn]
+async fn scroll_to_block(
+    _lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    position: usize,
+) -> LuaResult<Pair<bool>> {
+    let reply = try_pair!(
+        ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::ScrollToBlock {
+            position,
+            reply_tx
+        })
+        .await
+    );
+    try_pair!(reply);
+    Ok((Some(true), None))
+}
+
+/// Reads the transcript as the chat itself lists it: one entry per jumpable
+/// block, in display order. Each entry is `{ kind, text }` where `kind` is
+/// `"turn"`, `"thinking"` or `"reply"` and `text` is a first-line preview
+/// meant for a contents pane to clip to its own width.
+///
+/// This is the list `maki.ui.scroll_to_block` indexes: entry `n` here is
+/// what `scroll_to_block(n)` jumps to. Which messages show at all is the
+/// chat's decision alone, so a pane can never disagree with it about what a
+/// position means.
+///
+/// @return (table|nil, string|nil) Array of outline entries, or nil and an error when there is no UI.
+/// @example
+/// -- Print each entry with the position a jump answers to:
+/// for n, b in ipairs(maki.ui.transcript_outline() or {}) do
+///   print(n, b.kind, b.text)
+/// end
+#[lua_fn]
+async fn transcript_outline(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+) -> LuaResult<Pair<mlua::Value>> {
+    ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::TranscriptOutline {
+        reply_tx,
+    })
+    .await
+}
+
 async fn input_roundtrip(
     lua: Lua,
     tx: Option<&flume::Sender<UiAction>>,
@@ -749,15 +819,16 @@ lua_table! {
     /// Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
     /// still work. The calls that need a screen behave like this:
     ///
-    /// - `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
+    /// - `action`, `scroll_to_block`, `transcript_outline`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
     /// - `open_win`, `set_status_hint`, and `set_window_title` have no effect.
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_edit,
+        manual flash, manual action, manual scroll_to_block, manual transcript_outline,
+        manual open_editor, manual open_win,
+        manual set_status_hint, manual set_window_title, manual input, manual input_edit,
     ]
 }
 
@@ -772,6 +843,8 @@ pub(crate) fn create_ui_table(
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
     action__register(&t, lua, ui_action_tx.clone())?;
+    scroll_to_block__register(&t, lua, ui_action_tx.clone())?;
+    transcript_outline__register(&t, lua, ui_action_tx.clone())?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
     input__register(&t, lua, ui_action_tx.clone())?;
     input_edit__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
