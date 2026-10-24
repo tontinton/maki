@@ -2434,19 +2434,16 @@ fn collect_env_vars(path: &Path, vars: &mut HashMap<String, String>) {
 }
 
 pub fn load_permissions(project_config: &ProjectConfig) -> PermissionsConfig {
-    load_permissions_inner(&paths::config_search_dirs(), project_config)
+    load_permissions_inner(paths::config_dir().ok().as_deref(), project_config)
 }
 
 fn load_permissions_inner(
-    global_dirs: &[PathBuf],
+    global_dir: Option<&Path>,
     project_config: &ProjectConfig,
 ) -> PermissionsConfig {
-    let mut global_perms = PermissionsFileConfig::default();
-    for dir in global_dirs {
-        if let Some(p) = read_permissions_file(&dir.join(PERMISSIONS_FILE), true) {
-            global_perms = p;
-        }
-    }
+    let global_perms = global_dir
+        .and_then(|dir| read_permissions_file(&dir.join(PERMISSIONS_FILE), true))
+        .unwrap_or_default();
 
     // The one deliberate exception to the gate: read at any trust level so a
     // repository can narrow the agent inside it, then stripped down to its deny
@@ -2643,7 +2640,7 @@ pub fn append_permission_rule(
     effect: Effect,
     target: &PermissionTarget,
 ) -> Result<(), String> {
-    let dir = paths::config_search_dirs().into_iter().last();
+    let dir = paths::config_dir().ok();
     append_permission_rule_with_global(tool, scope, effect, target, dir)
 }
 
@@ -2669,7 +2666,7 @@ fn append_global_permission(
     global: Option<PathBuf>,
 ) -> Result<(), String> {
     let path = global
-        .ok_or_else(|| "cannot determine home directory".to_string())?
+        .ok_or_else(|| "cannot determine config directory".to_string())?
         .join(PERMISSIONS_FILE);
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
@@ -3366,10 +3363,7 @@ mod tests {
              [bash]\nallow = [\n    \"cargo *\",\n]\ndeny = [\n    \"rm -rf *\",\n]\n",
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Allow);
         assert_eq!(perms.rules.len(), 2);
         assert_eq!(perms.rules[0].effect, Effect::Deny);
@@ -3394,10 +3388,7 @@ mod tests {
              [write]\ndeny = [\"/etc/*\"]\n",
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(perms.rules.len(), 4);
 
@@ -3433,7 +3424,7 @@ mod tests {
         write_project_permissions(dir.path(), &legacy);
 
         let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
+            Some(&global),
             &ProjectConfig::discover(dir.path()).with_trust(trusted),
         );
 
@@ -3480,7 +3471,7 @@ mod tests {
         );
 
         let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
+            Some(&global),
             &ProjectConfig::discover(dir.path()).with_trust(trusted),
         );
 
@@ -3525,10 +3516,7 @@ mod tests {
             ),
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::discover(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::discover(dir.path()));
 
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert!(perms.tool_defaults.is_empty());
@@ -3546,10 +3534,7 @@ mod tests {
         );
         write_project_permissions(dir.path(), &format!("[bash]\ndeny = [\"{SCOPE}\"]\n"));
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::discover(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::discover(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Allow);
         let scoped: Vec<_> = perms
             .rules
@@ -3583,7 +3568,8 @@ mod tests {
         fs::write(linked.join(".git"), GIT_FILE_POINTER).unwrap();
         let global = global_config_dir(container.path());
 
-        let permissions = load_permissions_inner(&[global], &ProjectConfig::for_project(&linked));
+        let permissions =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(&linked));
 
         let scopes = permissions
             .rules
@@ -3669,10 +3655,7 @@ mod tests {
         fs::create_dir_all(&maki_dir).unwrap();
         fs::write(maki_dir.join("permissions.toml"), "default = \"allow\"\n").unwrap();
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
     }
 
@@ -3732,10 +3715,7 @@ mod tests {
     fn no_permissions_file_returns_defaults() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert!(perms.rules.is_empty());
     }
@@ -3749,10 +3729,7 @@ mod tests {
             "[bash]\nallow = [\"git *\"]\ndeny = [\"rm *\"]\n",
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.rules[0].effect, Effect::Deny);
         assert_eq!(perms.rules[1].effect, Effect::Allow);
     }
@@ -3763,10 +3740,7 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "default = \"deny\"\n");
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
     }
 
@@ -3779,10 +3753,7 @@ mod tests {
             "default = \"deny\"\n\n[bash]\ndefault = \"allow\"\nallow = [\"cargo *\"]\n",
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
@@ -3803,10 +3774,7 @@ mod tests {
         )
         .unwrap();
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
             Some(DefaultEffect::Deny)
@@ -3822,10 +3790,7 @@ mod tests {
             "allow_all = true\n\n[bash]\nallow = [\"cargo *\"]\n",
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Allow);
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
@@ -3839,10 +3804,7 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "allow_all = false\n");
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
@@ -3858,10 +3820,7 @@ mod tests {
         fs::create_dir_all(&maki_dir).unwrap();
         fs::write(maki_dir.join("permissions.toml"), "default = \"deny\"\n").unwrap();
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
     }
 
@@ -4329,10 +4288,7 @@ mod tests {
             dir.path(),
             "[mcp.deepwiki]\nallow = [\"search\", \"fetch\"]\n",
         );
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.rules.len(), 2);
         assert!(perms.rules.iter().any(|r| r.tool
             == ToolKey::McpTool {
@@ -4353,10 +4309,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.github]\ndeny = [\"admin_delete\"]\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.rules.len(), 1);
         assert_eq!(
             perms.rules[0].tool,
@@ -4373,10 +4326,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.myserver]\nallow = [\"web.search\"]\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(perms.rules.len(), 0, "dotted tool name should be rejected");
     }
 
@@ -4388,10 +4338,7 @@ mod tests {
             dir.path(),
             "default = \"deny\"\n\n[mcp.exa]\ndefault = \"allow\"\n",
         );
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::McpServer {
                 server: "exa".into()
@@ -4409,10 +4356,7 @@ mod tests {
             dir.path(),
             "[mcp.exa]\ndefault = \"prompt\"\nallow = [\"search\"]\n",
         );
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::McpServer {
                 server: "exa".into()
@@ -4443,10 +4387,7 @@ mod tests {
         )
         .unwrap();
 
-        let _perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let _perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
         assert!(content.contains("[mcp.deepwiki]"), "server table present");
@@ -4475,10 +4416,7 @@ mod tests {
         )
         .unwrap();
 
-        let _perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let _perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
         assert!(content.contains("[mcp.deepwiki]"), "server table present");
@@ -4493,10 +4431,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[\"\"]\ndefault = \"allow\"\nallow = [\"x\"]\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         assert!(perms.rules.is_empty());
         assert!(perms.tool_defaults.is_empty());
     }
@@ -4518,10 +4453,7 @@ mod tests {
             return; // running as root, cannot simulate a read-only dir
         }
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
         fs::set_permissions(&global, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(perms.rules.len(), 1);
