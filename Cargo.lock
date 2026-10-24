@@ -3201,6 +3201,7 @@ dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
  "flume",
+ "jiff",
  "maki-agent",
  "maki-config",
  "maki-otel",

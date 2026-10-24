@@ -1,8 +1,9 @@
 use agent_client_protocol_schema::ProtocolVersion;
 use agent_client_protocol_schema::v1::{
     AgentCapabilities, Implementation, InitializeResponse, LoadSessionResponse, McpCapabilities,
-    NewSessionResponse, PromptCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionMode, SessionModeId, SessionModeState,
+    NewSessionResponse, PromptCapabilities, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionListCapabilities, SessionMode,
+    SessionModeId, SessionModeState,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -18,7 +19,10 @@ pub fn initialize_response() -> InitializeResponse {
             AgentCapabilities::new()
                 .load_session(true)
                 .prompt_capabilities(PromptCapabilities::new().image(true).embedded_context(true))
-                .mcp_capabilities(McpCapabilities::new().http(true)),
+                .mcp_capabilities(McpCapabilities::new().http(true))
+                .session_capabilities(
+                    SessionCapabilities::new().list(SessionListCapabilities::new()),
+                ),
         )
         .auth_methods(vec![])
         .agent_info(Implementation::new("maki", VERSION))

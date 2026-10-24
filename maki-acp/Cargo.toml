@@ -10,6 +10,7 @@ maki-otel = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 agent-client-protocol-schema = { workspace = true }
+jiff = { workspace = true }
 smol = { workspace = true }
 flume = { workspace = true }
 serde = { workspace = true }
