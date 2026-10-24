@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
@@ -38,4 +39,19 @@ pub fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_len: u32
         .end_symbol(None);
 
     frame.render_stateful_widget(scrollbar, area, &mut state);
+}
+
+/// Rail cells of `area` that still hold the thumb glyph in `buf`, one per row
+/// of the thumb's span. Copy runs on the same buffer the user sees, so a rail
+/// a modal later painted over stops excluding once its cells show text again
+/// (#917).
+pub fn live_rails(buf: &Buffer, area: Rect) -> Vec<Rect> {
+    let area = area.intersection(*buf.area());
+    let Some(rail) = area.width.checked_sub(1).map(|w| area.x + w) else {
+        return Vec::new();
+    };
+    (area.y..area.bottom())
+        .filter(|&row| buf[(rail, row)].symbol() == SCROLLBAR_THUMB)
+        .map(|row| Rect::new(rail, row, 1, 1))
+        .collect()
 }

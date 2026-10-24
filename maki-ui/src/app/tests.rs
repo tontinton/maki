@@ -10,10 +10,13 @@ use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::messages::ScrollPos;
 use crate::components::rewind_picker::RewindEntry;
+use crate::components::scrollbar::{self, SCROLLBAR_THUMB};
 use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
-use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
+use crate::selection::{
+    self, ContentRegion, RowPos, ScreenSelection, SelectableZone, SelectionState, SelectionZone,
+};
 use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -4932,6 +4935,122 @@ fn overlay_zone_click_gating() {
     assert_eq!(state.sel().zone, SelectionZone::Overlay);
 }
 
+/// A modal's rail lands on content cells, and a copy of the overlay must not
+/// pick the ▐ up (#917). The test draws once, finds the modal's rail from the
+/// live buffer, and drives the same extraction `copy_selection` runs.
+#[test]
+fn overlay_copy_skips_painted_rail_cells() {
+    let mut app = test_app();
+    app.help_modal.toggle();
+    let (_cursor, buffer) = draw_to_buffer(&mut app);
+
+    let thumb = |x: u16, y: u16| buffer[(x, y)].symbol() == SCROLLBAR_THUMB;
+    let zone = (0..buffer.area.height)
+        .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| {
+            thumb(x, y)
+                && app
+                    .zone_at(y, x)
+                    .is_some_and(|z| z.zone == SelectionZone::Overlay)
+        })
+        .map(|(x, y)| app.zone_at(y, x).unwrap())
+        .expect("an overlay zone owns a rail cell");
+    let rails = scrollbar::live_rails(&buffer, zone.area);
+    assert!(!rails.is_empty(), "help modal paints a rail");
+
+    let sel = ScreenSelection {
+        start_row: zone.area.y,
+        start_col: zone.area.x,
+        end_row: zone.area.bottom() - 1,
+        end_col: zone.area.right() - 1,
+    };
+    let regions = [ContentRegion {
+        area: zone.area,
+        exclude: rails,
+        ..Default::default()
+    }];
+    let text = selection::extract_selected_text(&buffer, &sel, &regions);
+    assert!(
+        !text.contains(SCROLLBAR_THUMB),
+        "copy kept rail cells: {text:?}"
+    );
+    assert!(text.contains("General"), "copy lost modal text: {text:?}");
+}
+
+/// A rail painted before the modal opened must stop excluding once the modal
+/// overpaints its cells with text: the old recorded-rails approach kept the
+/// stale record and copies from the help modal lost a character per affected
+/// row ("trl+B" for "Ctrl+B"). Only what the buffer shows now counts (#917).
+#[test]
+fn overlay_copy_reads_rails_from_the_live_buffer() {
+    const SPLIT_EXTENT: u16 = 24;
+
+    let mut app = test_app();
+    for i in 0..40 {
+        app.active_chat().push(DisplayMessage::new(
+            DisplayRole::User,
+            format!("filler {i}"),
+        ));
+    }
+    open_split_window_with_extent(&mut app, maki_lua::Split::Right, SPLIT_EXTENT);
+    app.help_modal.toggle();
+    let (_cursor, buffer) = draw_to_buffer(&mut app);
+
+    let (msg_area, ..) = app.layout_geometry(TEST_AREA);
+    let chat_rail = msg_area.right() - 1;
+    let thumb = |x: u16, y: u16| buffer[(x, y)].symbol() == SCROLLBAR_THUMB;
+    let zone = (0..buffer.area.height)
+        .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| {
+            thumb(x, y)
+                && app
+                    .zone_at(y, x)
+                    .is_some_and(|z| z.zone == SelectionZone::Overlay)
+        })
+        .map(|(x, y)| app.zone_at(y, x).unwrap())
+        .expect("an overlay zone owns a rail cell");
+    let area = zone.area;
+
+    assert!(
+        (area.x..area.right()).contains(&chat_rail),
+        "chat rail {chat_rail} must cross the modal {:?}",
+        area
+    );
+    let overpainted = (area.y..area.bottom())
+        .find(|&y| {
+            let sym = buffer[(chat_rail, y)].symbol();
+            sym != " " && sym != SCROLLBAR_THUMB
+        })
+        .expect("modal text overpaints the chat rail");
+
+    let sel = ScreenSelection {
+        start_row: area.y,
+        start_col: area.x,
+        end_row: area.bottom() - 1,
+        end_col: area.right() - 1,
+    };
+    let regions = [ContentRegion {
+        area,
+        exclude: scrollbar::live_rails(&buffer, area),
+        ..Default::default()
+    }];
+    let text = selection::extract_selected_text(&buffer, &sel, &regions);
+
+    let expected: String = (area.x..area.right() - 1)
+        .map(|x| buffer[(x, overpainted)].symbol())
+        .collect();
+    let expected = expected.trim_end();
+    assert!(!expected.is_empty());
+    assert!(
+        text.contains(expected),
+        "copy mangled the row over the stale rail: {text:?}"
+    );
+    assert!(
+        !text.contains(SCROLLBAR_THUMB),
+        "copy kept rail cells: {text:?}"
+    );
+}
+
 fn streaming_app_with_history() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -6746,11 +6865,11 @@ const TEST_AREA: Rect = Rect {
 };
 const SPLIT_EXTENT: u16 = 8;
 
-fn open_split_window(app: &mut App, dir: maki_lua::Split) {
+fn open_split_window_with_extent(app: &mut App, dir: maki_lua::Split, extent: u16) {
     let buf = Arc::new(maki_agent::SharedBuf::new());
     let config = maki_lua::FloatConfig {
-        width: maki_lua::Dimension::Abs(SPLIT_EXTENT),
-        height: maki_lua::Dimension::Abs(SPLIT_EXTENT),
+        width: maki_lua::Dimension::Abs(extent),
+        height: maki_lua::Dimension::Abs(extent),
         border: maki_lua::Border::None,
         split: dir,
         ..maki_lua::FloatConfig::default()
@@ -6758,6 +6877,10 @@ fn open_split_window(app: &mut App, dir: maki_lua::Split) {
     let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
     let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
+}
+
+fn open_split_window(app: &mut App, dir: maki_lua::Split) {
+    open_split_window_with_extent(app, dir, SPLIT_EXTENT);
 }
 
 #[test]
