@@ -667,8 +667,8 @@ fn parse_buffer(opts: Option<&Table>) -> LuaResult<Scope> {
 ///
 /// The handler consumes the key, even when it throws (the error is logged).
 /// Call `ev.fallback()` to let maki handle the key after all. A handler that
-/// changes the text of the input needs `input`, see
-/// [chat input](/docs/lua-api/#chat-input).
+/// changes the text of the input needs `input`, `agent` and `session_write`,
+/// see [chat input](/docs/lua-api/#chat-input).
 ///
 /// While a handler runs, the keys, pastes and clicks after it wait, so its
 /// edits and mode switches are in place before the next key lands. Keys
@@ -677,21 +677,18 @@ fn parse_buffer(opts: Option<&Table>) -> LuaResult<Scope> {
 /// meanwhile, like an alert, a permission prompt or a question, the waiting
 /// keys are dropped so they cannot answer it, and the status bar says so.
 ///
-/// `<C-c>` and `<C-z>` never wait. Every other key waits its turn, `<Esc>`
-/// while the agent runs included. A `<C-c>` while keys wait only drops them
-/// and the pending `ev.fallback()`, and the status bar says so. The next
-/// `<C-c>` works as usual. With no keys waiting, `<C-c>` drops the pending
-/// `ev.fallback()` and works as usual.
+/// Every key waits its turn, also `<Esc>` while the agent runs, except
+/// `<C-c>` and `<C-z>`. A `<C-c>` drops the pending `ev.fallback()`. If keys
+/// were waiting, it drops them too and the status bar says so, and only the
+/// next `<C-c>` works as usual. Otherwise it works as usual right away.
 ///
-/// Text that changed since a key was pressed is never sent by that key. If
-/// anything changed the input while a `<CR>` waited, or the keyboard moved
-/// meanwhile, the user never saw what it would send. The same goes for
-/// `ev.fallback()` on `<CR>` once the input changed since the press, your
-/// handler's own edits included. Maki drops that send and asks the user to
-/// press Enter again.
-///
-/// A handler that changes the text of the input needs `input`, see
-/// [chat input](/docs/lua-api/#chat-input).
+/// A key never sends text that changed after it was pressed, because the
+/// user never saw what it would send. If the input changed or the keyboard
+/// moved while a `<CR>` waited, maki drops that send and asks the user to
+/// press Enter again. The same goes for `ev.fallback()` on `<CR>` after any
+/// change since the press, your handler's own edits included. To send what
+/// your handler wrote, use
+/// [`maki.ui.input_submit`](/docs/lua-api/#maki-ui-input_submit).
 ///
 /// Throws on an invalid mode or key, on `<C-c>` and `<C-z>`, which stay
 /// reserved for quit and suspend, on a taken key with `unique`, and with

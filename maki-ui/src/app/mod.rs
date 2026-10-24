@@ -33,7 +33,9 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
-use crate::components::command::{CommandAction, CommandPalette, ParsedCommand, PluginAccess};
+use crate::components::command::{
+    CommandAction, CommandPalette, ParsedCommand, PluginAccess, SUBMITS_PROMPT,
+};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission, sent_text};
@@ -70,9 +72,10 @@ use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks,
-    InputMode, InputRule, InputRulesReader, InputSnapshot, Key, KeymapReader, LuaCommandReader,
-    PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand, PackPreparation, Permission,
-    PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView, is_reserved,
+    InputMode, InputRule, InputRulesReader, InputSnapshot, InputSubmit, Key, KeymapReader,
+    LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
+    PackPreparation, Permission, PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView,
+    is_reserved,
 };
 use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
@@ -165,16 +168,36 @@ pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (ali
 pub(crate) const INPUT_NOT_LIVE_ERR: &str =
     "the chat input is not on screen, so it cannot be edited";
 pub(crate) const STALE_VERSION_ERR: &str = "input changed since version";
+const SUBMIT_NOT_LIVE_ERR: &str =
+    "Enter would not reach the chat input right now, so it cannot be sent";
+const NOTHING_TO_SEND_ERR: &str = "the chat input is empty, so there is nothing to send";
+const NO_COMMAND_MATCHED_ERR: &str =
+    "the command palette is open but matches no command, so nothing was sent";
+pub(crate) const SEND_MESSAGE: &str = "sending a chat message";
 pub(crate) const RUN_SHELL_LINE: &str = "running a shell line";
 const RUNS_SHELL: PluginAccess = PluginAccess::Needs(&[Permission::Run]);
 pub(crate) const WRITTEN_COMMAND: &str = "command";
 pub(crate) const WRITTEN_SHELL_LINE: &str = "shell line";
 pub(crate) const WRITTEN_EXIT: &str = "exit line";
+pub(crate) const WRITTEN_MESSAGE: &str = "message";
 pub(crate) const TYPE_IT_YOURSELF: &str = "retype it yourself in a fresh input";
 /// A writer whose name was lost, like that of a draft read back from disk.
 pub(crate) const UNKNOWN_WRITER: &str = "a plugin";
 
+/// For a typed key `Swallowed` and `Handled` mean the same thing, the key is
+/// used up. A plugin's submit has to tell them apart, because a swallowed
+/// Enter ran nothing and sent nothing.
+enum PaletteKey {
+    Passthrough,
+    Swallowed,
+    Handled(Vec<Action>),
+    /// Enter would run a command a sender may not, and left it in the input.
+    Refused(String),
+}
+
 /// What Enter does with the input once the command palette passed it on.
+/// The send, the check a plugin's send passes first and the check on the
+/// plugins that wrote the text all read it here, so they cannot disagree.
 enum Sending {
     /// Retries the turn a login cut short, whatever the input holds.
     AuthRetry,
@@ -201,34 +224,52 @@ impl Sending {
         Self::Message
     }
 
-    /// What the text is called when the plugins that wrote it are held to
-    /// [`Self::writer_refusal`], `None` when any writer may leave it.
+    /// A plugin needs what the direct way needs: `exit` what `/exit` needs,
+    /// a shell line `run` since it starts a process, and a message what a
+    /// turn needs, even one that waits in the queue first.
+    fn refusal(&self, caller: &PluginReach, palette: &CommandPalette) -> Option<String> {
+        match self {
+            Self::Nothing => None,
+            Self::Exit => palette.resolve_for_plugin(EXIT_COMMAND, caller).err(),
+            Self::Shell(_) => RUNS_SHELL.refusal(RUN_SHELL_LINE, caller),
+            Self::AuthRetry | Self::Message => SUBMITS_PROMPT.refusal(SEND_MESSAGE, caller),
+        }
+    }
+
+    /// What the text is called when each plugin that wrote it has to pass
+    /// [`Self::refusal`] too, `None` when nothing of it goes out. A message
+    /// is held to it as well, because the user cannot be trusted to have
+    /// read it. A plugin can hide text in more ways than we could ever spot,
+    /// like a conceal, a char that draws nothing or a line scrolled away.
+    /// A login retry sends none of the text.
     fn written_as(&self) -> Option<&'static str> {
         match self {
             Self::Exit => Some(WRITTEN_EXIT),
             Self::Shell(_) => Some(WRITTEN_SHELL_LINE),
-            Self::AuthRetry | Self::Nothing | Self::Message => None,
+            Self::Message => Some(WRITTEN_MESSAGE),
+            Self::AuthRetry | Self::Nothing => None,
         }
     }
 
-    /// What each plugin that wrote the text has to hold for this to go out.
-    /// `exit` and a shell line run on the Enter alone, so they need what
-    /// `/exit` and `run` need. A message waits for the model, and the user
-    /// read it before pressing Enter, so `input` was enough to write it. A
-    /// login retry sends none of the text.
-    fn writer_refusal(&self, writer: &PluginReach, palette: &CommandPalette) -> Option<String> {
-        match self {
-            Self::Exit => palette.resolve_for_plugin(EXIT_COMMAND, writer).err(),
-            Self::Shell(_) => RUNS_SHELL.refusal(RUN_SHELL_LINE, writer),
-            Self::AuthRetry | Self::Nothing | Self::Message => None,
-        }
+    /// Whether Enter acts on the text right away rather than handing it to
+    /// the model.
+    fn runs(&self) -> bool {
+        matches!(self, Self::Exit | Self::Shell(_))
     }
 }
 
-/// Why a send may not go out: a key typed blind to what it would send sends
-/// nothing, see [`Sight`].
-fn send_refusal(sight: Sight) -> Option<String> {
-    sight.blind.then(|| INPUT_CHANGED_UNSENT.to_owned())
+/// Why a send may not go out. A key typed blind to what it would send sends
+/// nothing, see [`Sight`]. Otherwise {refusal} is asked of {caller}, the
+/// plugin sending if any.
+fn send_refusal(
+    sight: Sight,
+    caller: Option<&PluginReach>,
+    refusal: impl FnOnce(&PluginReach) -> Option<String>,
+) -> Option<String> {
+    if sight.blind {
+        return Some(INPUT_CHANGED_UNSENT.to_owned());
+    }
+    caller.and_then(refusal)
 }
 
 /// Why Enter may not send {what} the plugins that wrote {buffer} left
@@ -732,10 +773,13 @@ impl App {
     /// one a key handler opened is what the user meant.
     fn prompts(&self) -> Option<Prompts> {
         let overlays = self.overlays().map(|overlay| overlay.is_prompting());
-        let up = [self.pending_input != PendingInput::None, self.plan_form_active()]
-            .into_iter()
-            .chain(overlays)
-            .fold(0, |up, open| up << 1 | u32::from(open));
+        let up = [
+            self.pending_input != PendingInput::None,
+            self.plan_form_active(),
+        ]
+        .into_iter()
+        .chain(overlays)
+        .fold(0, |up, open| up << 1 | u32::from(open));
         (up != 0).then(|| Prompts {
             up,
             opened: self.prompts_opened + self.float_mgr.prompts_opened(),
@@ -899,12 +943,8 @@ impl App {
         if !self.input_live(area) {
             return Err(INPUT_NOT_LIVE_ERR.to_string());
         }
-        let current = self.input_box.buffer.version();
-        if edit.strict && edit.version != current {
-            return Err(format!(
-                "{STALE_VERSION_ERR} {} (it is now {current})",
-                edit.version
-            ));
+        if edit.strict {
+            self.check_input_version(edit.version)?;
         }
         let plugin = edit
             .caller
@@ -941,6 +981,87 @@ impl App {
         for chat in &mut self.chats {
             chat.draft.clear_plugin_marks(plugin);
         }
+    }
+
+    /// Runs the same code as a typed Enter, so a plugin can never send
+    /// something Enter would have handled another way. The `\` continuation
+    /// is the one part left out, because the plugin asked to send.
+    ///
+    /// An edit gets moved past the typing since its version, but a send does
+    /// not. That would send text the plugin never planned against and the user
+    /// may not have read yet. An empty input still goes out while a login
+    /// retry is pending, because Enter sends the retry then.
+    ///
+    /// The plugin gets no further than its own grants would take it: a
+    /// command is held to what `maki.api.run_command` lets it run, and a send
+    /// to [`Sending::refusal`]. The plugins that wrote the text are held to
+    /// what an Enter holds them to, see [`written_refusal`]. A refused send
+    /// leaves the input as it was.
+    pub(crate) fn submit_input(
+        &mut self,
+        req: InputSubmit,
+        area: Rect,
+    ) -> Result<Vec<Action>, String> {
+        self.check_input_session(&req.session_id)?;
+        if !self.input_live(area) || !self.input_focused() {
+            return Err(SUBMIT_NOT_LIVE_ERR.to_string());
+        }
+        self.check_input_version(req.version)?;
+        let sight = Sight::default();
+        let caller = Some(&req.caller);
+        match self.dispatch_command_palette(KeyEvent::from(KeyCode::Enter), sight, caller) {
+            PaletteKey::Handled(actions) => return Ok(actions),
+            PaletteKey::Swallowed => return Err(NO_COMMAND_MATCHED_ERR.to_string()),
+            PaletteKey::Refused(refusal) => return Err(refusal),
+            PaletteKey::Passthrough => {}
+        }
+        let sending = self.input_sending();
+        if matches!(sending, Sending::Nothing) {
+            return Err(NOTHING_TO_SEND_ERR.to_string());
+        }
+        self.send_input(sending, sight, caller)
+    }
+
+    fn input_sending(&self) -> Sending {
+        let input = &self.input_box;
+        self.sending(sent_text(input.buffer.value()), input.has_images())
+    }
+
+    /// Sends the input the way Enter does. {sending} is what
+    /// [`Self::input_sending`] read it as. It goes out only when {caller} may
+    /// send it, see [`send_refusal`], and so may every plugin that wrote it,
+    /// see [`written_refusal`]. A login retry sends none of the text, so it
+    /// leaves the input as it was.
+    fn send_input(
+        &mut self,
+        sending: Sending,
+        sight: Sight,
+        caller: Option<&PluginReach>,
+    ) -> Result<Vec<Action>, String> {
+        if !matches!(sending, Sending::Nothing) {
+            let refusal = |plugin: &PluginReach| sending.refusal(plugin, &self.command_palette);
+            if let Some(refusal) = send_refusal(sight, caller, refusal)
+                .or_else(|| written_refusal(&self.input_box.buffer, sending.written_as()?, refusal))
+            {
+                return Err(refusal);
+            }
+        }
+        let sub = if matches!(sending, Sending::AuthRetry) {
+            Submission::default()
+        } else {
+            self.input_box.submit().unwrap_or_default()
+        };
+        Ok(self.handle_submit(sub))
+    }
+
+    fn check_input_version(&self, version: u64) -> Result<(), String> {
+        let current = self.input_box.buffer.version();
+        if version != current {
+            return Err(format!(
+                "{STALE_VERSION_ERR} {version} (it is now {current})"
+            ));
+        }
+        Ok(())
     }
 
     fn check_input_session(&self, session_id: &str) -> Result<(), String> {
@@ -1417,50 +1538,61 @@ impl App {
         // a plugin holding `<Tab>` or `<CR>` must not take them from the `/`
         // command the user is typing into. Last in the pass, because every
         // modal above is drawn over it.
-        //
-        // Ctrl keys pass it by, as they always did: `Ctrl+C` closes it and the
-        // rest belong to the input box and the built-in bindings.
-        if self.chat_accepts_input() && !is_ctrl(&key) {
-            if key.code == KeyCode::Enter
-                && let Some(refusal) = self.palette_refusal(sight)
-            {
+        match self.dispatch_command_palette(key, sight, None) {
+            PaletteKey::Passthrough => None,
+            PaletteKey::Swallowed => Some(vec![]),
+            PaletteKey::Handled(actions) => Some(actions),
+            PaletteKey::Refused(refusal) => {
                 self.flash(refusal);
-                return Some(vec![]);
-            }
-            match self.command_palette.handle_key(key, &self.input_box.buffer) {
-                CommandAction::Consumed => return Some(vec![]),
-                CommandAction::Execute(cmd) => {
-                    // Commands act on the session, so the main chat comes to
-                    // front. Clear the box first, or the command would stay
-                    // behind as the subagent chat's draft.
-                    self.input_box.discard();
-                    self.set_active_chat(MAIN_CHAT);
-                    return Some(self.execute_command(cmd, 0));
-                }
-                CommandAction::Complete(text) => {
-                    self.input_box.rewrite_input(&text);
-                    self.input_box.buffer.move_to_end();
-                    self.input_changed(InputWriter::Anyone);
-                    return Some(vec![]);
-                }
-                CommandAction::Passthrough => {}
+                Some(vec![])
             }
         }
-
-        None
     }
 
-    /// A blind Enter on a command runs nothing, see [`send_refusal`], and
-    /// neither does one on a command that one of the plugins that wrote the
-    /// text may not run, see [`written_refusal`].
-    fn palette_refusal(&mut self, sight: Sight) -> Option<String> {
-        let name = self.command_palette.enter_target(&self.input_box.buffer)?;
-        let palette = &self.command_palette;
-        send_refusal(sight).or_else(|| {
-            written_refusal(&self.input_box.buffer, WRITTEN_COMMAND, |writer| {
-                palette.resolve_for_plugin(&name, writer).err()
-            })
-        })
+    /// Ctrl keys pass the palette by, as they always did: `Ctrl+C` closes it
+    /// and the rest belong to the input box and the built-in bindings.
+    ///
+    /// The command an Enter would run is checked first, the way
+    /// `maki.api.run_command` checks it, see [`send_refusal`], also for the
+    /// plugins that wrote the text, see [`written_refusal`].
+    fn dispatch_command_palette(
+        &mut self,
+        key: KeyEvent,
+        sight: Sight,
+        caller: Option<&PluginReach>,
+    ) -> PaletteKey {
+        if !self.chat_accepts_input() || is_ctrl(&key) {
+            return PaletteKey::Passthrough;
+        }
+        if key.code == KeyCode::Enter
+            && let Some(name) = self.command_palette.enter_target(&self.input_box.buffer)
+        {
+            let palette = &self.command_palette;
+            let refusal = |plugin: &PluginReach| palette.resolve_for_plugin(&name, plugin).err();
+            if let Some(refusal) = send_refusal(sight, caller, refusal)
+                .or_else(|| written_refusal(&self.input_box.buffer, WRITTEN_COMMAND, refusal))
+            {
+                return PaletteKey::Refused(refusal);
+            }
+        }
+        match self.command_palette.handle_key(key, &self.input_box.buffer) {
+            CommandAction::Consumed => PaletteKey::Swallowed,
+            CommandAction::Execute(cmd) => {
+                // Commands act on the session, so the main chat comes to
+                // front. Clear the box first, or the command would stay
+                // behind as the subagent chat's draft.
+                self.input_box.discard();
+                self.set_active_chat(MAIN_CHAT);
+                PaletteKey::Handled(self.execute_command(cmd, 0))
+            }
+            CommandAction::Complete(text) => {
+                self.input_box.rewrite_input(&text);
+                self.input_box.buffer.move_to_end();
+                self.input_changed(InputWriter::Anyone);
+                PaletteKey::Handled(vec![])
+            }
+            CommandAction::Passthrough => PaletteKey::Passthrough,
+        }
     }
 
     fn plan_toggle_ready(&self) -> bool {
@@ -1937,10 +2069,12 @@ impl App {
             return self.handle_esc(streaming);
         }
         match self.input_box.handle_key(key, mode) {
-            InputAction::Submit => self.send_input(sight).unwrap_or_else(|refusal| {
-                self.flash(refusal);
-                vec![]
-            }),
+            InputAction::Submit => self
+                .send_input(self.input_sending(), sight, None)
+                .unwrap_or_else(|refusal| {
+                    self.flash(refusal);
+                    vec![]
+                }),
             InputAction::Changed => {
                 self.input_changed(InputWriter::Anyone);
                 vec![]
@@ -2020,30 +2154,6 @@ impl App {
 
     pub(crate) fn clear_exit_request(&mut self) {
         self.exit_request = ExitRequest::None;
-    }
-
-    /// Sends the input the way Enter does, see [`send_refusal`], once the
-    /// plugins that wrote the text may too, see [`written_refusal`]. A login
-    /// retry sends none of the text, so it leaves the input as it was.
-    fn send_input(&mut self, sight: Sight) -> Result<Vec<Action>, String> {
-        let input = &self.input_box;
-        let sending = self.sending(sent_text(input.buffer.value()), input.has_images());
-        if !matches!(sending, Sending::Nothing)
-            && let Some(refusal) = send_refusal(sight).or_else(|| {
-                let what = sending.written_as()?;
-                written_refusal(&input.buffer, what, |writer| {
-                    sending.writer_refusal(writer, &self.command_palette)
-                })
-            })
-        {
-            return Err(refusal);
-        }
-        let sub = if matches!(sending, Sending::AuthRetry) {
-            Submission::default()
-        } else {
-            self.input_box.submit().unwrap_or_default()
-        };
-        Ok(self.handle_submit(sub))
     }
 
     fn sending(&self, text: &str, has_images: bool) -> Sending {

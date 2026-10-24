@@ -50,7 +50,7 @@ pub(super) struct Sent {
 /// prompt takes, see [`PROMPT_NEEDS`].
 fn turn_writers(text: &str) -> Option<StoredWriters> {
     let sent = sent_text(text);
-    let runs = sent.starts_with(COMMAND_PREFIX) || Sending::of(sent, false).written_as().is_some();
+    let runs = sent.starts_with(COMMAND_PREFIX) || Sending::of(sent, false).runs();
     runs.then_some(StoredWriters::Agent)
 }
 

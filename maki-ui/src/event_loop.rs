@@ -1029,7 +1029,9 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(self.handle_model_request(req));
             }
             UiAction::Input { req, reply_tx } => {
-                let _ = reply_tx.send(self.handle_input_request(req));
+                let (reply, actions) = self.handle_input_request(req);
+                let _ = reply_tx.send(reply);
+                self.dispatch(self.focused, actions);
             }
             UiAction::Task { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_task_request(req));
@@ -1428,18 +1430,34 @@ impl<'t> EventLoop<'t> {
 
     /// The input a plugin reads and writes is the focused session's.
     ///
-    /// An edit is answered against the terminal as it is now, not as the last
-    /// frame found it: a batch of wakes runs between two paints, so the size
-    /// the box would be drawn at has to be asked for here.
-    fn handle_input_request(&mut self, req: InputRequest) -> UiReply {
-        match req {
+    /// An edit or a submit is answered against the terminal as it is now, not
+    /// as the last frame found it: a batch of wakes runs between two paints,
+    /// so the size the box would be drawn at has to be asked for here.
+    fn handle_input_request(&mut self, req: InputRequest) -> (UiReply, Vec<Action>) {
+        let reply = match req {
             InputRequest::Read => Ok(self.focused_app().input_snapshot()),
             InputRequest::Edit(edit) => {
-                let area = self.terminal.size().map(Rect::from).unwrap_or_default();
+                let area = self.terminal_area();
                 self.focused_app().apply_input_edit(edit, area)
             }
             InputRequest::Decorate(req) => self.focused_app().decorate_input(req),
-        }
+            InputRequest::Submit(req) => {
+                let area = self.terminal_area();
+                let version = req.version;
+                return match self.focused_app().submit_input(req, area) {
+                    Ok(actions) => (Ok(json!(true)), actions),
+                    Err(err) => {
+                        info!(version, error = %err, "input_submit refused");
+                        (Err(err), Vec::new())
+                    }
+                };
+            }
+        };
+        (reply, Vec::new())
+    }
+
+    fn terminal_area(&self) -> Rect {
+        self.terminal.size().map(Rect::from).unwrap_or_default()
     }
 
     /// Lua acts on the focused session, the same target the model picker

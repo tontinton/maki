@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::command::CustomCommand;
 use maki_agent::{McpPromptInfo, McpSnapshotReader};
-use maki_lua::{LuaCommandInfo, LuaCommandReader, Missing, Permission, PluginReach};
+use maki_lua::{LuaCommandInfo, LuaCommandReader, Missing, Permission, PluginReach, SENDS_PROMPT};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
@@ -22,7 +22,7 @@ pub(crate) const USER_ONLY_SUFFIX: &str = " can only be run by you";
 const STARTS_TURNS: PluginAccess = PluginAccess::Needs(&[Permission::Agent]);
 /// A prompt starts a turn and adds to the transcript, like `maki.session.prompt`.
 pub const SUBMITS_PROMPT: PluginAccess = PluginAccess::Needs(PROMPT_NEEDS);
-pub(crate) const PROMPT_NEEDS: &[Permission] = &[Permission::Agent, Permission::SessionWrite];
+pub(crate) const PROMPT_NEEDS: &[Permission] = SENDS_PROMPT;
 const WRITES_SESSION: PluginAccess = PluginAccess::Needs(&[Permission::SessionWrite]);
 const CHANGES_SETTINGS: PluginAccess = PluginAccess::Needs(&[Permission::SessionSettings]);
 
@@ -416,6 +416,15 @@ impl CommandPalette {
 
     fn is_open(&self) -> bool {
         !self.filtered.is_empty()
+    }
+
+    /// `sync` always leaves a row picked, so a test that wants an Enter the
+    /// palette swallows has to catch up with {input} and take the pick away
+    /// by hand.
+    #[cfg(test)]
+    pub(crate) fn unselect(&mut self, input: &TextBuffer) {
+        self.follow(input);
+        self.selected = self.filtered.len();
     }
 
     /// The box keeps one buffer for life and its version only climbs, so a

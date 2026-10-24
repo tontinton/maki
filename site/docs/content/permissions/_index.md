@@ -234,7 +234,7 @@ Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to th
 It runs after [folder trust](/docs/folder-trust/) has let the Lua file load, and
 limits which APIs the file reaches rather than sandboxing the file.
 
-A plugin that changes the chat input needs `input`. `maki.ui.input_edit` needs `session_read` as well. Enter refuses a `/` command or a `!` line when a plugin that changed the text may not run it itself, see [chat input](/docs/lua-api/#chat-input).
+A plugin that changes the chat input needs `input`, and changing its text also needs `agent` and `session_write`, since Enter sends it. `maki.ui.input_edit` needs `session_read` as well. Enter refuses a `/` command or a `!` line when a plugin that wrote it may not run it itself, see [chat input](/docs/lua-api/#chat-input).
 
 ### Session permissions
 

@@ -30,10 +30,10 @@ pub use api::ui::marks::{
 pub use api::ui::syntax::{SyntaxDoc, SyntaxEdit, SyntaxIndex, SyntaxInput, SyntaxRule};
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
-    HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks, InputRequest, LuaCommandInfo,
-    LuaCommandReader, ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow, PlanMenu,
-    PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest, TextEdit, TitlePos, UiAction,
-    UiAttachment, UiReply, WinCommand, WinEvent, WinView,
+    HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit,
+    LuaCommandInfo, LuaCommandReader, ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow,
+    PlanMenu, PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest, TextEdit, TitlePos,
+    UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
@@ -49,7 +49,9 @@ pub use pack::{
     UpdateTarget, apply_pack_plan, approvals_path, discover, discover_installed, install_declared,
     installed_names, lockfile_path, prepare_pack_command, sanitize_message, site_dir,
 };
-pub use plugin_permissions::{Missing, Permission, PluginPermissions, PluginReach, Requested};
+pub use plugin_permissions::{
+    Missing, Permission, PluginPermissions, PluginReach, Requested, SENDS_PROMPT,
+};
 pub use runtime::{
     KILL_GRACE, MAX_INFLIGHT_TOOLS, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
     RestoreItem, RestoreReason, SLICE_WARN, WARM_TOOL_CAP,

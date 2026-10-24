@@ -1,5 +1,7 @@
 [permissions]
 fs_read = true
 session_read = true
-# Accepting a row writes it into the chat input.
+# Accepting a row writes it into the chat input, and Enter sends it.
 input = true
+agent = true
+session_write = true

@@ -3071,7 +3071,7 @@ mod bundled_manifests {
     use crate::agent_autocmd::HostEventKind;
     use crate::api::util::command::BuiltinAction;
     use crate::docs::{DocKind, api_docs};
-    use crate::plugin_permissions::Permission;
+    use crate::plugin_permissions::{Permission, SENDS_PROMPT};
 
     const TEST_DIR: &str = "tests";
     const LUA_EXT: &str = "lua";
@@ -3082,6 +3082,7 @@ mod bundled_manifests {
     const SESSION_NOTIFY: &str = "maki.session.notify";
     const WAKE_OPTION: &str = "wake =";
     const UI_ACTION_CALL: &str = "maki.ui.action(";
+    const INPUT_EDIT_CALL: &str = "maki.ui.input_edit";
     const DISABLED_WAKE: &str = "false";
     const CREATE_AUTOCMD: &str = "maki.api.create_autocmd";
     const LUA_QUOTES: [char; 2] = ['"', '\''];
@@ -3304,12 +3305,21 @@ mod bundled_manifests {
                         }
                     }
                 }
-                // A built-in action is guarded by its name, which the API
-                // metadata cannot see.
-                if runs_an_input_action(source) {
+                // A built-in action is guarded by its name, and an edit by
+                // whether it changes the text, which the API metadata cannot
+                // see.
+                let edits_by_action = runs_an_input_action(source);
+                if edits_by_action {
                     needed
                         .entry(Permission::Input)
                         .or_insert_with(|| "a built-in action that edits".to_owned());
+                }
+                if edits_by_action || calls(source, INPUT_EDIT_CALL) {
+                    for &permission in SENDS_PROMPT {
+                        needed
+                            .entry(permission)
+                            .or_insert_with(|| "changing the text of the input".to_owned());
+                    }
                 }
                 // A bundled plugin opening a session hands over whatever the
                 // chat has, and a session pays for everything it hands over.

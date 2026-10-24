@@ -22,10 +22,11 @@ Sources.declare()
 
 -- Accepting writes a ranked file path into the input, where any plugin can
 -- read it, so a caller has to be allowed to list files itself. The edit also
--- costs `session_read`, like reading the input. The callback holds only this
--- list.
+-- costs `session_read`, like reading the input. Enter sends the path only
+-- when its writer could send a message, so that takes `agent` and
+-- `session_write`. The callback holds only this list.
 maki.api.register_action("accept", Menu.accept_if_open, {
-  capability = { "fs_read", "input", "session_read" },
+  capability = { "fs_read", "input", "session_read", "agent", "session_write" },
 })
 
 maki.api.create_autocmd("InputChanged", {

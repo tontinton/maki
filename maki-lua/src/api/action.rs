@@ -204,8 +204,9 @@ fn unknown_action(lua: &Lua, name: &str) -> String {
 /// slot layers and actions it registers. Keymaps and autocmds it sets run
 /// later with all your grants. Code of other plugins that runs meanwhile,
 /// like their autocmds, keeps its own grants. For example,
-/// `completion.accept` writes file paths into the input, so it lists
-/// `fs_read`, `input` and `session_read`.
+/// `completion.accept` writes file paths into the input that Enter then
+/// sends, so it lists `fs_read`, `input`, `session_read`, `agent` and
+/// `session_write`.
 ///
 /// Also bind a default key for users who do not
 /// [compose keys](/docs/keybindings/#composing-keys), preferably an Alt chord,
@@ -225,7 +226,7 @@ fn unknown_action(lua: &Lua, name: &str) -> String {
 ///   if not Menu.open() then return false end
 ///   Menu.accept()
 ///   return true
-/// end, { capability = { "fs_read", "input", "session_read" } })
+/// end, { capability = { "fs_read", "input", "session_read", "agent", "session_write" } })
 #[lua_fn]
 fn register_action(
     lua: &Lua,

@@ -6,7 +6,7 @@ use crate::agent::shared_queue;
 use crate::app::tasks::TaskStatus;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX};
 use crate::components::btw_modal::BtwEvent;
-use crate::components::command::{ParsedCommand, USER_ONLY_SUFFIX};
+use crate::components::command::{PROMPT_NEEDS, ParsedCommand, USER_ONLY_SUFFIX};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::messages::ScrollPos;
@@ -40,7 +40,7 @@ use maki_lua::test_support::{
     probed_event_handle, set_mode,
 };
 use maki_lua::{
-    BuiltinAction, Dimension, FloatConfig, HintReader, InputRequest, InputRulesReader,
+    BuiltinAction, Dimension, FloatConfig, HintReader, InputRequest, InputRulesReader, InputSubmit,
     KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader, Missing, PASTE, PackCommand,
     PackPlan, PackPreparation, PackReport, Permission, PluginHost, PluginPermissions,
     SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
@@ -6969,6 +6969,16 @@ fn serve_handler(app: &mut App, ui: &flume::Receiver<UiAction>) -> (Vec<String>,
                 asked.push(ASKED_EDIT.into());
                 let _ = reply_tx.send(app.apply_input_edit(edit, TEST_AREA));
             }
+            UiAction::Input {
+                req: InputRequest::Submit(req),
+                reply_tx,
+            } => {
+                let reply = app.submit_input(req, TEST_AREA).map(|sent| {
+                    actions.extend(sent);
+                    serde_json::json!(true)
+                });
+                let _ = reply_tx.send(reply);
+            }
             UiAction::KeybindFallback(ticket) => {
                 asked.push(ASKED_FALLBACK.into());
                 actions.extend(app.keybind_fallback(ticket));
@@ -7048,7 +7058,7 @@ fn granted_host(source: &str, grants: &[&str]) -> PluginHost {
 /// grant. Text that changed since the press is never sent by a fallback,
 /// and no grant of the handler changes that, since the Enter is the user's.
 #[test_case(PASSING_ENTER_PLUGIN, &[],                 "hi",  true  ; "passed_on_needs_nothing")]
-#[test_case(EDITING_ENTER_PLUGIN, &["input", "agent", "session_read"], "hi!", false ; "edited_sends_nothing")]
+#[test_case(EDITING_ENTER_PLUGIN, &["input", "agent", "session_read", "session_write"], "hi!", false ; "edited_sends_nothing")]
 fn a_fallback_enter_sends(source: &str, grants: &[&str], text: &str, sends: bool) {
     let host = granted_host(source, grants);
     let (mut app, ui) = hosted_app(&host);
@@ -7081,7 +7091,7 @@ end)
 /// The Enter typed while the `x` handler ran waited for it. Once the handler
 /// changed the input, the user never saw what the Enter would send, so it
 /// sends nothing, whatever the plugin may do.
-#[test_case(&rewriting_plugin("hello"), &["input", "agent", "session_read"], "hello", Some(INPUT_CHANGED_UNSENT) ; "a_message")]
+#[test_case(&rewriting_plugin("hello"), &["input", "agent", "session_read", "session_write"], "hello", Some(INPUT_CHANGED_UNSENT) ; "a_message")]
 #[test_case(MOVING_X_PLUGIN, &["input", "agent", "session_read"], "hi", Some(INPUT_CHANGED_UNSENT) ; "a_moved_cursor")]
 #[test_case(IDLE_X_PLUGIN, &["session_read"], "", None ; "an_untouched_input_needs_nothing_more")]
 fn an_enter_held_while_a_handler_changed_the_input_sends_nothing(
@@ -7100,6 +7110,121 @@ fn an_enter_held_while_a_handler_changed_the_input_sends_nothing(
     assert_eq!(app.input_box.buffer.value(), left);
     assert_eq!(app.status_bar.flash_text(), flash);
     assert!(!app.permissions.is_yolo());
+}
+
+/// The first send uses the version it read, which its own edit just made
+/// stale, and flashes the refusal so the test can see it.
+const SUBMIT_PLUGIN: &str = r#"
+maki.keymap.set("i", "<CR>", function(ev)
+    local st = ev.input
+    local edited = maki.ui.input_edit({
+        start = #st.text, stop = #st.text, text = "!",
+        version = st.version, session_id = st.session_id,
+    })
+    local ok, err = maki.ui.input_submit({ version = st.version, session_id = st.session_id })
+    if not ok then maki.ui.flash(err) end
+    maki.ui.input_submit({ version = edited.version, session_id = st.session_id })
+end)
+"#;
+
+/// The first message starts the agent, so the second one has to wait in the
+/// queue.
+#[test]
+fn a_handler_edits_then_submits_like_a_typed_enter() {
+    let (_host, mut app, ui) = plugin_app("shout", SUBMIT_PLUGIN);
+
+    type_keys(&mut app, "hi");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let (asked, actions) = serve_handler(&mut app, &ui);
+    let [edit, refusal] = &asked[..] else {
+        panic!("{asked:?}");
+    };
+    assert_eq!(edit, ASKED_EDIT);
+    assert!(refusal.starts_with(STALE_VERSION_ERR), "{refusal}");
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == "hi!"));
+    assert_eq!(app.input_box.buffer.value(), "");
+
+    type_keys(&mut app, "more");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let (_, actions) = serve_handler(&mut app, &ui);
+    assert!(!actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
+    assert_eq!(app.queue.text_messages(), ["more!"]);
+
+    app.input_box.history_up();
+    assert_eq!(app.input_box.buffer.value(), "more!");
+    app.input_box.history_up();
+    assert_eq!(app.input_box.buffer.value(), "hi!");
+}
+
+fn current_submit(app: &App, caller: PluginReach) -> InputSubmit {
+    let st = app.input_snapshot();
+    InputSubmit {
+        version: st["version"].as_u64().unwrap(),
+        session_id: st["session_id"].as_str().unwrap().into(),
+        caller,
+    }
+}
+
+/// The agent is busy, so a message that got out would sit in the queue next
+/// to the one already there. A user-only command is left to the user.
+#[test_case(|_| {}, "/yolo", &format!("/yolo{USER_ONLY_SUFFIX}") ; "a_user_only_command")]
+#[test_case(|app| app.help_modal.toggle(), "hello", SUBMIT_NOT_LIVE_ERR ; "a_modal_is_open")]
+#[test_case(|app| app.queue.set_focus_at(0), "hello", SUBMIT_NOT_LIVE_ERR ; "the_queue_has_the_keyboard")]
+#[test_case(|_| {}, "  ", NOTHING_TO_SEND_ERR ; "blank")]
+#[test_case(|app| app.command_palette.unselect(&app.input_box.buffer), "/help", NO_COMMAND_MATCHED_ERR ; "the_palette_swallows_enter")]
+fn a_submit_is_refused_where_enter_would_not_send(setup: fn(&mut App), text: &str, err: &str) {
+    let mut app = app_with_queued_message();
+    type_keys(&mut app, text);
+    setup(&mut app);
+
+    let req = current_submit(&app, trusted());
+    assert_eq!(app.submit_input(req, TEST_AREA).err().as_deref(), Some(err));
+    assert_eq!(app.input_box.buffer.value(), text);
+    assert_eq!(app.queue.len(), 1);
+    assert!(!app.permissions.is_yolo());
+}
+
+#[test]
+fn a_submitted_slash_command_runs_like_enter() {
+    let mut app = test_app();
+    type_keys(&mut app, "/help");
+
+    let req = current_submit(&app, trusted());
+    app.submit_input(req, TEST_AREA).unwrap();
+    assert!(app.help_modal.is_open());
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+/// A plugin's submit needs what doing the same thing directly needs. Holding
+/// only those grants is enough, and lacking any one of them is not.
+#[test_case(test_app, "hello", SEND_MESSAGE, PROMPT_NEEDS ; "a_message")]
+#[test_case(app_with_queued_message, "hello", SEND_MESSAGE, PROMPT_NEEDS ; "a_message_for_the_queue")]
+#[test_case(test_app, "!ls", RUN_SHELL_LINE, &[Permission::Run] ; "a_shell_line")]
+#[test_case(test_app, "!! ls", RUN_SHELL_LINE, &[Permission::Run] ; "a_hidden_shell_line")]
+#[test_case(test_app, "/btw hi", "/btw", &[Permission::Agent] ; "a_command_that_starts_a_turn")]
+fn a_submit_needs_the_grant_of_what_enter_would_do(
+    app: fn() -> App,
+    text: &str,
+    what: &str,
+    needed: &[Permission],
+) {
+    let mut app = app();
+    type_keys(&mut app, text);
+    let queued = app.queue.len();
+
+    for &permission in needed {
+        let refused = app.submit_input(current_submit(&app, without(permission)), TEST_AREA);
+        assert_eq!(
+            refused.err(),
+            Some(Missing::Permission(permission).refusal(what))
+        );
+        assert_eq!(app.input_box.buffer.value(), text);
+        assert_eq!(app.queue.len(), queued);
+    }
+
+    app.submit_input(current_submit(&app, only_these(needed)), TEST_AREA)
+        .unwrap();
+    assert_eq!(app.input_box.buffer.value(), "");
 }
 
 const PLAIN_LINE: &str = "say hi";
@@ -7142,6 +7267,19 @@ fn run_refused() -> String {
     Missing::Permission(Permission::Run).refusal(RUN_SHELL_LINE)
 }
 
+/// A plugin whose text Enter may send as a message.
+fn sender() -> PluginReach {
+    holding(&[
+        Permission::Input,
+        Permission::Agent,
+        Permission::SessionWrite,
+    ])
+}
+
+fn message_refused() -> String {
+    Missing::Permission(Permission::Agent).refusal(SEND_MESSAGE)
+}
+
 /// Writes {text} over the whole input as {writer} would with `input_edit`.
 fn write_as(app: &mut App, text: &str, writer: PluginReach) {
     let len = app.input_box.buffer.value().len();
@@ -7162,9 +7300,9 @@ fn press_enter(app: &mut App) -> Result<(), String> {
     Ok(())
 }
 
-/// With `input` a plugin may write any text. Enter runs a command or a
-/// shell line it wrote only when the plugin could run that itself. `exit`
-/// needs what `/exit` needs, and a plain message needs only `input`. Enter
+/// With `input` a plugin may write any text. Enter runs or sends what it
+/// wrote only when the plugin could do that itself. `exit` needs what
+/// `/exit` needs, and a plain message what a prompt needs. Enter
 /// reads the text trimmed like the palette does, so a space around a
 /// command leaves it a command.
 #[test_case(YOLO,       only(Permission::Input)                         => Err(written(WRITER, WRITTEN_COMMAND, &user_only(YOLO))) ; "a_user_only_command")]
@@ -7174,7 +7312,8 @@ fn press_enter(app: &mut App) -> Result<(), String> {
 #[test_case("/usage",   only(Permission::Input)                         => Ok(()) ; "an_open_command")]
 #[test_case(SHELL_LINE, only(Permission::Input)                         => Err(written(WRITER, WRITTEN_SHELL_LINE, &run_refused())) ; "a_shell_line_without_run")]
 #[test_case(SHELL_LINE, holding(&[Permission::Input, Permission::Run]) => Ok(()) ; "a_shell_line_with_run")]
-#[test_case(PLAIN_LINE, only(Permission::Input)                         => Ok(()) ; "a_plain_message")]
+#[test_case(PLAIN_LINE, only(Permission::Input)                         => Err(written(WRITER, WRITTEN_MESSAGE, &message_refused())) ; "a_plain_message_without_agent")]
+#[test_case(PLAIN_LINE, sender()                                        => Ok(()) ; "a_plain_message_with_agent")]
 #[test_case(EXIT_WORD,  only(Permission::Input)                         => Ok(()) ; "exit")]
 fn enter_on_text_a_plugin_wrote(text: &str, writer: PluginReach) -> Result<(), String> {
     let mut app = test_app();
@@ -7220,8 +7359,10 @@ fn complete_command(app: &mut App) {
 
 /// Nothing the user does to a line a plugin wrote makes it theirs: typing
 /// after it, undo and redo, or another plugin that holds `run` editing it.
-/// A conceal over the line changes nothing.
+/// A conceal over the line changes nothing, and hides nothing the user
+/// sends.
 #[test_case(HIDDEN_SHELL_LINE, type_after,       WRITTEN_SHELL_LINE ; "typing_after_a_concealed_line")]
+#[test_case(PLAIN_LINE,        type_after,       WRITTEN_MESSAGE    ; "typing_after_a_concealed_message")]
 #[test_case(SHELL_LINE,        undo_and_redo,    WRITTEN_SHELL_LINE ; "undo_and_redo")]
 #[test_case(SHELL_LINE,        clear_and_undo,   WRITTEN_SHELL_LINE ; "an_undo_past_a_clear")]
 #[test_case(SHELL_LINE,        edit_with_run,    WRITTEN_SHELL_LINE ; "a_second_plugin_with_run")]
@@ -7248,10 +7389,10 @@ fn a_line_a_plugin_wrote_stays_its(text: &str, then: fn(&mut App), what: &str) {
     then(&mut app);
 
     let refusal = press_enter(&mut app).unwrap_err();
-    let reason = if what == WRITTEN_SHELL_LINE {
-        run_refused()
-    } else {
-        user_only(YOLO)
+    let reason = match what {
+        WRITTEN_SHELL_LINE => run_refused(),
+        WRITTEN_MESSAGE => message_refused(),
+        _ => user_only(YOLO),
     };
     assert_eq!(refusal, written(WRITER, what, &reason));
 }
@@ -7312,7 +7453,7 @@ fn a_login_retry_leaves_the_input_alone() {
 fn enter_after_esc_keeps_in_history(text: &str, by_plugin: bool) -> bool {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
     if by_plugin {
-        write_as(&mut app, text, named(only(Permission::Input)));
+        write_as(&mut app, text, named(sender()));
     } else {
         type_keys(&mut app, text);
     }
@@ -7374,6 +7515,21 @@ fn a_plugin_that_wrote_twice_is_named_once() {
         press_enter(&mut app).err(),
         Some(written(WRITER, WRITTEN_COMMAND, &reason))
     );
+}
+
+/// A plugin that sends the text answers for itself and for the plugin that
+/// wrote it.
+#[test]
+fn a_submit_needs_the_grants_of_the_writer_too() {
+    let mut app = test_app();
+    write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
+
+    let refused = app.submit_input(current_submit(&app, trusted()), TEST_AREA);
+    assert_eq!(
+        refused.err(),
+        Some(written(WRITER, WRITTEN_SHELL_LINE, &run_refused()))
+    );
+    assert_eq!(app.input_box.buffer.value(), SHELL_LINE);
 }
 
 /// What a line may do is weighed at Enter, so a vim mode moves, selects
@@ -7487,6 +7643,8 @@ fn a_draft_a_plugin_wrote_goes_to_disk(writer: PluginReach) -> Option<StoredWrit
 #[test_case(StoredWriters::Agent,   YOLO         => Err(written(UNKNOWN_WRITER, WRITTEN_COMMAND, &user_only(YOLO)))                ; "a_turn_writer_leaves_user_only_commands")]
 #[test_case(StoredWriters::Unknown, COMPACT_LINE => Err(written(UNKNOWN_WRITER, WRITTEN_COMMAND, &Missing::Permission(Permission::Agent).refusal(COMPACT))) ; "an_unknown_writer_holds_nothing")]
 #[test_case(StoredWriters::Unknown, SHELL_LINE   => Err(written(UNKNOWN_WRITER, WRITTEN_SHELL_LINE, &run_refused()))              ; "an_unknown_writer_runs_no_shell_line")]
+#[test_case(StoredWriters::Unknown, PLAIN_LINE   => Err(written(UNKNOWN_WRITER, WRITTEN_MESSAGE, &message_refused()))             ; "an_unknown_writer_sends_no_message")]
+#[test_case(StoredWriters::Agent,   PLAIN_LINE   => Ok(())                                                                          ; "a_turn_writer_sends_a_message")]
 fn enter_on_a_restored_draft(writers: StoredWriters, text: &str) -> Result<(), String> {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
     let meta = &mut app.state.session_mut().meta;
@@ -7752,6 +7910,56 @@ fn a_burst_through_slow_handlers_lands_in_order(body: &str, bound_lands_as: &str
     assert_eq!(app.input_box.buffer.value(), format!("{expected}z"));
 }
 
+const EDITED_FLASH: &str = "edited";
+const SUBMIT_EDITED: &str =
+    "maki.ui.input_submit({ version = edited.version, session_id = st.session_id })";
+
+/// Whatever the handler did before its fallback lands first, and the keys
+/// typed behind it come after both, so none of them is sent. The fallback
+/// never sends what the handler wrote, the submit does.
+#[test_case("", &[], "hi!next" ; "the_fallback_sends_nothing")]
+#[test_case(SUBMIT_EDITED, &["hi!"], "next" ; "the_submit_sends_and_the_fallback_finds_nothing")]
+fn a_handler_edits_and_falls_back_before_the_keys_behind_it(
+    submit: &str,
+    sent: &[&str],
+    left: &str,
+) {
+    const TYPED_BEHIND: &str = "next";
+    let (_host, mut app, ui) = plugin_app(
+        "shout",
+        &format!(
+            r#"
+            maki.keymap.set("i", "<CR>", function(ev)
+                local st = ev.input
+                local edited = maki.ui.input_edit({{
+                    start = #st.text, stop = #st.text, text = "!",
+                    version = st.version, session_id = st.session_id,
+                }})
+                maki.ui.flash("{EDITED_FLASH}")
+                {submit}
+                ev.fallback()
+            end)
+            "#
+        ),
+    );
+    type_keys(&mut app, "hi");
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    type_keys(&mut app, TYPED_BEHIND);
+    let (asked, actions) = serve_handler(&mut app, &ui);
+
+    assert_eq!(asked, [ASKED_EDIT, EDITED_FLASH, ASKED_FALLBACK]);
+    let sends: Vec<_> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::SendMessage(s) => Some(s.message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sends, sent);
+    assert_eq!(app.input_box.buffer.value(), left);
+}
+
 /// The handler moves the keyboard from tab to tab before it is done. The
 /// keys typed in between were all aimed at wherever it ended up, so they
 /// land there once, and every tab it passed through is left with nothing.
@@ -7874,7 +8082,7 @@ maki.api.register_action("bang", function()
         version = st.version, session_id = st.session_id,
     })
     return err == nil
-end, { capability = { "input", "session_read" } })
+end, { capability = { "input", "session_read", "agent", "session_write" } })
 "#;
 const BANG_CALLER: &str = r#"
 maki.keymap.set("i", "<C-x>", function()
@@ -7951,10 +8159,12 @@ fn serve_until_popup(ui: &flume::Receiver<UiAction>) -> flume::Receiver<WinComma
     }
 }
 
-/// `completion.accept` asks its callers for all it uses. A caller short of
-/// that is refused, even one that may read files, and the key falls back.
-#[test_case(&["fs_read", "input", "session_read"], None                    ; "the_full_price")]
-#[test_case(&["fs_read", "session_read"], Some(Permission::Input) ; "without_input")]
+/// `completion.accept` asks its callers for all it uses, sending what it
+/// wrote included. A caller short of that is refused, even one that may
+/// read files, and the key falls back.
+#[test_case(&["fs_read", "input", "session_read", "agent", "session_write"], None ; "the_full_price")]
+#[test_case(&["fs_read", "session_read", "agent", "session_write"], Some(Permission::Input) ; "without_input")]
+#[test_case(&["fs_read", "input", "session_read", "session_write"], Some(Permission::Agent) ; "without_agent")]
 fn tab_composed_in_init_lua_accepts_a_completion_or_falls_back(
     grants: &[&str],
     missing: Option<Permission>,
@@ -7988,6 +8198,7 @@ fn tab_composed_in_init_lua_accepts_a_completion_or_falls_back(
             assert_eq!(app.input_box.buffer.value(), "$review ");
             app.update(Msg::Key(key(KeyCode::Tab)));
             assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_FALLBACK]);
+            press_enter(&mut app).unwrap();
         }
         Some(perm) => {
             let refusal = Missing::Permission(perm).refusal("completion.accept");

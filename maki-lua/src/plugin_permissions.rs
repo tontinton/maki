@@ -23,6 +23,9 @@ pub(crate) const OUTSIDE_CEILING: &str =
 const PROVIDER_ORIGIN_SHORTFALL: &str =
     "reaches a provider address only its own plugin, or one granted 'run', may use";
 const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// What sending a chat message takes. Enter sends the text in the chat input,
+/// so writing that text takes it too.
+pub const SENDS_PROMPT: &[Permission] = &[Permission::Agent, Permission::SessionWrite];
 
 /// The hosts a plugin declared it talks to, or `None` when it declared no
 /// list at all.

@@ -24,6 +24,12 @@ pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 pub(crate) const PLUGIN_LOADING_ERR: &str =
     "not available while a plugin loads: call it from a callback";
 
+/// Text in the chat input is what the user's Enter sends.
+const EDITS_TEXT: &[Permission] = &[
+    Permission::Input,
+    Permission::Agent,
+    Permission::SessionWrite,
+];
 const ROW_REFINE: &str = "refine";
 const ROW_CLEAR_AND_IMPLEMENT: &str = "clear_and_implement";
 const ROW_IMPLEMENT: &str = "implement";
@@ -596,6 +602,12 @@ pub struct TextEdit {
     pub text: String,
 }
 
+impl TextEdit {
+    pub fn changes_text(&self) -> bool {
+        self.start != self.stop || !self.text.is_empty()
+    }
+}
+
 pub struct InputEdit {
     /// All planned against the value at {version}, and applied together as
     /// one change.
@@ -641,10 +653,21 @@ pub struct InputDecorate {
     pub marks: InputMarks,
 }
 
+/// Sends the input of {session_id} the way Enter does, only while it still
+/// holds {version}.
+pub struct InputSubmit {
+    pub version: u64,
+    pub session_id: String,
+    /// What the send may reach, checked on the UI side, which alone knows
+    /// what Enter would do with the text.
+    pub caller: PluginReach,
+}
+
 pub enum InputRequest {
     Read,
     Edit(InputEdit),
     Decorate(InputDecorate),
+    Submit(InputSubmit),
 }
 
 pub type UiReply = Result<serde_json::Value, String>;
@@ -698,7 +721,7 @@ impl BuiltinAction {
     /// focus like `maki.task.focus`, so they are open. The plan form only
     /// shows, and the user decides there. Popping the queue throws away a
     /// prompt the user wrote, with nobody asked. An edit of the chat input
-    /// needs `input`, like `maki.ui.input_edit`.
+    /// needs what `maki.ui.input_edit` needs to change the text.
     pub fn needs(self) -> &'static [Permission] {
         match self {
             Self::FilePicker
@@ -713,7 +736,7 @@ impl BuiltinAction {
             | Self::InputRaw => &[],
             Self::PopQueue => &[Permission::SessionWrite],
             Self::Undo | Self::Redo | Self::HistoryPrev | Self::HistoryNext | Self::Newline => {
-                &[Permission::Input]
+                EDITS_TEXT
             }
         }
     }

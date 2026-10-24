@@ -117,7 +117,7 @@ Aliasing adds a name, so both stay in the palette. Any command works as a target
 
 ### What a plugin may run {#plugin-access}
 
-`run_command` only runs what the calling plugin's grants cover. Your `init.lua` counts as a plugin, and its grants come from `~/.config/maki/plugin.toml` (see [plugin permissions](/docs/lua-api/#plugin-permissions)). Commands not listed here run for any plugin.
+`run_command` only runs what the calling plugin's grants cover. Your `init.lua` counts as a plugin, and its grants come from `~/.config/maki/plugin.toml` (see [plugin permissions](/docs/lua-api/#plugin-permissions)). Commands not listed here run for any plugin. A command sent with [`maki.ui.input_submit`](/docs/lua-api/#maki-ui-input_submit) follows the same rules.
 
 - Needs `fs_read`, `fs_write`: `/memory`.
 - Needs `fs_read`, `fs_write`, `net`, `run`, `env`, `agent`, `session_read`, `session_write`, `session_settings`: `/tasks`.
