@@ -1829,11 +1829,13 @@ fn expand_home(pattern: &str) -> String {
     }
 }
 
-/// OpenTelemetry export settings. Every field also has an `OTEL_*` (or
-/// `MAKI_*`) environment variable, which wins over what is set here.
+/// OpenTelemetry export settings. `enabled`, the exporters and the content
+/// flags are maki's own, and their environment variables win. Every other key
+/// is a call on the OpenTelemetry SDK's builders and wins over the `OTEL_*`
+/// variable the SDK reads.
 ///
-/// Fields stay optional: `maki-otel` owns the defaults, resolution and
-/// validation, so the meaning of "unset" is decided in one place.
+/// Fields stay optional: `maki-otel` owns the defaults, so the meaning of
+/// "unset" is decided in one place.
 #[derive(Deserialize, Debug, Clone, ConfigSection)]
 #[serde(default, deny_unknown_fields)]
 #[config(section = "telemetry")]
@@ -1853,29 +1855,29 @@ pub struct TelemetryConfig {
              desc = "Where events go: `otlp`, `console`, `none`, or a comma-separated mix")]
     pub logs_exporter: Option<String>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string", default_doc = "http/json",
              env = "OTEL_EXPORTER_OTLP_PROTOCOL",
-             desc = "OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp`")]
+             desc = "OTLP protocol: `grpc`, `http/protobuf`, or `http/json`")]
     pub protocol: Option<String>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string", default_doc = "http://localhost:4318",
              env = "OTEL_EXPORTER_OTLP_ENDPOINT",
-             desc = "Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`")]
+             desc = "Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`. The gRPC default is `http://localhost:4317`")]
     pub endpoint: Option<String>,
 
     #[config(default = None, ty = "table", default_doc = "{}",
              env = "OTEL_EXPORTER_OTLP_HEADERS",
-             desc = "Extra headers sent with every export")]
+             desc = "Extra headers sent with every export. Headers from the environment are added on top")]
     pub headers: Option<BTreeMap<String, String>>,
 
     #[config(default = None, ty = "integer", default_doc = "10000",
              env = "OTEL_EXPORTER_OTLP_TIMEOUT",
-             desc = "Per-export request timeout (ms)")]
+             desc = "Deadline for one export, retries included (ms)")]
     pub timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "string", default_doc = "none",
              env = "OTEL_EXPORTER_OTLP_COMPRESSION",
-             desc = "Payload compression: `gzip` or `none`")]
+             desc = "Payload compression: `gzip`, or `none` to leave it to the environment")]
     pub compression: Option<String>,
 
     #[config(default = None, ty = "string", default_doc = "-",
@@ -1890,12 +1892,12 @@ pub struct TelemetryConfig {
 
     #[config(default = None, ty = "table", default_doc = "{}",
              env = "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
-             desc = "Metrics-only headers, merged over `headers`")]
+             desc = "Metrics-only headers, replacing `headers`")]
     pub metrics_headers: Option<BTreeMap<String, String>>,
 
     #[config(default = None, ty = "integer", default_doc = "-",
              env = "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
-             desc = "Metrics-only request timeout (ms)")]
+             desc = "Metrics-only export deadline (ms)")]
     pub metrics_timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "string", default_doc = "-",
@@ -1910,12 +1912,12 @@ pub struct TelemetryConfig {
 
     #[config(default = None, ty = "table", default_doc = "{}",
              env = "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
-             desc = "Logs-only headers, merged over `headers`")]
+             desc = "Logs-only headers, replacing `headers`")]
     pub logs_headers: Option<BTreeMap<String, String>>,
 
     #[config(default = None, ty = "integer", default_doc = "-",
              env = "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
-             desc = "Logs-only request timeout (ms)")]
+             desc = "Logs-only export deadline (ms)")]
     pub logs_timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "integer", default_doc = "60000",
@@ -1923,19 +1925,14 @@ pub struct TelemetryConfig {
              desc = "How often metrics are exported (ms)")]
     pub metrics_interval_ms: Option<u64>,
 
-    #[config(default = None, ty = "integer", default_doc = "30000",
-             env = "OTEL_METRIC_EXPORT_TIMEOUT",
-             desc = "Deadline for one metrics export, retries included (ms)")]
-    pub metrics_export_timeout_ms: Option<u64>,
-
-    #[config(default = None, ty = "integer", default_doc = "5000",
-             env = "OTEL_LOGS_EXPORT_INTERVAL, OTEL_BLRP_SCHEDULE_DELAY",
+    #[config(default = None, ty = "integer", default_doc = "1000",
+             env = "OTEL_BLRP_SCHEDULE_DELAY",
              desc = "How often queued events are flushed (ms)")]
     pub logs_interval_ms: Option<u64>,
 
     #[config(default = None, ty = "integer", default_doc = "2048",
              env = "OTEL_BLRP_MAX_QUEUE_SIZE",
-             desc = "Event queue capacity. Events are dropped and counted when it is full")]
+             desc = "Event queue capacity, at most 65536. Events are dropped when it is full")]
     pub logs_max_queue_size: Option<usize>,
 
     #[config(default = None, ty = "integer", default_doc = "512",
@@ -1943,14 +1940,9 @@ pub struct TelemetryConfig {
              desc = "Maximum events per export request")]
     pub logs_max_export_batch_size: Option<usize>,
 
-    #[config(default = None, ty = "integer", default_doc = "30000",
-             env = "OTEL_BLRP_EXPORT_TIMEOUT",
-             desc = "Deadline for one events export, retries included (ms)")]
-    pub logs_export_timeout_ms: Option<u64>,
-
-    #[config(default = None, ty = "string", default_doc = "delta",
+    #[config(default = None, ty = "string", default_doc = "cumulative",
              env = "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
-             desc = "Metric temporality: `delta` or `cumulative`")]
+             desc = "Metric temporality: `cumulative`, `delta` or `lowmemory`")]
     pub metrics_temporality: Option<String>,
 
     #[config(default = None, ty = "string", default_doc = "maki",
@@ -2011,11 +2003,9 @@ impl TelemetryConfig {
             logs_headers,
             logs_timeout_ms,
             metrics_interval_ms,
-            metrics_export_timeout_ms,
             logs_interval_ms,
             logs_max_queue_size,
             logs_max_export_batch_size,
-            logs_export_timeout_ms,
             metrics_temporality,
             service_name,
             resource_attributes,
@@ -4052,6 +4042,7 @@ mod tests {
     #[test_case("agent = { bash_timeout_secs = 60 }\n" ; "moved_bash_timeout")]
     #[test_case("agent = { search_result_limit = 50 }\n" ; "moved_search_limit")]
     #[test_case("[index]\nmax_file_size_mb = 4\n" ; "removed_index_section")]
+    #[test_case("[telemetry]\nmetrics_export_timeout_ms = 5000\n" ; "removed_telemetry_timeout")]
     fn deny_unknown_fields_rejects(toml_str: &str) {
         let result: Result<RawConfig, _> = toml::from_str(toml_str);
         assert!(

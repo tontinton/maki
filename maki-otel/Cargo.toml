@@ -5,16 +5,16 @@ edition.workspace = true
 
 [dependencies]
 maki-config = { workspace = true }
-isahc = { workspace = true }
-serde_json = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-proto = { workspace = true }
+http = { workspace = true }
+async-compat = { workspace = true }
 smol = { workspace = true }
-flume = { workspace = true }
-futures-lite = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-flate2 = { workspace = true }
-jiff = { workspace = true }
-fastrand = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

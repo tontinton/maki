@@ -1,50 +1,47 @@
-//! Opt-in OpenTelemetry export for maki.
+//! Opt-in OpenTelemetry export for maki, on the official SDK.
 //!
 //! Off unless `MAKI_ENABLE_TELEMETRY` (or `telemetry.enabled`) says otherwise,
-//! and when it is off every call site costs one relaxed atomic load.
-//!
-//! ```text
-//! call sites --try_send--> bounded channels --> pipeline task (smol)
-//!                            events   (logs_max_queue_size)
-//!                            measurements (METRICS_QUEUE_SIZE)
-//!                                                      |
-//!                              aggregate + batch ------+--> Transport::export
-//! ```
+//! and when it is off every call site costs one relaxed atomic load. When it
+//! is on, counters aggregate on the caller's thread and events go to the SDK's
+//! batch processor, which drops rather than blocks when its queue is full.
+//! Exports run on the SDK's own threads.
 
-pub mod attr;
+mod console;
 pub mod emit;
-pub mod encode;
+mod export;
 pub mod logs;
 pub mod metrics;
-pub mod pipeline;
 pub mod resource;
 pub mod settings;
-pub mod transport;
 
+use std::convert::Infallible;
+use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
-use flume::Sender;
 use maki_config::TelemetryConfig;
+use opentelemetry::logs::{LogRecord, Logger, LoggerProvider, Severity};
+use opentelemetry::metrics::{Counter, MeterProvider};
+use opentelemetry::{KeyValue, StringValue};
+use opentelemetry_otlp::ExporterBuildError;
+use opentelemetry_sdk::logs::{SdkLogRecord, SdkLogger, SdkLoggerProvider};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use thiserror::Error;
 
-use crate::attr::AttrSet;
-use crate::logs::LogRecord;
-use crate::metrics::{Measurement, MetricDef, Value};
-use crate::pipeline::{Dropped, Exporters, Inputs, Pipeline, Shutdown, now_nanos};
-use crate::settings::{Exporter, SettingsError, SignalSettings};
-use crate::transport::{ConsoleTransport, OtlpTransport, Transport};
+use crate::metrics::Instruments;
+use crate::settings::InvalidSetting;
 
-/// Metric points are tiny and aggregated on arrival, so the queue only needs
-/// to absorb bursts between ticks.
-const METRICS_QUEUE_SIZE: usize = 2048;
 const KEY_SESSION_ID: &str = "session.id";
 const KEY_APP_VERSION: &str = "app.version";
 const KEY_TERMINAL_TYPE: &str = "terminal.type";
 const KEY_EVENT_NAME: &str = "event.name";
 const KEY_EVENT_SEQUENCE: &str = "event.sequence";
 const TERMINAL_UNKNOWN: &str = "unknown";
+/// Terminal type, session id and version.
+const COMMON_METRIC_ATTRS: usize = 3;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static HANDLE: OnceLock<Handle> = OnceLock::new();
@@ -52,19 +49,29 @@ static HANDLE: OnceLock<Handle> = OnceLock::new();
 #[derive(Debug, Error)]
 pub enum InitError {
     #[error(transparent)]
-    Settings(#[from] SettingsError),
-    #[error("could not build the OTLP HTTP client: {0}")]
-    Client(#[from] isahc::Error),
+    Settings(#[from] InvalidSetting),
+    #[error("could not build the OTLP exporter: {0}")]
+    Exporter(#[from] ExporterBuildError),
+    #[error("telemetry headers are not valid: {0}")]
+    Headers(#[from] http::Error),
+}
+
+struct Metrics {
+    provider: SdkMeterProvider,
+    instruments: Instruments,
+}
+
+struct Events {
+    provider: SdkLoggerProvider,
+    logger: SdkLogger,
 }
 
 struct Handle {
-    measurements: Sender<Measurement>,
-    events: Sender<LogRecord>,
-    shutdown: Sender<Shutdown>,
-    dropped: Arc<Dropped>,
-    session_id: RwLock<Option<String>>,
+    metrics: Option<Metrics>,
+    events: Option<Events>,
+    session_id: RwLock<Option<StringValue>>,
     sequence: AtomicU64,
-    terminal_type: String,
+    terminal_type: StringValue,
     metrics_include_session_id: bool,
     metrics_include_version: bool,
     log_user_prompts: bool,
@@ -80,62 +87,37 @@ pub fn enabled() -> bool {
 /// Returns without doing anything when telemetry is off or has nowhere to
 /// send. Call after logging is set up so export errors are recorded.
 pub fn init(config: &TelemetryConfig) -> Result<(), InitError> {
-    init_with_env(config, |key| std::env::var(key).ok())
-}
-
-/// [`init`] with an injected environment, so integration tests are immune to
-/// whatever `OTEL_*` the developer's shell exports.
-pub fn init_with_env<F: Fn(&str) -> Option<String>>(
-    config: &TelemetryConfig,
-    env: F,
-) -> Result<(), InitError> {
-    let Some(settings) = settings::resolve(config, env)? else {
+    if HANDLE.get().is_some() {
+        return Ok(());
+    }
+    let Some(settings) = settings::resolve(config, |key| env::var(key).ok())? else {
         return Ok(());
     };
-    let exports_metrics = !settings.metrics_exporters.is_empty();
-    let exports_logs = !settings.logs_exporters.is_empty();
-    if !exports_metrics && !exports_logs {
+    if settings.metrics_exporters.is_empty() && settings.logs_exporters.is_empty() {
         return Ok(());
     }
 
-    let exporters = Exporters {
-        metrics: build_transports(&settings.metrics_exporters, settings.metrics.as_ref())?,
-        logs: build_transports(&settings.logs_exporters, settings.logs.as_ref())?,
-    };
-
-    let (measurements, metrics_rx) = flume::bounded(METRICS_QUEUE_SIZE);
-    let (events, logs_rx) = flume::bounded(settings.logs_max_queue_size);
-    let (shutdown, shutdown_rx) = flume::bounded(1);
-    let dropped = Arc::new(Dropped::default());
-
-    let pipeline = Pipeline::new(
-        &settings,
-        resource::build(&settings),
-        exporters,
-        Arc::clone(&dropped),
-        now_nanos(),
-    );
-    smol::spawn(pipeline.run(Inputs {
-        metrics: metrics_rx,
-        logs: logs_rx,
-        shutdown: shutdown_rx,
-    }))
-    .detach();
-
+    let (meter_provider, logger_provider) = export::providers(&settings, config)?;
+    let scope = resource::scope();
     let handle = Handle {
-        measurements,
-        events,
-        shutdown,
-        dropped,
+        metrics: meter_provider.map(|provider| Metrics {
+            instruments: Instruments::new(&provider.meter_with_scope(scope.clone())),
+            provider,
+        }),
+        events: logger_provider.map(|provider| Events {
+            logger: provider.logger_with_scope(scope),
+            provider,
+        }),
         session_id: RwLock::new(None),
         sequence: AtomicU64::new(0),
-        terminal_type: terminal_type(),
+        terminal_type: shared(&terminal_type()),
         metrics_include_session_id: settings.metrics_include_session_id,
         metrics_include_version: settings.metrics_include_version,
         log_user_prompts: settings.log_user_prompts,
         log_tool_details: settings.log_tool_details,
         content_max_length: settings.content_max_length,
     };
+    let (exports_metrics, exports_logs) = (handle.metrics.is_some(), handle.events.is_some());
     if HANDLE.set(handle).is_err() {
         return Ok(());
     }
@@ -143,36 +125,20 @@ pub fn init_with_env<F: Fn(&str) -> Option<String>>(
     tracing::info!(
         otel.metrics = exports_metrics,
         otel.logs = exports_logs,
-        otel.service_name = settings.service_name,
         "telemetry enabled"
     );
     Ok(())
 }
 
-fn build_transports(
-    kinds: &[Exporter],
-    signal_settings: Option<&SignalSettings>,
-) -> Result<Vec<Box<dyn Transport>>, isahc::Error> {
-    let mut out: Vec<Box<dyn Transport>> = Vec::with_capacity(kinds.len());
-    for kind in kinds {
-        match kind {
-            Exporter::Console => out.push(Box::new(ConsoleTransport)),
-            // Settings resolution guarantees an endpoint whenever otlp is on.
-            Exporter::Otlp => {
-                let Some(settings) = signal_settings else {
-                    continue;
-                };
-                out.push(Box::new(OtlpTransport::new(settings.clone())?));
-            }
-        }
-    }
-    Ok(out)
+fn terminal_type() -> String {
+    env::var("TERM_PROGRAM")
+        .or_else(|_| env::var("TERM"))
+        .unwrap_or_else(|_| TERMINAL_UNKNOWN.to_string())
 }
 
-fn terminal_type() -> String {
-    std::env::var("TERM_PROGRAM")
-        .or_else(|_| std::env::var("TERM"))
-        .unwrap_or_else(|_| TERMINAL_UNKNOWN.to_string())
+/// Reference counted, so attaching it to every emit is a refcount bump.
+fn shared(text: &str) -> StringValue {
+    StringValue::from(Arc::<str>::from(text))
 }
 
 /// Whether tool input is wanted, so callers can skip serializing it.
@@ -186,12 +152,17 @@ pub fn set_session_id(id: &str) {
         return;
     };
     if let Ok(mut slot) = handle.session_id.write() {
-        *slot = Some(id.to_string());
+        *slot = Some(shared(id));
     }
 }
 
 /// Final flush. Safe to call more than once and from a process that is about
 /// to `exit`, which skips destructors.
+///
+/// The providers shut down in parallel on their own threads, because
+/// `SdkMeterProvider` ignores the timeout it is given and waits up to 5s on
+/// its reader. The caller never waits past `timeout`, and a thread stuck in
+/// an export dies with the process.
 pub fn shutdown(timeout: Duration) {
     let Some(handle) = HANDLE.get() else {
         return;
@@ -199,69 +170,100 @@ pub fn shutdown(timeout: Duration) {
     if !ENABLED.swap(false, Ordering::Relaxed) {
         return;
     }
-    let (done_tx, done_rx) = flume::bounded(1);
-    let request = Shutdown {
-        budget: timeout,
-        done: done_tx,
-    };
-    if handle.shutdown.try_send(request).is_ok() {
-        let _ = done_rx.recv_timeout(timeout);
+    // Nothing is ever sent: the receiver disconnects once every thread has
+    // dropped its sender.
+    let (running, finished) = mpsc::channel::<Infallible>();
+    if let Some(metrics) = &handle.metrics {
+        let running = running.clone();
+        thread::spawn(move || {
+            let _ = metrics.provider.shutdown_with_timeout(timeout);
+            drop(running);
+        });
+    }
+    if let Some(events) = &handle.events {
+        let running = running.clone();
+        thread::spawn(move || {
+            let _ = events.provider.shutdown_with_timeout(timeout);
+            drop(running);
+        });
+    }
+    drop(running);
+    if let Err(RecvTimeoutError::Timeout) = finished.recv_timeout(timeout) {
+        tracing::warn!(
+            ?timeout,
+            "otel shutdown timed out, the last export may be lost"
+        );
     }
 }
 
 impl Handle {
-    fn session_id(&self) -> Option<String> {
+    fn session_id(&self) -> Option<StringValue> {
         self.session_id.read().ok().and_then(|s| s.clone())
     }
 
     /// Session id and version multiply metric cardinality, so they are
     /// opt-in per the OTel env vars.
-    fn record(&self, def: &'static MetricDef, value: Value, extra: AttrSet) {
-        let mut attrs = AttrSet::new().with(KEY_TERMINAL_TYPE, self.terminal_type.as_str());
+    fn count<T>(
+        &self,
+        counter: impl FnOnce(&Instruments) -> &Counter<T>,
+        value: T,
+        extra: &[KeyValue],
+    ) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut attrs = Vec::with_capacity(extra.len() + COMMON_METRIC_ATTRS);
+        attrs.push(KeyValue::new(KEY_TERMINAL_TYPE, self.terminal_type.clone()));
         if self.metrics_include_session_id
             && let Some(id) = self.session_id()
         {
-            attrs.insert(KEY_SESSION_ID, id);
+            attrs.push(KeyValue::new(KEY_SESSION_ID, id));
         }
         if self.metrics_include_version {
-            attrs.insert(KEY_APP_VERSION, resource::VERSION);
+            attrs.push(KeyValue::new(KEY_APP_VERSION, resource::VERSION));
         }
-        attrs.extend_from(&extra);
-        send_or_drop(
-            &self.measurements,
-            Measurement { def, value, attrs },
-            &self.dropped.metrics,
-        );
+        attrs.extend_from_slice(extra);
+        counter(&metrics.instruments).add(value, &attrs);
     }
 
     /// The name is repeated as an attribute because older collectors drop
-    /// the newer OTLP `event_name` field; the sequence orders events that
-    /// share a timestamp.
-    fn event(&self, name: &'static str, extra: AttrSet) {
-        let mut attrs = AttrSet::new()
-            .with(KEY_TERMINAL_TYPE, self.terminal_type.as_str())
-            .with(KEY_APP_VERSION, resource::VERSION)
-            .with_opt(KEY_SESSION_ID, self.session_id());
-        attrs.extend_from(&extra);
-        attrs.insert(KEY_EVENT_NAME, name);
-        attrs.insert(
+    /// the newer OTLP `event_name` field, and the sequence orders events that
+    /// share a timestamp. Both go last, and the SDK does not dedupe, so no
+    /// caller may use these keys.
+    fn event(&self, name: &'static str, fill: impl FnOnce(&mut SdkLogRecord)) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        let now = SystemTime::now();
+        let mut record = events.logger.create_log_record();
+        record.set_event_name(name);
+        record.set_timestamp(now);
+        record.set_observed_timestamp(now);
+        let severity = Severity::Info;
+        record.set_severity_number(severity);
+        record.set_severity_text(severity.name());
+        record.add_attribute(KEY_TERMINAL_TYPE, self.terminal_type.clone());
+        record.add_attribute(KEY_APP_VERSION, resource::VERSION);
+        if let Some(id) = self.session_id() {
+            record.add_attribute(KEY_SESSION_ID, id);
+        }
+        fill(&mut record);
+        record.add_attribute(KEY_EVENT_NAME, name);
+        record.add_attribute(
             KEY_EVENT_SEQUENCE,
-            self.sequence.fetch_add(1, Ordering::Relaxed),
+            saturating_i64(self.sequence.fetch_add(1, Ordering::Relaxed)),
         );
-        send_or_drop(
-            &self.events,
-            LogRecord {
-                time_unix_nano: now_nanos(),
-                event_name: name,
-                attrs,
-            },
-            &self.dropped.logs,
-        );
+        events.logger.emit(record);
     }
 
     fn truncate(&self, text: &str) -> String {
         truncate_chars(text, self.content_max_length)
     }
+}
+
+/// OTLP integers are signed, and `AnyValue` takes no `u64` or `usize`.
+pub(crate) fn saturating_i64(value: impl TryInto<i64>) -> i64 {
+    value.try_into().unwrap_or(i64::MAX)
 }
 
 /// Cuts on a char boundary, so slicing multi-byte text can never panic.
@@ -274,14 +276,6 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 fn handle() -> Option<&'static Handle> {
     enabled().then(|| HANDLE.get()).flatten()
-}
-
-/// A slow collector must never stall a turn, so a full queue costs the item
-/// and a counter instead of the caller's time.
-fn send_or_drop<T>(queue: &Sender<T>, item: T, dropped: &AtomicU64) {
-    if queue.try_send(item).is_err() {
-        dropped.fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 #[cfg(test)]
@@ -304,12 +298,8 @@ mod tests {
     }
 
     #[test]
-    fn a_full_queue_drops_and_counts_instead_of_blocking() {
-        let (tx, rx) = flume::bounded(1);
-        let dropped = AtomicU64::new(0);
-        send_or_drop(&tx, 1, &dropped);
-        send_or_drop(&tx, 2, &dropped);
-        assert_eq!(dropped.load(Ordering::Relaxed), 1);
-        assert_eq!(rx.try_recv(), Ok(1));
+    fn integers_past_i64_saturate() {
+        assert_eq!(saturating_i64(u64::MAX), i64::MAX);
+        assert_eq!(saturating_i64(7_u128), 7);
     }
 }
