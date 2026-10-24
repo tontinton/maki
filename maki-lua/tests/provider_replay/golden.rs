@@ -38,7 +38,7 @@ use maki_providers::model::ModelInfo;
 use maki_providers::model_registry;
 use maki_providers::plugin;
 use maki_providers::provider::Provider;
-use maki_providers::test_support::{Canned, Recorded, Requests, is_routed, serve};
+use maki_providers::test_support::{Canned, Recorded, Requests, is_routed, isolated_home, serve};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StreamResponse, ThinkingSupport,
     Timeouts,
@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::{isolated_state, load_bundled};
+use super::load_bundled;
 
 const GOLDEN_DIR: &str = "tests/goldens";
 const GOLDEN_EXTENSION: &str = "json";
@@ -327,7 +327,7 @@ impl Replay {
     /// origin a test can set. The declared `base_url` is the real provider, and
     /// `auth.base_url` only comes from an auth hook.
     fn open(slug: &str, script: &'static [Canned]) -> Self {
-        let home = isolated_state();
+        let home = isolated_home();
         let (base_url, requests) = serve(script);
         unsafe { env::set_var(base_url_env_var(slug), base_url) };
         let host = load_bundled(slug);

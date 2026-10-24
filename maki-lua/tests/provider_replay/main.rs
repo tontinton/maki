@@ -16,10 +16,9 @@ use maki_config::{PROVIDER_BUILTINS, PluginsConfig};
 use maki_lua::PluginHost;
 use maki_lua::test_support::runtime;
 use maki_providers::plugin;
-use maki_providers::test_support::{Canned, serve};
+use maki_providers::test_support::{Canned, isolated_home, serve};
 use maki_providers::{Message, Model, RequestOptions, ResolvedAuth, ThinkingSupport, Timeouts};
 use serde_json::json;
-use tempfile::TempDir;
 use test_case::test_case;
 
 mod golden;
@@ -37,17 +36,8 @@ const COST_SSE: &[Canned] = &[Canned::sse(
     "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"cost\":0.00042}}\n\ndata: [DONE]\n",
 )];
 
-const HOME_VARS: &[&str] = &[
-    "HOME",
-    "XDG_STATE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-];
-
 const HOST_FAILED: &str = "the plugin host did not start";
 const LOAD_FAILED: &str = "the bundled provider plugin did not load";
-const TEMPDIR_FAILED: &str = "no temporary state directory";
 const UNDECLARED_SLUG: &str =
     "a bundled provider plugin did not declare the slug it is named after";
 const NOT_LISTED_FOR_LOGIN: &str = "a bundled provider plugin is missing from maki auth login";
@@ -56,16 +46,6 @@ const UNKNOWN_MODEL: &str = "the model spec did not resolve";
 const NOT_BUILT: &str = "mistral did not build from its declaration";
 const STREAM_FAILED: &str = "stream must succeed";
 const PROMPT: &str = "hi";
-
-/// Points every base directory at a throwaway tree, so neither the real
-/// `providers.toml` nor this machine's credentials reach the registration.
-fn isolated_state() -> TempDir {
-    let dir = TempDir::new().expect(TEMPDIR_FAILED);
-    for var in HOME_VARS {
-        unsafe { std::env::set_var(var, dir.path()) };
-    }
-    dir
-}
 
 /// One bundled plugin and no others, so what registers the slug is never
 /// ambiguous, loaded with the permissions its own `plugin.toml` declares, so
@@ -94,7 +74,7 @@ fn load_bundled(slug: &str) -> PluginHost {
 /// Each one loads alone, so a neighbour can never answer for it.
 #[test]
 fn every_provider_builtin_declares_its_own_slug() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     for &slug in PROVIDER_BUILTINS {
         let _host = load_bundled(slug);
         assert!(plugin::is_registered(slug), "{UNDECLARED_SLUG}: {slug}");
@@ -110,7 +90,7 @@ fn every_provider_builtin_declares_its_own_slug() {
 /// quietly bill at the off-peak rate.
 #[test]
 fn deepseek_bills_the_published_peak_hours() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     let _host = load_bundled(DEEPSEEK);
 
     let schedule = plugin::spec(DEEPSEEK)
@@ -154,7 +134,7 @@ fn routed(model_id: &str) -> Model {
 #[test_case(declared, MEDIUM, true ; "declared_medium")]
 #[test_case(routed, MEDIUM, true ; "routed_medium")]
 fn only_ministral_is_denied_thinking(adjusted: fn(&str) -> Model, model_id: &str, thinks: bool) {
-    let _state = isolated_state();
+    let _state = isolated_home();
     unsafe { std::env::set_var(MISTRAL_KEY_ENV, MISTRAL_KEY) };
     let _host = load_bundled(MISTRAL);
 
@@ -169,7 +149,7 @@ fn only_ministral_is_denied_thinking(adjusted: fn(&str) -> Model, model_id: &str
 #[test_case(OPENROUTER, "openrouter/openai/gpt-5.5", Some(STREAMED_COST) ; "openrouter_reads_usage_cost")]
 #[test_case(MISTRAL, "mistral/mistral-medium-latest", None ; "mistral_ignores_usage_cost")]
 fn only_opted_in_providers_read_usage_cost(slug: &str, spec: &str, expected: Option<f64>) {
-    let _state = isolated_state();
+    let _state = isolated_home();
     let (base_url, _requests) = serve(COST_SSE);
     unsafe { std::env::set_var(base_url_env_var(slug), base_url) };
     let _host = load_bundled(slug);
