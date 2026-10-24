@@ -363,12 +363,19 @@ impl Chat {
         &mut self,
         frame: &mut Frame,
         area: Rect,
+        scrollbar_area: Rect,
         has_selection: bool,
         images_visible: bool,
         lua_commands: &[LuaCommandInfo],
     ) {
-        self.messages_panel
-            .view(frame, area, has_selection, images_visible, lua_commands);
+        self.messages_panel.view(
+            frame,
+            area,
+            scrollbar_area,
+            has_selection,
+            images_visible,
+            lua_commands,
+        );
     }
 
     pub fn scroll_pos(&self) -> ScrollPos {

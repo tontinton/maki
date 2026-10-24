@@ -32,6 +32,7 @@ pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
+pub const DEFAULT_OUTPUT_MARGIN: u16 = 0;
 pub const DEFAULT_THINKING_LINES: usize = 3;
 const NEVER_COLLAPSE_THINKING: i64 = -1;
 const THINKING_LINES_RANGE: &str =
@@ -645,6 +646,7 @@ pub struct UiFileConfig {
     pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
+    pub output_margin: Option<u16>,
 }
 
 impl UiFileConfig {
@@ -663,7 +665,8 @@ impl UiFileConfig {
             show_thinking,
             theme,
             clock_format,
-            max_input_lines
+            max_input_lines,
+            output_margin
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -1273,6 +1276,12 @@ pub struct UiConfig {
     pub max_input_lines: u32,
 
     #[config(
+        default = DEFAULT_OUTPUT_MARGIN,
+        desc = "Horizontal gutter on the scrollable output, in columns. Does not affect the prompt or status bar"
+    )]
+    pub output_margin: u16,
+
+    #[config(
         default = ThinkingLines::Tail(DEFAULT_THINKING_LINES),
         ty = "integer",
         default_doc = "3",
@@ -1307,6 +1316,7 @@ impl UiConfig {
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
+            output_margin: f.output_margin.unwrap_or(0),
             thinking_lines: f
                 .thinking_lines
                 .unwrap_or(ThinkingLines::Tail(DEFAULT_THINKING_LINES)),
@@ -2902,6 +2912,7 @@ mod tests {
         let config = RawConfig::default().into_config(&[]).unwrap();
         assert!(config.ui.splash_animation);
         assert_eq!(config.ui.notifications, NotificationMethod::Auto);
+        assert_eq!(config.ui.output_margin, DEFAULT_OUTPUT_MARGIN);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
         assert_eq!(
             config.provider.connect_timeout,
@@ -2928,6 +2939,13 @@ mod tests {
     fn notifications_reject_unknown_value() {
         let result: Result<RawConfig, _> = toml::from_str("[ui]\nnotifications = \"desktop\"\n");
         assert!(result.is_err());
+    }
+
+    #[test_case(0 ; "zero")]
+    #[test_case(4 ; "four")]
+    fn output_margin_deserializes(value: u16) {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\noutput_margin = {value}\n")).unwrap();
+        assert_eq!(raw.into_config(&[]).unwrap().ui.output_margin, value);
     }
 
     #[test]

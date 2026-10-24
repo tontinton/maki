@@ -854,6 +854,7 @@ impl MessagesPanel {
         &mut self,
         frame: &mut Frame,
         area: Rect,
+        scrollbar_area: Rect,
         has_selection: bool,
         images_visible: bool,
         lua_commands: &[LuaCommandInfo],
@@ -966,8 +967,13 @@ impl MessagesPanel {
         if scrollbar::is_enabled() {
             let layout = self.layout();
             let total_rows = layout.total_rows();
-            if total_rows > u32::from(area.height) {
-                render_vertical_scrollbar(frame, area, total_rows, layout.doc_row(self.scroll));
+            if total_rows > u32::from(scrollbar_area.height) {
+                render_vertical_scrollbar(
+                    frame,
+                    scrollbar_area,
+                    total_rows,
+                    layout.doc_row(self.scroll),
+                );
             }
         }
     }

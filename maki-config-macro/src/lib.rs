@@ -180,7 +180,7 @@ fn config_value_expr(ty_name: &str, default: &Option<Expr>) -> TokenStream2 {
             let val = default.as_ref().expect("bool field requires default");
             quote! { ConfigValue::Bool(#val) }
         }
-        "u32" | "u64" | "usize" => {
+        "u16" | "u32" | "u64" | "usize" => {
             let val = default.as_ref().expect("numeric field requires default");
             quote! { ConfigValue::U64(#val as u64) }
         }

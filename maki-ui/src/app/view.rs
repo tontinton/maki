@@ -13,7 +13,7 @@ use crate::theme;
 use maki_lua::Split;
 use maki_providers::RequestOptions;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
@@ -21,6 +21,7 @@ use super::{App, Mode, Status};
 
 struct ViewLayout {
     msg_area: Rect,
+    scrollbar_area: Rect,
     bottom_area: Rect,
     status_area: Rect,
     queue_area: Rect,
@@ -28,6 +29,11 @@ struct ViewLayout {
     input_area: Rect,
     splits: SplitLayout,
     bottom_takeover: bool,
+}
+
+/// `Rect::inner` saturates to an empty area when the margin is too wide, so no clamp is needed.
+fn with_horizontal_margin(area: Rect, margin: u16) -> Rect {
+    area.inner(Margin::new(margin, 0))
 }
 
 impl App {
@@ -130,6 +136,13 @@ impl App {
         // the bottom panel only ever splits the chat region.
         let [msg_area, bottom_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_height)]).areas(inner);
+        let msg_area = with_horizontal_margin(msg_area, self.ui_config.output_margin);
+        let scrollbar_area = Rect::new(
+            inner.right().saturating_sub(1),
+            msg_area.y,
+            1,
+            msg_area.height,
+        );
 
         let panel_reqs = if bottom_takeover {
             Vec::new()
@@ -160,6 +173,7 @@ impl App {
 
         ViewLayout {
             msg_area,
+            scrollbar_area,
             bottom_area,
             status_area,
             queue_area,
@@ -183,6 +197,7 @@ impl App {
         self.chats[render_chat].view(
             frame,
             layout.msg_area,
+            layout.scrollbar_area,
             self.selection_state.is_some(),
             images_visible,
             self.command_palette.lua_commands(),
@@ -461,6 +476,11 @@ impl App {
             layout.input_area,
             layout.splits,
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn scrollbar_area(&self, area: Rect) -> Rect {
+        self.compute_layout(area).scrollbar_area
     }
 
     fn lua_hint_line(&self) -> Option<Line<'static>> {
