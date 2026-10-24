@@ -6,14 +6,15 @@ use maki_agent::UiWaker;
 use maki_agent::tools::compact_duration;
 use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_storage::id::MakiId;
 use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
 
 use crate::api::keymap::accept_key;
 use crate::api::util::command::{
-    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
-    InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip,
-    ui_send,
+    Anchor, Border, BuiltinAction, ChatItem, ChatItemStatus, Dimension, FloatConfig, HintEntries,
+    HintWriter, InputEdit, InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent,
+    ui_json_roundtrip, ui_roundtrip, ui_send,
 };
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
@@ -22,6 +23,13 @@ use crate::key::Key;
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod win;
+
+const CHAT_ITEM_ID_ERR: &str = "chat_item: id must be a non-blank string";
+const CHAT_ITEM_SESSION_ERR: &str = "chat_item: 'session_id' is required";
+const CHAT_ITEM_STATUS_ERR: &str = "chat_item: status must be \"running\", \"done\", or \"failed\"";
+const CHAT_ITEM_DEFAULT_LABEL: &str = "item";
+const STATUS_SEGMENT_ID_ERR: &str = "status_segment: id must be a non-blank string";
+const STATUS_SEGMENT_DEFAULT_STYLE: &str = "status_dim";
 
 use crate::runtime::with_task_bufs;
 use win::{WinHandle, WinSender};
@@ -38,12 +46,16 @@ const FOCUSED_CLAIM_ERR: &str =
 
 pub(crate) struct HintStore {
     hints: BTreeMap<Arc<str>, Vec<(String, String)>>,
+    /// Plugin-keyed status bar segments, id-keyed within a plugin so one
+    /// id's update never touches another's and removal is exact.
+    segments: BTreeMap<Arc<str>, BTreeMap<String, (String, String)>>,
 }
 
 impl HintStore {
     pub fn new() -> Self {
         Self {
             hints: BTreeMap::new(),
+            segments: BTreeMap::new(),
         }
     }
 
@@ -55,14 +67,43 @@ impl HintStore {
         }
     }
 
+    pub fn set_segment(&mut self, plugin: Arc<str>, id: String, text: String, style: String) {
+        self.segments
+            .entry(plugin)
+            .or_default()
+            .insert(id, (text, style));
+    }
+
+    pub fn remove_segment(&mut self, plugin: &str, id: &str) {
+        if let Some(by_id) = self.segments.get_mut(plugin)
+            && by_id.remove(id).is_some()
+            && by_id.is_empty()
+        {
+            self.segments.remove(plugin);
+        }
+    }
+
+    pub fn remove_segments(&mut self, plugin: &str) {
+        self.segments.remove(plugin);
+    }
+
     pub fn clear_plugin(&mut self, plugin: &str) {
         self.hints.retain(|k, _| k.as_ref() != plugin);
+        self.segments.retain(|k, _| k.as_ref() != plugin);
     }
 
     pub fn snapshot_entries(&self) -> HintEntries {
         self.hints
             .iter()
             .map(|(k, v)| (Arc::clone(k), v.clone()))
+            .collect()
+    }
+
+    pub fn snapshot_segments(&self) -> Vec<(String, String)> {
+        self.segments
+            .values()
+            .flat_map(|by_id| by_id.values())
+            .cloned()
             .collect()
     }
 }
@@ -100,11 +141,12 @@ impl WinStore {
     }
 }
 
-fn publish_hint_snapshot(lua: &Lua) {
+pub(crate) fn publish_hint_snapshot(lua: &Lua) {
     if let Some(store) = lua.app_data_ref::<HintStore>() {
         let entries = store.snapshot_entries();
+        let segments = store.snapshot_segments();
         if let Some(writer) = lua.app_data_ref::<HintWriter>() {
-            writer.publish(entries);
+            writer.publish(entries, segments);
         }
     }
 }
@@ -392,6 +434,130 @@ fn set_window_title(
     title: String,
 ) -> LuaResult<()> {
     let _ = ui_send(tx.as_ref(), UiAction::SetWindowTitle(title));
+    Ok(())
+}
+
+/// Adds or updates a plugin-owned item in the transcript of one chat
+/// session. Call it with `status = "running"` to surface the item with a
+/// spinner, then with `status = "done"` or `"failed"` to close it with a
+/// terminal status. Re-calling `chat_item` with the same `id` updates the
+/// item in place, so the title can track progress while the item runs.
+///
+/// The id is scoped to the calling plugin: two plugins may use the same id
+/// without colliding. The item lands in the transcript `session_id` names,
+/// whichever tab is focused when the call runs; a session with no tab left
+/// drops the update quietly.
+///
+/// @param opts table Options:
+///   `id` (string) unique within the plugin.
+///   `session_id` (string) the session whose transcript owns the item, the `data.session_id` an autocmd hands you or `maki.ui.input` reports.
+///   `title` (string) headline shown while the item runs.
+///   `label` (string) item kind shown next to the status, e.g. `"monitor"`. Default `"item"`.
+///   `status` (string) `"running"` (the default), `"done"`, or `"failed"`.
+///   `detail` (string) terminal text for `done` / `failed`, e.g. `"exited (code 0)"`.
+/// @return
+/// @example
+/// maki.ui.chat_item({ id = id, session_id = sid, label = "monitor", title = cmd, status = "running" })
+/// maki.ui.chat_item({ id = id, session_id = sid, status = "done", detail = "exited (code 0)" })
+#[lua_fn]
+fn chat_item(
+    _lua: &Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] plugin: Arc<str>,
+    opts: Table,
+) -> LuaResult<()> {
+    let id: String = opts
+        .get::<Option<String>>("id")?
+        .ok_or_else(|| mlua::Error::runtime(CHAT_ITEM_ID_ERR))?;
+    if id.trim().is_empty() {
+        return Err(mlua::Error::runtime(CHAT_ITEM_ID_ERR));
+    }
+    let session_id: String = opts
+        .get::<Option<String>>("session_id")?
+        .ok_or_else(|| mlua::Error::runtime(CHAT_ITEM_SESSION_ERR))?;
+    let session: MakiId = session_id
+        .parse()
+        .map_err(|e: maki_storage::id::MakiIdParseError| mlua::Error::runtime(e.to_string()))?;
+    let title: Option<String> = opts.get("title")?;
+    let label: Option<String> = opts.get("label")?;
+    let detail: Option<String> = opts.get("detail")?;
+    let status = match opts.get::<Option<String>>("status")? {
+        None => ChatItemStatus::Running,
+        Some(s) => match s.as_str() {
+            "running" => ChatItemStatus::Running,
+            "done" => ChatItemStatus::Done,
+            "failed" => ChatItemStatus::Failed,
+            _ => return Err(mlua::Error::runtime(CHAT_ITEM_STATUS_ERR)),
+        },
+    };
+    let _ = ui_send(
+        tx.as_ref(),
+        UiAction::ChatItem {
+            session,
+            item: ChatItem {
+                id: format!("{plugin}:{id}").into(),
+                label: label
+                    .unwrap_or_else(|| CHAT_ITEM_DEFAULT_LABEL.to_string())
+                    .into(),
+                title: title.unwrap_or_default(),
+                status,
+                detail,
+            },
+        },
+    );
+    Ok(())
+}
+
+/// Adds, updates, or removes one of the plugin's status bar segments, the
+/// short text spans shown on the right side of the bar in every tab.
+///
+/// The id is scoped to the calling plugin: two plugins may use the same id
+/// without colliding. Re-calling with the same `id` updates the segment in
+/// place. The whole set leaves with the plugin: on unload, or sooner with
+/// `status_segment(nil)`.
+///
+/// @param opts table|nil Options:
+///   `id` (string) unique within the plugin.
+///   `text` (string) segment text, rendered as `[ text ]`. Omitting it removes that one segment.
+///   `style` (string) theme style name. Default `"status_dim"`.
+/// @return
+/// @example
+/// maki.ui.status_segment({ id = "jobs", text = "3 running" })
+/// maki.ui.status_segment({ id = "jobs" }) -- remove it
+/// maki.ui.status_segment(nil) -- remove all of this plugin's
+#[lua_fn]
+fn status_segment(lua: &Lua, #[ctx] plugin: Arc<str>, opts: Option<Table>) -> LuaResult<()> {
+    let Some(opts) = opts else {
+        if let Some(mut store) = lua.app_data_mut::<HintStore>() {
+            store.remove_segments(&plugin);
+        }
+        publish_hint_snapshot(lua);
+        return Ok(());
+    };
+    let id: String = opts
+        .get::<Option<String>>("id")?
+        .ok_or_else(|| mlua::Error::runtime(STATUS_SEGMENT_ID_ERR))?;
+    if id.trim().is_empty() {
+        return Err(mlua::Error::runtime(STATUS_SEGMENT_ID_ERR));
+    }
+    let text = opts.get::<Option<String>>("text")?;
+    let style: Option<String> = if text.is_some() {
+        opts.get("style")?
+    } else {
+        None
+    };
+    if let Some(mut store) = lua.app_data_mut::<HintStore>() {
+        match text {
+            Some(text) => store.set_segment(
+                Arc::clone(&plugin),
+                id,
+                text,
+                style.unwrap_or_else(|| STATUS_SEGMENT_DEFAULT_STYLE.to_string()),
+            ),
+            None => store.remove_segment(&plugin, &id),
+        }
+    }
+    publish_hint_snapshot(lua);
     Ok(())
 }
 
@@ -757,7 +923,8 @@ lua_table! {
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_edit,
+        manual set_window_title, manual input, manual input_edit, manual chat_item,
+        manual status_segment,
     ]
 }
 
@@ -771,6 +938,8 @@ pub(crate) fn create_ui_table(
 
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
+    chat_item__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
+    status_segment__register(&t, lua, Arc::clone(&plugin))?;
     action__register(&t, lua, ui_action_tx.clone())?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
     input__register(&t, lua, ui_action_tx.clone())?;
@@ -1684,6 +1853,73 @@ mod tests {
         store.set(Arc::from("plug"), vec![("a".into(), "b".into())]);
         store.set(Arc::from("plug"), vec![]);
         assert!(store.snapshot_entries().is_empty());
+    }
+
+    const SEGMENT_TEXT: &str = "3 running";
+    const SEGMENT_STYLE: &str = "status_dim";
+
+    #[test]
+    fn segment_updates_and_removes_by_exact_id() {
+        let mut store = HintStore::new();
+        store.set_segment(
+            Arc::from("plug"),
+            "jobs".into(),
+            SEGMENT_TEXT.into(),
+            SEGMENT_STYLE.into(),
+        );
+        store.set_segment(
+            Arc::from("plug"),
+            "ci".into(),
+            "ci ok".into(),
+            SEGMENT_STYLE.into(),
+        );
+        assert_eq!(store.snapshot_segments().len(), 2);
+
+        store.remove_segment("plug", "jobs");
+        assert_eq!(
+            store.snapshot_segments(),
+            vec![("ci ok".to_string(), SEGMENT_STYLE.to_string())],
+            "the documented removal path drops exactly one id"
+        );
+    }
+
+    #[test]
+    fn clearing_one_plugins_segments_never_takes_a_prefix_neighbor() {
+        let mut store = HintStore::new();
+        for plugin in ["git", "github"] {
+            store.set_segment(
+                Arc::from(plugin),
+                "jobs".into(),
+                SEGMENT_TEXT.into(),
+                SEGMENT_STYLE.into(),
+            );
+        }
+
+        store.clear_plugin("git");
+        assert_eq!(
+            store.snapshot_segments(),
+            vec![(SEGMENT_TEXT.to_string(), SEGMENT_STYLE.to_string())],
+            "clearing `git` must not touch `github`"
+        );
+
+        store.remove_segments("github");
+        assert!(store.snapshot_segments().is_empty());
+    }
+
+    #[test]
+    fn unloading_a_plugin_loses_its_segments_and_hints_together() {
+        let mut store = HintStore::new();
+        store.set(Arc::from("plug"), vec![("a".into(), "b".into())]);
+        store.set_segment(
+            Arc::from("plug"),
+            "jobs".into(),
+            SEGMENT_TEXT.into(),
+            SEGMENT_STYLE.into(),
+        );
+
+        store.clear_plugin("plug");
+        assert!(store.snapshot_entries().is_empty());
+        assert!(store.snapshot_segments().is_empty());
     }
 
     const WIN_PLUGIN: &str = "plug";

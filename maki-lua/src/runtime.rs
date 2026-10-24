@@ -53,7 +53,7 @@ use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
-use crate::api::ui::{HintStore, WinStore};
+use crate::api::ui::{HintStore, WinStore, publish_hint_snapshot};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
     LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
@@ -1738,7 +1738,7 @@ pub(crate) fn active_task(lua: &Lua) -> TaskHandle {
 
 pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
     if lua.app_data_ref::<JobStore>().is_none() {
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(None));
     }
     let mut store = lua
         .app_data_mut::<JobStore>()
@@ -2660,7 +2660,7 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(Some(EventHandle::from_tx(tx.clone()))));
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(SpawnedTasks::default());
@@ -3261,11 +3261,8 @@ impl LuaRuntime {
         }
         if let Some(mut store) = self.lua.app_data_mut::<HintStore>() {
             store.clear_plugin(plugin);
-            let entries = store.snapshot_entries();
             drop(store);
-            if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
-                writer.publish(entries);
-            }
+            publish_hint_snapshot(&self.lua);
         }
         // Last of the revocations, and the only one the user can see: a float
         // left up by an unloaded plugin still holds the keys it claimed, with

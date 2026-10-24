@@ -374,6 +374,10 @@ impl App {
             restricted: self.trust_question.is_some(),
             yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),
+            plugin_segments: self
+                .hints
+                .get()
+                .map_or_else(Vec::new, |snap| snap.segments.clone()),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

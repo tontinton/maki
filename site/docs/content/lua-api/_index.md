@@ -818,9 +818,10 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
-`"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
-and `"FileIndexReady"`. Plugins can also fire their own events with
-`exec_autocmds`.
+`"SessionCwdChanged"`, `"TaskStopped"`, `"TaskStatusChanged"`,
+`"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
+`"FileIndexReady"`, `"JobStart"`, and `"JobExit"`. Plugins can also fire
+their own events with `exec_autocmds`.
 
 Every host event carries `data.session_id` except `"FileIndexReady"`,
 which is about a directory rather than a session. For `"SessionReset"` and
@@ -876,6 +877,11 @@ name the session now running or focused. What each event adds:
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.
+- `"JobStart"`, `"JobExit"`: session-owned jobs (`scope = { session =
+  ... }`) only. Both carry `data.id` and `data.plugin`. `"JobStart"`
+  adds `data.name` and `data.command`; `"JobExit"` adds
+  `data.exit_code`. A killed job exits with `-1`, and an unnamed job
+  has no `data.name`.
 - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
   chat input as `maki.ui.input` reports it. `data.source` is the plugin
   name when that plugin's `maki.ui.input_edit` was the only writer this
@@ -6861,6 +6867,73 @@ maki.ui.input_edit({
   version = st.version,
   session_id = st.session_id,
 })
+```
+
+---
+
+### `maki.ui.chat_item()` {#maki-ui-chat_item}
+
+```lua
+maki.ui.chat_item({opts})
+```
+
+Adds or updates a plugin-owned item in the transcript of one chat
+session. Call it with `status = "running"` to surface the item with a
+spinner, then with `status = "done"` or `"failed"` to close it with a
+terminal status. Re-calling `chat_item` with the same `id` updates the
+item in place, so the title can track progress while the item runs.
+
+The id is scoped to the calling plugin: two plugins may use the same id
+without colliding. The item lands in the transcript `session_id` names,
+whichever tab is focused when the call runs; a session with no tab left
+drops the update quietly.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `id` (`string`) unique within the plugin.
+  - `session_id` (`string`) the session whose transcript owns the item, the `data.session_id` an autocmd hands you or `maki.ui.input` reports.
+  - `title` (`string`) headline shown while the item runs.
+  - `label` (`string`) item kind shown next to the status, e.g. `"monitor"`. Default `"item"`.
+  - `status` (`string`) `"running"` (the default), `"done"`, or `"failed"`.
+  - `detail` (`string`) terminal text for `done` / `failed`, e.g. `"exited (code 0)"`.
+
+**Example:**
+
+```lua
+maki.ui.chat_item({ id = id, session_id = sid, label = "monitor", title = cmd, status = "running" })
+maki.ui.chat_item({ id = id, session_id = sid, status = "done", detail = "exited (code 0)" })
+```
+
+---
+
+### `maki.ui.status_segment()` {#maki-ui-status_segment}
+
+```lua
+maki.ui.status_segment({opts?})
+```
+
+Adds, updates, or removes one of the plugin's status bar segments, the
+short text spans shown on the right side of the bar in every tab.
+
+The id is scoped to the calling plugin: two plugins may use the same id
+without colliding. Re-calling with the same `id` updates the segment in
+place. The whole set leaves with the plugin: on unload, or sooner with
+`status_segment(nil)`.
+
+**Parameters:**
+
+- `{opts?}` (`table|nil`) Options:
+  - `id` (`string`) unique within the plugin.
+  - `text` (`string`) segment text, rendered as `[ text ]`. Omitting it removes that one segment.
+  - `style` (`string`) theme style name. Default `"status_dim"`.
+
+**Example:**
+
+```lua
+maki.ui.status_segment({ id = "jobs", text = "3 running" })
+maki.ui.status_segment({ id = "jobs" }) -- remove it
+maki.ui.status_segment(nil) -- remove all of this plugin's
 ```
 
 

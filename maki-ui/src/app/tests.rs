@@ -2820,10 +2820,13 @@ fn tick_drains_live_bufs_of_background_chats() {
 #[test]
 fn status_hints_published_by_a_plugin_reach_the_screen() {
     let (mut app, plugin) = app_with_hints();
-    plugin.publish(vec![(
-        Arc::from(HINT_PLUGIN),
-        vec![(HINT_TEXT.into(), HINT_STYLE.into())],
-    )]);
+    plugin.publish(
+        vec![(
+            Arc::from(HINT_PLUGIN),
+            vec![(HINT_TEXT.into(), HINT_STYLE.into())],
+        )],
+        Vec::new(),
+    );
 
     assert!(
         !rendered(&mut app).contains(HINT_TEXT),
@@ -2832,7 +2835,7 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert!(rendered(&mut app).contains(HINT_TEXT));
 
-    plugin.publish(vec![]);
+    plugin.publish(Vec::new(), Vec::new());
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert!(!rendered(&mut app).contains(HINT_TEXT));
 }

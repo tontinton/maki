@@ -90,9 +90,14 @@ impl LuaCommandWriter {
 
 pub type HintEntries = Vec<(Arc<str>, Vec<(String, String)>)>;
 
+/// One snapshot of what plugins asked the status bar to show: their key
+/// hints and their segments. Plugin-keyed on the way in, flattened here in
+/// plugin order, so every tab renders the same spans.
 #[derive(Clone, Default)]
 pub struct HintSnapshot {
     pub entries: HintEntries,
+    /// `(text, style)` pairs, rendered as `[ text ]` on the right of the bar.
+    pub segments: Vec<(String, String)>,
     pub generation: u64,
 }
 
@@ -129,10 +134,11 @@ impl HintWriter {
         )
     }
 
-    pub fn publish(&self, entries: HintEntries) {
+    pub fn publish(&self, entries: HintEntries, segments: Vec<(String, String)>) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.store.store(Arc::new(HintSnapshot {
             entries,
+            segments,
             generation,
         }));
     }
@@ -695,6 +701,29 @@ pub enum UiAction {
         plugin: Arc<str>,
         info: Box<SubagentInfo>,
     },
+    /// A plugin-owned transcript item for one chat session: `running` creates
+    /// or re-titles it, `done` / `failed` closes it. The `id` is already
+    /// plugin-scoped.
+    ChatItem {
+        session: MakiId,
+        item: ChatItem,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatItemStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatItem {
+    pub id: Arc<str>,
+    pub label: Arc<str>,
+    pub title: String,
+    pub status: ChatItemStatus,
+    pub detail: Option<String>,
 }
 
 /// Whether an event loop is draining `UiAction`. The channel cannot answer
@@ -1019,13 +1048,17 @@ mod tests {
         let (writer, reader) = HintWriter::new();
         assert!(reader.load_full().entries.is_empty());
 
-        writer.publish(vec![(
-            Arc::from("plugA"),
-            vec![(" 2/4 ".into(), "fg".into())],
-        )]);
+        writer.publish(
+            vec![(Arc::from("plugA"), vec![(" 2/4 ".into(), "fg".into())])],
+            vec![("2 running".into(), "status_dim".into())],
+        );
 
         let snap = reader.load_full();
         assert_eq!(snap.entries.len(), 1);
+        assert_eq!(
+            snap.segments,
+            [("2 running".to_string(), "status_dim".into())]
+        );
         assert_eq!(snap.generation, 1);
     }
 }

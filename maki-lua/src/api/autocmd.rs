@@ -150,9 +150,10 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 /// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
-/// `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
-/// and `"FileIndexReady"`. Plugins can also fire their own events with
-/// `exec_autocmds`.
+/// `"SessionCwdChanged"`, `"TaskStopped"`, `"TaskStatusChanged"`,
+/// `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
+/// `"FileIndexReady"`, `"JobStart"`, and `"JobExit"`. Plugins can also fire
+/// their own events with `exec_autocmds`.
 ///
 /// Every host event carries `data.session_id` except `"FileIndexReady"`,
 /// which is about a directory rather than a session. For `"SessionReset"` and
@@ -208,6 +209,11 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
 ///   plus `data.previous_spec`. Picking the model already in use stays
 ///   quiet, and so does startup.
+/// - `"JobStart"`, `"JobExit"`: session-owned jobs (`scope = { session =
+///   ... }`) only. Both carry `data.id` and `data.plugin`. `"JobStart"`
+///   adds `data.name` and `data.command`; `"JobExit"` adds
+///   `data.exit_code`. A killed job exits with `-1`, and an unnamed job
+///   has no `data.name`.
 /// - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
 ///   chat input as `maki.ui.input` reports it. `data.source` is the plugin
 ///   name when that plugin's `maki.ui.input_edit` was the only writer this

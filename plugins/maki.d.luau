@@ -206,6 +206,8 @@ declare maki: {
     set_window_title: @checked (title: string) -> (),
     input: @checked () -> (any, string?),
     input_edit: @checked (opts: any) -> (boolean?, string?),
+    chat_item: @checked (opts: any) -> (),
+    status_segment: @checked (opts: any) -> (),
   },
   uv: {
     cwd: @checked () -> (string?),
