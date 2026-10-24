@@ -47,6 +47,10 @@ pub fn spec_for_tier_any(tier: ModelTier) -> Option<String> {
     read().spec_for_tier_any(tier)
 }
 
+pub fn spec_for_tier_override(tier: ModelTier) -> Option<String> {
+    read().spec_for_tier_override(tier)
+}
+
 pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
     read().discovered(provider, model_id).cloned()
 }
@@ -229,9 +233,13 @@ impl ModelRegistry {
         self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
     }
 
+    fn spec_for_tier_override(&self, tier: ModelTier) -> Option<String> {
+        self.overrides.get(&tier).cloned()
+    }
+
     fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
-        if let Some(spec) = self.overrides.get(&tier) {
-            return Some(spec.clone());
+        if let Some(spec) = self.spec_for_tier_override(tier) {
+            return Some(spec);
         }
         for provider in self.known_models.keys() {
             if let Some(spec) = self.spec_for_tier(provider, tier) {
