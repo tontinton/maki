@@ -1174,6 +1174,12 @@ impl ModuleLoader {
             return Ok(LuaValue::Table(module));
         }
 
+        if let Some(module) = crate::output::module(lua, modname) {
+            let module = module?;
+            self.loaded.set(modname, module.clone())?;
+            return Ok(module);
+        }
+
         // Cleared on every path, so a failed require never leaves the module
         // wedged as "in progress".
         self.loading.set(modname, true)?;

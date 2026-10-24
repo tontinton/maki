@@ -450,6 +450,10 @@ fn helpers() -> Vec<(String, &'static str)> {
                 .then(|| (format!("maki.{stem}"), file.contents_utf8().unwrap()))
         })
         .collect();
+    helpers.extend([
+        ("maki.truncate".to_owned(), "-- Rust-backed function. Nil limits are unlimited.\ntruncate(text, max_lines, max_bytes) -- string with an omitted-byte notice\n"),
+        ("maki.output_limits".to_owned(), "-- Rust-backed output helpers.\nlimits.DEFAULT_MAX_LINE_BYTES\nlimits.specs -- max_output_lines and max_output_bytes option specs\nlimits.extend(spec) -- add output option specs\nlimits.resolve(opts, ctx) -- max_lines, max_bytes; nil in full mode\nlimits.line_bytes(opts, ctx) -- max_line_bytes; zero in full mode\nlimits.tail(text, n) -- last n lines\nlimits.collect(opts, ctx, tail) -- native collector, optional tail selection\ncollector:append(line) -- add a line without retaining it in Lua\ncollector:result() -- bounded text and an omitted-byte notice\n-- jobstart accepts { output = collector } to capture before Lua previews.\n"),
+    ]);
     helpers.sort();
     helpers
 }

@@ -1,4 +1,3 @@
-local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local partial = require("maki.partial")
@@ -150,13 +149,6 @@ local function rtk_rewrite(command, ctx)
     return nil
   end
   return rewritten
-end
-
-local function append_line(output, line)
-  if #output > 0 then
-    output[#output + 1] = "\n"
-  end
-  output[#output + 1] = line
 end
 
 local function create_bash_view(command, ctx)
@@ -374,7 +366,6 @@ maki.api.register_tool({
 
     local command, workdir = parse_cd_hint(input)
     local timeout_secs = input.timeout or opts.timeout_secs
-    local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
     ctx:set_deadline(timeout_secs)
 
@@ -385,18 +376,12 @@ maki.api.register_tool({
 
     local buf, view = create_bash_view(command, ctx)
 
-    local output_parts = {}
+    local capture = output_limits.collect(opts, ctx, input.tail)
     local has_output = false
     local finished = false
 
-    -- Presentation limits apply after the view streams every line. Both the
-    -- exit and cancel path go through here.
     local function final_output()
-      local output = table.concat(output_parts)
-      if input.tail then
-        output = output_limits.tail(output, input.tail)
-      end
-      return truncate(output, max_lines, max_bytes)
+      return capture:result()
     end
 
     local function finish(exit_code)
@@ -436,12 +421,12 @@ maki.api.register_tool({
     local job, err = maki.fn.jobstart(command, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
+      output = capture,
       on_stdout = function(_, line)
         if not has_output then
           has_output = true
           view:clear()
         end
-        append_line(output_parts, line)
         view:append(line)
       end,
       on_stderr = function(_, line)
@@ -449,7 +434,6 @@ maki.api.register_tool({
           has_output = true
           view:clear()
         end
-        append_line(output_parts, line)
         view:append(line)
       end,
       on_exit = function(_, code)

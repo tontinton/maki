@@ -9,6 +9,7 @@ pub mod key;
 mod key_lint;
 pub mod language;
 mod loader;
+mod output;
 mod pack;
 pub(crate) mod plugin_permissions;
 mod runtime;

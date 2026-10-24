@@ -15,12 +15,13 @@ use maki_config::ShellPreference;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
-use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
+use mlua::{AnyUserData, Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
 
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::output::OutputCapture;
 use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 
@@ -30,6 +31,7 @@ const MAX_COMPLETED_SESSION_JOBS: usize = 256;
 const DEFAULT_WAIT_MS: u64 = 30_000;
 
 const READER_BUF_SIZE: usize = 8 * 1024;
+const JOB_EVENT_CAPACITY: usize = 64;
 
 const NO_TASK_SCOPE_ERR: &str =
     "jobstart: no active task; use scope = \"plugin\" or { session = ... }";
@@ -139,6 +141,7 @@ pub(crate) struct JobSpec {
     pub on_stdout: Option<RegistryKey>,
     pub on_stderr: Option<RegistryKey>,
     pub on_exit: Option<RegistryKey>,
+    pub output: Option<OutputCapture>,
 }
 
 impl JobSpec {
@@ -154,6 +157,7 @@ impl JobSpec {
             on_stdout: None,
             on_stderr: None,
             on_exit: None,
+            output: None,
         }
     }
 }
@@ -291,6 +295,7 @@ impl JobStore {
             on_stdout,
             on_stderr,
             on_exit,
+            output,
         } = spec;
         let mut command = cmd.build();
         strip_provider_keys(&mut command)
@@ -327,16 +332,24 @@ impl JobStore {
         let id = self.next_id;
         self.next_id += 1;
 
-        let (event_tx, event_rx) = flume::unbounded();
+        let (event_tx, event_rx) = flume::bounded(JOB_EVENT_CAPACITY);
 
         macro_rules! spawn_reader {
             ($stream:expr, $name:expr, $variant:ident) => {
                 if let Some(stream) = $stream {
                     let tx = event_tx.clone();
+                    let output = output.clone();
                     Some(
                         thread::Builder::new()
                             .name($name.into())
                             .spawn(move || {
+                                if let Some(output) = output {
+                                    output.read_lines(
+                                        BufReader::with_capacity(READER_BUF_SIZE, stream),
+                                        |line| tx.send(JobEvent::$variant(line)).is_ok(),
+                                    );
+                                    return;
+                                }
                                 for line in BufReader::with_capacity(READER_BUF_SIZE, stream)
                                     .lines()
                                     .map_while(Result::ok)
@@ -833,6 +846,8 @@ fn kill_job(job: &JobMeta) {
 /// @param opts table? Optional settings:
 ///   `cwd` (string?) working directory (tilde is expanded).
 ///   `env` (table?) extra environment variables, `{ VAR = "value" }`.
+///   `output` (userdata?) collector from `require("maki.output_limits").collect`.
+///     Captures output before Lua callbacks, which receive short preview lines.
 ///   `on_stdout` (function?) called with `(job_id, line)` for each stdout line.
 ///   `on_stderr` (function?) called with `(job_id, line)` for each stderr line.
 ///   `on_exit` (function?) called with `(job_id, code)` when the process finishes.
@@ -884,6 +899,14 @@ fn jobstart(
         spec.on_stdout = callback_key(lua, opts, "on_stdout")?;
         spec.on_stderr = callback_key(lua, opts, "on_stderr")?;
         spec.on_exit = callback_key(lua, opts, "on_exit")?;
+        spec.output = opts
+            .get::<Option<AnyUserData>>("output")?
+            .map(|output| {
+                output
+                    .borrow::<OutputCapture>()
+                    .map(|output| output.clone())
+            })
+            .transpose()?;
         spec.stdout = parse_redirect(opts, "stdout", spec.on_stdout.is_some(), fs_write)?;
         spec.stderr = parse_redirect(opts, "stderr", spec.on_stderr.is_some(), fs_write)?;
         tail = opts.get("tail").ok();

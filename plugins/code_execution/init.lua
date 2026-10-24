@@ -8,8 +8,6 @@ local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local partial = require("maki.partial")
 
-local DEFAULT_MAX_OUTPUT_LINES = 2000
-local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
 local OPEN_READ_CHECK_LINES = 1
 local READ_INPUT_SLOTS = { "tool.read.input", "tool.*.input" }
@@ -320,13 +318,13 @@ local function handler(input, ctx)
   view:append({ { "Waiting for output...", "dim" } })
 
   local waiting = true
-  local output_parts = {}
+  local output_capture = output_limits.collect(opts, ctx)
   local function show(line)
     if waiting then
       waiting = false
       view:clear()
     end
-    output_parts[#output_parts + 1] = line
+    output_capture:append(line)
     view:append(line)
   end
 
@@ -336,8 +334,7 @@ local function handler(input, ctx)
   -- again as the interpreter's error, and the view is painted only once.
   local cut_reply
   local function cut(reason)
-    cut_reply = cut_reply
-      or partial.cut(view, truncate(table.concat(output_parts, "\n"), max_lines, max_bytes), reason, timeout)
+    cut_reply = cut_reply or partial.cut(view, output_capture:result(), reason, timeout)
     return cut_reply
   end
 
