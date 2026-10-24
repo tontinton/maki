@@ -359,10 +359,12 @@ impl ToolOutput {
     }
 
     /// The text a [`HookStage::Output`] hook may read and rewrite, or `None`
-    /// when the output has none to lend. Only a plain-text shape with no
-    /// `state` qualifies: the other variants render from their own fields, and
-    /// a `state` sidecar is saved with the session and re-rendered on restore,
-    /// so text a hook redacted would come back verbatim after a restart.
+    /// when the output has none to lend. A plain-text shape qualifies only
+    /// without `state`: that sidecar is saved with the session and re-rendered
+    /// on restore, so text a hook redacted would come back verbatim after a
+    /// restart. A diff lends its `summary`, the only part the model reads; the
+    /// UI draws it from `before`/`after`, which the hook never sees. The other
+    /// variants render from their own fields.
     ///
     /// One accessor for both directions, so a getter and a setter can never
     /// drift into letting a hook read text it cannot write back.
@@ -373,6 +375,7 @@ impl ToolOutput {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) if t.state.is_none() => {
                 Some(&mut t.text)
             }
+            Self::Diff { summary, .. } => Some(summary),
             _ => None,
         }
     }
@@ -1300,7 +1303,7 @@ mod tests {
     #[test_case(ToolOutput::Plain(text_with_state()),        None                  ; "plain_with_state_withholds_text")]
     #[test_case(ToolOutput::Markdown(text_with_state()),     None                  ; "markdown_with_state_withholds_text")]
     #[test_case(ToolOutput::ReadDir(FILTERABLE_TEXT.into()), Some(FILTERABLE_TEXT) ; "read_dir_without_state_lends_text")]
-    #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: FILTERABLE_TEXT.into() }, None ; "diff_withholds_text")]
+    #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: FILTERABLE_TEXT.into() }, Some(FILTERABLE_TEXT) ; "diff_lends_summary")]
     fn filterable_text_needs_text_to_be_the_sole_representation(
         mut output: ToolOutput,
         expected: Option<&str>,

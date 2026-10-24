@@ -1292,9 +1292,7 @@ mod tests {
     const HOOK_OUTPUT_TEXT: &str = "trimmed";
     const HOOK_PERMISSION: Permission = Permission::Run;
     const HOOK_FIELD_TYPE: &str = "string";
-    const HOOK_DIFF_COMMAND: &str = "apply";
-    const HOOK_DIFF_PATH: &str = "/tmp/diffed.txt";
-    const HOOK_DIFF_SUMMARY: &str = "1 file changed";
+    const HOOK_TODO_COMMAND: &str = "plan";
     const HOOK_ESCAPED_PATH: &str = "/tmp/not-the-plan.md";
     const TEST_PLUGIN_SOURCE: &str = "lua:test";
     const START_PROBE_NAME: &str = "start_probe";
@@ -1478,13 +1476,8 @@ mod tests {
     /// One command answers with a shape the UI renders from fields, the one
     /// kind of output a hook may not touch.
     fn output_of(command: &str) -> ToolOutput {
-        if command == HOOK_DIFF_COMMAND {
-            return ToolOutput::Diff {
-                path: HOOK_DIFF_PATH.to_owned(),
-                before: String::new(),
-                after: String::new(),
-                summary: HOOK_DIFF_SUMMARY.to_owned(),
-            };
+        if command == HOOK_TODO_COMMAND {
+            return ToolOutput::TodoList(Vec::new());
         }
         ToolOutput::Plain(ran(command).into())
     }
@@ -1927,10 +1920,12 @@ mod tests {
     fn a_rendered_output_skips_the_output_stage() {
         smol::block_on(async {
             let (ctx, hook) = plain_hooked_ctx(RecordingHook::answering(deny_the_output));
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_DIFF_COMMAND)).await;
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_TODO_COMMAND)).await;
 
             assert!(!done.is_error);
-            assert_eq!(done.output.as_text(), HOOK_DIFF_SUMMARY);
+            assert!(
+                matches!(done.output.as_ref(), ToolOutput::TodoList(items) if items.is_empty())
+            );
             assert_eq!(
                 hook.stages(),
                 vec![(HookStage::Input, Authority::Unbounded)]

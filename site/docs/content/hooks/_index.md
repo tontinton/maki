@@ -127,12 +127,14 @@ A replacement table has to carry `text`. Without it the output is left alone and
 the reason is logged. Set `is_error` to turn a success into a failure, or a
 failure into a success.
 
-An output slot fires only when the text is the whole output. Tools the UI renders
-from fields, like `read` or `edit`, are excluded, because prose edited underneath
-would disagree with the display. So are tools whose result carries structured
-state saved with the session, like `batch` or `question`. That state is what gets
-re-rendered on restore, so a value redacted in the text would come back after a
-restart.
+An output slot fires when a layer can rewrite the text the model reads. For
+tools that answer with a diff, like `edit`, `multiedit`, `edit_lines` and
+`insert_lines`, that text is the summary line, so a layer can append to it, and
+the UI still draws the diff from the file contents. Images, like the ones
+`view_image` returns, are excluded. So are tools whose result carries structured
+state saved with the session, like `batch` or `question`. That state is what
+gets re-rendered on restore, so a value redacted in the text would come back
+after a restart.
 
 ### Asking the user
 

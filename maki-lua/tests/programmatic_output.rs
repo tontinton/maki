@@ -30,6 +30,7 @@ const TOOLS: &[&str] = &[
     "code_execution",
     "read",
     "write",
+    "edit",
     "grep",
     "glob",
     "batch",
@@ -41,6 +42,8 @@ const COMPACT_GLOB_LIMIT: usize = 100;
 const TEST_TIMEOUT_SECS: u64 = 60;
 const LAST_ITEM: &str = "final-item";
 const CALL_ID: &str = "output-test";
+const EDIT_TOOL: &str = "edit";
+const LSP_NOTE: &str = "error[E0308]: mismatched types";
 const PROMPT_PLUGIN: &str = "guard";
 const ALLOW_EVERY_PROMPT: &str =
     r#"maki.api.set_slot("permission.prompt", function() return { decision = "allow" } end)"#;
@@ -363,6 +366,58 @@ end)
         path.to_str().unwrap()
     );
     assert_eq!(python(&ctx, &code).unwrap().trim(), "redacted:1");
+}
+
+fn edit_directly(ctx: &ToolContext, input: Value) -> Result<String, String> {
+    run(ctx, EDIT_TOOL, input)
+}
+
+fn edit_from_python(ctx: &ToolContext, input: Value) -> Result<String, String> {
+    python(ctx, &format!("print(await {EDIT_TOOL}(**{input}))"))
+}
+
+fn edit_from_batch(ctx: &ToolContext, input: Value) -> Result<String, String> {
+    run(
+        ctx,
+        "batch",
+        json!({ "tool_calls": [{ "tool": EDIT_TOOL, "parameters": input }] }),
+    )
+}
+
+/// Edit answers with a diff, so this is the hook a language server plugin
+/// would use to put errors in the same result the model reads.
+#[test_case::test_case(edit_directly    ; "model")]
+#[test_case::test_case(edit_from_python ; "code_execution")]
+#[test_case::test_case(edit_from_batch  ; "batch")]
+fn an_edit_output_hook_appends_to_what_the_model_reads(
+    call: fn(&ToolContext, Value) -> Result<String, String>,
+) {
+    let (_registry, host, ctx) = setup();
+    host.load_source(
+        "lsp",
+        &format!(
+            r#"
+maki.api.set_slot("tool.{EDIT_TOOL}.output", function(_, output, ctx)
+    output.text = output.text .. "\n{LSP_NOTE} " .. ctx.input.path
+    return output
+end)
+"#
+        ),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lib.rs");
+    fs::write(&path, "let x: u8 = 1;").unwrap();
+    let path = path.to_str().unwrap();
+
+    let output = call(
+        &ctx,
+        json!({ "path": path, "old_string": "1", "new_string": "\"1\"" }),
+    )
+    .unwrap();
+
+    assert!(output.contains(&format!("{LSP_NOTE} {path}")), "{output}");
+    assert_eq!(fs::read_to_string(path).unwrap(), "let x: u8 = \"1\";");
 }
 
 #[test]
