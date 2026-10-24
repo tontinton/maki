@@ -235,6 +235,8 @@ The receipt names the task id. The parent can pass it to `task_message` to tell 
 
 To stop a task, open `/tasks`, select it, and press Ctrl+S. The parent still gets the result on its next turn, but the notice does not wake it.
 
+`/tasks` lists the session's running jobs as well, whichever plugin started them. Ctrl+S kills one the same way.
+
 Background and blocking tasks share `plugins.task.max_concurrent`. Plan mode still blocks its file writes. [Background Tasks](/docs/background-tasks/) covers permission prompts, what stops a task, and headless runs.
 
 Related: [Token Economy](/docs/token-economy/) for why all this frugality exists, [Configuration](/docs/configuration/) for the knobs.
