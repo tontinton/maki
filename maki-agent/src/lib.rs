@@ -21,6 +21,7 @@ pub use mcp::{
 };
 pub mod inbox;
 pub mod session;
+pub mod spawn;
 pub use inbox::SubagentInbox;
 pub(crate) mod task_set;
 pub use agent::{

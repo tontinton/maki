@@ -5,7 +5,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use rustix::io::Errno;
 #[cfg(unix)]
-use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpid};
+use rustix::process::{Pid, Signal, WaitOptions, kill_process, kill_process_group, waitpid};
 use smol::process::Child;
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -62,6 +62,11 @@ impl ChildGuard {
     fn signal_kill(&self) {
         if self.child.is_some() {
             sigkill_process_group(self.pid);
+            // Group-only kills can miss a child that has not `setsid`ed yet
+            // (the macOS trampoline) — fall back to the direct signal.
+            if let Some(id) = unix_pid(self.pid) {
+                let _ = kill_process(id, Signal::KILL);
+            }
         }
     }
 
@@ -95,14 +100,19 @@ impl ChildGuard {
 
 #[cfg(unix)]
 pub(crate) fn sigkill_process_group(pid: u32) {
-    let Some(group) = unix_pid(pid) else {
+    let Some(id) = unix_pid(pid) else {
         return;
     };
-    if let Err(err) = kill_process_group(group, Signal::KILL)
+    // With the macOS re-exec trampoline the child only `setsid`s after the
+    // spawn returns, so until it does the group may be empty (`ESRCH`) while
+    // the pid itself is still very much alive. Kill the pid too so the
+    // trampoline window can't outlive a cancellation.
+    if let Err(err) = kill_process_group(id, Signal::KILL)
         && err != Errno::SRCH
     {
         tracing::warn!(pid, %err, "failed to kill process group");
     }
+    let _ = kill_process(id, Signal::KILL);
 }
 
 #[cfg(unix)]
