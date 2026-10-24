@@ -82,7 +82,7 @@ end
 if opts.allow_background then
   schema.properties.background = {
     type = "boolean",
-    description = "Run in the background. The result arrives as a message when it ends. End your turn to wait for it.",
+    description = "Run in the background and continue other work: the call returns immediately and the result arrives later as a message. Launch every background task in one parallel batch, never as sequential calls, and don't sleep or poll for it; end your turn once nothing else is left.",
     needs_background = true,
   }
 end
