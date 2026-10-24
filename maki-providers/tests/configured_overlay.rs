@@ -12,19 +12,12 @@ use maki_providers::plugin::{
     self, DeclAuthority, PlanDecl, ProviderDecl, RegisterError, Registration,
 };
 use maki_providers::spec::Owner;
+use maki_providers::test_support::isolated_home;
 use maki_storage::StateDir;
 use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
 use serde_json::json;
 use tempfile::TempDir;
 use test_case::test_case;
-
-const HOME_VARS: &[&str] = &[
-    "HOME",
-    "XDG_STATE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-];
 
 const PROVIDERS_FILE: &str = "providers.toml";
 
@@ -43,7 +36,6 @@ const CONFIGURED_URL: &str = "https://configured.example/v1";
 const OWN_HOST: &str = "declared.example";
 const OWN_DISPLAY_NAME: &str = "Configured";
 
-const TEMPDIR_FAILED: &str = "no temporary state directory";
 const CONFIG_DIR_FAILED: &str = "the isolated config directory did not resolve";
 const WRITE_FAILED: &str = "providers.toml could not be written";
 const PROVIDER_LOST: &str = "a providers.toml overlay took the slug off its declaration";
@@ -58,10 +50,7 @@ const PLAN_KEY_ENV: &str = "MAKI_TEST_PLANNED_PROVIDER_KEY";
 /// path resolution says it lives, so a test can never quietly write somewhere
 /// nothing reads.
 fn isolated(providers_toml: &str) -> TempDir {
-    let dir = TempDir::new().expect(TEMPDIR_FAILED);
-    for var in HOME_VARS {
-        unsafe { std::env::set_var(var, dir.path()) };
-    }
+    let dir = isolated_home();
     let config = maki_storage::paths::config_dir().expect(CONFIG_DIR_FAILED);
     fs::write(config.join(PROVIDERS_FILE), providers_toml).expect(WRITE_FAILED);
     dir
