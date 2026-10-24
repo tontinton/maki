@@ -33,6 +33,33 @@ local function dense(questions, answers)
   return out
 end
 
+-- Another plugin may answer the form for the user, so it hears the form open
+-- and close, and whichever answer lands first is the one the model reads.
+local function ask(questions, ctx)
+  local tool_id = ctx:tool_id()
+  if not tool_id then
+    return QuestionForm.open(questions)
+  end
+  local session_id = ctx:session_id()
+  local result = QuestionForm.open(questions, function(win)
+    maki.session.register_question(tool_id, win, { session = session_id })
+    maki.api.exec_autocmds("QuestionAsked", {
+      data = { session_id = session_id, tool_id = tool_id, questions = questions },
+    })
+  end)
+  local by = "user"
+  local remote = maki.session.settle_question(tool_id)
+  if remote then
+    result, by = remote, "plugin"
+  elseif ctx:cancelled() then
+    by = "cancelled"
+  end
+  maki.api.exec_autocmds("QuestionResolved", {
+    data = { session_id = session_id, tool_id = tool_id, by = by },
+  })
+  return result
+end
+
 maki.api.register_tool({
   name = "question",
   description = DESCRIPTION,
@@ -82,7 +109,7 @@ maki.api.register_tool({
     if #questions == 0 then
       return { llm_output = "error: at least one question is required", is_error = true }
     end
-    local result = QuestionForm.open(questions)
+    local result = ask(questions, ctx)
     local opts = QuestionHelpers.view_opts(ctx)
     if result.type == "dismiss" then
       return {

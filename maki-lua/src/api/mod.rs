@@ -118,6 +118,8 @@ pub(crate) fn create_maki_global(
             ui_action_tx.clone(),
             permissions,
             permissions.is_allowed(Permission::Agent),
+            Arc::clone(&plugin),
+            permissions.holds_all_reach() && permissions.is_allowed(Permission::Agent),
         )?,
     )?;
     maki.set(
