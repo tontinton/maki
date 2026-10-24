@@ -17,6 +17,7 @@ use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_ui::{OpenSession, RunOutcome};
 
+use super::worktree;
 use crate::cli::{Cli, normalize_tool_name};
 use crate::provider_scripts;
 use crate::resume::{self, Resolved};
@@ -286,10 +287,31 @@ fn rebuild(
     Ok((stack, warnings, pack_report))
 }
 
-pub fn run(mut cli: Cli) -> Result<()> {
+pub fn run(cli: Cli) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
+    let worktree = cli
+        .worktree
+        .then(|| worktree::enter(cli.worktree_name.as_deref(), &storage))
+        .transpose()?;
+    // Any `?` in the session would otherwise strand a hidden worktree and a
+    // stray branch. Cleanup only deletes what it can prove is empty, so running
+    // it after an error is safe.
+    let result = run_session(cli, storage);
+    if let Some(worktree) = &worktree {
+        worktree.clean_up();
+    }
+    let code = result?;
+    if code != 0 {
+        maki_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// Returns the exit code instead of exiting, so `run` gets to clean up first.
+fn run_session(mut cli: Cli, storage: StateDir) -> Result<i32> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
     // Only the interactive UI can answer an install confirmation or a trust
@@ -412,7 +434,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             project_config: trust.project_config.clone(),
         })
         .context("run sdk mode")?;
-        return Ok(());
+        return Ok(0);
     }
 
     if cli.print {
@@ -437,7 +459,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             storage: storage.clone(),
         })
         .context("run print mode")?;
-        return Ok(());
+        return Ok(0);
     }
 
     let mut tabs = vec![open_tab(
@@ -524,11 +546,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     teardown_ms = started.elapsed().as_millis() as u64 - stack_ms,
                     "plugin host and teardown joined"
                 );
-                if code != 0 {
-                    maki_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
-                    std::process::exit(code);
-                }
-                return Ok(());
+                return Ok(code);
             }
             RunOutcome::Reload {
                 tabs: reloaded,
