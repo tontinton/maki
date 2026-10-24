@@ -4217,7 +4217,7 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
     .unwrap();
     let rx = host.ui_action_rx();
     host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/echo"), args.into(), 0);
+        .run_command(Arc::from("p"), Arc::from("/echo"), args.into(), 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -4260,12 +4260,13 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
     );
     let rx = host.ui_action_rx();
     host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
+        .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0, None);
 
     let maki_lua::UiAction::RunCommand {
         cmdline,
         depth,
         caller,
+        session,
         reply_tx,
     } = rx
         .recv_timeout(Duration::from_secs(5))
@@ -4274,6 +4275,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         panic!("{RUN_COMMAND_NO_ACTION}");
     };
     assert_eq!((cmdline.as_str(), depth), ("/cd ~/src", 1));
+    assert_eq!(session, None, "no opts means the focused session");
     assert!(!caller.is_allowed(maki_lua::Permission::Agent));
     reply_tx.send(reply).unwrap();
 
@@ -4281,6 +4283,44 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         .recv_timeout(Duration::from_secs(5))
         .expect(RUN_COMMAND_NO_ACTION);
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
+}
+
+/// A handler learns which chat it runs in, and can aim the next command at
+/// that same chat even when it is not the focused one.
+#[test]
+fn run_command_forwards_session_both_ways() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/here",
+            handler = function(opts)
+                maki.api.run_command("/new", { session = opts.session })
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    host.event_handle().run_command(
+        Arc::from("p"),
+        Arc::from("/here"),
+        String::new(),
+        0,
+        Some("s-bg".into()),
+    );
+
+    let maki_lua::UiAction::RunCommand {
+        cmdline, session, ..
+    } = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect(RUN_COMMAND_NO_ACTION)
+    else {
+        panic!("{RUN_COMMAND_NO_ACTION}");
+    };
+    assert_eq!(cmdline, "/new");
+    assert_eq!(session.as_deref(), Some("s-bg"));
 }
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
@@ -6523,7 +6563,7 @@ fn async_run_from_parked_command_handler_runs_promptly() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new(), 0);
+    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new(), 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -6554,7 +6594,7 @@ fn job_callbacks_fire_while_command_handler_parked() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new(), 0);
+    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new(), 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
