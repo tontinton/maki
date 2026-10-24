@@ -102,6 +102,18 @@ pub enum HostEvent<'a> {
     TaskFocusChanged {
         id: &'a str,
     },
+    JobStart {
+        id: u32,
+        plugin: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<&'a str>,
+        command: &'a str,
+    },
+    JobExit {
+        id: u32,
+        plugin: &'a str,
+        exit_code: i32,
+    },
     ModelChanged {
         model: Value,
         previous_spec: String,
@@ -203,6 +215,8 @@ impl HostEventKind {
             Self::TaskStatusChanged => (&[], &["id", "name", "status", "plugin"]),
             Self::TaskStopped => (&[], &["id", "plugin"]),
             Self::TaskFocusChanged => (&[], &["id"]),
+            Self::JobStart => (&["command"], &["id", "plugin", "name"]),
+            Self::JobExit => (&[], &["id", "plugin", "exit_code"]),
             Self::ModelChanged => (&[], &["model", "previous_spec"]),
             Self::InputChanged => (
                 &["text"],
@@ -511,6 +525,17 @@ mod tests {
                 plugin: Some(SAMPLE_TEXT),
             },
             HostEventKind::TaskFocusChanged => HostEvent::TaskFocusChanged { id: SAMPLE_TEXT },
+            HostEventKind::JobStart => HostEvent::JobStart {
+                id: 0,
+                plugin: SAMPLE_TEXT,
+                name: Some(SAMPLE_TEXT),
+                command: SAMPLE_TEXT,
+            },
+            HostEventKind::JobExit => HostEvent::JobExit {
+                id: 0,
+                plugin: SAMPLE_TEXT,
+                exit_code: 0,
+            },
             HostEventKind::ModelChanged => HostEvent::ModelChanged {
                 model: json!({}),
                 previous_spec: SAMPLE_TEXT.into(),

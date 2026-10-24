@@ -3195,7 +3195,7 @@ fn tick_drains_live_bufs_of_background_chats() {
 #[test]
 fn status_hints_published_by_a_plugin_reach_the_screen() {
     let (mut app, plugin) = app_with_hints();
-    plugin.publish(vec![hint_for(None)]);
+    plugin.publish(vec![hint_for(None)], Vec::new());
 
     assert!(
         !rendered(&mut app).contains(HINT_TEXT),
@@ -3204,7 +3204,7 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert!(rendered(&mut app).contains(HINT_TEXT));
 
-    plugin.publish(vec![]);
+    plugin.publish(Vec::new(), Vec::new());
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert!(!rendered(&mut app).contains(HINT_TEXT));
 }
@@ -3226,7 +3226,7 @@ fn session_hint_shows_only_in_its_tab(own: bool) {
     } else {
         MakiId::generate()
     };
-    plugin.publish(vec![hint_for(Some(owner))]);
+    plugin.publish(vec![hint_for(Some(owner))], Vec::new());
 
     let _ = app.tick();
 
