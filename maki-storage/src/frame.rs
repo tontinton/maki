@@ -15,6 +15,7 @@ use serde_json::Value;
 pub struct PromptFacts {
     pub date: String,
     pub cwd: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instructions: String,
@@ -110,7 +111,8 @@ impl LiveFacts {
         };
         let changed = |told: &String, now: &String| (told != now).then(|| now.clone());
         update.date = changed(&told.date, &now.date);
-        update.model = changed(&told.model, &now.model);
+        update.model =
+            (!now.model.is_empty() && told.model != now.model).then(|| now.model.clone());
         update.cwd = changed(&told.cwd, &now.cwd);
         update.instructions = changed(&told.instructions, &now.instructions);
         for (key, content) in &now.hints {
@@ -223,5 +225,13 @@ mod tests {
                 ..FactsUpdate::default()
             }
         );
+    }
+
+    #[test]
+    fn empty_now_model_tells_nothing() {
+        let told = rendered();
+        let mut now = rendered();
+        now.prompt.as_mut().unwrap().model.clear();
+        assert!(told.changes_to(&now).is_empty());
     }
 }

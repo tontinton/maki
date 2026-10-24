@@ -24,6 +24,7 @@ const INSTRUCTION_FILES: &[&str] = &[
 
 const LOCAL_INSTRUCTION_FILE: &str = "AGENTS.local.md";
 const GLOBAL_INSTRUCTION_FILE: &str = "AGENTS.md";
+pub(super) const MODEL_VAR: &str = "{model}";
 
 /// Instruction files the model has seen this session. Startup inserts the
 /// root files; a subdirectory file is inserted by the dispatcher only once its
@@ -94,13 +95,18 @@ pub fn build_system_prompt(
     instructions: &str,
     slots: &ResolvedPrompts,
     model: &Model,
+    model_in_prompt: bool,
 ) -> String {
-    let vars = vars.clone().set("{model}", model.spec());
+    let vars = vars.clone().set(MODEL_VAR, model.spec());
     if slots.has_template(PromptId::System) {
         return slots.render(PromptId::System, &vars, instructions);
     }
     let env = vars.apply("\n\n{environment}");
-    let env = format!("{env}\n- Model: {}", model.spec());
+    let env = if model_in_prompt {
+        format!("{env}\n- Model: {}", model.spec())
+    } else {
+        env.into_owned()
+    };
     let instructions = format!("{env}{instructions}");
     slots.render(PromptId::System, &vars, &instructions)
 }
@@ -286,8 +292,19 @@ mod tests {
             &format!("\n{INSTR}"),
             &slots,
             &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+            true,
         );
         assert!(prompt.find(INSTR).unwrap() < prompt.find(EXTRA).unwrap());
+    }
+
+    #[test_case(true  ; "model_included")]
+    #[test_case(false ; "model_excluded")]
+    fn build_system_prompt_honors_model_in_prompt(model_in_prompt: bool) {
+        let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
+        let slots = ResolvedPrompts::default();
+        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let prompt = build_system_prompt(&vars, "", &slots, &model, model_in_prompt);
+        assert_eq!(prompt.contains("- Model:"), model_in_prompt);
     }
 
     #[test_case("AGENTS.md",                true  ; "direct_match")]
