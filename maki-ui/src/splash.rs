@@ -238,6 +238,7 @@ impl Splash {
     pub fn render(
         &self,
         area: Rect,
+        edge: Rect,
         buf: &mut Buffer,
         accent: Color,
         lua_commands: &[LuaCommandInfo],
@@ -266,7 +267,7 @@ impl Splash {
         render_centered_faded(area, buf, fade, 0.75, tag_y, TAGLINE);
         self.render_help(area, buf, fade, help_y, accent);
         self.render_tip(area, buf, fade, tip_y, accent, lua_commands);
-        render_version(area, buf, fade, area.y, self.latest_version);
+        render_version(edge, buf, fade, area.y, self.latest_version);
     }
 
     /// The field is a gradient of intensities between the background and the
@@ -513,8 +514,8 @@ fn pick_tip(seed: usize, lua_commands: &[LuaCommandInfo]) -> Option<&'static Tip
     available().nth(seed % available().count().max(1))
 }
 
-fn render_version(area: Rect, buf: &mut Buffer, fade: f32, y: u16, new_version: Option<&str>) {
-    if y >= area.y + area.height {
+fn render_version(edge: Rect, buf: &mut Buffer, fade: f32, y: u16, new_version: Option<&str>) {
+    if y >= edge.y + edge.height {
         return;
     }
     let theme = theme::current();
@@ -524,8 +525,8 @@ fn render_version(area: Rect, buf: &mut Buffer, fade: f32, y: u16, new_version: 
         None => format!("v{}", update::CURRENT),
     };
     let style = faded_style(theme.foreground, bg, VERSION_ALPHA * fade);
-    let x_start = area.x + area.width.saturating_sub(text.chars().count() as u16 + 1);
-    render_segments(area, buf, y, x_start, &[(&text, style)]);
+    let x_start = (edge.x + edge.width).saturating_sub(text.chars().count() as u16 + 1);
+    render_segments(edge, buf, y, x_start, &[(&text, style)]);
 }
 
 fn render_centered_faded(
@@ -632,7 +633,7 @@ mod tests {
     fn rendered(splash: &Splash) -> String {
         let area = Rect::new(0, 0, 80, 20);
         let mut buf = Buffer::empty(area);
-        splash.render(area, &mut buf, Color::Blue, &[]);
+        splash.render(area, area, &mut buf, Color::Blue, &[]);
         buffer_text(&buf)
     }
 
@@ -734,7 +735,7 @@ todo_in_progress = { fg = "yellow" }
         splash.start -= Duration::from_secs_f32(FADE_DURATION);
         let area = Rect::new(0, 0, 80, 20);
         let mut buf = Buffer::empty(area);
-        splash.render(area, &mut buf, Color::Blue, &[]);
+        splash.render(area, area, &mut buf, Color::Blue, &[]);
 
         let rgb = buf
             .content
@@ -742,5 +743,31 @@ todo_in_progress = { fg = "yellow" }
             .filter_map(|c| c.style().fg)
             .find(|fg| matches!(fg, Color::Rgb(..)));
         assert_eq!(rgb, None, "a palette theme must not produce rgb cells");
+    }
+
+    /// The version stays pinned to the viewport edge even when the splash body
+    /// is centered in an inset reading column.
+    #[test]
+    fn version_hugs_the_viewport_edge() {
+        let splash = Splash::new(false);
+        let full = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(full);
+        splash.render(
+            Rect::new(2, 0, 76, 20),
+            Rect::new(79, 0, 1, 20),
+            &mut buf,
+            Color::Blue,
+            &[],
+        );
+
+        let text = format!("v{}", update::CURRENT);
+        let start = usize::from(full.width) - text.chars().count() - 1;
+        let drawn: String = (0..text.chars().count())
+            .filter_map(|i| {
+                buf.cell(((start + i) as u16, 0))
+                    .map(ratatui::buffer::Cell::symbol)
+            })
+            .collect();
+        assert_eq!(drawn, text, "version hugs the viewport edge");
     }
 }

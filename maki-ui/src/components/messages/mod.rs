@@ -877,8 +877,15 @@ impl MessagesPanel {
         self.cache.truncate(self.live_start);
         if self.show_idle_splash() {
             let accent = self.accent.resolve();
-            self.idle_splash
-                .render(area, frame.buffer_mut(), accent, lua_commands);
+            // The version hugs the viewport's right column; the rest of the
+            // splash stays centered in the reading area.
+            self.idle_splash.render(
+                area,
+                scrollbar_area,
+                frame.buffer_mut(),
+                accent,
+                lua_commands,
+            );
             return;
         }
 
