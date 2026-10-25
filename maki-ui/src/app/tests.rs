@@ -6906,7 +6906,12 @@ fn output_margin_keeps_the_whole_band_reachable_by_the_mouse(margin: u16) {
 
     let (msg, _bottom, _status, _input, _splits) = app.layout_geometry(TEST_AREA);
     let scrollbar_col = TEST_AREA.width - 1;
-    for col in [TEST_AREA.x, msg.x, msg.right().saturating_sub(1), scrollbar_col] {
+    for col in [
+        TEST_AREA.x,
+        msg.x,
+        msg.right().saturating_sub(1),
+        scrollbar_col,
+    ] {
         let zone = app.zone_at(msg.y, col).expect("a zone under the cursor");
         assert_eq!(
             zone.zone,
