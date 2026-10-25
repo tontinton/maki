@@ -8451,3 +8451,56 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
     };
     assert!(text.text.contains("fs_write"), "got: {}", text.text);
 }
+
+#[test]
+fn list_plugins_reports_registrations_load_failures_and_runtime_errors() {
+    let (reg, host) = builtins_host();
+    let src = format!(
+        r#"
+maki.api.create_autocmd("ProbeFailure", {{
+    callback = function() error("kaboom") end,
+}})
+maki.api.register_command({{ name = "/probe", handler = function() end }})
+maki.api.register_tool({{
+    name = "list_plugins_probe",
+    description = "returns list_plugins as json",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return maki.json.encode(maki.api.list_plugins())
+    end,
+}})
+"#
+    );
+    host.load_source("probe", &src).unwrap();
+    host.load_source("broken", "error('nope')")
+        .expect_err("load must fail");
+    host.event_handle().fire_autocmd("ProbeFailure", json!({}));
+
+    let out = exec_tool(&reg, "list_plugins_probe", json!({})).unwrap();
+    let list: Vec<Value> = serde_json::from_str(&out).unwrap();
+    let find = |name: &str| {
+        list.iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from {out}"))
+    };
+
+    let probe = find("probe");
+    assert_eq!(probe["loaded"], true);
+    assert_eq!(probe["commands"], json!(["/probe"]));
+    assert_eq!(probe["tools"], json!(["list_plugins_probe"]));
+    assert_eq!(probe["autocmds"], 1);
+    let errors = probe["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{out}");
+    assert_eq!(errors[0]["seam"], "autocmd");
+    assert!(errors[0]["msg"].as_str().unwrap().contains("kaboom"));
+
+    let broken = find("broken");
+    assert_eq!(broken["loaded"], false);
+    assert!(broken["load_error"].as_str().unwrap().contains("nope"));
+
+    let optional = find(maki_config::OPTIONAL_BUILTINS[0]);
+    assert_eq!(optional["source"], "bundled");
+    assert_eq!(optional["enabled"], false);
+    assert_eq!(optional["loaded"], false);
+}

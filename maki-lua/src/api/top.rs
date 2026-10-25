@@ -15,7 +15,8 @@ use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use crate::api::util::command::{UiAction, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::docs::FnDoc;
-use crate::runtime::{DeferQueue, DeferredCallback};
+use crate::plugin_status::{ErrorSeam, record_error};
+use crate::runtime::{DeferQueue, DeferredCallback, strip_traceback};
 
 /// How deep `maki.deepcopy` follows nested tables before it gives up, so it
 /// never overflows the stack. With `noref` set, this is also where a cycle
@@ -137,16 +138,15 @@ fn notify(
     };
     let handler_fn = lua.app_data_ref::<NotifyHandler>().and_then(|slot| {
         let guard = locked(&slot);
-        let (_, key) = guard.as_ref()?;
-        lua.registry_value::<Function>(key).ok()
+        let (owner, key) = guard.as_ref()?;
+        let func = lua.registry_value::<Function>(key).ok()?;
+        Some((Arc::clone(owner), func))
     });
-    if let Some(func) = handler_fn {
+    if let Some((owner, func)) = handler_fn {
         // A broken override must not swallow the message, so fall through.
         match func.call::<()>((msg.clone(), level.clone(), opts)) {
             Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(error = %e, "maki.notify handler failed; falling through to flash");
-            }
+            Err(e) => record_error(lua, &owner, ErrorSeam::Notify, strip_traceback(&e)),
         }
     }
     let text = match title {

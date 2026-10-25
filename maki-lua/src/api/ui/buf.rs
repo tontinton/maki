@@ -9,7 +9,8 @@ use mlua::{Function, Lua, Result as LuaResult, Table, Value as LuaValue};
 
 use super::{blit, segment_color_to_lua};
 use crate::api::util::convert::TableExt;
-use crate::runtime::{TaskHandle, lock_cell};
+use crate::plugin_status::{ErrorSeam, record_callback_error};
+use crate::runtime::{TaskHandle, lock_cell, strip_traceback};
 
 /// `live_buf` tracks the first buffer a handler creates, the one
 /// that gets streamed to the UI during execution.
@@ -272,9 +273,15 @@ fn on(lua: &Lua, this: &BufHandle, event: String, callback: Function) -> LuaResu
         // Change callbacks fire inline from buf mutations, so they
         // must not yield or mutate this buffer.
         "change" => {
+            let vm = lua.clone();
             this.buf.set_on_change(move || {
                 if let Err(e) = callback.call::<()>(()) {
-                    tracing::warn!(error = %e, "buf change callback failed");
+                    record_callback_error(
+                        &vm,
+                        &callback,
+                        ErrorSeam::BufChange,
+                        strip_traceback(&e),
+                    );
                 }
             });
             track_slot(lua, HandlerSlot::Change(Arc::clone(&this.buf)));

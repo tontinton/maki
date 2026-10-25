@@ -22,11 +22,12 @@ use crate::api::util::command::{
 };
 use crate::background::BackgroundSessions;
 use crate::error::PluginError;
-use crate::pack::{DiscoveredPackage, Interaction};
+use crate::pack::{DiscoveredPackage, Discovery, Interaction};
 use crate::plugin_permissions::{
     MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
     load_plugin_permissions,
 };
+use crate::plugin_status::PluginKind;
 use crate::runtime::{
     self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
     RestoreItem,
@@ -520,6 +521,12 @@ impl PluginHost {
         // the config surface.
         for bundled in BUNDLED_PLUGINS {
             let Some(builtin) = config.names.iter().find(|n| n.as_str() == bundled.name) else {
+                self.inner.plugin_status.record_idle(
+                    bundled.name,
+                    PluginKind::Bundled,
+                    None,
+                    false,
+                );
                 continue;
             };
             let dir = &bundled.dir;
@@ -928,6 +935,7 @@ impl PluginHost {
                 match result {
                     Ok(()) => warnings.extend(self.permission_name_warning(&pkg.name)),
                     Err(e) if e.is_version_floor() => {
+                        self.record_package_failure(pkg, &e);
                         tracing::warn!(
                             package = %pkg.name,
                             path = %pkg.dir.display(),
@@ -937,6 +945,7 @@ impl PluginHost {
                         warnings.push(format!("{SKIPPED_PLUGIN_WARNING}: {e}"));
                     }
                     Err(e) => {
+                        self.record_package_failure(pkg, &e);
                         tracing::error!(
                             package = %pkg.name,
                             path = %pkg.dir.display(),
@@ -994,7 +1003,43 @@ impl PluginHost {
                 tracing::warn!(error = %e, "could not close the package activation queue");
             }
         }
+        for pkg in packages
+            .iter()
+            .filter(|pkg| !loaded.contains(&pkg.name.as_str()))
+        {
+            let enabled = config.packages.iter().any(|n| n == &pkg.name);
+            self.inner.plugin_status.record_idle(
+                &pkg.name,
+                PluginKind::Package,
+                Some(pkg.dir.clone()),
+                enabled,
+            );
+        }
         warnings
+    }
+
+    fn record_package_failure(&self, pkg: &DiscoveredPackage, e: &PluginError) {
+        self.inner.plugin_status.record_load(
+            &pkg.name,
+            PluginKind::Package,
+            Some(pkg.dir.clone()),
+            Err(e.to_string()),
+        );
+    }
+
+    /// Packages discovery refused never reach a load, so this is the only
+    /// place `list_plugins` can learn about them.
+    pub fn record_discovery_problems(&self, discovery: &Discovery) {
+        for problem in &discovery.problems {
+            if let Some(name) = &problem.name {
+                self.inner.plugin_status.record_load(
+                    name,
+                    PluginKind::Package,
+                    None,
+                    Err(problem.to_string()),
+                );
+            }
+        }
     }
 
     pub fn event_handle(&self) -> EventHandle {

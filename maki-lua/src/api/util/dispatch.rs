@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use mlua::{FromLuaMulti, Function, IntoLuaMulti, Lua};
 
+use crate::plugin_status::record_slot_error;
 use crate::runtime::{TaskHandle, lock_cell, strip_traceback};
 
 pub const MAX_HOOK_DEPTH: u8 = 8;
@@ -93,23 +94,24 @@ impl Drop for DepthGuard {
     }
 }
 
-/// Calls a plugin callback so its failure stays its own: errors are logged
-/// with plugin and seam name, then swallowed.
+/// Calls a slot layer so its failure stays its own: errors are logged and
+/// recorded against the plugin under the slot's name, then swallowed.
 ///
 /// Runs in the caller's task, not a detached one. Every seam using this waits
 /// for the answer, so the caller's cancellation and deadline belong on the
 /// callback producing it, and [`Reentry::Task`] only tells nesting from
 /// concurrency while nesting stays inside one task.
 pub(crate) async fn call_swallowing<R: FromLuaMulti>(
+    lua: &Lua,
     func: &Function,
     args: impl IntoLuaMulti,
-    seam: &str,
+    slot: &str,
     plugin: &str,
 ) -> Option<R> {
     match func.call_async::<R>(args).await {
         Ok(r) => Some(r),
         Err(e) => {
-            tracing::warn!(seam, plugin, error = %strip_traceback(&e), "plugin callback failed");
+            record_slot_error(lua, plugin, slot, strip_traceback(&e));
             None
         }
     }
@@ -167,11 +169,24 @@ mod tests {
     #[test]
     fn call_swallowing_hides_errors_but_not_values() {
         let lua = Lua::new();
+        let store = crate::plugin_status::PluginStatusStore::default();
+        lua.set_app_data(store.clone());
         let bad: Function = lua.load("error('boom')").into_function().unwrap();
         let ok: Function = lua.load("return 7").into_function().unwrap();
         smol::block_on(async {
-            assert!(call_swallowing::<i64>(&bad, (), SEAM, "p").await.is_none());
-            assert_eq!(call_swallowing::<i64>(&ok, (), SEAM, "p").await, Some(7));
+            assert!(
+                call_swallowing::<i64>(&lua, &bad, (), SEAM, "p")
+                    .await
+                    .is_none()
+            );
+            assert_eq!(
+                call_swallowing::<i64>(&lua, &ok, (), SEAM, "p").await,
+                Some(7)
+            );
         });
+        let errors = &store.snapshot()["p"].errors;
+        assert_eq!(errors.len(), 1, "only the failure is kept");
+        assert_eq!(errors[0].seam, SEAM);
+        assert!(errors[0].msg.contains("boom"), "{}", errors[0].msg);
     }
 }

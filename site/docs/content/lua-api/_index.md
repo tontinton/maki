@@ -812,6 +812,39 @@ end
 
 ---
 
+### `maki.api.list_plugins()` {#maki-api-list_plugins}
+
+```lua
+maki.api.list_plugins()
+```
+
+List every plugin maki knows about, loaded or not, with what each one
+registered and the errors it raised recently.
+
+Covers bundled plugins (including disabled ones), installed packages
+(including disabled and never-activated `opt/` ones, and ones discovery
+refused), and `init.lua` files. `errors` keeps the 20 newest runtime
+errors, oldest first; `seam` names where the error surfaced: one of
+`"autocmd"`, `"command"`, `"keybind"`, `"defer_fn"`, `"async"`,
+`"job"`, `"cancel_hook"`, `"hint"`, `"header"`, `"describe"`,
+`"permission_scopes"`, `"start"`, `"restore"`, `"click"`,
+`"buf_change"`, `"plan_row"`, `"notify"`, `"watchdog"`, or the name
+of the slot a layer failed on.
+
+**Returns:** (`table[]`) Entries sorted by name: { name, source = "bundled"|"package"|"init", path?, enabled, loaded, load_error?, errors = { { t, seam, msg } }, commands = string[], tools = string[], autocmds = integer }.
+
+**Example:**
+
+```lua
+for _, p in ipairs(maki.api.list_plugins()) do
+  if p.load_error or #p.errors > 0 then
+    print(p.name, p.load_error or p.errors[#p.errors].msg)
+  end
+end
+```
+
+---
+
 ### `maki.api.run_command()` {#maki-api-run_command}
 
 ```lua
