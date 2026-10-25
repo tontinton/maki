@@ -87,8 +87,6 @@
       #   mismatch that prints the real hash. This is both the recovery
       #   path for updates and a hard stop if pinned content ever changes.
       gitDepHashes = {
-        "git+https://github.com/pydantic/monty.git?tag=v0.0.23#302e0f27ec8516689ba90793cd0381149e5f4076" =
-          "sha256-NUhHd3x0hA+qpQ7wQ30kiynn4M+5XWQrX/fG2zgnlwg=";
         "git+https://github.com/crossterm-rs/crossterm?rev=94ed7154e35d24a2f643c61760e1eb05b8ca9e63#94ed7154e35d24a2f643c61760e1eb05b8ca9e63" =
           "sha256-r2Xsxw8+eqESsJKaax5pb/rIWshkoqi5E81Dkh8snZ8=";
         "git+https://github.com/tontinton/syntect?rev=01df275f6f25da670e5ba5b7128cb89d03795119#01df275f6f25da670e5ba5b7128cb89d03795119" =
@@ -118,28 +116,10 @@
           craneLib = mkCraneLib pkgs;
           workspaceSrc = mkWorkspaceSrc craneLib;
 
-          # TODO: Upstream monty includes a relative README path that doesn't
-          # survive nix vendoring. Remove this once `monty` stops including
-          # the relative path
-          vendorDeps = craneLib.vendorCargoDeps {
+          cargoVendorDir = craneLib.vendorCargoDeps {
             src = workspaceSrc;
             outputHashes = gitDepHashes;
           };
-          cargoVendorDir = pkgs.runCommandLocal "vendor-cargo-deps" { } ''
-            cp -rL ${vendorDeps} $out
-            chmod -R +w $out
-            # config.toml has absolute paths to the original vendor dir;
-            # rewrite them to point to our patched copy
-            substituteInPlace "$out/config.toml" \
-              --replace-fail "${vendorDeps}" "$out"
-            find "$out" -name "*.rs" -print0 | while IFS= read -r -d "" f; do
-              if grep -qF '#![doc = include_str!("../../../README.md")]' "$f"; then
-                substituteInPlace "$f" \
-                  --replace-fail '#![doc = include_str!("../../../README.md")]' \
-                            '#![doc = "Monty Python bridge."]'
-              fi
-            done
-          '';
 
           commonArgs = {
             nativeBuildInputs = with pkgs; [

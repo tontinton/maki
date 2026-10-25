@@ -1,6 +1,6 @@
 //! Feeds monty's memory counters so `max_memory` holds in-process.
 //!
-//! monty v0.0.21 checks `LIVE_MEMORY - BASELINE_MEMORY` at VM checkpoints,
+//! monty checks `LIVE_MEMORY - BASELINE_MEMORY` at VM checkpoints,
 //! but something must feed those counters. Upstream feeds them with
 //! `monty-alloc` in a throwaway worker process that dies on a breach. maki
 //! runs the interpreter in-process, so this allocator does the accounting

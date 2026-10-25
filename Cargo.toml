@@ -194,8 +194,8 @@ tree-sitter-css = "0.25"
 tree-sitter-hcl = "1.1"
 tree-sitter-json = "0.24"
 tree-sitter-make = "1.1"
-monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.23", package = "monty" }
-monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.23", package = "monty-types" }
+monty = "1"
+monty-types = "1"
 notify = { version = "9.0.0-rc.5", default-features = false, features = ["flume", "macos_fsevent"] }
 notify-rust = "4.18.1"
 serde_yaml = "0.9"

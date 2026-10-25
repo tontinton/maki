@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::env::current_dir;
 use std::path::absolute;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use monty::{MontyRun, RunProgress};
 use monty_types::{
     CompileOptions, ExcType, ExtFunctionResult, MontyException, MontyFileHandle, MontyObject,
     NameLookupResult, OpenCallArgs, OsFunctionCall, PathStringDataArgs, PrintWriter,
-    PrintWriterCallback, ResourceLimits, ResourceTracker,
+    PrintWriterCallback, ResourceLimits, ResourceTracker, normalize_virtual_path,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -26,6 +27,7 @@ const DEFAULT_MAX_RECURSION: usize = 100;
 const SCRIPT_NAME: &str = "agent.py";
 const OS_CALLS_DENIED: &str = "OS calls are not permitted";
 const BINARY_FILES_UNSUPPORTED: &str = "binary files are not supported, open in text mode";
+const DIRECTORY_LISTING_UNSUPPORTED: &str = "listing directories is not supported";
 
 pub type ToolFn = Box<dyn Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<Value, String>>;
 
@@ -139,6 +141,7 @@ fn execute(
     let mut host = FileHost {
         files,
         pending: Vec::new(),
+        cwd: sandbox_cwd()?,
     };
     let result = drive(script, tools, resolver, &mut host, limits, print_writer);
     // CPython closes open files when a script dies, so their writes land even then.
@@ -160,8 +163,9 @@ fn drive(
     limits: ResourceLimits,
     print_writer: &mut PrintWriter<'_>,
 ) -> Result<Option<Value>, InterpreterError> {
-    let runner = MontyRun::new(script, SCRIPT_NAME, vec![], CompileOptions::default())
+    let mut runner = MontyRun::new(script, SCRIPT_NAME, vec![], CompileOptions::default())
         .map_err(|e| InterpreterError::Parse(e.to_string()))?;
+    runner.set_cwd(&host.cwd);
 
     let tracker = ResourceTracker::new(limits);
 
@@ -174,18 +178,14 @@ fn drive(
     loop {
         match progress {
             RunProgress::Complete(obj) => {
-                let output = match &obj {
-                    MontyObject::None => None,
-                    _ => Some(monty_to_json(&obj)),
-                };
-                return Ok(output);
+                return Ok((obj != MontyObject::none()).then(|| monty_to_json(obj.as_ref())));
             }
             RunProgress::FunctionCall(call) => {
                 let name = call.function_name.clone();
-                let args_json: Vec<Value> = call.args.iter().map(monty_to_json).collect();
+                let args_json: Vec<Value> = call.args.args().map(monty_to_json).collect();
                 let kwargs_json: Vec<(String, Value)> = call
-                    .kwargs
-                    .iter()
+                    .args
+                    .kwargs()
                     .map(|(k, v)| (k.to_string(), monty_to_json(v)))
                     .collect();
 
@@ -232,10 +232,7 @@ fn drive(
                 debug!(name = %name, "interpreter: name lookup");
 
                 let result = if tools.contains_key(name.as_str()) {
-                    NameLookupResult::Value(MontyObject::Function {
-                        name: name.clone(),
-                        docstring: None,
-                    })
+                    NameLookupResult::Value(MontyObject::function(name.clone(), None))
                 } else {
                     NameLookupResult::Undefined
                 };
@@ -296,15 +293,24 @@ fn drive(
 struct FileHost<'a> {
     files: Option<&'a FileFn>,
     pending: Vec<FileWrite>,
+    cwd: String,
 }
 
 impl FileHost<'_> {
     fn serve(&mut self, call: OsFunctionCall) -> ExtFunctionResult {
         let result = match call {
             OsFunctionCall::Open(args) => self.open(args),
-            OsFunctionCall::ReadText(path) => self.read(path.into_string()),
+            OsFunctionCall::ReadText(path) => self.read(self.host_path(path.into_string())),
             OsFunctionCall::WriteText(args) => self.write(args, false),
             OsFunctionCall::AppendText(args) => self.write(args, true),
+            // Walks and globs swallow an `OSError` like CPython does, so refusing
+            // a scan with the usual `PermissionError` would read as an empty tree.
+            OsFunctionCall::Scan(_) => {
+                return ExtFunctionResult::Error(MontyException::new(
+                    ExcType::RuntimeError,
+                    Some(DIRECTORY_LISTING_UNSUPPORTED.into()),
+                ));
+            }
             other => return ExtFunctionResult::Error(other.on_no_handler()),
         };
         match result {
@@ -329,12 +335,12 @@ impl FileHost<'_> {
         let path = args.path.into_string();
         if args.mode.truncate() {
             self.buffer(FileWrite {
-                path: path.clone(),
+                path: self.host_path(path.clone()),
                 content: String::new(),
                 append: false,
             });
         }
-        Ok(MontyObject::FileHandle(MontyFileHandle {
+        Ok(MontyObject::file_handle(MontyFileHandle {
             path,
             mode: args.mode,
             position: 0,
@@ -345,7 +351,7 @@ impl FileHost<'_> {
         if let Some(index) = self.pending.iter().position(|w| same_file(&w.path, &path)) {
             self.flush_at(index)?;
         }
-        self.call(FileOp::Read(path)).map(MontyObject::String)
+        self.call(FileOp::Read(path)).map(MontyObject::string)
     }
 
     /// Monty moves the file position by the number we return, and text
@@ -353,11 +359,11 @@ impl FileHost<'_> {
     fn write(&mut self, args: PathStringDataArgs, append: bool) -> Result<MontyObject, String> {
         let written = args.data.chars().count() as i64;
         self.buffer(FileWrite {
-            path: args.path.into_string(),
+            path: self.host_path(args.path.into_string()),
             content: args.data,
             append,
         });
-        Ok(MontyObject::Int(written))
+        Ok(MontyObject::int(written))
     }
 
     fn buffer(&mut self, write: FileWrite) {
@@ -390,6 +396,55 @@ impl FileHost<'_> {
             .map(drop)
             .map_err(|e| format!("{path}: {e}"))
     }
+
+    fn host_path(&self, sandbox: String) -> String {
+        written_path(&self.cwd, sandbox, cfg!(windows))
+    }
+}
+
+/// Monty resolves relative paths against its own POSIX cwd, so it gets the
+/// process cwd: `os.getcwd()` is then the real one.
+fn sandbox_cwd() -> Result<String, InterpreterError> {
+    current_dir()
+        .map(|dir| to_sandbox_cwd(&dir.to_string_lossy(), cfg!(windows)))
+        .map_err(|e| InterpreterError::Runtime(format!("cannot resolve cwd: {e}")))
+}
+
+/// Canonical like monty keeps it, so [`written_path`] can strip it. Windows
+/// `C:\proj` becomes `/C:/proj`, which monty accepts as an absolute path.
+fn to_sandbox_cwd(host: &str, windows: bool) -> String {
+    let posix = if windows {
+        Cow::Owned(format!("/{}", host.replace('\\', "/")))
+    } else {
+        Cow::Borrowed(host)
+    };
+    normalize_virtual_path(&posix).into_owned()
+}
+
+/// Monty prepends its cwd to every path not starting with `/`, without
+/// normalizing, so cutting it back off gives the path as the script wrote it.
+/// That is what the host tools expect: they expand `~`, resolve relative paths
+/// and Windows drive paths themselves, and permission rules match the spelling.
+fn written_path(cwd: &str, sandbox: String, windows: bool) -> String {
+    let written = sandbox.strip_prefix(cwd).and_then(|rest| {
+        if cwd.ends_with('/') {
+            Some(rest)
+        } else {
+            rest.strip_prefix('/')
+        }
+    });
+    match written {
+        Some(written) => written.to_owned(),
+        None if windows => match sandbox.strip_prefix('/') {
+            Some(rest) if is_drive_path(rest) => rest.to_owned(),
+            _ => sandbox,
+        },
+        None => sandbox,
+    }
+}
+
+fn is_drive_path(path: &str) -> bool {
+    matches!(path.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
 }
 
 /// Lexical only, like the host tools resolve paths, so symlinks still differ.
@@ -432,7 +487,7 @@ fn split_line_number(rest: &str) -> Option<(usize, &str)> {
 
 pub fn limits(timeout: Duration, max_memory: usize) -> ResourceLimits {
     ResourceLimits::default()
-        .max_duration(timeout)
+        .max_feed_duration(timeout)
         .max_memory(max_memory)
         .max_recursion_depth(DEFAULT_MAX_RECURSION)
 }
@@ -801,6 +856,56 @@ mod tests {
         let code = format!("open('{FILE_PATH}')");
         let err = run_code(&code, &empty_tools(), None, default_limits()).unwrap_err();
         assert!(matches!(err, InterpreterError::Sandboxed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn getcwd_reports_the_process_cwd() {
+        let result = run_code(
+            "import os\nos.getcwd()",
+            &empty_tools(),
+            None,
+            default_limits(),
+        );
+        assert_eq!(result.unwrap().output, Some(json!(sandbox_cwd().unwrap())));
+    }
+
+    #[test_case("import os\nlist(os.walk('.'))" ; "os_walk")]
+    #[test_case("from pathlib import Path\nlist(Path('.').glob('*'))" ; "path_glob")]
+    fn directory_listings_fail_loudly(code: &str) {
+        let err = run_with_files(code, &memory_fs(), false).unwrap_err();
+        assert!(
+            err.to_string().contains(DIRECTORY_LISTING_UNSUPPORTED),
+            "got {err:?}"
+        );
+    }
+
+    #[test_case("/proj", false, "/proj" ; "unix")]
+    #[test_case(r"C:\proj", true, "/C:/proj" ; "windows")]
+    #[test_case(r"C:\", true, "/C:" ; "windows_drive_root")]
+    #[test_case(r"\\server\share\proj", true, "/server/share/proj" ; "windows_unc")]
+    #[test_case(r"\\?\C:\proj", true, "/?/C:/proj" ; "windows_verbatim")]
+    fn sandbox_cwd_is_canonical(host: &str, windows: bool, expected: &str) {
+        assert_eq!(to_sandbox_cwd(host, windows), expected);
+    }
+
+    #[test_case("/proj", "/proj/a.txt", false, "a.txt" ; "relative")]
+    #[test_case("/proj", "/proj/./a.txt", false, "./a.txt" ; "dot")]
+    #[test_case("/proj", "/proj/../a.txt", false, "../a.txt" ; "above_the_cwd")]
+    #[test_case("/proj", "/proj/~/a.txt", false, "~/a.txt" ; "home")]
+    #[test_case("/proj", "/projx/a.txt", false, "/projx/a.txt" ; "sibling_sharing_the_prefix")]
+    #[test_case("/proj", "/proj", false, "/proj" ; "the_cwd_itself")]
+    #[test_case("/proj", "/etc/a.txt", false, "/etc/a.txt" ; "absolute")]
+    #[test_case("/", "/a.txt", false, "a.txt" ; "root_cwd")]
+    #[test_case("/C:/proj", r"/C:/proj/D:\x\a.txt", true, r"D:\x\a.txt" ; "windows_drive_path")]
+    #[test_case("/C:/proj", "/C:/proj/C:a.txt", true, "C:a.txt" ; "windows_drive_relative")]
+    #[test_case("/C:/proj", r"/C:/proj/\a.txt", true, r"\a.txt" ; "windows_root_relative")]
+    #[test_case("/C:/proj", r"/C:/proj/\\srv\share\a.txt", true, r"\\srv\share\a.txt" ; "windows_unc")]
+    #[test_case("/C:", "/C:/a.txt", true, "a.txt" ; "windows_drive_root_cwd")]
+    #[test_case("/C:/proj", "/C:/proj", true, "C:/proj" ; "windows_the_cwd_itself")]
+    #[test_case("/C:/proj", "/D:/a.txt", true, "D:/a.txt" ; "windows_posix_spelled_drive")]
+    #[test_case("/C:/proj", "/tmp/a.txt", true, "/tmp/a.txt" ; "windows_posix_absolute")]
+    fn host_gets_the_path_as_written(cwd: &str, sandbox: &str, windows: bool, expected: &str) {
+        assert_eq!(written_path(cwd, sandbox.to_owned(), windows), expected);
     }
 
     #[test]
