@@ -474,7 +474,7 @@ impl KeyPool {
         }
         Err(AgentError::Config {
             message: format!(
-                "{env_var} not set and no saved credentials for '{slug}' — run `maki auth login {slug}`"
+                "{env_var} not set and no saved credentials for '{slug}': run `maki auth login {slug}`"
             ),
         })
     }

@@ -205,15 +205,13 @@ fn migrate_stored_tool_key(s: &str) -> Option<maki_config::ToolKey> {
     {
         let new_form = format!("{server}.{tool}");
         return maki_config::ToolKey::parse(&new_form)
-            .map_err(
-                |e| tracing::warn!(key = s, error = %e, "malformed stored tool key — skipping"),
-            )
+            .map_err(|e| tracing::warn!(key = s, error = %e, "malformed stored tool key: skipping"))
             .ok();
     }
     match maki_config::ToolKey::parse(s) {
         Ok(key) => Some(key),
         Err(e) => {
-            tracing::error!(key = s, error = %e, "malformed stored tool key — rule DROPPED; a deny rule may have been lost");
+            tracing::error!(key = s, error = %e, "malformed stored tool key: rule DROPPED; a deny rule may have been lost");
             None
         }
     }
@@ -229,7 +227,7 @@ pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<maki_config::Permiss
                     if matches!(r.effect, StoredEffect::Deny) {
                         tracing::error!(
                             key = %r.tool,
-                            "SECURITY: stored DENY rule dropped — tool may now be accessible. \
+                            "SECURITY: stored DENY rule dropped: tool may now be accessible. \
                              Re-add this rule manually in permissions.toml"
                         );
                     }

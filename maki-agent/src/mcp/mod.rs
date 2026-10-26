@@ -178,7 +178,7 @@ impl ServerEntry {
                         tool = %info.name,
                         server = %self.name,
                         wire_len,
-                        "skipping tool — wire name exceeds 64 char LLM API limit"
+                        "skipping tool: wire name exceeds 64 char LLM API limit"
                     );
                     return false;
                 }

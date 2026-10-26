@@ -361,7 +361,7 @@ fn model_row(
         gap(),
         match cost {
             Some(c) => Span::styled(format!("{c:>6.3}"), fg),
-            None => Span::styled(format!("{:>6}", "—"), dim),
+            None => Span::styled(format!("{:>6}", "-"), dim),
         },
     ]
 }
@@ -481,7 +481,7 @@ mod tests {
     const ONE_MILLION: u32 = 1_000_000;
     const ONE_MILLION_TEXT: &str = "1.0m";
     const UNKNOWN_MODEL: &str = "a-model-no-table-has-ever-heard-of";
-    const NO_COST_TEXT: &str = "—";
+    const NO_COST_TEXT: &str = "-";
 
     fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
         lines

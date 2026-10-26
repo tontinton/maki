@@ -998,18 +998,18 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
                         } else {
                             tracing::warn!(
                                 server = server_name.as_str(),
-                                "[mcp.{server_name}] is not a table — skipping"
+                                "[mcp.{server_name}] is not a table: skipping"
                             );
                         }
                     }
                 } else {
-                    tracing::warn!("[mcp] is not a table (got {}) — skipping", v.type_str());
+                    tracing::warn!("[mcp] is not a table (got {}): skipping", v.type_str());
                 }
             } else if let Ok(tp) = v.clone().try_into::<ToolPermissions>() {
                 if k.contains('.') {
                     tracing::warn!(
                         key = k.as_str(),
-                        "tool section [{k}] contains a dot — did you mean [mcp.{k}]? Skipping."
+                        "tool section [{k}] contains a dot: did you mean [mcp.{k}]? Skipping."
                     );
                 } else {
                     tools.insert(k.clone(), tp);
@@ -2230,7 +2230,7 @@ fn parse_mcp_server_table(
     if !is_valid_server_name(server_name) {
         tracing::warn!(
             server = server_name,
-            "skipping [mcp.{server_name}] — invalid server name; \
+            "skipping [mcp.{server_name}]: invalid server name; \
              must contain only alphanumeric characters and hyphens"
         );
         return;
@@ -2282,7 +2282,7 @@ fn parse_mcp_server_table(
                             tracing::info!(
                                 server = server_name,
                                 tool = tool_name,
-                                "{key} = \"{tool_name}\" coerced to {key} = [\"{tool_name}\"] — \
+                                "{key} = \"{tool_name}\" coerced to {key} = [\"{tool_name}\"]: \
                                  consider using array syntax"
                             );
                             push_mcp_tool_rule(rules, server_name, tool_name, effect);
@@ -2293,7 +2293,7 @@ fn parse_mcp_server_table(
                             server = server_name,
                             key = key.as_str(),
                             value = ?other,
-                            "unexpected value for [mcp.{server_name}].{key} — \
+                            "unexpected value for [mcp.{server_name}].{key}: \
                              expected array of tool names or default = \"allow\"/\"deny\""
                         );
                     }
@@ -2311,7 +2311,7 @@ fn parse_mcp_server_table(
                     tracing::warn!(
                         server = server_name,
                         value = ?value,
-                        "invalid [mcp.{server_name}].default value — expected \"allow\", \"deny\", or \"prompt\""
+                        "invalid [mcp.{server_name}].default value: expected \"allow\", \"deny\", or \"prompt\""
                     );
                 }
             }
@@ -2320,14 +2320,14 @@ fn parse_mcp_server_table(
                     tracing::warn!(
                         server = server_name,
                         key = other,
-                        "unknown key [mcp.{server_name}.{other}] — server names cannot \
+                        "unknown key [mcp.{server_name}.{other}]: server names cannot \
                          contain dots; use [mcp.{other}] instead if this is a server name"
                     );
                 } else {
                     tracing::warn!(
                         server = server_name,
                         key = other,
-                        "unknown key in [mcp.{server_name}] — ignored"
+                        "unknown key in [mcp.{server_name}]: ignored"
                     );
                 }
             }
@@ -2353,7 +2353,7 @@ fn build_permissions(
             if matches!(key, ToolKey::Wildcard) {
                 tracing::warn!(
                     tool = tool,
-                    "ignoring [\"*\"].default — use the top-level `default` field instead \
+                    "ignoring [\"*\"].default: use the top-level `default` field instead \
                      for global fallback behavior"
                 );
             } else {
@@ -2372,7 +2372,7 @@ fn build_permissions(
             if matches!(key, ToolKey::Wildcard) {
                 tracing::warn!(
                     tool = tool,
-                    "ignoring project [\"*\"].default — use the top-level `default` field instead"
+                    "ignoring project [\"*\"].default: use the top-level `default` field instead"
                 );
             } else {
                 tool_defaults.insert(key, d);
@@ -2574,7 +2574,7 @@ fn migrate_permissions_file(path: &Path, persist: bool) -> Option<String> {
                         key = old_key.as_str(),
                         server = server,
                         tool = tool,
-                        "SECURITY: skipping migration of malformed MCP key — \
+                        "SECURITY: skipping migration of malformed MCP key: \
                          rules for this tool will not be restored"
                     );
                     continue;
@@ -2608,7 +2608,7 @@ fn migrate_permissions_file(path: &Path, persist: bool) -> Option<String> {
             tracing::error!(
                 server = server_name.as_str(),
                 tool = &*tool_name,
-                "SECURITY: skipping migration of malformed nested MCP key — \
+                "SECURITY: skipping migration of malformed nested MCP key: \
                  rules for this tool will not be restored"
             );
             continue;

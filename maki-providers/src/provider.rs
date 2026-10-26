@@ -115,7 +115,7 @@ pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Pro
 
 struct UnconfiguredProvider;
 
-const NOT_CONFIGURED: &str = "no provider configured — run /login or `maki auth login`";
+const NOT_CONFIGURED: &str = "no provider configured: run /login or `maki auth login`";
 
 impl Provider for UnconfiguredProvider {
     fn stream_message<'a>(

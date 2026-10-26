@@ -139,7 +139,7 @@ impl TrustCard {
                 Span::raw(INDENT),
                 Span::styled(marker, label),
                 Span::styled(choice.label, label),
-                Span::styled(format!(" — {}", choice.effect), theme.item_desc),
+                Span::styled(format!(": {}", choice.effect), theme.item_desc),
             ]));
         }
         lines.push(Line::raw(""));

@@ -389,7 +389,7 @@ impl PermissionManager {
             .any(|r| matches!(r.tool, ToolKey::Wildcard) && r.effect == Effect::Deny);
         if has_wildcard_deny {
             warn!(
-                "wildcard deny detected — this blocks ALL tools including \
+                "wildcard deny detected: this blocks ALL tools including \
                  builtins (write/edit/multiedit/task). Use per-tool rules \
                  instead if you want selective access."
             );
@@ -400,7 +400,7 @@ impl PermissionManager {
             .any(|r| matches!(r.tool, ToolKey::Wildcard) && r.effect == Effect::Allow);
         if has_wildcard_allow {
             warn!(
-                "wildcard allow detected — this permits ALL tools including \
+                "wildcard allow detected: this permits ALL tools including \
                  write/edit/multiedit/task. Use per-tool rules \
                  instead if you want selective access."
             );
