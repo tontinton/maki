@@ -132,8 +132,8 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
     Ok((Some(tbl), None))
 }
 
-/// Reads the focused session's model, thinking level, and fast mode.
-/// `thinking` comes back in the spelling `set` accepts, so a table from here
+/// Reads a session's model, thinking level, and fast mode, the focused one
+/// unless `opts.session` names another. `thinking` comes back in the spelling `set` accepts, so a table from here
 /// can go straight back in.
 ///
 /// `thinking_options` lists named thinking choices, cheapest first, as
@@ -152,6 +152,8 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
 /// Declared effort fields keep `adaptive` separate because their fragments can
 /// differ from the provider fallback.
 ///
+/// @param opts table? Options:
+///   session (string) id of a live session, defaults to the focused one.
 /// @return (table|nil, string|nil) `{spec, id, provider, thinking,
 ///   thinking_shown, thinking_options, fast, supports_thinking,
 ///   supports_fast}`, or nil and an error.
@@ -162,8 +164,16 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
 ///   print(option.name, option.tokens)
 /// end
 #[lua_fn]
-async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
-    roundtrip(lua, tx, ModelRequest::Get).await
+async fn get(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
+    let session = match opts {
+        Some(opts) => opts.get("session")?,
+        None => None,
+    };
+    roundtrip(lua, tx, ModelRequest::Get { session }).await
 }
 
 /// Lists the model specs you can switch to: what the providers you are logged
@@ -178,36 +188,56 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
     roundtrip(lua, tx, ModelRequest::Available).await
 }
 
-/// Switches the focused session's model, thinking level, or fast mode. Fields
-/// you leave out stay as they are, so this doubles as a thinking-only switch.
-/// Answers with the new state, in the same shape `get` returns.
+/// Switches a session's model, thinking level, or fast mode, the focused one
+/// unless `opts.session` names another. Fields you leave out stay as they
+/// are, so this doubles as a thinking-only switch. Answers with the new
+/// state, in the same shape `get` returns.
 ///
-/// @param opts string|table A model spec, or a table with any of:
+/// A new spec or thinking level also becomes what the next `maki` starts on,
+/// like picking it in `/model` or `/thinking`, unless `opts.persist` is
+/// false. Naming a session turns that off by default, since steering one tab
+/// is not choosing a default. `fast` is only ever remembered per session.
+///
+/// @param spec string|table A model spec, or a table with any of:
 ///   `spec` (string) `"provider/id"`, as listed by `available()`;
 ///   `thinking` (string|number) `"off"`, `"adaptive"`, an effort level
 ///   (`"minimal"` to `"max"`), a token budget, or `""` to toggle it on and off;
 ///   `fast` (boolean) Anthropic fast mode.
+/// @param opts table? Options:
+///   session (string) id of a live session, defaults to the focused one.
+///   persist (boolean) remember a new spec and thinking level as the default; true unless `session` is set.
 /// @return (table|nil, string|nil) The new state, or nil and an error.
 /// @example
 /// maki.model.set("anthropic/claude-opus-4-6")
 /// maki.model.set({ spec = "zai/glm-5", thinking = "high" })
 /// maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+/// maki.model.set({ thinking = "high" }, { session = id })
 #[lua_fn(guard = SessionSettings)]
 async fn set(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
-    opts: Value,
+    spec: Value,
+    opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
-    let req = match opts {
+    let (session, persist): (Option<String>, Option<bool>) = match &opts {
+        Some(opts) => (opts.get("session")?, opts.get("persist")?),
+        None => (None, None),
+    };
+    let persist = persist.unwrap_or(session.is_none());
+    let req = match spec {
         Value::String(spec) => ModelRequest::Set {
             spec: Some(spec.to_str()?.to_owned()),
             thinking: None,
             fast: None,
+            session,
+            persist,
         },
-        Value::Table(opts) => ModelRequest::Set {
-            spec: opts.opt("spec")?,
-            thinking: opts.opt("thinking")?,
-            fast: opts.opt("fast")?,
+        Value::Table(fields) => ModelRequest::Set {
+            spec: fields.opt("spec")?,
+            thinking: fields.opt("thinking")?,
+            fast: fields.opt("fast")?,
+            session,
+            persist,
         },
         other => {
             return Err(LuaError::runtime(format!(
@@ -294,13 +324,24 @@ mod tests {
     /// acted on. Fields left out stay `nil` on the way back.
     fn echo(req: ModelRequest) -> Option<UiReply> {
         Some(Ok(match req {
-            ModelRequest::Get => json!({ "spec": SPEC, "thinking": THINKING, "fast": true }),
+            ModelRequest::Get { session: None } => {
+                json!({ "spec": SPEC, "thinking": THINKING, "fast": true })
+            }
+            ModelRequest::Get { session } => json!({ "session": session }),
             ModelRequest::Available => json!([SPEC]),
             ModelRequest::Set {
                 spec,
                 thinking,
                 fast,
+                session: None,
+                persist: true,
             } => json!({ "spec": spec, "thinking": thinking, "fast": fast }),
+            ModelRequest::Set {
+                spec,
+                session,
+                persist,
+                ..
+            } => json!({ "spec": spec, "session": session, "persist": persist }),
         }))
     }
 
@@ -322,6 +363,16 @@ mod tests {
     #[test_case("return model.set({ thinking = '', fast = false })", json!({ "thinking": "", "fast": false }) ; "set_empty_thinking_and_false_fast")]
     #[test_case("local m = model.get() return model.set(m)", json!({ "spec": SPEC, "thinking": THINKING, "fast": true }) ; "set_fed_by_get")]
     fn requests_cross_the_channel_and_answer_with_the_new_state(script: &str, expected: Json) {
+        assert_eq!(eval(&stub_ui(echo), script), (expected, None));
+    }
+
+    /// Naming a session stops a switch from becoming the global default
+    /// unless asked, and `persist` overrides either way.
+    #[test_case("return model.get({ session = 's1' })", json!({ "session": "s1" }) ; "get_names_session")]
+    #[test_case("return model.set('a/b', { session = 's1' })", json!({ "spec": "a/b", "session": "s1", "persist": false }) ; "session_defaults_to_no_persist")]
+    #[test_case("return model.set({ spec = 'a/b' }, { session = 's1', persist = true })", json!({ "spec": "a/b", "session": "s1", "persist": true }) ; "session_with_persist")]
+    #[test_case("return model.set('a/b', { persist = false })", json!({ "spec": "a/b", "persist": false }) ; "focused_without_persist")]
+    fn session_and_persist_reach_the_ui(script: &str, expected: Json) {
         assert_eq!(eval(&stub_ui(echo), script), (expected, None));
     }
 

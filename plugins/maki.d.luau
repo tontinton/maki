@@ -116,9 +116,9 @@ declare maki: {
     error: @checked (msg: string) -> (),
   },
   model: {
-    get: @checked () -> (any, string?),
+    get: @checked (opts: any) -> (any, string?),
     available: @checked () -> (any, string?),
-    set: @checked (opts: any) -> (any, string?),
+    set: @checked (spec: any, opts: any) -> (any, string?),
     tier: @checked (name: string, provider: string?) -> (any, string?),
     info: @checked (spec: string) -> (any, string?),
   },

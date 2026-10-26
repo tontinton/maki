@@ -631,11 +631,16 @@ impl App {
     /// Stores the clamped value rather than the typed one, so the status bar
     /// can never read `off` on a model that is really sending minimal effort.
     ///
-    /// The value is also written to disk here, and only here: the next run
-    /// seeds its sessions from it (`SessionDefaults`), the same way the model
-    /// is remembered. A clamp on model change is not the user's choice, so it
-    /// does not overwrite the file.
-    pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
+    /// With {persist} the value is also written to disk here, and only here:
+    /// the next run seeds its sessions from it (`SessionDefaults`), the same
+    /// way the model is remembered. A clamp on model change is not the user's
+    /// choice, so it does not overwrite the file, and neither does a plugin
+    /// steering one tab.
+    pub(crate) fn set_thinking(
+        &mut self,
+        input: &str,
+        persist: bool,
+    ) -> Result<ThinkingConfig, String> {
         if !self.state.model.supports_thinking() {
             return Err(THINKING_UNSUPPORTED_MSG.into());
         }
@@ -643,7 +648,9 @@ impl App {
             .map_err(str::to_owned)?
             .clamped(&self.state.model);
         self.state.pending_thinking = None;
-        persist_thinking(&self.storage, self.state.thinking.into());
+        if persist {
+            persist_thinking(&self.storage, self.state.thinking.into());
+        }
         Ok(self.state.thinking)
     }
 

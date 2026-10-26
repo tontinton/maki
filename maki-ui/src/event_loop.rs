@@ -1400,11 +1400,14 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// Lua acts on the focused session, the same target the model picker
-    /// writes to.
+    /// Lua acts on the session it names, or the focused one, the same target
+    /// the model picker writes to.
     fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
         match req {
-            ModelRequest::Get => Ok(self.focused_app().model_state()),
+            ModelRequest::Get { session } => {
+                let idx = self.resolve_session_index(session.as_deref())?;
+                Ok(self.sessions[idx].app.model_state())
+            }
             ModelRequest::Available => {
                 let available = self.ctx.available_models.load();
                 Ok(json!(
@@ -1418,13 +1421,16 @@ impl<'t> EventLoop<'t> {
                 spec,
                 thinking,
                 fast,
+                session,
+                persist,
             } => {
+                let idx = self.resolve_session_index(session.as_deref())?;
                 if let Some(spec) = spec {
-                    self.change_model(&spec)?;
+                    self.change_model_in(idx, &spec, persist)?;
                 }
-                let app = self.focused_app();
+                let app = &mut self.sessions[idx].app;
                 if let Some(thinking) = thinking {
-                    app.set_thinking(&thinking)?;
+                    app.set_thinking(&thinking, persist)?;
                 }
                 if let Some(fast) = fast {
                     app.set_fast(fast)?;
@@ -1925,12 +1931,19 @@ impl<'t> EventLoop<'t> {
     /// The one explicit pick, which is why it alone writes the last-used file.
     /// Opening an old session must not change what the next `maki` starts on.
     fn change_model(&mut self, spec: &str) -> Result<(), String> {
+        self.change_model_in(self.focused, spec, true)
+    }
+
+    /// Without {persist} only the tab at {idx} switches: a plugin steering a
+    /// background session from elsewhere is not the user picking a default.
+    fn change_model_in(&mut self, idx: usize, spec: &str, persist: bool) -> Result<(), String> {
         let slot = self.slots.try_get(spec)?;
         let picked = slot.model.spec();
-        let idx = self.focused;
         self.apply_model(idx, slot);
-        self.sessions[idx].app.record_recent_model(spec);
-        persist_model(&self.ctx.storage, &picked);
+        if persist {
+            self.sessions[idx].app.record_recent_model(spec);
+            persist_model(&self.ctx.storage, &picked);
+        }
         Ok(())
     }
 
