@@ -10,7 +10,7 @@ const MODEL_FILE: &str = "model";
 const RECENT_FILE: &str = "recent-models";
 const THINKING_FILE: &str = "thinking";
 const EXPANDED_FILE: &str = "expanded-providers.json";
-const MAX_RECENTS: usize = 4;
+const MAX_RECENTS: usize = 6;
 
 pub fn persist_model(dir: &StateDir, spec: &str) {
     let _ = atomic_write(&dir.path().join(MODEL_FILE), spec.as_bytes());
