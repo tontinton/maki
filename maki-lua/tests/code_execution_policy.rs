@@ -63,6 +63,10 @@ const REWRITING_READ_HOOK: &str = concat!(
 const WILDCARD_INPUT_HOOK: &str =
     r#"maki.api.set_slot("tool.*.input", function(prev, input) return input end)"#;
 const NO_POLICY: &str = "";
+const LIST_HOOK: &str =
+    r#"maki.api.set_slot("tool.list.input", function(prev, input) return input end)"#;
+const RUNTIME_ERROR: &str = "RuntimeError";
+const MADE_DIR: &str = "made/deep";
 const OPEN_APPEND_REFUSED: &str = "write tool has no append option";
 const WRITE_WITHOUT_APPEND: &str = r#"maki.api.register_tool({
     name = "write",
@@ -396,6 +400,30 @@ fn open_for_writing_is_refused_where_the_write_tool_is(shape: fn(&mut ToolContex
     let err = out.expect_err("the write must be refused");
     assert!(err.contains(FILE_WRITE_FAILED), "got: {err}");
     assert_eq!(content, OPEN_ORIGINAL);
+}
+
+/// Loud on purpose, since `os.path.exists` would turn an `OSError` into False.
+/// mkdir looks before it creates, so it needs the list tool too.
+#[test_case::test_case("os.path.exists(path)", LIST_HOOK, &[] ; "list_tool_hooked")]
+#[test_case::test_case("os.path.exists(path)", NO_POLICY, &["list"] ; "list_tool_disabled")]
+#[test_case::test_case("os.makedirs(path + '.d', exist_ok=True)", NO_POLICY, &["list"] ; "mkdir_with_list_tool_disabled")]
+fn os_metadata_is_refused_where_the_list_tool_is(code: &str, policy: &str, disabled: &[&str]) {
+    let (out, _) = run_on_file(code, policy, |_| {}, disabled);
+    let err = out.expect_err("the query must be refused");
+    assert!(err.contains(RUNTIME_ERROR), "got: {err}");
+}
+
+/// `build_mode` also proves metadata is served, as a refused `isdir` would raise.
+#[test_case::test_case(|_| {}, true ; "build_mode")]
+#[test_case::test_case(|ctx| ctx.mode = AgentMode::Plan(PLAN_FILE.into()), false ; "plan_mode_blocks_the_write_tool")]
+#[test_case::test_case(|ctx| ctx.audience = ToolAudience::RESEARCH_SUB, false ; "write_tool_not_callable")]
+fn os_makedirs_goes_where_the_write_tool_would(shape: fn(&mut ToolContext), made: bool) {
+    let code = format!(
+        "target = os.path.join(os.path.dirname(path), '{MADE_DIR}')\ntry:\n    os.makedirs(target)\nexcept OSError:\n    pass\nos.path.isdir(target)"
+    );
+    let (out, _) = run_on_file(&code, NO_POLICY, shape, &[]);
+    let out = out.expect("a refused mkdir raises OSError, which the script catches");
+    assert!(out.contains(&format!("return: {made}")), "got: {out}");
 }
 
 /// Only a failed tool call belongs in the results. The script's own mistake

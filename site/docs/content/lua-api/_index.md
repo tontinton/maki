@@ -3681,13 +3681,25 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `tools` (`table?`) map of `name -> function` for tools the sandbox may call.
     Each function receives the tool input table and must return `(string)` or
     `(nil, err)`. Tool calls are batched and dispatched concurrently.
-  - `files` (`table?`) serves text file access from `open()` and `pathlib`.
-    `read(path)` returns `(content)`, `write(path, content, append)` returns
-    `(string)`, and both return `(nil, err)` on failure. Leave one out to
-    refuse that access. Writes wait and go out as one `write` per file right
-    before a tool call, a read of that path, or the end of the run, and a
-    cancelled run drops the ones still waiting. A failed write ends the run,
-    unless a read sent it, then it raises `OSError` just like a failed read.
+  - `files` (`table?`) callbacks that serve `open()`, `os` and `pathlib`.
+    Without it, any OS call ends the run. A missing callback refuses that
+    access, and `(nil, err)` refuses one call. Binary I/O, removing and
+    renaming always raise `RuntimeError`. `os.getenv` sees only non-secret
+    variables like `HOME`. Sleeps and metadata queries, `inspect` included,
+    share a budget of `timeout` seconds, and going over ends the run.
+    - `read(path)` returns `(content)`. A refusal raises `OSError`.
+    - `write(path, content, append)` returns `(string)` or `(true)`. Writes
+    are buffered per file, and flushed before a read of that file, before
+    any tool call or metadata query, and at the end of the run. A
+    cancelled run drops them. A failed flush ends the run, unless a read
+    triggered it, then the read raises `OSError`.
+    - `inspect(path)` gets the absolute path of each metadata query
+    (`os.stat`, `os.walk`, `Path.glob`) and returns `(true)` to allow it.
+    A walk or glob covers everything under {path}. A refusal raises
+    `RuntimeError`. Needs the `fs_read` permission.
+    - `mkdir(path, parents)` returns `(true)` once the directory exists.
+    It only gets missing paths that passed `inspect`. A refusal raises
+    `OSError`.
 
 **Returns:** (`table`, `string?`) Result table, plus an error string on failure.
 

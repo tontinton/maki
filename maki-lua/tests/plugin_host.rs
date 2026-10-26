@@ -6238,6 +6238,86 @@ fn interpreter_tools_gather_resolves_parallel_batch() {
     assert_eq!(out, "A|B");
 }
 
+const MKDIR_REFUSED: &str = "mkdir refused";
+const READ_NOT_CONTENT: &str = "expected string";
+
+fn interp_files_plugin(name: &str, python: &str) -> String {
+    format!(
+        r#"maki.api.register_tool({{
+            name = "{name}",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local lines = {{}}
+                local result, err = maki.interpreter.run("{python}", {{
+                    timeout = 10,
+                    max_memory_mb = 50,
+                    on_output = function(line) table.insert(lines, line) end,
+                    files = {{
+                        read = function(path) return true end,
+                        inspect = function(path) return true end,
+                        mkdir = function(path, parents)
+                            return nil, "{MKDIR_REFUSED} " .. path .. " " .. tostring(parents)
+                        end,
+                    }},
+                }})
+                if err then return "err: " .. err end
+                return table.concat(lines, "|")
+            end
+        }})"#
+    )
+}
+
+#[test]
+fn interpreter_files_inspect_and_mkdir_reach_lua() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = interp_files_plugin(
+        "interp_files",
+        r"import os\nprint(os.path.isdir('.'))\ntry:\n    os.makedirs('maki-never-created/x')\nexcept OSError as e:\n    print(e)",
+    );
+    host.load_source("interp_files_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "interp_files", serde_json::json!({})).unwrap();
+    let made = out
+        .strip_prefix(&format!("True|{MKDIR_REFUSED} "))
+        .and_then(|rest| rest.strip_suffix(" true"));
+    let expected = std::env::current_dir()
+        .unwrap()
+        .join("maki-never-created/x");
+    assert!(
+        made.is_some_and(|made| Path::new(made) == expected),
+        "got: {out}"
+    );
+}
+
+/// From `read`, a `(true)` ack would pass for an empty file.
+#[test]
+fn interpreter_files_read_must_return_content() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = interp_files_plugin(
+        "interp_read_ack",
+        r"try:\n    open('x').read()\nexcept OSError as e:\n    print(e)",
+    );
+    host.load_source("interp_read_ack_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "interp_read_ack", serde_json::json!({})).unwrap();
+    assert!(out.contains(READ_NOT_CONTENT), "got: {out}");
+}
+
+/// `inspect` lets the sandbox read the disk, so it takes `fs_read`.
+#[test]
+fn interpreter_inspect_needs_fs_read() {
+    let src = interp_files_plugin("interp_no_read", "1");
+    let perms = PluginPermissions::from_approved([Permission::Run.manifest_key()]);
+    let err =
+        exec_tool_with_perms(perms, &src, "interp_no_read", serde_json::json!({})).unwrap_err();
+    assert!(
+        err.contains(Permission::FsRead.manifest_key()),
+        "got: {err}"
+    );
+}
+
 const NESTED_DEPTH_TOOL: &str = "nested_depth";
 const NESTED_DEPTH_BOTTOM: &str = "bottom";
 const NESTED_DEPTH_WEDGED: &str =

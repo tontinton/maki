@@ -13,7 +13,10 @@ local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
 local OPEN_READ_CHECK_LINES = 1
 local READ_INPUT_SLOTS = { "tool.read.input", "tool.*.input" }
+local LIST_INPUT_SLOTS = { "tool.list.input", "tool.*.input" }
 local OPEN_READ_HOOKED_ERR = "open() cannot read while a plugin hooks the read tool, call read() instead"
+local INSPECT_HOOKED_ERR = "os and pathlib cannot look at files while a plugin hooks the list tool, call list() instead"
+local MKDIR_BASH_HINT = ", create the directory with the bash tool instead"
 local OPEN_APPEND_UNSUPPORTED_ERR = "open() cannot append because the write tool has no append option"
 local NO_OUTPUT = "(no output)"
 local SEPARATOR = "──────"
@@ -132,7 +135,7 @@ Use for chained/dependent tool calls and filtering/processing results, e.g. filt
 - All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
 - Tool results are complete. Only what you print/return is capped.
 - Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
-- Available libs: re, asyncio, sys, os, json. No other imports, no classes, no network access. `open()` works on text files.
+- Available libs: re, asyncio, sys, os, json, pathlib. No other imports, no classes, no network access. `open()` works on text files, and `os`/`pathlib` can stat, list, walk, glob and mkdir.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
 - Skip it when a single tool call needs no transformation.
@@ -273,6 +276,16 @@ local function start(input, ctx)
   highlight()
 end
 
+local function hooked(slot_names)
+  local slots = maki.api.get_slots()
+  for _, name in ipairs(slot_names) do
+    if slots[name] and #slots[name].fillers > 0 then
+      return true
+    end
+  end
+  return false
+end
+
 -- `open()` rides on the read and write tools, so hooks, plugins that replace
 -- them, permission prompts, the file lock and plan mode all still apply. The
 -- read tool numbers and caps lines, so we ask it for one line just to get its
@@ -281,15 +294,17 @@ end
 -- installed we refuse rather than read the path it steered away from.
 -- A replacement write tool without `append` would drop the flag and overwrite
 -- the file, so appends are refused there.
-local function file_access(tools, schemas)
+-- Metadata and listings follow the list tool the same way, minus the call,
+-- since it never prompts and a walk would make one call per directory. mkdir
+-- has no tool of its own, so it only goes where the write tool would go
+-- without asking. The sandbox looks before it creates, so mkdir also needs
+-- `inspect`.
+local function file_access(tools, schemas, ctx)
   local files = {}
   if tools.read then
     files.read = function(path)
-      local slots = maki.api.get_slots()
-      for _, name in ipairs(READ_INPUT_SLOTS) do
-        if slots[name] and #slots[name].fillers > 0 then
-          return nil, OPEN_READ_HOOKED_ERR
-        end
+      if hooked(READ_INPUT_SLOTS) then
+        return nil, OPEN_READ_HOOKED_ERR
       end
       local _, err = tools.read({ path = path, offset = 1, limit = OPEN_READ_CHECK_LINES })
       if err then
@@ -305,6 +320,21 @@ local function file_access(tools, schemas)
         return nil, OPEN_APPEND_UNSUPPORTED_ERR
       end
       return tools.write({ path = path, content = content, append = append })
+    end
+    files.mkdir = function(path, parents)
+      local _, err = ctx:can_write(path)
+      if err then
+        return nil, err .. MKDIR_BASH_HINT
+      end
+      return maki.fs.mkdir(path, { parents = parents })
+    end
+  end
+  if tools.list then
+    files.inspect = function()
+      if hooked(LIST_INPUT_SLOTS) then
+        return nil, INSPECT_HOOKED_ERR
+      end
+      return true
     end
   end
   return files
@@ -386,7 +416,7 @@ local function handler(input, ctx)
     preamble = PREAMBLE,
     on_output = show,
     tools = tools,
-    files = file_access(tools, schemas),
+    files = file_access(tools, schemas, ctx),
   })
 
   if err then

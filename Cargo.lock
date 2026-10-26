@@ -3314,9 +3314,11 @@ dependencies = [
 name = "maki-interpreter"
 version = "0.6.5"
 dependencies = [
+ "getrandom 0.4.3",
  "monty",
  "monty-types",
  "serde_json",
+ "tempfile",
  "test-case",
  "thiserror 2.0.21",
  "tracing",

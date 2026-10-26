@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use crate::agent::CallInstructions;
 use crate::mcp::{
     McpSession, TOOL_SEARCH_TOOL_NAME, ToolDeferral, UNKNOWN_MCP, internal_tool_name, is_wire_name,
 };
-use crate::permissions::{LayerAnswer, PromptLayers};
+use crate::permissions::{LayerAnswer, PermissionCheck, PromptLayers};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
 use crate::tools::registry::{BoxFuture, InstalledHook, RegisteredTool, Tool, ToolInvocation};
@@ -675,36 +675,10 @@ async fn run_native_tool(
     // what "the same file" means.
     let mutated = invocation.mutable_path().map(FileKey::new);
 
-    if let Some(key) = &mutated {
-        if let Some(chat) = ctx.background_for
-            && let Some(reason) = AgentSeed::background_write_block(chat)
-        {
-            warn!(
-                tool = %name,
-                %chat,
-                target = %key.as_path().display(),
-                reason = %reason,
-                "blocked background write"
-            );
-            return done_error(reason);
-        }
-        let is_plan_target = ctx
-            .mode
-            .plan_path()
-            .is_some_and(|plan| FileKey::new(plan) == *key);
-        if !is_plan_target {
-            if ctx.mode.plan_path().is_some() {
-                warn!(
-                    tool = %name,
-                    target = %key.as_path().display(),
-                    "blocked write in plan mode"
-                );
-                return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
-            }
-            if let Some(reason) = ctx.permissions.boundary_block_reason(key.as_path()) {
-                return done_error(reason);
-            }
-        }
+    if let Some(key) = &mutated
+        && let Some(reason) = mutation_block(ctx, name, key)
+    {
+        return done_error(reason);
     }
 
     let header_result = invocation.start_header().await;
@@ -891,6 +865,62 @@ fn run_tool_search(
         is_error,
         annotation: None,
         written_path: None,
+    }
+}
+
+/// Why a file-mutating tool is stopped before its permission check, if it is.
+fn mutation_block(ctx: &ToolContext, name: &str, key: &FileKey) -> Option<String> {
+    if let Some(chat) = ctx.background_for
+        && let Some(reason) = AgentSeed::background_write_block(chat)
+    {
+        warn!(
+            tool = %name,
+            %chat,
+            target = %key.as_path().display(),
+            reason = %reason,
+            "blocked background write"
+        );
+        return Some(reason);
+    }
+    let plan = ctx.mode.plan_path();
+    if plan.is_some_and(|plan| FileKey::new(plan) == *key) {
+        return None;
+    }
+    if plan.is_some() {
+        warn!(
+            tool = %name,
+            target = %key.as_path().display(),
+            "blocked write in plan mode"
+        );
+        return Some(crate::tools::PLAN_WRITE_RESTRICTED.into());
+    }
+    ctx.permissions.boundary_block_reason(key.as_path())
+}
+
+/// May `tool` change `path` right now without asking anyone? This is for a
+/// plugin that changes the disk itself, so there is no tool call to prompt
+/// on, and no call to hand an input hook that could rewrite, deny or
+/// escalate it. A rule or YOLO must already allow it.
+pub fn silent_mutation_check(ctx: &ToolContext, tool: &str, path: &str) -> Result<(), String> {
+    if let Some(reason) = mutation_block(ctx, tool, &FileKey::new(Path::new(path))) {
+        return Err(reason);
+    }
+    if ctx
+        .registry
+        .hook()
+        .is_some_and(|hook| hook.wraps(tool, HookStage::Input))
+    {
+        return Err(format!(
+            "a plugin hooks `{tool}`, so it must run as a tool call"
+        ));
+    }
+    match ctx
+        .permissions
+        .check(&ToolKey::native(tool), path, ctx.mode.plan_path())
+    {
+        PermissionCheck::Allowed => Ok(()),
+        PermissionCheck::Denied(reason) => Err(reason),
+        PermissionCheck::NeedsPrompt { .. } => Err(format!("`{tool}` on {path} needs permission")),
     }
 }
 
@@ -1301,6 +1331,9 @@ mod tests {
     /// Allowed by the shared stub permissions; nothing is ever written here.
     const TEST_ROOT: &str = "/tmp";
     const PLAN_PATH: &str = "/tmp/plan.md";
+    const INSIDE_ROOT: &str = "/tmp/maki-never-created/a";
+    const OUTSIDE_ROOT: &str = "/etc/maki-never-created/a";
+    const WRITE_TOOL: &str = "write";
     const HOOK_CALL_DEADLINE: Duration = Duration::from_secs(7);
     const HOOK_SLOW_COMMAND: &str = "slow";
     /// Real elapsed time inside the call, so the gap between the two stages'
@@ -2748,6 +2781,35 @@ mod tests {
             assert!(text.contains(name), "got: {text}");
             assert_eq!(text.contains(MCP_SERVER_GONE), server_gone, "got: {text}");
         });
+    }
+
+    /// Outside the project only a rule lets the write through, since there is
+    /// nobody to ask. Plan mode blocks even what a rule allows.
+    #[test_case(AgentMode::Build, None, INSIDE_ROOT, true ; "inside_the_project")]
+    #[test_case(AgentMode::Build, None, OUTSIDE_ROOT, false ; "outside_needs_a_prompt")]
+    #[test_case(AgentMode::Build, Some(Effect::Allow), OUTSIDE_ROOT, true ; "outside_allowed_by_rule")]
+    #[test_case(AgentMode::Build, Some(Effect::Deny), INSIDE_ROOT, false ; "inside_denied_by_rule")]
+    #[test_case(AgentMode::Plan(PathBuf::from(PLAN_PATH)), Some(Effect::Allow), INSIDE_ROOT, false ; "plan_mode")]
+    fn silent_mutation_needs_no_prompt(
+        mode: AgentMode,
+        rule: Option<Effect>,
+        path: &str,
+        allowed: bool,
+    ) {
+        let ctx = match rule {
+            Some(effect) => ruled_ctx(&mode, ToolKey::native(WRITE_TOOL), effect),
+            None => rules_ctx(&mode, Vec::new()),
+        };
+        let result = silent_mutation_check(&ctx, WRITE_TOOL, path);
+        assert_eq!(result.is_ok(), allowed, "got {result:?}");
+    }
+
+    #[test]
+    fn silent_mutation_refused_while_hooked() {
+        let ctx = rules_ctx(&AgentMode::Build, Vec::new());
+        ctx.registry
+            .set_hook(RecordingHook::never_answering(&[HookStage::Input]));
+        assert!(silent_mutation_check(&ctx, WRITE_TOOL, INSIDE_ROOT).is_err());
     }
 
     /// Plan mode puts MCP behind the user, it does not block it outright. An
