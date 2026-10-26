@@ -28,6 +28,9 @@ pub(crate) struct ProviderEntry {
     pub configured: bool,
     /// Catalog providers are listed under their own section.
     pub from_catalog: bool,
+    /// Explicitly declared in `providers.toml`: the user asked for this
+    /// provider, so it lists even when its key is missing.
+    pub from_config: bool,
 }
 
 impl ProviderEntry {
@@ -55,6 +58,7 @@ pub(crate) fn provider_entries(storage: &StateDir) -> (Vec<ProviderEntry>, bool)
             auth: auth_of(storage, b.slug, Some(b.default_api_key_env)),
             configured: config.get(b.slug).is_some_and(|d| d.base_url.is_some()),
             from_catalog: false,
+            from_config: false,
         })
         .collect();
 
@@ -68,6 +72,7 @@ pub(crate) fn provider_entries(storage: &StateDir) -> (Vec<ProviderEntry>, bool)
             auth: auth_of(storage, slug, def.api_key_env.as_deref()),
             configured: false,
             from_catalog: false,
+            from_config: true,
         });
     }
 
@@ -92,6 +97,7 @@ pub(crate) fn provider_entries(storage: &StateDir) -> (Vec<ProviderEntry>, bool)
             },
             configured: false,
             from_catalog: true,
+            from_config: false,
         });
     }
     (entries, true)

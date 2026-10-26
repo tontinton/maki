@@ -1629,6 +1629,13 @@ impl App {
                     self.flash(format!("{slug}{suffix}"));
                     vec![]
                 }
+                // The setup flow takes over: the picker closes so the
+                // wizard has the screen.
+                ModelPickerAction::Login(slug) => {
+                    self.model_picker.close();
+                    self.login_picker.open_for(self.storage.clone(), &slug);
+                    vec![]
+                }
                 ModelPickerAction::Close => vec![],
             });
         }
@@ -1636,6 +1643,13 @@ impl App {
         if self.login_picker.is_open() {
             return Some(match self.login_picker.handle_key(key) {
                 LoginPickerAction::Consumed => vec![],
+                // The wizard was opened from the model picker, so backing
+                // out returns there instead of dropping into chat.
+                LoginPickerAction::BackToPicker => {
+                    let providers = provider_entries(&self.storage).0;
+                    self.model_picker.open(&self.state.model.spec(), &providers);
+                    vec![Action::RefreshModels]
+                }
                 LoginPickerAction::Close => vec![],
                 LoginPickerAction::Authenticated { model_spec } => {
                     vec![Action::ChangeModel(model_spec), Action::RefreshModels]

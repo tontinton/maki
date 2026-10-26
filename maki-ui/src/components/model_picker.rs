@@ -28,6 +28,7 @@ const TIER_COL: usize = 10;
 const PRICE_COL: usize = 15;
 const PRICE_WIDTH: usize = 7;
 const LOADING_NOTICE: &str = "loading models...";
+const NO_KEY_LABEL: &str = "no key";
 const OFFLINE_LABEL: &str = "offline";
 const FALLBACK_LABEL: &str = "fallback";
 const EMPTY_LABEL: &str = "no models";
@@ -72,6 +73,9 @@ pub enum ModelPickerAction {
     /// `(slug, folded)`. The picker has no state dir, so the caller saves the
     /// new set.
     Collapse(String, bool),
+    /// A provider that cannot serve models right now (no key or
+    /// offline); the caller opens its setup flow.
+    Login(String),
     Close,
 }
 
@@ -87,6 +91,7 @@ struct ModelEntry {
     override_tiers: Vec<ModelTier>,
     free: bool,
     is_provider: bool,
+    needs_setup: bool,
     spinning: bool,
     hidden: bool,
     /// The model in use; marked on whichever row lists it.
@@ -261,7 +266,7 @@ impl ModelPicker {
         let mut rows: Vec<(String, String)> = self
             .providers
             .iter()
-            .filter(|p| p.usable())
+            .filter(|p| p.usable() || p.from_config)
             .map(|p| (p.slug.clone(), p.display_name.clone()))
             .collect();
         for slug in groups.keys() {
@@ -299,16 +304,21 @@ impl ModelPicker {
 
     fn provider_row(&self, slug: &str, display: &str, count: usize, loading: bool) -> ModelEntry {
         let answered = self.available.get().and_then(|l| l.providers.get(slug));
-        let (suffix, spinning) = if answered.is_none() && loading {
-            (None, true)
+        // Discovery, not the picker, decides where the keys come from: a skip
+        // for want of credentials is the one state the user can act on here.
+        let missing_key = answered.is_some_and(|s| s.missing_credentials);
+        let (suffix, spinning, needs_setup) = if missing_key {
+            (Some(NO_KEY_LABEL), false, true)
+        } else if answered.is_none() && loading {
+            (None, true, false)
         } else if answered.is_none() {
-            (Some(OFFLINE_LABEL), false)
+            (Some(OFFLINE_LABEL), false, true)
         } else if answered.is_some_and(|s| s.warning.is_some()) {
-            (Some(FALLBACK_LABEL), false)
+            (Some(FALLBACK_LABEL), false, false)
         } else if count == 0 {
-            (Some(EMPTY_LABEL), false)
+            (Some(EMPTY_LABEL), false, false)
         } else {
-            (None, false)
+            (None, false, false)
         };
         let plural = if count == 1 { "model" } else { "models" };
         ModelEntry {
@@ -326,6 +336,7 @@ impl ModelPicker {
             override_tiers: Vec::new(),
             free: false,
             is_provider: true,
+            needs_setup,
             spinning,
             hidden: false,
             current: false,
@@ -421,6 +432,13 @@ impl ModelPicker {
         }
         let on_provider_row = self.picker.selected_item().is_some_and(|e| e.is_provider);
         // Enter on a provider row would hand back a bare slug as the model.
+        if on_provider_row
+            && key.code == KeyCode::Enter
+            && self.picker.selected_item().is_some_and(|e| e.needs_setup)
+        {
+            let slug = self.picker.selected_item().unwrap().provider.clone();
+            return ModelPickerAction::Login(slug);
+        }
         if key.code == FOLD_KEY || (on_provider_row && key.code == KeyCode::Enter) {
             // Swallowed even on an empty list, so `%` never ends up typed
             // into the search.
@@ -561,6 +579,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         override_tiers,
         free,
         is_provider: false,
+        needs_setup: false,
         spinning: false,
         hidden: false,
         current: false,
@@ -612,11 +631,27 @@ mod tests {
         );
     }
 
+    /// A finished, healthy run: every spec's provider answered.
     fn loaded(specs: Vec<String>) -> Arc<ModelList> {
+        let mut providers = BTreeMap::new();
+        for spec in &specs {
+            if let Some((slug, _)) = spec.split_once('/') {
+                providers
+                    .entry(slug.to_string())
+                    .and_modify(|s: &mut maki_providers::models_cache::ProviderStatus| {
+                        s.models += 1
+                    })
+                    .or_insert(maki_providers::models_cache::ProviderStatus {
+                        models: 1,
+                        warning: None,
+                        missing_credentials: false,
+                    });
+            }
+        }
         Arc::new(ModelList {
             specs,
             loading: false,
-            providers: BTreeMap::new(),
+            providers,
         })
     }
 
@@ -654,6 +689,19 @@ mod tests {
             "zai/glm-5".into(),
         ])));
         models
+    }
+
+    /// The status discovery reports for a slug it could not build: no
+    /// credentials resolved, so there is nothing to probe.
+    fn skipped(slug: &str) -> (String, maki_providers::models_cache::ProviderStatus) {
+        (
+            slug.to_string(),
+            maki_providers::models_cache::ProviderStatus {
+                models: 0,
+                warning: None,
+                missing_credentials: true,
+            },
+        )
     }
 
     fn open_test_models(current_spec: &str) -> ModelPicker {
@@ -948,6 +996,170 @@ mod tests {
         assert_eq!(row.detail, "2 models");
     }
 
+    /// A `providers.toml` provider is an explicit opt-in: it lists even
+    /// without a key, and says so instead of spinning or reading offline.
+    #[test]
+    fn a_declared_provider_without_a_key_lists_and_says_no_key() {
+        let models = Arc::new(ArcSwapOption::empty());
+        models.store(Some(Arc::new(ModelList {
+            specs: Vec::new(),
+            loading: true,
+            providers: BTreeMap::from([skipped("disconnected")]),
+        })));
+        let mut p = ModelPicker::new(models);
+        p.open(
+            "",
+            &[ProviderEntry {
+                slug: "disconnected".into(),
+                display_name: "Disconnected".into(),
+                auth: crate::components::provider_auth::Auth::Missing,
+                configured: false,
+                from_catalog: false,
+                from_config: true,
+            }],
+        );
+
+        let entries = p.load_entries();
+        let row = entries
+            .iter()
+            .find(|e| e.is_provider && e.provider == "disconnected")
+            .expect("a declared provider always lists");
+        assert_eq!(row.suffix.as_deref(), Some(NO_KEY_LABEL));
+        assert!(!row.spinning, "it cannot be probed, so it never spins");
+        assert_eq!(row.detail, "");
+    }
+
+    /// Keys can sit where `provider_auth` cannot look: an inline `api_key`,
+    /// a host env like `OLLAMA_HOST`, a plugin's auth hook. Discovery built
+    /// the provider, so its row must not read as waiting for a key.
+    #[test]
+    fn a_provider_discovery_could_build_is_not_waiting_for_a_key() {
+        let models = Arc::new(ArcSwapOption::empty());
+        models.store(Some(loaded(vec!["ollama/llama3".into()])));
+        let mut p = ModelPicker::new(models);
+        p.open(
+            "",
+            &[ProviderEntry {
+                slug: "ollama".into(),
+                display_name: "Ollama".into(),
+                auth: crate::components::provider_auth::Auth::Missing,
+                configured: false,
+                from_catalog: false,
+                from_config: false,
+            }],
+        );
+
+        let entries = p.load_entries();
+        let row = entries
+            .iter()
+            .find(|e| e.is_provider && e.provider == "ollama")
+            .expect("a working provider keys its row");
+        assert_eq!(
+            row.suffix, None,
+            "discovery answered, so there is no key to add"
+        );
+        assert_eq!(row.detail, "1 model");
+
+        assert!(
+            p.picker
+                .select_item_by(|e| e.is_provider && e.provider == "ollama")
+        );
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&action, ModelPickerAction::Collapse(slug, false) if slug == "ollama"),
+            "Enter folds the group instead of opening login"
+        );
+    }
+
+    #[test]
+    fn detail_columns_are_aligned() {
+        assert_eq!(
+            format_detail("medium", false, Some("  $3.00/$15.00 ")),
+            format!("{:>TIER_COL$} · {:>PRICE_COL$}", "medium", "$3.00/$15.00")
+        );
+        assert_eq!(
+            format_detail("weak", false, None),
+            format!(
+                "{:>TIER_COL$}{}",
+                "weak",
+                " ".repeat(DETAIL_SEPARATOR.width() + PRICE_COL)
+            )
+        );
+        assert_eq!(
+            format_detail("", true, None),
+            format!(
+                "{}{FREE_SEGMENT:>PRICE_COL$}",
+                " ".repeat(TIER_COL + DETAIL_SEPARATOR.width())
+            )
+        );
+        assert_eq!(format_detail("", false, None), "");
+    }
+    /// Setup-pending rows (no key, offline) answer Enter with the
+    /// provider's slug so the host can open its login flow; the fold
+    /// key keeps its usual toggling.
+    #[test]
+    fn setup_pending_provider_rows_route_enter_to_the_login_flow() {
+        let models = Arc::new(ArcSwapOption::empty());
+        models.store(Some(Arc::new(ModelList {
+            specs: vec!["zai/glm-5".into()],
+            loading: false,
+            providers: BTreeMap::from([skipped("disconnected")]),
+        })));
+        let mut p = ModelPicker::new(models);
+        p.open(
+            "",
+            &[
+                ProviderEntry {
+                    slug: "disconnected".into(),
+                    display_name: "Disconnected".into(),
+                    auth: crate::components::provider_auth::Auth::Missing,
+                    configured: false,
+                    from_catalog: false,
+                    from_config: true,
+                },
+                ProviderEntry {
+                    slug: "unreachable".into(),
+                    display_name: "Unreachable".into(),
+                    auth: crate::components::provider_auth::Auth::Saved,
+                    configured: false,
+                    from_catalog: false,
+                    from_config: true,
+                },
+            ],
+        );
+
+        let entries = p.load_entries();
+        let no_key = entries
+            .iter()
+            .find(|e| e.provider == "disconnected")
+            .expect("the keyless provider lists");
+        assert_eq!(no_key.suffix.as_deref(), Some(NO_KEY_LABEL));
+        let offline = entries
+            .iter()
+            .find(|e| e.provider == "unreachable")
+            .expect("the unreachable provider lists");
+        assert_eq!(offline.suffix.as_deref(), Some(OFFLINE_LABEL));
+
+        p.picker.select_item_by(|e| e.provider == "disconnected");
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ModelPickerAction::Login(slug) if slug == "disconnected"),
+            "Enter on a keyless provider asks for its setup"
+        );
+
+        p.picker.select_item_by(|e| e.provider == "unreachable");
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ModelPickerAction::Login(slug) if slug == "unreachable"),
+            "Enter on an offline provider asks for its setup"
+        );
+
+        // The fold key keeps toggling the group even here.
+        let action = p.handle_key(key(KeyCode::Char('%')));
+        assert!(
+            matches!(&action, ModelPickerAction::Collapse(slug, false) if slug == "unreachable")
+        );
+    }
     /// A provider whose probe never landed reads as offline, not as empty.
     #[test]
     fn an_unanswered_probe_marks_its_provider_row_offline() {
@@ -962,6 +1174,7 @@ mod tests {
                 auth: crate::components::provider_auth::Auth::Saved,
                 configured: false,
                 from_catalog: false,
+                from_config: false,
             }],
         );
 
@@ -1178,33 +1391,6 @@ mod tests {
         );
     }
 
-    /// Every detail is a fixed two-column layout: the tier right-aligned in
-    /// its column, the free flag or pricing left-aligned in the value
-    /// column, blanks padding missing fields so rows line up.
-    #[test]
-    fn detail_columns_are_aligned() {
-        assert_eq!(
-            format_detail("medium", false, Some("  $3.00/$15.00 ")),
-            format!("{:>TIER_COL$} · {:>PRICE_COL$}", "medium", "$3.00/$15.00")
-        );
-        assert_eq!(
-            format_detail("weak", false, None),
-            format!(
-                "{:>TIER_COL$}{}",
-                "weak",
-                " ".repeat(DETAIL_SEPARATOR.width() + PRICE_COL)
-            )
-        );
-        assert_eq!(
-            format_detail("", true, None),
-            format!(
-                "{}{FREE_SEGMENT:>PRICE_COL$}",
-                " ".repeat(TIER_COL + DETAIL_SEPARATOR.width())
-            )
-        );
-        assert_eq!(format_detail("", false, None), "");
-    }
-
     fn discovered(id: &str, pricing: ModelPricing) -> ModelInfo {
         ModelInfo {
             pricing: Some(pricing),
@@ -1272,43 +1458,5 @@ mod tests {
             .map(|e| e.id.as_str())
             .collect();
         assert_eq!(ids, ["stealth/ox-alpha", PAID_ID]);
-    }
-}
-
-#[cfg(test)]
-mod layout_dbg {
-    use super::*;
-    use std::collections::BTreeMap;
-
-    use crate::components::buffer_text;
-    use ratatui::{Terminal, backend::TestBackend};
-
-    #[test]
-    fn dbg_layout() {
-        let models = Arc::new(ArcSwapOption::empty());
-        models.store(Some(Arc::new(ModelList {
-            specs: vec![
-                "zai/glm-5.3-flash".into(),
-                "mistral/zai-glm-5-3-flash".into(),
-            ],
-            loading: false,
-            providers: BTreeMap::new(),
-        })));
-        let mut p = ModelPicker::new(models);
-        p.set_recents(vec![
-            "opencode/beam-free".into(),
-            "mistral/zai-glm-5-3-flash".into(),
-            "zai/glm-5.3-flash".into(),
-        ]);
-        p.open("opencode/beam-free", &[]);
-        let mut t = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        t.draw(|f| _ = p.view(f, f.area())).unwrap();
-        let text = buffer_text(t.backend().buffer());
-        for line in text.lines() {
-            if let Some(pos) = line.find("medium").or_else(|| line.find("weak")) {
-                let dpos = line.find("$0.15").unwrap_or(line.find("free").unwrap_or(0));
-                println!("tier@{pos} value@{dpos} | {}", line.trim_end());
-            }
-        }
     }
 }
