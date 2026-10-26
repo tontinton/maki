@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
@@ -6,18 +6,20 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use maki_config::providers::{self, Protocol, ProviderDef, ProvidersConfig, slugify};
-use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
+use maki_providers::catalog_providers_if_available;
+use maki_storage::StateDir;
+use maki_storage::auth::{
+    ProviderCredentials, load_provider_credentials, load_tokens, save_provider_credentials,
+};
 use maki_storage::model::persist_model;
 
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
-use crate::components::provider_auth::{Auth, provider_entries};
 use crate::components::{Overlay, chevron_span, field_line, painted_caret};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 const TITLE: &str = " Login ";
-const CATALOG_SECTION: &str = "Providers from Models.dev";
 const CATALOG_UNAVAILABLE_SLUG: &str = "catalog-unavailable";
 const WRAP: Wrap = Wrap { trim: true };
 
@@ -34,6 +36,9 @@ struct ProviderItem {
     has_key: bool,
     has_env: bool,
     configured: bool,
+    /// Explicitly declared in `providers.toml`: the user asked for this
+    /// provider, so it lists even when its key is missing.
+    from_config: bool,
     section: Option<&'static str>,
 }
 
@@ -101,13 +106,17 @@ enum Step {
     CustomProtocol {
         picker: ListPicker<ProtocolItem>,
         slug: String,
-        name: String,
     },
     CustomUrl {
         input: TextBuffer,
         slug: String,
-        name: String,
         protocol: String,
+    },
+    EditEndpoint {
+        input: TextBuffer,
+        slug: String,
+        name: String,
+        api_key_optional: bool,
     },
     BuiltinUrl {
         input: TextBuffer,
@@ -144,12 +153,15 @@ enum StepAction {
     GoCustomName,
     GoCustomProtocol {
         slug: String,
-        name: String,
     },
     GoCustomUrl {
         slug: String,
-        name: String,
         protocol: String,
+    },
+    GoEditEndpoint {
+        slug: String,
+        name: String,
+        api_key_optional: bool,
     },
     GoBuiltinUrl {
         slug: String,
@@ -168,6 +180,8 @@ pub struct LoginPicker {
     step: Step,
     provider_items: Vec<ProviderItem>,
     storage: Option<maki_storage::StateDir>,
+    /// Opened from the model picker: backing out returns there.
+    from_picker: bool,
 }
 
 impl LoginPicker {
@@ -176,31 +190,96 @@ impl LoginPicker {
             step: Step::Closed,
             provider_items: Vec::new(),
             storage: None,
+            from_picker: false,
         }
     }
 
+    /// Opens the wizard already advanced into `slug`'s flow, so a model
+    /// picker row for a provider that cannot serve models lands straight on
+    /// its setup. Backing out closes the wizard and returns to the picker.
+    pub fn open_for(&mut self, storage: maki_storage::StateDir, slug: &str) {
+        self.open(storage);
+        let Some(item) = self.provider_items.iter().find(|i| i.slug == slug).cloned() else {
+            return;
+        };
+        if let Step::PickProvider(picker) = &mut self.step {
+            picker.select_item_by(|i| i.slug == slug);
+        }
+        self.from_picker = true;
+        self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
     pub fn open(&mut self, storage: maki_storage::StateDir) {
-        let (entries, catalog_available) = provider_entries(&storage);
-        let mut items: Vec<ProviderItem> = entries
-            .into_iter()
-            .map(|e| ProviderItem {
-                slug: e.slug,
-                display_name: e.display_name,
-                has_key: e.auth == Auth::Saved,
-                has_env: e.auth == Auth::Env,
-                configured: e.configured,
-                section: e.from_catalog.then_some(CATALOG_SECTION),
+        let builtins = providers::all_builtins();
+        let config = providers::ProvidersConfig::load();
+        let mut items: Vec<ProviderItem> = builtins
+            .iter()
+            .map(|b| {
+                let has_key = load_provider_credentials(&storage, b.slug).is_some()
+                    || load_tokens(&storage, b.slug).is_some();
+                let has_env = std::env::var(b.default_api_key_env).is_ok();
+                let configured = !has_key
+                    && !has_env
+                    && config.get(b.slug).is_some_and(|d| d.base_url.is_some());
+                ProviderItem {
+                    slug: b.slug.to_string(),
+                    display_name: b.display_name.to_string(),
+                    has_key,
+                    has_env,
+                    configured,
+                    from_config: false,
+                    section: None,
+                }
             })
             .collect();
 
-        if !catalog_available {
+        for (slug, def) in &config.providers {
+            if slug == "opencode" || providers::builtin_provider(slug).is_some() {
+                continue;
+            }
+            let has_key = load_provider_credentials(&storage, slug).is_some();
+            let has_env = def
+                .api_key_env
+                .as_deref()
+                .is_some_and(|e| std::env::var(e).is_ok());
+            items.push(ProviderItem {
+                slug: slug.clone(),
+                display_name: def.display_name.clone().unwrap_or_else(|| slug.clone()),
+                has_key,
+                has_env,
+                configured: false,
+                from_config: true,
+                section: None,
+            });
+        }
+
+        if let Some(catalog) = catalog_providers_if_available() {
+            let state_dir = StateDir::resolve().ok();
+            for cat in catalog {
+                let has_key = state_dir
+                    .as_ref()
+                    .and_then(|s| cat.load_key_from_storage(s))
+                    .is_some();
+                let has_env = cat.env_key_set().is_some();
+                items.push(ProviderItem {
+                    slug: cat.slug.clone(),
+                    display_name: cat.display_name.clone(),
+                    has_key,
+                    has_env,
+                    configured: false,
+                    from_config: false,
+                    section: Some("Providers from Models.dev"),
+                });
+            }
+        } else {
             items.push(ProviderItem {
                 slug: CATALOG_UNAVAILABLE_SLUG.to_string(),
                 display_name: "Models.dev providers (not yet downloaded)".to_string(),
                 has_key: false,
                 has_env: false,
                 configured: false,
-                section: Some(CATALOG_SECTION),
+                from_config: false,
+                section: Some("Providers from Models.dev"),
             });
         }
 
@@ -210,6 +289,7 @@ impl LoginPicker {
             has_key: false,
             has_env: false,
             configured: false,
+            from_config: false,
             section: None,
         });
 
@@ -230,6 +310,7 @@ impl LoginPicker {
             Step::EnterKey { input, .. }
             | Step::CustomName { input }
             | Step::CustomUrl { input, .. }
+            | Step::EditEndpoint { input, .. }
             | Step::BuiltinUrl { input, .. } => input.insert_text(text),
             Step::Closed | Step::Done { .. } => {}
         }
@@ -239,7 +320,55 @@ impl LoginPicker {
         let action = match &mut self.step {
             Step::Closed => return LoginPickerAction::Consumed,
             Step::PickProvider(picker) => match picker.handle_key(key) {
-                PickerAction::Select(item) => choose_provider(&item),
+                PickerAction::Select(item) => {
+                    if item.slug == CATALOG_UNAVAILABLE_SLUG {
+                        StepAction::None
+                    } else if item.slug == "custom" {
+                        StepAction::GoCustomName
+                    } else {
+                        let slug = item.slug.clone();
+                        let config = providers::ProvidersConfig::load();
+                        let def = config.get(&slug);
+                        let display_name =
+                            if providers::builtin_provider(&slug).is_some() || def.is_some() {
+                                providers::resolve_display_name(&slug, def)
+                            } else {
+                                item.display_name.clone()
+                            };
+                        // A declared provider entered from the model picker
+                        // edits its endpoint before pasting the key. An
+                        // existing key or env var can stay, so the prompt
+                        // accepts an empty answer.
+                        if self.from_picker && item.from_config {
+                            return self.transition(StepAction::GoEditEndpoint {
+                                slug,
+                                name: display_name,
+                                api_key_optional: item.has_key || item.has_env,
+                            });
+                        }
+                        let has_plans = providers::builtin_provider(&slug)
+                            .and_then(|b| b.plans)
+                            .is_some_and(|p| p.len() > 1);
+                        if has_plans {
+                            StepAction::GoPickPlan { slug }
+                        } else {
+                            let needs_url =
+                                providers::builtin_provider(&slug).is_some_and(|b| b.needs_url);
+                            if needs_url {
+                                StepAction::GoBuiltinUrl { slug, display_name }
+                            } else {
+                                StepAction::GoEnterKey {
+                                    slug,
+                                    plan: None,
+                                    display_name,
+                                    custom: None,
+                                    builtin_url: None,
+                                    api_key_optional: false,
+                                }
+                            }
+                        }
+                    }
+                }
                 PickerAction::Close => StepAction::Close,
                 PickerAction::Consumed | PickerAction::Toggle(..) => {
                     return LoginPickerAction::Consumed;
@@ -262,14 +391,28 @@ impl LoginPicker {
                     return LoginPickerAction::Consumed;
                 }
             },
-            Step::CustomName { input } => match key.code {
+            Step::EditEndpoint {
+                input,
+                slug,
+                name,
+                api_key_optional,
+            } => match key.code {
                 KeyCode::Enter => {
-                    let name = input.value().trim().to_string();
-                    let slug = slugify(&name);
-                    if slug.is_empty() {
+                    let base_url = input.value().trim().to_string();
+                    if base_url.is_empty() {
                         return LoginPickerAction::Consumed;
                     }
-                    StepAction::GoCustomProtocol { slug, name }
+                    StepAction::GoEnterKey {
+                        slug: slug.clone(),
+                        plan: None,
+                        display_name: format!("Custom ({})", slugify(&slug)),
+                        custom: Some(CustomInfo {
+                            base_url,
+                            protocol: "openai".to_string(),
+                        }),
+                        builtin_url: None,
+                        api_key_optional: *api_key_optional,
+                    }
                 }
                 KeyCode::Esc => StepAction::Back,
                 _ => {
@@ -277,10 +420,24 @@ impl LoginPicker {
                     return LoginPickerAction::Consumed;
                 }
             },
-            Step::CustomProtocol { picker, slug, name } => match picker.handle_key(key) {
+            Step::CustomName { input } => match key.code {
+                KeyCode::Enter => {
+                    let name = input.value().trim().to_string();
+                    let slug = slugify(&name);
+                    if slug.is_empty() {
+                        return LoginPickerAction::Consumed;
+                    }
+                    StepAction::GoCustomProtocol { slug }
+                }
+                KeyCode::Esc => StepAction::Back,
+                _ => {
+                    input.handle_key(key);
+                    return LoginPickerAction::Consumed;
+                }
+            },
+            Step::CustomProtocol { picker, slug } => match picker.handle_key(key) {
                 PickerAction::Select(item) => StepAction::GoCustomUrl {
                     slug: slug.clone(),
-                    name: name.clone(),
                     protocol: item.0.to_string(),
                 },
                 PickerAction::Close => StepAction::Back,
@@ -291,7 +448,6 @@ impl LoginPicker {
             Step::CustomUrl {
                 input,
                 slug,
-                name,
                 protocol,
             } => match key.code {
                 KeyCode::Enter => {
@@ -302,7 +458,7 @@ impl LoginPicker {
                     StepAction::GoEnterKey {
                         slug: slug.clone(),
                         plan: None,
-                        display_name: name.clone(),
+                        display_name: format!("Custom ({})", slug),
                         custom: Some(CustomInfo {
                             base_url,
                             protocol: protocol.clone(),
@@ -541,26 +697,40 @@ impl LoginPicker {
                 };
                 LoginPickerAction::Consumed
             }
-            StepAction::GoCustomProtocol { slug, name } => {
+            StepAction::GoCustomProtocol { slug } => {
                 let items: Vec<ProtocolItem> = PROTOCOLS
                     .iter()
                     .map(|(name, display)| ProtocolItem(name, display))
                     .collect();
                 let mut picker = ListPicker::new();
                 picker.open(items, " Protocol ");
-                self.step = Step::CustomProtocol { picker, slug, name };
+                self.step = Step::CustomProtocol { picker, slug };
                 LoginPickerAction::Consumed
             }
-            StepAction::GoCustomUrl {
-                slug,
-                name,
-                protocol,
-            } => {
+            StepAction::GoCustomUrl { slug, protocol } => {
                 self.step = Step::CustomUrl {
                     input: TextBuffer::new(String::new()),
                     slug,
-                    name,
                     protocol,
+                };
+                LoginPickerAction::Consumed
+            }
+            StepAction::GoEditEndpoint {
+                slug,
+                name,
+                api_key_optional,
+            } => {
+                let url = providers::ProvidersConfig::load()
+                    .get(&slug)
+                    .and_then(|d| d.base_url.clone())
+                    .unwrap_or_default();
+                let mut input = TextBuffer::new(url);
+                input.move_end();
+                self.step = Step::EditEndpoint {
+                    input,
+                    slug,
+                    name,
+                    api_key_optional,
                 };
                 LoginPickerAction::Consumed
             }
@@ -575,6 +745,16 @@ impl LoginPicker {
                 } else {
                     LoginPickerAction::Configured { slug }
                 }
+            }
+            StepAction::Back if self.from_picker => {
+                self.from_picker = false;
+                self.step = Step::Closed;
+                LoginPickerAction::BackToPicker
+            }
+            StepAction::Close if self.from_picker => {
+                self.from_picker = false;
+                self.step = Step::Closed;
+                LoginPickerAction::BackToPicker
             }
             StepAction::Back => {
                 let mut picker = ListPicker::new();
@@ -602,6 +782,13 @@ impl LoginPicker {
                 input,
             ),
             Step::CustomProtocol { picker, .. } => picker.view(frame, area),
+            Step::EditEndpoint { input, .. } => input_step_view(
+                frame,
+                area,
+                " Endpoint ",
+                "Edit the base URL, then Enter",
+                input,
+            ),
             Step::CustomUrl { input, .. } => input_step_view(
                 frame,
                 area,
@@ -670,44 +857,6 @@ impl Overlay for LoginPicker {
     }
 }
 
-/// The step that follows picking `item` in the provider list. Free-standing
-/// so `open_for` can reuse it without the key-handling borrow alive.
-fn choose_provider(item: &ProviderItem) -> StepAction {
-    if item.slug == CATALOG_UNAVAILABLE_SLUG {
-        return StepAction::None;
-    }
-    if item.slug == "custom" {
-        return StepAction::GoCustomName;
-    }
-    let slug = item.slug.clone();
-    let config = providers::ProvidersConfig::load();
-    let def = config.get(&slug);
-    let has_plans = providers::builtin_provider(&slug)
-        .and_then(|b| b.plans)
-        .is_some_and(|p| p.len() > 1);
-    if has_plans {
-        return StepAction::GoPickPlan { slug };
-    }
-    let display_name = if providers::builtin_provider(&slug).is_some() || def.is_some() {
-        providers::resolve_display_name(&slug, def)
-    } else {
-        item.display_name.clone()
-    };
-    let needs_url = providers::builtin_provider(&slug).is_some_and(|b| b.needs_url);
-    if needs_url {
-        StepAction::GoBuiltinUrl { slug, display_name }
-    } else {
-        StepAction::GoEnterKey {
-            slug,
-            plan: None,
-            display_name,
-            custom: None,
-            builtin_url: None,
-            api_key_optional: false,
-        }
-    }
-}
-
 fn step_modal(title: &str) -> Modal<'_> {
     Modal {
         title,
@@ -752,6 +901,9 @@ fn input_step_view(
 pub enum LoginPickerAction {
     Consumed,
     Close,
+    /// A model-picker-originated flow was backed out of; the host reopens
+    /// the picker instead of staying on the /login provider list.
+    BackToPicker,
     Authenticated { model_spec: String },
     Configured { slug: String },
 }
@@ -787,6 +939,7 @@ mod tests {
             has_key: false,
             has_env: false,
             configured: false,
+            from_config: false,
             section: None,
         }
     }
@@ -827,7 +980,6 @@ mod tests {
                 ProtocolItem(SLUG, SECOND_LABEL),
             ]),
             slug: SLUG.to_owned(),
-            name: "Declared".to_owned(),
         }
     }
 
