@@ -66,6 +66,7 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::iter;
@@ -3279,6 +3280,7 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
             specs: vec![LATE_MODEL_SPEC.into()],
             live_providers: Vec::new(),
             loading: false,
+            providers: BTreeMap::new(),
         })));
     });
 }

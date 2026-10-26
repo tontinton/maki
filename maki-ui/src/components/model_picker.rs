@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
@@ -507,6 +507,7 @@ mod tests {
             specs,
             live_providers,
             loading: false,
+            providers: BTreeMap::new(),
         })
     }
 
@@ -524,6 +525,7 @@ mod tests {
             specs: vec![SWAPPED_SPEC.into()],
             live_providers: Vec::new(),
             loading: true,
+            providers: BTreeMap::new(),
         })));
         let mut p = ModelPicker::new(Arc::clone(&models));
         p.open("");
@@ -899,6 +901,7 @@ mod tests {
                 specs,
                 live_providers: Vec::new(),
                 loading: true,
+                providers: BTreeMap::new(),
             })));
             let _ = p.refresh();
             let entry = p.picker.selected_item().expect("selection after a batch");
@@ -920,6 +923,7 @@ mod tests {
         models.store(Some(Arc::new(ModelList {
             specs: vec![SWAPPED_SPEC.into()],
             live_providers: vec!["anthropic".into(), "zai".into()],
+            providers: BTreeMap::new(),
             loading: false,
         })));
         let _ = p.refresh();
@@ -956,6 +960,7 @@ mod tests {
         models.store(Some(Arc::new(ModelList {
             specs: vec![SWAPPED_SPEC.into()],
             live_providers: Vec::new(),
+            providers: BTreeMap::new(),
             loading: true,
         })));
         let _ = p.refresh();

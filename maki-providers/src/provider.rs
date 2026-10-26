@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -176,6 +177,9 @@ pub async fn from_model_async(
 }
 
 pub struct ModelBatch {
+    /// The slug whose live answer this batch carries. The catalog and custom
+    /// sources send one batch per slug.
+    pub provider: String,
     pub models: Vec<String>,
     /// The providers this batch covers, independent of `ModelPolicy`: the
     /// policy filters `models`, but the picker still needs to know which
@@ -196,6 +200,17 @@ fn providers_of(specs: &[String]) -> Vec<String> {
         }
     }
     providers
+}
+
+/// Splits qualified specs into per-slug batches, keeping the order within a
+/// slug and sorting slugs so the batches are deterministic.
+fn group_by_slug(specs: Vec<String>) -> BTreeMap<String, Vec<String>> {
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for spec in specs {
+        let slug = provider_of(&spec).to_string();
+        groups.entry(slug).or_default().push(spec);
+    }
+    groups
 }
 
 /// The offline twin of [`fetch_all_models`]. It never waits for the catalog
@@ -287,8 +302,9 @@ pub async fn fetch_all_models(
             let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
             let _ = tx_catalog
                 .send_async(ModelBatch {
+                    providers: vec![slug.clone()],
+                    provider: slug,
                     models,
-                    providers: vec![slug],
                     warnings: Vec::new(),
                 })
                 .await;
@@ -297,22 +313,23 @@ pub async fn fetch_all_models(
 
     let tx_custom = tx.clone();
     tokio::spawn(async move {
-        let (declared, declared_providers) = custom::declared_batch();
-        if !declared.is_empty() {
+        for (provider, models) in group_by_slug(custom::declared_model_specs()) {
             let _ = tx_custom
                 .send_async(ModelBatch {
-                    providers: declared_providers,
-                    models: declared,
+                    providers: vec![provider.clone()],
+                    provider,
+                    models,
                     warnings: Vec::new(),
                 })
                 .await;
         }
         let custom_specs = custom::discover_models(timeouts).await;
-        if !custom_specs.is_empty() {
+        for (provider, models) in group_by_slug(custom_specs) {
             let _ = tx_custom
                 .send_async(ModelBatch {
-                    providers: providers_of(&custom_specs),
-                    models: custom_specs,
+                    providers: vec![provider.clone()],
+                    provider,
+                    models,
                     warnings: Vec::new(),
                 })
                 .await;
@@ -366,6 +383,7 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
         }
     };
     ModelBatch {
+        provider: slug.to_string(),
         models,
         providers: vec![slug.to_string()],
         warnings,
