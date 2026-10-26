@@ -5393,8 +5393,10 @@ fn parked_handler_reports_its_hook_finish_reply_on_deadline() {
 }
 
 const BASH_CANCEL_ID: &str = "bash-cancel-1";
-/// Mirrors the cancelled marker in `plugins/lib/maki/partial.lua`.
-const BASH_PARTIAL_MARKER: &str = "[cancelled by user; output above is partial]";
+/// Mirrors the cancelled marker in `plugins/lib/maki/partial.lua`, split
+/// around the elapsed time.
+const BASH_PARTIAL_MARKER_HEAD: &str = "[cancelled by user after ";
+const BASH_PARTIAL_MARKER_TAIL: &str = ", output above is partial]";
 /// Assembled by printf so the probe never appears in the command header.
 const BASH_PARTIAL_PROBE: &str = "XY";
 const BASH_PARTIAL_CMD: &str = "printf '%s%s\\n' X Y && sleep 30";
@@ -5438,7 +5440,13 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("cancelled bash must settle")
         .expect_err("a partial reply is an error reply");
-    assert_eq!(err, format!("{BASH_PARTIAL_PROBE}\n{BASH_PARTIAL_MARKER}"));
+    let marker = err
+        .strip_prefix(&format!("{BASH_PARTIAL_PROBE}\n"))
+        .expect("streamed output precedes the marker");
+    assert!(
+        marker.starts_with(BASH_PARTIAL_MARKER_HEAD) && marker.ends_with(BASH_PARTIAL_MARKER_TAIL),
+        "unexpected marker: {marker}"
+    );
 }
 
 #[test]

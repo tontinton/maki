@@ -362,6 +362,7 @@ maki.api.register_tool({
       return { llm_output = "error: command is required", is_error = true }
     end
 
+    local started_at = os.time()
     local command, workdir = parse_cd_hint(input)
     local timeout_secs = input.timeout or opts.timeout_secs
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
@@ -453,7 +454,7 @@ maki.api.register_tool({
         return
       end
       finished = true
-      ctx:finish(partial.cut(view, final_output(), reason, timeout_secs))
+      ctx:finish(partial.cut(view, final_output(), reason, timeout_secs, started_at))
     end)
 
     return nil

@@ -36,7 +36,7 @@ const CMD_TOOL: &str = "cmd";
 const BOOM_TOOL: &str = "boom";
 const BOOM_ERR: &str = "stub tool exploded";
 const PARTIAL_TOOL: &str = "partial";
-const PARTIAL_ERR: &str = "half the output [cancelled by user; output above is partial]";
+const PARTIAL_ERR: &str = "half the output [cancelled by user after 3s, output above is partial]";
 const CHILD_USAGE: &str = "12.3k↑ 456↓ $0.123";
 /// Wildly generous vs the expected kill (one poll plus one
 /// [`KILL_GRACE`]); only a watchdog that never fires gets here.

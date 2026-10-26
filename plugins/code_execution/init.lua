@@ -311,6 +311,7 @@ local function file_access(tools, schemas)
 end
 
 local function handler(input, ctx)
+  local started_at = os.time()
   local timeout = input.timeout or opts.timeout_secs
 
   local buf, view, highlight = build_body(ctx, input.code)
@@ -337,7 +338,13 @@ local function handler(input, ctx)
   local cut_reply
   local function cut(reason)
     cut_reply = cut_reply
-      or partial.cut(view, truncate(table.concat(output_parts, "\n"), max_lines, max_bytes), reason, timeout)
+      or partial.cut(
+        view,
+        truncate(table.concat(output_parts, "\n"), max_lines, max_bytes),
+        reason,
+        timeout,
+        started_at
+      )
     return cut_reply
   end
 
