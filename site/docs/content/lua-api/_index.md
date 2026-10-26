@@ -7798,6 +7798,12 @@ function M.resolve(opts, ctx)
 
 --- opts.max_line_bytes, or 0 (no limit) in full mode.
 function M.line_bytes(opts, ctx)
+
+--- Cuts {text} to the limits keeping its head and its tail, since on a long
+--- build or test run the errors and the summary sit at the end. Each end gets
+--- half of every limit. A nil limit is unlimited. The marker between the two
+--- notes how many lines and bytes it dropped.
+function M.cut_middle(text, max_lines, max_bytes)
 ```
 
 ### `require("maki.partial")`

@@ -1,4 +1,3 @@
-local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local partial = require("maki.partial")
@@ -261,7 +260,7 @@ Commands run in the session's working directory (see Environment) by default.
 - Do NOT use to communicate text to the user.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
-- Output sent to the model is truncated beyond 2000 lines or 50KB.
+- Output sent to the model is cut beyond 2000 lines or 50KB, keeping its start and end. Do not pipe to `tail` or `head`: piping hides live output.
 - Interactive commands (sudo, ssh prompts) fail immediately.]]
 
 maki.api.register_prompt_hint({
@@ -383,7 +382,7 @@ maki.api.register_tool({
     -- Presentation limits apply after the view streams every line. Both the
     -- exit and cancel path go through here.
     local function final_output()
-      return truncate(table.concat(output_parts), max_lines, max_bytes)
+      return output_limits.cut_middle(table.concat(output_parts), max_lines, max_bytes)
     end
 
     local function finish(exit_code)

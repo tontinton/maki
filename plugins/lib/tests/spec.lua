@@ -1,5 +1,6 @@
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
+local output_limits = require("maki.output_limits")
 local th = require("maki.test_helpers")
 
 -- Splitting a line is a method, not a key, so the random walk names it apart
@@ -54,6 +55,31 @@ end)
 case("truncate_trailing_newlines_counted", function()
   local result = truncate("a\n\n\n\n\n", 2, 1000)
   assert(result:find("%[truncated"), "trailing newlines should count as lines")
+end)
+
+local function cut_middle(head, lines, bytes, tail)
+  return head .. "\n\n[truncated " .. lines .. " lines, " .. bytes .. " bytes]" .. (tail and "\n\n" .. tail or "")
+end
+
+case("cut_middle_within_limits_unchanged", function()
+  eq(output_limits.cut_middle("a\nb\nc", 3, 1000), "a\nb\nc")
+  eq(output_limits.cut_middle("a\nb\nc", nil, nil), "a\nb\nc")
+  eq(output_limits.cut_middle("", 1, 1), "")
+end)
+
+case("cut_middle_keeps_both_ends_on_line_limit", function()
+  eq(output_limits.cut_middle("a\nb\nc\nd\ne\nf", 4, 1000), cut_middle("a\nb", 2, 5, "e\nf"))
+  eq(output_limits.cut_middle("a\nb\nc\nd\ne", 3, 1000), cut_middle("a\nb", 2, 5, "e"), "the head gets the odd line")
+end)
+
+case("cut_middle_keeps_both_ends_on_byte_limit", function()
+  local text = "aaaa\nbbbb\ncccc\ndddd\neeee"
+  eq(output_limits.cut_middle(text, 1000, 10), cut_middle("aaaa", 3, 16, "eeee"))
+end)
+
+case("cut_middle_oversized_first_line_keeps_a_utf8_prefix", function()
+  eq(output_limits.cut_middle(string.rep("é", 10), 1000, 6), cut_middle("é", 0, 18))
+  eq(output_limits.cut_middle(string.rep("x", 20) .. "\nok", 1000, 10), cut_middle("xxxxx", 0, 16, "ok"))
 end)
 
 -- ToolView tests
