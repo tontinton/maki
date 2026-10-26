@@ -32,7 +32,7 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
-use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+use crate::components::command::{CommandAction, CommandListing, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
@@ -1915,6 +1915,10 @@ impl App {
         }
         let idx = self.resolve_or_create_chat(info, &Some(plugin));
         self.chats[idx].idle = true;
+    }
+
+    pub(crate) fn command_listing(&mut self, caller: &PluginReach) -> Vec<CommandListing> {
+        self.command_palette.listing(caller)
     }
 
     /// Entry point for `maki.api.run_command`: splits a command line into the

@@ -645,6 +645,7 @@ mod tests {
             plugin: "thinking".into(),
             reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
+            interactive: false,
         }];
         let lua_commands: &[LuaCommandInfo] = if loaded { &thinking } else { &[] };
         let shown = (0..TIPS.len()).any(|seed| {

@@ -590,6 +590,7 @@ maki.api.create_autocmd("SessionStatusChanged", {
 maki.api.register_command({
   name = "/sessions",
   description = "Browse and switch sessions",
+  interactive = true,
   handler = open,
 })
 

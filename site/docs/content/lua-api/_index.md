@@ -610,6 +610,11 @@ browsing memory files or toggling settings.
     with one opts table: `opts.args` is the raw
     argument string (whitespace kept, may be empty)
     and `opts.fargs` is the same split into words.
+  - `interactive` (`boolean`) Optional, default false. Set it when the handler
+    only opens a picker or modal. `maki.api.list_commands`
+    reports it, so a front end that cannot show one
+    (a remote client, a headless session) can leave
+    the command out instead of running it to no effect.
 
 **Example:**
 
@@ -859,6 +864,41 @@ maki.api.register_command({
     end
   end,
 })
+```
+
+---
+
+### `maki.api.list_commands()` {#maki-api-list_commands}
+
+```lua
+maki.api.list_commands()
+```
+
+Lists every slash command `maki.api.run_command` accepts from this
+plugin: built-ins, custom `/project:` and `/user:` commands, MCP
+prompts, and plugin commands, in the order the palette shows them.
+Commands outside the calling plugin's grants, and the few that only run
+when the user types them, are left out, so every entry here runs.
+
+Each entry is `{ name, description, source, plugin?, max_args,
+argument_hint?, interactive }`. `source` is `"builtin"`, `"custom"`,
+`"mcp"` or `"lua"`, and `plugin` names the plugin that registered a
+`"lua"` one. `max_args` is -1 for a command that takes any number of
+arguments. `interactive` marks commands that only open a picker or
+modal, such as `/model`, which do nothing useful when nobody is looking
+at the terminal; plugins declare it in `maki.api.register_command`.
+
+**Returns:** (`table[]|nil`, `string|nil`) The command entries, or nil and an error when no UI is attached.
+
+**Example:**
+
+```lua
+local cmds = maki.api.list_commands()
+for _, c in ipairs(cmds or {}) do
+  if not c.interactive then
+    print(c.name, c.source, c.description)
+  end
+end
 ```
 
 ---

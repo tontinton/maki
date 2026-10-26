@@ -34,7 +34,7 @@ use crate::api::options::{PluginOpts, register_options__doc, register_options__r
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, UiAction, publish_command_snapshot,
-    ui_roundtrip,
+    ui_json_roundtrip, ui_roundtrip,
 };
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
@@ -944,6 +944,11 @@ fn allow_is_delegated(
 ///                          with one opts table: `opts.args` is the raw
 ///                          argument string (whitespace kept, may be empty)
 ///                          and `opts.fargs` is the same split into words.
+///   interactive (boolean)  Optional, default false. Set it when the handler
+///                          only opens a picker or modal. `maki.api.list_commands`
+///                          reports it, so a front end that cannot show one
+///                          (a remote client, a headless session) can leave
+///                          the command out instead of running it to no effect.
 /// @return
 /// @example
 /// maki.api.register_command({
@@ -1017,6 +1022,41 @@ async fn run_command(
     );
     try_pair!(reply);
     Ok((Some(true), None))
+}
+
+/// Lists every slash command `maki.api.run_command` accepts from this
+/// plugin: built-ins, custom `/project:` and `/user:` commands, MCP
+/// prompts, and plugin commands, in the order the palette shows them.
+/// Commands outside the calling plugin's grants, and the few that only run
+/// when the user types them, are left out, so every entry here runs.
+///
+/// Each entry is `{ name, description, source, plugin?, max_args,
+/// argument_hint?, interactive }`. `source` is `"builtin"`, `"custom"`,
+/// `"mcp"` or `"lua"`, and `plugin` names the plugin that registered a
+/// `"lua"` one. `max_args` is -1 for a command that takes any number of
+/// arguments. `interactive` marks commands that only open a picker or
+/// modal, such as `/model`, which do nothing useful when nobody is looking
+/// at the terminal; plugins declare it in `maki.api.register_command`.
+///
+/// @return (table[]|nil, string|nil) The command entries, or nil and an error when no UI is attached.
+/// @example
+/// local cmds = maki.api.list_commands()
+/// for _, c in ipairs(cmds or {}) do
+///   if not c.interactive then
+///     print(c.name, c.source, c.description)
+///   end
+/// end
+#[lua_fn]
+async fn list_commands(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] caller: PluginReach,
+) -> LuaResult<Pair<LuaValue>> {
+    ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::ListCommands {
+        caller,
+        reply_tx,
+    })
+    .await
 }
 
 /// Add a piece of text to an aggregate prompt slot. Multiple plugins can each
@@ -1209,7 +1249,7 @@ lua_table! {
         register_tool(pending, reach), register_permission_rule(pending_rules), register_command(plugin, reach),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
         get_tools, get_tool,
-        manual run_command,
+        manual run_command, manual list_commands,
     ]
 }
 
@@ -1223,7 +1263,8 @@ pub(crate) fn create_api_table(
     ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    run_command__register(&t, lua, ui_action_tx, reach.clone())?;
+    run_command__register(&t, lua, ui_action_tx.clone(), reach.clone())?;
+    list_commands__register(&t, lua, ui_action_tx, reach.clone())?;
     add_tool_fns(&t, lua, pending, pending_rules, reach, plugin, opts)?;
     Ok(t)
 }
@@ -1697,6 +1738,7 @@ fn register_command_from_lua(
     }
     let description: String = spec.get("description").unwrap_or_default();
     let max_args = parse_nargs(spec)?;
+    let interactive = spec.opt_bool("interactive").unwrap_or(false);
     let handler: Function = spec
         .get("handler")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
@@ -1716,6 +1758,7 @@ fn register_command_from_lua(
                 description,
                 reach,
                 max_args,
+                interactive,
             },
         );
     }
