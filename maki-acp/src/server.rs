@@ -4,6 +4,7 @@ use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agent_client_protocol_schema::v1::{
     AgentNotification, AgentRequest, AgentResponse, ConfigOptionUpdate, ContentBlock,
@@ -16,7 +17,7 @@ use agent_client_protocol_schema::v1::{
     TextContent,
 };
 use color_eyre::eyre::Context;
-use flume::{Sender, WeakSender};
+use flume::{Receiver, Sender, WeakSender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
@@ -31,7 +32,8 @@ use maki_agent::{
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
-use maki_providers::provider::{available_model_specs, fetch_all_models};
+use maki_providers::models_cache::{cached_model_specs, fetch_all_models_cached};
+use maki_providers::provider::available_model_specs;
 use maki_providers::{add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -45,6 +47,7 @@ use tracing::{debug, info, warn};
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
+const FIRST_RUN_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Turns already recorded were priced when they ran. `always_fast` is a live
 /// config value, so reading it here would reprice history the user paid for at
 /// standard rates. New turns still honour it.
@@ -100,6 +103,8 @@ struct Server {
     defaults: SessionDefaults,
     session: Option<SessionState>,
     on_session_end: Option<SessionEndHook>,
+    should_wait_models: bool,
+    models_rx: Option<Receiver<Vec<String>>>,
 }
 
 impl Server {
@@ -127,25 +132,54 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     });
 
+    let cached = cached_model_specs(&params.model_policy);
+    let has_cache = !cached.is_empty();
+    let mut model_specs = available_model_specs(&params.model_policy);
+    for spec in cached {
+        if !model_specs.contains(&spec) {
+            model_specs.push(spec);
+        }
+    }
+
+    let (lines_tx, lines_rx) = flume::unbounded::<String>();
+    let (models_tx, models_rx) = flume::unbounded::<Vec<String>>();
+    // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
+    discover_models(Arc::clone(&params.model_policy), models_tx.downgrade());
+    let reader_task = smol::spawn(read_stdin(lines_tx));
+
     let mut server = Server {
         out_tx,
-        model_specs: available_model_specs(&params.model_policy),
+        model_specs,
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
         defaults: params.defaults,
         session: None,
         on_session_end: params.on_session_end.clone(),
+        should_wait_models: !has_cache,
+        models_rx: Some(models_rx.clone()),
     };
 
-    let (in_tx, in_rx) = flume::unbounded::<Incoming>();
-    // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
-    discover_models(Arc::clone(&params.model_policy), in_tx.downgrade());
-    let reader_task = smol::spawn(read_stdin(in_tx));
+    loop {
+        let incoming = smol::future::race(
+            async {
+                match lines_rx.recv_async().await {
+                    Ok(line) => Some(Incoming::Line(line)),
+                    Err(_) => None,
+                }
+            },
+            async {
+                match models_rx.recv_async().await {
+                    Ok(specs) => Some(Incoming::Models(specs)),
+                    Err(_) => smol::future::pending().await,
+                }
+            },
+        )
+        .await;
 
-    while let Ok(incoming) = in_rx.recv_async().await {
         match incoming {
-            Incoming::Line(line) => handle_line(&mut server, &line, &params).await,
-            Incoming::Models(specs) => refresh_models(&mut server, specs),
+            Some(Incoming::Line(line)) => handle_line(&mut server, &line, &params).await,
+            Some(Incoming::Models(specs)) => refresh_models(&mut server, specs),
+            None => break,
         }
     }
 
@@ -159,14 +193,14 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
 /// Lives in its own task because `read_line` is not cancel safe: the main loop
 /// waits on discovery too, and a dropped read would eat half a line.
-async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
+async fn read_stdin(tx: Sender<String>) -> std::io::Result<()> {
     let mut reader = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).await? == 0 {
             return Ok(());
         }
-        if tx.send_async(Incoming::Line(line)).await.is_err() {
+        if tx.send_async(line).await.is_err() {
             return Ok(());
         }
     }
@@ -174,20 +208,14 @@ async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
 
 /// Static manifests miss providers that only list their models over the wire
 /// (OpenRouter and friends), so the same discovery the TUI runs happens here,
-/// in the background. Each batch leaves the moment it lands: the slowest source
-/// is a cold catalog download, and a provider the client could already pick from
-/// should not wait behind it.
-fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
+/// in the background. The on-disk cache replays first, followed by live batches.
+fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Vec<String>>) {
     smol::spawn(async move {
-        fetch_all_models(
-            &policy,
-            |batch| {
-                if let Some(tx) = tx.upgrade() {
-                    let _ = tx.send(Incoming::Models(batch.models));
-                }
-            },
-            None,
-        )
+        fetch_all_models_cached(&policy, |list, _warnings| {
+            if let Some(tx) = tx.upgrade() {
+                let _ = tx.send(list.specs);
+            }
+        })
         .await;
     })
     .detach();
@@ -205,6 +233,7 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     if srv.model_specs.len() == known {
         return;
     }
+    srv.should_wait_models = false;
     // Merged even with no session yet, since session/new builds its selector from this list.
     let Some(session) = &srv.session else { return };
     let option = methods::model_config_option(&session.current_model, &srv.model_specs);
@@ -213,6 +242,35 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
         &SessionId::from(session.handle.session_id.to_string()),
         SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![option])),
     );
+}
+
+async fn wait_for_models_on_first_run(srv: &mut Server) {
+    if !srv.should_wait_models {
+        return;
+    }
+    srv.should_wait_models = false;
+    let Some(models_rx) = srv.models_rx.clone() else {
+        return;
+    };
+    let timer = smol::Timer::after(FIRST_RUN_DISCOVERY_TIMEOUT);
+    smol::future::race(
+        async {
+            while let Ok(specs) = models_rx.recv_async().await {
+                let before = srv.model_specs.len();
+                refresh_models(srv, specs);
+                if srv.model_specs.len() > before {
+                    break;
+                }
+            }
+        },
+        async {
+            timer.await;
+        },
+    )
+    .await;
+    while let Ok(specs) = models_rx.try_recv() {
+        refresh_models(srv, specs);
+    }
 }
 
 async fn handle_line(server: &mut Server, line: &str, params: &AcpParams) {
@@ -281,6 +339,7 @@ async fn new_session(
     raw: &Value,
     params: &AcpParams,
 ) -> Result<AgentResponse, AcpError> {
+    wait_for_models_on_first_run(srv).await;
     let req: NewSessionRequest = parse_params(raw)?;
     close_session(srv, SessionEndReason::Replaced).await;
     let project_config = trusted_project_config(
@@ -313,6 +372,7 @@ async fn load_session(
     raw: &Value,
     params: &AcpParams,
 ) -> Result<AgentResponse, AcpError> {
+    wait_for_models_on_first_run(srv).await;
     let req: LoadSessionRequest = parse_params(raw)?;
     let session_ref: SessionRef = req
         .session_id
@@ -1339,6 +1399,8 @@ mod tests {
                 pending: Arc::default(),
                 claim,
             }),
+            should_wait_models: false,
+            models_rx: None,
         };
         (server, answer_rx, out_rx)
     }
@@ -2079,6 +2141,56 @@ mod tests {
 
         refresh_models(&mut srv, batch);
         assert!(out_rx.is_empty(), "a batch adding nothing is not announced");
+    }
+
+    #[test_case(true ; "without_session")]
+    #[test_case(false ; "with_session")]
+    fn refresh_models_merges_into_specs(has_session: bool) {
+        let (mut srv, .., out_rx) = test_server();
+        if !has_session {
+            srv.session = None;
+        }
+        srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
+        let batch = vec![DISCOVERED_SPEC.to_owned()];
+
+        refresh_models(&mut srv, batch);
+        assert!(srv.model_specs.contains(&DISCOVERED_SPEC.to_owned()));
+        assert!(srv.model_specs.contains(&OFFLINE_SPEC.to_owned()));
+        if !has_session {
+            assert!(
+                out_rx.is_empty(),
+                "discovery before session announces nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_for_models_on_first_run_merges_and_clears_flag() {
+        let (mut srv, .., _out_rx) = test_server();
+        srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
+        srv.should_wait_models = true;
+        let (models_tx, models_rx) = flume::unbounded();
+        srv.models_rx = Some(models_rx);
+
+        models_tx.send(vec![DISCOVERED_SPEC.to_owned()]).unwrap();
+
+        smol::block_on(wait_for_models_on_first_run(&mut srv));
+        assert!(srv.model_specs.contains(&DISCOVERED_SPEC.to_owned()));
+        assert!(!srv.should_wait_models);
+    }
+
+    #[test]
+    fn wait_for_models_times_out_when_disconnected() {
+        let (mut srv, .., _out_rx) = test_server();
+        srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
+        srv.should_wait_models = true;
+        let (_models_tx, models_rx) = flume::unbounded();
+        srv.models_rx = Some(models_rx);
+
+        drop(_models_tx);
+        smol::block_on(wait_for_models_on_first_run(&mut srv));
+        assert_eq!(srv.model_specs, vec![OFFLINE_SPEC.to_owned()]);
+        assert!(!srv.should_wait_models);
     }
 
     #[test]
