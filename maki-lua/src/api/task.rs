@@ -281,6 +281,7 @@ mod tests {
         let (val, err): (bool, Option<String>) = smol::block_on(run_command_scoped(
             &lua,
             0,
+            None,
             lua.load(STOP_CALL).eval_async(),
         ))
         .unwrap();
@@ -310,9 +311,9 @@ mod tests {
         let (val, err): (Value, Option<String>) = smol::block_on(async {
             match caller {
                 Caller::Hook => stop.await,
-                Caller::CommandAlias => run_command_scoped(&lua, 1, stop).await,
+                Caller::CommandAlias => run_command_scoped(&lua, 1, None, stop).await,
                 Caller::ChildOfUserCommand => {
-                    run_command_scoped(&lua, 0, async {
+                    run_command_scoped(&lua, 0, None, async {
                         let child =
                             TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
                         child.scope_future(stop).await

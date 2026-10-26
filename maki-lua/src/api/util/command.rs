@@ -719,6 +719,8 @@ pub enum UiAction {
         /// Checked on the UI side, since only the UI knows what each command
         /// can reach.
         caller: PluginReach,
+        /// Live session to run in; `None` is the focused one.
+        session: Option<String>,
         reply_tx: flume::Sender<Result<(), String>>,
     },
     /// An event from a subagent session a plugin opened on a chat session,

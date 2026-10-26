@@ -1186,12 +1186,22 @@ impl EventHandle {
         self
     }
 
-    pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
+    /// {session} is the id of the chat the command runs in, handed to the
+    /// handler as `opts.session`.
+    pub fn run_command(
+        &self,
+        plugin: Arc<str>,
+        command: Arc<str>,
+        args: String,
+        depth: u8,
+        session: Option<String>,
+    ) {
         let _ = self.prio_tx.try_send(Request::RunCommand {
             plugin,
             command,
             args,
             depth,
+            session,
         });
     }
 
@@ -1535,6 +1545,7 @@ mod tests {
             Arc::from("/greet"),
             "world".into(),
             2,
+            Some("s1".into()),
         );
         let req = prio_rx.try_recv().unwrap();
         match req {
@@ -1543,11 +1554,13 @@ mod tests {
                 command,
                 args,
                 depth,
+                session,
             } => {
                 assert_eq!(plugin.as_ref(), "myplugin");
                 assert_eq!(command.as_ref(), "/greet");
                 assert_eq!(args, "world");
                 assert_eq!(depth, 2);
+                assert_eq!(session.as_deref(), Some("s1"));
             }
             _ => panic!("expected RunCommand"),
         }

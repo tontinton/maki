@@ -111,19 +111,20 @@ pub mod test_support {
             })
         }
 
-        /// Next dispatched slash command as `(command, args, depth)`, skipping
-        /// other requests.
-        pub fn try_recv_command(&self) -> Option<(String, String, u8)> {
+        /// Next dispatched slash command as `(command, args, depth, session)`,
+        /// skipping other requests.
+        pub fn try_recv_command(&self) -> Option<(String, String, u8, Option<String>)> {
             use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
                 if let Request::RunCommand {
                     command,
                     args,
                     depth,
+                    session,
                     ..
                 } = req
                 {
-                    return Some((command.to_string(), args, depth));
+                    return Some((command.to_string(), args, depth, session));
                 }
             }
             None

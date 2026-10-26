@@ -4581,7 +4581,8 @@ fn run_cmdline_leaves_user_only_commands_to_the_user(cmdline: &str) {
 
 /// A Lua command reached through an alias carries the hop count onward, or a
 /// cycle of Lua aliases would never trip the cap. It goes out spelled as
-/// registered, since only that spelling dispatches.
+/// registered, since only that spelling dispatches, and names the session it
+/// runs in so the handler can aim follow-ups at the same tab.
 #[test]
 fn run_cmdline_forwards_depth_to_lua_command() {
     let dir = StateDir::from_path(env::temp_dir());
@@ -4603,7 +4604,12 @@ fn run_cmdline_forwards_depth_to_lua_command() {
 
     assert_eq!(
         probe.try_recv_command(),
-        Some(("/Sessions".to_string(), String::new(), 3))
+        Some((
+            "/Sessions".to_string(),
+            String::new(),
+            3,
+            Some(app.state.session.id.to_string())
+        ))
     );
 }
 

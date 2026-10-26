@@ -42,7 +42,7 @@ use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions, PluginReach};
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, PromptTarget, Request,
-    command_depth,
+    command_depth, command_session,
 };
 
 const TOOL_NAME_MAX: usize = 64;
@@ -942,8 +942,10 @@ fn allow_is_delegated(
 ///                          handle an empty `opts.args` yourself.
 ///   handler     (function) Required. Called when the user runs the command,
 ///                          with one opts table: `opts.args` is the raw
-///                          argument string (whitespace kept, may be empty)
-///                          and `opts.fargs` is the same split into words.
+///                          argument string (whitespace kept, may be empty),
+///                          `opts.fargs` is the same split into words, and
+///                          `opts.session` is the id of the session it runs
+///                          in.
 /// @return
 /// @example
 /// maki.api.register_command({
@@ -984,7 +986,15 @@ fn register_command(
 /// only run when you type them. [Commands](/docs/commands/#plugin-access)
 /// lists what each one needs.
 ///
+/// Pass `opts.session` to run it in a background tab instead of the focused
+/// one; a Lua handler sees that id as its own `opts.session`. Called from
+/// inside a command handler without one, it stays in the handler's session,
+/// so an alias sent to a background tab does not reset the one in view.
+///
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
+/// @param opts table? Options:
+///   session (string) id of a live session. Defaults to the session the
+///                    calling command handler runs in, else the focused one.
 /// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown or denied command.
 /// @example
 /// -- /resume as an alias for the built-in session picker:
@@ -1004,13 +1014,20 @@ async fn run_command(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     #[ctx] caller: PluginReach,
     cmdline: String,
+    opts: Option<Table>,
 ) -> LuaResult<Pair<bool>> {
+    let session = match opts {
+        Some(opts) => opts.opt("session")?,
+        None => None,
+    }
+    .or_else(|| command_session(&lua));
     let depth = command_depth(&lua).saturating_add(1);
     let reply = try_pair!(
         ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
             cmdline,
             depth,
             caller,
+            session,
             reply_tx,
         })
         .await

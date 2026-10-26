@@ -2078,6 +2078,7 @@ impl App {
             Arc::clone(&lua_cmd.name),
             args,
             depth,
+            Some(self.state.session.id.to_string()),
         );
     }
 

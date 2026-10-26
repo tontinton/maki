@@ -493,6 +493,8 @@ pub enum Request {
         /// How many `maki.api.run_command` hops led here; seeds the handler's
         /// [`TaskCell::command_depth`] so an alias cycle terminates.
         depth: u8,
+        /// The chat it runs in, passed to the handler as `opts.session`.
+        session: Option<String>,
     },
     CollectPromptSlots {
         reply: flume::Sender<ResolvedPrompts>,
@@ -745,6 +747,10 @@ pub(crate) struct TaskCell {
     /// can refuse to extend a chain that never ends. Inherited by
     /// `maki.async.run` tasks, or a cycle could hop through one and reset it.
     pub(crate) command_depth: u8,
+    /// The chat the running slash command was sent to, so a nested
+    /// `maki.api.run_command` that names none stays in the same tab instead
+    /// of hitting the focused one.
+    pub(crate) command_session: Option<String>,
     /// True while running a command the user typed or a key they pressed, so
     /// `maki.task.stop` knows a person asked for it. `maki.async` tasks start
     /// without it, since they can run long after the keypress. So do commands
@@ -779,6 +785,7 @@ impl TaskCell {
             bufs_claim: Weak::new(),
             owns_jobs: true,
             command_depth: 0,
+            command_session: None,
             user_action: false,
             detached: false,
         }
@@ -1635,13 +1642,20 @@ async fn run_abandonable<F: Future>(
 }
 
 /// [`run_detached`] for a slash-command handler or a keybind callback, seeding
-/// the hop count that `maki.api.run_command` checks before extending the chain.
-/// Depth 0 means the user acted directly, see [`TaskCell::user_action`].
-pub(crate) async fn run_command_scoped<F: Future>(lua: &Lua, depth: u8, fut: F) -> F::Output {
+/// the hop count that `maki.api.run_command` checks before extending the chain
+/// and the session nested calls default to. Depth 0 means the user acted
+/// directly, see [`TaskCell::user_action`].
+pub(crate) async fn run_command_scoped<F: Future>(
+    lua: &Lua,
+    depth: u8,
+    session: Option<String>,
+    fut: F,
+) -> F::Output {
     let scope = TaskScope::detached(lua);
     {
         let mut cell = lock_cell(scope.handle());
         cell.command_depth = depth;
+        cell.command_session = session;
         cell.user_action = depth == 0;
     }
     run_scoped(lua, scope, fut).await
@@ -1839,6 +1853,13 @@ pub(crate) fn active_task_cancel(lua: &Lua) -> Option<(u64, CancelToken)> {
 pub(crate) fn command_depth(lua: &Lua) -> u8 {
     lua.app_data_ref::<TaskHandle>()
         .map_or(0, |handle| lock_cell(&handle).command_depth)
+}
+
+/// The session the running slash command was sent to; `None` outside a
+/// command handler, or when it ran in the focused tab.
+pub(crate) fn command_session(lua: &Lua) -> Option<String> {
+    lua.app_data_ref::<TaskHandle>()
+        .and_then(|handle| lock_cell(&handle).command_session.clone())
 }
 
 pub(crate) fn is_user_action(lua: &Lua) -> bool {
@@ -2490,7 +2511,9 @@ fn spawn_keybind_callback(
     let plugin = Arc::clone(ticket.plugin());
     ex.spawn(async move {
         let _done = done_tx;
-        if let Err(e) = run_command_scoped(&handler_lua, 0, func.call_async::<LuaValue>(())).await {
+        if let Err(e) =
+            run_command_scoped(&handler_lua, 0, None, func.call_async::<LuaValue>(())).await
+        {
             tracing::warn!(?key, plugin = %plugin, error = %strip_traceback(&e), "keybind callback failed, key spent");
         }
     })
@@ -4857,6 +4880,7 @@ pub fn spawn(
                             command,
                             args,
                             depth,
+                            session,
                         } => {
                             let handler_fn =
                                 rt.lua.app_data_ref::<CommandHandlerMap>().and_then(|m| {
@@ -4866,6 +4890,7 @@ pub fn spawn(
                             if let Some(func) = handler_fn {
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
+                                    let handler_session = session.clone();
                                     let run = async {
                                         let opts = lua.create_table()?;
                                         opts.set(
@@ -4873,10 +4898,13 @@ pub fn spawn(
                                             lua.create_sequence_from(args.split_whitespace())?,
                                         )?;
                                         opts.set("args", args)?;
+                                        opts.set("session", handler_session)?;
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>(opts)?.await
                                     };
-                                    if let Err(e) = run_command_scoped(&lua, depth, run).await {
+                                    if let Err(e) =
+                                        run_command_scoped(&lua, depth, session, run).await
+                                    {
                                         tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
                                     }
                                 })

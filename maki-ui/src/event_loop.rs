@@ -1033,14 +1033,23 @@ impl<'t> EventLoop<'t> {
                 cmdline,
                 depth,
                 caller,
+                session,
                 reply_tx,
             } => {
                 // Answer before dispatching: the caller only waits on the name
                 // resolving, and dispatch may take a while (or exit the app).
-                match self.focused_app().run_cmdline(&cmdline, depth, &caller) {
-                    Ok(actions) => {
+                let ran = self
+                    .resolve_session_index(session.as_deref())
+                    .and_then(|idx| {
+                        let actions = self.sessions[idx]
+                            .app
+                            .run_cmdline(&cmdline, depth, &caller)?;
+                        Ok((idx, actions))
+                    });
+                match ran {
+                    Ok((idx, actions)) => {
                         let _ = reply_tx.send(Ok(()));
-                        self.dispatch(self.focused, actions);
+                        self.dispatch(idx, actions);
                     }
                     Err(e) => {
                         warn!(cmdline, depth, error = %e, "run_command refused");
