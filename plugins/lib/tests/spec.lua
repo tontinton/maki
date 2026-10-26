@@ -1,6 +1,5 @@
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
-local output_limits = require("maki.output_limits")
 local th = require("maki.test_helpers")
 
 -- Splitting a line is a method, not a key, so the random walk names it apart
@@ -55,14 +54,6 @@ end)
 case("truncate_trailing_newlines_counted", function()
   local result = truncate("a\n\n\n\n\n", 2, 1000)
   assert(result:find("%[truncated"), "trailing newlines should count as lines")
-end)
-
-case("output_limits_tail_keeps_the_last_n_lines", function()
-  eq(output_limits.tail("a\nb\nc\nd", 2), "c\nd")
-  eq(output_limits.tail("a\nb\nc\nd", 1), "d")
-  eq(output_limits.tail("a\nb\nc", 3), "a\nb\nc", "fewer lines than asked stays whole")
-  eq(output_limits.tail("", 5), "")
-  eq(output_limits.tail("a\nb\n", 1), "", "a trailing newline is an empty last line")
 end)
 
 -- ToolView tests

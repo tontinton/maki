@@ -252,7 +252,7 @@ fn python_glob_preserves_all_results_beyond_compact_limit() {
 
 #[test]
 #[cfg(unix)]
-fn python_bash_respects_tail_and_keeps_complete_error_output() {
+fn python_bash_returns_full_output_and_keeps_complete_error_output() {
     let (_registry, _host, ctx) = setup();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("lines.txt");
@@ -261,14 +261,8 @@ fn python_bash_respects_tail_and_keeps_complete_error_output() {
         .collect();
     fs::write(&path, lines.join("\n")).unwrap();
     let command = format!("cat '{}'", path.display());
-    let code = format!(
-        "text = await bash(command={command:?})\ntail = await bash(command={command:?}, tail=2)\nprint(len(text.splitlines()), tail == {:?})",
-        lines[lines.len() - 2..].join("\n")
-    );
-    assert_eq!(
-        python(&ctx, &code).unwrap().trim(),
-        format!("{} True", lines.len())
-    );
+    let code = format!("text = await bash(command={command:?})\nprint(len(text.splitlines()))");
+    assert_eq!(python(&ctx, &code).unwrap().trim(), lines.len().to_string());
     let failing = command + "; exit 7";
     let code = format!(
         "try:\n    await bash(command={failing:?})\nexcept RuntimeError as error:\n    print({:?} in str(error), 'Exit code: 7' in str(error))",

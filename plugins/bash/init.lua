@@ -262,8 +262,7 @@ Commands run in the session's working directory (see Environment) by default.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
 - Output sent to the model is truncated beyond 2000 lines or 50KB.
-- Interactive commands (sudo, ssh prompts) fail immediately.
-- Use the `tail` param, not `| tail`: piping hides live output.]]
+- Interactive commands (sudo, ssh prompts) fail immediately.]]
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
@@ -288,7 +287,6 @@ maki.api.register_tool({
       command = { type = "string", description = "The bash command to execute", required = true },
       timeout = { type = "integer", description = "Timeout in seconds (default 120)" },
       workdir = { type = "string", description = "Working directory (default: cwd)" },
-      tail = { type = "integer", description = "Return only the last N lines" },
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
     },
   },
@@ -325,9 +323,6 @@ maki.api.register_tool({
     local hints = {}
     if input.timeout then
       hints[#hints + 1] = maki.ui.humantime(input.timeout) .. " timeout"
-    end
-    if input.tail then
-      hints[#hints + 1] = "tail " .. input.tail
     end
     if #hints == 0 then
       return s
@@ -368,10 +363,6 @@ maki.api.register_tool({
       return { llm_output = "error: command is required", is_error = true }
     end
 
-    if input.tail and input.tail < 1 then
-      return { llm_output = "error: tail must be >= 1", is_error = true }
-    end
-
     local command, workdir = parse_cd_hint(input)
     local timeout_secs = input.timeout or opts.timeout_secs
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
@@ -392,11 +383,7 @@ maki.api.register_tool({
     -- Presentation limits apply after the view streams every line. Both the
     -- exit and cancel path go through here.
     local function final_output()
-      local output = table.concat(output_parts)
-      if input.tail then
-        output = output_limits.tail(output, input.tail)
-      end
-      return truncate(output, max_lines, max_bytes)
+      return truncate(table.concat(output_parts), max_lines, max_bytes)
     end
 
     local function finish(exit_code)

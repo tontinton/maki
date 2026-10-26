@@ -7798,11 +7798,6 @@ function M.resolve(opts, ctx)
 
 --- opts.max_line_bytes, or 0 (no limit) in full mode.
 function M.line_bytes(opts, ctx)
-
---- Last {n} lines of {text}, or all of it when it has fewer. Newlines separate
---- lines here rather than terminate them, so a trailing one is an empty last
---- line and counts as one.
-function M.tail(text, n)
 ```
 
 ### `require("maki.partial")`
