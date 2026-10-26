@@ -47,6 +47,7 @@ use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_menu, builtin_rows};
+use crate::components::provider_auth::provider_entries;
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
@@ -781,7 +782,7 @@ impl App {
                 .collect(),
         );
         app.model_picker
-            .set_collapsed(maki_storage::model::read_collapsed_providers(&app.storage));
+            .set_expanded(maki_storage::model::read_expanded_providers(&app.storage));
         // The manager arrives forked from the prototype the process was
         // started with, so a tab that resumes or spawns blank runs on
         // `--yolo` until its own meta is read back here.
@@ -1616,9 +1617,9 @@ impl App {
                 // Saved right here instead of going through an `Action`. A fold
                 // only changes how the picker looks, and the state dir lives here.
                 ModelPickerAction::Collapse(slug, folded) => {
-                    maki_storage::model::persist_collapsed_providers(
+                    maki_storage::model::persist_expanded_providers(
                         &self.storage,
-                        self.model_picker.collapsed_providers(),
+                        self.model_picker.expanded_providers(),
                     );
                     let suffix = if folded {
                         PROVIDER_FOLDED_SUFFIX
@@ -1814,7 +1815,8 @@ impl App {
                 true
             }
             BuiltinAction::ModelPicker => {
-                self.model_picker.open(&self.state.model.spec());
+                let providers = provider_entries(&self.storage).0;
+                self.model_picker.open(&self.state.model.spec(), &providers);
                 return (true, vec![Action::RefreshModels]);
             }
             BuiltinAction::InputRaw => {
@@ -2973,7 +2975,8 @@ impl App {
                 vec![]
             }
             "/model" => {
-                self.model_picker.open(&self.state.model.spec());
+                let providers = provider_entries(&self.storage).0;
+                self.model_picker.open(&self.state.model.spec(), &providers);
                 vec![Action::RefreshModels]
             }
             "/theme" => {

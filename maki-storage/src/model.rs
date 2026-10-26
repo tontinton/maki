@@ -9,7 +9,7 @@ use crate::{StateDir, atomic_write};
 const MODEL_FILE: &str = "model";
 const RECENT_FILE: &str = "recent-models";
 const THINKING_FILE: &str = "thinking";
-const COLLAPSED_FILE: &str = "collapsed-providers";
+const EXPANDED_FILE: &str = "expanded-providers.json";
 const MAX_RECENTS: usize = 4;
 
 pub fn persist_model(dir: &StateDir, spec: &str) {
@@ -36,18 +36,20 @@ pub fn read_thinking(dir: &StateDir) -> Option<StoredThinking> {
     StoredThinking::parse_setting(&raw).ok()
 }
 
-/// Providers folded away in the model picker, by slug. Kept as a sorted set,
-/// so folding and unfolding the same provider leaves the file as it was.
-pub fn read_collapsed_providers(dir: &StateDir) -> BTreeSet<String> {
-    fs::read_to_string(dir.path().join(COLLAPSED_FILE))
+/// Providers the model picker lists unfolded, by slug. The picker folds
+/// every group by default, so this is the exception list, not the rule.
+/// Kept as a sorted set, so folding and unfolding the same provider leaves
+/// the file as it was.
+pub fn read_expanded_providers(dir: &StateDir) -> BTreeSet<String> {
+    fs::read_to_string(dir.path().join(EXPANDED_FILE))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
 }
 
-pub fn persist_collapsed_providers(dir: &StateDir, slugs: &BTreeSet<String>) {
+pub fn persist_expanded_providers(dir: &StateDir, slugs: &BTreeSet<String>) {
     if let Ok(json) = serde_json::to_vec_pretty(slugs) {
-        let _ = atomic_write(&dir.path().join(COLLAPSED_FILE), &json);
+        let _ = atomic_write(&dir.path().join(EXPANDED_FILE), &json);
     }
 }
 
