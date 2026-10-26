@@ -284,9 +284,12 @@ fn write_telemetry_section(out: &mut String) {
     write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
     writeln!(
         out,
-        "Every field also has an environment variable, shown in the Env \
-         column, and the variable wins. See [Telemetry](/docs/telemetry/) \
-         for the full picture.\n"
+        "The Env column names the matching environment variable. For \
+         `enabled`, the exporters, `metrics_include_*`, \
+         `log_user_prompts`, `log_tool_details` and `content_max_length`, \
+         the variable wins. Every other field is passed to the OpenTelemetry SDK and wins \
+         over its variable. See [Telemetry](/docs/telemetry/) for the full \
+         picture.\n"
     )
     .unwrap();
 }

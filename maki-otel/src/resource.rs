@@ -1,105 +1,125 @@
-//! The OTLP resource: who is reporting, on what machine.
+//! The OTLP resource: who is reporting, on what machine. The SDK's detectors
+//! read `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, and `init.lua`
+//! goes on top, except for a service the environment names.
 
-use crate::attr::AttrSet;
-use crate::settings::Settings;
+use std::env::consts;
+
+use maki_config::TelemetryConfig;
+use opentelemetry::{InstrumentationScope, Key, KeyValue};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::resource::{ResourceDetector, SdkProvidedResourceDetector};
+
+use crate::export::Set;
 
 pub const SCOPE_NAME: &str = "maki";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const DEFAULT_SERVICE_NAME: &str = "maki";
 
-const SDK_LANGUAGE: &str = "rust";
-const SDK_NAME: &str = "maki-otel";
-
-pub(crate) const KEY_SERVICE_NAME: &str = "service.name";
+const KEY_SERVICE_NAME: &str = "service.name";
 const KEY_SERVICE_VERSION: &str = "service.version";
-const KEY_SDK_NAME: &str = "telemetry.sdk.name";
-const KEY_SDK_LANGUAGE: &str = "telemetry.sdk.language";
-const KEY_SDK_VERSION: &str = "telemetry.sdk.version";
 const KEY_OS_TYPE: &str = "os.type";
 const KEY_HOST_ARCH: &str = "host.arch";
+/// What the SDK calls a service nobody named, optionally followed by
+/// `:<executable>`.
+const UNKNOWN_SERVICE: &str = "unknown_service";
 
-/// User attributes come last so a collector-wide label can override a default.
-pub fn build(settings: &Settings) -> AttrSet {
-    let mut attrs = AttrSet::new()
-        .with(KEY_SERVICE_NAME, settings.service_name.as_str())
-        .with(KEY_SERVICE_VERSION, VERSION)
-        .with(KEY_SDK_NAME, SDK_NAME)
-        .with(KEY_SDK_LANGUAGE, SDK_LANGUAGE)
-        .with(KEY_SDK_VERSION, VERSION)
-        .with(KEY_OS_TYPE, std::env::consts::OS)
-        .with(KEY_HOST_ARCH, std::env::consts::ARCH);
-    for (key, value) in &settings.resource_attributes {
-        attrs.insert(key.clone(), value.as_str());
-    }
-    attrs
+pub fn build(lua: &TelemetryConfig) -> Resource {
+    let env_name = service_name(&SdkProvidedResourceDetector.detect());
+    Resource::builder()
+        .with_attributes([
+            KeyValue::new(KEY_SERVICE_VERSION, VERSION),
+            KeyValue::new(KEY_OS_TYPE, consts::OS),
+            KeyValue::new(KEY_HOST_ARCH, consts::ARCH),
+        ])
+        .with_attributes(
+            env_name
+                .is_none()
+                .then(|| KeyValue::new(KEY_SERVICE_NAME, DEFAULT_SERVICE_NAME)),
+        )
+        .with_attributes(
+            lua.resource_attributes
+                .iter()
+                .flatten()
+                .map(|(key, value)| KeyValue::new(key.clone(), value.clone())),
+        )
+        .set(
+            env_name.or_else(|| lua.service_name.clone()),
+            |builder, name| builder.with_service_name(name),
+        )
+        .build()
+}
+
+/// The name from `OTEL_SERVICE_NAME` or a `service.name` in
+/// `OTEL_RESOURCE_ATTRIBUTES`, unless the SDK fell back to its own.
+fn service_name(detected: &Resource) -> Option<String> {
+    detected
+        .get(&Key::from_static_str(KEY_SERVICE_NAME))
+        .map(|name| name.as_str().into_owned())
+        .filter(|name| !name.starts_with(UNKNOWN_SERVICE))
+}
+
+pub(crate) fn scope() -> InstrumentationScope {
+    InstrumentationScope::builder(SCOPE_NAME)
+        .with_version(VERSION)
+        .build()
 }
 
 #[cfg(test)]
 mod tests {
-    use maki_config::TelemetryConfig;
+    use std::collections::BTreeMap;
+
+    use opentelemetry::Value;
+    use test_case::test_case;
 
     use super::*;
-    use crate::attr::AttrValue;
-    use crate::settings::{ENV_ENABLE, resolve};
 
+    const LUA_NAME: &str = "from-lua";
+    const ENV_NAME: &str = "billing";
     const CUSTOM_KEY: &str = "team";
     const CUSTOM_VALUE: &str = "core";
 
-    fn settings_with(resource_attributes: Vec<(String, String)>) -> Settings {
-        let mut settings = resolve(&TelemetryConfig::default(), |k| {
-            (k == ENV_ENABLE).then(|| "1".to_string())
-        })
-        .unwrap()
-        .unwrap();
-        settings.resource_attributes = resource_attributes;
-        settings
+    fn value(resource: &Resource, key: &'static str) -> Option<Value> {
+        resource.get(&Key::from_static_str(key))
     }
 
-    fn value<'a>(attrs: &'a AttrSet, key: &str) -> &'a AttrValue {
-        attrs
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v)
-            .expect("attribute should be present")
+    #[test_case("unknown_service:maki", None; "sdk_fallback_with_executable")]
+    #[test_case("unknown_service", None; "sdk_fallback")]
+    #[test_case(ENV_NAME, Some(ENV_NAME); "named_in_the_environment")]
+    fn takes_only_a_service_the_environment_names(detected: &str, expected: Option<&str>) {
+        let resource = Resource::builder_empty()
+            .with_service_name(detected.to_string())
+            .build();
+        assert_eq!(service_name(&resource).as_deref(), expected);
     }
 
-    #[test]
-    fn carries_service_and_sdk_identity() {
-        let attrs = build(&settings_with(Vec::new()));
-        assert_eq!(
-            value(&attrs, KEY_SERVICE_NAME),
-            &AttrValue::Str("maki".into())
-        );
-        assert_eq!(
-            value(&attrs, KEY_SDK_NAME),
-            &AttrValue::Str(SDK_NAME.into())
-        );
-        assert_eq!(
-            value(&attrs, KEY_SDK_LANGUAGE),
-            &AttrValue::Str(SDK_LANGUAGE.into())
-        );
+    #[test_case("OTEL_SERVICE_NAME", ENV_NAME; "service_name")]
+    #[test_case("OTEL_RESOURCE_ATTRIBUTES", "service.name=billing"; "resource_attributes")]
+    fn a_service_the_environment_names_beats_lua(env: &str, raw: &str) {
+        // Sound because nextest runs each test in its own process.
+        unsafe { std::env::set_var(env, raw) };
+        let resource = build(&TelemetryConfig {
+            service_name: Some(LUA_NAME.to_string()),
+            resource_attributes: Some(BTreeMap::from([(
+                KEY_SERVICE_NAME.to_string(),
+                LUA_NAME.to_string(),
+            )])),
+            ..TelemetryConfig::default()
+        });
+        assert_eq!(value(&resource, KEY_SERVICE_NAME), Some(ENV_NAME.into()));
     }
 
     #[test]
-    fn user_attributes_override_defaults() {
-        let attrs = build(&settings_with(vec![(
-            KEY_SERVICE_NAME.to_string(),
-            CUSTOM_VALUE.to_string(),
-        )]));
-        assert_eq!(
-            value(&attrs, KEY_SERVICE_NAME),
-            &AttrValue::Str(CUSTOM_VALUE.into())
-        );
-    }
-
-    #[test]
-    fn user_attributes_are_added() {
-        let attrs = build(&settings_with(vec![(
-            CUSTOM_KEY.to_string(),
-            CUSTOM_VALUE.to_string(),
-        )]));
-        assert_eq!(
-            value(&attrs, CUSTOM_KEY),
-            &AttrValue::Str(CUSTOM_VALUE.into())
-        );
+    fn lua_service_name_beats_lua_attributes() {
+        let resource = build(&TelemetryConfig {
+            service_name: Some(LUA_NAME.to_string()),
+            resource_attributes: Some(BTreeMap::from([
+                (KEY_SERVICE_NAME.to_string(), CUSTOM_VALUE.to_string()),
+                (CUSTOM_KEY.to_string(), CUSTOM_VALUE.to_string()),
+            ])),
+            ..TelemetryConfig::default()
+        });
+        assert_eq!(value(&resource, KEY_SERVICE_NAME), Some(LUA_NAME.into()));
+        assert_eq!(value(&resource, CUSTOM_KEY), Some(CUSTOM_VALUE.into()));
+        assert_eq!(value(&resource, KEY_SERVICE_VERSION), Some(VERSION.into()));
     }
 }

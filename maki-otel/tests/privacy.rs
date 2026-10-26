@@ -1,7 +1,8 @@
 //! The privacy defaults, end to end: with telemetry on and nothing opted in,
 //! prompt text and tool input must never reach the collector, while the
-//! session id set at start must reach every event. Owns the process-wide
-//! state in `maki_otel`, so it lives in its own test binary.
+//! session id set at start must reach every event, along with the envelope
+//! maki fills in itself. Owns the process-wide state in `maki_otel`, so it
+//! lives in its own test binary.
 
 use std::time::Duration;
 
@@ -23,6 +24,8 @@ const SESSION_ID: &str = "sess-privacy";
 /// Multi-byte on purpose: the exported length must count chars, not bytes.
 const SECRET_PROMPT: &str = "the 秘密 prompt";
 const SECRET_INPUT: &str = "cat /etc/shadow";
+const SEVERITY_INFO: u64 = 9;
+const SEVERITY_TEXT_INFO: &str = "INFO";
 
 fn find<'a>(records: &'a [Value], event: &str) -> &'a Value {
     records
@@ -42,6 +45,7 @@ fn attr<'a>(record: &'a Value, key: &str) -> Option<&'a Value> {
 
 #[test]
 fn prompt_text_and_tool_input_stay_home_by_default() {
+    support::isolate_env();
     let (endpoint, server) = support::serve_once();
     let config = TelemetryConfig {
         enabled: Some(true),
@@ -51,7 +55,7 @@ fn prompt_text_and_tool_input_stay_home_by_default() {
         logs_interval_ms: Some(NEVER_MS),
         ..TelemetryConfig::default()
     };
-    maki_otel::init_with_env(&config, support::no_env).expect("telemetry should start");
+    maki_otel::init(&config).expect("telemetry should start");
     assert!(
         !maki_otel::logs_tool_details(),
         "tool details must be opt-in"
@@ -92,10 +96,26 @@ fn prompt_text_and_tool_input_stay_home_by_default() {
     let tool = find(records, EVENT_TOOL_RESULT);
     assert!(attr(tool, "tool_input").is_none());
 
-    for record in records {
+    for (sequence, record) in records.iter().enumerate() {
         assert_eq!(
             attr(record, "session.id").expect("every event carries the session")["stringValue"],
             SESSION_ID
+        );
+        assert_eq!(record["severityNumber"], SEVERITY_INFO);
+        assert_eq!(record["severityText"], SEVERITY_TEXT_INFO);
+        assert!(record["timeUnixNano"].as_str().is_some_and(|t| t != "0"));
+        assert!(
+            record["observedTimeUnixNano"]
+                .as_str()
+                .is_some_and(|t| t != "0")
+        );
+        assert_eq!(
+            attr(record, "event.name").expect("older collectors drop eventName")["stringValue"],
+            record["eventName"]
+        );
+        assert_eq!(
+            attr(record, "event.sequence").expect("orders events")["intValue"],
+            sequence.to_string()
         );
     }
 }

@@ -2,6 +2,7 @@
 //! socket on the other end. It owns the process-wide state in `maki_otel`, so
 //! it lives in its own test binary.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use maki_config::TelemetryConfig;
@@ -15,9 +16,12 @@ const METRICS_PATH: &str = "/v1/metrics";
 const EXPORTER_OTLP: &str = "otlp";
 const PROTOCOL_HTTP_JSON: &str = "http/json";
 const SERVICE_NAME: &str = "maki-test";
+const HEADER_NAME: &str = "x-team";
+const HEADER_VALUE: &str = "core";
 
 #[test]
 fn a_session_count_reaches_the_collector() {
+    support::isolate_env();
     let (endpoint, server) = support::serve_once();
     let config = TelemetryConfig {
         enabled: Some(true),
@@ -25,10 +29,14 @@ fn a_session_count_reaches_the_collector() {
         protocol: Some(PROTOCOL_HTTP_JSON.to_string()),
         endpoint: Some(endpoint),
         service_name: Some(SERVICE_NAME.to_string()),
+        headers: Some(BTreeMap::from([(
+            HEADER_NAME.to_string(),
+            HEADER_VALUE.to_string(),
+        )])),
         ..TelemetryConfig::default()
     };
 
-    maki_otel::init_with_env(&config, support::no_env).expect("telemetry should start");
+    maki_otel::init(&config).expect("telemetry should start");
     assert!(maki_otel::enabled());
 
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, None);
@@ -37,6 +45,11 @@ fn a_session_count_reaches_the_collector() {
 
     let request = server.join().expect("server thread");
     assert_eq!(request.target, METRICS_PATH);
+    assert!(
+        request
+            .headers
+            .contains(&(HEADER_NAME.to_string(), HEADER_VALUE.to_string()))
+    );
 
     let body: Value = serde_json::from_slice(&request.body).expect("valid OTLP/JSON");
     let scope = &body["resourceMetrics"][0]["scopeMetrics"][0];

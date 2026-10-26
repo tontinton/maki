@@ -4,15 +4,13 @@
 
 use std::time::Duration;
 
-use crate::attr::AttrSet;
-use crate::handle;
+use opentelemetry::KeyValue;
+use opentelemetry::logs::LogRecord;
+
 use crate::logs::{
     EVENT_API_ERROR, EVENT_API_REQUEST, EVENT_TOOL_DECISION, EVENT_TOOL_RESULT, EVENT_USER_PROMPT,
 };
-use crate::metrics::{
-    ACTIVE_TIME, COMMIT_COUNT, COST_USAGE, LINES_OF_CODE, PULL_REQUEST_COUNT, SESSION_COUNT,
-    TOKEN_USAGE, TOOL_DECISION, Value,
-};
+use crate::{handle, saturating_i64, shared};
 
 pub const START_FRESH: &str = "fresh";
 pub const START_RESUME: &str = "resume";
@@ -64,10 +62,10 @@ pub fn session_started(start_type: &'static str, session_id: Option<&str>) {
     let Some(handle) = handle() else {
         return;
     };
-    handle.record(
-        &SESSION_COUNT,
-        Value::Int(1),
-        AttrSet::new().with(KEY_START_TYPE, start_type),
+    handle.count(
+        |m| &m.session_count,
+        1,
+        &[KeyValue::new(KEY_START_TYPE, start_type)],
     );
 }
 
@@ -75,11 +73,12 @@ pub fn user_prompt(prompt: &str) {
     let Some(handle) = handle() else {
         return;
     };
-    let mut attrs = AttrSet::new().with(KEY_PROMPT_LENGTH, prompt.chars().count());
-    if handle.log_user_prompts {
-        attrs.insert(KEY_PROMPT, handle.truncate(prompt));
-    }
-    handle.event(EVENT_USER_PROMPT, attrs);
+    handle.event(EVENT_USER_PROMPT, |record| {
+        record.add_attribute(KEY_PROMPT_LENGTH, saturating_i64(prompt.chars().count()));
+        if handle.log_user_prompts {
+            record.add_attribute(KEY_PROMPT, handle.truncate(prompt));
+        }
+    });
 }
 
 pub struct ApiRequest<'a> {
@@ -98,22 +97,35 @@ pub fn api_request(request: &ApiRequest<'_>) {
     let Some(handle) = handle() else {
         return;
     };
-    let model_attrs = AttrSet::new()
-        .with(KEY_MODEL, request.model)
-        .with(KEY_PROVIDER, request.provider);
-    handle.event(
-        EVENT_API_REQUEST,
-        model_attrs
-            .clone()
-            .with(KEY_INPUT_TOKENS, request.input_tokens)
-            .with(KEY_OUTPUT_TOKENS, request.output_tokens)
-            .with(KEY_CACHE_READ_TOKENS, request.cache_read_tokens)
-            .with(KEY_CACHE_CREATION_TOKENS, request.cache_creation_tokens)
-            .with(KEY_COST_USD, request.cost_usd)
-            .with(KEY_DURATION_MS, request.duration.as_millis() as u64)
-            .with_opt(KEY_STOP_REASON, request.stop_reason),
-    );
+    let model = shared(request.model);
+    let provider = shared(request.provider);
+    handle.event(EVENT_API_REQUEST, |record| {
+        record.add_attribute(KEY_MODEL, model.clone());
+        record.add_attribute(KEY_PROVIDER, provider.clone());
+        record.add_attribute(KEY_INPUT_TOKENS, saturating_i64(request.input_tokens));
+        record.add_attribute(KEY_OUTPUT_TOKENS, saturating_i64(request.output_tokens));
+        record.add_attribute(
+            KEY_CACHE_READ_TOKENS,
+            saturating_i64(request.cache_read_tokens),
+        );
+        record.add_attribute(
+            KEY_CACHE_CREATION_TOKENS,
+            saturating_i64(request.cache_creation_tokens),
+        );
+        record.add_attribute(KEY_COST_USD, request.cost_usd);
+        record.add_attribute(
+            KEY_DURATION_MS,
+            saturating_i64(request.duration.as_millis()),
+        );
+        if let Some(stop_reason) = request.stop_reason {
+            record.add_attribute(KEY_STOP_REASON, stop_reason.to_string());
+        }
+    });
 
+    let model_attrs = [
+        KeyValue::new(KEY_MODEL, model),
+        KeyValue::new(KEY_PROVIDER, provider),
+    ];
     for (kind, count) in [
         (TOKEN_INPUT, request.input_tokens),
         (TOKEN_OUTPUT, request.output_tokens),
@@ -123,14 +135,15 @@ pub fn api_request(request: &ApiRequest<'_>) {
         if count == 0 {
             continue;
         }
-        handle.record(
-            &TOKEN_USAGE,
-            Value::Int(count as i64),
-            model_attrs.clone().with(KEY_TYPE, kind),
+        let [model, provider] = model_attrs.clone();
+        handle.count(
+            |m| &m.token_usage,
+            count,
+            &[model, provider, KeyValue::new(KEY_TYPE, kind)],
         );
     }
     if request.cost_usd > 0.0 {
-        handle.record(&COST_USAGE, Value::Double(request.cost_usd), model_attrs);
+        handle.count(|m| &m.cost_usage, request.cost_usd, &model_attrs);
     }
 }
 
@@ -147,16 +160,16 @@ pub fn api_error(error: &ApiError<'_>) {
     let Some(handle) = handle() else {
         return;
     };
-    handle.event(
-        EVENT_API_ERROR,
-        AttrSet::new()
-            .with(KEY_MODEL, error.model)
-            .with(KEY_PROVIDER, error.provider)
-            .with(KEY_ERROR, handle.truncate(error.error))
-            .with_opt(KEY_STATUS_CODE, error.status_code.map(i64::from))
-            .with(KEY_ATTEMPT, i64::from(error.attempt))
-            .with(KEY_DURATION_MS, error.duration.as_millis() as u64),
-    );
+    handle.event(EVENT_API_ERROR, |record| {
+        record.add_attribute(KEY_MODEL, error.model.to_string());
+        record.add_attribute(KEY_PROVIDER, error.provider.to_string());
+        record.add_attribute(KEY_ERROR, handle.truncate(error.error));
+        if let Some(status_code) = error.status_code {
+            record.add_attribute(KEY_STATUS_CODE, status_code);
+        }
+        record.add_attribute(KEY_ATTEMPT, error.attempt);
+        record.add_attribute(KEY_DURATION_MS, saturating_i64(error.duration.as_millis()));
+    });
 }
 
 pub struct ToolResult<'a> {
@@ -172,18 +185,20 @@ pub fn tool_result(result: &ToolResult<'_>) {
     let Some(handle) = handle() else {
         return;
     };
-    let mut attrs = AttrSet::new()
-        .with(KEY_TOOL_NAME, result.tool_name)
-        .with(KEY_TOOL_SOURCE, result.tool_source)
-        .with(KEY_SUCCESS, result.success)
-        .with(KEY_DURATION_MS, result.duration.as_millis() as u64)
-        .with_opt(KEY_ERROR_TYPE, result.error_type);
-    if handle.log_tool_details
-        && let Some(input) = result.tool_input
-    {
-        attrs.insert(KEY_TOOL_INPUT, handle.truncate(input));
-    }
-    handle.event(EVENT_TOOL_RESULT, attrs);
+    handle.event(EVENT_TOOL_RESULT, |record| {
+        record.add_attribute(KEY_TOOL_NAME, result.tool_name.to_string());
+        record.add_attribute(KEY_TOOL_SOURCE, result.tool_source.to_string());
+        record.add_attribute(KEY_SUCCESS, result.success);
+        record.add_attribute(KEY_DURATION_MS, saturating_i64(result.duration.as_millis()));
+        if let Some(error_type) = result.error_type {
+            record.add_attribute(KEY_ERROR_TYPE, error_type.to_string());
+        }
+        if handle.log_tool_details
+            && let Some(input) = result.tool_input
+        {
+            record.add_attribute(KEY_TOOL_INPUT, handle.truncate(input));
+        }
+    });
 }
 
 /// Both the event and the counter: dashboards want the rate, audits the detail.
@@ -191,12 +206,21 @@ pub fn tool_decision(tool_name: &str, decision: &'static str, source: &'static s
     let Some(handle) = handle() else {
         return;
     };
-    let attrs = AttrSet::new()
-        .with(KEY_TOOL_NAME, tool_name)
-        .with(KEY_DECISION, decision)
-        .with(KEY_SOURCE, source);
-    handle.event(EVENT_TOOL_DECISION, attrs.clone());
-    handle.record(&TOOL_DECISION, Value::Int(1), attrs);
+    let tool_name = shared(tool_name);
+    handle.event(EVENT_TOOL_DECISION, |record| {
+        record.add_attribute(KEY_TOOL_NAME, tool_name.clone());
+        record.add_attribute(KEY_DECISION, decision);
+        record.add_attribute(KEY_SOURCE, source);
+    });
+    handle.count(
+        |m| &m.tool_decision,
+        1,
+        &[
+            KeyValue::new(KEY_TOOL_NAME, tool_name),
+            KeyValue::new(KEY_DECISION, decision),
+            KeyValue::new(KEY_SOURCE, source),
+        ],
+    );
 }
 
 pub fn lines_of_code(added: u64, removed: u64) {
@@ -207,33 +231,33 @@ pub fn lines_of_code(added: u64, removed: u64) {
         if count == 0 {
             continue;
         }
-        handle.record(
-            &LINES_OF_CODE,
-            Value::Int(count as i64),
-            AttrSet::new().with(KEY_TYPE, kind),
+        handle.count(
+            |m| &m.lines_of_code,
+            count,
+            &[KeyValue::new(KEY_TYPE, kind)],
         );
     }
 }
 
 pub fn commit_created() {
     if let Some(handle) = handle() {
-        handle.record(&COMMIT_COUNT, Value::Int(1), AttrSet::new());
+        handle.count(|m| &m.commit_count, 1, &[]);
     }
 }
 
 pub fn pull_request_created() {
     if let Some(handle) = handle() {
-        handle.record(&PULL_REQUEST_COUNT, Value::Int(1), AttrSet::new());
+        handle.count(|m| &m.pull_request_count, 1, &[]);
     }
 }
 
 /// Time the agent spent working, as opposed to waiting for the user.
 pub fn active_time(duration: Duration) {
     if let Some(handle) = handle() {
-        handle.record(
-            &ACTIVE_TIME,
-            Value::Double(duration.as_secs_f64()),
-            AttrSet::new().with(KEY_TYPE, ACTIVE_TIME_CLI),
+        handle.count(
+            |m| &m.active_time,
+            duration.as_secs_f64(),
+            &[KeyValue::new(KEY_TYPE, ACTIVE_TIME_CLI)],
         );
     }
 }

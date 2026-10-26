@@ -146,9 +146,14 @@ futures = "0.3"
 isahc = { version = "2.0", default-features = false, features = ["text-decoding", "static-curl", "rustls-tls", "http2"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 async-compat = "0.2"
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["metrics", "logs", "grpc-tonic", "gzip-tonic", "tls-aws-lc", "tls-roots", "http-proto", "http-json", "gzip-http", "reqwest-blocking-client", "reqwest-rustls", "internal-logs"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "with-serde", "metrics", "logs"] }
+http = "1"
+percent-encoding = "2"
 futures-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
-flate2 = "1"
 libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
 nucleo = "0.5"
