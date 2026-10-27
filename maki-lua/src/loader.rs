@@ -45,8 +45,6 @@ pub const TRUST_SCOPE_WARNING: &str =
     "trust is only read from the global init.lua; ignoring the trust table in";
 pub const INSTRUCTIONS_SCOPE_WARNING: &str =
     "instructions is only read from the global init.lua; ignoring the instructions table in";
-pub const PROJECTS_SCOPE_WARNING: &str =
-    "projects is only read from the global init.lua; ignoring the projects list in";
 
 /// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
 /// project folder nobody vouched for stops at the global file.
@@ -464,20 +462,17 @@ impl PluginHost {
             // A folder cannot vouch for itself: ACP resolves many
             // client-chosen cwds against the config it read once at startup,
             // so one trusted project's `trust.paths` would reach folders
-            // nobody ever trusted. The same holds for `instructions` and
-            // `projects`, which pick what a folder's checkout loads into the
-            // model. Stripped rather than rejected, because there is no
-            // fallback config at this point and a hard error would brick the
-            // folder the user just trusted over an ignored setting.
+            // nobody ever trusted. The same holds for `instructions`, which
+            // picks what a folder's checkout loads into the model. Stripped
+            // rather than rejected, because there is no fallback config at
+            // this point and a hard error would brick the folder the user
+            // just trusted over an ignored setting.
             if !global {
                 if std::mem::take(&mut raw.trust).is_set() {
                     warnings.push(format!("{TRUST_SCOPE_WARNING} {owner}"));
                 }
                 if std::mem::take(&mut raw.instructions).is_set() {
                     warnings.push(format!("{INSTRUCTIONS_SCOPE_WARNING} {owner}"));
-                }
-                if !std::mem::take(&mut raw.projects).is_empty() {
-                    warnings.push(format!("{PROJECTS_SCOPE_WARNING} {owner}"));
                 }
             }
             match merged {
@@ -1912,21 +1907,21 @@ mod tests {
     }
 
     #[test]
-    fn project_scope_cannot_set_instructions_or_projects() {
+    fn project_scope_cannot_set_instructions() {
         let dir = tempfile::tempdir().unwrap();
         let global = dir.path().join("global");
         fs::create_dir_all(dir.path().join(".maki")).unwrap();
         fs::create_dir(&global).unwrap();
         fs::write(
             global.join("init.lua"),
-            "maki.setup({ instructions = { files = { \"CLAUDE.md\" } }, \
-                 projects = { { path = \"~/src/me/*\", instructions = { files = {} } } } })",
+            "maki.setup({ instructions = { files = { \"CLAUDE.md\" }, \
+                 overrides = { { path = \"~/src/me/*\", files = {} } } } })",
         )
         .unwrap();
         fs::write(
             dir.path().join(".maki/init.lua"),
-            "maki.setup({ instructions = { files = {} }, \
-                 projects = { { remote = \"github.com/*\", instructions = { files = {} } } } })",
+            "maki.setup({ instructions = { files = {}, \
+                 overrides = { { remote = \"github.com/*\", files = {} } } } })",
         )
         .unwrap();
 
@@ -1949,21 +1944,19 @@ mod tests {
             ["CLAUDE.md"]
         );
         assert_eq!(
-            merged.projects[0]
+            merged.instructions.overrides[0]
                 .path
                 .as_deref()
-                .expect("the global projects list survives"),
+                .expect("the global overrides list survives"),
             "~/src/me/*"
         );
-        for warning_text in [INSTRUCTIONS_SCOPE_WARNING, PROJECTS_SCOPE_WARNING] {
-            assert!(
-                warnings.iter().any(|warning| {
-                    warning.starts_with(warning_text)
-                        && warning.contains(ConfigScope::Project.label())
-                }),
-                "{warnings:?}"
-            );
-        }
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with(INSTRUCTIONS_SCOPE_WARNING)
+                    && warning.contains(ConfigScope::Project.label())),
+            "{warnings:?}"
+        );
     }
 
     #[test]

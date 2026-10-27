@@ -138,11 +138,11 @@ pub fn default_instruction_files() -> Vec<String> {
 }
 
 /// The file list that applies in `cwd`: the configured `instructions.files`,
-/// narrowed by the first `projects` entry matching this checkout, falling back
-/// to the built-in list. No `projects` means the checkout is never probed:
-/// the list cannot depend on it.
+/// narrowed by the first `instructions.overrides` entry matching this
+/// checkout, falling back to the built-in list. No `overrides` means the
+/// checkout is never probed: the list cannot depend on it.
 fn resolve_instruction_files(config: &InstructionsConfig, cwd: &Path) -> Vec<String> {
-    if config.projects.is_empty() {
+    if config.overrides.is_empty() {
         return config
             .files
             .clone()
@@ -400,12 +400,10 @@ mod tests {
     }
 
     fn files_config(files: &[&str]) -> InstructionsConfig {
-        InstructionsConfig::from_file(
-            InstructionsFileConfig {
-                files: Some(files.iter().map(|file| file.to_string()).collect()),
-            },
-            Vec::new(),
-        )
+        InstructionsConfig::from_file(InstructionsFileConfig {
+            files: Some(files.iter().map(|file| file.to_string()).collect()),
+            overrides: Vec::new(),
+        })
         .unwrap()
     }
 
@@ -418,16 +416,14 @@ mod tests {
         remote: Option<String>,
         files: &[&str],
     ) -> InstructionsConfig {
-        InstructionsConfig::from_file(
-            InstructionsFileConfig::default(),
-            vec![ProjectOverrideFileConfig {
+        InstructionsConfig::from_file(InstructionsFileConfig {
+            overrides: vec![ProjectOverrideFileConfig {
                 path,
                 remote,
-                instructions: Some(InstructionsFileConfig {
-                    files: Some(files.iter().map(|file| file.to_string()).collect()),
-                }),
+                files: Some(files.iter().map(|file| file.to_string()).collect()),
             }],
-        )
+            ..Default::default()
+        })
         .unwrap()
     }
 
@@ -500,7 +496,7 @@ mod tests {
         assert!(text.contains("my preferences"));
         assert!(
             !text.contains("team rules"),
-            "a matching projects entry replaces the file list, got {text}"
+            "a matching overrides entry replaces the file list, got {text}"
         );
     }
 

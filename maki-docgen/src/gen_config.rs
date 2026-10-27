@@ -235,7 +235,7 @@ fn write_trust_section(out: &mut String) {
     .unwrap();
 }
 
-/// `files` is a list of file names and `projects` a list of tables, which
+/// `files` is a list of file names and `overrides` a list of tables, which
 /// the `ConfigValue` table cannot describe, so these sections are prose like
 /// `trust`.
 fn write_instructions_section(out: &mut String) {
@@ -260,32 +260,22 @@ fn write_instructions_section(out: &mut String) {
         "```lua\nmaki.setup({{\n    instructions = {{ files = {{ \"CLAUDE.md\" }} }},\n}})\n```\n"
     )
     .unwrap();
-}
-
-fn write_projects_section(out: &mut String) {
-    writeln!(out, "### `projects`\n").unwrap();
     writeln!(
         out,
-        "Per-checkout overrides of the above, for when one repository wants a \
-         different answer. Read from the global `init.lua` only, like \
-         `instructions`.\n"
+        "`overrides` narrows it per checkout, for when one repository wants a \
+         different answer. Each entry matches a checkout by `path` (a glob \
+          against the project root, `~` included, like `trust.paths`) or by \
+          `remote` (a glob against every git remote URL of the project, \
+          normalized to `host/path`: `https://host/a/b.git` and \
+          `git@host:a/b.git` both become `host/a/b`). When both are set, both \
+          must match; an entry with neither matches every project. The first \
+          matching entry wins, and one that sets no `files` still ends the \
+          search, keeping the global `files`:\n"
     )
     .unwrap();
     writeln!(
         out,
-        "Each entry matches a checkout by `path` (a glob against the project \
-         root, `~` included, like `trust.paths`) or by `remote` (a glob \
-         against every git remote URL of the project, normalized to \
-         `host/path`: `https://host/a/b.git` and `git@host:a/b.git` both \
-         become `host/a/b`). When both are set, both must match; an entry \
-         with neither matches every project. The first matching entry wins, \
-         and one that sets no `instructions` still ends the search, keeping \
-         the global `files`:\n"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "```lua\nmaki.setup({{\n    projects = {{\n        {{ remote = \"github.com/example/*\", instructions = {{ files = {{}} }} }},\n        {{ path = \"~/src/secret\", instructions = {{ files = {{ \"CLAUDE.md\" }} }} }},\n    }},\n}})\n```\n"
+        "```lua\nmaki.setup({{\n    instructions = {{\n        overrides = {{\n            {{ remote = \"github.com/example/*\", files = {{}} }},\n            {{ path = \"~/src/secret\", files = {{ \"CLAUDE.md\" }} }},\n        }},\n    }},\n}})\n```\n"
     )
     .unwrap();
 }
@@ -405,7 +395,6 @@ All fields are optional. Typos in field names cause an error right away.
     write_net_section(&mut out);
     write_trust_section(&mut out);
     write_instructions_section(&mut out);
-    write_projects_section(&mut out);
     write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
@@ -490,7 +479,7 @@ On top of the project instruction files Maki loads from the git root down to the
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
-- `instructions.files` in the global `init.lua` to replace the project file list, scoped per checkout with `projects` (see [`instructions`](#instructions))
+- `instructions.files` in the global `init.lua` to replace the project file list, scoped per checkout with `instructions.overrides` (see [`instructions`](#instructions))
 
 All of these are added to the system prompt at the start of every session.
 

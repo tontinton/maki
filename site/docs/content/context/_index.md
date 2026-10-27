@@ -133,20 +133,22 @@ Put coding conventions, repo quirks, and off-limits directories in these files. 
 
 ### Your own file list
 
-The table above is the default. `instructions.files` in the global `~/.config/maki/init.lua` replaces it, and `projects` overrides it per checkout. Both are personal settings, so a project `init.lua` cannot set them:
+The table above is the default. `instructions.files` in the global `~/.config/maki/init.lua` replaces it, and `instructions.overrides` narrows it per checkout. Both are personal settings, so a project `init.lua` cannot set them:
 
 ```lua
 maki.setup({
     -- Only load CLAUDE.md, wherever it exists:
-    instructions = { files = { "CLAUDE.md" } },
-    -- Except in this checkout, where no project file loads at all:
-    projects = {
-        { remote = "github.com/example/*", instructions = { files = {} } },
+    instructions = {
+        files = { "CLAUDE.md" },
+        -- Except in this checkout, where no project file loads at all:
+        overrides = {
+            { remote = "github.com/example/*", files = {} },
+        },
     },
 })
 ```
 
-An empty `files` list skips every project instruction file, and `AGENTS.local.md` still loads. A `projects` entry matches by `path` (a glob against the project root) or by `remote` (a glob against the project's git remotes, normalized to `host/path`); an entry with neither matches every project. The first matching entry wins, and one that sets no `instructions` still ends the search. See [configuration](/docs/configuration/#instructions).
+An empty `files` list skips every project instruction file, and `AGENTS.local.md` still loads. An `overrides` entry matches by `path` (a glob against the project root) or by `remote` (a glob against the project's git remotes, normalized to `host/path`); an entry with neither matches every project. The first matching entry wins, and one that sets no `files` still ends the search. See [configuration](/docs/configuration/#instructions).
 
 ## Four places to put knowledge
 

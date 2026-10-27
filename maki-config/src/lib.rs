@@ -456,8 +456,10 @@ pub enum ConfigError {
         #[source]
         source: globset::Error,
     },
-    #[error("invalid config: projects contains invalid glob pattern `{pattern}`: {source}")]
-    InvalidProjectPattern {
+    #[error(
+        "invalid config: instructions.overrides contains invalid glob pattern `{pattern}`: {source}"
+    )]
+    InvalidOverridePattern {
         pattern: String,
         #[source]
         source: globset::Error,
@@ -551,7 +553,6 @@ pub struct RawConfig {
     pub net: NetFileConfig,
     pub trust: TrustFileConfig,
     pub instructions: InstructionsFileConfig,
-    pub projects: Vec<ProjectOverrideFileConfig>,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
 }
@@ -573,9 +574,6 @@ impl RawConfig {
         self.net.merge(overlay.net);
         self.trust.merge(overlay.trust);
         self.instructions.merge(overlay.instructions);
-        if !overlay.projects.is_empty() {
-            self.projects = overlay.projects;
-        }
         self.telemetry.merge(overlay.telemetry);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
@@ -596,7 +594,7 @@ impl RawConfig {
         }
         self.validate_plugin_tables(packages)?;
         let mut agent = AgentConfig::from_file(self.agent);
-        agent.instructions = InstructionsConfig::from_file(self.instructions, self.projects)?;
+        agent.instructions = InstructionsConfig::from_file(self.instructions)?;
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             session_defaults: SessionDefaults {
@@ -944,22 +942,28 @@ pub struct InstructionsFileConfig {
     /// Replaces the built-in file list. An empty list loads no project
     /// instruction files at all; `AGENTS.local.md` still loads.
     pub files: Option<Vec<String>>,
+    /// Per-checkout overrides of `files`, matched by local `path` glob, git
+    /// `remote` glob, or both. The first matching entry wins.
+    pub overrides: Vec<ProjectOverrideFileConfig>,
 }
 
 impl InstructionsFileConfig {
     fn merge(&mut self, overlay: InstructionsFileConfig) {
         merge_option!(self, overlay, files);
+        if !overlay.overrides.is_empty() {
+            self.overrides = overlay.overrides;
+        }
     }
 
     /// Whether the file mentioned instructions at all, so the scope that is
     /// not allowed to set them can warn about exactly the configs that tried.
     pub fn is_set(&self) -> bool {
-        self.files.is_some()
+        self.files.is_some() || !self.overrides.is_empty()
     }
 }
 
-/// One entry of the global `projects` list: a per-checkout override, matched
-/// by local `path` glob, git `remote` glob, or both.
+/// One entry of the `instructions.overrides` list: a per-checkout file list,
+/// matched by local `path` glob, git `remote` glob, or both.
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectOverrideFileConfig {
@@ -968,7 +972,9 @@ pub struct ProjectOverrideFileConfig {
     /// Glob matched against every git remote URL of the project, normalized
     /// to `host/path` (scheme, user, port and `.git` suffix removed).
     pub remote: Option<String>,
-    pub instructions: Option<InstructionsFileConfig>,
+    /// The file list that applies when this entry matches. `None` keeps the
+    /// global `files`.
+    pub files: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -1567,9 +1573,8 @@ pub struct AgentConfig {
     pub disabled_tools: Vec<String>,
 
     /// Which instruction files load, and the per-project overrides. Set from
-    /// the top-level `instructions`/`projects` tables in `into_config`, not
-    /// from the `[agent]` section, because only the global `init.lua` may set
-    /// them.
+    /// the top-level `instructions` table in `into_config`, not from the
+    /// `[agent]` section, because only the global `init.lua` may set them.
     #[config(skip, default = "InstructionsConfig::default()")]
     pub instructions: InstructionsConfig,
 }
@@ -1903,46 +1908,41 @@ fn expand_home(pattern: &str) -> String {
     }
 }
 
-/// Resolved `instructions` + `projects` config. Carried on [`AgentConfig`]
-/// so every instruction load sees the same answer.
+/// Resolved `instructions` config. Carried on [`AgentConfig`] so every
+/// instruction load sees the same answer.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct InstructionsConfig {
     /// `None` loads the built-in file list.
     pub files: Option<Vec<String>>,
-    pub projects: Vec<ProjectOverride>,
+    pub overrides: Vec<ProjectOverride>,
 }
 
 impl InstructionsConfig {
-    pub fn from_file(
-        file: InstructionsFileConfig,
-        projects: Vec<ProjectOverrideFileConfig>,
-    ) -> Result<Self, ConfigError> {
-        let mut resolved = Vec::with_capacity(projects.len());
-        for entry in projects {
+    pub fn from_file(file: InstructionsFileConfig) -> Result<Self, ConfigError> {
+        let mut resolved = Vec::with_capacity(file.overrides.len());
+        for entry in file.overrides {
             resolved.push(ProjectOverride {
                 path_matcher: compiled_matcher(entry.path.as_deref(), compile_path_glob)?,
                 remote_matcher: compiled_matcher(entry.remote.as_deref(), compile_remote_glob)?,
                 path: entry.path,
                 remote: entry.remote,
-                files: entry
-                    .instructions
-                    .and_then(|instructions| instructions.files),
+                files: entry.files,
             });
         }
         Ok(Self {
             files: file.files,
-            projects: resolved,
+            overrides: resolved,
         })
     }
 
-    /// Whether any `projects` entry matches on `remote`, so the caller knows
+    /// Whether any `overrides` entry matches on `remote`, so the caller knows
     /// it has to read the project's git remotes before resolving.
     pub fn needs_remotes(&self) -> bool {
-        self.projects.iter().any(|entry| entry.remote.is_some())
+        self.overrides.iter().any(|entry| entry.remote.is_some())
     }
 
     /// The file list that applies to the project at `project_root`, whose git
-    /// remotes are `remotes`. The first matching `projects` entry wins;
+    /// remotes are `remotes`. The first matching `overrides` entry wins;
     /// `default` applies when nothing configured does.
     pub fn resolve_files(
         &self,
@@ -1951,7 +1951,7 @@ impl InstructionsConfig {
         default: &[&str],
     ) -> Vec<String> {
         let mut files = self.files.clone();
-        for entry in &self.projects {
+        for entry in &self.overrides {
             if entry.matches(project_root, remotes) {
                 if let Some(entry_files) = &entry.files {
                     files = Some(entry_files.clone());
@@ -1963,7 +1963,7 @@ impl InstructionsConfig {
     }
 }
 
-/// One `projects` entry, with its matchers precompiled at load.
+/// One `instructions.overrides` entry, with its matchers precompiled at load.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectOverride {
     pub path: Option<String>,
@@ -1984,7 +1984,7 @@ fn compiled_matcher(
     };
     compile(pattern)
         .map(Some)
-        .map_err(|source| ConfigError::InvalidProjectPattern {
+        .map_err(|source| ConfigError::InvalidOverridePattern {
             pattern: pattern.to_owned(),
             source,
         })
@@ -3420,9 +3420,9 @@ mod tests {
 
     fn instructions_config(
         files: Option<Vec<String>>,
-        projects: Vec<ProjectOverrideFileConfig>,
+        overrides: Vec<ProjectOverrideFileConfig>,
     ) -> InstructionsConfig {
-        InstructionsConfig::from_file(InstructionsFileConfig { files }, projects)
+        InstructionsConfig::from_file(InstructionsFileConfig { files, overrides })
             .expect("valid patterns")
     }
 
@@ -3483,16 +3483,12 @@ mod tests {
                 },
                 ProjectOverrideFileConfig {
                     path: Some("/workspace".into()),
-                    instructions: Some(InstructionsFileConfig {
-                        files: Some(Vec::new()),
-                    }),
+                    files: Some(Vec::new()),
                     ..Default::default()
                 },
                 ProjectOverrideFileConfig {
                     path: Some("/workspace".into()),
-                    instructions: Some(InstructionsFileConfig {
-                        files: Some(vec!["GEMINI.md".into()]),
-                    }),
+                    files: Some(vec!["GEMINI.md".into()]),
                     ..Default::default()
                 },
             ],
@@ -3525,9 +3521,7 @@ mod tests {
             None,
             vec![ProjectOverrideFileConfig {
                 remote: Some("github.com/example/*".into()),
-                instructions: Some(InstructionsFileConfig {
-                    files: Some(Vec::new()),
-                }),
+                files: Some(Vec::new()),
                 ..Default::default()
             }],
         );
@@ -3568,49 +3562,52 @@ mod tests {
     #[test_case(None, Some(BROKEN_GLOB) ; "remote_glob_is_a_config_error")]
     fn invalid_project_pattern_is_a_config_error(path: Option<&str>, remote: Option<&str>) {
         let result = RawConfig {
-            projects: vec![ProjectOverrideFileConfig {
-                path: path.map(str::to_owned),
-                remote: remote.map(str::to_owned),
+            instructions: InstructionsFileConfig {
+                overrides: vec![ProjectOverrideFileConfig {
+                    path: path.map(str::to_owned),
+                    remote: remote.map(str::to_owned),
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
+            },
             ..Default::default()
         }
         .into_config(&[]);
 
         assert!(matches!(
             result,
-            Err(ConfigError::InvalidProjectPattern { pattern, .. }) if pattern == BROKEN_GLOB
+            Err(ConfigError::InvalidOverridePattern { pattern, .. }) if pattern == BROKEN_GLOB
         ));
     }
 
     #[test]
-    fn instructions_merge_and_projects_replace() {
+    fn instructions_merge_and_overrides_replace() {
         let mut base = RawConfig {
             instructions: InstructionsFileConfig {
                 files: Some(vec!["AGENTS.md".into()]),
+                overrides: vec![ProjectOverrideFileConfig {
+                    path: Some("/base".into()),
+                    ..Default::default()
+                }],
             },
-            projects: vec![ProjectOverrideFileConfig {
-                path: Some("/base".into()),
-                ..Default::default()
-            }],
             ..Default::default()
         };
         base.merge(RawConfig {
             instructions: InstructionsFileConfig {
                 files: Some(vec!["CLAUDE.md".into()]),
+                overrides: vec![ProjectOverrideFileConfig {
+                    path: Some("/overlay".into()),
+                    ..Default::default()
+                }],
             },
-            projects: vec![ProjectOverrideFileConfig {
-                path: Some("/overlay".into()),
-                ..Default::default()
-            }],
             ..Default::default()
         });
 
         let agent = base.into_config(&[]).unwrap().agent;
         assert_eq!(agent.instructions.files, Some(vec!["CLAUDE.md".to_owned()]));
-        assert_eq!(agent.instructions.projects.len(), 1);
+        assert_eq!(agent.instructions.overrides.len(), 1);
         assert_eq!(
-            agent.instructions.projects[0].path.as_deref(),
+            agent.instructions.overrides[0].path.as_deref(),
             Some("/overlay")
         );
     }
