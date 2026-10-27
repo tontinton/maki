@@ -60,6 +60,9 @@ pub struct ProviderStatus {
     pub models: usize,
     /// Set when the probe failed and the row is static fallback specs.
     pub warning: Option<String>,
+    /// Discovery could not build the provider for want of credentials, so the
+    /// row can say `no key` without guessing where keys come from.
+    pub missing_credentials: bool,
 }
 
 /// One discovery run as the picker sees it: last run's specs, with each
@@ -96,13 +99,12 @@ impl Listing {
                 self.live.push(spec.clone());
             }
         }
-        self.providers.insert(
-            batch.provider.clone(),
-            ProviderStatus {
-                models: batch.models.len(),
-                warning: batch.warnings.first().cloned(),
-            },
-        );
+        let status = self.providers.entry(batch.provider.clone()).or_default();
+        status.models = batch.models.len();
+        status.warning = batch.warnings.first().cloned();
+        // Declared specs travel in their own batch, so the skip can land on
+        // either side of a batch carrying models.
+        status.missing_credentials |= batch.missing_credentials;
     }
 
     fn snapshot(&self) -> ModelList {
@@ -345,6 +347,7 @@ mod tests {
             provider: provider.to_string(),
             models: specs(models),
             warnings: specs(warnings),
+            missing_credentials: false,
         }
     }
 
