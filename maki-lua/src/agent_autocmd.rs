@@ -6,7 +6,7 @@
 
 use std::fmt::Display;
 
-use maki_agent::{AgentEvent, DoneReason, Envelope};
+use maki_agent::{AgentEvent, DoneReason, Envelope, SubagentInfo};
 use maki_providers::TokenUsage;
 use serde::Serialize;
 use serde_json::Value;
@@ -42,7 +42,10 @@ pub enum HostEvent<'a> {
         duration_ms: Option<u64>,
         context_size: u32,
         context_window: u32,
-        subagent: bool,
+        /// The task of the subagent that made this call, which is what
+        /// `maki.task.send` addresses it by. Absent for the main session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<&'a str>,
     },
     AutoCompacting {
         context_size: u32,
@@ -180,7 +183,7 @@ impl HostEventKind {
                     "duration_ms",
                     "context_size",
                     "context_window",
-                    "subagent",
+                    "task_id",
                 ],
             ),
             Self::AutoCompacting => (&[], &["context_size", "context_window"]),
@@ -233,13 +236,8 @@ pub fn host_event_fields(event: &str) -> Option<EventFields> {
     event.parse().ok().map(HostEventKind::fields)
 }
 
-pub fn dispatch(
-    handle: &EventHandle,
-    session_id: &dyn Display,
-    envelope: &Envelope,
-    subagent_bounded: bool,
-) {
-    if let Some(event) = host_event_for(&envelope.event, subagent_bounded) {
+pub fn dispatch(handle: &EventHandle, session_id: &dyn Display, envelope: &Envelope) {
+    if let Some(event) = host_event_for(&envelope.event, envelope.subagent.as_ref()) {
         handle.fire(Some(session_id), event);
     }
 }
@@ -247,15 +245,18 @@ pub fn dispatch(
 /// Subagent envelopes carry the parent's `session_id`, so firing on them too
 /// would double count every budget and every tool the parent already reported,
 /// and a subagent compacting would look like the main context shrank. The one
-/// exception is `ToolDone`: it carries the subagent's own gauge, and
-/// `data.subagent` says which run it is, so a listener watching the parent's
-/// context can skip the subagent's calls.
+/// exception is `ToolDone`: it carries the subagent's own gauge, so context
+/// can be watched mid-turn, and `data.task_id` names the subagent to answer
+/// it with `maki.task.send` (absent for the main session's own calls).
 ///
 /// This runs on every envelope, streaming deltas included, and almost all of
 /// them map to nothing, so the event borrows and only a mapped one pays for
 /// a payload.
-pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<HostEvent<'_>> {
-    if subagent_bounded && !matches!(event, AgentEvent::ToolDone(_)) {
+pub fn host_event_for<'a>(
+    event: &'a AgentEvent,
+    subagent: Option<&'a SubagentInfo>,
+) -> Option<HostEvent<'a>> {
+    if subagent.is_some() && !matches!(event, AgentEvent::ToolDone(_)) {
         return None;
     }
     match event {
@@ -272,7 +273,7 @@ pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<Host
             duration_ms: e.call.as_ref().map(|call| call.duration.as_millis() as u64),
             context_size: e.context_size,
             context_window: e.context_window,
-            subagent: subagent_bounded,
+            task_id: subagent.map(|s| s.parent_tool_use_id.as_str()),
         }),
         AgentEvent::AutoCompacting {
             context_size,
@@ -333,7 +334,9 @@ mod tests {
 
     use std::time::Duration;
 
-    use maki_agent::{CallRecord, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use maki_agent::{
+        CallRecord, RunTotals, SessionControl, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    };
     use serde_json::json;
     use test_case::test_case;
 
@@ -345,7 +348,7 @@ mod tests {
     const TOOL_MILLIS: u64 = 42;
 
     fn fired(event: &AgentEvent) -> Option<(&'static str, Value)> {
-        host_event_for(event, false).map(|e| (e.name(), e.payload(Some(&SESSION))))
+        host_event_for(event, None).map(|e| (e.name(), e.payload(Some(&SESSION))))
     }
 
     fn done(reason: DoneReason) -> AgentEvent {
@@ -361,6 +364,19 @@ mod tests {
             context_window: 200_000,
             num_turns: 4,
             reason,
+        }
+    }
+
+    fn subagent() -> SubagentInfo {
+        SubagentInfo {
+            parent_tool_use_id: "toolu_sub".into(),
+            name: "research".into(),
+            prompt: None,
+            model: None,
+            opts: None,
+            answer_tx: None,
+            control: Arc::new(SessionControl::default()),
+            parent_call: None,
         }
     }
 
@@ -480,7 +496,7 @@ mod tests {
                 duration_ms: Some(0),
                 context_size: 0,
                 context_window: 0,
-                subagent: false,
+                task_id: Some(SAMPLE_TEXT),
             },
             HostEventKind::AutoCompacting => HostEvent::AutoCompacting {
                 context_size: 0,
@@ -588,26 +604,34 @@ mod tests {
         };
         done.context_size = 150_000;
         done.context_window = 200_000;
-        let data = host_event_for(&AgentEvent::ToolDone(done), false)
+        let data = host_event_for(&AgentEvent::ToolDone(done), None)
             .expect("ToolDone fires")
             .payload(Some(&SESSION));
         assert_eq!(data["context_size"], 150_000);
         assert_eq!(data["context_window"], 200_000);
-        assert_eq!(data["subagent"], false);
+        assert!(
+            data.get("task_id").is_none(),
+            "the main session has no task to answer"
+        );
     }
 
     #[test]
     fn subagent_envelopes_fire_only_tool_done() {
+        let info = subagent();
         for event in every_event() {
-            let fired = host_event_for(&event, true);
             assert_eq!(
-                fired.is_some(),
+                host_event_for(&event, Some(&info)).is_some(),
                 matches!(event, AgentEvent::ToolDone(_)),
                 "{event:?} leaked from a subagent"
             );
-            if let Some(HostEvent::ToolDone { subagent, .. }) = &fired {
-                assert!(*subagent, "{event:?} is not a subagent event");
-            }
         }
+    }
+
+    #[test]
+    fn subagent_tool_done_names_the_task_to_answer() {
+        let data = host_event_for(&tool_done(), Some(&subagent()))
+            .expect("ToolDone fires")
+            .payload(Some(&SESSION));
+        assert_eq!(data["task_id"], "toolu_sub");
     }
 }

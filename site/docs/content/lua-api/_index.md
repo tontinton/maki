@@ -902,8 +902,9 @@ name the session now running or focused. What each event adds:
   and `data.context_window` are the run's usage at dispatch time, so a
   plugin can nudge the model mid-turn, before `"AutoCompacting"` fires
   (a window of 0 means no run to ask, so guard divisions). Fires for
-  subagent tool calls too, with `data.subagent` true and the subagent's
-  own usage, which says nothing about the parent's context.
+  subagent tool calls too, with the subagent's own usage and a
+  `data.task_id` for `maki.task.send`; the main session's calls carry
+  no `task_id`.
 - `"TurnStart"`: `data.text`, the message that started the turn.
 - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
   `"max_turns"`, `"cancelled"`, or `"dropped"` when an

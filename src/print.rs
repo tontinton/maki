@@ -364,12 +364,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
         // totals when it calls `maki.session.read()`.
         snapshot.observe(&envelope);
-        maki_lua::agent_autocmd::dispatch(
-            &lua_handle,
-            &session_id,
-            &envelope,
-            envelope.subagent.is_some(),
-        );
+        maki_lua::agent_autocmd::dispatch(&lua_handle, &session_id, &envelope);
         let Envelope {
             ref event,
             ref subagent,
