@@ -685,6 +685,70 @@ case("open_requests_bottom_split", function()
   eq(captured.needs_input, true, "form must mark the session as needing input")
 end)
 
+-- A `question.form` layer keeps the window so it can close it when the remote
+-- answer lands, which only helps if it has it before the form waits.
+case("open_hands_the_window_out_before_the_first_key", function()
+  local original_open = maki.ui.open_win
+  local original_buf = maki.ui.buf
+  local original_size = maki.ui.terminal_size
+  local win, handed, recv_before_handed
+  win = {
+    width = 80,
+    set_config = function() end,
+    set_cursor = function() end,
+    recv = function()
+      recv_before_handed = handed == nil
+      return { type = "close" }
+    end,
+  }
+  maki.ui.open_win = function()
+    return win
+  end
+  maki.ui.buf = function()
+    return { set_lines = function() end }
+  end
+  maki.ui.terminal_size = function()
+    return { rows = 40, cols = 100 }
+  end
+  local ok, result = pcall(QuestionForm.open, single_question(), function(w)
+    handed = w
+  end)
+  maki.ui.open_win = original_open
+  maki.ui.buf = original_buf
+  maki.ui.terminal_size = original_size
+  assert(ok, "open must not error: " .. tostring(result))
+  eq(handed, win, "on_open gets the form's window")
+  eq(recv_before_handed, false, "the window is handed out before the form waits")
+  eq(result.type, "dismiss", "a window closed from outside reads as a dismiss")
+end)
+
+case("is_reply_takes_the_form_shape_only", function()
+  local good = {
+    { type = "dismiss" },
+    { type = "submit", answers = {} },
+    { type = "submit", answers = { { "Yes" }, { "a", "b" } } },
+    { type = "submit", answers = { [2] = { "free text" } } },
+  }
+  for i, reply in ipairs(good) do
+    eq(QuestionHelpers.is_reply(reply), true, "good reply " .. i)
+  end
+  local bad = {
+    nil,
+    "Yes",
+    {},
+    { type = "submit" },
+    { type = "submit", answers = "Yes" },
+    { type = "submit", answers = { "Yes" } },
+    { type = "submit", answers = { { 1 } } },
+    { type = "submit", answers = { yes = { "Yes" } } },
+    { type = "submit", answers = { [0] = { "Yes" } } },
+    { type = "answer", answers = { { "Yes" } } },
+  }
+  for i = 1, 10 do
+    eq(QuestionHelpers.is_reply(bad[i]), false, "bad reply " .. i)
+  end
+end)
+
 local function find_span_containing(lines, text)
   for _, line in ipairs(lines) do
     for _, span in ipairs(line) do

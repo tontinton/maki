@@ -441,6 +441,49 @@ can answer a prompt, as with `maki -p`, the default denies, the same as without
 a layer. Wrapping costs the same as a `tool.<name>.input` layer, see the
 [price table](#rules).
 
+## Question form
+
+The bundled `question` tool opens its form through `question.form`, a slot it
+declares itself, so a plugin can answer for a user who is away from the
+terminal. A layer takes `function(prev, questions, ev, on_open)`, where
+`questions` is the list the model sent and `ev.session` is the asking session.
+It answers in the form's own shape, `{ type = "submit", answers = { { "label",
+... }, ... } }` with one list per question (free text counts as a label), or
+`{ type = "dismiss" }`, or passes the call on with `prev(questions, ev,
+on_open)`. `on_open(win)` runs once the form is on screen, and closing that
+window ends the form as a dismiss, so a layer can race the user:
+
+```lua
+maki.api.set_slot("question.form", function(prev, questions, ev, on_open)
+  local win, reply
+  local remote = maki.async.spawn(function()
+    reply = ask_my_phone(ev.session, questions)
+    if win then
+      win:close()
+    end
+  end)
+  maki.async.on_cancel(function()
+    remote:cancel()
+  end)
+  local result = prev(questions, ev, function(w)
+    win = w
+    if reply then
+      w:close()
+    end
+    if on_open then
+      on_open(w)
+    end
+  end)
+  remote:cancel()
+  return reply or result
+end)
+```
+
+The slot names no price, so layering it costs every permission: answering
+stands in for the user. An answer in any other shape is dropped and the form
+opens without the layers. A question asked inside `batch` or
+`code_execution` goes through the same slot.
+
 ## Plugin slots
 
 A plugin can define an extension point of its own with
