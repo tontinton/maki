@@ -32,6 +32,8 @@ function M.open(path, max_bytes)
     pending_bytes = 0,
     draining = false,
     broken = false,
+    rotated_path = nil,
+    truncated = false,
     gate = maki.async.semaphore(1),
   }, Log)
 end
@@ -84,7 +86,10 @@ end
 --- loses it but still holds the cap.
 function Log:rotate()
   local renamed, err = maki.fs.rename(self.path, self.path .. ROTATED_SUFFIX)
-  if not renamed then
+  if renamed then
+    self.rotated_path = self.path .. ROTATED_SUFFIX
+  else
+    self.truncated = true
     maki.log.warn(("bash: cannot rotate %s: %s"):format(self.path, tostring(err)))
   end
   local emptied, write_err = maki.fs.write(self.path, "")

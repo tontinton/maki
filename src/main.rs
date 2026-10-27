@@ -1,5 +1,6 @@
 mod cli;
 mod cmd;
+mod interrupt;
 mod print;
 mod project_trust;
 mod provider_scripts;

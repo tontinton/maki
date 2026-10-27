@@ -21,6 +21,10 @@ use ratatui::widgets::{Block, Borders, Widget};
 use super::Status;
 use super::{App, Mode};
 
+/// A finished task's tab has no input box, so only this hint says how to
+/// get out.
+pub(super) const FINISHED_TAB_HINT: &str = " esc back · ctrl+x tasks ";
+
 struct ViewLayout {
     msg_area: Rect,
     bottom_area: Rect,
@@ -220,9 +224,11 @@ impl App {
             } else {
                 layout.bottom_area
             };
+            let hint = Line::from(Span::styled(FINISHED_TAB_HINT, theme::current().tool_dim));
             let sep = Block::default()
                 .borders(Borders::TOP)
-                .border_style(self.separator_style());
+                .border_style(self.separator_style())
+                .title_top(hint.right_aligned());
             frame.render_widget(sep, sep_area);
         } else if self.plan_form_active() {
             self.plan_form.view(frame, layout.bottom_area);

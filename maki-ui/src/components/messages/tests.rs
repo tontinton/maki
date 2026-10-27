@@ -974,14 +974,14 @@ fn collapsing_a_tool_keeps_the_scroll_inside_its_segment() {
     let mut panel = panel_with_long_tool(OUTPUT_LINES);
     push_tail_msgs(&mut panel);
     let area = Rect::new(0, 0, WIDE, HEIGHT);
-    assert!(panel.toggle_expansion_at(area.y, area), "expand");
+    assert!(panel.toggle_at(area.y, area), "expand");
     render(&mut panel, WIDE, HEIGHT);
     panel.scroll_to_top();
     render(&mut panel, WIDE, HEIGHT);
     panel.scroll(DEEP_SCROLL);
     render(&mut panel, WIDE, HEIGHT);
 
-    assert!(panel.toggle_expansion_at(area.y, area), "collapse");
+    assert!(panel.toggle_at(area.y, area), "collapse");
     let terminal = render(&mut panel, WIDE, HEIGHT);
     assert_scroll_draws(&panel, &terminal);
 }
@@ -1230,11 +1230,11 @@ fn toggle_expand_collapse_truncated_tool() {
     let area = Rect::new(0, 0, 80, 24);
     assert!(seg_text(&panel, "t1").contains("click to expand"));
 
-    assert!(panel.toggle_expansion_at(area.y, area));
+    assert!(panel.toggle_at(area.y, area));
     render(&mut panel, 80, 24);
     assert!(!seg_text(&panel, "t1").contains("click to expand"));
 
-    assert!(panel.toggle_expansion_at(area.y, area));
+    assert!(panel.toggle_at(area.y, area));
     render(&mut panel, 80, 24);
     assert!(seg_text(&panel, "t1").contains("click to expand"));
 }
@@ -1285,7 +1285,7 @@ fn copy_after_resize_keeps_offscreen_text() {
 fn toggle_returns_false_for_non_expandable() {
     let mut panel = panel_with_long_tool(3);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(!panel.toggle_expansion_at(area.y, area));
+    assert!(!panel.toggle_at(area.y, area));
 }
 
 fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
@@ -1326,11 +1326,11 @@ fn toggle_expand_collapse_grep_tool() {
     let area = Rect::new(0, 0, 80, 24);
     assert!(seg_text(&panel, "t1").contains("click to expand"));
 
-    assert!(panel.toggle_expansion_at(area.y, area));
+    assert!(panel.toggle_at(area.y, area));
     render(&mut panel, 80, 24);
     assert!(!seg_text(&panel, "t1").contains("click to expand"));
 
-    assert!(panel.toggle_expansion_at(area.y, area));
+    assert!(panel.toggle_at(area.y, area));
     render(&mut panel, 80, 24);
     assert!(seg_text(&panel, "t1").contains("click to expand"));
 }
@@ -3114,24 +3114,6 @@ fn movable_hint_disappears_after_tool_done() {
     assert!(!panel.messages[0].movable);
 }
 
-#[test]
-fn clicking_the_hint_moves_only_that_call() {
-    let mut panel = movable_panel(true);
-    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
-    let cols = hint_columns(header_line(&panel, MOVABLE_ID)).unwrap();
-
-    for col in [cols.start, cols.end - 1] {
-        assert_eq!(
-            panel.handle_click(0, col, view_area()),
-            ClickOutcome::MoveCall(MOVABLE_ID.into())
-        );
-    }
-    assert_eq!(
-        panel.handle_click(0, cols.start - 1, view_area()),
-        ClickOutcome::None
-    );
-}
-
 /// The hint's columns are the panel's own, so a panel that does not start
 /// at the screen's left edge shifts them by its offset.
 #[test]
@@ -3145,10 +3127,12 @@ fn clicking_the_hint_counts_from_the_panels_left_edge() {
         ..view_area()
     };
 
-    assert_eq!(
-        panel.handle_click(0, cols.start + PANEL_X, area),
-        ClickOutcome::MoveCall(MOVABLE_ID.into())
-    );
+    for col in [cols.start, cols.end - 1] {
+        assert_eq!(
+            panel.handle_click(0, col + PANEL_X, area),
+            ClickOutcome::MoveCall(MOVABLE_ID.into())
+        );
+    }
     assert_eq!(
         panel.handle_click(0, cols.start + PANEL_X - 1, area),
         ClickOutcome::None

@@ -10,6 +10,7 @@ use maki_config::project::{self, TrustMode};
 use maki_lua::{InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
 
+use crate::interrupt::Interrupt;
 use crate::provider_scripts;
 use crate::setup;
 
@@ -19,6 +20,7 @@ pub fn run(
     no_plugins: bool,
     no_jit: bool,
     trust_mode: TrustMode,
+    background: bool,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
@@ -71,6 +73,7 @@ pub fn run(
     let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
 
     let event_handle = plugin_host.event_handle();
+    let interrupt = Interrupt::install();
     maki_acp::run(maki_acp::AcpParams {
         model,
         config: config.agent,
@@ -88,5 +91,10 @@ pub fn run(
             Box::pin(async move { handle.end_session_async(id, reason).await })
         })),
         storage,
-    })
+        background,
+        stop: interrupt.stop(),
+    })?;
+    drop(plugin_host);
+    interrupt.exit_if_caught();
+    Ok(())
 }

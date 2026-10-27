@@ -7,8 +7,9 @@
 
 use std::mem;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use flume::TryRecvError;
 use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry, ToolSource};
 use maki_agent::{AgentEvent, ToolDoneEvent};
 use maki_lua::MoveOutcome;
@@ -17,7 +18,7 @@ use serde::Serialize;
 use strum::IntoStaticStr;
 
 use crate::app::{App, MAIN_CHAT};
-use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT};
+use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, LOST_TEXT};
 use crate::components::{Action, BackgroundBadge, BackgroundOutcome, DisplayRole, ToolStatus};
 use crate::repaint::Dirty;
 
@@ -73,12 +74,65 @@ pub(crate) enum TaskStatus {
     Error,
 }
 
+impl TaskStatus {
+    fn is_live(self) -> bool {
+        matches!(self, Self::Working | Self::Idle)
+    }
+}
+
 impl From<TaskOutcome> for TaskStatus {
     fn from(outcome: TaskOutcome) -> Self {
         match outcome {
             TaskOutcome::Error => Self::Error,
             TaskOutcome::Unknown | TaskOutcome::Done => Self::Done,
         }
+    }
+}
+
+/// When a task started, or moved to the background, and when it ended. A
+/// task loaded from disk has none: the session file keeps neither.
+pub(crate) struct TaskClock {
+    started: SystemTime,
+    ended: Option<SystemTime>,
+}
+
+impl TaskClock {
+    pub(crate) fn start() -> Self {
+        Self::started_ago(Duration::ZERO)
+    }
+
+    /// A moved call's task counts from the call's start, as the call's own
+    /// marks do, so `/tasks` and a stop's "after 40s" agree.
+    pub(crate) fn started_ago(ran: Duration) -> Self {
+        let now = SystemTime::now();
+        Self {
+            started: now.checked_sub(ran).unwrap_or(now),
+            ended: None,
+        }
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.ended.get_or_insert_with(SystemTime::now);
+    }
+
+    pub(crate) fn resume(&mut self) {
+        self.ended = None;
+    }
+}
+
+fn unix_secs(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_secs())
+}
+
+/// How the tab of a moved call ends, given how its row's badge did.
+pub(super) fn tab_ending(outcome: BackgroundOutcome) -> (TaskOutcome, &'static str) {
+    match outcome {
+        BackgroundOutcome::Done => (TaskOutcome::Done, DONE_TEXT),
+        BackgroundOutcome::Error => (TaskOutcome::Error, ERROR_TEXT),
+        BackgroundOutcome::Cancelled => (TaskOutcome::Error, CANCELLED_TEXT),
+        BackgroundOutcome::Lost => (TaskOutcome::Error, LOST_TEXT),
     }
 }
 
@@ -90,8 +144,8 @@ pub(crate) struct TaskState<'a> {
     pub(crate) plugin: Option<&'a Arc<str>>,
 }
 
-/// The wire shape of `maki.task.list()`. The main chat leaves `status` unset,
-/// a tool task `plugin`.
+/// The wire shape of `maki.task.list()`. The main chat leaves `status`, the
+/// times and `cost` unset, a tool task `plugin`.
 #[derive(Serialize)]
 pub(crate) struct TaskInfo {
     id: Arc<str>,
@@ -102,6 +156,12 @@ pub(crate) struct TaskInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     plugin: Option<Arc<str>>,
     focused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<f64>,
 }
 
 /// The answers to the last Ctrl+B, or click on a call's hint, folded as they
@@ -130,18 +190,16 @@ impl BackgroundMoves {
         if self.pending.is_empty() {
             return None;
         }
-        let mut answered = Vec::new();
-        self.pending.retain(|reply| match reply.try_recv() {
+        let mut pending = mem::take(&mut self.pending);
+        pending.retain(|reply| match reply.try_recv() {
             Ok(outcome) => {
-                answered.push(outcome);
+                self.record(outcome);
                 false
             }
-            Err(flume::TryRecvError::Empty) => true,
-            Err(flume::TryRecvError::Disconnected) => false,
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
         });
-        for outcome in answered {
-            self.record(outcome);
-        }
+        self.pending = pending;
         self.pending.is_empty().then(|| self.summary())
     }
 
@@ -155,7 +213,7 @@ impl BackgroundMoves {
     }
 }
 
-/// {one} for a single task, {count} then {many_suffix} for more.
+/// {one} when {count} is 1, else {count} followed by {many_suffix}.
 pub(crate) fn count_phrase(count: usize, one: &str, many_suffix: &str) -> String {
     if count == 1 {
         one.to_owned()
@@ -174,21 +232,20 @@ fn tool_owner(tool: &Arc<str>) -> Arc<str> {
 }
 
 impl App {
-    /// Asks the main chat's running calls to move, {only} one of them when
-    /// set. The main chat is the only mailbox a result can come back to, so
-    /// this never looks at the chat in front. A call parked on a permission
-    /// prompt has not started its work, so it is not asked.
-    /// Whether any running call was asked to move, so a key handler can try
-    /// something else when nothing could.
+    /// Asks the running calls of [`Self::background_origin`] to move, {only}
+    /// one of them when set. A call parked on a permission prompt has not
+    /// started its work, so it is not asked. Whether any call was asked, so
+    /// a key handler can try something else when nothing could.
     pub(super) fn move_to_background(&mut self, only: Option<&str>) -> bool {
+        let origin = self.background_origin();
         let mut asked = false;
-        for call in self.chats[MAIN_CHAT]
+        for call in self.chats[origin]
             .running_calls()
             .iter()
             .filter(|call| only.is_none_or(|id| id == call.id))
         {
             asked = true;
-            if call.awaiting_permission {
+            if self.permission_prompt.is_asking(&call.id) {
                 self.background_moves
                     .record(MoveOutcome::NotMovable(format!(
                         "{}{AWAITING_PERMISSION_SUFFIX}",
@@ -207,6 +264,20 @@ impl App {
         asked
     }
 
+    /// The subagent tab in front while it runs calls of its own, else the
+    /// main chat. A moved call reports to the agent that made it, and with
+    /// nothing running in the tab the call to move is the main one that owns
+    /// the subagent.
+    fn background_origin(&mut self) -> usize {
+        let idx = self.active_chat;
+        let chat = &mut self.chats[idx];
+        if idx != MAIN_CHAT && !chat.is_finished() && !chat.running_calls().is_empty() {
+            idx
+        } else {
+            MAIN_CHAT
+        }
+    }
+
     pub(super) fn tick_background_moves(&mut self) -> Dirty {
         let Some(summary) = self.background_moves.poll() else {
             return Dirty::NO;
@@ -215,22 +286,27 @@ impl App {
         Dirty::YES
     }
 
-    /// A moved call keeps streaming into the buf its row was drawing, so its
-    /// task tab starts as a copy of that row holding the same buf: nothing is
-    /// replayed and nothing is lost. Runs before the main row takes the
-    /// receipt, which retires the buf there. A call that already has a tab, a
-    /// subagent, keeps it and the tab is adopted.
-    pub(super) fn open_background_call(&mut self, done: &ToolDoneEvent) {
-        let badge = BackgroundBadge {
-            id: done.id.clone(),
-            started_at: Some(Instant::now()),
-            outcome: None,
-        };
+    /// A moved call keeps streaming into the buf its row was drawing. So its
+    /// task tab starts as a copy of that row, holding the same buf: nothing
+    /// is replayed and nothing is lost. This runs before the row in {origin}
+    /// takes the receipt, because the receipt retires the buf there. A `task`
+    /// call already has a tab, its subagent's, and that tab is adopted.
+    pub(super) fn open_background_call(&mut self, origin: usize, done: &ToolDoneEvent) {
+        let mut outcome = None;
         if let Ok(idx) = self.chat_of_task(&done.id) {
             self.adopt_subagent(idx, &tool_owner(&done.tool));
-        } else if let Some(mut row) = self.chats[MAIN_CHAT].tool_message(&done.id) {
+            self.chats[idx].backs_moved_call = true;
+            // Its close can beat the receipt, and so can its final result
+            // once its first plugin event adopted it.
+            outcome = match self.chats[idx].task_status() {
+                TaskStatus::Done => Some(BackgroundOutcome::Done),
+                TaskStatus::Error => Some(BackgroundOutcome::Error),
+                TaskStatus::Working | TaskStatus::Idle => None,
+            };
+        } else if let Some(mut row) = self.chats[origin].tool_message(&done.id) {
             row.movable = false;
-            // Esc may have failed the row just before a racing move landed.
+            // Esc may have failed the row just before a racing move landed,
+            // as it may have ended a subagent's tab, see `adopt_subagent`.
             if let DisplayRole::Tool(tool) = &mut row.role {
                 tool.status = ToolStatus::InProgress;
             }
@@ -241,7 +317,7 @@ impl App {
                 .filter(|line| !line.is_empty())
                 .unwrap_or(&*done.tool)
                 .to_owned();
-            let buf = self.chats[MAIN_CHAT].live_buf(&done.id);
+            let buf = self.chats[origin].live_buf(&done.id);
             let mut chat = Chat::new(
                 self.state.session.id,
                 Some(&done.id),
@@ -251,40 +327,60 @@ impl App {
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.plugin = Some(tool_owner(&done.tool));
+            chat.backs_moved_call = true;
+            chat.clock = Some(TaskClock::started_ago(done.ran_for()));
             chat.load_messages(vec![row]);
             if let Some(buf) = buf {
                 chat.register_live_buf(done.id.clone(), buf);
             }
             self.chats.push(chat);
         }
-        self.chats[MAIN_CHAT].set_tool_background(&done.id, badge);
+        let badge = BackgroundBadge {
+            outcome,
+            ..BackgroundBadge::moved(done)
+        };
+        self.chats[origin].set_tool_background(&done.id, badge);
+        if let Some(early) = self.early_finals.remove(&done.id)
+            && let Ok(idx) = self.chat_of_task(&done.id)
+        {
+            self.finish_background_call(idx, early);
+        }
     }
 
-    /// The final result of a moved call, which ends its task. A tab the user
-    /// already stopped reads as cancelled, whatever the call reported: only a
-    /// stop ends a task off the turn with an error before its result. The
-    /// close of an adopted subagent's session may come first, and knows no
-    /// verdict.
+    /// The badge sits on the row the call moved out of. A subagent tab closed
+    /// since took it along, and then there is nothing to update.
+    pub(super) fn set_badge_outcome(&mut self, id: &str, outcome: BackgroundOutcome) {
+        if let Some(chat) = self
+            .chats
+            .iter_mut()
+            .find(|chat| chat.has_background_badge(id))
+        {
+            chat.set_background_outcome(id, outcome);
+        }
+    }
+
+    /// The final result of a moved call ends its task. A tab that already
+    /// reads as an error was stopped by the user, since nothing else fails a
+    /// task before its result, so it stays cancelled whatever the call says.
+    /// An adopted subagent's session may close first, but a close carries no
+    /// verdict, so the result still decides.
     pub(super) fn finish_background_call(&mut self, idx: usize, event: AgentEvent) {
         let AgentEvent::ToolDone(done) = &event else {
             return;
         };
         let id = done.id.clone();
         let chat = &mut self.chats[idx];
-        let (outcome, ending, text) = if chat.task_status() == TaskStatus::Error {
-            (
-                BackgroundOutcome::Cancelled,
-                TaskOutcome::Error,
-                CANCELLED_TEXT,
-            )
+        let outcome = if chat.task_status() == TaskStatus::Error {
+            BackgroundOutcome::Cancelled
         } else if done.is_error {
-            (BackgroundOutcome::Error, TaskOutcome::Error, ERROR_TEXT)
+            BackgroundOutcome::Error
         } else {
-            (BackgroundOutcome::Done, TaskOutcome::Done, DONE_TEXT)
+            BackgroundOutcome::Done
         };
+        let (ending, text) = tab_ending(outcome);
         chat.handle_event(event, None);
         chat.mark_finished(ending, text);
-        self.chats[MAIN_CHAT].set_background_outcome(&id, outcome);
+        self.set_badge_outcome(&id, outcome);
     }
 
     /// A subagent whose call moved on becomes a task of {plugin}. Off the
@@ -292,14 +388,22 @@ impl App {
     /// sweeps it, and it keeps working. A chat that has an owner keeps it, so
     /// the receipt and the subagent's first plugin event adopt in either
     /// order.
+    ///
+    /// A move racing Esc is adopted after the turn's sweep ended the chat and
+    /// let go of it. Its own result waits for the adoption, see `deliver`, so
+    /// an ending on a chat the turn no longer holds is the sweep's alone, and
+    /// it is taken back.
     pub(super) fn adopt_subagent(&mut self, idx: usize, plugin: &Arc<str>) {
         let chat = &mut self.chats[idx];
         if idx == MAIN_CHAT || chat.plugin.is_some() {
             return;
         }
         chat.plugin = Some(Arc::clone(plugin));
-        if let Some(id) = chat.task_id() {
-            self.chat_index.remove(&**id);
+        let on_turn = chat
+            .task_id()
+            .is_some_and(|id| self.chat_index.remove(&**id).is_some());
+        if !on_turn {
+            chat.reopen();
         }
     }
 
@@ -346,6 +450,16 @@ impl App {
                 status: chat.task_id().map(|_| chat.task_status()),
                 plugin: chat.plugin.clone(),
                 focused: idx == self.active_chat,
+                started_at: chat
+                    .clock
+                    .as_ref()
+                    .and_then(|clock| unix_secs(clock.started)),
+                ended_at: chat
+                    .clock
+                    .as_ref()
+                    .and_then(|clock| clock.ended)
+                    .and_then(unix_secs),
+                cost: chat.task_id().and(chat.cost),
             })
             .collect()
     }
@@ -370,8 +484,11 @@ impl App {
         }
         let chat = &mut self.chats[idx];
         let live = !chat.is_finished();
-        let action = match chat.plugin {
-            Some(_) if live => Action::CancelPluginTask { id: id.to_owned() },
+        let action = match &chat.plugin {
+            Some(plugin) if live => Action::CancelPluginTask {
+                id: id.to_owned(),
+                plugin: Arc::clone(plugin),
+            },
             None if live && self.chat_index.get(id) == Some(&idx) => Action::CancelSubagent {
                 tool_use_id: id.to_owned(),
             },
@@ -381,6 +498,9 @@ impl App {
         chat.cancel_in_progress();
         chat.mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
         self.permission_prompt.drop_subagent(id);
+        // Settled now: the tab, and with it the final result, may be gone
+        // before the call honours the stop.
+        self.set_badge_outcome(id, BackgroundOutcome::Cancelled);
         Ok(action)
     }
 
@@ -449,28 +569,75 @@ impl App {
     }
 }
 
-/// Fires when a known task changes status, or when a new live task appears.
-/// A task first seen already finished is recorded quietly, so a restored
-/// session does not replay yesterday's tasks.
-///
-/// `previous` is keyed by id, because a session reset reuses positions.
-pub(crate) fn diff_task_states<'a>(
-    previous: &mut Vec<(Arc<str>, TaskStatus)>,
-    current: impl Iterator<Item = TaskState<'a>>,
-    mut emit: impl FnMut(TaskState<'a>),
-) {
-    let mut next = Vec::with_capacity(previous.len());
-    for task in current {
-        let announce = match previous.iter().find(|(id, _)| id == task.id) {
-            Some((_, status)) => *status != task.status,
-            None => matches!(task.status, TaskStatus::Working | TaskStatus::Idle),
-        };
-        if announce {
-            emit(task);
+/// What the last frame saw of a task: enough to announce its end once its
+/// tab is gone.
+struct SeenTask {
+    id: Arc<str>,
+    name: String,
+    status: TaskStatus,
+    plugin: Option<Arc<str>>,
+}
+
+/// The tasks of one session as the last frame saw them, keyed by id, because
+/// a session reset reuses positions.
+#[derive(Default)]
+pub(crate) struct TaskWatch {
+    session: Option<MakiId>,
+    tasks: Vec<SeenTask>,
+}
+
+impl TaskWatch {
+    /// Fires when a known task changes status, or when a new live task
+    /// appears. A task first seen already finished is recorded quietly, so a
+    /// restored session does not replay yesterday's tasks. A live task whose
+    /// tab went in between, as a rewind's stop takes it, ends as an error:
+    /// only a stop takes a live tab. A session swapped under the tab starts
+    /// over quietly, since `SessionReset` already speaks for the old one.
+    pub(crate) fn diff<'a>(
+        &mut self,
+        session: MakiId,
+        current: impl Iterator<Item = TaskState<'a>>,
+        mut emit: impl FnMut(TaskState<'_>),
+    ) {
+        if self.session.replace(session) != Some(session) {
+            self.tasks.clear();
         }
-        next.push((Arc::clone(task.id), task.status));
+        let mut next = Vec::with_capacity(self.tasks.len());
+        for task in current {
+            let seen = self
+                .tasks
+                .iter()
+                .position(|seen| seen.id == *task.id)
+                .map(|at| self.tasks.swap_remove(at));
+            let announce = seen
+                .as_ref()
+                .map_or_else(|| task.status.is_live(), |seen| seen.status != task.status);
+            if announce {
+                emit(task);
+            }
+            let mut seen = seen.unwrap_or_else(|| SeenTask {
+                id: Arc::clone(task.id),
+                name: String::new(),
+                status: task.status,
+                plugin: None,
+            });
+            if seen.name != task.name {
+                task.name.clone_into(&mut seen.name);
+            }
+            seen.status = task.status;
+            seen.plugin = task.plugin.cloned();
+            next.push(seen);
+        }
+        for gone in self.tasks.drain(..).filter(|seen| seen.status.is_live()) {
+            emit(TaskState {
+                id: &gone.id,
+                name: &gone.name,
+                status: TaskStatus::Error,
+                plugin: gone.plugin.as_ref(),
+            });
+        }
+        self.tasks = next;
     }
-    *previous = next;
 }
 
 #[cfg(test)]
@@ -478,11 +645,11 @@ mod tests {
     use super::*;
     use crate::app::Msg;
     use crate::app::tests::{
-        MONITOR_ID, MONITOR_PLUGIN, MOVE_RECEIPT, MOVED_ID, RESEARCH_NAME, SLOW_TOOL, agent_msg,
-        app_with_moved_call, app_with_plugin_task, app_with_subagent_call, app_with_subagent_id,
-        cancel_app, close_subagent_transcript, done, end_turn, error_app, finish_subagent,
-        moved_done, moved_subagent_event, plugin_event, start_subagent, streaming_app,
-        subagent_info, test_app, tool_start,
+        MONITOR_ID, MONITOR_PLUGIN, MOVE_RECEIPT, MOVED_ID, RESEARCH_NAME, SLOW_TOOL,
+        STARTED_AT_KEY, agent_msg, app_with_moved_call, app_with_plugin_task,
+        app_with_subagent_call, app_with_subagent_id, cancel_app, close_subagent_transcript, done,
+        end_turn, error_app, finish_subagent, moved_done, moved_subagent_event, plugin_event,
+        start_subagent, streaming_app, subagent_info, test_app, tool_start,
     };
     use crate::chat::{DONE_TEXT, ERROR_TEXT};
     use crate::components::Overlay;
@@ -500,6 +667,8 @@ mod tests {
     const DECLINE_REASON: &str = "batch is waiting on edit";
     const OTHER_DECLINE_REASON: &str = "16 background tasks already running";
     const FINAL_OUTPUT: &str = "test result: ok";
+    const SUB_TOOL: &str = "bash";
+    const SUB_CALL_ID: &str = "toolu_sub_call";
 
     fn call_id(n: usize) -> String {
         format!("{TASK_ID}_{n}")
@@ -523,7 +692,6 @@ mod tests {
         answer
     }
 
-    #[test_case(vec![MoveOutcome::Moved], MOVED_ONE_MSG.to_owned() ; "one_moved")]
     #[test_case(vec![MoveOutcome::Moved, MoveOutcome::NoHook, MoveOutcome::Moved], format!("{MOVED_PREFIX}2{MOVED_MANY_SUFFIX}") ; "moves_are_counted")]
     #[test_case(vec![MoveOutcome::NotMovable(DECLINE_REASON.into()), MoveOutcome::Moved], MOVED_ONE_MSG.to_owned() ; "a_move_outranks_a_decline")]
     #[test_case(vec![MoveOutcome::NoHook, MoveOutcome::NotMovable(DECLINE_REASON.into()), MoveOutcome::NotMovable(OTHER_DECLINE_REASON.into())], DECLINE_REASON.to_owned() ; "the_first_decline_says_why")]
@@ -585,6 +753,46 @@ mod tests {
         );
     }
 
+    fn subagent_event(app: &mut App, event: AgentEvent) {
+        app.update(Msg::Agent(Box::new(Envelope {
+            event,
+            subagent: Some(subagent_info(TASK_ID, RESEARCH_NAME)),
+            run_id: 1,
+        })));
+    }
+
+    /// A running subagent's tab in front moves its own calls, not the main
+    /// chat's `task` call: here its one call, parked on a prompt, says so.
+    /// With nothing of its own running, the press asks the main call that
+    /// owns the subagent.
+    #[test_case(true,  0, Some(format!("{SUB_TOOL}{AWAITING_PERMISSION_SUFFIX}")) ; "its_own_calls")]
+    #[test_case(false, 1, None                                                    ; "the_main_call_without_any")]
+    fn background_key_in_a_subagent_tab_asks_its_own_calls(
+        own_call: bool,
+        asked: usize,
+        flash: Option<String>,
+    ) {
+        let mut app = app_with_subagent_call(TASK_ID);
+        if own_call {
+            subagent_event(&mut app, tool_start(SUB_CALL_ID, SUB_TOOL));
+            subagent_event(
+                &mut app,
+                AgentEvent::PermissionRequest {
+                    id: SUB_CALL_ID.into(),
+                    tool: ToolKey::native(SUB_TOOL),
+                    scopes: vec![],
+                    reason: None,
+                },
+            );
+        }
+        app.focus_task(TASK_ID).unwrap();
+
+        press_background(&mut app);
+
+        assert_eq!(app.background_moves.pending.len(), asked);
+        assert_eq!(app.status_bar.flash_text(), flash.as_deref());
+    }
+
     /// The tab starts as a copy of the row holding the very buf the call
     /// streams into, so it shows the command still running with nothing
     /// replayed, and `/tasks` lists it as running.
@@ -609,6 +817,7 @@ mod tests {
         );
         let tasks = serde_json::to_value(app.tasks()).unwrap();
         assert_eq!(tasks[1]["status"], "working");
+        assert!(tasks[1][STARTED_AT_KEY].is_u64());
     }
 
     /// A moved call may run for hours, and its tab keeps the spinner of the
@@ -672,7 +881,7 @@ mod tests {
         if stopped {
             assert!(matches!(
                 app.stop_task(MOVED_ID),
-                Ok(Action::CancelPluginTask { id }) if id == MOVED_ID
+                Ok(Action::CancelPluginTask { id, .. }) if id == MOVED_ID
             ));
         }
         for event in [final_result(is_error), AgentEvent::StreamClosed] {
@@ -782,7 +991,7 @@ mod tests {
         }
         assert!(matches!(
             app.stop_task(MONITOR_ID),
-            Ok(Action::CancelPluginTask { id }) if id == MONITOR_ID
+            Ok(Action::CancelPluginTask { id, .. }) if id == MONITOR_ID
         ));
         assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
         assert_eq!(app.active_task_id().as_ref(), MAIN_TASK_ID);
@@ -856,17 +1065,35 @@ mod tests {
         }
     }
 
-    fn collect(
-        previous: &mut Vec<(Arc<str>, TaskStatus)>,
+    fn collect_in(
+        watch: &mut TaskWatch,
+        session: MakiId,
         current: &[(Arc<str>, TaskStatus)],
     ) -> Vec<(String, TaskStatus)> {
         let mut fired = Vec::new();
-        diff_task_states(
-            previous,
+        watch.diff(
+            session,
             current.iter().map(|(id, status)| state(id, *status)),
             |task| fired.push((task.id.to_string(), task.status)),
         );
         fired
+    }
+
+    /// One session throughout, the way a tab sees its own tasks.
+    fn collect(
+        watch: &mut TaskWatch,
+        current: &[(Arc<str>, TaskStatus)],
+    ) -> Vec<(String, TaskStatus)> {
+        let session = watch.session.unwrap_or_else(MakiId::generate);
+        collect_in(watch, session, current)
+    }
+
+    fn watched(watch: &TaskWatch) -> Vec<(Arc<str>, TaskStatus)> {
+        watch
+            .tasks
+            .iter()
+            .map(|seen| (Arc::clone(&seen.id), seen.status))
+            .collect()
     }
 
     /// Identity lives on the chat, not in `chat_index`: that one is wiped at
@@ -1013,24 +1240,54 @@ mod tests {
     fn diff_announces_first_sight_and_every_change() {
         let id: Arc<str> = Arc::from(TASK_ID);
         let working = [(Arc::clone(&id), TaskStatus::Working)];
-        let mut previous = Vec::new();
+        let mut watch = TaskWatch::default();
 
         assert_eq!(
-            collect(&mut previous, &working),
+            collect(&mut watch, &working),
             vec![(TASK_ID.to_owned(), TaskStatus::Working)]
         );
-        assert!(collect(&mut previous, &working).is_empty());
+        assert!(collect(&mut watch, &working).is_empty());
         assert_eq!(
-            collect(&mut previous, &[(Arc::clone(&id), TaskStatus::Done)]),
+            collect(&mut watch, &[(Arc::clone(&id), TaskStatus::Done)]),
             vec![(TASK_ID.to_owned(), TaskStatus::Done)]
         );
 
-        assert!(collect(&mut previous, &[]).is_empty());
-        assert!(previous.is_empty());
+        assert!(collect(&mut watch, &[]).is_empty());
+        assert!(watch.tasks.is_empty());
         assert_eq!(
-            collect(&mut previous, &working),
+            collect(&mut watch, &working),
             vec![(TASK_ID.to_owned(), TaskStatus::Working)]
         );
+    }
+
+    /// A rewind stops a task and takes its tab in the same frame, so the
+    /// diff never sees it finished. Its end is announced all the same, or a
+    /// count kept from these events stays up.
+    #[test_case(TaskStatus::Working ; "working")]
+    #[test_case(TaskStatus::Idle    ; "idle")]
+    fn diff_announces_a_live_task_whose_tab_went(status: TaskStatus) {
+        let mut watch = TaskWatch::default();
+        collect(&mut watch, &[(Arc::from(TASK_ID), status)]);
+
+        assert_eq!(
+            collect(&mut watch, &[]),
+            vec![(TASK_ID.to_owned(), TaskStatus::Error)]
+        );
+        assert!(collect(&mut watch, &[]).is_empty());
+    }
+
+    /// `SessionReset` speaks for the tasks of a session swapped out, and
+    /// their ids mean nothing in the new one.
+    #[test]
+    fn diff_stays_quiet_about_the_tasks_of_a_swapped_session() {
+        let mut watch = TaskWatch::default();
+        collect_in(
+            &mut watch,
+            MakiId::generate(),
+            &[(Arc::from(TASK_ID), TaskStatus::Working)],
+        );
+
+        assert!(collect_in(&mut watch, MakiId::generate(), &[]).is_empty());
     }
 
     #[test]
@@ -1127,9 +1384,9 @@ mod tests {
     #[test_case(TaskStatus::Working ; "working")]
     #[test_case(TaskStatus::Idle ; "idle")]
     fn diff_announces_a_live_task_on_first_sight(status: TaskStatus) {
-        let mut previous = Vec::new();
+        let mut watch = TaskWatch::default();
         assert_eq!(
-            collect(&mut previous, &[(Arc::from(TASK_ID), status)]),
+            collect(&mut watch, &[(Arc::from(TASK_ID), status)]),
             vec![(TASK_ID.to_owned(), status)]
         );
     }
@@ -1141,18 +1398,18 @@ mod tests {
     fn a_task_first_seen_finished_is_recorded_silently() {
         let one: Arc<str> = Arc::from(TASK_ID);
         let two: Arc<str> = Arc::from(OTHER_ID);
-        let mut previous = Vec::new();
+        let mut watch = TaskWatch::default();
 
-        assert!(collect(&mut previous, &[(Arc::clone(&one), TaskStatus::Done)]).is_empty());
+        assert!(collect(&mut watch, &[(Arc::clone(&one), TaskStatus::Done)]).is_empty());
         assert_eq!(
-            collect(&mut previous, &[(one, TaskStatus::Error)]),
+            collect(&mut watch, &[(one, TaskStatus::Error)]),
             vec![(TASK_ID.to_owned(), TaskStatus::Error)]
         );
 
         assert_eq!(
-            collect(&mut previous, &[(Arc::clone(&two), TaskStatus::Working)]),
+            collect(&mut watch, &[(Arc::clone(&two), TaskStatus::Working)]),
             vec![(OTHER_ID.to_owned(), TaskStatus::Working)]
         );
-        assert_eq!(previous, vec![(two, TaskStatus::Working)]);
+        assert_eq!(watched(&watch), vec![(two, TaskStatus::Working)]);
     }
 }

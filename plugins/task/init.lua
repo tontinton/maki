@@ -35,8 +35,8 @@ local examples = {
   },
 }
 
--- Standalone runs render markdown on the Rust side (format = "markdown");
--- this mirrors that for restore, batch children and a row that had to wait.
+-- Standalone runs render markdown on the Rust side (format = "markdown").
+-- This mirrors it for restore, batch children and a row that had to wait.
 local function result_body(output, is_error, ctx)
   local tol = ctx:tool_output_lines()
   return ToolView.restore_markdown(output, is_error, {
@@ -56,25 +56,25 @@ local function handler(input, ctx)
     return string.format(MOVED_RECEIPT, prepared.options.name)
   end
 
-  -- A background task moves before it waits for a slot, so the model's turn
-  -- does not wait with it. The move keeps waiting where it is and still holds
-  -- a slot once it gets one. A blocking task has no hook until it holds one.
-  -- Moving fails without a live chat (headless, -p, SDK, ACP), and then the
-  -- task simply runs blocking.
+  -- A background task moves before it waits for a slot, so a full house never
+  -- holds the model's turn. Once moved it still queues for a slot like any
+  -- other task. A blocking task only gets its hook once it holds a slot.
+  -- Moving fails where background work is off (a zero --background-timeout),
+  -- and then the task simply runs blocking.
   local foreground_note
   local run_in_background = Runner.allow_background and input.background == true
   if run_in_background then
     ctx:on_background(on_background)
     local moved, move_err = ctx:background()
     if not moved then
-      foreground_note = string.format(FOREGROUND_NOTE, move_err)
+      foreground_note = string.format(FOREGROUND_NOTE, tostring(move_err))
     end
   end
 
   -- Shown only while every slot is taken, moved subagents included. A live
   -- body outlives the wait as a snapshot, so the final reply carries its own.
   local waiting
-  local permit = Runner.semaphore:acquire(function()
+  local permit = Runner.acquire_slot(function()
     waiting = maki.ui.buf()
     waiting:line({ { WAITING_FOR_SLOT, "dim" } })
     ctx:live_buf(waiting)

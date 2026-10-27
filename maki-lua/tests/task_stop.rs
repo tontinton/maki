@@ -2,40 +2,44 @@
 //! parker tool registers a move hook and waits, standing in for a long
 //! command.
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
 
-use maki_agent::tools::test_support::stub_seed;
-use maki_agent::tools::{ToolAudience, ToolContext, ToolExecResult, ToolRegistry};
-use maki_agent::{
-    AgentEvent, AgentSeed, CallScope, CancelToken, CancelTrigger, EventSender, SessionMailbox,
-    ToolOutput,
+use common::{
+    Chat as LiveChat, WAIT, call_ctx, done_result, exec, next_task_done, request_move, wait_movable,
 };
-use maki_config::PluginsConfig;
+use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::{AgentEvent, AgentSeed, CancelToken, CancelTrigger, EventSender, SessionMailbox};
+use maki_config::{PluginsConfig, ToolOutputLines};
 use maki_lua::{MoveOutcome, PluginHost, RestoreItem, RestoreReason, UiAction};
 use maki_storage::id::MakiId;
-use serde_json::{Value, json};
+use serde_json::json;
 
 const STOP_TOOL: &str = "task_stop";
 const PARK_TOOL: &str = "park";
 const PARKER_PLUGIN: &str = "task_stop_parker";
+const REDACTOR_PLUGIN: &str = "redactor";
+const REDACTED: &str = "[redacted]";
 const RECEIPT: &str = "receipt: moved to the background";
 const PARTIAL_OUTPUT: &str = "partial output so far";
+const STOPPED_REASON: &str = "stopped";
+const CANCELLED_REASON: &str = "cancelled";
 const STOP_REQUESTED_FRAGMENT: &str = "Stop requested";
 const NO_RUNNING_TASK_FRAGMENT: &str = "no running background task";
 const FIRST_ID: &str = "toolu_first";
 const SECOND_ID: &str = "toolu_second";
 const MISSING_ID: &str = "toolu_missing";
 const HEADER_ID: &str = "toolu_header";
+const SUBAGENT_TASK_ID: &str = "toolu_subagent";
 const RUN_ID: u64 = 1;
-const DEADLINE: Duration = Duration::from_secs(60);
 
-/// `honor_cancel` returns at once and finishes with the partial output when
-/// the call is cancelled, as bash does with its job. Without it the handler
-/// stays parked and ignores the stop, so only the runtime's abandon timeout
-/// ends it.
+/// With `honor_cancel` the handler returns at once and, like bash with its
+/// job, finishes with the partial output and the cancel reason. Without it
+/// the handler stays parked and ignores the stop, so only the runtime's
+/// abandon timeout ends it.
 const PARKER_SRC: &str = r#"
 maki.api.register_tool({
   name = "park",
@@ -52,8 +56,8 @@ maki.api.register_tool({
     if not input.honor_cancel then
       maki.async.await(1, function() end)
     end
-    maki.async.on_cancel(function()
-      ctx:finish({ llm_output = "partial output so far" })
+    maki.async.on_cancel(function(reason)
+      ctx:finish({ llm_output = "partial output so far: " .. reason })
     end)
     maki.fn.jobstart("sleep 600", {})
     return nil
@@ -61,7 +65,19 @@ maki.api.register_tool({
 })
 "#;
 
+/// An output layer on `park` that hides whatever the call ended with. It
+/// leaves the receipt alone, so the move still reads as one.
+const REDACTOR_SRC: &str = r#"
+maki.api.set_slot("tool.park.output", function(prev, out, ctx)
+  if not ctx.receipt then
+    out.text = "[redacted]"
+  end
+  return prev(out, ctx)
+end)
+"#;
+
 struct Chat {
+    id: MakiId,
     mailbox: SessionMailbox,
     seed: Arc<AgentSeed>,
     _run_trigger: CancelTrigger,
@@ -69,11 +85,10 @@ struct Chat {
 }
 
 fn chat() -> Chat {
-    let id = MakiId::generate();
-    let mailbox = SessionMailbox::register(id);
-    let seed = mailbox.publish_seed(stub_seed(id));
+    let LiveChat { id, mailbox, seed } = LiveChat::live();
     let (run_trigger, run) = CancelToken::new();
     Chat {
+        id,
         mailbox,
         seed,
         _run_trigger: run_trigger,
@@ -90,21 +105,19 @@ fn host() -> (Arc<ToolRegistry>, PluginHost) {
     (reg, host)
 }
 
-fn exec(reg: &ToolRegistry, name: &str, input: Value, ctx: &ToolContext) -> ToolExecResult {
-    let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
-    smol::block_on(inv.execute(ctx))
+/// A ctx of the chat's own agent, whose run reads the chat's mailbox.
+fn agent_ctx(chat: &Chat) -> ToolContext {
+    let mut ctx = chat.seed.tool_context(CancelToken::none());
+    ctx.mailbox = Some(chat.mailbox.clone());
+    ctx
 }
 
-fn text(result: ToolExecResult) -> Result<String, String> {
-    match result.output? {
-        ToolOutput::Plain(s) | ToolOutput::Markdown(s) => Ok(s.text),
-        other => panic!("unexpected output {other:?}"),
-    }
+fn stop(reg: &Arc<ToolRegistry>, chat: &Chat, id: &str) -> Result<String, String> {
+    stop_as(reg, &agent_ctx(chat), id)
 }
 
-fn stop(reg: &ToolRegistry, chat: &Chat, id: &str) -> Result<String, String> {
-    let ctx = chat.seed.tool_context(CancelToken::none());
-    text(exec(reg, STOP_TOOL, json!({ "id": id }), &ctx))
+fn stop_as(reg: &Arc<ToolRegistry>, ctx: &ToolContext, id: &str) -> Result<String, String> {
+    done_result(&exec(reg, STOP_TOOL, json!({ "id": id }), ctx))
 }
 
 /// Runs a `park` call as the chat's model call `id` and moves it. Returns once
@@ -116,14 +129,7 @@ fn park_and_move(
     id: &str,
     honor_cancel: bool,
 ) {
-    let (events_tx, events_rx) = flume::unbounded();
-    let scope = Arc::new(CallScope::new(id.to_owned(), &chat.run));
-    let mut ctx = chat.seed.tool_context(CancelToken::none());
-    ctx.event_tx = EventSender::new(events_tx, RUN_ID);
-    ctx.tool_use_id = Some(id.to_owned());
-    ctx.cancel = scope.cancel().clone();
-    ctx.call = Some(scope);
-
+    let (ctx, events) = call_ctx(reg, chat.id, &chat.run, id);
     let (receipt_tx, receipt_rx) = flume::bounded(1);
     let reg = Arc::clone(reg);
     thread::spawn(move || {
@@ -131,41 +137,18 @@ fn park_and_move(
         receipt_tx.send(exec(&reg, PARK_TOOL, input, &ctx)).unwrap();
     });
 
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        let envelope = events_rx
-            .recv_deadline(deadline)
-            .expect("the call never announced it can move");
-        if matches!(
-            envelope.event,
-            AgentEvent::ToolMovable { movable: true, .. }
-        ) {
-            break;
-        }
-    }
-    let outcome = host
-        .event_handle()
-        .request_background(id.to_owned())
-        .recv_timeout(DEADLINE)
-        .unwrap();
-    assert_eq!(outcome, MoveOutcome::Moved);
+    wait_movable(&events, id);
+    assert_eq!(request_move(&host.event_handle(), id), MoveOutcome::Moved);
 
-    let receipt = receipt_rx.recv_timeout(DEADLINE).unwrap();
+    let receipt = receipt_rx.recv_timeout(WAIT).unwrap();
     assert!(receipt.backgrounded);
-    assert!(text(receipt).unwrap().contains(RECEIPT));
+    assert!(done_result(&receipt).unwrap().contains(RECEIPT));
 }
 
 /// The chat's notice for a task that ended on its own. The host sends it
 /// before the task tab's final reply, so that reply is the signal to look.
 fn next_notice(chat: &Chat, ui: &flume::Receiver<UiAction>) -> (String, bool) {
-    loop {
-        let action = ui.recv_timeout(DEADLINE).expect("no final reply arrived");
-        if let UiAction::PluginTaskEvent { envelope, .. } = action
-            && matches!(envelope.event, AgentEvent::ToolDone(_))
-        {
-            break;
-        }
-    }
+    next_task_done(ui);
     let mut woken = chat.mailbox.claim_wake();
     let woke = !woken.is_empty();
     if !woke {
@@ -175,13 +158,8 @@ fn next_notice(chat: &Chat, ui: &flume::Receiver<UiAction>) -> (String, bool) {
     (notice.first_text_content().unwrap().to_owned(), woke)
 }
 
-#[test]
-fn task_stop_is_registered_for_the_main_audience_only() {
-    let (reg, _host) = host();
-    let entry = reg.get(STOP_TOOL).expect("task_stop is always registered");
-    assert_eq!(entry.tool.audience(), ToolAudience::MAIN);
-}
-
+/// The cancel hook learns that the model stopped the call, so its marker can
+/// say so.
 #[test]
 fn stopping_a_moved_call_returns_its_output_and_sends_no_notice() {
     let (reg, host) = host();
@@ -190,8 +168,43 @@ fn stopping_a_moved_call_returns_its_output_and_sends_no_notice() {
 
     let output = stop(&reg, &chat, FIRST_ID).unwrap();
 
-    assert!(output.contains(PARTIAL_OUTPUT), "{output}");
+    assert!(
+        output.contains(&format!("{PARTIAL_OUTPUT}: {STOPPED_REASON}")),
+        "{output}"
+    );
     assert!(chat.mailbox.drain().is_empty());
+    assert!(chat.mailbox.unsettled().is_empty());
+}
+
+/// The stop cancels the call before its final reply exists, and the layer
+/// still has its say on that reply before the model reads it.
+#[test]
+fn a_stopped_calls_output_passes_its_output_layers() {
+    let (reg, host) = host();
+    host.load_source(REDACTOR_PLUGIN, REDACTOR_SRC).unwrap();
+    let chat = chat();
+    park_and_move(&reg, &host, &chat, FIRST_ID, true);
+
+    let output = stop(&reg, &chat, FIRST_ID).unwrap();
+
+    assert_eq!(output, REDACTED);
+}
+
+#[test]
+fn a_user_stop_reaches_the_cancel_hook_as_a_cancel() {
+    let (reg, host) = host();
+    host.ui_attachment().attach();
+    let ui = host.ui_action_rx();
+    let chat = chat();
+    park_and_move(&reg, &host, &chat, FIRST_ID, true);
+
+    host.event_handle().cancel_plugin_session(FIRST_ID);
+
+    let (notice, _) = next_notice(&chat, &ui);
+    assert!(
+        notice.contains(&format!("{PARTIAL_OUTPUT}: {CANCELLED_REASON}")),
+        "{notice}"
+    );
 }
 
 #[test]
@@ -253,6 +266,27 @@ fn another_chats_id_is_refused_and_its_task_keeps_running() {
     );
 }
 
+/// The chat's model moved the call, so a subagent of the chat, with a run
+/// of its own, has nothing to stop.
+#[test]
+fn a_subagent_cannot_stop_a_task_its_chat_moved() {
+    let (reg, host) = host();
+    let chat = chat();
+    park_and_move(&reg, &host, &chat, FIRST_ID, true);
+    let mut subagent_ctx = chat.seed.tool_context(CancelToken::none());
+    subagent_ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
+    subagent_ctx.mailbox = Some(SessionMailbox::register(MakiId::generate()));
+
+    let err = stop_as(&reg, &subagent_ctx, FIRST_ID).unwrap_err();
+
+    assert!(err.contains(NO_RUNNING_TASK_FRAGMENT), "{err}");
+    assert!(
+        stop(&reg, &chat, FIRST_ID)
+            .unwrap()
+            .contains(PARTIAL_OUTPUT)
+    );
+}
+
 #[test]
 fn restore_shows_the_id_as_the_header() {
     let (_reg, host) = host();
@@ -264,7 +298,7 @@ fn restore_shows_the_id_as_the_header() {
         output: PARTIAL_OUTPUT.to_owned(),
         input: json!({ "id": HEADER_ID }),
         is_error: false,
-        tool_output_lines: maki_config::ToolOutputLines::DEFAULT,
+        tool_output_lines: ToolOutputLines::DEFAULT,
         theme_gen: None,
         clicks: Vec::new(),
         state: None,

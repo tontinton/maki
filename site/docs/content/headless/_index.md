@@ -86,6 +86,44 @@ The lock is released when the process exits, even after a crash. On a filesystem
 without file locks, such as some NFS mounts, Maki logs a warning and runs
 unlocked.
 
+## Background Tasks
+
+SDK mode moves work with `background = true`, `ctx:background()` and `background_on_timeout` as the TUI does. See [Background Tasks](/docs/background-tasks/) for what can move.
+
+`--print` runs with moves off unless you pass `--background-timeout <SECS>`. It promises one answer and a predictable exit, and a dev server the model moves never ends, so it would hold a CI job for the full timeout. Every call blocks until it finishes, and `background = true` runs in the foreground. The rest of this section applies to SDK mode, and to `--print` with the flag set.
+
+If background work still runs when the run ends, the process stays alive and each result starts a new turn. The final result covers those turns. With `text` output it prints the last turn's text. `total_cost_usd` and `usage` also include spend after the last turn, such as a subagent stopped mid-run, and so does the stored session.
+
+With `--verbose`, the result that wakes a turn comes first as a notice, so the woken turn's assistant messages do not follow the last turn's without a break. SDK mode sends the same message. Claude Code has no counterpart for it.
+
+```json
+{"type":"system","subtype":"notice","text":"Background bash finished: cargo test","session_id":"..."}
+```
+
+The process exits once nothing is running. If `--background-timeout <SECS>` runs out first (default 600 in SDK mode), Maki stops the tasks and warns on stderr:
+
+```
+N background task result(s) never reached the model before --background-timeout ran out ...
+```
+
+No turn starts past the deadline, so the count includes results that came in during the last turn. Resuming the session reports all of them as lost.
+
+In SDK mode, while stdin is open, results ride along with the next user message. No turn starts on its own, so the client gets exactly one result per message. After stdin closes, Maki stays alive as `--print` does, but each woken turn sends a result of its own instead of one that covers them all.
+
+An SDK result is sent when its run ends, so it cannot include spend that came later. Maki reports that spend in one extra message before it exits, only when there is some. Add its `total_cost_usd` to the sum of the results for the full bill:
+
+```json
+{"type":"system","subtype":"background_usage","total_cost_usd":0.12,"usage":{"input_tokens":5300,"output_tokens":800,...},"session_id":"..."}
+```
+
+`--background-timeout 0` turns moves off in SDK mode, and the work runs in the foreground. SDK emits a result per turn, so consumers expect woken turns, and the default keeps them on.
+
+## Stopping a Run
+
+`Ctrl+C` (SIGINT) or SIGTERM stops a `--print` or SDK run without leaving work behind. Maki cancels the turn in flight, stops the background tasks, and kills the processes its tools started. It then sends the result as usual. If a turn was running, the result holds what that turn produced so far, with `"stop_reason":"cancelled"` and `"is_error":true`. Results that never reached the model get the same warning as a timeout, ending in `before maki was interrupted`.
+
+The exit code is 130 after SIGINT and 143 after SIGTERM, as a shell reports a process the signal killed. A second signal exits at once, without stopping the work.
+
 ## Claude Code Compatibility
 
 Maki's `--print` is a drop-in replacement for Claude Code:

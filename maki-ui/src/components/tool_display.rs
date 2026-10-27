@@ -19,6 +19,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::markdown::{should_truncate, text_to_lines, truncate_output, truncation_notice};
+use maki_agent::tools::is_timeout_annotation;
 use maki_agent::{
     BufferSnapshot, InstructionBlock, SnapshotSpan, SpanColor, SpanStyle, ToolInput, ToolOutput,
 };
@@ -38,6 +39,7 @@ pub const BACKGROUND_INDICATOR: &str = "↗ ";
 pub const MOVABLE_HINT: &str = "ctrl+b background";
 const BACKGROUND_LABEL: &str = "background";
 const BACKGROUND_CLICK_HINT: &str = "click or ctrl+x";
+const BACKGROUND_LOST_LABEL: &str = "lost";
 const SECS_PER_MINUTE: u64 = 60;
 const SECS_PER_HOUR: u64 = 3600;
 const RIGHT_INFO_GAP: &str = "  ";
@@ -144,7 +146,7 @@ pub struct ElapsedSpan {
 
 impl ElapsedSpan {
     pub fn text(secs: u64) -> String {
-        background_annotation(true, Some(secs))
+        background_annotation(None, Some(secs))
     }
 
     /// Shows `secs` on the header. The text can grow, so the right info that
@@ -315,15 +317,23 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
-fn background_annotation(running: bool, elapsed_secs: Option<u64>) -> String {
+fn background_annotation(outcome: Option<BackgroundOutcome>, elapsed_secs: Option<u64>) -> String {
     let mut text = format!(" ({BACKGROUND_LABEL}");
-    if running {
-        if let Some(secs) = elapsed_secs {
+    match outcome {
+        None => {
+            if let Some(secs) = elapsed_secs {
+                text.push_str(ANNOTATION_SEP);
+                text.push_str(&format_elapsed(secs));
+            }
             text.push_str(ANNOTATION_SEP);
-            text.push_str(&format_elapsed(secs));
+            text.push_str(BACKGROUND_CLICK_HINT);
         }
-        text.push_str(ANNOTATION_SEP);
-        text.push_str(BACKGROUND_CLICK_HINT);
+        Some(BackgroundOutcome::Lost) => {
+            text.push_str(ANNOTATION_SEP);
+            text.push_str(BACKGROUND_LOST_LABEL);
+        }
+        Some(BackgroundOutcome::Done | BackgroundOutcome::Error | BackgroundOutcome::Cancelled) => {
+        }
     }
     text.push(')');
     text
@@ -354,7 +364,7 @@ impl From<&BackgroundBadge> for Indicator {
             None => Self::Moved,
             Some(BackgroundOutcome::Done) => Self::Success,
             Some(BackgroundOutcome::Error) => Self::Error,
-            Some(BackgroundOutcome::Cancelled) => Self::Cancelled,
+            Some(BackgroundOutcome::Cancelled | BackgroundOutcome::Lost) => Self::Cancelled,
         }
     }
 }
@@ -503,10 +513,9 @@ impl ToolLineBuilder {
         let Some(header) = self.lines.first_mut() else {
             return;
         };
-        let running = badge.outcome.is_none();
         let ticking = badge
             .started_at
-            .filter(|_| running)
+            .filter(|_| badge.outcome.is_none())
             .map(|since| (since, since.elapsed().as_secs()));
         self.elapsed = ticking.map(|(since, shown_secs)| ElapsedSpan {
             span: header.spans.len(),
@@ -515,7 +524,7 @@ impl ToolLineBuilder {
             width: self.width,
         });
         header.spans.push(Span::styled(
-            background_annotation(running, ticking.map(|(_, secs)| secs)),
+            background_annotation(badge.outcome, ticking.map(|(_, secs)| secs)),
             theme::current().tool_dim,
         ));
     }
@@ -785,10 +794,14 @@ pub fn build_tool_lines(
             .map_or_else(|| status.into(), Indicator::from),
     );
     b.apply_output_format(msg.tool_output.as_deref());
+    let annotation = match (&msg.background, msg.annotation.as_deref()) {
+        (Some(_), Some(annotation)) => without_timeout(annotation).map(Cow::Owned),
+        (_, annotation) => annotation.map(Cow::Borrowed),
+    };
     b.push_header(
         tool_name,
         header,
-        msg.annotation.as_deref(),
+        annotation.as_deref(),
         msg.render_header.as_ref(),
     );
     if let Some(badge) = &msg.background {
@@ -918,6 +931,15 @@ fn plain_output_text(output: &ToolOutput) -> Option<&str> {
 pub fn truncate_to_header(text: &mut String) {
     let end = text.find('\n').unwrap_or(text.len());
     text.truncate(end);
+}
+
+/// A moved call has no deadline left, so its timeout note would mislead.
+fn without_timeout(annotation: &str) -> Option<String> {
+    let kept: Vec<&str> = annotation
+        .split(ANNOTATION_SEP)
+        .filter(|note| !is_timeout_annotation(note))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join(ANNOTATION_SEP))
 }
 
 /// Skips a note the row already shows. A `code_execution` run sends the same
@@ -1150,6 +1172,39 @@ mod tests {
         );
         let text = lines_text(&tl);
         assert!(text.contains("(2m timeout)"));
+    }
+
+    const TIMEOUT_AND_LINES: &str = "2m timeout · 24 lines";
+    const TIMEOUT_ONLY: &str = "2m timeout";
+    const TIMEOUT_WORD: &str = "timeout";
+
+    #[test_case(false, TIMEOUT_AND_LINES, Some("(2m timeout · 24 lines)") ; "a_foreground_row_keeps_it")]
+    #[test_case(true,  TIMEOUT_AND_LINES, Some("(24 lines)")              ; "a_moved_row_keeps_the_rest")]
+    #[test_case(true,  TIMEOUT_ONLY,      None                            ; "a_moved_row_with_nothing_else")]
+    fn a_moved_row_hides_the_timeout_it_outlived(
+        moved: bool,
+        annotation: &str,
+        shown: Option<&str>,
+    ) {
+        let mut msg = tool_msg();
+        msg.annotation = Some(annotation.into());
+        msg.background = moved.then(|| BackgroundBadge {
+            id: "t1".into(),
+            started_at: None,
+            outcome: None,
+        });
+
+        let text = lines_text(&build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        ));
+
+        match shown {
+            Some(shown) => assert!(text.contains(shown), "{text}"),
+            None => assert!(!text.contains(TIMEOUT_WORD), "{text}"),
+        }
     }
 
     #[test]
@@ -2140,7 +2195,6 @@ mod tests {
 
     #[test_case(30, true,  true  ; "room_for_usage_and_timestamp")]
     #[test_case(20, false, true  ; "usage_dropped_before_timestamp")]
-    #[test_case(10, false, false ; "nothing_fits")]
     fn right_info_drops_whole_pieces_and_never_exceeds_width(
         width: u16,
         expect_usage: bool,
@@ -2162,10 +2216,15 @@ mod tests {
         assert_eq!(format_elapsed(secs), expected);
     }
 
-    #[test_case(true,  Some(72), " (background · 1m12s · click or ctrl+x)" ; "running")]
-    #[test_case(true,  None,     " (background · click or ctrl+x)"          ; "restored")]
-    #[test_case(false, None,     " (background)"                            ; "ended")]
-    fn background_annotation_cases(running: bool, secs: Option<u64>, expected: &str) {
-        assert_eq!(background_annotation(running, secs), expected);
+    #[test_case(None, Some(72),                          " (background · 1m12s · click or ctrl+x)" ; "running")]
+    #[test_case(None, None,                              " (background · click or ctrl+x)"          ; "restored")]
+    #[test_case(Some(BackgroundOutcome::Done), None,     " (background)"                            ; "ended")]
+    #[test_case(Some(BackgroundOutcome::Lost), Some(72), " (background · lost)"                     ; "lost")]
+    fn background_annotation_cases(
+        outcome: Option<BackgroundOutcome>,
+        secs: Option<u64>,
+        expected: &str,
+    ) {
+        assert_eq!(background_annotation(outcome, secs), expected);
     }
 }

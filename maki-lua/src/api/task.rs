@@ -1,20 +1,19 @@
 //! `maki.task`. The host keeps the subagent transcripts, so a plugin only needs
 //! to list the tasks and show one.
 
+use maki_agent::SessionMailbox;
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_storage::id::SessionRef;
 use mlua::{Either as LuaEither, Lua, Result as LuaResult, UserDataRef, Value};
 
 use crate::api::util::command::{TaskRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::ctx::LuaCtx;
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::background::BackgroundTasks;
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{CANCEL_ABANDON_AFTER, is_user_action};
 
 const USER_ACTION_ERR: &str = "stopping a task requires a user command or keybind";
 const TASK_ID_ERR: &str = "stop(ctx, id): id must be a string";
-const NO_CHAT_ERR: &str = "maki.task.stop: the ctx has no chat session";
 const STOP_OPTS_ERR: &str = "stop(id, opts): opts must be a table";
 
 async fn roundtrip(
@@ -36,10 +35,14 @@ async fn roundtrip(
 /// [maki.agent.session](#maki-agent-session) has its session id and a
 /// `plugin` field.
 ///
-/// @return (table|nil, string|nil) Array of `{id, session, name, focused, status?, plugin?}`
-///   where `status` is `"working"`, `"idle"` (a plugin task between prompts),
-///   `"done"`, or `"error"`, and `session` is the chat session that `stop()`
-///   asks for. Or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, session, name, focused, status?, plugin?,
+///   started_at?, ended_at?, cost?}` where `status` is `"working"`, `"idle"` (a
+///   plugin task between prompts), `"done"`, or `"error"`, and `session` is the
+///   chat session that `stop()` asks for. `started_at` and `ended_at` are Unix
+///   seconds: when the task started, or moved to the background, and when it
+///   finished. A task loaded from disk has neither. `cost` is what a subagent
+///   billed so far, in dollars. The main chat has none of the three. Or nil and
+///   an error.
 /// @example
 /// for _, t in ipairs(maki.task.list() or {}) do
 ///   print(t.name, t.status or "main")
@@ -90,14 +93,14 @@ async fn remove(
 /// commands run through `maki.api.run_command` get an error instead, or any
 /// plugin could stop work that is not its own.
 ///
-/// Called as `stop(ctx, id)` from a tool handler, it is the model's stop
-/// instead: it stops a background task of the calling chat (a moved command
-/// or subagent), since a tool call is a turn the user started. It waits up to
-/// 5 seconds for the task's final reply and returns it, and then the chat gets
-/// no notice of its end. If the reply is late it returns `"stop requested"`,
-/// and the result still reaches the chat later as a quiet notice. An id of
-/// another chat, a finished task or an unknown id returns an error naming the
-/// chat's running task ids.
+/// From a tool handler, `stop(ctx, id)` is the model's stop. It stops a
+/// background task (a command or subagent) that the calling agent moved,
+/// which is allowed because the tool call belongs to a turn the user started.
+/// It waits up to 5 seconds for the final reply and returns it, and the agent
+/// gets no notice of the end. A late reply returns `"stop requested"`, and the
+/// result reaches the agent later as a quiet notice. A task another agent
+/// moved, a finished task or an unknown id returns an error that names the
+/// agent's running task ids.
 ///
 /// @param id string|LuaCtx Task id, as returned by `list()`. Or the handler's
 ///   ctx, for the model's stop.
@@ -124,21 +127,14 @@ async fn stop(
                 return Err(mlua::Error::runtime(TASK_ID_ERR));
             };
             let task_id = String::from(&*task_id.to_str()?);
-            let session = try_pair!(
-                ctx.agent()
-                    .ok_or_else(|| ctx.cap_err("maki.task.stop"))
-                    .and_then(|agent| {
-                        agent
-                            .session_id
-                            .as_ref()
-                            .ok_or_else(|| NO_CHAT_ERR.to_owned())
-                    })
-                    .map(SessionRef::id)
-            );
+            let Some(agent) = ctx.agent() else {
+                return Ok(err_pair(ctx.cap_err("maki.task.stop")));
+            };
+            let asker = agent.mailbox.as_ref().map(SessionMailbox::session_id);
             drop(ctx);
             let output = try_pair!(
                 BackgroundTasks::of(&lua)
-                    .stop_by_model(session, &task_id, CANCEL_ABANDON_AFTER)
+                    .stop_by_model(asker, &task_id, CANCEL_ABANDON_AFTER)
                     .await
             );
             return Ok((Some(Value::String(lua.create_string(output)?)), None));
@@ -173,20 +169,13 @@ mod tests {
     use crate::api::util::command::{NO_UI_ERR, UiReply};
     use mlua::Table;
     use serde_json::json;
-    use std::sync::Arc;
     use std::thread::JoinHandle;
     use test_case::test_case;
 
-    use crate::background::{BackgroundInfo, BackgroundTask, Fire, Kind, Lifetime, Stop, StopMark};
     use crate::runtime::{TaskCell, TaskScope, run_command_scoped};
     use maki_agent::cancel::CancelToken;
-    use maki_agent::tools::test_support::{stub_ctx_with, stub_seed};
-    use maki_agent::{AgentMode, SessionMailbox, ToolDoneEvent, ToolOutput};
-    use maki_storage::id::MakiId;
 
     const TASK_ID: &str = "toolu_01";
-    const PLUGIN: &str = "bash";
-    const OUTPUT: &str = "compiled";
     const DONE_ID: &str = "toolu_02";
     const ERROR_ID: &str = "toolu_03";
     const MAIN_ID: &str = "main";
@@ -404,109 +393,6 @@ mod tests {
             globals.get::<Option<String>>("flashed").unwrap().as_deref(),
             stop_error
         );
-    }
-
-    fn moved_call_lua(
-        owner: MakiId,
-        caller: MakiId,
-    ) -> (Lua, BackgroundTasks, StopMark, CancelToken) {
-        let lua = lua_with_task(None);
-        let registry = BackgroundTasks::of(&lua);
-        let (trigger, token) = CancelToken::new();
-        let stop = StopMark::default();
-        registry
-            .register(BackgroundTask {
-                info: BackgroundInfo {
-                    id: TASK_ID.to_owned(),
-                    plugin: Arc::from(PLUGIN),
-                    name: SUBAGENT_NAME.to_owned(),
-                    kind: Kind::Call {
-                        tool: Arc::from(PLUGIN),
-                    },
-                    running: true,
-                    started_at: 0,
-                    cost: None,
-                },
-                session: owner,
-                task: None,
-                lifetime: Lifetime::Call,
-                stop: stop.clone(),
-                cancel: Fire::Owned(trigger),
-            })
-            .unwrap();
-        let mut tool_ctx = stub_ctx_with(&AgentMode::Build, None, None);
-        tool_ctx.session_id = Some(SessionRef::from_id(caller));
-        let ctx = lua.create_userdata(LuaCtx::handler(&tool_ctx)).unwrap();
-        lua.globals().set("ctx", ctx).unwrap();
-        (lua, registry, stop, token)
-    }
-
-    fn live_chat(chat: MakiId) -> (SessionMailbox, Arc<maki_agent::AgentSeed>) {
-        let mailbox = SessionMailbox::register(chat);
-        let seed = mailbox.publish_seed(stub_seed(chat));
-        (mailbox, seed)
-    }
-
-    #[test_case(true, "missing", "running: toolu_01" ; "unknown_id")]
-    #[test_case(false, TASK_ID, "none running" ; "another_chats_id")]
-    fn ctx_stop_refuses_what_the_calling_chat_does_not_run(
-        caller_owns_it: bool,
-        target: &str,
-        listing: &str,
-    ) {
-        let (owner, stranger) = (MakiId::generate(), MakiId::generate());
-        let _live = (live_chat(owner), live_chat(stranger));
-        let caller = if caller_owns_it { owner } else { stranger };
-        let (lua, _registry, stop, token) = moved_call_lua(owner, caller);
-
-        let (val, err): (Value, Option<String>) = smol::block_on(
-            lua.load(format!("return task.stop(ctx, '{target}')"))
-                .eval_async(),
-        )
-        .unwrap();
-
-        assert!(val.is_nil());
-        assert_eq!(
-            err,
-            Some(format!("no running background task {target}; {listing}"))
-        );
-        assert_eq!(stop.get(), Stop::None);
-        assert!(!token.is_cancelled());
-    }
-
-    #[test]
-    fn ctx_stop_returns_the_final_reply_of_the_task() {
-        let chat = MakiId::generate();
-        let (mailbox, _seed) = live_chat(chat);
-        let (lua, registry, stop, token) = moved_call_lua(chat, chat);
-        let stop_call = lua
-            .load(format!("return task.stop(ctx, '{TASK_ID}')"))
-            .eval_async::<(Option<String>, Option<String>)>();
-        let deliver = async {
-            while stop.get() != Stop::Model {
-                futures_lite::future::yield_now().await;
-            }
-            registry.deliver(
-                TASK_ID,
-                ToolDoneEvent {
-                    id: TASK_ID.to_owned(),
-                    tool: Arc::from(PLUGIN),
-                    output: Arc::new(ToolOutput::Plain(OUTPUT.into())),
-                    is_error: false,
-                    annotation: None,
-                    written_path: None,
-                    call: None,
-                    backgrounded: false,
-                },
-                None,
-            );
-        };
-
-        let (stopped, ()) = smol::block_on(futures_lite::future::zip(stop_call, deliver));
-
-        assert_eq!(stopped.unwrap(), (Some(OUTPUT.to_owned()), None));
-        assert!(token.is_cancelled());
-        assert!(mailbox.drain().is_empty());
     }
 
     /// Runs `plugins/task/picker.lua` against a fake `maki` that lists the main

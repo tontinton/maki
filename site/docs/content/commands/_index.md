@@ -14,7 +14,7 @@ Type `/` in the input box to open the command palette.
 | Command | Description |
 |---------|-------------|
 | `/compact` | Summarize and compact conversation history (optional guidance) |
-| `/new` | Start a new session |
+| `/new` | Start a new session (! stops background tasks) |
 | `/fork` | Fork this session and switch to the copy |
 | `/help` | Show keybindings |
 | `/usage` | Show token usage breakdown |
@@ -29,7 +29,7 @@ Type `/` in the input box to open the command palette.
 | `/fast` | Toggle fast mode (Anthropic Opus or Codex subscription models) |
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |
 | `/exit` | Exit the application |
-| `/reload` | Reload plugins and config |
+| `/reload` | Reload plugins and config (! stops background tasks) |
 | `/trust` | Trust this folder and load its shared project config |
 | `/packupdate` | Update packages (++lockfile, ! skips review) |
 | `/packdel` | Remove undeclared packages (++all, or a name) |
@@ -41,7 +41,7 @@ Type `/` in the input box to open the command palette.
 
 ## Sessions
 
-Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete. Deleting the current session starts a fresh one and keeps the picker open.
+Sessions run concurrently. `Ctrl+N` in `/sessions` starts a fresh session while the current one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete. Deleting the current session starts a fresh one and keeps the picker open. `/new` replaces the current session instead, which ends its turn and background tasks.
 
 ## Modes and toggles
 

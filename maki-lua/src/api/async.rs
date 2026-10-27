@@ -52,13 +52,29 @@ async fn acquire(lua: Lua, this: mlua::UserDataRef<LuaSemaphore>) -> LuaResult<L
     })
 }
 
+/// Take a permit only if a slot is free right now, without waiting.
+///
+/// @return (maki.async.Permit|nil) A permit handle, or nil when every slot is taken.
+/// @example
+/// local permit = sem:try_acquire()
+/// if not permit then
+///   print("waiting for a free slot")
+///   permit = sem:acquire()
+/// end
+#[lua_fn]
+fn try_acquire(_lua: &Lua, this: &LuaSemaphore) -> LuaResult<Option<LuaPermit>> {
+    Ok(this.sem.try_acquire_arc().map(|guard| LuaPermit {
+        guard: std::sync::Mutex::new(Some(guard)),
+    }))
+}
+
 lua_class! {
     /// A counting semaphore for limiting how many tasks run at once.
     ///
     /// Create one with `maki.async.semaphore(n)`, then call `:acquire()` to
     /// get a permit before doing work. If the task is cancelled, the acquire
     /// is cancelled too.
-    "maki.async.Semaphore" => LuaSemaphore, SEMAPHORE_DOCS [acquire]
+    "maki.async.Semaphore" => LuaSemaphore, SEMAPHORE_DOCS [acquire, try_acquire]
 }
 
 /// Give the permit back to the semaphore so another task can acquire it.
@@ -181,7 +197,8 @@ lua_class! {
 /// (`gather`, `call_tool`) stays parked until they wind down, so anything
 /// after the wait is too late to reach the screen.
 ///
-/// The callback receives the reason (`"cancelled"` or `"timeout"`) and may
+/// The callback receives the reason (`"cancelled"`, `"timeout"`, or
+/// `"stopped"` when the model's `task_stop` ended a background task) and may
 /// still call `ctx:finish`; the host prefers that reply over the generic
 /// cancelled/timeout error. Mark it `is_error = true` and end it with a
 /// marker, so the model knows the output it gets is cut short.

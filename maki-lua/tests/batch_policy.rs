@@ -1,20 +1,22 @@
 //! Tests the batch plugin's policy end-to-end: real plugin source, real
 //! `maki.async.gather`, with tool dispatch replaced by a scriptable Lua stub.
 
+mod common;
+
 use std::sync::Arc;
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use common::{Chat, call_ctx, exec, next_task_done, poll_until, request_move};
 use maki_agent::cancel::{CancelToken, CancelTrigger};
-use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with, stub_seed};
+use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
 use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
 use maki_agent::{
-    AgentEvent, AgentMode, AgentSeed, BufferSnapshot, CallScope, Envelope, EventSender,
-    SessionMailbox, SpanStyle, ToolDoneEvent, ToolOutput,
+    AgentEvent, AgentMode, AgentSeed, BufferSnapshot, Envelope, EventSender, SessionMailbox,
+    SharedBuf, SpanStyle, ToolDoneEvent, ToolOutput,
 };
 use maki_config::ToolOutputLines;
 use maki_lua::{KILL_GRACE, MoveOutcome, PluginHost, UiAction};
-use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
 
 const BATCH_PLUGIN_SRC: &str = include_str!("../../plugins/batch/init.lua");
@@ -334,10 +336,10 @@ fn runaway_child_under_cancel_still_terminates() {
 /// result lands.
 struct RunningBatch {
     trigger: maki_agent::cancel::CancelTrigger,
-    body: Arc<maki_agent::SharedBuf>,
+    body: Arc<SharedBuf>,
     result: flume::Receiver<Result<String, String>>,
     /// Kept alive so the handler's later events still have a receiver.
-    _events: flume::Receiver<maki_agent::Envelope>,
+    _events: flume::Receiver<Envelope>,
 }
 
 fn start_batch(tool_calls: Value) -> RunningBatch {
@@ -349,7 +351,7 @@ fn start_batch_with(child_src: String, tool_calls: Value) -> RunningBatch {
     let event_tx = EventSender::new(event_tx, 0);
     let (trigger, token) = CancelToken::new();
     let (result_tx, result) = flume::bounded(1);
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         let (reg, _host) = load_batch_host_with(&child_src);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));
         ctx.cancel = token;
@@ -366,7 +368,7 @@ fn start_batch_with(child_src: String, tool_calls: Value) -> RunningBatch {
     }
 }
 
-fn recv_live_buf(rx: &flume::Receiver<maki_agent::Envelope>) -> Arc<maki_agent::SharedBuf> {
+fn recv_live_buf(rx: &flume::Receiver<Envelope>) -> Arc<SharedBuf> {
     let deadline = Instant::now() + PAINT_TIMEOUT;
     while let Ok(env) = rx.recv_deadline(deadline) {
         if let AgentEvent::LiveToolBuf { id, body } = env.event
@@ -380,12 +382,7 @@ fn recv_live_buf(rx: &flume::Receiver<maki_agent::Envelope>) -> Arc<maki_agent::
 
 /// A child header opens with the indicator span the batch draws for its
 /// status, so counting one style counts the children in that state.
-fn wait_for_indicators(
-    buf: &maki_agent::SharedBuf,
-    style: &str,
-    want: usize,
-    budget: Duration,
-) -> bool {
+fn wait_for_indicators(buf: &SharedBuf, style: &str, want: usize, budget: Duration) -> bool {
     let wanted = SpanStyle::Named(style.to_owned());
     let deadline = Instant::now() + budget;
     loop {
@@ -401,11 +398,11 @@ fn wait_for_indicators(
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(PAINT_POLL_INTERVAL);
+        thread::sleep(PAINT_POLL_INTERVAL);
     }
 }
 
-fn assert_indicators(buf: &maki_agent::SharedBuf, style: &str, want: usize, budget: Duration) {
+fn assert_indicators(buf: &SharedBuf, style: &str, want: usize, budget: Duration) {
     assert!(
         wait_for_indicators(buf, style, want, budget),
         "expected {want} {style} children"
@@ -1482,41 +1479,23 @@ struct MovableBatch {
     host: PluginHost,
     ui: flume::Receiver<UiAction>,
     mailbox: SessionMailbox,
-    body: Arc<maki_agent::SharedBuf>,
+    body: Arc<SharedBuf>,
     _seed: Arc<AgentSeed>,
     _run: CancelTrigger,
     _events: flume::Receiver<Envelope>,
 }
 
 impl MovableBatch {
-    fn start(tool_calls: Value) -> (Self, JoinHandle<ToolExecResult>) {
+    fn start(tool_calls: Value) -> (Self, JoinHandle<ToolDoneEvent>) {
         let (reg, host) = load_batch_host_with(MOVABLE_CHILD_SRC);
         host.ui_attachment().attach();
         let ui = host.ui_action_rx();
-        let chat = MakiId::generate();
-        let mailbox = SessionMailbox::register(chat);
-        let seed = mailbox.publish_seed(stub_seed(chat));
-        let (event_tx, events) = flume::unbounded();
+        let Chat { id, mailbox, seed } = Chat::live();
         let (run, run_token) = CancelToken::new();
-        let mut ctx = stub_ctx_with(
-            &AgentMode::Build,
-            Some(&EventSender::new(event_tx, 0)),
-            Some(BATCH_ID),
-        );
-        let scope = Arc::new(CallScope::new(BATCH_ID.to_owned(), &run_token));
-        ctx.cancel = scope.cancel().clone();
-        ctx.call = Some(scope);
-        ctx.session_id = Some(SessionRef::from(chat));
-        let batch_reg = Arc::clone(&reg);
-        let call = std::thread::spawn(move || {
-            let input = batch_input(tool_calls);
-            let inv = batch_reg
-                .get(BATCH_TOOL)
-                .unwrap()
-                .tool
-                .parse(&input)
-                .unwrap();
-            smol::block_on(inv.execute(&ctx))
+        let (ctx, events) = call_ctx(&reg, id, &run_token, BATCH_ID);
+        let call = thread::spawn({
+            let reg = Arc::clone(&reg);
+            move || exec(&reg, BATCH_TOOL, batch_input(tool_calls), &ctx)
         });
         let body = recv_live_buf(&events);
         let batch = Self {
@@ -1537,11 +1516,9 @@ impl MovableBatch {
     }
 
     fn wait_parked(&self, tag: &str) {
-        let deadline = Instant::now() + PAINT_TIMEOUT;
-        while self.child_tool(IS_PARKED_TOOL, tag) != IS_PARKED_TEXT {
-            assert!(Instant::now() < deadline, "child {tag} never parked");
-            std::thread::sleep(PAINT_POLL_INTERVAL);
-        }
+        poll_until(&format!("child {tag} never parked"), || {
+            (self.child_tool(IS_PARKED_TOOL, tag) == IS_PARKED_TEXT).then_some(())
+        });
     }
 
     fn release(&self, tag: &str) {
@@ -1549,59 +1526,13 @@ impl MovableBatch {
     }
 
     fn press(&self) -> MoveOutcome {
-        self.host
-            .event_handle()
-            .request_background(BATCH_ID.to_owned())
-            .recv_timeout(BATCH_RESULT_TIMEOUT)
-            .expect("move outcome")
+        request_move(&self.host.event_handle(), BATCH_ID)
     }
 
     /// The final reply of a moved batch, as its task tab gets it.
     fn task_done(&self) -> ToolDoneEvent {
-        loop {
-            let action = self
-                .ui
-                .recv_timeout(BATCH_RESULT_TIMEOUT)
-                .expect("task tab event");
-            if let UiAction::PluginTaskEvent { envelope, .. } = action
-                && let AgentEvent::ToolDone(done) = envelope.event
-            {
-                return *done;
-            }
-        }
+        next_task_done(&self.ui)
     }
-}
-
-fn hooked_and_edit(hooked_tag: &str, edit_tag: &str) -> Value {
-    json!([
-        { "tool": HOOKED_TOOL, "parameters": { "tag": hooked_tag } },
-        { "tool": EDIT_TOOL, "parameters": { "tag": edit_tag } },
-    ])
-}
-
-#[test]
-fn batch_declines_naming_a_running_child_without_a_hook() {
-    let (batch, call) = MovableBatch::start(hooked_and_edit("a", "b"));
-    batch.wait_parked("a");
-    batch.wait_parked("b");
-
-    assert_eq!(
-        batch.press(),
-        MoveOutcome::NotMovable(WAITING_ON_EDIT.to_owned())
-    );
-
-    batch.release("a");
-    batch.release("b");
-    let result = call.join().expect("batch thread");
-    assert!(!result.backgrounded);
-    let expected = format!(
-        "{}{}{}",
-        section(HOOKED_TOOL, "hooked:a"),
-        section(EDIT_TOOL, "edit:b"),
-        summary_all_ok(2)
-    );
-    assert_eq!(output_text(result.output.expect("batch failed")), expected);
-    assert!(batch.mailbox.drain().is_empty());
 }
 
 /// The receipt carries what already finished, in the batch's own section
@@ -1623,7 +1554,7 @@ fn batch_moves_with_finished_results_inline_and_replies_with_the_late_children()
 
     let result = call.join().expect("batch thread");
     assert!(result.backgrounded);
-    let receipt = output_text(result.output.expect("receipt"));
+    let receipt = result.output.as_text();
     let inline = format!(
         "{}{}{MOVED_HEADER}\n- {HOOKED_TOOL}: late",
         section(OK_TOOL, "ok:a"),
@@ -1649,11 +1580,15 @@ fn batch_moves_with_finished_results_inline_and_replies_with_the_late_children()
     assert_eq!(batch.mailbox.drain().len(), 1);
 }
 
-/// A decline leaves the batch untouched: once the blocking child finishes,
-/// the same press moves, and that child's result rides in the receipt.
+/// A decline names the child that cannot move and leaves the batch untouched:
+/// once that child finishes, the same press moves, and its result rides in
+/// the receipt.
 #[test]
-fn batch_moves_once_the_blocking_child_finished() {
-    let (batch, call) = MovableBatch::start(hooked_and_edit("a", "b"));
+fn batch_declines_while_a_child_without_a_hook_runs_and_moves_once_it_finished() {
+    let (batch, call) = MovableBatch::start(json!([
+        { "tool": HOOKED_TOOL, "parameters": { "tag": "a" } },
+        { "tool": EDIT_TOOL, "parameters": { "tag": "b" } },
+    ]));
     batch.wait_parked("a");
     batch.wait_parked("b");
     assert_eq!(
@@ -1667,7 +1602,7 @@ fn batch_moves_once_the_blocking_child_finished() {
 
     let result = call.join().expect("batch thread");
     assert!(result.backgrounded);
-    let receipt = output_text(result.output.expect("receipt"));
+    let receipt = result.output.as_text();
     let inline = format!(
         "{}{MOVED_HEADER}\n- {HOOKED_TOOL}: a",
         section(EDIT_TOOL, "edit:b")

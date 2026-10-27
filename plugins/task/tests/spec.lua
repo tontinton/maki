@@ -139,4 +139,35 @@ case("an_idle_plugin_task_sorts_with_the_running_ones", function()
   eq(sections(built.rows), "2:Running,3:Finished")
 end)
 
+local NOW = 1000
+local WIDE = 80
+local function secs(n)
+  return n .. "s"
+end
+
+case("a_running_task_shows_its_running_time_and_cost", function()
+  local task = { id = "toolu_06", name = "lint", status = "working", started_at = NOW - 12, cost = 0.0421 }
+  eq(Rows.trailer(task, NOW, WIDE, secs), "12s · $0.042 ")
+end)
+
+case("a_finished_task_shows_its_total_time_not_a_growing_one", function()
+  local task = { id = "toolu_07", name = "lint", status = "done", started_at = NOW - 30, ended_at = NOW - 10 }
+  eq(Rows.trailer(task, NOW, WIDE, secs), "20s ")
+  task.ended_at = nil
+  eq(Rows.trailer(task, NOW, WIDE, secs), "", "no end time means no total to show")
+end)
+
+case("the_owner_closes_the_trailer_and_survives_a_narrow_row", function()
+  local task = { id = "session-02", name = "ci", status = "idle", plugin = "ci", started_at = NOW - 5 }
+  eq(Rows.trailer(task, NOW, WIDE, secs), "5s · ci ")
+  eq(Rows.trailer(task, NOW, 4, secs), "ci ", "no room for the stats")
+  eq(Rows.trailer(MAIN, NOW, WIDE, secs), "", "the main chat has no clock")
+end)
+
+case("only_a_live_task_with_a_start_keeps_the_clock_ticking", function()
+  eq(Rows.has_clock({ MAIN, RESEARCH, BUILD }), false, "no start times")
+  eq(Rows.has_clock({ MAIN, { id = "x", name = "x", status = "done", started_at = NOW } }), false)
+  eq(Rows.has_clock({ MAIN, { id = "y", name = "y", status = "working", started_at = NOW } }), true)
+end)
+
 th.report()

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::OpenSession;
-use crate::app::tasks::{BackgroundMoves, TaskOutcome, count_phrase};
+use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, count_phrase};
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
@@ -66,7 +66,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SharedBuf, SharedMessages, SubagentInfo,
+    SessionMailbox, SharedBuf, SharedMessages, SubagentInfo,
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
@@ -113,6 +113,10 @@ const ESC_ONE_RUNNING: &str = "1 task in background";
 const ESC_MANY_RUNNING_SUFFIX: &str = " tasks in background";
 const QUIT_ONE_RUNNING: &str = "1 background task stops if you quit again";
 const QUIT_MANY_RUNNING_SUFFIX: &str = " background tasks stop if you quit again";
+const RELOAD_ONE_RUNNING: &str = "1 background task would stop. /reload! reloads anyway";
+const RELOAD_MANY_RUNNING_SUFFIX: &str = " background tasks would stop. /reload! reloads anyway";
+const NEW_ONE_RUNNING: &str = "1 background task would stop. /new! starts anyway";
+const NEW_MANY_RUNNING_SUFFIX: &str = " background tasks would stop. /new! starts anyway";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
@@ -442,10 +446,10 @@ fn task_id_of(envelope: &Envelope) -> Option<&str> {
     }
 }
 
-/// A chat opened before its session spoke, a moved call's tab or a subagent
-/// a plugin adopted, takes what it lacks from the first info naming it: the
-/// sender its permission prompts answer on, the inbox its input feeds, and
-/// the model and options its header shows.
+/// A chat can open before its session speaks: a moved call's tab, or a
+/// subagent a plugin adopted. The first info naming it fills in what it
+/// lacks: the sender its permission answers go to, the inbox its input
+/// feeds, and the model and options its header shows.
 fn fill_missing_subagent_info(chat: &mut Chat, info: &SubagentInfo) {
     if chat.is_finished() {
         return;
@@ -471,15 +475,6 @@ pub(crate) fn turn_response(message: &Message) -> Option<String> {
         ContentBlock::Text { text } => Some(text.as_str()),
         _ => None,
     }))
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(super) enum PendingInput {
-    #[default]
-    None,
-    AuthRetry {
-        subagent_id: Option<String>,
-    },
 }
 
 /// A plan form row picked by the user, waiting on the plugin handler behind
@@ -566,10 +561,14 @@ pub struct App {
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
+    /// How long an `exit_on_done` exit waits for background work, `None` for
+    /// not at all. One deadline, from the first held exit on, covers the
+    /// whole wait, so a chain of woken runs cannot keep the process up.
+    pub(crate) background_wait: Option<Duration>,
+    background_deadline: Option<Instant>,
     pub(crate) queue: MessageQueue,
     recoverable_queue: Vec<String>,
     pub answer_tx: Option<flume::Sender<String>>,
-    pub(super) pending_input: PendingInput,
     /// Bumped whenever the host opens a prompt, see [`Self::open_prompt`].
     /// The plugin windows that need input count their own, see
     /// [`Self::prompts`].
@@ -587,6 +586,9 @@ pub struct App {
     /// ends too. Only the event loop sees every session, so it keeps this.
     pub(crate) background_elsewhere: usize,
     pub(super) background_moves: BackgroundMoves,
+    /// Final results of moved calls whose receipt has not landed yet. The two
+    /// travel on different channels, and the receipt opens the tab.
+    pub(super) early_finals: HashMap<String, AgentEvent>,
 
     pub(crate) storage: StateDir,
     /// The folder trust question this run was started with, `None` when the
@@ -633,6 +635,9 @@ pub struct App {
     typeahead: Typeahead,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
+    /// The agent's mailbox, held here so the live session outlives every
+    /// write of its receipts.
+    pub(crate) mailbox: Option<SessionMailbox>,
 }
 
 impl App {
@@ -709,10 +714,11 @@ impl App {
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
+            background_wait: None,
+            background_deadline: None,
             queue: MessageQueue::default(),
             recoverable_queue: Vec::new(),
             answer_tx: None,
-            pending_input: PendingInput::None,
             prompts_opened: 0,
             run_id: 0,
             retry_info: None,
@@ -724,6 +730,7 @@ impl App {
             last_quit: None,
             background_elsewhere: 0,
             background_moves: BackgroundMoves::default(),
+            early_finals: HashMap::new(),
             storage,
             trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
@@ -750,6 +757,7 @@ impl App {
             pending_actions: Vec::new(),
             typeahead: Typeahead::default(),
             restore_event_tx: None,
+            mailbox: None,
             restoring: Arc::new(AtomicBool::new(false)),
         };
         app.model_picker.set_recents(
@@ -817,13 +825,10 @@ impl App {
     /// one a key handler opened is what the user meant.
     fn prompts(&self) -> Option<Prompts> {
         let overlays = self.overlays().map(|overlay| overlay.is_prompting());
-        let up = [
-            self.pending_input != PendingInput::None,
-            self.plan_form_active(),
-        ]
-        .into_iter()
-        .chain(overlays)
-        .fold(0, |up, open| up << 1 | u32::from(open));
+        let up = [self.turn_awaits_auth(), self.plan_form_active()]
+            .into_iter()
+            .chain(overlays)
+            .fold(0, |up, open| up << 1 | u32::from(open));
         (up != 0).then(|| Prompts {
             up,
             opened: self.prompts_opened + self.float_mgr.prompts_opened(),
@@ -1296,20 +1301,49 @@ impl App {
         }
     }
 
-    fn send_answer(&self, answer: String) {
-        if let Some(tx) = &self.answer_tx {
+    fn send_to_agent(&self, subagent_id: Option<&str>, answer: String) {
+        let idx = subagent_id
+            .and_then(|id| self.chat_of_task(id).ok())
+            .unwrap_or(MAIN_CHAT);
+        if let Some(tx) = self.answer_channel(idx) {
             let _ = tx.try_send(answer);
         }
     }
 
-    fn send_to_agent(&self, subagent_id: Option<&str>, answer: String) {
-        let routed = subagent_id
-            .and_then(|id| self.chat_of_task(id).ok())
-            .and_then(|idx| self.chats[idx].answer_tx.as_ref());
-        if let Some(tx) = routed {
-            let _ = tx.try_send(answer);
-        } else {
-            self.send_answer(answer);
+    /// Who hears the user's answer to an ask from {idx}. A tool task without a
+    /// channel of its own shares its turn's. A plugin task without one has
+    /// nobody to ask, so its run fails rather than park, and its caller hears.
+    /// A finished chat has no run left to answer, and the turn's channel is
+    /// not its to borrow.
+    fn answer_channel(&self, idx: usize) -> Option<&flume::Sender<String>> {
+        let chat = &self.chats[idx];
+        if chat.is_finished() {
+            return None;
+        }
+        match (&chat.answer_tx, &chat.plugin) {
+            (Some(tx), _) => Some(tx),
+            (None, None) => self.answer_tx.as_ref(),
+            (None, Some(_)) => None,
+        }
+    }
+
+    /// The main turn waits on expired credentials: its own run or a
+    /// subagent still on it. A task off the turn waits without holding it.
+    fn turn_awaits_auth(&self) -> bool {
+        self.chats
+            .iter()
+            .any(|chat| chat.auth_parked && chat.plugin.is_none())
+    }
+
+    /// One Enter retries every parked run: a lapsed login fails each of
+    /// them, and one left out would wait forever.
+    fn retry_auth(&mut self) {
+        for idx in 0..self.chats.len() {
+            if mem::take(&mut self.chats[idx].auth_parked)
+                && let Some(tx) = self.answer_channel(idx)
+            {
+                let _ = tx.try_send(String::new());
+            }
         }
     }
 
@@ -1422,9 +1456,6 @@ impl App {
                 return Some(self.run_builtin(BuiltinAction::Background));
             }
             if let Some(answered) = self.permission_prompt.handle_key(key) {
-                if answered.subagent_id.is_none() {
-                    self.chats[MAIN_CHAT].permission_answered(&answered.id);
-                }
                 let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
                 self.send_to_agent(answered.subagent_id.as_deref(), encoded);
             }
@@ -2107,6 +2138,11 @@ impl App {
         if !self.chat_accepts_input() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                KeyCode::Esc => {
+                    self.last_esc = None;
+                    self.set_active_chat(MAIN_CHAT);
+                    vec![]
+                }
                 _ => vec![],
             };
         }
@@ -2211,24 +2247,55 @@ impl App {
         vec![]
     }
 
-    /// Quitting ends every background task of every open session, so with
-    /// some running it takes a second press, the way Esc does.
+    /// Background tasks of every open session. They all run in the one Lua
+    /// host, which a quit or a reload ends.
+    fn background_everywhere(&self) -> usize {
+        self.running_background_tasks().count() + self.background_elsewhere
+    }
+
+    /// Flashes how many background tasks are {running}, if any, and says
+    /// whether it did, so the caller holds off.
+    fn warn_if_running(&mut self, running: usize, one: &str, many_suffix: &str) -> bool {
+        if running == 0 {
+            return false;
+        }
+        self.flash(count_phrase(running, one, many_suffix));
+        true
+    }
+
+    /// With background tasks running, quitting takes a second press, the way
+    /// Esc does.
     fn quit(&mut self) -> Vec<Action> {
-        let running = self.running_background_tasks().count() + self.background_elsewhere;
+        let running = self.background_everywhere();
         let armed = self
             .last_quit
             .take()
             .is_some_and(|t| t.elapsed() < self.status_bar.flash_duration);
-        if running > 0 && !armed {
+        if !armed && self.warn_if_running(running, QUIT_ONE_RUNNING, QUIT_MANY_RUNNING_SUFFIX) {
             self.last_quit = Some(Instant::now());
-            self.flash(count_phrase(
-                running,
-                QUIT_ONE_RUNNING,
-                QUIT_MANY_RUNNING_SUFFIX,
-            ));
             return vec![];
         }
         self.quit_with(ExitRequest::Success)
+    }
+
+    /// A press is easy to repeat, a typed command is not, so with background
+    /// tasks running a reload takes the bang.
+    fn reload(&mut self, force: bool) -> Vec<Action> {
+        let running = self.background_everywhere();
+        if !force && self.warn_if_running(running, RELOAD_ONE_RUNNING, RELOAD_MANY_RUNNING_SUFFIX) {
+            return vec![];
+        }
+        self.quit_with(ExitRequest::Reload)
+    }
+
+    /// `/new` ends this session, and its background tasks with it. Only the
+    /// tab's own count: other tabs keep running.
+    fn start_new_session(&mut self, force: bool) -> Vec<Action> {
+        let running = self.running_background_tasks().count();
+        if !force && self.warn_if_running(running, NEW_ONE_RUNNING, NEW_MANY_RUNNING_SUFFIX) {
+            return vec![];
+        }
+        self.reset_session()
     }
 
     /// `maki trust` lives outside the TUI, so without this a "not now" or a
@@ -2247,10 +2314,34 @@ impl App {
         self.quit_with(ExitRequest::Reload)
     }
 
+    /// An exit the user asks for goes now, never held by
+    /// [`Self::awaits_background`].
     fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
         self.save_input_history();
         self.exit_request = req;
+        self.exit_on_done = false;
         vec![Action::ManualExit]
+    }
+
+    /// `--exit-on-done` holds a successful exit while work a run moved to the
+    /// background is out: its result wakes a run, and that run's drain exits.
+    /// A failed turn exits with its error. Once the deadline lapses the exit
+    /// goes, the work stops with the process and the meta keeps its receipts.
+    pub(crate) fn awaits_background(&self, now: Instant) -> bool {
+        self.exit_on_done
+            && self.exit_request == ExitRequest::Success
+            && self
+                .background_deadline
+                .is_some_and(|deadline| now < deadline)
+            && self
+                .live_mailbox()
+                .is_some_and(|mailbox| mailbox.outstanding() > 0)
+    }
+
+    /// A woken run would clear the error a failed `--exit-on-done` turn
+    /// exits with, so such a session takes none.
+    pub(crate) fn takes_mailbox_runs(&self) -> bool {
+        self.exit_request != ExitRequest::Error
     }
 
     pub(crate) fn clear_exit_request(&mut self) {
@@ -2258,22 +2349,17 @@ impl App {
     }
 
     fn sending(&self, text: &str, has_images: bool) -> Sending {
-        if self.pending_input != PendingInput::None {
+        if self.turn_awaits_auth() {
             return Sending::AuthRetry;
         }
         Sending::of(text, has_images)
     }
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
-        match self.sending(&sub.text, !sub.images.is_empty()) {
-            Sending::AuthRetry => {
-                if let PendingInput::AuthRetry { subagent_id } = mem::take(&mut self.pending_input)
-                {
-                    self.send_to_agent(subagent_id.as_deref(), String::new());
-                }
-                vec![]
-            }
-            Sending::Nothing => vec![],
+        let sending = self.sending(&sub.text, !sub.images.is_empty());
+        self.retry_auth();
+        match sending {
+            Sending::AuthRetry | Sending::Nothing => vec![],
             Sending::Exit => self.quit(),
             Sending::Shell(prefix) => self.run_shell_line(prefix),
             Sending::Message if self.is_main_chat() => self.submit_or_queue(sub.into()),
@@ -2305,8 +2391,8 @@ impl App {
         self.run_id += 1;
         self.retry_info = None;
         self.close_all_overlays();
-        self.pending_input = PendingInput::None;
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
+        self.chats[MAIN_CHAT].auth_parked = false;
         self.shell.cancel_all();
         for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
             chat.flush();
@@ -2397,7 +2483,9 @@ impl App {
     }
 
     /// A move racing Esc lands after the run it moved out of. Its task lives
-    /// on, so the row it moved, while still on screen, needs its tab.
+    /// on, so the row it moved, while still on screen, needs its tab. Only a
+    /// main chat call: Esc ends the subagents with the run, and a call moved
+    /// out of one has no agent left to report to.
     fn is_racing_receipt(&self, envelope: &Envelope) -> bool {
         envelope.subagent.is_none()
             && matches!(&envelope.event, AgentEvent::ToolDone(done)
@@ -2443,11 +2531,28 @@ impl App {
                 .subagent
                 .as_ref()
                 .is_none_or(|s| s.parent_tool_use_id == done.id)
-            && let Ok(idx) = self.chat_of_task(&done.id)
-            && idx != MAIN_CHAT
         {
-            self.finish_background_call(idx, envelope.event);
-            return vec![];
+            match self.chat_of_task(&done.id) {
+                Ok(idx) if idx != MAIN_CHAT && self.chats[idx].plugin.is_some() => {
+                    self.finish_background_call(idx, envelope.event);
+                    return vec![];
+                }
+                // A subagent's tab is the turn's until the receipt adopts it,
+                // and the turn may have ended it by then. The result waits so
+                // the adoption can tell, see `App::adopt_subagent`.
+                Ok(idx) if idx != MAIN_CHAT => {
+                    self.early_finals.insert(done.id.clone(), envelope.event);
+                    return vec![];
+                }
+                // A deleted tab's receipt never comes back to claim it.
+                Err(_) if envelope.subagent.is_none() => {
+                    if !self.deleted_tasks.contains(&done.id) {
+                        self.early_finals.insert(done.id.clone(), envelope.event);
+                    }
+                    return vec![];
+                }
+                _ => {}
+            }
         }
 
         maki_lua::agent_autocmd::dispatch(
@@ -2480,11 +2585,12 @@ impl App {
             if !chat.is_finished() {
                 chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
                 if let Some(id) = &subagent_id {
-                    self.chats[MAIN_CHAT].set_background_outcome(id, BackgroundOutcome::Done);
+                    self.set_badge_outcome(id, BackgroundOutcome::Done);
                 }
             }
             return vec![];
         }
+        self.chats[chat_idx].track_run(&envelope.event);
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
             if self.state.mode == Mode::Plan
@@ -2497,8 +2603,8 @@ impl App {
                 .insert_tool_output(e.id.clone(), e.output.clone());
             // A receipt does not end the subagent behind it: the call goes
             // on, and adopting its chat takes it off the turn first.
-            if e.backgrounded && chat_idx == MAIN_CHAT {
-                self.open_background_call(e);
+            if e.backgrounded {
+                self.open_background_call(chat_idx, e);
             } else if let Some(&sub_idx) = self.chat_index.get(&e.id) {
                 let (outcome, text) = if e.is_error {
                     (TaskOutcome::Error, ERROR_TEXT)
@@ -2569,7 +2675,6 @@ impl App {
             if chat_idx == 0 {
                 self.on_queue_item_consumed(text, images);
             } else {
-                self.chats[chat_idx].idle = false;
                 self.chats[chat_idx].show_user_message(text, images);
             }
             return vec![];
@@ -2601,18 +2706,21 @@ impl App {
                 DisplayRole::Error,
                 AUTH_EXPIRED_MSG.into(),
             ));
-            // No retry is offered for a plugin task. Its plugin hears the
-            // error from `:prompt()` and decides whether to prompt again.
-            if is_plugin_task {
+            if self.answer_channel(chat_idx).is_none() {
                 return vec![];
             }
-            if chat_idx != 0 {
+            if chat_idx != MAIN_CHAT {
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Error,
                     AUTH_EXPIRED_MSG.into(),
                 ));
             }
-            self.open_prompt(|app| app.pending_input = PendingInput::AuthRetry { subagent_id });
+            let park = |app: &mut Self| app.chats[chat_idx].auth_parked = true;
+            if self.chats[chat_idx].plugin.is_none() {
+                self.open_prompt(park);
+            } else {
+                park(self);
+            }
             return vec![];
         }
 
@@ -2621,13 +2729,9 @@ impl App {
             // the next one. A run its Lua task's end cut short mid-tool has no
             // `handle_cancel` to settle the tool, so it is settled here.
             match result {
-                ChatEventResult::Done => {
-                    self.chats[chat_idx].cancel_in_progress();
-                    self.chats[chat_idx].idle = true;
-                }
+                ChatEventResult::Done => self.chats[chat_idx].cancel_in_progress(),
                 ChatEventResult::Error(message) => {
                     self.chats[chat_idx].cancel_in_progress();
-                    self.chats[chat_idx].idle = true;
                     // Esc in the tab already wrote the task's ending, and the
                     // error its cut short run sends after that would say it twice.
                     if !self.chats[chat_idx].is_finished() {
@@ -2651,6 +2755,9 @@ impl App {
                     self.status = Status::Idle;
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
+                        self.background_deadline = self
+                            .background_deadline
+                            .or_else(|| self.background_wait.map(|wait| Instant::now() + wait));
                     }
                 }
                 ChatEventResult::Error(message) => {
@@ -2724,6 +2831,7 @@ impl App {
         );
         chat.set_restore_channel(self.restore_event_tx.clone());
         chat.plugin = plugin.clone();
+        chat.clock = Some(TaskClock::start());
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;
         chat.inbox = subagent.inbox.clone();
@@ -2814,7 +2922,7 @@ impl App {
                     vec![Action::Btw(question)]
                 }
             }
-            "/new" => self.reset_session(),
+            "/new" => self.start_new_session(cmd.bang),
             "/fork" => self.fork_session(),
             "/queue" => {
                 self.queue.set_focus();
@@ -2876,7 +2984,7 @@ impl App {
                 vec![]
             }
             EXIT_COMMAND => self.quit(),
-            "/reload" => self.quit_with(ExitRequest::Reload),
+            "/reload" => self.reload(cmd.bang),
             // Typing `/trust` is the consent, exactly like `maki trust add
             // --yes`, so there is no second question to ask here.
             "/trust" => self.trust_folder(),
@@ -3088,9 +3196,7 @@ impl App {
     /// True when the agent is parked on user input. Drives the `needs_input`
     /// session status.
     pub(crate) fn awaiting_input(&self) -> bool {
-        self.permission_prompt.is_open()
-            || self.pending_input != PendingInput::None
-            || self.float_mgr.needs_input()
+        self.permission_prompt.is_open() || self.turn_awaits_auth() || self.float_mgr.needs_input()
     }
 
     /// True while `recoverable_queue` holds user text captured at an agent
@@ -3106,7 +3212,7 @@ impl App {
                 .flatten();
             return Some(Notification::PermissionRequested { tool });
         }
-        if matches!(self.pending_input, PendingInput::AuthRetry { .. }) {
+        if self.turn_awaits_auth() {
             return Some(Notification::AuthenticationRequired);
         }
         if self.status != Status::Streaming && self.plan_form_open() {
@@ -3367,7 +3473,7 @@ impl App {
             // Only the chat on screen draws motion. The rest only take data,
             // which `tick` polls in every chat.
             self.chats[self.active_chat].cadence(),
-            // A Ctrl+B reply wakes nothing, so it is looked for until in.
+            // A Ctrl+B reply wakes nothing, so the loop polls until it is in.
             Cadence::when(!self.background_moves.pending.is_empty(), Cadence::PENDING),
         ])
     }

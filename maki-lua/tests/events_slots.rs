@@ -589,6 +589,7 @@ fn call_of<'a>(
         origin,
         output_mode: ToolOutputMode::Compact,
         authority,
+        receipt: false,
         cancel,
         deadline: Instant::now() + DISPATCH_TIMEOUT,
     }
@@ -1882,8 +1883,9 @@ fn wildcard_layers_wrap_every_tool_outside_the_specific_ones() {
     );
 }
 
-#[test]
-fn output_ctx_carries_the_input_and_kind() {
+#[test_case(false ; "final_result")]
+#[test_case(true  ; "receipt_of_a_moved_call")]
+fn output_ctx_carries_the_input_kind_and_receipt(receipt: bool) {
     const KIND: &str = "execute";
     let (reg, host) = host();
     slotted_tool(&host);
@@ -1894,7 +1896,7 @@ fn output_ctx_carries_the_input_and_kind() {
             ANY_TOOL,
             HookStage::Output,
             &format!(
-                r#"value.{text} = ctx.tool_kind .. ":" .. ctx.input.{COMMAND_FIELD}; return prev(value, ctx)"#,
+                r#"value.{text} = ctx.tool_kind .. ":" .. ctx.input.{COMMAND_FIELD} .. ":" .. tostring(ctx.receipt); return prev(value, ctx)"#,
                 text = hook::OUTPUT_TEXT
             ),
         ),
@@ -1904,6 +1906,7 @@ fn output_ctx_carries_the_input_and_kind() {
     let call = HookCall {
         tool_kind: Some(KIND),
         input: Some(&tool_input),
+        receipt,
         ..call_of(SLOT_TOOL, Authority::Unbounded, CallOrigin::Model, &cancel)
     };
 
@@ -1916,7 +1919,10 @@ fn output_ctx_carries_the_input_and_kind() {
     let Verdict::Replaced(value) = verdict else {
         panic!("the layer rewrote the output, got {verdict:?}");
     };
-    assert_eq!(value[hook::OUTPUT_TEXT], format!("{KIND}:{COMMAND}"));
+    assert_eq!(
+        value[hook::OUTPUT_TEXT],
+        format!("{KIND}:{COMMAND}:{receipt}")
+    );
 }
 
 /// Handing the value back untouched is a pass through and not a rewrite, so

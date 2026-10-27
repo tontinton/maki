@@ -1,17 +1,19 @@
+use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use crate::app::tasks::{BackgroundMoves, TaskOutcome};
+use crate::app::tasks::{BackgroundMoves, TaskOutcome, tab_ending};
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
-use crate::components::Action;
 use crate::components::command::PROMPT_NEEDS;
 use crate::components::input::{COMMAND_PREFIX, sent_text};
-use crate::components::rewind_picker::{RewindEntry, stopped_by_rewind};
+use crate::components::rewind_picker::{RewindEntry, drops_receipt};
+use crate::components::{Action, BackgroundBadge, BackgroundOutcome};
 use crate::text_buffer::Writers;
-use maki_agent::Transcript;
 use maki_agent::agent::SessionExport;
 use maki_agent::session::SessionHeader;
+use maki_agent::{SessionMailbox, TaskEnd, Transcript};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{PluginPermissions, PluginReach, SessionEndReason};
 use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
@@ -23,7 +25,7 @@ use maki_storage::sessions::{
 use crate::{AppSession, OpenSession};
 
 use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
-use super::{App, MAIN_CHAT, Mode, PendingInput, PlanState, Sending, Status};
+use super::{App, MAIN_CHAT, Mode, PlanState, Sending, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
@@ -101,6 +103,38 @@ fn truncate_to_turn(session: &mut AppSession, turn_index: usize, context_size: u
     session.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
     let kept = estimate_message_tokens(session.messages());
     if kept == 0 { 0 } else { baseline + kept }
+}
+
+/// How each call in {messages} that moved to the background ended. A receipt
+/// says a call moved and the notice that settled it how it ended. One
+/// {pending} still waits on ends as the answer {queued_end} still holds for
+/// it says, since the model reads that answer next. With none it is lost. A
+/// receipt nothing else answered was cancelled: the model's `task_stop` took
+/// its output.
+fn moved_outcomes(
+    messages: &[Message],
+    pending: &[String],
+    queued_end: impl Fn(&str) -> Option<TaskEnd>,
+) -> Vec<(String, BackgroundOutcome)> {
+    let mut outcomes = HashMap::new();
+    for message in messages {
+        if let Some(settled) = &message.settles {
+            outcomes.insert(settled.task.as_str(), settled.end.into());
+        }
+        for id in &message.receipts {
+            outcomes
+                .entry(id.as_str())
+                .or_insert(BackgroundOutcome::Cancelled);
+        }
+    }
+    for id in pending {
+        let end = queued_end(id).unwrap_or(TaskEnd::Lost);
+        outcomes.insert(id, end.into());
+    }
+    outcomes
+        .into_iter()
+        .map(|(id, outcome)| (id.to_owned(), outcome))
+        .collect()
 }
 
 impl App {
@@ -203,6 +237,10 @@ impl App {
             fast: state.fast_intent(),
             workflow: state.workflow,
             yolo: self.permissions.persisted_yolo(),
+            pending_background: self.live_mailbox().map_or_else(
+                || state.session.meta.pending_background.clone(),
+                SessionMailbox::unsettled,
+            ),
         }
     }
 
@@ -236,15 +274,20 @@ impl App {
 
     /// Call only once `state.session` is final: the chats it builds are
     /// stamped with that session for life. A plugin task of that same session
-    /// stays if it is still running: a rewind rebuilds the main chat, not the
-    /// monitor a plugin runs beside it, and ending it here would leave a task
-    /// shown as done that keeps streaming and that Esc can no longer reach.
+    /// stays if it is still running: ending it here would leave a task shown
+    /// as done that keeps streaming and that Esc can no longer reach.
     pub(super) fn reset_ui_chrome(&mut self) {
+        let session = self.state.session.id;
+        self.reset_ui_chrome_keeping(|chat| chat.is_live_plugin_task_of(session));
+    }
+
+    /// [`Self::reset_ui_chrome`] that keeps every task tab {keep} accepts, as
+    /// it is. The main chat always goes.
+    fn reset_ui_chrome_keeping(&mut self, keep: impl Fn(&Chat) -> bool) {
         // Brings the main draft back to the box before the chats holding it go.
         self.set_active_chat(MAIN_CHAT);
-        let session = self.state.session.id;
         self.chats
-            .retain(|chat| chat.is_live_plugin_task_of(session));
+            .retain(|chat| chat.task_id().is_some() && keep(chat));
         let mut main = Chat::new(
             self.state.session.id,
             None,
@@ -262,11 +305,11 @@ impl App {
         self.queue.clear();
         self.recoverable_queue.clear();
         self.close_all_overlays();
-        self.pending_input = PendingInput::None;
         self.status_bar.clear_flash();
         self.last_esc = None;
         self.last_quit = None;
         self.background_moves = BackgroundMoves::default();
+        self.early_finals.clear();
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
         // The draft this chrome belonged to is gone, and the Lua thread still
@@ -370,15 +413,86 @@ impl App {
         self.permissions.set_session_yolo(meta.yolo);
     }
 
-    /// Resume at process start: the agent was already spawned with this
-    /// history, so no respawn follows and the restored queue must be
+    /// Resume at process start, or a stored session loaded, forked or handed
+    /// over by `/reload` into a new tab: the agent was already spawned with
+    /// this history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
+        self.restore_lost_background();
         self.restore_display();
+        self.rebadge_moves();
         self.flush_restored_queue();
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }
+    }
+
+    /// Receipts the stored session left unanswered come back as lost notices,
+    /// so the model stops waiting for them. Only for a session installed from
+    /// its stored copy: anywhere else the ids are this process's own. The
+    /// mailbox skips ids it still tracks, such as those a `/reload` already
+    /// reported lost when it shut the old Lua host down.
+    pub(crate) fn restore_lost_background(&self) {
+        if let Some(mailbox) = self.live_mailbox() {
+            mailbox.restore_lost(&self.state.session.meta.pending_background);
+        }
+    }
+
+    /// A history read back from disk shows every receipt as a success, so
+    /// each moved row and any tab it left get their ending back from the
+    /// history they came from and the answers the mailbox still queues, see
+    /// [`moved_outcomes`]. A `/reload` hands the mailbox over, so a result
+    /// that came in before it is still there. Only the main chat's receipts
+    /// are in the stored meta. A task still live here has no ending yet.
+    fn rebadge_moves(&mut self) {
+        let session = &self.state.session;
+        let mailbox = self.live_mailbox();
+        let queued_end = |id: &str| mailbox.and_then(|mailbox| mailbox.queued_end(id));
+        let mut badges = Vec::new();
+        for (idx, chat) in self.chats.iter().enumerate() {
+            let (messages, pending) = if idx == MAIN_CHAT {
+                (session.messages(), &session.meta.pending_background[..])
+            } else {
+                match chat
+                    .task_id()
+                    .and_then(|id| session.subagent_messages().get(&**id))
+                {
+                    Some(messages) => (&messages[..], &[][..]),
+                    None => continue,
+                }
+            };
+            badges.extend(
+                moved_outcomes(messages, pending, queued_end)
+                    .into_iter()
+                    .map(|(id, outcome)| (idx, id, outcome)),
+            );
+        }
+        for (idx, id, outcome) in badges {
+            let outcome = match self.chat_of_task(&id) {
+                Ok(tab) if !self.chats[tab].is_finished() => None,
+                Ok(tab) => {
+                    let (ending, text) = tab_ending(outcome);
+                    self.chats[tab].mark_finished(ending, text);
+                    Some(outcome)
+                }
+                Err(_) => Some(outcome),
+            };
+            let badge = BackgroundBadge {
+                id: id.clone(),
+                started_at: None,
+                outcome,
+            };
+            self.chats[idx].set_tool_background(&id, badge);
+        }
+    }
+
+    /// The mailbox of the session on screen. `None` until an agent serves it,
+    /// which includes the gap between a session swap and its respawn, so no
+    /// session reads another's receipts.
+    pub(super) fn live_mailbox(&self) -> Option<&SessionMailbox> {
+        self.mailbox
+            .as_ref()
+            .filter(|mailbox| mailbox.session_id() == self.state.session.id)
     }
 
     /// The one funnel for handing a history over. When the UI installs one the
@@ -415,6 +529,7 @@ impl App {
             input_draft_writers: None,
             queued_messages: Vec::new(),
             yolo: self.permissions.persisted_yolo(),
+            pending_background: Vec::new(),
         };
         open
     }
@@ -496,6 +611,11 @@ impl App {
     /// the original alone.
     pub(super) fn fork_to(&mut self, entry: RewindEntry) -> Vec<Action> {
         self.fork_session_with(|forked| {
+            // A receipt the copy drops was never made there, so its id must
+            // not come back as a lost notice.
+            let mut pending = mem::take(&mut forked.meta.pending_background);
+            pending.retain(|id| !drops_receipt(forked.messages(), entry.turn_index, id));
+            forked.meta.pending_background = pending;
             // The agent restores its gauge from this, and the full size on a
             // short copy would auto compact it on its first prompt.
             let context_size = forked.meta.context_size;
@@ -529,7 +649,6 @@ impl App {
         vec![Action::OpenFork(Box::new(OpenSession { session, claim }))]
     }
 
-    /// The id and name of every running background task.
     fn background_task_names(&self) -> Vec<(Arc<str>, String)> {
         self.running_background_tasks()
             .filter_map(|chat| Some((Arc::clone(chat.task_id()?), chat.name.clone())))
@@ -551,19 +670,33 @@ impl App {
     }
 
     /// A task whose receipt the rewind drops is stopped first: its result
-    /// would answer a call the model no longer made. Its late events find
-    /// no tab to bring back.
+    /// would answer a call the model no longer made. The mailbox forgets
+    /// every such receipt before that, so neither the result of a stop nor a
+    /// notice still queued reaches the next run. Its late events find no tab
+    /// to bring back. Every other task keeps its tab as it was, ending and
+    /// all, and its receipt row in the rebuilt main chat keeps its badge.
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
-        let running = self.background_task_names();
-        let stopped: Vec<Arc<str>> =
-            stopped_by_rewind(self.state.session.messages(), entry.turn_index, &running)
-                .into_iter()
-                .map(|(id, _)| Arc::clone(id))
-                .collect();
-        let mut actions: Vec<Action> = stopped
+        let messages = self.state.session.messages();
+        if let Some(mailbox) = self.live_mailbox() {
+            for id in mailbox.unsettled() {
+                if drops_receipt(messages, entry.turn_index, &id) {
+                    mailbox.forget(&id);
+                }
+            }
+        }
+        let dropped: HashSet<Arc<str>> = self
+            .chats
+            .iter()
+            .filter_map(Chat::task_id)
+            .filter(|id| drops_receipt(messages, entry.turn_index, id))
+            .cloned()
+            .collect();
+        let mut actions: Vec<Action> = dropped
             .iter()
             .filter_map(|id| self.stop_task(id).ok())
             .collect();
+        let badges = self.chats[MAIN_CHAT].background_badges();
+        let deleted = mem::take(&mut self.deleted_tasks);
 
         let measured = self.state.context_size;
         let session = self.state.session_mut();
@@ -571,10 +704,19 @@ impl App {
         session.update_title_if_default();
         self.state.context_size = context_size;
 
-        self.reset_ui_chrome();
+        // A tool task still running belongs to a turn that is over.
+        self.reset_ui_chrome_keeping(|chat| {
+            chat.task_id().is_some_and(|id| !dropped.contains(id))
+                && (chat.plugin.is_some() || chat.is_finished())
+        });
+        self.deleted_tasks = deleted;
         self.deleted_tasks
-            .extend(stopped.iter().map(|id| id.to_string()));
+            .extend(dropped.iter().map(|id| id.to_string()));
         self.restore_display();
+        for badge in badges {
+            let id = badge.id.clone();
+            self.chats[MAIN_CHAT].set_tool_background(&id, badge);
+        }
 
         self.restore_input(&entry.prompt_text, turn_writers(&entry.prompt_text));
 
@@ -613,6 +755,7 @@ impl App {
         }
         self.reset_ui_chrome();
         self.restore_display();
+        self.rebadge_moves();
 
         self.install_local_history()
     }

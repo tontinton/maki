@@ -62,21 +62,7 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
         .map(|tool| allow(tool, &cwd_glob))
         .collect();
     rules.push(allow(TASK_TOOL, "*"));
-    // Per chat would be tighter, but a manager is built before any chat exists.
-    if let Ok(task_logs) = maki_storage::paths::task_logs_dir() {
-        rules.push(allow(READ_TOOL, &task_logs_glob(&task_logs)));
-    }
     rules
-}
-
-/// The logs dir usually does not exist yet, so a plain canonicalize would
-/// keep a symlinked state dir as spelled. The existing part is resolved and
-/// the rest appended.
-fn task_logs_glob(task_logs: &Path) -> String {
-    format!(
-        "{}/**",
-        maki_storage::paths::canonical_key(task_logs).display()
-    )
 }
 
 pub const BOUNDARY_UNVERIFIABLE_PREFIX: &str = "Cannot verify project boundary for";
@@ -211,12 +197,16 @@ pub enum PermissionAnswer {
     DenyWithGuidance(String),
     DenyAlwaysProject,
     DenyAlwaysGlobal,
+    /// Nobody can see the prompt, so nobody will ever answer it: the asker
+    /// moved off its turn where no one watches.
+    Unattended,
 }
 
 impl PermissionAnswer {
     pub fn decision_source(&self) -> &'static str {
         match self {
             Self::AllowOnce | Self::Deny | Self::DenyWithGuidance(_) => DECISION_SOURCE_USER_ONCE,
+            Self::Unattended => DECISION_SOURCE_USER_ABORT,
             Self::AllowSession => DECISION_SOURCE_USER_SESSION,
             Self::AllowAlwaysProject
             | Self::AllowAlwaysGlobal
@@ -245,6 +235,7 @@ impl PermissionAnswer {
             Self::DenyWithGuidance(g) => format!("deny:{g}"),
             Self::DenyAlwaysProject => "deny_always_project".to_string(),
             Self::DenyAlwaysGlobal => "deny_always_global".to_string(),
+            Self::Unattended => "unattended".to_string(),
         }
     }
 
@@ -257,6 +248,7 @@ impl PermissionAnswer {
             "deny" => Some(Self::Deny),
             "deny_always_project" => Some(Self::DenyAlwaysProject),
             "deny_always_global" => Some(Self::DenyAlwaysGlobal),
+            "unattended" => Some(Self::Unattended),
             _ if s.starts_with("deny:") => {
                 let guidance = s.strip_prefix("deny:").unwrap();
                 if guidance.is_empty() {
@@ -386,6 +378,10 @@ pub struct PermissionManager {
     cwd: PathBuf,
     project_config: ProjectConfig,
     plugin_rules: Arc<PluginRuleStore>,
+    /// Canonical root of the background task logs. It usually does not exist
+    /// yet, so a plain canonicalize would keep a symlinked state dir as
+    /// spelled. See [`Self::task_logs_rule`].
+    task_logs: Option<PathBuf>,
 }
 
 impl PermissionManager {
@@ -433,6 +429,9 @@ impl PermissionManager {
             cwd,
             project_config,
             plugin_rules,
+            task_logs: maki_storage::paths::task_logs_dir()
+                .ok()
+                .map(|dir| maki_storage::paths::canonical_key(&dir)),
         }
     }
 
@@ -452,7 +451,28 @@ impl PermissionManager {
             cwd: self.cwd.clone(),
             project_config: self.project_config.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
+            task_logs: self.task_logs.clone(),
         }
+    }
+
+    /// Lets `read` into the calling session's own background task logs, which
+    /// its receipts point the model at. A subagent shares its parent's session,
+    /// so either side reads what the other started. Other sessions' logs, from
+    /// this project or any other, get the usual outside-project handling.
+    fn task_logs_rule(
+        &self,
+        tool: &ToolKey,
+        session: Option<&SessionRef>,
+    ) -> Option<PermissionRule> {
+        if !matches!(tool, ToolKey::Native(name) if name.as_ref() == READ_TOOL) {
+            return None;
+        }
+        let dir = self.task_logs.as_ref()?.join(session?.id().to_string());
+        Some(PermissionRule {
+            tool: tool.clone(),
+            scope: Some(format!("{}/**", dir.display())),
+            effect: Effect::Allow,
+        })
     }
 
     fn session_rules(&self) -> std::sync::MutexGuard<'_, Vec<PermissionRule>> {
@@ -473,9 +493,11 @@ impl PermissionManager {
         scopes: &[&str],
         force_prompt: bool,
         plan_path: Option<&Path>,
+        session_id: Option<&SessionRef>,
     ) -> PermissionCheck {
         let session = self.session_rules();
         let plugin = self.plugin_rules.snapshot();
+        let task_logs = self.task_logs_rule(tool, session_id);
 
         let gate = ApprovalGate::new(tool, plan_path);
 
@@ -494,7 +516,12 @@ impl PermissionManager {
                 .iter()
                 .map(|r| (ORIGIN_SESSION, r))
                 .chain(self.config_rules.iter().map(|r| (ORIGIN_CONFIG, r)))
-                .chain(self.builtin_rules.iter().map(|r| (ORIGIN_BUILTIN, r)))
+                .chain(
+                    self.builtin_rules
+                        .iter()
+                        .chain(&task_logs)
+                        .map(|r| (ORIGIN_BUILTIN, r)),
+                )
                 .chain(plugin.iter().map(|r| (ORIGIN_PLUGIN, r)))
             {
                 let Some(approval) = rule_reach(&r.tool, tool) else {
@@ -585,7 +612,7 @@ impl PermissionManager {
     }
 
     pub fn check(&self, tool: &ToolKey, scope: &str, plan_path: Option<&Path>) -> PermissionCheck {
-        self.check_inner(tool, &[scope], false, plan_path)
+        self.check_inner(tool, &[scope], false, plan_path, None)
     }
 
     pub fn check_multi(
@@ -595,7 +622,7 @@ impl PermissionManager {
         force_prompt: bool,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
-        self.check_inner(tool, scopes, force_prompt, plan_path)
+        self.check_inner(tool, scopes, force_prompt, plan_path, None)
     }
 
     pub fn add_session_rule(&self, rule: PermissionRule) {
@@ -696,7 +723,8 @@ impl PermissionManager {
         match answer {
             PermissionAnswer::AllowOnce
             | PermissionAnswer::Deny
-            | PermissionAnswer::DenyWithGuidance(_) => {}
+            | PermissionAnswer::DenyWithGuidance(_)
+            | PermissionAnswer::Unattended => {}
             PermissionAnswer::AllowSession => {
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
@@ -747,7 +775,7 @@ impl PermissionManager {
         scopes: &[&str],
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
-        match self.check_inner(tool, scopes, true, plan_path) {
+        match self.check_inner(tool, scopes, true, plan_path, None) {
             PermissionCheck::Denied(reason) => PermissionCheck::Denied(reason),
             PermissionCheck::Allowed | PermissionCheck::NeedsPrompt { .. } => {
                 PermissionCheck::NeedsPrompt {
@@ -782,7 +810,7 @@ impl PermissionManager {
     ) -> Result<Option<Arc<str>>, PermissionError> {
         let check = |tool: &ToolKey, scopes: &[&str], force_prompt: bool| match ask {
             Some(_) => self.check_escalated(tool, scopes, plan_path),
-            None => self.check_inner(tool, scopes, force_prompt, plan_path),
+            None => self.check_inner(tool, scopes, force_prompt, plan_path, session),
         };
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
@@ -858,7 +886,16 @@ impl PermissionManager {
             ));
         };
 
-        let guard = rx.lock().await;
+        // A call moved to the background can stay parked on its ask across
+        // turns, so waiting for the channel must end with ours.
+        let Ok(guard) = cancel.race(rx.lock()).await else {
+            return Err(deny(
+                DECISION_SOURCE_USER_ABORT,
+                PROMPT_UNANSWERED_REASON.to_owned(),
+                None,
+                None,
+            ));
+        };
         let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
         let (t2, s2) = match check(&pt, &refs, force_prompt) {
             PermissionCheck::Allowed => return allowed(by_rule()),
@@ -914,6 +951,14 @@ impl PermissionManager {
         };
         drop(guard);
 
+        if answer == PermissionAnswer::Unattended {
+            return Err(deny(
+                DECISION_SOURCE_USER_ABORT,
+                UNATTENDED_REASON.to_owned(),
+                None,
+                None,
+            ));
+        }
         self.apply_decision(&t2, &s2, &answer);
         let source = answer.decision_source();
         if answer.is_allow() {
@@ -1139,7 +1184,9 @@ mod tests {
     const PROJECT_DIR: &str = ".maki";
     const PROJECT_PERMISSIONS: &str = ".maki/permissions.toml";
     const TASK_LOGS_DIR: &str = "tasks";
-    const TASK_LOG: &str = "session/call.log";
+    const TASK_LOG: &str = "call.log";
+    const OWN_SESSION: &str = "{own}";
+    const OTHER_SESSION: &str = "{other}";
     #[cfg(unix)]
     const OUTSIDE_WRITES: [&str; 2] = ["/etc/passwd", "~/.bashrc"];
     const OUTSIDE_SCOPES: [&str; 3] = ["/etc/passwd", "~/.bashrc", "cargo test"];
@@ -1217,6 +1264,34 @@ mod tests {
 
         assert_eq!(err.reason, UNATTENDED_REASON);
         assert!(events.is_empty(), "no prompt may go out");
+    }
+
+    /// The asker moved where nobody watches, so whoever dropped its prompt
+    /// answers that nobody will, and the call needs an allow rule instead.
+    #[test]
+    fn an_unattended_answer_denies_like_a_missing_channel() {
+        let (event_tx, _events) = flume::unbounded();
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let answers = smol::lock::Mutex::new(answer_rx);
+        answer_tx
+            .send(TaggedAnswer::new(TAGGED_REQUEST_ID, PermissionAnswer::Unattended).encode())
+            .unwrap();
+
+        let err = smol::block_on(default_mgr().enforce(
+            &ToolKey::native(BASH_TOOL),
+            &PermissionScopes::single("cargo test".to_owned()),
+            None,
+            &EventSender::new(event_tx, 0),
+            Some(&answers),
+            TAGGED_REQUEST_ID,
+            &CancelToken::none(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap_err();
+
+        assert_eq!(err.reason, UNATTENDED_REASON);
     }
 
     fn plugin_edit_rule(scope: &str, effect: Effect) -> PermissionRule {
@@ -1438,16 +1513,58 @@ mod tests {
         )
     }
 
-    #[test_case("session/call.log" => true ; "task_log")]
-    #[test_case("session/call.log.1" => true ; "rotated_task_log")]
-    #[test_case("../tasks_sibling/call.log" => false ; "sibling_dir")]
-    fn read_of_task_logs_is_allowed_only_inside_the_dir(relative: &str) -> bool {
-        let logs = maki_storage::paths::task_logs_dir().expect("state dir resolves");
-        let scope = maki_storage::paths::normalize_path(&logs.join(relative));
-        matches!(
-            default_mgr().check(&ToolKey::native(READ_TOOL), &scope.to_string_lossy(), None),
-            PermissionCheck::Allowed
-        )
+    fn mgr_with_task_logs(state: &Path) -> PermissionManager {
+        let mut mgr = default_mgr();
+        mgr.task_logs = Some(maki_storage::paths::canonical_key(
+            &state.join(TASK_LOGS_DIR),
+        ));
+        mgr
+    }
+
+    /// Through `enforce` with nobody to answer, so only an allow gets through.
+    fn read_allowed(mgr: &PermissionManager, path: &Path, session: Option<&SessionRef>) -> bool {
+        let (guard, _events) = crate::event_stream();
+        smol::block_on(mgr.enforce(
+            &ToolKey::native(READ_TOOL),
+            &PermissionScopes::single(path.to_string_lossy().into_owned()),
+            session,
+            &guard.sender(0),
+            None,
+            TAGGED_REQUEST_ID,
+            &CancelToken::none(),
+            None,
+            None,
+            None,
+        ))
+        .is_ok()
+    }
+
+    #[test_case("{own}/call.log" => true ; "own_log")]
+    #[test_case("{own}/call.log.1" => true ; "own_rotated_log")]
+    #[test_case("{other}/call.log" => false ; "another_sessions_log")]
+    #[test_case("{own}/../{other}/call.log" => false ; "dotdot_into_another_session")]
+    #[test_case("{own}_sibling/call.log" => false ; "sibling_of_own_dir")]
+    #[test_case("call.log" => false ; "logs_root")]
+    fn read_of_task_logs_is_allowed_only_for_the_calling_session(relative: &str) -> bool {
+        let tmp = tempfile::tempdir().unwrap();
+        let own = SessionRef::generate();
+        let other = SessionRef::generate();
+        let relative = relative
+            .replace(OWN_SESSION, &own.id().to_string())
+            .replace(OTHER_SESSION, &other.id().to_string());
+        let path = tmp.path().join(TASK_LOGS_DIR).join(relative);
+        read_allowed(&mgr_with_task_logs(tmp.path()), &path, Some(&own))
+    }
+
+    #[test]
+    fn read_of_task_logs_without_a_session_is_not_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionRef::generate();
+        let log =
+            maki_storage::paths::session_task_logs_dir(tmp.path(), session.id()).join(TASK_LOG);
+        let mgr = mgr_with_task_logs(tmp.path());
+        assert!(read_allowed(&mgr, &log, Some(&session)));
+        assert!(!read_allowed(&mgr, &log, None));
     }
 
     #[test_case(true ; "read_through_the_link")]
@@ -1459,16 +1576,12 @@ mod tests {
         let link = tmp.path().join("state_link");
         std::fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
+        let session = SessionRef::generate();
 
-        let glob = task_logs_glob(&link.join(TASK_LOGS_DIR));
-        let real_canon = std::fs::canonicalize(&real).unwrap();
-        assert!(glob.starts_with(&*real_canon.to_string_lossy()), "{glob}");
+        let mgr = mgr_with_task_logs(&link);
         let state = if through_link { link } else { real };
-        let log = state.join(TASK_LOGS_DIR).join(TASK_LOG);
-        assert!(
-            scope_matches(&glob, &log.to_string_lossy()),
-            "{glob} misses {log:?}"
-        );
+        let log = maki_storage::paths::session_task_logs_dir(&state, session.id()).join(TASK_LOG);
+        assert!(read_allowed(&mgr, &log, Some(&session)), "{log:?}");
     }
 
     #[test]
@@ -1733,6 +1846,7 @@ mod tests {
             PermissionAnswer::AllowAlwaysProject,
             PermissionAnswer::Deny,
             PermissionAnswer::DenyWithGuidance("hint".into()),
+            PermissionAnswer::Unattended,
         ] {
             assert_eq!(PermissionAnswer::decode(&a.encode()), Some(a));
         }

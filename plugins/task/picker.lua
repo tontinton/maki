@@ -97,6 +97,7 @@ local function rebuild()
 end
 
 local function render()
+  board.drawn_at = os.time()
   board.header = {}
   ListPicker.render_header(board.win, board.header, board.input, FILTER_PREFIX, board.width - 4)
   -- `table.unpack` has an argument limit, and a long pasted query can wrap
@@ -131,13 +132,14 @@ local function render()
     end
     -- Rows with nothing on the right would otherwise end short of the border
     -- and read as padding on one side only, so the bar runs the full width.
-    local owner = task.plugin and (task.plugin .. " ") or ""
-    local trail = board.width - 2 - dispw(icon) - dispw(task.name) - dispw(hint) - dispw(owner)
+    local room = board.width - 2 - dispw(icon) - dispw(task.name) - dispw(hint)
+    local trailer = Rows.trailer(task, board.drawn_at, room, maki.ui.humantime)
+    local trail = room - dispw(trailer)
     if trail > 0 then
       line[#line + 1] = { string.rep(" ", trail), base }
     end
-    if owner ~= "" then
-      line[#line + 1] = { owner, selected and "selected" or "dim" }
+    if trailer ~= "" then
+      line[#line + 1] = { trailer, selected and "selected" or "dim" }
     end
     lines[#lines + 1] = line
     if selected then
@@ -338,7 +340,9 @@ local function browse()
       if board.expired then
         -- The session changed under us and its ids mean nothing here now.
         finish(true)
-      elseif board.dirty then
+      elseif board.dirty or (Rows.has_clock(board.tasks) and os.time() ~= board.drawn_at) then
+        -- A running clock ticks once a second, and the refresh brings the
+        -- cost a turn added since.
         board.dirty = false
         refresh()
       end

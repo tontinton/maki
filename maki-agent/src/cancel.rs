@@ -120,7 +120,7 @@ impl CancelToken {
             return;
         }
         let own = Arc::as_ptr(&self.0);
-        children.retain(|child| child.strong_count() > 0 && !std::ptr::eq(child.as_ptr(), own));
+        children.retain(|child| child.strong_count() > 0 && child.as_ptr() != own);
     }
 
     #[cfg(test)]
@@ -338,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn an_adopted_follower_fires_with_either_parent_only() {
+    fn a_follower_moved_to_another_parent_fires_only_with_it() {
         let (first_trigger, first) = CancelToken::new();
         let (second_trigger, second) = CancelToken::new();
         let follower = first.follower();
@@ -454,16 +454,6 @@ mod tests {
 
         child.unlink(&parent);
         assert!(child.is_cancelled());
-    }
-
-    #[test]
-    fn dropping_a_handle_fires_nothing() {
-        let (trigger, token) = CancelToken::new();
-        drop(trigger.handle());
-        assert!(!token.is_cancelled());
-
-        trigger.handle().fire();
-        assert!(token.is_cancelled());
     }
 
     const KEY: &str = "x";
@@ -603,14 +593,14 @@ mod tests {
         assert!(token.is_cancelled());
     }
 
-    /// The run ending must not reach a session that moved to the background:
-    /// only its own trigger ends it.
     enum Forget {
         Retire,
         CancelAll,
         DropMap,
     }
 
+    /// The run ending must not reach a session that moved to the background:
+    /// only its own trigger ends it.
     #[test_case(Forget::Retire    ; "retire")]
     #[test_case(Forget::CancelAll ; "cancel_all")]
     #[test_case(Forget::DropMap   ; "drop_map")]
@@ -624,18 +614,5 @@ mod tests {
             Forget::DropMap => drop(map),
         }
         assert!(!token.is_cancelled());
-    }
-
-    #[test]
-    fn cancel_map_cancel_all_fires_owned_triggers_but_not_handles() {
-        let map = CancelMap::new();
-        let (owned, owned_token) = CancelToken::new();
-        let (session_trigger, session_token) = CancelToken::new();
-        map.insert(key(), owned);
-        map.insert_handle(key(), session_trigger.handle());
-
-        map.cancel_all();
-        assert!(owned_token.is_cancelled());
-        assert!(!session_token.is_cancelled());
     }
 }

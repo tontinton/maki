@@ -395,7 +395,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         let (resumed, claim) = resolved.into_resumed();
         let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
-        crate::sdk_mode::run(crate::sdk_mode::SdkParams {
+        let interrupt = crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
             resumed,
             claim,
@@ -412,13 +412,17 @@ pub fn run(mut cli: Cli) -> Result<()> {
             project_config: trust.project_config.clone(),
         })
         .context("run sdk mode")?;
+        drop(stack.plugin_host);
+        teardown.join();
+        interrupt.exit_if_caught();
         return Ok(());
     }
 
     if cli.print {
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
-        crate::print::run(crate::print::PrintParams {
+        let background_wait = cli.background_wait();
+        let interrupt = crate::print::run(crate::print::PrintParams {
             model: stack.model,
             prompt: cli.initial_prompt,
             image_paths: cli.images,
@@ -435,8 +439,12 @@ pub fn run(mut cli: Cli) -> Result<()> {
             resumed,
             claim,
             storage: storage.clone(),
+            background_wait,
         })
         .context("run print mode")?;
+        drop(stack.plugin_host);
+        teardown.join();
+        interrupt.exit_if_caught();
         return Ok(());
     }
 
@@ -447,6 +455,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         &cwd_str,
     )];
     let mut focused = 0;
+    let mut handed_over = Vec::new();
     let mut warnings = startup_warnings;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
     let launch = Launch {
@@ -491,6 +500,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 )),
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
+                background_wait: cli.background_wait(),
                 lua_command_reader: stack.plugin_host.command_reader(),
                 keymap_reader: stack.plugin_host.keymap_reader(),
                 hint_reader: stack.plugin_host.hint_reader(),
@@ -502,6 +512,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),
                 trust_question: trust.state.question().cloned(),
+                handed_over: std::mem::take(&mut handed_over),
             },
             initial_prompt.take(),
         )
@@ -535,7 +546,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 tabs: reloaded,
                 focused: f,
                 pack,
+                mailboxes,
             } => {
+                // Held across the rebuild: a result no run drained yet lives
+                // only there.
+                handed_over = mailboxes;
                 let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
                 let was_trusted = trust.project_config.is_trusted();

@@ -1,3 +1,5 @@
+mod common;
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -7,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use common::poll_until;
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
 use maki_agent::template::Vars;
 use maki_agent::tools::test_support::stub_seed;
@@ -16,8 +19,8 @@ use maki_agent::tools::{
     ToolSource, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, AgentMode, AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput,
-    TurnCompleteEvent,
+    AgentEvent, AgentMode, AgentSeed, CallScope, CancelToken, ModelSlot, SessionMailbox,
+    ToolOutput, TurnCompleteEvent,
 };
 use maki_config::{
     AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
@@ -270,6 +273,8 @@ const NIL_WITHOUT_JOBS_ERR: &str =
 const FINISH_CALLED_TWICE_ERR: &str = "ctx:finish() already called";
 const DEADLINE_ALREADY_SET_ERR: &str = "ctx:set_deadline() already called";
 const TIMED_OUT_SUBSTR: &str = "timed out";
+const PARKED_PAST_DEADLINE_TOOL: &str = "parked_past_deadline";
+const PARKED_PAST_DEADLINE_ERR: &str = "tool parked_past_deadline timed out after 0s";
 const ALREADY_CALLED_ERR: &str = "already called";
 const UNKNOWN_FIELD_ERR: &str = "unknown field";
 const PERMISSION_DENIED_MSG: &str = "permission denied";
@@ -2368,7 +2373,8 @@ fn warm_click_runs_async_jobs() {
 }
 
 /// The call token fires with the reply, but a highlight queued by the
-/// handler still has to land: it lives as long as the turn.
+/// handler still has to land: it lives as long as the turn. The job waits
+/// for a release sent after the call ended, so it cannot slip in before.
 #[test]
 fn async_run_from_a_handler_outlives_the_call() {
     const CALL_ID: &str = "outlives-1";
@@ -2376,7 +2382,8 @@ fn async_run_from_a_handler_outlives_the_call() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"local release, released
+        maki.api.register_tool({{
             name = "late_async",
             description = "appends a line after its reply",
             schema = {MINIMAL_SCHEMA},
@@ -2385,26 +2392,40 @@ fn async_run_from_a_handler_outlives_the_call() {
                 local buf = maki.ui.buf()
                 ctx:live_buf(buf)
                 maki.async.run(function()
-                    maki.async.sleep(1)
+                    if not released then
+                        maki.async.await(1, function(cb) release = cb end)
+                    end
                     buf:line("{LATE_LINE}")
                 end)
                 return "done"
+            end
+        }})
+        maki.api.register_tool({{
+            name = "late_async_release",
+            description = "lets the late line land",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function()
+                if release then release() else released = true end
+                return "released"
             end
         }})"#,
     );
     host.load_source("late_async_plugin", &src).unwrap();
 
     let (mut ctx, rx) = warm_ctx(CALL_ID);
-    let (_run_trigger, run) = maki_agent::CancelToken::new();
-    let call = Arc::new(maki_agent::CallScope::new(CALL_ID.to_owned(), &run));
+    let (_run_trigger, run) = CancelToken::new();
+    let call = Arc::new(CallScope::new(CALL_ID.to_owned(), &run));
     ctx.cancel = call.cancel().clone();
     ctx.call = Some(Arc::clone(&call));
     exec_warm_tool(&reg, "late_async", &ctx).expect("tool output");
     let body = recv_live_buf(&rx, CALL_ID).expect("live buf published");
     call.end();
-    barrier(&host);
+    exec_tool(&reg, "late_async_release", json!({})).expect("release");
 
-    assert!(body.take().text().contains(LATE_LINE));
+    poll_until("the late line never landed", || {
+        body.take().text().contains(LATE_LINE).then_some(())
+    });
 }
 
 /// The warm cell gets a fresh `CancelToken::none()`: cancelling the
@@ -5371,6 +5392,32 @@ fn ctx_set_deadline_times_out() {
     assert!(err.contains(TIMED_OUT_SUBSTR), "got: {err}");
 }
 
+/// No cancel hook is set up yet to word the reply, so it reads the way the
+/// dispatch loop words a timeout.
+#[test]
+fn a_handler_parked_past_its_deadline_times_out() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "{PARKED_PAST_DEADLINE_TOOL}",
+            description = "parks past its deadline",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                ctx:set_deadline(0)
+                maki.async.await(1, function(_) end)
+                return "should-not-reach"
+            end
+        }})"#,
+    );
+    host.load_source(PARKED_PAST_DEADLINE_TOOL, &src).unwrap();
+
+    let err = exec_tool(&reg, PARKED_PAST_DEADLINE_TOOL, json!({})).unwrap_err();
+
+    assert_eq!(err, PARKED_PAST_DEADLINE_ERR);
+}
+
 #[test]
 fn ctx_set_deadline_twice_errors() {
     let reg = fresh_registry();
@@ -5395,18 +5442,6 @@ fn ctx_set_deadline_twice_errors() {
 /// Generous: every wait below ends on an event, never on the clock, so only
 /// an already failing test pays this.
 const CANCEL_TEST_TIMEOUT: Duration = Duration::from_secs(30);
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
-    let deadline = std::time::Instant::now() + CANCEL_TEST_TIMEOUT;
-    loop {
-        if let Some(got) = check() {
-            return got;
-        }
-        assert!(std::time::Instant::now() < deadline, "{what}");
-        std::thread::sleep(CANCEL_POLL_INTERVAL);
-    }
-}
 
 const PARKED_DEADLINE_REPLY: &str = "partial: timeout";
 const PARKED_DEADLINE_PLUGIN: &str = r#"

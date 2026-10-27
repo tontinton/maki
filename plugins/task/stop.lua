@@ -13,6 +13,7 @@ maki.api.register_tool({
   description = DESCRIPTION,
   kind = "execute",
   audiences = { "main" },
+  needs_background = true,
   schema = {
     type = "object",
     required = { "id" },

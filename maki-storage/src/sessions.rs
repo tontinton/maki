@@ -394,6 +394,11 @@ pub struct SessionMeta {
     /// makes `--yolo` a property of the invocation rather than of the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yolo: Option<bool>,
+    /// Background tasks the model holds a receipt for and has not read the
+    /// result of. Whatever is left here on resume died with the process that
+    /// ran it, and the model is told so instead of waiting forever.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_background: Vec<String>,
 }
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells

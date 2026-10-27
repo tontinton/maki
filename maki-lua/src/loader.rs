@@ -30,7 +30,7 @@ use crate::plugin_permissions::{
 };
 use crate::runtime::{
     self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, MoveOutcome,
-    Request, RestoreItem,
+    MoveRequest, Request, RestoreItem,
 };
 use maki_agent::prompt::ResolvedPrompts;
 use maki_storage::id::MakiId;
@@ -1043,6 +1043,7 @@ impl PluginHost {
         EventHandle {
             tx: self.inner.tx.clone(),
             prio_tx: self.inner.prio_tx.clone(),
+            moves: self.inner.moves.clone(),
             layered: Arc::clone(&self.inner.layered),
             background: self.inner.background.clone(),
         }
@@ -1087,6 +1088,7 @@ pub struct EventHandle {
     tx: flume::Sender<Request>,
     /// User-initiated requests bypass queued bulk work (session restores).
     prio_tx: flume::Sender<Request>,
+    moves: flume::Sender<MoveRequest>,
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
     layered: Arc<LayeredTools>,
@@ -1098,6 +1100,7 @@ impl EventHandle {
         Self {
             tx,
             prio_tx: flume::unbounded().0,
+            moves: flume::unbounded().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         }
@@ -1189,6 +1192,7 @@ impl EventHandle {
         Self {
             tx: shared.clone(),
             prio_tx: shared,
+            moves: flume::unbounded().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         }
@@ -1268,11 +1272,11 @@ impl EventHandle {
         });
     }
 
-    /// Asks the call to move to the background; the answer arrives once its
-    /// hook ran.
+    /// Asks the call to move to the background. The answer arrives once its
+    /// `ctx:on_background` hook ran.
     pub fn request_background(&self, tool_use_id: String) -> flume::Receiver<MoveOutcome> {
-        let (reply, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::BackgroundTool { tool_use_id, reply });
+        let (request, rx) = MoveRequest::by_user(tool_use_id);
+        let _ = self.moves.send(request);
         rx
     }
 
@@ -1554,6 +1558,7 @@ mod tests {
         let handle = EventHandle {
             tx,
             prio_tx,
+            moves: flume::unbounded().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         };

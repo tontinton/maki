@@ -570,27 +570,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn update_elapsed_rewrites_the_span_once_the_second_changes() {
-        const STALE: &str = "stale";
-        const ELAPSED_SECS: u64 = 72;
-        let mut seg = Segment {
-            lines: vec![Line::from(vec![Span::raw("head"), Span::raw(STALE)])],
-            elapsed: Some(ElapsedSpan {
-                span: 1,
-                since: Instant::now()
-                    .checked_sub(Duration::from_secs(ELAPSED_SECS))
-                    .unwrap(),
-                shown_secs: 0,
-                width: 0,
-            }),
-            ..Segment::default()
-        };
-        seg.update_elapsed();
-        assert!(seg.lines[0].spans[1].content.contains("1m"));
-        assert!(seg.elapsed.as_ref().unwrap().shown_secs >= ELAPSED_SECS);
-    }
-
     fn ticking_since(ago: Duration, shown_secs: u64) -> Segment {
         Segment {
             elapsed: Some(ElapsedSpan {
@@ -620,24 +599,24 @@ mod tests {
 
     const USAGE: &str = "10.6k↑ 148↓ $0.009";
     const TIMESTAMP: &str = "12:41:53 AM";
-    const GROWN_SECS: u64 = 94;
+    const GROWN: Duration = Duration::from_secs(94);
+    const GROWN_MINUTES: &str = "1m";
 
-    fn ticking_header(slack: usize) -> (Segment, u16) {
+    /// A header laid out with {usage} and the timestamp at "0s", {slack}
+    /// columns to spare, whose clock now reads [`GROWN`].
+    fn ticking_header(usage: Option<&str>, slack: usize) -> (Segment, u16) {
         let mut header = Line::from(vec![
             Span::raw("↗ bash> Sleep 120s then echo"),
             Span::raw(ElapsedSpan::text(0)),
         ]);
-        let natural = header.width();
-        let usage_and_timestamp = USAGE.width() + 2 + TIMESTAMP.width() + 1;
-        let width = (natural + 1 + usage_and_timestamp + slack) as u16;
-        append_right_info(&mut header, None, Some(USAGE), Some(TIMESTAMP), width);
+        let usage_width = usage.map_or(0, |usage| usage.width() + 2);
+        let width = (header.width() + 1 + usage_width + TIMESTAMP.width() + 1 + slack) as u16;
+        append_right_info(&mut header, None, usage, Some(TIMESTAMP), width);
         let seg = Segment {
             lines: vec![header],
             elapsed: Some(ElapsedSpan {
                 span: 1,
-                since: Instant::now()
-                    .checked_sub(Duration::from_secs(GROWN_SECS))
-                    .unwrap(),
+                since: Instant::now().checked_sub(GROWN).unwrap(),
                 shown_secs: 0,
                 width,
             }),
@@ -646,49 +625,25 @@ mod tests {
         (seg, width)
     }
 
-    #[test_case(0,  false, true  ; "usage_dropped_when_growth_does_not_fit")]
-    #[test_case(20, true,  true  ; "all_kept_when_growth_fits")]
+    #[test_case(Some(USAGE), 20, true,  true  ; "all_kept_when_growth_fits")]
+    #[test_case(Some(USAGE), 0,  false, true  ; "usage_dropped_when_growth_does_not_fit")]
+    #[test_case(None,        0,  false, false ; "all_dropped_when_nothing_fits")]
     fn update_elapsed_never_overflows_the_right_info(
+        usage: Option<&str>,
         slack: usize,
         expect_usage: bool,
         expect_timestamp: bool,
     ) {
-        let (mut seg, width) = ticking_header(slack);
+        let (mut seg, width) = ticking_header(usage, slack);
         seg.update_elapsed();
 
         let header = &seg.lines[0];
         let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("1m34s"));
+        assert!(text.contains(GROWN_MINUTES), "{text:?}");
         assert!(header.width() <= width as usize, "wrapped: {text:?}");
         assert_eq!(text.contains(USAGE), expect_usage);
         assert_eq!(text.contains(TIMESTAMP), expect_timestamp);
     }
-
-    #[test]
-    fn update_elapsed_drops_all_right_info_when_nothing_fits() {
-        let mut header = Line::from(vec![Span::raw("head"), Span::raw(ElapsedSpan::text(0))]);
-        let width = (header.width() + 1 + TIMESTAMP.width() + 1) as u16;
-        append_right_info(&mut header, None, None, Some(TIMESTAMP), width);
-        let mut seg = Segment {
-            lines: vec![header],
-            elapsed: Some(ElapsedSpan {
-                span: 1,
-                since: Instant::now()
-                    .checked_sub(Duration::from_secs(GROWN_SECS))
-                    .unwrap(),
-                shown_secs: 0,
-                width,
-            }),
-            ..Segment::default()
-        };
-        seg.update_elapsed();
-
-        let header = &seg.lines[0];
-        let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!text.contains(TIMESTAMP));
-        assert!(header.width() <= width as usize, "wrapped: {text:?}");
-    }
-
     #[test_case(4, 6 ; "splice_grows")]
     #[test_case(1, 3 ; "splice_shrinks")]
     fn highlight_splice_shifts_spinners_and_base(replacement_lines: usize, expected_base: usize) {

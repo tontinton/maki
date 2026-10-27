@@ -2,18 +2,23 @@
 //! The bundled bash plugin moved to the background through the runtime's hook
 //! path: the receipt, the output log, the bounded tail and the timeout option.
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
 
-use maki_agent::tools::test_support::stub_seed;
-use maki_agent::tools::{ToolOutputMode, ToolRegistry};
+use common::{Chat, Gate, WAIT, done_result, isolated_state, poll_until, request_move};
+use maki_agent::agent::tool_dispatch;
+use maki_agent::template::Vars;
+use maki_agent::tools::{
+    CallOrigin, DescriptionContext, ToolAudience, ToolFilter, ToolOutputMode, ToolRegistry,
+};
 use maki_agent::{
     AgentEvent, AgentSeed, CallScope, CancelToken, CancelTrigger, Envelope, EventSender,
-    SessionMailbox, SharedBuf, ToolOutput,
+    SessionMailbox, SharedBuf,
 };
 use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::{EventHandle, MoveOutcome, PluginHost};
@@ -21,38 +26,37 @@ use maki_storage::id::MakiId;
 use maki_storage::paths::{session_task_logs_dir, state_dir};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use test_case::test_case;
 
-const WAIT: Duration = Duration::from_secs(30);
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const GATE_FILE: &str = "go";
-const GATE_POLL_SECS: &str = "0.02";
 const RECEIPT_HEAD: &str = "Running in the background.";
-const PROGRESS_LABEL: &str = "Full output (read it to check progress): ";
-const FINAL_LABEL: &str = "Full output: ";
+const LOG_LABEL: &str = "Full output: ";
+/// The runtime's move note follows the plugin's receipt after a blank line.
+const MOVE_NOTE_SEPARATOR: &str = "\n\n";
 const ROTATED_SUFFIX: &str = ".1";
 const LOG_CAP_BYTES: u64 = 2048;
 const TAIL_LINES: usize = 5;
 const BASH_TOOL: &str = "bash";
 const BATCH_TOOL: &str = "batch";
-const STATE_ENV_VARS: [&str; 2] = ["HOME", "XDG_STATE_HOME"];
+const TASK_TOOL: &str = "task";
+const TASK_STOP_TOOL: &str = "task_stop";
+const BACKGROUND_PARAM: &str = "background";
 /// Long enough for the handler to reach `jobstart` on a loaded CI box.
 const TIMEOUT_SECS: u64 = 5;
-const TIMED_OUT_MARKER: &str = "timed out after 5s";
 /// The last line printed before the gate. The command text is part of the
 /// live buf, so the marker is computed by the shell and never spelled out in it.
 const READY_COMMAND: &str = "echo ready-$((40+2))";
 const READY_LINE: &str = "ready-42";
-
-fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        if let Some(got) = check() {
-            return got;
-        }
-        assert!(Instant::now() < deadline, "{what}");
-        thread::sleep(POLL_INTERVAL);
-    }
-}
+const FAILING_COMMAND: &str = "exit 3";
+const DESCRIPTION: &str = "Check the build";
+const FINISHED_LATE: &str = "finished-late";
+// Mirrors of the runtime's wording.
+const MOVED_AS_ASKED: &str = "Started in the background as asked";
+const EARLIER_IN_LOG: &str = "earlier lines are in the full output log";
+const EARLIER_DROPPED: &str = "earlier lines dropped]";
+const EARLY_LINES: usize = 10;
+const LATE_LINES: usize = 300;
+/// Lines of 49 bytes that cross `LOG_CAP_BYTES` once.
+const PADDED_LINES: usize = 60;
 
 fn builtins_host(opts: &Value) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
@@ -60,36 +64,15 @@ fn builtins_host(opts: &Value) -> (Arc<ToolRegistry>, PluginHost) {
     let mut bash = PluginFileConfig::default();
     bash.opts
         .extend(opts.as_object().expect("opts are an object").clone());
-    let config = PluginsConfig::from_plugins(HashMap::from([("bash".to_owned(), bash)]));
+    let mut task = PluginFileConfig::default();
+    task.opts
+        .insert("allow_background".into(), Value::Bool(true));
+    let config = PluginsConfig::from_plugins(HashMap::from([
+        ("bash".to_owned(), bash),
+        (TASK_TOOL.to_owned(), task),
+    ]));
     host.load_builtins(&config).unwrap();
     (reg, host)
-}
-
-/// Points the state directory at a throwaway tree, so task logs never land in
-/// the user's. Dropping the tree is the cleanup.
-fn isolated_state() -> TempDir {
-    let dir = TempDir::new().unwrap();
-    for var in STATE_ENV_VARS {
-        // SAFETY: setting a variable is only sound while no other thread reads
-        // the environment. Every test runs in its own process under nextest
-        // and calls this before it starts a thread.
-        unsafe { std::env::set_var(var, dir.path()) };
-    }
-    dir
-}
-
-fn gated_command(gate_file: &Path, before: &str, after: &str) -> String {
-    format!(
-        "{before}; while [ ! -e '{}' ]; do sleep {GATE_POLL_SECS}; done; {after}",
-        gate_file.display()
-    )
-}
-
-fn plain_text(output: ToolOutput) -> String {
-    match output {
-        ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
-        other => panic!("unexpected output: {other:?}"),
-    }
 }
 
 /// One bash call in a live chat, executing on its own thread so the test can
@@ -102,7 +85,7 @@ struct Run {
     events: flume::Receiver<Envelope>,
     result: flume::Receiver<Result<String, String>>,
     live: Option<Arc<SharedBuf>>,
-    gate: TempDir,
+    gate: Gate,
     finish: flume::Sender<()>,
     thread: Option<JoinHandle<()>>,
     _seed: Arc<AgentSeed>,
@@ -111,34 +94,34 @@ struct Run {
 }
 
 impl Run {
-    /// Prints `before`, then waits for `release`, then runs `after`.
     fn start(opts: Value, timeout: Option<u64>, before: &str, after: &str) -> Self {
-        let state = isolated_state();
-        let gate = TempDir::new().unwrap();
-        let command = gated_command(&gate.path().join(GATE_FILE), before, after);
-        let mut input = json!({ "command": command });
+        let gate = Gate::closed();
+        let mut input = json!({ "command": gate.command(before, after) });
         if let Some(secs) = timeout {
             input["timeout"] = json!(secs);
         }
-        Self::launch(state, opts, BASH_TOOL, input, gate)
+        Self::launch(opts, BASH_TOOL, input, gate)
     }
 
     /// The same command as the only child of a batch, the way a model runs
     /// bash next to other calls.
     fn start_in_batch(before: &str, after: &str) -> Self {
-        let state = isolated_state();
-        let gate = TempDir::new().unwrap();
-        let command = gated_command(&gate.path().join(GATE_FILE), before, after);
+        let gate = Gate::closed();
+        let command = gate.command(before, after);
         let input = json!({
             "tool_calls": [{ "tool": BASH_TOOL, "parameters": { "command": command } }]
         });
-        Self::launch(state, json!({}), BATCH_TOOL, input, gate)
+        Self::launch(json!({}), BATCH_TOOL, input, gate)
     }
 
-    fn launch(state: TempDir, opts: Value, tool: &str, input: Value, gate: TempDir) -> Self {
-        let session = MakiId::generate();
-        let mailbox = SessionMailbox::register(session);
-        let seed = mailbox.publish_seed(stub_seed(session));
+    /// Isolates the state directory before the call's thread starts.
+    fn launch(opts: Value, tool: &str, input: Value, gate: Gate) -> Self {
+        let state = isolated_state();
+        let Chat {
+            id: session,
+            mailbox,
+            seed,
+        } = Chat::live();
         let call_id = format!("toolu_{}", MakiId::generate());
         let (events_tx, events) = flume::unbounded();
         let (run_trigger, run_token) = CancelToken::new();
@@ -149,6 +132,7 @@ impl Run {
         let tool = tool.to_owned();
         let thread = thread::spawn({
             let seed = Arc::clone(&seed);
+            let mailbox = mailbox.clone();
             let call_id = call_id.clone();
             move || {
                 let (reg, host) = builtins_host(&opts);
@@ -156,8 +140,9 @@ impl Run {
                 let scope = Arc::new(CallScope::new(call_id.clone(), &run_token));
                 let mut ctx = seed.tool_context(scope.cancel().clone());
                 ctx.event_tx = EventSender::new(events_tx, 0);
-                ctx.tool_use_id = Some(call_id);
+                ctx.tool_use_id = Some(call_id.clone());
                 ctx.call = Some(scope);
+                ctx.mailbox = Some(mailbox);
                 ctx.output_mode = ToolOutputMode::Compact;
                 ctx.config.rtk = false;
                 ctx.registry = Arc::clone(&reg);
@@ -166,14 +151,14 @@ impl Run {
                 if !ctx.permissions.is_yolo() {
                     ctx.permissions.toggle_yolo();
                 }
-                let inv = reg
-                    .get(&tool)
-                    .unwrap_or_else(|| panic!("{tool} registered"))
-                    .tool
-                    .parse(&input)
-                    .expect("parse failed");
-                let result = smol::block_on(inv.execute(&ctx)).output.map(plain_text);
-                result_tx.send(result).ok();
+                let done = smol::block_on(tool_dispatch::run(
+                    call_id,
+                    &tool,
+                    &input,
+                    &ctx,
+                    CallOrigin::Model,
+                ));
+                result_tx.send(done_result(&done)).ok();
                 // The final reply is delivered by the host, which has to
                 // outlive the call.
                 finished.recv().ok();
@@ -204,7 +189,7 @@ impl Run {
     }
 
     fn release(&self) {
-        fs::write(self.gate.path().join(GATE_FILE), "").unwrap();
+        self.gate.release();
     }
 
     /// Output shows in the live buf in order, so seeing the last line printed
@@ -225,10 +210,7 @@ impl Run {
     }
 
     fn request_move(&self) -> MoveOutcome {
-        self.handle
-            .request_background(self.call_id.clone())
-            .recv_timeout(WAIT)
-            .expect("the hook answers")
+        request_move(&self.handle, &self.call_id)
     }
 
     fn move_to_background(&self) -> String {
@@ -265,27 +247,7 @@ impl Drop for Run {
 }
 
 fn progress_line(run: &Run) -> String {
-    format!("{PROGRESS_LABEL}{}", run.log_path().display())
-}
-
-#[test]
-fn receipt_has_the_tail_and_the_log_path() {
-    let mut run = Run::start(
-        json!({}),
-        None,
-        &format!("echo one; echo two; {READY_COMMAND}"),
-        "true",
-    );
-    run.wait_for_output(READY_LINE);
-
-    let receipt = run.move_to_background();
-
-    let expected = format!(
-        "{RECEIPT_HEAD} Last 3 lines:\none\ntwo\n{READY_LINE}\n{}",
-        progress_line(&run)
-    );
-    assert!(receipt.contains(&expected), "{receipt}");
-    assert_eq!(run.log(), format!("one\ntwo\n{READY_LINE}\n"));
+    format!("{LOG_LABEL}{}", run.log_path().display())
 }
 
 #[test]
@@ -297,7 +259,18 @@ fn log_keeps_growing_after_the_move_and_the_final_reply_names_it() {
         "echo after-1; echo after-2",
     );
     run.wait_for_output(READY_LINE);
-    run.move_to_background();
+
+    let receipt = run.move_to_background();
+
+    let expected = format!(
+        "{RECEIPT_HEAD} Last 2 lines:\nbefore\n{READY_LINE}\n{}",
+        progress_line(&run)
+    );
+    assert_eq!(
+        receipt.split_once(MOVE_NOTE_SEPARATOR).map(|(own, _)| own),
+        Some(expected.as_str()),
+        "{receipt}"
+    );
     assert_eq!(run.log(), format!("before\n{READY_LINE}\n"));
 
     run.release();
@@ -307,14 +280,31 @@ fn log_keeps_growing_after_the_move_and_the_final_reply_names_it() {
         notice.contains(&format!("before\n{READY_LINE}\nafter-1\nafter-2")),
         "{notice}"
     );
-    assert!(
-        notice.contains(&format!("{FINAL_LABEL}{}", run.log_path().display())),
-        "{notice}"
-    );
+    assert!(notice.contains(&progress_line(&run)), "{notice}");
     assert_eq!(
         run.log(),
         format!("before\n{READY_LINE}\nafter-1\nafter-2\n")
     );
+}
+
+/// The model asked up front, so the receipt answers at once and the command
+/// runs on behind it.
+#[test]
+fn the_background_param_moves_the_command_at_once() {
+    let gate = Gate::closed();
+    let mut input =
+        json!({ "command": gate.command("echo started", &format!("echo {FINISHED_LATE}")) });
+    input[BACKGROUND_PARAM] = json!(true);
+    let run = Run::launch(json!({}), BASH_TOOL, input, gate);
+
+    let receipt = run.reply().expect("a receipt is a success");
+
+    assert!(receipt.starts_with(RECEIPT_HEAD), "{receipt}");
+    assert!(receipt.contains(&progress_line(&run)), "{receipt}");
+    assert!(receipt.contains(MOVED_AS_ASKED), "{receipt}");
+    run.release();
+    let notice = run.final_notice();
+    assert!(notice.contains(FINISHED_LATE), "{notice}");
 }
 
 #[test]
@@ -322,8 +312,8 @@ fn memory_stays_bounded_while_the_log_keeps_everything() {
     let mut run = Run::start(
         json!({ "max_output_lines": TAIL_LINES }),
         None,
-        &format!("for i in $(seq 1 10); do echo early-$i; done; {READY_COMMAND}"),
-        "for i in $(seq 1 300); do echo late-$i; done",
+        &format!("for i in $(seq 1 {EARLY_LINES}); do echo early-$i; done; {READY_COMMAND}"),
+        &format!("for i in $(seq 1 {LATE_LINES}); do echo late-$i; done"),
     );
     run.wait_for_output(READY_LINE);
 
@@ -345,41 +335,110 @@ fn memory_stays_bounded_while_the_log_keeps_everything() {
     for dropped in ["late-295", "late-100", "early-10"] {
         assert!(!notice.contains(dropped), "{dropped} in {notice}");
     }
-    let marker = format!(
-        "[{} earlier lines are in the full output log]",
-        311 - TAIL_LINES
-    );
+    let total_lines = EARLY_LINES + 1 + LATE_LINES;
+    let marker = format!("[{} {EARLIER_IN_LOG}]", total_lines - TAIL_LINES);
     assert!(notice.contains(&marker), "{notice}");
     let log = run.log();
-    assert_eq!(log.lines().count(), 311);
+    assert_eq!(log.lines().count(), total_lines);
     assert!(log.starts_with("early-1\n") && log.ends_with("late-300\n"));
 }
 
+/// The reply's note on the lines its tail dropped points at both files,
+/// since the oldest of them may already be gone with an earlier rotation.
 #[test]
-fn log_rotates_at_the_cap() {
+fn log_rotates_at_the_cap_and_the_reply_names_the_rotated_copy() {
     let mut run = Run::start(
-        json!({ "background_log_bytes": LOG_CAP_BYTES }),
+        json!({ "background_log_bytes": LOG_CAP_BYTES, "max_output_lines": TAIL_LINES }),
         None,
         &format!("echo start; {READY_COMMAND}"),
-        "for i in $(seq 1 60); do printf '%048d\\n' $i; done",
+        &format!("for i in $(seq 1 {PADDED_LINES}); do printf '%048d\\n' $i; done"),
     );
     run.wait_for_output(READY_LINE);
     run.move_to_background();
     run.release();
-    run.final_notice();
+    let notice = run.final_notice();
 
     let expected: String = ["start".to_owned(), READY_LINE.to_owned()]
         .into_iter()
-        .chain((1..=60).map(|i| format!("{i:048}")))
+        .chain((1..=PADDED_LINES).map(|i| format!("{i:048}")))
         .map(|line| line + "\n")
         .collect();
-    let rotated = PathBuf::from(format!("{}{ROTATED_SUFFIX}", run.log_path().display()));
     assert!(
         expected.len() as u64 > LOG_CAP_BYTES && (expected.len() as u64) < 2 * LOG_CAP_BYTES,
         "the output must cross the cap exactly once"
     );
+    let rotated = format!("{}{ROTATED_SUFFIX}", run.log_path().display());
     assert_eq!(fs::read_to_string(&rotated).unwrap() + &run.log(), expected);
     assert!((run.log().len() as u64) < LOG_CAP_BYTES);
+    let marker = format!("{EARLIER_IN_LOG} or {rotated}; the oldest may be gone]");
+    assert!(notice.contains(&marker), "{notice}");
+}
+
+#[test]
+fn a_log_that_stopped_taking_writes_does_not_claim_to_hold_the_earlier_lines() {
+    let mut run = Run::start(
+        json!({ "max_output_lines": TAIL_LINES }),
+        None,
+        READY_COMMAND,
+        "for i in $(seq 1 30); do echo late-$i; done",
+    );
+    run.wait_for_output(READY_LINE);
+    run.move_to_background();
+    let log_path = run.log_path();
+    fs::remove_file(&log_path).unwrap();
+    fs::create_dir(&log_path).unwrap();
+    run.release();
+    let notice = run.final_notice();
+
+    assert!(notice.contains(EARLIER_DROPPED), "{notice}");
+    assert!(!notice.contains(EARLIER_IN_LOG), "{notice}");
+}
+
+fn offered_tools(audience: ToolAudience, background: bool) -> Value {
+    let (reg, _host) = builtins_host(&json!({}));
+    let ctx = DescriptionContext {
+        filter: &ToolFilter::All,
+        audience,
+        workflow: false,
+        mcp: false,
+    };
+    reg.definitions_with_background(&Vars::new(), &ctx, false, background)
+}
+
+fn tool_def<'a>(defs: &'a Value, name: &str) -> Option<&'a Value> {
+    defs.as_array()?.iter().find(|def| def["name"] == name)
+}
+
+#[test_case(ToolAudience::MAIN, true, true, true, true ; "main_with_background_on")]
+#[test_case(ToolAudience::MAIN, false, false, false, true ; "main_with_background_off")]
+#[test_case(ToolAudience::GENERAL_SUB, true, false, false, false ; "subagent_with_background_on")]
+fn the_background_param_and_task_stop_are_offered_by_audience_and_mode(
+    audience: ToolAudience,
+    background: bool,
+    offers_param: bool,
+    offers_task_stop: bool,
+    offers_task: bool,
+) {
+    let defs = offered_tools(audience, background);
+
+    let bash = tool_def(&defs, BASH_TOOL).expect("bash is offered to every audience");
+    assert!(bash["input_schema"]["properties"]["command"].is_object());
+    let task = tool_def(&defs, TASK_TOOL);
+    assert_eq!(task.is_some(), offers_task, "{defs}");
+    for tool in [Some(bash), task].into_iter().flatten() {
+        assert_eq!(
+            tool["input_schema"]["properties"]
+                .get(BACKGROUND_PARAM)
+                .is_some(),
+            offers_param,
+            "{tool}"
+        );
+    }
+    assert_eq!(
+        tool_def(&defs, TASK_STOP_TOOL).is_some(),
+        offers_task_stop,
+        "{defs}"
+    );
 }
 
 /// A bash inside a moved batch never runs its own hook, so it switches to the
@@ -400,7 +459,7 @@ fn a_bash_in_a_moved_batch_logs_the_output_it_prints_after_the_move() {
 
     let logs = session_task_logs_dir(&state_dir().unwrap(), run.session);
     let log_path = notice
-        .split_once(FINAL_LABEL)
+        .split_once(LOG_LABEL)
         .and_then(|(_, rest)| rest.lines().next())
         .unwrap_or_else(|| panic!("no log path in {notice}"));
     assert!(Path::new(log_path).starts_with(&logs), "{log_path}");
@@ -417,7 +476,10 @@ fn a_timeout_kills_the_command_by_default() {
 
     let err = run.reply().expect_err("a timeout is an error reply");
 
-    assert!(err.contains(TIMED_OUT_MARKER), "{err}");
+    assert!(
+        err.contains(&format!("timed out after {TIMEOUT_SECS}s")),
+        "{err}"
+    );
     assert!(!run.log_path().exists());
 }
 
@@ -427,7 +489,7 @@ fn a_timeout_moves_the_command_when_background_on_timeout_is_set() {
         json!({ "background_on_timeout": true }),
         Some(TIMEOUT_SECS),
         "echo started",
-        "echo finished-late",
+        &format!("echo {FINISHED_LATE}"),
     );
 
     let receipt = run.reply().expect("the move is a success");
@@ -435,6 +497,48 @@ fn a_timeout_moves_the_command_when_background_on_timeout_is_set() {
 
     run.release();
     let notice = run.final_notice();
-    assert!(notice.contains("finished-late"), "{notice}");
-    assert_eq!(run.log(), "started\nfinished-late\n");
+    assert!(notice.contains(FINISHED_LATE), "{notice}");
+    assert_eq!(run.log(), format!("started\n{FINISHED_LATE}\n"));
+}
+
+/// The timeout sits beside the header as an annotation, so the summary that
+/// names the call in `/tasks`, a rewind and a background notice is the label
+/// alone.
+#[test]
+fn the_timeout_annotates_the_header_and_stays_out_of_the_summary() {
+    let input = json!({ "command": "true", "description": DESCRIPTION, "timeout": TIMEOUT_SECS });
+    let run = Run::launch(json!({}), BASH_TOOL, input, Gate::closed());
+
+    let start = poll_until("bash never started", || {
+        run.events.try_iter().find_map(|env| match env.event {
+            AgentEvent::ToolStart(start) => Some(start),
+            _ => None,
+        })
+    });
+
+    assert_eq!(start.summary, DESCRIPTION);
+    assert_eq!(start.annotation, Some(format!("{TIMEOUT_SECS}s timeout")));
+}
+
+/// The UI repeats an error reply under a view that lacks the reply's last
+/// line, so the view of a moved command must end on the log line its final
+/// reply ends on, or a stopped or failed command shows its output twice.
+#[test_case(false ; "failed")]
+#[test_case(true ; "stopped")]
+fn the_view_ends_on_the_line_the_final_reply_ends_on(stop: bool) {
+    let mut run = Run::start(json!({}), None, READY_COMMAND, FAILING_COMMAND);
+    run.wait_for_output(READY_LINE);
+    run.move_to_background();
+
+    if stop {
+        run.handle.cancel_plugin_session(&run.call_id);
+    } else {
+        run.release();
+    }
+    let notice = run.final_notice();
+
+    let log_line = progress_line(&run);
+    assert_eq!(notice.lines().last(), Some(log_line.as_str()), "{notice}");
+    let view = run.live.as_ref().expect("the live buf").take().text();
+    assert_eq!(view.lines().last(), Some(log_line.as_str()), "{view}");
 }

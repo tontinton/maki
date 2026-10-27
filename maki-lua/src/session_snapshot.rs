@@ -159,6 +159,10 @@ impl HeadlessSnapshot {
         // an ending means the agent is busy. Sdk mode runs many turns and no
         // driver has to remember to clear a flag between them.
         totals.working = !matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. });
+        // Each run ending carries that run's whole bill, subagents and
+        // compaction included, so summing them lands on the exact session
+        // total. A failed run paid for its rounds too. Summing `TurnComplete`
+        // would miss compaction.
         match event {
             AgentEvent::Done {
                 usage,
@@ -167,13 +171,14 @@ impl HeadlessSnapshot {
                 context_window,
                 ..
             } => {
-                // Each turn's `Done` carries that turn's whole bill, subagents
-                // and compaction included, so summing them lands on the exact
-                // session total. Summing `TurnComplete` would miss compaction.
                 totals.usage += *usage;
                 add_cost(&mut totals.cost, *cost);
                 totals.context_size = *context_size;
                 totals.context_window = *context_window;
+            }
+            AgentEvent::Error { totals: run, .. } => {
+                totals.usage += run.usage;
+                add_cost(&mut totals.cost, run.cost);
             }
             AgentEvent::TurnComplete(turn) if envelope.subagent.is_none() => {
                 totals.context_size = turn.context_size.unwrap_or(totals.context_size);
@@ -233,7 +238,7 @@ impl HeadlessSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::{DoneReason, TurnCompleteEvent};
+    use maki_agent::{DoneReason, RunTotals, TurnCompleteEvent};
     use maki_providers::Message;
 
     use super::*;
@@ -307,5 +312,30 @@ mod tests {
         );
         assert_eq!(totals.cost, Some(TURN_COST * 2.0), "{GROWS_MSG}");
         assert_eq!(totals.context_size, SECOND_TURN_INPUT);
+    }
+
+    #[test]
+    fn failed_run_bill_joins_the_session_totals() {
+        let snapshot = HeadlessSnapshot::default();
+        snapshot.observe(&done(FIRST_TURN_INPUT));
+
+        snapshot.observe(&envelope(AgentEvent::Error {
+            message: String::new(),
+            auth: false,
+            totals: RunTotals {
+                usage: TokenUsage {
+                    input: SECOND_TURN_INPUT,
+                    ..Default::default()
+                },
+                cost: Some(TURN_COST),
+                list_cost: None,
+            },
+        }));
+
+        let totals = lock(&snapshot.0);
+        assert!(!totals.working);
+        assert_eq!(totals.usage.input, FIRST_TURN_INPUT + SECOND_TURN_INPUT);
+        assert_eq!(totals.cost, Some(TURN_COST * 2.0));
+        assert_eq!(totals.context_size, FIRST_TURN_INPUT);
     }
 }

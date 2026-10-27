@@ -38,9 +38,10 @@ pub struct SessionStub {
 pub struct CallScope {
     id: String,
     run: CancelToken,
-    /// Fires with the run, or once moved with the call's own token, which
-    /// only a stop or the moved call's end fires. Not when the call returns:
-    /// what it leaves running past its reply, like a highlight, lives on this.
+    /// Fires with the run. After a move it fires with the call's own token
+    /// instead, which only a stop or the end of the moved work fires. It does
+    /// not fire when the call returns, because what the call leaves running
+    /// past its reply, like a highlight, lives on this token.
     owner: CancelToken,
     cancel: CancelToken,
     trigger: Mutex<Option<CancelTrigger>>,
@@ -87,7 +88,6 @@ impl CallScope {
         self.moved.listen()
     }
 
-    /// Resolves once the call has moved.
     pub async fn moved(&self) {
         let listener = self.moved_listener();
         if self.home().is_none() {
@@ -95,22 +95,28 @@ impl CallScope {
         }
     }
 
-    /// Detaches the subtree from the run token and hands its trigger to the
-    /// caller, who now decides when the work ends.
+    /// Takes the gate of a move, detaches the subtree from the run token and
+    /// hands the call's trigger to the caller, who now decides when the work
+    /// ends. Detached here rather than at the landing, so the run ending as
+    /// the receipt reaches it finds nothing left to cancel.
     ///
     /// Taking the trigger is the one gate: a second move, or a move after the
     /// call ended and its guard fired, finds it gone. A run token that already
     /// fired has cancelled the call token by the time this returns.
-    pub fn move_to(&self, home: TaskHome) -> Result<CancelTrigger, AlreadyMoved> {
+    pub fn claim_move(&self) -> Result<(MoveClaim<'_>, CancelTrigger), AlreadyMoved> {
         let trigger = self.take_trigger().ok_or(AlreadyMoved)?;
         // In this order a run firing midway reaches the owner either way:
         // directly, or through the call token it now follows.
         self.cancel.adopt(&self.owner);
         self.owner.unlink(&self.run);
         self.cancel.unlink(&self.run);
-        // Only the holder of the trigger sets the home, so this cannot fail.
-        let _ = self.home.set(home);
-        self.moved.notify(usize::MAX);
+        Ok((MoveClaim(self), trigger))
+    }
+
+    /// A move with nothing to do between the claim and the landing.
+    pub fn move_to(&self, home: TaskHome) -> Result<CancelTrigger, AlreadyMoved> {
+        let (claim, trigger) = self.claim_move()?;
+        claim.land(home);
         Ok(trigger)
     }
 
@@ -156,6 +162,21 @@ impl CallScope {
     }
 }
 
+/// A move holding the gate that has not landed: the call reads as unmoved.
+/// Its holder does every step that can fail first and lands last, so a move
+/// that gives up never shows as moved. Giving up drops the trigger too, which
+/// ends the call as cancelled.
+#[must_use]
+pub struct MoveClaim<'a>(&'a CallScope);
+
+impl MoveClaim<'_> {
+    pub fn land(self, home: TaskHome) {
+        // Only the holder of the trigger sets the home, so this cannot fail.
+        let _ = self.0.home.set(home);
+        self.0.moved.notify(usize::MAX);
+    }
+}
+
 /// Fires the call's trigger when the call ends, unless a move took it first.
 pub struct CallGuard(Arc<CallScope>);
 
@@ -173,6 +194,9 @@ impl Drop for CallGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::pin;
+
+    use futures_lite::future::poll_once;
     use test_case::test_case;
 
     use super::*;
@@ -196,39 +220,41 @@ mod tests {
     }
 
     #[test]
-    fn the_guard_cancels_the_call_when_it_ends() {
-        let (_run_trigger, run) = CancelToken::new();
+    fn a_moved_call_ends_with_its_trigger_alone() {
+        let (run_trigger, run) = CancelToken::new();
         let (scope, guard) = scope_under(&run);
-        assert!(!scope.cancel().is_cancelled());
-
-        drop(guard);
-        assert!(scope.cancel().is_cancelled());
-        assert!(!run.is_cancelled());
-    }
-
-    #[test]
-    fn a_move_takes_the_trigger_so_the_guard_does_nothing() {
-        let (_run_trigger, run) = CancelToken::new();
-        let (scope, guard) = scope_under(&run);
+        let (_nested_trigger, nested) = scope.cancel().child();
         let trigger = scope.move_to(home(MakiId::generate())).unwrap();
 
         drop(guard);
-        assert!(!scope.cancel().is_cancelled());
+        run_trigger.cancel();
+        for token in [scope.cancel(), &nested, scope.owner()] {
+            assert!(
+                !token.is_cancelled(),
+                "the call's end or the run's reached it"
+            );
+        }
 
         drop(trigger);
-        assert!(scope.cancel().is_cancelled());
+        for token in [scope.cancel(), &nested, scope.owner()] {
+            assert!(token.is_cancelled());
+        }
     }
 
     #[test]
-    fn the_run_ending_after_a_move_reaches_nothing_in_the_subtree() {
+    fn a_claim_that_never_lands_leaves_the_call_unmoved_and_its_end_to_the_trigger() {
         let (run_trigger, run) = CancelToken::new();
-        let (scope, _guard) = scope_under(&run);
-        let (_nested_trigger, nested) = scope.cancel().child();
-        let _trigger = scope.move_to(home(MakiId::generate())).unwrap();
+        let (scope, guard) = scope_under(&run);
+        let (claim, trigger) = scope.claim_move().unwrap();
+        drop(claim);
 
+        assert!(scope.home().is_none());
+        assert!(matches!(scope.claim_move(), Err(AlreadyMoved)));
+        drop(guard);
         run_trigger.cancel();
         assert!(!scope.cancel().is_cancelled());
-        assert!(!nested.is_cancelled());
+        drop(trigger);
+        assert!(scope.cancel().is_cancelled());
     }
 
     #[test]
@@ -240,26 +266,6 @@ mod tests {
         assert!(!scope.owner().is_cancelled());
         run_trigger.cancel();
         assert!(scope.owner().is_cancelled());
-    }
-
-    #[test]
-    fn a_moved_owner_ends_with_the_task_not_the_run() {
-        let (run_trigger, run) = CancelToken::new();
-        let (scope, _guard) = scope_under(&run);
-        let trigger = scope.move_to(home(MakiId::generate())).unwrap();
-
-        run_trigger.cancel();
-        assert!(!scope.owner().is_cancelled());
-        drop(trigger);
-        assert!(scope.owner().is_cancelled());
-    }
-
-    #[test]
-    fn the_run_ending_before_a_move_cancels_the_call() {
-        let (run_trigger, run) = CancelToken::new();
-        let (scope, _guard) = scope_under(&run);
-        run_trigger.cancel();
-        assert!(scope.cancel().is_cancelled());
     }
 
     enum Before {
@@ -286,27 +292,17 @@ mod tests {
     }
 
     #[test]
-    fn the_moved_listener_wakes_on_the_move() {
-        let (_run_trigger, run) = CancelToken::new();
-        let (scope, _guard) = scope_under(&run);
-        let listener = scope.moved_listener();
-        assert!(scope.home().is_none());
-
-        let chat = MakiId::generate();
-        let _trigger = scope.move_to(home(chat)).unwrap();
-        smol::block_on(listener);
-        assert_eq!(scope.home(), Some(&home(chat)));
-    }
-
-    #[test]
-    fn background_for_a_call_reads_the_chat_it_moved_to() {
+    fn a_move_wakes_its_waiters_and_names_the_chat() {
         let (_run_trigger, run) = CancelToken::new();
         let (scope, _guard) = scope_under(&run);
         let background_for = BackgroundFor::Call(Arc::clone(&scope));
+        let mut moved = pin!(scope.moved());
+        assert!(smol::block_on(poll_once(&mut moved)).is_none());
         assert_eq!(background_for.chat(), None);
 
         let chat = MakiId::generate();
         let _trigger = scope.move_to(home(chat)).unwrap();
+        assert!(smol::block_on(poll_once(&mut moved)).is_some());
         assert_eq!(background_for.chat(), Some(chat));
     }
 }

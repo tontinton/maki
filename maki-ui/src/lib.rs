@@ -43,6 +43,7 @@ mod terminal_image;
 use std::time::Instant;
 
 use color_eyre::Result;
+use maki_agent::SessionMailbox;
 use maki_agent::session::{StoreError, save_new};
 use maki_lua::PackPlan;
 use maki_storage::StateDir;
@@ -101,7 +102,8 @@ pub use event_loop::EventLoopParams;
 
 /// How a UI generation ended. On `Reload`, each tab carries its in-memory
 /// session so the caller reopens everything without re-reading from disk, and
-/// its claim, so no other process can take the session while the UI rebuilds.
+/// its claim, so no other process can take the session while the UI rebuilds,
+/// and their mailboxes, which go back in as `EventLoopParams::handed_over`.
 pub enum RunOutcome {
     Exit {
         session_id: Option<MakiId>,
@@ -111,6 +113,7 @@ pub enum RunOutcome {
         tabs: Vec<OpenSession>,
         focused: usize,
         pack: Option<PackPlan>,
+        mailboxes: Vec<SessionMailbox>,
     },
 }
 
@@ -129,6 +132,7 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         tabs,
         focused,
         unsaved,
+        mailboxes,
     } = report;
     for id in unsaved {
         eprintln!("{SAVE_FAILED}{id}");
@@ -138,11 +142,13 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
             tabs,
             focused,
             pack: None,
+            mailboxes,
         },
         components::ExitRequest::Pack(request) => RunOutcome::Reload {
             tabs,
             focused,
             pack: Some(request),
+            mailboxes,
         },
         exit => {
             let session_id = tabs

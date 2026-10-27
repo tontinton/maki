@@ -7,6 +7,8 @@ local ListPicker = require("maki.list_picker")
 
 local RUNNING_SECTION = "Running"
 local FINISHED_SECTION = "Finished"
+local COST_FMT = "$%.3f"
+local TRAILER_SEP = " · "
 
 local M = {}
 
@@ -55,6 +57,38 @@ end
 -- the final say. This check only decides which rows ask "are you sure".
 function M.deletable(task)
   return task.status ~= nil and not alive(task.status)
+end
+
+-- The dim text at a row's right edge: how long the task has run (its total
+-- once finished), what it cost, and the plugin that owns it. A row with less
+-- than {room} columns to spare keeps only the owner. {humantime} formats
+-- seconds, passed in so this file stays free of host calls.
+function M.trailer(task, now, room, humantime)
+  local owner = task.plugin and (task.plugin .. " ") or ""
+  local parts = {}
+  local until_at = alive(task.status) and now or task.ended_at
+  if task.started_at and until_at then
+    parts[#parts + 1] = humantime(math.max(until_at - task.started_at, 0))
+  end
+  if task.cost then
+    parts[#parts + 1] = COST_FMT:format(task.cost)
+  end
+  if #parts == 0 then
+    return owner
+  end
+  parts[#parts + 1] = task.plugin
+  local full = table.concat(parts, TRAILER_SEP) .. " "
+  return (utf8.len(full) or #full) < room and full or owner
+end
+
+-- Whether a row's running time still ticks.
+function M.has_clock(tasks)
+  for _, task in ipairs(tasks) do
+    if task.started_at and alive(task.status) then
+      return true
+    end
+  end
+  return false
 end
 
 -- Position of {id} among {rows}, or nil. The selection is kept as an id and

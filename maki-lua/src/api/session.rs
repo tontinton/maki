@@ -315,6 +315,8 @@ fn message_table(lua: &Lua, message: &Message) -> LuaResult<Value> {
         content: Vec::new(),
         display_text: message.display_text.clone(),
         kind: message.kind.clone(),
+        receipts: message.receipts.clone(),
+        settles: message.settles.clone(),
     };
     let json = serde_json::to_value(&envelope).map_err(mlua::Error::external)?;
     let table = lua.unpack::<Table>(json_to_lua_exact(lua, &json)?)?;
@@ -404,7 +406,7 @@ async fn export(
 /// Each message has the same shape as in the session file:
 ///
 /// ```text
-/// { role = "user" | "assistant", kind, facts?, display_text?, content = { blocks } }
+/// { role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, content = { blocks } }
 /// ```
 ///
 /// `kind` is `"turn"` for something the user or the model said,
@@ -413,7 +415,10 @@ async fn export(
 /// system prompt was built (date, model, plan mode, ...), which carries the
 /// changed `facts`. `display_text` is what the UI shows instead of the
 /// content: nil shows the content, `""` hides the message (a nudge, a
-/// compaction note). `content` lists blocks:
+/// compaction note). `receipts` lists the calls whose results in this
+/// message moved to the background, and `settles` = `{ task, end }` marks the
+/// notice that answered one, with `end` one of `"finished"`, `"failed"`,
+/// `"cancelled"` or `"lost"`. `content` lists blocks:
 ///
 /// ```text
 /// { type = "text", text }

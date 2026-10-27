@@ -518,10 +518,10 @@ function Batch:run_child(c, ctx)
 end
 
 -- The children a reply still owes the model. Before a move that is all of
--- them; after one, only those the receipt did not already carry. A receipt
+-- them. After one, only those the receipt did not already carry. A receipt
 -- the runtime refused after the hook built it never reached the model.
 function Batch:unreported()
-  local moved = self.ctx and self.ctx:backgrounded()
+  local moved = self.ctx:backgrounded()
   local out = {}
   for _, c in ipairs(self.children) do
     if not (moved and c.reported) then
@@ -657,12 +657,13 @@ local function handler(input, ctx)
   batch.ctx = ctx
   ctx:live_buf(batch.buf)
   -- Registered up front, so a press that cannot move the batch is answered
-  -- with the blocking child's name; `sync_movable` hides the hint meanwhile.
-  -- Only a model's call can register; a nested batch simply never moves.
+  -- with the blocking child's name, while `sync_movable` hides the hint.
+  -- Only a model's call can register. A nested batch simply never moves.
+  -- Registering shows the hint, and no child is running yet to back it.
   batch.hooked = ctx:on_background(function()
     return batch:hand_over()
   end) == true
-  batch.shown_movable = batch.hooked or nil
+  batch.shown_movable = batch.hooked
   batch:sync_movable()
   batch:run(ctx)
 

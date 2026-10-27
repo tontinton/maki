@@ -412,9 +412,7 @@ Declare global packages after the global `init.lua` finishes.
 
 - `{specs}` (`table`) Sources or tables with `src`, `name`, `version`, and `data`.
 - `{opts?}` (`table?`) `confirm` controls source confirmation. `load` is a
-
   boolean or a custom loader function.
-
 
 **Example:**
 
@@ -509,6 +507,7 @@ only in compact mode.
   - `permission` (`string`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
   - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
+  - `needs_background` (`boolean`) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
 
 **Example:**
 
@@ -1847,6 +1846,11 @@ The returned table has fields: `text` (string), `duration_ms` (integer),
 string when the subagent produced no text block (e.g. it only called
 tools).
 
+A tool call the user moves to the background (Ctrl+B in the session's tab)
+keeps the prompt waiting. When the call finishes, the subagent gets its
+result and runs another turn, and `text` is that last turn's. Closing the
+session, or the end of the task that opened it, stops such calls.
+
 **Parameters:**
 
 - `{message}` (`string`) User message to send.
@@ -2209,7 +2213,8 @@ it to paint the cancelled state: a handler waiting on children
 (`gather`, `call_tool`) stays parked until they wind down, so anything
 after the wait is too late to reach the screen.
 
-The callback receives the reason (`"cancelled"` or `"timeout"`) and may
+The callback receives the reason (`"cancelled"`, `"timeout"`, or
+`"stopped"` when the model's `task_stop` ended a background task) and may
 still call `ctx:finish`; the host prefers that reply over the generic
 cancelled/timeout error. Mark it `is_error = true` and end it with a
 marker, so the model knows the output it gets is cut short.
@@ -2262,6 +2267,28 @@ local sem = maki.async.semaphore(3)
 local permit = sem:acquire()
 -- do work that needs the slot
 permit:release()
+```
+
+---
+
+### `Semaphore:try_acquire()` {#Semaphore-try_acquire}
+
+```lua
+Semaphore:try_acquire()
+```
+
+Take a permit only if a slot is free right now, without waiting.
+
+**Returns:** ([`maki.async.Permit|nil`](#maki-async-Permit)) A permit handle, or nil when every slot is taken.
+
+**Example:**
+
+```lua
+local permit = sem:try_acquire()
+if not permit then
+  print("waiting for a free slot")
+  permit = sem:acquire()
+end
 ```
 
 
@@ -2494,9 +2521,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{cmd}` (`string|table`) Shell command, or an argv table like
-
   `{ "tail", "-F", path }`.
-
 - `{opts?}` (`table?`) Optional settings:
   - `cwd` (`string?`) working directory (tilde is expanded).
   - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
@@ -5206,7 +5231,7 @@ been sent so far, tool calls and results included. Read only.
 Each message has the same shape as in the session file:
 
 ```text
-{ role = "user" | "assistant", kind, facts?, display_text?, content = { blocks } }
+{ role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, content = { blocks } }
 ```
 
 `kind` is `"turn"` for something the user or the model said,
@@ -5215,7 +5240,10 @@ Each message has the same shape as in the session file:
 system prompt was built (date, model, plan mode, ...), which carries the
 changed `facts`. `display_text` is what the UI shows instead of the
 content: nil shows the content, `""` hides the message (a nudge, a
-compaction note). `content` lists blocks:
+compaction note). `receipts` lists the calls whose results in this
+message moved to the background, and `settles` = `{ task, end }` marks the
+notice that answered one, with `end` one of `"finished"`, `"failed"`,
+`"cancelled"` or `"lost"`. `content` lists blocks:
 
 ```text
 { type = "text", text }
@@ -5399,9 +5427,7 @@ Requires the `agent` and `session_write` [plugin permissions](#plugin-permission
 
 - `{text}` (`string`) The prompt to send. Must not be blank.
 - `{opts?}` (`table?`) Optional fields: session (string) id of a live
-
   session; defaults to the focused one.
-
 
 **Returns:** (`string|nil`, `string|nil`) "started" or "queued", or nil and an error.
 
@@ -5547,10 +5573,14 @@ tool spawned has its tool call's id, one a plugin opened with
 [maki.agent.session](#maki-agent-session) has its session id and a
 `plugin` field.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, focused, status?, plugin?}`
-  where `status` is `"working"`, `"idle"` (a plugin task between prompts),
-  `"done"`, or `"error"`, and `session` is the chat session that `stop()`
-  asks for. Or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, focused, status?, plugin?,
+  started_at?, ended_at?, cost?}` where `status` is `"working"`, `"idle"` (a
+  plugin task between prompts), `"done"`, or `"error"`, and `session` is the
+  chat session that `stop()` asks for. `started_at` and `ended_at` are Unix
+  seconds: when the task started, or moved to the background, and when it
+  finished. A task loaded from disk has neither. `cost` is what a subagent
+  billed so far, in dollars. The main chat has none of the three. Or nil and
+  an error.
 
 **Example:**
 
@@ -5625,31 +5655,23 @@ or a key they pressed. Tools, hooks, autocmds, `maki.async` tasks, and
 commands run through `maki.api.run_command` get an error instead, or any
 plugin could stop work that is not its own.
 
-Called as `stop(ctx, id)` from a tool handler, it is the model's stop
-instead: it stops a background task of the calling chat (a moved command
-or subagent), since a tool call is a turn the user started. It waits up to
-5 seconds for the task's final reply and returns it, and then the chat gets
-no notice of its end. If the reply is late it returns `"stop requested"`,
-and the result still reaches the chat later as a quiet notice. An id of
-another chat, a finished task or an unknown id returns an error naming the
-chat's running task ids.
+From a tool handler, `stop(ctx, id)` is the model's stop. It stops a
+background task (a command or subagent) that the calling agent moved,
+which is allowed because the tool call belongs to a turn the user started.
+It waits up to 5 seconds for the final reply and returns it, and the agent
+gets no notice of the end. A late reply returns `"stop requested"`, and the
+result reaches the agent later as a quiet notice. A task another agent
+moved, a finished task or an unknown id returns an error that names the
+agent's running task ids.
 
 **Parameters:**
 
 - `{id}` (`string|LuaCtx`) Task id, as returned by `list()`. Or the handler's
-
   ctx, for the model's stop.
-
 - `{opts}` (`table|string`) `session` (string), the chat session of the
-
   `list()` row. If the user switched sessions since, this returns an error
-
-
   rather than stopping a task with the same id in the other session. With a
-
-
   ctx: the background task id.
-
 
 **Returns:** (`boolean|string|nil`, `string|nil`) true on success (with a ctx: the
   final reply or `"stop requested"`), or nil and an error.
@@ -8659,7 +8681,7 @@ function M.cut_middle(text, max_lines, max_bytes)
 --- Close {view} on the marker and build the tool reply. {out} is everything
 --- the tool streamed, already truncated; empty means the view still shows a
 --- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
---- "timeout"). {started_at} is the `os.time()` the tool began at.
+--- "timeout" | "stopped"). {started_at} is the `os.time()` the tool began at.
 function M.cut(view, out, reason, timeout_secs, started_at)
 ```
 

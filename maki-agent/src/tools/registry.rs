@@ -14,7 +14,7 @@ use maki_config::Permission;
 use serde_json::{Value, json};
 
 use crate::template::Vars;
-use crate::{BufferSnapshot, ToolOutput};
+use crate::{BufferSnapshot, ToolDoneEvent, ToolOutput};
 
 use super::hook::ToolHook;
 use super::schema::sanitize_tool_input_schema;
@@ -98,8 +98,27 @@ pub struct ToolExecResult {
     pub output: Result<ToolOutput, String>,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
-    /// `output` is a receipt: the call moved and finishes in the background.
-    pub backgrounded: bool,
+    /// Set when `output` is a receipt: the call moved and finishes in the
+    /// background.
+    pub moved: Option<MovedCall>,
+}
+
+/// Settles a moved call with its filtered final reply, `None` when there is
+/// none to give.
+pub type MovedLand = Box<dyn FnOnce(Option<ToolDoneEvent>) + Send>;
+
+/// The rest of a call that moved to the background. Dispatch runs the receipt
+/// and then `result` through the output pipeline every call's output takes,
+/// and hands the result to `land`, so no output of a moved call reaches the
+/// model unfiltered.
+pub struct MovedCall {
+    /// `None` when the work ended without a reply.
+    pub result: BoxFuture<'static, Option<ToolExecResult>>,
+    /// Dropped uncalled exactly when the receipt was never published to the
+    /// model: the call never moved as far as anyone was told. Once published,
+    /// it is called exactly once, with `None` when the work or the pipeline
+    /// died, so the model hears what became of the call.
+    pub land: MovedLand,
 }
 
 impl From<Result<ToolOutput, String>> for ToolExecResult {
@@ -108,7 +127,7 @@ impl From<Result<ToolOutput, String>> for ToolExecResult {
             output,
             annotation: None,
             written_path: None,
-            backgrounded: false,
+            moved: None,
         }
     }
 }
@@ -239,6 +258,14 @@ pub trait Tool: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str>;
     fn schema(&self) -> Value;
+    /// The schema the model is shown, or `None` to leave the tool out of its
+    /// array. `background` is whether the model can move a call to the
+    /// background itself. A tool that offers a parameter only for that
+    /// narrows it here, so the decision is made when the array is built and
+    /// the array never changes after.
+    fn offered_schema(&self, _background: bool) -> Option<Value> {
+        Some(self.schema())
+    }
     fn examples(&self) -> Option<Value> {
         None
     }
@@ -504,6 +531,20 @@ impl ToolRegistry {
         ctx: &DescriptionContext,
         supports_examples: bool,
     ) -> Value {
+        self.definitions_with_background(vars, ctx, supports_examples, true)
+    }
+
+    /// `background` is whether the session can move calls to the background.
+    /// Only the main agent ever moves one itself, so every other audience is
+    /// built as if it were off.
+    pub fn definitions_with_background(
+        &self,
+        vars: &Vars,
+        ctx: &DescriptionContext,
+        supports_examples: bool,
+        background: bool,
+    ) -> Value {
+        let background = background && ctx.audience.contains(ToolAudience::MAIN);
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
@@ -513,11 +554,14 @@ impl ToolRegistry {
             if !ctx.filter.matches(entry.name()) {
                 continue;
             }
+            let Some(schema) = entry.tool.offered_schema(background) else {
+                continue;
+            };
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();
             let mut def = json!({
                 "name": entry.name(),
                 "description": description,
-                "input_schema": sanitize_tool_input_schema(entry.tool.schema()),
+                "input_schema": sanitize_tool_input_schema(schema),
             });
             if let Some(examples) = entry.tool.examples() {
                 if supports_examples {

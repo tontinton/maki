@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedPrompts;
-use maki_agent::{AgentConfig, SessionEndReason};
+use maki_agent::{AgentConfig, CancelToken, SessionEndReason};
 use maki_config::project::TrustMode;
 use maki_config::{ModelPolicy, SessionDefaults, TrustConfig};
 use maki_providers::Timeouts;
@@ -43,6 +43,13 @@ pub struct AcpParams {
     /// instead of holding stdin for the whole `SessionEnd` grace period.
     pub on_session_end: Option<SessionEndHook>,
     pub storage: StateDir,
+    /// `false` keeps every tool call blocking. Otherwise calls can move to the
+    /// background and their results ride the next prompt. The server is long
+    /// lived, so it never waits for them: closing the session stops them.
+    pub background: bool,
+    /// Firing it shuts the server down as end of input does, without waiting
+    /// for the client to close stdin.
+    pub stop: CancelToken,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {

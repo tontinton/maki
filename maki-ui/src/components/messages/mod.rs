@@ -341,11 +341,7 @@ impl MessagesPanel {
         if event.backgrounded {
             msg.render_snapshot = None;
             if msg.background.is_none() {
-                msg.background = Some(BackgroundBadge {
-                    id: event.id.clone(),
-                    started_at: Some(Instant::now()),
-                    outcome: None,
-                });
+                msg.background = Some(BackgroundBadge::moved(&event));
             }
         }
         truncate_to_header(&mut msg.text);
@@ -404,12 +400,21 @@ impl MessagesPanel {
         });
     }
 
-    /// A copy of the tool's row, for a task tab that shows the same call.
-    pub fn tool_message(&self, tool_id: &str) -> Option<DisplayMessage> {
+    pub fn has_background_badge(&self, tool_id: &str) -> bool {
+        self.find_tool_msg(tool_id)
+            .is_some_and(|m| m.background.is_some())
+    }
+
+    pub fn background_badges(&self) -> Vec<BackgroundBadge> {
         self.messages
             .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
-            .cloned()
+            .filter_map(|m| m.background.clone())
+            .collect()
+    }
+
+    /// A copy of the tool's row, for a task tab that shows the same call.
+    pub fn tool_message(&self, tool_id: &str) -> Option<DisplayMessage> {
+        self.find_tool_msg(tool_id).cloned()
     }
 
     /// The buf a running tool streams into, live or still watched.
@@ -773,10 +778,7 @@ impl MessagesPanel {
         }
         let seg = self.cache.get(pos.seg)?;
         let tool_id = seg.tool_id.as_deref()?;
-        let msg = self
-            .messages
-            .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
+        let msg = self.find_tool_msg(tool_id)?;
         if let Some(badge) = &msg.background {
             return Some(ClickOutcome::OpenTask(badge.id.clone()));
         }
@@ -864,11 +866,6 @@ impl MessagesPanel {
         }
         self.rebuild_expanded_tool(&tool_id);
         true
-    }
-
-    #[cfg(test)]
-    pub fn toggle_expansion_at(&mut self, row: u16, area: Rect) -> bool {
-        self.toggle_at(row, area)
     }
 
     fn rebuild_expanded_tool(&mut self, tool_id: &str) {
@@ -1355,6 +1352,12 @@ impl MessagesPanel {
                 is_header, "snapshot dropped: no tool message with this id"
             );
         }
+    }
+
+    fn find_tool_msg(&self, tool_id: &str) -> Option<&DisplayMessage> {
+        self.messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
     }
 
     fn find_tool_msg_mut(&mut self, tool_id: &str) -> Option<&mut DisplayMessage> {

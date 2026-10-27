@@ -207,6 +207,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     } else {
         TrustMode::Consult
     };
+    let background = cli.background_wait().is_some();
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
@@ -254,7 +255,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Acp { model, yolo }) => {
-            acp::run(model, yolo, cli.no_plugins, cli.no_jit, trust_mode)?;
+            acp::run(
+                model,
+                yolo,
+                cli.no_plugins,
+                cli.no_jit,
+                trust_mode,
+                background,
+            )?;
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,

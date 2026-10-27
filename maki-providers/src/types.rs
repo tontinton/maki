@@ -252,6 +252,8 @@ pub async fn adapt_images_for_model<'a>(
             content,
             display_text: message.display_text.clone(),
             kind: message.kind.clone(),
+            receipts: message.receipts.clone(),
+            settles: message.settles.clone(),
         });
     }
     Cow::Owned(adapted)
@@ -465,9 +467,29 @@ impl ContentBlock {
     }
 }
 
+/// How a background task ended, as the notice that settled its receipt tells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskEnd {
+    Finished,
+    Failed,
+    /// Stopped by the user or `task_stop`. Only the transcript line says so:
+    /// the model reads `finished` or `failed`, and the output names the stop.
+    Cancelled,
+    Lost,
+}
+
+/// The receipt a background notice answers and how its task ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSettled {
+    pub task: String,
+    pub end: TaskEnd,
+}
+
 /// Part of the frozen session surface (disk, exports, Lua), written flat:
-/// `{"role", "content", "display_text"?, "kind"?, "facts"?}`, with `kind` as
-/// a bare tag and `facts` beside a `context_update`. Older logs nest it as
+/// `{"role", "content", "display_text"?, "kind"?, "facts"?, "receipts"?,
+/// "settles"?}`, with `kind` as a bare tag and `facts` beside a
+/// `context_update`. Older logs nest it as
 /// `{"kind": {"context_update": facts}}`. Those still load, and are not
 /// rewritten just for that.
 ///
@@ -479,6 +501,11 @@ pub struct Message {
     pub content: Vec<ContentBlock>,
     pub display_text: Option<String>,
     pub kind: MessageKind,
+    /// Calls whose results here are background receipts: each moved, and a
+    /// later notice [`settles`](Self::settles) it.
+    pub receipts: Vec<String>,
+    /// Set on the notice that answers a receipt.
+    pub settles: Option<TaskSettled>,
 }
 
 /// [`Message`] as stored, before `kind` and `facts` are paired up.
@@ -492,6 +519,23 @@ struct RawMessage {
     kind: Option<RawKind>,
     #[serde(default)]
     facts: Option<Arc<FactsUpdate>>,
+    #[serde(default)]
+    receipts: Vec<String>,
+    #[serde(default, deserialize_with = "settles_or_none")]
+    settles: Option<TaskSettled>,
+}
+
+/// A newer build may write a [`TaskEnd`] this one does not know. Only the
+/// mark is dropped then, never the message, and the task reads as cancelled.
+fn settles_or_none<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<TaskSettled>, D::Error> {
+    let Some(raw) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(TaskSettled::deserialize(raw)
+        .inspect_err(|error| debug!(%error, "dropping a task mark this build cannot read"))
+        .ok())
 }
 
 /// [`MessageKind`] reads every kind but the flat `context_update` tag, whose
@@ -528,6 +572,8 @@ impl TryFrom<RawMessage> for Message {
             content: raw.content,
             display_text: raw.display_text,
             kind,
+            receipts: raw.receipts,
+            settles: raw.settles,
         })
     }
 }
@@ -540,7 +586,9 @@ impl Serialize for Message {
         let len = 2
             + usize::from(self.display_text.is_some())
             + usize::from(!self.kind.is_turn())
-            + usize::from(facts.is_some());
+            + usize::from(facts.is_some())
+            + usize::from(!self.receipts.is_empty())
+            + usize::from(self.settles.is_some());
         let mut state = serializer.serialize_struct("Message", len)?;
         state.serialize_field("role", &self.role)?;
         state.serialize_field("content", &self.content)?;
@@ -552,6 +600,12 @@ impl Serialize for Message {
         }
         if let Some(facts) = facts {
             state.serialize_field("facts", facts)?;
+        }
+        if !self.receipts.is_empty() {
+            state.serialize_field("receipts", &self.receipts)?;
+        }
+        if let Some(settles) = &self.settles {
+            state.serialize_field("settles", settles)?;
         }
         state.end()
     }
@@ -1596,6 +1650,7 @@ mod tests {
     const LARGE_BUDGET: u32 = 16_384;
 
     const PROMPT: &str = "fix the flaky login test";
+    const TASK_ID: &str = "toolu_moved";
     const UPDATE_TEXT: &str = "<context-update>plan mode is on</context-update>";
     const UPDATE_DATE: &str = "2026-10-02";
     const UPDATE_PLAN: &str = "/project/.maki/plan.md";
@@ -1719,6 +1774,38 @@ mod tests {
     fn unpaired_context_update_is_an_error(stored: Value, expected: &str) {
         let err = serde_json::from_value::<Message>(stored).unwrap_err();
         assert!(err.to_string().contains(expected), "{err}");
+    }
+
+    /// A resume reads how each background task ended off these marks.
+    #[test]
+    fn task_marks_write_the_flat_shape() {
+        let stored = json!({
+            "role": "user",
+            "content": [],
+            "receipts": [TASK_ID],
+            "settles": { "task": TASK_ID, "end": "cancelled" }
+        });
+        let message = Message {
+            receipts: vec![TASK_ID.into()],
+            settles: Some(TaskSettled {
+                task: TASK_ID.into(),
+                end: TaskEnd::Cancelled,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(&message).unwrap(), stored);
+        assert_eq!(serde_json::from_value::<Message>(stored).unwrap(), message);
+    }
+
+    #[test]
+    fn an_unknown_task_end_drops_only_the_mark() {
+        let stored = json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": PROMPT }],
+            "settles": { "task": TASK_ID, "end": "timed_out" }
+        });
+        let loaded: Message = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded, Message::user(PROMPT.into()));
     }
 
     #[test_case(|_: &mut Message| {}, true ; "as_built")]

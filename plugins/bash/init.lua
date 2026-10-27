@@ -31,8 +31,10 @@ local LOG_MAX_BYTES = 32 * 1024 * 1024
 local LOG_MAX_BYTES_CEILING = 1024 * 1024 * 1024
 local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground."
 local EARLIER_IN_LOG = "[%d earlier lines are in the full output log]"
+local EARLIER_ROTATED = "[%d earlier lines are in the full output log or %s; the oldest may be gone]"
 local EARLIER_DROPPED = "[%d earlier lines dropped]"
 local FULL_OUTPUT_PATTERN = "^(.*)\nFull output: ([^\n]+)$"
+local FULL_OUTPUT_LINE = "Full output: %s"
 local EXPIRE_BACKGROUND = { expire = "background" }
 
 local rtk_available
@@ -177,9 +179,20 @@ local function log_path(ctx, session)
   return maki.fs.joinpath(state, TASK_LOGS_DIR, session, call_id:gsub("[^%w_%-]", "_") .. LOG_EXT)
 end
 
+-- Says where the lines the tail pushed out can still be found.
+local function earlier_note(log, dropped)
+  if not log or log.broken or log.truncated then
+    return EARLIER_DROPPED:format(dropped)
+  end
+  if log.rotated_path then
+    return EARLIER_ROTATED:format(dropped, log.rotated_path)
+  end
+  return EARLIER_IN_LOG:format(dropped)
+end
+
 local function receipt(tail, path, max_bytes)
   local text, count = bash_log.tail_text(tail, RECEIPT_TAIL_LINES)
-  local progress = ("Full output (read it to check progress): %s"):format(path)
+  local progress = FULL_OUTPUT_LINE:format(path)
   if count == 0 then
     return "Running in the background. No output yet.\n" .. progress
   end
@@ -312,7 +325,7 @@ local opts = maki.api.register_options(output_limits.extend({
   },
   background_on_timeout = {
     default = false,
-    desc = "Move a command that hits its timeout to the background instead of killing it.",
+    desc = "Move a command that hits its timeout to the background instead of killing it. Applies to the main agent while background tasks are on; elsewhere the command is killed.",
   },
   background_log_bytes = {
     default = LOG_MAX_BYTES,
@@ -335,10 +348,12 @@ maki.api.register_tool({
       background = {
         type = "boolean",
         description = "Run in the background and return at once; the result arrives as a message when it ends.",
+        needs_background = true,
       },
     },
   },
   permission = "run",
+  start_annotation = { field = "timeout", kind = "timeout" },
   permission_scopes = function(input)
     local command: string? = input.command
     if not command or command:match("^%s*$") then
@@ -368,16 +383,7 @@ maki.api.register_tool({
     if workdir then
       s = s .. " in " .. relative_path(workdir)
     end
-    local hints = {}
-    if input.timeout then
-      hints[#hints + 1] = maki.ui.humantime(input.timeout) .. " timeout"
-    end
-    if #hints == 0 then
-      return s
-    end
-    local buf = maki.ui.buf()
-    buf:line({ { s }, { " (" .. table.concat(hints, ", ") .. ")", "dim" } })
-    return buf
+    return s
   end,
 
   restore = function(input, output, is_error, ctx)
@@ -405,7 +411,7 @@ maki.api.register_tool({
       end
     end
     if log_file then
-      view:append({ { "Full output: " .. log_file, "dim" } })
+      view:append({ { FULL_OUTPUT_LINE:format(tostring(log_file)), "dim" } })
     end
     view:finish()
     return buf
@@ -522,12 +528,16 @@ maki.api.register_tool({
       if dropped == 0 then
         return text
       end
-      return (log and EARLIER_IN_LOG or EARLIER_DROPPED):format(dropped) .. "\n" .. text
+      return earlier_note(log, dropped) .. "\n" .. text
     end
 
+    -- The view ends on the log line the reply ends on: the UI repeats an
+    -- error reply under a view that lacks the reply's last line.
     local function reply_text(llm_output)
       if log then
-        llm_output = ("%s\nFull output: %s"):format(llm_output, log.path)
+        local log_line = FULL_OUTPUT_LINE:format(log.path)
+        view:append({ { log_line, "dim" } })
+        llm_output = llm_output .. "\n" .. log_line
       end
       return foreground_note and (foreground_note .. "\n" .. llm_output) or llm_output
     end
@@ -568,9 +578,10 @@ maki.api.register_tool({
       if is_error then
         view:append({ { "Exit code: " .. exit_code, "dim" } })
       end
+      local reply = reply_text(llm_output)
       view:finish()
 
-      ctx:finish({ llm_output = reply_text(llm_output), is_error = is_error, body = buf })
+      ctx:finish({ llm_output = reply, is_error = is_error, body = buf })
     end
 
     view:append({ { "Waiting for output...", "dim" } })
@@ -612,12 +623,12 @@ maki.api.register_tool({
       ctx:finish(cut)
     end)
 
-    -- Fails without a live chat (headless, -p, SDK, ACP), and then the
-    -- command simply stays in the foreground.
+    -- Fails where background work is off (a zero --background-timeout), and
+    -- then the command simply stays in the foreground.
     if input.background == true then
       local moved, move_err = ctx:background()
       if not moved then
-        foreground_note = FOREGROUND_NOTE:format(move_err)
+        foreground_note = FOREGROUND_NOTE:format(tostring(move_err))
       end
     end
 

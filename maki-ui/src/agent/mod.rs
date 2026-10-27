@@ -29,6 +29,17 @@ pub(crate) use self::model_slots::ModelSlots;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 pub(crate) use maki_agent::ModelSlot;
 
+/// Why a tab's agent loop is replaced.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Respawn {
+    /// The tab's own session moved on (rewind, `/new`). Its meta lags behind
+    /// the mailbox then, so the receipts it lists are not lost work.
+    Restart,
+    /// A stored session was loaded into the tab. The receipts it left
+    /// unanswered come back as lost notices, ahead of its restored queue.
+    Load,
+}
+
 /// Input channels (`answer_tx`, `queue`) are per-agent, so an old loop can
 /// never steal new input. The output channel (`agent_tx`/`agent_rx`) is
 /// per-tab: `respawn` reuses it, so anyone still holding a sender (a Lua
@@ -90,6 +101,7 @@ impl AgentHandles {
 
     pub(crate) fn apply_to_app(&self, app: &mut App) {
         app.answer_tx = Some(self.answer_tx.clone());
+        app.mailbox = Some(self.mailbox.clone());
         app.shared_history = Some(Arc::clone(&self.history));
         app.queue.set_shared(self.queue.clone());
         let restore_tx =
@@ -136,6 +148,10 @@ impl AgentHandles {
         self.mailbox.claim_wake()
     }
 
+    pub(crate) fn mailbox(&self) -> &SessionMailbox {
+        &self.mailbox
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn respawn(
         &mut self,
@@ -146,6 +162,7 @@ impl AgentHandles {
         permissions: &Arc<PermissionManager>,
         app: &mut App,
         lua_handle: EventHandle,
+        reason: Respawn,
     ) {
         // The output channel survives the respawn, so this bump is the only
         // thing that makes the old loop's in-flight envelopes stale. It lives
@@ -180,6 +197,11 @@ impl AgentHandles {
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
         // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
         self.apply_to_app(app);
+        // The first restored prompt can start a run at once, and that run
+        // has to drain the lost notices with it.
+        if reason == Respawn::Load {
+            app.restore_lost_background();
+        }
         app.flush_restored_queue();
         old.cancel_all();
     }
@@ -301,6 +323,7 @@ mod tests {
     use maki_providers::{
         AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
     };
+    use test_case::test_case;
 
     use super::shared_queue::{QueueItem, QueuedInput};
     use super::*;
@@ -321,6 +344,7 @@ mod tests {
     const NO_TURN_END: &str = "the run never reported that it was over";
     const GATE_CLOSED: &str = "the in-flight call is no longer waiting to be released";
     const SEED_NOT_LIVE: &str = "the respawned loop publishes a seed for the app's session";
+    const LOST_ID: &str = "toolu_lost_on_exit";
 
     struct StubProvider;
 
@@ -408,6 +432,7 @@ mod tests {
             permissions,
             app,
             EventHandle::disconnected_for_test(),
+            Respawn::Restart,
         );
     }
 
@@ -674,6 +699,7 @@ mod tests {
             &permissions,
             &mut app,
             EventHandle::disconnected_for_test(),
+            Respawn::Restart,
         );
 
         let mirror = app
@@ -687,6 +713,46 @@ mod tests {
             "a checkpoint right after respawn must not see the seeded empty snapshot"
         );
         assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
+    }
+
+    /// A loaded session's lost notices are queued before its restored prompt
+    /// can start a run, so that first run carries them. A restart brings none
+    /// back: the meta lags behind the mailbox there.
+    #[test_case(Respawn::Load, true ; "load_restores_before_the_queue_runs")]
+    #[test_case(Respawn::Restart, false ; "restart_restores_nothing")]
+    fn respawn_restores_lost_notices_only_for_a_loaded_session(reason: Respawn, restored: bool) {
+        let (provider, _reported) = recorder();
+        let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
+        let (mut handles, permissions) = spawn_on(&cell, Vec::new());
+        let mut app = crate::app::tests::test_app();
+        let meta = &mut app.state.session_mut().meta;
+        meta.pending_background = vec![LOST_ID.into()];
+        meta.queued_messages = vec![RESTORED_TEXT.into()];
+
+        handles.respawn(
+            Vec::new(),
+            &cell,
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            &permissions,
+            &mut app,
+            EventHandle::disconnected_for_test(),
+            reason,
+        );
+
+        let mut observed = false;
+        loop {
+            let envelope = handles
+                .agent_rx
+                .recv_timeout(LONG_TIMEOUT)
+                .expect(NO_TURN_END);
+            match envelope.event {
+                AgentEvent::ObservationLine { text, .. } => observed |= text.contains(LOST_ID),
+                AgentEvent::Error { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(observed, restored);
     }
 
     /// A monitor can prompt before the user sends anything, so the seed has to

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken, CancelTrigger};
+use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
@@ -21,15 +22,16 @@ use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, CallScope,
     DoneReason, EMPTY_RESPONSE_MARKER, EarlierInput, Envelope, EventSender, EventStreamGuard,
     History, ImageSource, InputSource, McpSession, RunContext, RunContextBuilder, RunLedger,
-    SessionEvents, SessionStub, SubagentInbox, SubagentInfo, TaskHome, ToolDoneEvent,
-    UNAVAILABLE_RESULT, event_stream,
+    RunTotals, SessionEvents, SessionMailbox, SessionStub, SubagentInbox, SubagentInfo, TaskHome,
+    ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::model_registry;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, Message, Model, RequestOptions, Role, ThinkingConfig, add_cost,
+    AgentError, ContentBlock, ContextGauge, Message, Model, RequestOptions, Role, ThinkingConfig,
+    add_cost,
 };
 use maki_storage::id::MakiId;
 use maki_storage::now_epoch;
@@ -255,18 +257,11 @@ pub(crate) fn adopt_session(
     if stub.ui_id == home.id {
         return;
     }
-    let SessionStub {
-        ui_id,
-        plugin,
-        name,
-        handle,
-        info: subagent,
-    } = stub;
     let entry = BackgroundTask {
         info: BackgroundInfo {
-            id: ui_id,
-            plugin: Arc::clone(&plugin),
-            name,
+            id: stub.ui_id,
+            plugin: Arc::clone(&stub.plugin),
+            name: stub.name,
             kind: Kind::Agent,
             running: true,
             started_at: now_epoch(),
@@ -276,16 +271,17 @@ pub(crate) fn adopt_session(
         task: None,
         lifetime: Lifetime::Call,
         stop: StopMark::default(),
-        cancel: Fire::Handle(handle),
+        cancel: Fire::Handle(stub.handle),
+        mailbox: None,
     };
     if let Err(error) = registry.register(entry) {
         tracing::debug!(call = %home.id, %error, "session under a moved call outlived its chat");
         return;
     }
-    if let (Some(ui), Some(info)) = (ui, subagent.get()) {
+    if let (Some(ui), Some(info)) = (ui, stub.info.get()) {
         let _ = ui.try_send(UiAction::PluginTaskOpened {
             session: home.chat,
-            plugin,
+            plugin: stub.plugin,
             info: Box::new(info.clone()),
         });
     }
@@ -397,7 +393,9 @@ impl Upstream {
 ///
 /// A ctx session switches to the chat between two events once its call moved,
 /// so none is reordered. The parent's run is still live at the switch, so the
-/// events it already got are not stale yet.
+/// events it already got are not stale yet. Headless, nobody reads that chat,
+/// so every ask sent there is answered as unattended instead of parking the
+/// session for good.
 async fn relay_session_events(
     mut sub_events: SessionEvents,
     mut upstream: Upstream,
@@ -408,6 +406,14 @@ async fn relay_session_events(
     let mut cost = None;
     while let Some(mut envelope) = sub_events.next().await {
         upstream.follow_move();
+        if matches!(upstream, Upstream::Chat { ui: None, .. })
+            && let Some(answer) = unattended_answer(&envelope.event)
+        {
+            if let Some(answers) = subagent_info.get().and_then(|i| i.answer_tx.as_ref()) {
+                let _ = answers.send(answer);
+            }
+            continue;
+        }
         let to_chat = matches!(upstream, Upstream::Chat { .. });
         match &envelope.event {
             AgentEvent::TurnComplete(turn) => {
@@ -441,6 +447,20 @@ async fn relay_session_events(
     upstream.follow_move();
     if matches!(upstream, Upstream::Chat { .. }) {
         upstream.send_event(AgentEvent::StreamClosed, subagent_info.get().cloned());
+    }
+}
+
+/// The answer to an ask that parks the run until the user replies, given in
+/// place of a user nobody can reach. A permission is refused as unattended.
+/// An auth retry rereads the credentials, and fails the run once the agent's
+/// own retry budget is spent.
+fn unattended_answer(event: &AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::PermissionRequest { id, .. } => {
+            Some(TaggedAnswer::new(id, PermissionAnswer::Unattended).encode())
+        }
+        AgentEvent::AuthRequired => Some(String::new()),
+        _ => None,
     }
 }
 
@@ -629,7 +649,14 @@ async fn tools(
     };
     // Base definitions only: the session injects MCP definitions per
     // request, so baking them into a tools array would freeze the catalog.
-    let defs = ToolRegistry::global().definitions(&vars, &ctx_desc, model.supports_tool_examples());
+    // A session opened from Lua is a subagent's, and a subagent never moves a
+    // call itself, so it is not offered what only that needs.
+    let defs = ToolRegistry::global().definitions_with_background(
+        &vars,
+        &ctx_desc,
+        model.supports_tool_examples(),
+        false,
+    );
 
     Ok((Some(json_to_lua(&lua, &defs)?), None))
 }
@@ -1029,11 +1056,13 @@ async fn session(
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
     let name = name.unwrap_or_default();
+    let registry = BackgroundTasks::of(&lua);
+    let ui = host_ui(&lua);
     let adoption = match (&owner, &agent_ctx.call) {
         (None, Some(call)) => Some(Adoption {
             call: Arc::clone(call),
-            ui: host_ui(&lua),
-            registry: BackgroundTasks::of(&lua),
+            ui: ui.clone(),
+            registry: registry.clone(),
             id: ui_id.clone(),
             plugin: Arc::clone(&plugin),
         }),
@@ -1043,8 +1072,8 @@ async fn session(
         Some((session, ..)) => Upstream::Chat {
             session: *session,
             plugin: Arc::clone(&plugin),
-            ui: host_ui(&lua),
-            registry: BackgroundTasks::of(&lua),
+            ui,
+            registry: registry.clone(),
             id: ui_id.clone(),
         },
         None => Upstream::Parent {
@@ -1092,13 +1121,15 @@ async fn session(
         ui_id,
         slot: cancel_slot,
         trigger: child_trigger,
-        background: owner.as_ref().map(|_| BackgroundTasks::of(&lua)),
+        registry: registry.clone(),
+        background: owner.is_some(),
+        mailbox: SessionMailbox::register(MakiId::generate()),
         adoption,
         stop: StopMark::default(),
     });
+    cancellation.end_mailbox_on_cancel(child_cancel.clone());
     let background = match owner {
         Some((session, task, cancel)) => {
-            let registry = BackgroundTasks::of(&lua);
             try_pair!(registry.register(BackgroundTask {
                 info: BackgroundInfo {
                     id: cancellation.ui_id.clone(),
@@ -1114,6 +1145,7 @@ async fn session(
                 lifetime: Lifetime::Plugin,
                 stop: cancellation.stop.clone(),
                 cancel: Fire::Owned(cancel),
+                mailbox: None,
             }));
             Some(Background {
                 registry,
@@ -1155,7 +1187,7 @@ async fn session(
                 (inherited, _) => inherited.clone(),
             },
             task_id: Some(Arc::from(cancellation.ui_id.as_str())),
-            mailbox: None,
+            mailbox: Some(cancellation.mailbox.clone()),
             timeouts: agent_ctx.timeouts,
             // Shared with the parent, not fresh: a lock that a subagent does
             // not take is no lock at all once two of them edit one file, and a
@@ -1489,17 +1521,29 @@ struct Background {
 }
 
 impl Background {
-    fn start_prompt(&self, id: &str, event_tx: EventSender) -> PromptSettle {
+    fn start_prompt(
+        &self,
+        id: &str,
+        event_tx: EventSender,
+        ledger: Arc<RunLedger>,
+    ) -> PromptSettle {
         self.registry.update(id, |e| e.info.running = true);
         PromptSettle {
             registry: self.registry.clone(),
             id: id.to_owned(),
             event_tx,
-            outcome: Some(AgentEvent::Error {
-                message: CANCELLED_MSG.to_owned(),
-                auth: false,
-            }),
+            ledger,
+            outcome: Some(cancelled_run()),
         }
+    }
+}
+
+/// What a run ends on in its tab until it ends on its own.
+fn cancelled_run() -> AgentEvent {
+    AgentEvent::Error {
+        message: CANCELLED_MSG.to_owned(),
+        auth: false,
+        totals: RunTotals::default(),
     }
 }
 
@@ -1513,18 +1557,24 @@ impl Background {
 /// dropped sends nothing, and its tab would keep its tools spinning until the
 /// session closes. So we tell the tab `outcome` ourselves. It goes through the
 /// relay, so it lands after the run's own events. It is never a `Done`, because
-/// the relay counts every `Done` against the ones `prompt` waits for.
+/// the relay counts every `Done` against the ones `prompt` waits for. It bills
+/// what `ledger` holds when it drops, as a `Done` would, so a run cancelled
+/// mid-turn still reports its spend.
 struct PromptSettle {
     registry: BackgroundTasks,
     id: String,
     event_tx: EventSender,
+    ledger: Arc<RunLedger>,
     outcome: Option<AgentEvent>,
 }
 
 impl Drop for PromptSettle {
     fn drop(&mut self) {
         self.registry.update(&self.id, |e| e.info.running = false);
-        if let Some(outcome) = self.outcome.take() {
+        if let Some(mut outcome) = self.outcome.take() {
+            if let AgentEvent::Error { totals, .. } = &mut outcome {
+                *totals = self.ledger.totals();
+            }
             let _ = self.event_tx.send(outcome);
         }
     }
@@ -1565,6 +1615,72 @@ impl SessionState {
             "subagent session closed",
         );
     }
+
+    fn agent(&mut self, inbox: &Arc<SubagentInbox>) -> Agent<'_> {
+        let agent = Agent::new(
+            self.params.clone(),
+            AgentRunParams {
+                history: &mut self.history,
+                gauge: &mut self.gauge,
+                event_tx: self.sub_event_tx.clone(),
+                context: Arc::clone(&self.context),
+            },
+        )
+        .with_reauth(self.reauth)
+        .with_interrupt_source(Arc::clone(inbox) as Arc<dyn maki_agent::InterruptSource>)
+        .with_loaded_instructions(
+            self.loaded_instructions.clone(),
+            Arc::clone(&self.instruction_files),
+        )
+        .with_cancel(self.child_cancel.clone())
+        .with_mcp(self.mcp.clone())
+        .with_local_tools(Arc::clone(&self.local_tools));
+        match &self.answer_rx {
+            Some(rx) => agent.with_user_response_rx(Arc::clone(rx)),
+            None => agent,
+        }
+    }
+}
+
+/// Auto-compaction can shrink the history mid-run, so the start is clamped.
+/// After a rewrite the tail is this call's output either way.
+fn messages_since(history: &History, start: usize) -> &[Message] {
+    &history.as_slice()[start.min(history.len())..]
+}
+
+/// Why a run left its caller without an answer, or `None` if it answered. A
+/// subagent can be cancelled on its own, and its caller should hear about that
+/// instead of taking a half-finished answer for a real one, so cancel reads
+/// like an error here even though the run ended normally. A dropped prompt
+/// never reached the model, so an empty answer would be a lie.
+fn cut_short_err(result: &Result<DoneReason, AgentError>, stopped_by_user: bool) -> Option<String> {
+    match result {
+        Err(e) => Some(e.to_string()),
+        Ok(DoneReason::Cancelled) if stopped_by_user => Some(STOPPED_BY_USER_ERR.to_owned()),
+        Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
+        Ok(DoneReason::Dropped) => Some(PROMPT_DROPPED_ERR.to_owned()),
+        Ok(
+            DoneReason::EndTurn
+            | DoneReason::MaxTokens
+            | DoneReason::MaxTurns
+            | DoneReason::Compact,
+        ) => None,
+    }
+}
+
+/// The notices that wake the session's next turn, or `None` once none of its
+/// moved calls is still out and nothing they reported is left unread. `Err`
+/// when the session or the caller is cancelled first.
+async fn next_wake(
+    mailbox: &SessionMailbox,
+    session: &CancelToken,
+    caller: Option<&CancelToken>,
+) -> Result<Option<Vec<Message>>, String> {
+    let wake = session.race(mailbox.next_wake_before_answer());
+    match caller {
+        Some(caller) => caller.race(wake).await?,
+        None => wake.await,
+    }
 }
 
 struct LuaSession {
@@ -1583,7 +1699,12 @@ struct SessionCancellation {
     slot: CancelSlot,
     /// Fires the session's token. `parent_cancels` holds only its handle.
     trigger: CancelTrigger,
-    background: Option<BackgroundTasks>,
+    registry: BackgroundTasks,
+    /// Opened by chat session id, so `registry` holds an entry under `ui_id`.
+    background: bool,
+    /// Where calls moved off this session's runs report, for the session's
+    /// whole life, so a later prompt still hears of a call an earlier one moved.
+    mailbox: SessionMailbox,
     adoption: Option<Adoption>,
     /// Esc in the task's tab, see [`BackgroundTasks::stop`].
     stop: StopMark,
@@ -1598,10 +1719,7 @@ impl SessionCancellation {
         }
         // Its chat session or its plugin may have ended while the plugin kept
         // the handle.
-        self.background
-            .as_ref()
-            .filter(|registry| !registry.contains(&self.ui_id))
-            .map(|_| CANCELLED_MSG)
+        (self.background && !self.registry.contains(&self.ui_id)).then_some(CANCELLED_MSG)
     }
 
     fn stopped_by_user(&self) -> bool {
@@ -1611,12 +1729,32 @@ impl SessionCancellation {
     fn cancel(&self) {
         self.parent_cancels.retire(&self.ui_id, self.slot);
         self.trigger.handle().fire();
-        if let Some(registry) = &self.background {
-            registry.remove(&self.ui_id);
+        if self.background {
+            self.registry.remove(&self.ui_id);
         }
+        self.end_mailbox();
         if let Some(adoption) = &self.adoption {
             adoption.release();
         }
+    }
+
+    /// No run of this session reads its mailbox again, so the calls it moved
+    /// stop instead of reporting to nobody.
+    fn end_mailbox(&self) {
+        self.registry.end_mailbox(&self.mailbox);
+    }
+
+    /// The session's token can fire with no prompt left to notice: the task
+    /// that opened it ends between prompts, or the prompt waiting on it was
+    /// dropped. Dropping the session fires it too, so this never outlives it.
+    fn end_mailbox_on_cancel(&self, token: CancelToken) {
+        let registry = self.registry.clone();
+        let mailbox = self.mailbox.clone();
+        smol::spawn(async move {
+            token.cancelled().await;
+            registry.end_mailbox(&mailbox);
+        })
+        .detach();
     }
 }
 
@@ -1639,6 +1777,26 @@ impl Drop for LuaSession {
             }
         }
     }
+}
+
+/// What was sent while no run read the inbox, shown as consumed and handed
+/// to the next run ahead of its own message, so its first reply reads it.
+fn take_waiting(inbox: &SubagentInbox, event_tx: &EventSender) -> Vec<EarlierInput> {
+    inbox
+        .drain()
+        .into_iter()
+        .map(|input| {
+            announce_consumed(event_tx, &input.message, &input.images);
+            EarlierInput::from(input)
+        })
+        .collect()
+}
+
+fn announce_consumed(event_tx: &EventSender, text: &str, images: &[ImageSource]) {
+    let _ = event_tx.send(AgentEvent::QueueItemConsumed {
+        text: text.to_owned(),
+        images: images.to_vec(),
+    });
 }
 
 fn plugin_input(message: String, opts: RequestOptions) -> AgentInput {
@@ -1665,6 +1823,11 @@ fn plugin_input(message: String, opts: RequestOptions) -> AgentInput {
 /// string when the subagent produced no text block (e.g. it only called
 /// tools).
 ///
+/// A tool call the user moves to the background (Ctrl+B in the session's tab)
+/// keeps the prompt waiting. When the call finishes, the subagent gets its
+/// result and runs another turn, and `text` is that last turn's. Closing the
+/// session, or the end of the task that opened it, stops such calls.
+///
 /// @param message string User message to send.
 /// @return (table?, string?) Result table on success, or `(nil, err)` on
 /// failure. A run cut short after streaming some text hands you both: the
@@ -1689,10 +1852,7 @@ async fn prompt(
     // wait for the session lock to the end of the run, or the handler would sit
     // there until the host gives up on it. Only the caller's own stack knows
     // which task it is, so this has to happen before the first await.
-    let caller_cancel = match (
-        this.cancellation.background.is_some(),
-        active_task_cancel(&lua),
-    ) {
+    let caller_cancel = match (this.cancellation.background, active_task_cancel(&lua)) {
         (false, _) => None,
         (true, Some((_, cancel))) => Some(cancel),
         (true, None) => return Ok(err_pair(TASK_REQUIRED_ERR)),
@@ -1727,7 +1887,11 @@ async fn prompt(
             );
             Some((
                 caller_cancel,
-                background.start_prompt(&s.cancellation.ui_id, s.sub_event_tx.clone()),
+                background.start_prompt(
+                    &s.cancellation.ui_id,
+                    s.sub_event_tx.clone(),
+                    Arc::clone(&s.params.ledger),
+                ),
             ))
         }
         _ => None,
@@ -1746,20 +1910,11 @@ async fn prompt(
     // The run only reads the inbox after a turn, so a message sent while we
     // sat idle would cost a reply that ignores it plus one more turn. It rides
     // in front of the prompt instead.
-    let waiting = inbox.drain();
-    let consumed = |text: &str, images: &[ImageSource]| {
-        let _ = s.sub_event_tx.send(AgentEvent::QueueItemConsumed {
-            text: text.to_owned(),
-            images: images.to_vec(),
-        });
-    };
-    for input in &waiting {
-        consumed(&input.message, &input.images);
-    }
+    let earlier = take_waiting(&inbox, &s.sub_event_tx);
     // The tab opened with the session, so every prompt shows up the way a
     // queued message does.
     if s.background.is_some() {
-        consumed(&message, &[]);
+        announce_consumed(&s.sub_event_tx, &message, &[]);
     }
 
     // A cancel drops the run future, here in the race or with the whole task,
@@ -1768,74 +1923,71 @@ async fn prompt(
     // on, so we close them before going again.
     s.history.close_dangling_tool_calls(UNAVAILABLE_RESULT);
     let history_len = s.history.len();
-    let mut agent = Agent::new(
-        s.params.clone(),
-        AgentRunParams {
-            history: &mut s.history,
-            gauge: &mut s.gauge,
-            event_tx: s.sub_event_tx.clone(),
-            context: Arc::clone(&s.context),
-        },
-    )
-    .with_reauth(s.reauth)
-    .with_interrupt_source(inbox as Arc<dyn maki_agent::InterruptSource>)
-    .with_loaded_instructions(s.loaded_instructions.clone(), s.instruction_files.clone())
-    .with_cancel(s.child_cancel.clone())
-    .with_mcp(s.mcp.clone())
-    .with_local_tools(Arc::clone(&s.local_tools));
-    if let Some(rx) = &s.answer_rx {
-        agent = agent.with_user_response_rx(Arc::clone(rx));
-    }
-
-    let run = agent.run(AgentInput {
-        earlier: waiting.into_iter().map(EarlierInput::from).collect(),
+    let mut input = AgentInput {
+        earlier,
         ..plugin_input(message, s.opts)
-    });
-    let finished = match &watch {
-        Some((caller_cancel, _)) => caller_cancel.race(run).await.ok(),
-        None => Some(run.await),
     };
-    drop(agent);
-    // A run that lost the race keeps the `cancelled` it started with.
-    if let (Some((_, settle)), Some(result)) = (&mut watch, &finished) {
-        settle.outcome = result.as_ref().err().map(AgentEvent::error);
-    }
+    // A call moved off a run reports to the session's mailbox, and the caller
+    // is owed the answer that comes after it. So the prompt waits for every
+    // moved call, and each wake runs one more turn on the same history.
+    let mut last_run_start;
+    let cut_short = loop {
+        last_run_start = s.history.len();
+        let mut agent = s.agent(&inbox);
+        let run = agent.run(input);
+        let finished = match &watch {
+            Some((caller_cancel, _)) => caller_cancel.race(run).await.ok(),
+            None => Some(run.await),
+        };
+        drop(agent);
+        // A run that lost the race keeps the `cancelled` it started with.
+        if let (Some((_, settle)), Some(result)) = (&mut watch, &finished) {
+            settle.outcome = result
+                .as_ref()
+                .err()
+                .map(|e| AgentEvent::error(e, RunTotals::default()));
+        }
+        if let Some(Ok(_)) = finished {
+            s.dones.expect_one();
+        }
+        // Before the run is judged, so a prompt Esc or an error cut short still
+        // leaves what it streamed in the tab's transcript. A monitor nobody
+        // closes would otherwise keep it in memory until the plugin unloads.
+        if s.background.is_some() {
+            s.upstream
+                .send_history(&s.cancellation.ui_id, s.history.as_slice().to_vec());
+        }
+        let result = finished.unwrap_or(Ok(DoneReason::Cancelled));
+        if let Some(err) = cut_short_err(&result, s.stopped_by_user()) {
+            break Some(err);
+        }
+        let caller_cancel = watch.as_ref().map(|(caller_cancel, _)| caller_cancel);
+        match next_wake(&s.cancellation.mailbox, &s.child_cancel, caller_cancel).await {
+            Ok(Some(notices)) => {
+                if let Some((_, settle)) = &mut watch {
+                    settle.outcome = Some(cancelled_run());
+                }
+                input = AgentInput {
+                    preamble: notices,
+                    earlier: take_waiting(&inbox, &s.sub_event_tx),
+                    ..plugin_input(String::new(), s.opts)
+                };
+            }
+            Ok(None) => break None,
+            Err(_) => break cut_short_err(&Ok(DoneReason::Cancelled), s.stopped_by_user()),
+        }
+    };
     drop(watch);
-    if let Some(Ok(_)) = finished {
-        s.dones.expect_one();
+    // Its own token fired, so no run of this session will read what its moved
+    // calls report. A caller's cancel alone leaves them for the next prompt.
+    if s.child_cancel.is_cancelled() {
+        s.cancellation.end_mailbox();
     }
-    let result = finished.unwrap_or(Ok(DoneReason::Cancelled));
-    // Before the run is judged, so a prompt Esc or an error cut short still
-    // leaves what it streamed in the tab's transcript. A monitor nobody closes
-    // would otherwise keep it in memory until the plugin unloads.
-    if s.background.is_some() {
-        s.upstream
-            .send_history(&s.cancellation.ui_id, s.history.as_slice().to_vec());
-    }
-    // Only this call's messages count: older turns may hold stale preamble
-    // text, and the agent loop's empty-response retry leaves a synthetic
-    // "(empty)" assistant marker that must not pass for a real response.
-    // Auto-compaction can shrink the history mid-run, so clamp the start:
-    // after a rewrite the tail is this call's output either way.
-    let turn = &s.history.as_slice()[history_len.min(s.history.len())..];
-    // A subagent can be cancelled on its own, and its caller should hear about
-    // that instead of taking a half-finished answer for a real one, so cancel
-    // reads like an error here even though the run ended normally. A dropped
-    // prompt never reached the model, so an empty answer would be a lie.
-    let cut_short = match &result {
-        Err(e) => Some(e.to_string()),
-        Ok(DoneReason::Cancelled) if s.stopped_by_user() => Some(STOPPED_BY_USER_ERR.to_owned()),
-        Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
-        Ok(DoneReason::Dropped) => Some(PROMPT_DROPPED_ERR.to_owned()),
-        Ok(
-            DoneReason::EndTurn
-            | DoneReason::MaxTokens
-            | DoneReason::MaxTurns
-            | DoneReason::Compact,
-        ) => None,
-    };
     if let Some(err) = cut_short {
-        let partial = turn
+        // Only this call's messages count: older turns may hold stale preamble
+        // text, and the agent loop's empty-response retry leaves a synthetic
+        // "(empty)" assistant marker that must not pass for a real response.
+        let partial = messages_since(&s.history, history_len)
             .iter()
             .filter(|m| matches!(m.role, Role::Assistant))
             .flat_map(|m| m.content.iter())
@@ -1862,7 +2014,7 @@ async fn prompt(
     }
     let usage = s.params.ledger.totals().usage;
 
-    let text = turn
+    let text = messages_since(&s.history, last_run_start)
         .iter()
         .rfind(|m| matches!(m.role, Role::Assistant))
         .and_then(|m| {
@@ -1981,7 +2133,8 @@ mod tests {
     use futures_lite::future::poll_once;
     use maki_agent::prompt::{PromptId, ResolvedPrompts};
     use maki_agent::tools::test_support::{stub_ctx_with, stub_seed};
-    use maki_agent::{DoneReason, SessionMailbox, TurnCompleteEvent};
+    use maki_agent::{BackgroundNotice, DoneReason, SessionMailbox, TaskEnd, TurnCompleteEvent};
+    use maki_config::ToolKey;
     use maki_providers::model::ThinkingSupport;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -2006,6 +2159,12 @@ mod tests {
     const CALL_ID: &str = "toolu_call";
     const CALL_TOOL: &str = "task";
     const CALL_PLUGIN: &str = "batch";
+    const REQUEST_ID: &str = "toolu_ask";
+    const ASKING_TOOL: &str = "bash";
+    const FIRST_REPLY: &str = "The build runs in the background.";
+    const WOKEN_REPLY: &str = "The build passed.";
+    const MOVED_CALL_ID: &str = "toolu_moved";
+    const NOTICE_TEXT: &str = "Background bash toolu_moved (cargo build) finished:\n\nok";
 
     #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
     #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
@@ -2511,12 +2670,12 @@ mod tests {
         info
     }
 
-    /// The error and the `Done` that end a relayed run.
     fn run_end() -> [AgentEvent; 2] {
         [
             AgentEvent::Error {
                 message: IGNORED_ERROR.into(),
                 auth: false,
+                totals: RunTotals::default(),
             },
             AgentEvent::Done {
                 usage: DONE_USAGE,
@@ -2590,6 +2749,69 @@ mod tests {
         }
     }
 
+    fn permission_ask() -> AgentEvent {
+        AgentEvent::PermissionRequest {
+            id: REQUEST_ID.into(),
+            tool: ToolKey::native(ASKING_TOOL),
+            scopes: Vec::new(),
+            reason: None,
+        }
+    }
+
+    fn unattended_permission() -> String {
+        TaggedAnswer::new(REQUEST_ID, PermissionAnswer::Unattended).encode()
+    }
+
+    /// Headless, a moved session's chat has no reader, so an ask that parks
+    /// its run would wait forever. The relay answers it in place of the user
+    /// it lacks, and nobody hears the ask. A watched chat's ask reaches the
+    /// tab instead, and its user answers it.
+    #[test_case(permission_ask, unattended_permission(), false ; "unwatched_permission")]
+    #[test_case(|| AgentEvent::AuthRequired, String::new(), false ; "unwatched_auth")]
+    #[test_case(permission_ask, unattended_permission(), true ; "watched_permission")]
+    #[test_case(|| AgentEvent::AuthRequired, String::new(), true ; "watched_auth")]
+    fn relay_answers_an_ask_only_when_nobody_watches(
+        ask: fn() -> AgentEvent,
+        unattended: String,
+        watched: bool,
+    ) {
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let info = Arc::new(OnceLock::new());
+        info.set(SubagentInfo {
+            answer_tx: Some(answer_tx),
+            ..subagent_info().get().unwrap().clone()
+        })
+        .unwrap();
+        let session = MakiId::generate();
+        let (ui_tx, ui_rx) = flume::unbounded();
+        let upstream = Upstream::Chat {
+            session,
+            plugin: Arc::from(PLUGIN),
+            ui: watched.then_some(ui_tx),
+            registry: BackgroundTasks::default(),
+            id: PARENT_ID.into(),
+        };
+        let (guard, sub_events) = event_stream();
+        guard.sender(RUN_ID).send(ask()).unwrap();
+        drop(guard);
+
+        smol::block_on(relay_session_events(
+            sub_events,
+            upstream,
+            info,
+            flume::unbounded().0,
+            None,
+        ));
+
+        let (answers, shown) = if watched {
+            (Vec::new(), event_names(&[ask(), AgentEvent::StreamClosed]))
+        } else {
+            (vec![unattended], Vec::new())
+        };
+        assert_eq!(answer_rx.drain().collect::<Vec<_>>(), answers);
+        assert_eq!(event_names(&chat_events(&ui_rx, session)), shown);
+    }
+
     /// Dropping the guard is what ends the relay: a Lua tool context keeps a
     /// sender alive past the run, so disconnect never comes. The forwarded
     /// count also pins down that the close marker itself stays behind, since
@@ -2642,7 +2864,7 @@ mod tests {
         ));
     }
 
-    /// What reached the tab of chat {session}, each event checked to name the
+    /// What reached the tab of this chat, each event checked to name the
     /// owning plugin and the subagent.
     fn chat_events(ui_rx: &flume::Receiver<UiAction>, session: MakiId) -> Vec<AgentEvent> {
         ui_rx
@@ -2714,7 +2936,9 @@ mod tests {
             parent_cancels,
             ui_id: entry.info.id.clone(),
             trigger,
-            background: Some(registry.clone()),
+            registry: registry.clone(),
+            background: true,
+            mailbox: SessionMailbox::register(MakiId::generate()),
             adoption: None,
             stop: StopMark::default(),
         };
@@ -2791,6 +3015,7 @@ mod tests {
     /// A cancel that drops a background prompt mid-run drops the run too, so
     /// no `Done` comes. The tab must still hear the run ended, or its task
     /// stays working, and the relay must not count that as the run's `Done`.
+    /// The error bills what the run spent before the cancel.
     #[test]
     fn dropped_background_prompt_still_ends_the_run_in_its_tab() {
         let (guard, sub_events) = event_stream();
@@ -2800,7 +3025,10 @@ mod tests {
             thinking: None,
             fast: None,
         };
-        drop(background.start_prompt(PARENT_ID, guard.sender(RUN_ID)));
+        let ledger = Arc::new(RunLedger::default());
+        let settle = background.start_prompt(PARENT_ID, guard.sender(RUN_ID), Arc::clone(&ledger));
+        ledger.add(DONE_USAGE, None, None);
+        drop(settle);
         drop(guard);
         let (done_tx, done_rx) = flume::unbounded();
         let (ui_tx, ui_rx) = flume::unbounded();
@@ -2824,8 +3052,8 @@ mod tests {
         assert!(
             matches!(
                 events.as_slice(),
-                [AgentEvent::Error { message, auth: false }, AgentEvent::StreamClosed]
-                    if message == CANCELLED_MSG
+                [AgentEvent::Error { message, auth: false, totals }, AgentEvent::StreamClosed]
+                    if message == CANCELLED_MSG && totals.usage == DONE_USAGE
             ),
             "{:?}",
             event_names(&events)
@@ -2888,6 +3116,7 @@ mod tests {
             lifetime: Lifetime::Call,
             stop: StopMark::default(),
             cancel: Fire::Owned(CancelToken::new().0),
+            mailbox: None,
         }
     }
 
@@ -3104,5 +3333,224 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = prompted.then(|| (chat, PLUGIN.to_owned(), PARENT_ID.to_owned()));
         assert_eq!(opened, Vec::from_iter(expected));
+    }
+
+    /// What a request carried, down to the parts the prompt cache keys on.
+    struct ScriptedRequest {
+        system: String,
+        tools: JsonValue,
+        messages: Vec<Message>,
+    }
+
+    /// Answers each request with the next reply and hands over what it carried.
+    struct ScriptedProvider {
+        requests: Sender<ScriptedRequest>,
+        replies: flume::Receiver<&'static str>,
+    }
+
+    impl Provider for ScriptedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            tools: &'a JsonValue,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.requests
+                    .send(ScriptedRequest {
+                        system: system.to_owned(),
+                        tools: tools.clone(),
+                        messages: messages.to_vec(),
+                    })
+                    .unwrap();
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: self.replies.try_recv().unwrap().into(),
+                        }],
+                        ..Default::default()
+                    },
+                    stop_reason: Some(StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn scripted_ctx() -> (ToolContext, flume::Receiver<ScriptedRequest>) {
+        let (requests_tx, requests) = flume::unbounded();
+        let (replies_tx, replies) = flume::unbounded();
+        for reply in [FIRST_REPLY, WOKEN_REPLY] {
+            replies_tx.send(reply).unwrap();
+        }
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.provider = Arc::new(ScriptedProvider {
+            requests: requests_tx,
+            replies,
+        });
+        (ctx, requests)
+    }
+
+    fn session_mailbox(sess: &AnyUserData) -> SessionMailbox {
+        sess.borrow::<LuaSession>()
+            .unwrap()
+            .cancellation
+            .mailbox
+            .clone()
+    }
+
+    async fn prompt_text(lua: &Lua, sess: &AnyUserData) -> (Option<String>, Option<String>) {
+        let (tbl, error) = prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into())
+            .await
+            .unwrap();
+        (tbl.map(|tbl| tbl.get("text").unwrap()), error)
+    }
+
+    fn moved_call_notice(wake: bool) -> BackgroundNotice<'static> {
+        BackgroundNotice {
+            text: NOTICE_TEXT.into(),
+            display: None,
+            wake,
+            end: TaskEnd::Finished,
+        }
+    }
+
+    /// The agent loop's own append-only contract: `system` and `tools` stay
+    /// put and earlier messages are never edited.
+    #[track_caller]
+    fn assert_append_only(prev: &ScriptedRequest, next: &ScriptedRequest) {
+        assert_eq!(prev.system, next.system, "system changed");
+        assert_eq!(prev.tools, next.tools, "tools changed");
+        assert!(
+            next.messages.starts_with(&prev.messages),
+            "earlier messages were edited"
+        );
+    }
+
+    fn texts(messages: &[Message]) -> Vec<&str> {
+        messages
+            .iter()
+            .filter_map(Message::first_text_content)
+            .collect()
+    }
+
+    /// The call is settled only once the first request went out, so the run
+    /// that made it can't have drained the result: only the wait reads it.
+    /// A user stop reports quietly, but the caller still waits on an answer
+    /// that knows the call ended.
+    #[test_case(false, true ; "without_moved_calls_returns_after_its_run")]
+    #[test_case(true, true ; "with_a_moved_call_returns_the_woken_turn")]
+    #[test_case(true, false ; "with_a_stopped_call_returns_the_woken_turn")]
+    fn a_prompt_waits_for_the_calls_its_session_moved(moved: bool, wake: bool) {
+        let lua = Lua::new();
+        let (ctx, requests) = scripted_ctx();
+        smol::block_on(async {
+            let sess = native_session(&lua, &ctx).await;
+            let mailbox = session_mailbox(&sess);
+            if moved {
+                mailbox.track(MOVED_CALL_ID);
+            }
+            let ((text, error), first) = futures::future::join(prompt_text(&lua, &sess), async {
+                let first = requests.recv_async().await.unwrap();
+                if moved {
+                    mailbox.settle(MOVED_CALL_ID, Some(moved_call_notice(wake)));
+                }
+                first
+            })
+            .await;
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+
+            assert!(error.is_none(), "{error:?}");
+            let later = requests.drain().collect::<Vec<_>>();
+            if !moved {
+                assert_eq!(text.as_deref(), Some(FIRST_REPLY));
+                assert!(later.is_empty());
+                return;
+            }
+            assert_eq!(text.as_deref(), Some(WOKEN_REPLY));
+            let [woken] = later.as_slice() else {
+                panic!("expected one woken request, got {}", later.len());
+            };
+            assert_append_only(&first, woken);
+            let appended = texts(&woken.messages[first.messages.len()..]);
+            assert_eq!(appended.first(), Some(&FIRST_REPLY));
+            assert!(
+                appended
+                    .last()
+                    .is_some_and(|text| text.contains(NOTICE_TEXT))
+            );
+            assert!(mailbox.unsettled().is_empty());
+        });
+    }
+
+    /// Its token fired with no prompt left to notice, so nothing would ever
+    /// read what the call it moved reports.
+    #[test_case(false ; "between_prompts")]
+    #[test_case(true ; "after_its_prompt_was_dropped")]
+    fn a_fired_session_token_stops_its_moved_calls(prompted: bool) {
+        let lua = Lua::new();
+        let (ctx, requests) = scripted_ctx();
+        let (chat, _chat_mailbox, _seed) = live_chat();
+        smol::block_on(async {
+            let sess = native_session(&lua, &ctx).await;
+            let (work_trigger, work) = CancelToken::new();
+            BackgroundTasks::of(&lua)
+                .register(BackgroundTask {
+                    cancel: Fire::Owned(work_trigger),
+                    mailbox: Some(session_mailbox(&sess)),
+                    ..call_entry(chat, MOVED_CALL_ID)
+                })
+                .unwrap();
+            if prompted {
+                let prompt = pin!(prompt_text(&lua, &sess));
+                let first_request = pin!(requests.recv_async());
+                let _ = select(prompt, first_request).await;
+            }
+
+            ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
+            work.cancelled().await;
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn cancelling_a_session_ends_its_prompt_waiting_for_moved_calls() {
+        let lua = Lua::new();
+        let (ctx, requests) = scripted_ctx();
+        smol::block_on(async {
+            let sess = native_session(&lua, &ctx).await;
+            session_mailbox(&sess).track(MOVED_CALL_ID);
+            let ((_, error), ()) = futures::future::join(prompt_text(&lua, &sess), async {
+                requests.recv_async().await.unwrap();
+                ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
+            })
+            .await;
+            assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
+            assert!(requests.is_empty());
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_caller_cancel_ends_the_wait_for_moved_calls() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(MOVED_CALL_ID);
+        let session = CancelToken::none();
+        let (caller_trigger, caller) = CancelToken::new();
+        smol::block_on(async {
+            let mut wake = pin!(next_wake(&mailbox, &session, Some(&caller)));
+            assert!(poll_once(&mut wake).await.is_none());
+            caller_trigger.cancel();
+            assert!(wake.await.is_err());
+        });
     }
 }

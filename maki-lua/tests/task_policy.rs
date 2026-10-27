@@ -2,18 +2,22 @@
 //! source, real `maki.json` / `maki.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
+mod common;
+
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
 
-use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with, stub_seed};
-use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
-use maki_agent::{
-    AgentEvent, AgentMode, AgentSeed, BufferSnapshot, CallScope, CancelToken, Envelope,
-    EventSender, SessionMailbox, SharedBuf, ToolOutput,
+use common::{
+    Chat, WAIT, call_ctx, done_text, exec, next_event, next_task_done, request_move, wait_live_buf,
+    wait_movable,
 };
-use maki_lua::{MoveOutcome, PluginHost, UiAction};
-use maki_storage::id::{MakiId, SessionRef};
+use maki_agent::tools::test_support::stub_ctx;
+use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::{
+    AgentEvent, AgentMode, BufferSnapshot, CancelToken, Envelope, SharedBuf, ToolDoneEvent,
+    ToolOutput,
+};
+use maki_lua::{MoveOutcome, PluginHost};
 use serde_json::{Value, json};
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
@@ -55,7 +59,6 @@ const WAITING_FOR_SLOT: &str = "waiting for a free subagent slot";
 /// Mirrors the task plugin's `FOREGROUND_NOTE` wording.
 const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
 const FOREGROUND_NOTE_TAIL: &str = "Ran in the foreground.";
-const EVENT_WAIT: Duration = Duration::from_secs(10);
 
 const SCENARIO_PLAIN: &str = "plain";
 const SCENARIO_HAPPY: &str = "happy";
@@ -106,18 +109,28 @@ local real_semaphore = maki.async.semaphore
 maki.async.semaphore = function(n)
   recorder.sem_size = n
   local sem = real_semaphore(n)
+  local function spied(permit)
+    recorder.acquired = recorder.acquired + 1
+    return {
+      release = function(p)
+        recorder.released = recorder.released + 1
+        return permit:release()
+      end,
+    }
+  end
   return {
+    try_acquire = function(self)
+      local permit = sem:try_acquire()
+      if permit then
+        recorder.acquire_attempts = recorder.acquire_attempts + 1
+        changed()
+        return spied(permit)
+      end
+    end,
     acquire = function(self)
       recorder.acquire_attempts = recorder.acquire_attempts + 1
       changed()
-      local permit = sem:acquire()
-      recorder.acquired = recorder.acquired + 1
-      return {
-        release = function(p)
-          recorder.released = recorder.released + 1
-          return permit:release()
-        end,
-      }
+      return spied(sem:acquire())
     end,
   }
 end
@@ -720,96 +733,33 @@ fn background_without_a_chat_session_runs_blocking() {
     assert_eq!(snap["notice_count"], json!(0));
 }
 
-struct LiveChat {
-    id: MakiId,
-    _mailbox: SessionMailbox,
-    _seed: Arc<AgentSeed>,
-}
-
-impl LiveChat {
-    fn new() -> Self {
-        let id = MakiId::generate();
-        let mailbox = SessionMailbox::register(id);
-        let seed = mailbox.publish_seed(stub_seed(id));
-        Self {
-            id,
-            _mailbox: mailbox,
-            _seed: seed,
-        }
-    }
-}
-
 /// A blocking `task` call as dispatch makes it: one scope under the run
 /// token and its own event channel, executing on its own thread.
 struct ModelCall {
-    id: &'static str,
     events: flume::Receiver<Envelope>,
-    result: flume::Receiver<ToolExecResult>,
+    result: flume::Receiver<ToolDoneEvent>,
 }
 
 impl ModelCall {
     fn start(
         reg: &Arc<ToolRegistry>,
-        chat: &LiveChat,
+        chat: &Chat,
         run: &CancelToken,
-        id: &'static str,
+        id: &str,
         input: Value,
     ) -> Self {
-        let (events_tx, events) = flume::unbounded();
-        let mut ctx = stub_ctx_with(
-            &AgentMode::Build,
-            Some(&EventSender::new(events_tx, 0)),
-            Some(id),
-        );
-        let scope = Arc::new(CallScope::new(id.to_owned(), run));
-        ctx.cancel = scope.cancel().clone();
-        ctx.call = Some(scope);
-        ctx.session_id = Some(SessionRef::from(chat.id));
-        ctx.registry = Arc::clone(reg);
-        let (result_tx, result) = flume::bounded(1);
+        let (ctx, events) = call_ctx(reg, chat.id, run, id);
         let reg = Arc::clone(reg);
+        let (result_tx, result) = flume::bounded(1);
         thread::spawn(move || {
-            let invocation = reg
-                .get(TASK_TOOL)
-                .unwrap()
-                .tool
-                .parse(&input)
-                .expect("parse failed");
-            let _ = result_tx.send(smol::block_on(invocation.execute(&ctx)));
+            let _ = result_tx.send(exec(&reg, TASK_TOOL, input, &ctx));
         });
-        Self { id, events, result }
+        Self { events, result }
     }
 
-    fn next_event<T>(&self, mut pick: impl FnMut(AgentEvent) -> Option<T>) -> T {
-        let deadline = Instant::now() + EVENT_WAIT;
-        loop {
-            let envelope = self
-                .events
-                .recv_deadline(deadline)
-                .expect("expected tool event");
-            if let Some(found) = pick(envelope.event) {
-                return found;
-            }
-        }
-    }
-
-    fn wait_movable(&self) {
-        self.next_event(|event| {
-            matches!(&event, AgentEvent::ToolMovable { id, movable: true } if id == self.id)
-                .then_some(())
-        });
-    }
-
-    fn wait_live_buf(&self) -> Arc<SharedBuf> {
-        self.next_event(|event| match event {
-            AgentEvent::LiveToolBuf { id, body } if id == self.id => Some(body),
-            _ => None,
-        })
-    }
-
-    fn finish(&self) -> ToolExecResult {
+    fn finish(&self) -> ToolDoneEvent {
         self.result
-            .recv_timeout(EVENT_WAIT)
+            .recv_timeout(WAIT)
             .expect("task call never replied")
     }
 }
@@ -818,29 +768,10 @@ fn buf_text(buf: &SharedBuf) -> String {
     BufferSnapshot::from_arc(buf.read()).text()
 }
 
-fn reply_text(result: ToolExecResult) -> String {
-    match result.output.expect("task call failed") {
-        ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
-        other => panic!("unexpected output: {other:?}"),
-    }
-}
-
-fn request_move(host: &PluginHost, id: &str) -> MoveOutcome {
-    host.event_handle()
-        .request_background(id.to_owned())
-        .recv_timeout(EVENT_WAIT)
-        .expect("move outcome")
-}
-
-fn moved_call_reply(ui: &flume::Receiver<UiAction>) -> (String, bool) {
-    loop {
-        let action = ui.recv_timeout(EVENT_WAIT).expect("task tab event");
-        if let UiAction::PluginTaskEvent { envelope, .. } = action
-            && let AgentEvent::ToolDone(done) = envelope.event
-        {
-            return (done.output.as_text(), done.is_error);
-        }
-    }
+fn reply_text(done: ToolDoneEvent) -> String {
+    let text = done.output.as_text();
+    assert!(!done.is_error, "task call failed: {text}");
+    text
 }
 
 #[test]
@@ -850,7 +781,7 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     let (reg, host) = load_task_host_with_opts(opts);
     host.ui_attachment().attach();
     let ui = host.ui_action_rx();
-    let chat = LiveChat::new();
+    let chat = Chat::live();
     let (_run_trigger, run) = CancelToken::new();
 
     let first = ModelCall::start(
@@ -861,12 +792,15 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
         task_input(SCENARIO_PARKED, None),
     );
     let mut showed_waiting_row = false;
-    first.next_event(|event| {
+    next_event(&first.events, |event| {
         showed_waiting_row |= matches!(event, AgentEvent::LiveToolBuf { .. });
         matches!(&event, AgentEvent::ToolMovable { movable: true, .. }).then_some(())
     });
     assert!(!showed_waiting_row, "a free slot needs no waiting row");
-    assert_eq!(request_move(&host, FIRST_CALL_ID), MoveOutcome::Moved);
+    assert_eq!(
+        request_move(&host.event_handle(), FIRST_CALL_ID),
+        MoveOutcome::Moved
+    );
     let receipt = first.finish();
     assert!(receipt.backgrounded);
     let receipt = reply_text(receipt);
@@ -879,26 +813,32 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
         SECOND_CALL_ID,
         task_input(SCENARIO_PARKED_SECOND, None),
     );
-    let waiting = second.wait_live_buf();
+    let waiting = wait_live_buf(&second.events, SECOND_CALL_ID);
     assert_eq!(buf_text(&waiting), WAITING_FOR_SLOT);
     wait(&reg, json!({ "acquires": 2 }));
-    assert_eq!(request_move(&host, SECOND_CALL_ID), MoveOutcome::NoHook);
+    assert_eq!(
+        request_move(&host.event_handle(), SECOND_CALL_ID),
+        MoveOutcome::NoHook
+    );
     assert!(second.result.is_empty());
     assert_eq!(probe(&reg)["acquired"], json!(1));
 
     wait(&reg, json!({ "parked": SCENARIO_PARKED }));
     release(&reg, SCENARIO_PARKED);
-    assert_eq!(moved_call_reply(&ui), (PLAIN_TEXT.to_owned(), false));
+    assert_eq!(
+        done_text(&next_task_done(&ui)),
+        (PLAIN_TEXT.to_owned(), false)
+    );
     assert_eq!(probe(&reg)["released"], json!(1));
 
     wait(&reg, json!({ "parked": SCENARIO_PARKED_SECOND }));
     assert_eq!(buf_text(&waiting), "");
-    second.wait_movable();
+    wait_movable(&second.events, SECOND_CALL_ID);
     release(&reg, SCENARIO_PARKED_SECOND);
     let result = second.finish();
     assert!(!result.backgrounded);
     assert_eq!(reply_text(result), PLAIN_TEXT);
-    let final_body = second.next_event(|event| match event {
+    let final_body = next_event(&second.events, |event| match event {
         AgentEvent::ToolSnapshot { snapshot, .. } => Some(snapshot.text()),
         _ => None,
     });

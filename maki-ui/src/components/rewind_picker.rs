@@ -16,36 +16,30 @@ const TITLE: &str = " Rewind ";
 const PREVIEW_MAX_LEN: usize = 80;
 pub(crate) const NO_TURNS_MSG: &str = "No user turns to rewind to";
 const FOOTER: &[(&str, &str)] = &[("Enter", "rewind"), (key::FORK.label, "fork")];
-const STOPS_PREFIX: &str = "This stops ";
+const CONFIRM_PREFIX: &str = "Press enter again to rewind and stop ";
 const ONE_TASK: &str = "1 background task";
 const MANY_TASKS_SUFFIX: &str = " background tasks";
-const CONFIRM_SUFFIX: &str = " · enter again to rewind";
+const NAMES_OPEN: &str = " (";
+const NAMES_CLOSE: &str = ")";
+const NAMES_SEP: &str = ", ";
 
-/// Of the {running} tasks, by id and name, those a rewind to {turn_index}
-/// stops: the ones whose receipt, the call that moved, leaves history with
-/// it. A task no call in history names is not a moved call, and stays.
-pub(crate) fn stopped_by_rewind<'a>(
-    messages: &[Message],
-    turn_index: usize,
-    running: &'a [(Arc<str>, String)],
-) -> Vec<&'a (Arc<str>, String)> {
-    running
+/// Whether a rewind to {turn_index} takes the call {id} out of history. A
+/// task no call in history names is not a moved call, and stays.
+pub(crate) fn drops_receipt(messages: &[Message], turn_index: usize, id: &str) -> bool {
+    messages
         .iter()
-        .filter(|(id, _)| {
-            messages
-                .iter()
-                .position(|m| m.tool_uses().any(|(tool_id, _, _)| tool_id == &**id))
-                .is_some_and(|at| at >= turn_index)
-        })
-        .collect()
+        .position(|m| m.tool_uses().any(|(tool_id, _, _)| tool_id == id))
+        .is_some_and(|at| at >= turn_index)
 }
 
+/// The names come last: the line is cut at the picker's edge, and what to
+/// press must survive the cut.
 fn stop_notice(stopped: &[&(Arc<str>, String)]) -> String {
     let count = count_phrase(stopped.len(), ONE_TASK, MANY_TASKS_SUFFIX);
     let names: Vec<&str> = stopped.iter().map(|(_, name)| name.as_str()).collect();
     format!(
-        "{STOPS_PREFIX}{count} ({}){CONFIRM_SUFFIX}",
-        names.join(", ")
+        "{CONFIRM_PREFIX}{count}{NAMES_OPEN}{}{NAMES_CLOSE}",
+        names.join(NAMES_SEP)
     )
 }
 
@@ -132,7 +126,10 @@ impl RewindPicker {
         self.stops = entries
             .iter()
             .filter_map(|entry| {
-                let stopped = stopped_by_rewind(messages, entry.turn_index, running);
+                let stopped: Vec<_> = running
+                    .iter()
+                    .filter(|(id, _)| drops_receipt(messages, entry.turn_index, id))
+                    .collect();
                 (!stopped.is_empty()).then(|| (entry.turn_index, stop_notice(&stopped)))
             })
             .collect();
@@ -227,11 +224,15 @@ impl Overlay for RewindPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::buffer_text;
     use crossterm::event::KeyModifiers;
     use maki_providers::ContentBlock;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use test_case::test_case;
 
     const RECEIPT_ID: &str = "toolu_moved";
+    const OTHER_RECEIPT_ID: &str = "toolu_moved_too";
     const TASK_NAME: &str = "cargo test";
 
     fn user_msg(text: &str) -> Message {
@@ -397,7 +398,7 @@ mod tests {
             picker.stops,
             HashMap::from([(
                 0,
-                format!("{STOPS_PREFIX}{ONE_TASK} ({TASK_NAME}){CONFIRM_SUFFIX}")
+                format!("{CONFIRM_PREFIX}{ONE_TASK}{NAMES_OPEN}{TASK_NAME}{NAMES_CLOSE}")
             )])
         );
 
@@ -411,6 +412,43 @@ mod tests {
             press(&mut picker, KeyCode::Enter),
             RewindPickerAction::Select(entry) if entry.turn_index == 0
         ));
+    }
+
+    /// Long task names fill the line before the picker's edge cuts it, so
+    /// what to press has to come before them.
+    #[test]
+    fn the_confirmation_keeps_what_to_press_at_any_name_length() {
+        const NARROW: u16 = 70;
+        const TALL: u16 = 20;
+        let receipt = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::tool_use(RECEIPT_ID, "bash", serde_json::json!({})),
+                ContentBlock::tool_use(OTHER_RECEIPT_ID, "bash", serde_json::json!({})),
+            ],
+            ..Default::default()
+        };
+        let long_name = "x".repeat(usize::from(NARROW));
+        let running = [
+            (Arc::from(RECEIPT_ID), long_name.clone()),
+            (Arc::from(OTHER_RECEIPT_ID), long_name),
+        ];
+        let mut picker = RewindPicker::new();
+        picker
+            .open(&[user_msg("first"), receipt, user_msg("second")], &running)
+            .unwrap();
+        press(&mut picker, KeyCode::Down);
+        press(&mut picker, KeyCode::Enter);
+
+        let mut terminal = Terminal::new(TestBackend::new(NARROW, TALL)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(screen.contains(CONFIRM_PREFIX.trim_end()), "{screen}");
     }
 
     #[test]

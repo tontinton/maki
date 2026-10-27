@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::fmt::Write;
+use std::ops::AddAssign;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -536,6 +537,14 @@ impl ToolDoneEvent {
         }
     }
 
+    /// How long the call ran before this result, a receipt's until the move.
+    /// Zero when dispatch did not time it.
+    pub fn ran_for(&self) -> Duration {
+        self.call
+            .as_ref()
+            .map_or(Duration::ZERO, |call| call.duration)
+    }
+
     pub fn written_path(&self) -> Option<&str> {
         if self.is_error {
             return None;
@@ -554,7 +563,11 @@ impl ToolDoneEvent {
 pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     let mut content = Vec::with_capacity(results.len());
     let mut images = Vec::new();
+    let mut receipts = Vec::new();
     for r in results {
+        if r.backgrounded {
+            receipts.push(r.id.clone());
+        }
         content.push(ContentBlock::ToolResult {
             tool_use_id: r.id,
             content: r.output.as_text(),
@@ -573,6 +586,7 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     Message {
         role: Role::User,
         content,
+        receipts,
         ..Default::default()
     }
 }
@@ -712,6 +726,10 @@ pub enum AgentEvent {
         message: String,
         /// The provider rejected the credentials, so a re-login is what fixes it.
         auth: bool,
+        /// What the run spent before it failed, the same bill a `Done` carries,
+        /// so a frontend settles either ending alike. Empty when no run started.
+        #[serde(flatten)]
+        totals: RunTotals,
     },
     PermissionRequest {
         id: String,
@@ -785,10 +803,11 @@ pub enum AgentEvent {
 }
 
 impl AgentEvent {
-    pub fn error(error: &AgentError) -> Self {
+    pub fn error(error: &AgentError, totals: RunTotals) -> Self {
         Self::Error {
             message: error.user_message(),
             auth: error.is_auth_error(),
+            totals,
         }
     }
 }
@@ -1083,7 +1102,7 @@ pub struct TurnCompleteEvent {
 }
 
 /// What one run spent, itself and everything it spawned.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct RunTotals {
     pub usage: TokenUsage,
     pub cost: Option<f64>,
@@ -1091,6 +1110,83 @@ pub struct RunTotals {
     /// alike so the total is never a partial sum of whichever turns happened
     /// to be subsidised.
     pub list_cost: Option<f64>,
+}
+
+impl RunTotals {
+    /// What `self` holds beyond `earlier`, a smaller total of the same spend.
+    /// Every paid round carries tokens, so when none moved nothing was spent,
+    /// whatever residue two float sums of the same rounds leave in the costs.
+    pub fn since(&self, earlier: &Self) -> Self {
+        let usage = TokenUsage {
+            input: self.usage.input.saturating_sub(earlier.usage.input),
+            output: self.usage.output.saturating_sub(earlier.usage.output),
+            cache_creation: self
+                .usage
+                .cache_creation
+                .saturating_sub(earlier.usage.cache_creation),
+            cache_read: self
+                .usage
+                .cache_read
+                .saturating_sub(earlier.usage.cache_read),
+            cost: None,
+        };
+        if usage == TokenUsage::default() {
+            return Self::default();
+        }
+        Self {
+            usage,
+            cost: cost_since(self.cost, earlier.cost),
+            list_cost: cost_since(self.list_cost, earlier.list_cost),
+        }
+    }
+}
+
+impl AddAssign for RunTotals {
+    fn add_assign(&mut self, rhs: Self) {
+        self.usage += rhs.usage;
+        add_cost(&mut self.cost, rhs.cost);
+        add_cost(&mut self.list_cost, rhs.list_cost);
+    }
+}
+
+fn cost_since(now: Option<f64>, earlier: Option<f64>) -> Option<f64> {
+    now.map(|now| now - earlier.unwrap_or_default())
+        .filter(|spent| *spent > 0.0)
+}
+
+/// The cost a frontend reports: runs that ended plus the one still streaming.
+/// Turns land their cost as they go, but once a run ends its ledger is the
+/// truth, since it also counts compaction and what work moved off an earlier
+/// turn spent since, which no turn reported.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CostTally {
+    settled: Option<f64>,
+    running: Option<f64>,
+}
+
+impl CostTally {
+    pub fn starting_at(cost: Option<f64>) -> Self {
+        Self {
+            settled: cost,
+            running: None,
+        }
+    }
+
+    pub fn turn(&mut self, cost: Option<f64>) {
+        add_cost(&mut self.running, cost);
+    }
+
+    /// The run ended: `ledger` is the cost its `Done` or `Error` carries.
+    pub fn settle(&mut self, ledger: Option<f64>) {
+        self.running = None;
+        add_cost(&mut self.settled, ledger);
+    }
+
+    pub fn total(&self) -> Option<f64> {
+        let mut total = self.settled;
+        add_cost(&mut total, self.running);
+        total
+    }
 }
 
 /// Spend accumulator for one run, chained to the run that spawned it.
@@ -1107,19 +1203,24 @@ pub struct RunLedger {
 
 impl RunLedger {
     pub fn child(parent: &Arc<Self>) -> Arc<Self> {
+        Self::carrying(parent, RunTotals::default())
+    }
+
+    /// A child that opens with `carried` on it: spend `parent` already holds,
+    /// which this one reports again but never passes up.
+    pub fn carrying(parent: &Arc<Self>, carried: RunTotals) -> Arc<Self> {
         Arc::new(Self {
-            totals: Mutex::default(),
+            totals: Mutex::new(carried),
             parent: Some(Arc::clone(parent)),
         })
     }
 
     pub fn add(&self, usage: TokenUsage, cost: Option<f64>, list_cost: Option<f64>) {
-        {
-            let mut totals = self.locked();
-            totals.usage += usage;
-            add_cost(&mut totals.cost, cost);
-            add_cost(&mut totals.list_cost, list_cost);
-        }
+        *self.locked() += RunTotals {
+            usage,
+            cost,
+            list_cost,
+        };
         if let Some(parent) = &self.parent {
             parent.add(usage, cost, list_cost);
         }
@@ -1457,7 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_results_builds_message_with_tool_result_blocks() {
+    fn tool_results_builds_message_with_tool_result_blocks_and_receipts() {
         let msg = tool_results(vec![
             ToolDoneEvent {
                 call: None,
@@ -1467,7 +1568,7 @@ mod tests {
                 is_error: false,
                 annotation: None,
                 written_path: None,
-                backgrounded: false,
+                backgrounded: true,
             },
             ToolDoneEvent {
                 call: None,
@@ -1482,6 +1583,7 @@ mod tests {
         ]);
         assert!(matches!(msg.role, Role::User));
         assert_eq!(msg.content.len(), 2);
+        assert_eq!(msg.receipts, ["t1"]);
         assert!(
             matches!(&msg.content[0], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "t1" && !is_error)
         );
@@ -1863,6 +1965,9 @@ mod tests {
     const SECOND_INPUT: u32 = 5;
     const OWN_SUBTREE_MSG: &str = "a child ledger reports only what it spent itself";
     const ROLLUP_MSG: &str = "a child's spend has to land in the parent's totals";
+    const CARRIED_ONCE_MSG: &str =
+        "a carried balance shows on the child and stays counted once on the parent";
+    const FLOAT_RESIDUE: f64 = 1e-12;
 
     fn usage(input: u32) -> TokenUsage {
         TokenUsage {
@@ -1888,6 +1993,18 @@ mod tests {
         assert_eq!(totals.list_cost, expected);
     }
 
+    #[test_case(Some(SECOND_COST), FIRST_COST + SECOND_COST ; "a_priced_ledger_replaces_its_turns")]
+    #[test_case(None, FIRST_COST ; "an_unpriced_ledger_adds_nothing")]
+    fn cost_tally_settles_a_run(ledger: Option<f64>, expected: f64) {
+        let mut tally = CostTally::starting_at(Some(FIRST_COST));
+        tally.turn(Some(FIRST_COST));
+        assert_eq!(tally.total(), Some(FIRST_COST * 2.0));
+
+        tally.settle(ledger);
+        tally.settle(None);
+        assert_eq!(tally.total(), Some(expected));
+    }
+
     #[test]
     fn ledger_child_spend_rolls_up_into_parent() {
         let parent = Arc::new(RunLedger::default());
@@ -1910,6 +2027,46 @@ mod tests {
             Some(FIRST_COST + SECOND_COST),
             "{ROLLUP_MSG}"
         );
+    }
+
+    #[test]
+    fn carried_spend_is_reported_by_the_child_but_not_passed_up() {
+        let parent = Arc::new(RunLedger::default());
+        parent.add(usage(FIRST_INPUT), Some(FIRST_COST), None);
+        let child = RunLedger::carrying(&parent, parent.totals());
+        child.add(usage(SECOND_INPUT), Some(SECOND_COST), None);
+
+        for totals in [child.totals(), parent.totals()] {
+            assert_eq!(
+                totals.usage.input,
+                FIRST_INPUT + SECOND_INPUT,
+                "{CARRIED_ONCE_MSG}"
+            );
+            assert_eq!(
+                totals.cost,
+                Some(FIRST_COST + SECOND_COST),
+                "{CARRIED_ONCE_MSG}"
+            );
+        }
+    }
+
+    #[test_case(SECOND_INPUT, Some(SECOND_COST) ; "spent_rounds_are_the_difference")]
+    #[test_case(0, None ; "no_tokens_means_no_spend_despite_cost_residue")]
+    fn totals_since_an_earlier_reading(input: u32, expected_cost: Option<f64>) {
+        let earlier = RunTotals {
+            usage: usage(FIRST_INPUT),
+            cost: Some(FIRST_COST),
+            list_cost: None,
+        };
+        let now = RunTotals {
+            usage: usage(FIRST_INPUT + input),
+            cost: Some(FIRST_COST + expected_cost.unwrap_or(FLOAT_RESIDUE)),
+            list_cost: None,
+        };
+
+        let spent = now.since(&earlier);
+        assert_eq!(spent.usage.input, input);
+        assert_eq!(spent.cost, expected_cost);
     }
 
     const STREAM_RUN_IDS: [u64; 3] = [1, 2, 3];

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
-use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
+use maki_agent::{BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput};
 use maki_lua::{PackCommand, PackPlan};
 use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};
@@ -221,6 +221,8 @@ pub enum Action {
     /// Esc in a plugin task's tab: closes the plugin session behind it.
     CancelPluginTask {
         id: String,
+        /// Read at the stop: a rewind drops the tab before this runs.
+        plugin: Arc<str>,
     },
     /// The history under this runtime changed (reset, load, rewind), so the
     /// agent has to be respawned on it.
@@ -349,11 +351,37 @@ pub struct BackgroundBadge {
     pub outcome: Option<BackgroundOutcome>,
 }
 
+impl BackgroundBadge {
+    /// The badge {receipt} puts on its row. It counts from the call's start,
+    /// as the call's own marks do, not from the move.
+    pub fn moved(receipt: &ToolDoneEvent) -> Self {
+        let now = Instant::now();
+        Self {
+            id: receipt.id.clone(),
+            started_at: Some(now.checked_sub(receipt.ran_for()).unwrap_or(now)),
+            outcome: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundOutcome {
     Done,
     Error,
     Cancelled,
+    /// The task died with the maki that ran it and never reported back.
+    Lost,
+}
+
+impl From<TaskEnd> for BackgroundOutcome {
+    fn from(end: TaskEnd) -> Self {
+        match end {
+            TaskEnd::Finished => Self::Done,
+            TaskEnd::Failed => Self::Error,
+            TaskEnd::Cancelled => Self::Cancelled,
+            TaskEnd::Lost => Self::Lost,
+        }
+    }
 }
 
 impl DisplayMessage {

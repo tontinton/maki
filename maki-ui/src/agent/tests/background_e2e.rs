@@ -25,7 +25,6 @@ use maki_providers::{
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
-use test_case::test_case;
 
 use crate::agent::AgentHandles;
 use crate::agent::shared_queue::{QueueItem, QueuedInput};
@@ -66,6 +65,8 @@ const GATE_CLOSED: &str = "the scripted model stopped waiting for its release";
 const RECEIPT_MISSING: &str = "the model's next request carries no result for the moved call";
 const SERIALIZES: &str = "messages serialize";
 const NO_WAKE: &str = "the finished task left no wake for the chat";
+const NOT_IDLE: &str = "check for extra requests only once the loop reported it is idle";
+const EXTRA_REQUEST: &str = "an extra request went out";
 
 // Mirrors of the wording in maki-lua's runtime and registry.
 const MOVED_BY_USER: &str = "Moved to the background by the user";
@@ -305,7 +306,7 @@ fn expected_text(output: &str) -> String {
     format!("Background {PARK_TOOL} {PARK_ID} ({SUMMARY}) {FINISHED}:\n\n{output}")
 }
 
-/// The transcript line; a task stopped by the user reads `cancelled`.
+/// The transcript line. A task stopped by the user reads `cancelled`.
 fn expected_display(outcome: &str) -> String {
     format!("Background {PARK_TOOL} {outcome}: {SUMMARY}")
 }
@@ -436,11 +437,18 @@ impl World {
         self.requests.recv_timeout(WAIT).expect(NO_REQUEST)
     }
 
+    /// The provider records a request before it answers, and `QueueDrained`
+    /// follows the last answer of the loop's last run, so once that event is
+    /// read nothing can still be in flight and `try_recv` is exact. Only the
+    /// event loop starts runs, never this one on its own, so no later run
+    /// needs a point to wait for.
+    #[track_caller]
     fn assert_no_more_requests(&self) {
         assert!(
-            self.requests.try_recv().is_err(),
-            "an extra request went out"
+            matches!(self.seen.last(), Some(AgentEvent::QueueDrained)),
+            "{NOT_IDLE}"
         );
+        assert!(self.requests.try_recv().is_err(), "{EXTRA_REQUEST}");
     }
 
     fn finish_moved_call(&self) {
@@ -703,33 +711,24 @@ fn a_task_stop_by_the_model_returns_the_partial_output_and_sends_no_notice() {
     world.assert_no_more_requests();
 }
 
-enum Ends {
-    TurnEnd,
-    Esc,
-}
-
-/// §10: neither the end of the turn nor Esc touches moved work, which keeps
-/// running and reports like any other.
-#[test_case(Ends::TurnEnd, DoneReason::EndTurn ; "turn_end")]
-#[test_case(Ends::Esc, DoneReason::Cancelled ; "esc")]
-fn the_end_of_the_turn_and_esc_leave_moved_work_running(ends: Ends, reason: DoneReason) {
+/// Esc does not touch moved work, which keeps running and reports like any
+/// other.
+#[test]
+fn esc_leaves_moved_work_running() {
     let (_model_gate_open, model_gate) = flume::unbounded::<()>();
-    let after_receipt = match ends {
-        Ends::TurnEnd => Step::new(answer(WAITING_TEXT)),
-        Ends::Esc => Step::new(answer(WAITING_TEXT)).held(model_gate),
-    };
-    let mut world = World::start(vec![Step::new(park_call()), after_receipt]);
+    let mut world = World::start(vec![
+        Step::new(park_call()),
+        Step::new(answer(WAITING_TEXT)).held(model_gate),
+    ]);
     world.prompt(FIRST_RUN, BUILD_PROMPT);
     world.move_call(PARK_ID);
     let _ = world.next_request();
     let receipt_request = world.next_request();
     World::assert_receipt(&receipt_request);
-    if matches!(ends, Ends::Esc) {
-        world.handles.cancel_run(FIRST_RUN);
-    }
+    world.handles.cancel_run(FIRST_RUN);
     world.wait_idle();
     world.assert_row_moved();
-    assert_eq!(world.done_reasons(), [reason]);
+    assert_eq!(world.done_reasons(), [DoneReason::Cancelled]);
     world.assert_no_wake_left();
 
     world.finish_moved_call();

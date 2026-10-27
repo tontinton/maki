@@ -11,30 +11,36 @@ use maki_agent::tools::{
 use maki_agent::{AgentEvent, AgentSeed};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::{MakiId, SessionRef};
-use mlua::{LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
+use mlua::{
+    Function, LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue,
+};
 
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, err_pair, pair};
-use crate::runtime::{MoveOutcome, RestoreReason, TaskHandle, active_task, lock_cell, move_self};
+use crate::runtime::{
+    MoveOutcome, RestoreReason, SUBAGENT_SELF_MOVE_MSG, TaskHandle, active_task, lock_cell,
+    move_self,
+};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 const WRITE_TOOL: &str = "write";
 const BACKGROUND_HOOK_ALREADY_SET_MSG: &str = "ctx:on_background() already called";
 const NOT_A_MODEL_CALL_MSG: &str =
     "on_background: only the handler of a model's tool call can move to the background";
+/// Model-facing: bash and task quote it when `background = true` cannot be
+/// honoured.
+const NESTED_CALL_MSG: &str = "background is ignored for a call inside batch or another \
+     tool; call the tool directly to run it in the background";
 const NO_BACKGROUND_HOOK_MSG: &str = "set_movable: call ctx:on_background() first";
 const NO_BACKGROUND_HOOK_FOR_MOVE_MSG: &str = "background: call ctx:on_background() first";
-const SUBAGENT_CALL_MSG: &str =
-    "background: a subagent's tool calls cannot move, its own call in the chat can";
 const EXPIRE_BACKGROUND: &str = "background";
 const EXPIRE_TIMEOUT: &str = "timeout";
 
 /// What `ctx:set_deadline` does when the deadline passes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeadlineExpire {
-    #[default]
     Timeout,
     /// Move the call to the background instead, falling back to a timeout
     /// when it cannot move.
@@ -76,10 +82,10 @@ fn announce_movable(handle: &TaskHandle, agent: &AgentContext, movable: bool) {
     }
 }
 
-/// What the runtime asks before a move: a subagent's result would land in
-/// its parent's mailbox, and a call needs a live chat to land in.
+/// What the runtime asks before a move: a run to report to, and a live chat
+/// whose task tabs show the work.
 fn could_move(agent: &AgentContext) -> bool {
-    agent.task_id.is_none()
+    agent.mailbox.is_some()
         && agent
             .session_id
             .as_ref()
@@ -400,30 +406,27 @@ impl UserData for LuaCtx {
 
         methods.add_method(
             "on_background",
-            |lua, this, hook: mlua::Function| -> mlua::Result<Pair<bool>> {
+            |lua, this, hook: Function| -> mlua::Result<Pair<bool>> {
                 let Some(agent) = this.agent() else {
                     return Ok(this.cap_err_pair("on_background"));
                 };
                 let Some(call) = &agent.call else {
                     return Ok(err_pair(NOT_A_MODEL_CALL_MSG));
                 };
-                // Made before the cell is locked: allocating can run the GC,
-                // and a finalizer may want the same cell.
-                let key = lua.create_registry_value(hook)?;
                 let handle = active_task(lua);
-                let mut cell = lock_cell(&handle);
-                if !cell.call.as_ref().is_some_and(|own| Arc::ptr_eq(own, call)) {
-                    drop(cell);
-                    lua.remove_registry_value(key)?;
-                    return Ok(err_pair(NOT_A_MODEL_CALL_MSG));
+                {
+                    let cell = lock_cell(&handle);
+                    if !cell.call.as_ref().is_some_and(|own| Arc::ptr_eq(own, call)) {
+                        return Ok(err_pair(NOT_A_MODEL_CALL_MSG));
+                    }
+                    if cell.background_hook.is_some() {
+                        return Err(mlua::Error::runtime(BACKGROUND_HOOK_ALREADY_SET_MSG));
+                    }
                 }
-                if cell.background_hook.is_some() {
-                    drop(cell);
-                    lua.remove_registry_value(key)?;
-                    return Err(mlua::Error::runtime(BACKGROUND_HOOK_ALREADY_SET_MSG));
-                }
-                cell.background_hook = Some(key);
-                drop(cell);
+                // Made outside the lock: allocating can run the GC, and a
+                // finalizer may want the same cell.
+                let key = lua.create_registry_value(hook)?;
+                lock_cell(&handle).background_hook = Some(key);
                 announce_movable(&handle, agent, true);
                 Ok((Some(true), None))
             },
@@ -451,10 +454,14 @@ impl UserData for LuaCtx {
                 return Ok(this.cap_err_pair("background"));
             };
             if agent.task_id.is_some() {
-                return Ok(err_pair(SUBAGENT_CALL_MSG));
+                return Ok(err_pair(SUBAGENT_SELF_MOVE_MSG));
             }
-            let (Some(call), Some(id)) = (agent.call.clone(), agent.tool_use_id.clone()) else {
+            let Some(call) = agent.call.clone() else {
                 return Ok(err_pair(NOT_A_MODEL_CALL_MSG));
+            };
+            // A nested call shares its parent's scope but has no id of its own.
+            let Some(id) = agent.tool_use_id.clone() else {
+                return Ok(err_pair(NESTED_CALL_MSG));
             };
             // Nothing may hold the ctx borrow across the wait: the hook runs
             // meanwhile and may call ctx methods.
@@ -487,7 +494,7 @@ impl UserData for LuaCtx {
                 }
                 let expire = DeadlineExpire::parse(opts.as_ref())?;
                 let handle = active_task(lua);
-                let cell = handle.lock().unwrap_or_else(|e| e.into_inner());
+                let cell = lock_cell(&handle);
                 if cell.deadline_secs.get().is_some() {
                     return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
                 }
@@ -590,11 +597,12 @@ mod tests {
 
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::tools::{LocalTool, ToolAudience};
-    use maki_agent::{AgentMode, CallScope, InstructionBlock};
+    use maki_agent::{AgentMode, InstructionBlock};
     use mlua::Lua;
     use test_case::test_case;
 
     use super::*;
+    use crate::runtime::test_support::call_scope;
     use crate::runtime::{TaskCell, TaskScope};
 
     const TOOL_USE_ID: &str = "tu-1";
@@ -721,8 +729,7 @@ mod tests {
     #[test]
     fn a_second_on_background_raises() {
         let lua = Lua::new();
-        let (_run_trigger, run) = CancelToken::new();
-        let call = Arc::new(CallScope::new(TOOL_USE_ID.to_owned(), &run));
+        let (call, _run, _) = call_scope(false);
         let mut ctx = populated_ctx();
         ctx.call = Some(Arc::clone(&call));
         let mut cell = TaskCell::new(call.cancel().clone(), None, None);

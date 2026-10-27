@@ -48,7 +48,7 @@ const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
 ];
 const QUEUE_PLACEHOLDER: &str = "Queue another prompt...";
 const SUBAGENT_QUEUE_PLACEHOLDER: &str = "Queue a message for this subagent...";
-const TASK_STOP_PLACEHOLDER: &str = "esc stop";
+const TASK_STOP_PLACEHOLDER: &str = "esc esc stop";
 const ASK_PREFIX: &str = "Ask maki to ";
 const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";

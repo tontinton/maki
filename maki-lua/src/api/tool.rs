@@ -14,13 +14,13 @@ use maki_agent::tools::Tool;
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
-    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
+    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError,
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
     ToolReach, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, CallScope, ImageMediaType, ImageSource, SharedBuf, TextOutput,
-    ToolDoneEvent, ToolOutput,
+    ToolOutput,
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -153,6 +153,33 @@ impl ToolPermission<PermissionScopeSpec> {
     }
 }
 
+const NEEDS_BACKGROUND_KEY: &str = "needs_background";
+
+/// What a tool offers only to a session whose model can move a call to the
+/// background itself.
+#[derive(Clone, Default)]
+pub(crate) struct BackgroundOnly {
+    pub(crate) tool: bool,
+    pub(crate) params: Vec<String>,
+}
+
+impl BackgroundOnly {
+    fn from_spec(spec: &Table, schema: &Value) -> LuaResult<Self> {
+        let params = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(_, param)| param.get(NEEDS_BACKGROUND_KEY) == Some(&Value::Bool(true)))
+            .map(|(name, _)| name.clone())
+            .collect();
+        Ok(Self {
+            tool: spec_opt(spec, NEEDS_BACKGROUND_KEY, "a boolean")?.unwrap_or(false),
+            params,
+        })
+    }
+}
+
 pub(crate) struct PendingTool {
     pub(crate) name: Arc<str>,
     pub(crate) description: String,
@@ -169,6 +196,7 @@ pub(crate) struct PendingTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) describe_key: Option<RegistryKey>,
+    pub(crate) background_only: BackgroundOnly,
 }
 
 impl PendingTool {
@@ -222,6 +250,7 @@ pub(crate) struct LuaTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) has_describe_fn: bool,
+    pub(crate) background_only: BackgroundOnly,
 }
 
 impl Tool for LuaTool {
@@ -266,6 +295,22 @@ impl Tool for LuaTool {
 
     fn schema(&self) -> Value {
         to_json_schema(self.schema)
+    }
+
+    fn offered_schema(&self, background: bool) -> Option<Value> {
+        if background {
+            return Some(self.schema());
+        }
+        if self.background_only.tool {
+            return None;
+        }
+        let mut schema = self.schema();
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            for param in &self.background_only.params {
+                properties.remove(param);
+            }
+        }
+        Some(schema)
     }
 
     fn audience(&self) -> ToolAudience {
@@ -546,27 +591,29 @@ impl ToolInvocation for LuaToolInvocation {
     }
 }
 
-/// Fires after {timeout} unless {call} moved to the background first: a
-/// moved subtree, nested calls included, runs until its work ends or someone
-/// stops it.
+/// Ends the wait after {timeout}, unless {call} moved to the background
+/// first. A moved call, and every call nested in it, runs until its work ends
+/// or someone stops it.
 ///
-/// For the model call itself ({own_call}) the lapse claims the call's trigger,
-/// the one a move takes too: a move landing as the timeout fires either wins,
-/// and its receipt is the reply, or finds the call ended. Never both.
+/// A move and the timeout can land at the same moment. For the model call
+/// itself ({own_call}) the timeout ends the call through the same trigger a
+/// move claims, so only one wins: the receipt is the reply, or the move finds
+/// the call already ended.
 async fn backstop(timeout: Duration, call: Option<&CallScope>, own_call: bool) {
+    let Some(call) = call else {
+        smol::Timer::after(timeout).await;
+        return;
+    };
     let lapsed = async {
         smol::Timer::after(timeout).await;
-        match call {
-            None => true,
-            Some(call) if own_call => call.end(),
-            Some(call) => call.home().is_none(),
+        if own_call {
+            call.end()
+        } else {
+            call.home().is_none()
         }
     };
     let moved = async {
-        match call {
-            Some(call) => call.moved().await,
-            None => std::future::pending().await,
-        }
+        call.moved().await;
         false
     };
     if !futures_lite::future::or(lapsed, moved).await {
@@ -737,6 +784,7 @@ fn register_prompt(
 ///   permission      (string)   The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
+///   needs_background (boolean) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
 /// @return
 /// @example
 /// maki.api.register_tool({
@@ -1629,6 +1677,7 @@ fn register_tool_from_lua(
         .ok()
         .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences, ToolAudience::default())?;
+    let background_only = BackgroundOnly::from_spec(spec, &schema_val)?;
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -1672,6 +1721,7 @@ fn register_tool_from_lua(
             start_annotation,
             examples,
             describe_key,
+            background_only,
         });
 
     Ok(())
@@ -1777,8 +1827,9 @@ pub(crate) struct ToolCallReply {
     /// return. It becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
-    /// `result` is the receipt of a call that moved to the background.
-    pub backgrounded: bool,
+    /// Set when `result` is the receipt of a call that moved to the
+    /// background.
+    pub moved: Option<MovedCall>,
 }
 
 impl ToolCallReply {
@@ -1791,7 +1842,7 @@ impl ToolCallReply {
             diff,
             image,
             state,
-            backgrounded,
+            moved,
             ..
         } = self;
         let output = result.map(|s| {
@@ -1819,27 +1870,7 @@ impl ToolCallReply {
             output,
             annotation,
             written_path,
-            backgrounded,
-        }
-    }
-
-    /// What dispatch would have made of the reply, for the final reply of a
-    /// moved call, which no dispatcher waits for any more.
-    pub(crate) fn into_done_event(self, id: String, tool: Arc<str>) -> ToolDoneEvent {
-        let result = self.into_exec_result();
-        let (output, is_error) = match result.output {
-            Ok(output) => (output, false),
-            Err(message) => (ToolOutput::Plain(message.into()), true),
-        };
-        ToolDoneEvent {
-            id,
-            tool,
-            output: Arc::new(output),
-            is_error,
-            annotation: result.annotation,
-            written_path: result.written_path,
-            call: None,
-            backgrounded: false,
+            moved,
         }
     }
 
@@ -1887,7 +1918,7 @@ impl ToolCallReply {
             diff,
             image,
             state,
-            backgrounded: false,
+            moved: None,
         }
     }
 
@@ -1920,7 +1951,7 @@ impl ToolCallReply {
             diff: None,
             image: None,
             state: None,
-            backgrounded: false,
+            moved: None,
         }
     }
 
@@ -2008,12 +2039,9 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::TaskHome;
-    use maki_agent::cancel::{CancelToken, CancelTrigger};
-    use maki_storage::id::MakiId;
-
     use super::*;
     use crate::runtime::block_on_or_fail;
+    use crate::runtime::test_support::{call_scope, moved_home};
 
     #[test_case::test_case("echo", true ; "simple_name")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]
@@ -2162,6 +2190,7 @@ mod tests {
             has_start_fn: false,
             examples: None,
             has_describe_fn: false,
+            background_only: BackgroundOnly::default(),
         }
     }
 
@@ -2499,40 +2528,15 @@ mod tests {
         smol::block_on(inv.start(&ctx));
     }
 
-    const BACKSTOP_CALL_ID: &str = "toolu_backstop";
-    const BACKSTOP_PLUGIN: &str = "backstop";
-
-    /// Holds the run trigger and, once moved, the task's, so neither firing
-    /// on drop reads as a cancel.
-    fn call_scope(moved: bool) -> (CallScope, CancelTrigger, Option<CancelTrigger>) {
-        let (run_trigger, run) = CancelToken::new();
-        let call = CallScope::new(BACKSTOP_CALL_ID.to_owned(), &run);
-        let task_trigger = moved.then(|| call.move_to(home()).expect("first move"));
-        (call, run_trigger, task_trigger)
-    }
-
-    fn home() -> TaskHome {
-        TaskHome {
-            chat: MakiId::generate(),
-            id: BACKSTOP_CALL_ID.to_owned(),
-            plugin: Arc::from(BACKSTOP_PLUGIN),
-        }
-    }
-
+    /// Once the timeout ended the model call, a move landing late finds
+    /// nothing to move, so the two never both answer it.
     #[test_case::test_case(true ; "own_call")]
     #[test_case::test_case(false ; "nested_call")]
     fn the_backstop_fires_for_a_call_still_in_the_foreground(own_call: bool) {
         let (call, _run, _task) = call_scope(false);
-        block_on_or_fail(backstop(Duration::ZERO, Some(&call), own_call));
+        block_on_or_fail(backstop(Duration::ZERO, Some(&*call), own_call));
         assert_eq!(call.cancel().is_cancelled(), own_call);
-    }
-
-    /// The timeout and a move landing with it cannot both answer the call.
-    #[test]
-    fn a_lapsed_backstop_refuses_a_later_move() {
-        let (call, _run, _task) = call_scope(false);
-        block_on_or_fail(backstop(Duration::ZERO, Some(&call), true));
-        assert!(call.move_to(home()).is_err());
+        assert_eq!(call.move_to(moved_home()).is_err(), own_call);
     }
 
     /// A bash nested in a moved batch would otherwise die at its own timeout.
@@ -2542,7 +2546,7 @@ mod tests {
         let (call, _run, _task) = call_scope(true);
         let fired = block_on_or_fail(futures_lite::future::or(
             async {
-                backstop(Duration::ZERO, Some(&call), own_call).await;
+                backstop(Duration::ZERO, Some(&*call), own_call).await;
                 true
             },
             async {

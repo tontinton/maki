@@ -5,8 +5,10 @@
 //! on the [`Tool`](super::Tool) trait, so a tool is hookable because dispatch
 //! reached it, not because whoever wrote it remembered to ask.
 
-use std::time::Instant;
+use std::future::Future;
+use std::time::{Duration, Instant};
 
+use futures_lite::FutureExt;
 use serde_json::Value;
 
 use super::registry::{BoxFuture, ToolReach};
@@ -83,6 +85,9 @@ pub struct HookCall<'a> {
     pub origin: CallOrigin,
     pub output_mode: ToolOutputMode,
     pub authority: Authority,
+    /// [`HookStage::Output`] on the receipt of a call that moved to the
+    /// background. Its final result fires the stage again, with this unset.
+    pub receipt: bool,
     /// The call's own cancellation, so a hook that runs elsewhere (the Lua
     /// thread) dies with the call rather than outliving the reply channel.
     pub cancel: &'a CancelToken,
@@ -109,10 +114,40 @@ pub enum Verdict {
     },
 }
 
+/// Why a chain ended without a verdict.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChainCut {
+    Cancelled,
+    Lapsed,
+}
+
+/// The one wait every hook chain takes. The host on the other end enforces
+/// `deadline` and has the last word there: a chain it already ran deserves
+/// its verdict however late it arrives. This only ends the wait on a host
+/// that never answers (one that is gone or mid-reload), `grace` past the
+/// deadline, or past now for a deadline that had already lapsed.
+pub async fn bounded<T>(
+    cancel: &CancelToken,
+    deadline: Instant,
+    grace: Duration,
+    chain: impl Future<Output = T>,
+) -> Result<T, ChainCut> {
+    let answered = async { cancel.race(chain).await.map_err(|_| ChainCut::Cancelled) };
+    let lapsed = async {
+        smol::Timer::at(deadline.max(Instant::now()) + grace).await;
+        Err(ChainCut::Lapsed)
+    };
+    answered.or(lapsed).await
+}
+
 pub trait ToolHook: Send + Sync + 'static {
     /// Synchronous and allocation free, because dispatch asks it for every
     /// call: a stage nobody wrapped never leaves the calling thread.
     fn wraps(&self, tool: &str, stage: HookStage) -> bool;
+
+    /// How long past a chain's deadline this host may still answer, see
+    /// [`bounded`].
+    fn answer_grace(&self) -> Duration;
 
     /// `value` is the call's input at [`HookStage::Input`], and
     /// `{ [OUTPUT_TEXT]: string, [OUTPUT_IS_ERROR]: bool }` at
@@ -133,4 +168,48 @@ pub trait ToolHook: Send + Sync + 'static {
         call: &'a HookCall<'a>,
         ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Option<LayerAnswer>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+
+    use smol::future::yield_now;
+    use test_case::test_case;
+
+    use super::*;
+
+    const SHORT_GRACE: Duration = Duration::from_millis(20);
+    const LONG_GRACE: Duration = Duration::from_secs(60);
+    const VERDICT: &str = "late but heard";
+
+    /// A reply crossing threads is pending on the first poll even when the
+    /// host already ran the chain, so a lapsed deadline alone must not end
+    /// the wait: the host decides what a late chain is worth. The answering
+    /// case gets a grace it never reaches, so a slow machine cannot fail it.
+    #[test_case(true,  LONG_GRACE,  Ok(VERDICT)           ; "a_late_answer_is_heard")]
+    #[test_case(false, SHORT_GRACE, Err(ChainCut::Lapsed) ; "silence_ends_after_the_grace")]
+    fn a_lapsed_deadline_waits_on_the_host(
+        answers: bool,
+        grace: Duration,
+        expected: Result<&str, ChainCut>,
+    ) {
+        smol::block_on(async {
+            let started = Instant::now();
+            let chain = async {
+                if !answers {
+                    pending::<()>().await;
+                }
+                yield_now().await;
+                VERDICT
+            };
+
+            let got = bounded(&CancelToken::none(), started, grace, chain).await;
+
+            assert_eq!(got, expected);
+            if !answers {
+                assert!(started.elapsed() >= grace, "gave up inside the grace");
+            }
+        });
+    }
 }

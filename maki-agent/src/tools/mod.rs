@@ -17,9 +17,9 @@ pub use deadline::Deadline;
 pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
-    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
-    RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation, ToolReach,
-    ToolRegistry, ToolSource,
+    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, MovedCall, MovedLand, ParseError,
+    PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult,
+    ToolInvocation, ToolReach, ToolRegistry, ToolSource,
 };
 
 use std::collections::HashMap;
@@ -37,6 +37,7 @@ use serde_json::Value;
 use crate::agent::{CallInstructions, LoadedInstructions, default_instruction_files};
 use crate::call_scope::CallScope;
 use crate::cancel::{CancelMap, CancelToken};
+use crate::live_session::SessionMailbox;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
@@ -51,6 +52,8 @@ pub(crate) const TOOL_NAME_FIELD: &str = "name";
 const COMPACT_DURATION: SpanPrinter = SpanPrinter::new()
     .designator(Designator::Compact)
     .spacing(Spacing::None);
+const COMPACT_DURATION_UNITS: [char; 3] = ['h', 'm', 's'];
+const TIMEOUT_SUFFIX: &str = " timeout";
 /// What `maki.task` calls the session's own chat.
 pub const MAIN_TASK_ID: &str = "main";
 
@@ -204,6 +207,23 @@ impl RequestTools {
         workflow: bool,
         mcp: bool,
     ) -> Self {
+        Self::build_with_background(registry, vars, model, config, excluded, workflow, mcp, true)
+    }
+
+    /// [`Self::build`] for a session whose `background` is known: when it is
+    /// off, tools and parameters that only exist to move a call to the
+    /// background stay out of the array for the whole session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_background(
+        registry: &ToolRegistry,
+        vars: &crate::template::Vars,
+        model: &Model,
+        config: &AgentConfig,
+        excluded: &[&str],
+        workflow: bool,
+        mcp: bool,
+        background: bool,
+    ) -> Self {
         let filter = ToolFilter::from_config(config, model, excluded);
         let ctx = DescriptionContext {
             filter: &filter,
@@ -212,7 +232,12 @@ impl RequestTools {
             mcp,
         };
         Self {
-            definitions: registry.definitions(vars, &ctx, model.supports_tool_examples()),
+            definitions: registry.definitions_with_background(
+                vars,
+                &ctx,
+                model.supports_tool_examples(),
+                background,
+            ),
             filter: Arc::new(filter),
         }
     }
@@ -290,7 +315,17 @@ pub fn compact_duration(secs: u64) -> String {
 }
 
 pub fn timeout_annotation(secs: u64) -> String {
-    format!("{} timeout", compact_duration(secs))
+    format!("{}{TIMEOUT_SUFFIX}", compact_duration(secs))
+}
+
+/// Whether {note} is what [`timeout_annotation`] writes.
+pub fn is_timeout_annotation(note: &str) -> bool {
+    note.strip_suffix(TIMEOUT_SUFFIX).is_some_and(|span| {
+        !span.is_empty()
+            && span
+                .chars()
+                .all(|c| c.is_ascii_digit() || COMPACT_DURATION_UNITS.contains(&c))
+    })
 }
 
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
@@ -352,6 +387,10 @@ pub struct ToolContext {
     /// The model call this context serves, shared by its nested calls. `None`
     /// outside a model call (one-shots, plugin-opened sessions).
     pub call: Option<Arc<CallScope>>,
+    /// Where a call moved off this run reports its result: the run's own
+    /// mailbox. `None` outside an agent run (one-shots, the interpreter), so
+    /// nothing there moves.
+    pub mailbox: Option<SessionMailbox>,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
     pub deadline: Deadline,
@@ -614,6 +653,7 @@ pub fn interpreter_ctx(
         instruction_files: Arc::new(default_instruction_files()),
         call_instructions: CallInstructions::default(),
         call: None,
+        mailbox: None,
         cancel,
         mcp: None,
         deadline: Deadline::default(),
@@ -920,6 +960,14 @@ mod tests {
     #[test_case(90,  "1m30s timeout" ; "mixed")]
     fn timeout_annotation_cases(secs: u64, expected: &str) {
         assert_eq!(timeout_annotation(secs), expected);
+        assert!(is_timeout_annotation(expected));
+    }
+
+    #[test_case("network timeout" ; "words")]
+    #[test_case(" timeout"        ; "no_span")]
+    #[test_case("24 lines"        ; "another_note")]
+    fn is_timeout_annotation_rejects(note: &str) {
+        assert!(!is_timeout_annotation(note));
     }
 
     #[test_case(0,     "0s"     ; "zero")]
