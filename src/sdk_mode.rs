@@ -1139,7 +1139,8 @@ impl EventPump {
             | AgentEvent::Nudge
             | AgentEvent::Notice { .. }
             | AgentEvent::PromptProgress { .. }
-            | AgentEvent::StreamClosed => {}
+            | AgentEvent::StreamClosed
+            | AgentEvent::RestoreDone => {}
             // A later kept message overwrites this with its own answer, so the
             // reason is the result only when every message was dropped.
             AgentEvent::Steered {
