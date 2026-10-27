@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # renovate: datasource=github-releases depName=JohnnyMorganz/StyLua
-      STYLUA_VERSION: v2.4.1
+      STYLUA_VERSION: v2.6.0
     steps:
       - uses: actions/checkout@v7
       - name: Install stylua
