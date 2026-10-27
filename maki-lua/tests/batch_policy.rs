@@ -4,6 +4,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -641,6 +642,53 @@ fn children_overlap_and_output_keeps_input_order() {
         summary_all_ok(2)
     );
     assert_eq!(out, expected);
+}
+
+/// The restore batch's `RestoreDone` rides the same channel the renders did,
+/// so it lands after the last one by construction — the ordering a reloaded
+/// UI relies on before placing a carried view.
+#[test]
+fn restore_done_arrives_after_the_batch_renders() {
+    let (_reg, host) = load_batch_host();
+    let handle = host.event_handle();
+    let (tx, rx) = flume::unbounded();
+    handle.request_restore(
+        maki_lua::RestoreItem {
+            tool: Arc::from(BATCH_TOOL),
+            tool_use_id: BATCH_ID.to_owned(),
+            output: "restored output".to_owned(),
+            input: json!({ "calls": [] }),
+            is_error: false,
+            tool_output_lines: ToolOutputLines::default(),
+            theme_gen: None,
+            clicks: Vec::new(),
+            state: None,
+            task_id: None,
+            session_id: None,
+            reason: maki_lua::RestoreReason::default(),
+        },
+        EventSender::new(tx.clone(), 0),
+    );
+    let done = Arc::new(AtomicBool::new(true));
+    handle.send_restore_complete(done, EventSender::new(tx, 0));
+
+    const DEADLINE: Duration = Duration::from_secs(30);
+    let finish_by = Instant::now() + DEADLINE;
+    let mut saw_render = false;
+    loop {
+        let remaining = finish_by.saturating_duration_since(Instant::now());
+        let envelope = rx
+            .recv_timeout(remaining)
+            .expect("RestoreDone never arrived");
+        match envelope.event {
+            AgentEvent::RestoreDone => break,
+            AgentEvent::ToolSnapshot { .. } | AgentEvent::ToolHeaderSnapshot { .. } => {
+                saw_render = true;
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+    assert!(saw_render, "the batch render comes before done");
 }
 
 fn restore_snapshot_lines(

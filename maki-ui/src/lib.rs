@@ -16,7 +16,7 @@ mod components;
 mod decor_worker;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand, PluginAccess, SUBMITS_PROMPT};
 pub use components::keybindings;
-pub use components::messages::ScrollPos;
+pub use components::messages::ScrollAnchor;
 mod highlight;
 pub use highlight::highlight_ansi;
 pub mod image;
@@ -63,8 +63,11 @@ pub struct OpenSession {
     pub claim: SessionClaim,
     /// Where the main chat was reading when the UI generation ended, so a
     /// `/reload` reopens the tab where it was instead of at the newest
-    /// message. `None` on every other entry path, which keeps the bottom pin.
-    pub view: Option<(ScrollPos, bool)>,
+    /// message. Counted over history-backed segments only: a cancel or an
+    /// error line above the view is not rebuilt, so it cannot shift the
+    /// reopening. `None` on every other entry path, which keeps the bottom
+    /// pin.
+    pub view: Option<ScrollAnchor>,
 }
 
 impl OpenSession {

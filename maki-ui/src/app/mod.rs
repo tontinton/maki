@@ -2474,6 +2474,13 @@ impl App {
     /// to every chat, stale runs are dropped, the rest goes to [`Self::deliver`].
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
         if envelope.run_id == RESTORE_RUN_ID {
+            if matches!(envelope.event, AgentEvent::RestoreDone) {
+                // The batch's last render was sent before this on the same
+                // channel, so the heights the carried anchor counts against
+                // are final now.
+                self.main_chat().settle_scroll_anchor();
+                return vec![];
+            }
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
                 AgentEvent::ToolSnapshot {
                     id,
