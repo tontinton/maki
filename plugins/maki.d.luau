@@ -72,6 +72,7 @@ declare maki: {
   fs: {
     read: @checked (path: string, opts: any) -> (string?, string?),
     read_bytes: @checked (path: string, opts: any) -> (buffer?, string?),
+    read_lines: @checked (path: string, opts: any) -> (any, string?),
     metadata: @checked (path: string) -> (any, string?),
     dirname: @checked (path: string) -> (string?),
     basename: @checked (path: string) -> (string?),

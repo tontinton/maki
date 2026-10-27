@@ -2724,7 +2724,7 @@ maki.fs.read({path}, {opts?})
 
 Read the file at {path} as a UTF-8 string. Pass {opts} to read only some
 lines, such as the end of a log.
-Returns nil plus an error message if the text read is over 512 MiB or not
+Returns nil plus an error message if the text read is over 64 MiB or not
 valid UTF-8. Skipped lines do not count, so tailing a huge log works.
 Use `read_bytes` for binary files.
 
@@ -2758,7 +2758,7 @@ maki.fs.read_bytes({path}, {opts?})
 
 Read the file at {path} as raw bytes in a Luau buffer. Pass {opts} to read
 a byte range.
-Returns nil plus an error message if the bytes read are over 512 MiB.
+Returns nil plus an error message if the bytes read are over 64 MiB.
 Use it for binary files or data headed for `maki.base64.encode`.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
@@ -2777,6 +2777,39 @@ local buf, err = maki.fs.read_bytes("image.png")
 if err then return end
 local encoded = maki.base64.encode(buf)
 local header = maki.fs.read_bytes("image.png", { len = 8 })
+```
+
+---
+
+### `maki.fs.read_lines()` {#maki-fs-read_lines}
+
+```lua
+maki.fs.read_lines({path}, {opts?})
+```
+
+Read a page of lines from the file at {path}, holding only that page, and
+count every line of the file in the same pass. With `max_line_bytes`, a
+file of any size pages fine, even one that is a single huge line.
+Lines come without their `\n` or `\r\n`, and a trailing newline does not
+start a new line: `a\nb\n` has 2 lines.
+Returns nil plus an error message if the page is over 64 MiB or not valid
+UTF-8.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
+- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
+
+**Returns:** (`table?`, `string?`) `{ lines = string[], total = integer? }`, or nil plus an error message.
+
+**Example:**
+
+```lua
+local page, err = maki.fs.read_lines("server.log", { offset = 101, limit = 100, max_line_bytes = 500 })
+if err then return end
+print(("lines 101-%d of %d"):format(100 + #page.lines, page.total))
 ```
 
 ---

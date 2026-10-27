@@ -1962,43 +1962,92 @@ pub(crate) fn enqueue_spawned_task(
     Ok(handle)
 }
 
+/// Decides when the shared VM collects garbage between ops.
+///
+/// Luau never collects when an allocation fails, and its own pacer waits for
+/// the heap to double before the next cycle. After a big read or a plugin that
+/// ran out of memory, that point lies past the memory limit. The garbage then
+/// stays forever and every plugin fails to allocate, even for `echo hi`.
+/// We run a full collect once the heap gets halfway from what the last collect
+/// kept to the limit. That always lands before the wall, and a big heap that
+/// is all live data is not rescanned on every op.
+struct GcPacer {
+    lua: Lua,
+    limit: usize,
+    collect_above: Cell<usize>,
+    ops_since_step: Cell<usize>,
+}
+
+impl GcPacer {
+    fn new(lua: Lua, limit: usize) -> Self {
+        Self {
+            lua,
+            limit,
+            collect_above: Cell::new(halfway_to(0, limit)),
+            ops_since_step: Cell::new(0),
+        }
+    }
+
+    /// Also runs before each op, so no op starts on garbage that work outside
+    /// the gate left behind. Returns whether it collected.
+    fn relieve_pressure(&self) -> bool {
+        if self.lua.used_memory() <= self.collect_above.get() {
+            return false;
+        }
+        self.lua.gc_collect().ok();
+        self.collect_above
+            .set(halfway_to(self.lua.used_memory(), self.limit));
+        true
+    }
+
+    fn op_finished(&self) {
+        if self.relieve_pressure() {
+            return;
+        }
+        let ops = self.ops_since_step.get() + 1;
+        if ops >= GC_STEP_INTERVAL {
+            self.ops_since_step.set(0);
+            self.lua.gc_step().ok();
+        } else {
+            self.ops_since_step.set(ops);
+        }
+    }
+}
+
+fn halfway_to(live: usize, limit: usize) -> usize {
+    live + limit.saturating_sub(live) / 2
+}
+
 /// Caps concurrent coroutines to avoid blowing the Lua stack.
 /// Also serves as a drain barrier for load/clear ops.
 struct InflightGate {
-    lua: Lua,
+    gc: GcPacer,
     count: Cell<usize>,
     /// What [`Self::drain`] waits on. Unlike `count`, it leaves out work under
     /// a `maki.async.spawn` task and includes work still waiting for a slot.
     held: Cell<usize>,
-    ops_since_gc: Cell<usize>,
     event: Event,
 }
 
 impl InflightGate {
     fn new(lua: Lua) -> Self {
         Self {
-            lua,
+            gc: GcPacer::new(lua, LUA_MEMORY_LIMIT),
             count: Cell::new(0),
             held: Cell::new(0),
-            ops_since_gc: Cell::new(0),
             event: Event::new(),
         }
     }
 
     fn increment(&self) {
         self.count.set(self.count.get() + 1);
+        self.gc.relieve_pressure();
     }
 
     fn decrement(&self) {
         self.count.set(self.count.get().saturating_sub(1));
         self.event.notify(usize::MAX);
-        let ops = self.ops_since_gc.get() + 1;
-        if ops >= GC_STEP_INTERVAL {
-            self.ops_since_gc.set(0);
-            self.lua.gc_step().ok();
-        } else {
-            self.ops_since_gc.set(ops);
-        }
+        self.gc.op_finished();
     }
 
     async fn wait_until(&self, ready: impl Fn() -> bool) {
@@ -5361,6 +5410,39 @@ mod tests {
 
     fn gate() -> InflightGate {
         InflightGate::new(Lua::new())
+    }
+
+    const MIB: usize = 1024 * 1024;
+    const PACER_HEADROOM: usize = 4 * MIB;
+    const PACER_LIVE: usize = 3 * MIB;
+    const PACER_GARBAGE: usize = MIB;
+
+    #[test]
+    fn gc_pacer_rescans_a_big_live_heap_only_once_it_grows() {
+        let lua = Lua::new();
+        // Luau's own GC would free memory behind the pacer's back. A full
+        // collect turns it back on, so it gets stopped again after each one.
+        lua.gc_stop();
+        let pacer = GcPacer::new(lua.clone(), lua.used_memory() + PACER_HEADROOM);
+        let alloc = |global: &str, bytes: usize| {
+            lua.load(format!("{global} = string.rep('x', {bytes})"))
+                .exec()
+                .unwrap()
+        };
+
+        alloc("live", PACER_LIVE);
+        assert!(pacer.relieve_pressure(), "past halfway to the limit");
+        lua.gc_stop();
+        let live = lua.used_memory();
+        assert!(!pacer.relieve_pressure(), "nothing grew since the collect");
+
+        alloc("garbage", PACER_GARBAGE);
+        lua.load("garbage = nil").exec().unwrap();
+        assert!(pacer.relieve_pressure(), "garbage pushed past the new mark");
+        assert!(
+            lua.used_memory() < live + PACER_GARBAGE,
+            "the garbage is gone, the live heap kept"
+        );
     }
 
     #[test]

@@ -5899,26 +5899,46 @@ fn pure_functions_not_guarded() {
     assert!(result.contains("json=true"), "got: {result}");
 }
 
+/// All plugins share one VM, so a tool that runs it out of memory must fail
+/// alone and leave enough room for the tools that come after it. The hog
+/// yields as it grows, so a slow machine hits the memory limit, not the
+/// watchdog for a blocked Lua thread.
 #[test]
-fn runaway_allocation_hits_memory_limit_instead_of_oom() {
-    const LIMITED: &str = "limited";
-    let src = r#"
-        local ok, err = pcall(function()
-            local t = {}
-            local chunk = string.rep("x", 1024 * 1024)
-            while true do
-                t[#t + 1] = chunk .. tostring(#t)
-            end
-        end)
-        if ok then error("expected allocation to fail under the memory limit") end
-        if not string.find(tostring(err), "memory") then
-            error("expected an out-of-memory error, got: " .. tostring(err))
-        end
-    "#;
+fn out_of_memory_tool_fails_alone() {
+    const AFTER_BYTES: usize = 1024 * 1024;
+    let src = format!(
+        r#"
+        maki.api.register_tool({{
+            name = "hog",
+            description = "d",
+            schema = {MINIMAL_SCHEMA},
+            handler = function()
+                local t = {{}}
+                local chunk = string.rep("x", 1024 * 1024)
+                while true do
+                    t[#t + 1] = chunk .. tostring(#t)
+                    maki.async.sleep(0)
+                end
+            end,
+        }})
+        maki.api.register_tool({{
+            name = "after",
+            description = "d",
+            schema = {MINIMAL_SCHEMA},
+            handler = function()
+                return tostring(#string.rep("y", {AFTER_BYTES}))
+            end,
+        }})
+    "#
+    );
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source(LIMITED, src)
-        .expect("plugin should hit the memory limit and recover, not crash the process");
+    host.load_source("oom", &src).unwrap();
+
+    let hog = exec_tool(&reg, "hog", serde_json::json!({})).unwrap_err();
+    assert!(hog.contains("memory"), "got: {hog}");
+    let after = exec_tool(&reg, "after", serde_json::json!({}));
+    assert_eq!(after, Ok(AFTER_BYTES.to_string()));
 }
 
 #[test]
@@ -6800,6 +6820,34 @@ mod read_tool_required_params {
             )),
             "explicit limit must be clamped to the cap, got: {out}"
         );
+    }
+
+    /// Reading the whole file used to fill the 512 MiB Lua heap that every
+    /// plugin shares. The file is sparse, so the test stays cheap.
+    #[cfg(unix)]
+    #[test]
+    fn file_bigger_than_lua_heap_with_one_huge_line() {
+        const HEAD: &str = "first\nsecond\n";
+        const OVER_LUA_HEAP: u64 = 600 * 1024 * 1024;
+        const DEFAULT_MAX_LINE_BYTES: usize = 500;
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.log");
+        std::fs::write(&path, HEAD).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(OVER_LUA_HEAP)
+            .unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({ "path": path.to_str().unwrap(), "offset": 2, "limit": 2 }),
+        );
+        let huge_line_cut = "\0".repeat(DEFAULT_MAX_LINE_BYTES);
+        assert_eq!(out, Ok(format!("2: second\n3: {huge_line_cut}...")));
     }
 
     #[test]
