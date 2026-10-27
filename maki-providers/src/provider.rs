@@ -348,14 +348,24 @@ pub async fn fetch_all_models(
                 })
                 .await;
         }
-        let custom_specs = custom::discover_models(timeouts).await;
-        for (provider, models) in group_by_slug(custom_specs) {
+        let custom = custom::discover_models(timeouts).await;
+        for (provider, models) in group_by_slug(custom.specs) {
             let _ = tx_custom
                 .send_async(ModelBatch {
                     provider,
                     models,
                     warnings: Vec::new(),
                     missing_credentials: false,
+                })
+                .await;
+        }
+        for slug in custom.missing_credentials {
+            let _ = tx_custom
+                .send_async(ModelBatch {
+                    provider: slug,
+                    models: Vec::new(),
+                    warnings: Vec::new(),
+                    missing_credentials: true,
                 })
                 .await;
         }
