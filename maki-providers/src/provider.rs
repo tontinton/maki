@@ -186,6 +186,9 @@ pub struct ModelBatch {
     /// providers answered.
     pub providers: Vec<String>,
     pub warnings: Vec<String>,
+    /// The provider could not be built for want of credentials. The picker
+    /// says so instead of resolving auth a second time.
+    pub missing_credentials: bool,
 }
 
 pub(crate) fn provider_of(spec: &str) -> &str {
@@ -267,12 +270,26 @@ pub async fn fetch_all_models(
 
     for spec in ProviderRegistry::all() {
         let slug = spec.slug;
-        let Ok(provider) = spawn_blocking(move || provider_for_slug(slug, timeouts))
+        let provider = match spawn_blocking(move || provider_for_slug(slug, timeouts))
             .await
             .expect("provider construction panicked")
-        else {
-            warn!(provider = slug, "failed to create provider, skipping");
-            continue;
+        {
+            Ok(provider) => provider,
+            Err(e) => {
+                warn!(provider = slug, error = %e, "failed to create provider, skipping");
+                if matches!(e, AgentError::MissingCredentials { .. }) {
+                    let _ = tx
+                        .send_async(ModelBatch {
+                            providers: vec![slug.to_string()],
+                            provider: slug.to_string(),
+                            models: Vec::new(),
+                            warnings: Vec::new(),
+                            missing_credentials: true,
+                        })
+                        .await;
+                }
+                continue;
+            }
         };
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -306,6 +323,7 @@ pub async fn fetch_all_models(
                     provider: slug,
                     models,
                     warnings: Vec::new(),
+                    missing_credentials: false,
                 })
                 .await;
         }
@@ -320,6 +338,7 @@ pub async fn fetch_all_models(
                     provider,
                     models,
                     warnings: Vec::new(),
+                    missing_credentials: false,
                 })
                 .await;
         }
@@ -331,6 +350,7 @@ pub async fn fetch_all_models(
                     provider,
                     models,
                     warnings: Vec::new(),
+                    missing_credentials: false,
                 })
                 .await;
         }
@@ -387,6 +407,7 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
         models,
         providers: vec![slug.to_string()],
         warnings,
+        missing_credentials: false,
     }
 }
 
