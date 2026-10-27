@@ -36,6 +36,28 @@
       commitMessageTopic: 'flake.lock',
     },
   },
+  customManagers: [
+    {
+      customType: 'regex',
+      description: "Copilot's API version has no listing, so follow the one opencode pins",
+      managerFilePatterns: ['/^maki-providers/src/providers/copilot/mod\\.rs$/'],
+      matchStrings: ['const API_VERSION_HEADER: &str = "(?<currentValue>\\d{4}-\\d{2}-\\d{2})";'],
+      depNameTemplate: 'copilot-api-version',
+      datasourceTemplate: 'custom.copilot-api-version',
+      versioningTemplate: 'regex:^(?<major>\\d{4})-(?<minor>\\d{2})-(?<patch>\\d{2})$',
+    },
+  ],
+  customDatasources: {
+    'copilot-api-version': {
+      defaultRegistryUrlTemplate: 'https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/core/src/plugin/provider/github-copilot.ts',
+      format: 'plain',
+      // Every line of the file comes in as a release. Keep the one that pins the version, and return
+      // nothing when it's gone, so a rename on their side fails the lookup instead of going quiet.
+      transformTemplates: [
+        '($pins := releases[$match(version, /^const apiVersion = "\\d{4}-\\d{2}-\\d{2}"$/)]; $count($pins) = 1 ? {"releases": [{"version": $match($pins.version, /\\d{4}-\\d{2}-\\d{2}/).match}]} : {})',
+      ],
+    },
+  },
   packageRules: [
     {
       description: 'In-range crate updates come with the weekly Cargo.lock PR',
@@ -68,6 +90,12 @@
     {
       matchManagers: ['custom.regex'],
       schedule: ['* * 1 * *'],
+    },
+    {
+      description: 'Weekly, unlike the other custom deps. The PR only moves the date, so the new /models shape needs a look before merging',
+      matchDepNames: ['copilot-api-version'],
+      schedule: ['* * * * 1'],
+      prBodyNotes: ['Check that `/models` still parses with this version (`billing.token_prices`, `capabilities.limits`) before merging.'],
     },
     {
       matchManagers: ['custom.regex'],
