@@ -50,7 +50,7 @@ jobs:
       - name: Build in Alpine container
         env:
           # renovate: datasource=docker depName=alpine
-          ALPINE_VERSION: "3.21"
+          ALPINE_VERSION: "3.24"
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
