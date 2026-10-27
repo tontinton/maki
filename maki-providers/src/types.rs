@@ -1091,10 +1091,11 @@ pub mod dialect {
             adaptive: None,
             off: None
         },
-        /// `output_config.effort` on Anthropic adaptive-thinking models. The API
-        /// has native adaptive mode, so Adaptive sends no effort.
+        /// `output_config.effort` on Anthropic adaptive-thinking models, all of
+        /// which take `xhigh` and `max`. The API has native adaptive mode, so
+        /// Adaptive sends no effort.
         ANTHROPIC_ADAPTIVE "anthropic-adaptive" {
-            supported: [Low, Medium, High],
+            supported: [Low, Medium, High, XHigh, Max],
             adaptive: None,
             off: None
         },
@@ -2123,9 +2124,10 @@ mod tests {
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-6", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_opus_4_6")]
     #[test_case(ThinkingConfig::Off, "claude-opus-4-7", json!({}) ; "off_adaptive_model")]
     #[test_case(ThinkingConfig::Adaptive, "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}}) ; "adaptive_adaptive_model")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_7")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "max"}}) ; "budget_adaptive_opus_4_7")]
     #[test_case(ThinkingConfig::Effort(Low), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_sonnet_5")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "max"}}) ; "budget_adaptive_sonnet_5")]
+    #[test_case(ThinkingConfig::Effort(Max), "claude-opus-5.5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "max"}}) ; "effort_max_passthrough")]
     fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
         config.apply_to_body(&mut body, &thinking_model(model_id));
@@ -2194,7 +2196,8 @@ mod tests {
     #[test_case(&dialect::DEEPSEEK, ThinkingConfig::Adaptive,        None        ; "deepseek_adaptive_uses_api_default")]
     #[test_case(&dialect::DEEPSEEK, ThinkingConfig::Effort(Minimal), Some("max") ; "deepseek_minimal")]
     #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Adaptive,      None         ; "anthropic_adaptive_is_native")]
-    #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(XHigh), Some("high") ; "anthropic_xhigh_snaps_down")]
+    #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(XHigh), Some("xhigh") ; "anthropic_xhigh_passthrough")]
+    #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(Minimal), Some("low") ; "anthropic_minimal_snaps_up")]
     #[test_case(&dialect::TENSORX, ThinkingConfig::Off,             Some("none") ; "tensorx_off_explicit_none")]
     #[test_case(&dialect::OLLAMA, ThinkingConfig::Off,             Some("none")   ; "ollama_off_explicit_none")]
     #[test_case(&dialect::OLLAMA, ThinkingConfig::Adaptive,        Some("medium") ; "ollama_adaptive")]
