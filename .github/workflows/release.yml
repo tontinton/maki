@@ -106,7 +106,7 @@ jobs:
       - name: Install zig
         env:
           # renovate: datasource=forgejo-tags depName=ziglang/zig registryUrl=https://codeberg.org
-          ZIG_VERSION: 0.16.0
+          ZIG_VERSION: 0.17.0
         run: |
           .github/scripts/retry.sh curl -sSfL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           tar xJf "$RUNNER_TEMP/zig.tar.xz" -C "$HOME"
