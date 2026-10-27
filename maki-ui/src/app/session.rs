@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -14,7 +15,9 @@ use maki_agent::agent::SessionExport;
 use maki_agent::session::SessionHeader;
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{PluginPermissions, PluginReach, SessionEndReason};
-use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
+use maki_providers::{
+    ContentBlock, Message, Model, RequestOptions, TokenUsage, estimate_message_tokens,
+};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{
     SessionClaim, SessionMeta, StoredMode, StoredSubagent, StoredWriters,
@@ -351,8 +354,13 @@ impl App {
         if eh.is_disconnected() {
             self.restoring
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+        } else if let Some(tx) = self.restore_event_tx.clone() {
+            // The done event rides the same channel the renders did, so the
+            // UI can trust the heights it has applied once it arrives.
+            eh.send_restore_complete(restoring, tx);
         } else {
-            eh.send_restore_complete(restoring);
+            self.restoring
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -415,6 +423,24 @@ impl App {
             yolo: self.permissions.persisted_yolo(),
         };
         open
+    }
+
+    /// Tool call ids the session transcript holds — the only ids a `/reload`
+    /// can still resolve after rebuilding the view from history. A local `!`
+    /// shell run carries a `shell-` id that never reaches the transcript, so
+    /// it cannot anchor the carried view.
+    pub(crate) fn session_tool_ids(&self) -> HashSet<String> {
+        self.state
+            .session
+            .messages()
+            .iter()
+            .flat_map(|msg| {
+                msg.content.iter().filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+            })
+            .collect()
     }
 
     /// `maki.session.new` lays its document over [`Self::blank_session`], so

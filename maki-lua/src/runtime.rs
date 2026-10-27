@@ -526,6 +526,7 @@ pub enum Request {
     },
     RestoreComplete {
         flag: Arc<AtomicBool>,
+        event_tx: maki_agent::EventSender,
     },
     FireAutocmd {
         event: String,
@@ -2309,19 +2310,23 @@ impl Drop for GateGuard {
 /// Restore items run as spawned tasks, so queue order no longer says when a
 /// batch is done: the App sends its `restoring` flag after the items, and the
 /// flag may only clear once every in-flight item has finished (it drives the
-/// restore spinner).
+/// restore spinner). The `RestoreDone` event rides the same channel the
+/// renders did, so it lands after the last one by construction.
 #[derive(Default)]
 struct RestoreTracker {
     inflight: Cell<usize>,
-    flags: RefCell<Vec<Arc<AtomicBool>>>,
+    flags: RefCell<Vec<(Arc<AtomicBool>, maki_agent::EventSender)>>,
 }
 
 impl RestoreTracker {
     /// Flags are global across sessions on purpose: any batch reaching idle
-    /// releases every registered spinner flag.
+    /// releases every registered spinner flag. `RestoreDone` is sent before
+    /// the flag clears, so seeing `false` implies the event is already on
+    /// the channel.
     fn release_if_idle(&self) {
         if self.inflight.get() == 0 {
-            for flag in self.flags.borrow_mut().drain(..) {
+            for (flag, event_tx) in self.flags.borrow_mut().drain(..) {
+                let _ = event_tx.send(maki_agent::AgentEvent::RestoreDone);
                 flag.store(false, Ordering::Relaxed);
             }
         }
@@ -2332,8 +2337,8 @@ impl RestoreTracker {
         self.release_if_idle();
     }
 
-    fn complete(&self, flag: Arc<AtomicBool>) {
-        self.flags.borrow_mut().push(flag);
+    fn complete(&self, flag: Arc<AtomicBool>, event_tx: maki_agent::EventSender) {
+        self.flags.borrow_mut().push((flag, event_tx));
         self.release_if_idle();
     }
 
@@ -5265,8 +5270,8 @@ pub fn spawn(
                         Request::RestoreToolAsync { item, event_tx } => {
                             spawn_restore(&ex, &gate, &restores, &rt, item, event_tx);
                         }
-                        Request::RestoreComplete { flag } => {
-                            restores.complete(flag);
+                        Request::RestoreComplete { flag, event_tx } => {
+                            restores.complete(flag, event_tx);
                         }
                         Request::ClickTool {
                             tool_use_id,

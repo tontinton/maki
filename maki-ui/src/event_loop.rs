@@ -10,6 +10,7 @@
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -446,7 +447,7 @@ impl SpawnCtx {
             self.mcp_config_errors.clone(),
             Arc::clone(&self.model_policy),
         );
-        let view = open.view;
+        let view = open.view.clone();
         let mut app = App::new(
             &slot.model,
             open,
@@ -473,9 +474,16 @@ impl SpawnCtx {
         }
         // A carried view belongs to the transcript `restore_resumed_session`
         // just rebuilt, so it lands only after that. `None` keeps the bottom
-        // pin a tab from disk or a fresh start opens on.
-        if let Some((scroll, auto_scroll)) = view {
-            app.main_chat().restore_scroll(scroll, auto_scroll);
+        // pin a tab from disk or a fresh start opens on. The panel holds it
+        // until the restore batch's done event settles it; a disconnected
+        // Lua owes no renders and never sends one, so it settles now.
+        if let Some(anchor) = view {
+            let batch_in_flight = app.restoring.load(Ordering::Relaxed);
+            let chat = app.main_chat();
+            chat.restore_anchor(anchor);
+            if !batch_in_flight {
+                chat.settle_scroll_anchor();
+            }
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         let last_title = app.state.session.title.clone();
@@ -2155,7 +2163,8 @@ impl<'t> EventLoop<'t> {
             app.checkpoint_now();
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
-            let view = Some(app.main_chat().scroll_state());
+            let shared = app.session_tool_ids();
+            let view = Some(app.main_chat().scroll_anchor(&shared));
             tabs.push(OpenSession {
                 session: Arc::unwrap_or_clone(app.state.session),
                 claim: app.state.claim,
