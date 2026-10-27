@@ -166,7 +166,8 @@ pub fn resolve(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Resolved> {
     };
     if continues_in_place(in_place.as_ref(), &id) {
         match StoredSession::claim_and_load(id.id(), storage) {
-            Ok((session, claim)) => {
+            Ok((mut session, claim)) => {
+                session.set_cwd(cwd.to_owned());
                 return Ok(Resolved {
                     id,
                     start_type: source.start_type(),
@@ -301,6 +302,7 @@ mod tests {
     const SURVIVED: &str = "a refused run must leave the session it pointed at alone";
     const COPY_ON_DISK: &str = "a copy has to be a session on disk before the run starts";
     const FORK_CWD: &str = "/project/fork";
+    const RESUME_CWD: &str = "/project/resume";
     const STORED_INPUT_TOKENS: u32 = 1_234;
     /// A session id spelled as the hex uuid a Claude Code compatible client
     /// sends, rather than the base58 a `MakiId` renders.
@@ -509,6 +511,18 @@ mod tests {
             original.token_usage.input, STORED_INPUT_TOKENS,
             "{SURVIVED}"
         );
+    }
+
+    #[test]
+    fn an_in_place_resume_adopts_the_current_workspace() {
+        let (_dir, storage, _cwd, stored) = storage_with_stored_session();
+
+        let session = resolve(&cli(&["-r", ID_PLACEHOLDER], stored), RESUME_CWD, &storage)
+            .expect("resume resolves")
+            .into_session(STORED_SPEC, RESUME_CWD)
+            .session;
+
+        assert_eq!(session.cwd, RESUME_CWD);
     }
 
     /// `--session-id` names where the run is written, which is a separate
