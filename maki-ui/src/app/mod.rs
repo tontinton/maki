@@ -951,7 +951,12 @@ impl App {
         if !self.state.model.supports_thinking() {
             return Err(THINKING_UNSUPPORTED_MSG.into());
         }
-        self.state.thinking = ThinkingConfig::parse(input.trim(), self.state.thinking)
+        // A model that can't turn thinking off stores `off` as its floor, which
+        // a toggle has to read as off again or it never turns thinking back on.
+        let current = Some(self.state.thinking)
+            .filter(|&thinking| thinking != ThinkingConfig::Off.clamped(&self.state.model))
+            .unwrap_or(ThinkingConfig::Off);
+        self.state.thinking = ThinkingConfig::parse(input.trim(), current)
             .map_err(str::to_owned)?
             .clamped(&self.state.model);
         self.state.pending_thinking = None;

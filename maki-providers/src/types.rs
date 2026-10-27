@@ -826,6 +826,11 @@ pub(crate) const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
 /// generation early, at 4.7; the other families joined at 5.
 const ADAPTIVE_SINCE: (u32, u32) = (5, 0);
 const ADAPTIVE_SINCE_OPUS: (u32, u32) = (4, 7);
+/// From 5 on every Claude model thinks when `thinking` is left out. Opus 5.5,
+/// Fable and Mythos can't turn it off at all, and for the rest Anthropic
+/// advises a low effort over `disabled`, which can make Opus 5 write its tool
+/// calls as plain text.
+const THINKS_BY_DEFAULT_SINCE: (u32, u32) = (5, 0);
 const GEMINI_LEVEL_SINCE: u32 = 3;
 const OPUS: &str = "opus";
 const CLAUDE: &str = "claude";
@@ -873,6 +878,12 @@ fn requires_adaptive(model_id: &str) -> bool {
         };
         version >= since
     })
+}
+
+/// Read off the id like [`requires_adaptive`], so `off` is gone for these
+/// models on every provider that serves them.
+pub(crate) fn thinks_by_default(model_id: &str) -> bool {
+    claude_version(model_id).is_some_and(|(_, version)| version >= THINKS_BY_DEFAULT_SINCE)
 }
 
 /// The releases that made thinking adaptive-only also reject any sampling
@@ -1471,16 +1482,21 @@ impl ThinkingConfig {
     /// one it goes out as. Declared fields keep `Adaptive` separate because
     /// their level fragments can differ from the provider fallback.
     pub fn shown(self, model: &Model) -> Self {
+        let config = if self.is_enabled() {
+            self
+        } else {
+            self.clamped(model)
+        };
         let fields = model.effective_thinking_fields();
         if let Some((fields, fallback)) = fields
-            && let Some(shown) = declared_thinking(fields, self, model, fallback)
+            && let Some(shown) = declared_thinking(fields, config, model, fallback)
         {
             return shown;
         }
-        if self == Self::Adaptive && fields.is_some_and(|(fields, _)| !fields.levels.is_empty()) {
-            return self;
+        if config == Self::Adaptive && fields.is_some_and(|(fields, _)| !fields.levels.is_empty()) {
+            return config;
         }
-        model.thinking_sent(self)
+        model.thinking_sent(config)
     }
 
     pub fn level(self) -> Option<Effort> {
@@ -2732,6 +2748,34 @@ mod tests {
             fast: false,
         };
         assert_eq!(opts.clamped(&model).thinking, expected);
+    }
+
+    #[test_case("claude-opus-5.5", ThinkingConfig::Effort(Minimal) ; "copilot_opus_5_5")]
+    #[test_case("anthropic.claude-opus-5", ThinkingConfig::Effort(Minimal) ; "bedrock_opus_5")]
+    #[test_case("claude-sonnet-5.5", ThinkingConfig::Effort(Minimal) ; "sonnet_5_5")]
+    #[test_case("claude-fable-5-1", ThinkingConfig::Effort(Minimal) ; "fable")]
+    #[test_case("claude-opus-4.8", ThinkingConfig::Off ; "opus_4_8_turns_it_off")]
+    fn off_rises_to_minimal_where_the_model_thinks_by_default(
+        model_id: &str,
+        expected: ThinkingConfig,
+    ) {
+        let mut model = thinking_model(model_id);
+        model.thinking_override = Some(Support::Yes);
+
+        assert_eq!(ThinkingConfig::Off.clamped(&model), expected);
+        assert_eq!(ThinkingConfig::Off.shown(&model), expected);
+    }
+
+    #[test]
+    fn a_spelled_off_survives_where_the_model_thinks_by_default() {
+        let mut model = native_thinking_model(
+            "claude-opus-5",
+            json!({"off": {"thinking": {"type": "disabled"}}}),
+        );
+        model.thinking_override = Some(Support::Yes);
+
+        assert_eq!(ThinkingConfig::Off.clamped(&model), ThinkingConfig::Off);
+        assert_eq!(ThinkingConfig::Off.shown(&model), ThinkingConfig::Off);
     }
 
     /// The picker and the status bar read the level, but the session keeps

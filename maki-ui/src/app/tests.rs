@@ -9691,6 +9691,19 @@ fn set_thinking_toggles_on_blank_input() {
     assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Off);
 }
 
+#[test]
+fn set_thinking_toggles_back_on_where_off_rises_to_minimal() {
+    let mut app = test_app();
+    app.state.model.id = "claude-opus-5".into();
+
+    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Adaptive);
+    assert_eq!(
+        app.set_thinking("").unwrap(),
+        ThinkingConfig::Effort(Effort::Minimal)
+    );
+    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Adaptive);
+}
+
 #[test_case(true, "garbage", THINKING_USAGE ; "unknown_word")]
 #[test_case(true, "0", THINKING_USAGE ; "zero_budget")]
 #[test_case(false, "low", THINKING_UNSUPPORTED_MSG ; "model_without_thinking")]

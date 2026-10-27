@@ -21,7 +21,9 @@ use crate::model_registry;
 use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, plugin};
 use crate::spec::{ProviderRegistry, ProviderSpec};
-use crate::types::{EffortDialect, FALLBACK_MAX_THINKING_BUDGET, ThinkingFallback, dialect};
+use crate::types::{
+    EffortDialect, FALLBACK_MAX_THINKING_BUDGET, ThinkingFallback, dialect, thinks_by_default,
+};
 pub use maki_config::providers::ModelTier;
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, ThinkingFields, base_url_override, builtin_provider,
@@ -679,8 +681,14 @@ impl Model {
             .unwrap_or(spec.supports_thinking)
     }
 
+    /// A model that spells its own `off` keeps it: the id rule only covers an
+    /// `off` that would go out as nothing.
     pub fn requires_thinking(&self) -> bool {
         self.thinking_override == Some(ThinkingSupport::Required)
+            || (thinks_by_default(&self.id)
+                && self
+                    .effective_thinking_fields()
+                    .is_none_or(|(fields, _)| fields.off.is_none()))
     }
 
     /// Discovery files its rows under the builtin slug, so a slug that
@@ -2025,6 +2033,18 @@ mod tests {
         let options = ladder_model(support, Some(ROOMY_OUTPUT)).thinking_options();
         let names: Vec<&str> = options.iter().map(|option| option.name).collect();
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn thinking_options_drop_off_where_the_model_thinks_by_default() {
+        let model = Model {
+            id: "claude-opus-5.5".into(),
+            ..ladder_model(ThinkingSupport::Yes, Some(ROOMY_OUTPUT))
+        };
+
+        let options = model.thinking_options();
+        let names: Vec<&str> = options.iter().map(|option| option.name).collect();
+        assert_eq!(names, &LADDER[1..]);
     }
 
     /// `adaptive` promises that the API picks the depth, so a provider that
