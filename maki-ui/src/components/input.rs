@@ -48,6 +48,7 @@ const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
 ];
 const QUEUE_PLACEHOLDER: &str = "Queue another prompt...";
 const SUBAGENT_QUEUE_PLACEHOLDER: &str = "Queue a message for this subagent...";
+const TASK_STOP_PLACEHOLDER: &str = "esc stop";
 const ASK_PREFIX: &str = "Ask maki to ";
 const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";
@@ -68,6 +69,8 @@ pub enum Placeholder {
     Blank,
     Queue,
     SubagentQueue,
+    /// A task that takes no messages, where Esc is all the input does.
+    TaskStop,
 }
 
 pub enum InputAction {
@@ -629,6 +632,7 @@ impl InputBox {
                 ),
                 Placeholder::Queue => (QUEUE_PLACEHOLDER, Vec::new()),
                 Placeholder::SubagentQueue => (SUBAGENT_QUEUE_PLACEHOLDER, Vec::new()),
+                Placeholder::TaskStop => (TASK_STOP_PLACEHOLDER, Vec::new()),
                 Placeholder::Blank => (BLANK_PLACEHOLDER, Vec::new()),
             };
             let mut spans = vec![super::chevron_span()];
@@ -1356,6 +1360,7 @@ mod tests {
     #[test_case(Placeholder::Blank, "" ; "blank_shows_only_the_chevron")]
     #[test_case(Placeholder::Queue, QUEUE_PLACEHOLDER ; "queue_asks_for_another_prompt")]
     #[test_case(Placeholder::SubagentQueue, SUBAGENT_QUEUE_PLACEHOLDER ; "subagent_queue_names_the_subagent")]
+    #[test_case(Placeholder::TaskStop, TASK_STOP_PLACEHOLDER ; "task_stop_names_the_key")]
     fn placeholder_row(placeholder: Placeholder, expected: &str) {
         let mut input = InputBox::new(InputHistory::default(), 20);
         let terminal = render_input_with(&mut input, 40, 4, placeholder);

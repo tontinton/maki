@@ -329,6 +329,31 @@ pub struct DisplayMessage {
     /// Only a click sets it, so thinking starts the way `ui.thinking_lines`
     /// says however the message got here.
     pub thinking_expanded: bool,
+    /// A running row a Ctrl+B press would move now.
+    pub movable: bool,
+    /// Set once the call moved: the row keeps its receipt and follows the task.
+    pub background: Option<BackgroundBadge>,
+    /// The full body behind a one-line notice, shown when the row expands.
+    pub detail: Option<String>,
+    /// Whether [`Self::detail`] is shown. Only a click sets it, so a notice
+    /// starts collapsed however it got here.
+    pub detail_expanded: bool,
+}
+
+/// How a moved call's row tracks its background task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundBadge {
+    pub id: String,
+    /// `None` after a restore: the row shows a neutral marker.
+    pub started_at: Option<Instant>,
+    pub outcome: Option<BackgroundOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundOutcome {
+    Done,
+    Error,
+    Cancelled,
 }
 
 impl DisplayMessage {
@@ -350,6 +375,10 @@ impl DisplayMessage {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_expanded: false,
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
         }
     }
 
@@ -383,6 +412,10 @@ impl DisplayMessage {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_expanded: false,
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
         }
     }
 

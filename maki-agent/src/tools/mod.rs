@@ -35,6 +35,7 @@ use maki_config::ProjectConfig;
 use serde_json::Value;
 
 use crate::agent::{CallInstructions, LoadedInstructions, default_instruction_files};
+use crate::call_scope::CallScope;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
@@ -330,7 +331,7 @@ pub struct ToolContext {
     pub session_id: Option<SessionRef>,
     /// See [`crate::AgentParams::background_for`]. Every nested call clones
     /// this context, so batch and code_execution children carry it too.
-    pub background_for: Option<MakiId>,
+    pub background_for: BackgroundFor,
     /// `None` in the agent that owns the session ([`MAIN_TASK_ID`]), the
     /// spawning call's `tool_use_id` in a subagent. A subagent shares
     /// `session_id` with its parent on purpose (provider affinity, hooks,
@@ -348,6 +349,9 @@ pub struct ToolContext {
     pub instruction_files: Arc<Vec<String>>,
     /// Per model call, shared with its nested calls.
     pub call_instructions: CallInstructions,
+    /// The model call this context serves, shared by its nested calls. `None`
+    /// outside a model call (one-shots, plugin-opened sessions).
+    pub call: Option<Arc<CallScope>>,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
     pub deadline: Deadline,
@@ -382,6 +386,30 @@ pub enum ToolLive {
     Usage(String),
     /// The plugin that answered the child's permission prompt.
     AllowedBy(Arc<str>),
+    /// The child registered (`true`) or lost (`false`) a background hook.
+    Movable(bool),
+}
+
+/// The chat whose plan mode blocks this work's writes, see
+/// [`crate::AgentSeed::background_write_block`].
+#[derive(Clone, Default)]
+pub enum BackgroundFor {
+    /// Watched by the user: never blocked.
+    #[default]
+    None,
+    Chat(MakiId),
+    /// Foreground until the call moves, then the chat it moved to.
+    Call(Arc<CallScope>),
+}
+
+impl BackgroundFor {
+    pub fn chat(&self) -> Option<MakiId> {
+        match self {
+            Self::None => None,
+            Self::Chat(chat) => Some(*chat),
+            Self::Call(scope) => scope.home().map(|home| home.chat),
+        }
+    }
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -577,7 +605,7 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
-        background_for: None,
+        background_for: BackgroundFor::None,
         task_id: None,
         tool_use_id: None,
         user_response_rx,
@@ -585,6 +613,7 @@ pub fn interpreter_ctx(
         loaded_instructions: LoadedInstructions::new(),
         instruction_files: Arc::new(default_instruction_files()),
         call_instructions: CallInstructions::default(),
+        call: None,
         cancel,
         mcp: None,
         deadline: Deadline::default(),

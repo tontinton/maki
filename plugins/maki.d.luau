@@ -89,6 +89,7 @@ declare maki: {
     write: @checked (path: string, content: string) -> (true?, string?),
     append: @checked (path: string, content: string) -> (true?, string?),
     atomic_write: @checked (path: string, content: string) -> (true?, string?),
+    rename: @checked (from: string, to: string) -> (true?, string?),
     rm: @checked (path: string, opts: any) -> (true?, string?),
     mkdir: @checked (path: string, opts: any) -> (true?, string?),
     glob: @checked (pattern: any, opts: any) -> (any, string?),
@@ -165,7 +166,7 @@ declare maki: {
     list: @checked () -> (any, string?),
     focus: @checked (id: string) -> (boolean?, string?),
     remove: @checked (id: string) -> (boolean?, string?),
-    stop: @checked (id: string, opts: any) -> (boolean?, string?),
+    stop: @checked (id: any, opts: any) -> (boolean | string?, string?),
   },
   text: {
     html_to_markdown: @checked (html: string) -> (string?, string?),

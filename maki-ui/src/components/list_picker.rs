@@ -22,6 +22,7 @@ use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NO_MATCHES: &str = "No matches";
+const ERROR_LABEL: &str = "Error: ";
 const MIN_WIDTH_PERCENT: u16 = 65;
 /// Fits a long model id next to its tier and price columns.
 const MIN_WIDTH_COLS: u16 = 72;
@@ -299,7 +300,18 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn set_error_text(&mut self, text: Option<String>) {
+        self.error_text = text.map(|text| format!("{ERROR_LABEL}{text}"));
+    }
+
+    /// A line in the error style that is not a failure, such as a question
+    /// to confirm before acting.
+    pub fn set_alert_text(&mut self, text: Option<String>) {
         self.error_text = text;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alert_text(&self) -> Option<&str> {
+        self.error_text.as_deref()
     }
 
     /// A dim line under the list, for state that is not an item.
@@ -582,10 +594,7 @@ fn render_ready<T: PickerItem>(
     let mut area_idx = 0;
 
     if let Some(err) = error_text {
-        let line = Line::from(Span::styled(
-            format!("  Error: {err}"),
-            theme::current().error,
-        ));
+        let line = Line::from(Span::styled(format!("  {err}"), theme::current().error));
         frame.render_widget(Paragraph::new(vec![line]), areas[area_idx]);
         area_idx += 1;
     }

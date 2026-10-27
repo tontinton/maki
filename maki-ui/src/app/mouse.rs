@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::clipboard::{self, CopyResult};
+use crate::components::messages::ClickOutcome;
 use crate::selection::{
     self, ContentRegion, DocPos, EdgeScroll, RowPos, ScreenSelection, Selection, SelectionState,
     SelectionZone,
@@ -58,13 +59,41 @@ impl App {
                         let zone = sel.zone;
                         self.selection_state = None;
                         if zone == SelectionZone::Messages {
-                            let area = self.msg_area();
-                            self.chats[self.active_chat].handle_click(event.row, area);
+                            self.click_messages(event.row, event.column);
                         }
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A moved row whose task tab was deleted, or never restored, has no task
+    /// to open, so it takes the click any row would.
+    fn click_messages(&mut self, row: u16, col: u16) {
+        let area = self.msg_area();
+        let chat = self.active_chat;
+        let outcome = self.chats[chat].handle_click(row, col, area);
+        let outcome = match outcome {
+            ClickOutcome::OpenTask(id) if self.chat_of_task(&id).is_err() => {
+                self.chats[chat].toggle_click(row, area)
+            }
+            outcome => outcome,
+        };
+        self.handle_click_outcome(outcome);
+    }
+
+    pub(super) fn handle_click_outcome(&mut self, outcome: ClickOutcome) {
+        match outcome {
+            ClickOutcome::OpenTask(id) => {
+                if let Err(e) = self.focus_task(&id) {
+                    self.flash(e);
+                }
+            }
+            ClickOutcome::MoveCall(id) => {
+                self.move_to_background(Some(&id));
+            }
+            ClickOutcome::Handled | ClickOutcome::None => {}
         }
     }
 

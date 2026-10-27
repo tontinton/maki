@@ -20,7 +20,9 @@ use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
 use crate::session::{Resumed, SessionTrack};
 use crate::template;
-use crate::tools::{FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegistry};
+use crate::tools::{
+    BackgroundFor, FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegistry,
+};
 use crate::types::EventSender;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, EventStreamGuard,
@@ -228,7 +230,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                     params.plugin_rules,
                 )),
                 session_id: Some(run_session_ref),
-                background_for: None,
+                background_for: BackgroundFor::None,
                 task_id: None,
                 mailbox: Some(mailbox),
                 timeouts: params.timeouts,
@@ -410,7 +412,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::clone(&task_permissions),
                     session_id: Some(session_ref_clone.clone()),
-                    background_for: None,
+                    background_for: BackgroundFor::None,
                     task_id: None,
                     mailbox: Some(mailbox.clone()),
                     timeouts: params.timeouts,

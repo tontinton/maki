@@ -817,6 +817,25 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
     Ok(pair(touched(removed, result).await.map(|()| true)))
 }
 
+/// Move the file or directory at {from} to {to}, replacing {to} if it is an
+/// existing file. Both must be on the same filesystem. Nothing is copied, so
+/// renaming a large file costs the same as a small one.
+///
+/// @param from string Path to move.
+/// @param to string New path. `~/` is expanded.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// local ok, err = maki.fs.rename("out.log", "out.log.1")
+/// if err then print("rename failed: " .. err) end
+#[lua_fn(guard = FsWrite)]
+async fn rename(_lua: Lua, from: String, to: String) -> LuaResult<Pair<bool>> {
+    let from = try_pair!(make_absolute(&from));
+    let to = try_pair!(make_absolute(&to));
+    let result = smol::fs::rename(&from, &to).await;
+    let result = touched(from, result).await;
+    Ok(pair(touched(to, result).await.map(|()| true)))
+}
+
 /// Create the directory at {path}. Set `parents = true` to create
 /// intermediate directories, like `mkdir -p`.
 ///
@@ -1368,8 +1387,8 @@ lua_table! {
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
         read(perms), read_bytes(perms), read_lines(perms), metadata(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
-        dir(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
-        glob(perms), grep(perms), fuzzy_files(perms, plugin),
+        dir(perms), write(perms), append(perms), atomic_write(perms), rename(perms),
+        rm(perms), mkdir(perms), glob(perms), grep(perms), fuzzy_files(perms, plugin),
     ]
 }
 
@@ -2090,6 +2109,71 @@ mod tests {
 
         assert!(error.to_string().contains(FS_WRITE_PERMISSION));
         assert!(!file.exists());
+    }
+
+    #[test_case(false ; "to_a_new_path")]
+    #[test_case(true ; "replacing_an_existing_file")]
+    fn rename_moves_the_file(replace: bool) {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("out.log");
+        let to = tmp.path().join("out.log.1");
+        std::fs::write(&from, FIRST_CONTENT).unwrap();
+        if replace {
+            std::fs::write(&to, REPLACEMENT_CONTENT).unwrap();
+        }
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let rename: mlua::Function = table.get("rename").unwrap();
+
+        let (ok, err): (Value, Value) =
+            smol::block_on(rename.call_async((from.to_str().unwrap(), to.to_str().unwrap())))
+                .unwrap();
+
+        assert_eq!((ok, err), (Value::Boolean(true), Value::Nil));
+        assert!(!from.exists());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), FIRST_CONTENT);
+    }
+
+    #[test]
+    fn rename_of_a_missing_file_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let to = tmp.path().join("to.txt");
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let rename: mlua::Function = table.get("rename").unwrap();
+
+        let (ok, err): (Value, Value) = smol::block_on(rename.call_async((
+            tmp.path().join("ghost.txt").to_str().unwrap(),
+            to.to_str().unwrap(),
+        )))
+        .unwrap();
+
+        assert_eq!(ok, Value::Nil);
+        assert!(matches!(err, Value::String(_)));
+        assert!(!to.exists());
+    }
+
+    #[test]
+    fn rename_requires_fs_write_permission() {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("out.log");
+        std::fs::write(&from, FIRST_CONTENT).unwrap();
+        let to = tmp.path().join("out.log.1");
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::denied(), Arc::from(TEST_PLUGIN)).unwrap();
+        let rename: mlua::Function = table.get("rename").unwrap();
+
+        let error = smol::block_on(
+            rename.call_async::<(Value, Value)>((from.to_str().unwrap(), to.to_str().unwrap())),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(FS_WRITE_PERMISSION));
+        assert!(from.exists());
+        assert!(!to.exists());
     }
 
     #[test]

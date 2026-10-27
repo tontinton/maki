@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::OpenSession;
-use crate::app::tasks::TaskOutcome;
+use crate::app::tasks::{BackgroundMoves, TaskOutcome, count_phrase};
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
@@ -38,7 +38,7 @@ use crate::components::command::{
 };
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
-use crate::components::input::{InputAction, InputBox, Submission, sent_text};
+use crate::components::input::{InputAction, InputBox, Placeholder, Submission, sent_text};
 use crate::components::keybindings::key;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
@@ -54,7 +54,8 @@ use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
-    Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
+    Action, BackgroundOutcome, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo,
+    Status, is_ctrl,
 };
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
@@ -107,6 +108,11 @@ const EXIT_COMMAND: &str = "/exit";
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
+// Short, because the flash shares the status bar with the model and cost.
+const ESC_ONE_RUNNING: &str = "1 task in background";
+const ESC_MANY_RUNNING_SUFFIX: &str = " tasks in background";
+const QUIT_ONE_RUNNING: &str = "1 background task stops if you quit again";
+const QUIT_MANY_RUNNING_SUFFIX: &str = " background tasks stop if you quit again";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
@@ -424,6 +430,38 @@ fn cap_error_text(message: &str) -> String {
     }
 }
 
+/// The task an event belongs to: a transcript names it itself, every other
+/// event through its subagent stamp.
+fn task_id_of(envelope: &Envelope) -> Option<&str> {
+    match &envelope.event {
+        AgentEvent::SubagentHistory { tool_use_id, .. } => Some(tool_use_id.as_str()),
+        _ => envelope
+            .subagent
+            .as_ref()
+            .map(|s| s.parent_tool_use_id.as_str()),
+    }
+}
+
+/// A chat opened before its session spoke, a moved call's tab or a subagent
+/// a plugin adopted, takes what it lacks from the first info naming it: the
+/// sender its permission prompts answer on, the inbox its input feeds, and
+/// the model and options its header shows.
+fn fill_missing_subagent_info(chat: &mut Chat, info: &SubagentInfo) {
+    if chat.is_finished() {
+        return;
+    }
+    if chat.answer_tx.is_none() {
+        chat.answer_tx.clone_from(&info.answer_tx);
+    }
+    if chat.inbox.is_none() {
+        chat.inbox.clone_from(&info.inbox);
+    }
+    if chat.model_id.is_none() {
+        chat.model_id.clone_from(&info.model);
+    }
+    chat.opts = chat.opts.or(info.opts);
+}
+
 pub(crate) fn turn_response(message: &Message) -> Option<String> {
     if message.has_tool_calls() {
         return None;
@@ -544,6 +582,11 @@ pub struct App {
     pub(super) last_esc: Option<Instant>,
     /// The last key was a `Ctrl+C` that copied, see [`Self::handle_ctrl`].
     quit_copied: bool,
+    pub(super) last_quit: Option<Instant>,
+    /// Background tasks running in the other open sessions, which a quit
+    /// ends too. Only the event loop sees every session, so it keeps this.
+    pub(crate) background_elsewhere: usize,
+    pub(super) background_moves: BackgroundMoves,
 
     pub(crate) storage: StateDir,
     /// The folder trust question this run was started with, `None` when the
@@ -590,7 +633,6 @@ pub struct App {
     typeahead: Typeahead,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
-    subagent_answers: HashMap<String, flume::Sender<String>>,
 }
 
 impl App {
@@ -679,6 +721,9 @@ impl App {
             clipboard: ClipboardState::new(),
             last_esc: None,
             quit_copied: false,
+            last_quit: None,
+            background_elsewhere: 0,
+            background_moves: BackgroundMoves::default(),
             storage,
             trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
@@ -706,7 +751,6 @@ impl App {
             typeahead: Typeahead::default(),
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
-            subagent_answers: HashMap::new(),
         };
         app.model_picker.set_recents(
             maki_storage::model::read_recents(&app.storage)
@@ -799,6 +843,25 @@ impl App {
                     new_mode: mode.letter(),
                 },
             );
+        }
+    }
+
+    /// A running task with no inbox takes no messages, so its input says how
+    /// to stop it instead.
+    pub(super) fn input_placeholder(&self) -> Placeholder {
+        let chat = &self.chats[self.active_chat];
+        if !self.is_main_chat() {
+            if chat.inbox.is_none() && !chat.is_finished() {
+                Placeholder::TaskStop
+            } else {
+                Placeholder::SubagentQueue
+            }
+        } else if self.status == Status::Streaming {
+            Placeholder::Queue
+        } else if self.state.session.messages().is_empty() {
+            Placeholder::Suggestion
+        } else {
+            Placeholder::Blank
         }
     }
 
@@ -1240,7 +1303,9 @@ impl App {
     }
 
     fn send_to_agent(&self, subagent_id: Option<&str>, answer: String) {
-        let routed = subagent_id.and_then(|id| self.subagent_answers.get(id));
+        let routed = subagent_id
+            .and_then(|id| self.chat_of_task(id).ok())
+            .and_then(|idx| self.chats[idx].answer_tx.as_ref());
         if let Some(tx) = routed {
             let _ = tx.try_send(answer);
         } else {
@@ -1315,6 +1380,9 @@ impl App {
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
         }
+        if key::BACKGROUND.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::Background));
+        }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
             self.active_chat().scroll(half);
@@ -1348,8 +1416,15 @@ impl App {
 
         // With both up the permission prompt goes first: a tool is blocked on
         // it and it owns the bottom panel. The pack review waits on nothing.
+        // Ctrl+B passes it by, so the user hears why the parked call stays.
         if self.permission_prompt.is_open() {
+            if key::BACKGROUND.matches(key) {
+                return Some(self.run_builtin(BuiltinAction::Background));
+            }
             if let Some(answered) = self.permission_prompt.handle_key(key) {
+                if answered.subagent_id.is_none() {
+                    self.chats[MAIN_CHAT].permission_answered(&answered.id);
+                }
                 let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
                 self.send_to_agent(answered.subagent_id.as_deref(), encoded);
             }
@@ -1700,6 +1775,7 @@ impl App {
                 input.newline();
                 true
             }),
+            BuiltinAction::Background => self.move_to_background(None),
         };
         (handled, vec![])
     }
@@ -2122,11 +2198,36 @@ impl App {
         } else {
             FLASH_REWIND
         };
-        self.status_bar.flash(hint.into());
+        // Esc never reaches background work, which a flash about stopping
+        // would otherwise suggest.
+        let running = self.running_background_tasks().count();
+        let flash = if in_subagent || running == 0 {
+            hint.to_owned()
+        } else {
+            let still = count_phrase(running, ESC_ONE_RUNNING, ESC_MANY_RUNNING_SUFFIX);
+            format!("{hint} {still}")
+        };
+        self.status_bar.flash(flash);
         vec![]
     }
 
+    /// Quitting ends every background task of every open session, so with
+    /// some running it takes a second press, the way Esc does.
     fn quit(&mut self) -> Vec<Action> {
+        let running = self.running_background_tasks().count() + self.background_elsewhere;
+        let armed = self
+            .last_quit
+            .take()
+            .is_some_and(|t| t.elapsed() < self.status_bar.flash_duration);
+        if running > 0 && !armed {
+            self.last_quit = Some(Instant::now());
+            self.flash(count_phrase(
+                running,
+                QUIT_ONE_RUNNING,
+                QUIT_MANY_RUNNING_SUFFIX,
+            ));
+            return vec![];
+        }
         self.quit_with(ExitRequest::Success)
     }
 
@@ -2206,7 +2307,6 @@ impl App {
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.clear();
         self.shell.cancel_all();
         for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
             chat.flush();
@@ -2273,7 +2373,12 @@ impl App {
             }
             return vec![];
         }
-        if envelope.run_id != self.run_id {
+        // What an adopted subagent sent before its call moved belongs to its
+        // task, not to the run, and may land after the next run started.
+        if let Some(plugin) = task_id_of(&envelope).and_then(|id| self.task_plugin(id)) {
+            return self.deliver(envelope, Some(plugin));
+        }
+        if envelope.run_id != self.run_id && !self.is_racing_receipt(&envelope) {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -2291,16 +2396,20 @@ impl App {
         self.deliver(envelope, None)
     }
 
+    /// A move racing Esc lands after the run it moved out of. Its task lives
+    /// on, so the row it moved, while still on screen, needs its tab.
+    fn is_racing_receipt(&self, envelope: &Envelope) -> bool {
+        envelope.subagent.is_none()
+            && matches!(&envelope.event, AgentEvent::ToolDone(done)
+                if done.backgrounded && self.chats[MAIN_CHAT].tool_message(&done.id).is_some())
+    }
+
     /// `plugin` names the plugin whose session sent the event, which the chat
     /// shows as a task of that plugin. Those events skip the run gate above:
     /// the session outlives turns, Esc and rewinds, so the only gate is the
     /// chat session, which the event loop already matched.
     pub(crate) fn deliver(&mut self, envelope: Envelope, plugin: Option<Arc<str>>) -> Vec<Action> {
-        let task_id = match &envelope.event {
-            AgentEvent::SubagentHistory { tool_use_id, .. } => Some(tool_use_id),
-            _ => envelope.subagent.as_ref().map(|s| &s.parent_tool_use_id),
-        };
-        if task_id.is_some_and(|id| self.deleted_tasks.contains(id)) {
+        if task_id_of(&envelope).is_some_and(|id| self.deleted_tasks.contains(id)) {
             return vec![];
         }
 
@@ -2324,6 +2433,23 @@ impl App {
             return vec![];
         }
 
+        // A moved call's final result names the call, and the envelope names
+        // no task or that same one. It ends the task and never reaches
+        // history: the receipt is what the model got for that call. A
+        // `ToolDone` inside another task's session is that session's own row.
+        if plugin.is_some()
+            && let AgentEvent::ToolDone(done) = &envelope.event
+            && envelope
+                .subagent
+                .as_ref()
+                .is_none_or(|s| s.parent_tool_use_id == done.id)
+            && let Ok(idx) = self.chat_of_task(&done.id)
+            && idx != MAIN_CHAT
+        {
+            self.finish_background_call(idx, envelope.event);
+            return vec![];
+        }
+
         maki_lua::agent_autocmd::dispatch(
             &self.lua_event_handle,
             &self.state.session.id,
@@ -2344,11 +2470,19 @@ impl App {
             None => MAIN_CHAT,
         };
         if is_plugin_task && matches!(envelope.event, AgentEvent::StreamClosed) {
-            // The session is gone. If Esc already ended the task, this `Done`
-            // leaves its `Error` in place. A close mid-prompt leaves tools
-            // without a result, and nothing after this would settle them.
-            self.chats[chat_idx].cancel_in_progress();
-            self.chats[chat_idx].mark_finished(TaskOutcome::Done, DONE_TEXT);
+            // The session is gone. If Esc already ended the task, its `Error`
+            // stays. A close mid-prompt leaves tools without a result, and
+            // nothing after this would settle them. The close knows no
+            // verdict, so the final result of an adopted subagent's call can
+            // still refine it, and its badge.
+            let chat = &mut self.chats[chat_idx];
+            chat.cancel_in_progress();
+            if !chat.is_finished() {
+                chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+                if let Some(id) = &subagent_id {
+                    self.chats[MAIN_CHAT].set_background_outcome(id, BackgroundOutcome::Done);
+                }
+            }
             return vec![];
         }
 
@@ -2361,7 +2495,11 @@ impl App {
             self.state
                 .session_mut()
                 .insert_tool_output(e.id.clone(), e.output.clone());
-            if let Some(&sub_idx) = self.chat_index.get(&e.id) {
+            // A receipt does not end the subagent behind it: the call goes
+            // on, and adopting its chat takes it off the turn first.
+            if e.backgrounded && chat_idx == MAIN_CHAT {
+                self.open_background_call(e);
+            } else if let Some(&sub_idx) = self.chat_index.get(&e.id) {
                 let (outcome, text) = if e.is_error {
                     (TaskOutcome::Error, ERROR_TEXT)
                 } else {
@@ -2510,7 +2648,6 @@ impl App {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
                     self.chat_index.clear();
-                    self.subagent_answers.clear();
                     self.status = Status::Idle;
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
@@ -2523,7 +2660,6 @@ impl App {
                         DisplayRole::Error,
                         cap_error_text(&message),
                     ));
-                    self.subagent_answers.clear();
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
@@ -2552,7 +2688,8 @@ impl App {
 
     /// A tool task is found through `chat_index`, a plugin task by id: the
     /// index is wiped every turn, and a plugin task would come back as a
-    /// second chat at the main chat's next turn end.
+    /// second chat at the main chat's next turn end. A plugin event naming a
+    /// subagent's chat adopts it, see [`Self::adopt_subagent`].
     fn resolve_or_create_chat(
         &mut self,
         subagent: &SubagentInfo,
@@ -2564,6 +2701,10 @@ impl App {
             Some(_) => self.chat_of_task(id).ok(),
         };
         if let Some(idx) = known {
+            if let Some(plugin) = plugin {
+                self.adopt_subagent(idx, plugin);
+            }
+            fill_missing_subagent_info(&mut self.chats[idx], subagent);
             return idx;
         }
         let idx = self.chats.len();
@@ -2573,9 +2714,6 @@ impl App {
             if let Some(ref model) = subagent.model {
                 self.chats[MAIN_CHAT].update_tool_model(id, model);
             }
-        }
-        if let Some(ref tx) = subagent.answer_tx {
-            self.subagent_answers.insert(id.clone(), tx.clone());
         }
         let mut chat = Chat::new(
             self.state.session.id,
@@ -2589,6 +2727,7 @@ impl App {
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;
         chat.inbox = subagent.inbox.clone();
+        chat.answer_tx = subagent.answer_tx.clone();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
@@ -2598,14 +2737,18 @@ impl App {
     }
 
     /// A chat this task already has, maybe one the user just stopped, stays as
-    /// it is rather than turning idle again.
+    /// it is rather than turning idle again. A subagent's chat is adopted,
+    /// which is how a session nested under a moved call leaves the turn.
     pub(crate) fn open_plugin_task(&mut self, info: &SubagentInfo, plugin: Arc<str>) {
         let id = &info.parent_tool_use_id;
-        if self.deleted_tasks.contains(id) || self.chat_of_task(id).is_ok() {
+        if self.deleted_tasks.contains(id) {
             return;
         }
+        let known = self.chat_of_task(id).is_ok();
         let idx = self.resolve_or_create_chat(info, &Some(plugin));
-        self.chats[idx].idle = true;
+        if !known {
+            self.chats[idx].idle = true;
+        }
     }
 
     /// Entry point for `maki.api.run_command`: splits a command line into the
@@ -3015,6 +3158,7 @@ impl App {
             | self.tick_plan()
             | self.tick_file_picker()
             | self.tick_input_changed()
+            | self.tick_background_moves()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
     }
 
@@ -3171,8 +3315,9 @@ impl App {
     /// What a tab nobody is looking at still owes the frame. Its floats have
     /// to drain, or a plugin writing to a window off screen would lose the
     /// output, and its plan form too, or a draft in a background tab would
-    /// sit unanswered until the user focused it. Nothing it holds was
-    /// announced this frame, because it never diffed its input, so the
+    /// sit unanswered until the user focused it. So do the replies to a
+    /// Ctrl+B pressed just before the user switched away. Nothing it holds
+    /// was announced this frame, because it never diffed its input, so the
     /// announcement has to speak when this tab takes focus. It holds no keys:
     /// those left with the focus, see [`Self::hand_typeahead_to`].
     pub fn tick_background(&mut self) {
@@ -3181,6 +3326,7 @@ impl App {
         let _ = self.tick_plan();
         let _ = self.poll_input_rules();
         let _ = self.input_box.poll_decor();
+        let _ = self.tick_background_moves();
     }
 
     /// Rules hold for every session, so a background tab takes them up too
@@ -3218,7 +3364,11 @@ impl App {
             self.selection_state
                 .as_ref()
                 .map_or(Cadence::IDLE, SelectionState::cadence),
-            Cadence::any(self.chats.iter().map(Chat::cadence)),
+            // Only the chat on screen draws motion. The rest only take data,
+            // which `tick` polls in every chat.
+            self.chats[self.active_chat].cadence(),
+            // A Ctrl+B reply wakes nothing, so it is looked for until in.
+            Cadence::when(!self.background_moves.pending.is_empty(), Cadence::PENDING),
         ])
     }
 

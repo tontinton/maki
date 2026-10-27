@@ -515,13 +515,15 @@ fn set_mode(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String) -> LuaResult<()> {
 /// | `"undo"`, `"redo"` | Undoes or redoes one input edit | nothing to undo or redo |
 /// | `"history_prev"`, `"history_next"` | Recalls the previous or next prompt | at either end of the history |
 /// | `"newline"` | Inserts a new line | |
+/// | `"background"` | Moves running calls to the background, like `Ctrl+B` | no call is running |
 ///
 /// `"undo"`, `"redo"`, `"history_prev"`, `"history_next"` and `"newline"`
 /// edit the chat input, also in normal mode. They need the `input`, `agent`
 /// and `session_write` permissions, see [chat input](#chat-input), and throw
 /// without them like any gated call. They return `false` in a finished subagent's chat, which has
 /// no input. `"pop_queue"` needs `session_write`, because it throws away a
-/// queued prompt. The other built-ins need no permission.
+/// queued prompt. `"background"` needs `agent`, because each call it moves
+/// wakes the chat with its result. The other built-ins need no permission.
 ///
 /// A built-in runs in the UI after your earlier `maki.ui` calls, and
 /// `action` waits for its answer. While your plugin loads, it returns `nil`

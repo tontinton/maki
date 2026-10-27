@@ -358,6 +358,7 @@ mod tests {
                 input: json!({ "command": TOOL_COMMAND }),
                 duration: Duration::from_millis(TOOL_MILLIS),
             })),
+            backgrounded: false,
         }))
     }
 

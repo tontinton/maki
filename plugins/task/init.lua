@@ -5,11 +5,14 @@
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 require("picker")
+require("stop")
 
 local Runner = require("runner")
-local Background = Runner.allow_background and require("background")
 
 local DEFAULT_OUTPUT_LINES = 5
+local WAITING_FOR_SLOT = "waiting for a free subagent slot"
+local MOVED_RECEIPT = "Subagent %s moved to the background"
+local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground."
 
 local description = [[Launch an autonomous subagent to perform tasks independently. Best combined with batch.
 
@@ -32,20 +35,53 @@ local examples = {
   },
 }
 
+-- Standalone runs render markdown on the Rust side (format = "markdown");
+-- this mirrors that for restore, batch children and a row that had to wait.
+local function result_body(output, is_error, ctx)
+  local tol = ctx:tool_output_lines()
+  return ToolView.restore_markdown(output, is_error, {
+    max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
+    keep = "head",
+    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
+  })
+end
+
 local function handler(input, ctx)
   local prepared, prepare_err = Runner.prepare(input, ctx)
   if prepare_err then
     return { llm_output = prepare_err, is_error = true }
   end
 
-  if Background and input.background then
-    local result = Background.start(prepared, ctx)
-    if result then
-      return result
+  local function on_background()
+    return string.format(MOVED_RECEIPT, prepared.options.name)
+  end
+
+  -- A background task moves before it waits for a slot, so the model's turn
+  -- does not wait with it. The move keeps waiting where it is and still holds
+  -- a slot once it gets one. A blocking task has no hook until it holds one.
+  -- Moving fails without a live chat (headless, -p, SDK, ACP), and then the
+  -- task simply runs blocking.
+  local foreground_note
+  local run_in_background = Runner.allow_background and input.background == true
+  if run_in_background then
+    ctx:on_background(on_background)
+    local moved, move_err = ctx:background()
+    if not moved then
+      foreground_note = string.format(FOREGROUND_NOTE, move_err)
     end
   end
 
-  local permit = Runner.semaphore:acquire()
+  -- Shown only while every slot is taken, moved subagents included. A live
+  -- body outlives the wait as a snapshot, so the final reply carries its own.
+  local waiting
+  local permit = Runner.semaphore:acquire(function()
+    waiting = maki.ui.buf()
+    waiting:line({ { WAITING_FOR_SLOT, "dim" } })
+    ctx:live_buf(waiting)
+  end)
+  if waiting then
+    waiting:set_lines({})
+  end
   -- Declared out here so the epilogue closes it on every path: left to the
   -- garbage collector it keeps the subagent's event relay alive on an idle VM.
   local sess
@@ -57,6 +93,9 @@ local function handler(input, ctx)
     if sess_err then
       return { llm_output = sess_err, is_error = true }
     end
+    if not run_in_background then
+      ctx:on_background(on_background)
+    end
     return Runner.run(sess, prepared)
   end)
 
@@ -67,6 +106,12 @@ local function handler(input, ctx)
   if not ok then
     error(out, 0)
   end
+  if waiting then
+    out.body = result_body(out.llm_output, out.is_error, ctx)
+  end
+  if foreground_note then
+    out.llm_output = foreground_note .. "\n\n" .. out.llm_output
+  end
   return out
 end
 
@@ -74,15 +119,8 @@ local function header(input)
   return input.description
 end
 
--- Standalone runs render markdown on the Rust side (format = "markdown");
--- this mirrors that for restore and batch children, which build the body here.
 local function restore(_input, output, is_error, ctx)
-  local tol = ctx:tool_output_lines()
-  return ToolView.restore_markdown(output, is_error, {
-    max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
-    keep = "head",
-    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
-  })
+  return result_body(output, is_error, ctx)
 end
 
 maki.api.register_tool({

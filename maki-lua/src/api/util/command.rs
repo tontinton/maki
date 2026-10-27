@@ -728,6 +728,8 @@ pub enum BuiltinAction {
     HistoryPrev,
     HistoryNext,
     Newline,
+    /// Moves the main chat's movable running calls to the background.
+    Background,
 }
 
 impl BuiltinAction {
@@ -763,6 +765,9 @@ impl BuiltinAction {
             Self::Undo | Self::Redo | Self::HistoryPrev | Self::HistoryNext | Self::Newline => {
                 EDITS_TEXT
             }
+            // Each moved call's result wakes the chat and costs a turn, the
+            // price of `notify{ wake = true }`.
+            Self::Background => &[Permission::Agent],
         }
     }
 }

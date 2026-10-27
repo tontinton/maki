@@ -23,6 +23,10 @@ local EMPTY_ERROR = "provide at least one tool call"
 local NESTED_ERROR = "cannot nest batch inside batch"
 local CANCELLED_ERROR = "cancelled"
 local DISCARDED_ERROR = string.format("maximum of %d tools per batch", MAX_BATCH_SIZE)
+local WAITING_FMT = "batch is waiting on %s"
+local NOTHING_RUNNING = "batch has no running tool left to move"
+local MOVED_HEADER = "Still running in the background (their results arrive when they finish):"
+local MOVED_ITEM_FMT = "- %s: %s"
 local SECTION_FMT = "## %s\n"
 local SECTION_PAT = "^## (.+)$"
 
@@ -273,9 +277,10 @@ local function render_children(children)
 end
 
 -- batch_policy.rs pins this exact llm format; keep it byte-identical.
-local function render_llm(children)
+-- Returns the sections and how many of them failed, so the move receipt
+-- can reuse them without the summary line.
+local function render_sections(children)
   local out = {}
-  local total = #children
   local failed = 0
   for _, c in ipairs(children) do
     out[#out + 1] = string.format(SECTION_FMT, c.tool)
@@ -287,12 +292,16 @@ local function render_llm(children)
     end
     out[#out + 1] = "\n\n"
   end
+  return table.concat(out), failed
+end
+
+local function render_llm(children)
+  local total = #children
+  local sections, failed = render_sections(children)
   if failed > 0 then
-    out[#out + 1] = string.format(SUMMARY_MIXED_FMT, total - failed, total, failed)
-  else
-    out[#out + 1] = string.format(SUMMARY_ALL_OK_FMT, total)
+    return sections .. string.format(SUMMARY_MIXED_FMT, total - failed, total, failed)
   end
-  return table.concat(out)
+  return sections .. string.format(SUMMARY_ALL_OK_FMT, total)
 end
 
 local function to_state(children)
@@ -460,6 +469,7 @@ function Batch:settle(c, status, output)
   c.output = output
   self:attach_body(c)
   self:rerender()
+  self:sync_movable()
 end
 
 function Batch:run_child(c, ctx)
@@ -485,6 +495,10 @@ function Batch:run_child(c, ctx)
       c.usage = usage
       self:rerender()
     end,
+    on_movable = function(movable)
+      c.movable = movable
+      self:sync_movable()
+    end,
   })
   -- The sweep may have settled this child mid-call, and the call knows
   -- nothing about that, so its result is moot. Unless it came back with
@@ -503,9 +517,49 @@ function Batch:run_child(c, ctx)
   end
 end
 
+-- The children a reply still owes the model. Before a move that is all of
+-- them; after one, only those the receipt did not already carry. A receipt
+-- the runtime refused after the hook built it never reached the model.
+function Batch:unreported()
+  local moved = self.ctx and self.ctx:backgrounded()
+  local out = {}
+  for _, c in ipairs(self.children) do
+    if not (moved and c.reported) then
+      out[#out + 1] = c
+    end
+  end
+  return out
+end
+
+-- What the hook would answer now, so the row's hint shows only when a
+-- press would move the batch.
+function Batch:movable_now()
+  local running = false
+  for _, c in ipairs(self.children) do
+    if not TERMINAL[c.status] then
+      if not c.movable then
+        return false
+      end
+      running = true
+    end
+  end
+  return running
+end
+
+function Batch:sync_movable()
+  if not self.hooked then
+    return
+  end
+  local movable = self:movable_now()
+  if movable ~= self.shown_movable then
+    self.shown_movable = movable
+    self.ctx:set_movable(movable)
+  end
+end
+
 function Batch:reply()
   return {
-    llm_output = render_llm(self.children),
+    llm_output = render_llm(self:unreported()),
     is_error = self.cancelled,
     body = self.buf,
     state = to_state(self.children),
@@ -521,6 +575,45 @@ function Batch:sweep_cancelled(reason)
       c.swept = true
     end
   end
+end
+
+local function header_text(c)
+  local parts = {}
+  for _, s in ipairs(c.header or {}) do
+    parts[#parts + 1] = s[1] or ""
+  end
+  return table.concat(parts)
+end
+
+-- The `ctx:on_background` hook: the whole batch task moves as one, so every
+-- child still running must be able to outlive the turn. Never yields, so the
+-- snapshot it reports is exact: a child that settles after it is listed as
+-- running and arrives with the final reply, whether it lands before the
+-- move commits or after. Finished children are marked `reported` only once
+-- the receipt is built, so a decline leaves the batch untouched.
+function Batch:hand_over()
+  local finished, running = {}, {}
+  for _, c in ipairs(self.children) do
+    if TERMINAL[c.status] then
+      finished[#finished + 1] = c
+    elseif c.movable then
+      running[#running + 1] = c
+    else
+      return nil, string.format(WAITING_FMT, c.tool)
+    end
+  end
+  if #running == 0 then
+    return nil, NOTHING_RUNNING
+  end
+  local items = {}
+  for i, c in ipairs(running) do
+    items[i] = string.format(MOVED_ITEM_FMT, c.tool, header_text(c))
+  end
+  local sections = render_sections(finished)
+  for _, c in ipairs(finished) do
+    c.reported = true
+  end
+  return sections .. MOVED_HEADER .. "\n" .. table.concat(items, "\n")
 end
 
 function Batch:run(ctx)
@@ -561,7 +654,16 @@ local function handler(input, ctx)
   end
 
   local batch = Batch.new(children, child_ctx(ctx))
+  batch.ctx = ctx
   ctx:live_buf(batch.buf)
+  -- Registered up front, so a press that cannot move the batch is answered
+  -- with the blocking child's name; `sync_movable` hides the hint meanwhile.
+  -- Only a model's call can register; a nested batch simply never moves.
+  batch.hooked = ctx:on_background(function()
+    return batch:hand_over()
+  end) == true
+  batch.shown_movable = batch.hooked or nil
+  batch:sync_movable()
   batch:run(ctx)
 
   return batch:reply()

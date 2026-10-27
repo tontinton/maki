@@ -98,6 +98,8 @@ pub struct ToolExecResult {
     pub output: Result<ToolOutput, String>,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
+    /// `output` is a receipt: the call moved and finishes in the background.
+    pub backgrounded: bool,
 }
 
 impl From<Result<ToolOutput, String>> for ToolExecResult {
@@ -106,6 +108,7 @@ impl From<Result<ToolOutput, String>> for ToolExecResult {
             output,
             annotation: None,
             written_path: None,
+            backgrounded: false,
         }
     }
 }

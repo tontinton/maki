@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
+use crate::call_scope::{CallGuard, CallScope};
 use crate::mcp::{
     McpSession, TOOL_SEARCH_TOOL_NAME, ToolDeferral, UNKNOWN_MCP, internal_tool_name, is_wire_name,
 };
@@ -160,6 +161,7 @@ pub async fn run(
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                backgrounded: false,
             };
         }
     };
@@ -625,6 +627,7 @@ async fn run_inner(
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                backgrounded: false,
             }
         }
     }
@@ -653,6 +656,7 @@ async fn run_native_tool(
         is_error: true,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     };
 
     let invocation = match entry.tool.parse(input) {
@@ -728,8 +732,10 @@ async fn run_native_tool(
     // Nothing else could have touched the file while the guard was held, so the
     // mtime is refreshed here instead of by each write plugin remembering to.
     // Only on success: a failed or half-finished write must leave the changed
-    // mtime visible, so the next edit is correctly told the file moved.
+    // mtime visible, so the next edit is correctly told the file moved. A
+    // receipt is half-finished: the moved work may still write.
     if result.output.is_ok()
+        && !result.backgrounded
         && let Some(key) = &mutated
     {
         ctx.file_access.record_read(key);
@@ -742,6 +748,7 @@ async fn run_native_tool(
                 tool = %name,
                 source = %entry.source.as_log_field(),
                 elapsed_ms = elapsed.as_millis() as u64,
+                backgrounded = result.backgrounded,
                 "tool ok"
             );
             ToolDoneEvent {
@@ -752,6 +759,7 @@ async fn run_native_tool(
                 is_error: false,
                 annotation: result.annotation,
                 written_path: result.written_path,
+                backgrounded: result.backgrounded,
             }
         }
         Err(message) => {
@@ -762,7 +770,10 @@ async fn run_native_tool(
                 error = %message,
                 "tool failed"
             );
-            done_error(message)
+            ToolDoneEvent {
+                backgrounded: result.backgrounded,
+                ..done_error(message)
+            }
         }
     }
 }
@@ -865,12 +876,13 @@ fn run_tool_search(
         is_error,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     }
 }
 
 /// Why a file-mutating tool is stopped before its permission check, if it is.
 fn mutation_block(ctx: &ToolContext, name: &str, key: &FileKey) -> Option<String> {
-    if let Some(chat) = ctx.background_for
+    if let Some(chat) = ctx.background_for.chat()
         && let Some(reason) = AgentSeed::background_write_block(chat)
     {
         warn!(
@@ -953,6 +965,7 @@ async fn run_local_tool(
         is_error,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     }
 }
 
@@ -1000,21 +1013,35 @@ async fn gate(
         tool_id: id,
         input,
     });
+    // The prompt channel belongs to the turn. A moved call has left it, so
+    // nobody there answers for it, and a wait would hold the channel from
+    // every later ask. A move during the wait withdraws the ask.
+    let unmoved = ctx.call.as_deref().filter(|call| call.home().is_none());
+    let moved = ctx.call.is_some() && unmoved.is_none();
+    let user_response_rx = ctx.user_response_rx.as_deref().filter(|_| !moved);
+    let (withdraw, ask_cancel) = ctx.cancel.child();
     let decision = ctx.permissions.enforce(
         tool,
         scopes,
         ctx.session_id.as_ref(),
         &ctx.event_tx,
-        ctx.user_response_rx.as_deref(),
+        user_response_rx,
         id,
-        &ctx.cancel,
+        &ask_cancel,
         ctx.mode.plan_path(),
         ask,
         layers.as_ref().map(|layers| layers as &dyn PromptLayers),
     );
+    let withdrawn = async move {
+        if let Some(call) = unmoved {
+            call.moved().await;
+            withdraw.cancel();
+        }
+        std::future::pending().await
+    };
     let allowed_by = ctx
         .deadline
-        .paused_while(decision)
+        .paused_while(futures_lite::future::or(decision, withdrawn))
         .await
         .map_err(|e| e.to_string())?;
     if let Some(plugin) = allowed_by {
@@ -1083,6 +1110,7 @@ async fn execute_mcp_tool(
         is_error,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     };
 
     let perm_tool = match ToolKey::parse(&tool) {
@@ -1154,12 +1182,17 @@ pub(super) async fn process_tool_calls(
     for (id, name, input) in runnable {
         spawned_ids.push(id.clone());
         let event_tx_clone = ctx.event_tx.clone();
+        let scope = Arc::new(CallScope::new(id.clone(), &ctx.cancel));
         let tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
             call_instructions: CallInstructions::default(),
+            cancel: scope.cancel().clone(),
+            call: Some(Arc::clone(&scope)),
             ..ctx.clone()
         };
+        let guard = CallGuard::new(scope);
         set.spawn(async move {
+            let _guard = guard;
             let done = run(id, &name, &input, &tool_ctx, CallOrigin::Model).await;
             event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
             done
@@ -1265,20 +1298,25 @@ fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: D
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::pin::pin;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use flume::Receiver;
+    use futures_lite::future::poll_once;
     use maki_config::{
         Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     };
+    use maki_providers::{ContentBlock, Message, Role, StreamResponse};
     use maki_storage::id::MakiId;
     use smol::lock::Mutex as AsyncMutex;
     use test_case::test_case;
 
     use super::*;
-    use crate::cancel::CancelToken;
+    use crate::agent::history::History;
+    use crate::call_scope::TaskHome;
+    use crate::cancel::{CancelToken, CancelTrigger};
     use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::{ToolDeferral, tool_names};
@@ -1293,9 +1331,9 @@ mod tests {
         stub_ctx_with_permissions, stub_seed,
     };
     use crate::tools::{
-        BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
-        ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience,
-        ToolExecResult, ToolFilter, ToolHook, ToolReach, local_tool,
+        BackgroundFor, BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture,
+        HeaderResult, ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool,
+        ToolAudience, ToolExecResult, ToolFilter, ToolHook, ToolReach, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
@@ -2039,7 +2077,7 @@ mod tests {
             seed.set_chat_settings(Default::default(), &chat_mode);
             let mut ctx = build_ctx();
             ctx.registry = registered(Arc::new(HookMock(None)));
-            ctx.background_for = Some(chat);
+            ctx.background_for = BackgroundFor::Chat(chat);
 
             let done = run(
                 TEST_ID.into(),
@@ -2262,6 +2300,57 @@ mod tests {
             let text = done.output.as_text();
             assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
             assert!(prompts(&events).is_empty());
+        });
+    }
+
+    fn moved_away(scope: &CallScope) -> CancelTrigger {
+        scope
+            .move_to(TaskHome {
+                chat: MakiId::generate(),
+                id: TEST_ID.to_owned(),
+                plugin: Arc::from(HOOK_TOOL_NAME),
+            })
+            .unwrap()
+    }
+
+    /// The queued allow is the control: were the user asked, the call would run.
+    #[test]
+    fn a_moved_call_asks_nobody() {
+        smol::block_on(async {
+            let (mut ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
+            let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
+            let _task = moved_away(&scope);
+            ctx.call = Some(scope);
+            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
+            let done = dispatch_nested(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+
+            assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
+            assert!(prompts(&events).is_empty());
+        });
+    }
+
+    #[test]
+    fn a_move_withdraws_the_ask_and_frees_the_prompt_channel() {
+        smol::block_on(async {
+            let (event_tx, events) = flume::unbounded();
+            let (_answer_tx, answer_rx) = flume::unbounded::<String>();
+            let mut ctx = build_ctx();
+            ctx.event_tx = EventSender::new(event_tx, 0);
+            let channel = Arc::new(AsyncMutex::new(answer_rx));
+            ctx.user_response_rx = Some(Arc::clone(&channel));
+            let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
+            ctx.call = Some(Arc::clone(&scope));
+            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
+
+            let input = call_input(HOOK_PLAIN);
+            let mut done = pin!(dispatch_nested(&ctx, HOOK_TOOL_NAME, &input));
+            assert!(poll_once(&mut done).await.is_none());
+            assert_eq!(prompts(&events).len(), 1);
+
+            let _task = moved_away(&scope);
+            let done = done.await;
+            assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
+            assert!(channel.try_lock().is_some());
         });
     }
 
@@ -3026,6 +3115,106 @@ mod tests {
                 "execute must not run after denial"
             );
         });
+    }
+
+    const PROBE_TOOL: &str = "probe";
+    const PARALLEL_IDS: [&str; 2] = ["call_a", "call_b"];
+
+    /// What one model call saw of its own context while it ran.
+    struct CallView {
+        id: String,
+        cancel: CancelToken,
+        scope: Arc<CallScope>,
+        cancelled_while_running: bool,
+    }
+
+    fn probe_turn(ids: &[&str]) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: ids
+                    .iter()
+                    .map(|id| ContentBlock::tool_use(*id, PROBE_TOOL, json!({ "id": id })))
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Runs one model turn of {ids} under {run}, with {on_call} inside each call.
+    fn run_turn(
+        ids: &[&str],
+        run: CancelToken,
+        on_call: impl Fn(&ToolContext) + Send + Sync + 'static,
+    ) -> Vec<CallView> {
+        let (tx, _rx) = flume::unbounded::<Envelope>();
+        let event_tx = EventSender::new(tx, 0);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+        ctx.cancel = run;
+        let views = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&views);
+        ctx.local_tools = Arc::new(HashMap::from([(
+            PROBE_TOOL.to_owned(),
+            local_tool(ToolAudience::all(), move |_input, call_ctx: ToolContext| {
+                on_call(&call_ctx);
+                record.lock().unwrap().push(CallView {
+                    id: call_ctx.tool_use_id.clone().unwrap(),
+                    cancel: call_ctx.cancel.clone(),
+                    scope: call_ctx.call.clone().unwrap(),
+                    cancelled_while_running: call_ctx.cancel.is_cancelled(),
+                });
+                Box::pin(async { Ok(String::new()) })
+            }),
+        )]));
+
+        smol::block_on(process_tool_calls(
+            probe_turn(ids),
+            &mut RecentCalls::new(),
+            &mut History::new(Vec::new()),
+            &event_tx,
+            &ctx,
+        ))
+        .unwrap();
+        std::mem::take(&mut *views.lock().unwrap())
+    }
+
+    #[test]
+    fn parallel_calls_each_get_their_own_scope_and_token() {
+        let (_run_trigger, run) = CancelToken::new();
+        let views = run_turn(&PARALLEL_IDS, run.clone(), |_| {});
+
+        assert_eq!(views.len(), PARALLEL_IDS.len());
+        for view in &views {
+            assert_eq!(view.scope.id(), view.id);
+            assert!(view.cancel.same_as(view.scope.cancel()));
+            assert!(!view.cancel.same_as(&run));
+            assert!(!view.cancelled_while_running);
+        }
+        assert!(!Arc::ptr_eq(&views[0].scope, &views[1].scope));
+        assert!(!views[0].cancel.same_as(&views[1].cancel));
+    }
+
+    #[test]
+    fn a_call_token_is_cancelled_once_the_call_ends() {
+        let (_run_trigger, run) = CancelToken::new();
+        let views = run_turn(&PARALLEL_IDS, run.clone(), |_| {});
+
+        assert!(views.iter().all(|view| view.cancel.is_cancelled()));
+        assert!(!run.is_cancelled(), "a call ending must not end the run");
+    }
+
+    #[test]
+    fn cancelling_the_run_cancels_an_unmoved_call() {
+        let (run_trigger, run) = CancelToken::new();
+        let run_trigger = Mutex::new(Some(run_trigger));
+        let views = run_turn(&PARALLEL_IDS[..1], run, move |_| {
+            if let Some(trigger) = run_trigger.lock().unwrap().take() {
+                trigger.cancel();
+            }
+        });
+
+        assert!(views[0].cancelled_while_running);
     }
 }
 

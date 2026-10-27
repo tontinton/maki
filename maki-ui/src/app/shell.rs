@@ -156,6 +156,7 @@ impl App {
                     is_error,
                     annotation: None,
                     written_path: None,
+                    backgrounded: false,
                 });
                 if let Some(msg) = result_msg {
                     self.shell.push_result(msg);

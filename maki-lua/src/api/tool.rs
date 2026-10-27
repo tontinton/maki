@@ -19,7 +19,8 @@ use maki_agent::tools::{
     ToolReach, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
+    AgentEvent, BufferSnapshot, CallScope, ImageMediaType, ImageSource, SharedBuf, TextOutput,
+    ToolDoneEvent, ToolOutput,
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -497,10 +498,12 @@ impl ToolInvocation for LuaToolInvocation {
             }
 
             let recv = async { Some(reply_rx.recv_async().await) };
+            let call = ctx.call.as_deref();
+            let own_call = call.is_some_and(|call| ctx.tool_use_id.as_deref() == Some(call.id()));
             let result = match effective_secs {
                 Some(secs) => {
                     futures_lite::future::race(recv, async move {
-                        smol::Timer::after(Duration::from_secs(secs)).await;
+                        backstop(Duration::from_secs(secs), call, own_call).await;
                         None
                     })
                     .await
@@ -517,9 +520,9 @@ impl ToolInvocation for LuaToolInvocation {
                 ))
                 .into(),
                 Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
-                Some(Ok(reply)) => {
+                Some(Ok(mut reply)) => {
                     if let Some(ref id) = ctx.tool_use_id {
-                        if let Some(live_buf) = reply.live_buf {
+                        if let Some(live_buf) = reply.live_buf.take() {
                             crate::runtime::send_render_event(
                                 &ctx.event_tx,
                                 id,
@@ -531,42 +534,43 @@ impl ToolInvocation for LuaToolInvocation {
                             );
                         }
                         crate::runtime::RestoreReply {
-                            body: reply.snapshot,
-                            header: reply.header,
+                            body: reply.snapshot.take(),
+                            header: reply.header.take(),
                         }
                         .emit(id, None, &ctx.event_tx);
                     }
-                    let format = reply.format;
-                    let image = reply.image;
-                    let state = reply.state;
-                    ToolExecResult {
-                        output: reply.result.map(|s| {
-                            if let Some(source) = image {
-                                ToolOutput::Image { source, text: s }
-                            } else if let Some(diff) = reply.diff {
-                                ToolOutput::Diff {
-                                    summary: s,
-                                    path: diff.path,
-                                    before: diff.before,
-                                    after: diff.after,
-                                }
-                            } else {
-                                let inner = TextOutput {
-                                    state,
-                                    ..TextOutput::from(s)
-                                };
-                                match format {
-                                    LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
-                                    LuaOutputFormat::Plain => ToolOutput::Plain(inner),
-                                }
-                            }
-                        }),
-                        annotation: reply.annotation,
-                        written_path: reply.written_path,
-                    }
+                    reply.into_exec_result()
                 }
             }
         })
+    }
+}
+
+/// Fires after {timeout} unless {call} moved to the background first: a
+/// moved subtree, nested calls included, runs until its work ends or someone
+/// stops it.
+///
+/// For the model call itself ({own_call}) the lapse claims the call's trigger,
+/// the one a move takes too: a move landing as the timeout fires either wins,
+/// and its receipt is the reply, or finds the call ended. Never both.
+async fn backstop(timeout: Duration, call: Option<&CallScope>, own_call: bool) {
+    let lapsed = async {
+        smol::Timer::after(timeout).await;
+        match call {
+            None => true,
+            Some(call) if own_call => call.end(),
+            Some(call) => call.home().is_none(),
+        }
+    };
+    let moved = async {
+        match call {
+            Some(call) => call.moved().await,
+            None => std::future::pending().await,
+        }
+        false
+    };
+    if !futures_lite::future::or(lapsed, moved).await {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -1773,9 +1777,72 @@ pub(crate) struct ToolCallReply {
     /// return. It becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
+    /// `result` is the receipt of a call that moved to the background.
+    pub backgrounded: bool,
 }
 
 impl ToolCallReply {
+    pub(crate) fn into_exec_result(self) -> ToolExecResult {
+        let Self {
+            result,
+            format,
+            annotation,
+            written_path,
+            diff,
+            image,
+            state,
+            backgrounded,
+            ..
+        } = self;
+        let output = result.map(|s| {
+            if let Some(source) = image {
+                ToolOutput::Image { source, text: s }
+            } else if let Some(diff) = diff {
+                ToolOutput::Diff {
+                    summary: s,
+                    path: diff.path,
+                    before: diff.before,
+                    after: diff.after,
+                }
+            } else {
+                let inner = TextOutput {
+                    state,
+                    ..TextOutput::from(s)
+                };
+                match format {
+                    LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
+                    LuaOutputFormat::Plain => ToolOutput::Plain(inner),
+                }
+            }
+        });
+        ToolExecResult {
+            output,
+            annotation,
+            written_path,
+            backgrounded,
+        }
+    }
+
+    /// What dispatch would have made of the reply, for the final reply of a
+    /// moved call, which no dispatcher waits for any more.
+    pub(crate) fn into_done_event(self, id: String, tool: Arc<str>) -> ToolDoneEvent {
+        let result = self.into_exec_result();
+        let (output, is_error) = match result.output {
+            Ok(output) => (output, false),
+            Err(message) => (ToolOutput::Plain(message.into()), true),
+        };
+        ToolDoneEvent {
+            id,
+            tool,
+            output: Arc::new(output),
+            is_error,
+            annotation: result.annotation,
+            written_path: result.written_path,
+            call: None,
+            backgrounded: false,
+        }
+    }
+
     pub fn from_lua_value(lua: &Lua, val: &LuaValue) -> Self {
         let mut result = coerce_tool_result(val);
         let LuaValue::Table(t) = val else {
@@ -1820,6 +1887,7 @@ impl ToolCallReply {
             diff,
             image,
             state,
+            backgrounded: false,
         }
     }
 
@@ -1852,6 +1920,7 @@ impl ToolCallReply {
             diff: None,
             image: None,
             state: None,
+            backgrounded: false,
         }
     }
 
@@ -1939,7 +2008,12 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 
 #[cfg(test)]
 mod tests {
+    use maki_agent::TaskHome;
+    use maki_agent::cancel::{CancelToken, CancelTrigger};
+    use maki_storage::id::MakiId;
+
     use super::*;
+    use crate::runtime::block_on_or_fail;
 
     #[test_case::test_case("echo", true ; "simple_name")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]
@@ -2423,5 +2497,59 @@ mod tests {
         };
         let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
         smol::block_on(inv.start(&ctx));
+    }
+
+    const BACKSTOP_CALL_ID: &str = "toolu_backstop";
+    const BACKSTOP_PLUGIN: &str = "backstop";
+
+    /// Holds the run trigger and, once moved, the task's, so neither firing
+    /// on drop reads as a cancel.
+    fn call_scope(moved: bool) -> (CallScope, CancelTrigger, Option<CancelTrigger>) {
+        let (run_trigger, run) = CancelToken::new();
+        let call = CallScope::new(BACKSTOP_CALL_ID.to_owned(), &run);
+        let task_trigger = moved.then(|| call.move_to(home()).expect("first move"));
+        (call, run_trigger, task_trigger)
+    }
+
+    fn home() -> TaskHome {
+        TaskHome {
+            chat: MakiId::generate(),
+            id: BACKSTOP_CALL_ID.to_owned(),
+            plugin: Arc::from(BACKSTOP_PLUGIN),
+        }
+    }
+
+    #[test_case::test_case(true ; "own_call")]
+    #[test_case::test_case(false ; "nested_call")]
+    fn the_backstop_fires_for_a_call_still_in_the_foreground(own_call: bool) {
+        let (call, _run, _task) = call_scope(false);
+        block_on_or_fail(backstop(Duration::ZERO, Some(&call), own_call));
+        assert_eq!(call.cancel().is_cancelled(), own_call);
+    }
+
+    /// The timeout and a move landing with it cannot both answer the call.
+    #[test]
+    fn a_lapsed_backstop_refuses_a_later_move() {
+        let (call, _run, _task) = call_scope(false);
+        block_on_or_fail(backstop(Duration::ZERO, Some(&call), true));
+        assert!(call.move_to(home()).is_err());
+    }
+
+    /// A bash nested in a moved batch would otherwise die at its own timeout.
+    #[test_case::test_case(true ; "own_call")]
+    #[test_case::test_case(false ; "nested_call")]
+    fn the_backstop_never_fires_once_the_call_moved(own_call: bool) {
+        let (call, _run, _task) = call_scope(true);
+        let fired = block_on_or_fail(futures_lite::future::or(
+            async {
+                backstop(Duration::ZERO, Some(&call), own_call).await;
+                true
+            },
+            async {
+                smol::future::yield_now().await;
+                false
+            },
+        ));
+        assert!(!fired);
     }
 }

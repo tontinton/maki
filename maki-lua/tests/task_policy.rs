@@ -3,18 +3,21 @@
 //! scriptable Lua stubs.
 
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use futures_lite::future::poll_once;
-use maki_agent::tools::test_support::stub_ctx;
-use maki_agent::tools::{ToolContext, ToolRegistry};
-use maki_agent::{AgentMode, CancelToken, ToolOutput};
-use maki_lua::{PluginHost, SessionEndReason};
-use maki_storage::id::SessionRef;
+use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with, stub_seed};
+use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
+use maki_agent::{
+    AgentEvent, AgentMode, AgentSeed, BufferSnapshot, CallScope, CancelToken, Envelope,
+    EventSender, SessionMailbox, SharedBuf, ToolOutput,
+};
+use maki_lua::{MoveOutcome, PluginHost, UiAction};
+use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
 const TASK_RUNNER_SRC: &str = include_str!("../../plugins/task/runner.lua");
-const TASK_BACKGROUND_SRC: &str = include_str!("../../plugins/task/background.lua");
 
 // Mirrors of the plugin's error contracts and policy numbers.
 const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -41,13 +44,18 @@ const PROMPT_ERR_MSG: &str = "model exploded";
 const RAISE_MSG: &str = "stub prompt kaboom";
 const PARTIAL_TEXT: &str = "half a transcript";
 const CANCELLED_ERR: &str = "cancelled";
-const BACKGROUND_STARTED: &str = "Background task started";
-const BACKGROUND_CANCELLED_ERR: &str = "background task cancelled";
 const SESSION_OPEN_ERR: &str = "session admission failed";
-const FINISHED: &str = "finished";
-const FAILED: &str = "failed";
 /// Mirrors the task plugin's `max_concurrent` default.
 const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
+
+const FIRST_CALL_ID: &str = "toolu_first";
+const SECOND_CALL_ID: &str = "toolu_second";
+const MOVED_RECEIPT: &str = "Subagent parked moved to the background";
+const WAITING_FOR_SLOT: &str = "waiting for a free subagent slot";
+/// Mirrors the task plugin's `FOREGROUND_NOTE` wording.
+const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
+const FOREGROUND_NOTE_TAIL: &str = "Ran in the foreground.";
+const EVENT_WAIT: Duration = Duration::from_secs(10);
 
 const SCENARIO_PLAIN: &str = "plain";
 const SCENARIO_HAPPY: &str = "happy";
@@ -337,7 +345,6 @@ fn load_task_host_with_opts(
         r#"{prelude}
 local builtin_require = require
 local runner
-local background
 local function require(name)
   if name == "runner" then
     if runner == nil then
@@ -346,14 +353,6 @@ local function require(name)
       end)()
     end
     return runner
-  end
-  if name == "background" then
-    if background == nil then
-      background = (function()
-{TASK_BACKGROUND_SRC}
-      end)()
-    end
-    return background
   end
   return builtin_require(name)
 end
@@ -387,32 +386,10 @@ fn exec_tool_with_ctx(
         })
 }
 
-fn session_ctx(session: &SessionRef) -> ToolContext {
-    let mut ctx = stub_ctx(&AgentMode::Build);
-    ctx.session_id = Some(session.clone());
-    ctx
-}
-
 fn background_input(scenario: &str, output_schema: Option<Value>) -> Value {
     let mut input = task_input(scenario, output_schema);
     input["background"] = json!(true);
     input
-}
-
-fn start_background(
-    reg: &ToolRegistry,
-    ctx: &ToolContext,
-    scenario: &str,
-    output_schema: Option<Value>,
-) {
-    let out = exec_tool_with_ctx(
-        reg,
-        TASK_TOOL,
-        background_input(scenario, output_schema),
-        ctx,
-    )
-    .expect("background task admission failed");
-    assert!(out.starts_with(BACKGROUND_STARTED), "{out}");
 }
 
 /// Blocks until every condition holds: `parked` (a scenario name),
@@ -730,144 +707,200 @@ fn background_input_is_opt_in() {
     assert!(advertised(&load_background_host().0));
 }
 
-#[test_case::test_case(SCENARIO_PLAIN, None, PLAIN_TEXT, FINISHED ; "plain")]
-#[test_case::test_case(SCENARIO_HAPPY, Some(answer_schema()), "{\"answer\":\"42\"}", FINISHED ; "structured")]
-#[test_case::test_case(SCENARIO_PROMPT_ERROR, None, PROMPT_ERR_MSG, FAILED ; "model_error")]
-#[test_case::test_case(SCENARIO_RAISE, None, RAISE_MSG, FAILED ; "exception")]
-fn background_delivers_the_result_in_one_waking_notice(
-    scenario: &str,
-    schema: Option<Value>,
-    expected: &str,
-    status: &str,
-) {
-    let (reg, _host) = load_background_host();
-    let session = SessionRef::generate();
-    start_background(&reg, &session_ctx(&session), scenario, schema);
-    wait(&reg, json!({ "notices": 1 }));
-    let snap = probe(&reg);
-    assert_eq!(snap["scope"], json!("session"));
-    assert_eq!(snap["owner"], json!(session.as_str()));
-    assert_eq!(snap["closed"], json!(1));
-    assert_eq!(snap["released"], json!(1));
-    let notices = snap["notices"].as_array().unwrap();
-    assert_eq!(notices.len(), 1);
-    assert_eq!(notices[0]["session"], json!(session.as_str()));
-    assert_eq!(notices[0]["wake"], json!(true));
-    let text = notices[0]["text"].as_str().unwrap();
-    for part in [scenario, status, expected] {
-        assert!(text.contains(part), "{part} missing from {text}");
-    }
-}
-
-#[test]
-fn background_open_error_returns_inline() {
-    let (reg, _host) = load_background_host();
-    let ctx = session_ctx(&SessionRef::generate());
-    let input = background_input(SCENARIO_SESSION_ERROR, None);
-    assert_eq!(
-        exec_tool_with_ctx(&reg, TASK_TOOL, input, &ctx).unwrap_err(),
-        SESSION_OPEN_ERR
-    );
-    let snap = probe(&reg);
-    assert_eq!(snap["acquired"], json!(0));
-    assert_eq!(snap["notice_count"], json!(0));
-}
-
 #[test]
 fn background_without_a_chat_session_runs_blocking() {
     let (reg, _host) = load_background_host();
     let out = exec_tool(&reg, TASK_TOOL, background_input(SCENARIO_PLAIN, None)).unwrap();
-    assert_eq!(out, PLAIN_TEXT);
+    assert!(out.starts_with(FOREGROUND_NOTE_HEAD), "{out}");
+    assert!(out.contains(FOREGROUND_NOTE_TAIL), "{out}");
+    assert!(out.ends_with(PLAIN_TEXT), "{out}");
     let snap = probe(&reg);
     assert_eq!(snap["scope"], Value::Null);
     assert_eq!(snap["released"], json!(1));
     assert_eq!(snap["notice_count"], json!(0));
 }
 
+struct LiveChat {
+    id: MakiId,
+    _mailbox: SessionMailbox,
+    _seed: Arc<AgentSeed>,
+}
+
+impl LiveChat {
+    fn new() -> Self {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let seed = mailbox.publish_seed(stub_seed(id));
+        Self {
+            id,
+            _mailbox: mailbox,
+            _seed: seed,
+        }
+    }
+}
+
+/// A blocking `task` call as dispatch makes it: one scope under the run
+/// token and its own event channel, executing on its own thread.
+struct ModelCall {
+    id: &'static str,
+    events: flume::Receiver<Envelope>,
+    result: flume::Receiver<ToolExecResult>,
+}
+
+impl ModelCall {
+    fn start(
+        reg: &Arc<ToolRegistry>,
+        chat: &LiveChat,
+        run: &CancelToken,
+        id: &'static str,
+        input: Value,
+    ) -> Self {
+        let (events_tx, events) = flume::unbounded();
+        let mut ctx = stub_ctx_with(
+            &AgentMode::Build,
+            Some(&EventSender::new(events_tx, 0)),
+            Some(id),
+        );
+        let scope = Arc::new(CallScope::new(id.to_owned(), run));
+        ctx.cancel = scope.cancel().clone();
+        ctx.call = Some(scope);
+        ctx.session_id = Some(SessionRef::from(chat.id));
+        ctx.registry = Arc::clone(reg);
+        let (result_tx, result) = flume::bounded(1);
+        let reg = Arc::clone(reg);
+        thread::spawn(move || {
+            let invocation = reg
+                .get(TASK_TOOL)
+                .unwrap()
+                .tool
+                .parse(&input)
+                .expect("parse failed");
+            let _ = result_tx.send(smol::block_on(invocation.execute(&ctx)));
+        });
+        Self { id, events, result }
+    }
+
+    fn next_event<T>(&self, mut pick: impl FnMut(AgentEvent) -> Option<T>) -> T {
+        let deadline = Instant::now() + EVENT_WAIT;
+        loop {
+            let envelope = self
+                .events
+                .recv_deadline(deadline)
+                .expect("expected tool event");
+            if let Some(found) = pick(envelope.event) {
+                return found;
+            }
+        }
+    }
+
+    fn wait_movable(&self) {
+        self.next_event(|event| {
+            matches!(&event, AgentEvent::ToolMovable { id, movable: true } if id == self.id)
+                .then_some(())
+        });
+    }
+
+    fn wait_live_buf(&self) -> Arc<SharedBuf> {
+        self.next_event(|event| match event {
+            AgentEvent::LiveToolBuf { id, body } if id == self.id => Some(body),
+            _ => None,
+        })
+    }
+
+    fn finish(&self) -> ToolExecResult {
+        self.result
+            .recv_timeout(EVENT_WAIT)
+            .expect("task call never replied")
+    }
+}
+
+fn buf_text(buf: &SharedBuf) -> String {
+    BufferSnapshot::from_arc(buf.read()).text()
+}
+
+fn reply_text(result: ToolExecResult) -> String {
+    match result.output.expect("task call failed") {
+        ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
+        other => panic!("unexpected output: {other:?}"),
+    }
+}
+
+fn request_move(host: &PluginHost, id: &str) -> MoveOutcome {
+    host.event_handle()
+        .request_background(id.to_owned())
+        .recv_timeout(EVENT_WAIT)
+        .expect("move outcome")
+}
+
+fn moved_call_reply(ui: &flume::Receiver<UiAction>) -> (String, bool) {
+    loop {
+        let action = ui.recv_timeout(EVENT_WAIT).expect("task tab event");
+        if let UiAction::PluginTaskEvent { envelope, .. } = action
+            && let AgentEvent::ToolDone(done) = envelope.event
+        {
+            return (done.output.as_text(), done.is_error);
+        }
+    }
+}
+
 #[test]
-fn background_and_blocking_tasks_share_one_concurrency_limit() {
+fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     let mut opts = serde_json::Map::new();
     opts.insert("max_concurrent".into(), json!(1));
-    opts.insert("allow_background".into(), json!(true));
-    let (reg, _host) = load_task_host_with_opts(opts);
-    let ctx = session_ctx(&SessionRef::generate());
-    start_background(&reg, &ctx, SCENARIO_PARKED, None);
-    wait(&reg, json!({ "parked": SCENARIO_PARKED }));
-    let invocation = reg
-        .get(TASK_TOOL)
-        .unwrap()
-        .tool
-        .parse(&task_input(SCENARIO_PARKED_SECOND, None))
-        .unwrap();
-    smol::block_on(async {
-        let mut blocking = invocation.execute(&ctx);
-        assert!(poll_once(&mut blocking).await.is_none());
-        wait(&reg, json!({ "acquires": 2 }));
-        assert_eq!(probe(&reg)["acquired"], json!(1));
-        release(&reg, SCENARIO_PARKED);
-        wait(&reg, json!({ "parked": SCENARIO_PARKED_SECOND }));
-        release(&reg, SCENARIO_PARKED_SECOND);
-        assert!(blocking.await.output.is_ok());
-    });
-    wait(&reg, json!({ "notices": 1 }));
-    assert_eq!(probe(&reg)["released"], json!(2));
-}
+    let (reg, host) = load_task_host_with_opts(opts);
+    host.ui_attachment().attach();
+    let ui = host.ui_action_rx();
+    let chat = LiveChat::new();
+    let (_run_trigger, run) = CancelToken::new();
 
-#[test]
-fn session_end_stops_only_that_chats_work() {
-    let (reg, host) = load_background_host();
-    let ending = SessionRef::generate();
-    start_background(&reg, &session_ctx(&ending), SCENARIO_PARKED, None);
-    let kept = SessionRef::generate();
-    start_background(&reg, &session_ctx(&kept), SCENARIO_PARKED_SECOND, None);
+    let first = ModelCall::start(
+        &reg,
+        &chat,
+        &run,
+        FIRST_CALL_ID,
+        task_input(SCENARIO_PARKED, None),
+    );
+    let mut showed_waiting_row = false;
+    first.next_event(|event| {
+        showed_waiting_row |= matches!(event, AgentEvent::LiveToolBuf { .. });
+        matches!(&event, AgentEvent::ToolMovable { movable: true, .. }).then_some(())
+    });
+    assert!(!showed_waiting_row, "a free slot needs no waiting row");
+    assert_eq!(request_move(&host, FIRST_CALL_ID), MoveOutcome::Moved);
+    let receipt = first.finish();
+    assert!(receipt.backgrounded);
+    let receipt = reply_text(receipt);
+    assert!(receipt.starts_with(MOVED_RECEIPT), "{receipt}");
+
+    let second = ModelCall::start(
+        &reg,
+        &chat,
+        &run,
+        SECOND_CALL_ID,
+        task_input(SCENARIO_PARKED_SECOND, None),
+    );
+    let waiting = second.wait_live_buf();
+    assert_eq!(buf_text(&waiting), WAITING_FOR_SLOT);
+    wait(&reg, json!({ "acquires": 2 }));
+    assert_eq!(request_move(&host, SECOND_CALL_ID), MoveOutcome::NoHook);
+    assert!(second.result.is_empty());
+    assert_eq!(probe(&reg)["acquired"], json!(1));
+
     wait(&reg, json!({ "parked": SCENARIO_PARKED }));
+    release(&reg, SCENARIO_PARKED);
+    assert_eq!(moved_call_reply(&ui), (PLAIN_TEXT.to_owned(), false));
+    assert_eq!(probe(&reg)["released"], json!(1));
+
     wait(&reg, json!({ "parked": SCENARIO_PARKED_SECOND }));
-    host.event_handle()
-        .end_sessions_blocking([ending.id()], SessionEndReason::Delete);
-    let snap = probe(&reg);
-    assert_eq!(snap["closed"], json!(1));
-    assert_eq!(snap["released"], json!(1));
+    assert_eq!(buf_text(&waiting), "");
+    second.wait_movable();
     release(&reg, SCENARIO_PARKED_SECOND);
-    wait(&reg, json!({ "notices": 1 }));
-    let snap = probe(&reg);
-    assert_eq!(snap["notice_count"], json!(1));
-    assert_eq!(snap["notices"][0]["session"], json!(kept.as_str()));
-}
-
-#[test_case::test_case(true ; "session_end")]
-#[test_case::test_case(false ; "foreground_cancel")]
-fn cancellation_during_background_admission_closes_the_session(session_end: bool) {
-    let (reg, host) = load_background_host();
-    let session = SessionRef::generate();
-    let mut ctx = session_ctx(&session);
-    let (cancel, token) = CancelToken::new();
-    ctx.cancel = token;
-    let entry = reg.get(TASK_TOOL).unwrap();
-    let invocation = entry
-        .tool
-        .parse(&background_input(SCENARIO_OPEN_PARKED, None))
-        .unwrap();
-    smol::block_on(async {
-        let mut admission = invocation.execute(&ctx);
-        assert!(poll_once(&mut admission).await.is_none());
-        wait(&reg, json!({ "parked": SCENARIO_OPEN_PARKED }));
-        if session_end {
-            host.event_handle()
-                .end_sessions_blocking([session.id()], SessionEndReason::Delete);
-        } else {
-            cancel.cancel();
-        }
-        release(&reg, SCENARIO_OPEN_PARKED);
-        assert_eq!(
-            admission.await.output.unwrap_err(),
-            BACKGROUND_CANCELLED_ERR
-        );
+    let result = second.finish();
+    assert!(!result.backgrounded);
+    assert_eq!(reply_text(result), PLAIN_TEXT);
+    let final_body = second.next_event(|event| match event {
+        AgentEvent::ToolSnapshot { snapshot, .. } => Some(snapshot.text()),
+        _ => None,
     });
-    let snap = probe(&reg);
-    assert_eq!(snap["sessions"], json!(1));
-    assert_eq!(snap["closed"], json!(1));
-    assert_eq!(snap["prompt_count"], json!(0));
-    assert_eq!(snap["acquired"], json!(0));
-    assert_eq!(snap["released"], json!(0));
-    assert_eq!(snap["notice_count"], json!(0));
+    assert!(final_body.contains(PLAIN_TEXT), "{final_body}");
 }

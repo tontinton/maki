@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
-use crate::components::input::{BORDER_ROWS, Placeholder};
+use crate::components::input::BORDER_ROWS;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
@@ -17,7 +17,9 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
-use super::{App, Mode, Status};
+#[cfg(test)]
+use super::Status;
+use super::{App, Mode};
 
 struct ViewLayout {
     msg_area: Rect,
@@ -231,15 +233,7 @@ impl App {
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            let placeholder = if !self.is_main_chat() {
-                Placeholder::SubagentQueue
-            } else if self.status == Status::Streaming {
-                Placeholder::Queue
-            } else if self.state.session.messages().is_empty() {
-                Placeholder::Suggestion
-            } else {
-                Placeholder::Blank
-            };
+            let placeholder = self.input_placeholder();
             let panel_hint = (self.state.mode == Mode::Plan)
                 .then(|| self.plan_form.hint_line())
                 .flatten()

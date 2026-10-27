@@ -5,10 +5,12 @@ use std::sync::OnceLock;
 use etcetera::base_strategy::BaseStrategy;
 
 use crate::StateDir;
+use crate::id::MakiId;
 
 const FALLBACK_DIR: &str = ".maki";
 const APP_NAME: &str = "maki";
 const PROJECTS_DIR: &str = "projects";
+const TASK_LOGS_DIR: &str = "tasks";
 pub(crate) const GIT_MARKER: &str = ".git";
 const UNNAMED_PROJECT: &str = "root";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -284,6 +286,18 @@ pub fn data_dir() -> Result<PathBuf, std::io::Error> {
 pub fn state_dir() -> Result<PathBuf, std::io::Error> {
     let p = resolve().ok_or_else(err)?;
     ensure(&p.state)
+}
+
+/// Where background commands log their output, one subdirectory per session.
+/// Not created: callers only compare paths against it.
+pub fn task_logs_dir() -> Result<PathBuf, std::io::Error> {
+    let p = resolve().ok_or_else(err)?;
+    Ok(p.state.join(TASK_LOGS_DIR))
+}
+
+/// The directory under `state` holding one session's task logs.
+pub fn session_task_logs_dir(state: &Path, session: MakiId) -> PathBuf {
+    state.join(TASK_LOGS_DIR).join(session.to_string())
 }
 
 pub fn logs_dir() -> Result<PathBuf, std::io::Error> {

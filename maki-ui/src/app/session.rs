@@ -2,12 +2,12 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use crate::app::tasks::TaskOutcome;
+use crate::app::tasks::{BackgroundMoves, TaskOutcome};
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::Action;
 use crate::components::command::PROMPT_NEEDS;
 use crate::components::input::{COMMAND_PREFIX, sent_text};
-use crate::components::rewind_picker::RewindEntry;
+use crate::components::rewind_picker::{RewindEntry, stopped_by_rewind};
 use crate::text_buffer::Writers;
 use maki_agent::Transcript;
 use maki_agent::agent::SessionExport;
@@ -265,6 +265,8 @@ impl App {
         self.pending_input = PendingInput::None;
         self.status_bar.clear_flash();
         self.last_esc = None;
+        self.last_quit = None;
+        self.background_moves = BackgroundMoves::default();
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
         // The draft this chrome belonged to is gone, and the Lua thread still
@@ -527,8 +529,19 @@ impl App {
         vec![Action::OpenFork(Box::new(OpenSession { session, claim }))]
     }
 
+    /// The id and name of every running background task.
+    fn background_task_names(&self) -> Vec<(Arc<str>, String)> {
+        self.running_background_tasks()
+            .filter_map(|chat| Some((Arc::clone(chat.task_id()?), chat.name.clone())))
+            .collect()
+    }
+
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
-        match self.rewind_picker.open(self.state.session.messages()) {
+        let running = self.background_task_names();
+        match self
+            .rewind_picker
+            .open(self.state.session.messages(), &running)
+        {
             Ok(()) => vec![],
             Err(msg) => {
                 self.status_bar.flash(msg);
@@ -537,7 +550,21 @@ impl App {
         }
     }
 
+    /// A task whose receipt the rewind drops is stopped first: its result
+    /// would answer a call the model no longer made. Its late events find
+    /// no tab to bring back.
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
+        let running = self.background_task_names();
+        let stopped: Vec<Arc<str>> =
+            stopped_by_rewind(self.state.session.messages(), entry.turn_index, &running)
+                .into_iter()
+                .map(|(id, _)| Arc::clone(id))
+                .collect();
+        let mut actions: Vec<Action> = stopped
+            .iter()
+            .filter_map(|id| self.stop_task(id).ok())
+            .collect();
+
         let measured = self.state.context_size;
         let session = self.state.session_mut();
         let context_size = truncate_to_turn(session, entry.turn_index, measured);
@@ -545,11 +572,14 @@ impl App {
         self.state.context_size = context_size;
 
         self.reset_ui_chrome();
+        self.deleted_tasks
+            .extend(stopped.iter().map(|id| id.to_string()));
         self.restore_display();
 
         self.restore_input(&entry.prompt_text, turn_writers(&entry.prompt_text));
 
-        vec![Action::RestartAgent(self.install_local_history())]
+        actions.push(Action::RestartAgent(self.install_local_history()));
+        actions
     }
 
     /// Puts back a draft from disk or a rewound turn. Its {writers} come back

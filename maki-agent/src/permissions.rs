@@ -32,6 +32,7 @@ pub const DECISION_SOURCE_PLUGIN: &str = "plugin";
 
 const TASK_TOOL: &str = "task";
 const BASH_TOOL: &str = "bash";
+const READ_TOOL: &str = "read";
 
 /// Splits the ask id from the encoded answer on the answer channel. A control
 /// character cannot appear in a tool-use id, and the answer is the tail, so
@@ -61,7 +62,21 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
         .map(|tool| allow(tool, &cwd_glob))
         .collect();
     rules.push(allow(TASK_TOOL, "*"));
+    // Per chat would be tighter, but a manager is built before any chat exists.
+    if let Ok(task_logs) = maki_storage::paths::task_logs_dir() {
+        rules.push(allow(READ_TOOL, &task_logs_glob(&task_logs)));
+    }
     rules
+}
+
+/// The logs dir usually does not exist yet, so a plain canonicalize would
+/// keep a symlinked state dir as spelled. The existing part is resolved and
+/// the rest appended.
+fn task_logs_glob(task_logs: &Path) -> String {
+    format!(
+        "{}/**",
+        maki_storage::paths::canonical_key(task_logs).display()
+    )
 }
 
 pub const BOUNDARY_UNVERIFIABLE_PREFIX: &str = "Cannot verify project boundary for";
@@ -1123,6 +1138,8 @@ mod tests {
     const PROMPTS: &str = "prompts";
     const PROJECT_DIR: &str = ".maki";
     const PROJECT_PERMISSIONS: &str = ".maki/permissions.toml";
+    const TASK_LOGS_DIR: &str = "tasks";
+    const TASK_LOG: &str = "session/call.log";
     #[cfg(unix)]
     const OUTSIDE_WRITES: [&str; 2] = ["/etc/passwd", "~/.bashrc"];
     const OUTSIDE_SCOPES: [&str; 3] = ["/etc/passwd", "~/.bashrc", "cargo test"];
@@ -1419,6 +1436,39 @@ mod tests {
             default_mgr().check(&ToolKey::native(tool), scope, None),
             PermissionCheck::Allowed
         )
+    }
+
+    #[test_case("session/call.log" => true ; "task_log")]
+    #[test_case("session/call.log.1" => true ; "rotated_task_log")]
+    #[test_case("../tasks_sibling/call.log" => false ; "sibling_dir")]
+    fn read_of_task_logs_is_allowed_only_inside_the_dir(relative: &str) -> bool {
+        let logs = maki_storage::paths::task_logs_dir().expect("state dir resolves");
+        let scope = maki_storage::paths::normalize_path(&logs.join(relative));
+        matches!(
+            default_mgr().check(&ToolKey::native(READ_TOOL), &scope.to_string_lossy(), None),
+            PermissionCheck::Allowed
+        )
+    }
+
+    #[test_case(true ; "read_through_the_link")]
+    #[test_case(false ; "read_through_the_target")]
+    #[cfg(unix)]
+    fn task_logs_rule_resolves_a_symlinked_state_dir(through_link: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("state");
+        let link = tmp.path().join("state_link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let glob = task_logs_glob(&link.join(TASK_LOGS_DIR));
+        let real_canon = std::fs::canonicalize(&real).unwrap();
+        assert!(glob.starts_with(&*real_canon.to_string_lossy()), "{glob}");
+        let state = if through_link { link } else { real };
+        let log = state.join(TASK_LOGS_DIR).join(TASK_LOG);
+        assert!(
+            scope_matches(&glob, &log.to_string_lossy()),
+            "{glob} misses {log:?}"
+        );
     }
 
     #[test]

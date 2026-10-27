@@ -11,7 +11,7 @@ use crate::agent::default_instruction_files;
 use crate::cancel::CancelToken;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::tools::{FileAccess, ToolContext, ToolRegistry, interpreter_ctx};
+use crate::tools::{BackgroundFor, FileAccess, ToolContext, ToolRegistry, interpreter_ctx};
 use crate::{AgentConfig, AgentMode, EventSender, ModelSlot, ToolOutputLines};
 
 pub const BACKGROUND_PLAN_WRITE_DENIED: &str =
@@ -244,7 +244,7 @@ impl AgentSeed {
             provider: Arc::clone(&slot.provider),
             model: Arc::new(slot.model.clone()),
             session_id: Some(self.session_id.clone()),
-            background_for: Some(self.session_id.id()),
+            background_for: BackgroundFor::Chat(self.session_id.id()),
             mcp: self.mcp.clone(),
             config: self.config.clone(),
             tool_output_lines: self.tool_output_lines,
@@ -469,7 +469,7 @@ mod tests {
         let ctx = live.tool_context(CancelToken::none());
         assert_eq!(ctx.opts, CHAT_OPTS);
         assert_eq!(ctx.mode, AgentMode::Build);
-        assert_eq!(ctx.background_for, Some(id));
+        assert_eq!(ctx.background_for.chat(), Some(id));
         assert_eq!(
             AgentSeed::background_write_block(id).as_deref(),
             Some(BACKGROUND_PLAN_WRITE_DENIED)

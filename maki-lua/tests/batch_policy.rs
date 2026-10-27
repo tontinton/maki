@@ -2,16 +2,19 @@
 //! `maki.async.gather`, with tool dispatch replaced by a scriptable Lua stub.
 
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use maki_agent::cancel::CancelToken;
-use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
+use maki_agent::cancel::{CancelToken, CancelTrigger};
+use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with, stub_seed};
 use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
 use maki_agent::{
-    AgentEvent, AgentMode, BufferSnapshot, Envelope, EventSender, SpanStyle, ToolOutput,
+    AgentEvent, AgentMode, AgentSeed, BufferSnapshot, CallScope, Envelope, EventSender,
+    SessionMailbox, SpanStyle, ToolDoneEvent, ToolOutput,
 };
 use maki_config::ToolOutputLines;
-use maki_lua::{KILL_GRACE, PluginHost};
+use maki_lua::{KILL_GRACE, MoveOutcome, PluginHost, UiAction};
+use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
 
 const BATCH_PLUGIN_SRC: &str = include_str!("../../plugins/batch/init.lua");
@@ -65,6 +68,15 @@ const OVERLAP_HEAD: &str = "XY";
 const OVERLAP_HEAD_NEW: &str = "Q";
 const OVERLAP_TAIL: &str = "YZ";
 const OVERLAP_TAIL_NEW: &str = "R";
+
+const HOOKED_TOOL: &str = "hooked";
+const RELEASE_CHILD_TOOL: &str = "release_child";
+const IS_PARKED_TOOL: &str = "is_parked";
+const IS_PARKED_TEXT: &str = "true";
+const MOVED_HEADER: &str =
+    "Still running in the background (their results arrive when they finish):";
+const MOVED_BY_USER: &str = "Moved to the background by the user";
+const WAITING_ON_EDIT: &str = "batch is waiting on edit";
 
 const SPINNER_STYLE: &str = "spinner";
 const ERROR_STYLE: &str = "tool_error";
@@ -1400,5 +1412,271 @@ fn batch_child_body_matches_standalone(tool: &str, input: fn(&str, &str) -> Valu
         "batch child differs from standalone\nbatch:\n{}\nsolo:\n{}",
         lines_text(&child),
         lines_text(&solo)
+    );
+}
+
+/// Children for the move tests. `hooked` reports itself movable (a bash-like
+/// child that registered `ctx:on_background`), `edit` never does. Both park
+/// until `release_child` frees them, so a test decides who is still running
+/// when the press lands.
+const MOVABLE_CHILD_SRC: &str = r#"
+do
+  local stubbed = maki.agent.call_tool
+  local parked, released = {}, {}
+  local function park(tag)
+    if released[tag] then
+      released[tag] = nil
+      return
+    end
+    maki.async.await(1, function(cb)
+      parked[tag] = cb
+    end)
+  end
+  maki.agent.call_tool = function(ctx, name, input, opts)
+    if name == "hooked" or name == "edit" then
+      if name == "hooked" then
+        opts.on_movable(true)
+      end
+      park(input.tag)
+      return name .. ":" .. input.tag
+    end
+    return stubbed(ctx, name, input, opts)
+  end
+
+  local schema = { type = "object", properties = { tag = { type = "string" } } }
+  local function tool(name, handler, header)
+    maki.api.register_tool({
+      name = name,
+      description = name,
+      schema = schema,
+      audiences = { "main" },
+      header = header,
+      handler = handler,
+    })
+  end
+  tool("hooked", function()
+    return "unused"
+  end, function(input)
+    return input.tag
+  end)
+  tool("is_parked", function(input)
+    return tostring(parked[input.tag] ~= nil)
+  end)
+  tool("release_child", function(input)
+    local cb = parked[input.tag]
+    parked[input.tag] = nil
+    if cb then
+      cb()
+    else
+      released[input.tag] = true
+    end
+    return "released"
+  end)
+end
+"#;
+
+/// A batch on its own thread as dispatch makes it (a call scope under the run
+/// token, in a live chat), so `request_background` can really move it.
+struct MovableBatch {
+    reg: Arc<ToolRegistry>,
+    host: PluginHost,
+    ui: flume::Receiver<UiAction>,
+    mailbox: SessionMailbox,
+    body: Arc<maki_agent::SharedBuf>,
+    _seed: Arc<AgentSeed>,
+    _run: CancelTrigger,
+    _events: flume::Receiver<Envelope>,
+}
+
+impl MovableBatch {
+    fn start(tool_calls: Value) -> (Self, JoinHandle<ToolExecResult>) {
+        let (reg, host) = load_batch_host_with(MOVABLE_CHILD_SRC);
+        host.ui_attachment().attach();
+        let ui = host.ui_action_rx();
+        let chat = MakiId::generate();
+        let mailbox = SessionMailbox::register(chat);
+        let seed = mailbox.publish_seed(stub_seed(chat));
+        let (event_tx, events) = flume::unbounded();
+        let (run, run_token) = CancelToken::new();
+        let mut ctx = stub_ctx_with(
+            &AgentMode::Build,
+            Some(&EventSender::new(event_tx, 0)),
+            Some(BATCH_ID),
+        );
+        let scope = Arc::new(CallScope::new(BATCH_ID.to_owned(), &run_token));
+        ctx.cancel = scope.cancel().clone();
+        ctx.call = Some(scope);
+        ctx.session_id = Some(SessionRef::from(chat));
+        let batch_reg = Arc::clone(&reg);
+        let call = std::thread::spawn(move || {
+            let input = batch_input(tool_calls);
+            let inv = batch_reg
+                .get(BATCH_TOOL)
+                .unwrap()
+                .tool
+                .parse(&input)
+                .unwrap();
+            smol::block_on(inv.execute(&ctx))
+        });
+        let body = recv_live_buf(&events);
+        let batch = Self {
+            reg,
+            host,
+            ui,
+            mailbox,
+            body,
+            _seed: seed,
+            _run: run,
+            _events: events,
+        };
+        (batch, call)
+    }
+
+    fn child_tool(&self, name: &str, tag: &str) -> String {
+        exec_tool(&self.reg, name, json!({ "tag": tag })).expect("child control tool failed")
+    }
+
+    fn wait_parked(&self, tag: &str) {
+        let deadline = Instant::now() + PAINT_TIMEOUT;
+        while self.child_tool(IS_PARKED_TOOL, tag) != IS_PARKED_TEXT {
+            assert!(Instant::now() < deadline, "child {tag} never parked");
+            std::thread::sleep(PAINT_POLL_INTERVAL);
+        }
+    }
+
+    fn release(&self, tag: &str) {
+        self.child_tool(RELEASE_CHILD_TOOL, tag);
+    }
+
+    fn press(&self) -> MoveOutcome {
+        self.host
+            .event_handle()
+            .request_background(BATCH_ID.to_owned())
+            .recv_timeout(BATCH_RESULT_TIMEOUT)
+            .expect("move outcome")
+    }
+
+    /// The final reply of a moved batch, as its task tab gets it.
+    fn task_done(&self) -> ToolDoneEvent {
+        loop {
+            let action = self
+                .ui
+                .recv_timeout(BATCH_RESULT_TIMEOUT)
+                .expect("task tab event");
+            if let UiAction::PluginTaskEvent { envelope, .. } = action
+                && let AgentEvent::ToolDone(done) = envelope.event
+            {
+                return *done;
+            }
+        }
+    }
+}
+
+fn hooked_and_edit(hooked_tag: &str, edit_tag: &str) -> Value {
+    json!([
+        { "tool": HOOKED_TOOL, "parameters": { "tag": hooked_tag } },
+        { "tool": EDIT_TOOL, "parameters": { "tag": edit_tag } },
+    ])
+}
+
+#[test]
+fn batch_declines_naming_a_running_child_without_a_hook() {
+    let (batch, call) = MovableBatch::start(hooked_and_edit("a", "b"));
+    batch.wait_parked("a");
+    batch.wait_parked("b");
+
+    assert_eq!(
+        batch.press(),
+        MoveOutcome::NotMovable(WAITING_ON_EDIT.to_owned())
+    );
+
+    batch.release("a");
+    batch.release("b");
+    let result = call.join().expect("batch thread");
+    assert!(!result.backgrounded);
+    let expected = format!(
+        "{}{}{}",
+        section(HOOKED_TOOL, "hooked:a"),
+        section(EDIT_TOOL, "edit:b"),
+        summary_all_ok(2)
+    );
+    assert_eq!(output_text(result.output.expect("batch failed")), expected);
+    assert!(batch.mailbox.drain().is_empty());
+}
+
+/// The receipt carries what already finished, in the batch's own section
+/// format, then lists the movable children still running. The late child's
+/// result is the whole final reply.
+#[test]
+fn batch_moves_with_finished_results_inline_and_replies_with_the_late_children() {
+    let (batch, call) = MovableBatch::start(json!([
+        { "tool": OK_TOOL, "parameters": { "tag": "a" } },
+        { "tool": HOOKED_TOOL, "parameters": { "tag": "early" } },
+        { "tool": HOOKED_TOOL, "parameters": { "tag": "late" } },
+    ]));
+    batch.wait_parked("early");
+    batch.wait_parked("late");
+    batch.release("early");
+    assert_indicators(&batch.body, SUCCESS_STYLE, 2, PAINT_TIMEOUT);
+
+    assert_eq!(batch.press(), MoveOutcome::Moved);
+
+    let result = call.join().expect("batch thread");
+    assert!(result.backgrounded);
+    let receipt = output_text(result.output.expect("receipt"));
+    let inline = format!(
+        "{}{}{MOVED_HEADER}\n- {HOOKED_TOOL}: late",
+        section(OK_TOOL, "ok:a"),
+        section(HOOKED_TOOL, "hooked:early"),
+    );
+    let suffix = receipt
+        .strip_prefix(&inline)
+        .unwrap_or_else(|| panic!("receipt must start with the inline results:\n{receipt}"));
+    assert!(suffix.starts_with("\n\n"), "{suffix}");
+    assert!(suffix.contains(MOVED_BY_USER), "{suffix}");
+
+    batch.release("late");
+    let done = batch.task_done();
+    assert!(!done.is_error);
+    assert_eq!(
+        done.output.as_text(),
+        format!(
+            "{}{}",
+            section(HOOKED_TOOL, "hooked:late"),
+            summary_all_ok(1)
+        )
+    );
+    assert_eq!(batch.mailbox.drain().len(), 1);
+}
+
+/// A decline leaves the batch untouched: once the blocking child finishes,
+/// the same press moves, and that child's result rides in the receipt.
+#[test]
+fn batch_moves_once_the_blocking_child_finished() {
+    let (batch, call) = MovableBatch::start(hooked_and_edit("a", "b"));
+    batch.wait_parked("a");
+    batch.wait_parked("b");
+    assert_eq!(
+        batch.press(),
+        MoveOutcome::NotMovable(WAITING_ON_EDIT.to_owned())
+    );
+
+    batch.release("b");
+    assert_indicators(&batch.body, SUCCESS_STYLE, 1, PAINT_TIMEOUT);
+    assert_eq!(batch.press(), MoveOutcome::Moved);
+
+    let result = call.join().expect("batch thread");
+    assert!(result.backgrounded);
+    let receipt = output_text(result.output.expect("receipt"));
+    let inline = format!(
+        "{}{MOVED_HEADER}\n- {HOOKED_TOOL}: a",
+        section(EDIT_TOOL, "edit:b")
+    );
+    assert!(receipt.starts_with(&inline), "{receipt}");
+
+    batch.release("a");
+    assert_eq!(
+        batch.task_done().output.as_text(),
+        format!("{}{}", section(HOOKED_TOOL, "hooked:a"), summary_all_ok(1))
     );
 }

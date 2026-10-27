@@ -29,7 +29,8 @@ use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
 use crate::tools::hook::Verdict;
 use crate::tools::{
-    Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter, ToolOutputMode,
+    BackgroundFor, Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter,
+    ToolOutputMode,
 };
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
@@ -37,7 +38,7 @@ use crate::{
     TurnCompleteEvent,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
-use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 /// One compaction is the whole remedy for an overflowing prompt, so a second
@@ -113,7 +114,7 @@ pub struct AgentParams {
     /// for anything the user watches. Its file writes are denied while the
     /// chat plans, see [`crate::AgentSeed::background_write_block`]. Subagents
     /// inherit it, or a monitor could get around the block by starting one.
-    pub background_for: Option<MakiId>,
+    pub background_for: BackgroundFor,
     pub task_id: Option<Arc<str>>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
@@ -172,7 +173,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
-    background_for: Option<MakiId>,
+    background_for: BackgroundFor,
     task_id: Option<Arc<str>>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
@@ -409,10 +410,8 @@ impl<'h> Agent<'h> {
         let Some(message) = message else {
             return Ok(());
         };
-        if drain_mailbox && let Some(mailbox) = &self.mailbox {
-            for message in mailbox.drain() {
-                self.land_observation(message)?;
-            }
+        if drain_mailbox {
+            self.land_mailbox()?;
         }
         self.tell_changes();
         if !message.content.is_empty() {
@@ -421,13 +420,25 @@ impl<'h> Agent<'h> {
         Ok(())
     }
 
+    fn land_mailbox(&mut self) -> Result<(), AgentError> {
+        let Some(mailbox) = &self.mailbox else {
+            return Ok(());
+        };
+        for message in mailbox.drain() {
+            self.land_observation(message)?;
+        }
+        Ok(())
+    }
+
     /// The line follows the observation into history, so frontends draw it
-    /// once and a restore draws it too.
+    /// once and a restore draws it too. `detail` is what the model reads.
     fn land_observation(&mut self, message: Message) -> Result<(), AgentError> {
         let line = observation_line(&message).map(str::to_owned);
+        let detail = line.is_some().then(|| message_text(&message));
         self.history.push(message);
         if let Some(text) = line {
-            self.event_tx.send(AgentEvent::ObservationLine { text })?;
+            self.event_tx
+                .send(AgentEvent::ObservationLine { text, detail })?;
         }
         Ok(())
     }
@@ -659,7 +670,10 @@ impl<'h> Agent<'h> {
             return Ok(TurnOutcome::Continue);
         }
 
+        // The request is going out anyway, so a notice rides along behind the
+        // tool results. After a final answer it stays queued: that is the wake.
         if has_tools {
+            self.land_mailbox()?;
             return Ok(TurnOutcome::Continue);
         }
         let reason = stop_reason.into();
@@ -954,7 +968,7 @@ impl<'h> Agent<'h> {
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
-            background_for: self.background_for,
+            background_for: self.background_for.clone(),
             task_id: self.task_id.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
@@ -962,6 +976,7 @@ impl<'h> Agent<'h> {
             loaded_instructions: self.loaded_instructions.clone(),
             instruction_files: self.instruction_files.clone(),
             call_instructions: CallInstructions::default(),
+            call: None,
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
             deadline: Deadline::default(),
@@ -1155,6 +1170,18 @@ impl<'h> Agent<'h> {
     }
 }
 
+fn message_text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn no_frame() -> AgentError {
     AgentError::Config {
         message: NO_FRAME.into(),
@@ -1186,6 +1213,7 @@ mod tests {
         StreamResponse, ThinkingSupport, TokenUsage,
     };
     use maki_storage::frame::{FactsUpdate, PlanChange};
+    use maki_storage::id::MakiId;
     use serde_json::Value;
     use test_case::test_case;
 
@@ -1425,7 +1453,7 @@ mod tests {
                     Arc::default(),
                 )),
                 session_id: None,
-                background_for: None,
+                background_for: BackgroundFor::None,
                 task_id: None,
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
@@ -1809,7 +1837,7 @@ mod tests {
         events
             .iter()
             .filter_map(|envelope| match &envelope.event {
-                AgentEvent::ObservationLine { text } => Some(text.as_str()),
+                AgentEvent::ObservationLine { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect()
@@ -1943,6 +1971,136 @@ mod tests {
             let landed = observations(&history);
             assert_eq!(landed.len(), 1);
             assert_eq!(landed[0].display_text, None);
+        });
+    }
+
+    /// Lands a notice when the loop looks for queued input, which is right
+    /// after the tool results are in and before the next request goes out.
+    struct NotifyOnce {
+        session: MakiId,
+        wake: bool,
+        armed: Mutex<bool>,
+    }
+
+    impl NotifyOnce {
+        fn new(session: MakiId, wake: bool) -> Arc<Self> {
+            Arc::new(Self {
+                session,
+                wake,
+                armed: Mutex::new(true),
+            })
+        }
+    }
+
+    impl InterruptSource for NotifyOnce {
+        fn poll(&self) -> Option<ExtractedCommand> {
+            if std::mem::take(&mut *self.armed.lock().unwrap()) {
+                SessionMailbox::notify(
+                    self.session,
+                    NOTICE_BODY.into(),
+                    Some(NOTICE_LINE),
+                    self.wake,
+                )
+                .unwrap();
+            }
+            None
+        }
+    }
+
+    #[test]
+    fn a_notice_landing_mid_run_follows_the_tool_results_in_the_next_request() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            let mock = MockProvider::new(vec![
+                tool_call_response("glob", "t1"),
+                text_response(StopReason::EndTurn),
+            ]);
+            let requests = Arc::clone(&mock.requests);
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(mock, &mut history);
+            agent.mailbox = Some(mailbox.clone());
+            let mut agent = agent.with_interrupt_source(NotifyOnce::new(id, false));
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let messages = history.as_slice();
+            let [.., results, notice, _answer] = messages else {
+                panic!("history too short: {messages:?}");
+            };
+            assert!(
+                results
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            );
+            assert!(notice.is_observation());
+            assert_eq!(notice.first_text_content(), Some(NOTICE_BODY));
+            assert_eq!(observations(&history).len(), 1);
+            assert!(mailbox.drain().is_empty());
+            assert_eq!(notice_lines(&drain_events(&event_rx)), [NOTICE_LINE]);
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_append_only(&requests[0], &requests[1]);
+            assert_eq!(
+                requests[1].messages.last(),
+                Some(&serde_json::to_value(notice).unwrap())
+            );
+        });
+    }
+
+    #[test]
+    fn a_notice_landing_as_the_model_answers_stays_queued() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            let mock = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&mock.requests);
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(mock, &mut history);
+            agent.mailbox = Some(mailbox.clone());
+            let mut agent = agent.with_interrupt_source(NotifyOnce::new(id, true));
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert!(observations(&history).is_empty());
+            assert!(notice_lines(&drain_events(&event_rx)).is_empty());
+            let woken = mailbox.claim_wake();
+            assert_eq!(woken.len(), 1);
+            assert_eq!(woken[0].first_text_content(), Some(NOTICE_BODY));
+        });
+    }
+
+    #[test]
+    fn an_observation_line_carries_the_text_the_model_reads() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, NOTICE_BODY.into(), Some(NOTICE_LINE), false).unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+
+            agent.run(default_input()).await.unwrap();
+
+            let details: Vec<_> = drain_events(&event_rx)
+                .into_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::ObservationLine { text, detail } => Some((text, detail)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                details,
+                [(NOTICE_LINE.to_owned(), Some(NOTICE_BODY.to_owned()))]
+            );
         });
     }
 

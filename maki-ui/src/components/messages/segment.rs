@@ -7,13 +7,15 @@ use maki_providers::ImageSource;
 use std::sync::Arc;
 
 use super::super::code_view::SectionFlags;
-use super::super::tool_display::{HighlightRequest, ToolLines};
+use super::super::tool_display::{ElapsedSpan, HighlightRequest, ToolLines};
 use ratatui::text::{Line, Span};
 use std::cell::Cell;
 use std::mem;
 use std::ops::Range;
+use std::time::Duration;
 
 const INST_SUFFIX: &str = "__inst";
+const ELAPSED_STEP: Duration = Duration::from_secs(1);
 
 pub fn is_instruction_segment(id: &str) -> bool {
     id.ends_with(INST_SUFFIX)
@@ -69,6 +71,7 @@ pub(super) struct Segment {
     highlight_range: Option<(usize, usize)>,
     highlight_key: HighlightKey,
     pub spinner_lines: Vec<(usize, usize)>,
+    elapsed: Option<ElapsedSpan>,
     snapshot_base: Option<usize>,
     pub content_indent: &'static str,
     /// The lines were built for another width or theme, so code blocks and
@@ -209,6 +212,34 @@ impl Segment {
         }
     }
 
+    /// How long until the elapsed time shown here goes stale: zero once it
+    /// has, else the rest of the current second.
+    pub fn elapsed_due(&self) -> Option<Duration> {
+        let elapsed = self.elapsed.as_ref()?;
+        let since = elapsed.since.elapsed();
+        if since.as_secs() != elapsed.shown_secs {
+            return Some(Duration::ZERO);
+        }
+        Some(ELAPSED_STEP.saturating_sub(Duration::from_nanos(u64::from(since.subsec_nanos()))))
+    }
+
+    /// Rewrites the elapsed time once per second. The text can change width,
+    /// so the cached height goes with it.
+    pub fn update_elapsed(&mut self) {
+        let Some(elapsed) = &mut self.elapsed else {
+            return;
+        };
+        let secs = elapsed.since.elapsed().as_secs();
+        if secs == elapsed.shown_secs {
+            return;
+        }
+        elapsed.shown_secs = secs;
+        if let Some(header) = self.lines.first_mut() {
+            elapsed.refit(header, secs);
+        }
+        self.invalidate_height();
+    }
+
     fn reuse_highlight(
         &self,
         key: &HighlightKey,
@@ -232,6 +263,7 @@ impl Segment {
         self.highlight_range = tl.highlight.as_ref().map(|h| h.range);
         self.highlight_key = HighlightKey::from_request(tl.highlight.as_ref());
         self.spinner_lines = tl.spinner_lines;
+        self.elapsed = tl.elapsed;
         self.snapshot_base = tl.snapshot_base;
         self.content_indent = tl.content_indent;
         self.truncation = tl.truncation;
@@ -253,6 +285,7 @@ impl Segment {
             self.highlight_range = Some((s, e));
             self.pending_highlight = None;
             self.spinner_lines = tl.spinner_lines;
+            self.elapsed = tl.elapsed;
             self.snapshot_base = tl.snapshot_base;
             self.content_indent = tl.content_indent;
         } else {
@@ -447,8 +480,11 @@ impl SegmentCache {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::tool_display::append_right_info;
     use super::*;
+    use std::time::{Duration, Instant};
     use test_case::test_case;
+    use unicode_width::UnicodeWidthStr;
 
     const OTHER_THEME: &str = "dracula";
 
@@ -532,6 +568,125 @@ mod tests {
             seg.reuse_highlight(&key(), (1, 3)).is_none(),
             "theme mismatch must force a fresh highlight, not splice old-palette lines"
         );
+    }
+
+    #[test]
+    fn update_elapsed_rewrites_the_span_once_the_second_changes() {
+        const STALE: &str = "stale";
+        const ELAPSED_SECS: u64 = 72;
+        let mut seg = Segment {
+            lines: vec![Line::from(vec![Span::raw("head"), Span::raw(STALE)])],
+            elapsed: Some(ElapsedSpan {
+                span: 1,
+                since: Instant::now()
+                    .checked_sub(Duration::from_secs(ELAPSED_SECS))
+                    .unwrap(),
+                shown_secs: 0,
+                width: 0,
+            }),
+            ..Segment::default()
+        };
+        seg.update_elapsed();
+        assert!(seg.lines[0].spans[1].content.contains("1m"));
+        assert!(seg.elapsed.as_ref().unwrap().shown_secs >= ELAPSED_SECS);
+    }
+
+    fn ticking_since(ago: Duration, shown_secs: u64) -> Segment {
+        Segment {
+            elapsed: Some(ElapsedSpan {
+                span: 0,
+                since: Instant::now().checked_sub(ago).unwrap(),
+                shown_secs,
+                width: 0,
+            }),
+            ..Segment::default()
+        }
+    }
+
+    /// A moved row's clock changes once a second, so it is due at the next
+    /// second boundary, or at once when the text already lags.
+    #[test]
+    fn elapsed_due_waits_for_the_next_second_only() {
+        const SHOWN_SECS: u64 = 3;
+        const INTO_SECOND: Duration = Duration::from_millis(250);
+        let fresh = ticking_since(Duration::from_secs(SHOWN_SECS) + INTO_SECOND, SHOWN_SECS);
+        assert!(fresh.elapsed_due().unwrap() <= ELAPSED_STEP - INTO_SECOND);
+
+        let stale = ticking_since(Duration::from_secs(SHOWN_SECS + 2), SHOWN_SECS);
+        assert_eq!(stale.elapsed_due(), Some(Duration::ZERO));
+
+        assert_eq!(Segment::default().elapsed_due(), None);
+    }
+
+    const USAGE: &str = "10.6k↑ 148↓ $0.009";
+    const TIMESTAMP: &str = "12:41:53 AM";
+    const GROWN_SECS: u64 = 94;
+
+    fn ticking_header(slack: usize) -> (Segment, u16) {
+        let mut header = Line::from(vec![
+            Span::raw("↗ bash> Sleep 120s then echo"),
+            Span::raw(ElapsedSpan::text(0)),
+        ]);
+        let natural = header.width();
+        let usage_and_timestamp = USAGE.width() + 2 + TIMESTAMP.width() + 1;
+        let width = (natural + 1 + usage_and_timestamp + slack) as u16;
+        append_right_info(&mut header, None, Some(USAGE), Some(TIMESTAMP), width);
+        let seg = Segment {
+            lines: vec![header],
+            elapsed: Some(ElapsedSpan {
+                span: 1,
+                since: Instant::now()
+                    .checked_sub(Duration::from_secs(GROWN_SECS))
+                    .unwrap(),
+                shown_secs: 0,
+                width,
+            }),
+            ..Segment::default()
+        };
+        (seg, width)
+    }
+
+    #[test_case(0,  false, true  ; "usage_dropped_when_growth_does_not_fit")]
+    #[test_case(20, true,  true  ; "all_kept_when_growth_fits")]
+    fn update_elapsed_never_overflows_the_right_info(
+        slack: usize,
+        expect_usage: bool,
+        expect_timestamp: bool,
+    ) {
+        let (mut seg, width) = ticking_header(slack);
+        seg.update_elapsed();
+
+        let header = &seg.lines[0];
+        let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("1m34s"));
+        assert!(header.width() <= width as usize, "wrapped: {text:?}");
+        assert_eq!(text.contains(USAGE), expect_usage);
+        assert_eq!(text.contains(TIMESTAMP), expect_timestamp);
+    }
+
+    #[test]
+    fn update_elapsed_drops_all_right_info_when_nothing_fits() {
+        let mut header = Line::from(vec![Span::raw("head"), Span::raw(ElapsedSpan::text(0))]);
+        let width = (header.width() + 1 + TIMESTAMP.width() + 1) as u16;
+        append_right_info(&mut header, None, None, Some(TIMESTAMP), width);
+        let mut seg = Segment {
+            lines: vec![header],
+            elapsed: Some(ElapsedSpan {
+                span: 1,
+                since: Instant::now()
+                    .checked_sub(Duration::from_secs(GROWN_SECS))
+                    .unwrap(),
+                shown_secs: 0,
+                width,
+            }),
+            ..Segment::default()
+        };
+        seg.update_elapsed();
+
+        let header = &seg.lines[0];
+        let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains(TIMESTAMP));
+        assert!(header.width() <= width as usize, "wrapped: {text:?}");
     }
 
     #[test_case(4, 6 ; "splice_grows")]

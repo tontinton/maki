@@ -38,6 +38,10 @@ pub struct CancelToken(Arc<Shared>);
 
 pub struct CancelTrigger(Arc<Shared>);
 
+/// Fires a token it does not own: dropping it fires nothing.
+#[derive(Clone)]
+pub struct CancelHandle(Weak<Shared>);
+
 impl CancelToken {
     pub fn new() -> (CancelTrigger, Self) {
         let shared = Arc::<Shared>::default();
@@ -76,19 +80,52 @@ impl CancelToken {
         }
     }
 
-    /// The flag is checked under the children lock, and `fire` raises the
-    /// flag before it takes that lock. So a child born while the parent is
-    /// firing is either in the list `fire` drains or sees the flag here.
     pub fn child(&self) -> (CancelTrigger, Self) {
         let (child_trigger, child_token) = Self::new();
+        self.adopt(&child_token);
+        (child_trigger, child_token)
+    }
+
+    /// A child with no trigger of its own: only a parent fires it.
+    pub fn follower(&self) -> Self {
+        let token = Self::none();
+        self.adopt(&token);
+        token
+    }
+
+    /// Makes {child} fire with this token, as well as with whatever already
+    /// fires it.
+    ///
+    /// The flag is checked under the children lock, and `fire` raises the
+    /// flag before it takes that lock. So a child linked while the parent is
+    /// firing is either in the list `fire` drains or sees the flag here.
+    pub fn adopt(&self, child: &CancelToken) {
         let mut children = self.0.children();
         if self.is_cancelled() {
-            child_token.0.fire();
+            child.0.fire();
         } else {
             children.retain(|child| child.strong_count() > 0);
-            children.push(Arc::downgrade(&child_token.0));
+            children.push(Arc::downgrade(&child.0));
         }
-        (child_trigger, child_token)
+    }
+
+    /// Removes this token from {parent}'s children, so {parent} firing no
+    /// longer reaches it. Mirrors [`adopt`](Self::adopt): under a parent that
+    /// already fired, this token is fired here, so it never escapes a cancel
+    /// that `fire` has not drained yet.
+    pub fn unlink(&self, parent: &CancelToken) {
+        let mut children = parent.0.children();
+        if parent.is_cancelled() {
+            self.0.fire();
+            return;
+        }
+        let own = Arc::as_ptr(&self.0);
+        children.retain(|child| child.strong_count() > 0 && !std::ptr::eq(child.as_ptr(), own));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn same_as(&self, other: &CancelToken) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -103,6 +140,18 @@ impl CancelTrigger {
     pub fn fires(&self, token: &CancelToken) -> bool {
         Arc::ptr_eq(&self.0, &token.0)
     }
+
+    pub fn handle(&self) -> CancelHandle {
+        CancelHandle(Arc::downgrade(&self.0))
+    }
+}
+
+impl CancelHandle {
+    pub fn fire(&self) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.fire();
+        }
+    }
 }
 
 impl Drop for CancelTrigger {
@@ -116,11 +165,25 @@ impl Drop for CancelTrigger {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CancelSlot(u64);
 
+enum Registration {
+    /// Dropping it fires the token of the session that registered it.
+    Owned(CancelTrigger),
+    /// The session owns its trigger, so only an explicit cancel fires it.
+    Handle(CancelHandle),
+}
+
+impl Registration {
+    fn fire(self) {
+        match self {
+            Self::Owned(trigger) => trigger.cancel(),
+            Self::Handle(handle) => handle.fire(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Entry {
-    /// Held, never read. Dropping a trigger is what fires the token of the
-    /// session that registered it.
-    registrations: Vec<(CancelSlot, CancelTrigger)>,
+    registrations: Vec<(CancelSlot, Registration)>,
     cancelled: bool,
 }
 
@@ -156,19 +219,29 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
     /// Registers {trigger} under {id}, alongside any already there, and
     /// returns the slot to hand back to [`retire`](Self::retire).
     pub fn insert(&self, id: K, trigger: CancelTrigger) -> CancelSlot {
+        self.register(id, Registration::Owned(trigger))
+    }
+
+    /// Like [`insert`](Self::insert), but the map never owns the token's
+    /// lifetime: retiring or [`cancel_all`](Self::cancel_all) leave it running.
+    pub fn insert_handle(&self, id: K, handle: CancelHandle) -> CancelSlot {
+        self.register(id, Registration::Handle(handle))
+    }
+
+    fn register(&self, id: K, registration: Registration) -> CancelSlot {
         let mut map = self.lock();
         let slot = CancelSlot(self.next_slot.fetch_add(1, Ordering::Relaxed));
         let entry = map.entry(id).or_default();
-        // Under a cancelled id the trigger is dropped instead of stored, and
-        // that drop is what fires the token, so the session is born cancelled.
-        if !entry.cancelled {
-            entry.registrations.push((slot, trigger));
+        if entry.cancelled {
+            registration.fire();
+        } else {
+            entry.registrations.push((slot, registration));
         }
         slot
     }
 
-    /// Retires one registration and drops its trigger. Siblings and the id's
-    /// cancelled mark stay.
+    /// Retires one registration: an owned trigger is dropped, which fires it,
+    /// a handle is forgotten. Siblings and the id's cancelled mark stay.
     pub fn retire(&self, id: &K, slot: CancelSlot) {
         let mut map = self.lock();
         let Some(entry) = map.get_mut(id) else {
@@ -185,7 +258,9 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         let mut map = self.lock();
         let entry = map.entry(id).or_default();
         entry.cancelled = true;
-        entry.registrations.clear();
+        for (_, registration) in entry.registrations.drain(..) {
+            registration.fire();
+        }
     }
 
     /// A plugin that loads again needs this, or every task it starts would be
@@ -196,8 +271,10 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         }
     }
 
-    /// The run that owned these is over: stop what is still registered and drop
-    /// the marks with it, so no cancel of this run leaks into the next one.
+    /// The run that owned these is over: stop the owned triggers, forget the
+    /// handles without firing them, and drop the marks, so no cancel of this
+    /// run leaks into the next one. A handle's session that is still bound to
+    /// the run dies through the token chain anyway, and a moved one must live.
     pub fn cancel_all(&self) {
         self.lock().clear();
     }
@@ -258,6 +335,20 @@ mod tests {
         trigger.cancel();
         let (_child_trigger, child) = parent.child();
         assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn an_adopted_follower_fires_with_either_parent_only() {
+        let (first_trigger, first) = CancelToken::new();
+        let (second_trigger, second) = CancelToken::new();
+        let follower = first.follower();
+        second.adopt(&follower);
+        follower.unlink(&first);
+
+        first_trigger.cancel();
+        assert!(!follower.is_cancelled());
+        second_trigger.cancel();
+        assert!(follower.is_cancelled());
     }
 
     #[test]
@@ -330,6 +421,49 @@ mod tests {
         let (_other_trigger, other_token) = CancelToken::new();
         assert!(trigger.fires(&token));
         assert!(!trigger.fires(&other_token));
+    }
+
+    #[test]
+    fn unlink_stops_propagation_and_leaves_siblings_alone() {
+        let (parent_trigger, parent) = CancelToken::new();
+        let (_unlinked_trigger, unlinked) = parent.child();
+        let (_grandchild_trigger, grandchild) = unlinked.child();
+        let (_sibling_trigger, sibling) = parent.child();
+
+        unlinked.unlink(&parent);
+        assert_eq!(parent.0.children().len(), 1, "only the sibling is left");
+
+        parent_trigger.cancel();
+        assert!(sibling.is_cancelled());
+        assert!(!unlinked.is_cancelled());
+        assert!(!grandchild.is_cancelled());
+    }
+
+    /// `drained = false` is the window inside `fire` between raising the flag
+    /// and draining the children: the unlink must not slip the child out.
+    #[test_case(true  ; "after_the_parent_fired")]
+    #[test_case(false ; "while_the_parent_fires")]
+    fn unlink_under_a_cancelled_parent_cancels_the_child(drained: bool) {
+        let (parent_trigger, parent) = CancelToken::new();
+        let (_child_trigger, child) = parent.child();
+        if drained {
+            parent_trigger.cancel();
+        } else {
+            parent.0.cancelled.store(true, Ordering::Release);
+        }
+
+        child.unlink(&parent);
+        assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn dropping_a_handle_fires_nothing() {
+        let (trigger, token) = CancelToken::new();
+        drop(trigger.handle());
+        assert!(!token.is_cancelled());
+
+        trigger.handle().fire();
+        assert!(token.is_cancelled());
     }
 
     const KEY: &str = "x";
@@ -452,5 +586,56 @@ mod tests {
 
         map.cancel(key());
         assert!(token.is_cancelled(), "a revived id can be cancelled again");
+    }
+
+    #[test_case(false ; "registered_before_the_cancel")]
+    #[test_case(true  ; "registered_under_a_cancelled_id")]
+    fn cancel_map_cancel_fires_a_handle(cancel_first: bool) {
+        let map = CancelMap::new();
+        let (session_trigger, token) = CancelToken::new();
+        if cancel_first {
+            map.cancel(key());
+        }
+        map.insert_handle(key(), session_trigger.handle());
+        assert_eq!(token.is_cancelled(), cancel_first);
+
+        map.cancel(key());
+        assert!(token.is_cancelled());
+    }
+
+    /// The run ending must not reach a session that moved to the background:
+    /// only its own trigger ends it.
+    enum Forget {
+        Retire,
+        CancelAll,
+        DropMap,
+    }
+
+    #[test_case(Forget::Retire    ; "retire")]
+    #[test_case(Forget::CancelAll ; "cancel_all")]
+    #[test_case(Forget::DropMap   ; "drop_map")]
+    fn cancel_map_forgets_a_handle_without_firing_it(forget: Forget) {
+        let map = CancelMap::new();
+        let (session_trigger, token) = CancelToken::new();
+        let slot = map.insert_handle(key(), session_trigger.handle());
+        match forget {
+            Forget::Retire => map.retire(&key(), slot),
+            Forget::CancelAll => map.cancel_all(),
+            Forget::DropMap => drop(map),
+        }
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_map_cancel_all_fires_owned_triggers_but_not_handles() {
+        let map = CancelMap::new();
+        let (owned, owned_token) = CancelToken::new();
+        let (session_trigger, session_token) = CancelToken::new();
+        map.insert(key(), owned);
+        map.insert_handle(key(), session_trigger.handle());
+
+        map.cancel_all();
+        assert!(owned_token.is_cancelled());
+        assert!(!session_token.is_cancelled());
     }
 }

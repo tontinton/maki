@@ -21,7 +21,7 @@ use crate::api::ui::marks::InputRulesReader;
 use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
-use crate::background::BackgroundSessions;
+use crate::background::{BackgroundTasks, Stop};
 use crate::error::PluginError;
 use crate::pack::{DiscoveredPackage, Interaction};
 use crate::plugin_permissions::{
@@ -29,8 +29,8 @@ use crate::plugin_permissions::{
     load_plugin_granted_providers, load_plugin_permissions,
 };
 use crate::runtime::{
-    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
-    RestoreItem,
+    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, MoveOutcome,
+    Request, RestoreItem,
 };
 use maki_agent::prompt::ResolvedPrompts;
 use maki_storage::id::MakiId;
@@ -1090,7 +1090,7 @@ pub struct EventHandle {
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
     layered: Arc<LayeredTools>,
-    background: BackgroundSessions,
+    background: BackgroundTasks,
 }
 
 impl EventHandle {
@@ -1099,7 +1099,7 @@ impl EventHandle {
             tx,
             prio_tx: flume::unbounded().0,
             layered: Arc::default(),
-            background: BackgroundSessions::default(),
+            background: BackgroundTasks::default(),
         }
     }
 
@@ -1108,7 +1108,7 @@ impl EventHandle {
     /// "stopped by user". Synchronous on purpose: the registry is a mutex the
     /// Lua thread shares, so a busy Lua thread cannot delay the stop.
     pub fn cancel_plugin_session(&self, id: &str) {
-        self.background.stop(id);
+        self.background.stop(id, Stop::User);
     }
 
     #[doc(hidden)]
@@ -1190,7 +1190,7 @@ impl EventHandle {
             tx: shared.clone(),
             prio_tx: shared,
             layered: Arc::default(),
-            background: BackgroundSessions::default(),
+            background: BackgroundTasks::default(),
         }
     }
 
@@ -1266,6 +1266,14 @@ impl EventHandle {
             row,
             fallback: Some(Box::new(ClickFallback { item, event_tx })),
         });
+    }
+
+    /// Asks the call to move to the background; the answer arrives once its
+    /// hook ran.
+    pub fn request_background(&self, tool_use_id: String) -> flume::Receiver<MoveOutcome> {
+        let (reply, rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::BackgroundTool { tool_use_id, reply });
+        rx
     }
 
     pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
@@ -1547,7 +1555,7 @@ mod tests {
             tx,
             prio_tx,
             layered: Arc::default(),
-            background: BackgroundSessions::default(),
+            background: BackgroundTasks::default(),
         };
         handle.run_command(
             Arc::from("myplugin"),
@@ -3085,6 +3093,7 @@ mod bundled_manifests {
     const INPUT_EDIT_CALL: &str = "maki.ui.input_edit";
     const DISABLED_WAKE: &str = "false";
     const CREATE_AUTOCMD: &str = "maki.api.create_autocmd";
+    const CTX_BACKGROUND: &str = "ctx:background";
     const LUA_QUOTES: [char; 2] = ['"', '\''];
 
     /// Every guarded `maki.*` function under the dotted name lua calls it by.
@@ -3287,6 +3296,12 @@ mod bundled_manifests {
                     needed
                         .entry(Permission::Agent)
                         .or_insert_with(|| format!("{SESSION_NOTIFY} with {WAKE_OPTION}"));
+                }
+                // A ctx method, so the API metadata has no guard for it.
+                if calls(source, CTX_BACKGROUND) {
+                    needed
+                        .entry(Permission::Agent)
+                        .or_insert_with(|| CTX_BACKGROUND.to_owned());
                 }
                 // Events are never refused, they arrive without their content
                 // fields, so no guard records the need. A bundled plugin

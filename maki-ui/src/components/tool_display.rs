@@ -1,4 +1,4 @@
-use super::{DisplayMessage, ToolStatus};
+use super::{BackgroundBadge, BackgroundOutcome, DisplayMessage, ToolStatus};
 
 use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
@@ -9,6 +9,7 @@ use maki_config::{ClockFormat, ToolOutputLines};
 
 use std::borrow::Cow;
 use std::fmt::Write;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,6 +34,13 @@ pub struct RenderCtx<'a> {
 }
 
 pub const TOOL_INDICATOR: &str = "● ";
+pub const BACKGROUND_INDICATOR: &str = "↗ ";
+pub const MOVABLE_HINT: &str = "ctrl+b background";
+const BACKGROUND_LABEL: &str = "background";
+const BACKGROUND_CLICK_HINT: &str = "click or ctrl+x";
+const SECS_PER_MINUTE: u64 = 60;
+const SECS_PER_HOUR: u64 = 3600;
+const RIGHT_INFO_GAP: &str = "  ";
 pub const TOOL_BODY_INDENT: &str = "  ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
@@ -123,6 +131,31 @@ pub struct ToolLines {
     pub snapshot_base: Option<usize>,
     pub content_indent: &'static str,
     pub truncation: SectionFlags,
+    pub elapsed: Option<ElapsedSpan>,
+}
+
+/// The header span that shows how long a moved call has been running.
+pub struct ElapsedSpan {
+    pub span: usize,
+    pub since: Instant,
+    pub shown_secs: u64,
+    pub width: u16,
+}
+
+impl ElapsedSpan {
+    pub fn text(secs: u64) -> String {
+        background_annotation(true, Some(secs))
+    }
+
+    /// Shows `secs` on the header. The text can grow, so the right info that
+    /// follows it is re-fitted instead of being left to overflow and wrap.
+    pub fn refit(&self, header: &mut Line<'static>, secs: u64) {
+        let Some(span) = header.spans.get_mut(self.span) else {
+            return;
+        };
+        span.content = Self::text(secs).into();
+        refit_right_info(header, self.span + 1, self.width);
+    }
 }
 
 pub struct HighlightRequest {
@@ -179,44 +212,121 @@ pub fn format_timestamp_now(format: ClockFormat) -> String {
     zoned.strftime(crate::clock::hms(format)).to_string()
 }
 
+type RightPart<'a> = Option<(&'a str, Style)>;
+
+fn right_parts_len(parts: &[RightPart]) -> Option<usize> {
+    let (count, width) = parts
+        .iter()
+        .flatten()
+        .fold((0, 0), |(count, width), (text, _)| {
+            (count + 1, width + UnicodeWidthStr::width(*text))
+        });
+    (count > 0).then(|| width + RIGHT_INFO_GAP.len() * (count - 1) + 1)
+}
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum()
+}
+
+/// Right-aligns the hint, usage and timestamp on the header line. Whole
+/// pieces are dropped from the left (hint, then usage) when there is no room
+/// for all of them, so the header text never moves and nothing wraps.
 pub fn append_right_info(
     line: &mut Line<'static>,
+    hint: Option<&str>,
     usage: Option<&str>,
     timestamp: Option<&str>,
     width: u16,
 ) {
-    if usage.is_none() && timestamp.is_none() {
-        return;
-    }
-    let separator = if usage.is_some() && timestamp.is_some() {
-        2
-    } else {
-        0
-    };
-    let suffix_len =
-        usage.map_or(0, UnicodeWidthStr::width) + timestamp.map_or(0, str::len) + separator + 1;
-    let header_width: usize = line
-        .spans
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum();
+    let palette = theme::current();
+    let parts: [RightPart; 3] = [
+        hint.map(|h| (h, palette.tool_dim)),
+        usage.map(|u| (u, palette.tool_dim)),
+        timestamp.map(|t| (t, palette.timestamp)),
+    ];
+    let header_width = spans_width(&line.spans);
     let w = width as usize;
-    if header_width + 1 + suffix_len > w {
+    let Some((parts, suffix_len)) = (0..parts.len()).find_map(|dropped| {
+        let kept = &parts[dropped..];
+        let len = right_parts_len(kept)?;
+        (header_width + 1 + len <= w).then_some((kept, len))
+    }) else {
+        return;
+    };
+    line.spans
+        .push(Span::raw(" ".repeat(w - header_width - suffix_len)));
+    for (i, (text, style)) in parts.iter().flatten().enumerate() {
+        if i > 0 {
+            line.spans.push(Span::raw(RIGHT_INFO_GAP));
+        }
+        line.spans.push(Span::styled((*text).to_owned(), *style));
+    }
+}
+
+/// Re-fits the right info laid out by `append_right_info` after the header
+/// grew: `pad_idx` is its padding span. Re-pads when it still fits, otherwise
+/// drops whole pieces from the left, and everything when none fit.
+fn refit_right_info(line: &mut Line<'static>, pad_idx: usize, width: u16) {
+    if pad_idx >= line.spans.len() {
         return;
     }
-    let pad = w - header_width - suffix_len;
-    line.spans.push(Span::raw(" ".repeat(pad)));
-    if let Some(u) = usage {
-        line.spans
-            .push(Span::styled(u.to_owned(), theme::current().tool_dim));
-        if timestamp.is_some() {
-            line.spans.push(Span::raw("  "));
+    let header_width = spans_width(&line.spans[..pad_idx]);
+    let mut right_width = spans_width(&line.spans[pad_idx + 1..]) + 1;
+    let w = width as usize;
+    while header_width + 1 + right_width > w {
+        let first = pad_idx + 1;
+        if line.spans.len() <= first + 1 {
+            line.spans.truncate(pad_idx);
+            return;
         }
+        right_width -= spans_width(&line.spans[first..first + 2]);
+        line.spans.drain(first..first + 2);
     }
-    if let Some(ts) = timestamp {
-        line.spans
-            .push(Span::styled(ts.to_owned(), theme::current().timestamp));
+    line.spans[pad_idx].content = " ".repeat(w - header_width - right_width).into();
+}
+
+/// Columns the movable hint covers on a header line, if it was drawn.
+pub fn hint_columns(header: &Line<'_>) -> Option<Range<u16>> {
+    let mut col = 0usize;
+    for span in &header.spans {
+        let width = UnicodeWidthStr::width(span.content.as_ref());
+        if span.content == MOVABLE_HINT {
+            return Some(col as u16..(col + width) as u16);
+        }
+        col += width;
     }
+    None
+}
+
+fn format_elapsed(secs: u64) -> String {
+    if secs < SECS_PER_MINUTE {
+        format!("{secs}s")
+    } else if secs < SECS_PER_HOUR {
+        format!("{}m{:02}s", secs / SECS_PER_MINUTE, secs % SECS_PER_MINUTE)
+    } else {
+        format!(
+            "{}h{:02}m",
+            secs / SECS_PER_HOUR,
+            secs % SECS_PER_HOUR / SECS_PER_MINUTE
+        )
+    }
+}
+
+fn background_annotation(running: bool, elapsed_secs: Option<u64>) -> String {
+    let mut text = format!(" ({BACKGROUND_LABEL}");
+    if running {
+        if let Some(secs) = elapsed_secs {
+            text.push_str(ANNOTATION_SEP);
+            text.push_str(&format_elapsed(secs));
+        }
+        text.push_str(ANNOTATION_SEP);
+        text.push_str(BACKGROUND_CLICK_HINT);
+    }
+    text.push(')');
+    text
 }
 
 #[derive(Clone, Copy)]
@@ -224,6 +334,8 @@ enum Indicator {
     InProgress,
     Success,
     Error,
+    Cancelled,
+    Moved,
 }
 
 impl From<ToolStatus> for Indicator {
@@ -232,6 +344,17 @@ impl From<ToolStatus> for Indicator {
             ToolStatus::InProgress => Self::InProgress,
             ToolStatus::Success => Self::Success,
             ToolStatus::Error => Self::Error,
+        }
+    }
+}
+
+impl From<&BackgroundBadge> for Indicator {
+    fn from(badge: &BackgroundBadge) -> Self {
+        match badge.outcome {
+            None => Self::Moved,
+            Some(BackgroundOutcome::Done) => Self::Success,
+            Some(BackgroundOutcome::Error) => Self::Error,
+            Some(BackgroundOutcome::Cancelled) => Self::Cancelled,
         }
     }
 }
@@ -308,6 +431,7 @@ struct ToolLineBuilder {
     limits: RenderLimits,
     markdown: bool,
     indicator: Indicator,
+    elapsed: Option<ElapsedSpan>,
 }
 
 impl ToolLineBuilder {
@@ -328,6 +452,7 @@ impl ToolLineBuilder {
             limits,
             markdown: false,
             indicator,
+            elapsed: None,
         }
     }
 
@@ -374,6 +499,27 @@ impl ToolLineBuilder {
         self.lines.push(Line::from(spans));
     }
 
+    fn push_background_annotation(&mut self, badge: &BackgroundBadge) {
+        let Some(header) = self.lines.first_mut() else {
+            return;
+        };
+        let running = badge.outcome.is_none();
+        let ticking = badge
+            .started_at
+            .filter(|_| running)
+            .map(|since| (since, since.elapsed().as_secs()));
+        self.elapsed = ticking.map(|(since, shown_secs)| ElapsedSpan {
+            span: header.spans.len(),
+            since,
+            shown_secs,
+            width: self.width,
+        });
+        header.spans.push(Span::styled(
+            background_annotation(running, ticking.map(|(_, secs)| secs)),
+            theme::current().tool_dim,
+        ));
+    }
+
     fn prepend_indicator(&mut self, started_at: Instant) {
         if self.lines.is_empty() {
             return;
@@ -383,7 +529,7 @@ impl ToolLineBuilder {
                 let ch = spinner_frame(started_at.elapsed().as_millis());
                 (format!("{ch} "), theme::current().spinner)
             }
-            finished => (TOOL_INDICATOR.into(), finished_style(finished)),
+            finished => (finished_glyph(finished).into(), finished_style(finished)),
         };
         for (line, span) in &mut self.spinner_lines {
             if *line == 0 {
@@ -392,6 +538,9 @@ impl ToolLineBuilder {
         }
         if matches!(self.indicator, Indicator::InProgress) {
             self.spinner_lines.push((0, 0));
+        }
+        if let Some(elapsed) = &mut self.elapsed {
+            elapsed.span += 1;
         }
         self.lines[0].spans.insert(0, Span::styled(text, style));
     }
@@ -483,6 +632,7 @@ impl ToolLineBuilder {
             snapshot_base: self.snapshot_base,
             content_indent,
             truncation: self.truncation,
+            elapsed: self.elapsed,
         }
     }
 }
@@ -516,7 +666,10 @@ fn bake_spans(
                     on_spinner(out.len());
                     out.push(Span::styled(spinner_frame, theme::current().spinner));
                 }
-                finished => out.push(Span::styled(TOOL_INDICATOR, finished_style(finished))),
+                finished => out.push(Span::styled(
+                    finished_glyph(finished),
+                    finished_style(finished),
+                )),
             }
         } else {
             out.push(Span::styled(
@@ -527,11 +680,20 @@ fn bake_spans(
     }
 }
 
-fn finished_style(indicator: Indicator) -> Style {
-    if matches!(indicator, Indicator::Error) {
-        theme::current().tool_error
+fn finished_glyph(indicator: Indicator) -> &'static str {
+    if matches!(indicator, Indicator::Moved) {
+        BACKGROUND_INDICATOR
     } else {
-        theme::current().tool_success
+        TOOL_INDICATOR
+    }
+}
+
+fn finished_style(indicator: Indicator) -> Style {
+    match indicator {
+        Indicator::Error => theme::current().tool_error,
+        Indicator::Cancelled => theme::current().todo_cancelled,
+        Indicator::Moved => theme::current().tool_dim,
+        Indicator::InProgress | Indicator::Success => theme::current().tool_success,
     }
 }
 
@@ -618,7 +780,9 @@ pub fn build_tool_lines(
         rctx.width,
         expanded,
         rctx.tool_output_lines.get(tool_name),
-        status.into(),
+        msg.background
+            .as_ref()
+            .map_or_else(|| status.into(), Indicator::from),
     );
     b.apply_output_format(msg.tool_output.as_deref());
     b.push_header(
@@ -627,6 +791,9 @@ pub fn build_tool_lines(
         msg.annotation.as_deref(),
         msg.render_header.as_ref(),
     );
+    if let Some(badge) = &msg.background {
+        b.push_background_annotation(badge);
+    }
     b.prepend_indicator(rctx.started_at);
     let has_snapshot = msg.render_snapshot.is_some();
     b.push_code_content(
@@ -878,6 +1045,10 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
         }
     }
 
@@ -957,7 +1128,7 @@ mod tests {
             SectionFlags::default(),
         );
         let span_count_before = tl.lines[0].spans.len();
-        append_right_info(&mut tl.lines[0], None, Some("12:34:56"), width);
+        append_right_info(&mut tl.lines[0], None, None, Some("12:34:56"), width);
         if expect_timestamp {
             let last = tl.lines[0].spans.last().unwrap();
             assert_eq!(last.style, theme::current().timestamp);
@@ -1017,6 +1188,10 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
         }
     }
 
@@ -1113,6 +1288,10 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
         }
     }
 
@@ -1154,6 +1333,10 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
         }
     }
 
@@ -1462,6 +1645,10 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
         }
     }
 
@@ -1564,6 +1751,10 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
         }
     }
 
@@ -1675,6 +1866,10 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
         };
         assert!(
             search_text_for(&msg).contains("llm_output_here"),
@@ -1709,6 +1904,10 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
         };
         assert!(
             search_text_for(&msg).contains("body_fallback"),
@@ -1740,6 +1939,10 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
         };
         assert!(
             search_text_for(&msg).contains(LIVE_TEXT),
@@ -1905,5 +2108,64 @@ mod tests {
         let header_line = tl.lines.first().expect("header line");
         let dot = header_line.spans.last().expect("baked dot span");
         assert_eq!(dot.content.as_ref(), TOOL_INDICATOR);
+    }
+
+    const HEADER_TEXT: &str = "head";
+    const TIMESTAMP: &str = "12:34:56";
+
+    fn right_info_text(width: u16) -> (String, Option<Range<u16>>) {
+        let mut line = Line::from(HEADER_TEXT);
+        append_right_info(&mut line, Some(MOVABLE_HINT), None, Some(TIMESTAMP), width);
+        let text = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        (text, hint_columns(&line))
+    }
+
+    #[test_case(33, true,  true  ; "room_for_both")]
+    #[test_case(20, false, true  ; "hint_dropped_first")]
+    #[test_case(10, false, false ; "room_for_neither")]
+    fn right_info_drops_the_hint_before_the_timestamp(
+        width: u16,
+        expect_hint: bool,
+        expect_timestamp: bool,
+    ) {
+        let (text, hint) = right_info_text(width);
+        assert!(text.starts_with(HEADER_TEXT));
+        assert_eq!(text.contains(MOVABLE_HINT), expect_hint);
+        assert_eq!(text.contains(TIMESTAMP), expect_timestamp);
+        assert_eq!(hint.is_some(), expect_hint);
+        if expect_timestamp {
+            assert_eq!(UnicodeWidthStr::width(text.as_str()), width as usize - 1);
+        }
+    }
+
+    #[test_case(30, true,  true  ; "room_for_usage_and_timestamp")]
+    #[test_case(20, false, true  ; "usage_dropped_before_timestamp")]
+    #[test_case(10, false, false ; "nothing_fits")]
+    fn right_info_drops_whole_pieces_and_never_exceeds_width(
+        width: u16,
+        expect_usage: bool,
+        expect_timestamp: bool,
+    ) {
+        const USAGE: &str = "148↓ $0.009";
+        let mut line = Line::from(HEADER_TEXT);
+        append_right_info(&mut line, None, Some(USAGE), Some(TIMESTAMP), width);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text.contains(USAGE), expect_usage);
+        assert_eq!(text.contains(TIMESTAMP), expect_timestamp);
+        assert!(UnicodeWidthStr::width(text.as_str()) < width as usize);
+    }
+
+    #[test_case(5,    "5s"     ; "seconds")]
+    #[test_case(72,   "1m12s"  ; "minutes")]
+    #[test_case(3725, "1h02m"  ; "hours")]
+    fn format_elapsed_cases(secs: u64, expected: &str) {
+        assert_eq!(format_elapsed(secs), expected);
+    }
+
+    #[test_case(true,  Some(72), " (background · 1m12s · click or ctrl+x)" ; "running")]
+    #[test_case(true,  None,     " (background · click or ctrl+x)"          ; "restored")]
+    #[test_case(false, None,     " (background)"                            ; "ended")]
+    fn background_annotation_cases(running: bool, secs: Option<u64>, expected: &str) {
+        assert_eq!(background_annotation(running, secs), expected);
     }
 }

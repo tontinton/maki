@@ -63,6 +63,8 @@ read × 300  → 300 files          filter in python
 in context forever               1 turn, 1 line in context
 ```
 
+**Background tasks** keep a slow build from holding the loop. The model gets a short receipt and works on, and the result arrives as one message when the build ends, so it never spends turns polling. See [Background Tasks](/docs/background-tasks/).
+
 **Compaction** resets the multiplier when a session runs long: older turns are summarized and dropped. [Context](/docs/context/#when-the-window-fills) has the details.
 
 ## Watching it work

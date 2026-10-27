@@ -1,6 +1,7 @@
 //! Async agent loop with tools.
 
 pub mod agent;
+pub mod call_scope;
 pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
@@ -29,7 +30,8 @@ pub use agent::{
     UNAVAILABLE_RESULT, close_dangling_tool_calls, display_order, find_subdirectory_instructions,
     is_instruction_file, observation_line,
 };
-pub use cancel::{CancelMap, CancelToken, CancelTrigger};
+pub use call_scope::{AlreadyMoved, CallGuard, CallScope, SessionStub, TaskHome};
+pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};
 pub use live_session::{AgentSeed, MailboxError, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;

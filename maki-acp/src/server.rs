@@ -1037,7 +1037,7 @@ fn start_event_pump(
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
-                AgentEvent::ObservationLine { text } => {
+                AgentEvent::ObservationLine { text, .. } => {
                     translate::notice(&MakiId::generate().to_string(), &text)
                 }
                 AgentEvent::Done { reason, .. } => {
@@ -1832,6 +1832,7 @@ mod tests {
             sender
                 .send(AgentEvent::ObservationLine {
                     text: NOTICE_LINE.to_owned(),
+                    detail: None,
                 })
                 .unwrap();
             sender
@@ -1843,6 +1844,7 @@ mod tests {
                 .send_envelope(Envelope {
                     event: AgentEvent::ObservationLine {
                         text: CHILD_NOTICE_LINE.to_owned(),
+                        detail: None,
                     },
                     subagent: Some(subagent(None)),
                     run_id: 0,

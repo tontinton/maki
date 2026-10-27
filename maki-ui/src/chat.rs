@@ -7,17 +7,19 @@ use std::sync::Arc;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::input::Draft;
-use crate::components::messages::{MessagesPanel, PromptProgress, ScrollPos};
+use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
-use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
+use crate::components::{
+    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, ToolRole, ToolStatus,
+};
 use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
-    AgentEvent, BufferSnapshot, DisplayItem, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, display_order,
+    AgentEvent, BufferSnapshot, DisplayItem, SharedBuf, SteerKind, SubagentInbox, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, display_order,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
@@ -58,6 +60,13 @@ pub enum ChatEventResult {
     AuthRequired,
 }
 
+/// A call this chat's agent started that has not reported done.
+pub(crate) struct RunningCall {
+    pub(crate) id: String,
+    pub(crate) tool: Arc<str>,
+    pub(crate) awaiting_permission: bool,
+}
+
 pub struct Chat {
     pub name: String,
     /// The plugin that opened this task with `maki.agent.session`. A tool task
@@ -78,6 +87,10 @@ pub struct Chat {
     /// A running subagent's inbox for messages typed in its chat. Taken when
     /// the chat finishes, since nothing would drain it after that.
     pub(crate) inbox: Option<Arc<SubagentInbox>>,
+    /// Where a subagent's permission answers go. It lives until the chat
+    /// finishes, not the turn, so a subagent moved off its turn can still be
+    /// answered.
+    pub(crate) answer_tx: Option<flume::Sender<String>>,
     /// Parked while another chat is in front, see `App::set_active_chat`.
     pub(crate) draft: Draft,
     pending_turn_usage: Option<String>,
@@ -85,6 +98,9 @@ pub struct Chat {
     /// The ending and the index of the bubble announcing it, so a later, better
     /// informed outcome can fix that bubble instead of appending a second one.
     finish: Option<(TaskOutcome, usize)>,
+    /// Candidates only: a row can stop running without a `ToolDone` (a cancel,
+    /// a retry), so [`Self::running_calls`] checks each against its row.
+    running_calls: Vec<RunningCall>,
 }
 
 impl Chat {
@@ -110,10 +126,12 @@ impl Chat {
             model_id: None,
             opts: None,
             inbox: None,
+            answer_tx: None,
             draft: Draft::default(),
             pending_turn_usage: None,
             messages_panel,
             finish: None,
+            running_calls: Vec::new(),
         }
     }
 
@@ -166,13 +184,23 @@ impl Chat {
                 self.messages_panel.text_delta(&text);
             }
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
-            AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
+            AgentEvent::ToolStart(e) => {
+                if !self.running_calls.iter().any(|call| call.id == e.id) {
+                    self.running_calls.push(RunningCall {
+                        id: e.id.clone(),
+                        tool: Arc::clone(&e.tool),
+                        awaiting_permission: false,
+                    });
+                }
+                self.messages_panel.tool_start(*e);
+            }
             AgentEvent::ToolOutput { id, content } => {
                 self.messages_panel.tool_output(&id, &content)
             }
             AgentEvent::ToolDone(e) => {
                 let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
                 let is_full_write = &*e.tool == WRITE_TOOL_NAME;
+                self.running_calls.retain(|call| call.id != e.id);
                 self.messages_panel.tool_done(*e);
                 if let Some(pp) = plan_write {
                     let content = if is_full_write {
@@ -215,6 +243,9 @@ impl Chat {
                 return ChatEventResult::QueueItemConsumed { text, images };
             }
             AgentEvent::QueueDrained => {}
+            AgentEvent::ToolMovable { id, movable } => {
+                self.messages_panel.set_tool_movable(&id, movable);
+            }
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::Done { .. } => {
                 self.messages_panel.flush();
@@ -230,6 +261,9 @@ impl Chat {
                 scopes,
                 reason,
             } => {
+                if let Some(call) = self.running_calls.iter_mut().find(|call| call.id == id) {
+                    call.awaiting_permission = true;
+                }
                 return ChatEventResult::PermissionRequest {
                     id,
                     tool,
@@ -279,10 +313,13 @@ impl Chat {
                     ));
                 }
             }
-            AgentEvent::Notice { text } | AgentEvent::ObservationLine { text } => {
+            AgentEvent::Notice { text } => {
                 self.messages_panel.flush();
-                self.messages_panel
-                    .push(DisplayMessage::new(DisplayRole::Notice, text));
+                self.messages_panel.push(notice(text, None));
+            }
+            AgentEvent::ObservationLine { text, detail } => {
+                self.messages_panel.flush();
+                self.messages_panel.push(notice(text, detail));
             }
             AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
@@ -392,8 +429,12 @@ impl Chat {
         self.messages_panel.extract_selection_text(sel, msg_area)
     }
 
-    pub fn handle_click(&mut self, row: u16, area: Rect) {
-        self.messages_panel.handle_click(row, area);
+    pub fn handle_click(&mut self, row: u16, col: u16, area: Rect) -> ClickOutcome {
+        self.messages_panel.handle_click(row, col, area)
+    }
+
+    pub fn toggle_click(&mut self, row: u16, area: Rect) -> ClickOutcome {
+        self.messages_panel.toggle_click(row, area)
     }
 
     pub fn tool_snapshot(
@@ -454,6 +495,7 @@ impl Chat {
             return;
         }
         self.messages_panel.flush();
+        self.answer_tx = None;
         let undelivered = self.inbox.take().map_or(0, |inbox| inbox.len());
         if undelivered > 0 {
             self.messages_panel.push(DisplayMessage::new(
@@ -483,7 +525,49 @@ impl Chat {
         self.messages_panel.set_tool_turn_usage(tool_id, usage);
     }
 
+    /// The calls still running now, oldest first.
+    pub(crate) fn running_calls(&mut self) -> &[RunningCall] {
+        let panel = &self.messages_panel;
+        self.running_calls.retain(|call| {
+            panel.tool_message(&call.id).is_some_and(|msg| {
+                matches!(&msg.role, DisplayRole::Tool(t) if t.status == ToolStatus::InProgress)
+            })
+        });
+        &self.running_calls
+    }
+
+    pub(crate) fn permission_answered(&mut self, tool_id: &str) {
+        if let Some(call) = self
+            .running_calls
+            .iter_mut()
+            .find(|call| call.id == tool_id)
+        {
+            call.awaiting_permission = false;
+        }
+    }
+
+    pub(crate) fn tool_message(&self, tool_id: &str) -> Option<DisplayMessage> {
+        self.messages_panel.tool_message(tool_id)
+    }
+
+    pub(crate) fn live_buf(&self, tool_id: &str) -> Option<Arc<SharedBuf>> {
+        self.messages_panel.live_buf(tool_id)
+    }
+
+    pub(crate) fn register_live_buf(&mut self, tool_id: String, buf: Arc<SharedBuf>) {
+        self.messages_panel.register_live_buf(tool_id, buf);
+    }
+
+    pub(crate) fn set_tool_background(&mut self, tool_id: &str, badge: BackgroundBadge) {
+        self.messages_panel.set_tool_background(tool_id, badge);
+    }
+
+    pub(crate) fn set_background_outcome(&mut self, tool_id: &str, outcome: BackgroundOutcome) {
+        self.messages_panel.set_background_outcome(tool_id, outcome);
+    }
+
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
+        self.running_calls.clear();
         self.messages_panel.load_messages(msgs);
     }
 
@@ -573,8 +657,9 @@ pub fn history_to_display(
     for item in display_order(messages) {
         let msg = match item {
             DisplayItem::Message(msg) => msg,
-            DisplayItem::ObservationLine { text, .. } => {
-                display.push(DisplayMessage::new(DisplayRole::Notice, text.to_owned()));
+            DisplayItem::ObservationLine { index, text } => {
+                let detail = messages[index].first_text_content().map(str::to_owned);
+                display.push(notice(text.to_owned(), detail));
                 continue;
             }
         };
@@ -696,6 +781,10 @@ pub fn history_to_display(
                                 render_header: None,
                                 snapshot_theme_gen: 0,
                                 thinking_expanded: false,
+                                movable: false,
+                                background: None,
+                                detail: None,
+                                detail_expanded: false,
                             });
                         }
                         _ => {}
@@ -705,6 +794,13 @@ pub fn history_to_display(
         }
     }
     (display, restore_items)
+}
+
+fn notice(text: String, detail: Option<String>) -> DisplayMessage {
+    DisplayMessage {
+        detail,
+        ..DisplayMessage::new(DisplayRole::Notice, text)
+    }
 }
 
 /// `ToolResult` is gone after session load, so we rebuild from
@@ -966,6 +1062,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path,
+            backgrounded: false,
         }))
     }
 

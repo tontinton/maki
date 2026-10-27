@@ -1650,6 +1650,9 @@ through optional callbacks while the tool runs.
     mark goes on your own tool's row instead.
   - `on_usage` (`function?`) called with a formatted cumulative token usage
     string. Must not yield.
+  - `on_movable` (`function?`) called with `true` when the child registers
+    `ctx:on_background`, so the caller knows it may outlive the turn, and
+    `false` if it loses that. Must not yield.
 
 **Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
   Instruction files the child picks up (a subdirectory `AGENTS.md`) are
@@ -1958,8 +1961,9 @@ maki.async.run({fn}, {on_finish?})
 
 Start {fn} as a background task without waiting for it. Pass
 {on_finish} to get the result. The task is cancelled with its caller
-and stopped after 60 seconds. For work that outlives the caller, use
-`maki.async.spawn`.
+and stopped after 60 seconds. Started from a tool handler, it may outlive
+the reply: it ends with the turn, or with the background task once the
+call moved. For work that outlives the caller, use `maki.async.spawn`.
 
 **Parameters:**
 
@@ -3309,6 +3313,34 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 ```lua
 local ok, err = maki.fs.atomic_write("state.json", encoded)
 if err then print("atomic write failed: " .. err) end
+```
+
+---
+
+### `maki.fs.rename()` {#maki-fs-rename}
+
+```lua
+maki.fs.rename({from}, {to})
+```
+
+Move the file or directory at {from} to {to}, replacing {to} if it is an
+existing file. Both must be on the same filesystem. Nothing is copied, so
+renaming a large file costs the same as a small one.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{from}` (`string`) Path to move.
+- `{to}` (`string`) New path. `~/` is expanded.
+
+**Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
+
+**Example:**
+
+```lua
+local ok, err = maki.fs.rename("out.log", "out.log.1")
+if err then print("rename failed: " .. err) end
 ```
 
 ---
@@ -5593,23 +5625,41 @@ or a key they pressed. Tools, hooks, autocmds, `maki.async` tasks, and
 commands run through `maki.api.run_command` get an error instead, or any
 plugin could stop work that is not its own.
 
+Called as `stop(ctx, id)` from a tool handler, it is the model's stop
+instead: it stops a background task of the calling chat (a moved command
+or subagent), since a tool call is a turn the user started. It waits up to
+5 seconds for the task's final reply and returns it, and then the chat gets
+no notice of its end. If the reply is late it returns `"stop requested"`,
+and the result still reaches the chat later as a quiet notice. An id of
+another chat, a finished task or an unknown id returns an error naming the
+chat's running task ids.
+
 **Parameters:**
 
-- `{id}` (`string`) Task id, as returned by `list()`.
-- `{opts}` (`table`) `session` (string), the chat session of the `list()`
+- `{id}` (`string|LuaCtx`) Task id, as returned by `list()`. Or the handler's
 
-  row. If the user switched sessions since, this returns an error rather
+  ctx, for the model's stop.
+
+- `{opts}` (`table|string`) `session` (string), the chat session of the
+
+  `list()` row. If the user switched sessions since, this returns an error
 
 
-  than stopping a task with the same id in the other session.
+  rather than stopping a task with the same id in the other session. With a
 
 
-**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+  ctx: the background task id.
+
+
+**Returns:** (`boolean|string|nil`, `string|nil`) true on success (with a ctx: the
+  final reply or `"stop requested"`), or nil and an error.
 
 **Example:**
 
 ```lua
 local _, err = maki.task.stop(task.id, { session = task.session })
+-- in a tool handler
+local output, err = maki.task.stop(ctx, input.id)
 ```
 
 
@@ -7384,13 +7434,15 @@ key:
 | `"undo"`, `"redo"` | Undoes or redoes one input edit | nothing to undo or redo |
 | `"history_prev"`, `"history_next"` | Recalls the previous or next prompt | at either end of the history |
 | `"newline"` | Inserts a new line | |
+| `"background"` | Moves running calls to the background, like `Ctrl+B` | no call is running |
 
 `"undo"`, `"redo"`, `"history_prev"`, `"history_next"` and `"newline"`
 edit the chat input, also in normal mode. They need the `input`, `agent`
 and `session_write` permissions, see [chat input](#chat-input), and throw
 without them like any gated call. They return `false` in a finished subagent's chat, which has
 no input. `"pop_queue"` needs `session_write`, because it throws away a
-queued prompt. The other built-ins need no permission.
+queued prompt. `"background"` needs `agent`, because each call it moves
+wakes the chat with its result. The other built-ins need no permission.
 
 A built-in runs in the UI after your earlier `maki.ui` calls, and
 `action` waits for its answer. While your plugin loads, it returns `nil`

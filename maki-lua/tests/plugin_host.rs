@@ -2367,6 +2367,46 @@ fn warm_click_runs_async_jobs() {
     assert!(text.contains(ASYNC_LINE), "async job line missing: {text}");
 }
 
+/// The call token fires with the reply, but a highlight queued by the
+/// handler still has to land: it lives as long as the turn.
+#[test]
+fn async_run_from_a_handler_outlives_the_call() {
+    const CALL_ID: &str = "outlives-1";
+    const LATE_LINE: &str = "after_the_reply";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "late_async",
+            description = "appends a line after its reply",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local buf = maki.ui.buf()
+                ctx:live_buf(buf)
+                maki.async.run(function()
+                    maki.async.sleep(1)
+                    buf:line("{LATE_LINE}")
+                end)
+                return "done"
+            end
+        }})"#,
+    );
+    host.load_source("late_async_plugin", &src).unwrap();
+
+    let (mut ctx, rx) = warm_ctx(CALL_ID);
+    let (_run_trigger, run) = maki_agent::CancelToken::new();
+    let call = Arc::new(maki_agent::CallScope::new(CALL_ID.to_owned(), &run));
+    ctx.cancel = call.cancel().clone();
+    ctx.call = Some(Arc::clone(&call));
+    exec_warm_tool(&reg, "late_async", &ctx).expect("tool output");
+    let body = recv_live_buf(&rx, CALL_ID).expect("live buf published");
+    call.end();
+    barrier(&host);
+
+    assert!(body.take().text().contains(LATE_LINE));
+}
+
 /// The warm cell gets a fresh `CancelToken::none()`: cancelling the
 /// original run after it finished must not kill warm clicks.
 #[test]

@@ -8,18 +8,83 @@ use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{
     Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive, ToolOutputMode,
 };
+use maki_agent::{AgentEvent, AgentSeed};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::{MakiId, SessionRef};
-use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
+use mlua::{LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
-use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::{Pair, pair};
-use crate::runtime::{RestoreReason, active_task, lock_cell};
+use crate::api::util::convert::{TableExt, json_to_lua};
+use crate::api::util::pair::{Pair, err_pair, pair};
+use crate::runtime::{MoveOutcome, RestoreReason, TaskHandle, active_task, lock_cell, move_self};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 const WRITE_TOOL: &str = "write";
+const BACKGROUND_HOOK_ALREADY_SET_MSG: &str = "ctx:on_background() already called";
+const NOT_A_MODEL_CALL_MSG: &str =
+    "on_background: only the handler of a model's tool call can move to the background";
+const NO_BACKGROUND_HOOK_MSG: &str = "set_movable: call ctx:on_background() first";
+const NO_BACKGROUND_HOOK_FOR_MOVE_MSG: &str = "background: call ctx:on_background() first";
+const SUBAGENT_CALL_MSG: &str =
+    "background: a subagent's tool calls cannot move, its own call in the chat can";
+const EXPIRE_BACKGROUND: &str = "background";
+const EXPIRE_TIMEOUT: &str = "timeout";
+
+/// What `ctx:set_deadline` does when the deadline passes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DeadlineExpire {
+    #[default]
+    Timeout,
+    /// Move the call to the background instead, falling back to a timeout
+    /// when it cannot move.
+    Background,
+}
+
+impl DeadlineExpire {
+    fn parse(opts: Option<&Table>) -> mlua::Result<Self> {
+        let Some(opts) = opts else {
+            return Ok(Self::Timeout);
+        };
+        match opts.opt::<String>("expire")?.as_deref() {
+            None | Some(EXPIRE_TIMEOUT) => Ok(Self::Timeout),
+            Some(EXPIRE_BACKGROUND) => Ok(Self::Background),
+            Some(other) => Err(mlua::Error::runtime(format!(
+                "set_deadline: unknown expire {other:?}, expected \"{EXPIRE_TIMEOUT}\" or \"{EXPIRE_BACKGROUND}\""
+            ))),
+        }
+    }
+}
+
+/// Tells whoever draws the call whether a Ctrl+B press would move it now: the
+/// row's hint for a top-level call, the calling tool for a nested one. A row
+/// the press cannot move gets no hint at all.
+fn announce_movable(handle: &TaskHandle, agent: &AgentContext, movable: bool) {
+    let (live, sink) = {
+        let cell = lock_cell(handle);
+        (cell.live.clone(), cell.live_sink.clone())
+    };
+    if let Some(live) = live {
+        if could_move(agent) {
+            let _ = live.event_tx.send(AgentEvent::ToolMovable {
+                id: live.tool_use_id,
+                movable,
+            });
+        }
+    } else if let Some(sink) = sink {
+        let _ = sink.send(ToolLive::Movable(movable));
+    }
+}
+
+/// What the runtime asks before a move: a subagent's result would land in
+/// its parent's mailbox, and a call needs a live chat to land in.
+fn could_move(agent: &AgentContext) -> bool {
+    agent.task_id.is_none()
+        && agent
+            .session_id
+            .as_ref()
+            .is_some_and(|session| AgentSeed::live(session.id()).is_some())
+}
 
 fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
     let shared = buf.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf))?;
@@ -281,6 +346,10 @@ impl UserData for LuaCtx {
 
         methods.add_method("task_id", |_, this, ()| Ok(this.task_id().to_owned()));
 
+        methods.add_method("tool_use_id", |_, this, ()| {
+            Ok(this.agent().and_then(|agent| agent.tool_use_id.clone()))
+        });
+
         methods.add_method("restore_reason", |_, this, ()| {
             let Some(reason) = this.restore_reason() else {
                 return Ok(this.cap_err_pair("restore_reason"));
@@ -329,21 +398,110 @@ impl UserData for LuaCtx {
             None => Ok(LuaValue::Nil),
         });
 
-        methods.add_method("set_deadline", |lua, this, secs: u64| {
-            if !matches!(this.caps, Caps::Handler { .. }) {
-                return Ok(this.cap_err_pair("set_deadline"));
-            }
+        methods.add_method(
+            "on_background",
+            |lua, this, hook: mlua::Function| -> mlua::Result<Pair<bool>> {
+                let Some(agent) = this.agent() else {
+                    return Ok(this.cap_err_pair("on_background"));
+                };
+                let Some(call) = &agent.call else {
+                    return Ok(err_pair(NOT_A_MODEL_CALL_MSG));
+                };
+                // Made before the cell is locked: allocating can run the GC,
+                // and a finalizer may want the same cell.
+                let key = lua.create_registry_value(hook)?;
+                let handle = active_task(lua);
+                let mut cell = lock_cell(&handle);
+                if !cell.call.as_ref().is_some_and(|own| Arc::ptr_eq(own, call)) {
+                    drop(cell);
+                    lua.remove_registry_value(key)?;
+                    return Ok(err_pair(NOT_A_MODEL_CALL_MSG));
+                }
+                if cell.background_hook.is_some() {
+                    drop(cell);
+                    lua.remove_registry_value(key)?;
+                    return Err(mlua::Error::runtime(BACKGROUND_HOOK_ALREADY_SET_MSG));
+                }
+                cell.background_hook = Some(key);
+                drop(cell);
+                announce_movable(&handle, agent, true);
+                Ok((Some(true), None))
+            },
+        );
+
+        // A hook that would decline right now (a batch waiting on an edit)
+        // hides the hint until it would accept again.
+        methods.add_method("set_movable", |lua, this, movable: bool| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("set_movable"));
+            };
             let handle = active_task(lua);
-            let cell = handle.lock().unwrap_or_else(|e| e.into_inner());
-            if cell.deadline_secs.get().is_some() {
-                return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
+            if lock_cell(&handle).background_hook.is_none() {
+                return Ok(err_pair(NO_BACKGROUND_HOOK_MSG));
             }
-            cell.deadline_secs.set(Some(secs));
-            cell.deadline
-                .set(Some(Instant::now() + Duration::from_secs(secs)));
-            cell.deadline_changed.notify(usize::MAX);
+            announce_movable(&handle, agent, movable);
             Ok((Some(true), None))
         });
+
+        // The call moves itself through its own `on_background` hook, as if
+        // the user pressed Ctrl+B. Gated on the plugin's `agent` permission
+        // by the runtime.
+        methods.add_async_method("background", |lua, this, ()| async move {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("background"));
+            };
+            if agent.task_id.is_some() {
+                return Ok(err_pair(SUBAGENT_CALL_MSG));
+            }
+            let (Some(call), Some(id)) = (agent.call.clone(), agent.tool_use_id.clone()) else {
+                return Ok(err_pair(NOT_A_MODEL_CALL_MSG));
+            };
+            // Nothing may hold the ctx borrow across the wait: the hook runs
+            // meanwhile and may call ctx methods.
+            drop(this);
+            let outcome = move_self(&lua, &id).await;
+            // Moved by a Ctrl+B press, before or during the wait: done all
+            // the same.
+            if call.home().is_some() {
+                return Ok((Some(true), None));
+            }
+            Ok(match outcome {
+                MoveOutcome::Moved => (Some(true), None),
+                MoveOutcome::NoHook => err_pair(NO_BACKGROUND_HOOK_FOR_MOVE_MSG),
+                MoveOutcome::NotMovable(reason) => (None, Some(reason)),
+            })
+        });
+
+        methods.add_method("backgrounded", |_, this, ()| {
+            Ok(this
+                .agent()
+                .and_then(|agent| agent.call.as_ref())
+                .is_some_and(|call| call.home().is_some()))
+        });
+
+        methods.add_method(
+            "set_deadline",
+            |lua, this, (secs, opts): (u64, Option<Table>)| {
+                if !matches!(this.caps, Caps::Handler { .. }) {
+                    return Ok(this.cap_err_pair("set_deadline"));
+                }
+                let expire = DeadlineExpire::parse(opts.as_ref())?;
+                let handle = active_task(lua);
+                let cell = handle.lock().unwrap_or_else(|e| e.into_inner());
+                if cell.deadline_secs.get().is_some() {
+                    return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
+                }
+                // Only a model call can move, anything else just times out.
+                if cell.call.is_some() {
+                    cell.deadline_expire.set(expire);
+                }
+                cell.deadline_secs.set(Some(secs));
+                cell.deadline
+                    .set(Some(Instant::now() + Duration::from_secs(secs)));
+                cell.deadline_changed.notify(usize::MAX);
+                Ok((Some(true), None))
+            },
+        );
 
         // The matching check before a write is not exposed: the dispatcher
         // runs it under the file lock for every tool declaring `mutable_path`,
@@ -432,10 +590,12 @@ mod tests {
 
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::tools::{LocalTool, ToolAudience};
-    use maki_agent::{AgentMode, InstructionBlock};
+    use maki_agent::{AgentMode, CallScope, InstructionBlock};
+    use mlua::Lua;
     use test_case::test_case;
 
     use super::*;
+    use crate::runtime::{TaskCell, TaskScope};
 
     const TOOL_USE_ID: &str = "tu-1";
     const INSTRUCTION_PATH: &str = "/tmp/nested/AGENTS.md";
@@ -556,6 +716,36 @@ mod tests {
         assert_eq!(LuaCtx::handler(&ctx).task_id(), expected);
         assert_eq!(LuaCtx::start(&ctx).task_id(), expected);
         assert_eq!(LuaCtx::restore(restore_ctx(&ctx)).task_id(), expected);
+    }
+
+    #[test]
+    fn a_second_on_background_raises() {
+        let lua = Lua::new();
+        let (_run_trigger, run) = CancelToken::new();
+        let call = Arc::new(CallScope::new(TOOL_USE_ID.to_owned(), &run));
+        let mut ctx = populated_ctx();
+        ctx.call = Some(Arc::clone(&call));
+        let mut cell = TaskCell::new(call.cancel().clone(), None, None);
+        cell.call = Some(call);
+        let scope = TaskScope::new(&lua, cell);
+        let _active = scope.enter();
+        let handler = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+
+        let (ok, err): (bool, String) = lua
+            .load(
+                r#"
+                local ctx = ...
+                local hook = function() end
+                ctx:on_background(hook)
+                local ok, err = pcall(ctx.on_background, ctx, hook)
+                return ok, tostring(err)
+                "#,
+            )
+            .call(handler)
+            .unwrap();
+
+        assert!(!ok);
+        assert!(err.contains(BACKGROUND_HOOK_ALREADY_SET_MSG), "{err}");
     }
 
     /// A plain-table ctx that names no reason must read as a rerender: side

@@ -506,6 +506,10 @@ pub struct ToolDoneEvent {
     /// doom-loop refusal, a restored transcript) has none.
     #[serde(skip)]
     pub call: Option<Box<CallRecord>>,
+    /// The call moved to the background and `output` is its receipt. Travels
+    /// live only: a restored transcript shows the receipt text alone.
+    #[serde(skip)]
+    pub backgrounded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -528,6 +532,7 @@ impl ToolDoneEvent {
             annotation: None,
             written_path: None,
             call: None,
+            backgrounded: false,
         }
     }
 
@@ -658,6 +663,12 @@ pub enum AgentEvent {
         content: String,
     },
     ToolDone(Box<ToolDoneEvent>),
+    /// A running top-level call gained (`true`) or lost a background hook, so
+    /// a Ctrl+B press would move it now.
+    ToolMovable {
+        id: String,
+        movable: bool,
+    },
     TurnComplete(Box<TurnCompleteEvent>),
     ToolResultsSubmitted {
         message: Box<Message>,
@@ -731,6 +742,8 @@ pub enum AgentEvent {
     /// shows the same line.
     ObservationLine {
         text: String,
+        /// What the model read, for a frontend that expands the line.
+        detail: Option<String>,
     },
     /// A plugin changed the run in a way the transcript alone would not show.
     /// `text` is the message as sent, the reason for a drop, or the message
@@ -1454,6 +1467,7 @@ mod tests {
                 is_error: false,
                 annotation: None,
                 written_path: None,
+                backgrounded: false,
             },
             ToolDoneEvent {
                 call: None,
@@ -1463,6 +1477,7 @@ mod tests {
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                backgrounded: false,
             },
         ]);
         assert!(matches!(msg.role, Role::User));
@@ -1492,6 +1507,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: None,
+            backgrounded: false,
         };
 
         let msg = tool_results(vec![
@@ -1575,6 +1591,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: Some("/plans/slug.md".into()),
+            backgrounded: false,
         };
         assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
 
@@ -1809,6 +1826,7 @@ mod tests {
             is_error,
             annotation: None,
             written_path,
+            backgrounded: false,
         };
         assert_eq!(event.written_path(), expected);
     }

@@ -898,6 +898,16 @@ impl<'t> EventLoop<'t> {
     /// [`App::tick_background`].
     fn tick(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
+        // A quit ends the whole process, so each session's double press
+        // counts the background tasks of all of them.
+        let running: usize = self
+            .sessions
+            .iter()
+            .map(|rt| rt.app.running_background_tasks().count())
+            .sum();
+        for rt in &mut self.sessions {
+            rt.app.background_elsewhere = running - rt.app.running_background_tasks().count();
+        }
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             if i == self.focused {
                 dirty |= rt.app.tick();

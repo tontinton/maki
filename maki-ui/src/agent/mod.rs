@@ -289,6 +289,8 @@ fn spawn_agent_internal(
 
 #[cfg(test)]
 mod tests {
+    mod background_e2e;
+
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 

@@ -1055,6 +1055,7 @@ impl EventPump {
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
+            | AgentEvent::ToolMovable { .. }
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
@@ -1076,7 +1077,7 @@ impl EventPump {
                 text,
             } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
             AgentEvent::Steered { .. } => {}
-            AgentEvent::ObservationLine { text } if parent_tool_use_id.is_none() => {
+            AgentEvent::ObservationLine { text, .. } if parent_tool_use_id.is_none() => {
                 self.writer
                     .emit_system(NOTICE_SUBTYPE, serde_json::json!({ "text": text }))?;
             }
@@ -1857,6 +1858,7 @@ mod tests {
 
         pump.handle(top_level(AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
+            detail: None,
         }))
         .unwrap();
         pump.handle(top_level(AgentEvent::Notice {
@@ -1866,6 +1868,7 @@ mod tests {
         pump.handle(Envelope {
             event: AgentEvent::ObservationLine {
                 text: CHILD_NOTICE_LINE.into(),
+                detail: None,
             },
             subagent: Some(SubagentInfo {
                 parent_tool_use_id: NOTICE_CHILD.into(),
