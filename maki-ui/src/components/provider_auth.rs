@@ -26,8 +26,6 @@ pub(crate) struct ProviderEntry {
     /// A `providers.toml` provider with a base_url but no key of its own:
     /// usable as-is, though `/login` still offers to set a key.
     pub configured: bool,
-    /// Catalog providers are listed under their own section.
-    pub from_catalog: bool,
     /// Explicitly declared in `providers.toml`: the user asked for this
     /// provider, so it lists even when its key is missing.
     pub from_config: bool,
@@ -57,7 +55,6 @@ pub(crate) fn provider_entries(storage: &StateDir) -> (Vec<ProviderEntry>, bool)
             display_name: b.display_name.to_string(),
             auth: auth_of(storage, b.slug, Some(b.default_api_key_env)),
             configured: config.get(b.slug).is_some_and(|d| d.base_url.is_some()),
-            from_catalog: false,
             from_config: false,
         })
         .collect();
@@ -71,7 +68,6 @@ pub(crate) fn provider_entries(storage: &StateDir) -> (Vec<ProviderEntry>, bool)
             display_name: providers::resolve_display_name(slug, config.get(slug)),
             auth: auth_of(storage, slug, def.api_key_env.as_deref()),
             configured: false,
-            from_catalog: false,
             from_config: true,
         });
     }
@@ -96,7 +92,6 @@ pub(crate) fn provider_entries(storage: &StateDir) -> (Vec<ProviderEntry>, bool)
                 Auth::Missing
             },
             configured: false,
-            from_catalog: true,
             from_config: false,
         });
     }

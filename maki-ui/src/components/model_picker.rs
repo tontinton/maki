@@ -1043,7 +1043,6 @@ mod tests {
                 display_name: "Disconnected".into(),
                 auth: crate::components::provider_auth::Auth::Missing,
                 configured: false,
-                from_catalog: false,
                 from_config: true,
             }],
         );
@@ -1073,7 +1072,6 @@ mod tests {
                 display_name: "Ollama".into(),
                 auth: crate::components::provider_auth::Auth::Missing,
                 configured: false,
-                from_catalog: false,
                 from_config: false,
             }],
         );
@@ -1144,7 +1142,6 @@ mod tests {
                     display_name: "Disconnected".into(),
                     auth: crate::components::provider_auth::Auth::Missing,
                     configured: false,
-                    from_catalog: false,
                     from_config: true,
                 },
                 ProviderEntry {
@@ -1152,7 +1149,6 @@ mod tests {
                     display_name: "Unreachable".into(),
                     auth: crate::components::provider_auth::Auth::Saved,
                     configured: false,
-                    from_catalog: false,
                     from_config: true,
                 },
             ],
@@ -1203,7 +1199,6 @@ mod tests {
                 display_name: "Mistral".into(),
                 auth: crate::components::provider_auth::Auth::Saved,
                 configured: false,
-                from_catalog: false,
                 from_config: false,
             }],
         );

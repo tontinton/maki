@@ -195,16 +195,6 @@ pub(crate) fn provider_of(spec: &str) -> &str {
     spec.split_once('/').map_or(spec, |(provider, _)| provider)
 }
 
-fn providers_of(specs: &[String]) -> Vec<String> {
-    let mut providers: Vec<String> = Vec::new();
-    for provider in specs.iter().map(|spec| provider_of(spec)) {
-        if !providers.iter().any(|known| known == provider) {
-            providers.push(provider.to_string());
-        }
-    }
-    providers
-}
-
 /// Splits qualified specs into per-slug batches, keeping the order within a
 /// slug and sorting slugs so the batches are deterministic.
 fn group_by_slug(specs: Vec<String>) -> BTreeMap<String, Vec<String>> {
@@ -342,8 +332,8 @@ pub async fn fetch_all_models(
                 })
                 .await;
         }
-        let custom_specs = custom::discover_models(timeouts).await;
-        for (provider, models) in group_by_slug(custom_specs) {
+        let custom = custom::discover_models(timeouts).await;
+        for (provider, models) in group_by_slug(custom.specs) {
             let _ = tx_custom
                 .send_async(ModelBatch {
                     providers: vec![provider.clone()],
@@ -351,6 +341,17 @@ pub async fn fetch_all_models(
                     models,
                     warnings: Vec::new(),
                     missing_credentials: false,
+                })
+                .await;
+        }
+        for slug in custom.missing_credentials {
+            let _ = tx_custom
+                .send_async(ModelBatch {
+                    providers: vec![slug.clone()],
+                    provider: slug,
+                    models: Vec::new(),
+                    warnings: Vec::new(),
+                    missing_credentials: true,
                 })
                 .await;
         }

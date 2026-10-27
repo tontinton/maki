@@ -199,9 +199,9 @@ impl LoginPicker {
     /// its setup. Backing out closes the wizard and returns to the picker.
     pub fn open_for(&mut self, storage: maki_storage::StateDir, slug: &str) {
         self.open(storage);
-        let Some(item) = self.provider_items.iter().find(|i| i.slug == slug).cloned() else {
+        if !self.provider_items.iter().any(|i| i.slug == slug) {
             return;
-        };
+        }
         if let Step::PickProvider(picker) = &mut self.step {
             picker.select_item_by(|i| i.slug == slug);
         }
@@ -405,7 +405,7 @@ impl LoginPicker {
                     StepAction::GoEnterKey {
                         slug: slug.clone(),
                         plan: None,
-                        display_name: format!("Custom ({})", slugify(&slug)),
+                        display_name: name.clone(),
                         custom: Some(CustomInfo {
                             base_url,
                             protocol: "openai".to_string(),
@@ -904,8 +904,12 @@ pub enum LoginPickerAction {
     /// A model-picker-originated flow was backed out of; the host reopens
     /// the picker instead of staying on the /login provider list.
     BackToPicker,
-    Authenticated { model_spec: String },
-    Configured { slug: String },
+    Authenticated {
+        model_spec: String,
+    },
+    Configured {
+        slug: String,
+    },
 }
 
 #[cfg(test)]
