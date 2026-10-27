@@ -2,7 +2,6 @@
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
   extends: [
     'config:recommended',
-    'helpers:pinGitHubActionDigestsToSemver',
     'customManagers:githubActionsVersions',
   ],
   // Commits are chore(deps) by default and fix(deps) for security fixes, not fix(deps) by depType.
@@ -81,11 +80,6 @@
       matchManagers: ['github-actions'],
       groupName: 'GitHub Actions',
       schedule: ['* * 1 * *'],
-    },
-    {
-      description: 'Only tags bare majors (v35), which the semver extractVersion of the pin preset drops',
-      matchPackageNames: ['nixbuild/nix-quick-install-action'],
-      extractVersion: '^(?<version>v\\d+)$',
     },
     {
       matchManagers: ['custom.regex'],
