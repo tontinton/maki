@@ -2948,6 +2948,89 @@ fn double_esc_cancels_flushes_and_fails_tools() {
     assert_eq!(app.chats[0].in_progress_count(), 0);
 }
 
+/// A plugin's cancel is the double Esc without the keys: it interrupts a
+/// running turn, and reports an idle session as nothing to cancel.
+#[test]
+fn cancel_turn_interrupts_only_a_running_turn() {
+    let mut app = test_app();
+    assert!(app.cancel_turn().is_none());
+
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let actions = app.cancel_turn().expect("a running turn is cancelled");
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
+    assert_eq!(app.status, Status::Idle);
+    assert!(app.cancel_turn().is_none());
+}
+
+/// A watchdog firing while the user is in a picker or has a plugin panel
+/// open must not take those away: only the permission prompt belongs to the
+/// turn being stopped.
+#[test]
+fn plugin_cancel_turn_keeps_the_users_windows_open() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.run_builtin(BuiltinAction::ModelPicker);
+    open_split_window(&mut app, maki_lua::Split::Below);
+    app.permission_prompt.push(
+        "perm-1".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["ls".into()],
+        None,
+        true,
+        None,
+    );
+
+    let actions = app.cancel_turn().expect("a running turn is cancelled");
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
+    assert_eq!(app.status, Status::Idle);
+    assert!(!app.permission_prompt.is_open());
+    assert!(app.model_picker.is_open());
+    assert!(app.float_mgr.is_open());
+}
+
+/// The keys keep their old meaning: a double Esc is the user asking for a
+/// clean slate, so every overlay goes with the turn.
+#[test]
+fn double_esc_closes_every_overlay_with_the_turn() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    // Unfocused, so the Esc reaches the chat input rather than the window.
+    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    app.float_mgr.open(
+        Arc::new(maki_agent::SharedBuf::new()),
+        maki_lua::FloatConfig {
+            split: maki_lua::Split::Below,
+            ..maki_lua::FloatConfig::default()
+        },
+        false,
+        event_tx,
+        cmd_rx,
+    );
+    assert!(app.float_mgr.is_open());
+
+    cancel_app(&mut app);
+    assert_eq!(app.status, Status::Idle);
+    assert!(!app.float_mgr.is_open());
+
+    app.status = Status::Streaming;
+    app.run_builtin(BuiltinAction::ModelPicker);
+    open_split_window(&mut app, maki_lua::Split::Below);
+    let actions = app.handle_cancel();
+    assert!(matches!(actions.as_slice(), [Action::CancelAgent { .. }]));
+    assert!(!app.model_picker.is_open());
+    assert!(!app.float_mgr.is_open());
+}
+
 #[test]
 fn double_esc_idle_opens_rewind_picker() {
     let mut app = test_app();

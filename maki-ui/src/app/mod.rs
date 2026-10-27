@@ -1,7 +1,7 @@
 //! Elm-style `update(Msg) -> Vec<Action>`; side effects are dispatched by the caller.
 //! Double-esc: first esc flashes a hint, second within `flash_duration` cancels/rewinds.
 //! `run_id` invalidates in-flight agent events. It bumps in exactly three
-//! places, one per transition: `start_run`, `handle_cancel`, and
+//! places, one per transition: `start_run`, `cancel_run`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
 mod btw;
@@ -1511,10 +1511,27 @@ impl App {
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
+        self.close_all_overlays();
+        self.cancel_run()
+    }
+
+    /// A plugin's interrupt, the one a double Esc fires. `None` when no turn
+    /// is running, so there is nothing to cancel.
+    ///
+    /// Unlike the keys, this closes only the permission prompt: it belongs to
+    /// the turn being stopped, while a picker or a plugin window the user has
+    /// open is theirs and must survive a watchdog firing underneath it.
+    pub(crate) fn cancel_turn(&mut self) -> Option<Vec<Action>> {
+        (self.status == Status::Streaming).then(|| {
+            self.permission_prompt.close();
+            self.cancel_run()
+        })
+    }
+
+    fn cancel_run(&mut self) -> Vec<Action> {
         let cancelled_run = self.run_id;
         self.run_id += 1;
         self.retry_info = None;
-        self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.clear();

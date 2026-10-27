@@ -5052,6 +5052,37 @@ local state, err = maki.session.prompt("run the tests", { session = id })
 
 ---
 
+### `maki.session.cancel()` {#maki-session-cancel}
+
+```lua
+maki.session.cancel({opts?})
+```
+
+Interrupts the running turn of a live session, the way a double Esc does
+in the TUI: the agent stops, in-flight tools are cancelled and queued
+prompts are dropped.
+
+Requires the `agent` and `session_write` [plugin permissions](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional fields: session (string) id of a live
+
+  session; defaults to the focused one.
+
+
+**Returns:** (`string|nil`, `string|nil`) "cancelled" if a turn was interrupted,
+  "idle" if the session had none running, or nil and an error.
+
+**Example:**
+
+```lua
+local state, err = maki.session.cancel({ session = id })
+if state == "cancelled" then maki.notify("turn stopped") end
+```
+
+---
+
 ### `maki.session.notify()` {#maki-session-notify}
 
 ```lua

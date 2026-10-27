@@ -434,6 +434,15 @@ pub enum WinCommand {
     Close,
 }
 
+/// What `maki.session.prompt` answers: the text started a turn, or waits
+/// behind the one running.
+pub const PROMPT_STARTED: &str = "started";
+pub const PROMPT_QUEUED: &str = "queued";
+/// What `maki.session.cancel` answers: a turn was interrupted, or there was
+/// none to interrupt. Both are successes, so neither is a `(nil, err)`.
+pub const CANCEL_CANCELLED: &str = "cancelled";
+pub const CANCEL_IDLE: &str = "idle";
+
 pub enum SessionRequest {
     List,
     Live,
@@ -475,6 +484,11 @@ pub enum SessionRequest {
     SetTitle {
         id: String,
         title: String,
+    },
+    /// Interrupts the running turn of the live session {id} names, or the
+    /// focused one. The UI replies [`CANCEL_CANCELLED`] or [`CANCEL_IDLE`].
+    Cancel {
+        id: Option<String>,
     },
 }
 
