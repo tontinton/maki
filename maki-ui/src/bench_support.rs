@@ -265,9 +265,9 @@ impl LiveMessage {
 
     fn styled(style: RoleStyle) -> Self {
         Self(StreamingContent::new(
-            style.prefix,
+            style.label,
             style.text_style,
-            style.prefix_style,
+            style.label_style(),
             INSTANT_REVEAL,
         ))
     }
