@@ -24,8 +24,11 @@ const SUCCESS_HTML: &str =
 const ERROR_HTML: &str =
     "<html><body><h1>Authentication failed</h1><p>Please try again.</p></body></html>";
 
+#[derive(Debug)]
 pub struct CallbackResult {
     pub code: String,
+    /// RFC 9207 `iss`, which the token exchange checks against the auth server.
+    pub issuer: Option<String>,
 }
 
 const DEFAULT_HOSTNAME: &str = "127.0.0.1";
@@ -190,8 +193,13 @@ impl CallbackServer {
             return None;
         };
 
+        let issuer = params
+            .iter()
+            .find(|(k, _)| k == "iss")
+            .map(|(_, v)| v.clone());
+
         let _ = respond(&mut stream, 200, SUCCESS_HTML).await;
-        Some(Ok(CallbackResult { code }))
+        Some(Ok(CallbackResult { code, issuer }))
     }
 }
 
@@ -281,10 +289,11 @@ mod tests {
     const TEST_HOSTNAME: &str = "localhost";
     const TEST_STATE: &str = "test-state";
     const TEST_CODE: &str = "auth-code";
+    const TEST_ISSUER: &str = "https://auth.example.com";
 
     fn redirect_request(path: &str) -> String {
         format!(
-            "GET {path}?code={TEST_CODE}&state={TEST_STATE} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            "GET {path}?code={TEST_CODE}&state={TEST_STATE}&iss={TEST_ISSUER} HTTP/1.1\r\nHost: localhost\r\n\r\n"
         )
     }
 
@@ -315,7 +324,9 @@ mod tests {
             let req = redirect_request(path.unwrap_or(CALLBACK_PATH));
             stream.write_all(req.as_bytes()).await.unwrap();
 
-            assert_eq!(handle.await.unwrap().code, TEST_CODE);
+            let result = handle.await.unwrap();
+            assert_eq!(result.code, TEST_CODE);
+            assert_eq!(result.issuer.as_deref(), Some(TEST_ISSUER));
         });
     }
 

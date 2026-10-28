@@ -9,6 +9,7 @@ maki-config = { workspace = true }
 maki-otel = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ignore = { workspace = true }
@@ -29,15 +30,18 @@ event-listener = { workspace = true }
 futures-lite = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
-isahc = { workspace = true }
+reqwest = { workspace = true }
+async-compat = { workspace = true }
+rmcp = { workspace = true }
+oauth2 = { workspace = true }
+async-trait = { workspace = true }
+tokio-util = { workspace = true }
 futures-rustls = { workspace = true }
 rcgen = { workspace = true }
 open = { workspace = true }
 sha2 = { workspace = true }
 serde-saphyr = { workspace = true, features = ["deserialize"] }
-base64 = { workspace = true }
 url = { workspace = true }
-getrandom = { workspace = true }
 
 
 [dev-dependencies]

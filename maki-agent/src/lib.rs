@@ -15,7 +15,7 @@ pub mod headless;
 pub mod live_session;
 pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
-pub use mcp::protocol::PromptRole;
+pub use mcp::transport::PromptRole;
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
     ToolDeferral,

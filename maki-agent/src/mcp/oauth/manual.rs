@@ -22,7 +22,7 @@ pub(crate) async fn wait_for_paste(expected_state: &str) -> Result<CallbackResul
         }
 
         match parse_pasted(line, expected_state)? {
-            Outcome::Code(code) => return Ok(CallbackResult { code }),
+            Outcome::Code(result) => return Ok(result),
             Outcome::Retry(msg) => eprintln!("{msg}\n{PASTE_HINT}"),
         }
     }
@@ -32,7 +32,7 @@ pub(crate) async fn wait_for_paste(expected_state: &str) -> Result<CallbackResul
 
 #[derive(Debug)]
 enum Outcome {
-    Code(String),
+    Code(CallbackResult),
     Retry(&'static str),
 }
 
@@ -66,7 +66,12 @@ fn parse_pasted(input: &str, expected_state: &str) -> Result<Outcome, String> {
         return Ok(Outcome::Retry(STATE_MISMATCH));
     }
 
-    Ok(Outcome::Code(code))
+    let issuer = params
+        .iter()
+        .find(|(k, _)| k == "iss")
+        .map(|(_, v)| v.clone());
+
+    Ok(Outcome::Code(CallbackResult { code, issuer }))
 }
 
 fn extract_query(input: &str) -> &str {
@@ -84,13 +89,17 @@ mod tests {
 
     const STATE: &str = "expected-state";
 
-    #[test_case("http://127.0.0.1:19876/mcp/oauth/callback?code=abc&state=expected-state", "abc" ; "full_redirect_url")]
-    #[test_case("code=abc&state=expected-state", "abc" ; "bare_query_string")]
-    #[test_case("code=a%2Bb%20c&state=expected-state", "a+b c" ; "url_encoded_code")]
-    #[test_case("http://127.0.0.1:19876/mcp/oauth/callback?state=expected-state&code=xyz#frag", "xyz" ; "fragment_stripped")]
-    fn accepts_code(input: &str, expected_code: &str) {
+    #[test_case("http://127.0.0.1:19876/mcp/oauth/callback?code=abc&state=expected-state", "abc", None ; "full_redirect_url")]
+    #[test_case("code=abc&state=expected-state", "abc", None ; "bare_query_string")]
+    #[test_case("code=a%2Bb%20c&state=expected-state", "a+b c", None ; "url_encoded_code")]
+    #[test_case("http://127.0.0.1:19876/mcp/oauth/callback?state=expected-state&code=xyz#frag", "xyz", None ; "fragment_stripped")]
+    #[test_case("code=abc&state=expected-state&iss=https%3A%2F%2Fauth.example.com", "abc", Some("https://auth.example.com") ; "with_issuer")]
+    fn accepts_code(input: &str, expected_code: &str, expected_issuer: Option<&str>) {
         match parse_pasted(input, STATE).unwrap() {
-            Outcome::Code(code) => assert_eq!(code, expected_code),
+            Outcome::Code(result) => {
+                assert_eq!(result.code, expected_code);
+                assert_eq!(result.issuer.as_deref(), expected_issuer);
+            }
             Outcome::Retry(msg) => panic!("expected code, got retry: {msg}"),
         }
     }

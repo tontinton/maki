@@ -17,10 +17,7 @@
 
 pub mod config;
 pub mod error;
-pub mod http;
 pub mod oauth;
-pub mod protocol;
-pub mod stdio;
 pub mod transport;
 
 use std::collections::hash_map::Entry;
@@ -33,6 +30,7 @@ use std::time::Duration;
 use arc_swap::{ArcSwap, Guard};
 use maki_config::ProjectConfig;
 use maki_providers::{ContentBlock, DEFER_LOADING_KEY, Message, Model};
+use rmcp::model::{Prompt, PromptArgument, Tool};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -41,9 +39,7 @@ use self::config::{
     ServerConfig, Transport, load_config, parse_server, transport_kind,
 };
 use self::error::McpError;
-use self::http::HttpTransport;
-use self::stdio::StdioTransport;
-use self::transport::McpTransport;
+use self::transport::{McpTransport, PromptMessage};
 use crate::tools::CallOrigin;
 use crate::tools::schema::sanitize_tool_input_schema;
 use crate::types::TextOutput;
@@ -104,16 +100,16 @@ struct McpPromptDef {
     qualified_name: String,
     raw_name: String,
     description: String,
-    arguments: Vec<protocol::PromptArgument>,
+    arguments: Vec<PromptArgument>,
 }
 
 impl McpPromptDef {
-    fn from_info(server_name: &str, info: protocol::PromptInfo) -> Self {
+    fn from_info(server_name: &str, info: Prompt) -> Self {
         Self {
             qualified_name: format!("{server_name}{SEPARATOR}{}", info.name),
             raw_name: info.name,
             description: info.description.unwrap_or_default(),
-            arguments: info.arguments,
+            arguments: info.arguments.unwrap_or_default(),
         }
     }
 
@@ -128,7 +124,7 @@ impl McpPromptDef {
                 .map(|a| McpPromptArg {
                     name: a.name.clone(),
                     description: a.description.clone().unwrap_or_default(),
-                    required: a.required,
+                    required: a.required.unwrap_or_default(),
                 })
                 .collect(),
         }
@@ -186,9 +182,9 @@ impl ServerEntry {
             })
             .map(|info| McpToolDef {
                 qualified_name: intern(format!("{}{SEPARATOR}{}", self.name, info.name)),
-                raw_name: info.name,
-                description: info.description,
-                input_schema: info.input_schema,
+                raw_name: info.name.into_owned(),
+                description: info.description.unwrap_or_default().into_owned(),
+                input_schema: Value::Object(Arc::unwrap_or_clone(info.input_schema)),
             })
             .collect();
         self.prompts = prompt_infos
@@ -671,14 +667,14 @@ impl McpHandle {
             };
             (t.raw_name.clone(), Arc::clone(&t.transport))
         };
-        transport::call_tool(transport.as_ref(), &raw_name, args).await
+        transport.call_tool(&raw_name, args).await
     }
 
     pub async fn get_prompt(
         &self,
         qualified_name: &str,
         arguments: &HashMap<String, String>,
-    ) -> Result<Vec<protocol::PromptMessage>, McpError> {
+    ) -> Result<Vec<PromptMessage>, McpError> {
         let (raw_name, transport) = {
             let idx = self.index.load();
             let Some(p) = idx.prompts.get(qualified_name) else {
@@ -688,7 +684,7 @@ impl McpHandle {
             };
             (p.raw_name.clone(), Arc::clone(&p.transport))
         };
-        transport::get_prompt(transport.as_ref(), &raw_name, arguments).await
+        transport.get_prompt(&raw_name, arguments).await
     }
 
     pub async fn shutdown(&self) {
@@ -981,68 +977,43 @@ async fn refresh_server(inner: &mut McpManagerInner, server_name: &str) -> Resul
 }
 
 fn status_from_err(e: &McpError) -> McpServerStatus {
-    if let McpError::HttpError {
-        status: 401,
-        reason,
-        ..
-    } = e
-    {
-        McpServerStatus::NeedsAuth {
+    match e {
+        McpError::HttpError {
+            status: 401,
+            reason,
+            ..
+        } => McpServerStatus::NeedsAuth {
             url: Some(reason.clone()),
-        }
-    } else {
-        McpServerStatus::Failed(e.to_string())
+        },
+        McpError::OAuthRequired { .. } => McpServerStatus::NeedsAuth { url: None },
+        _ => McpServerStatus::Failed(e.to_string()),
     }
 }
 
 struct StartResult {
     transport: Arc<dyn McpTransport>,
-    tool_infos: Vec<protocol::ToolInfo>,
-    prompt_infos: Vec<protocol::PromptInfo>,
+    tool_infos: Vec<Tool>,
+    prompt_infos: Vec<Prompt>,
 }
 
 async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
-    let transport: Arc<dyn McpTransport> = match &config.transport {
-        Transport::Stdio {
-            program,
-            args,
-            environment,
-        } => Arc::new(StdioTransport::spawn(
-            &config.name,
-            program,
-            args,
-            environment,
-            config.timeout,
-        )?),
-        Transport::Http {
-            url,
-            headers,
-            ca_file,
-            ..
-        } => Arc::new(HttpTransport::new(
-            &config.name,
-            url,
-            headers,
-            config.timeout,
-            maki_storage::StateDir::resolve().ok(),
-            ca_file.as_deref(),
-        )?),
-    };
-    let capabilities = transport::initialize(transport.as_ref()).await?;
-    // Asymmetric on purpose: sloppy servers omit `capabilities` yet serve
-    // tools/list fine, so always ask (fatal only when tools were declared).
+    let storage = maki_storage::StateDir::resolve().ok();
+    let connection = transport::connect(config, storage.as_ref()).await?;
+    // Asymmetric on purpose: some servers leave `tools` out of their
+    // capabilities yet serve tools/list fine, so always ask (fatal only when
+    // tools were declared).
     // Prompts only when declared: undeclared endpoints may answer junk,
     // and junk must not take down the server's tools.
-    let tool_infos = match transport::list_tools(transport.as_ref()).await {
+    let tool_infos = match connection.list_tools().await {
         Ok(tools) => tools,
-        Err(e) if !capabilities.tools => {
+        Err(e) if !connection.declares_tools() => {
             warn!(server = config.name, error = %e, "tools/list failed; server declared no tools");
             Vec::new()
         }
         Err(e) => return Err(e),
     };
-    let prompt_infos = if capabilities.prompts {
-        transport::list_prompts(transport.as_ref()).await?
+    let prompt_infos = if connection.declares_prompts() {
+        connection.list_prompts().await?
     } else {
         Vec::new()
     };
@@ -1053,7 +1024,7 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
         "MCP server initialized"
     );
     Ok(StartResult {
-        transport,
+        transport: Arc::new(connection),
         tool_infos,
         prompt_infos,
     })
@@ -1229,9 +1200,11 @@ pub mod test_support {
     use arc_swap::ArcSwap;
     use serde_json::{Value, json};
 
+    use std::collections::HashMap;
+
     use super::config::McpServerStatus;
     use super::error::McpError;
-    use super::transport::{self, McpTransport};
+    use super::transport::{BoxFuture, McpTransport, PromptMessage};
     use super::{
         McpHandle, McpManagerInner, McpSession, McpSnapshot, McpToolDef, SEPARATOR, ServerEntry,
         ToolIndex, publish,
@@ -1246,7 +1219,7 @@ pub mod test_support {
             transport_kind: "stub",
             origin: PathBuf::new(),
             status: McpServerStatus::Running,
-            transport: Some(Arc::new(StubTransport(Arc::from("stub")))),
+            transport: Some(Arc::new(StubTransport)),
             tools: tools
                 .iter()
                 .map(|(qualified, description)| McpToolDef {
@@ -1282,35 +1255,25 @@ pub mod test_support {
 
     /// Fails every call with `UnknownTool`, which is how a test proves the call
     /// reached MCP at all.
-    struct StubTransport(Arc<str>);
+    struct StubTransport;
 
     impl McpTransport for StubTransport {
-        fn send_request<'a>(
+        fn call_tool<'a>(
             &'a self,
-            method: &'a str,
-            _params: Option<Value>,
-        ) -> transport::BoxFuture<'a, Result<Value, McpError>> {
-            Box::pin(async move {
-                Err(McpError::UnknownTool {
-                    name: method.into(),
-                })
-            })
+            name: &'a str,
+            _args: &'a Value,
+        ) -> BoxFuture<'a, Result<String, McpError>> {
+            Box::pin(async move { Err(McpError::UnknownTool { name: name.into() }) })
         }
-        fn send_notification<'a>(
+        fn get_prompt<'a>(
             &'a self,
-            _method: &'a str,
-            _params: Option<Value>,
-        ) -> transport::BoxFuture<'a, Result<(), McpError>> {
-            Box::pin(async { Ok(()) })
+            name: &'a str,
+            _arguments: &'a HashMap<String, String>,
+        ) -> BoxFuture<'a, Result<Vec<PromptMessage>, McpError>> {
+            Box::pin(async move { Err(McpError::UnknownPrompt { name: name.into() }) })
         }
-        fn shutdown<'a>(&'a self) -> transport::BoxFuture<'a, ()> {
+        fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
             Box::pin(async {})
-        }
-        fn server_name(&self) -> &Arc<str> {
-            &self.0
-        }
-        fn transport_kind(&self) -> &'static str {
-            "stub"
         }
     }
 }
@@ -1452,6 +1415,8 @@ mod tests {
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
     const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
     const MISSING_CA_FILE: &str = "/nonexistent/ca.pem";
+    const SERVER: &str = "srv";
+    const CHALLENGE: &str = r#"Bearer resource_metadata="https://srv.example/.well-known""#;
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -1488,7 +1453,6 @@ mod tests {
     /// the call inside `call_gate` until tests release it. That way tests can meet an in-flight
     /// RPC at a known point without polling.
     struct FakeTransport {
-        name: Arc<str>,
         shutdowns: AtomicUsize,
         call_entered: flume::Sender<()>,
         call_entered_rx: flume::Receiver<()>,
@@ -1499,7 +1463,6 @@ mod tests {
         fn new() -> Arc<Self> {
             let (call_entered, call_entered_rx) = flume::bounded(1);
             Arc::new(Self {
-                name: Arc::from("fake"),
                 shutdowns: AtomicUsize::new(0),
                 call_entered,
                 call_entered_rx,
@@ -1513,37 +1476,27 @@ mod tests {
     }
 
     impl McpTransport for FakeTransport {
-        fn send_request<'a>(
+        fn call_tool<'a>(
             &'a self,
-            method: &'a str,
-            _params: Option<Value>,
-        ) -> transport::BoxFuture<'a, Result<Value, McpError>> {
+            _name: &'a str,
+            _args: &'a Value,
+        ) -> transport::BoxFuture<'a, Result<String, McpError>> {
             Box::pin(async move {
-                if method == "tools/call" {
-                    let _ = self.call_entered.try_send(());
-                    let _g = self.call_gate.lock().await;
-                    Ok(json!({ "content": [{ "type": "text", "text": "ok" }] }))
-                } else {
-                    Ok(Value::Null)
-                }
+                let _ = self.call_entered.try_send(());
+                let _g = self.call_gate.lock().await;
+                Ok("ok".into())
             })
         }
-        fn send_notification<'a>(
+        fn get_prompt<'a>(
             &'a self,
-            _method: &'a str,
-            _params: Option<Value>,
-        ) -> transport::BoxFuture<'a, Result<(), McpError>> {
-            Box::pin(async move { Ok(()) })
+            _name: &'a str,
+            _arguments: &'a HashMap<String, String>,
+        ) -> transport::BoxFuture<'a, Result<Vec<PromptMessage>, McpError>> {
+            Box::pin(async { Ok(Vec::new()) })
         }
         fn shutdown<'a>(&'a self) -> transport::BoxFuture<'a, ()> {
             self.shutdowns.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
-        }
-        fn server_name(&self) -> &Arc<str> {
-            &self.name
-        }
-        fn transport_kind(&self) -> &'static str {
-            "fake"
         }
     }
 
@@ -1764,6 +1717,20 @@ mod tests {
         assert!(catalog.contains("srv: tool"), "catalog groups by server");
         assert!(handle.resolve(TOOL_NAME).is_some());
         assert_eq!(handle.wire_names(), vec![WIRE_TOOL_NAME]);
+    }
+
+    #[test_case(
+        McpError::HttpError { server: SERVER.into(), status: 401, reason: CHALLENGE.into() },
+        McpServerStatus::NeedsAuth { url: Some(CHALLENGE.into()) }
+        ; "challenge"
+    )]
+    #[test_case(
+        McpError::OAuthRequired { server: SERVER.into() },
+        McpServerStatus::NeedsAuth { url: None }
+        ; "login_without_challenge"
+    )]
+    fn start_error_sets_the_status(error: McpError, status: McpServerStatus) {
+        assert_eq!(status_from_err(&error), status);
     }
 
     #[test_case(TOOL_NAME, Some(TOOL_NAME) ; "internal_name")]

@@ -294,7 +294,7 @@ impl AgentLoop {
                     message: e.to_string(),
                 })?;
             for pm in messages {
-                let text = pm.content.text.unwrap_or_default();
+                let text = pm.text;
                 let msg = match pm.role {
                     PromptRole::Assistant => Message {
                         role: maki_providers::Role::Assistant,

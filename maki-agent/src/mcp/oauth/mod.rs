@@ -1,44 +1,41 @@
 pub mod callback;
-pub mod discovery;
 pub mod manual;
-pub mod pkce;
-pub mod registration;
-pub mod token;
+mod store;
 
 use std::path::Path;
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use async_compat::Compat;
 use futures_lite::future;
-use isahc::HttpClient;
 use maki_storage::StateDir;
 use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
+use reqwest::Client;
+use rmcp::transport::auth::{AuthorizationMetadata, OAuthClientConfig};
+use rmcp::transport::{AuthError, AuthorizationManager};
 use tracing::{info, warn};
-use url::Url;
+use url::{Host, Url};
 
 use self::callback::{CallbackResult, CallbackServer};
-use self::discovery::{
-    AuthServerMetadata, ResourceMetadata, WwwAuthenticateInfo, parse_www_authenticate,
-};
+use self::store::AuthStore;
 use super::config::{CallbackScheme, OauthClientConfig};
 use super::error::McpError;
-use super::http::build_client;
+use super::transport::{CLIENT_NAME, http_client};
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(600);
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-/// In-band refresh blocks requests waiting on the transport's auth lock, so it
-/// gets a much tighter budget than the interactive flow.
-const SILENT_REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per OAuth request while logging in.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per OAuth request while refreshing behind an MCP request.
+pub(super) const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
+const STATE_PARAM: &str = "state";
+const RESOURCE_PARAM: &str = "resource";
+const HTTPS: &str = "https";
+const HTTP: &str = "http";
+const LOCALHOST: &str = "localhost";
 
 #[derive(Debug, thiserror::Error)]
-pub enum OAuthError {
-    #[error("network error: {0}")]
-    Network(String),
-    #[error("server rejected request: HTTP {status} {body}")]
-    ServerRejected { status: u16, body: String },
-    #[error("invalid response: {0}")]
-    InvalidResponse(String),
+enum OAuthError {
+    #[error(transparent)]
+    Auth(#[from] AuthError),
     #[error("{0}")]
     Other(String),
 }
@@ -57,112 +54,259 @@ pub async fn authenticate(
     interaction: Interaction,
     static_client: Option<OauthClientConfig>,
     ca_file: Option<&Path>,
-) -> Result<McpAuthData, McpError> {
-    let wrap = |e: OAuthError| McpError::OAuthFailed {
+) -> Result<(), McpError> {
+    Compat::new(async {
+        let client = http_client(ca_file, Some(LOGIN_TIMEOUT)).map_err(OAuthError::Other)?;
+
+        // We only get here after the server turned the token down, or when the
+        // user asks to log in, so a token that hasn't expired yet proves
+        // nothing. A stored login that can't be used at all, say because its
+        // auth server moved, goes straight to a new login.
+        let stored = stored_manager(storage, server_name, server_url, client.clone())
+            .await
+            .unwrap_or_else(|e| {
+                warn!(server = server_name, error = %e, "stored login unusable, starting full flow");
+                None
+            });
+        if let Some(manager) = stored {
+            match manager.refresh_token().await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    warn!(server = server_name, error = %e, "token refresh failed, starting full flow");
+                }
+            }
+        }
+
+        login(
+            server_name,
+            server_url,
+            www_authenticate,
+            storage,
+            interaction,
+            static_client.unwrap_or_default(),
+            client,
+        )
+        .await
+    })
+    .await
+    .map_err(|e| McpError::OAuthFailed {
         server: server_name.into(),
         reason: e.to_string(),
+    })
+}
+
+/// A manager that refreshes the tokens stored for this server in place, or
+/// `None` when there are none to refresh. It names the resource the login
+/// named, which is the server URL for logins from before it was kept.
+pub(super) async fn stored_manager(
+    storage: &StateDir,
+    server_name: &str,
+    server_url: &str,
+    client: Client,
+) -> Result<Option<AuthorizationManager>, AuthError> {
+    let Some(mut record) =
+        load_mcp_auth(storage, server_name, server_url).filter(|r| r.tokens.is_some())
+    else {
+        return Ok(None);
     };
-    let client = build_client(HTTP_TIMEOUT, ca_file).map_err(|e| wrap(OAuthError::Other(e)))?;
+    let pinned = record
+        .auth_server
+        .clone()
+        .and_then(|value| serde_json::from_value::<AuthorizationMetadata>(value).ok());
+    let metadata = match pinned {
+        Some(metadata) => metadata,
+        None => pin_auth_server(storage, server_name, &mut record, client.clone()).await?,
+    };
+    let resource = record.resource.as_deref().unwrap_or(&record.server_url);
+    let mut manager = AuthorizationManager::new(resource).await?;
+    manager.with_client(client)?;
+    manager.set_metadata(metadata);
+    manager.configure_client(client_config(&record))?;
+    manager.set_credential_store(AuthStore::new(storage.clone(), server_name, record));
+    Ok(Some(manager))
+}
 
-    if let Some(existing) = load_mcp_auth(storage, server_name, server_url)
-        && let Some(ref tokens) = existing.tokens
-        && !tokens.is_expired()
-    {
-        return Ok(existing);
+/// Records from before `auth_server` pinned only the token endpoint, so fresh
+/// discovery must agree with it before the refresh token goes anywhere. The
+/// result is saved right away, so each record is discovered once.
+async fn pin_auth_server(
+    storage: &StateDir,
+    server_name: &str,
+    record: &mut McpAuthData,
+    client: Client,
+) -> Result<AuthorizationMetadata, AuthError> {
+    let (_, metadata) = discover(&record.server_url, None, client).await?;
+    check_pin(record, &metadata)?;
+    record.auth_server = serde_json::to_value(&metadata).ok();
+    if let Err(e) = save_mcp_auth(storage, server_name, record) {
+        warn!(server = server_name, error = %e, "failed to save the MCP OAuth auth server");
     }
+    Ok(metadata)
+}
 
-    match silent_refresh(storage, server_name, server_url, ca_file).await {
-        Ok(Some(data)) => return Ok(data),
-        Ok(None) => {}
-        Err(e) => {
-            warn!(server = server_name, error = %e, "token refresh failed, starting full flow");
+/// The returned manager keeps the RFC 8707 resource the server named, if any.
+async fn discover(
+    server_url: &str,
+    www_authenticate: Option<&str>,
+    client: Client,
+) -> Result<(AuthorizationManager, AuthorizationMetadata), AuthError> {
+    let mut manager = AuthorizationManager::new(server_url).await?;
+    manager.with_client(client)?;
+    // maki never checked the metadata's `issuer`, and some auth servers leave it out.
+    manager.set_allow_missing_issuer(true);
+    let metadata = manager
+        .resolve_metadata_from_challenge(www_authenticate)
+        .await?
+        .metadata;
+    require_https(&metadata)?;
+    Ok((manager, metadata))
+}
+
+/// rmcp only refuses resource metadata that downgrades from https, so the
+/// endpoints it found are held to HTTPS here, loopback aside.
+fn require_https(metadata: &AuthorizationMetadata) -> Result<(), AuthError> {
+    [
+        Some(&metadata.authorization_endpoint),
+        Some(&metadata.token_endpoint),
+        metadata.registration_endpoint.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .try_for_each(|endpoint| {
+        let url = Url::parse(endpoint)?;
+        let loopback = match url.host() {
+            Some(Host::Domain(domain)) => domain == LOCALHOST,
+            Some(Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
+        match url.scheme() {
+            HTTPS => Ok(()),
+            HTTP if loopback => Ok(()),
+            _ => Err(AuthError::MetadataError(format!(
+                "OAuth endpoint must use HTTPS: {endpoint}"
+            ))),
         }
+    })
+}
+
+fn check_pin(record: &McpAuthData, metadata: &AuthorizationMetadata) -> Result<(), AuthError> {
+    match &record.token_endpoint {
+        Some(pinned) if *pinned != metadata.token_endpoint => {
+            Err(AuthError::MetadataError(format!(
+                "token endpoint moved from {pinned} to {}",
+                metadata.token_endpoint
+            )))
+        }
+        _ => Ok(()),
     }
+}
 
-    let www_auth = www_authenticate.and_then(parse_www_authenticate);
+fn client_config(record: &McpAuthData) -> OAuthClientConfig {
+    let redirect_uri = record.redirect_uri.as_deref().unwrap_or(&record.server_url);
+    let mut config = OAuthClientConfig::new(&record.client_id, redirect_uri);
+    config.client_secret = record.client_secret.clone();
+    config
+}
 
-    let (resource_meta, auth_server) =
-        discover_auth_server_for(&client, server_url, www_auth.as_ref())
-            .await
-            .map_err(wrap)?;
-
-    if !auth_server.code_challenge_methods_supported.is_empty()
-        && !auth_server
-            .code_challenge_methods_supported
-            .iter()
-            .any(|m| m == "S256")
-    {
-        return Err(wrap(OAuthError::Other(
-            "server does not support S256 PKCE".into(),
-        )));
-    }
+async fn login(
+    server_name: &str,
+    server_url: &str,
+    www_authenticate: Option<&str>,
+    storage: &StateDir,
+    interaction: Interaction,
+    static_client: OauthClientConfig,
+    client: Client,
+) -> Result<(), OAuthError> {
+    let (mut manager, metadata) = discover(server_url, www_authenticate, client).await?;
+    manager.set_metadata(metadata.clone());
 
     let OauthClientConfig {
         client_id,
         client_secret,
-        callback_port: port,
+        callback_port,
         callback_path,
         callback_hostname,
         callback_scheme,
-    } = static_client.unwrap_or_default();
-    let (path, hostname) = (callback_path.as_deref(), callback_hostname.as_deref());
-
-    let callback = CallbackServer::bind(port, path, hostname, callback_scheme)
-        .await
-        .map_err(|e| wrap(OAuthError::Other(e)))?;
-    let redirect_uri = callback.redirect_uri();
-
-    let reg = if let Some(client_id) = client_id {
-        registration::ClientRegistration {
-            client_id,
-            client_secret,
-            client_secret_expires_at: None,
-        }
-    } else if let Some(existing) = load_mcp_auth(storage, server_name, server_url)
-        && existing.redirect_uri.as_deref() == Some(&redirect_uri)
-    {
-        registration::ClientRegistration {
-            client_id: existing.client_id,
-            client_secret: existing.client_secret,
-            client_secret_expires_at: existing.client_secret_expires_at,
-        }
-    } else if let Some(endpoint) = &auth_server.registration_endpoint {
-        registration::register_client(&client, endpoint, &redirect_uri)
-            .await
-            .map_err(wrap)?
-    } else {
-        return Err(wrap(OAuthError::Other(
-            "no stored client and server has no registration endpoint".into(),
-        )));
-    };
-
-    let pkce = pkce::generate().map_err(wrap)?;
-
-    let mut state_buf = [0u8; 16];
-    getrandom::fill(&mut state_buf)
-        .map_err(|e| wrap(OAuthError::Other(format!("CSPRNG unavailable: {e}"))))?;
-    let state = URL_SAFE_NO_PAD.encode(state_buf);
-
-    let scope = www_auth.as_ref().and_then(|w| w.scope.clone()).or_else(|| {
-        resource_meta
-            .and_then(|m| m.scopes_supported)
-            .map(|s| s.join(" "))
-    });
-
-    let auth_url = build_authorization_url(
-        &auth_server.authorization_endpoint,
-        &reg.client_id,
-        &redirect_uri,
-        &state,
-        &pkce.challenge,
-        scope.as_deref(),
-        server_url,
+    } = static_client;
+    let callback = CallbackServer::bind(
+        callback_port,
+        callback_path.as_deref(),
+        callback_hostname.as_deref(),
+        callback_scheme,
     )
-    .map_err(wrap)?;
+    .await
+    .map_err(OAuthError::Other)?;
+    let redirect_uri = callback.redirect_uri();
+    let scopes = manager.select_initial_scopes(&[]).await;
+    let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
 
-    info!(server = server_name, endpoint = %auth_server.authorization_endpoint, "starting OAuth authorization");
-    let wait_callback = callback.wait_for_callback(&state);
-    let result = match interaction {
+    let reusable = load_mcp_auth(storage, server_name, server_url)
+        .filter(|r| can_reuse_client(r, &redirect_uri));
+    let (client_id, client_secret, client_secret_expires_at) = match (client_id, reusable) {
+        (Some(client_id), _) => (client_id, client_secret, None),
+        (None, Some(existing)) => (
+            existing.client_id,
+            existing.client_secret,
+            existing.client_secret_expires_at,
+        ),
+        (None, None) => {
+            let registered = manager
+                .register_client(CLIENT_NAME, &redirect_uri, &scopes)
+                .await?;
+            (registered.client_id, registered.client_secret, None)
+        }
+    };
+    let mut record = McpAuthData {
+        server_url: server_url.to_owned(),
+        tokens: None,
+        client_id,
+        client_secret,
+        client_secret_expires_at,
+        redirect_uri: Some(redirect_uri.clone()),
+        token_endpoint: Some(metadata.token_endpoint.clone()),
+        auth_server: serde_json::to_value(&metadata).ok(),
+        resource: None,
+    };
+    manager.configure_client(client_config(&record))?;
+
+    let auth_url = manager.get_authorization_url(&scopes).await?;
+    let state = query_param(&auth_url, STATE_PARAM)
+        .ok_or_else(|| OAuthError::Other("authorization URL carries no state".into()))?;
+    // rmcp keeps the resource it discovered to itself, so it's read off the URL.
+    record.resource = query_param(&auth_url, RESOURCE_PARAM).filter(|r| !r.is_empty());
+    manager.set_credential_store(AuthStore::new(storage.clone(), server_name, record));
+
+    info!(server = server_name, endpoint = %metadata.authorization_endpoint, "starting OAuth authorization");
+    let result = wait_for_code(
+        server_name,
+        &auth_url,
+        callback,
+        &state,
+        interaction,
+        callback_scheme,
+    )
+    .await
+    .map_err(OAuthError::Other)?;
+
+    manager
+        .exchange_code_for_token_with_issuer(&result.code, &state, result.issuer.as_deref())
+        .await?;
+    info!(server = server_name, "OAuth authentication complete");
+    Ok(())
+}
+
+async fn wait_for_code(
+    server_name: &str,
+    auth_url: &str,
+    callback: CallbackServer,
+    state: &str,
+    interaction: Interaction,
+    callback_scheme: CallbackScheme,
+) -> Result<CallbackResult, String> {
+    let redirect_uri = callback.redirect_uri();
+    let wait_callback = callback.wait_for_callback(state);
+    match interaction {
         Interaction::Cli => {
             eprintln!("\nOpen this URL in your browser:\n\n  {auth_url}\n");
 
@@ -171,25 +315,27 @@ pub async fn authenticate(
                     server = server_name,
                     "no display detected, skipping browser open"
                 );
-            } else if let Err(e) = open::that(&auth_url) {
+            } else if let Err(e) = open::that(auth_url) {
                 warn!(server = server_name, error = %e, "failed to open browser");
             }
 
             eprintln!("Waiting for callback on {redirect_uri}...");
             if callback_scheme == CallbackScheme::Https {
-                eprintln!("Your browser will warn about Maki's self-signed certificate for this login; proceed past it.");
+                eprintln!(
+                    "Your browser will warn about Maki's self-signed certificate for this login; proceed past it."
+                );
             }
             eprintln!("If this machine has no browser, log in on another device and paste");
             eprintln!("the full redirect URL ({redirect_uri}?...) here:");
 
-            let callback_or_paste = future::race(wait_callback, manual::wait_for_paste(&state));
+            let callback_or_paste = future::race(wait_callback, manual::wait_for_paste(state));
             future::race(callback_or_paste, auth_timeout()).await
         }
         Interaction::Background => {
             let cause = if is_headless() {
                 Some("no display to open a browser".to_string())
             } else {
-                open::that(&auth_url)
+                open::that(auth_url)
                     .err()
                     .map(|e| format!("failed to open browser: {e}"))
             };
@@ -199,109 +345,6 @@ pub async fn authenticate(
             }
         }
     }
-    .map_err(|e| wrap(OAuthError::Other(e)))?;
-
-    let tokens = token::exchange_code(
-        &client,
-        &auth_server.token_endpoint,
-        &result.code,
-        &redirect_uri,
-        &pkce.verifier,
-        &reg.client_id,
-        reg.client_secret.as_deref(),
-        server_url,
-    )
-    .await
-    .map_err(wrap)?;
-
-    let data = McpAuthData {
-        server_url: server_url.to_string(),
-        tokens: Some(tokens),
-        client_id: reg.client_id,
-        client_secret: reg.client_secret,
-        client_secret_expires_at: reg.client_secret_expires_at,
-        redirect_uri: Some(redirect_uri),
-        token_endpoint: Some(auth_server.token_endpoint.clone()),
-    };
-
-    save_mcp_auth(storage, server_name, &data)
-        .map_err(|e| wrap(OAuthError::Other(e.to_string())))?;
-    info!(server = server_name, "OAuth authentication complete");
-    Ok(data)
-}
-
-/// Refresh stored tokens without any user interaction. `Ok(None)` means an
-/// interactive flow is required (no stored auth or no refresh token).
-pub async fn silent_refresh(
-    storage: &StateDir,
-    server_name: &str,
-    server_url: &str,
-    ca_file: Option<&Path>,
-) -> Result<Option<McpAuthData>, OAuthError> {
-    let Some(existing) = load_mcp_auth(storage, server_name, server_url) else {
-        return Ok(None);
-    };
-
-    let Some(ref tokens) = existing.tokens else {
-        return Ok(None);
-    };
-
-    if tokens.refresh.is_empty() {
-        return Ok(None);
-    }
-
-    let client = build_client(SILENT_REFRESH_HTTP_TIMEOUT, ca_file).map_err(OAuthError::Other)?;
-
-    // Trust the endpoint pinned at interactive auth over fresh discovery: a
-    // later-compromised server must not redirect the refresh token (and any
-    // static client secret) elsewhere. Pre-pin records fall back to discovery.
-    let token_endpoint = match existing.token_endpoint.clone() {
-        Some(pinned) => pinned,
-        None => {
-            let (_, auth_server) = discover_auth_server_for(&client, server_url, None).await?;
-            auth_server.token_endpoint
-        }
-    };
-
-    let new_tokens = token::refresh_token(
-        &client,
-        &token_endpoint,
-        &tokens.refresh,
-        &existing.client_id,
-        existing.client_secret.as_deref(),
-        server_url,
-    )
-    .await?;
-
-    let data = McpAuthData {
-        tokens: Some(new_tokens),
-        ..existing
-    };
-
-    save_mcp_auth(storage, server_name, &data).map_err(|e| OAuthError::Other(e.to_string()))?;
-    info!(server = server_name, "MCP OAuth tokens refreshed");
-
-    Ok(Some(data))
-}
-
-async fn discover_auth_server_for(
-    client: &HttpClient,
-    server_url: &str,
-    www_auth: Option<&WwwAuthenticateInfo>,
-) -> Result<(Option<ResourceMetadata>, AuthServerMetadata), OAuthError> {
-    // Some servers, like Atlassian's, never publish RFC 9728 resource metadata.
-    // Before 9728 the MCP server was its own auth server, so its origin is a
-    // good guess. If that guess is wrong too, the auth server lookup says so.
-    let resource_meta = discovery::discover_resource_metadata(client, server_url, www_auth)
-        .await
-        .inspect_err(|e| warn!(server_url, error = %e, "no resource metadata, trying server origin as auth server"))
-        .ok();
-    let auth_server_url = resource_meta
-        .as_ref()
-        .and_then(|m| m.authorization_servers.first().cloned())
-        .unwrap_or_else(|| discovery::server_origin(server_url));
-    let auth_server = discovery::discover_auth_server(client, &auth_server_url).await?;
-    Ok((resource_meta, auth_server))
 }
 
 async fn auth_timeout() -> Result<CallbackResult, String> {
@@ -318,100 +361,96 @@ fn is_headless() -> bool {
         && std::env::var_os("WAYLAND_DISPLAY").is_none()
 }
 
-fn build_authorization_url(
-    authorization_endpoint: &str,
-    client_id: &str,
-    redirect_uri: &str,
-    state: &str,
-    code_challenge: &str,
-    scope: Option<&str>,
-    resource: &str,
-) -> Result<String, OAuthError> {
-    let parsed = Url::parse(authorization_endpoint).map_err(|e| {
-        OAuthError::InvalidResponse(format!(
-            "invalid authorization endpoint {authorization_endpoint}: {e}"
-        ))
-    })?;
-    let sep = if parsed.query().is_some() { '&' } else { '?' };
-    let mut url = format!(
-        "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&state={state}&code_challenge={code_challenge}&code_challenge_method=S256&resource={}",
-        token::url_encode(client_id),
-        token::url_encode(redirect_uri),
-        token::url_encode(resource),
-    );
-    if let Some(s) = scope {
-        url.push_str("&scope=");
-        url.push_str(&token::url_encode(s));
-    }
-    Ok(url)
+/// rmcp's registration drops `client_secret_expires_at`, so a secret without a
+/// known expiry may already be dead, and the login registers a new client.
+fn can_reuse_client(record: &McpAuthData, redirect_uri: &str) -> bool {
+    record.redirect_uri.as_deref() == Some(redirect_uri)
+        && (record.client_secret.is_none() || record.client_secret_expires_at.is_some())
+}
+
+fn query_param(url: &str, key: &str) -> Option<String> {
+    Url::parse(url)
+        .ok()?
+        .query_pairs()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{OAuthError, build_authorization_url};
+    use super::*;
     use test_case::test_case;
-    use url::Url;
 
-    const CLIENT_ID: &str = "client-id";
-    const REDIRECT_URI: &str = "http://127.0.0.1:8080/callback";
-    const STATE: &str = "state-value";
-    const CHALLENGE: &str = "challenge-value";
+    const PINNED: &str = "https://auth.example.com/token";
+    const MOVED: &str = "https://evil.example.com/token";
+    const REDIRECT: &str = "http://localhost:3118/callback";
+    const OTHER_REDIRECT: &str = "http://localhost:4000/callback";
+    const SECRET: &str = "secret";
 
-    const SCOPE: &str = "offline#access";
-    const RESOURCE: &str = "https://example.com/resource a b";
-
-    fn query_pairs(url: &str) -> Vec<(String, String)> {
-        let parsed = Url::parse(url).expect("built authorization URL should parse");
-        parsed
-            .query_pairs()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    fn has(pairs: &[(String, String)], key: &str, value: &str) -> bool {
-        pairs.iter().any(|(k, v)| k == key && v == value)
-    }
-
-    #[test_case("https://example.com/authorize", None; "plain_endpoint")]
-    #[test_case("https://mcp-slack.example.com/dcr/authorize?provider=slack", Some("slack"); "slack_provider")]
-    fn builds_authorization_url(endpoint: &str, provider: Option<&str>) {
-        let url = build_authorization_url(
-            endpoint,
-            CLIENT_ID,
-            REDIRECT_URI,
-            STATE,
-            CHALLENGE,
-            Some(SCOPE),
-            RESOURCE,
-        )
-        .expect("endpoint should parse");
-
-        assert!(url.contains("resource=https%3A%2F%2Fexample.com%2Fresource%20a%20b"));
-        assert!(url.contains("scope=offline%23access"));
-
-        let pairs = query_pairs(&url);
-        assert!(has(&pairs, "response_type", "code"));
-        assert!(has(&pairs, "client_id", CLIENT_ID));
-        assert!(has(&pairs, "resource", RESOURCE));
-        assert!(has(&pairs, "scope", SCOPE));
-        if let Some(expected) = provider {
-            assert!(has(&pairs, "provider", expected));
+    fn record(token_endpoint: Option<&str>) -> McpAuthData {
+        McpAuthData {
+            server_url: "https://mcp.example.com/mcp".into(),
+            tokens: None,
+            client_id: "cid".into(),
+            client_secret: None,
+            client_secret_expires_at: None,
+            redirect_uri: None,
+            token_endpoint: token_endpoint.map(Into::into),
+            auth_server: None,
+            resource: None,
         }
     }
 
-    #[test_case("not a url"; "invalid_endpoint")]
-    fn invalid_endpoint_returns_error(endpoint: &str) {
-        assert!(matches!(
-            build_authorization_url(
-                endpoint,
-                CLIENT_ID,
-                REDIRECT_URI,
-                STATE,
-                CHALLENGE,
-                None,
-                RESOURCE
-            ),
-            Err(OAuthError::InvalidResponse(_))
-        ));
+    #[test_case(Some(PINNED), PINNED, true  ; "same_endpoint")]
+    #[test_case(Some(PINNED), MOVED,  false ; "moved_endpoint")]
+    #[test_case(None,         MOVED,  true  ; "never_pinned")]
+    fn discovery_must_match_the_pinned_token_endpoint(
+        pinned: Option<&str>,
+        discovered: &str,
+        allowed: bool,
+    ) {
+        let mut metadata = AuthorizationMetadata::default();
+        metadata.token_endpoint = discovered.into();
+        assert_eq!(check_pin(&record(pinned), &metadata).is_ok(), allowed);
+    }
+
+    #[test_case("https://auth.example.com/token",       true  ; "https")]
+    #[test_case("http://127.0.0.1:8080/token",          true  ; "loopback_ipv4")]
+    #[test_case("http://[::1]:8080/token",              true  ; "loopback_ipv6")]
+    #[test_case("http://localhost:8080/token",          true  ; "localhost")]
+    #[test_case("http://auth.example.com/token",        false ; "plain_http")]
+    #[test_case("http://localhost.evil.example/token",  false ; "localhost_prefix")]
+    #[test_case("ftp://auth.example.com/token",         false ; "other_scheme")]
+    fn discovered_endpoints_must_use_https(token_endpoint: &str, allowed: bool) {
+        let mut metadata = AuthorizationMetadata::default();
+        metadata.authorization_endpoint = PINNED.into();
+        metadata.token_endpoint = token_endpoint.into();
+        assert_eq!(require_https(&metadata).is_ok(), allowed);
+    }
+
+    #[test_case(None,         None,           REDIRECT,       true  ; "public_client")]
+    #[test_case(Some(SECRET), Some(u64::MAX), REDIRECT,       true  ; "secret_with_known_expiry")]
+    #[test_case(Some(SECRET), None,           REDIRECT,       false ; "secret_without_known_expiry")]
+    #[test_case(None,         None,           OTHER_REDIRECT, false ; "other_redirect_uri")]
+    fn login_reuses_a_stored_client(
+        secret: Option<&str>,
+        secret_expires_at: Option<u64>,
+        redirect_uri: &str,
+        reused: bool,
+    ) {
+        let stored = McpAuthData {
+            client_secret: secret.map(Into::into),
+            client_secret_expires_at: secret_expires_at,
+            redirect_uri: Some(REDIRECT.into()),
+            ..record(None)
+        };
+        assert_eq!(can_reuse_client(&stored, redirect_uri), reused);
+    }
+
+    #[test_case("https://a.example/authorize?client_id=x&state=abc", Some("abc") ; "present")]
+    #[test_case("https://a.example/authorize?client_id=x",           None        ; "absent")]
+    #[test_case("not a url",                                           None        ; "invalid")]
+    fn reads_the_state_off_the_authorization_url(url: &str, expected: Option<&str>) {
+        assert_eq!(query_param(url, STATE_PARAM).as_deref(), expected);
     }
 }
