@@ -104,6 +104,9 @@ pub struct Chat {
     pub(crate) answer_tx: Option<flume::Sender<String>>,
     /// Parked while another chat is in front, see `App::set_active_chat`.
     pub(crate) draft: Draft,
+    /// Plugin chat items still running. They outlive the agent turn, so turn
+    /// settlement and Esc leave them in progress.
+    running_items: HashSet<String>,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
@@ -143,6 +146,7 @@ impl Chat {
             inbox: None,
             answer_tx: None,
             draft: Draft::default(),
+            running_items: HashSet::new(),
             pending_turn_usage: None,
             messages_panel,
             finish: None,
@@ -496,7 +500,7 @@ impl Chat {
     }
 
     pub fn stream_reset(&mut self) {
-        self.messages_panel.stream_reset();
+        self.messages_panel.stream_reset_except(&self.running_items);
     }
 
     pub fn flush(&mut self) {
@@ -504,16 +508,24 @@ impl Chat {
     }
 
     pub fn cancel_in_progress(&mut self) {
-        self.messages_panel.cancel_in_progress();
+        self.messages_panel
+            .cancel_in_progress_except(&self.running_items);
     }
 
     pub fn fail_in_progress_with_message(&mut self, message: String) {
-        self.messages_panel.fail_in_progress_with_message(message);
+        self.fail_in_progress_except(message, &HashSet::new());
     }
 
     pub fn fail_in_progress_except(&mut self, message: String, excluded: &HashSet<String>) {
+        let spared = if self.running_items.is_empty() {
+            None
+        } else {
+            let mut spared = excluded.clone();
+            spared.extend(self.running_items.iter().cloned());
+            Some(spared)
+        };
         self.messages_panel
-            .fail_in_progress_except(message, excluded);
+            .fail_in_progress_except(message, spared.as_ref().unwrap_or(excluded));
     }
 
     pub fn push(&mut self, msg: DisplayMessage) {
@@ -614,6 +626,7 @@ impl Chat {
     pub(crate) fn apply_chat_item(&mut self, item: &ChatItem) {
         match item.status {
             ChatItemStatus::Running => {
+                self.running_items.insert(item.id.to_string());
                 self.messages_panel.tool_start(ToolStartEvent {
                     id: item.id.to_string(),
                     tool: Arc::clone(&item.label),
@@ -626,6 +639,7 @@ impl Chat {
                 });
             }
             ChatItemStatus::Done | ChatItemStatus::Failed => {
+                self.running_items.remove(item.id.as_ref());
                 if let Some(detail) = &item.detail {
                     self.messages_panel.update_tool_summary(&item.id, detail);
                 }
@@ -637,6 +651,7 @@ impl Chat {
                     annotation: None,
                     written_path: None,
                     call: None,
+                    backgrounded: false,
                 });
             }
         }
