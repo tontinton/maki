@@ -1,17 +1,29 @@
 use std::env;
+use std::error::Error;
+use std::fmt::Display;
+use std::future::Future;
+use std::iter;
 use std::ops::ControlFlow;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
+use aws_config::Region;
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::environment::EnvironmentVariableRegionProvider;
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::profile::ProfileFileRegionProvider;
+use aws_credential_types::Credentials;
+use aws_credential_types::provider::ProvideCredentials;
+use aws_credential_types::provider::error::CredentialsError;
+use aws_sigv4::http_request::{self as sigv4, SignableBody, SignableRequest, SigningSettings};
+use aws_sigv4::sign::v4;
 use base64::Engine;
 use flume::Sender;
-use hmac::{Hmac, KeyInit, Mac};
 use maki_storage::id::SessionRef;
-use reqwest::Client;
+use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::{Client, Request};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use tokio::task::spawn_blocking;
+use tokio::sync::{Mutex, OnceCell};
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::model::Model;
@@ -21,42 +33,54 @@ use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 use super::shared;
 
 pub(crate) const BEARER_TOKEN_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
-const CONTAINER_CREDENTIALS_URI_ENV: &str = "AWS_CONTAINER_CREDENTIALS_FULL_URI";
+const SKIP_AUTH_ENV: &str = "CLAUDE_CODE_SKIP_BEDROCK_AUTH";
+const BASE_URL_ENV: &str = "ANTHROPIC_BEDROCK_BASE_URL";
 const BEDROCK_API_VERSION: &str = "bedrock-2023-05-31";
 const MIN_EVENTSTREAM_FRAME: usize = 16;
-const CONTAINER_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_REGION: &str = "us-east-1";
+const SIGNING_NAME: &str = "bedrock";
+const CONTENT_TYPE: &str = "content-type";
+const JSON: &str = "application/json";
+const FORBIDDEN: u16 = 403;
+/// Temporary credentials are replaced this long before they expire, so a
+/// request signed with them cannot outlive them. Credentials that live less
+/// than twice as long are replaced halfway instead.
 const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
-const CONTAINER_CREDENTIALS_PENDING: &str =
-    "Bedrock container credentials were not fetched before signing the request";
+/// Claude Code's limit, for a `credential_process` waiting on input it never
+/// gets.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
+const NO_CREDENTIALS_HINT: &str = "set AWS_PROFILE (after `aws sso login` for SSO), AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or AWS_BEARER_TOKEN_BEDROCK";
 
-fn io_error(
-    kind: std::io::ErrorKind,
-    e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-) -> AgentError {
+fn io_error(kind: std::io::ErrorKind, e: impl Into<Box<dyn Error + Send + Sync>>) -> AgentError {
     AgentError::Io(std::io::Error::new(kind, e))
 }
 
-#[derive(Clone)]
-enum AuthKind {
-    SigV4 {
-        access_key: String,
-        secret_key: String,
-        session_token: Option<String>,
-        // epoch seconds; Some only for temporary creds from the container endpoint.
-        expires_at: Option<u64>,
-    },
-    /// Fetched on the first request.
-    ContainerPending,
-    Bearer {
-        token: String,
-    },
-    None,
+enum Auth {
+    /// `AWS_BEARER_TOKEN_BEDROCK`, a Bedrock API key.
+    ApiKey(String),
+    /// `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1`: the gateway at the base URL signs.
+    Gateway,
+    /// SigV4 with credentials from the AWS SDK's default chain.
+    SigV4(CredentialCache),
 }
 
-#[derive(Clone)]
-struct BedrockAuth {
-    kind: AuthKind,
-    region: String,
+impl Auth {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::ApiKey(_) => "api key",
+            Self::Gateway => "gateway",
+            Self::SigV4(_) => "sigv4",
+        }
+    }
+}
+
+/// An empty key counts as unset, as it does for Claude Code.
+fn choose_auth(env_key: Option<String>, skip_auth: bool) -> Auth {
+    match (env_key.filter(|key| !key.is_empty()), skip_auth) {
+        (Some(key), _) => Auth::ApiKey(key),
+        (None, true) => Auth::Gateway,
+        (None, false) => Auth::SigV4(CredentialCache::default()),
+    }
 }
 
 pub(crate) fn is_enabled() -> bool {
@@ -69,336 +93,180 @@ fn resolve_bedrock_top_p() -> Option<f64> {
     maki_config::providers::top_p_for(super::SLUG)
 }
 
-fn resolve_bedrock_auth() -> Result<BedrockAuth, AgentError> {
-    let region = env::var("AWS_REGION").map_err(|_| AgentError::Config {
-        message: "AWS_REGION must be set when using Bedrock".into(),
-    })?;
+fn auth_from_env() -> Auth {
+    let auth = choose_auth(
+        env::var(BEARER_TOKEN_ENV).ok(),
+        env::var(SKIP_AUTH_ENV).is_ok_and(|v| v == "1"),
+    );
+    debug!(auth = auth.name(), "Bedrock auth");
+    auth
+}
 
-    let kind = if let Ok(token) = env::var(BEARER_TOKEN_ENV) {
-        debug!("using Bedrock bearer token auth");
-        AuthKind::Bearer { token }
-    } else if env::var("CLAUDE_CODE_SKIP_BEDROCK_AUTH").is_ok_and(|v| v == "1") {
-        debug!("skipping Bedrock auth (gateway proxy mode)");
-        AuthKind::None
-    } else if let (Ok(access_key), Ok(secret_key)) = (
-        env::var("AWS_ACCESS_KEY_ID"),
-        env::var("AWS_SECRET_ACCESS_KEY"),
-    ) {
-        let session_token = env::var("AWS_SESSION_TOKEN").ok();
-        debug!("using Bedrock SigV4 auth from env vars");
-        AuthKind::SigV4 {
-            access_key,
-            secret_key,
-            session_token,
-            expires_at: None,
+#[derive(Default)]
+struct CredentialCache {
+    /// Held across a lookup, so requests that arrive meanwhile wait for its
+    /// result, and a forget waits for it instead of being overwritten by it.
+    state: Mutex<Cached>,
+}
+
+#[derive(Default)]
+enum Cached {
+    #[default]
+    Empty,
+    Fresh {
+        credentials: Credentials,
+        /// `None` for credentials that do not expire.
+        refresh_at: Option<SystemTime>,
+    },
+    /// The chain found nothing. Kept until the next re-auth, so each request
+    /// does not wait out the instance metadata lookup again.
+    Missing(String),
+}
+
+impl CredentialCache {
+    async fn get<F, Fut>(&self, now: SystemTime, lookup: F) -> Result<Credentials, AgentError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Credentials, CredentialsError>>,
+    {
+        let mut cached = self.state.lock().await;
+        match &*cached {
+            Cached::Fresh {
+                credentials,
+                refresh_at,
+            } if refresh_at.is_none_or(|at| now < at) => return Ok(credentials.clone()),
+            Cached::Missing(message) => return Err(no_credentials(message)),
+            Cached::Fresh { .. } | Cached::Empty => {}
         }
-    } else if env::var(CONTAINER_CREDENTIALS_URI_ENV).is_ok() {
-        debug!("using Bedrock SigV4 auth from container credentials endpoint");
-        AuthKind::ContainerPending
-    } else {
-        let profile = env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
-        let creds_path = env::var("HOME")
-            .map(|h| PathBuf::from(h).join(".aws").join("credentials"))
-            .unwrap_or_default();
-        if let Ok(content) = std::fs::read_to_string(&creds_path)
-            && let Ok((access_key, secret_key, session_token)) =
-                parse_aws_credentials_file(&content, &profile)
+        let error = match lookup().await {
+            Ok(credentials) => {
+                debug!(expiry = ?credentials.expiry(), "resolved AWS credentials for Bedrock");
+                *cached = Cached::Fresh {
+                    refresh_at: refresh_at(&credentials, now),
+                    credentials: credentials.clone(),
+                };
+                return Ok(credentials);
+            }
+            Err(error) => error,
+        };
+        let message = error_chain(&error);
+        if let Cached::Fresh { credentials, .. } = &*cached
+            && !expired(credentials, now)
         {
-            debug!(profile = %profile, "using Bedrock SigV4 auth from credentials file");
-            AuthKind::SigV4 {
-                access_key,
-                secret_key,
-                session_token,
-                expires_at: None,
-            }
-        } else {
-            return Err(AgentError::Config {
-                message: "no AWS credentials found: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, AWS_CONTAINER_CREDENTIALS_FULL_URI, or AWS_BEARER_TOKEN_BEDROCK".into(),
-            });
+            warn!(error = %message, "refreshing AWS credentials failed, keeping the current ones");
+            return Ok(credentials.clone());
         }
+        if matches!(error, CredentialsError::CredentialsNotLoaded(_)) {
+            *cached = Cached::Missing(message.clone());
+        }
+        Err(no_credentials(&message))
+    }
+
+    async fn forget(&self) {
+        *self.state.lock().await = Cached::Empty;
+    }
+}
+
+fn refresh_at(credentials: &Credentials, now: SystemTime) -> Option<SystemTime> {
+    let expiry = credentials.expiry()?;
+    let lifetime = expiry.duration_since(now).unwrap_or_default();
+    Some(expiry - REFRESH_MARGIN.min(lifetime / 2))
+}
+
+fn expired(credentials: &Credentials, now: SystemTime) -> bool {
+    credentials.expiry().is_some_and(|expiry| expiry <= now)
+}
+
+fn no_credentials(message: &str) -> AgentError {
+    AgentError::Config {
+        message: format!("no AWS credentials for Bedrock ({message}): {NO_CREDENTIALS_HINT}"),
+    }
+}
+
+/// Env keys, profiles (static keys, SSO, `credential_process`, assumed roles,
+/// `aws login`), web identity, container and instance credentials. The chain
+/// is built per lookup, so its profile files are read fresh.
+async fn lookup_credentials(region: Region) -> Result<Credentials, CredentialsError> {
+    let lookup = async {
+        let chain = DefaultCredentialsChain::builder()
+            .region(region)
+            .build()
+            .await;
+        chain.provide_credentials().await
     };
-
-    Ok(BedrockAuth { kind, region })
+    timeout(LOOKUP_TIMEOUT, lookup)
+        .await
+        .unwrap_or_else(|_| Err(CredentialsError::provider_timed_out(LOOKUP_TIMEOUT)))
 }
 
-fn parse_aws_credentials_file(
-    content: &str,
-    profile: &str,
-) -> Result<(String, String, Option<String>), AgentError> {
-    let target_section = format!("[{profile}]");
-    let mut in_section = false;
-    let mut access_key = None;
-    let mut secret_key = None;
-    let mut session_token = None;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_section = trimmed == target_section;
-            continue;
-        }
-        if !in_section {
-            continue;
-        }
-        if let Some((key, value)) = trimmed.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            match key {
-                "aws_access_key_id" => access_key = Some(value.to_string()),
-                "aws_secret_access_key" => secret_key = Some(value.to_string()),
-                "aws_session_token" => session_token = Some(value.to_string()),
-                _ => {}
-            }
-        }
-    }
-
-    match (access_key, secret_key) {
-        (Some(ak), Some(sk)) => Ok((ak, sk, session_token)),
-        _ => Err(AgentError::Config {
-            message: format!("profile '{profile}' not found or missing keys in credentials file"),
-        }),
-    }
+fn invoke_request(client: &Client, url: &str) -> Result<Request, AgentError> {
+    let request = client
+        .post(url)
+        .header("user-agent", super::super::user_agent())
+        .header(CONTENT_TYPE, JSON)
+        .build()?;
+    Ok(request)
 }
 
-fn fetch_container_auth() -> Result<AuthKind, AgentError> {
-    let url = env::var(CONTAINER_CREDENTIALS_URI_ENV).map_err(|_| AgentError::Config {
-        message: format!("{CONTAINER_CREDENTIALS_URI_ENV} is no longer set"),
-    })?;
-    let (access_key, secret_key, session_token, expires_at) = fetch_container_credentials(&url)?;
-    Ok(AuthKind::SigV4 {
-        access_key,
-        secret_key,
-        session_token,
-        expires_at,
-    })
+fn set_header(request: &mut Request, name: &str, value: &str) -> Result<(), AgentError> {
+    let name = HeaderName::try_from(name).map_err(signing_error)?;
+    let value = HeaderValue::try_from(value).map_err(signing_error)?;
+    request.headers_mut().insert(name, value);
+    Ok(())
 }
 
-fn fetch_container_credentials(
-    url: &str,
-) -> Result<(String, String, Option<String>, Option<u64>), AgentError> {
-    // file rotates, so don't cache it.
-    let auth_header = match env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
-        Ok(path) => Some(
-            std::fs::read_to_string(&path).map_err(|e| AgentError::Config {
-                message: format!("read container auth token file {path}: {e}"),
-            })?,
-        ),
-        Err(_) => env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN").ok(),
-    };
-
-    let client = super::super::client_builder()
-        .connect_timeout(CONTAINER_METADATA_TIMEOUT)
-        .timeout(CONTAINER_METADATA_TIMEOUT)
-        .build()
-        .map_err(|e| AgentError::Config {
-            message: format!("container creds http client: {e}"),
-        })?;
-
-    let mut builder = client.get(url);
-    if let Some(token) = &auth_header {
-        builder = builder.header("Authorization", token.trim());
-    }
-    let request = builder.build()?;
-
-    let (status, body_text) = super::super::wait(super::super::status_and_text(&client, request))
-        .map_err(|e| AgentError::Config {
-        message: format!("container creds request: {e}"),
-    })?;
-
-    if status != 200 {
-        return Err(AgentError::Config {
-            message: format!("container creds endpoint returned {status}: {body_text}"),
-        });
-    }
-
-    parse_container_credentials_response(&body_text)
-}
-
-fn parse_container_credentials_response(
-    body: &str,
-) -> Result<(String, String, Option<String>, Option<u64>), AgentError> {
-    let v: Value = serde_json::from_str(body)?;
-    let access_key = v
-        .get("AccessKeyId")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| AgentError::Config {
-            message: "container creds response missing AccessKeyId".into(),
-        })?
-        .to_string();
-    let secret_key = v
-        .get("SecretAccessKey")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| AgentError::Config {
-            message: "container creds response missing SecretAccessKey".into(),
-        })?
-        .to_string();
-    let session_token = v.get("Token").and_then(|s| s.as_str()).map(str::to_string);
-    let expires_at = v
-        .get("Expiration")
-        .and_then(|s| s.as_str())
-        .and_then(parse_iso8601_to_epoch);
-    Ok((access_key, secret_key, session_token, expires_at))
-}
-
-// Hand-rolled to avoid pulling in chrono just for this one field.
-fn parse_iso8601_to_epoch(s: &str) -> Option<u64> {
-    let s = s.strip_suffix('Z')?;
-    let (date, time) = s.split_once('T')?;
-    let mut date_parts = date.split('-');
-    let year: u64 = date_parts.next()?.parse().ok()?;
-    let month: u64 = date_parts.next()?.parse().ok()?;
-    let day: u64 = date_parts.next()?.parse().ok()?;
-    let time = time.split('.').next()?; // drop fractional seconds
-    let mut time_parts = time.split(':');
-    let hour: u64 = time_parts.next()?.parse().ok()?;
-    let minute: u64 = time_parts.next()?.parse().ok()?;
-    let second: u64 = time_parts.next()?.parse().ok()?;
-    Some(ymdhms_to_epoch(year, month, day, hour, minute, second))
-}
-
-// Inverse of days_to_ymd. Howard Hinnant's algorithm; valid for any civil date.
-fn ymdhms_to_epoch(year: u64, month: u64, day: u64, hour: u64, minute: u64, second: u64) -> u64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let m = month as i64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i64 - 1;
-    let doe = yoe as i64 * 365 + (yoe / 4) as i64 - (yoe / 100) as i64 + doy;
-    let days_since_epoch = (era as i64 * 146097 + doe - 719468) as u64;
-    days_since_epoch * 86400 + hour * 3600 + minute * 60 + second
-}
-
-#[allow(clippy::too_many_arguments)]
-fn sign_request_sigv4(
-    method: &str,
-    url: &str,
-    headers: &[(&str, &str)],
+/// Signs the method, URL and headers `request` already holds, so the signature
+/// covers what goes out. `content-type` ends up signed next to `host` and the
+/// date, `user-agent` is left out because proxies rewrite it.
+fn sign_request(
+    request: &mut Request,
+    credentials: Credentials,
+    region: &Region,
     body: &[u8],
-    access_key: &str,
-    secret_key: &str,
-    session_token: Option<&str>,
-    region: &str,
-    service: &str,
-    timestamp: &str,
-) -> Vec<(String, String)> {
-    let date = &timestamp[..8];
+    time: SystemTime,
+) -> Result<(), AgentError> {
+    let identity = credentials.into();
+    let params = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(region.as_ref())
+        .name(SIGNING_NAME)
+        .time(time)
+        .settings(SigningSettings::default())
+        .build()
+        .map_err(signing_error)?
+        .into();
+    let headers = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)));
+    let signable = SignableRequest::new(
+        request.method().as_str(),
+        request.url().as_str(),
+        headers,
+        SignableBody::Bytes(body),
+    )
+    .map_err(signing_error)?;
+    let (instructions, _) = sigv4::sign(signable, &params)
+        .map_err(signing_error)?
+        .into_parts();
+    instructions
+        .headers()
+        .try_for_each(|(name, value)| set_header(request, name, value))
+}
 
-    let (_, path, query) = parse_url(url);
-    let payload_hash = hex_sha256(body);
-
-    // 'host' belongs to the HTTP request, so the caller already sets it. If we add
-    // it here too it ends up signed twice and AWS rejects the signature.
-    let mut canonical_headers: Vec<(&str, String)> =
-        headers.iter().map(|(k, v)| (*k, v.to_string())).collect();
-    canonical_headers.push(("x-amz-date", timestamp.to_string()));
-    if let Some(tok) = session_token {
-        canonical_headers.push(("x-amz-security-token", tok.to_string()));
+fn signing_error(e: impl Display) -> AgentError {
+    AgentError::Config {
+        message: format!("signing the Bedrock request: {e}"),
     }
-    canonical_headers.sort_by(|a, b| a.0.cmp(b.0));
+}
 
-    let canonical_headers_str: String = canonical_headers
-        .iter()
-        .map(|(k, v)| format!("{k}:{v}\n"))
-        .collect();
-
-    let signed_headers: String = canonical_headers
-        .iter()
-        .map(|(k, _)| *k)
+/// The SDK's errors keep the useful part (an expired SSO session, a missing
+/// profile) in their sources.
+fn error_chain(error: &(dyn Error + 'static)) -> String {
+    iter::successors(Some(error), |&e| e.source())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
-        .join(";");
-
-    // Bedrock model IDs contain ':', which the URL already spells as '%3A'. SigV4
-    // wants the path percent-encoded again when it goes into the canonical request,
-    // so '%3A' becomes '%253A'. Skip this and the signature will not match.
-    let canonical_path = encode_path(path);
-    let canonical_request = format!(
-        "{method}\n{canonical_path}\n{query}\n{canonical_headers_str}\n{signed_headers}\n{payload_hash}"
-    );
-
-    let credential_scope = format!("{date}/{region}/{service}/aws4_request");
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{timestamp}\n{credential_scope}\n{}",
-        hex_sha256(canonical_request.as_bytes())
-    );
-
-    let signing_key = derive_signing_key(secret_key, date, region, service);
-    let signature = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
-
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
-    );
-
-    let mut result = vec![
-        ("Authorization".into(), authorization),
-        ("x-amz-date".into(), timestamp.into()),
-    ];
-    if let Some(tok) = session_token {
-        result.push(("x-amz-security-token".into(), tok.into()));
-    }
-    result
-}
-
-fn encode_path(path: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(path.len());
-    for b in path.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push('%');
-                out.push(HEX[(b >> 4) as usize] as char);
-                out.push(HEX[(b & 0xF) as usize] as char);
-            }
-        }
-    }
-    out
-}
-
-fn parse_url(url: &str) -> (&str, &str, &str) {
-    let after_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    let (host, path_and_query) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
-    let full_path = if path_and_query.is_empty() {
-        "/"
-    } else {
-        // the leading slash got split off, so we grab it back from the original url
-        let path_start = url.len() - path_and_query.len() - 1;
-        &url[path_start..]
-    };
-    let (path, query) = full_path.split_once('?').unwrap_or((full_path, ""));
-    (host, path, query)
-}
-
-fn hex_sha256(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex_encode(&hasher.finalize())
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-fn derive_signing_key(secret_key: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
-    hmac_sha256(&k_service, b"aws4_request")
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+        .join(": ")
 }
 
 fn decode_eventstream_frame(buf: &[u8]) -> Result<(usize, Option<Vec<u8>>), AgentError> {
@@ -492,44 +360,71 @@ fn decode_eventstream_frame(buf: &[u8]) -> Result<(usize, Option<Vec<u8>>), Agen
 
 pub(crate) struct Bedrock {
     client: Client,
-    auth: Arc<Mutex<BedrockAuth>>,
+    auth: Auth,
     base_url: Option<String>,
     top_p: Option<f64>,
+    /// Resolved on the first request, so building the provider reads nothing.
+    region: OnceCell<Region>,
 }
 
 impl Bedrock {
-    pub fn new(timeouts: super::super::Timeouts) -> Result<Self, AgentError> {
-        // is_available() upstream calls new().is_ok() and discards the error,
-        // so the user sees a generic "no provider available" message. Surface
-        // the real reason here before that happens.
-        let auth = resolve_bedrock_auth().inspect_err(|e| {
-            warn!(error = %e, "Bedrock auth resolution failed");
-        })?;
-        let base_url = env::var("ANTHROPIC_BEDROCK_BASE_URL").ok();
-        Ok(Self {
+    pub fn new(timeouts: super::super::Timeouts) -> Self {
+        Self {
             client: super::super::http_client(timeouts),
-            auth: Arc::new(Mutex::new(auth)),
-            base_url,
+            auth: auth_from_env(),
+            base_url: env::var(BASE_URL_ENV).ok(),
             top_p: resolve_bedrock_top_p(),
-        })
+            region: OnceCell::new(),
+        }
     }
 
-    fn needs_refresh(&self) -> bool {
-        let auth = self.auth.lock().unwrap();
-        match &auth.kind {
-            AuthKind::ContainerPending => true,
-            AuthKind::SigV4 {
-                expires_at: Some(exp),
-                ..
-            } => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                now + REFRESH_MARGIN.as_secs() >= *exp
+    async fn authorize(
+        &self,
+        request: &mut Request,
+        body: &[u8],
+        region: &Region,
+    ) -> Result<(), AgentError> {
+        match &self.auth {
+            Auth::ApiKey(key) => set_header(
+                request,
+                super::super::AUTHORIZATION_HEADER,
+                &super::super::bearer_value(key),
+            ),
+            Auth::Gateway => Ok(()),
+            Auth::SigV4(cache) => {
+                let now = SystemTime::now();
+                let credentials = cache
+                    .get(now, || lookup_credentials(region.clone()))
+                    .await?;
+                sign_request(request, credentials, region, body, now)
             }
-            _ => false,
         }
+    }
+
+    /// The next request asks the credential chain again, which picks up a new
+    /// `aws sso login` or rotated keys. The region stays until a restart.
+    async fn forget_credentials(&self) {
+        if let Auth::SigV4(cache) = &self.auth {
+            cache.forget().await;
+        }
+    }
+
+    /// Claude Code's order: `AWS_REGION`, `AWS_DEFAULT_REGION`, the profile's
+    /// region, then `us-east-1`.
+    async fn region(&self) -> &Region {
+        self.region
+            .get_or_init(|| async {
+                let chain =
+                    RegionProviderChain::first_try(EnvironmentVariableRegionProvider::new())
+                        .or_else(ProfileFileRegionProvider::new());
+                let region = chain
+                    .region()
+                    .await
+                    .unwrap_or_else(|| Region::from_static(DEFAULT_REGION));
+                debug!(%region, "resolved Bedrock region");
+                region
+            })
+            .await
     }
 }
 
@@ -545,12 +440,7 @@ impl Provider for Bedrock {
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            if self.needs_refresh() {
-                debug!("Bedrock container creds missing or near expiry, fetching before request");
-                let kind = spawn_blocking(fetch_container_auth).await??;
-                self.auth.lock().unwrap().kind = kind;
-            }
-            let auth = self.auth.lock().unwrap().clone();
+            let region = self.region().await;
             let requested_id = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| model.id.clone());
             let long_context = requested_id.ends_with(shared::LONG_CONTEXT_SUFFIX);
             let model_id = shared::strip_long_context(&requested_id).to_string();
@@ -591,66 +481,24 @@ impl Provider for Bedrock {
             let url = match &self.base_url {
                 Some(base) => format!("{base}/model/{encoded_model}/invoke-with-response-stream"),
                 None => format!(
-                    "https://bedrock-runtime.{}.amazonaws.com/model/{encoded_model}/invoke-with-response-stream",
-                    auth.region
+                    "https://bedrock-runtime.{region}.amazonaws.com/model/{encoded_model}/invoke-with-response-stream"
                 ),
             };
 
             let json_body = serde_json::to_vec(&body)?;
+            let mut request = invoke_request(&self.client, &url)?;
+            self.authorize(&mut request, &json_body, region).await?;
+            *request.body_mut() = Some(json_body.into());
 
-            let (host, _, _) = parse_url(&url);
-            let host = host.to_string();
-            let extra_headers = vec![("content-type", "application/json"), ("host", &host)];
-
-            let timestamp = now_timestamp();
-            let signing_headers = match &auth.kind {
-                AuthKind::SigV4 {
-                    access_key,
-                    secret_key,
-                    session_token,
-                    expires_at: _,
-                } => Some(sign_request_sigv4(
-                    "POST",
-                    &url,
-                    &extra_headers,
-                    &json_body,
-                    access_key,
-                    secret_key,
-                    session_token.as_deref(),
-                    &auth.region,
-                    "bedrock",
-                    &timestamp,
-                )),
-                AuthKind::Bearer { token } => {
-                    Some(vec![("Authorization".into(), format!("Bearer {token}"))])
-                }
-                AuthKind::None => None,
-                AuthKind::ContainerPending => {
-                    return Err(AgentError::Config {
-                        message: CONTAINER_CREDENTIALS_PENDING.into(),
-                    });
-                }
-            };
-
-            let mut builder = self
-                .client
-                .post(&url)
-                .header("user-agent", super::super::user_agent());
-            for (k, v) in &extra_headers {
-                builder = builder.header(*k, *v);
-            }
-            if let Some(ref sign_hdrs) = signing_headers {
-                for (k, v) in sign_hdrs {
-                    builder = builder.header(k.as_str(), v.as_str());
-                }
-            }
-            let request = builder.body(json_body).build()?;
-
-            debug!(model = %model_id, region = %auth.region, "sending Bedrock request");
+            debug!(model = %model_id, %region, "sending Bedrock request");
 
             let mut response = self.client.execute(request).await?;
             let status = response.status().as_u16();
             if status != 200 {
+                // SigV4 rejections are 403s, which never reach `refresh_auth`.
+                if status == FORBIDDEN {
+                    self.forget_credentials().await;
+                }
                 return Err(AgentError::from_response(response).await);
             }
 
@@ -703,13 +551,15 @@ impl Provider for Bedrock {
         })
     }
 
-    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        Box::pin(async {
-            let new_auth = spawn_blocking(resolve_bedrock_auth).await??;
-            *self.auth.lock().unwrap() = new_auth;
-            debug!("reloaded Bedrock auth from env");
+    fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async move {
+            self.forget_credentials().await;
             Ok(())
         })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        self.refresh_auth()
     }
 }
 
@@ -738,42 +588,50 @@ fn decode_event_payload(payload: &[u8]) -> Result<(String, String), AgentError> 
     Ok((event_type, json))
 }
 
-fn now_timestamp() -> String {
-    use std::time::SystemTime;
-    let dur = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
-    let secs = dur.as_secs();
-    let days = secs / 86400;
-    let day_secs = secs % 86400;
-    let hours = day_secs / 3600;
-    let minutes = (day_secs % 3600) / 60;
-    let seconds = day_secs % 60;
-
-    let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}{month:02}{day:02}T{hours:02}{minutes:02}{seconds:02}Z")
-}
-
-fn days_to_ymd(days_since_epoch: u64) -> (u64, u64, u64) {
-    // Howard Hinnant's date algorithm: http://howardhinnant.github.io/date_algorithms.html
-    let z = days_since_epoch + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::future::{Ready, ready};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::UNIX_EPOCH;
+
+    use reqwest::header::HeaderMap;
+
     use super::*;
     use crate::{ContentBlock, ProviderEvent};
     use test_case::test_case;
+
+    const ACCESS_KEY: &str = "AKID";
+    const OTHER_ACCESS_KEY: &str = "AKID2";
+    const SECRET_KEY: &str = "SECRET";
+    const API_KEY: &str = "bedrock-api-key";
+    const REGION: &str = "us-east-1";
+    const CHAIN_FAILED: &str = "sso endpoint unreachable";
+    /// 2024-01-01T00:00:00Z, when the signature below was pinned.
+    const SIGNED_AT: Duration = Duration::from_secs(1_704_067_200);
+
+    fn credentials(access_key: &str, expiry: Option<SystemTime>) -> Credentials {
+        Credentials::new(access_key, SECRET_KEY, None, expiry, "test")
+    }
+
+    fn signed_headers(url: &str, session_token: Option<&str>) -> HeaderMap {
+        let credentials = Credentials::new(
+            ACCESS_KEY,
+            SECRET_KEY,
+            session_token.map(String::from),
+            None,
+            "test",
+        );
+        let mut request = invoke_request(&Client::new(), url).unwrap();
+        sign_request(
+            &mut request,
+            credentials,
+            &Region::from_static(REGION),
+            b"{}",
+            UNIX_EPOCH + SIGNED_AT,
+        )
+        .unwrap();
+        request.headers().clone()
+    }
 
     #[test]
     fn sigv4_signing_encodes_path_segments() {
@@ -781,25 +639,9 @@ mod tests {
         // was computed against the doubly encoded '%253A' canonical path, so this
         // test fails the moment someone stops re-encoding the path.
         let url = "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/invoke-with-response-stream";
-        let headers = sign_request_sigv4(
-            "POST",
-            url,
-            &[
-                ("content-type", "application/json"),
-                ("host", "bedrock-runtime.us-east-1.amazonaws.com"),
-            ],
-            b"{}",
-            "AKID",
-            "SECRET",
-            None,
-            "us-east-1",
-            "bedrock",
-            "20240101T000000Z",
-        );
-        let auth = headers
-            .iter()
-            .find(|(k, _)| k == "Authorization")
-            .map(|(_, v)| v.as_str())
+        let headers = signed_headers(url, None);
+        let auth = headers[super::super::super::AUTHORIZATION_HEADER]
+            .to_str()
             .unwrap();
         assert!(
             auth.contains(
@@ -812,23 +654,14 @@ mod tests {
     #[test_case(None ; "without_session_token")]
     #[test_case(Some("TOKEN") ; "with_session_token")]
     fn sigv4_signing(session_token: Option<&str>) {
-        let headers = sign_request_sigv4(
-            "POST",
+        let headers = signed_headers(
             "https://bedrock-runtime.us-east-1.amazonaws.com/model/test/invoke",
-            &[
-                ("content-type", "application/json"),
-                ("host", "bedrock-runtime.us-east-1.amazonaws.com"),
-            ],
-            b"{}",
-            "AKID",
-            "SECRET",
             session_token,
-            "us-east-1",
-            "bedrock",
-            "20240101T000000Z",
         );
-        let auth = headers.iter().find(|(k, _)| k == "Authorization").unwrap();
-        assert!(auth.1.starts_with(
+        let auth = headers[super::super::super::AUTHORIZATION_HEADER]
+            .to_str()
+            .unwrap();
+        assert!(auth.starts_with(
             "AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/bedrock/aws4_request"
         ));
         let expected_signed = if session_token.is_some() {
@@ -837,15 +670,146 @@ mod tests {
             "SignedHeaders=content-type;host;x-amz-date"
         };
         assert!(
-            auth.1.contains(expected_signed),
-            "Authorization missing expected SignedHeaders: {}",
-            auth.1
+            auth.contains(expected_signed),
+            "Authorization missing expected SignedHeaders: {auth}"
         );
-        assert!(auth.1.contains("Signature="));
         assert_eq!(
-            headers.iter().any(|(k, _)| k == "x-amz-security-token"),
-            session_token.is_some(),
+            headers
+                .get("x-amz-security-token")
+                .map(|v| v.to_str().unwrap()),
+            session_token
         );
+    }
+
+    #[test_case(Some(API_KEY), true, "api key" ; "key_beats_gateway")]
+    #[test_case(Some(""), false, "sigv4" ; "empty_key_is_unset")]
+    #[test_case(None, true, "gateway" ; "gateway")]
+    #[test_case(None, false, "sigv4" ; "credential_chain")]
+    fn auth_order(env_key: Option<&str>, skip_auth: bool, expected: &str) {
+        assert_eq!(
+            choose_auth(env_key.map(String::from), skip_auth).name(),
+            expected
+        );
+    }
+
+    #[test_case(None, None ; "static_credentials_never_refresh")]
+    #[test_case(Some(3600), Some(3300) ; "five_minutes_early")]
+    #[test_case(Some(240), Some(120) ; "short_lived_halfway")]
+    fn refresh_at_cases(expires_in: Option<u64>, refresh_in: Option<u64>) {
+        let now = SystemTime::now();
+        let expiry = expires_in.map(|secs| now + Duration::from_secs(secs));
+        assert_eq!(
+            refresh_at(&credentials(ACCESS_KEY, expiry), now),
+            refresh_in.map(|secs| now + Duration::from_secs(secs))
+        );
+    }
+
+    fn answer(
+        calls: &AtomicUsize,
+        result: Result<Credentials, CredentialsError>,
+    ) -> impl FnOnce() -> Ready<Result<Credentials, CredentialsError>> + '_ {
+        move || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            ready(result)
+        }
+    }
+
+    fn access_key(result: Result<Credentials, AgentError>) -> String {
+        result.unwrap().access_key_id().to_owned()
+    }
+
+    #[tokio::test]
+    async fn cache_reuses_fresh_credentials() {
+        let (cache, calls, now) = (
+            CredentialCache::default(),
+            AtomicUsize::new(0),
+            SystemTime::now(),
+        );
+        for _ in 0..2 {
+            let found = cache
+                .get(now, answer(&calls, Ok(credentials(ACCESS_KEY, None))))
+                .await;
+            assert_eq!(access_key(found), ACCESS_KEY);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_refreshes_inside_the_margin() {
+        let (cache, calls, now) = (
+            CredentialCache::default(),
+            AtomicUsize::new(0),
+            SystemTime::now(),
+        );
+        let expiry = Some(now + Duration::from_secs(600));
+        cache
+            .get(now, answer(&calls, Ok(credentials(ACCESS_KEY, expiry))))
+            .await
+            .unwrap();
+        let later = now + Duration::from_secs(420);
+        let found = cache
+            .get(
+                later,
+                answer(&calls, Ok(credentials(OTHER_ACCESS_KEY, None))),
+            )
+            .await;
+        assert_eq!(access_key(found), OTHER_ACCESS_KEY);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_keeps_credentials_that_still_work() {
+        let (cache, calls, now) = (
+            CredentialCache::default(),
+            AtomicUsize::new(0),
+            SystemTime::now(),
+        );
+        let expiry = Some(now + Duration::from_secs(600));
+        cache
+            .get(now, answer(&calls, Ok(credentials(ACCESS_KEY, expiry))))
+            .await
+            .unwrap();
+        let later = now + Duration::from_secs(420);
+        let failed = Err(CredentialsError::provider_error(CHAIN_FAILED));
+        let found = cache.get(later, answer(&calls, failed)).await;
+        assert_eq!(access_key(found), ACCESS_KEY);
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_are_remembered_until_forgotten() {
+        let (cache, calls, now) = (
+            CredentialCache::default(),
+            AtomicUsize::new(0),
+            SystemTime::now(),
+        );
+        for _ in 0..2 {
+            let missing = Err(CredentialsError::not_loaded_no_source());
+            assert!(cache.get(now, answer(&calls, missing)).await.is_err());
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        cache.forget().await;
+        let found = cache
+            .get(now, answer(&calls, Ok(credentials(ACCESS_KEY, None))))
+            .await;
+        assert_eq!(access_key(found), ACCESS_KEY);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn transient_failures_are_not_remembered() {
+        let (cache, calls, now) = (
+            CredentialCache::default(),
+            AtomicUsize::new(0),
+            SystemTime::now(),
+        );
+        let failed = Err(CredentialsError::provider_error(CHAIN_FAILED));
+        let error = cache.get(now, answer(&calls, failed)).await.unwrap_err();
+        assert!(error.to_string().contains(CHAIN_FAILED), "{error}");
+        let found = cache
+            .get(now, answer(&calls, Ok(credentials(ACCESS_KEY, None))))
+            .await;
+        assert_eq!(access_key(found), ACCESS_KEY);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     fn build_eventstream_frame(header_name: &str, header_value: &str, payload: &[u8]) -> Vec<u8> {
@@ -903,79 +867,6 @@ mod tests {
         }
     }
 
-    #[test_case("default", "AKID", "SECRET", None ; "default_profile")]
-    #[test_case("myprofile", "MYKEY", "MYSECRET", Some("MYTOKEN") ; "named_profile_with_token")]
-    fn parse_aws_credentials(
-        profile: &str,
-        expected_key: &str,
-        expected_secret: &str,
-        expected_token: Option<&str>,
-    ) {
-        let content = "\
-[default]\n\
-aws_access_key_id = AKID\n\
-aws_secret_access_key = SECRET\n\
-\n\
-[myprofile]\n\
-aws_access_key_id = MYKEY\n\
-aws_secret_access_key = MYSECRET\n\
-aws_session_token = MYTOKEN\n";
-        let (key, secret, token) = parse_aws_credentials_file(content, profile).unwrap();
-        assert_eq!(key, expected_key);
-        assert_eq!(secret, expected_secret);
-        assert_eq!(token.as_deref(), expected_token);
-    }
-
-    #[test]
-    fn parse_aws_credentials_missing_profile_errors() {
-        let content = "[default]\naws_access_key_id = AKID\naws_secret_access_key = SECRET\n";
-        assert!(parse_aws_credentials_file(content, "nonexistent").is_err());
-    }
-
-    #[test]
-    fn parse_container_creds_full_response() {
-        let body = r#"{
-            "AccessKeyId": "ASIA123",
-            "SecretAccessKey": "secret456",
-            "Token": "session789",
-            "Expiration": "2026-05-11T18:00:00Z"
-        }"#;
-        let (ak, sk, tok, exp) = parse_container_credentials_response(body).unwrap();
-        assert_eq!(ak, "ASIA123");
-        assert_eq!(sk, "secret456");
-        assert_eq!(tok.as_deref(), Some("session789"));
-        assert_eq!(exp, Some(1778522400));
-    }
-
-    #[test]
-    fn parse_container_creds_missing_token_is_ok() {
-        let body = r#"{"AccessKeyId":"AKIA1","SecretAccessKey":"s1"}"#;
-        let (ak, sk, tok, exp) = parse_container_credentials_response(body).unwrap();
-        assert_eq!(ak, "AKIA1");
-        assert_eq!(sk, "s1");
-        assert!(tok.is_none());
-        assert!(exp.is_none());
-    }
-
-    #[test]
-    fn parse_container_creds_missing_required_field_errors() {
-        let body = r#"{"SecretAccessKey":"s1"}"#;
-        assert!(parse_container_credentials_response(body).is_err());
-    }
-
-    #[test_case("2026-05-11T18:00:00Z",      Some(1778522400) ; "plain_seconds")]
-    #[test_case("2026-05-11T18:00:00.123Z",  Some(1778522400) ; "fractional_dropped")]
-    #[test_case("2024-01-01T00:00:00Z",      Some(1704067200) ; "epoch_2024")]
-    #[test_case("1970-01-01T00:00:00Z",      Some(0)          ; "unix_epoch")]
-    #[test_case("2000-02-29T23:59:59Z",      Some(951868799)  ; "leap_day")]
-    #[test_case("2024-12-31T23:59:59Z",      Some(1735689599) ; "year_end")]
-    #[test_case("2100-03-01T00:00:00Z",      Some(4107542400) ; "century_non_leap")]
-    #[test_case("not a date",                None              ; "garbage")]
-    #[test_case("2026-05-11T18:00:00",       None              ; "missing_z")]
-    fn iso8601_parse(input: &str, expected: Option<u64>) {
-        assert_eq!(parse_iso8601_to_epoch(input), expected);
-    }
-
     #[tokio::test]
     async fn event_parser_text_stream() {
         let (tx, rx) = flume::unbounded();
@@ -1019,20 +910,5 @@ aws_session_token = MYTOKEN\n";
             rx.drain()
                 .any(|e| matches!(e, ProviderEvent::TextDelta { text } if text == "Hello"))
         );
-    }
-
-    #[test_case("https://host.com/path?q=1", "host.com", "/path", "q=1" ; "with_query")]
-    #[test_case("https://host.com/path", "host.com", "/path", "" ; "without_query")]
-    fn url_parsing(url: &str, expected_host: &str, expected_path: &str, expected_query: &str) {
-        let (host, path, query) = parse_url(url);
-        assert_eq!(host, expected_host);
-        assert_eq!(path, expected_path);
-        assert_eq!(query, expected_query);
-    }
-
-    #[test_case(0, (1970, 1, 1) ; "epoch")]
-    #[test_case(19723, (2024, 1, 1) ; "known_date")]
-    fn days_to_ymd_conversion(days: u64, expected: (u64, u64, u64)) {
-        assert_eq!(days_to_ymd(days), expected);
     }
 }
