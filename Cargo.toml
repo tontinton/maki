@@ -224,6 +224,11 @@ debug = false
 [profile.dev.build-override]
 debug = false
 
+# Fat LTO makes the UI hot paths about 8% faster and the binary 8% smaller. Only
+# release builds pay for it, about 2.5 minutes on an M3 Pro.
+[profile.release]
+lto = true
+
 # crossterm 0.29.0 has no VT input on Windows, so bracketed paste never decodes and a
 # multiline paste submits at the first newline (#336). Pinned to the head of
 # crossterm-rs/crossterm#1030, which lives in refs/pull/1030/head on the upstream repo.
