@@ -34,7 +34,7 @@ futures-rustls = { workspace = true }
 rcgen = { workspace = true }
 open = { workspace = true }
 sha2 = { workspace = true }
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true, features = ["deserialize"] }
 base64 = { workspace = true }
 url = { workspace = true }
 getrandom = { workspace = true }

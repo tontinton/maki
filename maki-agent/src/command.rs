@@ -66,7 +66,7 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
     let yaml = &rest[1..end + 1];
     let body = rest[end + 4..].trim();
 
-    let fm = serde_yaml::from_str(yaml).unwrap_or_default();
+    let fm = serde_saphyr::from_str(yaml).unwrap_or_default();
     (fm, body)
 }
 

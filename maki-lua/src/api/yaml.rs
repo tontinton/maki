@@ -1,5 +1,6 @@
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, LuaSerdeExt, LuaString, Result as LuaResult, Value};
+use serde_saphyr::NonFiniteFloatPolicy;
 
 use super::util::pair::{Pair, pair, try_pair};
 
@@ -12,9 +13,8 @@ use super::util::pair::{Pair, pair, try_pair};
 /// local s, err = maki.yaml.encode({ name = "maki", tags = { "ai", "agent" } })
 /// print(s)
 #[lua_fn]
-fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
-    let serde_val: serde_yaml::Value = try_pair!(lua.from_value(value));
-    Ok(pair(serde_yaml::to_string(&serde_val)))
+fn encode(_lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
+    Ok(pair(serde_saphyr::to_string(&value)))
 }
 
 /// Parse a YAML string into a Lua value. Mappings become tables and
@@ -27,7 +27,15 @@ fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
 /// print(t.name) -- maki
 #[lua_fn]
 fn decode(lua: &Lua, str: LuaString) -> LuaResult<Pair<Value>> {
-    let value = try_pair!(serde_yaml::from_slice::<serde_yaml::Value>(&str.as_bytes()));
+    // The YAML 1.2 core schema: `yes` stays a string and `.inf` is a float.
+    let options = serde_saphyr::options! {
+        strict_booleans: true,
+        non_finite_float_policy: NonFiniteFloatPolicy::PassThrough,
+    };
+    let value: serde_value::Value = try_pair!(serde_saphyr::from_slice_with_options(
+        &str.as_bytes(),
+        options
+    ));
     Ok((Some(lua.to_value(&value)?), None))
 }
 
@@ -64,6 +72,28 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(result, 42);
+    }
+
+    #[test_case("yes", "string" ; "yaml_1_1_boolean_stays_string")]
+    #[test_case("true", "boolean" ; "yaml_1_2_boolean")]
+    #[test_case(".inf", "number" ; "infinity_is_a_float")]
+    fn decode_scalar_type(scalar: &str, expected: &str) {
+        let lua = lua_with_yaml();
+        let result: String = lua
+            .load(format!("return type(yaml.decode('x: {scalar}').x)"))
+            .eval()
+            .unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn decode_keeps_integer_keys() {
+        let lua = lua_with_yaml();
+        let result: String = lua
+            .load("return yaml.decode('200: ok')[200]")
+            .eval()
+            .unwrap();
+        assert_eq!(result, "ok");
     }
 
     #[test_case(r#"":\n  - :\n  bad""# ; "invalid_yaml")]
