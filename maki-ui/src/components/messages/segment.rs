@@ -14,6 +14,7 @@ use std::mem;
 use std::ops::Range;
 use std::time::Duration;
 
+pub(crate) const GUTTER_COLS: u16 = 2;
 const INST_SUFFIX: &str = "__inst";
 const ELAPSED_STEP: Duration = Duration::from_secs(1);
 
@@ -58,6 +59,8 @@ pub(super) struct Segment {
     lines: Vec<Line<'static>>,
     pub images: Vec<InlineImage>,
     pub tool_id: Option<String>,
+    /// First-row marker drawn in a `GUTTER_COLS` wide column left of the body.
+    pub gutter: Option<Span<'static>>,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
     /// collapsed thinking view has no tool_id to route by, so this is how
     /// the click finds its message. Rendering also reads it to give user
@@ -156,13 +159,27 @@ impl Segment {
         }
     }
 
+    /// Columns reserved left of the body at `width`. Zero without a gutter, and
+    /// zero when the pane is too narrow to give the body any room.
+    pub fn gutter_cols(&self, width: u16) -> u16 {
+        if self.gutter.is_some() && width > GUTTER_COLS {
+            GUTTER_COLS
+        } else {
+            0
+        }
+    }
+
+    pub fn body_width(&self, width: u16) -> u16 {
+        width - self.gutter_cols(width)
+    }
+
     pub fn text_height(&self, width: u16) -> u16 {
         if let Some(c) = self.cached_height.get()
             && c.at_width == width
         {
             return c.height;
         }
-        let h = wrap::total_rows(&self.lines, width);
+        let h = wrap::total_rows(&self.lines, self.body_width(width));
         self.cached_height.set(Some(CachedHeight {
             at_width: width,
             height: h,
@@ -179,7 +196,7 @@ impl Segment {
     pub fn rows_from(&self, start_row: u16, width: u16) -> RowWalk<'_> {
         let mut walk = RowWalk {
             lines: &self.lines,
-            measure: wrap::Measure::new(width),
+            measure: wrap::Measure::new(self.body_width(width)),
             next_line: 0,
             row: 0,
         };
@@ -658,5 +675,41 @@ mod tests {
             vec![(0, 0), (5usize.saturating_add_signed(delta), 1)],
             "positions before the splice stay, after it shift by the delta"
         );
+    }
+
+    const WIDTH: u16 = 20;
+
+    fn gutter_seg(text: &str) -> Segment {
+        Segment {
+            gutter: Some(Span::raw("● ")),
+            ..Segment::with_lines(vec![Line::raw(text.to_owned())], None)
+        }
+    }
+
+    #[test]
+    fn gutter_reduces_body_width_for_height() {
+        let text = "x".repeat(100);
+        let plain = Segment::with_lines(vec![Line::raw(text.clone())], None);
+        assert_eq!(
+            gutter_seg(&text).height(WIDTH),
+            plain.height(WIDTH - GUTTER_COLS)
+        );
+    }
+
+    #[test]
+    fn gutter_dropped_when_pane_too_narrow() {
+        let seg = gutter_seg("x");
+        assert_eq!(seg.gutter_cols(GUTTER_COLS), 0);
+        assert_eq!(seg.gutter_cols(GUTTER_COLS + 1), GUTTER_COLS);
+    }
+
+    #[test]
+    fn rows_from_uses_body_width() {
+        let body = usize::from(WIDTH - GUTTER_COLS);
+        let mut seg = gutter_seg("");
+        seg.set_lines(vec![Line::raw("a".repeat(body + 1)), Line::raw("b")]);
+        assert_eq!(seg.source_line_at(0, WIDTH), Some(0));
+        assert_eq!(seg.source_line_at(1, WIDTH), Some(0));
+        assert_eq!(seg.source_line_at(2, WIDTH), Some(1));
     }
 }
