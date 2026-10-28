@@ -30,6 +30,7 @@ local STOP_PARENT_HINT_FMT = "  Ctrl+S again to stop all of %s"
 local MAIN_TASK_ID = "main"
 local FOOTER_KEYS = { { "Enter", "open" }, { "Ctrl+S", "stop" }, { "Ctrl+D", "delete" }, { "Esc", "cancel" } }
 local HINT_KEY = "Ctrl+X"
+local NESTED_INDENT = "  "
 -- The main chat has no status, so it falls through to MAIN.
 local ICONS = {
   working = { RUNNING_ICON, "accent", true },

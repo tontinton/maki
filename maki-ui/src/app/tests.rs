@@ -50,8 +50,8 @@ use maki_lua::{
     Border, BuiltinAction, ChatItem, ChatItemStatus, Dimension, FloatConfig, HintEntry, HintReader,
     InputRequest, InputRulesReader, InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo,
     LuaCommandReader, Missing, PASTE, PackCommand, PackPlan, PackPreparation, PackReport,
-    Permission, PlanActionOutcome, PlanMenu, PlanRowAction, PluginHost, PluginPermissions,
-    SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
+    Permission, PlanActionOutcome, PluginHost, PluginPermissions, SessionEndReason, Split,
+    TextEdit, UiAction, WinCommand, WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TaskAnswer,
