@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui_image::{
     Image,
@@ -62,7 +62,7 @@ impl RenderCursor {
         }
         let Some(protocol) = image.protocol(self.viewport.width) else {
             let fallback = image.fallback().map(Line::from);
-            self.render(fallback.as_slice(), height, None, false, frame);
+            self.render(fallback.as_slice(), height, None, false, (0, None), frame);
             return;
         };
         let visible_rows = height
@@ -99,6 +99,7 @@ impl RenderCursor {
         h: u16,
         style: Option<Style>,
         highlight: bool,
+        (gutter_cols, marker): (u16, Option<&Span<'static>>),
         frame: &mut Frame,
     ) {
         if self.skip >= h {
@@ -111,11 +112,21 @@ impl RenderCursor {
         let visible_h = h
             .saturating_sub(self.skip)
             .min(self.bottom.saturating_sub(self.y));
-        let seg_area = Rect::new(self.viewport.x, self.y, self.viewport.width, visible_h);
+        let gutter_area = Rect::new(self.viewport.x, self.y, gutter_cols, visible_h);
+        let seg_area = Rect::new(
+            self.viewport.x + gutter_cols,
+            self.y,
+            self.viewport.width - gutter_cols,
+            visible_h,
+        );
         let mut p = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
         let mut base = style.unwrap_or_default();
         if highlight {
             base = base.add_modifier(Modifier::REVERSED);
+        }
+        if gutter_cols > 0 {
+            let marker_line = marker.map_or_else(Line::default, |m| Line::from(m.clone()));
+            frame.render_widget(Paragraph::new(marker_line).style(base), gutter_area);
         }
         p = p.style(base);
         if self.skip > 0 {
@@ -142,6 +153,7 @@ impl RenderCursor {
             self.skip -= h;
             return;
         }
+        let cols = seg.gutter_cols(self.viewport.width);
         let mut walk = seg.rows_from(self.skip, self.viewport.width);
         while self.y < self.bottom
             && let Some((lines, rows)) = walk.next_chunk(self.bottom - self.y)
@@ -150,7 +162,18 @@ impl RenderCursor {
             // only the rows above `skip` inside that line are left to drop.
             // `render` zeroes `skip`, so later chunks drop nothing.
             self.skip = self.skip.saturating_sub(rows.start);
-            self.render(lines, rows.end - rows.start, style, highlight, frame);
+            let marker = seg
+                .gutter
+                .as_ref()
+                .filter(|_| rows.start == 0 && self.skip == 0);
+            self.render(
+                lines,
+                rows.end - rows.start,
+                style,
+                highlight,
+                (cols, marker),
+                frame,
+            );
         }
     }
 }
@@ -163,14 +186,20 @@ mod tests {
     use color_eyre::eyre::Result;
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use maki_providers::{ImageMediaType, ImageSource};
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect, style::Style};
     use ratatui_image::{
         FontSize,
         picker::{Picker, ProtocolType},
     };
     use test_case::test_case;
 
+    use ratatui::{
+        style::Color,
+        text::{Line, Span},
+    };
+
     use super::RenderCursor;
+    use crate::components::messages::segment::{GUTTER_COLS, Segment};
     use crate::terminal_image::InlineImage;
 
     const VIEWPORT: Rect = Rect::new(2, 2, 4, 2);
@@ -253,6 +282,60 @@ mod tests {
         assert_eq!(cursor.skip, 0);
         assert_eq!(cursor.y, VIEWPORT.bottom());
         assert!(cursor.past_bottom());
+        Ok(())
+    }
+
+    const MARKER: &str = "● ";
+    const GUTTER_BG: Color = Color::Blue;
+    const GUTTER_WIDTH: u16 = 8;
+    const BODY: &str = "abcdefghijkl";
+
+    fn gutter_segment() -> Segment {
+        let mut seg = Segment::with_lines(vec![Line::raw(BODY)], None);
+        seg.gutter = Some(Span::raw(MARKER));
+        seg
+    }
+
+    fn draw_rows(seg: &Segment, skip: u16, style: Option<Style>) -> Result<Buffer> {
+        let viewport = Rect::new(0, 0, GUTTER_WIDTH, 4);
+        let mut terminal = Terminal::new(TestBackend::new(GUTTER_WIDTH, 4))?;
+        let frame = terminal.draw(|frame| {
+            RenderCursor::new(skip, viewport).render_segment(seg, style, false, frame);
+        })?;
+        Ok(frame.buffer.clone())
+    }
+
+    fn row_text(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    #[test]
+    fn marker_drawn_in_gutter_and_body_indented() -> Result<()> {
+        let buf = draw_rows(&gutter_segment(), 0, None)?;
+        assert_eq!(row_text(&buf, 0), "● abcdef");
+        assert_eq!(
+            row_text(&buf, 1),
+            format!("{}ghijkl", " ".repeat(GUTTER_COLS.into()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn marker_hidden_when_first_row_scrolled_off() -> Result<()> {
+        let buf = draw_rows(&gutter_segment(), 1, None)?;
+        assert!(!(0..4).any(|y| row_text(&buf, y).contains('●')));
+        assert_eq!(row_text(&buf, 0).trim_end(), "  ghijkl");
+        Ok(())
+    }
+
+    #[test]
+    fn segment_style_fills_gutter() -> Result<()> {
+        let buf = draw_rows(&gutter_segment(), 0, Some(Style::new().bg(GUTTER_BG)))?;
+        for y in 0..2 {
+            for x in 0..GUTTER_COLS {
+                assert_eq!(buf[(x, y)].bg, GUTTER_BG);
+            }
+        }
         Ok(())
     }
 }
