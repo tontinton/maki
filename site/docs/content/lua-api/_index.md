@@ -1820,7 +1820,8 @@ A subagent session with its own conversation history.
 
 Create one with `maki.agent.session()`, then send messages with
 `:prompt()`. The session remembers previous turns, so you can have
-a multi-step conversation.
+a multi-step conversation. `:send()` nudges a prompt that is still
+running.
 
 Always call `:close()` when you are done, on error paths too. The
 garbage collector is a fallback that may never run while the VM sits
@@ -1861,6 +1862,39 @@ local r, err = sess:prompt("What files are in this project?")
 if err then error(err) end
 print(r.text)
 print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
+```
+
+---
+
+### `Session:send()` {#Session-send}
+
+```lua
+Session:send({message})
+```
+
+Hand the subagent a message without waiting, the way a user typing in its
+tab does. A running `:prompt()` picks it up at its next turn boundary, once
+the current reply and its tool calls finish, and the model reads it as a
+user interrupt. The tab draws it when it lands. Messages sent in a burst
+land together.
+
+With no prompt running, or one already past its last turn, the message
+waits. The next `:prompt()` sends it in the same request as its own
+message, just before it, so the first reply already reads it.
+
+**Parameters:**
+
+- `{message}` (`string`) Message to deliver.
+
+**Returns:** (`boolean?`, `string?`) `true`, or `(nil, err)` when the session takes
+no more messages. The errors are the ones `:prompt()` refuses with.
+
+**Example:**
+
+```lua
+-- From another task, while `sess:prompt()` is still running.
+local ok, err = sess:send("New finding: the bug is in parser.rs, focus there.")
+if not ok then maki.log.warn(err) end
 ```
 
 ---

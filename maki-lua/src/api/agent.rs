@@ -20,9 +20,9 @@ use maki_agent::tools::{
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, DoneReason,
-    EMPTY_RESPONSE_MARKER, Envelope, EventSender, EventStreamGuard, History, InputSource,
-    McpSession, RunContext, RunContextBuilder, RunLedger, SessionEvents, SubagentInbox,
-    SubagentInfo, ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
+    EMPTY_RESPONSE_MARKER, EarlierInput, Envelope, EventSender, EventStreamGuard, History,
+    ImageSource, InputSource, McpSession, RunContext, RunContextBuilder, RunLedger, SessionEvents,
+    SubagentInbox, SubagentInfo, ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -985,6 +985,7 @@ async fn session(
     let context: RunContextBuilder =
         Arc::new(move |_, _| RunContext::fixed(system.clone(), tools.clone()));
 
+    let inbox = Arc::new(SubagentInbox::default());
     let state = SessionState {
         params: AgentParams {
             provider,
@@ -1026,7 +1027,6 @@ async fn session(
         answer_rx,
         answer_tx,
         reauth: agent_ctx.reauth,
-        inbox: Arc::new(SubagentInbox::default()),
         cancellation: Arc::clone(&cancellation),
         upstream,
         subagent_info,
@@ -1046,7 +1046,7 @@ async fn session(
             model: Some(state.params.model.spec()),
             opts: Some(state.opts),
             answer_tx: None,
-            inbox: Some(Arc::clone(&state.inbox)),
+            inbox: Some(Arc::clone(&inbox)),
         };
         state.upstream.open_task(info.clone());
         let _ = state.subagent_info.set(info);
@@ -1055,6 +1055,7 @@ async fn session(
     let sess = lua.create_userdata(LuaSession {
         inner: Arc::new(AsyncMutex::new(state)),
         cancellation,
+        inbox,
     })?;
     Ok((Some(sess), None))
 }
@@ -1276,9 +1277,6 @@ struct SessionState {
     answer_rx: Option<Arc<AsyncMutex<flume::Receiver<String>>>>,
     answer_tx: Option<flume::Sender<String>>,
     reauth: bool,
-    /// Shared with the host through [`SubagentInfo`], so a user watching this
-    /// session can queue messages that its next turn boundary picks up.
-    inbox: Arc<SubagentInbox>,
     cancellation: Arc<SessionCancellation>,
     upstream: Upstream,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
@@ -1373,6 +1371,22 @@ impl Drop for PromptSettle {
 }
 
 impl SessionState {
+    /// Why this session takes no more messages, if it does not.
+    fn refusal(&self) -> Option<&'static str> {
+        if self.closed {
+            return Some(SESSION_CLOSED_ERR);
+        }
+        if self.stopped_by_user() {
+            return Some(STOPPED_BY_USER_ERR);
+        }
+        // Its chat session or its plugin may have ended while the plugin kept
+        // the handle.
+        self.background
+            .as_ref()
+            .filter(|b| !b.registry.contains(&self.cancellation.ui_id))
+            .map(|_| CANCELLED_MSG)
+    }
+
     /// Esc in the task's tab, see [`BackgroundSessions::stop`].
     fn stopped_by_user(&self) -> bool {
         self.background
@@ -1404,6 +1418,11 @@ impl SessionState {
 struct LuaSession {
     inner: Arc<AsyncMutex<SessionState>>,
     cancellation: Arc<SessionCancellation>,
+    /// Shared with the host through [`SubagentInfo`], so a user watching this
+    /// session can queue messages that its next turn boundary picks up. Kept
+    /// outside the lock, which a running prompt holds for the whole run, so
+    /// `send` can still reach it.
+    inbox: Arc<SubagentInbox>,
 }
 
 struct SessionCancellation {
@@ -1440,6 +1459,21 @@ impl Drop for LuaSession {
                 smol::spawn(async move { inner.lock().await.close() }).detach();
             }
         }
+    }
+}
+
+fn plugin_input(message: String, opts: RequestOptions) -> AgentInput {
+    AgentInput {
+        message,
+        mode: AgentMode::Build,
+        images: Vec::new(),
+        preamble: Vec::new(),
+        earlier: Vec::new(),
+        thinking: opts.thinking,
+        fast: opts.fast,
+        workflow: false,
+        prompt: None,
+        source: InputSource::Plugin,
     }
 }
 
@@ -1485,6 +1519,7 @@ async fn prompt(
         (true, None) => return Ok(err_pair(TASK_REQUIRED_ERR)),
     };
     let inner = Arc::clone(&this.inner);
+    let inbox = Arc::clone(&this.inbox);
     drop(this);
     let mut guard = match &caller_cancel {
         Some(cancel) => match cancel.race(inner.lock()).await {
@@ -1494,18 +1529,8 @@ async fn prompt(
         None => inner.lock().await,
     };
     let s = &mut *guard;
-    if s.closed {
-        return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
-    }
-    if s.stopped_by_user() {
-        return Ok(err_pair(STOPPED_BY_USER_ERR));
-    }
-    // Its chat session or its plugin may have ended while the plugin kept the
-    // handle. Refuse here, before the prompt reaches the model or the tab.
-    if let Some(background) = &s.background
-        && !background.registry.contains(&s.cancellation.ui_id)
-    {
-        return Ok(err_pair(CANCELLED_MSG));
+    if let Some(refusal) = s.refusal() {
+        return Ok(err_pair(refusal));
     }
     // The user can lower the effort while a monitor sits idle, so we ask the
     // seed again on every prompt. Plan mode is left out on purpose. Each write
@@ -1528,14 +1553,7 @@ async fn prompt(
         }
         _ => None,
     };
-    if s.background.is_some() {
-        // The tab opened with the session, so every prompt shows up the way a
-        // queued message does.
-        let _ = s.sub_event_tx.send(AgentEvent::QueueItemConsumed {
-            text: message.clone(),
-            images: Vec::new(),
-        });
-    } else if s.subagent_info.get().is_none() {
+    if s.background.is_none() && s.subagent_info.get().is_none() {
         let _ = s.subagent_info.set(SubagentInfo {
             parent_tool_use_id: s.cancellation.ui_id.clone(),
             name: s.name.clone(),
@@ -1543,8 +1561,26 @@ async fn prompt(
             model: Some(s.params.model.spec()),
             opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
-            inbox: Some(Arc::clone(&s.inbox)),
+            inbox: Some(Arc::clone(&inbox)),
         });
+    }
+    // The run only reads the inbox after a turn, so a message sent while we
+    // sat idle would cost a reply that ignores it plus one more turn. It rides
+    // in front of the prompt instead.
+    let waiting = inbox.drain();
+    let consumed = |text: &str, images: &[ImageSource]| {
+        let _ = s.sub_event_tx.send(AgentEvent::QueueItemConsumed {
+            text: text.to_owned(),
+            images: images.to_vec(),
+        });
+    };
+    for input in &waiting {
+        consumed(&input.message, &input.images);
+    }
+    // The tab opened with the session, so every prompt shows up the way a
+    // queued message does.
+    if s.background.is_some() {
+        consumed(&message, &[]);
     }
 
     // A cancel drops the run future, here in the race or with the whole task,
@@ -1563,7 +1599,7 @@ async fn prompt(
         },
     )
     .with_reauth(s.reauth)
-    .with_interrupt_source(Arc::clone(&s.inbox) as Arc<dyn maki_agent::InterruptSource>)
+    .with_interrupt_source(inbox as Arc<dyn maki_agent::InterruptSource>)
     .with_loaded_instructions(s.loaded_instructions.clone(), s.instruction_files.clone())
     .with_cancel(s.child_cancel.clone())
     .with_mcp(s.mcp.clone())
@@ -1572,19 +1608,10 @@ async fn prompt(
         agent = agent.with_user_response_rx(Arc::clone(rx));
     }
 
-    let input = AgentInput {
-        message,
-        mode: AgentMode::Build,
-        images: Vec::new(),
-        preamble: Vec::new(),
-        earlier: Vec::new(),
-        thinking: s.opts.thinking,
-        fast: s.opts.fast,
-        workflow: false,
-        prompt: None,
-        source: InputSource::Plugin,
-    };
-    let run = agent.run(input);
+    let run = agent.run(AgentInput {
+        earlier: waiting.into_iter().map(EarlierInput::from).collect(),
+        ..plugin_input(message, s.opts)
+    });
     let finished = match &watch {
         Some((caller_cancel, _)) => caller_cancel.race(run).await.ok(),
         None => Some(run.await),
@@ -1675,6 +1702,35 @@ async fn prompt(
     Ok((Some(tbl), None))
 }
 
+/// Hand the subagent a message without waiting, the way a user typing in its
+/// tab does. A running `:prompt()` picks it up at its next turn boundary, once
+/// the current reply and its tool calls finish, and the model reads it as a
+/// user interrupt. The tab draws it when it lands. Messages sent in a burst
+/// land together.
+///
+/// With no prompt running, or one already past its last turn, the message
+/// waits. The next `:prompt()` sends it in the same request as its own
+/// message, just before it, so the first reply already reads it.
+///
+/// @param message string Message to deliver.
+/// @return (boolean?, string?) `true`, or `(nil, err)` when the session takes
+/// no more messages. The errors are the ones `:prompt()` refuses with.
+/// @example
+/// -- From another task, while `sess:prompt()` is still running.
+/// local ok, err = sess:send("New finding: the bug is in parser.rs, focus there.")
+/// if not ok then maki.log.warn(err) end
+#[lua_fn]
+fn send(_lua: &Lua, this: &LuaSession, message: String) -> LuaResult<Pair<bool>> {
+    // A held lock means a prompt is running. A sent message never picks the
+    // run's settings, so the options here are inert.
+    if let Some(refusal) = this.inner.try_lock().and_then(|s| s.refusal()) {
+        return Ok(err_pair(refusal));
+    }
+    this.inbox
+        .push(plugin_input(message, RequestOptions::default()));
+    Ok((Some(true), None))
+}
+
 /// Close the session and flush its history back to the parent agent. Calling
 /// it more than once is safe.
 ///
@@ -1711,12 +1767,13 @@ lua_class! {
     ///
     /// Create one with `maki.agent.session()`, then send messages with
     /// `:prompt()`. The session remembers previous turns, so you can have
-    /// a multi-step conversation.
+    /// a multi-step conversation. `:send()` nudges a prompt that is still
+    /// running.
     ///
     /// Always call `:close()` when you are done, on error paths too. The
     /// garbage collector is a fallback that may never run while the VM sits
     /// idle, so a session you only drop can stay open for the rest of the run.
-    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close, id]
+    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, send, close, id]
 }
 
 /// Weak Lua ref avoids a reference cycle when the session is stored in userdata.
@@ -1915,6 +1972,9 @@ mod tests {
                             .await
                             .unwrap();
                     assert_eq!(error.as_deref(), Some(SESSION_CLOSED_ERR));
+                    let (_, error) =
+                        send(&lua, &sess.borrow().unwrap(), SESSION_PROMPT.into()).unwrap();
+                    assert_eq!(error.as_deref(), Some(SESSION_CLOSED_ERR));
                     assert!(started_rx.is_empty());
                 }
                 loop {
@@ -2032,6 +2092,121 @@ mod tests {
             requests.recv().unwrap(),
             format!("You analyse evidence.\n{CHILD_INSTRUCTIONS}")
         );
+    }
+
+    const NUDGE: &str = "new finding, hurry up";
+    const INTERRUPT_OPEN: &str = "<user-interrupt>";
+
+    /// Hands the texts of each request's closing user messages to the test,
+    /// then holds the reply until the test lets it go.
+    struct GatedProvider {
+        requests: Sender<Vec<String>>,
+        release: flume::Receiver<()>,
+    }
+
+    impl Provider for GatedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a JsonValue,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let mut user_turn: Vec<String> = messages
+                    .iter()
+                    .rev()
+                    .take_while(|m| matches!(m.role, Role::User))
+                    .filter_map(|m| m.first_text_content().map(str::to_owned))
+                    .collect();
+                user_turn.reverse();
+                self.requests.send(user_turn).unwrap();
+                self.release.recv_async().await.unwrap();
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: CHILD_RESPONSE.into(),
+                        }],
+                        ..Default::default()
+                    },
+                    stop_reason: Some(StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// A nudge sent ahead of a prompt rides in its first request, in front of
+    /// it. One sent mid-prompt waits for the turn boundary and lands as a user
+    /// interrupt in the next request. Either way the tab hears it through the
+    /// same event a message typed there would raise.
+    #[test_case(false ; "before_prompt")]
+    #[test_case(true ; "while_prompt_runs")]
+    fn send_reaches_the_child(mid_prompt: bool) {
+        let lua = Lua::new();
+        let (requests_tx, requests) = flume::unbounded();
+        let (release, release_rx) = flume::unbounded();
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, RUN_ID);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
+        ctx.provider = Arc::new(GatedProvider {
+            requests: requests_tx,
+            release: release_rx,
+        });
+        let nudge = |sess: &AnyUserData| {
+            let sent = send(&lua, &sess.borrow().unwrap(), NUDGE.into()).unwrap();
+            assert_eq!(sent, (Some(true), None));
+        };
+        let run = async {
+            let sess = native_session(&lua, &ctx).await;
+            if !mid_prompt {
+                nudge(&sess);
+            }
+            let (result, requests_seen) = futures::future::join(
+                prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into()),
+                async {
+                    let mut seen = vec![requests.recv_async().await.unwrap()];
+                    if mid_prompt {
+                        nudge(&sess);
+                        release.send(()).unwrap();
+                        seen.push(requests.recv_async().await.unwrap());
+                    }
+                    release.send(()).unwrap();
+                    seen
+                },
+            )
+            .await;
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+            assert!(result.unwrap().1.is_none());
+            if mid_prompt {
+                assert_eq!(requests_seen[0], [SESSION_PROMPT]);
+                let [interrupt] = &requests_seen[1][..] else {
+                    panic!("the interrupt should land alone: {requests_seen:?}");
+                };
+                assert!(interrupt.starts_with(INTERRUPT_OPEN) && interrupt.contains(NUDGE));
+            } else {
+                assert_eq!(requests_seen, [[NUDGE, SESSION_PROMPT]]);
+            }
+        };
+        smol::block_on(futures_lite::future::or(run, async {
+            smol::Timer::after(SESSION_TIMEOUT).await;
+            panic!("the prompt never finished");
+        }));
+        assert!(requests.is_empty());
+        assert!(events.drain().any(|envelope| {
+            matches!(&envelope.event, AgentEvent::QueueItemConsumed { text, .. } if text == NUDGE)
+                && envelope
+                    .subagent
+                    .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
+        }));
     }
 
     fn call(src: &str, input: JsonValue) -> Result<String, String> {

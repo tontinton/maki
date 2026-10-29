@@ -288,14 +288,7 @@ impl InterruptSource for QueueReceiver {
 /// message, the user's most recent intent.
 pub(crate) fn merge_inputs(mut inputs: Vec<AgentInput>) -> Option<AgentInput> {
     let mut last = inputs.pop()?;
-    last.earlier = inputs
-        .into_iter()
-        .map(|earlier| EarlierInput {
-            message: earlier.message,
-            images: earlier.images,
-            preamble: earlier.preamble,
-        })
-        .collect();
+    last.earlier = inputs.into_iter().map(EarlierInput::from).collect();
     Some(last)
 }
 

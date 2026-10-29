@@ -29,6 +29,10 @@ impl SubagentInbox {
         self.lock().is_empty()
     }
 
+    pub fn drain(&self) -> Vec<AgentInput> {
+        self.lock().drain(..).collect()
+    }
+
     pub fn texts(&self) -> Vec<String> {
         self.lock()
             .iter()
@@ -43,11 +47,8 @@ impl SubagentInbox {
 
 impl InterruptSource for SubagentInbox {
     fn poll(&self) -> Option<ExtractedCommand> {
-        let mut items = self.lock();
-        if items.is_empty() {
-            return None;
-        }
-        Some(ExtractedCommand::Interrupt(items.drain(..).collect()))
+        let inputs = self.drain();
+        (!inputs.is_empty()).then_some(ExtractedCommand::Interrupt(inputs))
     }
 }
 

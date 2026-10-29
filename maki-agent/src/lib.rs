@@ -121,6 +121,16 @@ pub struct EarlierInput {
     pub preamble: Vec<Message>,
 }
 
+impl From<AgentInput> for EarlierInput {
+    fn from(input: AgentInput) -> Self {
+        Self {
+            message: input.message,
+            images: input.images,
+            preamble: input.preamble,
+        }
+    }
+}
+
 pub struct AgentInput {
     pub message: String,
     pub mode: AgentMode,
