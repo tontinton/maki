@@ -100,7 +100,7 @@ local function handler(input, ctx)
     local sess_err
     sess, sess_err = maki.agent.session(ctx, prepared.options)
     if sess_err then
-      return { llm_output = sess_err, is_error = true }
+      return { llm_output = prepared.error_context .. sess_err, is_error = true }
     end
     if moved then
       Message.attach(moved, sess)

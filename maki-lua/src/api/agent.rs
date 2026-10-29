@@ -45,6 +45,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::spawn_blocking;
 use tracing::info;
 
+use crate::api::model::stale_tier_err;
 use crate::api::session::{not_live, required_session};
 use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
@@ -77,24 +78,37 @@ const MCP_REACH_ERR: &str =
 const TASK_REQUIRED_ERR: &str = "maki.agent.session({ session = id }) and its prompts must run \
      in a task: maki.async.spawn, an autocmd callback or a tool handler";
 
-fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
+/// Also returns the tier when the user's assignment picked the model. A curated
+/// default that does not resolve falls back quietly. An assigned model is an
+/// error instead, because running some other model would hide the stale
+/// assignment from the user. Headless loads the models.dev catalog only for
+/// the main model, so a catalog provider's spec has to warm it here first.
+async fn resolve_model_from_ctx(
+    ctx: &AgentContext,
+    tier: Option<&str>,
+) -> Result<(Model, Option<ModelTier>), String> {
     let Some(tier_str) = tier else {
-        return Ok(Model::clone(&ctx.model));
+        return Ok((Model::clone(&ctx.model), None));
     };
     let requested = tier_str.parse::<ModelTier>().map_err(|e| e.to_string())?;
     let effective = requested.capped_at(ctx.model.tier);
     if effective == ctx.model.tier {
-        return Ok(Model::clone(&ctx.model));
+        return Ok((Model::clone(&ctx.model), None));
     }
     let slug = &ctx.model.provider;
-    model_registry::resolve_tier(Some(slug), effective)
+    if let Some(spec) = model_registry::resolve_tier(Some(slug), effective)
         .filter(|spec| ctx.model_policy.allows(spec))
-        .and_then(|s| Model::from_spec(&s).ok())
-        .map(Ok)
-        .unwrap_or_else(|| {
-            Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
-                .map_err(|e| e.to_string())
-        })
+    {
+        let assigned = model_registry::override_tiers(&spec).contains(&effective);
+        match Model::from_spec_or_warm_catalog(&spec).await {
+            Ok(model) => return Ok((model, assigned.then_some(effective))),
+            Err(e) if assigned => return Err(stale_tier_err(effective, &spec, e)),
+            Err(_) => {}
+        }
+    }
+    Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
+        .map(|model| (model, None))
+        .map_err(|e| e.to_string())
 }
 
 fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
@@ -484,7 +498,11 @@ fn unattended_answer(event: &AgentEvent) -> Option<String> {
 /// without hard-coding a model name.
 ///
 /// The returned table has fields: `id` (string), `tier` (string),
-/// `provider` (string), `spec` (string).
+/// `provider` (string), `spec` (string), `assigned_tier` (string?).
+/// `assigned_tier` is set when the user assigned this model to that tier, and
+/// nil for an explicit `spec`, the inherited model or a curated default. Mention
+/// it in your errors, since the user may have forgotten the assignment. If an
+/// assigned model no longer resolves, you get an error instead of another model.
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table? Optional fields:
@@ -513,11 +531,16 @@ async fn resolve_model(
         .as_ref()
         .and_then(|t| t.opt::<String>("spec").ok().flatten());
 
-    let model = match spec_str {
-        Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
-        None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref())),
+    let (model, assigned_tier) = match spec_str {
+        Some(ref spec) => (
+            try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
+            None,
+        ),
+        None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref()).await),
     };
-    Ok((Some(model_to_lua_table(&lua, &model)?), None))
+    let tbl = model_to_lua_table(&lua, &model)?;
+    tbl.set("assigned_tier", assigned_tier.map(|tier| tier.to_string()))?;
+    Ok((Some(tbl), None))
 }
 
 /// Build a system prompt from the parent's resolved prompt catalogue.
@@ -2235,6 +2258,11 @@ mod tests {
     const HINTED_TOOL: &str = "hinted_tool";
     const OTHER_TOOL: &str = "other_tool";
     const TOOL_HINT: &str = "Call hinted_tool first.";
+    const SESSION_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+    const ASSIGNED_SPEC: &str = "zai/glm-5";
+    // Malformed on purpose: an unknown slug would warm the catalog, which
+    // fetches models.dev.
+    const STALE_SPEC: &str = "removed-model";
 
     #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
     #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
@@ -3190,25 +3218,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_model_selection_tier_override_beats_the_session_provider() {
+    #[test_case(None ; "unassigned_default_has_no_provenance")]
+    #[test_case(Some(ASSIGNED_SPEC) ; "assignment_beats_the_session_provider")]
+    #[test_case(Some(STALE_SPEC) ; "stale_assignment_fails_instead_of_falling_back")]
+    #[tokio::test]
+    async fn task_model_selection_follows_the_tier_assignment(assigned: Option<&str>) {
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
-        ctx.model = Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap());
+        ctx.model = Arc::new(Model::from_spec(SESSION_SPEC).unwrap());
         let ctx = AgentContext::from(&ctx);
-
-        let same_provider_weak = resolve_model_from_ctx(&ctx, Some("weak")).unwrap().spec();
-        assert!(same_provider_weak.starts_with("anthropic/"));
-
         let dir = tempfile::TempDir::new().unwrap();
-        maki_providers::model_registry::set_and_persist(
-            "zai/glm-5".into(),
-            ModelTier::Weak,
-            &maki_storage::StateDir::from_path(dir.path().to_path_buf()),
-        );
+        if let Some(spec) = assigned {
+            model_registry::set_and_persist(
+                spec.into(),
+                ModelTier::Weak,
+                &maki_storage::StateDir::from_path(dir.path().to_path_buf()),
+            );
+        }
 
-        let model = resolve_model_from_ctx(&ctx, Some("weak")).unwrap();
-        assert_eq!(model.spec(), "zai/glm-5");
-        assert_ne!(model.spec(), same_provider_weak);
+        let resolved = resolve_model_from_ctx(&ctx, Some(ModelTier::Weak.to_string().as_str()))
+            .await
+            .map(|(model, tier)| (model.spec(), tier));
+        match assigned.map(|spec| (spec, Model::from_spec(spec))) {
+            None => {
+                let (spec, tier) = resolved.unwrap();
+                assert_eq!(spec.split_once('/').unwrap().0, &*ctx.model.provider);
+                assert_eq!(tier, None);
+            }
+            Some((spec, Ok(_))) => {
+                assert_eq!(resolved, Ok((spec.to_owned(), Some(ModelTier::Weak))));
+            }
+            Some((spec, Err(cause))) => {
+                assert_eq!(resolved, Err(stale_tier_err(ModelTier::Weak, spec, cause)));
+            }
+        }
     }
 
     fn live_chat() -> (MakiId, SessionMailbox, Arc<AgentSeed>) {

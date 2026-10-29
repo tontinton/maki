@@ -1471,7 +1471,11 @@ You might want a cheaper model for simple subtasks (summaries, classification)
 without hard-coding a model name.
 
 The returned table has fields: `id` (string), `tier` (string),
-`provider` (string), `spec` (string).
+`provider` (string), `spec` (string), `assigned_tier` (string?).
+`assigned_tier` is set when the user assigned this model to that tier, and
+nil for an explicit `spec`, the inherited model or a curated default. Mention
+it in your errors, since the user may have forgotten the assignment. If an
+assigned model no longer resolves, you get an error instead of another model.
 
 **Parameters:**
 

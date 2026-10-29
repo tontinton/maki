@@ -1034,6 +1034,19 @@ impl Model {
         Err(ModelError::UnsupportedProvider(slug.to_string()))
     }
 
+    /// An unknown slug may just mean the models.dev catalog has not been loaded
+    /// yet, so retry once with a warm catalog. This waits for the fetch, which
+    /// is why `from_spec` itself stays non-blocking: the UI draws with it.
+    pub async fn from_spec_or_warm_catalog(spec: &str) -> Result<Self, ModelError> {
+        match Self::from_spec(spec) {
+            Err(ModelError::UnsupportedProvider(_)) => {
+                catalog::warm_catalog().await;
+                Self::from_spec(spec)
+            }
+            result => result,
+        }
+    }
+
     /// Free public models surfaced through the OpenCode provider (Zen/Go),
     /// using the catalog's definition of free (zero input and output price),
     /// the same one that gates `enable_free_models`, plus models a provider's
