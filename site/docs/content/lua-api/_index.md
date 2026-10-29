@@ -1887,7 +1887,9 @@ message, just before it, so the first reply already reads it.
 - `{message}` (`string`) Message to deliver.
 
 **Returns:** (`boolean?`, `string?`) `true`, or `(nil, err)` when the session takes
-no more messages. The errors are the ones `:prompt()` refuses with.
+no more messages. The errors are the ones `:prompt()` refuses with. `true`
+means queued, not delivered: a message still waiting when the session
+closes is dropped.
 
 **Example:**
 

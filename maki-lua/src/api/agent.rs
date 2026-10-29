@@ -1714,7 +1714,9 @@ async fn prompt(
 ///
 /// @param message string Message to deliver.
 /// @return (boolean?, string?) `true`, or `(nil, err)` when the session takes
-/// no more messages. The errors are the ones `:prompt()` refuses with.
+/// no more messages. The errors are the ones `:prompt()` refuses with. `true`
+/// means queued, not delivered: a message still waiting when the session
+/// closes is dropped.
 /// @example
 /// -- From another task, while `sess:prompt()` is still running.
 /// local ok, err = sess:send("New finding: the bug is in parser.rs, focus there.")
