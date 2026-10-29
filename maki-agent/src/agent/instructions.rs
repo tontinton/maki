@@ -209,7 +209,11 @@ fn collect_instruction_files(
 }
 
 pub fn load_instruction_text(cwd: &str, config: &InstructionsConfig) -> String {
-    load_instruction_text_with_global_dir(cwd, maki_storage::paths::config_dir().ok().as_deref(), config)
+    load_instruction_text_with_global_dir(
+        cwd,
+        maki_storage::paths::config_dir().ok().as_deref(),
+        config,
+    )
 }
 
 pub(crate) fn load_instruction_text_with_global_dir(
@@ -229,7 +233,11 @@ pub(crate) fn load_instruction_text_with_global_dir(
 }
 
 pub fn load_instructions(cwd: &str, config: &InstructionsConfig) -> Instructions {
-    load_instructions_with_global_dir(cwd, maki_storage::paths::config_dir().ok().as_deref(), config)
+    load_instructions_with_global_dir(
+        cwd,
+        maki_storage::paths::config_dir().ok().as_deref(),
+        config,
+    )
 }
 
 pub(crate) fn load_instructions_with_global_dir(

@@ -18,6 +18,18 @@ use crate::provider_scripts::{self, MIGRATE_COMMAND, Reference, Script};
 const AUTH_FILE_MODE: u32 = 0o600;
 const WAYLAND_DISPLAY_ENV: &str = "WAYLAND_DISPLAY";
 
+fn kept_line(new: &Path, old_moved_to: &Path) -> String {
+    format!(
+        "kept {}, old copy moved to {}",
+        tilde(new),
+        tilde(old_moved_to)
+    )
+}
+
+fn log_kept(new: &Path, old_moved_to: &Path) {
+    println!("  {}", kept_line(new, old_moved_to));
+}
+
 fn log_move(name: &str, dst: &Path, note: Option<&str>) {
     match note {
         Some(n) => println!("  {name:<22}-> {} ({n})", tilde(dst)),
@@ -91,6 +103,7 @@ fn merge_json_file(legacy: &Path, target: &Path, name: &str) -> Result<()> {
         return Ok(());
     }
 
+    log_kept(target, legacy);
     let legacy_bytes = fs::read(legacy)?;
     let target_bytes = fs::read(target)?;
 
@@ -124,6 +137,7 @@ fn merge_input_history(legacy: &Path, target: &Path) -> Result<()> {
         return Ok(());
     }
 
+    log_kept(target, legacy);
     let target_items: Vec<String> = serde_json::from_slice(&fs::read(target)?).unwrap_or_default();
 
     let mut merged = Vec::with_capacity(target_items.len() + legacy_items.len());
@@ -165,6 +179,7 @@ fn merge_dir(legacy: &Path, target: &Path, subdir: &str, recursive: bool) -> Res
                 moved += m;
                 skipped += s;
             } else {
+                log_kept(&entry_dst, &entry.path());
                 skipped += 1;
             }
         } else {
@@ -310,15 +325,25 @@ fn clipboard_command() -> &'static str {
     }
 }
 
+fn moved_name(src: &Path) -> String {
+    src.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// A plain config file has nothing to merge, so the new copy wins and the old
 /// one is left alone rather than clobbered.
 fn move_if_absent(src: &Path, dst: &Path) -> Result<()> {
-    if !src.exists() || dst.exists() {
+    if !src.exists() {
+        return Ok(());
+    }
+    if dst.exists() {
+        log_kept(dst, src);
         return Ok(());
     }
     move_file(src, dst)?;
-    let name = src.file_name().unwrap_or_default().to_string_lossy();
-    log_move(&name, dst.parent().unwrap_or(dst), None);
+    log_move(&moved_name(src), dst.parent().unwrap_or(dst), None);
     Ok(())
 }
 
@@ -329,17 +354,30 @@ pub fn xdg() -> Result<()> {
     };
 
     let config = paths::config_dir().context("determine config directory")?;
+    let data = paths::data_dir().context("determine data directory")?;
     let state = paths::state_dir().context("determine state directory")?;
     let logs = paths::logs_dir().context("determine log directory")?;
+
+    move_legacy_layout(&legacy, &config, &data, &state, &logs)
+}
+
+fn move_legacy_layout(
+    legacy: &Path,
+    config: &Path,
+    data: &Path,
+    state: &Path,
+    logs: &Path,
+) -> Result<()> {
+    fs::create_dir_all(data).with_context(|| format!("create {}", tilde(data)))?;
 
     println!("Moving files from ~/.maki/ ...\n");
 
     move_auth(&legacy.join("auth"), &state.join("auth"))?;
 
-    merge_dir(&legacy, &state, "sessions", false)?;
-    merge_dir(&legacy, &state, "plans", false)?;
-    merge_dir(&legacy, &state, "projects", true)?;
-    merge_dir(&legacy, &config, "providers", false)?;
+    merge_dir(legacy, state, "sessions", false)?;
+    merge_dir(legacy, state, "plans", false)?;
+    merge_dir(legacy, state, "projects", true)?;
+    merge_dir(legacy, config, "providers", false)?;
 
     for name in [
         "init.lua",
@@ -351,8 +389,21 @@ pub fn xdg() -> Result<()> {
     ] {
         move_if_absent(&legacy.join(name), &config.join(name))?;
     }
-    merge_dir(&legacy, &config, "commands", false)?;
-    merge_dir(&legacy, &config, "themes", false)?;
+    merge_dir(legacy, config, "commands", false)?;
+    merge_dir(legacy, config, "themes", false)?;
+    move_if_absent(
+        &legacy.join("pack-lock.json"),
+        &config.join("pack-lock.json"),
+    )?;
+
+    for name in [
+        "trusted-folders.json",
+        "trusted-folders.lock",
+        "recent-models",
+    ] {
+        move_if_absent(&legacy.join(name), &state.join(name))?;
+    }
+    merge_dir(legacy, data, "site", true)?;
 
     merge_json_file(
         &legacy.join("cwd_latest.json"),
@@ -370,43 +421,42 @@ pub fn xdg() -> Result<()> {
     )?;
 
     for name in ["theme", "model"] {
-        let src = legacy.join(name);
+        let src = &legacy.join(name);
         if src.exists() {
-            let dst = state.join(name);
+            let dst = &state.join(name);
             if dst.exists() {
-                fs::remove_file(&dst)
-                    .with_context(|| format!("remove existing {}", tilde(&dst)))?;
+                fs::remove_file(dst).with_context(|| format!("remove existing {}", tilde(dst)))?;
             }
-            move_file(&src, &dst)?;
-            log_move(name, dst.parent().unwrap_or(&dst), None);
+            move_file(src, dst)?;
+            log_move(name, dst.parent().unwrap_or(dst), None);
         }
     }
 
-    move_logs(&legacy, &logs)?;
+    move_logs(legacy, logs)?;
 
-    let lock_file = legacy.join("maki.log.lock");
+    let lock_file = &legacy.join("maki.log.lock");
     if lock_file.exists() {
-        fs::remove_file(&lock_file).ok();
+        fs::remove_file(lock_file).ok();
     }
 
-    let remaining = list_remaining(&legacy);
+    let remaining = list_remaining(legacy);
     let has_leftovers = !remaining.is_empty();
     let backup = legacy.with_file_name(".maki.bak");
     if has_leftovers {
         fs::create_dir_all(&backup).context("create ~/.maki.bak/")?;
         for name in &remaining {
-            let src = legacy.join(name);
+            let src = &legacy.join(name);
             let dst = backup.join(name);
             if dst.exists() {
                 println!("  {name} (skipped, already in ~/.maki.bak/)");
-            } else if let Err(e) = fs::rename(&src, &dst) {
+            } else if let Err(e) = fs::rename(src, dst) {
                 eprintln!("  warning: could not move {name} to ~/.maki.bak/: {e}");
             }
         }
     }
 
     if legacy.is_dir() {
-        fs::remove_dir_all(&legacy).context("remove ~/.maki/")?;
+        fs::remove_dir_all(legacy).context("remove ~/.maki/")?;
     }
 
     println!(
@@ -419,9 +469,9 @@ pub fn xdg() -> Result<()> {
          \x20 Logs     {}\n\n\
          Per-project settings (.maki/ in your repos) are not affected.\n\n\
          Removed ~/.maki/.",
-        tilde(&config),
-        tilde(&state),
-        tilde(&logs),
+        tilde(config),
+        tilde(state),
+        tilde(logs),
     );
 
     if has_leftovers {
@@ -441,4 +491,123 @@ pub fn xdg() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    const AGENTS: &str = "AGENTS.md";
+    const INIT_LUA: &str = "init.lua";
+    const SESSIONS: &str = "sessions";
+    const SESSION_ID: &str = "abc.json";
+    const TRUST: &str = "trusted-folders.json";
+    const RECENT_MODELS: &str = "recent-models";
+    const PACK_LOCK: &str = "pack-lock.json";
+    const SITE: &str = "site";
+    const SITE_FILE: &str = "pack.lua";
+    const MCP: &str = "mcp.toml";
+
+    fn xdg_layout(root: &Path) -> [PathBuf; 4] {
+        [
+            root.join("config"),
+            root.join("data"),
+            root.join("state"),
+            root.join("logs"),
+        ]
+    }
+
+    fn migrate(legacy: &Path, xdg: &[PathBuf; 4]) -> Result<()> {
+        move_legacy_layout(legacy, &xdg[0], &xdg[1], &xdg[2], &xdg[3])
+    }
+
+    fn write(path: PathBuf, content: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    fn write_json(path: PathBuf, content: &str) {
+        write(path, content);
+    }
+
+    fn full_legacy_tree(legacy: &Path) {
+        write(legacy.join(INIT_LUA), "setup()");
+        write(legacy.join(AGENTS), "global rules");
+        write(legacy.join(MCP), "[server]");
+        write(legacy.join(SESSIONS).join(SESSION_ID), "{}");
+        write_json(legacy.join(TRUST), r#"{"folders":[]}"#);
+        write_json(legacy.join(RECENT_MODELS), r#"["a/b"]"#);
+        write_json(legacy.join(PACK_LOCK), r#"{"packs":{}}"#);
+        write(legacy.join(SITE).join(SITE_FILE), "return {}");
+        write(legacy.join("providers").join("openai.sh"), "echo");
+    }
+
+    #[test]
+    fn migrating_a_full_legacy_tree_leaves_no_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(".maki");
+        let xdg = xdg_layout(root.path());
+        full_legacy_tree(&legacy);
+
+        migrate(&legacy, &xdg).unwrap();
+
+        assert!(!legacy.exists(), "the legacy tree is removed");
+        assert!(
+            !root.path().join(".maki.bak").exists(),
+            "every artifact has a home, so nothing is backed up"
+        );
+        for moved in [
+            xdg[0].join(INIT_LUA),
+            xdg[0].join(AGENTS),
+            xdg[0].join(MCP),
+            xdg[0].join(PACK_LOCK),
+            xdg[0].join("providers").join("openai.sh"),
+            xdg[2].join(SESSIONS).join(SESSION_ID),
+            xdg[2].join(TRUST),
+            xdg[2].join(RECENT_MODELS),
+            xdg[1].join(SITE).join(SITE_FILE),
+        ] {
+            assert!(moved.exists(), "{} should have moved", tilde(&moved));
+        }
+    }
+
+    #[test]
+    fn a_file_in_both_places_is_reported_and_the_new_copy_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(".maki");
+        let xdg = xdg_layout(root.path());
+        write(legacy.join(AGENTS), "old rules");
+        write(xdg[0].join(AGENTS), "new rules");
+
+        migrate(&legacy, &xdg).unwrap();
+
+        let expected = kept_line(&xdg[0].join(AGENTS), &legacy.join(AGENTS));
+        assert!(
+            expected.contains(&tilde(&xdg[0].join(AGENTS)))
+                && expected.contains(&tilde(&legacy.join(AGENTS))),
+            "the report names both copies, got {expected}"
+        );
+        assert_eq!(
+            fs::read_to_string(xdg[0].join(AGENTS)).unwrap(),
+            "new rules",
+            "the new copy is untouched"
+        );
+    }
+
+    #[test]
+    fn moving_global_config_leaves_no_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(".maki");
+        let xdg = xdg_layout(root.path());
+        write(legacy.join(INIT_LUA), "setup()");
+        write(legacy.join(AGENTS), "global rules");
+
+        migrate(&legacy, &xdg).unwrap();
+
+        assert!(xdg[0].join(INIT_LUA).exists());
+        assert!(xdg[0].join(AGENTS).exists());
+        assert!(!root.path().join(".maki.bak").exists());
+    }
 }
