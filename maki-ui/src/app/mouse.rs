@@ -26,8 +26,12 @@ impl App {
             // plain button event, so the selection is read back and routed
             // like a bracketed paste.
             MouseEventKind::Down(MouseButton::Middle) => {
-                self.primary_paste_rx
+                self.text_paste_rx
                     .push(spawn_read(clipboard::read_primary_selection));
+            }
+            // Mouse capture also takes the Windows right-click paste.
+            MouseEventKind::Down(MouseButton::Right) if cfg!(windows) => {
+                self.text_paste_rx.push(spawn_read(clipboard::read_text));
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(zone) = self.zone_at(event.row, event.column) {
@@ -86,12 +90,11 @@ impl App {
         }
     }
 
-    /// The selection is read in the background, so it comes back as a paste
-    /// typed now and waits behind any keys still held, like one from the
-    /// terminal.
-    pub fn poll_primary_paste(&mut self) -> Dirty {
+    /// The text is read in the background, so it comes back as a paste typed
+    /// now and waits behind any keys still held, like one from the terminal.
+    pub fn poll_text_paste(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
-        while let Some(selection) = take_ready(&mut self.primary_paste_rx) {
+        while let Some(selection) = take_ready(&mut self.text_paste_rx) {
             dirty = Dirty::YES;
             if let Some(text) = selection.filter(|text| !text.is_empty()) {
                 let actions = self.update(Msg::Paste(text));

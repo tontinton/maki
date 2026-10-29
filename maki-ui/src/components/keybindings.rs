@@ -128,6 +128,7 @@ pub mod key {
 
     pub const QUIT: Bind = ctrl_bind!('c');
     pub const HELP: Bind = ctrl_bind!('h');
+    pub const PASTE: Bind = ctrl_bind!('v');
     pub const SESSIONS: Bind = ctrl_bind!('p');
     pub const TASKS: Bind = ctrl_bind!('x');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
@@ -481,6 +482,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::EDIT_INPUT.label),
         description: "Edit input in external editor",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::PASTE.label),
+        description: "Paste clipboard image or text",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
