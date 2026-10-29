@@ -156,6 +156,11 @@ pub struct StoredFrame {
     /// resumed process cannot reproduce.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_tools: Vec<Value>,
+    /// The first message sent under this frame. Thinking in the ones before
+    /// it is bound to an older prefix, so Anthropic flags it on every request
+    /// and that is no news. Saved so a restart still knows.
+    #[serde(default)]
+    pub first_message_index: usize,
 }
 
 impl StoredFrame {
@@ -171,6 +176,7 @@ impl StoredFrame {
             facts,
             inherited: FactsUpdate::default(),
             mcp_tools,
+            first_message_index: 0,
         }
     }
 
@@ -183,6 +189,7 @@ impl StoredFrame {
             facts: Some(facts),
             inherited: FactsUpdate::default(),
             mcp_tools: Vec::new(),
+            first_message_index: 0,
         }
     }
 

@@ -68,6 +68,8 @@ const NO_FRAME: &str = "no prompt frame to send the request under";
 /// The reason the API gives when it drops the old model's thinking after a
 /// switch. That is expected and does not mean the prefix moved.
 const MODEL_BINDING_MISMATCH: &str = "model_binding_mismatch";
+const TRANSFORMED_MESSAGE_PREFIX: &str = "messages.";
+const MAX_LOGGED_PATHS: usize = 5;
 const THINKING_DROPPED: &str =
     "The prompt changed under earlier reasoning, so it was dropped to keep the session going.";
 
@@ -733,17 +735,34 @@ impl<'h> Agent<'h> {
         Ok(TurnOutcome::Done(reason))
     }
 
-    /// A thinking block the model can no longer see, or one that failed the
-    /// prefix check and was let through on an account that does not enforce
-    /// it. After a model switch that is normal. Anything else means the
-    /// prefix moved, which an enforcing account answers with a 400.
+    /// Thinking from another model, or from before the frame was rebuilt,
+    /// gets flagged again on every request, so it only earns a debug line.
+    /// Anything else means the prefix moved, which an enforcing account
+    /// answers with a 400. One line per request either way: a resumed session
+    /// once wrote 42 warnings a turn and buried the one that mattered.
     fn note_input_transformations(&self, transformations: &[InputTransformation]) {
-        for t in transformations {
-            if t.reason == MODEL_BINDING_MISMATCH {
-                info!(session = ?self.session_id, model = %self.model.id, kind = %t.kind, path = %t.path, reason = %t.reason, "thinking from another model not carried over");
-            } else {
-                warn!(session = ?self.session_id, model = %self.model.id, kind = %t.kind, path = %t.path, reason = %t.reason, flagged = transformations.len(), "thinking block failed the prefix check");
-            }
+        let first_message = self
+            .history
+            .frame()
+            .map_or(0, |frame| frame.first_message_index);
+        let (expected, unexpected): (Vec<_>, Vec<_>) = transformations
+            .iter()
+            .partition(|t| flagged_every_request(t, first_message));
+        if !expected.is_empty() {
+            let model_switch = expected
+                .iter()
+                .filter(|t| t.reason == MODEL_BINDING_MISMATCH)
+                .count();
+            debug!(session = ?self.session_id, model = %self.model.id, model_switch, older_frame = expected.len() - model_switch, "thinking the API flags on every request");
+        }
+        if let Some(first) = unexpected.first() {
+            let paths = unexpected
+                .iter()
+                .take(MAX_LOGGED_PATHS)
+                .map(|t| t.path.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            warn!(session = ?self.session_id, model = %self.model.id, count = unexpected.len(), kind = %first.kind, reason = %first.reason, paths = %paths, "thinking block failed the prefix check");
         }
     }
 
@@ -1229,6 +1248,16 @@ fn no_frame() -> AgentError {
     }
 }
 
+/// `path` is where the API found the block, like `messages.3.content.0`.
+fn flagged_every_request(t: &InputTransformation, first_message: usize) -> bool {
+    t.reason == MODEL_BINDING_MISMATCH
+        || t.path
+            .strip_prefix(TRANSFORMED_MESSAGE_PREFIX)
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|index| index.parse::<usize>().ok())
+            .is_some_and(|index| index < first_message)
+}
+
 fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
     let wrapped = format!("<user-interrupt>\n{INTERRUPT_NOTE}\n\n{message}\n</user-interrupt>");
     Message {
@@ -1293,6 +1322,7 @@ mod tests {
         "TurnComplete, Done, and the compaction trigger must read one context gauge";
     const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
     const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const FRAME_START: usize = 3;
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -2682,7 +2712,9 @@ mod tests {
         fn restart(&mut self, kept: usize) {
             let mut messages = self.history.as_slice().to_vec();
             messages.truncate(kept);
-            self.history = History::restored(messages).with_frame(self.history.frame().cloned());
+            let saved = serde_json::to_string(&self.history.frame()).unwrap();
+            let frame = serde_json::from_str(&saved).unwrap();
+            self.history = History::restored(messages).with_frame(frame);
         }
 
         fn assert_append_only(&self) {
@@ -2747,6 +2779,7 @@ mod tests {
         let mut h = Harness::new(Vec::new());
         h.run_in(AgentMode::Build);
         let first_frame = h.history.frame().cloned();
+        let sent_before_rebuild = h.history.len();
         change(&h.world);
         let events = h.run_in(AgentMode::Build);
 
@@ -2755,6 +2788,47 @@ mod tests {
             &e.event,
             AgentEvent::Notice { text } if text == FRAME_REBUILT
         )));
+        h.restart(h.history.len());
+        assert_eq!(
+            h.history.frame().unwrap().first_message_index,
+            sent_before_rebuild
+        );
+    }
+
+    /// Messages written after a rewind below the frame's start are sent under
+    /// the frame, so their warnings must still show.
+    #[test]
+    fn rewind_below_the_frame_moves_its_start() {
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build);
+        *h.world.tool.lock().unwrap() = "reloaded";
+        h.run_in(AgentMode::Build);
+        let kept = h.history.frame().unwrap().first_message_index - 1;
+
+        h.history.truncate(kept);
+        assert_eq!(h.history.frame().unwrap().first_message_index, kept);
+        h.restart(kept - 1);
+        assert_eq!(h.history.frame().unwrap().first_message_index, kept - 1);
+    }
+
+    #[test_case("messages.2.content.0", "", true ; "before_the_frame")]
+    #[test_case("messages.3.content.0", "", false ; "under_the_frame")]
+    #[test_case("system.0", "", false ; "outside_the_messages")]
+    #[test_case("messages.3.content.0", MODEL_BINDING_MISMATCH, true ; "model_switch")]
+    fn only_thinking_sent_under_the_frame_by_this_model_is_unexpected(
+        path: &str,
+        reason: &str,
+        flagged_every_time: bool,
+    ) {
+        let flagged = InputTransformation {
+            kind: String::new(),
+            path: path.into(),
+            reason: reason.into(),
+        };
+        assert_eq!(
+            flagged_every_request(&flagged, FRAME_START),
+            flagged_every_time
+        );
     }
 
     /// Swapping maki's prompt for one the host wrote, or back, rebuilds the
