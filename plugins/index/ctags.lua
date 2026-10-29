@@ -17,6 +17,7 @@ local function run_ctags(path)
     "--options=NONE",
     "--output-format=json",
     "--fields=+nKe",
+    "--sort=no",
     "-f",
     "-",
     path,
