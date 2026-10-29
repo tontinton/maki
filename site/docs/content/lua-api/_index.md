@@ -4849,7 +4849,11 @@ it does for a built-in provider.
   the model table when `models` is empty.
 - `system_prefix` (`string`) Text prepended to the system prompt. The
   `google` codec refuses it.
-- `openai` (`table`) Options for `codec = "openai"`, all optional:
+- `openai` (`table`) Options for the openai codecs (`"openai"` and
+  `"openai-responses"`), all optional. On `"openai-responses"` only
+  `thinking` and `thinking_overrides` are honoured: the responses
+  wire writes the standard `reasoning` block, so `field` must stay
+  unset, and the body/header options below are refused:
   - `max_tokens_field` (`string`) Body field carrying the output cap.
     Defaults to `max_tokens`.
   - `include_stream_usage` (`boolean`) Ask for usage on the stream.

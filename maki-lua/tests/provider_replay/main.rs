@@ -10,6 +10,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use serde_json::{Map as JsonMap, Value as JsonValue};
+
 use maki_agent::tools::ToolRegistry;
 use maki_config::providers::builtin_provider;
 use maki_config::{PROVIDER_BUILTINS, PluginsConfig};
@@ -66,13 +68,19 @@ fn isolated_state() -> TempDir {
 /// local gateway. The host comes back instead of being dropped, since a hook
 /// whose host has died answers nothing.
 fn load_bundled(slug: &str) -> PluginHost {
+    load_bundled_with_opts(slug, HashMap::new())
+}
+
+/// `opts` is the `plugins.<name>` table from `maki.setup`, so a golden can
+/// load its plugin the way a user who set that option would.
+fn load_bundled_with_opts(slug: &str, opts: HashMap<String, JsonMap<String, JsonValue>>) -> PluginHost {
     let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).expect(HOST_FAILED);
     plugin::begin_load();
     host.load_builtins(&PluginsConfig {
         enabled: true,
         names: vec![slug.to_owned()],
         packages: Vec::new(),
-        opts: HashMap::new(),
+        opts,
     })
     .expect(LOAD_FAILED);
     plugin::commit_load();

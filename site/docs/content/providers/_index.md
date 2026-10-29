@@ -290,6 +290,7 @@ Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 
 - **Env var**: `MISTRAL_API_KEY`
 - **API**: `https://api.mistral.ai/v1`
+- **Features**: Chat or Responses API (`plugins.mistral.responses_api = true`); reasoning effort high-only, or the ladder each model's card publishes with `plugins.mistral.effort_ladders = true`
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|

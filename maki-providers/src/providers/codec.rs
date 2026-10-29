@@ -209,6 +209,23 @@ impl OpenAiWire {
             .collect()
     }
 
+    /// Whether every field set here is one the responses codec honours. The
+    /// body and header options shape the chat wire only; `thinking` renders
+    /// the responses `reasoning` block, and `thinking_overrides` shapes the
+    /// picker on both. A custom thinking `field` is refused too, since the
+    /// responses pass writes the standard `reasoning` block and would drop it.
+    pub(crate) fn responses_compatible(&self) -> bool {
+        self.max_tokens_field.is_none()
+            && self.include_stream_usage.is_none()
+            && self.headers.is_empty()
+            && self.extra_body.is_none()
+            && self.session_id.is_none()
+            && self
+                .thinking
+                .as_ref()
+                .is_none_or(|t| t.field == EffortField::default())
+    }
+
     /// Applied after everything else that shapes the model, so the provider's
     /// word on thinking is the one that stands.
     pub(crate) fn adjust_model(&self, model: &mut Model) {
@@ -602,7 +619,17 @@ impl Provider for CompatProvider {
                     auth.base_url = Some(resolved);
                 }
                 let mut body = responses::build_body(model, messages, system, tools);
-                // TODO: wire thinking budget into responses API when llama.cpp supports it
+                // A declared dialect renders `reasoning.effort` here, narrowed
+                // by what discovery listed for the model, exactly as the chat
+                // path's thinking pass does. Without one, nothing is sent:
+                // the responses wire's own field, not a fallback the codec
+                // invents.
+                if let Some(thinking) = &self.openai.thinking
+                    && (!thinking.requires_support || model.supports_thinking())
+                {
+                    let dialect = thinking.dialect_for(ctx.discovered.as_ref());
+                    responses::apply_responses_reasoning(&mut body, opts.thinking, model, &dialect);
+                }
                 if let Some(hook) = &self.build_body {
                     body = hook.call(body, &ctx).await?;
                 }
