@@ -9,8 +9,6 @@ use crate::StateDir;
 const FALLBACK_DIR: &str = ".maki";
 const APP_NAME: &str = "maki";
 const PROJECTS_DIR: &str = "projects";
-const SESSIONS_DIR: &str = "sessions";
-const AUTH_DIR: &str = "auth";
 pub(crate) const GIT_MARKER: &str = ".git";
 const UNNAMED_PROJECT: &str = "root";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -287,23 +285,14 @@ pub fn tilde(path: &Path) -> String {
     }
 }
 
-/// The `~/.maki` directory of the pre-XDG layout, if it exists. Only migration
-/// reads this; nothing in the running app resolves paths under it.
+/// The `~/.maki` directory of the pre-XDG layout, if it exists. Migration moves
+/// it and the startup warning names it; nothing in the running app resolves
+/// paths under it.
 pub fn legacy_home_dir() -> Option<PathBuf> {
     etcetera::home_dir()
         .ok()
         .map(|h| h.join(FALLBACK_DIR))
         .filter(|d| d.is_dir())
-}
-
-/// `~/.maki` only when it holds maki's own data, so a stray directory of that
-/// name never reads as a legacy install worth warning about.
-pub fn legacy_data_dir() -> Option<PathBuf> {
-    let legacy = legacy_home_dir()?;
-    [SESSIONS_DIR, AUTH_DIR, PROJECTS_DIR]
-        .iter()
-        .any(|name| legacy.join(name).exists())
-        .then_some(legacy)
 }
 
 /// The global config file `name`, if it exists. Writes still go through

@@ -478,7 +478,17 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 startup_notice: notice.take(),
                 // Read per run: plugins have just (re)loaded, and a script one
                 // of them now replaces is no longer worth a word.
-                startup_alert: provider_scripts::startup_warning(),
+                // An alert, not a status-bar flash: both of these ask the user to
+                // do something about the install, and a 1.5s flash is not long
+                // enough to read let alone act on. Joined so one cannot drop the
+                // other.
+                startup_alert: [
+                    super::legacy_layout_warning(),
+                    provider_scripts::startup_warning(),
+                ]
+                .into_iter()
+                .flatten()
+                .reduce(|shown, next| format!("{shown}\n\n{next}")),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),

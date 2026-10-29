@@ -37,14 +37,16 @@ fn report_warnings(warnings: Vec<String>) {
 
 /// The app no longer reads `~/.maki`, so a user who never migrated would
 /// silently see an empty install. Point them at the command that moves it.
-fn warn_legacy_layout() {
-    if let Some(legacy) = maki_storage::paths::legacy_data_dir() {
-        eprintln!(
-            "warning: found legacy maki data in {}, which maki no longer uses.\n\
-             \x20        Run `maki migrate xdg` to move it to the XDG directories.",
-            maki_storage::paths::tilde(&legacy)
-        );
-    }
+///
+/// Returned rather than printed: `dispatch` runs before the UI takes the
+/// screen, so stderr from here is covered by the alternate screen.
+pub fn legacy_layout_warning() -> Option<String> {
+    let legacy = maki_storage::paths::legacy_home_dir()?;
+    Some(format!(
+        "found legacy maki data in {}, which maki no longer uses. \
+         Run `maki migrate xdg` to move it to the XDG directories.",
+        maki_storage::paths::tilde(&legacy)
+    ))
 }
 
 /// What a builtin that fails to load means for the run in progress.
@@ -212,8 +214,17 @@ fn cli_stack(
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
-    if !matches!(cli.command, Some(Command::Migrate { .. })) {
-        warn_legacy_layout();
+    // Only the TUI and ACP own a channel of their own, and `migrate` is the
+    // command this names. Everything else prints here, including `-p` and the
+    // SDK: an upgrader whose login is still in `~/.maki/auth` fails model
+    // resolution before any UI exists, and this is the only line they get.
+    let prints_here = match &cli.command {
+        Some(Command::Acp { .. } | Command::Migrate { .. }) => false,
+        None => cli.print,
+        Some(_) => true,
+    };
+    if prints_here && let Some(warning) = legacy_layout_warning() {
+        report_warnings(vec![warning]);
     }
     // `--trust` is a grant for this process, so every entry point under it
     // reads the same shared project config the TUI would.

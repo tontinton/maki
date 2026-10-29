@@ -55,6 +55,7 @@ pub fn run(
         },
     )?;
     warnings.extend(provider_scripts::startup_warning());
+    warnings.extend(super::legacy_layout_warning());
     super::report_warnings(warnings);
 
     let timeouts = maki_providers::Timeouts::from(&config.provider);
