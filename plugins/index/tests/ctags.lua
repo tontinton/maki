@@ -24,58 +24,37 @@ case("ctags_parse_tags_keeps_only_real_tags", function()
   eq(tags[2].name, "Foo")
 end)
 
-case("ctags_group_tags_sorts_by_line_and_buckets_kinds", function()
+case("ctags_group_tags_buckets_by_kind_name", function()
   local tags = {
     { name = "b_fn", line = 20, kind = "function" },
     { name = "Widget", line = 3, kind = "class" },
     { name = "a_fn", line = 5, kind = "function" },
-    { name = "Weird", line = 9, kind = "totally_unknown_kind" },
+    { name = "Weird", line = 9 },
   }
   local grouped = ctags.group_tags(tags)
-  eq(grouped.fns[1].name, "a_fn")
-  eq(grouped.fns[2].name, "b_fn")
-  eq(grouped.classes[1].name, "Widget")
+  eq(#grouped["function"], 2)
+  eq(grouped["class"][1].name, "Widget")
   eq(grouped.tags[1].name, "Weird")
 end)
 
-case("ctags_format_outline_is_flat_and_announces_itself", function()
+case("ctags_format_outline_headings_use_the_reported_kind", function()
   local grouped = ctags.group_tags({
-    { name = "add", line = 8, kind = "function" },
-    { name = "Foo", line = 1, kind = "module" },
+    { name = "Widget", line = 1, kind = "class" },
+    { name = "hello", line = 1, ["end"] = 3, kind = "procedure" },
+    { name = "draw", line = 3, ["end"] = 5, kind = "method", scope = "Widget" },
+    { name = "setup", line = 2, kind = "subroutine" },
   })
-  local out = ctags.format_outline("a.ex", grouped)
+  local out = ctags.format_outline("a.tcl", grouped)
   local expected = lines_of({
-    "a.ex (ctags outline)",
-    "mod:",
-    "  Foo [1]",
-    "fns:",
-    "  add [8]",
-  })
-  eq(out, expected)
-end)
-
-case("ctags_format_outline_omits_missing_sections", function()
-  local grouped = ctags.group_tags({ { name = "x", line = 4, kind = "function" } })
-  local out = ctags.format_outline("f.ex", grouped)
-  assert(not out:find("mod:", 1, true), "empty sections must not appear:\n" .. out)
-  assert(not out:find("types:", 1, true), "empty sections must not appear:\n" .. out)
-end)
-
-case("ctags_format_outline_uses_end_lines_and_scope", function()
-  local grouped = ctags.group_tags({
-    { name = "Widget", line = 1, ["end"] = 9, kind = "class" },
-    { name = "draw", line = 3, ["end"] = 5, kind = "member", scope = "Widget" },
-    { name = "init", line = 2, kind = "function" },
-  })
-  local out = ctags.format_outline("a.ex", grouped)
-  local expected = lines_of({
-    "a.ex (ctags outline)",
-    "consts:",
+    "a.tcl (ctags outline)",
+    "class:",
+    "  Widget [1]",
+    "method:",
     "  Widget.draw [3-5]",
-    "classes:",
-    "  Widget [1-9]",
-    "fns:",
-    "  init [2]",
+    "procedure:",
+    "  hello [1-3]",
+    "subroutine:",
+    "  setup [2]",
   })
   eq(out, expected)
 end)

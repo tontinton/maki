@@ -7,47 +7,14 @@
 -- result as a signal to keep the old unsupported error, never as an empty
 -- skeleton.
 
-local SECTION_HEADER = {
-  mod = "mod:",
-  consts = "consts:",
-  types = "types:",
-  classes = "classes:",
-  fns = "fns:",
-  macros = "macros:",
-  tags = "tags:",
-}
-
--- ctags kinds are per-language and mostly stable, so unknown kinds land in
--- "tags" instead of being dropped. Order here is the output order.
-local KIND_TO_SECTION = {
-  module = "mod",
-  namespace = "mod",
-  package = "mod",
-  constant = "consts",
-  variable = "consts",
-  -- Some parsers use "variable" for file-level globals, some for locals.
-  member = "consts",
-  type = "types",
-  typedef = "types",
-  enum = "types",
-  union = "types",
-  struct = "types",
-  interface = "classes",
-  class = "classes",
-  trait = "classes",
-  implementation = "classes",
-  ["function"] = "fns",
-  method = "fns",
-  macro = "macros",
-}
-
-local SECTION_ORDER = { "mod", "consts", "types", "classes", "fns", "macros", "tags" }
+local UNKNOWN_KIND = "tags"
 
 local RUN_TIMEOUT_MS = 15000
 
 local function run_ctags(path)
   local id = maki.fn.jobstart({
     "ctags",
+    "--options=NONE",
     "--output-format=json",
     "--fields=+nKe",
     "-f",
@@ -76,37 +43,35 @@ local function parse_tags(stdout)
   return tags
 end
 
+--- Groups tags by kind name, in file order.
 local function group_tags(tags)
   local grouped = {}
   for _, tag in ipairs(tags) do
-    local section = KIND_TO_SECTION[tag.kind] or "tags"
-    local bucket = grouped[section]
+    local bucket = grouped[tag.kind or UNKNOWN_KIND]
     if not bucket then
       bucket = {}
-      grouped[section] = bucket
+      grouped[tag.kind or UNKNOWN_KIND] = bucket
     end
     bucket[#bucket + 1] = tag
-  end
-  for _, bucket in pairs(grouped) do
-    table.sort(bucket, function(a, b)
-      return a.line < b.line
-    end)
   end
   return grouped
 end
 
 local function format_outline(path, grouped)
+  local kinds = {}
+  for kind in pairs(grouped) do
+    kinds[#kinds + 1] = kind
+  end
+  table.sort(kinds)
+
   local out = { path .. " (ctags outline)" }
-  for _, section in ipairs(SECTION_ORDER) do
-    local bucket = grouped[section]
-    if bucket then
-      out[#out + 1] = SECTION_HEADER[section]
-      for _, item in ipairs(bucket) do
-        local end_line = item["end"]
-        local name = item.scope and (item.scope .. "." .. item.name) or item.name
-        local span = end_line and end_line > item.line and (item.line .. "-" .. end_line) or item.line
-        out[#out + 1] = "  " .. name .. " [" .. span .. "]"
-      end
+  for _, kind in ipairs(kinds) do
+    out[#out + 1] = kind .. ":"
+    for _, item in ipairs(grouped[kind]) do
+      local end_line = item["end"]
+      local name = item.scope and (item.scope .. "." .. item.name) or item.name
+      local span = end_line and end_line > item.line and (item.line .. "-" .. end_line) or item.line
+      out[#out + 1] = "  " .. name .. " [" .. span .. "]"
     end
   end
   return table.concat(out, "\n")
