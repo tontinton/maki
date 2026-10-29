@@ -33,6 +33,7 @@ const KNOWN_BLOCK_TYPES: &[&str] = match ContentBlock::VARIANTS.split_last() {
     Some((_unknown, known)) => known,
     None => &[],
 };
+const MODEL_FALLBACK_MARK: &str = "⚠";
 pub const UNTYPED_BLOCK: &str = "a content block must be an object with a string `type`";
 pub const CONTEXT_UPDATE_WITHOUT_FACTS: &str = "a context_update message must carry its facts";
 /// Facts are only ever written beside a context update, so anywhere else
@@ -717,6 +718,30 @@ pub enum ProviderEvent {
         total: u32,
         cache: u32,
     },
+    ModelFallback(ModelFallback),
+}
+
+/// The API blocked the request on the model that was asked for and answers it
+/// with another one instead. `category` names the policy that blocked it,
+/// such as `cyber`, when the API says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelFallback {
+    pub from: String,
+    pub to: String,
+    pub category: Option<String>,
+}
+
+impl fmt::Display for ModelFallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { from, to, category } = self;
+        let policy = category.as_deref().map_or_else(String::new, |category| {
+            format!(" ({category} safety filter)")
+        });
+        write!(
+            f,
+            "{MODEL_FALLBACK_MARK} Model downgraded: {from} blocked this request{policy}, so {to} is answering instead"
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display, IntoStaticStr)]
@@ -1595,6 +1620,8 @@ mod tests {
     /// Between `Medium` and `High` against [`FALLBACK_MAX_THINKING_BUDGET`].
     const LARGE_BUDGET: u32 = 16_384;
 
+    const DOWNGRADED_CYBER: &str = "⚠ Model downgraded: claude-opus-5-5 blocked this request (cyber safety filter), so claude-opus-5 is answering instead";
+    const DOWNGRADED_UNNAMED: &str = "⚠ Model downgraded: claude-opus-5-5 blocked this request, so claude-opus-5 is answering instead";
     const PROMPT: &str = "fix the flaky login test";
     const UPDATE_TEXT: &str = "<context-update>plan mode is on</context-update>";
     const UPDATE_DATE: &str = "2026-10-02";
@@ -1608,6 +1635,17 @@ mod tests {
     const SERDE_UNKNOWN_VARIANT: &str = "unknown variant";
     const SERDE_INVALID_TYPE: &str = "invalid type";
     const SERDE_MISSING_ID: &str = "missing field `id`";
+
+    #[test_case(Some("cyber"), DOWNGRADED_CYBER ; "names_the_filter")]
+    #[test_case(None, DOWNGRADED_UNNAMED ; "no_category")]
+    fn model_fallback_says_it_was_blocked_and_who_answers(category: Option<&str>, expected: &str) {
+        let fallback = ModelFallback {
+            from: "claude-opus-5-5".into(),
+            to: "claude-opus-5".into(),
+            category: category.map(Into::into),
+        };
+        assert_eq!(fallback.to_string(), expected);
+    }
 
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]

@@ -15,7 +15,7 @@ use super::tool_display::{
     RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info, assistant_style,
     build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
     instructions_search_text, notice_style, search_text_for, thinking_style, truncate_to_header,
-    user_style,
+    user_style, warning_style,
 };
 use super::{
     DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole, ToolStatus, code_view::SectionFlags,
@@ -1568,6 +1568,7 @@ fn message_style(role: &DisplayRole) -> RoleStyle {
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
         DisplayRole::Notice => notice_style(),
+        DisplayRole::Warning => warning_style(),
         DisplayRole::Tool(_) => unreachable!(),
     }
 }

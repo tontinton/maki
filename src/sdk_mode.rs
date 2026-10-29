@@ -43,6 +43,11 @@ use crate::cli::Cli;
 /// An accepted observation's line, such as a background result. It goes out
 /// live only, since the SDK has no history replay.
 const NOTICE_SUBTYPE: &str = "notice";
+/// Claude Code's subtype and fields for an answer served by another model
+/// after a refusal, so SDK callers that already read it need nothing new.
+const MODEL_REFUSAL_FALLBACK_SUBTYPE: &str = "model_refusal_fallback";
+const SESSION_SCOPE: &str = "session";
+const SUBAGENT_SCOPE: &str = "local";
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("bash", "Bash"),
     ("read", "Read"),
@@ -1076,6 +1081,20 @@ impl EventPump {
                 text,
             } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
             AgentEvent::Steered { .. } => {}
+            AgentEvent::ModelFallback(fallback) => {
+                self.writer.emit_system(
+                    MODEL_REFUSAL_FALLBACK_SUBTYPE,
+                    serde_json::json!({
+                        "trigger": "refusal",
+                        "direction": "retry",
+                        "scope": if parent_tool_use_id.is_none() { SESSION_SCOPE } else { SUBAGENT_SCOPE },
+                        "original_model": fallback.from,
+                        "fallback_model": fallback.to,
+                        "api_refusal_category": fallback.category,
+                        "content": fallback.to_string(),
+                    }),
+                )?;
+            }
             AgentEvent::ObservationLine { text } if parent_tool_use_id.is_none() => {
                 self.writer
                     .emit_system(NOTICE_SUBTYPE, serde_json::json!({ "text": text }))?;
@@ -1220,6 +1239,7 @@ mod tests {
     use flume::Receiver;
     use maki_agent::SubagentInfo;
     use maki_config::ToolKey;
+    use maki_providers::ModelFallback;
     use test_case::test_case;
 
     use super::*;
@@ -1615,6 +1635,10 @@ mod tests {
     const SYSTEM_TYPE: &str = "system";
     const RESULT_TYPE: &str = "result";
     const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const DECLINING_MODEL: &str = "claude-opus-5-5";
+    const FALLBACK_MODEL: &str = "claude-opus-5";
+    const REFUSAL_CATEGORY: &str = "cyber";
+    const FALLBACK_CHILD: &str = "toolu_child";
     const CHILD_NOTICE_LINE: &str = "a child's own notice";
     const HOST_NOTICE: &str = "the prompt changed, so the cache starts over";
     const NOTICE_CHILD: &str = "child-1";
@@ -1847,6 +1871,45 @@ mod tests {
         let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
         assert_eq!(wire["is_error"], true);
         assert_eq!(wire["result"], DROP_REASON);
+    }
+
+    /// Claude Code's own notice, so a caller that reads it (SAM's answered-by
+    /// line) learns of the switch the same way from either CLI. A subagent's
+    /// switch is scoped to that subagent.
+    #[test_case(None, SESSION_SCOPE ; "main_thread")]
+    #[test_case(Some(FALLBACK_CHILD), SUBAGENT_SCOPE ; "subagent")]
+    fn a_model_fallback_is_claude_codes_refusal_fallback_notice(parent: Option<&str>, scope: &str) {
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        let fallback = ModelFallback {
+            from: DECLINING_MODEL.into(),
+            to: FALLBACK_MODEL.into(),
+            category: Some(REFUSAL_CATEGORY.into()),
+        };
+        let content = fallback.to_string();
+
+        pump.handle(Envelope {
+            event: AgentEvent::ModelFallback(fallback),
+            subagent: parent.map(|id| SubagentInfo {
+                parent_tool_use_id: id.into(),
+                name: id.into(),
+                prompt: None,
+                model: None,
+                opts: None,
+                answer_tx: None,
+                inbox: None,
+            }),
+            run_id: 0,
+        })
+        .unwrap();
+
+        let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["type"], SYSTEM_TYPE);
+        assert_eq!(wire["subtype"], MODEL_REFUSAL_FALLBACK_SUBTYPE);
+        assert_eq!(wire["scope"], scope);
+        assert_eq!(wire["original_model"], DECLINING_MODEL);
+        assert_eq!(wire["fallback_model"], FALLBACK_MODEL);
+        assert_eq!(wire["api_refusal_category"], REFUSAL_CATEGORY);
+        assert_eq!(wire["content"], content.as_str());
     }
 
     /// The SDK has no history replay, so the line goes out live as a system

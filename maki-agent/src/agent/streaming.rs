@@ -67,6 +67,7 @@ async fn forward_provider_events(
                 total,
                 cache,
             },
+            ProviderEvent::ModelFallback(fallback) => AgentEvent::ModelFallback(fallback),
         };
         if event_tx.send(ae).is_err() {
             break;

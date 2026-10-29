@@ -102,6 +102,19 @@ pub fn notice_style() -> RoleStyle {
     }
 }
 
+pub fn warning_style() -> RoleStyle {
+    let warning = theme::current()
+        .todo_in_progress
+        .add_modifier(ratatui::style::Modifier::BOLD);
+    RoleStyle {
+        prefix: "",
+        text_style: warning,
+        prefix_style: warning,
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
 pub fn done_style() -> RoleStyle {
     RoleStyle {
         prefix: "",

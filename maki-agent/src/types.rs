@@ -8,8 +8,8 @@ use std::time::Duration;
 use flume::{Receiver, Sender};
 use maki_config::ToolKey;
 use maki_providers::{
-    AgentError, ContentBlock, ImageSource, Message, RequestOptions, Role, StopReason, TokenUsage,
-    add_cost,
+    AgentError, ContentBlock, ImageSource, Message, ModelFallback, RequestOptions, Role,
+    StopReason, TokenUsage, add_cost,
 };
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
@@ -726,6 +726,10 @@ pub enum AgentEvent {
     Notice {
         text: String,
     },
+    /// The API blocked the request on the session's model and is answering
+    /// it on another one. Frontends must make this loud: the user picked a
+    /// model and is now reading another one's answer.
+    ModelFallback(ModelFallback),
     /// The transcript line of an observation the loop just accepted, such as
     /// a background result. History keeps the observation, so a restore
     /// shows the same line.

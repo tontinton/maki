@@ -11,8 +11,8 @@ use crate::model::Model;
 use crate::providers::copilot::copilot_usd;
 use crate::types::{is_deferred_tool, rejects_sampling};
 use crate::{
-    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, Message, ProviderEvent,
-    Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, Message, ModelFallback,
+    ProviderEvent, Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
@@ -126,14 +126,36 @@ struct MessageStartEvent {
 enum SseContentBlock {
     Text,
     Thinking,
-    RedactedThinking { data: String },
-    ToolUse { id: String, name: String },
+    RedactedThinking {
+        data: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+    },
+    Fallback {
+        from: SseModelRef,
+        to: SseModelRef,
+        #[serde(default)]
+        trigger: Option<SseFallbackTrigger>,
+    },
+}
+
+#[derive(Deserialize)]
+struct SseModelRef {
+    model: String,
+}
+
+#[derive(Deserialize)]
+struct SseFallbackTrigger {
+    #[serde(default)]
+    category: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ContentBlockStartEvent {
     index: usize,
-    content_block: SseContentBlock,
+    content_block: Value,
 }
 
 #[derive(Deserialize)]
@@ -443,10 +465,13 @@ impl EventParser {
                     }
                 }
             }
-            "content_block_start" => match serde_json::from_str::<ContentBlockStartEvent>(data) {
-                Ok(ev) => {
+            "content_block_start" => match serde_json::from_str::<ContentBlockStartEvent>(data)
+                .and_then(|ev| {
+                    SseContentBlock::deserialize(&ev.content_block).map(|block| (ev, block))
+                }) {
+                Ok((ev, block)) => {
                     self.current_block_idx = ev.index;
-                    match ev.content_block {
+                    match block {
                         SseContentBlock::Text => {
                             self.content_blocks.push(ContentBlock::Text {
                                 text: String::new(),
@@ -472,6 +497,20 @@ impl EventParser {
                                 .await?;
                             self.content_blocks
                                 .push(ContentBlock::tool_use(id, name, Value::Null));
+                        }
+                        SseContentBlock::Fallback { from, to, trigger } => {
+                            let fallback = ModelFallback {
+                                from: from.model,
+                                to: to.model,
+                                category: trigger.and_then(|t| t.category),
+                            };
+                            warn!(from = %fallback.from, to = %fallback.to, category = ?fallback.category, "API served the request on a fallback model");
+                            // Holds the block's index, so the blocks after it land where their deltas point.
+                            self.content_blocks
+                                .push(ContentBlock::Unknown(ev.content_block));
+                            event_tx
+                                .send_async(ProviderEvent::ModelFallback(fallback))
+                                .await?;
                         }
                     }
                 }

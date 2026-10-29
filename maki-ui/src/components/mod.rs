@@ -409,6 +409,9 @@ pub enum DisplayRole {
     Done,
     /// One dim line about what the host told the model on the user's behalf.
     Notice,
+    /// One loud line the user must not miss, like the API answering on
+    /// another model than the one they picked.
+    Warning,
 }
 
 impl DisplayRole {

@@ -279,6 +279,13 @@ impl Chat {
                     ));
                 }
             }
+            AgentEvent::ModelFallback(fallback) => {
+                self.messages_panel.flush();
+                self.messages_panel.push(DisplayMessage::new(
+                    DisplayRole::Warning,
+                    fallback.to_string(),
+                ));
+            }
             AgentEvent::Notice { text } | AgentEvent::ObservationLine { text } => {
                 self.messages_panel.flush();
                 self.messages_panel
@@ -823,7 +830,7 @@ mod tests {
     use crate::components::IMAGE_PLACEHOLDER;
     use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
     use maki_config::UiConfig;
-    use maki_providers::ImageMediaType;
+    use maki_providers::{ImageMediaType, ModelFallback};
     use test_case::test_case;
 
     const IMAGE_DATA: &str = "dGVzdA==";
@@ -994,6 +1001,9 @@ mod tests {
     const TASK_ID: &str = "toolu_01";
     const USER_TEXT: &str = "one more thing";
     const REPLY_TEXT: &str = "on it";
+    const FALLBACK_FROM: &str = "claude-opus-5-5";
+    const FALLBACK_TO: &str = "claude-opus-5";
+    const FALLBACK_CATEGORY: &str = "cyber";
     const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
     const NOTICE_LINE: &str = "Background agent finished: find auth";
 
@@ -1541,6 +1551,27 @@ mod tests {
         );
         assert_eq!(chat.last_message_text(), ERROR_TEXT);
         assert_eq!(chat.last_message_role(), Some(&DisplayRole::Error));
+    }
+
+    #[test]
+    fn a_model_fallback_is_a_warning_row_of_its_own() {
+        let mut chat = chat();
+        let fallback = ModelFallback {
+            from: FALLBACK_FROM.into(),
+            to: FALLBACK_TO.into(),
+            category: Some(FALLBACK_CATEGORY.into()),
+        };
+        let expected = fallback.to_string();
+        text_delta(&mut chat, REPLY_TEXT);
+
+        chat.handle_event(AgentEvent::ModelFallback(fallback), None);
+
+        assert_eq!(
+            chat.message_at(0).map(|m| m.text.as_str()),
+            Some(REPLY_TEXT)
+        );
+        assert_eq!(chat.last_message_text(), expected);
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Warning));
     }
 
     /// Every order two endings can arrive in. Only the placeholder gives way,

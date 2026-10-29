@@ -1040,6 +1040,9 @@ fn start_event_pump(
                 AgentEvent::ObservationLine { text } => {
                     translate::notice(&MakiId::generate().to_string(), &text)
                 }
+                AgentEvent::ModelFallback(fallback) => {
+                    translate::notice(&MakiId::generate().to_string(), &fallback.to_string())
+                }
                 AgentEvent::Done { reason, .. } => {
                     tool_inputs.clear();
                     if let Some(id) = finish_turn(&pending) {

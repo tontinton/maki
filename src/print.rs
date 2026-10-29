@@ -321,6 +321,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::ObservationLine { .. }
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::StreamClosed => {}
+            AgentEvent::ModelFallback(fallback) => eprintln!("{fallback}"),
             AgentEvent::Steered { .. } => {
                 if let Some(reason) = dropped_prompt(event, parent_tool_use_id) {
                     is_error = true;

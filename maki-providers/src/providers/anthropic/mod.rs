@@ -701,8 +701,8 @@ mod tests {
     use super::*;
     use crate::test_support::{Canned, serve, sse_event};
     use crate::{
-        ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, ProviderEvent, Role, StopReason,
-        TokenUsage,
+        ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, ModelFallback, ProviderEvent,
+        Role, StopReason, TokenUsage,
     };
     use serde_json::{Value, json};
     use shared::{DISPLACED_ERROR_PREFIX, build_wire_messages};
@@ -1738,6 +1738,69 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n";
             assert_eq!(tools.len(), 1);
             assert_eq!(tools[0].1, "read");
             assert_eq!(*tools[0].2, Value::Object(Default::default()));
+        })
+    }
+
+    const DECLINING_MODEL: &str = "claude-opus-5-5";
+    const FALLBACK_MODEL: &str = "claude-opus-5";
+    const FALLBACK_ANSWER: &str = "Here is the answer.";
+
+    /// The API answers on another model after blocking the request on the one
+    /// asked for. The answer after the notice must still land in the message,
+    /// and the switch must reach the frontend while it streams.
+    #[test_case(r#","trigger":{"type":"refusal","category":"cyber"}"#, Some("cyber") ; "with_category")]
+    #[test_case("", None ; "without_trigger")]
+    fn parse_sse_server_fallback(trigger: &str, category: Option<&str>) {
+        smol::block_on(async {
+            let fallback_block = format!(
+                r#"{{"type":"fallback","from":{{"model":"{DECLINING_MODEL}"}},"to":{{"model":"{FALLBACK_MODEL}"}}{trigger}}}"#
+            );
+            let sse_data = format!(
+                "\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{fallback_block}}}\n\
+\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\
+\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\
+\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{FALLBACK_ANSWER}\"}}}}\n\
+\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\
+\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":3}}}}\n"
+            );
+
+            let (tx, rx) = flume::unbounded();
+            let resp = parse_sse(mock_response(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            let fallback_raw: Value = serde_json::from_str(&fallback_block).unwrap();
+            assert!(
+                matches!(&resp.message.content[..], [ContentBlock::Unknown(raw), ContentBlock::Text { text }]
+                if *raw == fallback_raw && text == FALLBACK_ANSWER)
+            );
+            let fallbacks: Vec<_> = rx
+                .drain()
+                .filter_map(|e| match e {
+                    ProviderEvent::ModelFallback(fallback) => Some(fallback),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                fallbacks,
+                vec![ModelFallback {
+                    from: DECLINING_MODEL.into(),
+                    to: FALLBACK_MODEL.into(),
+                    category: category.map(Into::into),
+                }]
+            );
         })
     }
 
