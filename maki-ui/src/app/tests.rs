@@ -28,10 +28,10 @@ use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{
-    AgentMode, BackgroundNotice, CallRecord, DoneReason, HistorySnapshot, ImageMediaType,
-    McpConfigErrors, McpPromptArg, McpPromptInfo, McpServerInfo, McpServerStatus, McpSnapshot,
-    McpSnapshotReader, RunTotals, SharedBuf, SteerKind, SubagentInbox, TaskLabel, ToolDoneEvent,
-    ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
+    AgentMode, BackgroundNotice, BufferSnapshot, CallRecord, DoneReason, HistorySnapshot,
+    ImageMediaType, McpConfigErrors, McpPromptArg, McpPromptInfo, McpServerInfo, McpServerStatus,
+    McpSnapshot, McpSnapshotReader, RunTotals, SharedBuf, SteerKind, SubagentInbox, TaskLabel,
+    ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
 };
 use maki_config::{
     Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
@@ -66,9 +66,12 @@ use std::env;
 use std::fs;
 use std::iter;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use test_case::test_case;
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Level, Metadata, Subscriber};
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_OUTPUT_CAP: u32 = 8192;
@@ -2598,6 +2601,63 @@ fn tasks_report_running_time_and_cost() {
     assert_eq!(tasks[1].get(STARTED_AT_KEY), None);
     assert_eq!(tasks[1].get(ENDED_AT_KEY), None);
     assert_eq!(tasks[1][COST_KEY].as_f64(), MONITOR_TURN.cost);
+}
+
+#[derive(Default)]
+struct WarnCounter(AtomicUsize);
+
+impl Subscriber for WarnCounter {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        *metadata.level() == Level::WARN
+    }
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+    fn event(&self, _: &Event<'_>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+    fn enter(&self, _: &Id) {}
+    fn exit(&self, _: &Id) {}
+}
+
+/// A resumed session asks Lua to restore every tool of every chat, and all the
+/// replies come back on one channel. Each must land only in the chat that owns
+/// the tool, or every other chat logs a warning for it.
+#[test]
+fn restore_snapshots_reach_only_their_owning_chat() {
+    const MAIN_TOOL: &str = "main_t1";
+    const SUBAGENT_TOOL: &str = "sub_t1";
+    const PLUGIN_TOOL: &str = "plugin_t1";
+    let mut app = app_with_subagent();
+    app.update(agent_msg(tool_start(MAIN_TOOL, "bash")));
+    app.update(subagent_msg(
+        tool_start(SUBAGENT_TOOL, "bash"),
+        TASK_ID,
+        None,
+    ));
+    plugin_event(&mut app, tool_start(PLUGIN_TOOL, "bash"));
+    let owners = [MAIN_TOOL, SUBAGENT_TOOL, PLUGIN_TOOL];
+    assert_eq!(app.chats.len(), owners.len());
+
+    let restored = |id: &str| format!("restored {id}");
+    let warnings = Arc::new(WarnCounter::default());
+    tracing::subscriber::with_default(Arc::clone(&warnings), || {
+        for id in owners {
+            let event = AgentEvent::ToolHeaderSnapshot {
+                id: id.into(),
+                snapshot: BufferSnapshot::plain_text(restored(id)),
+                theme_gen: Some(theme::generation()),
+            };
+            app.update(agent_msg_with_run_id(event, RESTORE_RUN_ID));
+        }
+    });
+
+    assert_eq!(warnings.0.load(Ordering::Relaxed), 0);
+    for (chat, id) in app.chats.iter().zip(owners) {
+        assert_eq!(chat.last_message_text(), restored(id));
+    }
 }
 
 /// A rewind rebuilds the main chat, not the monitor a plugin runs beside it.

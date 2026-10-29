@@ -445,6 +445,10 @@ impl MessagesPanel {
         self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, note));
     }
 
+    pub fn has_tool(&self, tool_id: &str) -> bool {
+        self.find_tool_msg(tool_id).is_some()
+    }
+
     pub fn tool_snapshot(
         &mut self,
         tool_id: &str,
