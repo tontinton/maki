@@ -226,6 +226,13 @@ pub(crate) enum FrameFit {
 /// [`History::told`] replays every update in the transcript on top anyway,
 /// so this tells the same thing today. A later rewind can cut those updates,
 /// and then the frame must not claim the model still heard them.
+///
+/// Thinking is signed against the prefix it was written under, so a new frame
+/// makes every signature in history invalid. An enforcing account answers
+/// with a 400, and a lenient one flags each block again on every request. The
+/// cache is gone anyway, so the signatures go here and the text stays for the
+/// transcript. Only lenient accounts lose anything: the old reasoning they
+/// still showed the model.
 pub(crate) fn fit_frame(
     history: &mut History,
     context: RunContext,
@@ -259,6 +266,7 @@ pub(crate) fn fit_frame(
                 live.mcp_tools().to_vec(),
             );
             frame.inherited = inherited;
+            history.unbind_thinking();
             history.set_frame(frame, live);
             if stored.is_some() {
                 FrameFit::Rebuilt

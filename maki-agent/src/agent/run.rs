@@ -72,6 +72,7 @@ const NO_FRAME: &str = "no prompt frame to send the request under";
 /// The reason the API gives when it drops the old model's thinking after a
 /// switch. That is expected and does not mean the prefix moved.
 const MODEL_BINDING_MISMATCH: &str = "model_binding_mismatch";
+const MAX_LOGGED_PATHS: usize = 5;
 const THINKING_DROPPED: &str =
     "The prompt changed under earlier reasoning, so it was dropped to keep the session going.";
 
@@ -736,17 +737,26 @@ impl<'h> Agent<'h> {
         Ok(TurnOutcome::Done(reason))
     }
 
-    /// A thinking block the model can no longer see, or one that failed the
-    /// prefix check and was let through on an account that does not enforce
-    /// it. After a model switch that is normal. Anything else means the
-    /// prefix moved, which an enforcing account answers with a 400.
+    /// After a model switch the API flags the old model's thinking again on
+    /// every request, which is normal, so it only gets a debug line. Anything
+    /// else means the prefix moved, and an enforcing account would answer
+    /// that with a 400. We log one line per request, not one per block, so a
+    /// long session cannot flood the log and hide the warning.
     fn note_input_transformations(&self, transformations: &[InputTransformation]) {
-        for t in transformations {
-            if t.reason == MODEL_BINDING_MISMATCH {
-                info!(session = ?self.session_id, model = %self.model.id, kind = %t.kind, path = %t.path, reason = %t.reason, "thinking from another model not carried over");
-            } else {
-                warn!(session = ?self.session_id, model = %self.model.id, kind = %t.kind, path = %t.path, reason = %t.reason, flagged = transformations.len(), "thinking block failed the prefix check");
-            }
+        let (model_switch, moved): (Vec<_>, Vec<_>) = transformations
+            .iter()
+            .partition(|t| t.reason == MODEL_BINDING_MISMATCH);
+        if !model_switch.is_empty() {
+            debug!(session = ?self.session_id, model = %self.model.id, count = model_switch.len(), "thinking from another model not carried over");
+        }
+        if let Some(first) = moved.first() {
+            let paths = moved
+                .iter()
+                .take(MAX_LOGGED_PATHS)
+                .map(|t| t.path.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            warn!(session = ?self.session_id, model = %self.model.id, count = moved.len(), kind = %first.kind, reason = %first.reason, paths = %paths, "thinking block failed the prefix check");
         }
     }
 
@@ -885,11 +895,12 @@ impl<'h> Agent<'h> {
     }
 
     /// The account enforces thinking binding and something before a thinking
-    /// block moved: a rebuilt frame, an evicted image, a tool that joined in
-    /// full. The same body fails the same way every time, so every thinking
-    /// block goes, once. That edit is valid on every endpoint and leaves the
-    /// prefix append-only from here on. With none left to drop, the error is
-    /// the honest answer.
+    /// block moved: an evicted image, a tool that joined in full. A new frame
+    /// never gets here, because it clears the signatures when it is built.
+    /// The same body fails the same way every time, so every thinking block
+    /// goes, once. That edit is valid on every endpoint and leaves the prefix
+    /// append-only from here on. With none left to drop, the error is the
+    /// honest answer.
     fn recover_unbound_thinking(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
         let dropped = self.history.strip_thinking();
         if dropped == 0 {
@@ -1290,6 +1301,11 @@ mod tests {
     const MOVING_RECEIPT: &str = "Moved to the background. End your turn.";
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
     const RESPONSE_TEXT: &str = "response";
+    const FIXED_SYSTEM: &str = "system";
+    const THOUGHT: &str = "pondered";
+    const THOUGHT_SIGNATURE: &str = "sig";
+    const STALE_THINKING_MSG: &str = "thinking from before a new frame must not stay signed";
+    const KEPT_THINKING_MSG: &str = "a new frame must keep the reasoning text";
     const PLAN_ENDED: &str = "Plan mode ended. You may edit files again.";
     const CUSTOM_SYSTEM: &str = "You analyse information.";
     const CUSTOM_CONVENTIONS: &str = "State the evidence and uncertainty.";
@@ -1327,6 +1343,20 @@ mod tests {
         system: String,
         tools: Value,
         messages: Vec<Value>,
+    }
+
+    impl CapturedRequest {
+        fn thinking(&self) -> Vec<ContentBlock> {
+            self.messages
+                .iter()
+                .flat_map(|m| {
+                    serde_json::from_value::<Message>(m.clone())
+                        .unwrap()
+                        .content
+                })
+                .filter(ContentBlock::is_thinking)
+                .collect()
+        }
     }
 
     /// The contract that keeps the cache and every thinking block valid:
@@ -1471,6 +1501,28 @@ mod tests {
         }])
     }
 
+    fn thought_response() -> StreamResponse {
+        let mut response = text_response(StopReason::EndTurn);
+        response.message.content.insert(
+            0,
+            ContentBlock::Thinking {
+                thinking: THOUGHT.into(),
+                signature: Some(THOUGHT_SIGNATURE.into()),
+            },
+        );
+        response
+    }
+
+    fn is_signed(block: &ContentBlock) -> bool {
+        matches!(
+            block,
+            ContentBlock::Thinking {
+                signature: Some(_),
+                ..
+            } | ContentBlock::RedactedThinking { .. }
+        )
+    }
+
     fn assistant_response(content: Vec<ContentBlock>) -> StreamResponse {
         StreamResponse {
             message: Message {
@@ -1532,12 +1584,14 @@ mod tests {
                 history,
                 gauge: Box::leak(Box::default()),
                 event_tx: EventSender::new(raw_tx, 0),
-                context: Arc::new(|_, _| {
-                    RunContext::fixed("system".into(), RequestTools::default())
-                }),
+                context: Arc::new(|_, _| fixed_context()),
             },
         );
         (agent, event_rx)
+    }
+
+    fn fixed_context() -> RunContext {
+        RunContext::fixed(FIXED_SYSTEM.into(), RequestTools::default())
     }
 
     fn default_input() -> AgentInput {
@@ -2733,7 +2787,8 @@ mod tests {
     #[tokio::test]
     async fn fingerprint_change_starts_a_new_frame_with_a_notice(change: fn(&World)) {
         let mut h = Harness::new(Vec::new());
-        h.run_in(AgentMode::Build).await;
+        h.run(default_input(), vec![thought_response()], |_| {})
+            .await;
         let first_frame = h.history.frame().cloned();
         change(&h.world);
         let events = h.run_in(AgentMode::Build).await;
@@ -2743,6 +2798,10 @@ mod tests {
             &e.event,
             AgentEvent::Notice { text } if text == FRAME_REBUILT
         )));
+        let requests = h.requests.lock().unwrap();
+        let thinking = requests.last().unwrap().thinking();
+        assert!(!thinking.is_empty(), "{KEPT_THINKING_MSG}");
+        assert!(!thinking.iter().any(is_signed), "{STALE_THINKING_MSG}");
     }
 
     #[tokio::test]
@@ -3080,12 +3139,17 @@ mod tests {
         let mut h = Harness::new(Vec::new());
         h.run_in(AgentMode::Build).await;
         h.world.change(|f| f.date = NEXT_DATE.into());
-        let replies = (0..3).map(|_| text_response(StopReason::EndTurn)).collect();
+        let replies = (0..3).map(|_| thought_response()).collect();
         h.run(default_input(), replies, with_compact).await;
 
         let requests = h.requests.lock().unwrap();
         assert_append_only(&requests[0], &requests[1]);
-        assert!(requests.last().unwrap().system.contains(NEXT_DATE));
+        let after = requests.last().unwrap();
+        assert!(after.system.contains(NEXT_DATE));
+        assert!(
+            !after.thinking().iter().any(is_signed),
+            "{STALE_THINKING_MSG}"
+        );
         assert!(updates(&h.history).is_empty());
     }
 
@@ -3633,22 +3697,21 @@ mod tests {
     #[test_case(true, false, UNBOUND_GIVE_UP_MSG ; "nothing_left_to_drop_surfaces_the_error")]
     #[tokio::test]
     async fn unbound_thinking_recovery(always: bool, expected: bool, message: &str) {
-        let mut history = History::new(vec![
-            Message::user("go".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![
-                    ContentBlock::Thinking {
-                        thinking: "hmm".into(),
-                        signature: Some("sig".into()),
-                    },
-                    ContentBlock::Text {
-                        text: "done".into(),
-                    },
-                ],
-                ..Default::default()
-            },
-        ]);
+        let mut history = History::new(vec![Message::user("go".into())]);
+        fit_frame(&mut history, fixed_context(), None, &default_model());
+        history.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "hmm".into(),
+                    signature: Some("sig".into()),
+                },
+                ContentBlock::Text {
+                    text: "done".into(),
+                },
+            ],
+            ..Default::default()
+        });
         let (mut agent, event_rx) = make_agent(UnboundThinkingProvider { always }, &mut history);
 
         let recovered = agent.run(default_input()).await.is_ok();

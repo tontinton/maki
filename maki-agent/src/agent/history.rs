@@ -284,6 +284,20 @@ impl History {
         thinking
     }
 
+    /// Every signature is bound to the prefix it was written under, so a new
+    /// frame voids them all. The reasoning text stays for the transcript, and
+    /// a provider that needs a signature leaves unsigned thinking out.
+    pub(crate) fn unbind_thinking(&mut self) {
+        if self
+            .as_slice()
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(is_bound)
+        {
+            self.rewrite(|msgs| unbind_thinking(msgs));
+        }
+    }
+
     pub fn into_vec(self) -> Vec<Message> {
         Arc::unwrap_or_clone(self.snapshot.messages)
     }
@@ -388,6 +402,37 @@ pub(super) fn strip_thinking(messages: &mut [Message]) {
             } = block
             {
                 *thought_signature = None;
+            }
+        }
+    }
+}
+
+fn is_bound(block: &ContentBlock) -> bool {
+    matches!(
+        block,
+        ContentBlock::Thinking {
+            signature: Some(_),
+            ..
+        } | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::ToolUse {
+                thought_signature: Some(_),
+                ..
+            }
+    )
+}
+
+/// A redacted block is nothing but its binding, so it goes whole.
+fn unbind_thinking(messages: &mut [Message]) {
+    for msg in messages {
+        msg.content
+            .retain(|block| !matches!(block, ContentBlock::RedactedThinking { .. }));
+        for block in &mut msg.content {
+            match block {
+                ContentBlock::Thinking { signature, .. } => *signature = None,
+                ContentBlock::ToolUse {
+                    thought_signature, ..
+                } => *thought_signature = None,
+                _ => {}
             }
         }
     }
@@ -798,6 +843,39 @@ mod tests {
             &history.as_slice()[1].content[..],
             [ContentBlock::ToolUse { thought_signature, .. }] if thought_signature.is_some() == signature_kept
         ));
+    }
+
+    #[test]
+    fn unbind_thinking_keeps_the_reasoning_text() {
+        let thinking = |signature: Option<&str>| ContentBlock::Thinking {
+            thinking: GO.into(),
+            signature: signature.map(Into::into),
+        };
+        let tool_use = |thought_signature: Option<&str>| ContentBlock::ToolUse {
+            id: FIRST.into(),
+            name: SECOND.into(),
+            input: serde_json::json!({}),
+            thought_signature: thought_signature.map(Into::into),
+        };
+        let call = Message {
+            role: Role::Assistant,
+            content: vec![
+                thinking(Some(SIGNATURE)),
+                ContentBlock::RedactedThinking {
+                    data: SIGNATURE.into(),
+                },
+                tool_use(Some(SIGNATURE)),
+            ],
+            ..Default::default()
+        };
+        let mut history = History::new(vec![Message::user(GO.into()), call]);
+
+        history.unbind_thinking();
+
+        assert_eq!(
+            history.as_slice()[1].content,
+            [thinking(None), tool_use(None)]
+        );
     }
 
     /// Dropping an orphaned result must not take a newer build's block with it.
