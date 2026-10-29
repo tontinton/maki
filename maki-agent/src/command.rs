@@ -107,18 +107,18 @@ pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
     discover_commands_inner(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
+        maki_storage::paths::config_dir().ok().as_deref(),
     )
 }
 
 fn discover_commands_inner(
     cwd: &Path,
     home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_config: Option<&Path>,
 ) -> Vec<CustomCommand> {
     let mut commands: HashMap<String, CustomCommand> = HashMap::new();
 
-    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
+    if let Some(dir) = global_config {
         scan_command_dir(&dir.join(COMMANDS_DIR), CommandScope::User, &mut commands);
     }
     if let Some(home) = home {
