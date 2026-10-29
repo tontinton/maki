@@ -67,8 +67,8 @@ use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SessionMailbox, SharedBuf, SharedMessages, SubagentInfo, ToolPart,
+    AgentEvent, Envelope, McpConfigErrors, McpPromptInfo, McpSnapshotReader, SessionMailbox,
+    SharedBuf, SharedMessages, SubagentInfo, ToolPart,
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
@@ -91,6 +91,9 @@ use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
 
 pub(crate) use crate::agent::QueuedMessage;
+use image_paste::PastedContent;
+#[cfg(test)]
+use image_paste::READING_CLIPBOARD_MSG;
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
@@ -621,8 +624,8 @@ pub struct App {
     pub(crate) trust_question: Option<TrustQuestion>,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
-    pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
-    pub(crate) primary_paste_rx: Vec<flume::Receiver<Option<String>>>,
+    pub(crate) paste_rx: Vec<flume::Receiver<Result<PastedContent, String>>>,
+    pub(crate) mouse_paste_rx: Vec<flume::Receiver<Option<String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
@@ -759,8 +762,8 @@ impl App {
             trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
-            image_paste_rx: vec![],
-            primary_paste_rx: vec![],
+            paste_rx: vec![],
+            mouse_paste_rx: vec![],
             storage_writer,
             last_sent: None,
             shell: shell::ShellState::default(),
@@ -1320,8 +1323,8 @@ impl App {
             Msg::Key(key) => self.handle_key(key, sight, turn),
             Msg::Paste(text) => {
                 if text.is_empty() {
-                    if self.input_focused() && self.image_paste_rx.is_empty() {
-                        self.start_image_paste();
+                    if self.input_focused() && self.paste_rx.is_empty() {
+                        self.start_clipboard_paste();
                     }
                 } else {
                     self.route_text_paste(&text, turn);
@@ -2220,8 +2223,8 @@ impl App {
                 return self.run_builtin(BuiltinAction::Search);
             } else if key::FILE_PICKER.matches(key) {
                 return self.run_builtin(BuiltinAction::FilePicker);
-            } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
-                self.start_image_paste();
+            } else if key::PASTE.matches(key) && self.paste_rx.is_empty() {
+                self.start_clipboard_paste();
             } else if let InputAction::Changed = self.input_box.handle_key(key, mode) {
                 self.input_changed(InputWriter::Anyone);
             }
@@ -3325,8 +3328,8 @@ impl App {
             | self.tick_typeahead()
             | self.tick_edge_scroll()
             | self.tick_error_expiry()
-            | self.poll_image_paste()
-            | self.poll_primary_paste()
+            | self.poll_paste()
+            | self.poll_mouse_paste()
             | self.btw_modal.poll()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
