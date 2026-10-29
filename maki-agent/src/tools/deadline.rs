@@ -96,7 +96,10 @@ mod tests {
         let before = deadline.at().unwrap();
         let clone = deadline.clone();
 
-        smol::block_on(deadline.paused_while(smol::Timer::after(WAIT)));
+        // The timer starts inside the wait, so it can't start before the pause.
+        smol::block_on(deadline.paused_while(async {
+            smol::Timer::after(WAIT).await;
+        }));
 
         assert!(clone.at().unwrap() - before >= WAIT);
     }
