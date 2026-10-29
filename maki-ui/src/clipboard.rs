@@ -27,6 +27,12 @@ pub(crate) fn read_primary_selection() -> Option<String> {
     None
 }
 
+/// Blocks, so never call it on the UI thread.
+pub(crate) fn read_text() -> Option<String> {
+    let text = Clipboard::new().ok()?.get_text().ok()?;
+    (!text.is_empty()).then_some(text)
+}
+
 pub(crate) struct ClipboardState {
     native: Option<Clipboard>,
 }

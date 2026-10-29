@@ -29,9 +29,10 @@ use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{
     AgentMode, BackgroundNotice, BufferSnapshot, CallRecord, DoneReason, HistorySnapshot,
-    ImageMediaType, McpConfigErrors, McpPromptArg, McpPromptInfo, McpServerInfo, McpServerStatus,
-    McpSnapshot, McpSnapshotReader, RunTotals, SharedBuf, SteerKind, SubagentInbox, TaskLabel,
-    ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
+    ImageMediaType, ImageSource, McpConfigErrors, McpPromptArg, McpPromptInfo, McpServerInfo,
+    McpServerStatus, McpSnapshot, McpSnapshotReader, RunTotals, SharedBuf, SteerKind,
+    SubagentInbox, TaskLabel, ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript,
+    TurnCompleteEvent, result_notice,
 };
 use maki_config::{
     Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
@@ -93,6 +94,7 @@ const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
 const LATE_MODEL_SPEC: &str = "zai/glm-5";
 const PRIMARY_TEXT: &str = "selected text";
+const CLIPBOARD_TEXT: &str = "copied text";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
@@ -869,7 +871,7 @@ fn paste_normalizes_line_endings(input: &str, expected: &str) {
 fn paste_file_path_triggers_image_load() {
     let mut app = test_app();
     app.update(Msg::Paste("file:///tmp/nonexistent.png".into()));
-    assert!(!app.image_paste_rx.is_empty());
+    assert!(!app.paste_rx.is_empty());
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
@@ -879,7 +881,7 @@ fn paste_loads_every_image_path_in_the_text() {
     app.update(Msg::Paste(
         "file:///tmp/one.png\nnot an image\nfile:///tmp/two.jpg".into(),
     ));
-    assert_eq!(app.image_paste_rx.len(), 2);
+    assert_eq!(app.paste_rx.len(), 2);
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
@@ -888,11 +890,24 @@ fn paste_loads_every_image_path_in_the_text() {
 fn primary_selection_read_lands_on_tick(selection: Option<&str>, expected: &str) {
     let mut app = test_app();
     let (tx, rx) = flume::bounded(1);
-    app.primary_paste_rx.push(rx);
+    app.mouse_paste_rx.push(rx);
     tx.send(selection.map(String::from)).unwrap();
     assert_eq!(app.tick(), Dirty::YES);
     assert_eq!(app.input_box.buffer.value(), expected);
-    assert!(app.primary_paste_rx.is_empty());
+    assert!(app.mouse_paste_rx.is_empty());
+}
+
+#[test]
+fn clipboard_text_lands_in_input_and_clears_flash() {
+    let mut app = test_app();
+    app.status_bar.flash(READING_CLIPBOARD_MSG.into());
+    let (tx, rx) = flume::bounded(1);
+    app.paste_rx.push(rx);
+    tx.send(Ok(PastedContent::Text(CLIPBOARD_TEXT.into())))
+        .unwrap();
+    let _ = app.tick();
+    assert_eq!(app.input_box.buffer.value(), CLIPBOARD_TEXT);
+    assert_eq!(app.status_bar.flash_text(), None);
 }
 
 #[test]
@@ -7074,11 +7089,11 @@ fn a_primary_paste_waits_behind_held_keys(paste_bound: bool) {
     let tab = press_bound(&mut app, &probe, KeyCode::Tab);
     type_keys(&mut app, TYPED);
     let (tx, rx) = flume::bounded(1);
-    app.primary_paste_rx.push(rx);
+    app.mouse_paste_rx.push(rx);
     tx.send(Some(PRIMARY_TEXT.into())).unwrap();
     // The poll alone, since a full tick lets a hold older than the slow
     // handler warning go, which a loaded machine can reach.
-    let _ = app.poll_primary_paste();
+    let _ = app.poll_mouse_paste();
     assert_eq!(app.input_box.buffer.value(), "");
     assert!(
         probe.try_recv_ticket().is_none(),

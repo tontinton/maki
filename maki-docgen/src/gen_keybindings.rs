@@ -281,8 +281,8 @@ fn write_overrides(out: &mut String) {
         "These are input conventions, not remappable key rows:\n\n\
          - Prefix a line with `!` to run a shell command yourself (5 minute \
          timeout). Use `!!` to hide the command and its output from the agent.\n\
-         - `Ctrl+V` pastes an image from the clipboard into the prompt when the \
-         model supports vision. You can also paste image file paths.\n\
+         - Pasting image file paths attaches the images.\n\
+         - Right-click pastes clipboard text on Windows.\n\
          - Middle-click inserts the PRIMARY selection, the same text \
          middle-click pastes in a shell. Linux only, since other platforms \
          have no PRIMARY selection. On Wayland the compositor must support it.\n",
