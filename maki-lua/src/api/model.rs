@@ -2,6 +2,8 @@
 //! request options, so most calls round-trip to it; `info` resolves
 //! locally and works without a UI.
 
+use std::fmt::Display;
+
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{Model, ModelTier, model_registry};
 use mlua::{Error as LuaError, Lua, Result as LuaResult, Table, Value};
@@ -12,6 +14,12 @@ use crate::api::util::pair::{Pair, err_pair};
 use crate::plugin_permissions::PluginPermissions;
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
+
+/// Shared with `maki.agent.resolve_model`, so a tier assignment that no longer
+/// resolves reads the same wherever it surfaces.
+pub(crate) fn stale_tier_err(tier: ModelTier, spec: &str, cause: impl Display) -> String {
+    format!("tier {tier} points at {spec}: {cause}")
+}
 
 async fn roundtrip(
     lua: Lua,
@@ -121,7 +129,7 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
     };
     let model = match Model::from_spec(&spec) {
         Ok(model) => model,
-        Err(e) => return Ok(err_pair(format!("tier {tier} points at {spec}: {e}"))),
+        Err(e) => return Ok(err_pair(stale_tier_err(tier, &spec, e))),
     };
     let tbl = model_info_table(lua, &model)?;
     tbl.set(

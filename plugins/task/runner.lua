@@ -22,6 +22,7 @@ local NUDGE_MISSING =
   "You did not call the structured_output tool. Call it now with your final result matching its input schema."
 local NUDGE_SUMMARY =
   "You finished your work but did not provide a summary. Reply with a concise summary of what you did and found."
+local ASSIGNED_MODEL_CONTEXT = "model `%s`, assigned to the %s tier: "
 local INVALID_INPUT_PREFIX =
   "Input does not match the required schema. Fix the errors and call structured_output again:\n"
 
@@ -195,6 +196,10 @@ function Runner.prepare(input, ctx)
     },
     message = input.prompt .. (validator and STRUCTURED_OUTPUT_PROMPT_SUFFIX or ""),
     capture = capture,
+    -- The user may have made the assignment long ago and logged out of its
+    -- provider since. Naming it turns a bare 401 into something they can fix.
+    error_context = model.assigned_tier and string.format(ASSIGNED_MODEL_CONTEXT, model.spec, model.assigned_tier)
+      or "",
   }
 end
 
@@ -215,6 +220,7 @@ function Runner.run(sess, prepared)
   end
 
   if err then
+    err = prepared.error_context .. err
     -- A result alongside the error means the run was cut short after
     -- streaming some text, and half a transcript beats a bare error.
     if result then
