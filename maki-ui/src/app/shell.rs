@@ -2,11 +2,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
 use futures_lite::StreamExt;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
+use maki_agent::spawn::detached_command;
 use maki_agent::{
     AgentConfig, CancelToken, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
 };
@@ -216,16 +214,10 @@ async fn run_command(
     max_output_bytes: usize,
     shell: &ShellPreference,
 ) -> Result<String, String> {
-    let mut std_cmd = shell_command(command, shell);
+    let shell_cmd = shell_command(command, shell);
+    let args: Vec<&std::ffi::OsStr> = shell_cmd.get_args().collect();
+    let mut std_cmd = detached_command(shell_cmd.get_program(), &args);
     strip_provider_keys(&mut std_cmd).env("GIT_TERMINAL_PROMPT", "0");
-
-    #[cfg(unix)]
-    unsafe {
-        std_cmd.pre_exec(|| {
-            let _ = rustix::process::setsid();
-            Ok(())
-        });
-    }
 
     let mut cmd: Command = std_cmd.into();
     cmd.stdin(Stdio::null())
