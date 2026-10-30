@@ -1254,7 +1254,7 @@ pub struct SubagentInfo {
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
     /// Where a host queues messages for this subagent. Its loop drains the
-    /// queue between turns, so a message lands as a user interrupt.
+    /// queue between turns, so a message lands as an interrupt.
     #[serde(skip)]
     pub inbox: Option<Arc<crate::SubagentInbox>>,
 }

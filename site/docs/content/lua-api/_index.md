@@ -1879,11 +1879,11 @@ print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 Session:send({message})
 ```
 
-Hand the subagent a message without waiting, the way a user typing in its
-tab does. A running `:prompt()` picks it up at its next turn boundary, once
-the current reply and its tool calls finish, and the model reads it as a
-user interrupt. The tab draws it when it lands. Messages sent in a burst
-land together.
+Hand the subagent a message without waiting, delivered the same way as a
+message typed in its tab. A running `:prompt()` picks it up at its next turn boundary, once
+the current reply and its tool calls finish, and the model reads it as an
+interrupt from its parent, not the user. The tab draws it when it lands.
+Messages sent in a burst land together.
 
 With no prompt running, or one already past its last turn, the message
 waits. The next `:prompt()` sends it in the same request as its own

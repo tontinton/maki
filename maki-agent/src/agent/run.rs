@@ -54,8 +54,11 @@ const RECENT_TOOL_WINDOW: usize = 5;
 /// turn, and a model resuming its own cut-off text can wedge the session
 /// (seen with llama.cpp stuck on an unterminated tool call).
 const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
-const INTERRUPT_NOTE: &str =
+const USER_INTERRUPT_TAG: &str = "user-interrupt";
+const USER_INTERRUPT_NOTE: &str =
     "The user sent a new message while you were working. Address it and continue.";
+const PARENT_INTERRUPT_TAG: &str = "parent-interrupt";
+const PARENT_INTERRUPT_NOTE: &str = "Your parent agent or plugin sent a new message while you were working, not the user directly. Address it and continue.";
 /// A layer that always answers "continue" would never let the run end, and
 /// the user would pay for every turn of it. So `agent.stop` gets this many in
 /// a row, and the count starts over whenever the user speaks.
@@ -1191,7 +1194,8 @@ impl<'h> Agent<'h> {
                     let kept = self
                         .filter_user_message(input.message, input.images.len(), input.source)
                         .await?;
-                    let message = kept.map(|text| interrupt_message(text, input.images));
+                    let message =
+                        kept.map(|text| interrupt_message(text, input.images, input.source));
                     if message.is_some() {
                         self.mode = input.mode;
                         // The user spoke, so `agent.stop` gets its full
@@ -1229,8 +1233,14 @@ fn no_frame() -> AgentError {
     }
 }
 
-fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
-    let wrapped = format!("<user-interrupt>\n{INTERRUPT_NOTE}\n\n{message}\n</user-interrupt>");
+fn interrupt_message(message: String, images: Vec<ImageSource>, source: InputSource) -> Message {
+    let (tag, note) = match source {
+        InputSource::Plugin => (PARENT_INTERRUPT_TAG, PARENT_INTERRUPT_NOTE),
+        InputSource::Tui | InputSource::Acp | InputSource::Headless => {
+            (USER_INTERRUPT_TAG, USER_INTERRUPT_NOTE)
+        }
+    };
+    let wrapped = format!("<{tag}>\n{note}\n\n{message}\n</{tag}>");
     Message {
         display_text: Some(if message.is_empty() && !images.is_empty() {
             IMAGE_PLACEHOLDER.into()
@@ -2169,7 +2179,7 @@ mod tests {
     fn has_interrupt_in_history(history: &[Message]) -> bool {
         history.iter().any(|m| {
             m.content.iter().any(
-                |b| matches!(b, ContentBlock::Text { text } if text.contains("<user-interrupt>")),
+                |b| matches!(b, ContentBlock::Text { text } if text.contains(USER_INTERRUPT_TAG)),
             )
         })
     }

@@ -42,7 +42,7 @@ const MESSAGE_CALL_ID: &str = "toolu_message";
 const MESSAGE: &str = "the user added an IOC, check it too";
 const QUEUED: &str = "Message queued for find the answer.";
 const NOT_RUNNING: &str = "no running background subagent with id";
-const INTERRUPT_OPEN: &str = "<user-interrupt>";
+const INTERRUPT_OPEN: &str = "<parent-interrupt>";
 const INIT: &str = include_str!("../../plugins/task/init.lua");
 const RUNNER: &str = include_str!("../../plugins/task/runner.lua");
 
@@ -435,7 +435,7 @@ fn ctx_background_without_a_seed_names_the_cause(session_up: bool, reason: &str)
 }
 
 /// The receipt names the id `task_message` takes, and the subagent reads the
-/// message as a user interrupt once its current turn ends.
+/// message as an interrupt from its parent once its current turn ends.
 #[test]
 fn a_message_reaches_a_running_background_task_at_its_next_turn() {
     let host = Host::task(Arc::new(ToolRegistry::new()));

@@ -1,5 +1,6 @@
-//! Messages a user queues for a subagent while it runs. The host pushes,
-//! the subagent's loop drains them between turns as one `<user-interrupt>`.
+//! Messages queued for a subagent while it runs, typed in its tab or sent by
+//! a plugin. The host pushes, the subagent's loop drains them between turns,
+//! each as its own message in one burst.
 
 use std::collections::VecDeque;
 use std::fmt;
