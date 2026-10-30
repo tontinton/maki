@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -14,7 +15,9 @@ use maki_agent::agent::SessionExport;
 use maki_agent::session::SessionHeader;
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{PluginPermissions, PluginReach, SessionEndReason};
-use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
+use maki_providers::{
+    ContentBlock, Message, Model, RequestOptions, TokenUsage, estimate_message_tokens,
+};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{
     SessionClaim, SessionMeta, StoredMode, StoredSubagent, StoredWriters,
@@ -351,8 +354,13 @@ impl App {
         if eh.is_disconnected() {
             self.restoring
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+        } else if let Some(tx) = self.restore_event_tx.clone() {
+            // The done event rides the same channel the renders did, so the
+            // UI can trust the heights it has applied once it arrives.
+            eh.send_restore_complete(restoring, tx);
         } else {
-            eh.send_restore_complete(restoring);
+            self.restoring
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -417,14 +425,40 @@ impl App {
         open
     }
 
+    /// Tool call ids the session transcript holds — the only ids a `/reload`
+    /// can still resolve after rebuilding the view from history. A local `!`
+    /// shell run carries a `shell-` id that never reaches the transcript, so
+    /// it cannot anchor the carried view.
+    pub(crate) fn session_tool_ids(&self) -> HashSet<String> {
+        self.state
+            .session
+            .messages()
+            .iter()
+            .flat_map(|msg| {
+                msg.content.iter().filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
     /// `maki.session.new` lays its document over [`Self::blank_session`], so
     /// a plugin's session starts where `Ctrl-N` would.
     pub(crate) fn session_from(&self, transcript: Transcript) -> Result<OpenSession, String> {
-        let OpenSession { session, claim } = self.blank_session();
+        let OpenSession {
+            session,
+            claim,
+            view: _,
+        } = self.blank_session();
         let session = transcript
             .into_session(session)
             .map_err(|e| e.to_string())?;
-        Ok(OpenSession { session, claim })
+        Ok(OpenSession {
+            session,
+            claim,
+            view: None,
+        })
     }
 
     /// Settings come from live state rather than the session, because a
@@ -470,7 +504,11 @@ impl App {
             .end_session(self.state.session.id, SessionEndReason::Reset);
         // Swapping the claim is what gives the old session back: the snapshot
         // `checkpoint_now` just queued holds its own clone until it lands.
-        let OpenSession { session, claim } = self.blank_session();
+        let OpenSession {
+            session,
+            claim,
+            view: _,
+        } = self.blank_session();
         self.apply_stored_permissions(&session.meta);
         self.state.session = Arc::new(session);
         self.state.claim = claim;
@@ -524,7 +562,11 @@ impl App {
         // Without this a young session forks into "fork of New session".
         session.update_title_if_default();
         session.set_title(format!("{FORK_TITLE_PREFIX}{}", session.title));
-        vec![Action::OpenFork(Box::new(OpenSession { session, claim }))]
+        vec![Action::OpenFork(Box::new(OpenSession {
+            session,
+            claim,
+            view: None,
+        }))]
     }
 
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {

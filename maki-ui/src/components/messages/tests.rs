@@ -10,11 +10,12 @@ use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
-use maki_config::DEFAULT_THINKING_LINES;
+use maki_config::{DEFAULT_THINKING_LINES, ToolOutputLines};
 use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
 use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 use test_case::test_case;
 
@@ -2700,6 +2701,351 @@ fn winsaveview_round_trips_through_winrestview() {
     panel.scroll_to_row(saved.scroll_top);
 
     assert_eq!(panel.scroll_pos(), pos);
+}
+
+const CANCEL_LINE: &str = "Cancelled.";
+const NOTICE_LINE: &str = "background task finished";
+const SHARED_TOOL: &str = "toolu_shared";
+const SHELL_TOOL: &str = "shell-1";
+const OUTPUT_LINES: usize = 200;
+const FULL_ROWS: usize = 25;
+const FALLBACK_ROWS: usize = 5;
+const READ_DEPTH: i32 = 15;
+
+fn anchor_panel() -> MessagesPanel {
+    let ui = UiConfig {
+        tool_output_lines: ToolOutputLines {
+            bash: OUTPUT_LINES,
+            ..ToolOutputLines::default()
+        },
+        ..UiConfig::default()
+    };
+    MessagesPanel::new(ui, EventHandle::disconnected_for_test())
+}
+
+fn shared_ids(ids: &[&str]) -> HashSet<String> {
+    ids.iter().map(|id| (*id).to_owned()).collect()
+}
+
+fn tail_text(rows: usize) -> String {
+    (0..rows)
+        .map(|i| format!("tail row {i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn run_tool(panel: &mut MessagesPanel, id: &str, lines: usize) {
+    panel.tool_start(ToolStartEvent {
+        id: id.into(),
+        tool: BASH_TOOL_NAME.into(),
+        summary: format!("{id} summary"),
+        annotation: None,
+        input: None,
+        raw_input: None,
+        output: None,
+        render_header: None,
+    });
+    panel.tool_done(ToolDoneEvent {
+        call: None,
+        id: id.into(),
+        tool: BASH_TOOL_NAME.into(),
+        output: Arc::new(ToolOutput::Plain(tail_text(lines).into())),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    });
+}
+
+/// The headline claim of the reload handoff: the view is anchored to a tool
+/// call id the session transcript holds, so it resolves to the very row the
+/// reader was on no matter what live-only lines sat above.
+#[test]
+fn anchor_returns_to_the_same_row_of_a_tool_output() {
+    const READ_DOWN: i32 = 5;
+    let mut live = anchor_panel();
+    live.push(DisplayMessage::new(DisplayRole::Error, CANCEL_LINE.into()));
+    run_tool(&mut live, SHARED_TOOL, 40);
+    render(&mut live, 80, 10);
+    let tool_seg = live.cache.find_by_tool_id(SHARED_TOOL).unwrap();
+    live.scroll_to_segment(tool_seg);
+    live.scroll(-READ_DOWN);
+    render(&mut live, 80, 10);
+    let anchor = live.scroll_anchor(&shared_ids(&[SHARED_TOOL]));
+    assert_eq!(anchor.tool.as_deref(), Some(SHARED_TOOL));
+    assert!(
+        !anchor.auto_scroll,
+        "the test must read anchored, not pinned"
+    );
+
+    let mut reloaded = anchor_panel();
+    reloaded.load_messages(live.messages.clone());
+    reloaded.restore_anchor(anchor);
+    reloaded.settle_scroll_anchor();
+    render(&mut reloaded, 80, 10);
+
+    assert_eq!(
+        reloaded.scroll_pos(),
+        ScrollPos {
+            seg: reloaded.cache.find_by_tool_id(SHARED_TOOL).unwrap(),
+            row: READ_DOWN as u16,
+        },
+        "the reload must reopen reading the same rows of the tool output"
+    );
+}
+
+/// A background-result notice comes back from history, so the rebuilt
+/// transcript has it too. Anchoring on the shared tool below it keeps the
+/// spot exact instead of guessing whether the line survives.
+#[test]
+fn anchor_survives_a_notice_above_the_view() {
+    const READ_DOWN: i32 = 3;
+    let mut live = anchor_panel();
+    run_tool(&mut live, SHARED_TOOL, 4);
+    live.push(DisplayMessage::new(DisplayRole::Notice, NOTICE_LINE.into()));
+    live.push(DisplayMessage::new(DisplayRole::Assistant, tail_text(40)));
+    render(&mut live, 80, 10);
+    live.scroll_to_segment(live.cache.len() - 1);
+    live.scroll(-READ_DOWN);
+    render(&mut live, 80, 10);
+    let anchor = live.scroll_anchor(&shared_ids(&[SHARED_TOOL]));
+
+    let mut reloaded = anchor_panel();
+    reloaded.load_messages(live.messages.clone());
+    reloaded.restore_anchor(anchor);
+    reloaded.settle_scroll_anchor();
+    render(&mut reloaded, 80, 10);
+
+    assert_eq!(
+        reloaded.scroll_pos(),
+        ScrollPos {
+            seg: reloaded.cache.len() - 1,
+            row: READ_DOWN as u16,
+        },
+        "a notice history rebuilds must not shift the reopening"
+    );
+}
+
+/// A `!` shell run is a tool with a local id that never reaches the session
+/// transcript, so it cannot anchor: the handoff falls to the shared tool
+/// below it and the shell's rows shift the landing by exactly their height.
+#[test]
+fn anchor_ignores_a_shell_run_above_the_view() {
+    const READ_DOWN: i32 = 3;
+    const SHELL_ROWS: usize = 4;
+    let mut live = anchor_panel();
+    run_tool(&mut live, SHARED_TOOL, 4);
+    run_tool(&mut live, SHELL_TOOL, SHELL_ROWS);
+    live.push(DisplayMessage::new(DisplayRole::Assistant, tail_text(40)));
+    render(&mut live, 80, 10);
+    live.scroll_to_segment(live.cache.len() - 1);
+    live.scroll(-READ_DOWN);
+    render(&mut live, 80, 10);
+    let anchor = live.scroll_anchor(&shared_ids(&[SHARED_TOOL]));
+    assert_eq!(anchor.tool.as_deref(), Some(SHARED_TOOL));
+    let rows = anchor.rows;
+
+    let history: Vec<DisplayMessage> = live
+        .messages
+        .iter()
+        .filter(|m| !matches!(&m.role, DisplayRole::Tool(t) if t.id == SHELL_TOOL))
+        .cloned()
+        .collect();
+    let mut reloaded = anchor_panel();
+    reloaded.load_messages(history);
+    reloaded.restore_anchor(anchor);
+    reloaded.settle_scroll_anchor();
+    render(&mut reloaded, 80, 10);
+
+    let text = reloaded.cache.len() - 1;
+    let text_rows = reloaded.layout().rows_from(
+        ScrollPos { seg: text, row: 0 },
+        ScrollPos {
+            seg: text + 1,
+            row: 0,
+        },
+    );
+    let above_text = reloaded
+        .layout()
+        .rows_from(ScrollPos::default(), ScrollPos { seg: text, row: 0 });
+    let expected_row = rows - above_text;
+    assert!(
+        text_rows > expected_row,
+        "the test must land inside the text, not past its end"
+    );
+    assert_eq!(
+        reloaded.scroll_pos(),
+        ScrollPos {
+            seg: text,
+            row: expected_row as u16,
+        },
+        "a shell run history drops must shift the landing by exactly its rows"
+    );
+}
+
+/// Above every shared tool call the anchor is the transcript top, so the
+/// carried rows count from there.
+#[test]
+fn anchor_without_a_shared_tool_counts_from_the_top() {
+    const READ_DOWN: i32 = 3;
+    let mut live = anchor_panel();
+    run_tool(&mut live, SHELL_TOOL, 4);
+    live.push(DisplayMessage::new(DisplayRole::Assistant, tail_text(40)));
+    render(&mut live, 80, 10);
+    live.scroll_to_segment(live.cache.len() - 1);
+    live.scroll(-READ_DOWN);
+    render(&mut live, 80, 10);
+    let anchor = live.scroll_anchor(&shared_ids(&[]));
+    assert_eq!(anchor.tool, None);
+    let rows = anchor.rows;
+
+    let history: Vec<DisplayMessage> = live
+        .messages
+        .iter()
+        .filter(|m| !matches!(&m.role, DisplayRole::Tool(t) if t.id == SHELL_TOOL))
+        .cloned()
+        .collect();
+    let mut reloaded = anchor_panel();
+    reloaded.load_messages(history);
+    reloaded.restore_anchor(anchor);
+    reloaded.settle_scroll_anchor();
+    render(&mut reloaded, 80, 10);
+
+    assert_eq!(
+        reloaded.scroll_pos(),
+        reloaded.layout().at_row(rows),
+        "with no shared tool the rows count from the transcript top"
+    );
+}
+
+/// The anchor waits out the restore batch, which on a long session takes
+/// seconds. A reader who scrolls or re-pins in that window has taken over;
+/// the settling must not yank the viewport back to the carried spot.
+#[test]
+fn a_reader_who_moves_before_the_batch_settles_takes_over() {
+    let mut live = anchor_panel();
+    run_tool(&mut live, SHARED_TOOL, FULL_ROWS);
+    render(&mut live, 80, 10);
+    let tool_seg = live.cache.find_by_tool_id(SHARED_TOOL).unwrap();
+    live.scroll_to_segment(tool_seg);
+    live.scroll(-READ_DEPTH);
+    render(&mut live, 80, 10);
+    let anchor = live.scroll_anchor(&shared_ids(&[SHARED_TOOL]));
+
+    let mut reloaded = anchor_panel();
+    reloaded.load_messages(live.messages.clone());
+    reloaded.restore_anchor(anchor);
+    render(&mut reloaded, 80, 10);
+
+    reloaded.scroll(2);
+    let moved = reloaded.scroll_pos();
+    reloaded.settle_scroll_anchor();
+    render(&mut reloaded, 80, 10);
+    assert_eq!(
+        reloaded.scroll_pos(),
+        moved,
+        "a reader who scrolled during the restore keeps their spot"
+    );
+
+    let mut re_pinned = anchor_panel();
+    re_pinned.load_messages(live.messages.clone());
+    re_pinned.restore_anchor(live.scroll_anchor(&shared_ids(&[SHARED_TOOL])));
+    render(&mut re_pinned, 80, 10);
+    re_pinned.enable_auto_scroll();
+    let pinned = re_pinned.scroll_pos();
+    re_pinned.settle_scroll_anchor();
+    render(&mut re_pinned, 80, 10);
+    assert!(
+        re_pinned.auto_scroll() && re_pinned.scroll_pos() >= pinned,
+        "a reader who re-pinned during the restore stays at the bottom"
+    );
+}
+
+/// A background tab never paints between two reloads, so its parked anchor
+/// must hand over to the next generation instead of the default bottom the
+/// panel would otherwise save.
+#[test]
+fn an_unpainted_tab_hands_its_parked_anchor_on() {
+    let mut live = anchor_panel();
+    run_tool(&mut live, SHARED_TOOL, FULL_ROWS);
+    render(&mut live, 80, 10);
+    let tool_seg = live.cache.find_by_tool_id(SHARED_TOOL).unwrap();
+    live.scroll_to_segment(tool_seg);
+    live.scroll(-READ_DEPTH);
+    render(&mut live, 80, 10);
+    let anchor = live.scroll_anchor(&shared_ids(&[SHARED_TOOL]));
+    let shared = shared_ids(&[SHARED_TOOL]);
+
+    // First reload: the anchor is parked and the tab never paints.
+    let mut reloaded = anchor_panel();
+    reloaded.load_messages(live.messages.clone());
+    reloaded.restore_anchor(anchor.clone());
+
+    // Second reload, no frame in between: the parked anchor hands over.
+    assert_eq!(reloaded.scroll_anchor(&shared), anchor);
+
+    // The handed-on anchor still resolves once the tab finally paints.
+    reloaded.settle_scroll_anchor();
+    render(&mut reloaded, 80, 10);
+    assert_eq!(
+        reloaded.scroll_pos(),
+        ScrollPos {
+            seg: reloaded.cache.find_by_tool_id(SHARED_TOOL).unwrap(),
+            row: READ_DEPTH as u16,
+        }
+    );
+}
+
+/// A reload rebuild queues plugin tool renders that land after the first
+/// frames and grow their segments (bash's adds the command and a
+/// separator). Rows the anchor counted against the full heights would
+/// overshoot a shorter Rust fallback, so the anchor waits out the restore
+/// batch and resolves against the settled transcript.
+#[test]
+fn anchor_waits_for_the_restore_batch() {
+    let mut live = anchor_panel();
+    run_tool(&mut live, SHARED_TOOL, FULL_ROWS);
+    render(&mut live, 80, 10);
+    let tool_seg = live.cache.find_by_tool_id(SHARED_TOOL).unwrap();
+    live.scroll_to_segment(tool_seg);
+    live.scroll(-READ_DEPTH);
+    render(&mut live, 80, 10);
+    let anchor = live.scroll_anchor(&shared_ids(&[SHARED_TOOL]));
+    let target = ScrollPos {
+        seg: tool_seg,
+        row: READ_DEPTH as u16,
+    };
+
+    let mut reloaded = anchor_panel();
+    run_tool(&mut reloaded, SHARED_TOOL, FALLBACK_ROWS);
+    reloaded.restore_anchor(anchor);
+    render(&mut reloaded, 80, 10);
+    assert_ne!(
+        reloaded.scroll_pos(),
+        target,
+        "the anchor must not resolve while the restore batch is in flight"
+    );
+
+    // The plugin render lands and grows the tool segment to its real height.
+    let full = live.message_at(0).unwrap().clone();
+    reloaded.replace(0, full);
+    render(&mut reloaded, 80, 10);
+    assert_ne!(
+        reloaded.scroll_pos(),
+        target,
+        "a grown segment alone must not settle the anchor either"
+    );
+
+    // A drain that started after the batch finished ran to empty.
+    reloaded.settle_scroll_anchor();
+    render(&mut reloaded, 80, 10);
+    assert_eq!(
+        reloaded.scroll_pos(),
+        ScrollPos {
+            seg: reloaded.cache.find_by_tool_id(SHARED_TOOL).unwrap(),
+            row: READ_DEPTH as u16,
+        },
+        "once the batch clears the anchor must resolve against the settled heights"
+    );
 }
 
 const THEME_CODE: &str = "fn main() { let x = 1; }";

@@ -1268,8 +1268,8 @@ impl EventHandle {
         });
     }
 
-    pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
-        let _ = self.tx.send(Request::RestoreComplete { flag });
+    pub fn send_restore_complete(&self, flag: Arc<AtomicBool>, event_tx: maki_agent::EventSender) {
+        let _ = self.tx.send(Request::RestoreComplete { flag, event_tx });
     }
 
     /// Blocks until every restore item queued so far has finished; restores
@@ -1279,7 +1279,8 @@ impl EventHandle {
     pub fn wait_restore_complete_for_test(&self) {
         const DEADLINE: Duration = Duration::from_secs(30);
         let flag = Arc::new(AtomicBool::new(true));
-        self.send_restore_complete(Arc::clone(&flag));
+        let (tx, _rx) = flume::unbounded();
+        self.send_restore_complete(Arc::clone(&flag), maki_agent::EventSender::new(tx, 0));
         let start = std::time::Instant::now();
         while flag.load(Ordering::Relaxed) {
             assert!(start.elapsed() < DEADLINE, "restore batch never completed");

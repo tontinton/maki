@@ -10,6 +10,7 @@
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -446,6 +447,7 @@ impl SpawnCtx {
             self.mcp_config_errors.clone(),
             Arc::clone(&self.model_policy),
         );
+        let view = open.view.clone();
         let mut app = App::new(
             &slot.model,
             open,
@@ -469,6 +471,19 @@ impl SpawnCtx {
         handles.apply_to_app(&mut app);
         if resumed {
             app.restore_resumed_session();
+        }
+        // A carried view belongs to the transcript `restore_resumed_session`
+        // just rebuilt, so it lands only after that. `None` keeps the bottom
+        // pin a tab from disk or a fresh start opens on. The panel holds it
+        // until the restore batch's done event settles it; a disconnected
+        // Lua owes no renders and never sends one, so it settles now.
+        if let Some(anchor) = view {
+            let batch_in_flight = app.restoring.load(Ordering::Relaxed);
+            let chat = app.main_chat();
+            chat.restore_anchor(anchor);
+            if !batch_in_flight {
+                chat.settle_scroll_anchor();
+            }
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         let last_title = app.state.session.title.clone();
@@ -1422,8 +1437,9 @@ impl<'t> EventLoop<'t> {
                     if let Some(i) = self.position(id) {
                         self.sessions[i].app.state.session_mut().set_title(title);
                     } else {
-                        let OpenSession { mut session, claim } =
-                            OpenSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
+                        let OpenSession {
+                            mut session, claim, ..
+                        } = OpenSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
                         session.set_title(title);
                         self.ctx.storage_writer.send(Arc::new(session), claim);
                     }
@@ -2159,9 +2175,12 @@ impl<'t> EventLoop<'t> {
             app.checkpoint_now();
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
+            let shared = app.session_tool_ids();
+            let view = Some(app.main_chat().scroll_anchor(&shared));
             tabs.push(OpenSession {
                 session: Arc::unwrap_or_clone(app.state.session),
                 claim: app.state.claim,
+                view,
             });
             agent_tasks.push(handles.into_task());
         }

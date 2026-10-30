@@ -10,6 +10,23 @@ pub struct ScrollPos {
     pub row: u16,
 }
 
+/// The viewport a `/reload` carries into the next UI generation: an anchor
+/// both transcripts share plus how many rows below it the reader sits, and
+/// the bottom pin. The anchor is a tool call id the session transcript
+/// holds, so it survives the rebuild from history; lines that only ever
+/// exist live (a `!` shell run, a nudge, the compacting line) carry no such
+/// id and cannot shift the reopening.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScrollAnchor {
+    /// `None` anchors to the top of the transcript, for views above every
+    /// tool call history keeps.
+    pub tool: Option<String>,
+    /// Rows below the anchor segment's first row (the transcript's, when
+    /// `tool` is `None`).
+    pub rows: u32,
+    pub auto_scroll: bool,
+}
+
 /// One frame's document. Every row walk goes through here.
 pub(super) struct Layout<'a> {
     cache: &'a SegmentCache,
@@ -31,7 +48,7 @@ impl<'a> Layout<'a> {
 
     /// One past the last addressable row, so `retreat` from here is "the last
     /// N rows of the document".
-    fn end(&self) -> ScrollPos {
+    pub fn end(&self) -> ScrollPos {
         ScrollPos {
             seg: self.len(),
             row: 0,

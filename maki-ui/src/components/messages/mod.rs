@@ -5,7 +5,7 @@ mod selection;
 #[cfg(test)]
 mod tests;
 
-pub use self::scroll::ScrollPos;
+pub use self::scroll::{ScrollAnchor, ScrollPos};
 
 use self::render::RenderCursor;
 use self::scroll::Layout;
@@ -68,6 +68,15 @@ pub struct PromptProgress {
     pub cache: u32,
 }
 
+/// A [`ScrollAnchor`] the shutdown handed over, waiting for the restore
+/// batch's done event. The rebuild's plugin tool renders land after the
+/// first frames and change segment heights, so resolving before the batch
+/// is done would count rows against heights that are still moving.
+struct PendingAnchor {
+    anchor: ScrollAnchor,
+    settled: bool,
+}
+
 pub struct MessagesPanel {
     messages: Vec<DisplayMessage>,
     streaming_thinking: StreamingContent,
@@ -75,6 +84,11 @@ pub struct MessagesPanel {
     started_at: Instant,
     scroll: ScrollPos,
     auto_scroll: bool,
+    /// A [`PendingAnchor`] handed over before this transcript existed. The
+    /// rebuild's plugin tool renders land after the first frames and change
+    /// segment heights, so it resolves only in the first `view` after the
+    /// event loop settles it.
+    pending_anchor: Option<PendingAnchor>,
     viewport_height: u16,
     viewport_width: u16,
     cache: SegmentCache,
@@ -138,6 +152,7 @@ impl MessagesPanel {
             started_at: Instant::now(),
             scroll: ScrollPos::default(),
             auto_scroll: true,
+            pending_anchor: None,
             viewport_height: 24,
             viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
             cache: SegmentCache::new(),
@@ -222,6 +237,8 @@ impl MessagesPanel {
 
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.messages = msgs;
+        // The parked anchor belonged to the transcript being replaced.
+        self.pending_anchor = None;
         self.cache.clear();
         self.expanded_tools.clear();
         self.lua_clicks.clear();
@@ -629,6 +646,9 @@ impl MessagesPanel {
     /// Always unpins, and the next `view` re-pins if this lands on the
     /// bottom line.
     fn scroll_to(&mut self, pos: ScrollPos) {
+        // The reader took over, so a carried view still waiting out the
+        // restore batch must not jump the viewport out from under them.
+        self.pending_anchor = None;
         self.scroll = pos;
         self.auto_scroll = false;
     }
@@ -642,6 +662,7 @@ impl MessagesPanel {
     }
 
     pub fn enable_auto_scroll(&mut self) {
+        self.pending_anchor = None;
         self.auto_scroll = true;
     }
 
@@ -661,6 +682,27 @@ impl MessagesPanel {
     pub fn restore_scroll(&mut self, scroll: ScrollPos, auto_scroll: bool) {
         self.scroll = scroll;
         self.auto_scroll = auto_scroll;
+    }
+
+    /// Parks a [`ScrollAnchor`] captured before a `/reload`. The rebuild's
+    /// plugin tool renders land after the first frames (bash's adds the
+    /// command and a separator), and rows counted against the shorter Rust
+    /// fallback would land the view too low, so it waits for
+    /// [`Self::settle_scroll_anchor`] before the next `view` resolves it.
+    pub fn restore_anchor(&mut self, anchor: ScrollAnchor) {
+        self.pending_anchor = Some(PendingAnchor {
+            anchor,
+            settled: false,
+        });
+    }
+
+    /// The restore batch's `RestoreDone` event, which the batch sent after
+    /// its last render on the same channel: the heights the anchor counts
+    /// against are final by the time the next `view` runs.
+    pub(crate) fn settle_scroll_anchor(&mut self) {
+        if let Some(pending) = &mut self.pending_anchor {
+            pending.settled = true;
+        }
     }
 
     pub fn set_highlight_segment(&mut self, idx: Option<usize>) {
@@ -897,6 +939,7 @@ impl MessagesPanel {
             );
         }
         self.rebuild_line_cache();
+        self.apply_pending_anchor();
         if self.in_progress_count() > 0 {
             self.update_spinners();
         }
@@ -1007,6 +1050,68 @@ impl MessagesPanel {
 
     pub fn scroll_pos(&self) -> ScrollPos {
         self.scroll
+    }
+
+    /// The reload handoff, [`Self::restore_anchor`]'s counterpart. The index
+    /// a live transcript answers would drift across the rebuild: every line
+    /// above the view that history does not give back shifts it a message.
+    /// So the anchor is the nearest tool call at or above the viewport whose
+    /// id the session transcript holds — an id the rebuilt transcript shares
+    /// — plus the rows below it. `shared` is those ids; a `!` shell run has
+    /// a local id that never reaches the transcript and cannot anchor.
+    pub fn scroll_anchor(&self, shared: &HashSet<String>) -> ScrollAnchor {
+        // A background tab never paints, so an anchor still parked is the
+        // spot; saving the panel's default bottom instead would drop it on
+        // the next handoff.
+        if let Some(pending) = &self.pending_anchor {
+            return pending.anchor.clone();
+        }
+        let mut anchor = None;
+        for seg in (0..=self.scroll.seg).rev() {
+            let Some(id) = self.cache.get(seg).and_then(|s| s.tool_id.as_deref()) else {
+                continue;
+            };
+            if shared.contains(id) {
+                anchor = Some((id.to_owned(), ScrollPos { seg, row: 0 }));
+                break;
+            }
+        }
+        let layout = self.layout();
+        let rows = match anchor {
+            Some((_, pos)) => layout.rows_from(pos, self.scroll),
+            None => layout.doc_row(self.scroll),
+        };
+        ScrollAnchor {
+            tool: anchor.map(|(id, _)| id),
+            rows,
+            auto_scroll: self.auto_scroll,
+        }
+    }
+
+    /// Resolves the anchor the shutdown handed over against the segments the
+    /// rebuild just produced. A tool history dropped (the transcript never
+    /// reached it) anchors nowhere, so the view falls to the end and the
+    /// clamp settles it.
+    fn apply_pending_anchor(&mut self) {
+        if self
+            .pending_anchor
+            .as_ref()
+            .is_some_and(|pending| !pending.settled)
+        {
+            return;
+        }
+        let Some(anchor) = self.pending_anchor.take().map(|p| p.anchor) else {
+            return;
+        };
+        let base = match anchor.tool.as_deref() {
+            None => ScrollPos::default(),
+            Some(id) => self
+                .cache
+                .find_by_tool_id(id)
+                .map_or_else(|| self.layout().end(), |seg| ScrollPos { seg, row: 0 }),
+        };
+        self.scroll = self.layout().advance(base, anchor.rows);
+        self.auto_scroll = anchor.auto_scroll;
     }
 
     /// Where a click at `rel_row` rows into the viewport lands, as a place a
