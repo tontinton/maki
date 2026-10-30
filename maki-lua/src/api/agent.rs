@@ -29,7 +29,8 @@ use maki_providers::model::ModelTier;
 use maki_providers::model_registry;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, Message, Model, RequestOptions, Role, ThinkingConfig, add_cost,
+    AgentError, ContentBlock, ContextGauge, Message, Model, RequestOptions, Role, ThinkingConfig,
+    add_cost,
 };
 use maki_storage::id::MakiId;
 use maki_storage::now_epoch;
@@ -66,29 +67,65 @@ const IDLE_STATUS: &str = "idle";
 const TASK_SCOPE: &str = "task";
 const SESSION_SCOPE: &str = "session";
 const NO_REGISTRY_ERR: &str = "tool registry not available";
+const TIER_PINNED_HINT: &str = "tier is pinned to";
+const REASSIGN_MODEL_HINT: &str = "Reassign in `/model`.";
 const MCP_REACH_ERR: &str =
     "mcp = true reaches whatever its servers do, so a session of your own takes every permission";
 const TASK_REQUIRED_ERR: &str = "maki.agent.session({ session = id }) and its prompts must run \
      in a task: maki.async.spawn, an autocmd callback or a tool handler";
 
-fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
+fn resolve_model_from_ctx(
+    ctx: &AgentContext,
+    tier: Option<&str>,
+) -> Result<(Model, Option<ModelTier>), String> {
     let Some(tier_str) = tier else {
-        return Ok(Model::clone(&ctx.model));
+        return Ok((Model::clone(&ctx.model), None));
     };
     let requested = tier_str.parse::<ModelTier>().map_err(|e| e.to_string())?;
     let effective = requested.capped_at(ctx.model.tier);
     if effective == ctx.model.tier {
-        return Ok(Model::clone(&ctx.model));
+        return Ok((Model::clone(&ctx.model), None));
     }
     let slug = &ctx.model.provider;
-    model_registry::resolve_tier(Some(slug), effective)
+    if let Some(spec) = model_registry::resolve_tier(Some(slug), effective)
         .filter(|spec| ctx.model_policy.allows(spec))
-        .and_then(|s| Model::from_spec(&s).ok())
-        .map(Ok)
-        .unwrap_or_else(|| {
-            Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
-                .map_err(|e| e.to_string())
-        })
+    {
+        let pinned_tier = model_registry::override_tiers(&spec)
+            .contains(&effective)
+            .then_some(effective);
+        match Model::from_spec(&spec) {
+            Ok(model) => return Ok((model, pinned_tier)),
+            Err(error) if pinned_tier.is_some() => {
+                return Err(tier_failure(pinned_tier, &spec, error.to_string()));
+            }
+            Err(_) => {}
+        }
+    }
+    Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
+        .map(|model| (model, None))
+        .map_err(|e| e.to_string())
+}
+
+fn tier_failure(tier: Option<ModelTier>, spec: &str, message: String) -> String {
+    let Some(tier) = tier else {
+        return message;
+    };
+    let provider = spec
+        .split_once('/')
+        .map(|(slug, _)| format!(" (provider `{slug}`)"))
+        .unwrap_or_default();
+    format!("{tier} {TIER_PINNED_HINT} `{spec}`{provider}. {REASSIGN_MODEL_HINT}\n{message}")
+}
+
+/// Let the provider decide what credentials it needs: OAuth and anonymous
+/// endpoints cannot be judged by the presence of an API key.
+fn provider_failure(model: &Model, tier: Option<ModelTier>, error: &AgentError) -> String {
+    let message = error.to_string();
+    if matches!(error, AgentError::Config { .. }) || error.is_auth_error() {
+        tier_failure(tier, &model.spec(), message)
+    } else {
+        message
+    }
 }
 
 fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
@@ -332,7 +369,9 @@ async fn relay_session_events(
 /// without hard-coding a model name.
 ///
 /// The returned table has fields: `id` (string), `tier` (string),
-/// `provider` (string), `spec` (string).
+/// `provider` (string), `spec` (string), `pinned_tier` (string?, the tier pick
+/// that selected this model). Pass `pinned_tier` to `maki.agent.session` to
+/// explain credential failures for that pick.
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table? Optional fields:
@@ -361,11 +400,16 @@ async fn resolve_model(
         .as_ref()
         .and_then(|t| t.opt::<String>("spec").ok().flatten());
 
-    let model = match spec_str {
-        Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
+    let (model, pinned_tier) = match spec_str {
+        Some(ref spec) => (
+            try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
+            None,
+        ),
         None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref())),
     };
-    Ok((Some(model_to_lua_table(&lua, &model)?), None))
+    let model = model_to_lua_table(&lua, &model)?;
+    model.set("pinned_tier", pinned_tier.map(|tier| tier.to_string()))?;
+    Ok((Some(model), None))
 }
 
 /// Build a system prompt from the parent's resolved prompt catalogue.
@@ -717,6 +761,8 @@ async fn call_tool(
 ///   `scope` (string?) - only without a ctx: `"task"` (default) or
 ///     `"session"`, see above.
 ///   `model_spec` (string?) - model spec string to use instead of the parent model.
+///   `pinned_tier` (string?) - tier pick from `maki.agent.resolve_model`.
+///     Adds the pick and `/model` recovery hint to credential errors.
 ///   `system` (string?) - system prompt. Defaults to empty.
 ///   `tools` (table?) - tool definitions array (from `maki.agent.tools()`).
 ///   `local_tools` (table?) - map of `name -> spec` for Lua-backed tools. Each spec
@@ -781,6 +827,11 @@ async fn session(
         }
     };
     let model_spec: Option<String> = opts.opt("model_spec")?;
+    let pinned_tier = try_pair!(
+        opts.opt::<String>("pinned_tier")?
+            .map(|tier| tier.parse::<ModelTier>())
+            .transpose()
+    );
     let system: Option<String> = opts.opt("system")?;
     let tools_val: Option<LuaValue> = opts.opt("tools")?;
     let local_tools_tbl: Option<Table> = opts.opt("local_tools")?;
@@ -797,8 +848,15 @@ async fn session(
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
     {
-        let mut m = try_pair!(Model::from_spec_with_policy(spec, &agent_ctx.model_policy));
-        let p = try_pair!(provider::from_model_async(&mut m, agent_ctx.timeouts).await);
+        let mut m = try_pair!(
+            Model::from_spec_with_policy(spec, &agent_ctx.model_policy)
+                .map_err(|error| tier_failure(pinned_tier, spec, error.to_string()))
+        );
+        let p = try_pair!(
+            provider::from_model_async(&mut m, agent_ctx.timeouts)
+                .await
+                .map_err(|error| provider_failure(&m, pinned_tier, &error))
+        );
         (m, Arc::from(p))
     } else {
         (
@@ -986,6 +1044,7 @@ async fn session(
 
     let inbox = Arc::new(SubagentInbox::default());
     let state = SessionState {
+        pinned_tier,
         params: AgentParams {
             provider,
             model,
@@ -1251,6 +1310,7 @@ async fn dispatch_racing_live(
 
 struct SessionState {
     params: AgentParams,
+    pinned_tier: Option<ModelTier>,
     /// The caller's prompt and tools, fixed for the session's life.
     context: RunContextBuilder,
     /// Already reconciled against `params.model`, so every reader agrees.
@@ -1651,7 +1711,7 @@ async fn prompt(
     // reads like an error here even though the run ended normally. A dropped
     // prompt never reached the model, so an empty answer would be a lie.
     let cut_short = match &result {
-        Err(e) => Some(e.to_string()),
+        Err(error) => Some(provider_failure(&s.params.model, s.pinned_tier, error)),
         Ok(DoneReason::Cancelled) if s.stopped_by_user() => Some(STOPPED_BY_USER_ERR.to_owned()),
         Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
         Ok(DoneReason::Dropped) => Some(PROMPT_DROPPED_ERR.to_owned()),
@@ -2028,6 +2088,39 @@ mod tests {
     const CHILD_SYSTEM: &str = "You analyse evidence.\n{{instructions}}";
     const CHILD_INSTRUCTIONS: &str = "Keep {{identity}} literal.";
     const CHILD_RESPONSE: &str = "Analysis complete.";
+    const PINNED_SPEC: &str = "zai/glm-5";
+    const PROVIDER_FAILURE: &str = "provider credentials unavailable";
+    const UNAUTHORIZED: u16 = 401;
+    const FORBIDDEN: u16 = 403;
+    const REMOVED_PROVIDER_SPEC: &str = "removed-tier-provider/probe";
+
+    struct RejectingProvider(Option<u16>);
+
+    impl Provider for RejectingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a JsonValue,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                Err(self.0.map_or_else(
+                    || AgentError::Config {
+                        message: PROVIDER_FAILURE.into(),
+                    },
+                    |status| AgentError::api(status, PROVIDER_FAILURE),
+                ))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
 
     struct PromptRecorder(Sender<String>);
 
@@ -2583,18 +2676,137 @@ mod tests {
         ctx.model = Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap());
         let ctx = AgentContext::from(&ctx);
 
-        let same_provider_weak = resolve_model_from_ctx(&ctx, Some("weak")).unwrap().spec();
-        assert!(same_provider_weak.starts_with("anthropic/"));
+        let (same_provider_weak, pinned_tier) = resolve_model_from_ctx(&ctx, Some("weak")).unwrap();
+        assert!(same_provider_weak.spec().starts_with("anthropic/"));
+        assert_eq!(pinned_tier, None);
 
         let dir = tempfile::TempDir::new().unwrap();
         maki_providers::model_registry::set_and_persist(
-            "zai/glm-5".into(),
+            PINNED_SPEC.into(),
             ModelTier::Weak,
             &maki_storage::StateDir::from_path(dir.path().to_path_buf()),
         );
 
-        let model = resolve_model_from_ctx(&ctx, Some("weak")).unwrap();
-        assert_eq!(model.spec(), "zai/glm-5");
-        assert_ne!(model.spec(), same_provider_weak);
+        let (model, pinned_tier) = resolve_model_from_ctx(&ctx, Some("weak")).unwrap();
+        assert_eq!(model.spec(), PINNED_SPEC);
+        assert_ne!(model.spec(), same_provider_weak.spec());
+        assert_eq!(pinned_tier, Some(ModelTier::Weak));
+
+        let lua = Lua::new();
+        let parent = lua
+            .create_userdata(LuaCtx::handler(&ctx.to_tool_context()))
+            .unwrap();
+        let options = lua.create_table().unwrap();
+        options.set("tier", ModelTier::Weak.to_string()).unwrap();
+        options.set("spec", PINNED_SPEC).unwrap();
+        let (explicit, error) = smol::block_on(resolve_model(
+            lua.clone(),
+            parent.borrow().unwrap(),
+            Some(options),
+        ))
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(
+            explicit.unwrap().opt::<String>("pinned_tier").unwrap(),
+            None
+        );
+        for tier in [None, Some("strong")] {
+            let (inherited, pinned_tier) = resolve_model_from_ctx(&ctx, tier).unwrap();
+            assert_eq!(inherited.spec(), ctx.model.spec());
+            assert_eq!(pinned_tier, None);
+        }
+    }
+
+    #[test_case(None, Some(ModelTier::Weak), true ; "selected_tier_config_error")]
+    #[test_case(Some(UNAUTHORIZED), Some(ModelTier::Weak), true ; "selected_tier_unauthorized")]
+    #[test_case(Some(FORBIDDEN), Some(ModelTier::Weak), false ; "selected_tier_forbidden")]
+    #[test_case(None, None, false ; "inherited_config_error")]
+    #[test_case(Some(UNAUTHORIZED), None, false ; "inherited_unauthorized")]
+    fn task_prompt_only_explains_the_selected_tier(
+        status: Option<u16>,
+        pinned_tier: Option<ModelTier>,
+        expect_hint: bool,
+    ) {
+        let lua = Lua::new();
+        lua.set_app_data(Arc::clone(ToolRegistry::global_arc()));
+        let mut child = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        child.model = Arc::new(Model::from_spec(PINNED_SPEC).unwrap());
+        child.provider = Arc::new(RejectingProvider(status));
+        let parent = lua.create_userdata(LuaCtx::handler(&child)).unwrap();
+        let options = lua.create_table().unwrap();
+        options
+            .set("pinned_tier", pinned_tier.map(|tier| tier.to_string()))
+            .unwrap();
+        smol::block_on(async {
+            let (sess, error) = session(
+                lua.clone(),
+                Arc::from(PLUGIN),
+                PluginPermissions::trusted(),
+                LuaEither::Left(parent.borrow().unwrap()),
+                Some(options),
+            )
+            .await
+            .unwrap();
+            assert!(error.is_none(), "{error:?}");
+            let sess = sess.unwrap();
+            let (_, error) = prompt(lua.clone(), sess.borrow().unwrap(), CHILD_REQUEST.into())
+                .await
+                .unwrap();
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+            let cause = status
+                .map_or_else(
+                    || AgentError::Config {
+                        message: PROVIDER_FAILURE.into(),
+                    },
+                    |status| AgentError::api(status, PROVIDER_FAILURE),
+                )
+                .to_string();
+            let expected = if expect_hint {
+                format!(
+                    "{} {TIER_PINNED_HINT} `{PINNED_SPEC}` (provider `zai`). {REASSIGN_MODEL_HINT}\n{cause}",
+                    ModelTier::Weak
+                )
+            } else {
+                cause
+            };
+            assert_eq!(error.as_deref(), Some(expected.as_str()));
+        });
+    }
+
+    #[test_case(Some(ModelTier::Weak) ; "selected_tier")]
+    #[test_case(None ; "explicit_model")]
+    fn removed_provider_session_error_keeps_the_selection_context(pinned_tier: Option<ModelTier>) {
+        let lua = Lua::new();
+        lua.set_app_data(Arc::clone(ToolRegistry::global_arc()));
+        let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        let parent = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+        let options = lua.create_table().unwrap();
+        options.set("model_spec", REMOVED_PROVIDER_SPEC).unwrap();
+        options
+            .set("pinned_tier", pinned_tier.map(|tier| tier.to_string()))
+            .unwrap();
+        let (opened, error) = smol::block_on(session(
+            lua.clone(),
+            Arc::from(PLUGIN),
+            PluginPermissions::trusted(),
+            LuaEither::Left(parent.borrow().unwrap()),
+            Some(options),
+        ))
+        .unwrap();
+        assert!(opened.is_none());
+        let error = error.unwrap();
+        let cause = Model::from_spec(REMOVED_PROVIDER_SPEC)
+            .unwrap_err()
+            .to_string();
+        let expected = match pinned_tier {
+            Some(tier) => {
+                let (provider, _) = REMOVED_PROVIDER_SPEC.split_once('/').unwrap();
+                format!(
+                    "{tier} {TIER_PINNED_HINT} `{REMOVED_PROVIDER_SPEC}` (provider `{provider}`). {REASSIGN_MODEL_HINT}\n{cause}"
+                )
+            }
+            None => cause,
+        };
+        assert_eq!(error, expected);
     }
 }

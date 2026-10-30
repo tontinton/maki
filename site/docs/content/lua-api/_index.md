@@ -1468,7 +1468,9 @@ You might want a cheaper model for simple subtasks (summaries, classification)
 without hard-coding a model name.
 
 The returned table has fields: `id` (string), `tier` (string),
-`provider` (string), `spec` (string).
+`provider` (string), `spec` (string), `pinned_tier` (string?, the tier pick
+that selected this model). Pass `pinned_tier` to `maki.agent.session` to
+explain credential failures for that pick.
 
 **Parameters:**
 
@@ -1739,6 +1741,8 @@ session, so opening one fails with "session not live". The
   - `scope` (`string?`) only without a ctx: `"task"` (default) or
     `"session"`, see above.
   - `model_spec` (`string?`) model spec string to use instead of the parent model.
+  - `pinned_tier` (`string?`) tier pick from `maki.agent.resolve_model`.
+    Adds the pick and `/model` recovery hint to credential errors.
   - `system` (`string?`) system prompt. Defaults to empty.
   - `tools` (`table?`) tool definitions array (from `maki.agent.tools()`).
   - `local_tools` (`table?`) map of `name -> spec` for Lua-backed tools. Each spec

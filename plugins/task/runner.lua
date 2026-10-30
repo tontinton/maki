@@ -171,6 +171,7 @@ function Runner.prepare(input, ctx)
   return {
     options = {
       model_spec = model.spec,
+      pinned_tier = model.pinned_tier,
       system = system,
       tools = tool_defs,
       local_tools = local_tools,
