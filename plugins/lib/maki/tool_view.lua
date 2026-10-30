@@ -276,7 +276,8 @@ function ToolView:flush()
     end
   end
 
-  self.buf:set_lines(lines)
+  -- The header names the call, so a row that moved to the background keeps it.
+  self.buf:set_lines(lines, { head = #self.header })
 end
 
 function ToolView:update_line(all_idx, line)

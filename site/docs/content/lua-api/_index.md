@@ -8277,21 +8277,28 @@ buf:lines({
 ### `Buf:set_lines()` {#Buf-set_lines}
 
 ```lua
-Buf:set_lines({lines})
+Buf:set_lines({lines}, {opts?})
 ```
 
 Replaces every line in the buffer with {lines}. Use this when you
 want to redraw the whole buffer, for example after the user toggles
 a view.
 
+`head` counts the leading lines that say what the buffer is about, like
+the command above a bash output. When the tool call moves to the
+background, its row in the chat keeps only those lines, because the rest
+streams in the task's tab. Without a head the row keeps just its title.
+
 **Parameters:**
 
 - `{lines}` (`table`) Sequence of line values, each the same format accepted by `buf:line`.
+- `{opts?}` (`table|nil`) Options: `head` = number of leading lines (default 0).
 
 **Example:**
 
 ```lua
 buf:set_lines({ "new content", "replaces everything" })
+buf:set_lines({ "cargo test", "──────", "running 3 tests" }, { head = 2 })
 ```
 
 ---

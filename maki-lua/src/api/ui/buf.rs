@@ -198,18 +198,29 @@ fn lines(_lua: &Lua, this: &BufHandle, lines: Table) -> LuaResult<()> {
 /// want to redraw the whole buffer, for example after the user toggles
 /// a view.
 ///
+/// `head` counts the leading lines that say what the buffer is about, like
+/// the command above a bash output. When the tool call moves to the
+/// background, its row in the chat keeps only those lines, because the rest
+/// streams in the task's tab. Without a head the row keeps just its title.
+///
 /// @param lines table Sequence of line values, each the same format accepted by `buf:line`.
+/// @param opts table|nil Options: `head` = number of leading lines (default 0).
 /// @return
 /// @example
 /// buf:set_lines({ "new content", "replaces everything" })
+/// buf:set_lines({ "cargo test", "──────", "running 3 tests" }, { head = 2 })
 #[lua_fn]
-fn set_lines(_lua: &Lua, this: &BufHandle, lines: Table) -> LuaResult<()> {
+fn set_lines(_lua: &Lua, this: &BufHandle, lines: Table, opts: Option<Table>) -> LuaResult<()> {
     let mut parsed = Vec::with_capacity(lines.raw_len());
     for i in 1..=lines.raw_len() {
         let val: LuaValue = lines.raw_get(i)?;
         parsed.push(parse_line(&val)?);
     }
-    this.buf.set_lines(parsed);
+    let head = match opts {
+        Some(opts) => opts.opt::<usize>("head")?.unwrap_or(0),
+        None => 0,
+    };
+    this.buf.set_lines_with_head(parsed, head);
     Ok(())
 }
 
@@ -803,6 +814,21 @@ mod tests {
         });
         assert_eq!(store.len(handle.id), 1);
         assert_eq!(store.live_buf().unwrap().len(), 1);
+    }
+
+    #[test_case(r#"buf:set_lines({ "cmd", "--", "out" }, { head = 2 })"#, 2 ; "kept")]
+    #[test_case(r#"buf:set_lines({ "cmd" }, { head = 1 }) buf:set_lines({ "out" })"#, 0 ; "cleared_by_a_redraw_without_it")]
+    fn set_lines_head_names_the_leading_lines(script: &str, head: usize) {
+        let lua = test_lua();
+        let handle = lua.app_data_mut::<BufferStore>().unwrap().create();
+        let buf = Arc::clone(&handle.buf);
+        lua.globals()
+            .set("buf", lua.create_userdata(handle).unwrap())
+            .unwrap();
+
+        lua.load(script).exec().unwrap();
+
+        assert_eq!(buf.take().head, head);
     }
 
     #[test]

@@ -866,7 +866,7 @@ impl UiWaker {
 /// Append-only buffer for streaming tool output to the UI. Writers append
 /// under a Mutex, readers get a cheap Arc clone via `read_if_dirty()`.
 pub struct SharedBuf {
-    committed: Mutex<Arc<Vec<SnapshotLine>>>,
+    committed: Mutex<BufferSnapshot>,
     dirty: AtomicBool,
     /// Only a buffer shown in a plugin window gets one, since the UI reads
     /// those on a tick. A tool body is repainted by the agent events that
@@ -883,7 +883,7 @@ pub struct SharedBuf {
 impl SharedBuf {
     pub fn new() -> Self {
         Self {
-            committed: Mutex::new(Arc::new(Vec::new())),
+            committed: Mutex::default(),
             dirty: AtomicBool::new(false),
             waker: OnceLock::new(),
             on_change: Mutex::new(None),
@@ -944,15 +944,23 @@ impl SharedBuf {
 
     pub fn append(&self, line: SnapshotLine) {
         let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::make_mut(&mut guard).push(line);
+        Arc::make_mut(&mut guard.lines).push(line);
         drop(guard);
         self.dirty.store(true, Ordering::Release);
         self.notify_change();
     }
 
     pub fn set_lines(&self, lines: Vec<SnapshotLine>) {
+        self.set_lines_with_head(lines, 0);
+    }
+
+    /// See [`BufferSnapshot::head`].
+    pub fn set_lines_with_head(&self, lines: Vec<SnapshotLine>, head: usize) {
         let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Arc::new(lines);
+        *guard = BufferSnapshot {
+            lines: Arc::new(lines),
+            head,
+        };
         drop(guard);
         self.dirty.store(true, Ordering::Release);
         self.notify_change();
@@ -962,6 +970,7 @@ impl SharedBuf {
         self.committed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .lines
             .len()
     }
 
@@ -970,16 +979,17 @@ impl SharedBuf {
     }
 
     pub fn read(&self) -> Arc<Vec<SnapshotLine>> {
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(&guard)
+        self.take().lines
     }
 
     pub fn read_if_dirty(&self) -> Option<Arc<Vec<SnapshotLine>>> {
-        if !self.dirty.swap(false, Ordering::AcqRel) {
-            return None;
-        }
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        Some(Arc::clone(&guard))
+        self.take_if_dirty().map(|snapshot| snapshot.lines)
+    }
+
+    pub fn take_if_dirty(&self) -> Option<BufferSnapshot> {
+        self.dirty
+            .swap(false, Ordering::AcqRel)
+            .then(|| self.take())
     }
 
     /// A copy for a tool reply. Leaves the dirty flag alone: only the UI
@@ -987,8 +997,10 @@ impl SharedBuf {
     /// events are stale), which would strand the last repaint a tool made
     /// on its way out. Re-reading the same lines once costs nothing.
     pub fn take(&self) -> BufferSnapshot {
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        BufferSnapshot::from_arc(Arc::clone(&guard))
+        self.committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -1010,14 +1022,28 @@ impl Serialize for SharedBuf {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct BufferSnapshot {
     pub lines: Arc<Vec<SnapshotLine>>,
+    /// How many leading lines say what the buffer is about, like the command
+    /// above a bash output. A tool row that moved to the background keeps
+    /// only these, because the rest now streams in the task's tab.
+    #[serde(skip)]
+    pub head: usize,
 }
 
 impl BufferSnapshot {
     pub fn from_arc(lines: Arc<Vec<SnapshotLine>>) -> Self {
-        Self { lines }
+        Self { lines, head: 0 }
+    }
+
+    /// The [`Self::head`] lines alone, or `None` when there are none.
+    pub fn head_only(&self) -> Option<Self> {
+        let head = self.head.min(self.lines.len());
+        (head > 0).then(|| Self {
+            lines: Arc::new(self.lines[..head].to_vec()),
+            head,
+        })
     }
 
     pub fn plain_text(text: String) -> Self {
@@ -1833,25 +1859,20 @@ mod tests {
 
     #[test]
     fn buffer_snapshot_first_line_text() {
-        let empty = BufferSnapshot {
-            lines: Arc::new(vec![]),
-        };
-        assert_eq!(empty.first_line_text(), "");
+        assert_eq!(BufferSnapshot::default().first_line_text(), "");
 
-        let multi = BufferSnapshot {
-            lines: Arc::new(vec![SnapshotLine {
-                spans: vec![
-                    SnapshotSpan {
-                        text: "hello ".into(),
-                        style: SpanStyle::Default,
-                    },
-                    SnapshotSpan {
-                        text: "world".into(),
-                        style: SpanStyle::Named("bold".into()),
-                    },
-                ],
-            }]),
-        };
+        let multi = BufferSnapshot::from_arc(Arc::new(vec![SnapshotLine {
+            spans: vec![
+                SnapshotSpan {
+                    text: "hello ".into(),
+                    style: SpanStyle::Default,
+                },
+                SnapshotSpan {
+                    text: "world".into(),
+                    style: SpanStyle::Named("bold".into()),
+                },
+            ],
+        }]));
         assert_eq!(multi.first_line_text(), "hello world");
     }
 

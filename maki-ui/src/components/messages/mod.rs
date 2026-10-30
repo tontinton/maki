@@ -1246,8 +1246,8 @@ impl MessagesPanel {
         let Some(buf) = self.live_bufs.remove(id) else {
             return false;
         };
-        if let Some(lines) = buf.read_if_dirty() {
-            self.store_snapshot(id, BufferSnapshot::from_arc(lines), false, None);
+        if let Some(snapshot) = buf.take_if_dirty() {
+            self.store_snapshot(id, snapshot, false, None);
         }
         // A part's tab registers the same buf again on every report.
         self.watched_bufs.retain(|(watched, _)| watched != id);
@@ -1398,9 +1398,9 @@ impl MessagesPanel {
     /// would leave this one blank until the tool writes again. So it draws
     /// what the buf holds now.
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
-        let lines = body.read();
-        if !lines.is_empty() && self.find_tool_msg(&id).is_some() {
-            self.store_snapshot(&id, BufferSnapshot::from_arc(lines), false, None);
+        let snapshot = body.take();
+        if !snapshot.lines.is_empty() && self.find_tool_msg(&id).is_some() {
+            self.store_snapshot(&id, snapshot, false, None);
         }
         self.live_bufs.insert(id, body);
     }
@@ -1413,11 +1413,11 @@ impl MessagesPanel {
             .live_bufs
             .iter()
             .chain(self.watched_bufs.iter().map(|(id, buf)| (id, buf)))
-            .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
+            .filter_map(|(id, buf)| buf.take_if_dirty().map(|snapshot| (id.clone(), snapshot)))
             .collect();
         let dirty = Dirty::from(!updated.is_empty());
-        for (tool_id, lines) in updated {
-            self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines), false, None);
+        for (tool_id, snapshot) in updated {
+            self.store_snapshot(&tool_id, snapshot, false, None);
         }
         dirty
     }

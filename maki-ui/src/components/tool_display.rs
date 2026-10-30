@@ -499,7 +499,7 @@ impl ToolLineBuilder {
         render_header: Option<&BufferSnapshot>,
     ) {
         let mut spans = vec![Span::styled(
-            format!("{tool_name}> "),
+            header_prefix(tool_name, header),
             theme::current().tool_prefix,
         )];
         if let Some(snapshot) = render_header {
@@ -816,13 +816,21 @@ pub fn build_tool_lines(
             .as_ref()
             .map_or_else(|| status.into(), |badge| badge.outcome.into()),
     );
-    // A moved row only points at its task. Its body now lives in the task's
-    // tab, and its result comes back as a notice. What is left on the row
-    // describes the receipt, which is for the model, not the user.
+    // A moved row only points at its task. The output streams in the task's
+    // tab and the result comes back as a notice. The row keeps the head, like
+    // a bash command, so you can still tell what runs. The rest of its text is
+    // the receipt, which is meant for the model, not for you.
     if let Some(badge) = &msg.background {
         b.push_header(tool_name, header, None, msg.render_header.as_ref());
         b.push_background_annotation(badge);
         b.prepend_indicator(rctx.started_at);
+        if let Some(head) = msg
+            .render_snapshot
+            .as_ref()
+            .and_then(BufferSnapshot::head_only)
+        {
+            b.push_snapshot(&head, rctx.started_at);
+        }
         return b.finish(None, None, TOOL_BODY_INDENT);
     }
     b.apply_output_format(msg.tool_output.as_deref());
@@ -930,10 +938,21 @@ pub fn instructions_search_text(blocks: &[InstructionBlock]) -> String {
     out
 }
 
+/// A bash call without a description has an empty title, and a trailing
+/// space here would sit next to the one the annotation starts with.
+fn header_prefix(tool: &str, header: &str) -> String {
+    if header.is_empty() {
+        format!("{tool}>")
+    } else {
+        format!("{tool}> ")
+    }
+}
+
 fn header_search_text(tool: &str, header: &str, annotation: Option<&str>) -> String {
+    let prefix = header_prefix(tool, header);
     match annotation {
-        Some(ann) => format!("{tool}> {header} ({ann})"),
-        None => format!("{tool}> {header}"),
+        Some(ann) => format!("{prefix}{header} ({ann})"),
+        None => format!("{prefix}{header}"),
     }
 }
 
@@ -1200,13 +1219,33 @@ mod tests {
         assert!(text.contains("(2m timeout)"));
     }
 
+    #[test_case("",          "bash> (3 lines)"          ; "untitled")]
+    #[test_case("run tests", "bash> run tests (3 lines)" ; "titled")]
+    fn header_has_one_space_before_the_annotation(header: &str, expected: &str) {
+        let mut msg = bash_msg(header, ToolStatus::Success, None, None);
+        msg.annotation = Some("3 lines".into());
+
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+
+        assert!(lines_text(&tl).contains(expected), "{}", lines_text(&tl));
+        assert!(search_text_for(&msg).starts_with(expected));
+    }
     const MOVED_HEADER: &str = "Run the tests";
     const RECEIPT_ANNOTATION: &str = "3 lines";
     const RECEIPT_BODY: &str = "Running in the background. Last 2 lines:";
 
-    #[test_case(None                              ; "running")]
-    #[test_case(Some(BackgroundOutcome::Done)     ; "ended")]
-    fn a_moved_row_draws_only_its_header(outcome: Option<BackgroundOutcome>) {
+    const MOVED_COMMAND: &str = "cargo test";
+    const MOVED_OUTPUT: &str = "running 3 tests";
+
+    #[test_case(None, 0                          ; "running")]
+    #[test_case(Some(BackgroundOutcome::Done), 0 ; "ended")]
+    #[test_case(None, 1                          ; "with_a_head")]
+    fn a_moved_row_keeps_only_its_header_and_head(outcome: Option<BackgroundOutcome>, head: usize) {
         let mut msg = bash_msg(
             &format!("{MOVED_HEADER}\n{RECEIPT_BODY}"),
             ToolStatus::Success,
@@ -1219,6 +1258,13 @@ mod tests {
             started_at: None,
             outcome,
         });
+        msg.render_snapshot = Some(BufferSnapshot {
+            lines: Arc::new(vec![
+                SnapshotLine::plain(MOVED_COMMAND.into()),
+                SnapshotLine::plain(MOVED_OUTPUT.into()),
+            ]),
+            head,
+        });
 
         let tl = build_tool_lines(
             &msg,
@@ -1228,8 +1274,10 @@ mod tests {
         );
 
         let text = lines_text(&tl);
-        assert_eq!(tl.lines.len(), 1, "{text}");
+        assert_eq!(tl.lines.len(), 1 + head, "{text}");
         assert!(text.contains(MOVED_HEADER), "{text}");
+        assert_eq!(text.contains(MOVED_COMMAND), head > 0, "{text}");
+        assert!(!text.contains(MOVED_OUTPUT), "{text}");
         assert!(
             text.contains(&background_annotation(outcome, None)),
             "{text}"
@@ -1429,14 +1477,12 @@ mod tests {
     }
 
     fn make_snapshot(lines: Vec<Vec<SnapshotSpan>>) -> BufferSnapshot {
-        BufferSnapshot {
-            lines: Arc::new(
-                lines
-                    .into_iter()
-                    .map(|spans| SnapshotLine { spans })
-                    .collect(),
-            ),
-        }
+        BufferSnapshot::from_arc(Arc::new(
+            lines
+                .into_iter()
+                .map(|spans| SnapshotLine { spans })
+                .collect(),
+        ))
     }
 
     #[test]

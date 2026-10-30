@@ -3431,7 +3431,7 @@ fn spawn_async_task(
         if let Some(ref live) = task.live_ctx
             && let Some(buf) = task.owner.as_ref().and_then(|c| c.root_buf())
         {
-            // Always `read`, not `read_if_dirty`: the dirty flag is
+            // Always `take`, not `take_if_dirty`: the dirty flag is
             // consume-once and the UI polls each frame, so the flag
             // races. Re-emitting identical content is harmless.
             send_render_event(
@@ -3440,7 +3440,7 @@ fn spawn_async_task(
                 "async_snapshot",
                 maki_agent::AgentEvent::ToolSnapshot {
                     id: live.tool_use_id.clone(),
-                    snapshot: maki_agent::BufferSnapshot::from_arc(buf.read()),
+                    snapshot: buf.take(),
                     theme_gen: None,
                 },
             );
