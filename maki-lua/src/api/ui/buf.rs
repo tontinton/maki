@@ -158,6 +158,8 @@ pub(crate) fn buf_from_reply(val: &LuaValue) -> Option<Arc<SharedBuf>> {
 /// resolve, so they follow the user's palette. To mix a named style with colors
 /// of your own, `maki.ui.theme_style` hands back its parts.
 ///
+/// Invalid UTF-8 in text is replaced for display.
+///
 /// @param line string|table Plain string, or a sequence of spans: `{ {text, style?}, ... }`.
 /// @return
 /// @example
@@ -384,7 +386,7 @@ lua_class! {
 pub(crate) fn parse_line(arg: &LuaValue) -> LuaResult<SnapshotLine> {
     match arg {
         LuaValue::String(s) => {
-            let text = s.to_str().map_err(mlua::Error::external)?.to_owned();
+            let text = s.to_string_lossy();
             Ok(SnapshotLine {
                 spans: vec![SnapshotSpan {
                     text,
@@ -412,7 +414,7 @@ fn parse_span(val: &LuaValue) -> LuaResult<SnapshotSpan> {
     };
     let text_val: LuaValue = t.raw_get(1)?;
     let text = match &text_val {
-        LuaValue::String(s) => s.to_str().map_err(mlua::Error::external)?.to_owned(),
+        LuaValue::String(s) => s.to_string_lossy(),
         _ => return Err(mlua::Error::runtime("span[1] must be a string")),
     };
     let style_val: LuaValue = t.raw_get(2)?;
@@ -516,6 +518,9 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const LEGACY_TEXT: &[u8] = b"caf\xe9";
+    const DISPLAY_TEXT: &str = "caf\u{fffd}";
+
     #[test]
     fn take_removes_buffer_from_store() {
         let mut store = BufferStore::new();
@@ -597,6 +602,33 @@ mod tests {
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].text, "hello world");
         assert_eq!(line.spans[0].style, SpanStyle::Default);
+    }
+
+    #[test_case(false ; "plain")]
+    #[test_case(true ; "styled")]
+    fn display_text_replaces_invalid_utf8(styled: bool) {
+        let lua = test_lua();
+        let text = lua.create_string(LEGACY_TEXT).unwrap();
+        let value = if styled {
+            let span = lua.create_table().unwrap();
+            span.set(1, text).unwrap();
+            span.set(2, "keyword").unwrap();
+            let line = lua.create_table().unwrap();
+            line.set(1, span).unwrap();
+            LuaValue::Table(line)
+        } else {
+            LuaValue::String(text)
+        };
+        let line = parse_line(&value).unwrap();
+        assert_eq!(line.spans[0].text, DISPLAY_TEXT);
+        assert_eq!(
+            line.spans[0].style,
+            if styled {
+                SpanStyle::Named("keyword".into())
+            } else {
+                SpanStyle::Default
+            }
+        );
     }
 
     #[test]

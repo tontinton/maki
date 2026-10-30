@@ -16,7 +16,7 @@ use mlua::{
     AnyUserData, Lua, LuaString, Result as LuaResult, Table, UserDataRef, Value as LuaValue,
 };
 
-use super::base64::bytes_arg;
+use super::util::convert::bytes_arg;
 use super::util::pair::{Pair, try_pair};
 
 /// Decode-bomb guard: a tiny file can declare huge dimensions and balloon

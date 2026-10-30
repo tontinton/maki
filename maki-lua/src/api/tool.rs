@@ -698,6 +698,7 @@ fn register_prompt(
 /// to decide when to use the tool), a JSON Schema for the input, and a handler
 /// function. The handler receives `(input, ctx)` and returns either a plain
 /// string or a table with richer output fields.
+/// Returned text replaces invalid UTF-8 bytes with replacement characters.
 ///
 /// `ctx:output_mode()` returns "compact" when the result goes to the model and
 /// "full" when code such as `code_execution` made the call. Apply output limits
@@ -1916,11 +1917,11 @@ fn extract_image(t: &mlua::Table) -> Result<Option<ImageSource>, String> {
 
 pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
     match result {
-        LuaValue::String(s) => s.to_str().map(|s| s.to_owned()).map_err(|e| e.to_string()),
+        LuaValue::String(s) => Ok(s.to_string_lossy()),
         LuaValue::Table(t) => {
             let output = t.get::<LuaValue>("llm_output").ok().and_then(|v| {
                 if let LuaValue::String(s) = v {
-                    s.to_str().ok().map(|s| s.to_owned())
+                    Some(s.to_string_lossy())
                 } else {
                     None
                 }
@@ -1940,6 +1941,9 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LEGACY_TEXT: &[u8] = b"caf\xe9";
+    const DISPLAY_TEXT: &str = "caf\u{fffd}";
 
     #[test_case::test_case("echo", true ; "simple_name")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]
@@ -2124,11 +2128,29 @@ mod tests {
         assert!(smol::block_on(unconfigured.permission_scopes()).is_none());
     }
 
-    #[test]
-    fn coerce_string_returns_ok() {
+    #[test_case::test_case(b"hello", "hello" ; "utf8")]
+    #[test_case::test_case(LEGACY_TEXT, DISPLAY_TEXT ; "non_utf8")]
+    fn coerce_string_returns_ok(input: &[u8], expected: &str) {
         let lua = Lua::new();
-        let val = LuaValue::String(lua.create_string("hello").unwrap());
-        assert_eq!(coerce_tool_result(&val), Ok("hello".to_string()));
+        let val = LuaValue::String(lua.create_string(input).unwrap());
+        assert_eq!(coerce_tool_result(&val).as_deref(), Ok(expected));
+    }
+
+    #[test_case::test_case(false ; "success")]
+    #[test_case::test_case(true ; "error")]
+    fn coerce_table_decodes_text_without_changing_the_error_flag(is_error: bool) {
+        let lua = Lua::new();
+        let result = lua.create_table().unwrap();
+        result
+            .set("llm_output", lua.create_string(LEGACY_TEXT).unwrap())
+            .unwrap();
+        result.set("is_error", is_error).unwrap();
+        let expected = if is_error {
+            Err(DISPLAY_TEXT.to_owned())
+        } else {
+            Ok(DISPLAY_TEXT.to_owned())
+        };
+        assert_eq!(coerce_tool_result(&LuaValue::Table(result)), expected);
     }
 
     #[test]
