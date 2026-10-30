@@ -53,6 +53,16 @@ pub struct Cli {
     #[arg(short = 'c', long = "continue")]
     pub continue_session: bool,
 
+    /// Run the interactive session in a new git worktree on branch
+    /// worktree-<NAME>, so parallel sessions never share files. The worktree
+    /// lives in maki's state dir.
+    #[arg(short = 'w', long)]
+    pub worktree: bool,
+
+    /// Name for the --worktree branch and dir, auto-generated when omitted
+    #[arg(long, value_name = "NAME", requires = "worktree")]
+    pub worktree_name: Option<String>,
+
     /// Resume a specific session by its ID
     #[arg(
         short = 'r',

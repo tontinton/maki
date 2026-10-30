@@ -3245,6 +3245,7 @@ dependencies = [
  "async-compat",
  "clap",
  "color-eyre",
+ "fastrand",
  "flume",
  "maki-acp",
  "maki-agent",

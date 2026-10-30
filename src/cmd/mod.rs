@@ -3,12 +3,13 @@ mod migrate;
 mod session;
 mod subcmd;
 mod tui;
+mod worktree;
 
 use std::env;
 use std::sync::Arc;
 
 use color_eyre::Result;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, bail};
 
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, TrustMode};
@@ -207,6 +208,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     } else {
         TrustMode::Consult
     };
+    // Only the interactive session cleans its worktree up on exit.
+    if cli.worktree && (cli.command.is_some() || cli.print || cli.is_sdk_mode()) {
+        bail!(
+            "--worktree only works in the interactive session, not with subcommands or headless mode"
+        );
+    }
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;

@@ -37,6 +37,7 @@ async-compat = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
+fastrand = { workspace = true }
 open = { workspace = true }
 unicode-width = { workspace = true }
 
