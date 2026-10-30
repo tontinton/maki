@@ -344,7 +344,7 @@ maki.api.register_tool({
       command = { type = "string", description = "The bash command to execute", required = true },
       timeout = { type = "integer", description = "Timeout in seconds (default 120)" },
       workdir = { type = "string", description = "Working directory (default: cwd)" },
-      description = { type = "string", description = "Short description (3-5 words) of what the command does" },
+      description = { type = "string", description = "What the command does in 3-5 words, not the command itself" },
       background = {
         type = "boolean",
         description = "Run in the background and return at once; the result arrives as a message when it ends.",

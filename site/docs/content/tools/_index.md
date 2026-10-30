@@ -20,7 +20,7 @@ Commands run in the session's working directory (see Environment) by default.
 |-----------|------|----------|---------|-------------|
 | `background` | boolean | no |  | Run in the background and return at once; the result arrives as a message when it ends. |
 | `command` | string | yes |  | The bash command to execute |
-| `description` | string | no |  | Short description (3-5 words) of what the command does |
+| `description` | string | no |  | What the command does in 3-5 words, not the command itself |
 | `timeout` | integer | no | 120 | Timeout in seconds |
 | `workdir` | string | no | cwd | Working directory |
 
