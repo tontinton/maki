@@ -27,6 +27,7 @@ local WAITING_FMT = "batch is waiting on %s"
 local NOTHING_RUNNING = "batch has no running tool left to move"
 local MOVED_HEADER = "Still running in the background (their results arrive when they finish):"
 local MOVED_ITEM_FMT = "- %s: %s"
+local FOREGROUND_NOTE_FMT = "Could not start in the background (%s). Ran in the foreground.\n"
 local SECTION_FMT = "## %s\n"
 local SECTION_PAT = "^## (.+)$"
 
@@ -137,6 +138,12 @@ local function normalize_entry(entry)
 end
 
 --- Child presentation ------------------------------------------------------
+
+local function takes_background(tool)
+  local t = maki.api.get_tool(tool)
+  local props = t and t.schema and t.schema.properties
+  return props ~= nil and props.background ~= nil
+end
 
 -- Let the child tool draw its own header. A tool with none, or a broken
 -- one, comes back nil; either way the plain tool name is enough.
@@ -532,23 +539,28 @@ function Batch:unreported()
 end
 
 -- What the hook would answer now, so the row's hint shows only when a
--- press would move the batch.
-function Batch:movable_now()
+-- press would move the batch. The second value says nothing blocks a move,
+-- which also holds once every child is done.
+function Batch:movable_now(background_only)
   local running = false
   for _, c in ipairs(self.children) do
     if not TERMINAL[c.status] then
-      if not c.movable then
-        return false
+      if not c.movable or (background_only and not c.background) then
+        return false, false
       end
       running = true
     end
   end
-  return running
+  return running, true
 end
 
 function Batch:sync_movable()
   if not self.hooked then
     return
+  end
+  if self.gate_permit and select(2, self:movable_now(true)) then
+    self.gate_permit:release()
+    self.gate_permit = nil
   end
   local movable = self:movable_now()
   if movable ~= self.shown_movable then
@@ -559,7 +571,7 @@ end
 
 function Batch:reply()
   return {
-    llm_output = render_llm(self:unreported()),
+    llm_output = (self.foreground_note or "") .. render_llm(self:unreported()),
     is_error = self.cancelled,
     body = self.buf,
     state = to_state(self.children),
@@ -616,13 +628,41 @@ function Batch:hand_over()
   return sections .. MOVED_HEADER .. "\n" .. table.concat(items, "\n")
 end
 
+-- A child has no call of its own to move, so the batch takes its
+-- `background` flag and moves itself once only such children are left.
+-- The move yields, and `sync_movable` runs in callbacks that must not, so
+-- it waits here as its own gathered fun until the gate opens.
+function Batch:move_when_ready(gate)
+  gate:acquire()
+  if not self:movable_now(true) or self.ctx:backgrounded() then
+    return
+  end
+  local moved, err = self.ctx:background()
+  if not moved then
+    self.foreground_note = string.format(FOREGROUND_NOTE_FMT, tostring(err))
+  end
+end
+
 function Batch:run(ctx)
   local funs = {}
+  local wants_background = false
   for _, c in ipairs(self.children) do
     if c.status == STATUS.PENDING then
+      c.background = self.hooked and c.params.background == true and takes_background(c.tool)
+      if c.background then
+        c.params.background = nil
+        wants_background = true
+      end
       funs[#funs + 1] = function()
         self:run_child(c, ctx)
       end
+    end
+  end
+  if wants_background then
+    local gate = maki.async.semaphore(1)
+    self.gate_permit = gate:try_acquire()
+    funs[#funs + 1] = function()
+      self:move_when_ready(gate)
     end
   end
   -- The cancel reaches neither `call_tool` nor `gather`, so a child parked

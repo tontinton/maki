@@ -53,7 +53,7 @@ const TIMED_OUT: &str = "timed out after";
 const SUBAGENT_SELF_MOVE: &str =
     "background: a subagent's tool call only moves when the user moves it";
 const SUBAGENT_TASK_ID: &str = "toolu_subagent";
-const NESTED_CALL: &str = "background is ignored for a call inside batch or another tool; \
+const NESTED_CALL: &str = "background is ignored for a call inside another tool; \
      call the tool directly to run it in the background";
 const NO_LIVE_CHAT: &str = "no live chat";
 const BACKGROUND_OFF: &str = "background tasks are turned off here (--background-timeout 0)";

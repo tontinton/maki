@@ -78,6 +78,12 @@ const IS_PARKED_TEXT: &str = "true";
 const MOVED_HEADER: &str =
     "Still running in the background (their results arrive when they finish):";
 const MOVED_BY_USER: &str = "Moved to the background by the user";
+const MOVED_AS_ASKED: &str = "Started in the background as asked";
+const SUBAGENT_SELF_MOVE: &str =
+    "background: a subagent's tool call only moves when the user moves it";
+const SUBAGENT_TASK_ID: &str = "toolu_subagent";
+const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
+const FOREGROUND_NOTE_TAIL: &str = "). Ran in the foreground.\n";
 const WAITING_ON_EDIT: &str = "batch is waiting on edit";
 
 const SPINNER_STYLE: &str = "spinner";
@@ -1435,12 +1441,15 @@ do
         opts.on_movable(true)
       end
       park(input.tag)
-      return name .. ":" .. input.tag
+      return name .. ":" .. input.tag .. (input.background and " (background leaked)" or "")
     end
     return stubbed(ctx, name, input, opts)
   end
 
-  local schema = { type = "object", properties = { tag = { type = "string" } } }
+  local schema = {
+    type = "object",
+    properties = { tag = { type = "string" }, background = { type = "boolean" } },
+  }
   local function tool(name, handler, header)
     maki.api.register_tool({
       name = name,
@@ -1487,12 +1496,20 @@ struct MovableBatch {
 
 impl MovableBatch {
     fn start(tool_calls: Value) -> (Self, JoinHandle<ToolDoneEvent>) {
+        Self::start_with(tool_calls, |_| {})
+    }
+
+    fn start_with(
+        tool_calls: Value,
+        configure: impl FnOnce(&mut ToolContext),
+    ) -> (Self, JoinHandle<ToolDoneEvent>) {
         let (reg, host) = load_batch_host_with(MOVABLE_CHILD_SRC);
         host.ui_attachment().attach();
         let ui = host.ui_action_rx();
         let Chat { id, mailbox, seed } = Chat::live();
         let (run, run_token) = CancelToken::new();
-        let (ctx, events) = call_ctx(&reg, id, &run_token, BATCH_ID);
+        let (mut ctx, events) = call_ctx(&reg, id, &run_token, BATCH_ID);
+        configure(&mut ctx);
         let call = thread::spawn({
             let reg = Arc::clone(&reg);
             move || exec(&reg, BATCH_TOOL, batch_input(tool_calls), &ctx)
@@ -1613,5 +1630,56 @@ fn batch_declines_while_a_child_without_a_hook_runs_and_moves_once_it_finished()
     assert_eq!(
         batch.task_done().output.as_text(),
         format!("{}{}", section(HOOKED_TOOL, "hooked:a"), summary_all_ok(1))
+    );
+}
+
+/// A child the model asked to run in the background moves the batch with no
+/// press, but only once its siblings are done: `fg` is movable too, so a
+/// move that did not wait would list it as running instead of inline.
+#[test]
+fn background_children_move_the_batch_once_only_they_are_left() {
+    let (batch, call) = MovableBatch::start(json!([
+        { "tool": HOOKED_TOOL, "parameters": { "tag": "fg" } },
+        { "tool": HOOKED_TOOL, "parameters": { "tag": "bg", "background": true } },
+    ]));
+    batch.wait_parked("fg");
+    batch.wait_parked("bg");
+    batch.release("fg");
+
+    let result = call.join().expect("batch thread");
+    assert!(result.backgrounded);
+    let receipt = result.output.as_text();
+    let inline = format!(
+        "{}{MOVED_HEADER}\n- {HOOKED_TOOL}: bg\n\n",
+        section(HOOKED_TOOL, "hooked:fg")
+    );
+    assert!(receipt.starts_with(&inline), "{receipt}");
+    assert!(receipt.contains(MOVED_AS_ASKED), "{receipt}");
+
+    batch.release("bg");
+    assert_eq!(
+        batch.task_done().output.as_text(),
+        format!("{}{}", section(HOOKED_TOOL, "hooked:bg"), summary_all_ok(1))
+    );
+}
+
+#[test]
+fn batch_that_cannot_move_runs_background_children_in_the_foreground_and_says_why() {
+    let (batch, call) = MovableBatch::start_with(
+        json!([{ "tool": HOOKED_TOOL, "parameters": { "tag": "bg", "background": true } }]),
+        |ctx| ctx.task_id = Some(SUBAGENT_TASK_ID.into()),
+    );
+    batch.wait_parked("bg");
+    batch.release("bg");
+
+    let result = call.join().expect("batch thread");
+    assert!(!result.backgrounded);
+    assert_eq!(
+        result.output.as_text(),
+        format!(
+            "{FOREGROUND_NOTE_HEAD}{SUBAGENT_SELF_MOVE}{FOREGROUND_NOTE_TAIL}{}{}",
+            section(HOOKED_TOOL, "hooked:bg"),
+            summary_all_ok(1)
+        )
     );
 }

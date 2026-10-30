@@ -31,7 +31,7 @@ const NOT_A_MODEL_CALL_MSG: &str =
     "on_background: only the handler of a model's tool call can move to the background";
 /// Model-facing: bash and task quote it when `background = true` cannot be
 /// honoured.
-const NESTED_CALL_MSG: &str = "background is ignored for a call inside batch or another \
+const NESTED_CALL_MSG: &str = "background is ignored for a call inside another \
      tool; call the tool directly to run it in the background";
 const NO_BACKGROUND_HOOK_MSG: &str = "set_movable: call ctx:on_background() first";
 const NO_BACKGROUND_HOOK_FOR_MOVE_MSG: &str = "background: call ctx:on_background() first";

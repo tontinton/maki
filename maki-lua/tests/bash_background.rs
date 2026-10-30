@@ -51,6 +51,7 @@ const DESCRIPTION: &str = "Check the build";
 const FINISHED_LATE: &str = "finished-late";
 // Mirrors of the runtime's wording.
 const MOVED_AS_ASKED: &str = "Started in the background as asked";
+const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background";
 const EARLIER_IN_LOG: &str = "earlier lines are in the full output log";
 const EARLIER_DROPPED: &str = "earlier lines dropped]";
 const TRUNCATED: &str = "[truncated ";
@@ -308,6 +309,28 @@ fn the_background_param_moves_the_command_at_once() {
     assert!(receipt.starts_with(RECEIPT_HEAD), "{receipt}");
     assert!(receipt.contains(&progress_line(&run)), "{receipt}");
     assert!(receipt.contains(MOVED_AS_ASKED), "{receipt}");
+    run.release();
+    let notice = run.final_notice();
+    assert!(notice.contains(FINISHED_LATE), "{notice}");
+}
+
+#[test]
+fn the_background_param_moves_a_batch_once_its_foreground_children_finish() {
+    let gate = Gate::closed();
+    let input = json!({ "tool_calls": [
+        { "tool": BASH_TOOL, "parameters": { "command": READY_COMMAND } },
+        { "tool": BASH_TOOL, "parameters": {
+            "command": gate.command("echo started", &format!("echo {FINISHED_LATE}")),
+            BACKGROUND_PARAM: true,
+        } },
+    ] });
+    let run = Run::launch(json!({}), BATCH_TOOL, input, gate);
+
+    let receipt = run.reply().expect("a receipt is a success");
+
+    assert!(receipt.contains(READY_LINE), "{receipt}");
+    assert!(receipt.contains(MOVED_AS_ASKED), "{receipt}");
+    assert!(!receipt.contains(FOREGROUND_NOTE_HEAD), "{receipt}");
     run.release();
     let notice = run.final_notice();
     assert!(notice.contains(FINISHED_LATE), "{notice}");

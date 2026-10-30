@@ -149,7 +149,9 @@ maki.setup({
 
 Both take the same path as `Ctrl+B`, with the same `/tasks` row, result message and stop behavior. Maki's receipt sentence then starts with `Started in the background as asked`. A `task(background = true)` call that has to wait for a free subagent slot waits in the background, so the turn goes on.
 
-If the move fails, for example inside `batch` or with background tasks off, the call runs in the foreground and its result starts with `Could not start in the background (<reason>). Ran in the foreground.`
+Inside `batch`, the whole batch moves once only its `background = true` calls are still running and each of them can move. Results that came back before the move go in the receipt, and the rest arrive as one message.
+
+If the move fails, for example inside `code_execution` or with background tasks off, the call runs in the foreground and its result starts with `Could not start in the background (<reason>). Ran in the foreground.`
 
 ### Move a slow command instead of killing it
 
