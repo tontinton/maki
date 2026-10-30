@@ -199,6 +199,26 @@ impl History {
         &self.snapshot.messages
     }
 
+    /// The first thing the user typed, kept for the session title: the
+    /// messages may hold a layer's rewrite. First wins; blank counts as
+    /// nothing typed. Published with the messages, so a checkpoint adopts it.
+    pub fn offer_title_source(&mut self, typed: &str) {
+        if self.snapshot.title_source.is_some() {
+            return;
+        }
+        let text = typed.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.snapshot.title_source = Some(text.to_owned());
+        self.unsaved = true;
+        self.publish();
+    }
+
+    pub fn title_source(&self) -> Option<&str> {
+        self.snapshot.title_source.as_deref()
+    }
+
     pub fn push(&mut self, msg: Message) {
         self.edit(|msgs| msgs.push(msg));
     }

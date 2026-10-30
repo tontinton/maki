@@ -620,7 +620,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::sessions::{Session, SessionClaim, TitleSource};
+    use crate::sessions::{Session, SessionClaim};
 
     const SESSION_MODEL: &str = "test-model";
     const INIT_LUA: &str = "init.lua";
@@ -666,12 +666,6 @@ mod tests {
 
     #[derive(Clone, Deserialize, Serialize)]
     struct StoredMessage;
-
-    impl TitleSource for StoredMessage {
-        fn first_user_text(&self) -> Option<&str> {
-            None
-        }
-    }
 
     fn record_session(dir: &tempfile::TempDir, cwd: &Path) {
         let state = StateDir::from_path(dir.path().to_path_buf());

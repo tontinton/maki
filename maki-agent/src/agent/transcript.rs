@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
 use maki_storage::frame::{PromptFacts, StoredFrame};
-use maki_storage::sessions::{StoredMode, StoredThinking, ThinkingParseError, normalize_title};
+use maki_storage::sessions::{
+    StoredMode, StoredThinking, ThinkingParseError, TitleSource, normalize_title,
+};
 use serde::de;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -162,7 +164,16 @@ impl Transcript {
         base.token_usage = TokenUsage::default();
         match self.title.map(|title| normalize_title(&title)) {
             Some(title) if !title.is_empty() => base.set_title(title),
-            _ => base.update_title_if_default(),
+            _ => {
+                base.title_source = base
+                    .messages()
+                    .iter()
+                    .find_map(|message| message.first_user_text())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned);
+                base.update_title_if_default();
+            }
         }
         Ok(base)
     }

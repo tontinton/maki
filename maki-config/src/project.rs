@@ -627,7 +627,7 @@ fn git_checkout_boundary(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use maki_storage::sessions::{SESSIONS_DIR, Session, SessionClaim, TitleSource};
+    use maki_storage::sessions::{SESSIONS_DIR, Session, SessionClaim};
     use maki_storage::trusted_folders::TrustStatus;
     use serde::{Deserialize, Serialize};
 
@@ -718,12 +718,6 @@ mod tests {
 
     #[derive(Clone, Serialize, Deserialize)]
     struct StoredMessage;
-
-    impl TitleSource for StoredMessage {
-        fn first_user_text(&self) -> Option<&str> {
-            None
-        }
-    }
 
     fn record_session(storage: &StateDir, cwd: &Path) {
         let mut session: Session<StoredMessage, u32, ()> =

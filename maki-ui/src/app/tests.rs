@@ -10575,7 +10575,9 @@ fn opened_fork(actions: Vec<Action>) -> AppSession {
 #[test]
 fn fork_opens_a_copy_and_leaves_the_original_alone() {
     let mut app = test_app();
-    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+    let mut live = attach_live_history(&mut app, vec![]);
+    live.offer_title_source(LIVE_AGENT_TEXT);
+    live.push(Message::user(LIVE_AGENT_TEXT.into()));
     app.recoverable_queue = vec![RECOVERED_PROMPT.into()];
     let original = app.state.session.id;
 

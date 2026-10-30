@@ -1575,7 +1575,6 @@ mod tests {
     use std::sync::Arc;
 
     use maki_storage::frame::PlanChange;
-    use maki_storage::sessions::generate_title;
 
     use super::*;
     use crate::model::ThinkingSupport as Support;
@@ -1773,10 +1772,8 @@ mod tests {
     #[test_case(Message::context_update(UPDATE_TEXT.into(), plan_mode_facts()) ; "context_update")]
     #[test_case(Message::observation(UPDATE_TEXT.into())                       ; "observation")]
     fn title_skips_what_the_host_wrote(host: Message) {
-        assert_eq!(
-            generate_title(&[host, Message::user(PROMPT.into())]),
-            PROMPT
-        );
+        assert_eq!(host.first_user_text(), None);
+        assert_eq!(Message::user(PROMPT.into()).first_user_text(), Some(PROMPT));
     }
 
     /// A result that loaded nothing must serialize to the same bytes as

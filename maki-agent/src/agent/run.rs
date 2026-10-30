@@ -318,6 +318,7 @@ impl<'h> Agent<'h> {
             .chain([(message, images, preamble)]);
         let mut prompt = None;
         for (message, images, preamble) in burst {
+            self.history.offer_title_source(&message);
             let kept = match self
                 .filter_user_message(message, images.len(), source)
                 .await
@@ -1120,6 +1121,7 @@ impl<'h> Agent<'h> {
                         text: input.message.clone(),
                         images: input.images.clone(),
                     })?;
+                    self.history.offer_title_source(&input.message);
                     let kept = self
                         .filter_user_message(input.message, input.images.len(), input.source)
                         .await?;
@@ -1182,8 +1184,8 @@ mod tests {
     use maki_config::ProjectConfig;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, ThinkingSupport, TokenUsage,
+        ContentBlock, ImageMediaType, Message, Model, ProviderEvent, RequestOptions, Role,
+        StopReason, StreamResponse, ThinkingSupport, TokenUsage,
     };
     use maki_storage::frame::{FactsUpdate, PlanChange};
     use serde_json::Value;
@@ -1740,6 +1742,11 @@ mod tests {
             assert_eq!(history.as_slice()[0].user_text(), Some("preamble"));
             assert_eq!(history.as_slice()[1].user_text(), Some("mailbox"));
             assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
+            assert_eq!(
+                history.title_source(),
+                Some("hello"),
+                "the first typed text is set aside, rewrite or not"
+            );
         });
     }
 
@@ -3766,6 +3773,7 @@ mod tests {
     }
 
     const REWRITTEN: &str = "hello, with the CI log attached";
+    const TYPED: &str = "interrupt thought";
     const DROP_REASON: &str = "that prompt is on the blocklist";
     const KEEP_GOING: &str = "The todo list still has open items.";
     const BLOCKED: &str = "blocked";
@@ -3797,7 +3805,22 @@ mod tests {
             agent.run(default_input()).await.unwrap();
             drop(agent);
 
-            assert_eq!(history.as_slice()[0].user_text(), Some(REWRITTEN));
+            let first = &history.as_slice()[0];
+            assert_eq!(
+                first.first_text_content(),
+                Some(REWRITTEN),
+                "the model reads the rewrite"
+            );
+            assert_eq!(
+                first.user_text(),
+                Some(REWRITTEN),
+                "history and the transcript keep the rewrite"
+            );
+            assert_eq!(
+                history.title_source(),
+                Some("hello"),
+                "the title keeps what the user typed"
+            );
             let (slot, value) = seen.lock().unwrap()[0].clone();
             assert_eq!(slot, AgentSlot::UserMessage);
             assert_eq!(value["source"], InputSource::Tui.as_str());
@@ -3805,6 +3828,113 @@ mod tests {
                 steers(&drain_events(&event_rx)),
                 [(SteerKind::MessageRewritten, REWRITTEN.to_owned())]
             );
+        });
+    }
+
+    #[test]
+    fn rewritten_image_only_message_does_not_block_a_later_typed_title() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let _seen = script(
+                &agent.registry,
+                answer_only(AgentSlot::UserMessage, json!({ FIELD_TEXT: REWRITTEN })),
+            );
+
+            let mut input = default_input();
+            input.message = String::new();
+            input.images = vec![ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8="))];
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            assert_eq!(
+                history.as_slice()[0].first_text_content(),
+                Some(REWRITTEN),
+                "the model reads the rewrite"
+            );
+            assert_eq!(
+                history.as_slice()[0].user_text(),
+                Some(REWRITTEN),
+                "the transcript keeps the rewrite, image-only original or not"
+            );
+            assert_eq!(
+                history.title_source(),
+                None,
+                "nothing was typed, so no text is set aside for the title"
+            );
+
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+            assert_eq!(
+                history.title_source(),
+                Some("hello"),
+                "rewritten image-only history must not block the first typed title"
+            );
+        });
+    }
+
+    /// The transcript shows the interrupt's rewrite either way; the title
+    /// source moves only when the interrupt is the first message that
+    /// carries user text — the prompt before it was image-only.
+    #[test_case(false, Some("hello") ; "after_a_typed_first_message")]
+    #[test_case(true,  Some(TYPED)  ; "behind_an_image_only_prompt")]
+    fn a_rewritten_interrupt_in_the_transcript_and_the_title_source(
+        image_only_prompt: bool,
+        expected_source: Option<&str>,
+    ) {
+        smol::block_on(async {
+            let source =
+                MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![AgentInput {
+                    message: TYPED.into(),
+                    ..default_input()
+                }])]);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+            let _seen = script(&agent.registry, move |fired, value| {
+                if fired == AgentSlot::UserMessage && value[FIELD_TEXT] == TYPED {
+                    Verdict::Replaced(json!({ FIELD_TEXT: REWRITTEN }))
+                } else {
+                    Verdict::Unchanged
+                }
+            });
+            agent = agent.with_interrupt_source(source);
+
+            let mut input = default_input();
+            if image_only_prompt {
+                input.message = String::new();
+                input.images = vec![ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8="))];
+            }
+            agent.run(input).await.unwrap();
+
+            let interrupt = history
+                .as_slice()
+                .iter()
+                .find(|m| has_interrupt_in_history(std::slice::from_ref(m)))
+                .expect("interrupt landed in history");
+            assert!(
+                interrupt.first_text_content().unwrap().contains(REWRITTEN),
+                "the model reads the rewrite inside the interrupt envelope"
+            );
+            assert_eq!(
+                interrupt.user_text(),
+                Some(REWRITTEN),
+                "the transcript shows the rewrite, not the envelope"
+            );
+            assert_eq!(history.title_source(), expected_source);
         });
     }
 
@@ -3826,6 +3956,11 @@ mod tests {
 
             assert_eq!(done, DoneReason::Dropped);
             assert!(history.is_empty());
+            assert_eq!(
+                history.title_source(),
+                Some("hello"),
+                "a dropped message still names the session after what the user typed"
+            );
             assert_eq!(
                 steers(&drain_events(&event_rx)),
                 [(SteerKind::MessageDropped, reason.to_owned())]
