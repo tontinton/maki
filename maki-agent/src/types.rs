@@ -9,8 +9,8 @@ use std::time::Duration;
 use flume::{Receiver, Sender};
 use maki_config::ToolKey;
 use maki_providers::{
-    AgentError, ContentBlock, ImageSource, Message, RequestOptions, Role, StopReason, TokenUsage,
-    add_cost,
+    AgentError, ContentBlock, ImageSource, Message, RequestOptions, Role, StopReason, TaskEnd,
+    TokenUsage, add_cost,
 };
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
@@ -251,6 +251,10 @@ pub enum ToolOutput {
     },
 }
 
+fn counted(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
 /// Saturating arithmetic so callers can't overflow with any combination of inputs.
 fn lines_remaining_after(total: usize, start_line: usize, shown: usize) -> usize {
     let end = start_line.saturating_add(shown).saturating_sub(1);
@@ -270,23 +274,21 @@ impl ToolOutput {
                 if *total_lines > shown {
                     Some(format!("{shown} of {total_lines} lines"))
                 } else {
-                    Some(format!("{shown} lines"))
+                    Some(counted(shown, "line", "lines"))
                 }
             }
-            Self::WriteCode { byte_count, .. } => Some(format!("{byte_count} bytes")),
+            Self::WriteCode { byte_count, .. } => Some(counted(*byte_count, "byte", "bytes")),
             Self::GrepResult { entries } => {
                 let matches: usize = entries.iter().map(|e| e.match_count()).sum();
-                let files = entries.len();
-                let f = if files == 1 { "file" } else { "files" };
-                Some(format!("{matches} matches in {files} {f}"))
+                Some(format!(
+                    "{} in {}",
+                    counted(matches, "match", "matches"),
+                    counted(entries.len(), "file", "files")
+                ))
             }
-            Self::ReadDir(t) => {
-                let n = t.text.lines().count();
-                Some(format!("{n} entries"))
-            }
+            Self::ReadDir(t) => Some(counted(t.text.lines().count(), "entry", "entries")),
             Self::Plain(text) | Self::Markdown(text) if !text.text.is_empty() => {
-                let n = text.text.lines().count();
-                Some(format!("{n} lines"))
+                Some(counted(text.text.lines().count(), "line", "lines"))
             }
             Self::Image { text, .. } => Some(
                 text.strip_prefix("[image: ")
@@ -656,6 +658,30 @@ pub enum SessionEndReason {
 /// `maki.agent.call_tool` hands it to a caller's `on_annotation`.
 pub const ALLOWED_BY: &str = "allowed by";
 
+/// Spelled the way `maki.task.list()` spells a task's status, so a part reads
+/// like any other task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartStatus {
+    Working,
+    Done,
+    Error,
+    Cancelled,
+}
+
+/// A piece of a call, like the `bash` child of a `batch`, that gets its own
+/// task under the call once the call moves. A subagent child already has a
+/// task of its own, so it is never a part.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolPart {
+    /// Stable across reports, or the part opens a new tab each time.
+    pub id: String,
+    pub name: String,
+    pub tool: Arc<str>,
+    pub status: PartStatus,
+    pub body: Option<Arc<SharedBuf>>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -682,6 +708,11 @@ pub enum AgentEvent {
     ToolMovable {
         id: String,
         movable: bool,
+    },
+    /// What a running top-level call is made of now, see [`ToolPart`].
+    ToolParts {
+        id: String,
+        parts: Vec<ToolPart>,
     },
     TurnComplete(Box<TurnCompleteEvent>),
     ToolResultsSubmitted {
@@ -760,8 +791,11 @@ pub enum AgentEvent {
     /// shows the same line.
     ObservationLine {
         text: String,
-        /// What the model read, for a frontend that expands the line.
+        /// What the line unfolds to, see `observation_detail`.
         detail: Option<String>,
+        /// Set when the line answers a background task, for its colored dot.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        end: Option<TaskEnd>,
     },
     /// A plugin changed the run in a way the transcript alone would not show.
     /// `text` is the message as sent, the reason for a drop, or the message
@@ -1257,6 +1291,11 @@ pub struct SubagentInfo {
     /// queue between turns, so a message lands as a user interrupt.
     #[serde(skip)]
     pub inbox: Option<Arc<crate::SubagentInbox>>,
+    /// The model's call this session runs under when that is not its own
+    /// `task` call, like the `batch` it is a child of. Once that call moves,
+    /// `/tasks` lists the session under it.
+    #[serde(skip)]
+    pub parent_call: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1393,13 +1432,13 @@ mod tests {
     use std::pin::pin;
     use test_case::test_case;
 
-    #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
+    #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 line")      ; "plain_short_annotates")]
     #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]
     #[test_case(ToolOutput::Plain(String::new().into()),             None                ; "plain_empty_no_annotation")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("5 of 100 lines") ; "read_code_partial")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_bytes")]
-    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }] }, Some("1 matches in 1 file") ; "grep_file_count")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }] }, Some("1 match in 1 file") ; "grep_file_count")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.annotation().as_deref(), expected);

@@ -276,7 +276,7 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"SessionCwdChanged"`: `data.cwd`, the session's new working
 ///   directory, when `/cd` changes it.
 /// - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
-///   (`"working"`, `"idle"`, `"done"`, or `"error"`), when a subagent starts
+///   (`"working"`, `"idle"`, `"done"`, `"error"`, or `"cancelled"`), when a subagent starts
 ///   or changes status. A task a plugin opened with `maki.agent.session`
 ///   carries `data.plugin`, and `"idle"` is such a task between prompts. A
 ///   task that comes back from disk already finished stays quiet, so

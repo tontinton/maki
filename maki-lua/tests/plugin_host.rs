@@ -2595,7 +2595,7 @@ maki.api.register_tool({{
     assert_eq!(
         out,
         format!(
-            "child_done/5 items stream_done/streamed line/1 lines \
+            "child_done/5 items stream_done/streamed line/1 line \
              {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
         )
     );

@@ -736,6 +736,9 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 ///   `on_movable` (function?) - called with `true` when the child registers
 ///     `ctx:on_background`, so the caller knows it may outlive the turn, and
 ///     `false` if it loses that. Must not yield.
+///   `on_task` (function?) - called with the task id when the child runs as
+///     a subagent, which `/tasks` then lists as a task of its own. Must not
+///     yield.
 /// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
 ///   Instruction files the child picks up (a subdirectory `AGENTS.md`) are
 ///   not in the text: they land on the calling tool's own result.
@@ -762,7 +765,8 @@ async fn call_tool(
     // permission prompt, the user still has to see it somewhere.
     let (live_tx, live_rx) = flume::unbounded();
     tctx.live_sink = Some(live_tx);
-    let (mut on_buf, mut on_ann, mut on_usage, mut on_movable) = (None, None, None, None);
+    let (mut on_buf, mut on_ann, mut on_usage, mut on_movable, mut on_task) =
+        (None, None, None, None, None);
     if let Some(o) = opts {
         if let Some(mode) = o.opt::<String>("output_mode")? {
             let Some(mode) = ToolOutputMode::parse(&mode) else {
@@ -777,6 +781,7 @@ async fn call_tool(
         on_ann = o.opt::<Function>("on_annotation")?;
         on_usage = o.opt::<Function>("on_usage")?;
         on_movable = o.opt::<Function>("on_movable")?;
+        on_task = o.opt::<Function>("on_task")?;
     }
     let cbs = LiveCallbacks {
         tool: &name,
@@ -785,6 +790,7 @@ async fn call_tool(
         on_ann,
         on_usage,
         on_movable,
+        on_task,
     };
     drop(ctx);
     if let Err(e) = tctx.deadline.check() {
@@ -1082,6 +1088,11 @@ async fn session(
         },
     };
 
+    if owner.is_none()
+        && let Some(sink) = &agent_ctx.live_sink
+    {
+        let _ = sink.send(ToolLive::Task(ui_id.clone()));
+    }
     smol::spawn(relay_session_events(
         sub_events,
         upstream.clone(),
@@ -1238,6 +1249,7 @@ async fn session(
             opts: Some(state.opts),
             answer_tx: None,
             inbox: Some(Arc::clone(&inbox)),
+            parent_call: None,
         };
         state.upstream.open_task(info.clone());
         let _ = state.subagent_info.set(info);
@@ -1381,6 +1393,7 @@ struct LiveCallbacks<'a> {
     on_ann: Option<Function>,
     on_usage: Option<Function>,
     on_movable: Option<Function>,
+    on_task: Option<Function>,
 }
 
 impl LiveCallbacks<'_> {
@@ -1397,6 +1410,7 @@ impl LiveCallbacks<'_> {
                 None
             }
             ToolLive::Movable(movable) => call_opt(&self.on_movable, movable).await,
+            ToolLive::Task(id) => call_opt(&self.on_task, id).await,
         };
         if let Some(Err(e)) = res {
             tracing::warn!(tool = self.tool, error = %e, "call_tool callback failed");
@@ -1711,6 +1725,12 @@ struct SessionCancellation {
 }
 
 impl SessionCancellation {
+    /// See [`SubagentInfo::parent_call`].
+    fn parent_call(&self) -> Option<String> {
+        let call = self.adoption.as_ref()?.call.id();
+        (call != self.ui_id).then(|| call.to_owned())
+    }
+
     /// Why this session takes no more messages, closing aside. It needs no
     /// session lock, so `send` gets the same answer mid-prompt as between.
     fn refusal(&self) -> Option<&'static str> {
@@ -1908,6 +1928,7 @@ async fn prompt(
             opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
             inbox: Some(Arc::clone(&inbox)),
+            parent_call: s.cancellation.parent_call(),
         });
     }
     // The run only reads the inbox after a turn, so a message sent while we
@@ -2668,6 +2689,7 @@ mod tests {
             opts: None,
             answer_tx: None,
             inbox: None,
+            parent_call: None,
         })
         .unwrap();
         info

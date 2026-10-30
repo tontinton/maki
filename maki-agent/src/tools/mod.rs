@@ -427,6 +427,8 @@ pub enum ToolLive {
     AllowedBy(Arc<str>),
     /// The child registered (`true`) or lost (`false`) a background hook.
     Movable(bool),
+    /// The child runs as this subagent task, which `/tasks` lists on its own.
+    Task(String),
 }
 
 /// The chat whose plan mode blocks this work's writes, see

@@ -14,7 +14,7 @@ use maki_providers::{
 use maki_storage::frame::{LiveFacts, PromptFacts};
 
 use super::compaction::{self, CompactReason, CompactSteer, Compacted};
-use super::display_order::observation_line;
+use super::display_order::{observation_detail, observation_line};
 use super::frame::{
     FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
 };
@@ -448,12 +448,13 @@ impl<'h> Agent<'h> {
         let line = observation_line(&message).map(str::to_owned);
         let detail = line
             .as_ref()
-            .and(message.first_text_content())
+            .and(observation_detail(&message))
             .map(str::to_owned);
+        let end = message.settles.as_ref().map(|settled| settled.end);
         self.history.push(message);
         if let Some(text) = line {
             self.event_tx
-                .send(AgentEvent::ObservationLine { text, detail })?;
+                .send(AgentEvent::ObservationLine { text, detail, end })?;
         }
         Ok(())
     }
@@ -1892,7 +1893,7 @@ mod tests {
         events
             .iter()
             .filter_map(|envelope| match &envelope.event {
-                AgentEvent::ObservationLine { text, detail } => {
+                AgentEvent::ObservationLine { text, detail, .. } => {
                     Some((text.as_str(), detail.as_deref()))
                 }
                 _ => None,

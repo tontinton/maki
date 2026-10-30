@@ -15,16 +15,16 @@ use std::time::Duration;
 
 use maki_agent::cancel::{CancelHandle, CancelToken, CancelTrigger};
 use maki_agent::{
-    AgentEvent, AgentSeed, BackgroundNotice, Envelope, SessionMailbox, TaskEnd, ToolDoneEvent,
-    result_notice,
+    AgentEvent, AgentSeed, BackgroundNotice, Envelope, SessionMailbox, TaskEnd, TaskLabel,
+    ToolDoneEvent, result_notice,
 };
 use maki_storage::id::MakiId;
 use mlua::Lua;
+use serde::Serialize;
 
 use crate::api::session::not_live;
 use crate::api::util::command::UiAction;
 
-const STOP_REQUESTED: &str = "stop requested";
 pub(crate) const NONE_RUNNING: &str = "none running";
 pub(crate) const NO_RUNNING_TASK: &str = "no running background task";
 const RUNNING_LIST: &str = "running:";
@@ -123,6 +123,18 @@ impl BackgroundTask {
         self.is_call() && !self.info.running
     }
 
+    fn label(&self, tool: &str) -> TaskLabel {
+        TaskLabel::new(tool, Some(&self.info.name))
+    }
+
+    /// Only a moved call holds a receipt, so a session entry has nothing to
+    /// report.
+    fn report_lost(&self, mailbox: &SessionMailbox) {
+        if let Kind::Call { tool } = &self.info.kind {
+            mailbox.lose(&self.info.id, &self.label(tool));
+        }
+    }
+
     fn reports_to(&self, mailbox: MakiId) -> bool {
         self.mailbox
             .as_ref()
@@ -137,14 +149,23 @@ impl BackgroundTask {
             Kind::Agent => &done.tool,
         };
         result_notice(
-            tool,
+            &self.label(tool),
             &self.info.id,
-            &self.info.name,
             done.is_error,
             self.stop.get() != Stop::None,
             output,
         )
     }
+}
+
+/// What `maki.task.stop(ctx)` hands Lua. `output` is missing when the final
+/// reply was late. `name` is how the user knows the task, since the model
+/// only knows its id.
+#[derive(Debug, PartialEq, Serialize)]
+pub(crate) struct ModelStop {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) output: Option<String>,
+    pub(crate) name: String,
 }
 
 /// What `maki.agent.list()` and `/tasks` show.
@@ -187,12 +208,24 @@ impl MovedEnd {
         }
     }
 
+    /// A lost call never sends a final result, so nothing else would end its
+    /// tab. Only the one that settles the receipt tells it, so it hears once.
     pub(crate) fn land(mut self, done: Option<ToolDoneEvent>) {
         self.landed = true;
-        match done {
-            Some(done) => self.registry.deliver(&self.id, done, self.ui.take()),
-            None => self.registry.lose(&self.id),
-        }
+        let ui = self.ui.take();
+        let Some(done) = done else {
+            if let Some(session) = self.registry.lose(&self.id)
+                && let Some(ui) = ui
+            {
+                let _ = ui.try_send(UiAction::PluginTaskEnded {
+                    session,
+                    id: self.id.clone(),
+                    end: TaskEnd::Lost,
+                });
+            }
+            return;
+        };
+        self.registry.deliver(&self.id, done, ui);
     }
 }
 
@@ -304,51 +337,51 @@ impl BackgroundTasks {
     /// The model's stop of one of the calls it moved, those reporting to its
     /// run's `mailbox` (`None` outside a run: it moved none). Waits up to
     /// `wait` for the final reply and returns its text, and then the run gets
-    /// no notice of the end. When the reply is late this returns
-    /// [`STOP_REQUESTED`], and the reply still reaches the run as a quiet
-    /// notice.
+    /// no notice of the end. When the reply is late this returns no output,
+    /// and the reply still reaches the run as a quiet notice.
     pub(crate) async fn stop_by_model(
         &self,
         mailbox: Option<MakiId>,
         id: &str,
         wait: Duration,
-    ) -> Result<String, String> {
+    ) -> Result<ModelStop, String> {
         // Armed before the stop fires, so a call that ignores the stop is
         // abandoned (cancel + the same wait) only after this gives up.
         let timer = smol::Timer::after(wait);
-        let reply = self.begin_model_stop(mailbox, id)?;
+        let (reply, name) = self.begin_model_stop(mailbox, id)?;
         let arrived = futures_lite::future::or(async { reply.recv_async().await.ok() }, async {
             timer.await;
             None
         })
         .await;
-        if let Some(output) = arrived {
-            return Ok(output);
-        }
-        lock(&self.waiters).remove(id);
-        Ok(reply
-            .try_recv()
-            .unwrap_or_else(|_| STOP_REQUESTED.to_owned()))
+        let output = arrived.or_else(|| {
+            lock(&self.waiters).remove(id);
+            reply.try_recv().ok()
+        });
+        Ok(ModelStop { output, name })
     }
 
+    /// The reply to wait on, and the stopped call's name.
     fn begin_model_stop(
         &self,
         mailbox: Option<MakiId>,
         id: &str,
-    ) -> Result<flume::Receiver<String>, String> {
+    ) -> Result<(flume::Receiver<String>, String), String> {
         let running: Vec<_> = self
             .locked()
             .iter()
             .filter(|e| is_running_call(e) && mailbox.is_some_and(|mailbox| e.reports_to(mailbox)))
-            .map(|e| e.info.id.clone())
+            .map(|e| e.info.clone())
             .collect();
-        if !running.iter().any(|running_id| running_id == id) {
-            return Err(no_running_task_err(id, &running));
-        }
+        let Some(target) = running.iter().find(|info| info.id == id) else {
+            let ids: Vec<_> = running.into_iter().map(|info| info.id).collect();
+            return Err(no_running_task_err(id, &ids));
+        };
+        let name = target.name.clone();
         let (waiter, reply) = flume::bounded(1);
         lock(&self.waiters).insert(id.to_owned(), waiter);
         self.stop(id, Stop::Model);
-        Ok(reply)
+        Ok((reply, name))
     }
 
     /// The final reply of a moved call: settles its receipt in the run it
@@ -384,6 +417,15 @@ impl BackgroundTasks {
             }
         }
         if let Some(ui) = ui {
+            // A killed process usually exits with an error, so the tab hears
+            // of the stop first and ends cancelled, not failed.
+            if task.stop.get() != Stop::None {
+                let _ = ui.try_send(UiAction::PluginTaskEnded {
+                    session: task.session,
+                    id: id.to_owned(),
+                    end: TaskEnd::Cancelled,
+                });
+            }
             for event in [
                 AgentEvent::ToolDone(Box::new(done)),
                 AgentEvent::StreamClosed,
@@ -432,13 +474,20 @@ impl BackgroundTasks {
     /// ends as if it never moved, and its receipt cannot come back as lost on
     /// resume.
     pub(crate) fn abandon(&self, id: &str) {
-        self.settle_unanswered(|e| e.info.id == id, SessionMailbox::forget);
+        self.settle_unanswered(
+            |e| e.info.id == id,
+            |task, mailbox| {
+                mailbox.forget(&task.info.id);
+            },
+        );
     }
 
     /// A moved call whose work ended without a final reply, its Lua task
-    /// gone with the host or a panic.
-    pub(crate) fn lose(&self, id: &str) {
-        self.settle_unanswered(|e| e.info.id == id, SessionMailbox::lose);
+    /// gone with the host or a panic. Returns its chat session, or `None`
+    /// when something else settled it first.
+    pub(crate) fn lose(&self, id: &str) -> Option<MakiId> {
+        self.settle_unanswered(|e| e.info.id == id, BackgroundTask::report_lost)
+            .pop()
     }
 
     pub(crate) fn end_session(&self, session: MakiId) {
@@ -467,19 +516,24 @@ impl BackgroundTasks {
     /// otherwise wait on it for the rest of the process. A call whose final
     /// reply already exists is left to [`Self::deliver`].
     pub(crate) fn lose_all(&self) {
-        self.settle_unanswered(|e| !e.has_final(), SessionMailbox::lose);
+        self.settle_unanswered(|e| !e.has_final(), BackgroundTask::report_lost);
     }
 
+    /// Returns the chat sessions of the entries it settled.
     fn settle_unanswered(
         &self,
         doomed: impl Fn(&BackgroundTask) -> bool,
-        settle: impl Fn(&SessionMailbox, &str),
-    ) {
-        for task in &self.extract(doomed) {
-            if let Some(mailbox) = &task.mailbox {
-                settle(mailbox, &task.info.id);
-            }
-        }
+        settle: impl Fn(&BackgroundTask, &SessionMailbox),
+    ) -> Vec<MakiId> {
+        self.extract(doomed)
+            .into_iter()
+            .map(|task| {
+                if let Some(mailbox) = &task.mailbox {
+                    settle(&task, mailbox);
+                }
+                task.session
+            })
+            .collect()
     }
 
     /// Hands out a copy, because building Lua tables can run the GC, and a
@@ -831,6 +885,28 @@ pub(crate) mod tests {
         assert!(matches!(events[1], AgentEvent::StreamClosed));
     }
 
+    #[test_case(Stop::User ; "by_the_user")]
+    #[test_case(Stop::Model ; "by_the_model")]
+    fn a_stopped_calls_tab_hears_of_the_stop_before_its_reply(stop: Stop) {
+        let session = MakiId::generate();
+        let _live = live(session);
+        let (registry, ..) = registry_with_call(session);
+        let (tx, rx) = flume::unbounded();
+        registry.stop(CALL_ID, stop);
+
+        registry.deliver(CALL_ID, done(OUTPUT, true), Some(tx));
+
+        let first = rx.try_recv().expect("the tab hears of the stop");
+        assert!(matches!(
+            first,
+            UiAction::PluginTaskEnded { session: chat, id, end: TaskEnd::Cancelled } if chat == session && id == CALL_ID
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiAction::PluginTaskEvent { envelope, .. }) if matches!(envelope.event, AgentEvent::ToolDone(_))
+        ));
+    }
+
     #[test]
     fn model_stop_that_gets_the_output_leaves_the_chat_no_notice() {
         let session = MakiId::generate();
@@ -842,7 +918,7 @@ pub(crate) mod tests {
             async { registry.deliver(CALL_ID, done(OUTPUT, true), None) },
         ));
 
-        assert_eq!(stopped, Ok(OUTPUT.to_owned()));
+        assert_eq!(stopped.map(|stop| stop.output), Ok(Some(OUTPUT.to_owned())));
         assert_eq!(mark.get(), Stop::Model);
         assert!(token.is_cancelled());
         assert!(mailbox.unsettled().is_empty());
@@ -859,7 +935,7 @@ pub(crate) mod tests {
         let stopped =
             smol::block_on(registry.stop_by_model(Some(session), CALL_ID, Duration::ZERO));
 
-        assert_eq!(stopped, Ok(STOP_REQUESTED.to_owned()));
+        assert_eq!(stopped.map(|stop| stop.output), Ok(None));
         assert!(registry.contains(CALL_ID));
 
         registry.deliver(CALL_ID, done(OUTPUT, true), None);
@@ -972,7 +1048,11 @@ pub(crate) mod tests {
         assert!(!registry.contains(CALL_ID));
         assert!(mailbox.claim_wake().is_empty());
         assert_eq!(mailbox.drain().len(), 1);
-        assert_eq!(rx.len(), 2, "{TAB_CLOSED}");
+        let tab_events = rx
+            .try_iter()
+            .filter(|action| matches!(action, UiAction::PluginTaskEvent { .. }))
+            .count();
+        assert_eq!(tab_events, 2, "{TAB_CLOSED}");
     }
 
     /// `/reload` ends every session and then the host: work stopped by the
@@ -1067,5 +1147,30 @@ pub(crate) mod tests {
                 assert!(mailbox.unsettled().is_empty());
             }
         }
+    }
+
+    /// When the host died first, it already settled the receipt, so the
+    /// late landing must stay quiet or the tab hears twice.
+    #[test_case(true  ; "lost_on_its_own")]
+    #[test_case(false ; "after_the_host_died")]
+    fn a_lost_calls_tab_hears_of_it_from_whoever_settled_it(settles_it: bool) {
+        let session = MakiId::generate();
+        let _live = live(session);
+        let (registry, ..) = registry_with_call(session);
+        let (tx, rx) = flume::unbounded();
+        if !settles_it {
+            registry.lose_all();
+        }
+
+        MovedEnd::new(registry, CALL_ID.to_owned(), Some(tx)).land(None);
+
+        let told = rx.try_iter().any(|action| {
+            matches!(
+                action,
+                UiAction::PluginTaskEnded { session: chat, id, end: TaskEnd::Lost }
+                    if chat == session && id == CALL_ID
+            )
+        });
+        assert_eq!(told, settles_it);
     }
 }

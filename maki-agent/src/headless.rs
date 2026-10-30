@@ -71,7 +71,7 @@ impl BackgroundMode {
 fn open_mailbox(resumed: &Resumed) -> SessionMailbox {
     let mailbox = SessionMailbox::register(resumed.id.id());
     if let Some(session) = &resumed.session {
-        mailbox.restore_lost(&session.meta.pending_background);
+        mailbox.restore_lost(&session.meta.pending_background, session.messages());
     }
     mailbox
 }

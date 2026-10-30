@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flume::TryRecvError;
 use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry, ToolSource};
-use maki_agent::{AgentEvent, ToolDoneEvent};
+use maki_agent::{AgentEvent, PartStatus, ToolDoneEvent, ToolPart};
 use maki_lua::MoveOutcome;
 use maki_storage::id::MakiId;
 use serde::Serialize;
@@ -19,7 +19,10 @@ use strum::IntoStaticStr;
 
 use crate::app::{App, MAIN_CHAT};
 use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, LOST_TEXT};
-use crate::components::{Action, BackgroundBadge, BackgroundOutcome, DisplayRole, ToolStatus};
+use crate::components::tool_display::without_timeout;
+use crate::components::{
+    Action, BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, ToolRole, ToolStatus,
+};
 use crate::repaint::Dirty;
 
 const UNKNOWN_TASK_ERR: &str = "unknown task: ";
@@ -33,6 +36,7 @@ const MOVED_PREFIX: &str = "Moved ";
 const MOVED_MANY_SUFFIX: &str = " calls to the background";
 pub(crate) const NOTHING_TO_MOVE_MSG: &str = "Nothing here can run in the background";
 const AWAITING_PERMISSION_SUFFIX: &str = " is waiting for your permission answer";
+const PART_SEP: char = '/';
 
 /// How a chat ended, from the vaguest to the most specific. `SubagentHistory`
 /// only sees the transcript close, and the `ToolDone` carrying `is_error`
@@ -43,6 +47,9 @@ pub(crate) enum TaskOutcome {
     Unknown,
     Done,
     Error,
+    /// Stopped by the user or the model. The work did not fail, so it must
+    /// not read as an error in `/tasks`.
+    Cancelled,
 }
 
 impl TaskOutcome {
@@ -56,8 +63,36 @@ impl TaskOutcome {
     /// than passed beside it, so a green marker cannot sit on a failed task.
     pub(crate) fn role(self) -> DisplayRole {
         match self {
-            Self::Error => DisplayRole::Error,
+            Self::Error | Self::Cancelled => DisplayRole::Error,
             Self::Unknown | Self::Done => DisplayRole::Done,
+        }
+    }
+
+    /// What that bubble says when nothing more specific, like a loss, is
+    /// known.
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            Self::Unknown | Self::Done => DONE_TEXT,
+            Self::Error => ERROR_TEXT,
+            Self::Cancelled => CANCELLED_TEXT,
+        }
+    }
+}
+
+/// The moved call a task sits under in `/tasks`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TaskParent {
+    /// A subagent the call started: its work, and its stop, are its own.
+    Started(Arc<str>),
+    /// A piece of the call, see [`ToolPart`]. Only the call can stop it, and
+    /// only [`App::sync_parts`] writes its tab.
+    Part(Arc<str>),
+}
+
+impl TaskParent {
+    pub(crate) fn call(&self) -> &Arc<str> {
+        match self {
+            Self::Started(call) | Self::Part(call) => call,
         }
     }
 }
@@ -72,6 +107,7 @@ pub(crate) enum TaskStatus {
     Idle,
     Done,
     Error,
+    Cancelled,
 }
 
 impl TaskStatus {
@@ -84,6 +120,7 @@ impl From<TaskOutcome> for TaskStatus {
     fn from(outcome: TaskOutcome) -> Self {
         match outcome {
             TaskOutcome::Error => Self::Error,
+            TaskOutcome::Cancelled => Self::Cancelled,
             TaskOutcome::Unknown | TaskOutcome::Done => Self::Done,
         }
     }
@@ -131,7 +168,7 @@ pub(super) fn tab_ending(outcome: BackgroundOutcome) -> (TaskOutcome, &'static s
     match outcome {
         BackgroundOutcome::Done => (TaskOutcome::Done, DONE_TEXT),
         BackgroundOutcome::Error => (TaskOutcome::Error, ERROR_TEXT),
-        BackgroundOutcome::Cancelled => (TaskOutcome::Error, CANCELLED_TEXT),
+        BackgroundOutcome::Cancelled => (TaskOutcome::Cancelled, CANCELLED_TEXT),
         BackgroundOutcome::Lost => (TaskOutcome::Error, LOST_TEXT),
     }
 }
@@ -155,6 +192,12 @@ pub(crate) struct TaskInfo {
     status: Option<TaskStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plugin: Option<Arc<str>>,
+    /// See [`Chat::parent`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<Arc<str>>,
+    /// A [`TaskParent::Part`], whose stop is its parent's.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    part: bool,
     focused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at: Option<u64>,
@@ -220,6 +263,35 @@ pub(crate) fn count_phrase(count: usize, one: &str, many_suffix: &str) -> String
     } else {
         format!("{count}{many_suffix}")
     }
+}
+
+/// Brings the tab of part {id} up to date, so it is safe to run on every
+/// report. A part still working when its call ended ({call_end}) ends with
+/// it: its last report travels apart from the call's result and may never
+/// come.
+fn show_part(chat: &mut Chat, id: &str, part: ToolPart, call_end: Option<TaskOutcome>) {
+    if let Some(body) = part.body {
+        chat.register_live_buf(id.to_owned(), body);
+    }
+    let ending = match part.status {
+        PartStatus::Working => call_end,
+        PartStatus::Done => Some(TaskOutcome::Done),
+        PartStatus::Error => Some(TaskOutcome::Error),
+        PartStatus::Cancelled => Some(TaskOutcome::Cancelled),
+    };
+    let Some(outcome) = ending else {
+        return;
+    };
+    let status = match outcome {
+        TaskOutcome::Unknown | TaskOutcome::Done => ToolStatus::Success,
+        TaskOutcome::Error | TaskOutcome::Cancelled => ToolStatus::Error,
+    };
+    chat.settle_tool(id, status);
+    chat.end_as(outcome, outcome.text());
+}
+
+fn part_task_id(call: &str, part: &str) -> String {
+    format!("{call}{PART_SEP}{part}")
 }
 
 /// The plugin that registered {tool}, or the tool itself for one no plugin
@@ -301,10 +373,12 @@ impl App {
             outcome = match self.chats[idx].task_status() {
                 TaskStatus::Done => Some(BackgroundOutcome::Done),
                 TaskStatus::Error => Some(BackgroundOutcome::Error),
+                TaskStatus::Cancelled => Some(BackgroundOutcome::Cancelled),
                 TaskStatus::Working | TaskStatus::Idle => None,
             };
         } else if let Some(mut row) = self.chats[origin].tool_message(&done.id) {
             row.movable = false;
+            row.annotation = row.annotation.as_deref().and_then(without_timeout);
             // Esc may have failed the row just before a racing move landed,
             // as it may have ended a subagent's tab, see `adopt_subagent`.
             if let DisplayRole::Tool(tool) = &mut row.role {
@@ -345,6 +419,7 @@ impl App {
         {
             self.finish_background_call(idx, early);
         }
+        self.sync_parts(&done.id);
     }
 
     /// The badge sits on the row the call moved out of. A subagent tab closed
@@ -359,18 +434,17 @@ impl App {
         }
     }
 
-    /// The final result of a moved call ends its task. A tab that already
-    /// reads as an error was stopped by the user, since nothing else fails a
-    /// task before its result, so it stays cancelled whatever the call says.
-    /// An adopted subagent's session may close first, but a close carries no
-    /// verdict, so the result still decides.
+    /// The final result of a moved call ends its task. A stopped tab stays
+    /// cancelled whatever the call says, see [`Self::end_task`]. An adopted
+    /// subagent's session may close first, but a close carries no verdict,
+    /// so the result still decides.
     pub(super) fn finish_background_call(&mut self, idx: usize, event: AgentEvent) {
         let AgentEvent::ToolDone(done) = &event else {
             return;
         };
         let id = done.id.clone();
         let chat = &mut self.chats[idx];
-        let outcome = if chat.task_status() == TaskStatus::Error {
+        let outcome = if chat.finish_outcome() == Some(TaskOutcome::Cancelled) {
             BackgroundOutcome::Cancelled
         } else if done.is_error {
             BackgroundOutcome::Error
@@ -381,6 +455,115 @@ impl App {
         chat.handle_event(event, None);
         chat.mark_finished(ending, text);
         self.set_badge_outcome(&id, outcome);
+    }
+
+    /// Its parts get tabs only once the call has one, which a call that never
+    /// moves never gets, see [`Self::forget_untasked_parts`].
+    pub(super) fn set_parts(&mut self, call: String, parts: Vec<ToolPart>) {
+        self.tool_parts.insert(call.clone(), parts);
+        self.sync_parts(&call);
+    }
+
+    /// Makes the tabs of {call}'s parts match its last report: one per listed
+    /// part while the call has a tab, and none otherwise. A part has no run of
+    /// its own, so this is the only writer of its tab.
+    pub(super) fn sync_parts(&mut self, call: &str) {
+        let parts = match self.chat_of_task(call) {
+            Ok(_) => self.tool_parts.get(call).cloned().unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        let unlisted = |chat: &Chat| {
+            chat.part_of().is_some_and(|of| **of == *call)
+                && chat.task_id().is_some_and(|id| {
+                    !parts
+                        .iter()
+                        .any(|part| **id == part_task_id(call, &part.id))
+                })
+        };
+        self.remove_chats(unlisted);
+        let Ok(parent) = self.chat_of_task(call) else {
+            return;
+        };
+        let call_end = self.chats[parent].finish_outcome();
+        let started = self.chats[parent].clock.as_ref().map(|clock| clock.started);
+        for part in parts {
+            let id = part_task_id(call, &part.id);
+            if self.deleted_tasks.contains(&id) {
+                continue;
+            }
+            let idx = match self.chat_of_task(&id) {
+                Ok(idx) => idx,
+                Err(_) => self.open_part(call, &id, &part, started),
+            };
+            show_part(&mut self.chats[idx], &id, part, call_end);
+        }
+    }
+
+    /// A call ends or goes away on many paths: its result, a stop, a loss, a
+    /// delete, a rewind. Chasing each one is how a part ends up spinning under
+    /// a finished call forever. So every wake looks for parts left behind
+    /// instead: one still going under a finished call, or one whose call is
+    /// gone.
+    pub(crate) fn settle_stranded_parts(&mut self) {
+        let mut stranded: Vec<Arc<str>> = Vec::new();
+        for chat in &self.chats {
+            let Some(call) = chat.part_of() else {
+                continue;
+            };
+            let left_behind = match self.chat_of_task(call) {
+                Ok(idx) => self.chats[idx].is_finished() && !chat.is_finished(),
+                Err(_) => true,
+            };
+            if left_behind && !stranded.contains(call) {
+                stranded.push(Arc::clone(call));
+            }
+        }
+        for call in stranded {
+            self.sync_parts(&call);
+        }
+    }
+
+    /// Runs at every run's end. A call that did not move by then never will,
+    /// and its report holds on to the bodies of all its pieces.
+    pub(super) fn forget_untasked_parts(&mut self) {
+        let chats = &self.chats;
+        self.tool_parts.retain(|call, _| {
+            chats
+                .iter()
+                .any(|chat| chat.task_id().is_some_and(|task| **task == *call))
+        });
+    }
+
+    fn open_part(
+        &mut self,
+        call: &str,
+        id: &str,
+        part: &ToolPart,
+        started: Option<SystemTime>,
+    ) -> usize {
+        let mut chat = Chat::new(
+            self.state.session.id,
+            Some(id),
+            part.name.clone(),
+            self.ui_config.clone(),
+            self.lua_event_handle.clone(),
+        );
+        chat.plugin = Some(tool_owner(&part.tool));
+        chat.parent = Some(TaskParent::Part(Arc::from(call)));
+        chat.clock = started.map(|started| TaskClock {
+            started,
+            ended: None,
+        });
+        chat.push(DisplayMessage::new(
+            DisplayRole::Tool(Box::new(ToolRole {
+                id: id.to_owned(),
+                status: ToolStatus::InProgress,
+                name: Arc::clone(&part.tool),
+            })),
+            part.name.clone(),
+        ));
+        self.chats.push(chat);
+        self.chats.len() - 1
     }
 
     /// A subagent whose call moved on becomes a task of {plugin}. Off the
@@ -420,9 +603,11 @@ impl App {
     /// What `/tasks` counts in its hint: the tasks quitting or a rewind would
     /// end, as opposed to the tool tasks a turn owns.
     pub(crate) fn running_background_tasks(&self) -> impl Iterator<Item = &Chat> {
-        self.chats
-            .iter()
-            .filter(|chat| chat.plugin.is_some() && chat.task_status() == TaskStatus::Working)
+        self.chats.iter().filter(|chat| {
+            chat.plugin.is_some()
+                && chat.parent.is_none()
+                && chat.task_status() == TaskStatus::Working
+        })
     }
 
     /// Subagent chats only, in chat order.
@@ -449,6 +634,8 @@ impl App {
                 name: chat.name.clone(),
                 status: chat.task_id().map(|_| chat.task_status()),
                 plugin: chat.plugin.clone(),
+                parent: chat.parent.as_ref().map(TaskParent::call).cloned(),
+                part: chat.part_of().is_some(),
                 focused: idx == self.active_chat,
                 started_at: chat
                     .clock
@@ -476,9 +663,14 @@ impl App {
     }
 
     /// A tool task can be stopped only while its turn still routes to it. A
-    /// plugin task can be stopped any time it is alive, idle included.
+    /// plugin task can be stopped any time it is alive, idle included. A part
+    /// has no run of its own, so stopping it stops its whole call.
     pub(crate) fn stop_task(&mut self, id: &str) -> Result<Action, String> {
         let idx = self.chat_of_task(id)?;
+        if let Some(call) = self.chats[idx].part_of() {
+            let call = Arc::clone(call);
+            return self.stop_task(&call);
+        }
         if idx == 0 {
             return Err(MAIN_STOP_ERR.to_owned());
         }
@@ -494,14 +686,30 @@ impl App {
             },
             _ => return Err(format!("{NOT_RUNNING_ERR}{id}")),
         };
-        chat.flush();
-        chat.cancel_in_progress();
-        chat.mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
-        self.permission_prompt.drop_subagent(id);
-        // Settled now: the tab, and with it the final result, may be gone
-        // before the call honours the stop.
-        self.set_badge_outcome(id, BackgroundOutcome::Cancelled);
+        self.end_task(id, BackgroundOutcome::Cancelled);
         Ok(action)
+    }
+
+    /// Ends task `id` before its final result, if one ever comes. The user or
+    /// the model stopped it, or the host lost it (`UiAction::PluginTaskEnded`).
+    /// The subagents it started go down with it, since their own end comes
+    /// later and would read as a plain finish. The badge settles now too,
+    /// because the tab and its final result may be gone before the call
+    /// honours the stop.
+    pub(crate) fn end_task(&mut self, id: &str, outcome: BackgroundOutcome) {
+        let (ending, text) = tab_ending(outcome);
+        for chat in &mut self.chats {
+            let Some(task) = chat.task_id() else {
+                continue;
+            };
+            let started_by_it =
+                matches!(&chat.parent, Some(TaskParent::Started(call)) if **call == *id);
+            if (**task == *id || started_by_it) && !chat.is_finished() {
+                self.permission_prompt.drop_subagent(task);
+                chat.end_early(ending, text);
+            }
+        }
+        self.set_badge_outcome(id, outcome);
     }
 
     /// The picker sends the session its row came from. By the time the stop
@@ -530,7 +738,29 @@ impl App {
             return Err(format!("{RUNNING_DELETE_ERR}{id}"));
         }
 
-        // Step off through `set_active_chat`, or the box keeps the deleted
+        self.remove_chat_at(pos);
+        self.state.session_mut().remove_subagent(id, |m| {
+            m.tool_uses()
+                .map(|(tool_id, _, _)| tool_id.to_owned())
+                .collect()
+        });
+        self.deleted_tasks.insert(id.to_owned());
+        self.tool_parts.remove(id);
+        Ok(())
+    }
+
+    /// Takes out every chat {doomed} picks, the main chat never among them.
+    fn remove_chats(&mut self, doomed: impl Fn(&Chat) -> bool) {
+        for pos in (1..self.chats.len()).rev() {
+            if doomed(&self.chats[pos]) {
+                self.remove_chat_at(pos);
+            }
+        }
+    }
+
+    /// Keeps the active chat and `chat_index` on the chats they pointed at.
+    fn remove_chat_at(&mut self, pos: usize) {
+        // Step off through `set_active_chat`, or the box keeps the removed
         // chat's draft and the draft of the chat we land on stays parked.
         if self.active_chat == pos {
             self.set_active_chat(pos - 1);
@@ -546,13 +776,6 @@ impl App {
             }
             keep
         });
-        self.state.session_mut().remove_subagent(id, |m| {
-            m.tool_uses()
-                .map(|(tool_id, _, _)| tool_id.to_owned())
-                .collect()
-        });
-        self.deleted_tasks.insert(id.to_owned());
-        Ok(())
     }
 
     /// Tasks are looked up by id, never by position and never through
@@ -590,7 +813,7 @@ impl TaskWatch {
     /// Fires when a known task changes status, or when a new live task
     /// appears. A task first seen already finished is recorded quietly, so a
     /// restored session does not replay yesterday's tasks. A live task whose
-    /// tab went in between, as a rewind's stop takes it, ends as an error:
+    /// tab went in between, as a rewind's stop takes it, ends as cancelled:
     /// only a stop takes a live tab. A session swapped under the tab starts
     /// over quietly, since `SessionReset` already speaks for the old one.
     pub(crate) fn diff<'a>(
@@ -632,7 +855,7 @@ impl TaskWatch {
             emit(TaskState {
                 id: &gone.id,
                 name: &gone.name,
-                status: TaskStatus::Error,
+                status: TaskStatus::Cancelled,
                 plugin: gone.plugin.as_ref(),
             });
         }
@@ -655,7 +878,7 @@ mod tests {
     use crate::components::Overlay;
     use crate::components::keybindings::key;
     use crate::repaint::Cadence;
-    use maki_agent::{Envelope, ToolOutput};
+    use maki_agent::{Envelope, SharedBuf, ToolOutput};
     use maki_config::ToolKey;
     use test_case::test_case;
 
@@ -866,23 +1089,33 @@ mod tests {
     /// The end of a moved call travels the plugin task path: its final
     /// `ToolDone`, then `StreamClosed`, whether or not the envelope names
     /// the task.
-    #[test_case(false, false, false, TaskStatus::Done,  BackgroundOutcome::Done      ; "finished")]
-    #[test_case(false, false, true,  TaskStatus::Done,  BackgroundOutcome::Done      ; "finished_named")]
-    #[test_case(true,  false, false, TaskStatus::Error, BackgroundOutcome::Error     ; "failed")]
-    #[test_case(false, true,  false, TaskStatus::Error, BackgroundOutcome::Cancelled ; "stopped_by_the_user")]
+    enum StoppedBy {
+        Nobody,
+        User,
+        /// `task_stop`, which the tab hears of from the host.
+        Model,
+    }
+
+    #[test_case(false, StoppedBy::Nobody, false, TaskStatus::Done,  BackgroundOutcome::Done      ; "finished")]
+    #[test_case(false, StoppedBy::Nobody, true,  TaskStatus::Done,  BackgroundOutcome::Done      ; "finished_named")]
+    #[test_case(true,  StoppedBy::Nobody, false, TaskStatus::Error, BackgroundOutcome::Error     ; "failed")]
+    #[test_case(true,  StoppedBy::User,   false, TaskStatus::Cancelled, BackgroundOutcome::Cancelled ; "stopped_by_the_user")]
+    #[test_case(true,  StoppedBy::Model,  false, TaskStatus::Cancelled, BackgroundOutcome::Cancelled ; "stopped_by_the_model")]
     fn the_final_result_ends_the_task_and_its_badge(
         is_error: bool,
-        stopped: bool,
+        stopped_by: StoppedBy,
         named: bool,
         status: TaskStatus,
         outcome: BackgroundOutcome,
     ) {
         let (mut app, _buf) = app_with_moved_call();
-        if stopped {
-            assert!(matches!(
+        match stopped_by {
+            StoppedBy::Nobody => {}
+            StoppedBy::User => assert!(matches!(
                 app.stop_task(MOVED_ID),
                 Ok(Action::CancelPluginTask { id, .. }) if id == MOVED_ID
-            ));
+            )),
+            StoppedBy::Model => app.end_task(MOVED_ID, BackgroundOutcome::Cancelled),
         }
         for event in [final_result(is_error), AgentEvent::StreamClosed] {
             app.deliver(
@@ -919,6 +1152,152 @@ mod tests {
                 run_id: 0,
             },
             Some(Arc::from(SLOW_TOOL)),
+        );
+    }
+
+    const PART_KEY: &str = "1";
+    const PART_NAME: &str = "Sleep then greet";
+    const FOREGROUND_CALL_ID: &str = "toolu_foreground";
+
+    fn report_part(app: &mut App, status: PartStatus, body: &Arc<SharedBuf>) {
+        app.update(agent_msg(AgentEvent::ToolParts {
+            id: MOVED_ID.into(),
+            parts: vec![ToolPart {
+                id: PART_KEY.into(),
+                name: PART_NAME.into(),
+                tool: SUB_TOOL.into(),
+                status,
+                body: Some(Arc::clone(body)),
+            }],
+        }));
+    }
+
+    fn app_with_working_part() -> (App, Arc<SharedBuf>, String) {
+        let (mut app, _) = app_with_moved_call();
+        let body = Arc::new(SharedBuf::new());
+        report_part(&mut app, PartStatus::Working, &body);
+        (app, body, part_task_id(MOVED_ID, PART_KEY))
+    }
+
+    fn part_status(app: &App, part: &str) -> Option<TaskStatus> {
+        let idx = app.chat_of_task(part).ok()?;
+        Some(app.chats[idx].task_status())
+    }
+
+    /// Opening the `bash` child of a moved batch shows that child, not the
+    /// whole batch again.
+    #[test]
+    fn a_part_is_a_task_under_its_call_showing_its_own_body() {
+        let (mut app, body, part) = app_with_working_part();
+
+        app.focus_task(&part).unwrap();
+
+        let tab = &app.chats[app.active_chat];
+        assert_eq!(tab.part_of().map(|call| &**call), Some(MOVED_ID));
+        assert!(
+            tab.live_buf(&part)
+                .is_some_and(|shared| Arc::ptr_eq(&shared, &body))
+        );
+        assert_eq!(
+            app.running_background_tasks().count(),
+            1,
+            "a part is counted with its call"
+        );
+        let listed = app.tasks().into_iter().find(|task| *task.id == *part);
+        assert!(listed.as_ref().is_some_and(|task| task.part));
+        assert_eq!(
+            listed.and_then(|task| task.parent).as_deref(),
+            Some(MOVED_ID)
+        );
+    }
+
+    #[test]
+    fn stopping_a_part_stops_its_call() {
+        let (mut app, _, part) = app_with_working_part();
+
+        assert!(matches!(
+            app.stop_task(&part),
+            Ok(Action::CancelPluginTask { id, .. }) if id == MOVED_ID
+        ));
+        app.settle_stranded_parts();
+        assert_eq!(part_status(&app, &part), Some(TaskStatus::Cancelled));
+    }
+
+    fn finish_call(app: &mut App) {
+        deliver_final_result(app, false);
+    }
+
+    fn lose_call(app: &mut App) {
+        app.end_task(MOVED_ID, BackgroundOutcome::Lost);
+    }
+
+    fn delete_call(app: &mut App) {
+        finish_call(app);
+        app.remove_task(MOVED_ID).unwrap();
+    }
+
+    /// A part's last report travels apart from its call's result and may
+    /// never come, so a part still working follows its call, however the
+    /// call ended.
+    #[test_case(finish_call as fn(&mut App), Some(TaskStatus::Done)  ; "finished")]
+    #[test_case(lose_call,                   Some(TaskStatus::Error) ; "lost")]
+    #[test_case(delete_call,                 None                    ; "deleted")]
+    fn a_part_left_working_follows_its_call(end_call: fn(&mut App), status: Option<TaskStatus>) {
+        let (mut app, _, part) = app_with_working_part();
+        end_call(&mut app);
+
+        app.settle_stranded_parts();
+
+        assert_eq!(part_status(&app, &part), status);
+    }
+
+    #[test]
+    fn a_part_report_after_its_call_ended_has_the_last_word() {
+        let (mut app, body, part) = app_with_working_part();
+        finish_call(&mut app);
+        app.settle_stranded_parts();
+
+        report_part(&mut app, PartStatus::Error, &body);
+
+        assert_eq!(part_status(&app, &part), Some(TaskStatus::Error));
+    }
+
+    /// A child that turns out to run as a subagent leaves the list, and its
+    /// tab goes with it rather than spinning on.
+    #[test]
+    fn a_part_no_longer_listed_loses_its_tab() {
+        let (mut app, _, part) = app_with_working_part();
+        app.focus_task(&part).unwrap();
+
+        app.set_parts(MOVED_ID.into(), Vec::new());
+
+        assert_eq!(part_status(&app, &part), None);
+        assert_eq!(app.active_task_id().as_ref(), MOVED_ID);
+    }
+
+    /// A call that never moved never gets tabs for its parts, so its report,
+    /// bodies and all, goes when the run ends. A part is a view of its call
+    /// and is never stored as a task of its own.
+    #[test]
+    fn parts_outlive_neither_their_run_nor_the_session_file() {
+        let (mut app, _, part) = app_with_working_part();
+        app.set_parts(FOREGROUND_CALL_ID.into(), Vec::new());
+
+        end_turn(&mut app);
+
+        assert_eq!(
+            app.tool_parts
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [MOVED_ID]
+        );
+        assert!(
+            app.state
+                .session
+                .subagents()
+                .iter()
+                .all(|sub| sub.tool_use_id != part)
         );
     }
 
@@ -977,7 +1356,7 @@ mod tests {
             Ok(Action::CancelSubagent { tool_use_id }) if tool_use_id == TASK_ID
         ));
         assert_eq!(app.active_task_id().as_ref(), MAIN_TASK_ID);
-        assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Cancelled);
         assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
         assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
     }
@@ -993,7 +1372,7 @@ mod tests {
             app.stop_task(MONITOR_ID),
             Ok(Action::CancelPluginTask { id, .. }) if id == MONITOR_ID
         ));
-        assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Cancelled);
         assert_eq!(app.active_task_id().as_ref(), MAIN_TASK_ID);
     }
 
@@ -1010,7 +1389,7 @@ mod tests {
         assert!(app.stop_task(MONITOR_ID).is_ok());
         app.open_plugin_task(&info, Arc::from(MONITOR_PLUGIN));
         assert_eq!(app.chats.len(), 2);
-        assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Cancelled);
     }
 
     /// `chat_index` is wiped at the end of every turn, so a tool task that
@@ -1196,10 +1575,13 @@ mod tests {
     /// No way of ending a turn may leave a task `working`: nothing runs after
     /// to correct it, and the picker would spin on it forever. The finished
     /// task comes along to show the sweep leaves it alone.
-    #[test_case(end_turn as fn(&mut App) ; "turn_end")]
-    #[test_case(error_app                ; "parent_error")]
-    #[test_case(cancel_app               ; "user_cancel")]
-    fn a_turn_ending_terminalizes_every_unfinished_task(terminate: fn(&mut App)) {
+    #[test_case(end_turn as fn(&mut App), TaskStatus::Error ; "turn_end")]
+    #[test_case(error_app,                TaskStatus::Error ; "parent_error")]
+    #[test_case(cancel_app,               TaskStatus::Cancelled ; "user_cancel")]
+    fn a_turn_ending_terminalizes_every_unfinished_task(
+        terminate: fn(&mut App),
+        swept: TaskStatus,
+    ) {
         let mut app = app_with_two_subagents();
         finish_subagent(&mut app, TASK_ID, false);
         assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
@@ -1208,7 +1590,7 @@ mod tests {
 
         assert_eq!(
             app.task_states().map(|t| t.status).collect::<Vec<_>>(),
-            vec![TaskStatus::Done, TaskStatus::Error]
+            vec![TaskStatus::Done, swept]
         );
     }
 
@@ -1271,7 +1653,7 @@ mod tests {
 
         assert_eq!(
             collect(&mut watch, &[]),
-            vec![(TASK_ID.to_owned(), TaskStatus::Error)]
+            vec![(TASK_ID.to_owned(), TaskStatus::Cancelled)]
         );
         assert!(collect(&mut watch, &[]).is_empty());
     }

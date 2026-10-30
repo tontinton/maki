@@ -23,7 +23,7 @@ use maki_agent::tools::is_timeout_annotation;
 use maki_agent::{
     BufferSnapshot, InstructionBlock, SnapshotSpan, SpanColor, SpanStyle, ToolInput, ToolOutput,
 };
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::render_worker::RenderWorker;
@@ -38,7 +38,10 @@ pub const TOOL_INDICATOR: &str = "● ";
 pub const BACKGROUND_INDICATOR: &str = "↗ ";
 pub const MOVABLE_HINT: &str = "ctrl+b background";
 const BACKGROUND_LABEL: &str = "background";
-const BACKGROUND_CLICK_HINT: &str = "click or ctrl+x";
+const BACKGROUND_CLICK_HINT: &str = "click to open";
+const BACKGROUND_DONE_LABEL: &str = "done";
+const BACKGROUND_FAILED_LABEL: &str = "failed";
+const BACKGROUND_CANCELLED_LABEL: &str = "cancelled";
 const BACKGROUND_LOST_LABEL: &str = "lost";
 const SECS_PER_MINUTE: u64 = 60;
 const SECS_PER_HOUR: u64 = 3600;
@@ -317,6 +320,8 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
+/// A running task says how long it has run and where to watch it. An ended
+/// one says how it ended in words, since two endings share a color.
 fn background_annotation(outcome: Option<BackgroundOutcome>, elapsed_secs: Option<u64>) -> String {
     let mut text = format!(" ({BACKGROUND_LABEL}");
     match outcome {
@@ -328,15 +333,29 @@ fn background_annotation(outcome: Option<BackgroundOutcome>, elapsed_secs: Optio
             text.push_str(ANNOTATION_SEP);
             text.push_str(BACKGROUND_CLICK_HINT);
         }
-        Some(BackgroundOutcome::Lost) => {
+        Some(outcome) => {
             text.push_str(ANNOTATION_SEP);
-            text.push_str(BACKGROUND_LOST_LABEL);
-        }
-        Some(BackgroundOutcome::Done | BackgroundOutcome::Error | BackgroundOutcome::Cancelled) => {
+            text.push_str(outcome_label(outcome));
         }
     }
     text.push(')');
     text
+}
+
+fn outcome_label(outcome: BackgroundOutcome) -> &'static str {
+    match outcome {
+        BackgroundOutcome::Done => BACKGROUND_DONE_LABEL,
+        BackgroundOutcome::Error => BACKGROUND_FAILED_LABEL,
+        BackgroundOutcome::Cancelled => BACKGROUND_CANCELLED_LABEL,
+        BackgroundOutcome::Lost => BACKGROUND_LOST_LABEL,
+    }
+}
+
+/// The dot a background task's result notice opens with, colored the way
+/// the moved row's own dot ends.
+pub fn outcome_glyph(outcome: BackgroundOutcome) -> Span<'static> {
+    let indicator = Indicator::from(Some(outcome));
+    Span::styled(finished_glyph(indicator), finished_style(indicator))
 }
 
 #[derive(Clone, Copy)]
@@ -358,9 +377,9 @@ impl From<ToolStatus> for Indicator {
     }
 }
 
-impl From<&BackgroundBadge> for Indicator {
-    fn from(badge: &BackgroundBadge) -> Self {
-        match badge.outcome {
+impl From<Option<BackgroundOutcome>> for Indicator {
+    fn from(outcome: Option<BackgroundOutcome>) -> Self {
+        match outcome {
             None => Self::Moved,
             Some(BackgroundOutcome::Done) => Self::Success,
             Some(BackgroundOutcome::Error) => Self::Error,
@@ -700,7 +719,11 @@ fn finished_glyph(indicator: Indicator) -> &'static str {
 fn finished_style(indicator: Indicator) -> Style {
     match indicator {
         Indicator::Error => theme::current().tool_error,
-        Indicator::Cancelled => theme::current().todo_cancelled,
+        // The color of a cancelled todo, without its strike, which would run
+        // through the space after the dot as a stray line.
+        Indicator::Cancelled => theme::current()
+            .todo_cancelled
+            .remove_modifier(Modifier::CROSSED_OUT),
         Indicator::Moved => theme::current().tool_dim,
         Indicator::InProgress | Indicator::Success => theme::current().tool_success,
     }
@@ -791,22 +814,24 @@ pub fn build_tool_lines(
         rctx.tool_output_lines.get(tool_name),
         msg.background
             .as_ref()
-            .map_or_else(|| status.into(), Indicator::from),
+            .map_or_else(|| status.into(), |badge| badge.outcome.into()),
     );
+    // A moved row only points at its task. Its body now lives in the task's
+    // tab, and its result comes back as a notice. What is left on the row
+    // describes the receipt, which is for the model, not the user.
+    if let Some(badge) = &msg.background {
+        b.push_header(tool_name, header, None, msg.render_header.as_ref());
+        b.push_background_annotation(badge);
+        b.prepend_indicator(rctx.started_at);
+        return b.finish(None, None, TOOL_BODY_INDENT);
+    }
     b.apply_output_format(msg.tool_output.as_deref());
-    let annotation = match (&msg.background, msg.annotation.as_deref()) {
-        (Some(_), Some(annotation)) => without_timeout(annotation).map(Cow::Owned),
-        (_, annotation) => annotation.map(Cow::Borrowed),
-    };
     b.push_header(
         tool_name,
         header,
-        annotation.as_deref(),
+        msg.annotation.as_deref(),
         msg.render_header.as_ref(),
     );
-    if let Some(badge) = &msg.background {
-        b.push_background_annotation(badge);
-    }
     b.prepend_indicator(rctx.started_at);
     let has_snapshot = msg.render_snapshot.is_some();
     b.push_code_content(
@@ -934,7 +959,7 @@ pub fn truncate_to_header(text: &mut String) {
 }
 
 /// A moved call has no deadline left, so its timeout note would mislead.
-fn without_timeout(annotation: &str) -> Option<String> {
+pub(crate) fn without_timeout(annotation: &str) -> Option<String> {
     let kept: Vec<&str> = annotation
         .split(ANNOTATION_SEP)
         .filter(|note| !is_timeout_annotation(note))
@@ -1071,6 +1096,7 @@ mod tests {
             background: None,
             detail: None,
             detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -1174,37 +1200,41 @@ mod tests {
         assert!(text.contains("(2m timeout)"));
     }
 
-    const TIMEOUT_AND_LINES: &str = "2m timeout · 24 lines";
-    const TIMEOUT_ONLY: &str = "2m timeout";
-    const TIMEOUT_WORD: &str = "timeout";
+    const MOVED_HEADER: &str = "Run the tests";
+    const RECEIPT_ANNOTATION: &str = "3 lines";
+    const RECEIPT_BODY: &str = "Running in the background. Last 2 lines:";
 
-    #[test_case(false, TIMEOUT_AND_LINES, Some("(2m timeout · 24 lines)") ; "a_foreground_row_keeps_it")]
-    #[test_case(true,  TIMEOUT_AND_LINES, Some("(24 lines)")              ; "a_moved_row_keeps_the_rest")]
-    #[test_case(true,  TIMEOUT_ONLY,      None                            ; "a_moved_row_with_nothing_else")]
-    fn a_moved_row_hides_the_timeout_it_outlived(
-        moved: bool,
-        annotation: &str,
-        shown: Option<&str>,
-    ) {
-        let mut msg = tool_msg();
-        msg.annotation = Some(annotation.into());
-        msg.background = moved.then(|| BackgroundBadge {
+    #[test_case(None                              ; "running")]
+    #[test_case(Some(BackgroundOutcome::Done)     ; "ended")]
+    fn a_moved_row_draws_only_its_header(outcome: Option<BackgroundOutcome>) {
+        let mut msg = bash_msg(
+            &format!("{MOVED_HEADER}\n{RECEIPT_BODY}"),
+            ToolStatus::Success,
+            None,
+            Some(ToolOutput::Plain(RECEIPT_BODY.into())),
+        );
+        msg.annotation = Some(RECEIPT_ANNOTATION.into());
+        msg.background = Some(BackgroundBadge {
             id: "t1".into(),
             started_at: None,
-            outcome: None,
+            outcome,
         });
 
-        let text = lines_text(&build_tool_lines(
+        let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
             SectionFlags::default(),
-        ));
+        );
 
-        match shown {
-            Some(shown) => assert!(text.contains(shown), "{text}"),
-            None => assert!(!text.contains(TIMEOUT_WORD), "{text}"),
-        }
+        let text = lines_text(&tl);
+        assert_eq!(tl.lines.len(), 1, "{text}");
+        assert!(text.contains(MOVED_HEADER), "{text}");
+        assert!(
+            text.contains(&background_annotation(outcome, None)),
+            "{text}"
+        );
+        assert!(!text.contains(RECEIPT_ANNOTATION), "{text}");
     }
 
     #[test]
@@ -1247,6 +1277,7 @@ mod tests {
             background: None,
             detail: None,
             detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -1347,6 +1378,7 @@ mod tests {
             background: None,
             detail: None,
             detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -1392,6 +1424,7 @@ mod tests {
             background: None,
             detail: None,
             detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -1704,6 +1737,7 @@ mod tests {
             background: None,
             detail: None,
             detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -1810,6 +1844,7 @@ mod tests {
             background: None,
             detail: None,
             detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -1925,6 +1960,7 @@ mod tests {
             background: None,
             detail: None,
             detail_expanded: false,
+            task_end: None,
         };
         assert!(
             search_text_for(&msg).contains("llm_output_here"),
@@ -1963,6 +1999,7 @@ mod tests {
             background: None,
             detail: None,
             detail_expanded: false,
+            task_end: None,
         };
         assert!(
             search_text_for(&msg).contains("body_fallback"),
@@ -1998,6 +2035,7 @@ mod tests {
             background: None,
             detail: None,
             detail_expanded: false,
+            task_end: None,
         };
         assert!(
             search_text_for(&msg).contains(LIVE_TEXT),
@@ -2216,10 +2254,12 @@ mod tests {
         assert_eq!(format_elapsed(secs), expected);
     }
 
-    #[test_case(None, Some(72),                          " (background · 1m12s · click or ctrl+x)" ; "running")]
-    #[test_case(None, None,                              " (background · click or ctrl+x)"          ; "restored")]
-    #[test_case(Some(BackgroundOutcome::Done), None,     " (background)"                            ; "ended")]
-    #[test_case(Some(BackgroundOutcome::Lost), Some(72), " (background · lost)"                     ; "lost")]
+    #[test_case(None, Some(72),                               " (background · 1m12s · click to open)" ; "running")]
+    #[test_case(None, None,                                   " (background · click to open)"         ; "restored")]
+    #[test_case(Some(BackgroundOutcome::Done), None,          " (background · done)"                  ; "done")]
+    #[test_case(Some(BackgroundOutcome::Error), None,         " (background · failed)"                ; "failed")]
+    #[test_case(Some(BackgroundOutcome::Cancelled), None,     " (background · cancelled)"             ; "cancelled")]
+    #[test_case(Some(BackgroundOutcome::Lost), Some(72),      " (background · lost)"                  ; "lost")]
     fn background_annotation_cases(
         outcome: Option<BackgroundOutcome>,
         secs: Option<u64>,

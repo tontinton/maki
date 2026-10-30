@@ -28,12 +28,13 @@ pub use agent::{
     Agent, AgentParams, AgentRunParams, DisplayItem, History, HistorySnapshot, Instructions,
     LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages, Transcript,
     UNAVAILABLE_RESULT, close_dangling_tool_calls, display_order, find_subdirectory_instructions,
-    is_instruction_file, observation_line,
+    is_instruction_file, observation_detail, observation_line,
 };
 pub use call_scope::{AlreadyMoved, CallGuard, CallScope, SessionStub, TaskHome};
 pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};
 pub use live_session::{
-    AgentSeed, BackgroundNotice, MailboxError, SessionMailbox, receipt_tag, result_notice,
+    AgentSeed, BackgroundNotice, MailboxError, SessionMailbox, TaskLabel, receipt_tag,
+    result_notice,
 };
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
@@ -56,9 +57,9 @@ pub use maki_providers::{
 pub use types::{
     AgentEvent, BufferSnapshot, CallRecord, CostTally, DoneReason, Envelope, EventSender,
     EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
-    RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan,
-    SpanColor, SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput,
-    ToolOutput, ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
+    PartStatus, RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine,
+    SnapshotSpan, SpanColor, SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent,
+    ToolInput, ToolOutput, ToolPart, ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

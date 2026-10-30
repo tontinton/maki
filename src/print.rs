@@ -389,6 +389,7 @@ pub fn run(params: PrintParams) -> Result<Interrupt> {
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::ToolMovable { .. }
+            | AgentEvent::ToolParts { .. }
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }

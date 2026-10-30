@@ -8,11 +8,12 @@ use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{
     Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive, ToolOutputMode,
 };
-use maki_agent::{AgentEvent, AgentSeed};
+use maki_agent::{AgentEvent, AgentSeed, ToolPart};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::{MakiId, SessionRef};
 use mlua::{
-    Function, LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue,
+    AnyUserData, Function, LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods,
+    Value as LuaValue,
 };
 
 use crate::api::tool::ToolCallReply;
@@ -35,6 +36,10 @@ const NESTED_CALL_MSG: &str = "background is ignored for a call inside batch or 
      tool; call the tool directly to run it in the background";
 const NO_BACKGROUND_HOOK_MSG: &str = "set_movable: call ctx:on_background() first";
 const NO_BACKGROUND_HOOK_FOR_MOVE_MSG: &str = "background: call ctx:on_background() first";
+const NESTED_PARTS_MSG: &str =
+    "set_parts: only a model's own call is a task, a call nested in another has no parts";
+const PART_STATUS_ERR: &str =
+    "set_parts: status must be \"working\", \"done\", \"error\" or \"cancelled\"";
 const EXPIRE_BACKGROUND: &str = "background";
 const EXPIRE_TIMEOUT: &str = "timeout";
 
@@ -317,7 +322,7 @@ impl LuaCtx {
         format!("{method} not available in {} ctx", self.kind())
     }
 
-    fn cap_err_pair<T>(&self, method: &str) -> Pair<T> {
+    pub(crate) fn cap_err_pair<T>(&self, method: &str) -> Pair<T> {
         (None, Some(self.cap_err(method)))
     }
 }
@@ -443,6 +448,36 @@ impl UserData for LuaCtx {
                 return Ok(err_pair(NO_BACKGROUND_HOOK_MSG));
             }
             announce_movable(&handle, agent, movable);
+            Ok((Some(true), None))
+        });
+
+        // Parts hang under the model's own call, the only call with a tab in
+        // `/tasks`. A nested call has no tab, so it gets an error instead.
+        methods.add_method("set_parts", |lua, this, parts: Vec<Table>| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("set_parts"));
+            };
+            let Some(id) = agent.tool_use_id.clone() else {
+                return Ok(err_pair(NESTED_PARTS_MSG));
+            };
+            let parts = parts
+                .iter()
+                .map(|part| {
+                    Ok(ToolPart {
+                        id: part.get::<String>("id")?,
+                        name: part.get::<String>("name")?,
+                        tool: part.get::<String>("tool")?.into(),
+                        status: lua
+                            .from_value(part.get::<LuaValue>("status")?)
+                            .map_err(|_| mlua::Error::runtime(PART_STATUS_ERR))?,
+                        body: part
+                            .opt::<AnyUserData>("body")?
+                            .map(|body| body.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf)))
+                            .transpose()?,
+                    })
+                })
+                .collect::<mlua::Result<Vec<_>>>()?;
+            let _ = agent.event_tx.send(AgentEvent::ToolParts { id, parts });
             Ok((Some(true), None))
         });
 

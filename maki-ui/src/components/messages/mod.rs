@@ -14,8 +14,8 @@ use self::segment::{Segment, SegmentCache};
 use super::tool_display::{
     MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info,
     assistant_style, build_instructions_lines, build_tool_lines, done_style, error_style,
-    format_timestamp_now, hint_columns, instructions_search_text, notice_style, search_text_for,
-    thinking_style, truncate_to_header, user_style,
+    format_timestamp_now, hint_columns, instructions_search_text, notice_style, outcome_glyph,
+    search_text_for, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole,
@@ -382,6 +382,16 @@ impl MessagesPanel {
         msg.tool_output = Some(event.output);
         msg.live_output = None;
         self.rebuild_tool_segment(&event.id);
+    }
+
+    /// Ends a row that no `ToolDone` will reach.
+    pub fn settle_tool(&mut self, tool_id: &str, status: ToolStatus) {
+        self.retire_live_buf(tool_id);
+        self.update_tool(tool_id, |msg| {
+            if let DisplayRole::Tool(tool) = &mut msg.role {
+                tool.status = status;
+            }
+        });
     }
 
     pub fn set_tool_movable(&mut self, tool_id: &str, movable: bool) {
@@ -808,6 +818,13 @@ impl MessagesPanel {
             return self.try_toggle_cached_thinking(pos.seg, width)
                 || self.try_toggle_cached_notice(pos.seg, width);
         };
+        // A moved row draws only its header, so there is nothing to unfold.
+        if self
+            .find_tool_msg(tool_id)
+            .is_some_and(|msg| msg.background.is_some())
+        {
+            return false;
+        }
 
         if self.has_snapshot(tool_id) {
             let buf_row = seg
@@ -1232,6 +1249,8 @@ impl MessagesPanel {
         if let Some(lines) = buf.read_if_dirty() {
             self.store_snapshot(id, BufferSnapshot::from_arc(lines), false, None);
         }
+        // A part's tab registers the same buf again on every report.
+        self.watched_bufs.retain(|(watched, _)| watched != id);
         self.watched_bufs.push_back((id.to_owned(), buf));
         if self.watched_bufs.len() > WARM_TOOL_CAP {
             self.watched_bufs.pop_front();
@@ -1374,7 +1393,15 @@ impl MessagesPanel {
         }
     }
 
+    /// The dirty flag has a single reader. When another panel already read
+    /// this buf, as the row a call moved out of does, waiting for the flag
+    /// would leave this one blank until the tool writes again. So it draws
+    /// what the buf holds now.
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
+        let lines = body.read();
+        if !lines.is_empty() && self.find_tool_msg(&id).is_some() {
+            self.store_snapshot(&id, BufferSnapshot::from_arc(lines), false, None);
+        }
         self.live_bufs.insert(id, body);
     }
 
@@ -1741,6 +1768,11 @@ fn message_view(
         return (lines, true);
     }
     let mut lines = build_message_lines(msg, width);
+    if let Some(end) = msg.task_end
+        && let Some(first) = lines.first_mut()
+    {
+        first.spans.insert(0, outcome_glyph(end));
+    }
     if matches!(msg.role, DisplayRole::Notice)
         && let Some(detail) = &msg.detail
     {

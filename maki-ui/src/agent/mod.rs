@@ -321,7 +321,8 @@ mod tests {
     use maki_config::{PermissionsConfig, ProjectConfig};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+        AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, TaskEnd,
+        ThinkingConfig,
     };
     use test_case::test_case;
 
@@ -747,7 +748,7 @@ mod tests {
                 .recv_timeout(LONG_TIMEOUT)
                 .expect(NO_TURN_END);
             match envelope.event {
-                AgentEvent::ObservationLine { text, .. } => observed |= text.contains(LOST_ID),
+                AgentEvent::ObservationLine { end, .. } => observed |= end == Some(TaskEnd::Lost),
                 AgentEvent::Error { .. } => break,
                 _ => {}
             }

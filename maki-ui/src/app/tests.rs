@@ -4,7 +4,7 @@ use super::view::FINISHED_TAB_HINT;
 use super::*;
 use crate::AppSession;
 use crate::agent::shared_queue;
-use crate::app::tasks::TaskStatus;
+use crate::app::tasks::{TaskParent, TaskStatus};
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX, LOST_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::{PROMPT_NEEDS, ParsedCommand, USER_ONLY_SUFFIX};
@@ -30,8 +30,8 @@ use maki_agent::tools::ToolRegistry;
 use maki_agent::{
     AgentMode, BackgroundNotice, CallRecord, DoneReason, HistorySnapshot, ImageMediaType,
     McpConfigErrors, McpPromptArg, McpPromptInfo, McpServerInfo, McpServerStatus, McpSnapshot,
-    McpSnapshotReader, RunTotals, SharedBuf, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
+    McpSnapshotReader, RunTotals, SharedBuf, SteerKind, SubagentInbox, TaskLabel, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
 };
 use maki_config::{
     Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
@@ -356,6 +356,7 @@ fn subagent_info_with_tx(
         opts: None,
         answer_tx,
         inbox: None,
+        parent_call: None,
     }
 }
 
@@ -485,6 +486,7 @@ fn a_notice_line_appears_when_the_loop_accepts_it() {
         AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
             detail: None,
+            end: None,
         },
         app.run_id,
     ));
@@ -568,6 +570,7 @@ fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedSte
             LiveStep::Accepted(text) => AgentEvent::ObservationLine {
                 text: text.into(),
                 detail: None,
+                end: None,
             },
             LiveStep::Done => done(),
         };
@@ -2522,12 +2525,12 @@ fn esc_in_a_plugin_task_tab_stops_its_session() {
         actions.as_slice(),
         [Action::CancelPluginTask { id, .. }] if id == MONITOR_ID
     ));
-    assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Cancelled);
     assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
     assert_eq!(app.chats[0].last_message_role(), None);
 
     plugin_event(&mut app, AgentEvent::StreamClosed);
-    assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Cancelled);
 }
 
 /// The transcript lands after every prompt, so a monitor that dies with the
@@ -2797,16 +2800,16 @@ fn tasks_report_main_chat_then_subagent_outcomes() {
 }
 
 /// Escaping out of a subagent takes the single-chat cancel path instead of the
-/// sweep over the whole turn, and that path has to land the task in `error`
-/// too, or it spins forever.
+/// sweep over the whole turn, and that path has to land the task in
+/// `cancelled` too, or it spins forever.
 #[test]
-fn cancelling_from_inside_a_subagent_reports_error() {
+fn cancelling_from_inside_a_subagent_reports_cancelled() {
     let mut app = app_with_subagent();
     app.focus_task(TASK_ID).unwrap();
     cancel_app(&mut app);
     assert_eq!(
         serde_json::to_value(app.tasks()).unwrap()[1]["status"],
-        serde_json::json!("error")
+        serde_json::json!("cancelled")
     );
 }
 
@@ -10248,15 +10251,12 @@ fn finished_subagent_reports_undelivered_messages() {
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
 }
 
-/// A finished subagent's chat is a transcript: no box to type into, and a
-/// draft typed elsewhere is left alone.
+/// A finished subagent's chat is a transcript: no box to type into, and
+/// Enter sends nothing.
 #[test]
 fn finished_subagent_chat_takes_no_prompt() {
     let mut app = app_with_active_subagent();
     finish_subagent_task(&mut app, false);
-    app.update(Msg::Key(key(KeyCode::Char('q'))));
-    app.update(Msg::Paste("hi".into()));
-    assert!(app.input_box.is_empty());
     assert!(!app.input_live(Rect::new(0, 0, 80, 24)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(actions.is_empty());
@@ -11398,6 +11398,25 @@ fn esc_says_background_tasks_keep_running() {
     );
 }
 
+/// A moved call keeps the agent waiting after its turn. While the agent
+/// streams, queuing a prompt is what the box is for.
+#[test_case(Status::Idle,      Some(2) ; "idle_says_what_it_waits_on")]
+#[test_case(Status::Streaming, None    ; "streaming_queues")]
+fn the_main_input_tells_what_the_agent_waits_on(status: Status, waiting: Option<usize>) {
+    let mut app = test_app();
+    let mailbox = hold_mailbox(&mut app);
+    mailbox.track(MOVED_ID);
+    mailbox.track(LOST_ID);
+    app.status = status;
+
+    let shown = match app.input_placeholder() {
+        Placeholder::Background(count) => Some(count),
+        _ => None,
+    };
+
+    assert_eq!(shown, waiting);
+}
+
 /// The tab has no inbox, so Esc is what its input does: twice, it stops the
 /// task by its id.
 #[test]
@@ -11423,6 +11442,7 @@ fn a_notice_keeps_its_detail_live_and_on_restore() {
         AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
             detail: Some(NOTICE_BODY.into()),
+            end: None,
         },
         app.run_id,
     ));
@@ -11519,7 +11539,7 @@ fn rewind_keeps_a_stopped_task_whose_receipt_stays(subagent: bool) {
     let idx = app
         .chat_of_task(RECEIPT_TURN_ID)
         .expect("a kept receipt keeps its tab");
-    assert_eq!(app.chats[idx].task_status(), TaskStatus::Error);
+    assert_eq!(app.chats[idx].task_status(), TaskStatus::Cancelled);
     assert_eq!(receipt_outcome(&app), Some(BackgroundOutcome::Cancelled));
 }
 
@@ -11573,8 +11593,13 @@ fn moved_call_history(receipt: bool, notice: Option<(bool, bool)>) -> Vec<Messag
         },
     ];
     if let Some((failed, stopped)) = notice {
-        let (text, display, end) =
-            result_notice("bash", MOVED_ID, MOVED_SUMMARY, failed, stopped, "output");
+        let (text, display, end) = result_notice(
+            &TaskLabel::new("bash", Some(MOVED_SUMMARY)),
+            MOVED_ID,
+            failed,
+            stopped,
+            "output",
+        );
         let mut message = Message::observation(text);
         message.display_text = Some(display);
         message.settles = Some(TaskSettled {
@@ -11632,8 +11657,13 @@ fn a_reloaded_moved_row_tells_the_ending_its_queued_result_gives(
     let mailbox = hold_mailbox(&mut app);
     mailbox.track(MOVED_ID);
     if let Some((failed, stopped)) = notice {
-        let (text, display, end) =
-            result_notice("bash", MOVED_ID, MOVED_SUMMARY, failed, stopped, "output");
+        let (text, display, end) = result_notice(
+            &TaskLabel::new("bash", Some(MOVED_SUMMARY)),
+            MOVED_ID,
+            failed,
+            stopped,
+            "output",
+        );
         let notice = BackgroundNotice {
             text,
             display: Some(&display),
@@ -11667,6 +11697,65 @@ fn esc_in_a_finished_tab_goes_back_to_the_main_chat() {
     app.update(Msg::Key(key(KeyCode::Esc)));
 
     assert_eq!(app.active_chat, MAIN_CHAT);
+}
+
+/// Nothing in a finished tab takes text, so a typed message, or a `/`
+/// command, starts in the main chat rather than going nowhere.
+#[test_case(false ; "typed")]
+#[test_case(true ; "pasted")]
+fn text_for_a_finished_tab_lands_in_the_main_chat(pasted: bool) {
+    let mut app = app_with_subagent();
+    finish_subagent(&mut app, TASK_ID, false);
+    app.focus_task(TASK_ID).unwrap();
+
+    if pasted {
+        app.update(Msg::Paste("hi".into()));
+    } else {
+        app.update(Msg::Key(key(KeyCode::Char('h'))));
+        app.update(Msg::Key(key(KeyCode::Char('i'))));
+    }
+
+    assert_eq!(app.active_chat, MAIN_CHAT);
+    assert_eq!(app.input_box.buffer.value(), "hi");
+}
+
+/// Normal mode belongs to a vim plugin, so its keys never type, even after
+/// they hop to the main chat.
+#[test]
+fn a_key_from_a_finished_tab_in_normal_mode_types_nothing() {
+    let mut app = app_with_subagent();
+    finish_subagent(&mut app, TASK_ID, false);
+    app.focus_task(TASK_ID).unwrap();
+    set_mode(&app.keymap_reader, InputMode::Normal);
+
+    app.update(Msg::Key(key(KeyCode::Char('x'))));
+
+    assert!(app.input_box.is_empty());
+}
+
+/// A stopped batch takes the subagents it started down with it, and a
+/// subagent that already finished keeps its ending.
+#[test]
+fn stopping_a_task_cancels_the_subagents_it_started() {
+    const CHILD_ID: &str = "toolu_child";
+    const DONE_CHILD_ID: &str = "toolu_done_child";
+    let (mut app, _buf) = app_with_moved_call();
+    for id in [CHILD_ID, DONE_CHILD_ID] {
+        app.update(subagent_msg(
+            AgentEvent::TextDelta { text: "y".into() },
+            id,
+            Some(id),
+        ));
+        let idx = app.chat_of_task(id).unwrap();
+        app.chats[idx].parent = Some(TaskParent::Started(MOVED_ID.into()));
+    }
+    finish_subagent(&mut app, DONE_CHILD_ID, false);
+
+    app.stop_task(MOVED_ID).unwrap();
+
+    let status = |app: &App, id| app.chats[app.chat_of_task(id).unwrap()].task_status();
+    assert_eq!(status(&app, CHILD_ID), TaskStatus::Cancelled);
+    assert_eq!(status(&app, DONE_CHILD_ID), TaskStatus::Done);
 }
 
 const NESTED_ID: &str = "toolu_batch_child";
@@ -11841,7 +11930,10 @@ fn esc_in_an_adopted_nested_subagents_tab_stops_it_by_its_own_id(adopt: fn(&mut 
         actions.as_slice(),
         [Action::CancelPluginTask { id, .. }] if id == NESTED_ID
     ));
-    assert_eq!(app.chats[app.active_chat].task_status(), TaskStatus::Error);
+    assert_eq!(
+        app.chats[app.active_chat].task_status(),
+        TaskStatus::Cancelled
+    );
 }
 
 const NESTED_TASK_ID: &str = "toolu_nested_task";

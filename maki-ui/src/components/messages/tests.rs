@@ -15,6 +15,7 @@ use maki_agent::{
 use maki_config::DEFAULT_THINKING_LINES;
 use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
+use ratatui::style::Modifier;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::time::Duration;
@@ -215,7 +216,7 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
 }
 
 #[test_case("line\n".repeat(200).as_str(), Some("2m timeout · 200 lines") ; "merges_start_and_output_annotations")]
-#[test_case("ok",                           Some("2m timeout · 1 lines") ; "merges_start_and_short_output")]
+#[test_case("ok",                           Some("2m timeout · 1 line") ; "merges_start_and_short_output")]
 fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     let mut event = start("t1", BASH_TOOL_NAME);
@@ -3043,7 +3044,7 @@ const MOVABLE_ID: &str = "t1";
 const NARROW_WIDTH: u16 = 24;
 const RECEIPT: &str = "Moved to the background. Last 2 lines: Running unittests";
 const STREAMED: &str = "streamed output";
-const CLICK_HINT: &str = "click or ctrl+x";
+const CLICK_HINT: &str = "click to open";
 const ELAPSED_MINUTE: &str = "1m";
 const ELAPSED_SECS: u64 = 72;
 const NOTICE_TEXT: &str = "Background bash finished: cargo test";
@@ -3139,18 +3140,40 @@ fn clicking_the_hint_counts_from_the_panels_left_edge() {
     );
 }
 
-#[test_case(0 ; "header")]
-#[test_case(1 ; "receipt")]
-fn clicking_a_moved_row_opens_its_task(row: u16) {
+#[test]
+fn clicking_a_moved_row_opens_its_task() {
     let mut panel = moved_panel();
     assert_eq!(
-        panel.handle_click(row, 0, view_area()),
+        panel.handle_click(0, 0, view_area()),
         ClickOutcome::OpenTask(MOVABLE_ID.into())
     );
 }
 
+/// Its body moved to the task's tab, so there is nothing left to unfold.
 #[test]
-fn backgrounded_tool_done_keeps_receipt_and_shows_moved_indicator() {
+fn a_moved_row_takes_no_toggle() {
+    let mut panel = moved_panel();
+    assert_eq!(panel.toggle_click(0, view_area()), ClickOutcome::None);
+}
+
+/// A moved call's tab shares the buf of the row it left, and that row
+/// already read the change. A quiet command never writes again, so the tab
+/// draws what is there now.
+#[test]
+fn a_registered_buf_shows_what_it_holds_even_if_read_elsewhere() {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.set_lines(vec![snap_line(STREAMED)]);
+    assert!(buf.read_if_dirty().is_some());
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(MOVABLE_ID, BASH_TOOL_NAME));
+
+    panel.register_live_buf(MOVABLE_ID.into(), buf);
+
+    assert!(view_text(&mut panel).contains(STREAMED));
+}
+
+#[test]
+fn backgrounded_tool_done_hides_the_receipt_and_shows_moved_indicator() {
     let buf = Arc::new(maki_agent::SharedBuf::new());
     buf.set_lines(vec![snap_line(STREAMED)]);
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
@@ -3159,17 +3182,22 @@ fn backgrounded_tool_done_keeps_receipt_and_shows_moved_indicator() {
     panel.tool_done(backgrounded_done(RECEIPT));
 
     let text = view_text(&mut panel);
-    assert!(text.contains(RECEIPT), "{text}");
+    assert!(!text.contains(RECEIPT), "{text}");
     assert!(!text.contains(STREAMED), "{text}");
     assert!(text.contains(BACKGROUND_INDICATOR.trim()), "{text}");
     assert!(!text.contains(TOOL_INDICATOR.trim()), "{text}");
     assert!(text.contains(CLICK_HINT), "{text}");
 }
 
+fn unstruck_cancelled(theme: &Theme) -> Style {
+    theme.todo_cancelled.remove_modifier(Modifier::CROSSED_OUT)
+}
+
 #[test_case(None, BACKGROUND_INDICATOR, |t| t.tool_dim ; "running")]
 #[test_case(Some(BackgroundOutcome::Done), TOOL_INDICATOR, |t| t.tool_success ; "done")]
 #[test_case(Some(BackgroundOutcome::Error), TOOL_INDICATOR, |t| t.tool_error ; "error")]
-#[test_case(Some(BackgroundOutcome::Cancelled), TOOL_INDICATOR, |t| t.todo_cancelled ; "cancelled")]
+#[test_case(Some(BackgroundOutcome::Cancelled), TOOL_INDICATOR, unstruck_cancelled ; "cancelled")]
+#[test_case(Some(BackgroundOutcome::Lost), TOOL_INDICATOR, unstruck_cancelled ; "lost")]
 fn badge_outcome_switches_indicator(
     outcome: Option<BackgroundOutcome>,
     glyph: &str,
@@ -3223,6 +3251,22 @@ fn notice_detail_expands_then_collapses_on_click() {
 
     assert_eq!(panel.handle_click(0, 0, view_area()), ClickOutcome::Handled);
     assert!(!view_text(&mut panel).contains(NOTICE_DETAIL));
+}
+
+#[test_case(None, None ; "plain_notice")]
+#[test_case(Some(BackgroundOutcome::Error), Some(|t: &Theme| t.tool_error) ; "failed_task")]
+#[test_case(Some(BackgroundOutcome::Done), Some(|t: &Theme| t.tool_success) ; "done_task")]
+fn a_task_notice_opens_with_its_ending_dot(
+    task_end: Option<BackgroundOutcome>,
+    style: Option<fn(&Theme) -> Style>,
+) {
+    let mut panel = notice_panel(None);
+    panel.messages[0].task_end = task_end;
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let first = &panel.cache.get(0).unwrap().lines()[0].spans[0];
+    let dot = (first.content == TOOL_INDICATOR).then_some(first.style);
+    assert_eq!(dot, style.map(|style| style(&theme::current())));
 }
 
 #[test]

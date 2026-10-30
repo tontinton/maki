@@ -14,7 +14,7 @@ use crate::image;
 use crate::repaint::Dirty;
 
 use super::image_paste::{spawn_read, take_ready};
-use super::{App, InputWriter, Msg};
+use super::{App, InputWriter, MAIN_CHAT, Msg};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -100,8 +100,11 @@ impl App {
     /// What the chat input does with a paste no one else took: a line that is
     /// an image path attaches the image, otherwise the text goes in.
     pub(super) fn builtin_paste(&mut self, text: &str) {
+        // A finished tab has no input box, so the paste goes to the main
+        // chat, the way typed keys do.
         if !self.chat_accepts_input() {
-            return;
+            self.last_esc = None;
+            self.set_active_chat(MAIN_CHAT);
         }
         let mut any_image = false;
         for line in text.lines() {

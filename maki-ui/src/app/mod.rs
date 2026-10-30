@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::OpenSession;
-use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, count_phrase};
+use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, TaskParent, count_phrase};
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
@@ -62,11 +62,11 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::text_buffer::{RuleSet, TextBuffer, Writers, normalize_line_endings, sanitize};
 use arc_swap::ArcSwapOption;
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SessionMailbox, SharedBuf, SharedMessages, SubagentInfo,
+    SessionMailbox, SharedBuf, SharedMessages, SubagentInfo, ToolPart,
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
@@ -446,11 +446,20 @@ fn task_id_of(envelope: &Envelope) -> Option<&str> {
     }
 }
 
+fn started_by(info: &SubagentInfo) -> Option<TaskParent> {
+    info.parent_call
+        .as_deref()
+        .map(|call| TaskParent::Started(Arc::from(call)))
+}
+
 /// A chat can open before its session speaks: a moved call's tab, or a
 /// subagent a plugin adopted. The first info naming it fills in what it
 /// lacks: the sender its permission answers go to, the inbox its input
 /// feeds, and the model and options its header shows.
 fn fill_missing_subagent_info(chat: &mut Chat, info: &SubagentInfo) {
+    if chat.parent.is_none() {
+        chat.parent = started_by(info);
+    }
     if chat.is_finished() {
         return;
     }
@@ -589,6 +598,10 @@ pub struct App {
     /// Final results of moved calls whose receipt has not landed yet. The two
     /// travel on different channels, and the receipt opens the tab.
     pub(super) early_finals: HashMap<String, AgentEvent>,
+    /// The last parts each call reported, by call id. Kept from the first
+    /// report, since a call reports before it moves and `/tasks` lists the
+    /// parts only after.
+    pub(super) tool_parts: HashMap<String, Vec<ToolPart>>,
 
     pub(crate) storage: StateDir,
     /// The folder trust question this run was started with, `None` when the
@@ -731,6 +744,7 @@ impl App {
             background_elsewhere: 0,
             background_moves: BackgroundMoves::default(),
             early_finals: HashMap::new(),
+            tool_parts: HashMap::new(),
             storage,
             trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
@@ -852,9 +866,11 @@ impl App {
     }
 
     /// A running task with no inbox takes no messages, so its input says how
-    /// to stop it instead.
+    /// to stop it instead. The background count is the receipts the model
+    /// holds, so it leaves out a plugin's own sessions, which wake nobody.
     pub(super) fn input_placeholder(&self) -> Placeholder {
         let chat = &self.chats[self.active_chat];
+        let waiting_on = self.live_mailbox().map_or(0, SessionMailbox::outstanding);
         if !self.is_main_chat() {
             if chat.inbox.is_none() && !chat.is_finished() {
                 Placeholder::TaskStop
@@ -863,6 +879,8 @@ impl App {
             }
         } else if self.status == Status::Streaming {
             Placeholder::Queue
+        } else if waiting_on > 0 {
+            Placeholder::Background(waiting_on)
         } else if self.state.session.messages().is_empty() {
             Placeholder::Suggestion
         } else {
@@ -2143,6 +2161,20 @@ impl App {
                     self.set_active_chat(MAIN_CHAT);
                     vec![]
                 }
+                // A finished tab has no input box. Typing there used to do
+                // nothing at all, so the keys go to the main chat instead.
+                // Without an input box the mode always reads normal, so the
+                // real one is read again once the main chat has focus.
+                KeyCode::Char(_)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.last_esc = None;
+                    self.set_active_chat(MAIN_CHAT);
+                    let mode = self.sync_input_mode();
+                    self.handle_chat_key(key, sight, mode)
+                }
                 _ => vec![],
             };
         }
@@ -2391,7 +2423,7 @@ impl App {
         self.run_id += 1;
         self.retry_info = None;
         self.close_all_overlays();
-        self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
+        self.finish_subagents(TaskOutcome::Cancelled, CANCELLED_TEXT);
         self.chats[MAIN_CHAT].auth_parked = false;
         self.shell.cancel_all();
         for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
@@ -2457,6 +2489,12 @@ impl App {
                     chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
                 }
             }
+            return vec![];
+        }
+        // Taken before the run check, since a moved call keeps reporting
+        // after its turn ended.
+        if let AgentEvent::ToolParts { id, parts } = envelope.event {
+            self.set_parts(id, parts);
             return vec![];
         }
         // What an adopted subagent sent before its call moved belongs to its
@@ -2836,6 +2874,7 @@ impl App {
         chat.opts = subagent.opts;
         chat.inbox = subagent.inbox.clone();
         chat.answer_tx = subagent.answer_tx.clone();
+        chat.parent = started_by(subagent);
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
@@ -3504,6 +3543,7 @@ impl App {
                 false
             }
         });
+        self.forget_untasked_parts();
         self.sync_subagents();
     }
 

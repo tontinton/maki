@@ -133,6 +133,62 @@ case("only_finished_subagents_are_deletable", function()
   eq(Rows.deletable(MONITOR), false, "an idle plugin task is still alive")
 end)
 
+local BATCH = { id = "toolu_08", name = "3 tools", status = "working", plugin = "batch", focused = false }
+local CHILD_DONE = { id = "session-02", name = "lint", status = "done", parent = BATCH.id, focused = false }
+local CHILD_RUNNING = { id = "session-03", name = "tests", status = "working", parent = BATCH.id, focused = false }
+local ORPHAN = { id = "session-04", name = "docs", status = "working", parent = "toolu_gone", focused = false }
+
+local function depths(rows)
+  local out = {}
+  for _, row in ipairs(rows) do
+    out[#out + 1] = row.depth or 0
+  end
+  return table.concat(out, ",")
+end
+
+-- A finished subagent stays under its running batch rather than dropping into
+-- the Finished section on its own.
+case("subagents_sit_under_the_task_that_started_them", function()
+  local built = Rows.build({ MAIN, BATCH, CHILD_DONE, CHILD_RUNNING, BUILD }, "")
+  eq(ids(built.rows), table.concat({ MAIN.id, BATCH.id, CHILD_DONE.id, CHILD_RUNNING.id, BUILD.id }, ","))
+  eq(depths(built.rows), "0,0,1,1,0")
+  eq(sections(built.rows), "2:Running,5:Finished")
+  eq(built.sections.running, 1, "a subagent is part of its parent's task")
+  eq(built.sections.finished, 1)
+end)
+
+case("a_subagent_whose_parent_is_not_listed_is_a_task_of_its_own", function()
+  local built = Rows.build({ MAIN, ORPHAN }, "")
+  eq(ids(built.rows), MAIN.id .. "," .. ORPHAN.id)
+  eq(depths(built.rows), "0,0")
+end)
+
+case("a_matching_subagent_brings_its_parent_along", function()
+  local all = { MAIN, BATCH, CHILD_DONE, CHILD_RUNNING }
+  eq(ids(Rows.build(all, CHILD_RUNNING.name).rows), BATCH.id .. "," .. CHILD_RUNNING.id)
+  eq(ids(Rows.build(all, BATCH.name).rows), BATCH.id, "a matching parent leaves unmatched subagents out")
+end)
+
+case("the_working_count_leaves_out_subagents_of_a_listed_task", function()
+  eq(Rows.working({ MAIN, BATCH, CHILD_RUNNING, ORPHAN, BUILD }), 2)
+end)
+
+-- A part stops with its whole call, so its stop names the call. A subagent
+-- the call started stops alone.
+case("only_a_part_of_a_running_call_stops_its_parent", function()
+  local part = { id = BATCH.id .. "/1", name = "serve", status = "done", parent = BATCH.id, part = true }
+  local finished_batch = { id = BATCH.id, name = BATCH.name, status = "done" }
+  eq(Rows.stopped_parent(part, { MAIN, BATCH, part }), BATCH)
+  eq(Rows.stopped_parent(CHILD_RUNNING, { MAIN, BATCH, CHILD_RUNNING }), nil, "a subagent stops alone")
+  eq(Rows.stopped_parent(part, { MAIN, finished_batch, part }), nil, "a finished call stops nothing")
+end)
+
+case("a_cancelled_task_is_finished", function()
+  local stopped = { id = "toolu_09", name = "serve", status = "cancelled", focused = false }
+  eq(Rows.deletable(stopped), true)
+  eq(sections(Rows.build({ MAIN, stopped }, "").rows), "2:Finished")
+end)
+
 case("an_idle_plugin_task_sorts_with_the_running_ones", function()
   local built = Rows.build({ MAIN, BUILD, MONITOR }, "")
   eq(ids(built.rows), "main,session-01,toolu_02")

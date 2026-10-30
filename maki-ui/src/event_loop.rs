@@ -1002,6 +1002,9 @@ impl<'t> EventLoop<'t> {
         dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
         self.emit_title_changes();
+        for rt in &mut self.sessions {
+            rt.app.settle_stranded_parts();
+        }
         self.emit_task_changes();
         self.emit_notifications();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
@@ -1147,6 +1150,11 @@ impl<'t> EventLoop<'t> {
             } => {
                 if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
                     rt.app.open_plugin_task(&info, plugin);
+                }
+            }
+            UiAction::PluginTaskEnded { session, id, end } => {
+                if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
+                    rt.app.end_task(&id, end.into());
                 }
             }
         }

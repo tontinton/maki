@@ -16,7 +16,8 @@ use maki_agent::{AgentEvent, AgentSeed, CancelToken, CancelTrigger, EventSender,
 use maki_config::{PluginsConfig, ToolOutputLines};
 use maki_lua::{MoveOutcome, PluginHost, RestoreItem, RestoreReason, UiAction};
 use maki_storage::id::MakiId;
-use serde_json::json;
+use serde_json::{Value, json};
+use test_case::test_case;
 
 const STOP_TOOL: &str = "task_stop";
 const PARK_TOOL: &str = "park";
@@ -33,6 +34,7 @@ const FIRST_ID: &str = "toolu_first";
 const SECOND_ID: &str = "toolu_second";
 const MISSING_ID: &str = "toolu_missing";
 const HEADER_ID: &str = "toolu_header";
+const HEADER_NAME: &str = "Wait then finish";
 const SUBAGENT_TASK_ID: &str = "toolu_subagent";
 const RUN_ID: u64 = 1;
 
@@ -287,8 +289,11 @@ fn a_subagent_cannot_stop_a_task_its_chat_moved() {
     );
 }
 
-#[test]
-fn restore_shows_the_id_as_the_header() {
+/// The stop names the task the way the user knows it, and the id is what is
+/// left when the name was never known.
+#[test_case(None, HEADER_ID ; "without_a_name")]
+#[test_case(Some(json!({ "name": HEADER_NAME })), HEADER_NAME ; "with_a_name")]
+fn restore_shows_the_task_as_the_header(state: Option<Value>, expected: &str) {
     let (_reg, host) = host();
     let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
@@ -301,7 +306,7 @@ fn restore_shows_the_id_as_the_header() {
         tool_output_lines: ToolOutputLines::DEFAULT,
         theme_gen: None,
         clicks: Vec::new(),
-        state: None,
+        state,
         session_id: None,
         task_id: None,
         reason: RestoreReason::default(),
@@ -317,5 +322,5 @@ fn restore_shows_the_id_as_the_header() {
             _ => None,
         })
         .expect("restore emits a header");
-    assert_eq!(header, HEADER_ID);
+    assert_eq!(header, expected);
 }

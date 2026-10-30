@@ -205,6 +205,21 @@ local function receipt(tail, path, max_bytes)
   return ("Running in the background. %s\n%s\n%s"):format(heading, shown, progress)
 end
 
+-- The body already shows the highlighted command, so the title only carries
+-- what the model says it does. Once a model pastes the command into
+-- `description`, it copies its own past calls and keeps doing it, so a
+-- description that is blank or just the command counts as none.
+local function description_of(input)
+  local description = input.description
+  if not description or not description:find("%S") then
+    return nil
+  end
+  if description == input.command or description == parse_cd_hint(input) then
+    return nil
+  end
+  return description
+end
+
 local function create_bash_view(command, ctx)
   local tol = ctx:tool_output_lines()
   local buf = maki.ui.buf()
@@ -382,12 +397,14 @@ maki.api.register_tool({
   end,
 
   header = function(input)
-    local command, workdir = parse_cd_hint(input)
-    local s = input.description or command
-    if workdir then
-      s = s .. " in " .. relative_path(workdir)
+    -- The body leaves out a leading `cd`, so the title keeps the directory.
+    local _, workdir = parse_cd_hint(input)
+    local dir = workdir and relative_path(workdir)
+    local title = description_of(input) or ""
+    if dir and dir ~= "." then
+      title = title == "" and "in " .. dir or title .. " in " .. dir
     end
-    return s
+    return title
   end,
 
   restore = function(input, output, is_error, ctx)

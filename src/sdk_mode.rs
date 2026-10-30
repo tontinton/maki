@@ -1109,6 +1109,7 @@ impl EventPump {
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::ToolMovable { .. }
+            | AgentEvent::ToolParts { .. }
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
@@ -1946,6 +1947,7 @@ mod tests {
         pump.handle(top_level(AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
             detail: None,
+            end: None,
         }))
         .unwrap();
         pump.handle(top_level(AgentEvent::Notice {
@@ -1956,6 +1958,7 @@ mod tests {
             event: AgentEvent::ObservationLine {
                 text: CHILD_NOTICE_LINE.into(),
                 detail: None,
+                end: None,
             },
             subagent: Some(SubagentInfo {
                 parent_tool_use_id: NOTICE_CHILD.into(),
@@ -1965,6 +1968,7 @@ mod tests {
                 opts: None,
                 answer_tx: None,
                 inbox: None,
+                parent_call: None,
             }),
             run_id: 0,
         })

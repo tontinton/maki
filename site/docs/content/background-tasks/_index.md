@@ -10,15 +10,13 @@ group = "Guides"
 A build, a test run, a dev server or a subagent can keep the agent waiting for minutes. Press `Ctrl+B` and the work keeps running while the agent carries on. The model gets a receipt at once, and the result arrives in the chat as a message when the work ends.
 
 ```
-⠹ cargo test --workspace                                      ctrl+b background
+⠹ bash> Run the tests                                         ctrl+b background
     Compiling maki-agent v0.9.0
     Running unittests src/lib.rs
 
             press Ctrl+B
 
-↗ cargo test --workspace  (background · 12s · click or ctrl+x)
-    Running in the background. Last 2 lines: ...
-    Moved to the background by the user (task toolu_01...). Its result arrives as a message ...
+↗ bash> Run the tests (background · 12s · click to open)
 ```
 
 Only tools that opt in can move. You move them with `Ctrl+B`, or the model asks for it. Calls that cannot move, such as `edit` or an MCP tool, finish before the model carries on.
@@ -87,7 +85,14 @@ A subagent has no `task_stop`. Its receipt tells it that the result arrives befo
 
 Calls in the same round that did not move finish as usual.
 
-While the task runs, its row shows `↗` and `(background · 1m12s · click or ctrl+x)`. When it ends, the row turns into `●` in the success, error or cancelled style. Click the row to open the task. A rewind keeps the badges of the rows it keeps. A session loaded from disk or after `/reload` reads each badge back from the history, so a stopped task still shows as cancelled. A receipt nobody answered shows `(background · lost)`, because its task did not survive. A moved row drops its timeout, since a moved call no longer has one.
+While the task runs, its row shrinks to one line. Click it to open the task tab, where the output streams. When the task ends, the row says how:
+
+```
+↗ bash> Run the tests (background · 1m12s · click to open)
+● bash> Run the tests (background · failed)
+```
+
+The ending is `done`, `failed`, `cancelled`, or `lost` for a task that died with maki, see [Lost tasks](#lost-tasks). A rewind, `/reload` and a session loaded from disk keep the ending.
 
 While any task runs, the input box shows `1 task Ctrl+X` in its top border, so a dev server is hard to forget.
 
@@ -99,16 +104,25 @@ Other moved calls cannot prompt. A tool they call after the move is denied unles
 
 ### `/tasks`
 
-`/tasks` or `Ctrl+X` lists moved calls next to subagents, with their running time and, for subagents, their cost.
+`/tasks` or `Ctrl+X` lists moved calls and subagents, with their running time and, for subagents, their cost. A moved `batch` lists its calls one level in, and opening one shows that call alone:
+
+```
+  Running
+  ⠹ 3 tools                                  30s · batch
+    ⠹ Start the dev server                    30s · bash
+    ✓ Review the diff                23s · $0.004 · task
+```
+
+`✓` marks a finished task, `✗` a failed one and `⊘` a stopped one.
 
 | Key | Effect |
 |-----|--------|
 | `Enter` | Open the task. A bash task streams its output, a subagent shows its transcript. |
-| `Ctrl+S` | Stop the task. |
+| `Ctrl+S` | Stop the task. A call inside a batch cannot stop alone, so the first press asks and the second stops the whole batch. A subagent inside a batch stops alone. |
 | `Ctrl+D` | Delete a finished task from the list. |
 | `Esc` | Close the picker. |
 
-A moved bash or batch takes no messages, and its tab shows `esc esc stop`. A moved subagent still reads what you type in its tab. In a finished tab, `Esc` goes back to the main chat.
+A moved bash or batch takes no messages, and its tab shows `esc esc stop`. A moved subagent still reads what you type in its tab. In a finished tab, `Esc` goes back to the main chat. So does typing or pasting, and the text goes to the main chat as if typed there.
 
 ## Stop a task
 
@@ -127,7 +141,7 @@ Stopping a bash task kills its process group and keeps the output so far. Who st
 
 ## Results
 
-A finished task reaches the model as a message that starts with `Background bash <id> (<summary>) finished:`, or `failed:`, followed by the output a foreground call would have returned. The transcript shows a short line with the call's description, which expands to the full message on click:
+A finished task reaches the model as a message that starts with `Background bash <id> (<summary>) finished:`, or `failed:`, followed by the output a foreground call would have returned. The transcript shows a short line with the call's description and a dot in the color of the outcome. Click the line to unfold the output:
 
 ```
 ● Background bash finished: Run the test suite
@@ -149,7 +163,9 @@ maki.setup({
 
 Both take the same path as `Ctrl+B`, with the same `/tasks` row, result message and stop behavior. Maki's receipt sentence then starts with `Started in the background as asked`. A `task(background = true)` call that has to wait for a free subagent slot waits in the background, so the turn goes on.
 
-If the move fails, for example inside `batch` or with background tasks off, the call runs in the foreground and its result starts with `Could not start in the background (<reason>). Ran in the foreground.`
+Inside `batch`, a `background = true` call cannot move by itself. Once only such calls are still running, the batch moves as a whole, and the model gets the results that are already in.
+
+If the move fails, for example with background tasks off, the call runs in the foreground and its result starts with `Could not start in the background (<reason>). Ran in the foreground.` A batch that cannot move adds that line once, at the top of its result.
 
 ### Move a slow command instead of killing it
 
@@ -199,9 +215,28 @@ end
 | `ctx:set_movable(bool)` | Hide the hint while `fn` would decline, and show it again. |
 | `ctx:backgrounded()` | `true` once the call has moved, for example to switch to a bounded buffer. |
 | `ctx:background()` | Move the call from the handler, as `bash(background = true)` does. Answers `true` or `nil, reason`. |
+| `ctx:set_parts(parts)` | List the pieces of the call under it in `/tasks`. See [Pieces of a call](#pieces-of-a-call). |
 | `ctx:set_deadline(secs, { expire = "background" })` | Move the call at its deadline instead of ending it. |
 
 A move the plugin starts itself, through `ctx:background()` or a deadline, needs the `agent` [plugin permission](/docs/lua-api/#plugin-permissions) and fails inside a subagent.
+
+### Pieces of a call
+
+A tool that runs other tools, like `batch`, can give each one its own row under the call in `/tasks`. Send the whole list every time something changes:
+
+```lua
+ctx:set_parts({
+    { id = "1", name = "Run the tests", tool = "bash", status = "working", body = buf },
+    { id = "2", name = "Read README.md", tool = "read", status = "done" },
+})
+```
+
+- `id` must stay the same between calls, or the piece opens a new row each time.
+- `status` is `"working"`, `"done"`, `"error"` or `"cancelled"`.
+- `body` is the buffer its tab shows.
+- A piece left out of the list loses its row. One still `"working"` when the call ends ends with it.
+
+The rows show up once the call moves. A piece has no run of its own, so stopping it stops the whole call, and `maki.task.list()` marks it with `part = true`. Only the model's own call has pieces, so a nested call gets `nil, reason`.
 
 ## Lifecycle
 
@@ -224,10 +259,12 @@ A chat holds at most 16 background tasks. Moved tasks do not count against the l
 The session records which tasks the model still waits on. When you resume, fork or reload, the model gets a quiet message for each task that died:
 
 ```
-Background task <id> ended without reporting back: maki exited or reloaded, or this session was forked from the one it ran in. Its result is lost.
+Background bash <id> (<summary>) lost:
+
+It ended without reporting back: maki exited or reloaded, or this session was forked from the one it ran in. Its result is lost.
 ```
 
-The transcript shows `Background task lost: <id>`. The message does not start a turn and reaches the model with your next prompt. A fork only reports receipts that are still in its history.
+The transcript names the task, as in `Background bash lost: Start the dev server`. The message does not start a turn and reaches the model with your next prompt. A fork only reports receipts that are still in its history.
 
 ## Headless, SDK and ACP
 

@@ -1227,8 +1227,11 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 /// `server__tool` shaped name resolves whether or not a server offers it,
 /// so this is not an existence check for MCP tools.
 ///
+/// `background_params` lists the parameters marked `needs_background`,
+/// which only a session that can move calls to the background sees.
+///
 /// @param name string Exact tool name.
-/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore?, format? }, or nil if not found.
+/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, background_params?, header?, restore?, format? }, or nil if not found.
 /// @example
 /// local t = maki.api.get_tool("bash")
 /// if t then
@@ -1326,13 +1329,33 @@ fn routed_tool_entry(lua: &Lua, name: String) -> LuaResult<LuaValue> {
 
 fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
     let t = lua.create_table()?;
+    let schema = entry.tool.schema();
     t.set("name", entry.name())?;
-    t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
+    t.set("schema", json_to_lua(lua, &schema)?)?;
     t.set("audiences", audiences_to_lua(lua, entry.tool.audience())?)?;
     if let Some(kind) = entry.tool.tool_kind() {
         t.set("kind", kind)?;
     }
+    let background_params = background_params(&schema, entry.tool.offered_schema(false));
+    if !background_params.is_empty() {
+        t.set("background_params", background_params)?;
+    }
     Ok(t)
+}
+
+/// The parameters `schema` has and `offered`, the schema a session without
+/// background moves gets, leaves out. A tool that such a session never sees
+/// has none, since the whole tool is the condition.
+fn background_params(schema: &Value, offered: Option<Value>) -> Vec<String> {
+    let properties = |schema: &Value| schema.get("properties").and_then(Value::as_object).cloned();
+    let (Some(all), Some(offered)) = (properties(schema), offered.as_ref().and_then(properties))
+    else {
+        return Vec::new();
+    };
+    all.keys()
+        .filter(|name| !offered.contains_key(*name))
+        .cloned()
+        .collect()
 }
 
 /// Async so wrapped fns can yield (e.g. bash restore highlights inline).
@@ -2042,6 +2065,20 @@ mod tests {
     use super::*;
     use crate::runtime::block_on_or_fail;
     use crate::runtime::test_support::{call_scope, moved_home};
+
+    const BACKGROUND_PARAM: &str = "background";
+
+    #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {} } })), &[BACKGROUND_PARAM] ; "a_hidden_param")]
+    #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {}, "background": {} } })), &[] ; "offered_everywhere")]
+    #[test_case::test_case(None, &[] ; "a_background_only_tool")]
+    fn background_params_are_those_offered_only_for_the_background(
+        offered: Option<Value>,
+        expected: &[&str],
+    ) {
+        let schema = serde_json::json!({ "properties": { "command": {}, "background": {} } });
+
+        assert_eq!(background_params(&schema, offered), expected);
+    }
 
     #[test_case::test_case("echo", true ; "simple_name")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]

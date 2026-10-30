@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::app::tasks::{TaskClock, TaskOutcome, TaskStatus};
+use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
 use crate::components::input::Draft;
 use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
@@ -19,7 +19,7 @@ use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_N
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     AgentEvent, BufferSnapshot, DisplayItem, SharedBuf, SteerKind, SubagentInbox, ToolDoneEvent,
-    ToolOutput, ToolStartEvent, display_order,
+    ToolOutput, ToolStartEvent, display_order, observation_detail,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
@@ -82,6 +82,8 @@ pub struct Chat {
     /// Shows a call moved off its turn. The call is out until its final
     /// result, whatever its runs do in between, so it never reads idle.
     pub(crate) backs_moved_call: bool,
+    /// The moved call `/tasks` lists this task under.
+    pub(crate) parent: Option<TaskParent>,
     pub(crate) clock: Option<TaskClock>,
     pub cost: Option<f64>,
     /// This chat's slice of the session's list-price reference cost; mirrors
@@ -130,6 +132,7 @@ impl Chat {
             idle: false,
             auth_parked: false,
             backs_moved_call: false,
+            parent: None,
             clock: None,
             cost: None,
             list_cost: None,
@@ -277,6 +280,8 @@ impl Chat {
             AgentEvent::ToolMovable { id, movable } => {
                 self.messages_panel.set_tool_movable(&id, movable);
             }
+            // Parts belong to `/tasks`, which the App keeps, never to a transcript.
+            AgentEvent::ToolParts { .. } => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::Done { .. } => {
                 self.messages_panel.flush();
@@ -345,9 +350,13 @@ impl Chat {
                 self.messages_panel.flush();
                 self.messages_panel.push(notice(text, None));
             }
-            AgentEvent::ObservationLine { text, detail } => {
+            AgentEvent::ObservationLine { text, detail, end } => {
                 self.messages_panel.flush();
-                self.messages_panel.push(notice(text, detail));
+                self.messages_panel.push(task_notice(
+                    text,
+                    detail,
+                    end.map(BackgroundOutcome::from),
+                ));
             }
             AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
@@ -510,6 +519,41 @@ impl Chat {
         self.messages_panel.push(msg);
     }
 
+    /// Ends the task before its work says so, after a stop or a loss. Rows
+    /// still in progress would never hear back, so they are cancelled here.
+    pub(crate) fn end_early(&mut self, outcome: TaskOutcome, text: &str) {
+        self.flush();
+        self.cancel_in_progress();
+        self.mark_finished(outcome, text);
+    }
+
+    /// Like [`Self::mark_finished`], but the latest word wins. A part's tab
+    /// only mirrors reports, and a report that lands after its call ended
+    /// knows better than the call did.
+    pub(crate) fn end_as(&mut self, outcome: TaskOutcome, text: &str) {
+        match self.finish {
+            Some((previous, _)) if previous == outcome => {}
+            Some((_, bubble)) => {
+                self.finish = Some((outcome, bubble));
+                self.messages_panel
+                    .replace(bubble, DisplayMessage::new(outcome.role(), text.into()));
+            }
+            None => self.mark_finished(outcome, text),
+        }
+    }
+
+    pub(crate) fn finish_outcome(&self) -> Option<TaskOutcome> {
+        self.finish.map(|(outcome, _)| outcome)
+    }
+
+    /// The call this tab is a part of, see [`TaskParent::Part`].
+    pub(crate) fn part_of(&self) -> Option<&Arc<str>> {
+        match &self.parent {
+            Some(TaskParent::Part(call)) => Some(call),
+            _ => None,
+        }
+    }
+
     /// Ends the transcript with the bubble [`TaskOutcome::role`] picks. A chat
     /// only ever grows one ending, but a caller who knows more than the one who
     /// got here first rewrites it in place. See [`TaskOutcome::refines`].
@@ -588,6 +632,10 @@ impl Chat {
 
     pub(crate) fn register_live_buf(&mut self, tool_id: String, buf: Arc<SharedBuf>) {
         self.messages_panel.register_live_buf(tool_id, buf);
+    }
+
+    pub(crate) fn settle_tool(&mut self, tool_id: &str, status: ToolStatus) {
+        self.messages_panel.settle_tool(tool_id, status);
     }
 
     pub(crate) fn set_tool_background(&mut self, tool_id: &str, badge: BackgroundBadge) {
@@ -698,8 +746,12 @@ pub fn history_to_display(
         let msg = match item {
             DisplayItem::Message(msg) => msg,
             DisplayItem::ObservationLine { index, text } => {
-                let detail = messages[index].first_text_content().map(str::to_owned);
-                display.push(notice(text.to_owned(), detail));
+                let message = &messages[index];
+                display.push(task_notice(
+                    text.to_owned(),
+                    observation_detail(message).map(str::to_owned),
+                    message.settles.as_ref().map(|settled| settled.end.into()),
+                ));
                 continue;
             }
         };
@@ -825,6 +877,7 @@ pub fn history_to_display(
                                 background: None,
                                 detail: None,
                                 detail_expanded: false,
+                                task_end: None,
                             });
                         }
                         _ => {}
@@ -837,8 +890,17 @@ pub fn history_to_display(
 }
 
 fn notice(text: String, detail: Option<String>) -> DisplayMessage {
+    task_notice(text, detail, None)
+}
+
+fn task_notice(
+    text: String,
+    detail: Option<String>,
+    task_end: Option<BackgroundOutcome>,
+) -> DisplayMessage {
     DisplayMessage {
         detail,
+        task_end,
         ..DisplayMessage::new(DisplayRole::Notice, text)
     }
 }
@@ -961,7 +1023,7 @@ mod tests {
         AgentEvent, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
     };
     use maki_config::UiConfig;
-    use maki_providers::ImageMediaType;
+    use maki_providers::{ImageMediaType, TaskEnd, TaskSettled};
     use test_case::test_case;
 
     const IMAGE_DATA: &str = "dGVzdA==";
@@ -1158,11 +1220,7 @@ mod tests {
     }
 
     fn end(chat: &mut Chat, outcome: TaskOutcome) {
-        let text = match outcome {
-            TaskOutcome::Error => ERROR_TEXT,
-            TaskOutcome::Unknown | TaskOutcome::Done => DONE_TEXT,
-        };
-        chat.mark_finished(outcome, text);
+        chat.mark_finished(outcome, outcome.text());
     }
 
     fn text_delta(chat: &mut Chat, text: &str) {
@@ -1308,6 +1366,35 @@ mod tests {
             .map(|d| (d.role.clone(), d.text.as_str()))
             .collect();
         assert_eq!(shown, expected);
+    }
+
+    const NOTICE_OUTPUT: &str = "ok";
+
+    /// The line already names the task, so a background result unfolds to
+    /// its output alone, and its dot says how the task ended.
+    #[test_case(Some(TaskEnd::Failed), NOTICE_OUTPUT, Some(BackgroundOutcome::Error) ; "a_result")]
+    #[test_case(None, NOTICE_BODY, None ; "a_plain_observation")]
+    fn a_restored_notice_unfolds_to_what_it_reports(
+        end: Option<TaskEnd>,
+        detail: &str,
+        task_end: Option<BackgroundOutcome>,
+    ) {
+        let mut observation = Message::observation(NOTICE_BODY.into());
+        observation.display_text = Some(NOTICE_LINE.into());
+        observation.settles = end.map(|end| TaskSettled {
+            task: TASK_ID.into(),
+            end,
+        });
+
+        let display = history_to_display(
+            &[observation],
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+        )
+        .0;
+
+        assert_eq!(display[0].detail.as_deref(), Some(detail));
+        assert_eq!(display[0].task_end, task_end);
     }
 
     fn tool_use_pair(
@@ -1735,7 +1822,7 @@ mod tests {
     /// Once its run ends, only another run brings a task back. A woken run
     /// opens with no prompt, and what trails a run says nothing of the next.
     #[test_case(AgentEvent::TextDelta { text: USER_TEXT.into() }, TaskStatus::Working ; "a_run_streams")]
-    #[test_case(AgentEvent::ObservationLine { text: USER_TEXT.into(), detail: None }, TaskStatus::Working ; "a_woken_run_lands_its_notice")]
+    #[test_case(AgentEvent::ObservationLine { text: USER_TEXT.into(), detail: None, end: None }, TaskStatus::Working ; "a_woken_run_lands_its_notice")]
     #[test_case(AgentEvent::SubagentHistory { tool_use_id: TASK_ID.into(), messages: Vec::new() }, TaskStatus::Idle ; "transcript_trails_the_run")]
     #[test_case(AgentEvent::StreamClosed, TaskStatus::Idle ; "close_trails_the_run")]
     fn only_a_run_event_brings_an_idle_task_back(event: AgentEvent, status: TaskStatus) {

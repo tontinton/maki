@@ -1572,6 +1572,7 @@ mod tests {
             opts: None,
             answer_tx,
             inbox: None,
+            parent_call: None,
         }
     }
 
@@ -1866,6 +1867,7 @@ mod tests {
                 .send(AgentEvent::ObservationLine {
                     text: NOTICE_LINE.to_owned(),
                     detail: None,
+                    end: None,
                 })
                 .unwrap();
             sender
@@ -1878,6 +1880,7 @@ mod tests {
                     event: AgentEvent::ObservationLine {
                         text: CHILD_NOTICE_LINE.to_owned(),
                         detail: None,
+                        end: None,
                     },
                     subagent: Some(subagent(None)),
                     run_id: 0,

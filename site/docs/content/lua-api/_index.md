@@ -799,11 +799,14 @@ composing tool like batch to draw a child the same way. Any
 `server__tool` shaped name resolves whether or not a server offers it,
 so this is not an existence check for MCP tools.
 
+`background_params` lists the parameters marked `needs_background`,
+which only a session that can move calls to the background sees.
+
 **Parameters:**
 
 - `{name}` (`string`) Exact tool name.
 
-**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, header?, restore?, format? }, or nil if not found.
+**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, background_params?, header?, restore?, format? }, or nil if not found.
 
 **Example:**
 
@@ -921,7 +924,7 @@ name the session now running or focused. What each event adds:
 - `"SessionCwdChanged"`: `data.cwd`, the session's new working
   directory, when `/cd` changes it.
 - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
-  (`"working"`, `"idle"`, `"done"`, or `"error"`), when a subagent starts
+  (`"working"`, `"idle"`, `"done"`, `"error"`, or `"cancelled"`), when a subagent starts
   or changes status. A task a plugin opened with `maki.agent.session`
   carries `data.plugin`, and `"idle"` is such a task between prompts. A
   task that comes back from disk already finished stays quiet, so
@@ -1652,6 +1655,9 @@ through optional callbacks while the tool runs.
   - `on_movable` (`function?`) called with `true` when the child registers
     `ctx:on_background`, so the caller knows it may outlive the turn, and
     `false` if it loses that. Must not yield.
+  - `on_task` (`function?`) called with the task id when the child runs as
+    a subagent, which `/tasks` then lists as a task of its own. Must not
+    yield.
 
 **Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
   Instruction files the child picks up (a subdirectory `AGENTS.md`) are
@@ -5591,13 +5597,18 @@ tool spawned has its tool call's id, one a plugin opened with
 `plugin` field.
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, focused, status?, plugin?,
-  started_at?, ended_at?, cost?}` where `status` is `"working"`, `"idle"` (a
-  plugin task between prompts), `"done"`, or `"error"`, and `session` is the
-  chat session that `stop()` asks for. `started_at` and `ended_at` are Unix
-  seconds: when the task started, or moved to the background, and when it
-  finished. A task loaded from disk has neither. `cost` is what a subagent
-  billed so far, in dollars. The main chat has none of the three. Or nil and
-  an error.
+  parent?, part?, started_at?, ended_at?, cost?}` where `status` is `"working"`,
+  `"idle"` (a plugin task between prompts), `"done"`, `"error"`, or
+  `"cancelled"` (stopped by the user or the model), and `session` is the
+  chat session that `stop()` asks for. `parent` is the id of the call the
+  task runs under, like a `batch` that started it. That call is listed
+  only once it moved. `part` is true for a piece listed with
+  `ctx:set_parts()`. Stopping a part stops its whole call, while a
+  subagent the call started stops alone. `started_at` and `ended_at` are
+  Unix seconds: when the task started, or moved to the background, and
+  when it finished. A task loaded from disk has neither. `cost` is what a
+  subagent billed so far, in dollars. The main chat has none of the
+  three. Or nil and an error.
 
 **Example:**
 
@@ -5676,7 +5687,7 @@ From a tool handler, `stop(ctx, id)` is the model's stop. It stops a
 background task (a command or subagent) that the calling agent moved,
 which is allowed because the tool call belongs to a turn the user started.
 It waits up to 5 seconds for the final reply and returns it, and the agent
-gets no notice of the end. A late reply returns `"stop requested"`, and the
+gets no notice of the end. A late reply returns no `output`, and the
 result reaches the agent later as a quiet notice. A task another agent
 moved, a finished task or an unknown id returns an error that names the
 agent's running task ids.
@@ -5690,15 +5701,17 @@ agent's running task ids.
   rather than stopping a task with the same id in the other session. With a
   ctx: the background task id.
 
-**Returns:** (`boolean|string|nil`, `string|nil`) true on success (with a ctx: the
-  final reply or `"stop requested"`), or nil and an error.
+**Returns:** (`boolean|table|nil`, `string|nil`) true on success, or nil and an
+  error. With a ctx, success is `{name, output?}`. `name` is the task's
+  name in `/tasks`, and `output` is the final reply, missing when it was
+  late.
 
 **Example:**
 
 ```lua
 local _, err = maki.task.stop(task.id, { session = task.session })
 -- in a tool handler
-local output, err = maki.task.stop(ctx, input.id)
+local stopped, err = maki.task.stop(ctx, input.id)
 ```
 
 
@@ -8664,6 +8677,7 @@ ListPicker.split_words = split_words
 ListPicker.matches = matches
 ListPicker.highlight_spans = highlight_spans
 ListPicker.range_spans = range_spans
+ListPicker.clamp_parts = clamp_parts
 ```
 
 ### `require("maki.output_limits")`

@@ -509,10 +509,16 @@ impl ToolRegistry {
     /// Human-friendly summary of an invocation; the raw tool name when
     /// there is nothing better.
     pub fn resolve_header(&self, name: &str, input: &Value) -> String {
+        self.start_header(name, input)
+            .map(|header| header.into_ready().text())
+            .unwrap_or_else(|| name.to_owned())
+    }
+
+    /// The header of a call to `name`, which a plugin tool answers later.
+    pub fn start_header(&self, name: &str, input: &Value) -> Option<HeaderFuture> {
         self.get(name)
             .and_then(|e| e.try_parse(input))
-            .map(|inv| inv.start_header().into_ready().text())
-            .unwrap_or_else(|| name.to_owned())
+            .map(|inv| inv.start_header())
     }
 
     pub fn names(&self) -> Vec<Arc<str>> {

@@ -251,6 +251,8 @@ impl App {
         let subagents = self
             .chats
             .iter()
+            // A part only mirrors its call, so it has nothing of its own to keep.
+            .filter(|chat| chat.part_of().is_none())
             .filter_map(|chat| {
                 Some(StoredSubagent {
                     tool_use_id: chat.task_id()?.to_string(),
@@ -310,6 +312,7 @@ impl App {
         self.last_quit = None;
         self.background_moves = BackgroundMoves::default();
         self.early_finals.clear();
+        self.forget_untasked_parts();
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
         // The draft this chrome belonged to is gone, and the Lua thread still
@@ -434,7 +437,8 @@ impl App {
     /// reported lost when it shut the old Lua host down.
     pub(crate) fn restore_lost_background(&self) {
         if let Some(mailbox) = self.live_mailbox() {
-            mailbox.restore_lost(&self.state.session.meta.pending_background);
+            let session = &self.state.session;
+            mailbox.restore_lost(&session.meta.pending_background, session.messages());
         }
     }
 

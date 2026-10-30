@@ -340,6 +340,8 @@ pub struct DisplayMessage {
     /// Whether [`Self::detail`] is shown. Only a click sets it, so a notice
     /// starts collapsed however it got here.
     pub detail_expanded: bool,
+    /// On a notice that answers a background task: how the task ended.
+    pub task_end: Option<BackgroundOutcome>,
 }
 
 /// How a moved call's row tracks its background task.
@@ -407,6 +409,7 @@ impl DisplayMessage {
             background: None,
             detail: None,
             detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -444,6 +447,7 @@ impl DisplayMessage {
             background: None,
             detail: None,
             detail_expanded: false,
+            task_end: None,
         }
     }
 

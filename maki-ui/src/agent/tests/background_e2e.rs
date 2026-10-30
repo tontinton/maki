@@ -485,7 +485,7 @@ impl World {
         self.seen
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::ObservationLine { text, detail } => {
+                AgentEvent::ObservationLine { text, detail, .. } => {
                     Some((text.as_str(), detail.as_deref()))
                 }
                 _ => None,
@@ -577,7 +577,7 @@ fn a_moved_call_whose_turn_ends_wakes_the_chat_with_its_result() {
     assert_append_only(&receipt_request, &wake_request);
     assert_eq!(
         world.observation_lines(),
-        [(display.as_str(), Some(text.as_str()))]
+        [(display.as_str(), Some(FINAL_REPLY))]
     );
     assert_eq!(
         world.done_reasons(),
@@ -632,7 +632,7 @@ fn a_result_landing_mid_run_follows_the_next_tool_results_without_a_new_request(
     let display = expected_display(FINISHED);
     assert_eq!(
         world.observation_lines(),
-        [(display.as_str(), Some(text.as_str()))]
+        [(display.as_str(), Some(FINAL_REPLY))]
     );
     assert_eq!(world.done_reasons(), [DoneReason::EndTurn]);
     assert!(world.errors().is_empty(), "{:?}", world.errors());
@@ -674,7 +674,7 @@ fn a_task_stopped_by_the_user_is_a_quiet_notice_that_waits_for_the_next_prompt()
     assert_append_only(&receipt_request, &next_request);
     assert_eq!(
         world.observation_lines(),
-        [(display.as_str(), Some(text.as_str()))]
+        [(display.as_str(), Some(PARTIAL_OUTPUT))]
     );
     assert!(world.errors().is_empty(), "{:?}", world.errors());
 }

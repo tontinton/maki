@@ -12,6 +12,7 @@ use crate::agent::default_instruction_files;
 use crate::cancel::CancelToken;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::tools::registry::HeaderFuture;
 use crate::tools::{BackgroundFor, FileAccess, ToolContext, ToolRegistry, interpreter_ctx};
 use crate::{AgentConfig, AgentMode, EventSender, ModelSlot, ToolOutputLines};
 
@@ -20,10 +21,11 @@ pub const BACKGROUND_PLAN_WRITE_DENIED: &str =
 const MAILBOX_CAPACITY: usize = 100;
 const NOTICE_DISPLAY_MAX_BYTES: usize = 256;
 const NOTICE_HEAD: &str = "Background";
-/// A lost notice knows only the receipt's id, so it names no tool.
+const NOTICE_BODY_SEP: &str = ":\n\n";
+/// A fork can drop the call a receipt came from, and then nobody knows the tool.
 const LOST_TOOL: &str = "task";
-const LOST_NOTICE_TAIL: &str = " ended without reporting back: maki exited or reloaded, or this \
-     session was forked from the one it ran in. Its result is lost.";
+const LOST_NOTICE_BODY: &str = "It ended without reporting back: maki exited or reloaded, or \
+     this session was forked from the one it ran in. Its result is lost.";
 /// Nobody listens on an unattended context's events, so its run id is never read.
 const UNATTENDED_RUN_ID: u64 = 0;
 
@@ -55,6 +57,43 @@ struct Mailbox {
     outstanding: Vec<String>,
     /// No run reads it again, so it takes no new receipts.
     closed: bool,
+}
+
+/// How a notice names a task: its tool, plus the call's summary when that
+/// says more than the tool name. The summary is squeezed onto one line, so
+/// the head of a notice never wraps. That is how [`notice_body`] finds where
+/// the head stops.
+pub struct TaskLabel {
+    tool: String,
+    summary: Option<String>,
+}
+
+impl TaskLabel {
+    pub fn new(tool: &str, summary: Option<&str>) -> Self {
+        Self {
+            tool: tool.to_owned(),
+            summary: summary
+                .map(one_line)
+                .filter(|summary| !summary.is_empty() && summary != tool),
+        }
+    }
+
+    /// Names receipt `id` after its call in `history`. A plugin tool's header
+    /// comes from the Lua thread, so it may still be on its way. Then it is
+    /// handed back to wait for.
+    fn of_receipt(history: &[Message], id: &str) -> (Self, Option<HeaderFuture>) {
+        let call = history
+            .iter()
+            .flat_map(Message::tool_uses)
+            .find(|(call_id, _, _)| *call_id == id);
+        let Some((_, tool, input)) = call else {
+            return (Self::new(LOST_TOOL, None), None);
+        };
+        match ToolRegistry::global().start_header(tool, input) {
+            Some(HeaderFuture::Ready(header)) => (Self::new(tool, Some(&header.text())), None),
+            late => (Self::new(tool, None), late),
+        }
+    }
 }
 
 /// The result of a background task, for the run that holds its receipt.
@@ -99,13 +138,21 @@ impl Mailbox {
 
     /// Answers `id` with a quiet notice that its result is lost. It stays
     /// unsettled until a run drains it, so quitting before that keeps it.
-    fn push_lost(&mut self, id: &str) {
-        let text = format!("{NOTICE_HEAD} {LOST_TOOL} {id}{LOST_NOTICE_TAIL}");
-        let display = format!(
-            "{NOTICE_HEAD} {LOST_TOOL} {}: {id}",
-            end_word(TaskEnd::Lost)
-        );
-        self.push(settling(id, TaskEnd::Lost, text, Some(&display)), false);
+    fn push_lost(&mut self, id: &str, label: &TaskLabel) {
+        self.push(lost_notice(id, label), false);
+    }
+
+    /// A notice a run already read stays the way the model saw it.
+    fn relabel_lost(&mut self, id: &str, label: &TaskLabel) {
+        let queued = self.pending.iter_mut().find(|notice| {
+            notice
+                .settles
+                .as_ref()
+                .is_some_and(|settled| settled.task == id && settled.end == TaskEnd::Lost)
+        });
+        if let Some(notice) = queued {
+            *notice = lost_notice(id, label);
+        }
     }
 
     /// Stops tracking `id` as running work. False when nothing tracked it.
@@ -118,6 +165,11 @@ impl Mailbox {
     }
 }
 
+fn lost_notice(id: &str, label: &TaskLabel) -> Message {
+    let (text, display) = notice(label, id, TaskEnd::Lost, TaskEnd::Lost, LOST_NOTICE_BODY);
+    settling(id, TaskEnd::Lost, text, Some(&display))
+}
+
 fn end_word(end: TaskEnd) -> &'static str {
     match end {
         TaskEnd::Finished => "finished",
@@ -127,12 +179,37 @@ fn end_word(end: TaskEnd) -> &'static str {
     }
 }
 
+/// Returns the text the model reads and the line the transcript shows. They
+/// can disagree on the ending: a stopped command often exits with an error,
+/// so the model reads `failed` while the user, who stopped it, sees
+/// `cancelled`. [`notice_body`] parses the text back, so its shape lives
+/// here alone.
+fn notice(
+    label: &TaskLabel,
+    id: &str,
+    read: TaskEnd,
+    shown: TaskEnd,
+    body: &str,
+) -> (String, String) {
+    let TaskLabel { tool, summary } = label;
+    let (named, summarized) = summary
+        .as_ref()
+        .map(|summary| (format!(" ({summary})"), format!(": {summary}")))
+        .unwrap_or_default();
+    (
+        format!(
+            "{NOTICE_HEAD} {tool} {id}{named} {}{NOTICE_BODY_SEP}{body}",
+            end_word(read)
+        ),
+        format!("{NOTICE_HEAD} {tool} {}{summarized}", end_word(shown)),
+    )
+}
+
 /// The notice a moved call's final result becomes: the text the model reads,
 /// the line the transcript shows, and how the task ended.
 pub fn result_notice(
-    tool: &str,
+    label: &TaskLabel,
     id: &str,
-    summary: &str,
     failed: bool,
     stopped: bool,
     output: &str,
@@ -143,14 +220,19 @@ pub fn result_notice(
         TaskEnd::Finished
     };
     let shown = if stopped { TaskEnd::Cancelled } else { read };
-    (
-        format!(
-            "{NOTICE_HEAD} {tool} {id} ({summary}) {}:\n\n{output}",
-            end_word(read)
-        ),
-        format!("{NOTICE_HEAD} {tool} {}: {summary}", end_word(shown)),
-        shown,
-    )
+    let (text, display) = notice(label, id, read, shown, output);
+    (text, display, shown)
+}
+
+/// The part of a [`notice`] text after its head line, for a transcript line
+/// that already names the task. Older builds did not squeeze the summary
+/// onto one line, so a head that wraps is not trusted and the whole text
+/// comes back.
+pub fn notice_body(text: &str) -> &str {
+    text.strip_prefix(NOTICE_HEAD)
+        .and_then(|rest| rest.split_once(NOTICE_BODY_SEP))
+        .filter(|(head, _)| !head.contains('\n'))
+        .map_or(text, |(_, body)| body)
 }
 
 /// How a receipt names the task its call moved to.
@@ -212,9 +294,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// One line, cut on a character boundary, or `None` when nothing is left.
 fn notice_label(text: &str) -> Option<String> {
-    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let line = one_line(text);
     let label = line[..line.floor_char_boundary(NOTICE_DISPLAY_MAX_BYTES)].trim_end();
     (!label.is_empty()).then(|| label.to_owned())
 }
@@ -340,22 +426,43 @@ impl SessionMailbox {
     /// The receipts a stored session left unsettled, each answered with a
     /// quiet notice that its result is lost. One this process still tracks is
     /// skipped: its work runs here, or [`Self::lose`] already answered it.
-    pub fn restore_lost(&self, ids: &[String]) {
-        self.change(|state| {
+    ///
+    /// On a resume the plugins are still loading when this runs, so a plugin
+    /// tool cannot name its call yet. The notice goes out with just the tool
+    /// name and picks up the summary when the plugin answers. A host that
+    /// goes away first answers with the tool name, so no task waits on a dead
+    /// host.
+    pub fn restore_lost(&self, ids: &[String], history: &[Message]) {
+        let late = self.change(|state| {
+            let mut late = Vec::new();
             for id in ids {
-                if !state.unsettled().any(|unsettled| unsettled == id) {
-                    state.push_lost(id);
+                if state.unsettled().any(|unsettled| unsettled == id) {
+                    continue;
+                }
+                let (label, header) = TaskLabel::of_receipt(history, id);
+                state.push_lost(id, &label);
+                if let Some(header) = header {
+                    late.push((id.clone(), label.tool, header));
                 }
             }
+            late
         });
+        for (id, tool, header) in late {
+            let mailbox = self.clone();
+            smol::spawn(async move {
+                let label = TaskLabel::new(&tool, Some(&header.await.text()));
+                mailbox.change(|state| state.relabel_lost(&id, &label));
+            })
+            .detach();
+        }
     }
 
     /// The work behind `id` died without a result, with the plugin host that
     /// ran it (`/reload`, exit). Nothing else would ever settle it.
-    pub fn lose(&self, id: &str) {
+    pub fn lose(&self, id: &str, label: &TaskLabel) {
         self.change(|state| {
             if state.untrack(id) {
-                state.push_lost(id);
+                state.push_lost(id, label);
             }
         });
     }
@@ -528,7 +635,7 @@ mod tests {
     use std::fs;
 
     use futures_lite::future::poll_once;
-    use maki_providers::ThinkingConfig;
+    use maki_providers::{ContentBlock, Role, ThinkingConfig};
     use test_case::test_case;
 
     use super::*;
@@ -813,15 +920,15 @@ mod tests {
         mailbox.track(TASK_ID);
         let stored = [TASK_ID.to_owned(), OTHER_TASK_ID.to_owned()];
 
-        mailbox.restore_lost(&stored);
-        mailbox.restore_lost(&stored);
+        mailbox.restore_lost(&stored, &[]);
+        mailbox.restore_lost(&stored, &[]);
 
         assert_eq!(mailbox.unsettled(), [TASK_ID, OTHER_TASK_ID]);
         assert!(mailbox.claim_wake().is_empty(), "{LOST_IS_QUIET}");
         let lost = mailbox.drain();
         assert_eq!(lost.len(), 1);
         assert!(text(&lost[0]).contains(OTHER_TASK_ID));
-        assert!(text(&lost[0]).ends_with(LOST_NOTICE_TAIL));
+        assert!(text(&lost[0]).ends_with(LOST_NOTICE_BODY));
         assert_eq!(mailbox.unsettled(), [TASK_ID]);
     }
 
@@ -830,18 +937,63 @@ mod tests {
         let mailbox = SessionMailbox::register(MakiId::generate());
         mailbox.track(TASK_ID);
 
-        mailbox.lose(TASK_ID);
-        mailbox.lose(TASK_ID);
-        mailbox.lose(OTHER_TASK_ID);
-        mailbox.restore_lost(&[TASK_ID.to_owned()]);
+        mailbox.lose(TASK_ID, &label(Some(SUMMARY)));
+        mailbox.lose(TASK_ID, &label(Some(SUMMARY)));
+        mailbox.lose(OTHER_TASK_ID, &label(Some(SUMMARY)));
+        mailbox.restore_lost(&[TASK_ID.to_owned()], &[]);
 
         assert_eq!(mailbox.outstanding(), 0);
         assert_eq!(mailbox.unsettled(), [TASK_ID]);
         assert!(mailbox.claim_wake().is_empty(), "{LOST_IS_QUIET}");
         let lost = mailbox.drain();
         assert_eq!(lost.len(), 1);
-        assert!(text(&lost[0]).ends_with(LOST_NOTICE_TAIL));
+        assert!(text(&lost[0]).ends_with(LOST_NOTICE_BODY));
         assert_eq!(lost[0].settles, settled(TaskEnd::Lost));
+    }
+
+    fn label(summary: Option<&str>) -> TaskLabel {
+        TaskLabel::new(TOOL, summary)
+    }
+
+    fn lost_line(mailbox: &SessionMailbox) -> Option<String> {
+        mailbox.drain().pop()?.display_text
+    }
+
+    #[test]
+    fn a_late_header_names_the_lost_notice_still_queued() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+        mailbox.lose(TASK_ID, &label(None));
+
+        mailbox.change(|state| state.relabel_lost(TASK_ID, &label(Some(SUMMARY))));
+
+        let lost = mailbox.drain();
+        assert_eq!(
+            lost[0].display_text,
+            Some(format!("{NOTICE_HEAD} {TOOL} lost: {SUMMARY}"))
+        );
+        assert!(text(&lost[0]).contains(SUMMARY));
+        mailbox.change(|state| state.relabel_lost(TASK_ID, &label(Some(SUMMARY))));
+        assert!(mailbox.drain().is_empty());
+    }
+
+    #[test_case(true,  TOOL      ; "its_call_in_history")]
+    #[test_case(false, LOST_TOOL ; "no_call")]
+    fn a_restored_lost_notice_names_the_call_in_history(in_history: bool, tool: &str) {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        let call = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(TASK_ID, TOOL, serde_json::json!({}))],
+            ..Default::default()
+        };
+        let history = if in_history { vec![call] } else { Vec::new() };
+
+        mailbox.restore_lost(&[TASK_ID.to_owned()], &history);
+
+        assert_eq!(
+            lost_line(&mailbox),
+            Some(format!("{NOTICE_HEAD} {tool} lost"))
+        );
     }
 
     fn settled(end: TaskEnd) -> Option<TaskSettled> {
@@ -858,7 +1010,7 @@ mod tests {
         let mailbox = SessionMailbox::register(MakiId::generate());
         mailbox.track(TASK_ID);
         let (text, display, shown) =
-            result_notice(TOOL, TASK_ID, SUMMARY, failed, stopped, NOTICE_BODY);
+            result_notice(&label(Some(SUMMARY)), TASK_ID, failed, stopped, NOTICE_BODY);
 
         mailbox.settle(
             TASK_ID,
@@ -876,11 +1028,39 @@ mod tests {
     #[test]
     fn a_plugin_notice_in_the_same_words_settles_nothing() {
         let mailbox = SessionMailbox::register(MakiId::generate());
-        let (text, display, _) = result_notice(TOOL, TASK_ID, SUMMARY, false, false, NOTICE_BODY);
+        let (text, display, _) =
+            result_notice(&label(Some(SUMMARY)), TASK_ID, false, false, NOTICE_BODY);
 
         SessionMailbox::notify(mailbox.session_id(), text, Some(&display), false).unwrap();
 
         assert_eq!(mailbox.drain()[0].settles, None);
+    }
+
+    #[test_case(Some(SUMMARY), NOTICE_BODY ; "plain")]
+    #[test_case(None, NOTICE_BODY ; "unnamed")]
+    #[test_case(Some(SUMMARY), "tests:\n\nall green" ; "output_with_the_separator")]
+    #[test_case(Some(SUMMARY), "" ; "empty_output")]
+    #[test_case(Some("Wait:\n\nthen print"), NOTICE_BODY ; "summary_with_the_separator")]
+    #[test_case(Some("Wait\nthen print"), NOTICE_BODY ; "summary_with_a_line_break")]
+    fn notice_body_is_what_follows_the_head(summary: Option<&str>, output: &str) {
+        let (text, display, _) = result_notice(&label(summary), TASK_ID, false, false, output);
+
+        assert_eq!(notice_body(&text), output);
+        assert!(!display.contains('\n'), "{display}");
+    }
+
+    #[test_case(Some(TOOL), None ; "the_tool_name_says_nothing_more")]
+    #[test_case(Some("  "), None ; "blank")]
+    #[test_case(Some("Run\n  the tests"), Some("Run the tests") ; "kept_to_one_line")]
+    fn a_label_summary_names_more_than_the_tool(summary: Option<&str>, kept: Option<&str>) {
+        assert_eq!(label(summary).summary.as_deref(), kept);
+    }
+
+    #[test]
+    fn notice_body_keeps_other_text_whole() {
+        assert_eq!(notice_body(NOTICE_BODY), NOTICE_BODY);
+        let spanning = format!("{NOTICE_HEAD} note\nsaid{NOTICE_BODY_SEP}{NOTICE_BODY}");
+        assert_eq!(notice_body(&spanning), spanning);
     }
 
     #[test]
