@@ -19,6 +19,7 @@ use flume::Sender;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_config::providers::ProvidersConfig;
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -34,9 +35,10 @@ use crate::providers::openai_compat::{
 };
 use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, plugin, user_agent};
 use crate::spec::ProviderRegistry;
+use crate::types::rfc3339_millis;
 use crate::{
-    AgentError, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    ThinkingConfig, dialect,
+    AgentError, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse, ThinkingConfig, UsageLimit, dialect,
 };
 
 const MESSAGES_PATH: &str = "/messages";
@@ -790,6 +792,26 @@ impl CatalogTransport {
         }
     }
 
+    pub(crate) async fn get_text(
+        &self,
+        auth: &ResolvedAuth,
+        url: &str,
+    ) -> Result<String, AgentError> {
+        let request = auth
+            .configure_request(
+                Request::builder()
+                    .method("GET")
+                    .uri(url)
+                    .header("user-agent", user_agent()),
+            )
+            .body(())?;
+        let mut response = self.client.send_async(request).await?;
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+        Ok(response.text().await?)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stream(
         &self,
@@ -893,6 +915,56 @@ impl CatalogAuth {
     }
 }
 
+const USAGE_STATUS_OK: &str = "ok";
+
+#[derive(Deserialize)]
+struct GoUsage {
+    usage: GoUsageWindows,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct GoUsageWindows {
+    rolling: Option<GoUsageWindow>,
+    weekly: Option<GoUsageWindow>,
+    monthly: Option<GoUsageWindow>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct GoUsageWindow {
+    status: Option<String>,
+    percent: f64,
+    #[serde(rename = "resetsAt")]
+    resets_at: Option<String>,
+}
+
+impl From<GoUsage> for ProviderUsage {
+    fn from(usage: GoUsage) -> Self {
+        let windows = [
+            ("5-hour rolling", usage.usage.rolling),
+            ("Weekly", usage.usage.weekly),
+            ("Monthly", usage.usage.monthly),
+        ];
+        Self {
+            plan: None,
+            limits: windows
+                .into_iter()
+                .filter_map(|(label, window)| {
+                    let window = window?;
+                    Some(UsageLimit {
+                        label: label.into(),
+                        percentage: Some(window.percent.clamp(0.0, 100.0).round() as u32),
+                        reset_at: window.resets_at.as_deref().and_then(rfc3339_millis),
+                        detail: window.status.filter(|status| status != USAGE_STATUS_OK),
+                    })
+                })
+                .collect(),
+            by_model_today: Vec::new(),
+        }
+    }
+}
+
 impl CatalogProvider {
     pub fn new(
         data: ProviderData,
@@ -953,6 +1025,23 @@ impl Provider for CatalogProvider {
                     &opts,
                 )
                 .await
+        })
+    }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move {
+            if self.data.slug != opencode::GO_SLUG {
+                return Ok(None);
+            }
+            let CatalogAuth::Keyed(auth) = &self.auth else {
+                return Ok(None);
+            };
+            let body = self
+                .transport
+                .get_text(auth, opencode::GO_USAGE_URL)
+                .await?;
+            let parsed: GoUsage = serde_json::from_str(&body)?;
+            Ok(Some(parsed.into()))
         })
     }
 
@@ -1029,6 +1118,10 @@ impl Provider for LazyCatalogProvider {
         })
     }
 
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move { self.resolve().await?.fetch_usage().await })
+    }
+
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move { self.resolve().await?.list_models().await })
     }
@@ -1093,8 +1186,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
-        SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
+        Authentication, CatalogData, CatalogMeta, EndpointType, GoUsage, ProviderData,
+        ProviderQuirks, SessionRef, StateDir, available_if_warm, determine_catalog_format,
+        parse_model, quirks_for,
     };
     use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
     use crate::provider::Provider;
@@ -1207,6 +1301,40 @@ mod tests {
                 ("free-model".into(), priced(0.0)),
             ]),
         }
+    }
+
+    #[test]
+    fn opencode_go_usage_maps_windows() {
+        let body = r#"{
+            "usage": {
+                "rolling": {"status": "ok", "percent": 4, "resetsAt": "1970-01-01T00:00:01Z"},
+                "weekly": {"status": "rate-limited", "percent": 100, "resetsAt": "1970-01-01T00:00:02Z"}
+            }
+        }"#;
+        let usage: crate::ProviderUsage = serde_json::from_str::<GoUsage>(body).unwrap().into();
+        assert_eq!(usage.limits.len(), 2);
+        assert_eq!(usage.limits[0].label, "5-hour rolling");
+        assert_eq!(usage.limits[0].percentage, Some(4));
+        assert_eq!(usage.limits[0].reset_at, Some(1000));
+        assert_eq!(usage.limits[0].detail, None);
+        assert_eq!(usage.limits[1].label, "Weekly");
+        assert_eq!(usage.limits[1].percentage, Some(100));
+        assert_eq!(usage.limits[1].reset_at, Some(2000));
+        assert_eq!(usage.limits[1].detail.as_deref(), Some("rate-limited"));
+    }
+
+    #[test]
+    fn usage_is_unsupported_for_non_go_catalog_providers() {
+        let data = ProviderData {
+            slug: "opencode".into(),
+            ..opencode_go_provider_data("UNUSED")
+        };
+        let provider = super::CatalogProvider {
+            data,
+            auth: super::CatalogAuth::Keyed(ResolvedAuth::for_test(None, Vec::new())),
+            transport: super::CatalogTransport::new(Timeouts::default()),
+        };
+        assert!(smol::block_on(provider.fetch_usage()).unwrap().is_none());
     }
 
     #[test]

@@ -28,6 +28,7 @@ const GO_DISPLAY_NAME: &str = "Opencode Go";
 const ENV_VAR: &str = "OPENCODE_API_KEY";
 const ZEN_API_URL: &str = "https://opencode.ai/zen/v1";
 const GO_API_URL: &str = "https://opencode.ai/zen/go/v1";
+pub(crate) const GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 const ZEN_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API";
 const GO_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API";
 const GO_DISCOVERY_NOTE: &str = "No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.";
