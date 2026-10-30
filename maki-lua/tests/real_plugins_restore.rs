@@ -22,8 +22,12 @@ const COMMAND_WORD: &str = "echo";
 const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
 const TODO_SRC: &str = include_str!("../../plugins/todo_write/init.lua");
 const READ_SRC: &str = include_str!("../../plugins/read/init.lua");
+/// Deeper than the 200 lines of context the read plugin highlights.
 const READ_PADDING_LINES: usize = 300;
-const READ_PADDING_BYTES: usize = 128;
+/// Kept short, so the context stays far below the highlighter's 16 KiB
+/// prefix cut, which `maki-highlight` tests on its own. Long lines made a
+/// loaded CI runner miss the 10 s restore deadline and lose the colors.
+const READ_PADDING_BYTES: usize = 8;
 const READ_COMMENT: &str = "/* comment";
 const READ_EXCERPT: &str = "let value = 1;";
 const READ_LANG: &str = "rust";
