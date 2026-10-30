@@ -5,7 +5,7 @@ use maki_config::AgentConfig;
 use maki_providers::retry::RetryPolicy;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
-    StreamResponse, TokenUsage,
+    StreamResponse,
 };
 use serde_json::{Value, json};
 use tracing::info;
@@ -18,7 +18,7 @@ use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
 use crate::tools::truncate_bytes;
-use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
+use crate::{AgentError, AgentEvent, DoneReason, EventSender, RunLedger, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
@@ -164,15 +164,14 @@ fn summary_prompt(config: &AgentConfig, request: Option<&str>) -> String {
     format!("{COMPACTION_USER}\n\nAdditional instructions:\n{extras}")
 }
 
-pub(super) fn continue_message(config: &AgentConfig, added: Option<&str>) -> String {
-    match join_lines([config.post_compaction_instructions.as_deref(), added]) {
+pub(super) fn continue_message(added: Option<&str>) -> String {
+    match added {
         Some(extra) => format!("{CONTINUE_AFTER_COMPACT}\n\n{extra}"),
         None => CONTINUE_AFTER_COMPACT.to_string(),
     }
 }
 
 pub(super) struct Compacted {
-    pub usage: TokenUsage,
     pub summary: String,
     /// How many unanswered messages follow the summary. Context updates are
     /// never among them, see [`History::restart`].
@@ -197,6 +196,7 @@ pub(super) async fn compact_history(
     instructions: Option<&str>,
     carry_len: usize,
     retry: RetryPolicy,
+    ledger: &RunLedger,
 ) -> Result<Compacted, AgentError> {
     let compact_start = std::time::Instant::now();
     let summarized = history.len().saturating_sub(carry_len);
@@ -235,17 +235,26 @@ pub(super) async fn compact_history(
         .await
         {
             Ok(response) => {
+                // The summary request never asks for fast mode, so it costs the
+                // standard rate. It is banked before the text is checked,
+                // because an unusable summary was still paid for.
+                ledger.add(
+                    response.usage,
+                    model.billed_cost(&response.usage, false),
+                    model.list_cost(&response.usage, false),
+                );
                 if attempt > 0 {
                     info!(attempt, "compaction succeeded after pruning history");
                 }
-                return finish_compact(
-                    response,
-                    history,
-                    summarized,
-                    event_tx,
-                    compact_start,
-                    model,
+                let compacted = finish_compact(
+                    response, history, summarized, event_tx, model, hooks, config,
+                )?;
+                info!(
+                    model = %model.id,
+                    duration_ms = compact_start.elapsed().as_millis() as u64,
+                    "compaction completed"
                 );
+                return Ok(compacted);
             }
             Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
@@ -269,22 +278,30 @@ fn finish_compact(
     history: &mut History,
     summarized: usize,
     event_tx: &EventSender,
-    compact_start: std::time::Instant,
     model: &Model,
+    hooks: &AgentHooks<'_>,
+    config: &AgentConfig,
 ) -> Result<Compacted, AgentError> {
+    let summary = response.message.first_text_content().map(str::to_owned);
+    // An unusable summary leaves the session as it was, so it keeps its size.
+    let context_size = if summary.is_some() {
+        response.usage.output.min(u32::MAX as u64) as u32
+    } else {
+        hooks.context_size
+    };
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
         model: model.id.clone(),
         cost: model.billed_cost(&response.usage, false),
         subsidised_list_cost: model.subsidised_list_cost(&response.usage, false),
-        context_size: Some(response.usage.output.min(u32::MAX as u64) as u32),
-        context_window: model.context_window,
+        context_size: Some(context_size),
+        context_window: hooks.model.context_window,
     })));
 
     // Swapping the history for a summary the model never wrote would throw the
     // session away for nothing.
-    let Some(summary) = response.message.first_text_content().map(str::to_owned) else {
+    let Some(summary) = summary else {
         return Err(AgentError::EmptySummary);
     };
 
@@ -292,17 +309,17 @@ fn finish_compact(
         Message::user("What did we do so far?".into()),
         response.message,
     ];
+    // Part of the summary block and not the carried input, so the next
+    // compaction summarizes this copy away instead of carrying a duplicate.
+    new_history.extend(
+        normalize(config.post_compaction_instructions.as_deref())
+            .map(|text| Message::synthetic(text.to_owned())),
+    );
     let summary_len = new_history.len();
     new_history.extend_from_slice(&history.as_slice()[summarized..]);
     history.restart(new_history);
-    info!(
-        model = %model.id,
-        duration_ms = compact_start.elapsed().as_millis() as u64,
-        "compaction completed"
-    );
 
     Ok(Compacted {
-        usage: response.usage,
         summary,
         carried: history.len() - summary_len,
     })
@@ -332,23 +349,27 @@ pub async fn compact(
     retry: RetryPolicy,
 ) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
-    let finished = |usage: TokenUsage, context_size| AgentEvent::Done {
-        usage,
-        cost: model.billed_cost(&usage, false),
-        list_cost: model.list_cost(&usage, false),
-        context_size,
-        context_window: model.context_window,
-        num_turns: 1,
-        // `Compact` and not `EndTurn`, so a goal loop reading this sees
-        // housekeeping and does not treat it as a turn boundary.
-        reason: DoneReason::Compact,
+    let ledger = RunLedger::default();
+    let finished = |context_size| {
+        let totals = ledger.totals();
+        AgentEvent::Done {
+            usage: totals.usage,
+            cost: totals.cost,
+            list_cost: totals.list_cost,
+            context_size,
+            context_window: hooks.model.context_window,
+            num_turns: 1,
+            // `Compact` and not `EndTurn`, so a goal loop reading this sees
+            // housekeeping and does not treat it as a turn boundary.
+            reason: DoneReason::Compact,
+        }
     };
     let Some(steer) = steer_compaction(hooks, config, CompactReason::Manual, instructions).await
     else {
-        event_tx.send(finished(TokenUsage::default(), size_before))?;
+        event_tx.send(finished(size_before))?;
         return Ok(DoneReason::Compact);
     };
-    let Compacted { usage, summary, .. } = match compact_history(
+    let Compacted { summary, .. } = match compact_history(
         provider,
         model,
         history,
@@ -358,6 +379,7 @@ pub async fn compact(
         steer.instructions.as_deref(),
         0,
         retry,
+        &ledger,
     )
     .await
     {
@@ -367,11 +389,8 @@ pub async fn compact(
         Err(AgentError::Cancelled) => return Ok(DoneReason::Cancelled),
         Err(e) => return Err(e),
     };
-    if let Some(post) = join_lines([
-        config.post_compaction_instructions.as_deref(),
-        steer.continue_text.as_deref(),
-    ]) {
-        history.push(Message::synthetic(post));
+    if let Some(text) = steer.continue_text {
+        history.push(Message::synthetic(text));
     }
     fit_frame(history, next, mcp, hooks.model);
     if let Some((system, tools)) = history.request_prefix() {
@@ -381,15 +400,16 @@ pub async fn compact(
     // The summariser read a subset of the session's prompt, so its own count is
     // a floor on the size before, and the only number a gauge that has not seen
     // a turn yet can offer.
-    let context_size_before = size_before.max(usage.total_input().min(u32::MAX as u64) as u32);
+    let context_size_before =
+        size_before.max(ledger.totals().usage.total_input().min(u32::MAX as u64) as u32);
     let context_size_after = gauge.size();
     event_tx.send(AgentEvent::CompactionDone {
         context_size_before,
         context_size_after,
-        context_window: model.context_window,
+        context_window: hooks.model.context_window,
         summary,
     })?;
-    event_tx.send(finished(usage, context_size_after))?;
+    event_tx.send(finished(context_size_after))?;
 
     Ok(DoneReason::Compact)
 }
@@ -633,6 +653,8 @@ mod tests {
     const POST: &str = "Re-read plan.md and agent.md";
     const OVERFLOW_MESSAGE: &str = "prompt is too long";
     const OVERFLOW_STATUS: u16 = 413;
+    /// Differs from the session window, so a report that mixes them up shows.
+    const SUMMARY_CONTEXT_WINDOW: u32 = 128_000;
     /// Shorter than [`NEW_RESULT`], so the budget-burn case below is the only
     /// reason it collapses.
     const OLD_RESULT: &str = "old";
@@ -785,6 +807,7 @@ mod tests {
             None,
             carry_len,
             RetryPolicy::default(),
+            &RunLedger::default(),
         )
         .await
         .unwrap();
@@ -860,77 +883,59 @@ mod tests {
         );
     }
 
-    /// The summariser reads a stripped, collapsed subset of the transcript, so
-    /// its count is well under the session's real prompt. Left in the gauge by
-    /// a compaction that then failed, it reads as a session with room to spare
-    /// and silences the threshold that would have tried again.
-    #[tokio::test]
-    async fn a_failed_compaction_leaves_the_gauge_alone() {
-        let provider = MockProvider::new(vec![Ok(StreamResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: Vec::new(),
-                ..Default::default()
-            },
-            usage: TokenUsage {
-                input: SUMMARISED_INPUT / 2,
-                ..Default::default()
-            },
-            stop_reason: Some(StopReason::EndTurn),
-            ..Default::default()
-        })]);
-        let mut history = History::new(vec![Message::user("first".into())]);
-        let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
-
-        summarize(
-            &provider,
-            &mut history,
-            &mut gauge,
-            &AgentConfig::default(),
-            None,
-            &CancelToken::none(),
-        )
-        .await
-        .expect_err("empty summary must fail");
-
-        assert_eq!(
-            gauge.size(),
-            SUMMARISED_PROMPT,
-            "the summariser's own prompt was written over the session's size"
-        );
-    }
-
     #[test_case(vec![] ; "no_content")]
     #[test_case(vec![ContentBlock::Text { text: " \n".into() }] ; "blank_text")]
+    #[test_case(vec![ContentBlock::Thinking { thinking: KEPT_TEXT.into(), signature: None }] ; "thinking_only")]
     #[tokio::test]
-    async fn compact_keeps_history_when_summary_has_no_text(content: Vec<ContentBlock>) {
+    async fn a_failed_compaction_leaves_the_context_alone(content: Vec<ContentBlock>) {
         let provider = MockProvider::new(vec![Ok(StreamResponse {
             message: Message {
                 role: Role::Assistant,
                 content,
                 ..Default::default()
             },
-            usage: TokenUsage::default(),
+            usage: TokenUsage {
+                input: SUMMARISED_INPUT / 2,
+                output: SUMMARISED_INPUT / 10,
+                ..Default::default()
+            },
             stop_reason: Some(StopReason::EndTurn),
             ..Default::default()
         })]);
-        const KEPT: &str = "first";
-        let mut history = History::new(vec![Message::user(KEPT.into())]);
+        let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+        let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
+        let (raw_tx, rx) = flume::unbounded();
+        let registry = ToolRegistry::new();
+        let model = default_model();
+        let cancel = CancelToken::none();
+        let mut hooks = test_hooks(&registry, None, &model, &cancel);
+        hooks.context_size = gauge.size();
 
-        let err = summarize(
+        let result = compact(
             &provider,
+            &small_context_model(SUMMARY_CONTEXT_WINDOW),
             &mut history,
-            &mut ContextGauge::default(),
+            &mut gauge,
+            bare_context(&model),
+            None,
+            &EventSender::new(raw_tx, 0),
+            &hooks,
             &AgentConfig::default(),
             None,
-            &CancelToken::none(),
+            RetryPolicy::default(),
         )
-        .await
-        .expect_err("empty summary must fail");
+        .await;
 
-        assert!(matches!(err, AgentError::EmptySummary));
+        assert!(matches!(result, Err(AgentError::EmptySummary)));
+        assert_eq!(gauge.size(), SUMMARISED_PROMPT);
         assert_eq!(history.len(), 1);
-        assert_eq!(history.as_slice()[0].user_text(), Some(KEPT));
+        assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
+        let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
+        let [AgentEvent::TurnComplete(turn)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(turn.context_size, Some(SUMMARISED_PROMPT));
+        assert_eq!(turn.context_window, model.context_window);
     }
 
     #[tokio::test]
@@ -1023,7 +1028,7 @@ mod tests {
         let cancel = CancelToken::none();
         let result = compact(
             provider,
-            &model,
+            &small_context_model(SUMMARY_CONTEXT_WINDOW),
             history,
             &mut ContextGauge::restored(SUMMARISED_PROMPT),
             bare_context(&model),
@@ -1066,9 +1071,10 @@ mod tests {
                 AgentEvent::Done {
                     usage,
                     context_size,
+                    context_window,
                     reason,
                     ..
-                } => Some((*usage, *context_size, *reason)),
+                } => Some((*usage, *context_size, *context_window, *reason)),
                 _ => None,
             })
             .collect();
@@ -1077,6 +1083,7 @@ mod tests {
             [(
                 TokenUsage::default(),
                 SUMMARISED_PROMPT,
+                default_model().context_window,
                 DoneReason::Compact
             )]
         );
@@ -1105,6 +1112,11 @@ mod tests {
 
     #[tokio::test]
     async fn manual_compact_reports_the_summary() {
+        let usage = TokenUsage {
+            input: SUMMARISED_INPUT / 2,
+            output: SUMMARY.len() as u64,
+            ..Default::default()
+        };
         let provider = MockProvider::new(vec![Ok(StreamResponse {
             message: Message {
                 role: Role::Assistant,
@@ -1113,22 +1125,41 @@ mod tests {
                 }],
                 ..Default::default()
             },
+            usage,
             ..text_response(StopReason::EndTurn)
         })]);
         let mut history = History::new(vec![Message::user("work".into())]);
 
         let (result, events) =
             summarize_steered(&provider, &mut history, None, |_, _| Verdict::Unchanged).await;
-        result.unwrap();
+        assert_eq!(result.unwrap(), DoneReason::Compact);
 
-        let summaries: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                AgentEvent::CompactionDone { summary, .. } => Some(summary.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(summaries, [SUMMARY]);
+        let [
+            AgentEvent::TurnComplete(turn),
+            AgentEvent::CompactionDone {
+                context_size_after,
+                context_window,
+                summary,
+                ..
+            },
+            AgentEvent::Done {
+                usage: done_usage,
+                context_size,
+                context_window: done_window,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(summary, SUMMARY);
+        assert_eq!(*done_usage, usage);
+        assert_eq!(context_size, context_size_after);
+        let session_window = default_model().context_window;
+        assert_eq!(
+            [turn.context_window, *context_window, *done_window],
+            [session_window; 3]
+        );
     }
 
     #[test_case(None, None, false, false ; "no_instructions")]
