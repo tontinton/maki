@@ -209,7 +209,7 @@ supports_vision = false
 | `supports_tool_examples` | bool | protocol default | |
 | `supports_thinking` | bool | protocol default | |
 | `requires_thinking` | bool | false | For APIs that reject requests with thinking disabled. Implies `supports_thinking` and raises thinking to minimal effort when off (including compaction). On generic `openai` entries without `thinking_fields` its only wire effect is that the `disabled` block is never sent |
-| `thinking_fields` | table | unset | How this model spells each thinking mode on the wire. The only thinking control on generic `openai` entries, and it implies `supports_thinking` |
+| `thinking_fields` | table | unset | How this model spells each thinking mode on the wire. The only thinking control on generic `openai` entries; on `anthropic` entries a declared mode's fragment replaces the built-in `thinking` block. An undeclared `off` or `adaptive` falls back to that block; an undeclared effort level instead sends the nearest declared level's fragment. Implies `supports_thinking`. A typo'd level key fails the parse (exit 2) |
 | `supports_vision` | bool | protocol default | When false, image input and `view_image` are off |
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
@@ -236,6 +236,33 @@ max = {{ reasoning_effort = "xhigh" }}
 A mode you left out sends nothing. To get Ollama's own effort words (`low`, `medium`, `high`, and `none` when thinking is off) instead of writing every fragment yourself, use the built-in `ollama` slug: set `[ollama].base_url` (or `OLLAMA_HOST`) and give `[[ollama.models]]` the thinking keys. Only `supports_thinking`, `requires_thinking` and `thinking_fields` overlay onto a built-in slug. The rest of the entry stays ignored, and startup names the keys it dropped.
 
 Without `thinking_fields`, maki sends `"thinking": {{"type": "disabled"}}` when thinking is off and nothing when it is on. GLM and Kimi gateways need this block to stop reasoning. Declaring `thinking_fields` replaces it, so add an `off` key if your gateway needs one. Some gateways, such as LiteLLM in front of Azure, reject the block. Maki then retries without it, and if the retry works, leaves the block out for that model until restart.
+
+Custom `anthropic`-protocol models can declare `thinking_fields` too. Each key is a thinking mode, and its JSON fragment replaces the built-in `thinking` block for that mode. A model without `thinking_fields` keeps the built-in block, the same request as before. What a mode the table leaves undeclared sends:
+
+- An effort level sends the fragment of the nearest declared level below it. When it sits below every declared level, it sends the lowest one. With only `low` and `high` declared, `medium` sends the `low` fragment and `max` sends the `high` fragment.
+- `off` sends nothing. Declare an `off` key if the gateway needs an explicit stop, as GLM does.
+- `adaptive` falls back to Anthropic's own adaptive block.
+
+A litellm-served GLM, for example, spells its effort knob like this:
+
+```toml
+[my-gateway]
+protocol = "anthropic"
+
+[[my-gateway.models]]
+id = "glm-5-3"
+
+[my-gateway.models.thinking_fields.low]
+thinking = {{ type = "adaptive" }}
+output_config = {{ effort = "low" }}
+
+[my-gateway.models.thinking_fields.high]
+thinking = {{ type = "adaptive" }}
+output_config = {{ effort = "high" }}
+
+[my-gateway.models.thinking_fields.off]
+thinking = {{ type = "disabled" }}
+```
 
 You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
 
@@ -361,7 +388,7 @@ A row matches every model id that starts with one of its `prefixes`, and the lon
 
 An unset `supports_*` flag uses the codec or base provider's answer, and `false` turns the feature off for that model.
 
-`thinking_fields` works as in [providers.toml](#providers-toml). Keys are `off`, `adaptive` and the effort levels {}, each mapped to a JSON fragment merged into the request body. A mode you leave out sends nothing with a codec, and falls back to the built-in mapping with `base = "llama-cpp"` or `base = "ollama"`.
+`thinking_fields` works as in [providers.toml](#providers-toml), including how an undeclared mode picks what to send. Keys are `off`, `adaptive` and the effort levels {}, each mapped to a JSON fragment merged into the request body. `off` and `adaptive` left undeclared send nothing with the other codecs, and fall back to the built-in mapping with `codec = "anthropic"`, `base = "llama-cpp"` or `base = "ollama"`.
 
 ### Hooks
 
