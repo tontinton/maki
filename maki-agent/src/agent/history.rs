@@ -108,6 +108,7 @@ impl History {
     /// Call before [`Self::with_mirror`], which publishes.
     pub fn with_frame(mut self, frame: Option<Arc<StoredFrame>>) -> Self {
         self.snapshot.frame = frame;
+        self.clamp_frame_start();
         self
     }
 
@@ -157,8 +158,9 @@ impl History {
         self.live = Some(live);
     }
 
-    pub(crate) fn set_frame(&mut self, stored: StoredFrame, live: LiveFrame) {
+    pub(crate) fn set_frame(&mut self, mut stored: StoredFrame, live: LiveFrame) {
         self.live = Some(live);
+        stored.first_message_index = self.len();
         self.snapshot.frame = Some(Arc::new(stored));
         self.unsaved = true;
         self.publish();
@@ -281,8 +283,21 @@ impl History {
     /// one place that has to mark the list unsaved.
     fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
         f(Arc::make_mut(&mut self.snapshot.messages));
+        self.clamp_frame_start();
         self.unsaved = true;
         self.publish();
+    }
+
+    /// A rewind can cut below where the frame started. Left there, the
+    /// messages written into that gap would look older than the frame and
+    /// their warnings would go quiet.
+    fn clamp_frame_start(&mut self) {
+        let len = self.len();
+        if let Some(frame) = &mut self.snapshot.frame
+            && frame.first_message_index > len
+        {
+            Arc::make_mut(frame).first_message_index = len;
+        }
     }
 
     /// Any other change, so a consumer has to start the list over.
