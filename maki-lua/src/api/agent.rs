@@ -1121,6 +1121,7 @@ async fn session(
         ui_id,
         slot: cancel_slot,
         trigger: child_trigger,
+        token: child_cancel.clone(),
         registry: registry.clone(),
         background: owner.is_some(),
         mailbox: SessionMailbox::register(MakiId::generate()),
@@ -1699,6 +1700,7 @@ struct SessionCancellation {
     slot: CancelSlot,
     /// Fires the session's token. `parent_cancels` holds only its handle.
     trigger: CancelTrigger,
+    token: CancelToken,
     registry: BackgroundTasks,
     /// Opened by chat session id, so `registry` holds an entry under `ui_id`.
     background: bool,
@@ -1716,6 +1718,9 @@ impl SessionCancellation {
     fn refusal(&self) -> Option<&'static str> {
         if self.stopped_by_user() {
             return Some(STOPPED_BY_USER_ERR);
+        }
+        if self.token.is_cancelled() {
+            return Some(CANCELLED_MSG);
         }
         // Its chat session or its plugin may have ended while the plugin kept
         // the handle.
@@ -2355,6 +2360,48 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn send_refuses_once_the_opening_call_is_cancelled() {
+        let lua = Lua::new();
+        let (started_tx, started_rx) = flume::unbounded();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.provider = Arc::new(PendingProvider(started_tx));
+        let (call_trigger, call_cancel) = CancelToken::new();
+        ctx.cancel = call_cancel;
+        smol::block_on(futures_lite::future::or(
+            async {
+                let sess = native_session(&lua, &ctx).await;
+                let (result, ()) = futures::future::join(
+                    prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into()),
+                    async {
+                        started_rx.recv_async().await.unwrap();
+                        call_trigger.cancel();
+                        assert!(
+                            sess.borrow::<LuaSession>()
+                                .unwrap()
+                                .inner
+                                .try_lock()
+                                .is_none()
+                        );
+                        let (sent, error) =
+                            send(&lua, &sess.borrow().unwrap(), NUDGE.into()).unwrap();
+                        assert_eq!((sent, error.as_deref()), (None, Some(CANCELLED_MSG)));
+                    },
+                )
+                .await;
+                let (_, error) = result.unwrap();
+                assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
+                let (sent, error) = send(&lua, &sess.borrow().unwrap(), NUDGE.into()).unwrap();
+                assert_eq!((sent, error.as_deref()), (None, Some(CANCELLED_MSG)));
+                close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+            },
+            async {
+                smol::Timer::after(SESSION_TIMEOUT).await;
+                panic!("the cancelled prompt never returned");
+            },
+        ));
+    }
+
     use crate::runtime::SpawnedTasks;
     use maki_agent::tools::ToolRegistry;
 
@@ -2930,12 +2977,13 @@ mod tests {
         let (mut entry, _token) = crate::background::tests::entry(session, None);
         let parent_cancels = Arc::new(CancelMap::new());
         let (slot_trigger, _cancel) = CancelToken::new();
-        let (trigger, _session_cancel) = CancelToken::new();
+        let (trigger, token) = CancelToken::new();
         let cancellation = SessionCancellation {
             slot: parent_cancels.insert(entry.info.id.clone(), slot_trigger),
             parent_cancels,
             ui_id: entry.info.id.clone(),
             trigger,
+            token,
             registry: registry.clone(),
             background: true,
             mailbox: SessionMailbox::register(MakiId::generate()),
