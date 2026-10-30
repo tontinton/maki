@@ -60,6 +60,9 @@ const UPDATE_ON: &str = "1";
 const HOST_HEADER: &str = "host";
 const USER_AGENT_HEADER: &str = "user-agent";
 const VOLATILE_VALUE: &str = "<volatile>";
+const ACCEPT_ENCODING_POINTER: &str = "/headers/accept-encoding";
+const CODING_SEPARATOR: char = ',';
+const CANONICAL_CODING_SEPARATOR: &str = ", ";
 const REQUESTS_KEY: &str = "requests";
 const BODY_KEY: &str = "body";
 const PATH_KEY: &str = "path";
@@ -584,6 +587,13 @@ fn canonical_observation(observed: &Value) -> Value {
         .and_then(Value::as_array_mut)
         .expect(NO_REQUESTS);
     for request in requests {
+        // The codings a client accepts are a set. How the list is ordered and
+        // spaced is up to its HTTP library, not the provider.
+        if let Some(Value::String(codings)) = request.pointer_mut(ACCEPT_ENCODING_POINTER) {
+            let mut sorted: Vec<_> = codings.split(CODING_SEPARATOR).map(str::trim).collect();
+            sorted.sort_unstable();
+            *codings = sorted.join(CANONICAL_CODING_SEPARATOR);
+        }
         let Some(body) = request.get_mut(BODY_KEY) else {
             continue;
         };

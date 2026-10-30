@@ -480,7 +480,7 @@ fn a_side_request_that_cannot_connect_is_a_transport_error() {
 
     let error = smol::block_on(fixture.provider.list_models()).unwrap_err();
 
-    assert!(matches!(error, AgentError::Http(_)), "{error:?}");
+    assert_eq!(error.retry_kind(), Some(RetryKind::Connect), "{error:?}");
 }
 
 /// There is no `has_auth` flag: defining `login` is the whole of what makes a

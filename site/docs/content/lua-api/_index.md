@@ -4569,11 +4569,11 @@ one. This holds only for an origin the user set (`<SLUG>_BASE_URL`,
 `providers.toml`) or a built-in provider's default.
 
 {opts} fields:
-- `method` (`string`) HTTP verb (default `"GET"`).
+- `method` (`string`) HTTP verb, in any case (default `"GET"`).
 - `headers` (`table`) Header name/value pairs.
 - `body` (`string`) Request body.
 - `timeout` (`integer`) Total timeout in seconds, max 120 (default 30,
-  none on a provider's origin).
+  none on a provider's origin). 0 means the default.
 - `max_bytes` (`integer`) Max response size in bytes (default 5 MB).
 - `retry` (`integer`) Retries on 5xx errors (default 3).
 - `line_match` (`string`) Regex. Keep only the response lines it
@@ -4584,8 +4584,9 @@ The response table has `body` (string), `status` (integer),
 `content_type` (string) and `headers` (table). `headers` holds the final
 response's headers under lowercase names, as in
 `res.headers["retry-after"]`. Repeated headers are joined with `, `,
-which breaks `set-cookie`. A failed response can go straight to
-`maki.provider.http_error`.
+which breaks `set-cookie`. A compressed response arrives decoded, without
+its `content-encoding` and `content-length`. A failed response can go
+straight to `maki.provider.http_error`.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 

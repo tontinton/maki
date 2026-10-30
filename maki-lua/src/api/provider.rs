@@ -493,8 +493,9 @@ async fn fetch_json(
     } = net::provider_get(url, headers, egress)
         .await
         .map_err(|error| match error {
-            NetError::Transport(error) => AgentError::Http(error),
-            NetError::Read(error) => AgentError::Io(error),
+            NetError::Transport(error) | NetError::Read(error) => {
+                AgentError::Io(net::provider_io_error(&error))
+            }
             NetError::Refused(message) => AgentError::Config {
                 message: format!("{GET_JSON} {url}: {message}"),
             },
