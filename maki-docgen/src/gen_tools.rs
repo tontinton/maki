@@ -107,6 +107,13 @@ fn extract_params(schema: &Value) -> Vec<Param> {
             description,
         });
     }
+    // Sort by name so the generated table is deterministic regardless of the
+    // schema map's hash-seeded iteration order; required params lead.
+    params.sort_by(|a, b| {
+        b.required
+            .cmp(&a.required)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     params
 }
 
@@ -384,6 +391,22 @@ mod tests {
         let (default, cleaned) = extract_default(input);
         assert_eq!(default, expected_default);
         assert!(cleaned.starts_with(remaining_prefix), "cleaned: {cleaned}");
+    }
+
+    #[test]
+    fn params_sort_required_first_then_name() {
+        let schema = serde_json::json!({
+            "properties": {
+                "zebra": { "type": "string" },
+                "alpha": { "type": "string" },
+                "needed": { "type": "string" }
+            },
+            "required": ["needed"]
+        });
+        let params = extract_params(&schema);
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        // required `needed` leads, then the optionals alphabetically.
+        assert_eq!(names, vec!["needed", "alpha", "zebra"]);
     }
 
     #[test]

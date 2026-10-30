@@ -15,6 +15,10 @@ use crate::tools::PermissionScopes;
 use crate::tools::registry::BoxFuture;
 use crate::{AgentEvent, CancelToken, EventSender};
 
+mod cedar_backend;
+pub use cedar_backend::CedarBackend;
+use maki_cedar::CedarDecision;
+
 pub const DEFAULT_DENY_GUIDANCE: &str =
     "Do not retry. Try a different approach or ask the user for guidance.";
 
@@ -371,6 +375,9 @@ pub struct PermissionManager {
     cwd: PathBuf,
     project_config: ProjectConfig,
     plugin_rules: Arc<PluginRuleStore>,
+    /// Present when `permissions.toml` set `engine = "cedar"`. Consulted in
+    /// `check_inner` as a decision source in place of config rules.
+    cedar: Option<Arc<CedarBackend>>,
 }
 
 impl PermissionManager {
@@ -382,6 +389,7 @@ impl PermissionManager {
     ) -> Self {
         let config_rules = config.rules;
         let builtin_rules = builtin_rules(&cwd);
+        let cedar = CedarBackend::build(&config.cedar).map(Arc::new);
 
         // Warn if wildcard deny is present — it blocks ALL tools including builtins.
         let has_wildcard_deny = config_rules
@@ -418,6 +426,7 @@ impl PermissionManager {
             cwd,
             project_config,
             plugin_rules,
+            cedar,
         }
     }
 
@@ -437,6 +446,7 @@ impl PermissionManager {
             cwd: self.cwd.clone(),
             project_config: self.project_config.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
+            cedar: self.cedar.clone(),
         }
     }
 
@@ -445,6 +455,12 @@ impl PermissionManager {
             warn!("permission mutex was poisoned, recovering");
             e.into_inner()
         })
+    }
+
+    #[cfg(test)]
+    fn with_cedar(mut self, backend: CedarBackend) -> Self {
+        self.cedar = Some(Arc::new(backend));
+        self
     }
 
     /// The order of the checks below is the policy itself, not an accident of
@@ -475,10 +491,31 @@ impl PermissionManager {
 
         for scope in scopes {
             let mut has_allow = false;
+
+            // Cedar, when active, stands in for the config rules: it answers
+            // this scope with the same deny-wins semantics, and a non-answer
+            // (NoDecision) defers to the builtin/session/plugin rules and the
+            // defaults below, exactly as an absent config rule would.
+            if let Some(cedar) = &self.cedar {
+                match cedar.decide(&tool.to_string(), Some(scope)) {
+                    CedarDecision::Deny(reason) => {
+                        info!(tool = %tool, scope = %scope, "permission denied by cedar");
+                        return PermissionCheck::Denied(reason);
+                    }
+                    CedarDecision::Allow => has_allow |= gate.accepts(Approval::Standing),
+                    CedarDecision::NoDecision => {}
+                }
+            }
+
             for (origin, r) in session
                 .iter()
                 .map(|r| (ORIGIN_SESSION, r))
-                .chain(self.config_rules.iter().map(|r| (ORIGIN_CONFIG, r)))
+                .chain(
+                    self.config_rules
+                        .iter()
+                        .filter(|_| self.cedar.is_none())
+                        .map(|r| (ORIGIN_CONFIG, r)),
+                )
                 .chain(self.builtin_rules.iter().map(|r| (ORIGIN_BUILTIN, r)))
                 .chain(plugin.iter().map(|r| (ORIGIN_PLUGIN, r)))
             {
@@ -2576,5 +2613,53 @@ mod tests {
             "{err}"
         );
         assert!(err.contains(expected), "{err}");
+    }
+
+    mod cedar {
+        use std::sync::Arc;
+
+        use maki_cedar::CedarEngine;
+
+        use super::super::{CedarBackend, PermissionCheck, PermissionManager};
+        use super::mgr_with;
+        use maki_config::{PermissionsConfig, ToolKey};
+        use std::path::PathBuf;
+
+        const ALLOW_GIT: &str = r#"permit(principal, action, resource == Tool::"bash") when { context.scope like "git *" };"#;
+        const FORBID_RM: &str = r#"forbid(principal, action, resource == Tool::"bash") when { context.scope like "rm *" };"#;
+
+        fn cedar_mgr(policies: &str) -> PermissionManager {
+            let engine = CedarEngine::from_source(policies, None).expect("policies compile");
+            let backend = CedarBackend::from_engine(Arc::new(engine));
+            mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp")).with_cedar(backend)
+        }
+
+        #[test]
+        fn cedar_permit_allows() {
+            let mgr = cedar_mgr(ALLOW_GIT);
+            assert!(matches!(
+                mgr.check(&ToolKey::native("bash"), "git status", None),
+                PermissionCheck::Allowed
+            ));
+        }
+
+        #[test]
+        fn cedar_forbid_denies() {
+            let mgr = cedar_mgr(FORBID_RM);
+            assert!(matches!(
+                mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
+                PermissionCheck::Denied(_)
+            ));
+        }
+
+        #[test]
+        fn cedar_no_match_falls_through_to_prompt() {
+            // Default effect is Prompt, and Cedar has no say on this scope.
+            let mgr = cedar_mgr(ALLOW_GIT);
+            assert!(matches!(
+                mgr.check(&ToolKey::native("bash"), "npm install", None),
+                PermissionCheck::NeedsPrompt { .. }
+            ));
+        }
     }
 }

@@ -1003,6 +1003,7 @@ impl StorageFileConfig {
 #[derive(Default)]
 struct PermissionsFileConfig {
     default: Option<DefaultEffect>,
+    cedar: Option<CedarSettings>,
     tools: HashMap<String, ToolPermissions>,
     mcp_rules: Vec<PermissionRule>,
     mcp_defaults: HashMap<ToolKey, DefaultEffect>,
@@ -1014,6 +1015,7 @@ impl PermissionsFileConfig {
     /// repository cannot set a fallback effect of its own.
     fn restrict_to_deny_scopes(&mut self) {
         self.default = None;
+        self.cedar = None;
         self.mcp_defaults.clear();
         self.mcp_rules.retain(|rule| rule.effect == Effect::Deny);
         for perms in self.tools.values_mut() {
@@ -1040,8 +1042,10 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
         let mut mcp_rules = Vec::new();
         let mut mcp_defaults = HashMap::new();
 
+        let cedar = table.get("cedar").and_then(parse_cedar_settings);
+
         for (k, v) in table.iter() {
-            if k.is_empty() || k == "allow_all" || k == "default" {
+            if k.is_empty() || k == "allow_all" || k == "default" || k == "cedar" {
                 continue;
             }
             if k == "mcp" {
@@ -1079,11 +1083,42 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
 
         Ok(Self {
             default,
+            cedar,
             tools,
             mcp_rules,
             mcp_defaults,
         })
     }
+}
+
+/// Parse a `[cedar]` table. An unknown `engine` value or a malformed field
+/// leaves the setting off, with a warning, rather than failing the whole file.
+fn parse_cedar_settings(value: &toml::Value) -> Option<CedarSettings> {
+    let t = value.as_table()?;
+    let engine = match t.get("engine").and_then(toml::Value::as_str) {
+        None | Some("builtin") => PolicyEngineKind::Builtin,
+        Some("cedar") => PolicyEngineKind::Cedar,
+        Some(other) => {
+            tracing::warn!(engine = other, "unknown permissions engine, using builtin");
+            PolicyEngineKind::Builtin
+        }
+    };
+    let string = |k: &str| t.get(k).and_then(toml::Value::as_str).map(str::to_string);
+    Some(CedarSettings {
+        engine,
+        policy_file: string("policy_file").map(PathBuf::from),
+        schema_file: string("schema_file").map(PathBuf::from),
+        agent_url: string("agent_url"),
+        agent_per_call: t
+            .get("agent_per_call")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false),
+        sync_interval_secs: t
+            .get("sync_interval_secs")
+            .and_then(toml::Value::as_integer)
+            .filter(|n| *n >= 0)
+            .unwrap_or(0) as u64,
+    })
 }
 
 #[derive(Deserialize)]
@@ -1278,9 +1313,40 @@ pub struct PermissionRule {
     pub effect: Effect,
 }
 
+/// Which engine answers permission checks, and where Cedar policy comes from.
+/// Only a global `permissions.toml` may set this; a project cannot switch the
+/// agent onto Cedar (or off it), the same trust stance that stops a project
+/// widening its own permissions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PolicyEngineKind {
+    #[default]
+    Builtin,
+    Cedar,
+}
+
+/// How the Cedar engine sources its policy set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CedarSettings {
+    pub engine: PolicyEngineKind,
+    /// A local Cedar policy file (`.cedar`); mutually usable with `agent_url`.
+    pub policy_file: Option<PathBuf>,
+    /// A local Cedar schema file (`.cedarschema`).
+    pub schema_file: Option<PathBuf>,
+    /// A remote `cedar-agent` base URL to sync policies from, e.g.
+    /// `http://localhost:8180`.
+    pub agent_url: Option<String>,
+    /// Ask the agent to decide each call (`POST /v1/is_authorized`) instead of
+    /// syncing its policies for local evaluation. Needs `agent_url`.
+    pub agent_per_call: bool,
+    /// How often to re-fetch policies from `agent_url`, in seconds. 0 disables
+    /// periodic refresh (fetch once at startup).
+    pub sync_interval_secs: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PermissionsConfig {
     pub default: DefaultEffect,
+    pub cedar: CedarSettings,
     pub tool_defaults: HashMap<ToolKey, DefaultEffect>,
     pub rules: Vec<PermissionRule>,
     pub yolo: bool,
@@ -2624,6 +2690,9 @@ fn build_permissions(
     }
     PermissionsConfig {
         default,
+        // Cedar is a global-only switch: a project cannot move the agent onto
+        // Cedar or change where policy comes from. Project `[cedar]` is ignored.
+        cedar: global.cedar.unwrap_or_default(),
         tool_defaults,
         rules,
         yolo: false,

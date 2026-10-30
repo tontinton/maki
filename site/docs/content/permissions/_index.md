@@ -145,6 +145,80 @@ That value is ignored so a repository cannot grant itself full access. Project
 | `dir/**` | `dir` itself or anything under it (path-aware on Windows and Unix) |
 | `exact` | Exact match only |
 
+## Cedar Engine
+
+Maki can answer permission checks with [Cedar](https://www.cedarpolicy.com/)
+instead of the builtin rule engine. Cedar is a policy language with an
+explicit `permit` and `forbid` model and tools to validate and audit policy.
+The builtin engine stays the default. Set the engine in a global
+`permissions.toml`:
+
+```toml
+[cedar]
+engine = "cedar"                 # "builtin" (default) or "cedar"
+policy_file = "~/.config/maki/policies.cedar"
+schema_file = "~/.config/maki/maki.cedarschema"
+```
+
+Only a global `permissions.toml` may set `[cedar]`. A project cannot move the
+agent onto Cedar or off it, the same trust stance that stops a project widening
+its own permissions.
+
+A Cedar `forbid` denies the call. A `permit` allows it. When no policy matches,
+Maki applies its own default from the `default` key, which usually means it
+asks you. So Cedar decides allow and deny, and the prompt behaviour you already
+have stays in place. Deny wins over allow, which is Cedar's own rule.
+
+Maki models each check as the agent (`Agent::"maki"`) invoking
+`Action::"invoke"` on a `Tool` resource named by the tool key (`bash`,
+`server.tool`). The requested scope travels in the context as `context.scope`,
+so a scope pattern like `git *` becomes a Cedar `like` match:
+
+```cedar
+permit(principal, action, resource == Tool::"bash")
+  when { context.scope like "git *" };
+
+forbid(principal, action, resource == Tool::"bash")
+  when { context.scope like "sudo *" };
+```
+
+### Remote cedar-agent
+
+Point Maki at a [cedar-agent](https://github.com/permitio/cedar-agent) store to
+manage policy centrally:
+
+```toml
+[cedar]
+engine = "cedar"
+agent_url = "http://localhost:8180"
+sync_interval_secs = 300         # re-fetch policies every 5 minutes (0 = once at startup)
+```
+
+Maki fetches the policy set from the agent and evaluates it in process, so a
+tool call never waits on the network and a brief agent outage does not stall
+Maki. Combine `agent_url` with `policy_file` to merge a local file and the
+remote set.
+
+For deployments that want the agent to decide each call, set
+`agent_per_call = true`. Maki then sends `POST /v1/is_authorized` per check. A
+failed request defers to Maki's own rules rather than denying, so a network
+fault never blocks every tool.
+
+### Migrating from TOML
+
+`maki permissions export-cedar` compiles the merged `permissions.toml` (global
+plus the current project, with the builtin defaults) into Cedar policy and
+schema text:
+
+```sh
+maki permissions export-cedar -o policies.cedar
+# writes policies.cedar and policies.cedarschema
+```
+
+The default effect is not written as a policy. Cedar stays silent when no rule
+matches and Maki applies its default, so a round trip through Cedar keeps the
+same fall-through behaviour.
+
 ## MCP Tool Permissions
 
 MCP tools use natural TOML nesting. Server names are table keys under `[mcp]`, tool names are array values:

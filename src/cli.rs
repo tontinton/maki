@@ -273,6 +273,11 @@ pub enum Command {
         #[command(subcommand)]
         action: MigrateAction,
     },
+    /// Inspect and convert the permission configuration
+    Permissions {
+        #[command(subcommand)]
+        action: PermissionsAction,
+    },
     /// Manage projects that may load automatic shared project configuration
     Trust {
         #[command(subcommand)]
@@ -339,6 +344,17 @@ pub enum MigrateAction {
     Xdg,
     /// Print a prompt that ports your old provider scripts to Lua plugins
     Providers,
+}
+
+#[derive(Subcommand)]
+pub enum PermissionsAction {
+    /// Compile the merged permissions.toml to Cedar policies and schema
+    ExportCedar {
+        /// Write policies here instead of stdout (schema goes alongside as
+        /// <stem>.cedarschema)
+        #[arg(short, long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]

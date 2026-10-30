@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 maki-providers = { workspace = true }
+maki-cedar = { workspace = true }
 maki-config = { workspace = true }
 maki-otel = { workspace = true }
 serde = { workspace = true }
