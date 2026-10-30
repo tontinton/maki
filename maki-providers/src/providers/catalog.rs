@@ -19,7 +19,6 @@ use flume::Sender;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_config::providers::ProvidersConfig;
-use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -35,10 +34,9 @@ use crate::providers::openai_compat::{
 };
 use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, plugin, user_agent};
 use crate::spec::ProviderRegistry;
-use crate::types::rfc3339_millis;
 use crate::{
     AgentError, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
-    StreamResponse, ThinkingConfig, UsageLimit, dialect,
+    StreamResponse, ThinkingConfig, dialect,
 };
 
 const MESSAGES_PATH: &str = "/messages";
@@ -61,7 +59,10 @@ pub(crate) const CATALOG_BACKED_BUILTINS: &[&str] = opencode::SLUGS;
 const CHAT_DIALECT: EffortDialect<'static> = dialect::PREFER_HIGH;
 
 /// Provider modules own their entry here; the catalog only reads it.
-const QUIRKS: &[(&[&str], ProviderQuirks)] = &[(opencode::SLUGS, opencode::QUIRKS)];
+const QUIRKS: &[(&[&str], ProviderQuirks)] = &[
+    (&[opencode::ZEN_SLUG], opencode::ZEN_QUIRKS),
+    (&[opencode::GO_SLUG], opencode::GO_QUIRKS),
+];
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
@@ -83,11 +84,20 @@ pub enum EndpointType {
 }
 
 /// Behaviour a provider needs beyond what models.dev publishes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ProviderQuirks {
     pub free_tier: Option<FreeTier>,
     pub session_header: Option<&'static str>,
+    pub(crate) fetch_usage: Option<UsageFetcher>,
 }
+
+/// A provider's own usage endpoint client, kept in its module so the catalog
+/// needs no knowledge of its wire format.
+pub(crate) type UsageFetcher =
+    for<'a> fn(
+        &'a ResolvedAuth,
+        &'a CatalogTransport,
+    ) -> BoxFuture<'a, Result<Option<ProviderUsage>, AgentError>>;
 
 /// A no-key tier that unlocks only zero-priced models, and only after the
 /// user opts in via `providers.<config_slug>.enable_free_models`.
@@ -915,56 +925,6 @@ impl CatalogAuth {
     }
 }
 
-const USAGE_STATUS_OK: &str = "ok";
-
-#[derive(Deserialize)]
-struct GoUsage {
-    usage: GoUsageWindows,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct GoUsageWindows {
-    rolling: Option<GoUsageWindow>,
-    weekly: Option<GoUsageWindow>,
-    monthly: Option<GoUsageWindow>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct GoUsageWindow {
-    status: Option<String>,
-    percent: f64,
-    #[serde(rename = "resetsAt")]
-    resets_at: Option<String>,
-}
-
-impl From<GoUsage> for ProviderUsage {
-    fn from(usage: GoUsage) -> Self {
-        let windows = [
-            ("5-hour rolling", usage.usage.rolling),
-            ("Weekly", usage.usage.weekly),
-            ("Monthly", usage.usage.monthly),
-        ];
-        Self {
-            plan: None,
-            limits: windows
-                .into_iter()
-                .filter_map(|(label, window)| {
-                    let window = window?;
-                    Some(UsageLimit {
-                        label: label.into(),
-                        percentage: Some(window.percent.clamp(0.0, 100.0).round() as u32),
-                        reset_at: window.resets_at.as_deref().and_then(rfc3339_millis),
-                        detail: window.status.filter(|status| status != USAGE_STATUS_OK),
-                    })
-                })
-                .collect(),
-            by_model_today: Vec::new(),
-        }
-    }
-}
-
 impl CatalogProvider {
     pub fn new(
         data: ProviderData,
@@ -1030,18 +990,13 @@ impl Provider for CatalogProvider {
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async move {
-            if self.data.slug != opencode::GO_SLUG {
-                return Ok(None);
-            }
             let CatalogAuth::Keyed(auth) = &self.auth else {
                 return Ok(None);
             };
-            let body = self
-                .transport
-                .get_text(auth, opencode::GO_USAGE_URL)
-                .await?;
-            let parsed: GoUsage = serde_json::from_str(&body)?;
-            Ok(Some(parsed.into()))
+            match self.data.quirks.fetch_usage {
+                Some(fetch) => fetch(auth, &self.transport).await,
+                None => Ok(None),
+            }
         })
     }
 
@@ -1186,9 +1141,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Authentication, CatalogData, CatalogMeta, EndpointType, GoUsage, ProviderData,
-        ProviderQuirks, SessionRef, StateDir, available_if_warm, determine_catalog_format,
-        parse_model, quirks_for,
+        Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
+        SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
     };
     use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
     use crate::provider::Provider;
@@ -1289,7 +1243,7 @@ mod tests {
 
     fn opencode_go_provider_data(env_key: &str) -> ProviderData {
         ProviderData {
-            quirks: opencode::QUIRKS,
+            quirks: opencode::GO_QUIRKS,
             slug: "opencode-go".into(),
             display_name: "Opencode Go".into(),
             env_keys: vec![env_key.into()],
@@ -1304,29 +1258,10 @@ mod tests {
     }
 
     #[test]
-    fn opencode_go_usage_maps_windows() {
-        let body = r#"{
-            "usage": {
-                "rolling": {"status": "ok", "percent": 4, "resetsAt": "1970-01-01T00:00:01Z"},
-                "weekly": {"status": "rate-limited", "percent": 100, "resetsAt": "1970-01-01T00:00:02Z"}
-            }
-        }"#;
-        let usage: crate::ProviderUsage = serde_json::from_str::<GoUsage>(body).unwrap().into();
-        assert_eq!(usage.limits.len(), 2);
-        assert_eq!(usage.limits[0].label, "5-hour rolling");
-        assert_eq!(usage.limits[0].percentage, Some(4));
-        assert_eq!(usage.limits[0].reset_at, Some(1000));
-        assert_eq!(usage.limits[0].detail, None);
-        assert_eq!(usage.limits[1].label, "Weekly");
-        assert_eq!(usage.limits[1].percentage, Some(100));
-        assert_eq!(usage.limits[1].reset_at, Some(2000));
-        assert_eq!(usage.limits[1].detail.as_deref(), Some("rate-limited"));
-    }
-
-    #[test]
-    fn usage_is_unsupported_for_non_go_catalog_providers() {
+    fn usage_is_unsupported_for_providers_without_a_fetcher() {
         let data = ProviderData {
             slug: "opencode".into(),
+            quirks: quirks_for("opencode"),
             ..opencode_go_provider_data("UNUSED")
         };
         let provider = super::CatalogProvider {
