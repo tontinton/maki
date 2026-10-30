@@ -106,6 +106,12 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 | `Ctrl+P` | Browse sessions |
 | `Ctrl+X` | Open tasks |
 | `Alt+T` | Thinking effort |
+| `Alt+J` | Next message |
+| `Alt+K` | Previous message |
+| `Alt+N` | Next user prompt |
+| `Alt+P` | Previous user prompt |
+
+The `navigation` plugin moves between user and assistant message headers, including streaming assistant text. Each jump briefly highlights its target. At a boundary, it stays in place and highlights the boundary in the error style. Set `plugins.navigation = { wrap = true }` in `maki.setup()` to wrap instead. Wrapping is off by default. Set `plugins.navigation = { enabled = false }` to disable these navigation bindings.
 
 ## Context Inheritance
 

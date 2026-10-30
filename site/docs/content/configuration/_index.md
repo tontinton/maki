@@ -323,6 +323,12 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MB. |
 
+### `plugins.navigation`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `wrap` | boolean | `false` | - | Wrap message navigation at transcript boundaries |
+
 ### `plugins.read`
 
 | Field | Type | Default | Min | Description |

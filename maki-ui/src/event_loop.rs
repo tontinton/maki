@@ -1045,6 +1045,17 @@ impl<'t> EventLoop<'t> {
             UiAction::Plan { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_plan_request(req));
             }
+            UiAction::HighlightTranscript {
+                row,
+                style,
+                duration,
+            } => {
+                self.focused_app()
+                    .highlight_transcript(row, style, duration);
+            }
+            UiAction::TranscriptPositions { reply_tx } => {
+                let _ = reply_tx.send(Ok(self.focused_app().transcript_positions()));
+            }
             UiAction::WinSaveView { reply_tx } => {
                 let _ = reply_tx.send(self.focused_app().win_view());
             }

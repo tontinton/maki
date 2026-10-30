@@ -6890,7 +6890,8 @@ local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 
 Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
 still work. The calls that need a screen behave like this:
 
-- `input`, `input_edit`, `input_decorate`, `input_submit`, and `action`
+- `input`, `input_edit`, `input_decorate`, `input_submit`,
+  `transcript_positions`, `highlight_transcript`, and `action`
   on a built-in name return `nil, "no interactive UI attached"`.
   Plugin actions still run.
 - `open_editor` returns -1.
@@ -7899,6 +7900,67 @@ maki.keymap.set("i", "<CR>", function(ev)
   end
   maki.ui.input_submit({ version = version, session_id = st.session_id })
 end)
+```
+
+---
+
+### `maki.ui.transcript_positions()` {#maki-ui-transcript_positions}
+
+```lua
+maki.ui.transcript_positions()
+```
+
+Read message headers from the last painted transcript without changing render state.
+Each entry has `role` (`"user"` or `"assistant"`) and `line` (the one-based,
+unclamped transcript row). Includes streaming assistant text. New messages
+appear after the next paint.
+
+Read the viewport with `maki.fn.winsaveview()` and scroll with
+`maki.fn.winrestview({ topline = line })`, which clamps to the scrollable range.
+
+**Returns:** (`table[]|nil`, `string|nil`) Message headers in transcript order, or nil and an error if the UI is unavailable.
+
+**Example:**
+
+```lua
+local positions, err = maki.ui.transcript_positions()
+if not positions then
+  maki.notify(err, "error")
+  return
+end
+if positions[1] then
+  maki.fn.winrestview({ topline = positions[1].line })
+end
+```
+
+---
+
+### `maki.ui.highlight_transcript()` {#maki-ui-highlight_transcript}
+
+```lua
+maki.ui.highlight_transcript({line}, {duration_ms}, {style})
+```
+
+Highlight a one-based transcript line for `duration_ms` milliseconds.
+Uses the same named theme styles as UI spans, such as `"item_selected"`
+or `"error"`. Scrolling clears the highlight. A line above the viewport
+highlights the first visible row instead.
+
+**Parameters:**
+
+- `{line}` (`integer`) Positive, one-based transcript line.
+- `{duration_ms}` (`integer`) Highlight duration in milliseconds.
+- `{style}` (`string`) Named theme style, using the same spelling as a span.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` when queued, or nil and an error for a zero line or unavailable UI.
+
+**Example:**
+
+```lua
+local ok, err = maki.ui.highlight_transcript(1, 180, "item_selected")
+if not ok then
+  maki.notify(err, "error")
+end
 ```
 
 
