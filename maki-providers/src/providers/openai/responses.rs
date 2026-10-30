@@ -4,8 +4,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
-use isahc::{HttpClient, Request};
+use futures_lite::io::{AsyncBufRead, AsyncBufReadExt};
+use reqwest::Client;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
@@ -194,7 +194,7 @@ fn strip_summary(body: &mut Value) {
 }
 
 pub(crate) async fn do_stream(
-    client: &HttpClient,
+    client: &Client,
     model: &crate::model::Model,
     body: &Value,
     event_tx: &Sender<ProviderEvent>,
@@ -221,7 +221,7 @@ pub(crate) async fn do_stream(
 
 #[allow(clippy::too_many_arguments)]
 async fn post_responses(
-    client: &HttpClient,
+    client: &Client,
     model: &crate::model::Model,
     body: &Value,
     event_tx: &Sender<ProviderEvent>,
@@ -233,13 +233,13 @@ async fn post_responses(
 
     let request = auth
         .configure_request(
-            Request::builder()
-                .method("POST")
-                .uri(format!("{base}{RESPONSES_PATH}"))
+            client
+                .post(format!("{base}{RESPONSES_PATH}"))
                 .header("content-type", "application/json")
                 .header("user-agent", super::super::user_agent()),
         )
-        .body(json_body)?;
+        .body(json_body)
+        .build()?;
 
     debug!(
         model = %model.id,
@@ -247,19 +247,19 @@ async fn post_responses(
         "sending Responses API request"
     );
 
-    let response = client.send_async(request).await?;
-    let status = response.status().as_u16();
-
-    if status == 200 {
-        parse_sse(
-            BufReader::new(response.into_body()),
-            event_tx,
-            stream_timeout,
-        )
-        .await
-    } else {
-        Err(AgentError::from_response(response).await)
-    }
+    super::super::send_request(client, request, |response| async move {
+        if response.status().as_u16() == 200 {
+            parse_sse(
+                super::super::body_reader(response),
+                event_tx,
+                stream_timeout,
+            )
+            .await
+        } else {
+            Err(AgentError::from_response(response).await)
+        }
+    })
+    .await
 }
 
 struct ToolAccumulator {

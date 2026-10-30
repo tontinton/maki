@@ -146,7 +146,6 @@ bitflags = "2"
 event-listener = "5"
 futures-lite = "2"
 futures = "0.3"
-isahc = { version = "2.0", default-features = false, features = ["text-decoding", "static-curl", "rustls-tls", "http2"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 async-compat = "0.2"
 rmcp = { version = "3", default-features = false, features = ["client", "auth", "reqwest", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
@@ -229,7 +228,7 @@ debug = true
 debug = false
 
 # `cc` reads DEBUG from here and passes -g when it is on, which covers the C
-# and C++ we build from source: aws-lc, curl, Luau and 30 tree-sitter
+# and C++ we build from source: aws-lc, Luau and 30 tree-sitter
 # grammars. Those static archives held the bulk of the bytes.
 [profile.dev.build-override]
 debug = false

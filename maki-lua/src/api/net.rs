@@ -13,16 +13,15 @@ use futures_lite::FutureExt;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use maki_config::split_host_port;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
-use maki_providers::Timeouts;
 use maki_providers::http::{
-    DNS_ATTEMPTS, HTTP_SCHEME, HTTPS_SCHEME, Lookup, ProxyEnv, error_chain, extract_host_port,
-    is_connect_failure, proxy_env, resolve,
+    DNS_ATTEMPTS, HTTP_SCHEME, HTTPS_SCHEME, ProxyEnv, error_chain, extract_host_port, proxy_env,
+    resolve,
 };
+use maki_providers::{Timeouts, client_builder};
 use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef};
 use regex::bytes::Regex;
 use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
-use reqwest::redirect::Policy;
-use reqwest::{Client, Error as ReqwestError, Method, Proxy, Request, Response};
+use reqwest::{Client, Error as ReqwestError, Method, Request, Response};
 use smol::lock::Mutex as AsyncMutex;
 use smol::{Async, Timer};
 use thiserror::Error;
@@ -304,19 +303,6 @@ impl From<String> for NetError {
     fn from(message: String) -> Self {
         Self::Refused(message)
     }
-}
-
-/// The provider error a codec request failing the same way would give. Those
-/// still go through isahc, whose error type this cannot fill, so it becomes
-/// an I/O error of the kind the provider's retries tell apart: nothing
-/// answering draws on the connect budget, anything else retries as transient.
-pub(crate) fn provider_io_error(error: &ReqwestError) -> io::Error {
-    let kind = if is_connect_failure(error) {
-        io::ErrorKind::ConnectionRefused
-    } else {
-        io::ErrorKind::Other
-    };
-    io::Error::new(kind, error_chain(error))
 }
 
 impl ResponseData {
@@ -902,33 +888,20 @@ fn redirect_location(response: &Response) -> Option<String> {
 /// cannot be attached to a single request. The pin changes with every
 /// redirect, so the client has to as well.
 fn build_client(key: &ClientKey) -> Result<Client, String> {
-    let mut builder = Client::builder()
-        // Redirects are followed by hand, so every hop goes through the SSRF
-        // check. Left to reqwest, a URL that passed the check could still
-        // bounce us into 169.254.169.254.
-        .redirect(Policy::none())
-        // This client fetches arbitrary user URLs, so it stays on HTTP/1.1
-        // even if something turns on reqwest's http2 feature, rather than
-        // change how every one of them is negotiated.
-        .http1_only()
-        // `User-Agent`, not `user-agent`, the way curl and browsers send it. A
-        // few servers still match header names case-sensitively.
-        .http1_title_case_headers()
-        .proxy(Proxy::custom(|url| proxy_env().proxy_for(url.as_str())))
-        .dns_resolver(Arc::new(Lookup));
+    // The providers' base, so a plugin's side requests trust the same CA
+    // bundle and go through the same proxy and DNS rules as its chat requests.
+    // Redirects stay off there too, which here means every hop goes through
+    // the SSRF check instead of bouncing into 169.254.169.254.
+    //
+    // `User-Agent`, not `user-agent`, the way curl and browsers send it. A
+    // few servers still match header names case-sensitively.
+    let mut builder = client_builder().http1_title_case_headers();
 
     if let Some(timeout) = key.timeout {
         builder = builder.timeout(timeout);
     }
     match &key.route {
-        // reqwest has no low-speed limit, so one read waiting out the stall
-        // bound stands in for it.
-        Route::Provider => {
-            let timeouts = Timeouts::default();
-            builder = builder
-                .connect_timeout(timeouts.connect)
-                .read_timeout(timeouts.low_speed);
-        }
+        Route::Provider => builder = Timeouts::default().bound(builder),
         // Connect to the address the guard vetted instead of asking DNS again
         // and trusting whatever the second answer says.
         Route::Guarded(Some(pin)) => {

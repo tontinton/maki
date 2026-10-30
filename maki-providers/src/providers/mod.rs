@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
+use std::io;
+use std::iter;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use async_compat::Compat;
+use futures::TryStreamExt;
 use futures_lite::StreamExt;
 use futures_lite::io::AsyncBufRead;
-use isahc::config::{Configurable, VersionNegotiation};
-use isahc::http::request::Builder;
+use reqwest::redirect::Policy;
+use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -15,6 +19,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, lock_tokens, save_tokens};
 
 use crate::AgentError;
+use crate::http::{Lookup, error_chain, proxy_env};
 use crate::retry::RetryPolicy;
 
 pub(crate) mod anthropic;
@@ -35,7 +40,6 @@ pub mod plugin;
 pub(crate) mod xai;
 pub(crate) mod zai;
 
-const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
 const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no detail";
 pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
@@ -253,8 +257,8 @@ impl ResolvedAuth {
     }
 
     /// Replace a same-name header (case-insensitive) instead of appending a
-    /// second one: `Builder::header` appends, so a configured `Authorization`
-    /// next to the built-in bearer would send two credentials.
+    /// second one: `RequestBuilder::header` appends, so a configured
+    /// `Authorization` next to the built-in bearer would send two credentials.
     pub(crate) fn set_header(&mut self, name: &str, value: String) {
         match self
             .headers
@@ -266,8 +270,8 @@ impl ResolvedAuth {
         }
     }
 
-    /// Apply all auth headers to an HTTP request builder.
-    pub fn configure_request(&self, builder: Builder) -> Builder {
+    /// Apply all auth headers to a request builder.
+    pub fn configure_request(&self, builder: RequestBuilder) -> RequestBuilder {
         self.headers.iter().fold(builder, |b, (key, value)| {
             b.header(key.as_str(), value.as_str())
         })
@@ -413,23 +417,111 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
 
 impl Timeouts {
     /// The connect and stall bounds every request to a provider runs under.
-    /// No total cap: a slow but moving download is not a dead one.
-    pub fn bound<C: Configurable>(&self, client: C) -> C {
-        client
+    /// No total cap: a slow but moving download is not a dead one. The read
+    /// timeout is one window from the send to the response head, so sending
+    /// the request body counts against it where curl counted those bytes as
+    /// progress, and is then re-armed by every frame of the body, which
+    /// stands in for curl's window of under a byte per second.
+    pub fn bound(&self, builder: ClientBuilder) -> ClientBuilder {
+        builder
             .connect_timeout(self.connect)
-            .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, self.low_speed)
+            .read_timeout(self.low_speed)
     }
 }
 
-pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
+/// Where every client in the crate starts, so a side request (OAuth, the
+/// catalogs, container credentials) shares the providers' redirect, proxy,
+/// DNS and trust rules. Redirects stay off: a 3xx reaches
+/// [`AgentError::from_response`] and a key header is never replayed
+/// cross-origin. HTTP/1.1 stays pinned in case a dependency turns on reqwest's
+/// http2 feature.
+pub fn client_builder() -> ClientBuilder {
+    Client::builder()
+        .redirect(Policy::none())
+        .http1_only()
+        .user_agent(user_agent())
+        .proxy(Proxy::custom(|url| proxy_env().proxy_for(url.as_str())))
+        .dns_resolver(Arc::new(Lookup))
+}
+
+/// Trust comes from the platform verifier, which on Linux reads
+/// `SSL_CERT_FILE` the way curl did. A store it cannot load (a stale
+/// `SSL_CERT_FILE`, a container without CA roots) must not take maki down at
+/// startup, so the client is built without roots instead and every TLS connect
+/// fails with the reason, as under curl.
+pub(crate) fn http_client(timeouts: Timeouts) -> Client {
     timeouts
-        .bound(isahc::HttpClient::builder())
-        // The workspace enables curl's http2 feature for OTLP over gRPC, which
-        // would otherwise flip provider streaming to h2 over TLS. Streaming is
-        // tuned for HTTP/1.1, so pin it.
-        .version_negotiation(VersionNegotiation::http11())
+        .bound(client_builder())
         .build()
-        .expect("failed to build HTTP client")
+        .unwrap_or_else(|error| {
+            warn!(%error, "no trust roots could be loaded, TLS connections will fail");
+            timeouts
+                .bound(client_builder())
+                .tls_certs_only(iter::empty())
+                .build()
+                .expect("an HTTP client without trust roots always builds")
+        })
+}
+
+/// reqwest runs on tokio: `Client::execute` arms the timeouts as it is called,
+/// the body is polled on the same runtime, and a cancelled stream has to drop
+/// there too. So everything from the send to the last byte runs inside one
+/// [`Compat`], and this is the only place `execute` appears (bedrock excepted,
+/// where the whole stream block is the `Compat` future).
+pub(crate) async fn send_request<T, F, Fut>(
+    client: &Client,
+    request: Request,
+    read: F,
+) -> Result<T, AgentError>
+where
+    F: FnOnce(Response) -> Fut,
+    Fut: Future<Output = Result<T, AgentError>>,
+{
+    Compat::new(async move {
+        let response = client.execute(request).await?;
+        read(response).await
+    })
+    .await
+}
+
+/// For the flows that decide per status themselves.
+pub(crate) async fn status_and_text(
+    client: &Client,
+    request: Request,
+) -> Result<(u16, String), AgentError> {
+    send_request(client, request, |response| async move {
+        let status = response.status().as_u16();
+        Ok((status, response.text().await?))
+    })
+    .await
+}
+
+/// The body of a 200, or the response read as an API error.
+pub(crate) async fn ok_text(client: &Client, request: Request) -> Result<String, AgentError> {
+    send_request(client, request, |response| async move {
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+        Ok(response.text().await?)
+    })
+    .await
+}
+
+/// The body as the line reader the SSE parsers take. A stall is an io timeout,
+/// so it retries as transient and never as the stream deadline, and the URL is
+/// left out before the error is worded.
+pub(crate) fn body_reader(response: Response) -> impl AsyncBufRead + Unpin {
+    response
+        .bytes_stream()
+        .map_err(|e| {
+            let kind = if e.is_timeout() {
+                io::ErrorKind::TimedOut
+            } else {
+                io::ErrorKind::Other
+            };
+            io::Error::new(kind, error_chain(&e.without_url()))
+        })
+        .into_async_read()
 }
 
 #[derive(Clone, Debug)]
@@ -586,12 +678,20 @@ impl<'a> KeyRotation<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
     use maki_storage::auth::save_tokens;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::retry::RetryKind;
     use futures_lite::io::AsyncBufReadExt;
     use test_case::test_case;
+
+    use crate::test_support::{Canned, serve, transport::LOOPBACK_HOST};
 
     const ERROR_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const PARSE_FAILED: &str = "SSE error payload should deserialize";
@@ -606,6 +706,20 @@ mod tests {
     const EXPIRED: u64 = 0;
     const SOONER: u64 = u64::MAX - 1;
     const LATER: u64 = u64::MAX;
+    const SSE_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+    const CHUNKED_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
+    /// Wide enough for a loaded machine to answer the response head within
+    /// it, since the read timeout covers the head as well as the body.
+    const SHORT: Duration = Duration::from_millis(500);
+    const LONG: Duration = Duration::from_secs(10);
+    const REDIRECT_STATUS: u16 = 302;
+    const REDIRECT_TARGET: &str = "http://127.0.0.1:9/";
+    const REDIRECT_SCRIPT: &[Canned] = &[Canned {
+        status: REDIRECT_STATUS,
+        headers: &[("location", REDIRECT_TARGET)],
+        body: "",
+        path: None,
+    }];
 
     fn state_with_tokens(access: &str) -> TempDir {
         let dir = TempDir::new().expect("temp dir");
@@ -781,6 +895,111 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, AgentError::Timeout { .. }));
         })
+    }
+
+    /// Reads the request head, answers `head` and then sends nothing until
+    /// the returned sender is dropped. hyper drops a response that arrives
+    /// before the request went out, so the server must not answer on accept.
+    fn stalled_sse_server(head: &'static [u8]) -> (String, mpsc::Sender<()>) {
+        let listener = TcpListener::bind((LOOPBACK_HOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (hold, held) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let request_head = BufReader::new(&conn)
+                .lines()
+                .map_while(Result::ok)
+                .take_while(|line| !line.is_empty());
+            request_head.for_each(drop);
+            conn.write_all(head).unwrap();
+            let _ = held.recv();
+        });
+        (format!("http://{LOOPBACK_HOST}:{port}/"), hold)
+    }
+
+    /// The provider client without the shell's proxy, so a request goes where
+    /// the test points it.
+    fn direct_client(timeouts: Timeouts) -> Client {
+        let builder = client_builder().no_proxy();
+        timeouts.bound(builder).build().unwrap()
+    }
+
+    fn first_sse_line(
+        client: &Client,
+        url: &str,
+        stream: Duration,
+    ) -> Result<Option<String>, AgentError> {
+        smol::block_on(async {
+            let request = client.get(url).build()?;
+            send_request(client, request, |response| async move {
+                let mut lines = body_reader(response).lines();
+                let mut deadline = Instant::now() + stream;
+                next_sse_line(&mut lines, &mut deadline, stream).await
+            })
+            .await
+        })
+    }
+
+    fn is_io_timeout(error: &AgentError) -> bool {
+        matches!(error, AgentError::Io(e) if e.kind() == io::ErrorKind::TimedOut)
+    }
+
+    fn is_stream_timeout(error: &AgentError) -> bool {
+        matches!(error, AgentError::Timeout { .. })
+    }
+
+    #[test_case(SHORT, LONG, is_io_timeout, RetryKind::Transient  ; "a_stalled_body_is_an_io_timeout")]
+    #[test_case(LONG, SHORT, is_stream_timeout, RetryKind::Timeout ; "the_stream_deadline_is_its_own_kind")]
+    fn the_shorter_bound_fires_first(
+        low_speed: Duration,
+        stream: Duration,
+        expected: fn(&AgentError) -> bool,
+        kind: RetryKind,
+    ) {
+        let (url, _hold) = stalled_sse_server(SSE_HEAD);
+        let client = direct_client(Timeouts {
+            low_speed,
+            stream,
+            ..Timeouts::default()
+        });
+        let error = first_sse_line(&client, &url, stream).unwrap_err();
+        assert!(expected(&error), "{error}");
+        assert_eq!(error.retry_kind(), Some(kind));
+    }
+
+    #[test]
+    fn a_body_cut_mid_stream_retries_as_transient() {
+        let (url, hold) = stalled_sse_server(CHUNKED_HEAD);
+        drop(hold);
+        let client = direct_client(Timeouts::default());
+        let error = first_sse_line(&client, &url, LONG).unwrap_err();
+        assert!(
+            matches!(&error, AgentError::Io(e) if e.kind() == io::ErrorKind::Other),
+            "{error}"
+        );
+        assert_eq!(error.retry_kind(), Some(RetryKind::Transient));
+    }
+
+    #[test]
+    fn a_redirect_is_read_as_the_api_error_it_is() {
+        let (base_url, requests) = serve(REDIRECT_SCRIPT);
+        let client = direct_client(Timeouts::default());
+        let error = smol::block_on(async {
+            let request = client.get(base_url.as_str()).build()?;
+            ok_text(&client, request).await
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AgentError::Api {
+                    status: REDIRECT_STATUS,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[test]

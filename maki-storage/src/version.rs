@@ -34,7 +34,7 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     matches!((parse(latest), parse(current)), (Some(l), Some(c)) if l > c)
 }
 
-/// Redirects stay off, as with isahc. reqwest runs on tokio, so a request
+/// Redirects stay off. reqwest runs on tokio, so a request
 /// built from this has to be awaited through [`Compat`].
 pub fn client() -> ClientBuilder {
     Client::builder()

@@ -16,9 +16,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use flume::Sender;
-use isahc::config::{Configurable, VersionNegotiation};
-use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_config::providers::ProvidersConfig;
+use reqwest::Client;
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -32,7 +31,10 @@ use crate::providers::anthropic::shared;
 use crate::providers::openai_compat::{
     DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
 };
-use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, plugin, user_agent};
+use crate::providers::{
+    ResolvedAuth, Timeouts, body_reader, http_client, opencode, plugin, send_request,
+    status_and_text, user_agent,
+};
 use crate::spec::ProviderRegistry;
 use crate::{
     AgentError, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
@@ -628,33 +630,23 @@ async fn save_cached_catalog_async(index: &schema::CatalogIndex) {
     .await;
 }
 
-async fn fetch_remote_catalog_async(
-    client: &HttpClient,
-) -> Result<schema::CatalogIndex, AgentError> {
-    let request = Request::builder()
-        .uri(CATALOG_URL)
+async fn fetch_remote_catalog_async(client: &Client) -> Result<schema::CatalogIndex, AgentError> {
+    let request = client
+        .get(CATALOG_URL)
         .header("user-agent", user_agent())
-        .body(())?;
+        .build()?;
 
-    let mut resp = client.send_async(request).await.map_err(|e| {
+    let (status, text) = status_and_text(client, request).await.map_err(|e| {
         warn!(error = %e, CATALOG_URL, "failed to fetch catalog");
         config_error(format!("failed to fetch catalog from {CATALOG_URL}: {e}"))
     })?;
 
-    let status = resp.status().as_u16();
     if status != 200 {
-        // Drain the body so isahc can reuse the connection
-        let _ = resp.text().await;
         return Err(AgentError::api(
             status,
             format!("catalog fetch returned HTTP {status}"),
         ));
     }
-
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| config_error(format!("failed to read catalog response body: {e}")))?;
 
     serde_json::from_str(&text)
         .map_err(|e| config_error(format!("failed to parse catalog JSON: {e}")))
@@ -734,18 +726,10 @@ fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
     }
 }
 
-fn catalog_client() -> HttpClient {
-    isahc::HttpClient::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .low_speed_timeout(1, Duration::from_secs(30))
-        // curl carries http2 for OTLP.
-        .version_negotiation(VersionNegotiation::http11())
-        .build()
-        .expect("failed to build catalog HTTP client")
-}
-
 fn fetch_catalog_blocking(state_dir: &StateDir) -> Result<CatalogData, AgentError> {
-    let index = smol::block_on(fetch_remote_catalog_async(&catalog_client()))?;
+    let index = smol::block_on(fetch_remote_catalog_async(
+        &http_client(Timeouts::default()),
+    ))?;
     smol::block_on(save_cached_catalog_async(&index));
     Ok(CatalogData::from_index(index, state_dir))
 }
@@ -777,7 +761,7 @@ fn init_catalog_blocking() -> CatalogData {
 /// lands once.
 pub(crate) struct CatalogTransport {
     chat_compat: OpenAiCompatProvider,
-    client: HttpClient,
+    client: Client,
     stream_timeout: Duration,
 }
 
@@ -836,9 +820,8 @@ impl CatalogTransport {
                 body["stream"] = serde_json::json!(true);
                 let request = auth
                     .configure_request(
-                        Request::builder()
-                            .method("POST")
-                            .uri(format!(
+                        self.client
+                            .post(format!(
                                 "{}{}",
                                 auth.base_url.as_deref().unwrap_or(""),
                                 MESSAGES_PATH
@@ -847,15 +830,22 @@ impl CatalogTransport {
                             .header("content-type", "application/json")
                             .header("anthropic-version", ANTHROPIC_VERSION),
                     )
-                    .body(serde_json::to_vec(&body)?)?;
+                    .body(serde_json::to_vec(&body)?)
+                    .build()?;
                 debug!(model = %model.id, "sending Anthropic-format request via catalog");
-                let response = self.client.send_async(request).await?;
-                if response.status().as_u16() == 200 {
-                    crate::providers::anthropic::parse_sse(response, event_tx, self.stream_timeout)
+                send_request(&self.client, request, |response| async move {
+                    if response.status().as_u16() == 200 {
+                        crate::providers::anthropic::parse_sse(
+                            body_reader(response),
+                            event_tx,
+                            self.stream_timeout,
+                        )
                         .await
-                } else {
-                    Err(AgentError::from_response(response).await)
-                }
+                    } else {
+                        Err(AgentError::from_response(response).await)
+                    }
+                })
+                .await
             }
         }
     }

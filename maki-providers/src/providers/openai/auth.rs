@@ -3,16 +3,15 @@ use std::{env, thread};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use isahc::ReadResponseExt;
-use isahc::config::{Configurable, VersionNegotiation};
 use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
+use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
 use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
-use crate::providers::{ResolvedAuth, urlenc};
+use crate::providers::{ResolvedAuth, client_builder, status_and_text, urlenc};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const PROVIDER: &str = super::SLUG;
@@ -55,12 +54,10 @@ struct TokenResponse {
     expires_in: Option<u64>,
 }
 
-fn http_client(timeout: Duration) -> Result<isahc::HttpClient, AgentError> {
-    isahc::HttpClient::builder()
+fn http_client(timeout: Duration) -> Result<Client, AgentError> {
+    client_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(timeout)
-        // curl carries http2 for OTLP.
-        .version_negotiation(VersionNegotiation::http11())
         .build()
         .map_err(|e| AgentError::Config {
             message: format!("http client: {e}"),
@@ -108,24 +105,23 @@ fn request_device_code() -> Result<DeviceCodeResponse, AgentError> {
     let body = serde_json::json!({"client_id": CLIENT_ID});
     let json_body = serde_json::to_vec(&body)?;
 
-    let request = isahc::Request::builder()
-        .method("POST")
-        .uri(DEVICE_CODE_URL)
+    let request = client
+        .post(DEVICE_CODE_URL)
         .header("content-type", "application/json")
-        .body(json_body)?;
+        .body(json_body)
+        .build()?;
 
-    let mut resp = client.send(request).map_err(|e| AgentError::Config {
-        message: format!("device code request: {e}"),
-    })?;
+    let (status, body_text) =
+        smol::block_on(status_and_text(&client, request)).map_err(|e| AgentError::Config {
+            message: format!("device code request: {e}"),
+        })?;
 
-    if resp.status().as_u16() != 200 {
-        let body_text = resp.text().unwrap_or_else(|_| "unknown error".into());
+    if status != 200 {
         return Err(AgentError::Config {
             message: format!("device code request failed: {body_text}"),
         });
     }
 
-    let body_text = resp.text()?;
     serde_json::from_str(&body_text).map_err(Into::into)
 }
 
@@ -150,24 +146,22 @@ fn poll_device_token(device: &DeviceCodeResponse) -> Result<DeviceTokenResponse,
 
         thread::sleep(poll_interval);
 
-        let request = isahc::Request::builder()
-            .method("POST")
-            .uri(DEVICE_TOKEN_URL)
+        let request = client
+            .post(DEVICE_TOKEN_URL)
             .header("content-type", "application/json")
-            .body(json_body.clone())?;
+            .body(json_body.clone())
+            .build()?;
 
-        let mut resp = client.send(request).map_err(|e| AgentError::Config {
-            message: format!("device token poll: {e}"),
-        })?;
+        let (status, body_text) =
+            smol::block_on(status_and_text(&client, request)).map_err(|e| AgentError::Config {
+                message: format!("device token poll: {e}"),
+            })?;
 
-        if resp.status().as_u16() == 200 {
-            let body_text = resp.text()?;
+        if status == 200 {
             return serde_json::from_str(&body_text).map_err(Into::into);
         }
 
-        let status = resp.status().as_u16();
         if status != 403 && status != 404 {
-            let body_text = resp.text().unwrap_or_else(|_| "unknown error".into());
             return Err(AgentError::Config {
                 message: format!("device token poll failed ({status}): {body_text}"),
             });
@@ -194,24 +188,23 @@ fn exchange_authorization_code(
         urlenc(verifier),
     );
 
-    let request = isahc::Request::builder()
-        .method("POST")
-        .uri(OAUTH_TOKEN_URL)
+    let request = client
+        .post(OAUTH_TOKEN_URL)
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(form_body.into_bytes())?;
+        .body(form_body)
+        .build()?;
 
-    let mut resp = client.send(request).map_err(|e| AgentError::Config {
-        message: format!("token exchange: {e}"),
-    })?;
+    let (status, body_text) =
+        smol::block_on(status_and_text(&client, request)).map_err(|e| AgentError::Config {
+            message: format!("token exchange: {e}"),
+        })?;
 
-    if resp.status().as_u16() != 200 {
-        let body_text = resp.text().unwrap_or_else(|_| "unknown error".into());
+    if status != 200 {
         return Err(AgentError::Config {
             message: format!("token exchange failed: {body_text}"),
         });
     }
 
-    let body_text = resp.text()?;
     serde_json::from_str(&body_text).map_err(Into::into)
 }
 
@@ -252,25 +245,22 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
         urlenc(CLIENT_ID),
     );
 
-    let request = isahc::Request::builder()
-        .method("POST")
-        .uri(OAUTH_TOKEN_URL)
+    let request = client
+        .post(OAUTH_TOKEN_URL)
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(form_body.into_bytes())?;
+        .body(form_body)
+        .build()?;
 
     // A transport error, not `Config`: only the token endpoint's answer may clear the tokens.
-    let mut resp = client.send(request)?;
+    let (status, body_text) = smol::block_on(status_and_text(&client, request))?;
 
-    let status = resp.status().as_u16();
     if status != 200 {
-        let body_text = resp.text().unwrap_or_else(|_| "unknown error".into());
         return Err(AgentError::api(
             status,
             format!("OpenAI token refresh failed: {body_text}"),
         ));
     }
 
-    let body_text = resp.text()?;
     let token_resp: TokenResponse = serde_json::from_str(&body_text)?;
     Ok(into_oauth_tokens(token_resp))
 }

@@ -2,14 +2,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use isahc::ReadResponseExt;
-use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use maki_storage::auth::now_millis;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::AgentError;
 use crate::model::{ModelInfo, ModelPricing};
+use crate::providers::{status_and_text, user_agent};
 
 use super::auth;
 
@@ -20,7 +19,6 @@ const CACHE_SCHEMA: u32 = 1;
 const FRESH_TTL_MS: u64 = 15 * 60 * 1000;
 const MAX_STALE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ENTRIES: usize = 256;
 const MAX_MODEL_ID_LEN: usize = 128;
 const MAX_CONTEXT_WINDOW: u32 = 10_000_000;
@@ -195,44 +193,33 @@ fn curated_fallback() -> Vec<CachedModel> {
 }
 
 fn fetch_catalog(access: &str) -> FetchOutcome {
-    let client = match isahc::HttpClient::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(FETCH_TIMEOUT)
-        .redirect_policy(RedirectPolicy::None)
-        // curl carries http2 for OTLP.
-        .version_negotiation(VersionNegotiation::http11())
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return FetchOutcome::Transient,
+    let Ok(client) = auth::http_client(FETCH_TIMEOUT) else {
+        return FetchOutcome::Transient;
     };
 
-    let request = match isahc::Request::builder()
-        .method("GET")
-        .uri(CLI_MODELS_URL)
+    let Ok(request) = client
+        .get(CLI_MODELS_URL)
         .header("accept", "application/json")
         .header("authorization", format!("Bearer {access}"))
-        .header("user-agent", crate::providers::user_agent())
+        .header("user-agent", user_agent())
         .header("x-xai-token-auth", auth::TOKEN_AUTH)
         .header("x-authenticateresponse", auth::AUTHENTICATE_RESPONSE)
         .header("x-grok-client-identifier", auth::CLIENT_IDENTIFIER)
         .header("x-grok-client-version", auth::GROK_CLI_VERSION)
         .header("x-grok-client-mode", "headless")
-        .body(())
-    {
-        Ok(request) => request,
-        Err(_) => return FetchOutcome::Transient,
+        .build()
+    else {
+        return FetchOutcome::Transient;
     };
 
-    let mut resp = match client.send(request) {
-        Ok(resp) => resp,
+    let (status, body) = match smol::block_on(status_and_text(&client, request)) {
+        Ok(result) => result,
         Err(e) => {
             debug!(error = %e, "xAI catalog request failed");
             return FetchOutcome::Transient;
         }
     };
 
-    let status = resp.status().as_u16();
     if status == 401 || status == 403 {
         return FetchOutcome::Auth;
     }
@@ -243,10 +230,6 @@ fn fetch_catalog(access: &str) -> FetchOutcome {
         return FetchOutcome::Permanent;
     }
 
-    let body = match resp.text() {
-        Ok(body) => body,
-        Err(_) => return FetchOutcome::Invalid,
-    };
     match normalize_catalog_payload(&body) {
         Ok(models) => FetchOutcome::Success(models),
         Err(_) => FetchOutcome::Invalid,

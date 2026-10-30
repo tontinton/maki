@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufReadExt, BufReader};
-use isahc::{AsyncReadResponseExt, HttpClient, Request};
+use futures_lite::io::{AsyncBufRead, AsyncBufReadExt};
 use maki_storage::id::SessionRef;
+use reqwest::{Client, Method, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::debug;
@@ -355,7 +355,7 @@ fn resolve_auth_from_key(
 }
 
 pub struct Anthropic {
-    client: HttpClient,
+    client: Client,
     auth: Arc<Mutex<super::ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
@@ -422,13 +422,12 @@ impl Anthropic {
             .unwrap_or(API_ORIGIN)
     }
 
-    fn build_request(&self, method: &str, path: &str) -> isahc::http::request::Builder {
+    fn build_request(&self, method: Method, path: &str) -> RequestBuilder {
         let auth = self.auth.lock().unwrap();
         let url = format!("{}{path}", origin(self.base_url(&auth)));
         auth.configure_request(
-            Request::builder()
-                .method(method)
-                .uri(url)
+            self.client
+                .request(method, url)
                 .header("anthropic-version", API_VERSION)
                 .header("user-agent", super::user_agent()),
         )
@@ -442,20 +441,20 @@ impl Anthropic {
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut builder = self
-            .build_request("POST", MESSAGES_PATH)
+            .build_request(Method::POST, MESSAGES_PATH)
             .header("content-type", "application/json");
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
-        let request = builder.body(json_body)?;
-        let response = self.client.send_async(request).await?;
-        let status = response.status().as_u16();
-
-        if status == 200 {
-            parse_sse(response, event_tx, self.stream_timeout).await
-        } else {
-            Err(AgentError::from_response(response).await)
-        }
+        let request = builder.body(json_body).build()?;
+        super::send_request(&self.client, request, |response| async move {
+            if response.status().as_u16() == 200 {
+                parse_sse(super::body_reader(response), event_tx, self.stream_timeout).await
+            } else {
+                Err(AgentError::from_response(response).await)
+            }
+        })
+        .await
     }
 
     async fn do_list_models(&self) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
@@ -468,13 +467,8 @@ impl Anthropic {
                 path.push_str(&format!("&after_id={cursor}"));
             }
 
-            let request = self.build_request("GET", &path).body(())?;
-            let mut response = self.client.send_async(request).await?;
-            if response.status().as_u16() != 200 {
-                return Err(AgentError::from_response(response).await);
-            }
-
-            let body_text = response.text().await?;
+            let request = self.build_request(Method::GET, &path).build()?;
+            let body_text = super::ok_text(&self.client, request).await?;
             let page: ModelsPage = serde_json::from_str(&body_text)?;
             for m in page.data {
                 models.extend(discovered_model_infos(m));
@@ -597,14 +591,11 @@ impl Provider for Anthropic {
                 return Ok(None);
             }
             let request = self
-                .build_request("GET", USAGE_PATH)
+                .build_request(Method::GET, USAGE_PATH)
                 .header("anthropic-beta", OAUTH_BETA)
-                .body(())?;
-            let mut response = self.client.send_async(request).await?;
-            if response.status().as_u16() != 200 {
-                return Err(AgentError::from_response(response).await);
-            }
-            let parsed: OauthUsage = serde_json::from_str(&response.text().await?)?;
+                .build()?;
+            let body_text = super::ok_text(&self.client, request).await?;
+            let parsed: OauthUsage = serde_json::from_str(&body_text)?;
             Ok(Some(parsed.into()))
         })
     }
@@ -663,11 +654,10 @@ struct ModelsPage {
 }
 
 pub(crate) async fn parse_sse(
-    response: isahc::Response<isahc::AsyncBody>,
+    reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let reader = BufReader::new(response.into_body());
     let mut lines = reader.lines();
     let mut parser = shared::EventParser::new();
     let mut current_event = String::new();
@@ -704,6 +694,7 @@ mod tests {
         ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, ProviderEvent, Role, StopReason,
         TokenUsage,
     };
+    use futures_lite::io::Cursor;
     use serde_json::{Value, json};
     use shared::{DISPLACED_ERROR_PREFIX, build_wire_messages};
     use std::time::Duration;
@@ -873,11 +864,6 @@ mod tests {
         assert_eq!(origin(input), expected);
     }
 
-    fn mock_response(data: impl Into<Vec<u8>>) -> isahc::Response<isahc::AsyncBody> {
-        let body = isahc::AsyncBody::from(data.into());
-        isahc::Response::builder().status(200).body(body).unwrap()
-    }
-
     #[test]
     fn parse_sse_text_and_usage() {
         smol::block_on(async {
@@ -904,7 +890,7 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap();
 
@@ -955,7 +941,7 @@ data: {{\"type\":\"message_stop\"}}\n"
             );
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap();
 
@@ -1001,7 +987,7 @@ data: {{\"type\":\"message_stop\"}}\n"
             .concat();
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap();
 
@@ -1058,7 +1044,7 @@ data: {{\"type\":\"message_stop\"}}\n"
         );
         smol::block_on(async {
             let (tx, _rx) = flume::unbounded();
-            parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap()
         })
@@ -1111,7 +1097,7 @@ event:message_stop\n\
 data:{\"type\":\"message_stop\"}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap();
 
@@ -1147,7 +1133,7 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap();
 
@@ -1675,7 +1661,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         smol::block_on(async {
             let input = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
             let (tx, _rx) = flume::unbounded();
-            let err = parse_sse(mock_response(input), &tx, TEST_STREAM_TIMEOUT)
+            let err = parse_sse(Cursor::new(input), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap_err();
             match err {
@@ -1695,7 +1681,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         smol::block_on(async {
             let input = b"event: error\ndata: not-json\n";
             let (tx, _rx) = flume::unbounded();
-            let err = parse_sse(mock_response(input), &tx, TEST_STREAM_TIMEOUT)
+            let err = parse_sse(Cursor::new(input), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap_err();
             match err {
@@ -1730,7 +1716,7 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap();
 
@@ -1776,7 +1762,7 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap();
 
@@ -1825,7 +1811,7 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap();
 

@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use flume::Sender;
-use isahc::http::header::{CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
-use isahc::http::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{
+    CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, TRANSFER_ENCODING,
+};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};

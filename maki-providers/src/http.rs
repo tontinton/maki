@@ -6,7 +6,7 @@ use std::env;
 use std::error::Error;
 use std::io;
 use std::iter;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -24,6 +24,7 @@ pub const DNS_ATTEMPTS: u32 = 3;
 const NO_PROXY_ALL: &str = "*";
 const NO_PROXY_SEPARATOR: char = ',';
 const NO_PROXY_BLANKS: [char; 2] = [' ', '\t'];
+const CIDR_SEPARATOR: char = '/';
 const DNS_RETRY_DELAY: Duration = Duration::from_millis(150);
 pub(crate) const NO_ADDRESSES: &str = "the name has no addresses";
 /// How a connect fails when nothing answers, besides a name that does not
@@ -91,19 +92,23 @@ impl ProxyEnv {
     }
 }
 
-/// curl's `NO_PROXY` rule for a host name: an entry matches the name itself
-/// and every subdomain, with leading and trailing dots ignored.
+/// curl's `NO_PROXY` rule for a host: an entry matches the name itself and
+/// every subdomain, with leading and trailing dots ignored, and an address
+/// matches an entry in CIDR notation that covers it.
 fn no_proxy_matches(no_proxy: &str, host: &str) -> bool {
     if no_proxy == NO_PROXY_ALL {
         return true;
     }
-    let host = host.trim_end_matches('.').as_bytes();
+    let host = host.trim_end_matches('.');
+    let address = host.parse::<IpAddr>().ok();
     for segment in no_proxy.split(NO_PROXY_SEPARATOR) {
         let segment = segment.trim_matches(NO_PROXY_BLANKS);
         let entry = segment
             .split_once(NO_PROXY_BLANKS)
             .map_or(segment, |(entry, _)| entry);
-        if domain_matches(entry.trim_matches('.').as_bytes(), host) {
+        if domain_matches(entry.trim_matches('.').as_bytes(), host.as_bytes())
+            || address.is_some_and(|address| cidr_matches(entry, address))
+        {
             return true;
         }
         // curl stops reading the list at a blank inside an entry.
@@ -112,6 +117,29 @@ fn no_proxy_matches(no_proxy: &str, host: &str) -> bool {
         }
     }
     false
+}
+
+/// `10.0.0.0/8` or `fe80::/10`: the address shares the network's leading
+/// bits. An entry of the other address family never matches.
+fn cidr_matches(entry: &str, address: IpAddr) -> bool {
+    let Some((network, bits)) = entry.split_once(CIDR_SEPARATOR) else {
+        return false;
+    };
+    let Ok(bits) = bits.parse::<u32>() else {
+        return false;
+    };
+    let (network, address, width) = match (network.parse::<IpAddr>(), address) {
+        (Ok(IpAddr::V4(network)), IpAddr::V4(address)) => (
+            u128::from(u32::from(network)),
+            u128::from(u32::from(address)),
+            Ipv4Addr::BITS,
+        ),
+        (Ok(IpAddr::V6(network)), IpAddr::V6(address)) => {
+            (u128::from(network), u128::from(address), Ipv6Addr::BITS)
+        }
+        _ => return false,
+    };
+    bits <= width && (network ^ address).checked_shr(width - bits).unwrap_or(0) == 0
 }
 
 fn domain_matches(entry: &[u8], host: &[u8]) -> bool {
@@ -171,8 +199,14 @@ pub fn error_chain(error: &(dyn Error + 'static)) -> String {
 }
 
 /// Nothing answered: no socket listening, no route to it, or a name that does
-/// not resolve. A connect timeout stays out, as it does for the provider's own
-/// requests, since it reads the same as a stall.
+/// not resolve.
+///
+/// A timeout stays out: both the connect timeout and the read timeout answer
+/// `is_timeout()`, and an expired connect and a stall on a stream that was
+/// already flowing want opposite budgets, which the error alone cannot say.
+/// So a timeout retries as transient, unbounded, and a blackholed SYN keeps
+/// trying where a refused port gives up in seconds. Splitting the two means
+/// tracking whether any byte ever arrived.
 pub fn is_connect_failure(error: &ReqwestError) -> bool {
     error.is_connect()
         && !error.is_timeout()
@@ -286,6 +320,13 @@ mod tests {
     #[test_case("localhost example.com", "example.com", false ; "blank_ends_the_list")]
     #[test_case("example.com", "badexample.com", false ; "suffix_without_dot")]
     #[test_case("api.example.com", "example.com", false ; "longer_entry")]
+    #[test_case("10.0.0.0/8", "10.1.2.20", true ; "ipv4_cidr")]
+    #[test_case("10.0.0.0/8", "11.1.2.20", false ; "outside_the_ipv4_cidr")]
+    #[test_case("10.0.0.0/0", "192.168.1.1", true ; "a_zero_prefix_covers_every_address")]
+    #[test_case("10.0.0.0/33", "10.1.2.20", false ; "a_prefix_past_the_width")]
+    #[test_case("fe80::/10", "fe80::1", true ; "ipv6_cidr")]
+    #[test_case("10.0.0.0/8", "fe80::1", false ; "a_cidr_of_the_other_family")]
+    #[test_case("10.0.0.0/8", "10.example.com", false ; "a_cidr_needs_an_address")]
     fn no_proxy_matches_cases(no_proxy: &str, host: &str, expected: bool) {
         assert_eq!(no_proxy_matches(no_proxy, host), expected);
     }

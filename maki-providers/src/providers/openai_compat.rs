@@ -1,12 +1,14 @@
 use std::borrow::Cow;
+use std::fmt::Display;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
-use isahc::{AsyncReadResponseExt, HttpClient, Request};
+use futures_lite::io::{AsyncBufRead, AsyncBufReadExt};
 use maki_storage::id::MakiId;
+use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -69,7 +71,7 @@ impl From<OpenAiCompatConfig> for Cow<'static, OpenAiCompatConfig> {
 }
 
 pub(crate) struct OpenAiCompatProvider {
-    client: HttpClient,
+    client: Client,
     config: Cow<'static, OpenAiCompatConfig>,
     stream_timeout: Duration,
     /// Env / `providers.toml` override, resolved once at construction. The
@@ -100,7 +102,7 @@ impl OpenAiCompatProvider {
         }
     }
 
-    pub(crate) fn client(&self) -> &HttpClient {
+    pub(crate) fn client(&self) -> &Client {
         &self.client
     }
 
@@ -119,17 +121,12 @@ impl OpenAiCompatProvider {
     ) -> Result<String, AgentError> {
         let request = auth
             .configure_request(
-                Request::builder()
-                    .method("GET")
-                    .uri(url)
+                self.client
+                    .get(url)
                     .header("user-agent", super::user_agent()),
             )
-            .body(())?;
-        let mut response = self.client.send_async(request).await?;
-        if response.status().as_u16() != 200 {
-            return Err(AgentError::from_response(response).await);
-        }
-        Ok(response.text().await?)
+            .build()?;
+        super::ok_text(&self.client, request).await
     }
 
     pub(crate) async fn post_text(
@@ -139,21 +136,18 @@ impl OpenAiCompatProvider {
         content_type: &str,
         body: &[u8],
     ) -> Result<String, AgentError> {
-        let mut builder = Request::builder()
-            .method("POST")
-            .uri(url)
+        let mut builder = self
+            .client
+            .post(url)
             .header("user-agent", super::user_agent());
         for (key, value) in &auth.headers {
             builder = builder.header(key.as_str(), value.as_str());
         }
         let request = builder
             .header("content-type", content_type)
-            .body(body.to_vec())?;
-        let mut response = self.client.send_async(request).await?;
-        if response.status().as_u16() != 200 {
-            return Err(AgentError::from_response(response).await);
-        }
-        Ok(response.text().await?)
+            .body(body.to_vec())
+            .build()?;
+        super::ok_text(&self.client, request).await
     }
 
     pub fn build_body(
@@ -207,17 +201,11 @@ impl OpenAiCompatProvider {
             .to_owned()
     }
 
-    fn build_request(
-        &self,
-        method: &str,
-        path: &str,
-        auth: &ResolvedAuth,
-    ) -> isahc::http::request::Builder {
+    fn build_request(&self, method: Method, path: &str, auth: &ResolvedAuth) -> RequestBuilder {
         let base = self.base_url(auth);
         auth.configure_request(
-            Request::builder()
-                .method(method)
-                .uri(format!("{base}{path}"))
+            self.client
+                .request(method, format!("{base}{path}"))
                 .header("user-agent", super::user_agent()),
         )
     }
@@ -236,20 +224,18 @@ impl OpenAiCompatProvider {
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut request = self
-            .build_request("POST", "/chat/completions", auth)
-            .header("content-type", "application/json");
+            .build_request(Method::POST, "/chat/completions", auth)
+            .header("content-type", "application/json")
+            .body(json_body)
+            .build()?;
         for &(key, value) in extra_headers {
-            if request
-                .headers_ref()
-                .is_some_and(|set| set.contains_key(key))
-            {
+            if request.headers().contains_key(key) {
                 debug!(header = key, "kept the header already on the request");
                 continue;
             }
-            request = request.header(key, value);
+            let (name, value) = extra_header(key, value)?;
+            request.headers_mut().append(name, value);
         }
-
-        let request = request.body(json_body)?;
 
         debug!(
             model = %model.id,
@@ -257,19 +243,14 @@ impl OpenAiCompatProvider {
             "sending API request"
         );
 
-        let response = self.client.send_async(request).await?;
-        let status = response.status().as_u16();
-
-        if status == 200 {
-            parse_sse(
-                BufReader::new(response.into_body()),
-                event_tx,
-                self.stream_timeout,
-            )
-            .await
-        } else {
-            Err(AgentError::from_response(response).await)
-        }
+        super::send_request(&self.client, request, |response| async move {
+            if response.status().as_u16() == 200 {
+                parse_sse(super::body_reader(response), event_tx, self.stream_timeout).await
+            } else {
+                Err(AgentError::from_response(response).await)
+            }
+        })
+        .await
     }
 
     /// Parses the `data` array served at `{base}{path}`, keeping the entries
@@ -344,6 +325,18 @@ impl OpenAiCompatProvider {
         self.fetch_and_parse_models(auth, MODELS_PATH, Self::default_model_parser)
             .await
     }
+}
+
+/// The codec validated declared headers when it built the provider, so this
+/// cannot fail in practice; it keeps a stray one a config error, not a panic.
+fn extra_header(key: &str, value: &str) -> Result<(HeaderName, HeaderValue), AgentError> {
+    let invalid = |e: &dyn Display| AgentError::Config {
+        message: format!("request error: invalid header {key}: {e}"),
+    };
+    Ok((
+        HeaderName::from_bytes(key.as_bytes()).map_err(|e| invalid(&e))?,
+        HeaderValue::from_str(value).map_err(|e| invalid(&e))?,
+    ))
 }
 
 pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
@@ -844,6 +837,14 @@ mod tests {
     const UNUSED_BASE: &str = "https://unused.example/v2/";
     const MODELS_URL_PATH: &str = "/v1/models";
     const MODEL_ID: &str = "test-model";
+    const ACCEPT_HEADER: &str = "accept";
+    const ACCEPT_ENCODING_HEADER: &str = "accept-encoding";
+    const USER_AGENT_HEADER: &str = "user-agent";
+    const ANY_MEDIA_TYPE: &str = "*/*";
+    const GZIP: &str = "gzip";
+    const DEFLATE: &str = "deflate";
+    const ENCODINGS_ARE_RECORDED: &str =
+        "the goldens pin accept-encoding with gzip and deflate, so both have to stay on";
     const MODELS_SCRIPT: &[Canned] = &[Canned::at(
         MODELS_URL_PATH,
         Canned::json(200, r#"{"data":[{"id":"test-model"}]}"#),
@@ -1555,11 +1556,11 @@ data: [DONE]\n";
         let auth = ResolvedAuth::for_test(auth.map(str::to_owned), Vec::new());
 
         let request = provider
-            .build_request("POST", "/chat/completions", &auth)
-            .body(())
+            .build_request(Method::POST, "/chat/completions", &auth)
+            .build()
             .unwrap();
 
-        assert_eq!(request.uri().to_string(), FIREWORKS_CHAT_URL);
+        assert_eq!(request.url().as_str(), FIREWORKS_CHAT_URL);
     }
 
     #[test]
@@ -1574,6 +1575,28 @@ data: [DONE]\n";
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0].method, "GET");
         assert_eq!(requests[0].path, MODELS_URL_PATH);
+    }
+
+    #[test]
+    fn requests_keep_the_recorded_header_set() {
+        let (base_url, requests) = serve(MODELS_SCRIPT);
+        let auth = ResolvedAuth::for_test(Some(base_url), Vec::new());
+
+        smol::block_on(test_provider().do_list_models(&auth)).unwrap();
+
+        let requests = requests.lock().unwrap();
+        let headers = &requests[0].headers;
+        assert_eq!(headers[ACCEPT_HEADER], ANY_MEDIA_TYPE);
+        let encodings = &headers[ACCEPT_ENCODING_HEADER];
+        assert!(
+            encodings.contains(GZIP),
+            "{ENCODINGS_ARE_RECORDED}: {encodings}"
+        );
+        assert!(
+            encodings.contains(DEFLATE),
+            "{ENCODINGS_ARE_RECORDED}: {encodings}"
+        );
+        assert_eq!(headers[USER_AGENT_HEADER], super::super::user_agent());
     }
 
     #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]

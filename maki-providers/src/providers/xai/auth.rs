@@ -4,16 +4,17 @@ use std::str;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use isahc::ReadResponseExt;
-use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
+use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
 use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
-use crate::providers::{KeyPool, ResolvedAuth, UNAUTHORIZED_STATUS, urlenc};
+use crate::providers::{
+    KeyPool, ResolvedAuth, UNAUTHORIZED_STATUS, client_builder, status_and_text, urlenc,
+};
 
 use super::catalog;
 
@@ -87,13 +88,10 @@ struct DeviceTokenError {
     interval: Option<u64>,
 }
 
-fn http_client(timeout: Duration) -> Result<isahc::HttpClient, AgentError> {
-    isahc::HttpClient::builder()
+pub(super) fn http_client(timeout: Duration) -> Result<Client, AgentError> {
+    client_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(timeout)
-        .redirect_policy(RedirectPolicy::None)
-        // curl carries http2 for OTLP.
-        .version_negotiation(VersionNegotiation::http11())
         .build()
         .map_err(|e| AgentError::Config {
             message: format!("http client: {e}"),
@@ -117,16 +115,13 @@ fn post_form(url: &str, body: &str, timeout: Duration) -> Result<(u16, String), 
         });
     }
     let client = http_client(timeout)?;
-    let mut builder = isahc::Request::builder().method("POST").uri(url);
+    let mut builder = client.post(url);
     for (key, value) in oauth_form_headers() {
         builder = builder.header(key, value);
     }
-    let request = builder.body(body.as_bytes().to_vec())?;
+    let request = builder.body(body.to_owned()).build()?;
     // A transport error, not `Config`: only the token endpoint's answer may clear the tokens.
-    let mut resp = client.send(request)?;
-    let status = resp.status().as_u16();
-    let text = resp.text()?;
-    Ok((status, text))
+    smol::block_on(status_and_text(&client, request))
 }
 
 fn into_oauth_tokens(

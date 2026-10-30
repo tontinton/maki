@@ -7,10 +7,11 @@
 
 use std::{io, time::Duration};
 
-use isahc::{AsyncReadResponseExt, error::ErrorKind as HttpErrorKind};
+use reqwest::Response;
 use serde_json::Value;
 
 use crate::{
+    http::{error_chain, is_connect_failure},
     providers::opencode::{self, NonLoginError},
     retry::RetryKind,
 };
@@ -119,10 +120,8 @@ pub enum AgentError {
     Tool { tool: String, message: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("http: {0}")]
-    Http(#[from] isahc::Error),
-    #[error("http request: {0}")]
-    HttpRequest(#[from] isahc::http::Error),
+    #[error("http: {}", error_chain(.0))]
+    Http(reqwest::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("channel send failed")]
@@ -160,7 +159,6 @@ pub enum ErrorProjection {
     Http {
         connect_failure: bool,
     },
-    HttpRequest,
     Json,
     Channel,
     Cancelled,
@@ -189,7 +187,6 @@ impl AgentError {
             Self::Http(e) => ErrorProjection::Http {
                 connect_failure: is_connect_failure(e),
             },
-            Self::HttpRequest(_) => ErrorProjection::HttpRequest,
             Self::Json(_) => ErrorProjection::Json,
             Self::Channel => ErrorProjection::Channel,
             Self::Cancelled => ErrorProjection::Cancelled,
@@ -228,8 +225,7 @@ impl AgentError {
             | Self::Channel
             | Self::Json(_)
             | Self::Cancelled
-            | Self::EmptySummary
-            | Self::HttpRequest(_) => None,
+            | Self::EmptySummary => None,
         }
     }
 
@@ -396,7 +392,6 @@ impl AgentError {
             Self::Http(e) if is_connect_failure(e) => CONNECT_FAILED_MESSAGE.into(),
             Self::Http(_) => NETWORK_ERROR_MESSAGE.into(),
             Self::Timeout { .. } => "stream timed out, retrying".into(),
-            Self::HttpRequest(e) => format!("request error: {e}"),
             Self::Json(_) => "received an invalid response from the API".into(),
             Self::Channel => "internal error, try again".into(),
             Self::Cancelled => "cancelled".into(),
@@ -404,21 +399,23 @@ impl AgentError {
         }
     }
 
-    pub async fn from_response(mut response: isahc::Response<isahc::AsyncBody>) -> Self {
+    pub async fn from_response(response: Response) -> Self {
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let body = response
             .text()
             .await
             .unwrap_or_else(|_| UNREADABLE_BODY_MESSAGE.into());
         Self::from_parts(
-            response.status().as_u16(),
-            |name| response.headers().get(name).and_then(|v| v.to_str().ok()),
+            status,
+            |name| headers.get(name).and_then(|v| v.to_str().ok()),
             body,
         )
     }
 
     /// The one classifier for a failed HTTP exchange, built from what any
     /// client can hand over: the status, a header lookup by lowercase name,
-    /// and the body text. [`Self::from_response`] is this over isahc, and a
+    /// and the body text. [`Self::from_response`] is this over reqwest, and a
     /// plugin's `maki.net` response reaches it through the same parts, so a
     /// failure reads the same whichever side made the request.
     pub fn from_parts<'a>(
@@ -475,22 +472,19 @@ impl From<maki_storage::StorageError> for AgentError {
     }
 }
 
-/// Nothing answered at the other end, either because no socket is listening or
-/// because the host name does not resolve. isahc folds a refused connection and
-/// a dead provider edge into the same `ConnectionFailed`, and telling them
-/// apart is not possible from here.
-///
-/// `ErrorKind::Timeout` stays out: it covers both an expired connect timeout
-/// and a stall on a stream that was already flowing, which want opposite
-/// budgets, and the error alone cannot say which happened. So it retries as
-/// [`RetryKind::Transient`], unbounded, and a blackholed SYN keeps trying where
-/// a refused port gives up in seconds. Splitting the two means tracking whether
-/// any byte ever arrived.
-fn is_connect_failure(e: &isahc::Error) -> bool {
-    matches!(
-        e.kind(),
-        HttpErrorKind::ConnectionFailed | HttpErrorKind::NameResolution
-    )
+/// The only way a reqwest error enters the type. The URL goes first: a key in
+/// the query (Gemini's model listing) would otherwise reach maki.log through
+/// `error = %e`. A request that cannot be built, from a malformed URL or a
+/// header value the wire cannot carry, is a config mistake that no retry fixes.
+impl From<reqwest::Error> for AgentError {
+    fn from(e: reqwest::Error) -> Self {
+        if e.is_builder() {
+            return Self::Config {
+                message: format!("request error: {}", error_chain(&e)),
+            };
+        }
+        Self::Http(e.without_url())
+    }
 }
 
 /// Only the delta-seconds form ("30", "60"). The HTTP-date form is legal but
@@ -508,16 +502,29 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, mem::discriminant};
+    use std::{collections::HashSet, mem::discriminant, sync::Arc};
 
+    use async_compat::Compat;
     use maki_config::DEFAULT_MAX_RETRIES;
+    use reqwest::{
+        Client, ClientBuilder,
+        dns::{Name, Resolve, Resolving},
+    };
     use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::*;
     use crate::{
-        providers::opencode::{NON_LOGIN_FALLBACK_MESSAGE, QUOTA_FALLBACK_MESSAGE},
+        http::{NO_ADDRESSES, Unresolved},
+        providers::{
+            client_builder,
+            opencode::{NON_LOGIN_FALLBACK_MESSAGE, QUOTA_FALLBACK_MESSAGE},
+        },
         retry::{RetryPolicy, RetryState},
+    };
+
+    use crate::test_support::transport::{
+        LOOPBACK_HOST, QUERY_SECRET, UNRESOLVABLE_HOST, URL_MARKER, closed_port, plain_http_port,
     };
 
     const QUOTA_MESSAGE: &str = "Weekly usage limit reached. Resets in 3 hours.";
@@ -529,6 +536,75 @@ mod tests {
     /// Retry budgets are what these tests measure, so the key walk must not add
     /// attempts of its own.
     const ONE_KEY: usize = 1;
+    const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
+    const REQUEST_ERROR_PREFIX: &str = "request error: ";
+
+    /// Answers for `UNRESOLVABLE_HOST` without a lookup; with `NeverResolves`
+    /// below, no test here needs DNS.
+    struct Unresolvable;
+
+    impl Resolve for Unresolvable {
+        fn resolve(&self, name: Name) -> Resolving {
+            Box::pin(async move {
+                Err(Unresolved {
+                    host: name.as_str().to_owned(),
+                    source: io::Error::other(NO_ADDRESSES),
+                }
+                .into())
+            })
+        }
+    }
+
+    struct NeverResolves;
+
+    impl Resolve for NeverResolves {
+        fn resolve(&self, _: Name) -> Resolving {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// reqwest arms its timeouts as `send` is called, so the call has to
+    /// happen inside the future `Compat` runs, never before. The shell's
+    /// proxy is left out, so the request goes where the test points it.
+    fn failed_request(url: &str, builder: ClientBuilder) -> reqwest::Error {
+        let client = builder.no_proxy().build().unwrap();
+        let request = Compat::new(async { client.get(url).send().await });
+        smol::block_on(request).unwrap_err()
+    }
+
+    fn refused() -> reqwest::Error {
+        failed_request(
+            &format!("http://{LOOPBACK_HOST}:{}/", closed_port()),
+            client_builder(),
+        )
+    }
+
+    fn unresolved() -> reqwest::Error {
+        failed_request(
+            &format!("https://{UNRESOLVABLE_HOST}/"),
+            client_builder().dns_resolver(Arc::new(Unresolvable)),
+        )
+    }
+
+    fn connect_timeout() -> reqwest::Error {
+        failed_request(
+            &format!("https://{UNRESOLVABLE_HOST}/"),
+            client_builder()
+                .dns_resolver(Arc::new(NeverResolves))
+                .connect_timeout(CONNECT_TIMEOUT),
+        )
+    }
+
+    fn tls_failure() -> reqwest::Error {
+        failed_request(
+            &format!("https://{LOOPBACK_HOST}:{}/", plain_http_port()),
+            client_builder(),
+        )
+    }
+
+    fn builder() -> reqwest::Error {
+        Client::new().get(INVALID_URI).build().unwrap_err()
+    }
 
     fn api(status: u16) -> AgentError {
         AgentError::api(status, "")
@@ -701,16 +777,20 @@ mod tests {
             .count() as u32
     }
 
-    /// A dead provider edge and a local server nobody started both land in
-    /// `ConnectionFailed`, so the run has to give up on it, while a failure on
+    /// A dead provider edge and a local server nobody started both read as
+    /// nothing answering, so the run has to give up on it, while a failure on
     /// a connection that was made is the network being the network and is
-    /// waited out.
-    #[test_case(HttpErrorKind::ConnectionFailed, DEFAULT_MAX_RETRIES ; "a_refused_connection_gives_up")]
-    #[test_case(HttpErrorKind::NameResolution, DEFAULT_MAX_RETRIES   ; "an_unresolvable_host_gives_up")]
-    #[test_case(HttpErrorKind::Io, ROUNDS                            ; "a_read_error_keeps_retrying")]
-    #[test_case(HttpErrorKind::TlsEngine, ROUNDS                     ; "a_tls_failure_keeps_retrying")]
-    fn a_transport_failure_is_waited_out_only_once_connected(kind: HttpErrorKind, expected: u32) {
-        assert_eq!(retries_granted(&AgentError::Http(kind.into())), expected);
+    /// waited out. A connect timeout reads the same as a stall, so it is
+    /// waited out too.
+    #[test_case(refused, DEFAULT_MAX_RETRIES    ; "a_refused_connection_gives_up")]
+    #[test_case(unresolved, DEFAULT_MAX_RETRIES ; "an_unresolvable_host_gives_up")]
+    #[test_case(tls_failure, ROUNDS             ; "a_tls_failure_keeps_retrying")]
+    #[test_case(connect_timeout, ROUNDS         ; "a_connect_timeout_keeps_retrying")]
+    fn a_transport_failure_is_waited_out_only_once_connected(
+        error: fn() -> reqwest::Error,
+        expected: u32,
+    ) {
+        assert_eq!(retries_granted(&AgentError::from(error())), expected);
     }
 
     #[test_case(io::ErrorKind::ConnectionRefused, DEFAULT_MAX_RETRIES ; "a_refused_socket_gives_up")]
@@ -719,10 +799,35 @@ mod tests {
         assert_eq!(retries_granted(&AgentError::Io(kind.into())), expected);
     }
 
-    #[test_case(HttpErrorKind::ConnectionFailed, CONNECT_FAILED_MESSAGE ; "connect_failure_names_the_server")]
-    #[test_case(HttpErrorKind::TlsEngine, NETWORK_ERROR_MESSAGE         ; "other_transport_blames_the_network")]
-    fn user_message_transport(kind: HttpErrorKind, expected: &str) {
-        assert_eq!(AgentError::Http(kind.into()).user_message(), expected);
+    #[test_case(refused, CONNECT_FAILED_MESSAGE    ; "connect_failure_names_the_server")]
+    #[test_case(tls_failure, NETWORK_ERROR_MESSAGE ; "other_transport_blames_the_network")]
+    fn user_message_transport(error: fn() -> reqwest::Error, expected: &str) {
+        assert_eq!(AgentError::from(error()).user_message(), expected);
+    }
+
+    #[test]
+    fn a_request_that_cannot_be_built_is_a_config_error() {
+        let error = AgentError::from(builder());
+        assert_eq!(error.projection(), ErrorProjection::Config);
+        assert_eq!(error.retry_kind(), None);
+        assert!(
+            error.user_message().starts_with(REQUEST_ERROR_PREFIX),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_transport_error_leaves_out_the_url() {
+        let error = AgentError::from(failed_request(
+            &format!("https://{UNRESOLVABLE_HOST}/?key={QUERY_SECRET}"),
+            client_builder().dns_resolver(Arc::new(Unresolvable)),
+        ));
+        let message = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(message.contains(UNRESOLVABLE_HOST), "{message}");
+        assert!(!message.contains(QUERY_SECRET), "{message}");
+        assert!(!message.contains(URL_MARKER), "{message}");
+        assert!(!debug.contains(QUERY_SECRET), "{debug}");
     }
 
     #[test_case("30", Some(Duration::from_secs(30)) ; "delta_seconds")]
@@ -841,7 +946,7 @@ mod tests {
 
     /// One sample per `AgentError` variant. A new variant means a new sample
     /// in [`corpus`] and a bump here, or the corpus quietly stops covering it.
-    const VARIANT_COUNT: usize = 11;
+    const VARIANT_COUNT: usize = 10;
     /// One status per branch the answers below split on: refused for size
     /// (400, 413), stale token (401), dead key but live account (403), rate
     /// limit (429), server trouble (500). The rest behave like one of these.
@@ -893,14 +998,7 @@ mod tests {
             ]
             .map(|kind| AgentError::Io(kind.into())),
         );
-        corpus.extend(
-            [
-                HttpErrorKind::ConnectionFailed,
-                HttpErrorKind::NameResolution,
-                HttpErrorKind::TlsEngine,
-            ]
-            .map(|kind| AgentError::Http(kind.into())),
-        );
+        corpus.extend([refused(), unresolved(), tls_failure()].map(AgentError::Http));
         corpus.extend([
             AgentError::Config {
                 message: CONFIG_MESSAGE.into(),
@@ -909,11 +1007,6 @@ mod tests {
                 tool: TOOL_NAME.into(),
                 message: PLAIN_MESSAGE.into(),
             },
-            AgentError::HttpRequest(
-                isahc::http::Uri::try_from(INVALID_URI)
-                    .expect_err("a malformed uri")
-                    .into(),
-            ),
             AgentError::Json(
                 serde_json::from_str::<Value>(INVALID_JSON).expect_err("truncated json"),
             ),
