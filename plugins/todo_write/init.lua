@@ -1,9 +1,18 @@
+local L = require("lines")
 local ToolView = require("maki.tool_view")
 
 local MAIN_TASK = "main"
 -- The panel already shows the live list, so the chat keeps each call folded to
 -- its header until clicked.
 local BODY_VIEW = { max_lines = 0, keep = "head" }
+
+local DESCRIPTION = [[Create or update a structured todo list to track tasks.
+
+**Use after EACH completed step!**
+
+- Send the complete list each time (replace-all semantics).
+- Use ONLY for multi-step work (3+ steps).
+- Skip for trivial tasks.]]
 
 -- `sessions[session_id]`, one per session that wrote todos or took focus:
 --   lists[task_id]  the latest list of each task. A subagent shares its
@@ -16,55 +25,27 @@ local sessions = {}
 -- first TaskFocusChanged.
 local focused_session
 
-local STATUS_MARKERS = {
-  completed = { "[✓]", "todo_completed" },
-  in_progress = { "[•]", "todo_in_progress" },
-  pending = { "[ ]", "todo_pending" },
-  cancelled = { "[x]", "todo_cancelled" },
-}
+local function shown_items(s)
+  return s.lists[s.task] or {}
+end
 
-local DESCRIPTION = [[Create or update a structured todo list to track tasks.
-
-**Use after EACH completed step!**
-
-- Send the complete list each time (replace-all semantics).
-- Use ONLY for multi-step work (3+ steps).
-- Skip for trivial tasks.]]
+local opts = maki.api.register_options({
+  panel_max_items = {
+    default = 5,
+    min = 1,
+    desc = "How many todos the panel above the prompt shows; the rest stay in the chat.",
+  },
+})
 
 local function state_of(sid)
   sessions[sid] = sessions[sid] or { lists = {}, task = MAIN_TASK }
   return sessions[sid]
 end
 
-local function shown_items(s)
-  return s.lists[s.task] or {}
-end
-
-local function count_done(items)
-  local n = 0
-  for _, item in ipairs(items) do
-    if item.status == "completed" then
-      n = n + 1
-    end
-  end
-  return n
-end
-
-local function build_lines(items)
-  local lines = {}
-  for _, item in ipairs(items) do
-    local marker = STATUS_MARKERS[item.status] or STATUS_MARKERS.pending
-    lines[#lines + 1] = {
-      { marker[1] .. " " .. item.content, marker[2] },
-    }
-  end
-  return lines
-end
-
 -- Shared by handler and restore, so a call looks the same live and reloaded,
 -- and the UI's recorded clicks replay onto the same toggle.
 local function list_body(items)
-  return ToolView.restore_lines(build_lines(items), BODY_VIEW)
+  return ToolView.restore_lines(L.build_lines(items), BODY_VIEW)
 end
 
 -- A plain buf made during a tool call becomes that call's chat body, and it
@@ -89,7 +70,7 @@ end
 
 local function collapsed_hint(items)
   return {
-    { string.format(" %d/%d ", count_done(items), #items), "foreground" },
+    { string.format(" %d/%d ", L.count_done(items), #items), "foreground" },
     { "Ctrl+T", "keybind_key" },
     { " ", "" },
   }
@@ -103,25 +84,26 @@ end
 local function sync(sid)
   local s = state_of(sid)
   local items = shown_items(s)
-  local opts = { session = sid }
+  local sid_opts = { session = sid }
   if #items == 0 then
     if s.win then
       s.win:hide()
     end
-    maki.ui.set_status_hint(nil, opts)
+    maki.ui.set_status_hint(nil, sid_opts)
     return
   end
   if not (s.win and s.win:is_open()) then
     s.buf, s.win = open_panel(sid)
   end
-  s.buf:set_lines(build_lines(items))
-  s.win:set_config({ height = #items + 2 })
+  local rows = L.panel_lines(items, opts.panel_max_items)
+  s.buf:set_lines(rows)
+  s.win:set_config({ height = #rows + 2 })
   if s.hidden then
     s.win:hide()
-    maki.ui.set_status_hint(collapsed_hint(items), opts)
+    maki.ui.set_status_hint(collapsed_hint(items), sid_opts)
   else
     s.win:show()
-    maki.ui.set_status_hint(nil, opts)
+    maki.ui.set_status_hint(nil, sid_opts)
   end
 end
 
