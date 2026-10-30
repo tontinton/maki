@@ -228,11 +228,18 @@ impl Splash {
     /// The starfield drifts for as long as the splash is up. With it off the
     /// only motion left is the entry fade, which ends, so the loop settles on
     /// the start screen instead of burning a core on a still picture.
+    fn animating(&self) -> bool {
+        self.animate || self.start.elapsed().as_secs_f32() < FADE_DURATION
+    }
+
     pub fn cadence(&self) -> Cadence {
-        Cadence::when(
-            self.animate || self.start.elapsed().as_secs_f32() < FADE_DURATION,
-            Cadence::SMOOTH,
-        )
+        Cadence::when(self.animating(), Cadence::Smooth)
+    }
+
+    /// The splash draws from the clock, so its tick only has to report that it
+    /// is still moving; `render` reads the elapsed time.
+    pub fn tick(&self) -> Dirty {
+        Dirty::from(self.animating())
     }
 
     pub fn render(
@@ -673,9 +680,9 @@ mod tests {
     /// `splash_animation = false` is what a user on a slow machine reaches
     /// for, so the start screen really has to stop painting once the entry
     /// fade is over.
-    #[test_case(false, false => Cadence::SMOOTH ; "entry_fade_is_running")]
-    #[test_case(false, true  => Cadence::IDLE   ; "still_splash_settles_after_the_fade")]
-    #[test_case(true,  true  => Cadence::SMOOTH ; "starfield_drifts_for_as_long_as_it_is_up")]
+    #[test_case(false, false => Cadence::Smooth ; "entry_fade_is_running")]
+    #[test_case(false, true  => Cadence::Idle   ; "still_splash_settles_after_the_fade")]
+    #[test_case(true,  true  => Cadence::Smooth ; "starfield_drifts_for_as_long_as_it_is_up")]
     fn splash_cadence(animate: bool, faded: bool) -> Cadence {
         let mut splash = Splash::new(animate);
         if faded {

@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::animation::{animation_elapsed, spinner_str};
 use crate::components::split_layout::SplitReq;
 use crate::components::{
     Overlay, hint_footer,
@@ -290,7 +290,7 @@ impl FloatManager {
                 dirty = Dirty::YES;
             }
         }
-        dirty | self.drain_commands()
+        dirty | self.drain_commands() | Dirty::from(self.is_open())
     }
 
     /// Applies what the plugins asked of their windows since the last look and
@@ -353,7 +353,7 @@ impl FloatManager {
     /// Float snapshots bake spinner spans at render time, so an open float has
     /// to keep painting for plugin spinners to turn.
     pub fn cadence(&self) -> Cadence {
-        Cadence::when(self.is_open(), Cadence::SPINNER)
+        Cadence::when(self.is_open(), Cadence::Spinner)
     }
 
     /// Whether a window on screen is waiting on the user. It checks `visible`
@@ -896,7 +896,7 @@ fn snapshot_to_line(sline: &SnapshotLine) -> Line<'_> {
                     if n == SPINNER_STYLE_NAME || n.starts_with(SPINNER_STYLE_PREFIX) =>
                 {
                     Span::styled(
-                        spinner_str(animation_elapsed_ms()),
+                        spinner_str(animation_elapsed()),
                         theme::style_by_name(n.strip_prefix(SPINNER_STYLE_PREFIX).unwrap_or(n)),
                     )
                 }
@@ -2445,36 +2445,46 @@ mod tests {
     }
 
     /// Plugin output lands in the buffer behind the UI's back, so an append is
-    /// only ever seen because `tick` reports it. Exactly once, though: this
-    /// poller runs for every session, so a manager that keeps reporting dirty
-    /// with nothing to show would keep the whole loop awake forever.
+    /// only ever seen because `tick` reports it. The open window keeps
+    /// claiming frames for its spinner; closing it is what settles the manager.
     #[test]
-    fn buffer_append_owes_exactly_one_frame() {
+    fn buffer_append_is_reported_while_open_and_closing_settles() {
         let mut mgr = FloatManager::new();
         assert_eq!(mgr.tick(), Dirty::NO, "{QUIET}");
 
         let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
         let buf = make_buf(&["initial"]);
         mgr.open(buf.clone(), make_config(), true, event_tx, cmd_rx);
-        assert_eq!(mgr.tick(), Dirty::NO, "{QUIET}");
+        assert_eq!(
+            mgr.tick(),
+            Dirty::YES,
+            "an open float's spinner keeps asking for frames"
+        );
 
         buf.append(make_line("second"));
         assert_eq!(mgr.tick(), Dirty::YES, "{OWED}");
+
+        mgr.close_all();
         assert_eq!(mgr.tick(), Dirty::NO, "{QUIET}");
     }
 
-    /// Every command changes what is drawn, and `Close` reports through a
-    /// different branch than the rest because it breaks out of the drain loop.
+    /// Every command changes what is drawn. An open window keeps claiming
+    /// frames for its spinner; `Close` is what lets the manager settle.
     #[test_case(WinCommand::SetCursor(2) ; "set_cursor")]
     #[test_case(WinCommand::SetVisible(false) ; "set_visible")]
     #[test_case(WinCommand::Close ; "close")]
-    fn window_command_owes_exactly_one_frame(cmd: WinCommand) {
+    fn window_command_is_reported_and_close_settles(cmd: WinCommand) {
         let mut mgr = FloatManager::new();
         let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a", "b", "c"]);
+        let closed = matches!(&cmd, WinCommand::Close);
 
         cmd_tx.send(cmd).unwrap();
         assert_eq!(mgr.tick(), Dirty::YES, "{OWED}");
-        assert_eq!(mgr.tick(), Dirty::NO, "{QUIET}");
+        if closed {
+            assert_eq!(mgr.tick(), Dirty::NO, "{QUIET}");
+        } else {
+            assert_eq!(mgr.tick(), Dirty::YES, "the open spinner still owes");
+        }
     }
 
     /// A plugin that goes away drops its sender and the window goes with it.
@@ -2499,22 +2509,22 @@ mod tests {
     #[test]
     fn cadence_spins_while_any_window_is_open_visible_or_not() {
         let mut mgr = FloatManager::new();
-        assert_eq!(mgr.cadence(), Cadence::IDLE);
+        assert_eq!(mgr.cadence(), Cadence::Idle);
 
         let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
-        assert_eq!(mgr.cadence(), Cadence::SPINNER);
+        assert_eq!(mgr.cadence(), Cadence::Spinner);
 
         cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
         let _ = mgr.tick();
         assert!(!mgr.windows[0].visible);
         assert_eq!(
             mgr.cadence(),
-            Cadence::SPINNER,
+            Cadence::Spinner,
             "an invisible window still counts as open, so the loop keeps draining it"
         );
 
         mgr.close_all();
-        assert_eq!(mgr.cadence(), Cadence::IDLE);
+        assert_eq!(mgr.cadence(), Cadence::Idle);
     }
 
     #[test]

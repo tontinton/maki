@@ -8,7 +8,8 @@
 //! - [`Watch`]: how a poller notices a background thread writing to a shared
 //!   slot, the one kind of change nothing else announces.
 //! - [`Cadence`]: how soon the loop has to come back when no event will wake
-//!   it, and whether the clock alone owes a frame when it does.
+//!   it. It is a wake request, not a paint request: a timeout only buys another
+//!   `tick`, and that tick's [`Dirty`] decides whether a frame is owed.
 //!
 //! Two rules keep them honest, and breaking either one looks the same from the
 //! outside: a screen that will not update, or a laptop fan that will not stop.
@@ -20,11 +21,12 @@
 //! quota: it puts data on screen that no poller ever saw. Put a [`Watch`] on
 //! the slot, poll it in `App::tick`, render from the [`Watch`].
 //!
-//! **Whatever draws the motion reports the [`Cadence`]**, next to the span,
-//! instead of some condition in `app` that slowly stops meaning what it used
-//! to. It describes pixels, not work: a running tool that draws one spinner
-//! glyph is [`Cadence::SPINNER`], and a reveal collapsed out of view moves
-//! nothing at all.
+//! **Whatever draws the motion reports the [`Cadence`] and advances the clock
+//! in `tick`**, instead of some condition in `app` that slowly stops meaning
+//! what it used to. A timeout only asks `tick` to look again; the frame follows
+//! only if that tick returned [`Dirty`]. It describes pixels, not work: a
+//! running tool that draws one spinner glyph is [`Cadence::Spinner`], and a
+//! reveal collapsed out of view moves nothing at all.
 
 use std::ops::{BitOr, BitOrAssign};
 use std::sync::Arc;
@@ -37,7 +39,7 @@ use crate::animation::SPINNER_FRAME;
 pub const IDLE_POLL: Duration = Duration::from_millis(100);
 
 /// Fast enough that per-character reveals and colour fades look continuous.
-const SMOOTH_FRAME: Duration = Duration::from_millis(16);
+pub(crate) const SMOOTH_FRAME: Duration = Duration::from_millis(16);
 
 /// What every poller in the crate is tested against, so the two invariants
 /// read the same wherever they are checked.
@@ -130,86 +132,60 @@ impl<T> Default for Watch<T> {
     }
 }
 
-/// How soon the loop has to come back when nothing is due to wake it.
+/// How soon the loop has to look again when no event wakes it.
 ///
-/// Two very different things ask for this. Pixels that move on their own
-/// ([`Cadence::SPINNER`], [`Cadence::SMOOTH`]) owe a frame once the time is up.
-/// A worker mid-answer ([`Cadence::PENDING`]) owes none: looking again is the
-/// only way to find the result, and the frame follows only if the poll came
-/// back [`Dirty`].
-///
-/// Anything a component notices by itself is a [`Dirty`]. Calling that a
-/// cadence pins the loop at full frame rate for as long as it lasts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Cadence {
-    frame: Option<Duration>,
-    moves: bool,
+/// This is a wake request, not a paint request: a timeout buys another `tick`,
+/// and only that tick's [`Dirty`] decides whether a frame is owed. A spinner
+/// and a smooth source differ only in how soon they need the look; they
+/// combine by urgency, so `Smooth` always outranks `Spinner`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Cadence {
+    /// Nothing to come back for. The loop sleeps until something happens.
+    #[default]
+    Idle,
+    /// Spinner glyphs, which advance once per [`SPINNER_FRAME`]. Painting any
+    /// faster redraws the same glyph.
+    Spinner,
+    /// Typewriter reveals and colour fades, which change every frame.
+    Smooth,
 }
 
 impl Cadence {
-    /// Nothing to come back for. The loop sleeps until something happens.
-    pub const IDLE: Self = Self {
-        frame: None,
-        moves: false,
-    };
-    /// Spinner glyphs, which advance once per [`SPINNER_FRAME`]. Painting any
-    /// faster redraws the same glyph.
-    pub const SPINNER: Self = Self {
-        frame: Some(SPINNER_FRAME),
-        moves: true,
-    };
-    /// Typewriter reveals and colour fades, which change every frame.
-    pub const SMOOTH: Self = Self {
-        frame: Some(SMOOTH_FRAME),
-        moves: true,
-    };
-    /// A worker mid-answer, looked at again on the smooth frame so a result
-    /// landing between two frames is on screen in the next one.
-    pub const PENDING: Self = Self {
-        frame: Some(SMOOTH_FRAME),
-        moves: false,
-    };
-
-    /// `cadence` while `applies`, else [`Cadence::IDLE`].
+    /// `cadence` while `applies`, else [`Cadence::Idle`].
     pub fn when(applies: bool, cadence: Self) -> Self {
-        if applies { cadence } else { Self::IDLE }
+        if applies { cadence } else { Self::Idle }
     }
 
-    /// Combines both axes: the soonest anyone has to be looked at again, and
-    /// motion if anyone moves. A single scale would let a pending poll outrank
-    /// a typewriter and freeze it.
+    /// The most urgent source. `Smooth` is always at least as urgent as
+    /// `Spinner` because the spinner interval is clamped to the smooth frame.
     pub fn any(cadences: impl IntoIterator<Item = Self>) -> Self {
-        cadences.into_iter().fold(Self::IDLE, |a, b| Self {
-            frame: match (a.frame, b.frame) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            },
-            moves: a.moves | b.moves,
-        })
+        cadences.into_iter().max().unwrap_or(Self::Idle)
     }
 
     /// How long the loop may sleep, or `None` to sleep until something wakes
-    /// it.
-    pub fn frame(self) -> Option<Duration> {
-        self.frame
-    }
-
-    /// Whether the next frame differs from this one on the clock alone.
-    pub fn moves(self) -> bool {
-        self.moves
+    /// it. `smooth` is the loop's fastest frame; a spinner never asks for one
+    /// faster than that.
+    pub fn interval(self, smooth: Duration) -> Option<Duration> {
+        match self {
+            Self::Idle => None,
+            Self::Spinner => Some(SPINNER_FRAME.max(smooth)),
+            Self::Smooth => Some(smooth),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::expect::{OWED, QUIET};
-    use super::{Cadence, Dirty, Watch};
+    use super::{Cadence, Dirty, SMOOTH_FRAME, Watch};
+    use crate::animation::SPINNER_FRAME;
     use std::sync::Arc;
+    use std::time::Duration;
 
     const EXPECT_SETTLED: &str = "nothing to combine must leave the loop asleep";
-    const EXPECT_SOONEST: &str = "the soonest source must win over the whole list";
-    const EXPECT_MOTION_KEPT: &str = "a pending poll must not swallow another source's motion";
+    const EXPECT_URGENT: &str = "the most urgent source must win";
     const EXPECT_UNSEEN: &str = "an unpolled watch has nothing to render";
+    const SLOW_FRAME: Duration = Duration::from_millis(100);
 
     #[test]
     fn any_runs_every_poller() {
@@ -233,16 +209,27 @@ mod tests {
     /// The empty fold is the common case: a settled session takes it on every
     /// loop turn.
     #[test]
-    fn any_takes_the_soonest_frame_and_keeps_the_motion() {
+    fn any_takes_the_most_urgent_source() {
         assert_eq!(Dirty::any([]), Dirty::NO, "{EXPECT_SETTLED}");
-        assert_eq!(Cadence::any([]), Cadence::IDLE, "{EXPECT_SETTLED}");
+        assert_eq!(Cadence::any([]), Cadence::Idle, "{EXPECT_SETTLED}");
 
-        let picked = Cadence::any([Cadence::IDLE, Cadence::SMOOTH, Cadence::SPINNER]);
-        assert_eq!(picked.frame(), Cadence::SMOOTH.frame(), "{EXPECT_SOONEST}");
+        let picked = Cadence::any([Cadence::Idle, Cadence::Spinner, Cadence::Smooth]);
+        assert_eq!(picked, Cadence::Smooth, "{EXPECT_URGENT}");
 
-        let mixed = Cadence::any([Cadence::SPINNER, Cadence::PENDING]);
-        assert_eq!(mixed.frame(), Cadence::PENDING.frame(), "{EXPECT_SOONEST}");
-        assert!(mixed.moves(), "{EXPECT_MOTION_KEPT}");
+        let spinning = Cadence::any([Cadence::Idle, Cadence::Spinner]);
+        assert_eq!(spinning, Cadence::Spinner, "{EXPECT_URGENT}");
+    }
+
+    #[test]
+    fn interval_maps_the_three_rates() {
+        assert_eq!(Cadence::Idle.interval(SMOOTH_FRAME), None);
+        assert_eq!(Cadence::Smooth.interval(SMOOTH_FRAME), Some(SMOOTH_FRAME));
+        assert_eq!(Cadence::Spinner.interval(SMOOTH_FRAME), Some(SPINNER_FRAME));
+        assert_eq!(
+            Cadence::Spinner.interval(SLOW_FRAME),
+            Some(SLOW_FRAME),
+            "a slow frame never makes the spinner ask faster than it can paint"
+        );
     }
 
     /// A generation counter answers this too, as long as every publisher

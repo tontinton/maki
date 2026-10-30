@@ -2996,6 +2996,7 @@ impl App {
     /// Every poller that feeds the screen, in one place and never in `view`;
     /// see [`crate::repaint`] for why.
     pub fn tick(&mut self) -> Dirty {
+        let active = self.active_chat;
         // `|` never short-circuits: every poller must run on every tick.
         self.float_mgr.tick()
             | self.tick_typeahead()
@@ -3006,6 +3007,11 @@ impl App {
             | self.btw_modal.poll()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
+            | self.status_bar.tick(
+                &self.status,
+                self.restoring.load(Ordering::Relaxed),
+                self.retry_info.is_some(),
+            )
             | self.mcp_picker.refresh()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
@@ -3015,7 +3021,13 @@ impl App {
             | self.tick_plan()
             | self.tick_file_picker()
             | self.tick_input_changed()
-            | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+            | Dirty::any(self.chats.iter_mut().enumerate().map(|(i, chat)| {
+                if i == active {
+                    chat.tick()
+                } else {
+                    chat.poll_data()
+                }
+            }))
     }
 
     /// Both halves of the plan surface the Lua host answers asynchronously:
@@ -3206,7 +3218,9 @@ impl App {
 
     /// What moves with the clock alone; changes that come from arriving data
     /// are reported by [`Self::tick`] instead. Overlays answer as a group, so
-    /// adding one to [`Self::overlays`] is enough.
+    /// adding one to [`Self::overlays`] is enough. Only the active chat is
+    /// drawn, so only it reports motion; a hidden chat's reveal must not keep
+    /// the focused screen awake.
     pub fn cadence(&self) -> Cadence {
         Cadence::any([
             Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
@@ -3217,8 +3231,8 @@ impl App {
             ),
             self.selection_state
                 .as_ref()
-                .map_or(Cadence::IDLE, SelectionState::cadence),
-            Cadence::any(self.chats.iter().map(Chat::cadence)),
+                .map_or(Cadence::Idle, SelectionState::cadence),
+            self.chats[self.active_chat].cadence(),
         ])
     }
 

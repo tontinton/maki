@@ -356,6 +356,10 @@ impl Chat {
         self.messages_panel.tick()
     }
 
+    pub fn poll_data(&mut self) -> Dirty {
+        self.messages_panel.poll_data()
+    }
+
     pub fn cadence(&self) -> Cadence {
         self.messages_panel.cadence()
     }

@@ -544,7 +544,7 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
     panel.cancel_in_progress();
 
     assert_eq!(panel.in_progress_count(), 0);
-    assert_eq!(panel.cadence(), Cadence::IDLE);
+    assert_eq!(panel.cadence(), Cadence::Idle);
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Success);
     assert_eq!(msg_status(&panel, "t2"), ToolStatus::Error);
 }
@@ -555,12 +555,12 @@ const STEP_COUNT: usize = 10;
 const HIGHLIGHTED_CODE: &str = "fn main() {}";
 const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Only `view` advances a typewriter, and thinking collapsed to its header
-/// never draws the text, so its reveal can never finish. Believing it would
+/// Only `tick` advances a typewriter, and thinking collapsed to its header
+/// never shows the text, so its reveal can never finish. Believing it would
 /// hold the loop at full frame rate for as long as the model reasons.
-#[test_case(ThinkingLines::Never   => Cadence::SMOOTH ; "expanded_thinking_reveals")]
-#[test_case(ThinkingLines::Tail(3) => Cadence::SMOOTH ; "the_tail_reveals")]
-#[test_case(ThinkingLines::Tail(0) => Cadence::IDLE   ; "header_only_reveals_nothing")]
+#[test_case(ThinkingLines::Never   => Cadence::Smooth ; "expanded_thinking_reveals")]
+#[test_case(ThinkingLines::Tail(3) => Cadence::Smooth ; "the_tail_reveals")]
+#[test_case(ThinkingLines::Tail(0) => Cadence::Idle   ; "header_only_reveals_nothing")]
 fn thinking_animates_only_while_it_is_on_screen(thinking_lines: ThinkingLines) -> Cadence {
     let mut panel = thinking_panel(thinking_lines);
 
@@ -577,8 +577,8 @@ fn thinking_animates_only_while_it_is_on_screen(thinking_lines: ThinkingLines) -
 /// pinned the loop at full frame rate. It draws one spinner glyph, so the
 /// glyph rate is all it may ask for. Text arriving beside it earns the smooth
 /// budget.
-#[test_case(false => Cadence::SPINNER ; "waiting_tool_only_spins")]
-#[test_case(true  => Cadence::SMOOTH  ; "streaming_text_beside_it_wins")]
+#[test_case(false => Cadence::Spinner ; "waiting_tool_only_spins")]
+#[test_case(true  => Cadence::Smooth  ; "streaming_text_beside_it_wins")]
 fn cadence_while_a_tool_is_in_progress(text_streaming: bool) -> Cadence {
     let mut panel = panel_with_tools(&[("t1", BASH_TOOL_NAME)]);
     if text_streaming {
@@ -600,14 +600,30 @@ fn splash_stops_driving_cadence_once_a_message_exists() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     assert_eq!(
         panel.cadence(),
-        Cadence::SMOOTH,
+        Cadence::Smooth,
         "the starfield drifts while the splash is the only thing drawn"
     );
 
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_done(done("t1"));
 
-    assert_eq!(panel.cadence(), Cadence::IDLE, "the splash is gone");
+    assert_eq!(panel.cadence(), Cadence::Idle, "the splash is gone");
+}
+
+#[test]
+fn a_fresh_panel_tick_reports_the_splash() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    assert_eq!(panel.tick(), Dirty::YES, "the starfield still drifts");
+}
+
+#[test]
+fn a_running_tool_tick_reports_the_spinner() {
+    let mut panel = panel_with_tools(&[("t1", BASH_TOOL_NAME)]);
+    assert_eq!(
+        panel.tick(),
+        Dirty::YES,
+        "a running tool owes a spinner frame"
+    );
 }
 
 /// `drain_highlights` moved out of `view`, so `tick` is the only thing feeding
@@ -1693,7 +1709,7 @@ fn tool_done_moves_live_buf_to_watched_polled_but_not_animating() {
     assert!(panel.watching("t1"));
     assert_eq!(
         panel.cadence(),
-        Cadence::IDLE,
+        Cadence::Idle,
         "a finished tool must not leave a spinner running"
     );
 
@@ -1797,7 +1813,7 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
     panel.cancel_in_progress();
     assert_eq!(
         panel.cadence(),
-        Cadence::IDLE,
+        Cadence::Idle,
         "cancel must not leave a tool marked in progress"
     );
     assert!(panel.watching("t1"));
@@ -2095,10 +2111,15 @@ fn header_snapshot_stamps_gen_on_top_level() {
 #[test]
 fn live_snapshot_uses_panel_generation() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let generation = panel.theme_generation;
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_snapshot("t1", rendered_snapshot(), None);
 
-    assert_eq!(panel.snapshot_gen_of("t1"), Some(0), "{LIVE_PANEL_GEN_MSG}");
+    assert_eq!(
+        panel.snapshot_gen_of("t1"),
+        Some(generation),
+        "{LIVE_PANEL_GEN_MSG}"
+    );
 }
 
 #[test]

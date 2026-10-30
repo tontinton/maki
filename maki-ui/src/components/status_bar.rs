@@ -78,6 +78,8 @@ pub struct StatusBar {
     /// stops notify's event thread and closes the inotify fd. Every session
     /// builds its own bar, so a watcher that outlives it leaks a thread.
     _branch_watcher: Option<RecommendedWatcher>,
+    /// Whether the previous tick was moving, so the stop still paints.
+    was_animating: bool,
 }
 
 impl StatusBar {
@@ -91,6 +93,7 @@ impl StatusBar {
             flash_duration,
             branch_update_rx,
             _branch_watcher: branch_watcher,
+            was_animating: false,
         }
     }
 
@@ -165,23 +168,36 @@ impl StatusBar {
     ///
     /// A queue claims frames too. Startup fills it and then the UI sits idle,
     /// so without frames the next message would never get its turn.
+    fn animating(&self, status: &Status, restoring: bool, retrying: bool) -> bool {
+        *status == Status::Streaming || restoring || retrying || !self.queued.is_empty()
+    }
+
     pub fn cadence(&self, status: &Status, restoring: bool, retrying: bool) -> Cadence {
         Cadence::when(
-            *status == Status::Streaming || restoring || retrying || !self.queued.is_empty(),
-            Cadence::SPINNER,
+            self.animating(status, restoring, retrying),
+            Cadence::Spinner,
         )
+    }
+
+    /// `view` reads the elapsed time, so this reports whether the bar is
+    /// moving, including the tick that stops and clears the spinner.
+    pub fn tick(&mut self, status: &Status, restoring: bool, retrying: bool) -> Dirty {
+        let animating = self.animating(status, restoring, retrying);
+        let dirty = Dirty::from(animating || self.was_animating);
+        self.was_animating = animating;
+        dirty
     }
 
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
         let mut left_spans = Vec::new();
 
         if *ctx.status == Status::Streaming {
-            let ch = spinner_frame(self.started_at.elapsed().as_millis());
+            let ch = spinner_frame(self.started_at.elapsed());
             left_spans.push(Span::styled(format!(" {ch}"), theme::current().spinner));
         }
 
         if ctx.restoring {
-            let ch = spinner_frame(self.started_at.elapsed().as_millis());
+            let ch = spinner_frame(self.started_at.elapsed());
             left_spans.push(Span::styled(
                 format!(" {ch}"),
                 theme::current().status_notice,
@@ -687,7 +703,7 @@ mod tests {
         assert_eq!(bar.flash_text(), Some("disabled"), "{EXPECT_NEWEST}");
         assert_eq!(
             bar.cadence(&Status::Idle, false, false),
-            Cadence::IDLE,
+            Cadence::Idle,
             "{EXPECT_IDLE}"
         );
     }
@@ -717,7 +733,7 @@ mod tests {
         bar.queue_flash(FLASH_MSG.into());
         assert_eq!(
             bar.cadence(&Status::Idle, false, false),
-            Cadence::IDLE,
+            Cadence::Idle,
             "{EXPECT_IDLE}"
         );
 
@@ -725,9 +741,31 @@ mod tests {
 
         assert_eq!(
             bar.cadence(&Status::Idle, false, false),
-            Cadence::SPINNER,
+            Cadence::Spinner,
             "{EXPECT_TICKING}"
         );
+    }
+
+    #[test_case(Status::Streaming, false, false => Dirty::YES ; "streaming_turn")]
+    #[test_case(Status::Idle, true, false => Dirty::YES ; "restoring_session")]
+    #[test_case(Status::Idle, false, true => Dirty::YES ; "retry_countdown")]
+    #[test_case(Status::Idle, false, false => Dirty::NO ; "nothing_in_flight")]
+    fn tick_reports_what_the_bar_is_doing(
+        status: Status,
+        restoring: bool,
+        retrying: bool,
+    ) -> Dirty {
+        StatusBar::new(FLASH_TTL).tick(&status, restoring, retrying)
+    }
+
+    /// The Lua thread clears `restoring` with no event, so the tick that sees
+    /// the stop is the only chance to clear the glyph.
+    #[test]
+    fn tick_reports_the_frame_that_stops_the_spinner() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        assert_eq!(bar.tick(&Status::Idle, true, false), Dirty::YES);
+        assert_eq!(bar.tick(&Status::Idle, false, false), Dirty::YES);
+        assert_eq!(bar.tick(&Status::Idle, false, false), Dirty::NO);
     }
 
     #[test]
@@ -743,7 +781,7 @@ mod tests {
         assert_eq!(bar.flash_text(), None, "{EXPECT_DRAINS}");
         assert_eq!(
             bar.cadence(&Status::Idle, false, false),
-            Cadence::IDLE,
+            Cadence::Idle,
             "{EXPECT_IDLE}"
         );
     }
