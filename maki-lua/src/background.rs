@@ -120,7 +120,7 @@ impl BackgroundSessions {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use maki_agent::SessionMailbox;
     use maki_agent::cancel::CancelToken;
     use maki_agent::tools::test_support::stub_seed;
@@ -130,13 +130,13 @@ mod tests {
 
     const PLUGIN: &str = "monitor";
 
-    fn live(session: MakiId) -> (SessionMailbox, Arc<AgentSeed>) {
+    pub(crate) fn live(session: MakiId) -> (SessionMailbox, Arc<AgentSeed>) {
         let mailbox = SessionMailbox::register(session);
         let seed = mailbox.publish_seed(stub_seed(session));
         (mailbox, seed)
     }
 
-    fn entry(session: MakiId, task: Option<u64>) -> (BackgroundSession, CancelToken) {
+    pub(crate) fn entry(session: MakiId, task: Option<u64>) -> (BackgroundSession, CancelToken) {
         let (cancel, token) = CancelToken::new();
         let entry = BackgroundSession {
             info: BackgroundInfo {

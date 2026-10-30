@@ -940,12 +940,12 @@ async fn session(
         ui_id,
         slot: cancel_slot,
         background: owner.as_ref().map(|_| BackgroundSessions::of(&lua)),
+        stopped: Arc::default(),
     });
     let name = name.unwrap_or_default();
     let background = match owner {
         Some((session, task, cancel)) => {
             let registry = BackgroundSessions::of(&lua);
-            let stopped = Arc::new(AtomicBool::new(false));
             try_pair!(registry.register(BackgroundSession {
                 info: BackgroundInfo {
                     id: cancellation.ui_id.clone(),
@@ -957,13 +957,12 @@ async fn session(
                 },
                 session,
                 task,
-                stopped: Arc::clone(&stopped),
+                stopped: Arc::clone(&cancellation.stopped),
                 _cancel: cancel,
             }));
             Some(Background {
                 registry,
                 session,
-                stopped,
                 thinking: requested_thinking,
                 fast,
             })
@@ -1321,7 +1320,6 @@ impl RunDones {
 struct Background {
     registry: BackgroundSessions,
     session: MakiId,
-    stopped: Arc<AtomicBool>,
     /// What the plugin asked for at open. We keep it because every prompt caps
     /// it again against the chat as it is at that moment.
     thinking: Option<ThinkingConfig>,
@@ -1376,22 +1374,11 @@ impl SessionState {
         if self.closed {
             return Some(SESSION_CLOSED_ERR);
         }
-        if self.stopped_by_user() {
-            return Some(STOPPED_BY_USER_ERR);
-        }
-        // Its chat session or its plugin may have ended while the plugin kept
-        // the handle.
-        self.background
-            .as_ref()
-            .filter(|b| !b.registry.contains(&self.cancellation.ui_id))
-            .map(|_| CANCELLED_MSG)
+        self.cancellation.refusal()
     }
 
-    /// Esc in the task's tab, see [`BackgroundSessions::stop`].
     fn stopped_by_user(&self) -> bool {
-        self.background
-            .as_ref()
-            .is_some_and(|b| b.stopped.load(Ordering::Relaxed))
+        self.cancellation.stopped_by_user()
     }
 
     fn close(&mut self) {
@@ -1430,9 +1417,29 @@ struct SessionCancellation {
     ui_id: String,
     slot: CancelSlot,
     background: Option<BackgroundSessions>,
+    /// Esc in the task's tab, see [`BackgroundSessions::stop`].
+    stopped: Arc<AtomicBool>,
 }
 
 impl SessionCancellation {
+    /// Why this session takes no more messages, closing aside. It needs no
+    /// session lock, so `send` gets the same answer mid-prompt as between.
+    fn refusal(&self) -> Option<&'static str> {
+        if self.stopped_by_user() {
+            return Some(STOPPED_BY_USER_ERR);
+        }
+        // Its chat session or its plugin may have ended while the plugin kept
+        // the handle.
+        self.background
+            .as_ref()
+            .filter(|registry| !registry.contains(&self.ui_id))
+            .map(|_| CANCELLED_MSG)
+    }
+
+    fn stopped_by_user(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
     fn cancel(&self) {
         self.parent_cancels.retire(&self.ui_id, self.slot);
         if let Some(registry) = &self.background {
@@ -1723,11 +1730,17 @@ async fn prompt(
 /// if not ok then maki.log.warn(err) end
 #[lua_fn]
 fn send(_lua: &Lua, this: &LuaSession, message: String) -> LuaResult<Pair<bool>> {
-    // A held lock means a prompt is running. A sent message never picks the
-    // run's settings, so the options here are inert.
-    if let Some(refusal) = this.inner.try_lock().and_then(|s| s.refusal()) {
+    // A held lock means a prompt is running, and a task stopped mid-prompt
+    // holds it until the prompt unwinds. Without the fallback its message
+    // would queue for a run that never reads it.
+    let refusal = match this.inner.try_lock() {
+        Some(s) => s.refusal(),
+        None => this.cancellation.refusal(),
+    };
+    if let Some(refusal) = refusal {
         return Ok(err_pair(refusal));
     }
+    // A sent message never picks the run's settings, so these are inert.
     this.inbox
         .push(plugin_input(message, RequestOptions::default()));
     Ok((Some(true), None))
@@ -2494,6 +2507,32 @@ mod tests {
         );
     }
 
+    /// A running prompt holds the session lock until it unwinds, so `send`
+    /// can only ask the cancellation whether Esc stopped the task.
+    #[test]
+    fn user_stop_refuses_without_the_session_lock() {
+        let session = MakiId::generate();
+        let _live = crate::background::tests::live(session);
+        let registry = BackgroundSessions::default();
+        let (mut entry, _token) = crate::background::tests::entry(session, None);
+        let parent_cancels = Arc::new(CancelMap::new());
+        let (trigger, _cancel) = CancelToken::new();
+        let cancellation = SessionCancellation {
+            slot: parent_cancels.insert(entry.info.id.clone(), trigger),
+            parent_cancels,
+            ui_id: entry.info.id.clone(),
+            background: Some(registry.clone()),
+            stopped: Arc::default(),
+        };
+        entry.stopped = Arc::clone(&cancellation.stopped);
+        registry.register(entry).unwrap();
+        assert_eq!(cancellation.refusal(), None);
+
+        registry.stop(&cancellation.ui_id);
+
+        assert_eq!(cancellation.refusal(), Some(STOPPED_BY_USER_ERR));
+    }
+
     /// A cancel that drops a background prompt mid-run drops the run too, so
     /// no `Done` comes. The tab must still hear the run ended, or its task
     /// stays working, and the relay must not count that as the run's `Done`.
@@ -2503,7 +2542,6 @@ mod tests {
         let background = Background {
             registry: BackgroundSessions::default(),
             session: MakiId::generate(),
-            stopped: Arc::default(),
             thinking: None,
             fast: None,
         };
