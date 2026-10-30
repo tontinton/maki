@@ -220,7 +220,14 @@ impl AgentLoop {
         let has_mcp = self.seed.mcp.is_some();
         let context: RunContextBuilder = Arc::new(move |model, workflow| {
             let tools = base_tools(&vars, model, &config, has_mcp, workflow);
-            RunContext::render(&vars, &instructions, &slots, model, tools)
+            RunContext::render(
+                &vars,
+                &instructions,
+                &slots,
+                model,
+                tools,
+                config.model_in_prompt,
+            )
         });
         (context, prompt_slots)
     }
