@@ -21,6 +21,7 @@ flume = { workspace = true }
 futures-lite = { workspace = true }
 futures = { workspace = true }
 isahc = { workspace = true }
+reqwest = { workspace = true, features = ["socks"] }
 base64 = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 sha2 = { workspace = true }
@@ -37,6 +38,7 @@ toml = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
+async-compat = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 

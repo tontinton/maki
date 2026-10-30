@@ -1,5 +1,6 @@
 mod child_env;
 pub(crate) mod error;
+pub mod http;
 pub(crate) mod image;
 pub(crate) mod manifest;
 pub mod model;

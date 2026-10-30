@@ -1,10 +1,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::env;
 use std::error::Error as StdError;
 use std::io;
-use std::iter;
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -16,14 +14,17 @@ use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use maki_config::split_host_port;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::Timeouts;
+use maki_providers::http::{
+    DNS_ATTEMPTS, HTTP_SCHEME, HTTPS_SCHEME, Lookup, ProxyEnv, error_chain, extract_host_port,
+    is_connect_failure, proxy_env, resolve,
+};
 use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef};
 use regex::bytes::Regex;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Error as ReqwestError, Method, Proxy, Request, Response};
 use smol::lock::Mutex as AsyncMutex;
-use smol::{Async, Timer, unblock};
+use smol::{Async, Timer};
 use thiserror::Error;
 use url::Url;
 
@@ -45,31 +46,14 @@ const USER_AGENT_HEADER: &str = "User-Agent";
 const CF_MITIGATED: &str = "cf-mitigated";
 const CF_CHALLENGE: &str = "challenge";
 const FALLBACK_USER_AGENT: &str = "maki";
-const HTTP_SCHEME: &str = "http://";
-const HTTPS_SCHEME: &str = "https://";
-const HTTP_PORT: u16 = 80;
-const HTTPS_PORT: u16 = 443;
-const DNS_ATTEMPTS: u32 = 3;
 /// Behind a proxy our lookup is only a second opinion, since the proxy
 /// resolves the name itself. One try is enough, and in a sandbox with no DNS
 /// every retry would just be a wait.
 const PROXIED_DNS_ATTEMPTS: u32 = 1;
-const NO_PROXY_ALL: &str = "*";
-const NO_PROXY_SEPARATOR: char = ',';
-const NO_PROXY_BLANKS: [char; 2] = [' ', '\t'];
 const SCHEME_SEPARATOR: &str = "://";
 /// `socks4` and `socks5` are missing on purpose: with them the client looks the
 /// name up itself and hands the proxy an address.
 const NAME_RESOLVING_PROXY_SCHEMES: [&str; 4] = ["http", "https", "socks4a", "socks5h"];
-const DNS_RETRY_DELAY: Duration = Duration::from_millis(150);
-const NO_ADDRESSES: &str = "the name has no addresses";
-/// How a connect fails when nothing answers, besides a name that does not
-/// resolve.
-const UNANSWERED: [io::ErrorKind; 3] = [
-    io::ErrorKind::ConnectionRefused,
-    io::ErrorKind::HostUnreachable,
-    io::ErrorKind::NetworkUnreachable,
-];
 const MAX_POOLED_CLIENTS: usize = 8;
 /// A pooled client holds open sockets, so an endpoint nobody reads any more has
 /// to give them back.
@@ -113,9 +97,6 @@ const CROSS_AUTHORITY_HEADERS: [&str; 5] = [
 /// the config: every `maki.net` call, in any plugin, on any Lua thread, reads
 /// the same list, and `/reload` swaps it.
 static ALLOWED_PRIVATE_HOSTS: LazyLock<ArcSwap<HostAllowlist>> = LazyLock::new(ArcSwap::default);
-
-static PROXY_ENV: LazyLock<ProxyEnv> =
-    LazyLock::new(|| ProxyEnv::from_env(|name| env::var(name).ok()));
 
 thread_local! {
     /// Cancelling a plugin's tasks on unload misses a conn it keeps in a plain
@@ -221,57 +202,11 @@ fn leading_bits_match(ip: u128, net: u128, prefix: u8, width: u32) -> bool {
     prefix == 0 || (ip ^ net) >> (width - u32::from(prefix)) == 0
 }
 
-/// Which proxy a request goes through, and so whether the proxy resolves the
-/// host name instead of us. Sandboxes like nono block DNS and only let traffic
-/// out through their proxy, so there the proxy has to resolve names for us.
-///
-/// The guard and the client have to agree exactly. If we think the proxy
-/// resolves a name but the client resolves it, the client connects to an
-/// address the guard never checked. So the client is handed its proxy from
-/// [`Self::proxy_for`] too, instead of reading the environment by its own rules.
-#[derive(Debug, Default)]
-struct ProxyEnv {
-    http: Option<String>,
-    https: Option<String>,
-    no_proxy: String,
-}
-
-impl ProxyEnv {
-    /// Same rules as curl. An empty variable counts as unset. Plain http only
-    /// reads lowercase `http_proxy`, because under CGI a request's `Proxy:`
-    /// header turns into `HTTP_PROXY` and would let a client pick our proxy.
-    /// A proxy reqwest cannot parse counts as unset too, since the client goes
-    /// direct past it.
-    fn from_env(var: impl Fn(&str) -> Option<String>) -> Self {
-        let var = |name: &str| var(name).filter(|value| !value.is_empty());
-        let proxy = |name: &str| var(name).filter(|value| Proxy::all(value.as_str()).is_ok());
-        let all = || proxy("all_proxy").or_else(|| proxy("ALL_PROXY"));
-        Self {
-            http: proxy("http_proxy").or_else(all),
-            https: proxy("https_proxy")
-                .or_else(|| proxy("HTTPS_PROXY"))
-                .or_else(all),
-            no_proxy: var("no_proxy")
-                .or_else(|| var("NO_PROXY"))
-                .unwrap_or_default(),
-        }
-    }
-
-    fn proxy_for(&self, url: &str) -> Option<&str> {
-        let (host, _) = extract_host_port(url)?;
-        let proxy = if url.starts_with(HTTPS_SCHEME) {
-            &self.https
-        } else {
-            &self.http
-        };
-        proxy
-            .as_deref()
-            .filter(|_| !no_proxy_matches(&self.no_proxy, host))
-    }
-
-    fn resolves_remotely(&self, url: &str) -> bool {
-        self.proxy_for(url).is_some_and(proxy_resolves_names)
-    }
+/// Whether the proxy a URL goes through resolves the host name instead of us.
+/// Sandboxes like nono block DNS and only let traffic out through their
+/// proxy, so there the proxy has to resolve names for us.
+fn resolves_remotely(proxy_env: &ProxyEnv, url: &str) -> bool {
+    proxy_env.proxy_for(url).is_some_and(proxy_resolves_names)
 }
 
 /// A proxy without a scheme is read as http.
@@ -282,37 +217,6 @@ fn proxy_resolves_names(proxy: &str) -> bool {
             NAME_RESOLVING_PROXY_SCHEMES
                 .iter()
                 .any(|known| scheme.eq_ignore_ascii_case(known))
-        })
-}
-
-/// curl's `NO_PROXY` rule for a host name: an entry matches the name itself
-/// and every subdomain, with leading and trailing dots ignored.
-fn no_proxy_matches(no_proxy: &str, host: &str) -> bool {
-    if no_proxy == NO_PROXY_ALL {
-        return true;
-    }
-    let host = host.trim_end_matches('.').as_bytes();
-    for segment in no_proxy.split(NO_PROXY_SEPARATOR) {
-        let segment = segment.trim_matches(NO_PROXY_BLANKS);
-        let entry = segment
-            .split_once(NO_PROXY_BLANKS)
-            .map_or(segment, |(entry, _)| entry);
-        if domain_matches(entry.trim_matches('.').as_bytes(), host) {
-            return true;
-        }
-        // curl stops reading the list at a blank inside an entry.
-        if entry.len() < segment.len() {
-            return false;
-        }
-    }
-    false
-}
-
-fn domain_matches(entry: &[u8], host: &[u8]) -> bool {
-    !entry.is_empty()
-        && host.len().checked_sub(entry.len()).is_some_and(|split| {
-            let (head, tail) = host.split_at(split);
-            tail.eq_ignore_ascii_case(entry) && (head.is_empty() || head.ends_with(b"."))
         })
 }
 
@@ -402,16 +306,6 @@ impl From<String> for NetError {
     }
 }
 
-/// reqwest's own message is only the outermost layer, "error sending request",
-/// so the causes beneath it are spelled out. Errors are stored without their
-/// URL, which can carry a key in the query.
-fn error_chain(error: &ReqwestError) -> String {
-    causes(error)
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(": ")
-}
-
 /// The provider error a codec request failing the same way would give. Those
 /// still go through isahc, whose error type this cannot fill, so it becomes
 /// an I/O error of the kind the provider's retries tell apart: nothing
@@ -423,53 +317,6 @@ pub(crate) fn provider_io_error(error: &ReqwestError) -> io::Error {
         io::ErrorKind::Other
     };
     io::Error::new(kind, error_chain(error))
-}
-
-/// Nothing answered: no socket listening, no route to it, or a name that does
-/// not resolve. A connect timeout stays out, as it does for the provider's own
-/// requests, since it reads the same as a stall.
-fn is_connect_failure(error: &ReqwestError) -> bool {
-    error.is_connect()
-        && !error.is_timeout()
-        && causes(error).any(|e| {
-            e.is::<Unresolved>()
-                || e.downcast_ref::<io::Error>()
-                    .is_some_and(|e| UNANSWERED.contains(&e.kind()))
-        })
-}
-
-fn causes(error: &ReqwestError) -> impl Iterator<Item = &(dyn StdError + 'static)> {
-    iter::successors(Some(error as &(dyn StdError + 'static)), |&e| e.source())
-}
-
-#[derive(Debug, Error)]
-#[error("cannot resolve {host}")]
-struct Unresolved {
-    host: String,
-    source: io::Error,
-}
-
-/// The client's own name lookups, for hosts the guard did not pin. They run
-/// here rather than in reqwest so a name that does not resolve, or resolves
-/// to nothing, fails as [`Unresolved`], which is how [`is_connect_failure`]
-/// knows it.
-struct Lookup;
-
-impl Resolve for Lookup {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_owned();
-        Box::pin(async move {
-            match resolve(&host, 0, DNS_ATTEMPTS).await {
-                Ok(addrs) if !addrs.is_empty() => Ok(Box::new(addrs.into_iter()) as Addrs),
-                Ok(_) => Err(Unresolved {
-                    host,
-                    source: io::Error::other(NO_ADDRESSES),
-                }
-                .into()),
-                Err(source) => Err(Unresolved { host, source }.into()),
-            }
-        })
-    }
 }
 
 impl ResponseData {
@@ -863,7 +710,7 @@ async fn vet(
         return Ok((parsed.into(), Route::Provider));
     }
     let url = validate_and_upgrade_url(url, allowed)?;
-    let pin = check_ssrf(&url, allowed, &PROXY_ENV).await?;
+    let pin = check_ssrf(&url, allowed, proxy_env()).await?;
     check_declared_host(&url, egress)?;
     Ok((url, Route::Guarded(pin)))
 }
@@ -1067,7 +914,7 @@ fn build_client(key: &ClientKey) -> Result<Client, String> {
         // `User-Agent`, not `user-agent`, the way curl and browsers send it. A
         // few servers still match header names case-sensitively.
         .http1_title_case_headers()
-        .proxy(Proxy::custom(|url| PROXY_ENV.proxy_for(url.as_str())))
+        .proxy(Proxy::custom(|url| proxy_env().proxy_for(url.as_str())))
         .dns_resolver(Arc::new(Lookup));
 
     if let Some(timeout) = key.timeout {
@@ -1328,39 +1175,6 @@ fn authority(url: &Url) -> (&str, Option<&str>, Option<u16>) {
     (url.scheme(), url.host_str(), url.port_or_known_default())
 }
 
-/// Host and port of an `http(s)` URL. Any userinfo is dropped, so
-/// `https://example.com@127.0.0.1/` is seen for the loopback address it is.
-fn extract_host_port(url: &str) -> Option<(&str, u16)> {
-    let (rest, default_port) = url
-        .strip_prefix(HTTPS_SCHEME)
-        .map(|rest| (rest, HTTPS_PORT))
-        .or_else(|| url.strip_prefix(HTTP_SCHEME).map(|rest| (rest, HTTP_PORT)))?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let (host, port) = split_host_port(authority)?;
-    Some((host, port.unwrap_or(default_port)))
-}
-
-/// getaddrinfo blocks, so it runs on the blocking pool rather than on the
-/// executor thread every other plugin future shares. A resolver saying "try
-/// again" (a cold cache, a link that just came back) has not answered yet, so a
-/// few retries go out before the lookup counts as a failure.
-async fn resolve(host: &str, port: u16, attempts: u32) -> io::Result<Vec<SocketAddr>> {
-    let mut attempt = 1;
-    loop {
-        let target = (host.to_string(), port);
-        match unblock(move || target.to_socket_addrs()).await {
-            Ok(addrs) => return Ok(addrs.collect()),
-            Err(e) if attempt >= attempts => return Err(e),
-            Err(e) => {
-                tracing::debug!(host, port, attempt, error = %e, "name lookup failed, retrying")
-            }
-        }
-        attempt += 1;
-        Timer::after(DNS_RETRY_DELAY).await;
-    }
-}
-
 async fn lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     resolve(host, port, DNS_ATTEMPTS)
         .await
@@ -1434,7 +1248,7 @@ async fn check_ssrf(
     proxy_env: &ProxyEnv,
 ) -> Result<Option<DnsPin>, String> {
     let (host, port) = extract_host_port(url).ok_or("cannot extract host from URL")?;
-    let via_proxy = proxy_env.resolves_remotely(url);
+    let via_proxy = resolves_remotely(proxy_env, url);
     // One pinned address, the first, which is the one the client would have
     // tried first anyway.
     Ok(guard(host, port, allowed, via_proxy)
@@ -1535,6 +1349,7 @@ mod tests {
     const LOOPBACK_CIDR_ENTRY: &str = "127.0.0.0/8";
     const IPV6_LOOPBACK_ENTRY: &str = "::1/128";
     const ALLOWED_PORT: u16 = 8888;
+    const HTTPS_PORT: u16 = 443;
     /// An address rather than a name, so no test needs a DNS answer.
     const PUBLIC_URL: &str = "https://8.8.8.8/";
     const PUBLIC_HOST: &str = "8.8.8.8";
@@ -1685,11 +1500,11 @@ mod tests {
     }
 
     fn https_proxy(no_proxy: &str) -> ProxyEnv {
-        ProxyEnv {
-            https: Some(PROXY_URL.to_string()),
-            no_proxy: no_proxy.to_string(),
-            ..ProxyEnv::default()
-        }
+        ProxyEnv::from_env(|name| match name {
+            "https_proxy" => Some(PROXY_URL.to_string()),
+            "no_proxy" => Some(no_proxy.to_string()),
+            _ => None,
+        })
     }
 
     fn ssrf_via(url: &str, proxy_env: &ProxyEnv) -> Result<Option<DnsPin>, String> {
@@ -1724,34 +1539,10 @@ mod tests {
     fn proxy_env_reads_what_curl_reads(var: &str, value: &str, http: bool, https: bool) {
         let proxy_env = ProxyEnv::from_env(|name| (name == var).then(|| value.to_string()));
         let resolves = (
-            proxy_env.resolves_remotely(PUBLIC_HTTP_URL),
-            proxy_env.resolves_remotely(PUBLIC_URL),
+            resolves_remotely(&proxy_env, PUBLIC_HTTP_URL),
+            resolves_remotely(&proxy_env, PUBLIC_URL),
         );
         assert_eq!(resolves, (http, https));
-    }
-
-    #[test]
-    fn a_scheme_proxy_shadows_all_proxy() {
-        let proxy_env = ProxyEnv::from_env(|name| match name {
-            "https_proxy" => Some(SOCKS_PROXY_URL.to_string()),
-            "ALL_PROXY" => Some(PROXY_URL.to_string()),
-            _ => None,
-        });
-        assert_eq!(proxy_env.proxy_for(PUBLIC_URL), Some(SOCKS_PROXY_URL));
-    }
-
-    #[test_case("*", "example.com", true ; "wildcard")]
-    #[test_case("example.com", "example.com", true ; "exact")]
-    #[test_case("example.com", "API.Example.com", true ; "subdomain_any_case")]
-    #[test_case(".example.com", "example.com", true ; "leading_dot")]
-    #[test_case("example.com.", "example.com.", true ; "trailing_dots")]
-    #[test_case("localhost, example.com", "example.com", true ; "comma_and_space_list")]
-    #[test_case("localhost,\texample.com", "example.com", true ; "tab_after_comma")]
-    #[test_case("localhost example.com", "example.com", false ; "blank_ends_the_list")]
-    #[test_case("example.com", "badexample.com", false ; "suffix_without_dot")]
-    #[test_case("api.example.com", "example.com", false ; "longer_entry")]
-    fn no_proxy_matches_cases(no_proxy: &str, host: &str, expected: bool) {
-        assert_eq!(no_proxy_matches(no_proxy, host), expected);
     }
 
     fn redirect_params(url: &str) -> RequestParams {
@@ -1917,19 +1708,6 @@ mod tests {
     fn addresses_beside_the_reserved_ranges_stay_public(v4: Ipv4Addr) {
         assert!(!is_private_ip(&IpAddr::V4(v4)));
         assert!(!is_private_ip(&IpAddr::V6(v4.to_ipv6_mapped())));
-    }
-
-    #[test_case("https://example.com", Some(("example.com", HTTPS_PORT)) ; "simple_domain")]
-    #[test_case("http://example.com", Some(("example.com", HTTP_PORT)) ; "http_default_port")]
-    #[test_case("https://example.com:8080/path", Some(("example.com", 8080)) ; "domain_with_port")]
-    #[test_case("https://[::1]/path", Some(("::1", HTTPS_PORT)) ; "bracketed_ipv6")]
-    #[test_case("https://[::1]:8080/path", Some(("::1", 8080)) ; "bracketed_ipv6_with_port")]
-    #[test_case("https://192.168.1.1:443", Some(("192.168.1.1", HTTPS_PORT)) ; "ipv4_with_port")]
-    #[test_case("https://user:pw@10.0.0.1/", Some(("10.0.0.1", HTTPS_PORT)) ; "userinfo_stripped")]
-    #[test_case("https://example.com?a=/b", Some(("example.com", HTTPS_PORT)) ; "query_before_path")]
-    #[test_case("not-a-url", None ; "no_scheme")]
-    fn extract_host_port_cases(url: &str, expected: Option<(&str, u16)>) {
-        assert_eq!(extract_host_port(url), expected);
     }
 
     #[test_case("10.0.0.0/33" ; "prefix_too_long")]
@@ -2111,41 +1889,6 @@ mod tests {
         };
         assert_eq!(send_on_its_own_client(&params).unwrap(), 200);
         server.join().unwrap();
-    }
-
-    fn closed_port_url() -> String {
-        let (_, port) = loopback_listener();
-        format!("http://{LOOPBACK_HOST}:{port}/")
-    }
-
-    fn unresolvable_url() -> String {
-        format!("https://{UNRESOLVABLE_HOST}/")
-    }
-
-    fn plain_tcp_behind_https_url() -> String {
-        let (listener, port) = loopback_listener();
-        std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
-            let _ = conn.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
-        });
-        format!("https://{LOOPBACK_HOST}:{port}/")
-    }
-
-    #[test_case(closed_port_url, io::ErrorKind::ConnectionRefused ; "a_closed_port_draws_on_the_connect_budget")]
-    #[test_case(unresolvable_url, io::ErrorKind::ConnectionRefused ; "an_unresolvable_name_draws_on_the_connect_budget")]
-    #[test_case(plain_tcp_behind_https_url, io::ErrorKind::Other ; "a_failed_handshake_retries_as_transient")]
-    fn transport_failures_classify_like_a_providers(url: fn() -> String, kind: io::ErrorKind) {
-        let client = build_client(&client_key(DEFAULT_TIMEOUT_SECS)).unwrap();
-        let error = smol::block_on(Compat::new(async {
-            client.get(url()).send().await.map(|r| r.status())
-        }))
-        .unwrap_err();
-        assert_eq!(
-            provider_io_error(&error).kind(),
-            kind,
-            "{}",
-            error_chain(&error)
-        );
     }
 
     #[test]

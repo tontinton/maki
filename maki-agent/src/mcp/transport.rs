@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::future::Future;
-use std::iter;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -13,6 +12,7 @@ use std::time::{Duration, Instant};
 use async_compat::Compat;
 use futures_lite::io::BufReader;
 use futures_lite::{AsyncBufReadExt, StreamExt, future};
+use maki_providers::http::error_chain;
 use maki_providers::strip_provider_keys;
 use maki_storage::StateDir;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderName, HeaderValue};
@@ -569,19 +569,6 @@ fn transport_chain(error: &DynamicTransportError) -> String {
         Some(StreamableHttpError::Client(e)) => error_chain(e),
         _ => error_chain(&*error.error),
     }
-}
-
-fn error_chain(error: &(dyn Error + 'static)) -> String {
-    iter::successors(Some(error), |&e| e.source())
-        .map(|e| {
-            match e.downcast_ref::<ReqwestError>().and_then(ReqwestError::url) {
-                // Server URLs can carry a key in the path or query.
-                Some(url) => e.to_string().replace(&format!(" for url ({url})"), ""),
-                None => e.to_string(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(": ")
 }
 
 fn init_error(server: &str, error: ClientInitializeError) -> McpError {

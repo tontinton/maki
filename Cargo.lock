@@ -3583,6 +3583,7 @@ dependencies = [
 name = "maki-providers"
 version = "0.6.5"
 dependencies = [
+ "async-compat",
  "base64 0.23.1",
  "fastrand",
  "flume",
@@ -3599,6 +3600,7 @@ dependencies = [
  "maki-config",
  "maki-storage",
  "open",
+ "reqwest",
  "serde",
  "serde-saphyr",
  "serde_json",

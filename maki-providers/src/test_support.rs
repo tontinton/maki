@@ -237,6 +237,47 @@ pub fn sse_event(event: &str, data: &Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
+/// What the transport tests in `http` and `error` fail against: a port that
+/// refuses, a port that cannot complete a TLS handshake, a name that cannot
+/// resolve, and a secret that must never reach a message.
+#[cfg(test)]
+pub(crate) mod transport {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::thread;
+
+    pub(crate) const LOOPBACK_HOST: &str = "127.0.0.1";
+    /// Reserved by RFC 6761, so every resolver answers NXDOMAIN for it. The
+    /// trailing dot keeps it absolute: a search-domain resolver would
+    /// otherwise rewrite the bare name to something that can resolve.
+    pub(crate) const UNRESOLVABLE_HOST: &str = "maki.invalid.";
+    pub(crate) const QUERY_SECRET: &str = "sk-not-for-logs";
+    pub(crate) const URL_MARKER: &str = "for url";
+    const PLAIN_HTTP_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n";
+
+    fn loopback_listener() -> (TcpListener, u16) {
+        let listener = TcpListener::bind((LOOPBACK_HOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    /// A loopback port nothing listens on any more.
+    pub(crate) fn closed_port() -> u16 {
+        loopback_listener().1
+    }
+
+    /// A loopback port where plain HTTP answers, so a TLS handshake to it
+    /// cannot complete.
+    pub(crate) fn plain_http_port() -> u16 {
+        let (listener, port) = loopback_listener();
+        thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let _ = conn.write_all(PLAIN_HTTP_RESPONSE);
+        });
+        port
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::catch_unwind;
