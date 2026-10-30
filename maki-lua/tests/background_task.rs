@@ -7,12 +7,12 @@ mod common;
 use std::sync::Arc;
 use std::thread;
 
-use common::{Chat, Parked, WAIT, call_ctx, done_text, exec, next_task_event};
+use common::{Chat, Parked, WAIT, call_ctx, done_text, exec, next_task_event, request_move};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{AgentEvent, CancelToken, PermissionsConfig, SessionMailbox, ToolDoneEvent};
 use maki_config::ProjectConfig;
-use maki_lua::{Permission, PluginHost, PluginPermissions, UiAction};
+use maki_lua::{MoveOutcome, Permission, PluginHost, PluginPermissions, UiAction};
 use maki_providers::ContentBlock;
 use maki_storage::id::MakiId;
 use serde_json::{Value, json};
@@ -36,6 +36,13 @@ const MOVED_RECEIPT: &str = "Subagent find the answer moved to the background";
 const MOVER_RECEIPT: &str = "mover moved";
 const MOVER_FINAL: &str = "true: nil";
 const DEFAULT_SLOTS: u64 = 8;
+const MESSAGE_TOOL: &str = "task_message";
+const STOP_TOOL: &str = "task_stop";
+const MESSAGE_CALL_ID: &str = "toolu_message";
+const MESSAGE: &str = "the user added an IOC, check it too";
+const QUEUED: &str = "Message queued for find the answer.";
+const NOT_RUNNING: &str = "no running background subagent with id";
+const INTERRUPT_OPEN: &str = "<user-interrupt>";
 const INIT: &str = include_str!("../../plugins/task/init.lua");
 const RUNNER: &str = include_str!("../../plugins/task/runner.lua");
 
@@ -114,12 +121,16 @@ impl Host {
     }
 
     fn task_with_slots(reg: Arc<ToolRegistry>, slots: u64) -> Self {
+        Self::task_with_opts(reg, true, slots)
+    }
+
+    fn task_with_opts(reg: Arc<ToolRegistry>, allow_background: bool, slots: u64) -> Self {
         let host = PluginHost::new(Arc::clone(&reg)).unwrap();
         host.load_source_with_opts(
             PLUGIN,
             &task_source(),
             serde_json::Map::from_iter([
-                ("allow_background".into(), json!(true)),
+                ("allow_background".into(), json!(allow_background)),
                 ("max_concurrent".into(), json!(slots)),
             ]),
         )
@@ -195,6 +206,23 @@ maki.agent.resolve_model = function() return {{}} end
 
 fn task_input() -> Value {
     json!({ "description": NAME, "prompt": PROMPT, "background": true })
+}
+
+/// Sends {MESSAGE} to task {id} as a model call of chat {chat}.
+fn message(host: &Host, chat: MakiId, id: &str) -> (String, bool) {
+    let (_run, run_token) = CancelToken::new();
+    let (ctx, _events) = call_ctx(&host.reg, chat, &run_token, MESSAGE_CALL_ID);
+    done_text(&exec(
+        &host.reg,
+        MESSAGE_TOOL,
+        json!({ "id": id, "message": MESSAGE }),
+        &ctx,
+    ))
+}
+
+fn assert_refused(host: &Host, chat: MakiId, id: &str) {
+    let (output, failed) = message(host, chat, id);
+    assert!(failed && output.starts_with(NOT_RUNNING), "{output}");
 }
 
 /// The provider stays parked until released, so the receipt coming back at
@@ -404,4 +432,139 @@ fn ctx_background_without_a_seed_names_the_cause(session_up: bool, reason: &str)
 
     assert!(!result.backgrounded);
     assert_eq!(done_text(&result), (format!("nil: {reason}"), false));
+}
+
+/// The receipt names the id `task_message` takes, and the subagent reads the
+/// message as a user interrupt once its current turn ends.
+#[test]
+fn a_message_reaches_a_running_background_task_at_its_next_turn() {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let parked = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    ctx.provider = Arc::clone(&parked.provider);
+
+    let (receipt, _) = done_text(&exec(&host.reg, TASK_TOOL, task_input(), &ctx));
+    assert!(receipt.contains(CALL_ID), "{receipt}");
+    parked.wait_started();
+    assert_eq!(parked.user_turns.recv().unwrap(), [PROMPT]);
+
+    assert_eq!(message(&host, chat.id, CALL_ID), (QUEUED.to_owned(), false));
+    parked.release.send(()).unwrap();
+    parked.wait_started();
+    let [interrupt] = &parked.user_turns.recv().unwrap()[..] else {
+        panic!("the message should land alone");
+    };
+    assert!(
+        interrupt.starts_with(INTERRUPT_OPEN) && interrupt.contains(MESSAGE),
+        "{interrupt}"
+    );
+    parked.release.send(()).unwrap();
+    assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
+    assert_refused(&host, chat.id, CALL_ID);
+}
+
+/// A task still waiting for a slot has no session yet, so the message waits
+/// and the first request carries it just before the prompt.
+#[test]
+fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
+    let host = Host::task_with_slots(Arc::new(ToolRegistry::new()), 1);
+    let chat = Chat::live();
+    let parked = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut first, _first_events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    first.provider = Arc::clone(&parked.provider);
+    let (mut second, _second_events) = call_ctx(&host.reg, chat.id, &run_token, SECOND_CALL_ID);
+    second.provider = Arc::clone(&parked.provider);
+
+    assert!(exec(&host.reg, TASK_TOOL, task_input(), &first).backgrounded);
+    parked.wait_started();
+    assert!(exec(&host.reg, TASK_TOOL, task_input(), &second).backgrounded);
+
+    assert_eq!(
+        message(&host, chat.id, SECOND_CALL_ID),
+        (QUEUED.to_owned(), false)
+    );
+    parked.release.send(()).unwrap();
+    parked.wait_started();
+    parked.release.send(()).unwrap();
+    let turns: Vec<_> = parked.user_turns.drain().collect();
+    assert_eq!(turns, [vec![PROMPT], vec![MESSAGE, PROMPT]]);
+    host.task_dones(&[CALL_ID, SECOND_CALL_ID]);
+}
+
+/// A user stop does not wait for the task to end, and the message must not
+/// queue for a prompt that is already unwinding.
+#[test]
+fn a_message_is_refused_by_a_task_the_user_just_stopped() {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let parked = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    ctx.provider = Arc::clone(&parked.provider);
+
+    assert!(exec(&host.reg, TASK_TOOL, task_input(), &ctx).backgrounded);
+    parked.wait_started();
+
+    host.host.event_handle().cancel_plugin_session(CALL_ID);
+    assert_refused(&host, chat.id, CALL_ID);
+    host.task_done();
+}
+
+/// Only the chat that started a task reaches it.
+#[test]
+fn a_message_is_refused_by_tasks_the_caller_cannot_reach() {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let other = Chat::live();
+    let parked = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    ctx.provider = Arc::clone(&parked.provider);
+
+    assert!(exec(&host.reg, TASK_TOOL, task_input(), &ctx).backgrounded);
+    parked.wait_started();
+
+    assert_refused(&host, other.id, CALL_ID);
+    assert_refused(&host, chat.id, SECOND_CALL_ID);
+    let mut agent = chat.seed.tool_context(CancelToken::none());
+    agent.mailbox = Some(chat.mailbox.clone());
+    exec(&host.reg, STOP_TOOL, json!({ "id": CALL_ID }), &agent);
+    assert_refused(&host, chat.id, CALL_ID);
+}
+
+/// Ctrl+B still moves a blocking task with `allow_background` off, where
+/// `task_message` is not offered and nothing tracks the call for it.
+#[test]
+fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports() {
+    let host = Host::task_with_opts(Arc::new(ToolRegistry::new()), false, DEFAULT_SLOTS);
+    assert!(host.reg.get(MESSAGE_TOOL).is_none());
+    let chat = Chat::live();
+    let parked = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    ctx.provider = Arc::clone(&parked.provider);
+
+    let reg = Arc::clone(&host.reg);
+    let call = thread::spawn(move || {
+        exec(
+            &reg,
+            TASK_TOOL,
+            json!({ "description": NAME, "prompt": PROMPT }),
+            &ctx,
+        )
+    });
+    parked.wait_started();
+    assert_eq!(
+        request_move(&host.host.event_handle(), CALL_ID),
+        MoveOutcome::Moved
+    );
+    let result = call.join().expect("task call");
+    assert!(result.backgrounded);
+    assert!(done_text(&result).0.starts_with(MOVED_RECEIPT));
+
+    parked.release.send(()).unwrap();
+    assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
 }

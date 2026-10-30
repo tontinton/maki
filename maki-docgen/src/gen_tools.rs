@@ -12,6 +12,9 @@ use maki_lua::{OptionType, PluginHost};
 use crate::lua_util::in_registration_window;
 
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
+/// Tools a plugin registers only when one of its boolean options is on, as
+/// (plugin, option, tool).
+const OPTION_GATED_TOOLS: &[(&str, &str, &str)] = &[("task", "allow_background", "task_message")];
 
 const SECTIONS: &[(&str, &[&str])] = &[
     (
@@ -37,7 +40,14 @@ const SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "Agent & Knowledge",
-        &["task", "task_stop", "todo_write", "memory", "skill"],
+        &[
+            "task",
+            "task_stop",
+            "task_message",
+            "todo_write",
+            "memory",
+            "skill",
+        ],
     ),
     ("Web", &["webfetch", "websearch"]),
 ];
@@ -221,15 +231,24 @@ fn collect_tool_info(
     })
 }
 
-/// Loads every builtin with all sub-tools on, so the reference documents
-/// opt-in tools too. "Opt-in" means the plugin declares the tool as a boolean
-/// option defaulting to false, so the badge cannot drift from the defaults.
+/// Loads every builtin with all sub-tools and option-gated tools on, so the
+/// reference documents opt-in tools too. "Opt-in" means the plugin declares
+/// the tool, or the option gating it, as a boolean option defaulting to false,
+/// so the badge cannot drift from the defaults.
 fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     let mut edit = PluginFileConfig::default();
     for &sub in maki_config::EDIT_SUB_TOOLS {
         edit.opts.insert(sub.to_owned(), Value::Bool(true));
     }
-    let config = PluginsConfig::from_plugins(HashMap::from([("edit".to_owned(), edit)]));
+    let mut plugins = HashMap::from([("edit".to_owned(), edit)]);
+    for &(plugin, option, _) in OPTION_GATED_TOOLS {
+        plugins
+            .entry(plugin.to_owned())
+            .or_default()
+            .opts
+            .insert(option.to_owned(), Value::Bool(true));
+    }
+    let config = PluginsConfig::from_plugins(plugins);
 
     let registry = Arc::new(ToolRegistry::new());
     let host = in_registration_window(|| {
@@ -239,7 +258,7 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
         host
     });
 
-    let opt_in = host
+    let mut opt_in: HashSet<String> = host
         .plugin_options()
         .expect("collecting plugin options")
         .into_values()
@@ -247,6 +266,12 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
         .filter(|o| o.ty == OptionType::Boolean && o.default == Some(Value::Bool(false)))
         .map(|o| o.name)
         .collect();
+    let gated: Vec<String> = OPTION_GATED_TOOLS
+        .iter()
+        .filter(|(_, option, _)| opt_in.contains(*option))
+        .map(|(_, _, tool)| (*tool).to_owned())
+        .collect();
+    opt_in.extend(gated);
     (registry, opt_in)
 }
 

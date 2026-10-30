@@ -215,6 +215,7 @@ impl Drop for Gate {
 /// subagent must stay mid-turn.
 struct ParkedProvider {
     started: flume::Sender<()>,
+    user_turns: flume::Sender<Vec<String>>,
     release: flume::Receiver<()>,
     answer: &'static str,
     first_turn: Mutex<Option<ContentBlock>>,
@@ -224,7 +225,7 @@ impl Provider for ParkedProvider {
     fn stream_message<'a>(
         &'a self,
         _: &'a Model,
-        _: &'a [Message],
+        messages: &'a [Message],
         _: &'a str,
         _: &'a Value,
         _: &'a flume::Sender<ProviderEvent>,
@@ -232,6 +233,7 @@ impl Provider for ParkedProvider {
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            let _ = self.user_turns.send(closing_user_texts(messages));
             let _ = self.started.send(());
             let _ = self.release.recv_async().await;
             let first_turn = self.first_turn.lock().unwrap().take();
@@ -262,9 +264,23 @@ impl Provider for ParkedProvider {
     }
 }
 
+/// The texts of the user messages that close {messages}, oldest first.
+fn closing_user_texts(messages: &[Message]) -> Vec<String> {
+    let mut texts: Vec<String> = messages
+        .iter()
+        .rev()
+        .take_while(|m| matches!(m.role, Role::User))
+        .filter_map(|m| m.first_text_content().map(str::to_owned))
+        .collect();
+    texts.reverse();
+    texts
+}
+
 pub struct Parked {
     pub provider: Arc<dyn Provider>,
     pub started: flume::Receiver<()>,
+    /// What each request's closing user turn says.
+    pub user_turns: flume::Receiver<Vec<String>>,
     pub release: flume::Sender<()>,
 }
 
@@ -277,14 +293,17 @@ impl Parked {
     pub fn with_first_turn(answer: &'static str, first_turn: Option<ContentBlock>) -> Self {
         let (started_tx, started) = flume::unbounded();
         let (release, release_rx) = flume::unbounded();
+        let (user_turns_tx, user_turns) = flume::unbounded();
         Self {
             provider: Arc::new(ParkedProvider {
                 started: started_tx,
+                user_turns: user_turns_tx,
                 release: release_rx,
                 answer,
                 first_turn: Mutex::new(first_turn),
             }),
             started,
+            user_turns,
             release,
         }
     }

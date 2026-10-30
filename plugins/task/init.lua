@@ -8,6 +8,9 @@ require("picker")
 require("stop")
 
 local Runner = require("runner")
+-- Steering is for parents that chose background delegation, the rest should
+-- not pay for the tool's definition.
+local Message = Runner.allow_background and require("message")
 
 local DEFAULT_OUTPUT_LINES = 5
 local WAITING_FOR_SLOT = "waiting for a free subagent slot"
@@ -52,7 +55,16 @@ local function handler(input, ctx)
     return { llm_output = prepare_err, is_error = true }
   end
 
+  local call_id, chat = ctx:tool_use_id(), ctx:session_id()
+  -- Declared out here so the epilogue closes it on every path: left to the
+  -- garbage collector it keeps the subagent's event relay alive on an idle VM.
+  local sess
+  local moved
   local function on_background()
+    moved = Message and Message.track(call_id, chat, prepared.options.name)
+    if moved and sess then
+      Message.attach(moved, sess)
+    end
     return string.format(MOVED_RECEIPT, prepared.options.name)
   end
 
@@ -82,9 +94,6 @@ local function handler(input, ctx)
   if waiting then
     waiting:set_lines({})
   end
-  -- Declared out here so the epilogue closes it on every path: left to the
-  -- garbage collector it keeps the subagent's event relay alive on an idle VM.
-  local sess
 
   -- pcall so a raised error cannot leak the permit or the session.
   local ok, out = pcall(function()
@@ -93,12 +102,18 @@ local function handler(input, ctx)
     if sess_err then
       return { llm_output = sess_err, is_error = true }
     end
+    if moved then
+      Message.attach(moved, sess)
+    end
     if not run_in_background then
       ctx:on_background(on_background)
     end
     return Runner.run(sess, prepared)
   end)
 
+  if moved then
+    Message.untrack(call_id)
+  end
   if sess then
     sess:close()
   end
