@@ -17,7 +17,7 @@ use mlua::{
 };
 use tokio::task::spawn_blocking;
 
-use super::base64::bytes_arg;
+use super::util::convert::bytes_arg;
 use super::util::pair::{Pair, try_pair};
 
 /// Decode-bomb guard: a tiny file can declare huge dimensions and balloon
