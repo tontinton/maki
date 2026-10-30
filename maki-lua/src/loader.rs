@@ -402,17 +402,13 @@ impl PluginHost {
         init_files: InitFiles,
         warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
-        self.load_init_files_from_dirs(
-            init_files,
-            maki_storage::paths::config_search_dirs(),
-            warnings,
-        )
+        self.load_init_files_from_dir(init_files, maki_storage::paths::config_dir().ok(), warnings)
     }
 
-    fn load_init_files_from_dirs(
+    fn load_init_files_from_dir(
         &self,
         init_files: InitFiles,
-        global_dirs: impl IntoIterator<Item = PathBuf>,
+        global_dir: Option<PathBuf>,
         warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
         if init_files == InitFiles::Disabled {
@@ -421,16 +417,13 @@ impl PluginHost {
 
         let mut merged: Option<RawConfig> = None;
 
-        for global_dir in global_dirs {
+        if let Some(global_dir) = global_dir {
             self.run_init_file(
                 &global_dir.join("init.lua"),
                 ConfigScope::Global,
                 &mut merged,
                 warnings,
             )?;
-            if merged.is_some() {
-                break;
-            }
         }
         if let InitFiles::GlobalAndProject(path) = &init_files {
             self.run_init_file(path, ConfigScope::Project, &mut merged, warnings)?;
@@ -2195,14 +2188,14 @@ mod tests {
         let mut warnings = Vec::new();
         for scope in [InitFiles::Disabled, InitFiles::Global] {
             let skipped = host
-                .load_init_files_from_dirs(scope, [], &mut warnings)
+                .load_init_files_from_dir(scope, None, &mut warnings)
                 .expect("scope skips broken project init.lua");
             assert!(skipped.is_none());
         }
 
-        let ran = host.load_init_files_from_dirs(
+        let ran = host.load_init_files_from_dir(
             InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
-            [],
+            None,
             &mut warnings,
         );
         assert!(
@@ -2231,7 +2224,7 @@ mod tests {
         let mut warnings = Vec::new();
         let global_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let global_only = global_host
-            .load_init_files_from_dirs(InitFiles::Global, [global.clone()], &mut warnings)
+            .load_init_files_from_dir(InitFiles::Global, Some(global.clone()), &mut warnings)
             .unwrap()
             .unwrap();
         assert_eq!(global_only.always_yolo, Some(false));
@@ -2239,9 +2232,9 @@ mod tests {
 
         let project_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let merged = project_host
-            .load_init_files_from_dirs(
+            .load_init_files_from_dir(
                 InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
-                [global],
+                Some(global),
                 &mut warnings,
             )
             .unwrap()
@@ -2272,9 +2265,9 @@ mod tests {
         let mut warnings = Vec::new();
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let merged = host
-            .load_init_files_from_dirs(
+            .load_init_files_from_dir(
                 InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
-                [global],
+                Some(global),
                 &mut warnings,
             )
             .unwrap()
@@ -2316,9 +2309,9 @@ mod tests {
         let mut warnings = Vec::new();
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let merged = host
-            .load_init_files_from_dirs(
+            .load_init_files_from_dir(
                 InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
-                [global],
+                Some(global),
                 &mut warnings,
             )
             .unwrap()
