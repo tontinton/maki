@@ -8,7 +8,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use tokio::task::spawn_blocking;
 
 use super::util::convert::TableExt;
-use super::util::pair::{Pair, pair, try_pair};
+use super::util::pair::{Pair, pair};
 
 thread_local! {
     /// `Matcher::new` allocates a score matrix of about 135KB, so building one
@@ -20,6 +20,7 @@ thread_local! {
 
 /// Convert an HTML string to Markdown.
 /// Useful for cleaning up web content fetched with `maki.webfetch`.
+/// Invalid UTF-8 bytes are replaced before conversion.
 ///
 /// @param html string HTML source text.
 /// @return (string?, string?) Markdown text on success, or nil plus an error message.
@@ -29,7 +30,7 @@ thread_local! {
 /// print(md) -- "# Hello\n\nworld"
 #[lua_fn]
 async fn html_to_markdown(_lua: Lua, html: LuaString) -> LuaResult<Pair<String>> {
-    let html = try_pair!(html.to_str()).to_owned();
+    let html = html.to_string_lossy();
     Ok(pair(
         spawn_blocking(move || htmd::convert(&html))
             .await
@@ -219,9 +220,12 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlua::Function;
     use test_case::test_case;
 
     const PATHS: [&str; 3] = ["maki-ui/src/main.rs", "README.md", "docs/index.html"];
+    const LATIN1_HTML: &[u8] = b"<h1>caf\xe9</h1>";
+    const LOSSY_MARKDOWN: &str = "# caf\u{fffd}";
 
     fn best(needle: &str) -> Option<&'static str> {
         let pattern = compile(needle);
@@ -283,6 +287,21 @@ mod tests {
         let text = create_text_table(&lua).unwrap();
         lua.globals().set("text", text).unwrap();
         lua
+    }
+
+    #[test_case(b"<h1>hello</h1>", "# hello" ; "utf8")]
+    #[test_case(LATIN1_HTML, LOSSY_MARKDOWN ; "non_utf8")]
+    #[tokio::test]
+    async fn html_bytes_are_decoded_at_the_text_boundary(input: &[u8], expected: &str) {
+        let lua = lua_with_text();
+        let text: Table = lua.globals().get("text").unwrap();
+        let convert: Function = text.get("html_to_markdown").unwrap();
+        let (markdown, error): (String, Option<String>) = convert
+            .call_async(lua.create_string(input).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(error, None);
+        assert_eq!(markdown.trim(), expected);
     }
 
     #[test]

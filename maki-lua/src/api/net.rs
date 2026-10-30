@@ -15,7 +15,7 @@ use maki_providers::http::{
     resolve,
 };
 use maki_providers::{Timeouts, client_builder};
-use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef};
+use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef, Value as LuaValue};
 use regex::bytes::Regex;
 use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Error as ReqwestError, Method, Request, Response};
@@ -26,6 +26,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 use url::Url;
 
+use crate::api::util::convert::{TableExt, bytes_arg};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 use crate::plugin_permissions::{NetEgress, PluginPermissions};
@@ -279,7 +280,7 @@ impl Route {
 }
 
 pub(crate) struct ResponseData {
-    pub(crate) body: String,
+    pub(crate) body: Vec<u8>,
     pub(crate) status: u16,
     content_type: String,
     pub(crate) headers: Vec<(String, String)>,
@@ -307,7 +308,7 @@ impl From<String> for NetError {
 impl ResponseData {
     fn into_table(self, lua: &Lua) -> LuaResult<Table> {
         let tbl = lua.create_table()?;
-        tbl.set("body", self.body)?;
+        tbl.set("body", lua.create_string(self.body)?)?;
         tbl.set("status", self.status)?;
         tbl.set("content_type", self.content_type)?;
         tbl.set("headers", lua.create_table_from(self.headers)?)?;
@@ -348,7 +349,7 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 /// {opts} fields:
 ///   `method` (string) HTTP verb, in any case (default `"GET"`).
 ///   `headers` (table) Header name/value pairs.
-///   `body` (string) Request body.
+///   `body` (string|buffer) Raw request bytes.
 ///   `timeout` (integer) Total timeout in seconds, max 120 (default 30,
 ///     none on a provider's origin). 0 means the default.
 ///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
@@ -364,6 +365,9 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 /// which breaks `set-cookie`. A compressed response arrives decoded, without
 /// its `content-encoding` and `content-length`. A failed response can go
 /// straight to `maki.provider.http_error`.
+/// `body` is a byte string, including NUL and non-UTF-8 bytes. Save it
+/// with `maki.fs.write`. Tool results and `maki.text.html_to_markdown`
+/// replace invalid UTF-8 when turning bytes into text.
 ///
 /// @param url string URL starting with `http://` or `https://`.
 /// @param opts table? Request options (see above).
@@ -743,10 +747,15 @@ async fn extract_request_params(
         Vec::new()
     };
 
-    let body = opts
-        .and_then(|o| o.get::<String>("body").ok())
-        .map(|s| s.into_bytes())
-        .unwrap_or_default();
+    let body = match opts
+        .map(|opts| opts.opt::<LuaValue>("body"))
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .flatten()
+    {
+        Some(value) => bytes_arg(&value, "net.request body").map_err(|error| error.to_string())?,
+        None => Vec::new(),
+    };
 
     let timeout = opts
         .and_then(|o| o.get::<u64>("timeout").ok())
@@ -1111,9 +1120,8 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, NetError>
         Some(pattern) => keep_lines_matching(&bytes, pattern),
         None => bytes,
     };
-    let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(ResponseData {
-        body,
+        body: bytes,
         status,
         content_type,
         headers: collect_headers(response.headers()),
@@ -1363,6 +1371,7 @@ mod tests {
     const EXAMPLE_URL: &str = "https://example.com";
     const ZERO_CONTENT_LENGTH: &str = "content-length: 0";
     const QUERY_SECRET: &str = "sk-not-for-logs";
+    const BINARY_PAYLOAD: &[u8] = b"before\0\xff\x80after\r\n";
     const AUTH_HEADER: &str = "Authorization";
     const AUTH_VALUE: &str = "Bearer tok";
     const ACCEPT_HEADER: &str = "Accept";
@@ -2022,15 +2031,43 @@ mod tests {
         assert_eq!(params.timeout, expected);
     }
 
+    #[test_case(PAYLOAD.as_bytes(), false ; "text")]
+    #[test_case(BINARY_PAYLOAD, false ; "binary_string")]
+    #[test_case(BINARY_PAYLOAD, true ; "buffer")]
+    #[test_case(b"", false ; "empty_string")]
     #[tokio::test]
-    async fn extract_params_post_with_body() {
+    async fn extract_params_post_with_body(body: &[u8], buffer: bool) {
         let lua = Lua::new();
         let opts = lua.create_table().unwrap();
         opts.set("method", "POST").unwrap();
-        opts.set("body", r#"{"key":"val"}"#).unwrap();
+        let value = if buffer {
+            LuaValue::Buffer(lua.create_buffer(body).unwrap())
+        } else {
+            LuaValue::String(lua.create_string(body).unwrap())
+        };
+        opts.set("body", value).unwrap();
         let params = request_params(PUBLIC_URL, Some(&opts)).await.unwrap();
         assert_eq!(params.method, "POST");
-        assert_eq!(params.body, br#"{"key":"val"}"#);
+        assert_eq!(params.body, body);
+    }
+
+    #[tokio::test]
+    async fn extract_params_rejects_an_invalid_body() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("body", lua.create_table().unwrap()).unwrap();
+        assert!(request_params(PUBLIC_URL, Some(&opts)).await.is_err());
+    }
+
+    #[test_case(LuaValue::Nil ; "nil")]
+    #[test_case(LuaValue::NULL ; "json_null")]
+    #[tokio::test]
+    async fn extract_params_null_body_is_empty(value: LuaValue) {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("body", value).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).await.unwrap();
+        assert!(params.body.is_empty());
     }
 
     #[tokio::test]
@@ -2058,11 +2095,12 @@ mod tests {
         assert_eq!(collected, expected);
     }
 
-    #[test]
-    fn response_table_exposes_headers_by_lowercase_name() {
+    #[test_case(PAYLOAD.as_bytes() ; "text")]
+    #[test_case(BINARY_PAYLOAD ; "binary")]
+    fn response_table_preserves_body_and_headers(body: &[u8]) {
         let lua = Lua::new();
         let response = ResponseData {
-            body: PAYLOAD.to_owned(),
+            body: body.to_vec(),
             status: TOO_MANY_REQUESTS,
             content_type: JSON_CONTENT_TYPE.to_owned(),
             headers: vec![(RETRY_AFTER_KEY.to_owned(), RETRY_AFTER_SECS.to_owned())],
@@ -2070,14 +2108,14 @@ mod tests {
         lua.globals()
             .set("res", response.into_table(&lua).unwrap())
             .unwrap();
-        let (status, body, content_type, retry_after): (u16, String, String, String) = lua
+        let (status, returned, content_type, retry_after): (u16, LuaString, String, String) = lua
             .load(format!(
                 r#"return res.status, res.body, res.content_type, res.headers["{RETRY_AFTER_KEY}"]"#
             ))
             .eval()
             .unwrap();
         assert_eq!(status, TOO_MANY_REQUESTS);
-        assert_eq!(body, PAYLOAD);
+        assert_eq!(&*returned.as_bytes(), body);
         assert_eq!(content_type, JSON_CONTENT_TYPE);
         assert_eq!(retry_after, RETRY_AFTER_SECS);
     }
