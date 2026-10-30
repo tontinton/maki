@@ -3895,6 +3895,7 @@ fn websearch_config(provider: &str) -> PluginsConfig {
 #[test_case::test_case("exa", "Exa AI" ; "default_backend")]
 #[test_case::test_case("youcom", "You.com" ; "opt_in_backend")]
 #[test_case::test_case("kagi", "Kagi" ; "keyed_backend")]
+#[test_case::test_case("serply", "Serply" ; "serply_backend")]
 #[test_case::test_case("searxng", "SearXNG" ; "self_hosted_backend")]
 fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str) {
     let (reg, _host) = builtins_host_with(&websearch_config(provider));

@@ -359,7 +359,7 @@ maki.setup({
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
-| `provider` | string | `"exa"` | - | Search backend: "exa" (default), "youcom" (You.com MCP), "kagi" (Kagi MCP, needs KAGI_API_KEY), or "searxng" (self-hosted). |
+| `provider` | string | `"exa"` | - | Search backend: "exa" (default), "youcom" (You.com MCP), "kagi" (Kagi MCP, needs KAGI_API_KEY), "serply" (Serply MCP, needs SERPLY_API_KEY), or "searxng" (self-hosted). |
 | `searxng_base_url` | string | `""` | - | SearXNG instance URL; falls back to the `SEARXNG_BASE_URL` env var. A LAN instance also needs its host in `net.allowed_private_hosts`. Only this backend accepts websearch's `time_range` (day, week, month, or year); its `num_results` is capped by the instance page size. |
 
 ## Validation
