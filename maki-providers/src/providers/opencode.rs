@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_storage::id::SessionRef;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
@@ -14,7 +15,11 @@ use crate::spec::{
     AuthDoc, Build, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, NO_CURATED_MODELS, Native,
     ProviderSpec,
 };
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::types::rfc3339_millis;
+use crate::{
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    ThinkingConfig, UsageLimit,
+};
 
 use super::{ResolvedAuth, Timeouts, with_prefix};
 
@@ -28,6 +33,7 @@ const GO_DISPLAY_NAME: &str = "Opencode Go";
 const ENV_VAR: &str = "OPENCODE_API_KEY";
 const ZEN_API_URL: &str = "https://opencode.ai/zen/v1";
 const GO_API_URL: &str = "https://opencode.ai/zen/go/v1";
+pub(crate) const GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 const ZEN_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API";
 const GO_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API";
 const GO_DISCOVERY_NOTE: &str = "No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.";
@@ -126,13 +132,80 @@ fn create_with_auth(
 const SESSION_HEADER: &str = "x-opencode-session";
 const PUBLIC_KEY: &str = "public";
 
-pub(crate) const QUIRKS: ProviderQuirks = ProviderQuirks {
+pub(crate) const ZEN_QUIRKS: ProviderQuirks = ProviderQuirks {
     free_tier: Some(FreeTier {
         public_key: PUBLIC_KEY,
         config_slug: ZEN_SLUG,
     }),
     session_header: Some(SESSION_HEADER),
+    fetch_usage: None,
 };
+
+pub(crate) const GO_QUIRKS: ProviderQuirks = ProviderQuirks {
+    fetch_usage: Some(fetch_go_usage),
+    ..ZEN_QUIRKS
+};
+
+const USAGE_STATUS_OK: &str = "ok";
+
+#[derive(Deserialize)]
+struct GoUsage {
+    usage: GoUsageWindows,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct GoUsageWindows {
+    rolling: Option<GoUsageWindow>,
+    weekly: Option<GoUsageWindow>,
+    monthly: Option<GoUsageWindow>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct GoUsageWindow {
+    status: Option<String>,
+    percent: f64,
+    #[serde(rename = "resetsAt")]
+    resets_at: Option<String>,
+}
+
+impl From<GoUsage> for ProviderUsage {
+    fn from(usage: GoUsage) -> Self {
+        let windows = [
+            ("5-hour rolling", usage.usage.rolling),
+            ("Weekly", usage.usage.weekly),
+            ("Monthly", usage.usage.monthly),
+        ];
+        Self {
+            plan: None,
+            limits: windows
+                .into_iter()
+                .filter_map(|(label, window)| {
+                    let window = window?;
+                    Some(UsageLimit {
+                        label: label.into(),
+                        percentage: Some(window.percent.clamp(0.0, 100.0).round() as u32),
+                        reset_at: window.resets_at.as_deref().and_then(rfc3339_millis),
+                        detail: window.status.filter(|status| status != USAGE_STATUS_OK),
+                    })
+                })
+                .collect(),
+            by_model_today: Vec::new(),
+        }
+    }
+}
+
+fn fetch_go_usage<'a>(
+    auth: &'a ResolvedAuth,
+    transport: &'a CatalogTransport,
+) -> BoxFuture<'a, Result<Option<ProviderUsage>, AgentError>> {
+    Box::pin(async move {
+        let body = transport.get_text(auth, GO_USAGE_URL).await?;
+        let parsed: GoUsage = serde_json::from_str(&body)?;
+        Ok(Some(parsed.into()))
+    })
+}
 
 /// Plan quotas, served on 401 as well as 429. They clear on a weekly or monthly
 /// boundary, so retrying or rotating keys only burns time. OpenCode's genuinely
@@ -314,4 +387,29 @@ pub(crate) fn non_login_error(status: u16, body: &str) -> Option<NonLoginError> 
             .to_owned(),
         is_quota,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn go_usage_maps_windows() {
+        let body = r#"{
+            "usage": {
+                "rolling": {"status": "ok", "percent": 4, "resetsAt": "1970-01-01T00:00:01Z"},
+                "weekly": {"status": "rate-limited", "percent": 100, "resetsAt": "1970-01-01T00:00:02Z"}
+            }
+        }"#;
+        let usage: ProviderUsage = serde_json::from_str::<GoUsage>(body).unwrap().into();
+        assert_eq!(usage.limits.len(), 2);
+        assert_eq!(usage.limits[0].label, "5-hour rolling");
+        assert_eq!(usage.limits[0].percentage, Some(4));
+        assert_eq!(usage.limits[0].reset_at, Some(1000));
+        assert_eq!(usage.limits[0].detail, None);
+        assert_eq!(usage.limits[1].label, "Weekly");
+        assert_eq!(usage.limits[1].percentage, Some(100));
+        assert_eq!(usage.limits[1].reset_at, Some(2000));
+        assert_eq!(usage.limits[1].detail.as_deref(), Some("rate-limited"));
+    }
 }

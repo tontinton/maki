@@ -35,8 +35,8 @@ use crate::providers::openai_compat::{
 use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, plugin, user_agent};
 use crate::spec::ProviderRegistry;
 use crate::{
-    AgentError, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    ThinkingConfig, dialect,
+    AgentError, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse, ThinkingConfig, dialect,
 };
 
 const MESSAGES_PATH: &str = "/messages";
@@ -59,7 +59,10 @@ pub(crate) const CATALOG_BACKED_BUILTINS: &[&str] = opencode::SLUGS;
 const CHAT_DIALECT: EffortDialect<'static> = dialect::PREFER_HIGH;
 
 /// Provider modules own their entry here; the catalog only reads it.
-const QUIRKS: &[(&[&str], ProviderQuirks)] = &[(opencode::SLUGS, opencode::QUIRKS)];
+const QUIRKS: &[(&[&str], ProviderQuirks)] = &[
+    (&[opencode::ZEN_SLUG], opencode::ZEN_QUIRKS),
+    (&[opencode::GO_SLUG], opencode::GO_QUIRKS),
+];
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
@@ -81,11 +84,20 @@ pub enum EndpointType {
 }
 
 /// Behaviour a provider needs beyond what models.dev publishes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ProviderQuirks {
     pub free_tier: Option<FreeTier>,
     pub session_header: Option<&'static str>,
+    pub(crate) fetch_usage: Option<UsageFetcher>,
 }
+
+/// A provider's own usage endpoint client, kept in its module so the catalog
+/// needs no knowledge of its wire format.
+pub(crate) type UsageFetcher =
+    for<'a> fn(
+        &'a ResolvedAuth,
+        &'a CatalogTransport,
+    ) -> BoxFuture<'a, Result<Option<ProviderUsage>, AgentError>>;
 
 /// A no-key tier that unlocks only zero-priced models, and only after the
 /// user opts in via `providers.<config_slug>.enable_free_models`.
@@ -790,6 +802,26 @@ impl CatalogTransport {
         }
     }
 
+    pub(crate) async fn get_text(
+        &self,
+        auth: &ResolvedAuth,
+        url: &str,
+    ) -> Result<String, AgentError> {
+        let request = auth
+            .configure_request(
+                Request::builder()
+                    .method("GET")
+                    .uri(url)
+                    .header("user-agent", user_agent()),
+            )
+            .body(())?;
+        let mut response = self.client.send_async(request).await?;
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+        Ok(response.text().await?)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stream(
         &self,
@@ -956,6 +988,18 @@ impl Provider for CatalogProvider {
         })
     }
 
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move {
+            let CatalogAuth::Keyed(auth) = &self.auth else {
+                return Ok(None);
+            };
+            match self.data.quirks.fetch_usage {
+                Some(fetch) => fetch(auth, &self.transport).await,
+                None => Ok(None),
+            }
+        })
+    }
+
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             Ok(self
@@ -1027,6 +1071,10 @@ impl Provider for LazyCatalogProvider {
                 .stream_message(model, messages, system, tools, event_tx, opts, session_id)
                 .await
         })
+    }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move { self.resolve().await?.fetch_usage().await })
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
@@ -1195,7 +1243,7 @@ mod tests {
 
     fn opencode_go_provider_data(env_key: &str) -> ProviderData {
         ProviderData {
-            quirks: opencode::QUIRKS,
+            quirks: opencode::GO_QUIRKS,
             slug: "opencode-go".into(),
             display_name: "Opencode Go".into(),
             env_keys: vec![env_key.into()],
@@ -1207,6 +1255,21 @@ mod tests {
                 ("free-model".into(), priced(0.0)),
             ]),
         }
+    }
+
+    #[test]
+    fn usage_is_unsupported_for_providers_without_a_fetcher() {
+        let data = ProviderData {
+            slug: "opencode".into(),
+            quirks: quirks_for("opencode"),
+            ..opencode_go_provider_data("UNUSED")
+        };
+        let provider = super::CatalogProvider {
+            data,
+            auth: super::CatalogAuth::Keyed(ResolvedAuth::for_test(None, Vec::new())),
+            transport: super::CatalogTransport::new(Timeouts::default()),
+        };
+        assert!(smol::block_on(provider.fetch_usage()).unwrap().is_none());
     }
 
     #[test]
