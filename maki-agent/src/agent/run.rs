@@ -1083,28 +1083,6 @@ impl<'h> Agent<'h> {
         // images and all. `carry_from` is where that input starts: the run's
         // own prompt, plus anything queued in since the last turn ended.
         let carry_len = self.history.len().saturating_sub(self.carry_from);
-        let carried = self
-            .compact_and_bill(steer.instructions.as_deref(), carry_len)
-            .await?;
-        // An unanswered prompt says what to do next better than the generic
-        // nudge, so it stands in for it. A layer's own words still go in.
-        if carried == 0 {
-            self.history
-                .push(Message::synthetic(compaction::continue_message(
-                    &self.config,
-                    steer.continue_text.as_deref(),
-                )));
-        } else if let Some(text) = steer.continue_text {
-            self.history.push(Message::synthetic(text));
-        }
-        Ok(())
-    }
-
-    async fn compact_and_bill(
-        &mut self,
-        instructions: Option<&str>,
-        carry_len: usize,
-    ) -> Result<usize, AgentError> {
         let context_size_before = self.gauge.size();
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
@@ -1123,36 +1101,35 @@ impl<'h> Agent<'h> {
             cancel: &self.cancel,
             context_size: context_size_before,
         };
-        let Compacted {
-            usage: compaction_usage,
-            summary,
-            carried,
-        } = compaction::compact_history(
+        let Compacted { summary, carried } = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
             &self.event_tx,
             &hooks,
             &self.config,
-            instructions,
+            steer.instructions.as_deref(),
             carry_len,
             self.timeouts.retry,
+            &self.ledger,
         )
         .await?;
-        // The summariser can be a different model, so price this with
-        // `compact_model` and not `self.model`. `list_cost` gates `fast`
-        // against whichever one it gets, and is the un-subsidised price the
-        // ledger wants either way.
-        let compact_cost = compact_model.billed_cost(&compaction_usage, self.opts.fast);
-        let compact_list_cost = compact_model.list_cost(&compaction_usage, self.opts.fast);
-        self.ledger
-            .add(compaction_usage, compact_cost, compact_list_cost);
         let carry_from = self.history.len() - carried;
         self.rollback_len = carry_from;
         self.carry_from = carry_from;
         // The old prefix has nothing worth keeping now, so the new prompt picks
         // up every fact told since.
         self.refresh_frame()?;
+        // An unanswered prompt says what to do next better than the generic
+        // nudge, so it stands in for it. A layer's own words still go in.
+        if carried == 0 {
+            self.history
+                .push(Message::synthetic(compaction::continue_message(
+                    steer.continue_text.as_deref(),
+                )));
+        } else if let Some(text) = steer.continue_text {
+            self.history.push(Message::synthetic(text));
+        }
         // The measurement the gauge holds describes the transcript that was
         // just summarized away, so what is left is all it may count.
         if let Some((system, tools)) = self.history.request_prefix() {
@@ -1164,8 +1141,7 @@ impl<'h> Agent<'h> {
             context_size_after,
             context_window: self.model.context_window,
             summary,
-        })?;
-        Ok(carried)
+        })
     }
 
     async fn handle_queued_command(&mut self) -> Result<bool, AgentError> {
@@ -1257,10 +1233,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use maki_config::ProjectConfig;
+    use maki_providers::model::FastSupport;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, ThinkingSupport, TokenUsage,
+        ContentBlock, FastPricing, Message, Model, ModelPricing, ProviderEvent, RequestOptions,
+        Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
     };
     use maki_storage::frame::{FactsUpdate, PlanChange};
     use maki_storage::id::MakiId;
@@ -1327,6 +1304,7 @@ mod tests {
         system: String,
         tools: Value,
         messages: Vec<Value>,
+        opts: RequestOptions,
     }
 
     /// The contract that keeps the cache and every thinking block valid:
@@ -1369,10 +1347,10 @@ mod tests {
             system: &'a str,
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
-            _: RequestOptions,
+            opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async {
+            Box::pin(async move {
                 self.requests.lock().unwrap().push(CapturedRequest {
                     model: model.id.clone(),
                     system: system.to_owned(),
@@ -1381,6 +1359,7 @@ mod tests {
                         .iter()
                         .map(|m| serde_json::to_value(m).unwrap())
                         .collect(),
+                    opts,
                 });
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
@@ -3258,7 +3237,7 @@ mod tests {
         })
         .await;
 
-        let continue_text = compaction::continue_message(&AgentConfig::default(), None);
+        let continue_text = compaction::continue_message(None);
         let messages = h.history.as_slice();
         assert!(
             messages
@@ -3440,6 +3419,47 @@ mod tests {
         });
         assert_eq!(turn_subsidised_list_cost, Some(None));
         assert_eq!(done_list_cost, Some(Some(expected)));
+    }
+
+    /// The summary request never asks for fast mode, so a fast session must
+    /// not price it at fast rates, even when the summary turns out unusable.
+    #[test_case(text_response(StopReason::EndTurn) ; "usable_summary")]
+    #[test_case(thinking_response() ; "unusable_summary")]
+    #[tokio::test]
+    async fn fast_session_bills_compaction_at_standard_rates(mut response: StreamResponse) {
+        const INPUT_TOKENS: u64 = 1_000;
+        const OUTPUT_TOKENS: u64 = 100;
+        let usage = TokenUsage {
+            input: INPUT_TOKENS,
+            output: OUTPUT_TOKENS,
+            ..Default::default()
+        };
+        response.usage = usage;
+        let provider = MockProvider::new(vec![response]);
+        let requests = Arc::clone(&provider.requests);
+        let mut model = default_model();
+        model.supports_fast_override = Some(FastSupport::Supported);
+        model.pricing = ModelPricing {
+            input: 1.0,
+            output: 2.0,
+            fast: Some(FastPricing {
+                input: 3.0,
+                output: 6.0,
+            }),
+            ..Default::default()
+        };
+        let mut history = History::new(vec![Message::user(CARRIED.into())]);
+        let (mut agent, _event_rx) = make_agent_with(Arc::new(provider), model, &mut history);
+        agent.opts.fast = true;
+        agent.carry_from = agent.history.len();
+
+        let _ = agent.do_compact(CompactSteer::default()).await;
+
+        assert!(!requests.lock().unwrap()[0].opts.fast);
+        let totals = agent.ledger.totals();
+        assert_eq!(totals.usage, usage);
+        assert_eq!(totals.cost, agent.model.billed_cost(&usage, false));
+        assert_eq!(totals.list_cost, agent.model.list_cost(&usage, false));
     }
 
     #[test_case(true,  170_000, true  ; "enabled_and_over_threshold")]
@@ -3722,26 +3742,6 @@ mod tests {
                 .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(QUEUED_INPUT))),
             "{QUEUED_KEPT_MSG}"
         );
-    }
-
-    #[tokio::test]
-    async fn do_compact_appends_post_instructions_to_continue_message() {
-        const POST: &str = "Re-read plan.md";
-        let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, _event_rx) = make_agent(
-            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
-            &mut history,
-        );
-        agent.config.post_compaction_instructions = Some(POST.into());
-        agent.carry_from = agent.history.len();
-        agent.do_compact(CompactSteer::default()).await.unwrap();
-        drop(agent);
-
-        let last = history.as_slice().last().unwrap();
-        assert!(matches!(
-            &last.content[0],
-            ContentBlock::Text { text } if text.ends_with(POST) && text != POST
-        ));
     }
 
     #[tokio::test]
@@ -4359,15 +4359,16 @@ mod tests {
         );
     }
 
+    const POST_COMPACTION: &str = "Re-read plan.md";
+
     #[tokio::test]
-    async fn compact_before_continue_joins_the_configured_one() {
-        const POST: &str = "Re-read plan.md";
+    async fn compact_before_continue_follows_the_configured_instructions() {
         let mut history = History::new(vec![Message::user("go".into())]);
         let (mut agent, _event_rx) = make_agent(
             MockProvider::new(vec![text_response(StopReason::EndTurn)]),
             &mut history,
         );
-        agent.config.post_compaction_instructions = Some(POST.into());
+        agent.config.post_compaction_instructions = Some(POST_COMPACTION.into());
         agent.carry_from = agent.history.len();
         script(
             &agent.registry,
@@ -4386,7 +4387,11 @@ mod tests {
             .unwrap()
             .first_text_content()
             .unwrap();
-        assert!(last.contains(POST) && last.contains(KEEP_GOING), "{last}");
+        assert_eq!(
+            history.as_slice()[2].first_text_content(),
+            Some(POST_COMPACTION)
+        );
+        assert_eq!(last, compaction::continue_message(Some(KEEP_GOING)));
     }
 
     const CARRIED: &str = "answer this next";
@@ -4423,28 +4428,93 @@ mod tests {
         assert_eq!(tail, [Some(CARRIED), Some(KEEP_GOING)]);
     }
 
+    fn summary_response() -> StreamResponse {
+        assistant_response(vec![ContentBlock::Text {
+            text: SUMMARY.into(),
+        }])
+    }
+
+    /// The continuation lands after the summary, so measuring before it would
+    /// report a context short by that message.
     #[tokio::test]
-    async fn compaction_done_carries_the_summary() {
+    async fn compaction_done_describes_the_final_history() {
         let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, event_rx) = make_agent(
-            MockProvider::new(vec![assistant_response(vec![ContentBlock::Text {
-                text: SUMMARY.into(),
-            }])]),
-            &mut history,
-        );
+        let (mut agent, event_rx) =
+            make_agent(MockProvider::new(vec![summary_response()]), &mut history);
         agent.carry_from = agent.history.len();
 
-        agent.do_compact(CompactSteer::default()).await.unwrap();
-        drop(agent);
+        agent
+            .do_compact(CompactSteer {
+                continue_text: Some(KEEP_GOING.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
-        let summaries: Vec<_> = drain_events(&event_rx)
+        let mut expected_gauge = ContextGauge::default();
+        let (system, tools) = agent.history.request_prefix().unwrap();
+        expected_gauge.reset(agent.history.as_slice(), system, tools);
+        assert_eq!(agent.gauge.size(), expected_gauge.size());
+        let completions: Vec<_> = drain_events(&event_rx)
             .into_iter()
             .filter_map(|e| match e.event {
-                AgentEvent::CompactionDone { summary, .. } => Some(summary),
+                AgentEvent::CompactionDone {
+                    summary,
+                    context_size_after,
+                    ..
+                } => Some((summary, context_size_after)),
                 _ => None,
             })
             .collect();
-        assert_eq!(summaries, [SUMMARY]);
+        assert_eq!(completions, [(SUMMARY.into(), expected_gauge.size())]);
+    }
+
+    /// The configured instructions close the summary block, ahead of the
+    /// carried input. A truncated answer stays last so it can be continued, and
+    /// the next compaction summarizes the old copy instead of carrying it.
+    #[test_case(Vec::new(), 1 ; "not_carried")]
+    #[test_case(vec![Message::user(CARRIED.into())], 1 ; "carried")]
+    #[test_case(vec![Message::user(CARRIED.into())], 2 ; "repeated_compaction")]
+    #[test_case(
+        vec![Message::user(PENDING_PROMPT.into()), text_response(StopReason::MaxTokens).message], 1
+        ; "truncated_answer"
+    )]
+    #[tokio::test]
+    async fn post_compaction_instructions_close_the_summary(
+        carried: Vec<Message>,
+        compactions: usize,
+    ) {
+        let mut history = History::new(
+            [Message::user("go".into())]
+                .into_iter()
+                .chain(carried.iter().cloned())
+                .collect(),
+        );
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new((0..compactions).map(|_| summary_response()).collect()),
+            &mut history,
+        );
+        agent.config.post_compaction_instructions = Some(POST_COMPACTION.into());
+        agent.carry_from = 1;
+
+        for _ in 0..compactions {
+            agent.do_compact(CompactSteer::default()).await.unwrap();
+        }
+
+        let messages = agent.history.as_slice();
+        assert_eq!(
+            messages[1..agent.carry_from],
+            [
+                summary_response().message,
+                Message::synthetic(POST_COMPACTION.into())
+            ]
+        );
+        let expected_tail = if carried.is_empty() {
+            vec![Message::synthetic(compaction::continue_message(None))]
+        } else {
+            carried
+        };
+        assert_eq!(messages[agent.carry_from..], expected_tail);
     }
 
     /// Lands its command once the stop layer has spent the allowance, keyed on
