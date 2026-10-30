@@ -54,11 +54,11 @@ impl BtwModal {
         Self {
             open: false,
             question: String::new(),
-            answer: StreamingContent::new("", answer.text_style, answer.prefix_style, ms_per_char),
+            answer: StreamingContent::new("", answer.text_style, answer.label_style(), ms_per_char),
             thinking: StreamingContent::new(
-                thinking.prefix,
+                thinking.label,
                 thinking.text_style,
-                thinking.prefix_style,
+                thinking.label_style(),
                 ms_per_char,
             ),
             thinking_lines,
@@ -216,9 +216,9 @@ impl BtwModal {
         let thinking = thinking_style();
         let answer = assistant_style();
         self.thinking
-            .set_style(thinking.prefix, thinking.text_style, thinking.prefix_style);
+            .set_style(thinking.label, thinking.text_style, thinking.label_style());
         self.answer
-            .set_style("", answer.text_style, answer.prefix_style);
+            .set_style("", answer.text_style, answer.label_style());
     }
 
     #[cfg(test)]

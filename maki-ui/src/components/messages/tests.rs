@@ -1,4 +1,4 @@
-use super::segment;
+use super::segment::{self, GUTTER_COLS};
 use super::*;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
@@ -808,7 +808,7 @@ fn search_text_instruction_segment_indexes_its_own_blocks() {
 }
 
 #[test]
-fn search_text_includes_role_prefix() {
+fn search_text_includes_role_marker() {
     let md = "# Heading\n\nSome **bold** text";
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
@@ -816,9 +816,9 @@ fn search_text_includes_role_prefix() {
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
     rebuild(&mut panel);
     let texts = panel.segment_search_texts();
-    assert_eq!(texts[0], "you> hello");
-    assert_eq!(texts[2], format!("maki> {md}"));
-    assert_eq!(texts[4], "thinking> hmm");
+    assert_eq!(texts[0], "❯ hello");
+    assert_eq!(texts[2], format!("● {md}"));
+    assert_eq!(texts[4], "● thinking> hmm");
 }
 
 #[test]
@@ -1029,7 +1029,7 @@ fn stream_reset_clears_streaming_and_fails_tools() {
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Error);
 }
 
-const MAKI_PREFIX_LEN: u16 = 6;
+const GUTTER_LEN: u16 = GUTTER_COLS;
 
 /// Selections live per segment, so the tests that think in document rows
 /// convert through the same walker the panel uses.
@@ -1074,7 +1074,7 @@ fn panel_with_msgs(texts: &[&str], width: u16, height: u16) -> MessagesPanel {
 fn extract_partial_column_selection() {
     let panel = panel_with_msgs(&["Hello world"], 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    let world_start = MAKI_PREFIX_LEN + "Hello ".len() as u16;
+    let world_start = GUTTER_LEN + "Hello ".len() as u16;
     let sel = make_sel(&panel, area, (0, world_start), (0, world_start + 4));
     let text = panel.extract_selection_text(&sel, area);
     assert_eq!(text, "world");
@@ -1117,7 +1117,7 @@ fn extract_mixed_fully_enclosed_and_partial() {
     let panel = panel_with_msgs(&["full segment", "partial here"], 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     let seg1_start = seg_start_row(&panel, 2);
-    let sel = make_sel(&panel, area, (0, 0), (seg1_start, MAKI_PREFIX_LEN + 6));
+    let sel = make_sel(&panel, area, (0, 0), (seg1_start, GUTTER_LEN + 6));
     let text = panel.extract_selection_text(&sel, area);
     assert!(text.contains("full segment"));
     assert!(text.contains("partial"));
@@ -1133,8 +1133,8 @@ fn extract_partial_col_symmetric(msgs: &[&str], expect_start: &str, expect_end: 
     render(&mut panel, 80, 24);
     let total = panel.layout().total_rows();
     let area = Rect::new(0, 0, 80, 24);
-    let down = make_sel(&panel, area, (0, MAKI_PREFIX_LEN), (total - 1, 79));
-    let up = make_sel(&panel, area, (total - 1, 79), (0, MAKI_PREFIX_LEN));
+    let down = make_sel(&panel, area, (0, GUTTER_LEN), (total - 1, 79));
+    let up = make_sel(&panel, area, (total - 1, 79), (0, GUTTER_LEN));
     let text_down = panel.extract_selection_text(&down, area);
     let text_up = panel.extract_selection_text(&up, area);
     assert!(text_down.contains(expect_start));
@@ -1170,7 +1170,7 @@ fn extract_partial_last_line_truncated() {
     render(&mut panel, 80, 24);
     let total = panel.layout().total_rows();
     let area = Rect::new(0, 0, 80, 24);
-    let sel = make_sel(&panel, area, (0, 0), (total - 1, 3));
+    let sel = make_sel(&panel, area, (0, 0), (total - 1, GUTTER_LEN + 3));
     let text = panel.extract_selection_text(&sel, area);
     assert_eq!(text.lines().last().unwrap(), "ABCD");
 }
@@ -2138,7 +2138,7 @@ fn step(n: usize) -> String {
 fn collapsed_header(line_count: usize) -> String {
     format!(
         "{}{TRUNCATION_PREFIX} ({line_count} lines)",
-        thinking_style().prefix
+        thinking_style().label
     )
 }
 
@@ -2985,7 +2985,7 @@ fn selection_survives_a_resize() {
 
     let wide = Rect::new(0, 0, 80, 24);
     let mut sel = Selection::start(
-        first_row_of(&panel, ALPHA, MAKI_PREFIX_LEN),
+        first_row_of(&panel, ALPHA, GUTTER_LEN),
         wide,
         SelectionZone::Messages,
     );
@@ -3004,4 +3004,161 @@ fn selection_survives_a_resize() {
         before,
         "the reflow above the selection dragged the copy with it"
     );
+}
+
+const GUTTER_TEST_WIDTH: u16 = 40;
+const GUTTER_TEST_HEIGHT: u16 = 12;
+const USER_MARKER_TEXT: &str = "❯ ";
+const GUTTER_INDENT: &str = "  ";
+const LONG_PROSE: &str = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi";
+
+fn screen_rows(panel: &mut MessagesPanel) -> Vec<String> {
+    let terminal = render(panel, GUTTER_TEST_WIDTH, GUTTER_TEST_HEIGHT);
+    buffer_text(&terminal).lines().map(str::to_owned).collect()
+}
+
+fn body_rows(rows: &[String]) -> Vec<&String> {
+    rows.iter().filter(|r| !r.trim().is_empty()).collect()
+}
+
+#[test]
+fn user_message_has_marker_and_indented_wrap() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, LONG_PROSE.into()));
+    let rows = screen_rows(&mut panel);
+    let body = body_rows(&rows);
+    assert!(body.len() > 1, "prose must wrap: {rows:?}");
+    assert!(body[0].starts_with(USER_MARKER_TEXT));
+    assert!(body[1..].iter().all(|r| r.starts_with(GUTTER_INDENT)));
+    assert!(body[1..].iter().all(|r| !r.contains(USER_MARKER_TEXT)));
+}
+
+#[test]
+fn error_message_sits_behind_blank_gutter() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::Error, ERROR_TEXT.into()));
+    let rows = screen_rows(&mut panel);
+    let body = body_rows(&rows);
+    assert_eq!(body[0].trim_end(), format!("{GUTTER_INDENT}{ERROR_TEXT}"));
+}
+
+#[test]
+fn assistant_streaming_rows_indented_before_flush() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.streaming_text.set_buffer(LONG_PROSE);
+    let streaming = screen_rows(&mut panel);
+    let body = body_rows(&streaming);
+    assert!(body.len() > 1, "prose must wrap: {streaming:?}");
+    assert!(body[1..].iter().all(|r| r.starts_with(GUTTER_INDENT)));
+    assert!(
+        body[1..]
+            .iter()
+            .all(|r| !r[GUTTER_INDENT.len()..].starts_with(' '))
+    );
+
+    panel.flush();
+    assert_eq!(screen_rows(&mut panel), streaming);
+}
+
+#[test]
+fn thinking_starting_with_heading_keeps_markdown() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        "# Plan\n- a".into(),
+    ));
+    let terminal = render(&mut panel, GUTTER_TEST_WIDTH, GUTTER_TEST_HEIGHT);
+    let rows: Vec<String> = buffer_text(&terminal).lines().map(str::to_owned).collect();
+    let label = thinking_style().label;
+    assert!(rows[0].starts_with(&format!("● {label}Plan")), "{rows:?}");
+    assert!(rows[1].starts_with("  • a"), "{rows:?}");
+    let x = rows[0].find("Plan").unwrap() as u16;
+    let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+    assert_eq!(cell.fg, theme::current().heading.fg.unwrap());
+}
+
+#[test]
+fn resize_rewraps_gutter_message_without_reflow() {
+    const WIDE: u16 = 80;
+    const NARROW: u16 = 40;
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, LONG_PROSE.repeat(3)));
+    render(&mut panel, WIDE, GUTTER_TEST_HEIGHT);
+    let stale = panel.cache.get(0).unwrap().height(NARROW - 1);
+
+    let mut fresh = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    fresh.push(DisplayMessage::new(DisplayRole::User, LONG_PROSE.repeat(3)));
+    render(&mut fresh, NARROW, GUTTER_TEST_HEIGHT);
+    assert_eq!(stale, fresh.cache.get(0).unwrap().height(NARROW - 1));
+}
+
+#[test]
+fn long_tool_output_wraps_at_gutter_column_and_copy_excludes_gutter() {
+    const WIDTH: u16 = 40;
+    const TOKEN: &str = "abcdefghij";
+    let body = format!("{TOKEN} ").repeat(12);
+    let body = body.trim_end();
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        call: None,
+        id: "t1".into(),
+        tool: BASH_TOOL_NAME.into(),
+        output: Arc::new(ToolOutput::Plain(body.into())),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    });
+    let terminal = render(&mut panel, WIDTH, 24);
+    let rows: Vec<String> = buffer_text(&terminal)
+        .lines()
+        .map(|row| row.trim_end().to_owned())
+        .collect();
+    let body_rows: Vec<&String> = rows.iter().filter(|r| r.contains(TOKEN)).collect();
+    let gutter = " ".repeat(GUTTER_COLS as usize);
+    assert!(body_rows.len() >= 2, "output should wrap: {rows:?}");
+    for row in &body_rows {
+        assert!(
+            row.starts_with(&format!("{gutter}{TOKEN}")),
+            "row not at col {GUTTER_COLS}: {row:?}"
+        );
+    }
+
+    let area = Rect::new(0, 0, WIDTH, 24);
+    let sel = make_sel(&panel, area, (0, 0), (23, WIDTH - 1));
+    let copied = panel.extract_selection_text(&sel, area);
+    assert!(
+        copied.lines().all(|l| !l.starts_with(' ')),
+        "copy kept the gutter: {copied:?}"
+    );
+}
+
+#[test]
+fn copy_user_message_excludes_marker() {
+    let mut panel = panel_with_msgs(&[], 80, 24);
+    panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let sel = make_sel(&panel, area, (0, 0), (0, 79));
+    assert_eq!(panel.extract_selection_text(&sel, area), "hello");
+}
+
+#[test]
+fn user_message_bg_covers_gutter_and_body_but_not_the_spacer() {
+    const USER_TEXT: &str = "hello";
+    const SPACER_ROW: u16 = 1;
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, USER_TEXT.into()));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "reply".into()));
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let buf = terminal.backend().buffer();
+    let tint = theme::current().user_message_bg.bg.expect("tinted theme");
+
+    let body_end = GUTTER_COLS + USER_TEXT.len() as u16;
+    for x in 0..body_end {
+        assert_eq!(buf.cell((x, 0)).unwrap().bg, tint, "col {x}");
+    }
+    for x in 0..VIEW_WIDTH {
+        assert_ne!(buf.cell((x, SPACER_ROW)).unwrap().bg, tint, "col {x}");
+    }
 }

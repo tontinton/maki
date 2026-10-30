@@ -121,6 +121,7 @@ keybind_key        = { fg = "frost_light", modifiers = ["bold"] }
 user               = { fg = "frost_light" }
 assistant          = { fg = "foreground" }
 thinking           = { fg = "comment", modifiers = ["italic"] }
+user_message_bg    = { bg = "#363e4c" }
 tool               = { fg = "foreground" }
 tool_path          = { fg = "frost_light" }
 tool_annotation    = { fg = "comment" }

@@ -118,6 +118,7 @@ user               = { fg = "blue" }
 assistant          = { fg = "foreground" }
 assistant_prefix   = { fg = "orange" }
 thinking           = { fg = "comment", modifiers = ["italic"] }
+user_message_bg    = { bg = "#1c202b" }
 # surface.sunk
 tool_bg            = { bg = "#181c26" }
 tool               = { fg = "foreground" }

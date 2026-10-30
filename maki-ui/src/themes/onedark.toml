@@ -107,6 +107,7 @@ user               = { fg = "blue", modifiers = ["bold"] }
 assistant_prefix   = { fg = "purple" }
 assistant          = { fg = "foreground" }
 thinking           = { fg = "comment", modifiers = ["italic"] }
+user_message_bg    = { bg = "#313640" }
 strikethrough      = { fg = "comment", modifiers = ["crossed_out"] }
 code_block         = { fg = "foreground" }
 horizontal_rule    = { fg = "selection" }

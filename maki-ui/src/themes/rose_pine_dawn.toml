@@ -114,6 +114,7 @@ user              = { fg = "rose" }
 assistant_prefix  = { fg = "iris" }
 assistant         = { fg = "foreground" }
 thinking          = { fg = "comment", modifiers = ["italic"] }
+user_message_bg    = { bg = "#efeae5" }
 strikethrough     = { fg = "comment", modifiers = ["crossed_out"] }
 code_block        = { fg = "foreground" }
 plan_rule         = { fg = "rose", modifiers = ["bold"] }
