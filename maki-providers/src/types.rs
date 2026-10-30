@@ -733,14 +733,15 @@ pub struct ModelFallback {
 
 impl fmt::Display for ModelFallback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { from, to, category } = self;
-        let policy = category.as_deref().map_or_else(String::new, |category| {
-            format!(" ({category} safety filter)")
-        });
         write!(
             f,
-            "{MODEL_FALLBACK_MARK} Model downgraded: {from} blocked this request{policy}, so {to} is answering instead"
-        )
+            "{MODEL_FALLBACK_MARK} Model downgraded: {} blocked this request",
+            self.from
+        )?;
+        if let Some(category) = &self.category {
+            write!(f, " ({category} safety filter)")?;
+        }
+        write!(f, ", so {} is answering instead", self.to)
     }
 }
 
