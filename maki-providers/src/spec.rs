@@ -8,8 +8,8 @@ use crate::model::{Model, ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::provider::Provider;
 use crate::providers::{
-    ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, google, llama_cpp, ollama,
-    openai, opencode, plugin, xai, zai,
+    ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, google, llama_cpp, localai,
+    ollama, openai, opencode, plugin, xai, zai,
 };
 use crate::types::ThinkingFallback;
 use crate::{AgentError, Effort};
@@ -26,6 +26,7 @@ pub const BASES: &[&str] = &[
     copilot::SPEC.slug,
     ollama::SPEC.slug,
     llama_cpp::SPEC.slug,
+    localai::SPEC.slug,
     zai::SPEC.slug,
     opencode::ZEN_SPEC.slug,
     xai::SPEC.slug,
@@ -228,6 +229,7 @@ const BUILTINS: &[ProviderSpec] = &[
     copilot::SPEC,
     ollama::SPEC,
     llama_cpp::SPEC,
+    localai::SPEC,
     zai::SPEC,
     opencode::ZEN_SPEC,
     xai::SPEC,
