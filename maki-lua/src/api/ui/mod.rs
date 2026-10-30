@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use maki_agent::UiWaker;
 use maki_agent::tools::compact_duration;
-use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
+use maki_color::DEFAULT_COLOR_NAME;
+use maki_highlight::SegmentColor;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::{MakiId, MakiIdParseError};
 use mlua::{Lua, Result as LuaResult, Table};
@@ -275,7 +276,7 @@ fn theme_color(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
 /// buf:line({ { "note", { fg = dim.fg, bg = sel.bg } } })
 #[lua_fn]
 fn theme_style(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
-    let Some(style) = maki_highlight::ui_style(&name) else {
+    let Some(style) = maki_color::Registry::style(&name) else {
         return Ok(mlua::Value::Nil);
     };
     let tbl = lua.create_table_with_capacity(0, UI_STYLE_FIELDS)?;
@@ -471,6 +472,102 @@ fn set_window_title(
 ) -> LuaResult<()> {
     let _ = ui_send(tx.as_ref(), UiAction::SetWindowTitle(title));
     Ok(())
+}
+
+/// Overrides the foreground color of a named theme style at runtime, or
+/// restores the theme's own color when the {color} is nil. The change is
+/// live: the next frame repaints with it, and it survives theme switches,
+/// because it patches whatever theme is running rather than replacing it.
+///
+/// Valid names are the ones `maki.ui.theme_style` accepts ("dim",
+/// "input_border", "accent", ...), except "background" and "foreground",
+/// which have no foreground field of their own, plus the three mode colors
+/// "mode_build", "mode_plan", and "mode_bash" that paint the input box
+/// border. Only the foreground changes; modifiers and backgrounds stay.
+/// A name outside that list returns `nil` and an error.
+///
+/// @param name string Style name, e.g. "input_border" or "mode_build".
+/// @param color string|nil `#rrggbb`, an ANSI palette index like "4", or nil to restore the theme color.
+/// @return (boolean|nil, string|nil) true when applied, or nil and an error for an unknown name or a missing UI.
+/// @example
+/// maki.ui.set_theme_color("mode_build", "#1e6bb8")
+/// -- and back to the theme's own color:
+/// maki.ui.set_theme_color("mode_build")
+#[lua_fn]
+fn set_theme_color(
+    _lua: &Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    name: String,
+    color: Option<String>,
+) -> LuaResult<(Option<bool>, Option<String>)> {
+    if let Some(color) = &color {
+        // Fail here, before the action: an unresolvable color must not reach
+        // the event loop, where `None` means "restore the theme color".
+        if maki_color::Registry::resolve_color(color).is_none() {
+            return Ok((
+                None,
+                Some(format!(
+                    "not a color: '{color}' (expected #rrggbb, an ANSI index, a palette name, or 'default')"
+                )),
+            ));
+        }
+    }
+    let Some(tx) = tx else {
+        return Ok((None, Some("no interactive UI attached".to_owned())));
+    };
+    // The UI thread refuses an unknown name too, but this answer reaches the
+    // plugin first. A name the screen would not paint must not read as
+    // applied.
+    if !maki_color::Registry::is_settable(&name) {
+        return Ok((None, Some(format!("unknown style: {name}"))));
+    }
+    if ui_send(Some(&tx), UiAction::SetThemeColor { name, color }).is_err() {
+        return Ok((None, Some("UI is shutting down".to_owned())));
+    }
+    Ok((Some(true), None))
+}
+
+/// Reads the foreground color a named theme style paints with, after every
+/// `maki.ui.set_theme_color` override. The names are the ones
+/// `maki.ui.theme_style` accepts, plus "mode_build", "mode_plan", and
+/// "mode_bash".
+///
+/// @param name string Style name, e.g. "input_border".
+/// @return (string|nil, string|nil) The color as `maki.ui.theme_color` spells it, or nil and an error for an unknown name.
+/// @example
+/// local c = maki.ui.get_theme_color("mode_build")
+/// if c then
+///   buf:line({ { "border color", { fg = c } } })
+/// end
+#[lua_fn]
+fn get_theme_color(_lua: &Lua, name: String) -> LuaResult<(Option<String>, Option<String>)> {
+    // The mode colors are published as styles too, so one lookup covers
+    // every name a UI can paint.
+    match maki_color::Registry::style(&name) {
+        Some(style) => Ok((style.fg.map(segment_color_to_lua), None)),
+        None => Ok((None, Some(format!("unknown style: {name}")))),
+    }
+}
+
+/// Reads the running theme's `[palette]`: color name to `#rrggbb`, e.g.
+/// `{ blue = "#7aa2f7", comment = "#565f89" }`. The map matches what
+/// `maki.ui.set_theme_color` and span colors resolve names against, so a
+/// picker built from it always offers the colors the active theme actually
+/// paints with. Empty when the running theme has no `[palette]`.
+///
+/// @return (table) Map of palette name to `#rrggbb` hex string.
+/// @example
+/// local pal = maki.ui.get_theme_palette()
+/// for name, hex in pairs(pal) do
+///   print(name .. " = " .. hex)
+/// end
+#[lua_fn]
+fn get_theme_palette(lua: &Lua) -> LuaResult<Table> {
+    let tbl = lua.create_table()?;
+    for (name, hex) in maki_color::Registry::palette() {
+        tbl.raw_set(name, hex)?;
+    }
+    Ok(tbl)
 }
 
 /// Switches the chat input to normal mode (`"n"`) or insert mode (`"i"`),
@@ -1226,6 +1323,7 @@ lua_table! {
     /// - `flash` writes to the log.
     /// - `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
     ///   `input_rules` still throws on a bad rule, so a plugin's tests catch it.
+    /// - `set_theme_color` returns `nil, "no interactive UI attached"`.
     ///
     /// ### Chat input
     ///
@@ -1382,10 +1480,10 @@ lua_table! {
     /// draft across chat switches, go away when the plugin unloads, and are
     /// not saved.
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
-        buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
+        buf, theme_color, theme_style, get_theme_color, get_theme_palette, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual set_mode, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_rules, manual input_decorate,
+        manual set_window_title, manual set_theme_color, manual input, manual input_rules, manual input_decorate,
         manual input_edit, manual input_submit,
     ]
 }
@@ -1402,6 +1500,7 @@ pub(crate) fn create_ui_table(
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
     set_mode__register(&t, lua, Arc::clone(&plugin))?;
+    set_theme_color__register(&t, lua, ui_action_tx.clone())?;
     action__register(
         &t,
         lua,
@@ -2714,5 +2813,144 @@ mod tests {
         let mut granted = PluginPermissions::denied();
         granted.set(perm, true);
         assert_eq!(run(&granted), Ok(Some(true)));
+    }
+
+    const BAD_COLOR: &str = "bananas";
+    const NOT_A_COLOR_PREFIX: &str = "not a color:";
+
+    /// Stands in for the event loop: holds the action channel, so a test
+    /// drains it when it chooses and no background thread can race the
+    /// assertions.
+    fn ui_with_theme_log() -> (Lua, flume::Receiver<UiAction>) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        (lua_with_ui(Some(tx)), rx)
+    }
+
+    fn theme_actions(rx: &flume::Receiver<UiAction>) -> Vec<(String, Option<String>)> {
+        rx.drain()
+            .filter_map(|a| match a {
+                UiAction::SetThemeColor { name, color } => Some((name, color)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An unresolvable color must fail before it reaches the UI, where a
+    /// `None` color means "restore the theme color": silently resetting the
+    /// borders is the failure this guards against.
+    #[test]
+    fn set_theme_color_rejects_an_unresolvable_color() {
+        let (lua, rx) = ui_with_theme_log();
+        let (val, err) = eval(
+            &lua,
+            &format!(r#"return ui.set_theme_color("mode_build", "{BAD_COLOR}")"#),
+        );
+        assert_eq!(val, serde_json::Value::Null);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains(NOT_A_COLOR_PREFIX) && e.contains(BAD_COLOR)),
+            "error names the bad color: {err:?}"
+        );
+        assert!(theme_actions(&rx).is_empty(), "nothing reached the UI");
+    }
+
+    /// A typo'd name must not read as applied. The UI thread would only
+    /// log a warning, after the plugin already got `true`.
+    #[test]
+    fn set_theme_color_rejects_an_unknown_style_name() {
+        let (lua, rx) = ui_with_theme_log();
+        let (val, err) = eval(
+            &lua,
+            r##"return ui.set_theme_color("input_borders", "#ff0000")"##,
+        );
+        assert_eq!(val, serde_json::Value::Null);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("unknown style") && e.contains("input_borders")),
+            "error names the bad style: {err:?}"
+        );
+        assert!(theme_actions(&rx).is_empty(), "nothing reached the UI");
+    }
+
+    /// Hex, a palette name and the literal "default" are the three spellings
+    /// a picker offers; all must reach the UI as written.
+    #[test]
+    fn set_theme_color_applies_hex_palette_name_and_default() {
+        let _registry = maki_color::exclusive();
+        const MODE_STYLE: &str = "mode_build";
+        const HEX: &str = "#1e6bb8";
+        const PALETTE_NAME: &str = "blue";
+        const DEFAULT: &str = "default";
+
+        maki_color::Registry::set_palette(std::collections::HashMap::from([(
+            PALETTE_NAME.to_owned(),
+            "#7aa2f7".to_owned(),
+        )]));
+        let (lua, rx) = ui_with_theme_log();
+        for color in [HEX, PALETTE_NAME, DEFAULT] {
+            let (val, err) = eval(
+                &lua,
+                &format!(r#"return ui.set_theme_color("{MODE_STYLE}", "{color}")"#),
+            );
+            assert_eq!(err, None, "resolvable color {color} applies");
+            assert_eq!(val, serde_json::Value::Bool(true));
+        }
+        assert_eq!(
+            theme_actions(&rx),
+            vec![
+                (MODE_STYLE.to_owned(), Some(HEX.to_owned())),
+                (MODE_STYLE.to_owned(), Some(PALETTE_NAME.to_owned())),
+                (MODE_STYLE.to_owned(), Some(DEFAULT.to_owned())),
+            ]
+        );
+        maki_color::Registry::set_palette(std::collections::HashMap::new());
+    }
+
+    /// The restore path is a nil color, the only spelling the UI reads as
+    /// "back to the theme's own color".
+    #[test]
+    fn set_theme_color_nil_restores_the_theme_color() {
+        let (lua, rx) = ui_with_theme_log();
+        let (val, err) = eval(&lua, r#"return ui.set_theme_color("mode_build")"#);
+        assert_eq!(err, None);
+        assert_eq!(val, serde_json::Value::Bool(true));
+        assert_eq!(theme_actions(&rx), vec![("mode_build".to_owned(), None)]);
+    }
+
+    /// A picker built from the palette must offer exactly the colors the
+    /// running theme paints with, so the map round-trips by name.
+    #[test]
+    fn get_theme_palette_round_trips_the_running_palette() {
+        let _registry = maki_color::exclusive();
+        const PALETTE_BLUE: &str = "#7aa2f7";
+        const PALETTE_LOVE: &str = "#eb6f92";
+
+        maki_color::Registry::set_palette(std::collections::HashMap::from([
+            ("blue".to_owned(), PALETTE_BLUE.to_owned()),
+            ("love".to_owned(), PALETTE_LOVE.to_owned()),
+        ]));
+        let (lua, _) = ui_with_theme_log();
+        let (val, err) = eval(&lua, "return ui.get_theme_palette()");
+        assert_eq!(err, None);
+        assert_eq!(
+            val,
+            serde_json::json!({
+                "blue": PALETTE_BLUE,
+                "love": PALETTE_LOVE,
+            })
+        );
+        maki_color::Registry::set_palette(std::collections::HashMap::new());
+    }
+
+    /// A theme that names no colors must not leave the previous theme's
+    /// palette behind, or a picker would offer stale entries.
+    #[test]
+    fn get_theme_palette_is_empty_without_a_theme_palette() {
+        let _registry = maki_color::exclusive();
+        maki_color::Registry::set_palette(std::collections::HashMap::new());
+        let (lua, _) = ui_with_theme_log();
+        let (val, err) = eval(&lua, "return ui.get_theme_palette()");
+        assert_eq!(err, None);
+        assert_eq!(val, serde_json::json!({}));
     }
 }

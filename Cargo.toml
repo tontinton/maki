@@ -53,6 +53,7 @@ test-case = { workspace = true }
 members = [
   "maki-acp",
   "maki-agent",
+  "maki-color",
   "maki-config",
   "maki-config-macro",
   "maki-docgen",
@@ -90,6 +91,7 @@ maki-ui = { path = "maki-ui" }
 maki-lua = { path = "maki-lua" }
 maki-config-macro = { path = "maki-config-macro" }
 maki-lua-macro = { path = "maki-lua-macro" }
+maki-color = { path = "maki-color" }
 maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }
 maki-otel = { path = "maki-otel" }

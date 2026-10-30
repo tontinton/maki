@@ -3369,6 +3369,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "maki-color"
+version = "0.6.5"
+
+[[package]]
 name = "maki-config"
 version = "0.6.5"
 dependencies = [
@@ -3416,6 +3420,7 @@ name = "maki-highlight"
 version = "0.6.5"
 dependencies = [
  "flume",
+ "maki-color",
  "serde_json",
  "syntect",
  "test-case",
@@ -3457,6 +3462,7 @@ dependencies = [
  "jiff",
  "jsonschema",
  "maki-agent",
+ "maki-color",
  "maki-config",
  "maki-highlight",
  "maki-interpreter",
@@ -3650,6 +3656,7 @@ dependencies = [
  "jiff",
  "libc",
  "maki-agent",
+ "maki-color",
  "maki-config",
  "maki-highlight",
  "maki-lua",

@@ -784,6 +784,12 @@ pub enum UiAction {
     },
     Flash(String),
     SetWindowTitle(String),
+    /// Runtime theme override: `(style name, #rrggbb | "default" | nil)`.
+    /// Handled on the UI thread, then the next frame repaints with it.
+    SetThemeColor {
+        name: String,
+        color: Option<String>,
+    },
     OpenEditor {
         path: PathBuf,
         reply_tx: flume::Sender<i32>,

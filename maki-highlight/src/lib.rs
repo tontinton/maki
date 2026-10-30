@@ -11,6 +11,8 @@ use syntect::highlighting::{
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
+pub use maki_color::{DEFAULT_COLOR_NAME, SegmentColor, ansi_color_index};
+
 pub mod pool;
 
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
@@ -23,107 +25,31 @@ const MAX_HIGHLIGHT_PREFIX_BYTES: usize = 16 * 1024;
 /// palette index, `a = 1` means the terminal default.
 const ANSI_ALPHA_INDEX: u8 = 0x00;
 const ANSI_ALPHA_DEFAULT: u8 = 0x01;
-pub const DEFAULT_COLOR_NAME: &str = "default";
-const HEX_RGB_LEN: usize = 6;
 
-type Rgb = (u8, u8, u8);
 pub type BlockSegments = Arc<Vec<Vec<StyledSegment>>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SegmentColor {
-    Rgb(Rgb),
-    Ansi(u8),
-    Default,
-}
-
-/// Shaped like a plugin span style, so a lookup goes straight back to Lua.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UiStyle {
-    pub fg: Option<SegmentColor>,
-    pub bg: Option<SegmentColor>,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub dim: bool,
-    pub strikethrough: bool,
-    pub reversed: bool,
-}
-
-impl SegmentColor {
-    pub fn from_syntect(c: syntect::highlighting::Color) -> Self {
-        match c.a {
-            ANSI_ALPHA_INDEX => Self::Ansi(c.r),
-            ANSI_ALPHA_DEFAULT => Self::Default,
-            _ => Self::Rgb((c.r, c.g, c.b)),
-        }
-    }
-
-    pub fn to_syntect(self) -> syntect::highlighting::Color {
-        let (r, g, b, a) = match self {
-            Self::Rgb((r, g, b)) => (r, g, b, 0xFF),
-            Self::Ansi(i) => (i, 0, 0, ANSI_ALPHA_INDEX),
-            Self::Default => (0, 0, 0, ANSI_ALPHA_DEFAULT),
-        };
-        syntect::highlighting::Color { r, g, b, a }
-    }
-
-    /// The one reader of the `#rrggbb | index | name | default` grammar, so
-    /// themes, syntax scopes and plugin spans cannot drift apart on what they
-    /// accept.
-    pub fn parse(s: &str) -> Option<Self> {
-        if let Some(hex) = s.strip_prefix('#') {
-            return parse_hex_rgb(hex).map(Self::Rgb);
-        }
-        if s == DEFAULT_COLOR_NAME {
-            return Some(Self::Default);
-        }
-        if s.bytes().all(|b| b.is_ascii_digit()) {
-            return s.parse().ok().map(Self::Ansi);
-        }
-        ansi_color_index(s).map(Self::Ansi)
+/// Bat encodes ANSI palette semantics in the syntect alpha channel: see the
+/// consts above. Free functions, not methods: [`SegmentColor`] is foreign
+/// here.
+pub fn segment_from_syntect(c: syntect::highlighting::Color) -> SegmentColor {
+    match c.a {
+        ANSI_ALPHA_INDEX => SegmentColor::Ansi(c.r),
+        ANSI_ALPHA_DEFAULT => SegmentColor::Default,
+        _ => SegmentColor::Rgb((c.r, c.g, c.b)),
     }
 }
 
-/// Rejects the `+4` and `-0` that `u8::from_str` would otherwise accept, and
-/// any casing or separator sloppiness, so a spelling either resolves exactly
-/// or not at all.
-fn parse_hex_rgb(hex: &str) -> Option<Rgb> {
-    if hex.len() != HEX_RGB_LEN || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
-    Some((channel(0)?, channel(2)?, channel(4)?))
-}
-
-/// Resolve a terminal color name to its palette index. These are Helix's
-/// palette names, so its themes load unchanged. Spelling is exact:
-/// `light-gray` resolves, `lightgray` and `LIGHT-GRAY` do not.
-pub fn ansi_color_index(name: &str) -> Option<u8> {
-    let index = match name {
-        "black" => 0,
-        "red" => 1,
-        "green" => 2,
-        "yellow" => 3,
-        "blue" => 4,
-        "magenta" => 5,
-        "cyan" => 6,
-        "gray" => 7,
-        "light-gray" => 8,
-        "light-red" => 9,
-        "light-green" => 10,
-        "light-yellow" => 11,
-        "light-blue" => 12,
-        "light-magenta" => 13,
-        "light-cyan" => 14,
-        "white" => 15,
-        _ => return None,
+pub fn segment_to_syntect(color: SegmentColor) -> syntect::highlighting::Color {
+    let (r, g, b, a) = match color {
+        SegmentColor::Rgb((r, g, b)) => (r, g, b, 0xFF),
+        SegmentColor::Ansi(i) => (i, 0, 0, ANSI_ALPHA_INDEX),
+        SegmentColor::Default => (0, 0, 0, ANSI_ALPHA_DEFAULT),
     };
-    Some(index)
+    syntect::highlighting::Color { r, g, b, a }
 }
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<Arc<Theme>>> = OnceLock::new();
-static UI_STYLES: OnceLock<RwLock<HashMap<String, UiStyle>>> = OnceLock::new();
 static BLOCK_CACHE: OnceLock<RwLock<BlockCache>> = OnceLock::new();
 static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
@@ -252,29 +178,13 @@ pub fn theme() -> Arc<Theme> {
         .clone()
 }
 
-fn ui_styles_lock() -> &'static RwLock<HashMap<String, UiStyle>> {
-    UI_STYLES.get_or_init(RwLock::default)
-}
-
-pub fn set_ui_styles(styles: HashMap<String, UiStyle>) {
-    *ui_styles_lock().write().unwrap_or_else(|e| e.into_inner()) = styles;
-}
-
-pub fn ui_style(name: &str) -> Option<UiStyle> {
-    ui_styles_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(name)
-        .cloned()
-}
-
-/// Colors the syntax theme names itself. UI styles live in [`ui_style`].
+/// Colors the syntax theme names itself. UI styles live in `maki_color`.
 pub fn theme_color(name: &str) -> Option<SegmentColor> {
     let settings = &theme().settings;
     let map = serde_json::to_value(settings).ok()?;
     let obj = map.as_object()?.get(name)?.as_object()?;
     let channel = |k: &str| obj.get(k)?.as_u64().map(|v| v as u8);
-    Some(SegmentColor::from_syntect(syntect::highlighting::Color {
+    Some(segment_from_syntect(syntect::highlighting::Color {
         r: channel("r")?,
         g: channel("g")?,
         b: channel("b")?,
@@ -395,7 +305,7 @@ impl StyledSegment {
     fn from_syntect(style: SynStyle, text: String) -> Self {
         Self {
             text,
-            fg: SegmentColor::from_syntect(style.foreground),
+            fg: segment_from_syntect(style.foreground),
             bold: style.font_style.contains(FontStyle::BOLD),
             italic: style.font_style.contains(FontStyle::ITALIC),
             underline: style.font_style.contains(FontStyle::UNDERLINE),
@@ -1146,14 +1056,14 @@ mod tests {
             b: 3,
             a: alpha,
         };
-        assert_eq!(SegmentColor::from_syntect(c), expected);
+        assert_eq!(segment_from_syntect(c), expected);
     }
 
     #[test_case(SegmentColor::Rgb((9, 2, 3)); "rgb")]
     #[test_case(SegmentColor::Ansi(9); "palette index")]
     #[test_case(SegmentColor::Default; "terminal default")]
     fn segment_color_survives_a_syntect_roundtrip(color: SegmentColor) {
-        assert_eq!(SegmentColor::from_syntect(color.to_syntect()), color);
+        assert_eq!(segment_from_syntect(segment_to_syntect(color)), color);
     }
 
     #[test_case(SegmentColor::Ansi(4), "\x1b[48;5;4m"; "palette background")]

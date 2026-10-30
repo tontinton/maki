@@ -18,6 +18,7 @@ base64 = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp", "bmp"] }
 crossterm = { workspace = true }
 maki-agent = { workspace = true }
+maki-color = { workspace = true }
 maki-config = { workspace = true }
 maki-highlight = { workspace = true }
 maki-interpreter = { workspace = true }
