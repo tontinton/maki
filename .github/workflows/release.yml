@@ -195,6 +195,90 @@ jobs:
       - name: Upload artifact
         run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
 
+  build-freebsd:
+    name: Build (${{ matrix.target }})
+    needs: create-release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-freebsd
+            release_arch: amd64/amd64
+          - target: aarch64-unknown-freebsd
+            release_arch: arm64/aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # FreeBSD cross-builds with the host clang: it is natively multicross,
+      # so the only missing piece is a sysroot, which is just the official
+      # FreeBSD base release archive (headers, libs, crt objects).
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld
+
+      # a 14.x sysroot keeps the binaries running on every supported release
+      - name: Install FreeBSD sysroot
+        env:
+          ARCH: ${{ matrix.release_arch }}
+          TARGET: ${{ matrix.target }}
+          FREEBSD_VERSION: "14.4-RELEASE"
+        run: |
+          sysroot="$RUNNER_TEMP/freebsd-sysroot"
+          base="https://download.freebsd.org/ftp/releases/${ARCH}/${FREEBSD_VERSION}/base.txz"
+          # download.freebsd.org drops EOL releases, ftp-archive keeps them forever
+          archive="https://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/${ARCH}/${FREEBSD_VERSION}/base.txz"
+          .github/scripts/retry.sh curl -sSfL -o "$RUNNER_TEMP/base.txz" "$base" \
+            || .github/scripts/retry.sh curl -sSfL -o "$RUNNER_TEMP/base.txz" "$archive"
+          mkdir -p "$sysroot"
+          tar xJf "$RUNNER_TEMP/base.txz" -C "$sysroot" ./lib ./usr/lib ./usr/include
+          echo "SYSROOT=$sysroot" >> "$GITHUB_ENV"
+          # append the release version to the rust triple, clang accepts it
+          # natively and it tags the produced ELF with the minimum release
+          echo "FREEBSD_TARGET_TRIPLE=${TARGET}${FREEBSD_VERSION%%-RELEASE}" >> "$GITHUB_ENV"
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Configure cross toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          u=${TARGET//-/_}
+          U=${TARGET^^}; U=${U//-/_}
+          w="$PWD/.cross"
+          mkdir -p "$w"
+          # cc-rs injects its own --target for clang, the wrapper's comes last
+          # and wins. lld is only passed to linking: -fuse-ld at a compile is
+          # an unused argument, fatal under aws-lc-sys' -Werror feature probes.
+          printf '#!/bin/bash\nexec clang --target="$FREEBSD_TARGET_TRIPLE" --sysroot="$SYSROOT" "$@"\n' > "$w/cc"
+          printf '#!/bin/bash\nexec clang++ --target="$FREEBSD_TARGET_TRIPLE" --sysroot="$SYSROOT" -stdlib=libc++ -isystem "$SYSROOT/usr/include/c++/v1" "$@"\n' > "$w/cxx"
+          printf '#!/bin/bash\nexec clang --target="$FREEBSD_TARGET_TRIPLE" --sysroot="$SYSROOT" -fuse-ld=lld "$@"\n' > "$w/linker"
+          chmod +x "$w"/*
+          {
+            echo "CC_$u=$w/cc"
+            echo "CXX_$u=$w/cxx"
+            echo "CARGO_TARGET_${U}_LINKER=$w/linker"
+          } >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ github.ref_name }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          tag="$GITHUB_REF_NAME"
+          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
+          tar czf "${archive}" "${BINARY_NAME}"
+          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+
   build-other:
     name: Build (${{ matrix.target }})
     needs: create-release
@@ -249,7 +333,7 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [build-linux, build-netbsd, build-other]
+    needs: [build-linux, build-netbsd, build-freebsd, build-other]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

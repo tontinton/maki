@@ -105,15 +105,20 @@ main() {
         need_cmd unzip
     else
         case "$(uname -s)" in
-            Linux)  os="unknown-linux-musl" ;;
-            Darwin) os="apple-darwin" ;;
+            Linux)   os="unknown-linux-musl" ;;
+            Darwin)  os="apple-darwin" ;;
+            FreeBSD) os="unknown-freebsd" ;;
+            NetBSD)  os="unknown-netbsd" ;;
             *) err "unsupported OS: $(uname -s)" ;;
         esac
 
-        case "$(uname -m)" in
+        # NetBSD arm64 reports the machine as evbarm, the cpu as aarch64
+        machine="$(uname -m)"
+        [ "$machine" = "evbarm" ] && machine="$(uname -p)"
+        case "$machine" in
             x86_64|amd64)   arch="x86_64" ;;
             aarch64|arm64)  arch="aarch64" ;;
-            *) err "unsupported architecture: $(uname -m)" ;;
+            *) err "unsupported architecture: $machine" ;;
         esac
 
         target="${arch}-${os}"
