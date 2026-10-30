@@ -6,8 +6,9 @@ use std::pin::pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use futures::future::{Either, select};
-use maki_agent::agent::{LoadedInstructions, tool_dispatch};
+use maki_agent::agent::{HistorySnapshot, LoadedInstructions, SharedMessages, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken, CancelTrigger};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::tools::interpreter_bridge;
@@ -243,8 +244,9 @@ impl Adoption {
 
 /// Gives a session opened under a moved call an entry of its own, so its
 /// adopted tab can be stopped by its id. A top-level `task` shares the call's
-/// id, and the call's entry already covers it. An entry its chat refuses
-/// fires the session as it drops, and its chat ending ends the session anyway.
+/// id, so the call's entry covers it and only adds its messages. An entry its
+/// chat refuses fires the session as it drops, and its chat ending ends the
+/// session anyway.
 ///
 /// A session that already ran has a chat in the UI, under the call's row.
 /// The UI adopts it now rather than at its next event, or a quiet one would
@@ -256,6 +258,10 @@ pub(crate) fn adopt_session(
     stub: SessionStub,
 ) {
     if stub.ui_id == home.id {
+        registry.update(&home.id, |entry| {
+            entry.messages.retain(|sibling| sibling.strong_count() > 0);
+            entry.messages.push(Arc::downgrade(&stub.messages));
+        });
         return;
     }
     let entry = BackgroundTask {
@@ -274,6 +280,7 @@ pub(crate) fn adopt_session(
         stop: StopMark::default(),
         cancel: Fire::Handle(stub.handle),
         mailbox: None,
+        messages: vec![Arc::downgrade(&stub.messages)],
     };
     if let Err(error) = registry.register(entry) {
         tracing::debug!(call = %home.id, %error, "session under a moved call outlived its chat");
@@ -1113,6 +1120,7 @@ async fn session(
     let cancel_slot = agent_ctx
         .subagent_cancels
         .insert_handle(ui_id.clone(), child_trigger.handle());
+    let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     if let Some(adoption) = &adoption {
         let stub = SessionStub {
             ui_id: ui_id.clone(),
@@ -1120,6 +1128,7 @@ async fn session(
             name: name.clone(),
             handle: child_trigger.handle(),
             info: Arc::clone(&subagent_info),
+            messages: Arc::clone(&mirror),
         };
         if let Some(stub) = adoption.call.add_session(stub)
             && let Some(home) = adoption.call.home()
@@ -1158,6 +1167,7 @@ async fn session(
                 stop: cancellation.stop.clone(),
                 cancel: Fire::Owned(cancel),
                 mailbox: None,
+                messages: vec![Arc::downgrade(&mirror)],
             }));
             Some(Background {
                 registry,
@@ -1220,7 +1230,7 @@ async fn session(
             .as_ref()
             .filter(|_| mcp_enabled)
             .map(McpSession::fresh),
-        history: History::new(Vec::new()),
+        history: History::new(Vec::new()).with_lazy_mirror(mirror),
         gauge: ContextGauge::default(),
         loaded_instructions: LoadedInstructions::new(),
         instruction_files: Arc::clone(&agent_ctx.instruction_files),
@@ -2192,6 +2202,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::api::task::{NO_RUNNING_SUBAGENT, create_task_table};
     use crate::runtime::{TaskCell, TaskScope};
 
     const PLUGIN: &str = "monitor";
@@ -2210,6 +2221,16 @@ mod tests {
     const MOVED_CALL_ID: &str = "toolu_moved";
     const NOTICE_TEXT: &str = "Background bash toolu_moved (cargo build) finished:\n\nok";
     const SENT_MESSAGE: &str = "Wrap up now.";
+    const UNKNOWN_TASK_ID: &str = "toolu_unknown";
+    const PEEK_TEXTS: &str = "
+        local messages, err = task.messages(id, { last = last })
+        if not messages then return nil, err end
+        local texts = {}
+        for i, message in ipairs(messages) do
+            texts[i] = message.content[1].text
+        end
+        return texts
+    ";
 
     #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
     #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
@@ -3177,6 +3198,7 @@ mod tests {
             stop: StopMark::default(),
             cancel: Fire::Owned(CancelToken::new().0),
             mailbox: None,
+            messages: Vec::new(),
         }
     }
 
@@ -3405,6 +3427,8 @@ mod tests {
     }
 
     /// Answers each request with the next reply and hands over what it carried.
+    /// A request waits for its reply while the sender lives, and fails once
+    /// it is gone.
     struct ScriptedProvider {
         requests: Sender<ScriptedRequest>,
         replies: flume::Receiver<&'static str>,
@@ -3433,7 +3457,7 @@ mod tests {
                     message: Message {
                         role: Role::Assistant,
                         content: vec![ContentBlock::Text {
-                            text: self.replies.try_recv().unwrap().into(),
+                            text: self.replies.recv_async().await.unwrap().into(),
                         }],
                         ..Default::default()
                     },
@@ -3448,17 +3472,24 @@ mod tests {
         }
     }
 
-    fn scripted_ctx() -> (ToolContext, flume::Receiver<ScriptedRequest>) {
+    fn scripted_provider(
+        ctx: &mut ToolContext,
+    ) -> (flume::Receiver<ScriptedRequest>, Sender<&'static str>) {
         let (requests_tx, requests) = flume::unbounded();
         let (replies_tx, replies) = flume::unbounded();
-        for reply in [FIRST_REPLY, WOKEN_REPLY] {
-            replies_tx.send(reply).unwrap();
-        }
-        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         ctx.provider = Arc::new(ScriptedProvider {
             requests: requests_tx,
             replies,
         });
+        (requests, replies_tx)
+    }
+
+    fn scripted_ctx() -> (ToolContext, flume::Receiver<ScriptedRequest>) {
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        let (requests, replies) = scripted_provider(&mut ctx);
+        for reply in [FIRST_REPLY, WOKEN_REPLY] {
+            replies.send(reply).unwrap();
+        }
         (ctx, requests)
     }
 
@@ -3626,6 +3657,103 @@ mod tests {
         assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
         assert!(requests.is_empty());
         close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+    }
+
+    /// A coordinator peeks at a moved subagent while its run holds the
+    /// session lock. A top-level `task` shares the call's entry, a nested one
+    /// gets its own.
+    #[test_case(Some(CALL_ID), Opened::BeforeTheMove ; "top_level_opened_before_the_move")]
+    #[test_case(Some(CALL_ID), Opened::AfterTheMove ; "top_level_opened_after_the_move")]
+    #[test_case(None, Opened::BeforeTheMove ; "nested_opened_before_the_move")]
+    #[test_case(None, Opened::AfterTheMove ; "nested_opened_after_the_move")]
+    #[tokio::test]
+    async fn task_messages_reads_a_moved_session_mid_run(
+        tool_use_id: Option<&str>,
+        opened: Opened,
+    ) {
+        let lua = Lua::new();
+        install_task_table(&lua);
+        let (chat, _mailbox, _seed) = live_chat();
+        let (_run_trigger, run) = CancelToken::new();
+        let (mut ctx, call) = call_ctx(&run, tool_use_id);
+        let (requests, replies) = scripted_provider(&mut ctx);
+        BackgroundTasks::of(&lua)
+            .register(call_entry(chat, CALL_ID))
+            .unwrap();
+        let (sess, _call_trigger) = open_under_moved_call(&lua, &ctx, &call, chat, opened).await;
+        let id = session_ui_id(&sess);
+        replies.send(FIRST_REPLY).unwrap();
+        prompt_text(&lua, &sess).await;
+        requests.drain();
+        let (_, peeked) = futures::future::join(prompt_text(&lua, &sess), async {
+            requests.recv_async().await.unwrap();
+            let peeked = [peek(&lua, &id, None).await, peek(&lua, &id, Some(2)).await];
+            replies.send(WOKEN_REPLY).unwrap();
+            peeked
+        })
+        .await;
+        let all = [SESSION_PROMPT, FIRST_REPLY, SESSION_PROMPT].map(String::from);
+        assert_eq!(
+            peeked.map(Result::unwrap),
+            [(Some(all.to_vec()), None), (Some(all[1..].to_vec()), None)]
+        );
+
+        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        let (_, closed) = peek(&lua, &id, None).await.unwrap();
+        assert_eq!(closed, Some(format!("{NO_RUNNING_SUBAGENT} {id}")));
+        let (_, unknown) = peek(&lua, UNKNOWN_TASK_ID, None).await.unwrap();
+        assert_eq!(
+            unknown,
+            Some(format!("{NO_RUNNING_SUBAGENT} {UNKNOWN_TASK_ID}"))
+        );
+    }
+
+    /// One tool call can run several subagents under its own id. The call's
+    /// entry reads the newest one still open, so closing it falls back to
+    /// an older sibling instead of reading as done.
+    #[tokio::test]
+    async fn task_messages_falls_back_to_an_open_sibling() {
+        let lua = Lua::new();
+        install_task_table(&lua);
+        let (chat, _mailbox, _seed) = live_chat();
+        let (_run_trigger, run) = CancelToken::new();
+        let (mut ctx, call) = call_ctx(&run, Some(CALL_ID));
+        let (_requests, replies) = scripted_provider(&mut ctx);
+        BackgroundTasks::of(&lua)
+            .register(call_entry(chat, CALL_ID))
+            .unwrap();
+        let (older, _call_trigger) =
+            open_under_moved_call(&lua, &ctx, &call, chat, Opened::BeforeTheMove).await;
+        let newer = native_session(&lua, &ctx).await;
+        for (sess, reply) in [(&older, FIRST_REPLY), (&newer, WOKEN_REPLY)] {
+            replies.send(reply).unwrap();
+            prompt_text(&lua, sess).await;
+        }
+        let last_reply = async || peek(&lua, CALL_ID, Some(1)).await.unwrap();
+
+        assert_eq!(last_reply().await, (Some(vec![WOKEN_REPLY.into()]), None));
+        close(lua.clone(), newer.borrow().unwrap()).await.unwrap();
+        assert_eq!(last_reply().await, (Some(vec![FIRST_REPLY.into()]), None));
+        close(lua.clone(), older.borrow().unwrap()).await.unwrap();
+        assert_eq!(
+            last_reply().await,
+            (None, Some(format!("{NO_RUNNING_SUBAGENT} {CALL_ID}")))
+        );
+    }
+
+    fn install_task_table(lua: &Lua) {
+        let task = create_task_table(lua, None, &PluginPermissions::trusted()).unwrap();
+        lua.globals().set("task", task).unwrap();
+    }
+
+    async fn peek(
+        lua: &Lua,
+        id: &str,
+        last: Option<usize>,
+    ) -> mlua::Result<(Option<Vec<String>>, Option<String>)> {
+        lua.globals().set("id", id)?;
+        lua.globals().set("last", last)?;
+        lua.load(PEEK_TEXTS).eval_async().await
     }
 
     #[tokio::test]

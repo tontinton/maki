@@ -3,9 +3,11 @@
 
 use maki_agent::SessionMailbox;
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Either as LuaEither, Lua, LuaSerdeExt, Result as LuaResult, UserDataRef, Value};
+use mlua::{Either as LuaEither, Lua, LuaSerdeExt, Result as LuaResult, Table, UserDataRef, Value};
 
+use crate::api::session::newest_messages_table;
 use crate::api::util::command::{TaskRequest, UiAction, ui_json_roundtrip};
+use crate::api::util::convert::TableExt;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::background::BackgroundTasks;
@@ -15,6 +17,8 @@ use crate::runtime::{CANCEL_ABANDON_AFTER, is_user_action};
 const USER_ACTION_ERR: &str = "stopping a task requires a user command or keybind";
 const TASK_ID_ERR: &str = "stop(ctx, id): id must be a string";
 const STOP_OPTS_ERR: &str = "stop(id, opts): opts must be a table";
+pub(crate) const NO_RUNNING_SUBAGENT: &str = "no running background subagent with id";
+const LAST_KEY: &str = "last";
 
 async fn roundtrip(
     lua: Lua,
@@ -158,6 +162,37 @@ async fn stop(
     roundtrip(lua, tx, TaskRequest::Stop { id, session }).await
 }
 
+/// Reads a background subagent's transcript, oldest first, while it works.
+/// The messages have the shape `maki.session.messages` returns. A subagent is
+/// readable while it runs under a call moved to the background, or in a
+/// session a plugin opened with `maki.agent.session({ session = id })`, until
+/// it closes. When one call runs several subagents under its id, this reads
+/// the newest one still open. Works without an interactive UI.
+///
+/// @param id string Task id, as returned by `list()`.
+/// @param opts table? `last` (integer?) only the newest `last` messages.
+/// @return (table|nil, string|nil) Array of messages, or nil and an error.
+/// @example
+/// local msgs = maki.task.messages(task.id, { last = 1 })
+/// local last = msgs and msgs[1]
+/// if last and last.content[1].type == "text" then
+///   print(last.content[1].text)
+/// end
+#[lua_fn(guard = SessionRead)]
+async fn messages(lua: Lua, id: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
+    let last = match &opts {
+        Some(opts) => opts.opt::<usize>(LAST_KEY)?,
+        None => None,
+    };
+    let Some(history) = BackgroundTasks::of(&lua).messages(&id) else {
+        return Ok(err_pair(format!("{NO_RUNNING_SUBAGENT} {id}")));
+    };
+    Ok((
+        Some(newest_messages_table(&lua, &history, last).await?),
+        None,
+    ))
+}
+
 lua_table! {
     /// The subagents of the focused session and their transcripts. Tasks are
     /// spawned by the `task` tool and addressed by an id that survives a reload.
@@ -167,7 +202,7 @@ lua_table! {
         tx: Option<flume::Sender<UiAction>>,
         perms: &PluginPermissions,
     ),
-    DOCS [list(tx), focus(tx), remove(perms, tx), stop(tx)]
+    DOCS [list(tx), focus(tx), remove(perms, tx), stop(tx), messages(perms)]
 }
 
 #[cfg(test)]

@@ -85,6 +85,7 @@ pub struct History {
     /// disagree and so a new run can never inherit the last one's epoch.
     snapshot: HistorySnapshot,
     mirror: Option<SharedMessages>,
+    mirror_needs_reader: bool,
     /// Set by every change and cleared only once a save lands, so a failed
     /// write is retried by the next turn instead of lost. [`Self::restored`]
     /// leaves it clear: its repair alone is not worth rewriting the file for.
@@ -100,6 +101,7 @@ impl History {
         Self {
             snapshot: HistorySnapshot::new(messages),
             mirror: None,
+            mirror_needs_reader: false,
             unsaved: false,
             live: None,
         }
@@ -195,6 +197,16 @@ impl History {
         self
     }
 
+    /// For a mirror only read through weak handles, which may never come.
+    /// While nobody holds one, each change takes the mirror's copy back first,
+    /// or every push would deep clone the whole list for nobody. A reader that
+    /// shows up later still finds the newest list, unless it lands in the
+    /// middle of a change and sees an empty one.
+    pub fn with_lazy_mirror(mut self, mirror: SharedMessages) -> Self {
+        self.mirror_needs_reader = true;
+        self.with_mirror(mirror)
+    }
+
     pub fn as_slice(&self) -> &[Message] {
         &self.snapshot.messages
     }
@@ -280,6 +292,7 @@ impl History {
     /// Every change goes through here, [`Self::rewrite`] too, so this is the
     /// one place that has to mark the list unsaved.
     fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
+        self.release_unread_mirror();
         f(Arc::make_mut(&mut self.snapshot.messages));
         self.unsaved = true;
         self.publish();
@@ -295,6 +308,15 @@ impl History {
     /// here used to make the snapshot as long as the real results that came
     /// next, so the log never saw them. Callers that need an API-valid list
     /// close the dangling calls on their own copy.
+    fn release_unread_mirror(&self) {
+        if let Some(mirror) = &self.mirror
+            && self.mirror_needs_reader
+            && Arc::weak_count(mirror) == 0
+        {
+            mirror.store(Arc::default());
+        }
+    }
+
     fn publish(&self) {
         let Some(mirror) = &self.mirror else { return };
         mirror.store(Arc::new(self.snapshot.clone()));
@@ -912,6 +934,23 @@ mod tests {
         assert_eq!(after_push.messages.len(), 2);
         assert_eq!(after_push.messages[1].user_text(), Some(SECOND));
         assert!(!Arc::ptr_eq(&after_push.messages, &mirror.load().messages));
+    }
+
+    #[test_case(false, true ; "unread_lazy_mirror_pushes_in_place")]
+    #[test_case(true, false ; "read_lazy_mirror_keeps_its_copy")]
+    fn lazy_mirror_stays_current_and_copies_only_for_a_reader(read: bool, in_place: bool) {
+        let mirror = make_mirror();
+        let reader = read.then(|| Arc::downgrade(&mirror));
+        let mut history =
+            History::new(vec![Message::user(FIRST.into())]).with_lazy_mirror(Arc::clone(&mirror));
+        let before = Arc::as_ptr(&mirror.load().messages);
+
+        history.push(Message::user(SECOND.into()));
+
+        let after = mirror.load();
+        assert_eq!(after.messages.len(), 2);
+        assert_eq!(Arc::as_ptr(&after.messages) == before, in_place);
+        drop(reader);
     }
 
     /// After a respawn the old run's messages must be gone from the mirror

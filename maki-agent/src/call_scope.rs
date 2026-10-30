@@ -8,6 +8,7 @@ use event_listener::{Event, EventListener};
 use maki_storage::id::MakiId;
 use thiserror::Error;
 
+use crate::agent::SharedMessages;
 use crate::cancel::{CancelHandle, CancelToken, CancelTrigger};
 use crate::types::SubagentInfo;
 
@@ -33,6 +34,9 @@ pub struct SessionStub {
     pub handle: CancelHandle,
     /// Set at the session's first prompt, when the UI first hears of it.
     pub info: Arc<OnceLock<SubagentInfo>>,
+    /// Strong, so the session's mirror stays unread, and cheap, until a move
+    /// hands its registry entry the weak handle a reader goes through.
+    pub messages: SharedMessages,
 }
 
 pub struct CallScope {

@@ -10,14 +10,17 @@
 use std::collections::HashMap;
 use std::mem;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+use maki_agent::agent::HistorySnapshot;
 use maki_agent::cancel::{CancelHandle, CancelToken, CancelTrigger};
 use maki_agent::{
     AgentEvent, AgentSeed, BackgroundNotice, Envelope, SessionMailbox, TaskEnd, TaskLabel,
     ToolDoneEvent, result_notice,
 };
+use maki_providers::Message;
 use maki_storage::id::MakiId;
 use mlua::Lua;
 use serde::Serialize;
@@ -111,6 +114,10 @@ pub(crate) struct BackgroundTask {
     /// open while the work is out, so the run's receipt survives an agent
     /// respawn.
     pub(crate) mailbox: Option<SessionMailbox>,
+    /// Subagent transcripts, newest last, empty for other work. A call's
+    /// entry holds one per subagent the call runs under its id. Weak, so a
+    /// session that closes stops answering even while its entry stays.
+    pub(crate) messages: Vec<Weak<ArcSwap<HistorySnapshot>>>,
 }
 
 impl BackgroundTask {
@@ -304,6 +311,18 @@ impl BackgroundTasks {
         if let Some(entry) = self.locked().iter_mut().find(|e| e.info.id == id) {
             apply(entry);
         }
+    }
+
+    pub(crate) fn messages(&self, id: &str) -> Option<Arc<Vec<Message>>> {
+        let mirror = self
+            .locked()
+            .iter()
+            .find(|e| e.info.id == id)?
+            .messages
+            .iter()
+            .rev()
+            .find_map(Weak::upgrade)?;
+        Some(Arc::clone(&mirror.load().messages))
     }
 
     pub(crate) fn stopped_by(&self, id: &str) -> Stop {
@@ -654,6 +673,7 @@ pub(crate) mod tests {
             stop: StopMark::default(),
             cancel: Fire::Owned(cancel),
             mailbox: None,
+            messages: Vec::new(),
         };
         (entry, token)
     }

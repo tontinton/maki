@@ -1260,6 +1260,7 @@ impl LiveTask {
             stop,
             cancel: Fire::Owned(cancel),
             mailbox: Some(mailbox.clone()),
+            messages: Vec::new(),
         };
         let registry = BackgroundTasks::of(lua);
         // A refused entry fires the trigger it holds, so the call ends as
