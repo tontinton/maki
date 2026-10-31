@@ -45,6 +45,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 maki-config = { workspace = true, features = ["test-util"] }
+maki-providers = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 

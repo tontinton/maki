@@ -1197,7 +1197,7 @@ impl AddAssign for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::register_bundled;
+    use crate::test_support::{isolated_home, register_bundled};
     use serde_json::json;
     use test_case::test_case;
 
@@ -1739,6 +1739,7 @@ mod tests {
     #[test_case("anthropic/claude-3-5-haiku-20241022", false ; "model_missing_from_the_table")]
     #[test_case("openai/gpt-5", false ; "endpoint_without_support")]
     fn deferred_tools_need_the_endpoint_and_the_model(spec: &str, expected: bool) {
+        let _home = isolated_home();
         assert_eq!(
             Model::from_spec(spec).unwrap().supports_deferred_tools(),
             expected
