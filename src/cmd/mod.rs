@@ -12,7 +12,7 @@ use color_eyre::eyre::Context;
 
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, TrustMode};
-use maki_config::{Config, load_env_files, load_permissions};
+use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{DiscoveredPackage, InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
 
@@ -66,6 +66,7 @@ fn load_plugins(
     no_plugins: bool,
     on_builtin_failure: BuiltinFailure,
     interaction: Interaction,
+    project_config: &ProjectConfig,
     build_config: impl FnOnce(&PluginHost, &KnownNames<'_>, &mut Vec<String>) -> Result<Config>,
 ) -> Result<(Config, Vec<String>)> {
     // Opens the provider registration window and drops what the previous load
@@ -73,6 +74,7 @@ fn load_plugins(
     // one left behind answers on a channel nobody serves.
     maki_providers::plugin::begin_load();
     let legacy_warnings = maki_providers::plugin::keep_legacy_selections();
+    host.set_project_config(project_config)?;
 
     let discovery = maki_lua::discover_installed(no_plugins);
     // Includes the names discovery refused, so a package it could not read does
@@ -173,6 +175,7 @@ fn cli_stack(
         no_plugins,
         BuiltinFailure::Fatal,
         Interaction::None,
+        &trust.project_config,
         |host, names, warnings| {
             // `notices`, not `warning`: these commands never ask, so the
             // skipped path and how to undo it are the only sign the project

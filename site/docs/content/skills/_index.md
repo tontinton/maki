@@ -13,7 +13,8 @@ Write one for anything you keep explaining: how you cut a release, how you write
 
 ## Where skills live
 
-A skill is a directory with a `SKILL.md` inside. Maki looks for them every time the `skill` tool runs (and once at startup, to build the list). When two skills share a name, the one found last wins:
+A skill is a directory with a `SKILL.md` inside. Maki looks for them every time the `skill` tool runs (and once at startup, to build the list). When two skills share a name, the one found last wins and Maki logs both
+paths. Directory entries are sorted by name before scanning:
 
 1. The builtin `maki-plugin-dev` (if enabled)
 2. `~/.config/maki/skills/` (Windows: `%APPDATA%\maki\skills\`)
@@ -22,9 +23,10 @@ A skill is a directory with a `SKILL.md` inside. Maki looks for them every time 
 
 So project skills beat personal ones, and a skill at the repo root beats one with the same name deeper down. The `.claude`, `.opencode` and `.agents` dirs are there so skills you already wrote for other agents keep working.
 
-[Folder trust](/docs/folder-trust/) does not gate skills. Every project skill
-name and description is in the system prompt from startup, trusted or not, so
-read a repository's skills before you work in it.
+[Folder trust](/docs/folder-trust/) gates project skills in every supported
+location. Untrusted projects contribute no skill names, descriptions, or
+instructions. Trust the project and restart or use `--trust` for one run.
+Personal and builtin skills remain available without project trust.
 
 Only `SKILL.md` is read. If you want extra notes, put them in files next to it and link them from the body, like `./notes.md`.
 
@@ -49,13 +51,43 @@ description: Cut a tagged release and open the changelog PR
 3. Only tag after the user confirms.
 ```
 
-The frontmatter is optional. Without it, the directory name is the skill name and the whole file is the body. An empty body is skipped. The `description` is what the model reads when picking a skill, so make it specific.
+Skills follow the [Agent Skills specification](https://agentskills.io/specification).
+YAML frontmatter must contain a non-empty `name` and `description`.
+Descriptions can contain up to 1024 characters. An optional `compatibility`
+string can contain up to 500 characters. Empty instruction bodies are allowed.
+
+Use a name of 1 to 64 lowercase letters, digits, and single hyphens, with no
+hyphen at either end. Match the directory name. Maki warns about name
+violations and loads the skill when possible, as the client integration guide
+recommends. Invalid YAML, missing required fields, and incorrect field types
+skip that file and report its path and cause at startup and in the log.
+Other skills remain available.
+
+Before skipping invalid YAML, Maki retries plain text metadata containing
+`: ` as quoted strings, such as `description: Use when: the user asks`.
+Structured values and other YAML errors still fail validation.
+
+The optional `license`, `compatibility`, `metadata`, and `allowed-tools`
+fields are retained when the skill loads. `metadata` must map strings to
+strings. `allowed-tools` is experimental and advisory in Maki. It does not
+approve tool calls or override your permission rules.
 
 ## How it gets used
 
-The `skill` tool lists every skill it found, the agent calls it with a name and gets the body back. A wrong name errors and reprints the list so the model can pick again.
+The `skill` tool is registered only when skills are available. Its name
+parameter is restricted to the startup catalog. It lists every skill it found, the agent calls it with a name and gets the full file and its resource directory back. A wrong name errors and reprints the list so the model can pick again.
 
-Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
+Use `/skill git-release` to load a skill directly. Add a request after its
+name, such as `/skill git-release prepare the changelog`. Maki resolves and
+loads the file before it sends the prompt to the model. Missing or invalid
+skills report an error without starting a model request. You can also ask the
+agent to use a skill or let it select one. The same `/skill name [request]`
+syntax works in headless and ACP user messages.
+
+Loaded skill instructions survive manual and automatic compaction. Maki
+retains the latest successful load for each requested skill name from the
+current transcript. Reset and rewind follow the same history as the rest of
+the session. Extra user requests are summarized normally.
 
 ## The builtin: maki-plugin-dev
 

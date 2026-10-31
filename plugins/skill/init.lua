@@ -1,13 +1,13 @@
-local SKILL_FILE = "SKILL.md"
+local SKILL_TOOL = "skill"
+local SKILL_COMMAND = "/" .. SKILL_TOOL
+local SKILL_USAGE = "Usage: /skill name [request]"
 local NOT_FOUND = "skill not found: "
 local REFERENCE_FILE = "lua-api.md"
 local REFERENCE_UNAVAILABLE = "(unavailable; full reference inlined below)"
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local helpers = require("skill_helpers")
-local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
-local format_output = helpers.format_output
 local parse_output = helpers.parse_output
 
 local PROJECT_SKILL_DIRS = {
@@ -22,47 +22,14 @@ local GLOBAL_SKILL_DIRS = {
   ".agents/skills",
 }
 
-local function scan_skill_dir(dir, skills)
-  local entries = maki.fs.dir(dir)
-  if not entries then
-    return
+local function scan_skill_dir(dir, skills, skipped)
+  local diagnostics, invalid = helpers.scan_skill_dir(dir, skills)
+  for _, diagnostic in ipairs(diagnostics) do
+    maki.log.warn(diagnostic)
   end
-  for _, entry in ipairs(entries) do
-    if entry[2] == "directory" then
-      local skill_path = maki.fs.joinpath(dir, entry[1], SKILL_FILE)
-      local content = maki.fs.read(skill_path)
-      if content then
-        local fm, body = parse_frontmatter(content)
-        if body and #body > 0 then
-          local name = (fm and fm.name) or entry[1]
-          skills[name] = {
-            name = name,
-            description = (fm and fm.description) or "",
-            content = body,
-            location = skill_path,
-          }
-        end
-      end
-    end
+  if skipped then
+    table.move(invalid, 1, #invalid, #skipped + 1, skipped)
   end
-end
-
-local function find_project_ancestors()
-  local cwd = maki.uv.cwd()
-  if not cwd then
-    return {}
-  end
-  local dirs = { cwd }
-  if maki.fs.metadata(maki.fs.joinpath(cwd, ".git")) then
-    return dirs
-  end
-  for _, parent in ipairs(maki.fs.parents(cwd)) do
-    dirs[#dirs + 1] = parent
-    if maki.fs.metadata(maki.fs.joinpath(parent, ".git")) then
-      break
-    end
-  end
-  return dirs
 end
 
 local opts = maki.api.register_options({
@@ -97,7 +64,7 @@ local function resolve_builtin_content()
   return content .. "\n---\n\n" .. reference.content
 end
 
-local function discover_skills()
+local function discover_skills(skipped)
   local skills = {}
 
   if builtin and opts.plugin_dev then
@@ -112,24 +79,90 @@ local function discover_skills()
 
   local config = maki.env.config_dir()
   if config then
-    scan_skill_dir(maki.fs.joinpath(config, "skills"), skills)
+    scan_skill_dir(maki.fs.joinpath(config, "skills"), skills, skipped)
   end
 
   local home = maki.uv.os_homedir()
   if home then
     for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(home, rel), skills)
+      scan_skill_dir(maki.fs.joinpath(home, rel), skills, skipped)
     end
   end
 
-  for _, ancestor in ipairs(find_project_ancestors()) do
+  for _, ancestor in ipairs(maki.env.project_dirs()) do
     for _, rel in ipairs(PROJECT_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills)
+      scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills, skipped)
     end
   end
 
   return skills
 end
+
+local function load_skill(name)
+  local skill = discover_skills()[name]
+  if not skill then
+    return nil, NOT_FOUND .. name
+  end
+  if skill.resolve then
+    skill.content = skill.resolve()
+  end
+  return helpers.activation_output(skill)
+end
+
+local function load_request(args)
+  local name, request = args:match("^%s*(%S+)%s*(.*)$")
+  if not name then
+    return nil, SKILL_USAGE
+  end
+  local output, err = load_skill(name)
+  if not output then
+    return nil, err
+  end
+  local durable = { key = SKILL_TOOL .. ":" .. name, text = output }
+  if #request > 0 then
+    output = output .. "\n\n" .. request
+  end
+  return output, nil, durable
+end
+
+maki.api.set_slot("agent.user_message", function(prev, value, ctx)
+  local updated, reason = prev(value, ctx)
+  if type(updated) ~= "table" or type(updated.text) ~= "string" then
+    return updated, reason
+  end
+  local args = updated.text == SKILL_COMMAND and "" or updated.text:match("^" .. SKILL_COMMAND .. "%s+(.*)$")
+  if args == nil then
+    return updated
+  end
+  local output, err, durable = load_request(args)
+  if not output then
+    return nil, err
+  end
+  updated.text = output
+  updated.durable = durable
+  return updated
+end)
+
+maki.api.register_command({
+  name = SKILL_COMMAND,
+  nargs = "+",
+  description = "Load a skill: /skill name [request]",
+  handler = function(command)
+    if not command.fargs[1] then
+      maki.ui.flash(SKILL_USAGE)
+      return
+    end
+    local session, err = maki.session.current()
+    if not session then
+      maki.ui.flash(err)
+      return
+    end
+    local state, prompt_error = maki.session.prompt(SKILL_COMMAND .. " " .. command.args, { session = session })
+    if not state then
+      maki.ui.flash(prompt_error)
+    end
+  end,
+})
 
 local function view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -157,19 +190,27 @@ local function skill_view(output, ctx)
   return { body = buf, header = header }
 end
 
-local boot_skills = discover_skills()
-local description = "Load a skill that provides instructions and workflows for specific tasks."
-  .. build_skill_list(boot_skills)
+local skipped = {}
+local boot_skills = discover_skills(skipped)
+for _, diagnostic in ipairs(skipped) do
+  maki.notify(diagnostic, "warn", { title = "Skipped skill" })
+end
+local names = helpers.skill_names(boot_skills)
+if #names == 0 then
+  return
+end
+local description = "When a task matches a listed skill, load it before proceeding." .. build_skill_list(boot_skills)
 
 maki.api.register_tool({
-  name = "skill",
+  name = SKILL_TOOL,
   kind = "read",
+  durable = "name",
   description = description,
 
   schema = {
     type = "object",
     properties = {
-      name = { type = "string", description = "Name of the skill to load", required = true },
+      name = { type = "string", enum = names, description = "Name of the skill to load", required = true },
     },
   },
 
@@ -186,17 +227,10 @@ maki.api.register_tool({
       return { llm_output = "error: name is required", is_error = true }
     end
 
-    local skills = discover_skills()
-    local skill = skills[input.name]
-    if not skill then
-      local available = build_skill_list(skills)
-      return { llm_output = NOT_FOUND .. input.name .. available, is_error = true }
+    local llm_output, err = load_skill(input.name)
+    if not llm_output then
+      return { llm_output = err .. build_skill_list(discover_skills()), is_error = true }
     end
-    if skill.resolve then
-      skill.content = skill.resolve()
-    end
-
-    local llm_output = format_output(skill.location, skill.content)
     local result = skill_view(llm_output, ctx)
     result.llm_output = llm_output
     return result

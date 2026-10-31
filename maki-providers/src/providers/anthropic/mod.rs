@@ -691,8 +691,8 @@ mod tests {
     use super::*;
     use crate::test_support::{Canned, serve, sse_event};
     use crate::{
-        ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, ProviderEvent, Role, StopReason,
-        TokenUsage,
+        ContentBlock, DurableContent, EMPTY_RESPONSE_MARKER, InputTransformation, ProviderEvent,
+        Role, StopReason, TokenUsage,
     };
     use serde_json::{Value, json};
     use shared::{DISPLACED_ERROR_PREFIX, build_wire_messages};
@@ -1213,6 +1213,20 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             })
             .collect();
         assert_eq!(marked, expected);
+    }
+
+    #[test]
+    fn durable_host_metadata_never_reaches_the_wire() {
+        let plain = Message::user("instructions".into());
+        let mut marked = plain.clone();
+        marked.durable = Some(DurableContent {
+            key: "remember:release".into(),
+            text: "instructions".into(),
+        });
+        let tools = json!([]);
+        let expected = serde_json::to_value(build_wire_messages(&[plain], &tools)).unwrap();
+        let actual = serde_json::to_value(build_wire_messages(&[marked], &tools)).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

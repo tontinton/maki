@@ -251,6 +251,7 @@ pub async fn adapt_images_for_model<'a>(
             role: message.role.clone(),
             content,
             display_text: message.display_text.clone(),
+            durable: message.durable.clone(),
             kind: message.kind.clone(),
             receipts: message.receipts.clone(),
             settles: message.settles.clone(),
@@ -467,6 +468,12 @@ impl ContentBlock {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableContent {
+    pub key: String,
+    pub text: String,
+}
+
 /// How a background task ended, as the notice that settled its receipt tells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -488,7 +495,7 @@ pub struct TaskSettled {
 
 /// Part of the frozen session surface (disk, exports, Lua), written flat:
 /// `{"role", "content", "display_text"?, "kind"?, "facts"?, "receipts"?,
-/// "settles"?}`, with `kind` as a bare tag and `facts` beside a
+/// "settles"?, "durable"?}`, with `kind` as a bare tag and `facts` beside a
 /// `context_update`. Older logs nest it as
 /// `{"kind": {"context_update": facts}}`. Those still load, and are not
 /// rewritten just for that.
@@ -500,6 +507,9 @@ pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
     pub display_text: Option<String>,
+    /// Host metadata for content carried verbatim across compaction.
+    /// Provider encoders omit this marker from requests.
+    pub durable: Option<DurableContent>,
     pub kind: MessageKind,
     /// Calls whose results here are background receipts: each moved, and a
     /// later notice [`settles`](Self::settles) it.
@@ -511,6 +521,8 @@ pub struct Message {
 /// [`Message`] as stored, before `kind` and `facts` are paired up.
 #[derive(Deserialize)]
 struct RawMessage {
+    #[serde(default)]
+    durable: Option<DurableContent>,
     role: Role,
     content: Vec<ContentBlock>,
     #[serde(default)]
@@ -571,6 +583,7 @@ impl TryFrom<RawMessage> for Message {
             role: raw.role,
             content: raw.content,
             display_text: raw.display_text,
+            durable: raw.durable,
             kind,
             receipts: raw.receipts,
             settles: raw.settles,
@@ -588,9 +601,13 @@ impl Serialize for Message {
             + usize::from(!self.kind.is_turn())
             + usize::from(facts.is_some())
             + usize::from(!self.receipts.is_empty())
-            + usize::from(self.settles.is_some());
+            + usize::from(self.settles.is_some())
+            + usize::from(self.durable.is_some());
         let mut state = serializer.serialize_struct("Message", len)?;
         state.serialize_field("role", &self.role)?;
+        if let Some(durable) = &self.durable {
+            state.serialize_field("durable", durable)?;
+        }
         state.serialize_field("content", &self.content)?;
         if let Some(display_text) = &self.display_text {
             state.serialize_field("display_text", display_text)?;
@@ -1898,6 +1915,23 @@ mod tests {
             generate_title(&[host, Message::user(PROMPT.into())]),
             PROMPT
         );
+    }
+
+    #[test]
+    fn durable_message_metadata_is_backward_compatible_and_round_trips() {
+        let stored =
+            json!({ "role": "user", "content": [{ "type": "text", "text": "instructions" }] });
+        let old: Message = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(old.durable, None);
+        assert_eq!(serde_json::to_value(old).unwrap(), stored);
+        let marked = json!({
+            "role": "user", "content": [{ "type": "text", "text": "instructions" }],
+            "durable": { "key": "remember:release", "text": "instructions" },
+            "receipts": ["running"],
+            "settles": { "task": "finished", "end": TaskEnd::Finished },
+        });
+        let restored: Message = serde_json::from_value(marked.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), marked);
     }
 
     /// A result that loaded nothing must serialize to the same bytes as

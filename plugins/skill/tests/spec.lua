@@ -31,29 +31,52 @@ case("frontmatter_with_name_and_description", function()
   assert(body:find("Instructions"), "body should contain content after closing ---")
 end)
 
-case("no_frontmatter_returns_content_as_body", function()
-  local fm, body = parse_frontmatter("Just content without frontmatter")
-  eq(fm.name, nil)
-  eq(body, "Just content without frontmatter")
-end)
-
 case("frontmatter_with_leading_whitespace", function()
   local fm, body = parse_frontmatter("  \n---\nname: trimmed\n---\nBody here")
   eq(fm.name, "trimmed")
   eq(body, "Body here")
 end)
 
-case("frontmatter_no_closing_delimiter", function()
-  local input = "---\nname: oops\nThis never closes"
-  local fm, body = parse_frontmatter(input)
-  eq(fm.name, nil)
-  eq(body, input)
+case("frontmatter_recovers_plain_metadata_with_colons", function()
+  for _, newline in ipairs({ "\n", "\r\n" }) do
+    local fm, body, err = parse_frontmatter(table.concat({
+      "---",
+      "name: portable",
+      'description: Use when: the user asks about "PDFs" # parser comment',
+      "compatibility: Requires: Python 3",
+      "license: Custom: see LICENSE",
+      "allowed-tools: Bash(command: *)",
+      "metadata:",
+      '  author: "Team: docs"',
+      "---",
+      "Body: keep this unchanged",
+    }, newline))
+    eq(err, nil)
+    eq(fm.description, 'Use when: the user asks about "PDFs"')
+    eq(fm.compatibility, "Requires: Python 3")
+    eq(fm.license, "Custom: see LICENSE")
+    eq(fm["allowed-tools"], "Bash(command: *)")
+    eq(fm.metadata.author, "Team: docs")
+    eq(body, "Body: keep this unchanged")
+  end
 end)
 
-case("frontmatter_invalid_yaml_falls_back", function()
-  local fm, body = parse_frontmatter("---\n: invalid: yaml: [[\n---\nBody")
-  eq(fm.name, nil)
-  eq(body, "Body")
+case("invalid_frontmatter_returns_a_diagnostic", function()
+  for _, input in ipairs({
+    "Plain instructions",
+    "---\nname: missing-close",
+    "---\n: invalid: yaml: [[\n---\nBody",
+    "---\n123\n---\nBody",
+    "---\nname: {nested: value}\n---\nBody",
+    "---\nname: valid\ndescription: [wrong]\n---\nBody",
+    "---\nname: valid\ndescription: [unclosed: value\n---\nBody",
+    "---\nname: valid\ndescription: Use when: " .. string.char(255) .. "\n---\nBody",
+  }) do
+    local fm, body, err = parse_frontmatter(input)
+    eq(fm, nil)
+    eq(body, nil)
+    assert(type(err) == "string" and #err > 0, "invalid files need a diagnostic")
+  end
 end)
 
 case("frontmatter_empty_body_after_close", function()
@@ -68,18 +91,116 @@ case("frontmatter_body_with_embedded_triple_dashes", function()
   assert(body:find("Some text"), "body should start after first closing ---")
 end)
 
-case("frontmatter_only_dashes_no_yaml", function()
-  local fm, body = parse_frontmatter("---\n\n---\nBody")
-  eq(body, "Body")
+case("frontmatter_accepts_crlf_and_complete_delimiters", function()
+  for _, newline in ipairs({ "\n", "\r\n" }) do
+    local input = table.concat({
+      "---",
+      "name: portable",
+      "description: Windows file",
+      "---extra: value",
+      "---",
+      "Body",
+    }, newline)
+    local fm, body = parse_frontmatter(input)
+    eq(fm.name, "portable")
+    eq(fm["---extra"], "value")
+    eq(body, "Body")
+  end
+end)
+
+case("frontmatter_closing_delimiter_at_eof", function()
+  local fm, body = parse_frontmatter("---\nname: portable\ndescription: Example\n---")
+  eq(fm.name, "portable")
+  eq(body, "")
+end)
+
+case("required_metadata_and_character_limits", function()
+  for _, fm in ipairs({
+    {},
+    { name = "valid" },
+    { name = "", description = "Example" },
+    { name = "valid", description = "  " },
+    { name = "valid", description = string.rep("x", 1025) },
+    { name = "valid", description = "Example", compatibility = "" },
+    { name = "valid", description = "Example", compatibility = string.rep("x", 501) },
+  }) do
+    local warnings, err = helpers.validate_frontmatter(fm, "valid")
+    eq(warnings, nil)
+    assert(err and #err > 0, "invalid metadata needs an error")
+  end
+  local fm = { name = "valid", description = string.rep("é", 1024), compatibility = string.rep("é", 500) }
+  local warnings, err = helpers.validate_frontmatter(fm, "valid")
+  eq(err, nil)
+  eq(#warnings, 0)
+end)
+
+case("cosmetic_name_issues_load_with_diagnostics", function()
+  for _, name in ipairs({ "Upper", "-start", "end-", "two--hyphens", "has space", string.rep("x", 65) }) do
+    local warnings, err = helpers.validate_frontmatter({ name = name, description = "Example" }, "other")
+    eq(err, nil)
+    assert(#warnings > 0, "name violations must be reported")
+  end
+end)
+
+case("discovery_keeps_valid_empty_body_and_skips_bad_neighbors", function()
+  local th = require("maki.test_helpers")
+  local dir = th.mktmpdir("skill_discovery")
+  local ok, err = pcall(function()
+    for name, content in pairs({
+      valid = "---\nname: valid\ndescription: Example\n---\n",
+      broken = "---\n123\n---\nBody",
+      missing = "---\nname: missing\n---\nBody",
+      portable = "---\nname: portable\ndescription: Use when: testing\n---\nBody",
+    }) do
+      maki.fs.mkdir(maki.fs.joinpath(dir, name))
+      maki.fs.write(maki.fs.joinpath(dir, name, "SKILL.md"), content)
+    end
+    local skills = {}
+    local diagnostics = helpers.scan_skill_dir(dir, skills)
+    local _, body = parse_frontmatter(skills.valid.content)
+    eq(body, "")
+    eq(skills.broken, nil)
+    eq(skills.missing, nil)
+    eq(skills.portable.description, "Use when: testing")
+    eq(#diagnostics, 2)
+    for _, message in ipairs(diagnostics) do
+      assert(message:find(dir, 1, true), "diagnostic must identify the file")
+    end
+  end)
+  th.rmtree(dir)
+  assert(ok, err)
+end)
+
+case("collisions_are_deterministic_and_identify_both_files", function()
+  local th = require("maki.test_helpers")
+  local dir = th.mktmpdir("skill_collisions")
+  local ok, err = pcall(function()
+    for _, name in ipairs({ "z", "a" }) do
+      maki.fs.mkdir(maki.fs.joinpath(dir, name))
+      maki.fs.write(maki.fs.joinpath(dir, name, "SKILL.md"), "---\nname: shared\ndescription: Example\n---\n" .. name)
+    end
+    local skills = {}
+    local diagnostics = helpers.scan_skill_dir(dir, skills)
+    local _, body = parse_frontmatter(skills.shared.content)
+    eq(body, "z")
+    local collision
+    for _, message in ipairs(diagnostics) do
+      if message:find("shadows", 1, true) then
+        collision = message
+      end
+    end
+    assert(collision and collision:find(maki.fs.joinpath(dir, "a", "SKILL.md"), 1, true), "identify the shadowed file")
+    assert(collision:find(maki.fs.joinpath(dir, "z", "SKILL.md"), 1, true), "identify the winning file")
+  end)
+  th.rmtree(dir)
+  assert(ok, err)
 end)
 
 -- ── build_skill_list ──
 
 case("build_skill_list_empty", function()
   local result = build_skill_list({})
-  assert(result:find("No skills available"), "empty list should say no skills available")
-  assert(result:find("<available_skills>"), "should have opening tag")
-  assert(result:find("</available_skills>"), "should have closing tag")
+  eq(result, "")
 end)
 
 case("build_skill_list_single_skill", function()
@@ -104,6 +225,27 @@ case("build_skill_list_sorted_alphabetically", function()
   local zebra_pos = result:find("zebra")
   assert(alpha_pos < middle_pos, "alpha should come before middle")
   assert(middle_pos < zebra_pos, "middle should come before zebra")
+end)
+
+case("optional_metadata_types_are_checked", function()
+  for field, value in pairs({ license = {}, compatibility = {}, metadata = { version = 1 }, ["allowed-tools"] = {} }) do
+    local fm = { name = "release", description = "Example" }
+    fm[field] = value
+    local warnings, err = helpers.validate_frontmatter(fm, "release")
+    eq(warnings, nil)
+    assert(err and err:find(field, 1, true), "diagnostic must name the field")
+  end
+end)
+
+case("activation_retains_metadata_and_relative_path_base", function()
+  local source =
+    "---\nname: release\ndescription: Example\nlicense: MIT\ncompatibility: Requires python3\nmetadata:\n  version: '1'\nallowed-tools: Bash(git:*) Read\n---\n# Release"
+  local output = helpers.activation_output({ location = LOCATION, content = source })
+  local location, content = parse_output(output)
+  eq(location, LOCATION)
+  assert(content:find(source, 1, true), "activation must retain all metadata")
+  assert(content:find(maki.fs.dirname(LOCATION), 1, true), "activation must identify the resource base")
+  assert(output:find("<skill_content>", 1, true), "activation needs a durable content boundary")
 end)
 
 -- ── llm text round trip ──

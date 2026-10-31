@@ -275,6 +275,11 @@ pub trait Tool: Send + Sync + 'static {
     fn tool_kind(&self) -> Option<&str> {
         None
     }
+    /// The latest non-empty successful result text for this key survives
+    /// compaction. Keys use recorded input, so old sessions need no migration.
+    fn durable_key<'a>(&self, _input: &'a Value) -> Option<&'a str> {
+        None
+    }
     /// `None` is undeclared reach, which every consumer prices as everything.
     fn reach(&self) -> Option<ToolReach> {
         None

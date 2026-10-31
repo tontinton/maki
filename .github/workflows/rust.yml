@@ -160,6 +160,8 @@ jobs:
         with:
           tool: just
       - run: just lint
+      - name: Test canonical project paths
+        run: cargo test -p maki-config --lib project::tests::canonical_project_directories_ignore_drive_letter_case -- --exact
       - run: just build
 
   ci-pass:
