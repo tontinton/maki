@@ -100,7 +100,7 @@ bs58 = "0.5"
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
-crossterm = { version = "0.29", features = ["osc52"] }
+crossterm = { version = "0.29", features = ["osc52", "event-stream"] }
 color-eyre = { version = "0.6", default-features = false, features = ["track-caller"] }
 termini = "1"
 thiserror = "2"
