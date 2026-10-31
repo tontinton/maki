@@ -655,12 +655,20 @@ fn coerce_primitive(v: &Value, expected: ParamKind) -> Option<Value> {
             .or_else(|| f64_as_i64(s.parse::<f64>().ok()?))
             .map(Value::from),
         ParamKind::Number => s.parse::<f64>().ok().map(Value::from),
-        ParamKind::Bool => match s {
-            "true" => Some(Value::Bool(true)),
-            "false" => Some(Value::Bool(false)),
-            _ => None,
-        },
+        ParamKind::Bool => parse_bool_like(s).map(Value::Bool),
         _ => None,
+    }
+}
+
+/// Models stringify booleans, and some capitalize the word, so accept either
+/// spelling in any case instead of bouncing the call back.
+fn parse_bool_like(s: &str) -> Option<bool> {
+    if s.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if s.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -995,7 +1003,11 @@ mod tests {
     #[test_case(json!("NaN"),                     ParamKind::Integer, None              ; "nan_string_rejected")]
     #[test_case(json!("inf"),                     ParamKind::Integer, None              ; "inf_string_rejected")]
     #[test_case(json!("1.25"),                   ParamKind::Number,  Some(json!(1.25)) ; "string_to_float")]
-    #[test_case(json!("true"),                   ParamKind::Bool,    Some(json!(true)) ; "string_to_bool")]
+    #[test_case(json!("true"),                   ParamKind::Bool,    Some(json!(true)) ; "string_to_true")]
+    #[test_case(json!("false"),                  ParamKind::Bool,    Some(json!(false)) ; "string_to_false")]
+    #[test_case(json!("True"),                   ParamKind::Bool,    Some(json!(true)) ; "capitalized_string_to_true")]
+    #[test_case(json!("FALSE"),                  ParamKind::Bool,    Some(json!(false)) ; "uppercase_string_to_false")]
+    #[test_case(json!("yes"),                    ParamKind::Bool,    None              ; "non_bool_word_rejected")]
     #[test_case(json!(30),                       ParamKind::Integer, None              ; "already_correct_type_no_coercion")]
     fn coerce_primitive_cases(value: Value, expected: ParamKind, wanted: Option<Value>) {
         assert_eq!(coerce_primitive(&value, expected), wanted);
