@@ -17,7 +17,6 @@ use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
-use tokio::runtime::Handle;
 
 pub type SessionEndHook =
     Arc<dyn Fn(MakiId, SessionEndReason) -> BoxFuture<'static, ()> + Send + Sync>;
@@ -54,6 +53,6 @@ pub struct AcpParams {
     pub stop: CancelToken,
 }
 
-pub fn run(params: AcpParams) -> color_eyre::Result<()> {
-    Handle::current().block_on(server::serve(params))
+pub async fn run(params: AcpParams) -> color_eyre::Result<()> {
+    server::serve(params).await
 }

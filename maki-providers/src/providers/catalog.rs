@@ -19,7 +19,6 @@ use flume::Sender;
 use maki_config::providers::ProvidersConfig;
 use reqwest::Client;
 use serde_json::Value;
-use tokio::runtime::Handle;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
@@ -34,7 +33,7 @@ use crate::providers::openai_compat::{
 };
 use crate::providers::{
     ResolvedAuth, Timeouts, body_reader, http_client, opencode, plugin, send_request,
-    status_and_text, user_agent,
+    status_and_text, user_agent, wait,
 };
 use crate::spec::ProviderRegistry;
 use crate::{
@@ -468,14 +467,14 @@ pub(crate) fn init_shared_catalog_if_needed() -> &'static Mutex<CatalogData> {
 }
 
 /// Loads the models.dev catalog from the on-disk cache, fetching once if the
-/// cache is cold or stale. Blocks, so only call it from startup paths; every
-/// other lookup must stay on the `*_if_available` variants.
+/// cache is cold or stale. Blocks on the fetch, so only startup paths call
+/// it; every other lookup stays on the `*_if_available` variants.
 pub fn warm_catalog() {
     init_shared_catalog_if_needed();
 }
 
 /// Force-refetches the models.dev catalog; failures keep the stale catalog and cache.
-/// Blocks, so only call it from startup paths, never from inside the executor.
+/// Blocks on the fetch, so only `maki models --refresh` calls it.
 pub fn refresh_catalog() -> Result<(), AgentError> {
     let state_dir = StateDir::resolve()
         .map_err(|e| config_error(format!("failed to resolve state dir: {e}")))?;
@@ -716,12 +715,11 @@ fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
     }
 }
 
-/// Runs on the cli thread or the blocking pool, never on a worker: a worker
-/// cannot block on the fetch.
+/// Blocks on the fetch through [`wait`], so it runs anywhere [`wait`] does.
 fn fetch_catalog_blocking(state_dir: &StateDir) -> Result<CatalogData, AgentError> {
-    let index = Handle::current().block_on(fetch_remote_catalog_async(&http_client(
-        Timeouts::default(),
-    )))?;
+    let index = wait(fetch_remote_catalog_async(
+        &http_client(Timeouts::default()),
+    ))?;
     save_cached_catalog(&index);
     Ok(CatalogData::from_index(index, state_dir))
 }

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io;
 use std::iter;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,6 +12,8 @@ use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, Lines};
+use tokio::runtime::Handle;
+use tokio::task::block_in_place;
 use tokio::time::timeout;
 use tokio_util::io::StreamReader;
 use tracing::{debug, warn};
@@ -457,6 +460,14 @@ pub(crate) fn http_client(timeouts: Timeouts) -> Client {
                 .build()
                 .expect("an HTTP client without trust roots always builds")
         })
+}
+
+/// For the credential and catalog flows that are still synchronous and have
+/// to block on one request. Works from a worker, from the main thread's
+/// `block_on` and from the blocking pool alike; panics on a current_thread
+/// runtime (every `#[tokio::test]`) and inside a `LocalSet` (the Lua thread).
+pub(crate) fn wait<T>(future: impl Future<Output = T>) -> T {
+    block_in_place(|| Handle::current().block_on(future))
 }
 
 /// `Client::execute` arms the timeouts as it is called, so the send and the

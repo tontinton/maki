@@ -8,13 +8,12 @@ use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
 use reqwest::Client;
 use serde::Deserialize;
-use tokio::runtime::Handle;
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
 use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
 use crate::providers::{
-    KeyPool, ResolvedAuth, UNAUTHORIZED_STATUS, client_builder, status_and_text, urlenc,
+    KeyPool, ResolvedAuth, UNAUTHORIZED_STATUS, client_builder, status_and_text, urlenc, wait,
 };
 
 use super::catalog;
@@ -122,7 +121,7 @@ fn post_form(url: &str, body: &str, timeout: Duration) -> Result<(u16, String), 
     }
     let request = builder.body(body.to_owned()).build()?;
     // A transport error, not `Config`: only the token endpoint's answer may clear the tokens.
-    Handle::current().block_on(status_and_text(&client, request))
+    wait(status_and_text(&client, request))
 }
 
 fn into_oauth_tokens(

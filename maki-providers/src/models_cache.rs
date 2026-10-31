@@ -14,6 +14,7 @@ use maki_config::ModelPolicy;
 use maki_storage::StateDir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
 use crate::provider::{ModelBatch, fetch_all_models, provider_available};
@@ -255,7 +256,9 @@ pub async fn fetch_all_models_cached(
     mut on_update: impl FnMut(ModelList, Vec<String>),
 ) {
     let path = cache_path();
-    let fingerprint = fingerprint();
+    let fingerprint = spawn_blocking(fingerprint)
+        .await
+        .expect("fingerprint task panicked");
     let mut listing = Listing {
         replayed: path
             .as_deref()

@@ -14,7 +14,7 @@ use crate::interrupt::Interrupt;
 use crate::provider_scripts;
 use crate::setup;
 
-pub fn run(
+pub async fn run(
     model_arg: Option<String>,
     yolo: bool,
     no_plugins: bool,
@@ -55,7 +55,8 @@ pub fn run(
             config.validate()?;
             Ok(config)
         },
-    )?;
+    )
+    .await?;
     warnings.extend(provider_scripts::startup_warning());
     super::report_warnings(warnings);
 
@@ -93,7 +94,8 @@ pub fn run(
         storage,
         background,
         stop: interrupt.stop(),
-    })?;
+    })
+    .await?;
     drop(plugin_host);
     interrupt.exit_if_caught();
     Ok(())

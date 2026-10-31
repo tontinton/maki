@@ -2120,12 +2120,11 @@ impl<'t> EventLoop<'t> {
         let tx = self.pack_tx.clone();
         let runtime = Handle::current();
         std::thread::spawn(move || {
-            let _runtime = runtime.enter();
             // Without this a panic drops the sender with no answer, and
             // `pack_running` stays set for the rest of the process, so every
             // later package command reports "already running".
             let preparation = catch_unwind(AssertUnwindSafe(|| match handle.package_context() {
-                Ok(context) => maki_lua::prepare_pack_command(&command, &context),
+                Ok(context) => runtime.block_on(maki_lua::prepare_pack_command(&command, &context)),
                 Err(error) => PackPreparation::failed(error),
             }))
             .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
