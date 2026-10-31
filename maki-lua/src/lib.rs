@@ -29,11 +29,12 @@ pub use api::ui::marks::{
 };
 pub use api::ui::syntax::{SyntaxDoc, SyntaxEdit, SyntaxIndex, SyntaxInput, SyntaxRule};
 pub use api::util::command::{
-    Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch, HintEntry,
-    HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit,
-    LuaCommandInfo, LuaCommandReader, ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow,
-    PlanMenu, PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest, TextEdit, TitlePos,
-    UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
+    Anchor, Axis, Border, BuiltinAction, ChatItem, ChatItemStatus, Dimension, Edge, FloatConfig,
+    FloatConfigPatch, HintEntry, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks,
+    InputRequest, InputSubmit, LuaCommandInfo, LuaCommandReader, ModelRequest, NO_UI_ERR,
+    PlanActionOutcome, PlanFormRow, PlanMenu, PlanRequest, PlanRowAction, SessionRequest, Split,
+    TaskRequest, TextEdit, TitlePos, UiAction, UiAttachment, UiReply, WinCommand, WinEvent,
+    WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
@@ -90,8 +91,8 @@ pub mod test_support {
     pub struct HintWriterHandle(HintWriter);
 
     impl HintWriterHandle {
-        pub fn publish(&self, entries: HintEntries) {
-            self.0.publish(entries);
+        pub fn publish(&self, entries: HintEntries, segments: Vec<(String, String)>) {
+            self.0.publish(entries, segments);
         }
     }
 

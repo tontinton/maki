@@ -6,6 +6,7 @@
 local ListPicker = require("maki.list_picker")
 
 local RUNNING_SECTION = "Running"
+local JOBS_SECTION = "Jobs"
 local FINISHED_SECTION = "Finished"
 local COST_FMT = "$%.3f"
 local TRAILER_SEP = " · "
@@ -32,18 +33,28 @@ local function parent_of(task, by_id)
   return task.parent and by_id[task.parent]
 end
 
+-- An unnamed job is identified by the command it runs.
+local function job_label(job)
+  return job.name or job.command
+end
+
 -- The main chat comes first and has no status. The other tasks follow, live
 -- ones above finished ones so a long job never gets buried under the ones
--- that already returned. Within a section, newest first (`tasks` comes in
--- chat order, which is spawn order), so the latest task is the one at hand.
--- Children follow their parent one level in, in spawn order, whatever their
--- status, so a finished child of a running batch stays under it. A parent
--- shows when it or one of its children matches the filter.
+-- that already returned. The session's running jobs sit between the two:
+-- they are work in progress the picker can stop, whether or not this plugin
+-- started them.
+--
+-- Within a task section, newest first (`tasks` comes in chat order, which is
+-- spawn order), so the latest task is the one at hand. Children follow their
+-- parent one level in, in spawn order, whatever their status, so a finished
+-- child of a running batch stays under it. A parent shows when it or one of
+-- its children matches the filter. Jobs keep list order. An exited job leaves
+-- the list: its owner already reported how it ended.
 --
 -- Returns { rows, sections }. A row carries a section header only when it opens
 -- one, and `depth` 1 when it sits under a parent. `sections` counts the
 -- top-level rows that survived the filter.
-function M.build(tasks, query)
+function M.build(tasks, jobs, query)
   local words = ListPicker.split_words(query)
   local by_id, children = index_by_id(tasks), {}
   local function matches(task)
@@ -70,6 +81,13 @@ function M.build(tasks, query)
     end
   end
 
+  local live_jobs = {}
+  for _, job in ipairs(jobs or {}) do
+    if job.status == "running" and ListPicker.matches(job_label(job), words) then
+      live_jobs[#live_jobs + 1] = job
+    end
+  end
+
   local rows = {}
   local function add(task, section)
     rows[#rows + 1] = { task = task, section = section }
@@ -80,13 +98,36 @@ function M.build(tasks, query)
   if main then
     add(main)
   end
-  for _, group in ipairs({ { RUNNING_SECTION, running }, { FINISHED_SECTION, finished } }) do
-    local header, tasks_in_section = group[1], group[2]
-    for i = #tasks_in_section, 1, -1 do
-      add(tasks_in_section[i], i == #tasks_in_section and header or nil)
+  -- Tasks read newest first, so their header goes on the last row drawn.
+  local function append(header, items, key, newest_first)
+    local from, to, step = 1, #items, 1
+    if newest_first then
+      from, to, step = #items, 1, -1
+    end
+    for i = from, to, step do
+      local section = i == from and header or nil
+      if key == "task" then
+        add(items[i], section)
+      else
+        rows[#rows + 1] = { [key] = items[i], section = section }
+      end
     end
   end
-  return { rows = rows, sections = { running = #running, finished = #finished } }
+  append(RUNNING_SECTION, running, "task", true)
+  append(JOBS_SECTION, live_jobs, "job", false)
+  append(FINISHED_SECTION, finished, "task", true)
+  return {
+    rows = rows,
+    sections = { running = #running, jobs = #live_jobs, finished = #finished },
+  }
+end
+
+function M.row_id(row)
+  return row.task and row.task.id or row.job.id
+end
+
+function M.row_name(row)
+  return row.task and row.task.name or job_label(row.job)
 end
 
 -- A child counts as part of its listed parent, the way the input box counts.
@@ -102,8 +143,9 @@ function M.working(tasks)
 end
 
 -- Only a finished subagent may leave the list. The main chat is the session
--- itself, and dropping a live task would orphan its transcript. The host has
--- the final say. This check only decides which rows ask "are you sure".
+-- itself, dropping a live task would orphan its transcript, and a job's
+-- process is not ours to delete. The host has the final say. This check only
+-- decides which rows ask "are you sure".
 function M.deletable(task)
   return task.status ~= nil and not alive(task.status)
 end
@@ -153,7 +195,7 @@ end
 -- the cursor with it.
 function M.index_of(rows, id)
   for i, row in ipairs(rows) do
-    if row.task.id == id then
+    if M.row_id(row) == id then
       return i
     end
   end

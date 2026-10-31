@@ -1113,6 +1113,12 @@ impl<'t> EventLoop<'t> {
                     rt.app.clear_plugin_marks(&plugin);
                 }
             }
+            UiAction::ChatItem { session, item } => {
+                // A straggler after `/new` finds no tab and is dropped.
+                if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
+                    rt.app.handle_chat_item(&item);
+                }
+            }
             UiAction::RunCommand {
                 cmdline,
                 depth,

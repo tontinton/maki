@@ -1,9 +1,10 @@
--- The /tasks picker: the subagents of the focused session, running ones first.
--- The tool in init.lua spawns them, this file only shows them.
+-- The /tasks picker: the focused session's activity — its subagents and the
+-- command jobs a plugin left running in it, running ones first.
+-- The tool in init.lua spawns the subagents, this file only shows both.
 --
 -- The host keeps the transcripts, so there is no task state here. Every
--- refresh rebuilds the rows from maki.task.list(), and previewing is just
--- maki.task.focus() with a restore on cancel.
+-- refresh rebuilds the rows from maki.task.list() and maki.fn.joblist(), and
+-- previewing is just maki.task.focus() with a restore on cancel.
 
 local TextInput = require("maki.text_input")
 local ListPicker = require("maki.list_picker")
@@ -18,6 +19,7 @@ local RUNNING_ICON = "· "
 local MAIN_ICON = "● "
 -- The footer counts never animate, so they get a real bullet.
 local RUNNING_COUNT_ICON = "● "
+local JOB_COUNT_ICON = "▶ "
 local DONE_ICON = "✓ "
 local ERROR_ICON = "✗ "
 local CANCELLED_ICON = "⊘ "
@@ -69,12 +71,22 @@ local function icon_of(task)
   return icon[1], icon[2], icon[3]
 end
 
+local function icon_of_row(row)
+  if row.task then
+    return icon_of(row.task)
+  end
+  return RUNNING_ICON, "accent", true
+end
+
 -- The counts describe the rows on screen, so a filter that hides half the list
 -- has to retally them.
 local function update_footer(counts)
   local footer = {}
   if counts.running > 0 then
     footer[#footer + 1] = { RUNNING_COUNT_ICON .. counts.running, "running" }
+  end
+  if counts.jobs > 0 then
+    footer[#footer + 1] = { JOB_COUNT_ICON .. counts.jobs, "dim" }
   end
   if counts.finished > 0 then
     footer[#footer + 1] = { tostring(counts.finished), "finished" }
@@ -89,10 +101,10 @@ end
 -- falls to whatever row took over the old position.
 local function rebuild()
   local previous = Rows.index_of(board.rows, board.sel_id) or 1
-  local built = Rows.build(board.tasks, board.input:value())
+  local built = Rows.build(board.tasks, board.jobs, board.input:value())
   board.rows = built.rows
   local idx = Rows.index_of(board.rows, board.sel_id) or math.min(previous, math.max(#board.rows, 1))
-  board.sel_id = board.rows[idx] and board.rows[idx].task.id or nil
+  board.sel_id = board.rows[idx] and Rows.row_id(board.rows[idx]) or nil
   update_footer(built.sections)
 end
 
@@ -109,10 +121,9 @@ local function render()
     if row.section then
       lines[#lines + 1] = { { "  " .. row.section, "keybind_section" } }
     end
-    local task = row.task
-    local selected = task.id == board.sel_id
+    local selected = Rows.row_id(row) == board.sel_id
     local base = selected and "selected" or "item"
-    local icon, icon_style, spinning = icon_of(task)
+    local icon, icon_style, spinning = icon_of_row(row)
     if selected then
       icon_style = "selected"
     end
@@ -123,14 +134,16 @@ local function render()
     end
     local indent = row.depth and NESTED_INDENT or ""
     local line = { { "  " .. indent, base }, { icon, icon_style } }
-    local hint = selected and board.confirm and board.confirm.id == task.id and board.confirm.hint or ""
+    local task = row.task
+    local hint = selected and task and board.confirm and board.confirm.id == task.id and board.confirm.hint or ""
     -- A bash task is named after its command, which can run for hundreds of
     -- columns. The name gives way first, so the owner on the right stays in
     -- view.
+    local name = Rows.row_name(row)
     local fixed = 2 + dispw(indent) + dispw(icon) + dispw(hint)
-    local owner = Rows.trailer(task, board.drawn_at, 0, maki.ui.humantime)
+    local owner = task and Rows.trailer(task, board.drawn_at, 0, maki.ui.humantime) or ""
     local match_style = selected and "match_selected" or "match"
-    local spans = ListPicker.highlight_spans(task.name, words, base, match_style)
+    local spans = ListPicker.highlight_spans(name, words, base, match_style)
     local name_width = 0
     for _, span in ipairs(ListPicker.clamp_parts(spans, board.width - fixed - dispw(owner))) do
       line[#line + 1] = span
@@ -142,7 +155,7 @@ local function render()
     -- Rows with nothing on the right would otherwise end short of the border
     -- and read as padding on one side only, so the bar runs the full width.
     local room = board.width - fixed - name_width
-    local trailer = Rows.trailer(task, board.drawn_at, room, maki.ui.humantime)
+    local trailer = task and Rows.trailer(task, board.drawn_at, room, maki.ui.humantime) or ""
     local trail = room - dispw(trailer)
     if trail > 0 then
       line[#line + 1] = { string.rep(" ", trail), base }
@@ -162,7 +175,7 @@ local function render()
   board.win:set_cursor(cursor_line)
 end
 
--- The one host round-trip. `list()` suspends this coroutine and the picker can
+-- The host round-trips. `list()` suspends this coroutine and the picker can
 -- close while it waits, so bail out unless this board is still the current one.
 local function refresh()
   local this_board = board
@@ -174,7 +187,25 @@ local function refresh()
     maki.ui.flash(err)
     return
   end
+  -- Session jobs belong to the plugin that started them, but a shared one is
+  -- listed here too, so a monitor shows up and can be stopped from this list.
+  local jobs
+  local session, session_err = maki.session.current()
+  if session_err then
+    maki.ui.flash(session_err)
+  else
+    local listed, jobs_err = maki.fn.joblist(session)
+    if board ~= this_board then
+      return
+    end
+    if jobs_err then
+      maki.ui.flash(jobs_err)
+    else
+      jobs = listed
+    end
+  end
   board.tasks = tasks
+  board.jobs = jobs or {}
   rebuild()
   render()
 end
@@ -209,8 +240,13 @@ local function move_sel(delta, wrap)
   else
     idx = math.min(math.max(cur + delta, 1), n)
   end
-  board.sel_id = board.rows[idx].task.id
+  local row = board.rows[idx]
+  board.sel_id = Rows.row_id(row)
   render()
+  -- A job is a process, not a transcript: there is nothing to preview.
+  if not row.task then
+    return
+  end
   local _, err = maki.task.focus(board.sel_id)
   if err then
     maki.ui.flash(err)
@@ -223,6 +259,15 @@ end
 
 local function open_selected()
   if not board.sel_id then
+    return
+  end
+  local idx = Rows.index_of(board.rows, board.sel_id)
+  if not idx then
+    return
+  end
+  local row = board.rows[idx]
+  if not row.task then
+    maki.ui.flash("a job has no transcript to open")
     return
   end
   local _, err = maki.task.focus(board.sel_id)
@@ -245,19 +290,34 @@ local function confirmed(task, hint)
 end
 
 -- Ctrl+S asks first only when it would stop more than the row, which is
--- when the row is a part of a running call.
+-- when the row is a part of a running call. A task stops through the host, a
+-- job through its own handle. A shared job from another plugin is the case
+-- this list exists for.
 local function stop_selected()
   local idx = Rows.index_of(board.rows, board.sel_id)
   if not idx then
     return
   end
-  local task = board.rows[idx].task
-  local parent = Rows.stopped_parent(task, board.tasks)
-  if parent and not confirmed(task, STOP_PARENT_HINT_FMT:format(parent.name)) then
+  local row = board.rows[idx]
+  if row.task then
+    local parent = Rows.stopped_parent(row.task, board.tasks)
+    if parent and not confirmed(row.task, STOP_PARENT_HINT_FMT:format(parent.name)) then
+      return
+    end
+  end
+  board.confirm = nil
+  if row.job then
+    -- jobstop raises instead of answering with an error slot.
+    local ok, stop_err = pcall(maki.fn.jobstop, row.job.id)
+    if not ok then
+      maki.ui.flash(tostring(stop_err))
+      return
+    end
+    refresh()
     return
   end
+  local task = row.task
   local this_board = board
-  board.confirm = nil
   local _, err = maki.task.stop(task.id, { session = task.session })
   if board ~= this_board then
     return
@@ -282,6 +342,9 @@ local function delete_selected()
     return
   end
   local task = board.rows[idx].task
+  if not task then
+    return
+  end
   if Rows.deletable(task) and not confirmed(task, CONFIRM_HINT) then
     return
   end
@@ -301,6 +364,10 @@ local function delete_selected()
   end
   refresh()
   if board == this_board and board.sel_id then
+    local landed = board.rows[Rows.index_of(board.rows, board.sel_id)]
+    if not landed or not landed.task then
+      return
+    end
     local _, focus_err = maki.task.focus(board.sel_id)
     if focus_err then
       maki.ui.flash(focus_err)
@@ -407,6 +474,7 @@ local function open()
     -- it ended up once it wrapped, and page_size() reads it back.
     header = {},
     tasks = {},
+    jobs = {},
     rows = {},
   }
   -- Without this an error leaves a frozen float behind, and `/tasks` refuses
@@ -424,8 +492,10 @@ local function open()
 end
 
 -- Autocmds run synchronously while a refresh needs an async round-trip, so both
--- handlers only raise a flag and let the recv tick do the work.
-maki.api.create_autocmd({ "TaskStatusChanged", "SessionStatusChanged" }, {
+-- handlers only raise a flag and let the recv tick do the work. `JobStart` and
+-- `JobExit` reach every plugin, which is how a job another plugin started and
+-- shared reaches this list.
+maki.api.create_autocmd({ "TaskStatusChanged", "SessionStatusChanged", "JobStart", "JobExit" }, {
   callback = function()
     if board then
       board.dirty = true

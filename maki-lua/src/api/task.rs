@@ -193,6 +193,7 @@ mod tests {
     const ERROR_STATUS: &str = "error";
     const NIL_STATUS: &str = "nil";
     const CHAT_SESSION: &str = "chat-session";
+    const JOB_ID: u32 = 7;
     const UNKNOWN_TASK_ERR: &str = "unknown task: toolu_01";
     const NO_REQUEST_ERR: &str = "expected a task request";
     const LIST_CALL: &str = "return task.list()";
@@ -386,7 +387,7 @@ mod tests {
     #[test_case(None ; "stopped")]
     #[test_case(Some(UNKNOWN_TASK_ERR) ; "refused")]
     fn tasks_picker_stops_the_selected_row_and_refreshes(stop_error: Option<&str>) {
-        let lua = picker_lua(stop_error);
+        let lua = picker_lua(stop_error, &["<Down>", "<C-s>", "<Esc>"]);
         lua.load("open_tasks()").exec().unwrap();
 
         let globals = lua.globals();
@@ -402,24 +403,44 @@ mod tests {
         );
     }
 
+    /// A shared job is listed and stopped by the picker even though another
+    /// plugin started it, and stopping a job never touches the task path.
+    #[test]
+    fn tasks_picker_stops_a_listed_job() {
+        let lua = picker_lua(None, &["<Down>", "<Down>", "<C-s>", "<Esc>"]);
+        lua.load("open_tasks()").exec().unwrap();
+
+        let globals = lua.globals();
+        assert_eq!(globals.get::<u32>("stopped_job").unwrap(), JOB_ID);
+        assert!(
+            globals
+                .get::<Option<String>>("stopped_id")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(globals.get::<u32>("list_calls").unwrap(), 2);
+    }
+
     /// Runs `plugins/task/picker.lua` against a fake `maki` that lists the main
-    /// chat and one task, then presses Down, Ctrl+S and Esc.
-    fn picker_lua(stop_error: Option<&str>) -> Lua {
+    /// chat, one task and one shared job, then presses {keys}.
+    fn picker_lua(stop_error: Option<&str>, keys: &[&str]) -> Lua {
         let lua = Lua::new();
         let globals = lua.globals();
         globals.set("task_id", TASK_ID).unwrap();
         globals.set("chat_session", CHAT_SESSION).unwrap();
         globals.set("stop_error", stop_error).unwrap();
+        globals.set("next_keys", keys).unwrap();
         lua.load(
             r#"
             local modules = {}
             function require(name) return assert(modules[name], name) end
             function install_module(name, source) modules[name] = assert(loadstring(source))() end
-            local keys = {'<Down>', '<C-s>', '<Esc>'}
+            local keys = next_keys
             local tasks = {
                 {id = 'main', session = chat_session, name = 'chat', focused = true},
                 {id = task_id, session = chat_session, name = 'work', status = 'working'},
             }
+            local jobs = {{id = 7, command = 'cargo test', status = 'running'}}
             list_calls = 0
             local win = {width = 80, height = 20}
             function win:set_config(_) end
@@ -437,6 +458,11 @@ mod tests {
                         if stop_error then return nil, stop_error end
                         return true
                     end,
+                },
+                session = {current = function() return chat_session end},
+                fn = {
+                    joblist = function() return jobs end,
+                    jobstop = function(id) stopped_job = id end,
                 },
                 ui = {
                     buf = function() return {set_lines = function() end} end,

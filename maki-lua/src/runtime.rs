@@ -62,7 +62,7 @@ use crate::api::tool::{
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::ui::marks::{InputRuleStore, InputRulesReader};
-use crate::api::ui::{HintStore, WinStore, clear_session_hints};
+use crate::api::ui::{HintStore, WinStore, clear_session_hints, publish_hint_snapshot};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
     LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
@@ -2489,7 +2489,7 @@ fn try_active_task(lua: &Lua) -> mlua::Result<TaskHandle> {
 
 pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
     if lua.app_data_ref::<JobStore>().is_none() {
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(None));
     }
     let mut store = lua
         .app_data_mut::<JobStore>()
@@ -3607,7 +3607,7 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(Some(EventHandle::from_tx(tx.clone()))));
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(SpawnedTasks::default());
@@ -4230,11 +4230,8 @@ impl LuaRuntime {
         }
         if let Some(mut store) = self.lua.app_data_mut::<HintStore>() {
             store.clear_plugin(plugin);
-            let entries = store.snapshot_entries();
             drop(store);
-            if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
-                writer.publish(entries);
-            }
+            publish_hint_snapshot(&self.lua);
         }
         if let Some(mut store) = self.lua.app_data_mut::<InputRuleStore>() {
             store.clear_plugin(plugin);

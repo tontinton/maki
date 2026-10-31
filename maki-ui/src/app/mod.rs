@@ -72,11 +72,11 @@ use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks,
-    InputMode, InputRule, InputRulesReader, InputSnapshot, InputSubmit, Key, KeymapReader,
-    LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
-    PackPreparation, Permission, PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView,
-    is_reserved,
+    BuiltinAction, ChatItem, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit,
+    InputMarks, InputMode, InputRule, InputRulesReader, InputSnapshot, InputSubmit, Key,
+    KeymapReader, LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
+    PackCommand, PackPreparation, Permission, PlanActionOutcome, PlanMenu, PlanRowAction,
+    PluginReach, WinView, is_reserved,
 };
 use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
@@ -1239,6 +1239,10 @@ impl App {
     /// shows all of them rather than whichever was reported last.
     pub(crate) fn queue_flash(&mut self, msg: String) {
         self.status_bar.queue_flash(msg);
+    }
+
+    pub(crate) fn handle_chat_item(&mut self, item: &ChatItem) {
+        self.main_chat().apply_chat_item(item);
     }
 
     pub(crate) fn fire_session_event(&self, event: HostEvent<'_>) {

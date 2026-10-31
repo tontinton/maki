@@ -13,7 +13,7 @@ use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::messages::{ClickOutcome, ScrollPos};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
-use crate::components::{ExitRequest, buffer_text, key, test_model};
+use crate::components::{DisplayRole, ExitRequest, ToolStatus, buffer_text, key, test_model};
 use crate::decor_worker;
 use crate::highlight::TAB_SPACES;
 use crate::repaint::expect::{OWED, QUIET};
@@ -41,10 +41,11 @@ use maki_lua::test_support::{
     probed_event_handle, set_mode,
 };
 use maki_lua::{
-    BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest, InputRulesReader,
-    InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader, Missing, PASTE,
-    PackCommand, PackPlan, PackPreparation, PackReport, Permission, PluginHost, PluginPermissions,
-    SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
+    BuiltinAction, ChatItem, ChatItemStatus, Dimension, FloatConfig, HintEntry, HintReader,
+    InputRequest, InputRulesReader, InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo,
+    LuaCommandReader, Missing, PASTE, PackCommand, PackPlan, PackPreparation, PackReport,
+    Permission, PluginHost, PluginPermissions, SessionEndReason, Split, TextEdit, UiAction,
+    WinCommand, WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TaskSettled,
@@ -3188,7 +3189,7 @@ fn tick_drains_live_bufs_of_background_chats() {
 #[test]
 fn status_hints_published_by_a_plugin_reach_the_screen() {
     let (mut app, plugin) = app_with_hints();
-    plugin.publish(vec![hint_for(None)]);
+    plugin.publish(vec![hint_for(None)], Vec::new());
 
     assert!(
         !rendered(&mut app).contains(HINT_TEXT),
@@ -3197,7 +3198,7 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert!(rendered(&mut app).contains(HINT_TEXT));
 
-    plugin.publish(vec![]);
+    plugin.publish(Vec::new(), Vec::new());
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert!(!rendered(&mut app).contains(HINT_TEXT));
 }
@@ -3219,7 +3220,7 @@ fn session_hint_shows_only_in_its_tab(own: bool) {
     } else {
         MakiId::generate()
     };
-    plugin.publish(vec![hint_for(Some(owner))]);
+    plugin.publish(vec![hint_for(Some(owner))], Vec::new());
 
     let _ = app.tick();
 
@@ -5715,6 +5716,87 @@ fn reserved_shell_survives_parent_done_until_shell_done() {
     });
     assert_eq!(app.chats[0].in_progress_count(), 0);
     assert!(!app.shell.active_ids().contains(&id));
+}
+
+const PLUGIN_ITEM_ID: &str = "monitor:1";
+const PLUGIN_ITEM_TITLE: &str = "watch tests";
+const AGENT_TOOL_ID: &str = "agent-tool";
+
+fn running_plugin_item() -> ChatItem {
+    ChatItem {
+        id: PLUGIN_ITEM_ID.into(),
+        label: "monitor".into(),
+        title: PLUGIN_ITEM_TITLE.into(),
+        status: ChatItemStatus::Running,
+        detail: None,
+    }
+}
+
+fn tool_message<'a>(
+    chat: &'a crate::chat::Chat,
+    id: &str,
+) -> Option<&'a crate::components::DisplayMessage> {
+    (0..chat.message_count()).find_map(|index| {
+        let msg = chat.message_at(index)?;
+        match &msg.role {
+            DisplayRole::Tool(tool) if tool.id == id => Some(msg),
+            _ => None,
+        }
+    })
+}
+
+fn start_running_item_and_agent_tool(app: &mut App) {
+    app.handle_chat_item(&running_plugin_item());
+    app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+        id: AGENT_TOOL_ID.into(),
+        tool: "read".into(),
+        summary: "reading".into(),
+        annotation: None,
+        input: None,
+        raw_input: None,
+        output: None,
+        render_header: None,
+    }))));
+}
+
+#[test]
+fn a_running_chat_item_survives_the_turn_that_started_it() {
+    let mut app = streaming_app_with_history();
+    start_running_item_and_agent_tool(&mut app);
+
+    app.update(done_event());
+
+    let item = tool_message(&app.chats[0], PLUGIN_ITEM_ID).expect("the item stays");
+    let DisplayRole::Tool(role) = &item.role else {
+        panic!("a chat item is a tool-shaped row");
+    };
+    assert_eq!(role.status, ToolStatus::InProgress);
+    assert_eq!(item.text, PLUGIN_ITEM_TITLE);
+    let agent = tool_message(&app.chats[0], AGENT_TOOL_ID).expect("the agent tool stays");
+    assert!(
+        agent.text.contains(MISSING_TOOL_COMPLETION),
+        "the agent's own tool is still settled"
+    );
+}
+
+#[test]
+fn a_running_chat_item_survives_esc() {
+    let mut app = streaming_app_with_history();
+    start_running_item_and_agent_tool(&mut app);
+
+    cancel_app(&mut app);
+
+    let item = tool_message(&app.chats[0], PLUGIN_ITEM_ID).expect("the item stays");
+    let DisplayRole::Tool(role) = &item.role else {
+        panic!("a chat item is a tool-shaped row");
+    };
+    assert_eq!(role.status, ToolStatus::InProgress);
+    assert_eq!(item.text, PLUGIN_ITEM_TITLE);
+    let agent = tool_message(&app.chats[0], AGENT_TOOL_ID).expect("the agent tool stays");
+    let DisplayRole::Tool(role) = &agent.role else {
+        panic!("the agent tool stays a tool row");
+    };
+    assert_eq!(role.status, ToolStatus::Error);
 }
 
 #[test]

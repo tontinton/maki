@@ -511,15 +511,16 @@ impl MessagesPanel {
         self.rebuild_tool_segment(tool_id);
     }
 
+    #[cfg(test)]
     pub fn stream_reset(&mut self) {
+        self.stream_reset_except(&HashSet::new());
+    }
+
+    pub fn stream_reset_except(&mut self, excluded: &HashSet<String>) {
         self.streaming_thinking.clear();
         self.streaming_text.clear();
         self.live_thinking_expanded = false;
-        self.cancel_in_progress();
-    }
-
-    pub fn fail_in_progress_with_message(&mut self, message: String) {
-        self.fail_in_progress_except(message, &HashSet::new());
+        self.cancel_in_progress_except(excluded);
     }
 
     pub fn fail_in_progress_except(&mut self, message: String, excluded: &HashSet<String>) {
@@ -551,13 +552,19 @@ impl MessagesPanel {
         }
     }
 
+    #[cfg(test)]
     pub fn cancel_in_progress(&mut self) {
+        self.cancel_in_progress_except(&HashSet::new());
+    }
+
+    pub fn cancel_in_progress_except(&mut self, excluded: &HashSet<String>) {
         let affected_ids: Vec<String> = self
             .messages
             .iter_mut()
             .filter_map(|msg| {
                 if let DisplayRole::Tool(t) = &mut msg.role
                     && t.status == ToolStatus::InProgress
+                    && !excluded.contains(&t.id)
                 {
                     t.status = ToolStatus::Error;
                     Some(t.id.clone())
