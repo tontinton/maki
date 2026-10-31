@@ -465,38 +465,28 @@ fn convert_tools(tools: &Value) -> Vec<Value> {
                 "description": description,
             });
             if let Some(parameters) = tool_parameters(t) {
-                decl["parameters"] = parameters;
+                decl["parametersJsonSchema"] = parameters;
             }
             Some(decl)
         })
         .collect()
 }
 
+/// The schema goes out as `parametersJsonSchema`, which takes JSON Schema as
+/// is. The older `parameters` field knows only Gemini's OpenAPI subset and 400s
+/// on every other key (`additionalProperties`, `$schema`, MCP's `x-mcp-header`),
+/// so MCP servers kept tripping it one key at a time.
+///
 /// Gemini turns down an object schema that lists no properties, while MiniMax
 /// turns down a bare `{}`, so no single payload pleases both. A tool that takes
-/// no arguments simply travels here without `parameters`.
+/// no arguments simply travels here without a schema.
 fn tool_parameters(tool: &Value) -> Option<Value> {
     let schema = tool.get("input_schema")?;
     let has_properties = schema
         .get("properties")
         .and_then(Value::as_object)
         .is_some_and(|props| !props.is_empty());
-    has_properties.then(|| strip_additional_properties(schema.clone()))
-}
-
-fn strip_additional_properties(value: Value) -> Value {
-    match value {
-        Value::Object(mut map) => {
-            map.remove("additionalProperties");
-            map.values_mut()
-                .for_each(|v| *v = strip_additional_properties(std::mem::take(v)));
-            Value::Object(map)
-        }
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(strip_additional_properties).collect())
-        }
-        other => other,
-    }
+    has_properties.then(|| schema.clone())
 }
 
 fn tool_defs_empty(tool_decls: &[Value]) -> bool {
@@ -781,27 +771,40 @@ mod tests {
         let decls = convert_tools(&tools);
         assert_eq!(decls[0]["name"], json!(TOOL_NAME));
         assert_eq!(
-            decls[0].get("parameters"),
+            decls[0].get("parametersJsonSchema"),
             None,
             "{EMPTY_PROPERTIES_REJECTED}"
         );
     }
 
     #[test]
-    fn convert_tools_keeps_populated_parameters() {
+    fn convert_tools_sends_input_schema_as_json_schema() {
+        let input_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                PATH_PROP: {"type": "string", "x-mcp-header": "Path"},
+                "opts": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"verbose": {"type": "boolean"}}
+                }
+            },
+            "additionalProperties": false,
+        });
         let tools = json!([{
             "name": TOOL_NAME,
             "description": TOOL_DESCRIPTION,
-            "input_schema": {
-                "type": "object",
-                "properties": { PATH_PROP: {"type": "string"} },
-                "additionalProperties": false,
-            },
+            "input_schema": input_schema,
         }]);
         let decls = convert_tools(&tools);
         assert_eq!(
-            decls[0]["parameters"],
-            json!({"type": "object", "properties": { PATH_PROP: {"type": "string"} }})
+            decls[0],
+            json!({
+                "name": TOOL_NAME,
+                "description": TOOL_DESCRIPTION,
+                "parametersJsonSchema": input_schema,
+            })
         );
     }
 
@@ -1067,82 +1070,6 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["text"], "what is this?");
         assert_eq!(parts[1]["inlineData"]["mimeType"], "image/webp");
-    }
-
-    #[test]
-    fn convert_tools_basic() {
-        let tools = json!([{
-            "name": "bash",
-            "description": "run a command",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "cmd": {"type": "string", "additionalProperties": false},
-                    "opts": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {"verbose": {"type": "boolean"}}
-                    }
-                },
-                "additionalProperties": false
-            }
-        }]);
-        let result = convert_tools(&tools);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["name"], "bash");
-        assert_eq!(result[0]["description"], "run a command");
-        assert!(result[0]["parameters"]["properties"]["cmd"].is_object());
-        assert!(
-            result[0]["parameters"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            result[0]["parameters"]["properties"]["cmd"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            result[0]["parameters"]["properties"]["opts"]
-                .get("additionalProperties")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn strip_additional_properties_recursive() {
-        let schema = json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "inner": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {"x": {"type": "number", "additionalProperties": false}}
-                },
-                "list": {
-                    "type": "array",
-                    "items": {"type": "string", "additionalProperties": false}
-                }
-            }
-        });
-        let cleaned = strip_additional_properties(schema);
-        assert!(cleaned.get("additionalProperties").is_none());
-        assert!(
-            cleaned["properties"]["inner"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            cleaned["properties"]["inner"]["properties"]["x"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            cleaned["properties"]["list"]["items"]
-                .get("additionalProperties")
-                .is_none()
-        );
     }
 
     #[tokio::test]
