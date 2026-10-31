@@ -25,6 +25,7 @@ arboard = { workspace = true }
 jiff = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures = { workspace = true }
 flume = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
