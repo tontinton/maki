@@ -2,7 +2,7 @@ use std::any::Any;
 use std::fmt::Write;
 use std::ops::AddAssign;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -864,10 +864,10 @@ impl UiWaker {
 }
 
 /// Append-only buffer for streaming tool output to the UI. Writers append
-/// under a Mutex, readers get a cheap Arc clone via `read_if_dirty()`.
+/// under a Mutex, readers get a cheap Arc clone through a [`BufWatch`].
 pub struct SharedBuf {
     committed: Mutex<BufferSnapshot>,
-    dirty: AtomicBool,
+    version: AtomicU64,
     /// Only a buffer shown in a plugin window gets one, since the UI reads
     /// those on a tick. A tool body is repainted by the agent events that
     /// carry it.
@@ -884,7 +884,7 @@ impl SharedBuf {
     pub fn new() -> Self {
         Self {
             committed: Mutex::default(),
-            dirty: AtomicBool::new(false),
+            version: AtomicU64::new(0),
             waker: OnceLock::new(),
             on_change: Mutex::new(None),
             click: Mutex::new(None),
@@ -946,8 +946,7 @@ impl SharedBuf {
         let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
         Arc::make_mut(&mut guard.lines).push(line);
         drop(guard);
-        self.dirty.store(true, Ordering::Release);
-        self.notify_change();
+        self.changed();
     }
 
     pub fn set_lines(&self, lines: Vec<SnapshotLine>) {
@@ -962,7 +961,11 @@ impl SharedBuf {
             head,
         };
         drop(guard);
-        self.dirty.store(true, Ordering::Release);
+        self.changed();
+    }
+
+    fn changed(&self) {
+        self.version.fetch_add(1, Ordering::Release);
         self.notify_change();
     }
 
@@ -982,25 +985,39 @@ impl SharedBuf {
         self.take().lines
     }
 
-    pub fn read_if_dirty(&self) -> Option<Arc<Vec<SnapshotLine>>> {
-        self.take_if_dirty().map(|snapshot| snapshot.lines)
-    }
-
-    pub fn take_if_dirty(&self) -> Option<BufferSnapshot> {
-        self.dirty
-            .swap(false, Ordering::AcqRel)
-            .then(|| self.take())
-    }
-
-    /// A copy for a tool reply. Leaves the dirty flag alone: only the UI
-    /// clears it, and a reply can die on the way there (a cancelled run's
-    /// events are stale), which would strand the last repaint a tool made
-    /// on its way out. Re-reading the same lines once costs nothing.
     pub fn take(&self) -> BufferSnapshot {
         self.committed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+}
+
+/// One reader of a [`SharedBuf`]. A moved call streams into one buf that two
+/// places draw, the row it left and its task tab. So every reader keeps its
+/// own mark, and one reading never hides a change from the other.
+pub struct BufWatch {
+    buf: Arc<SharedBuf>,
+    seen: u64,
+}
+
+impl BufWatch {
+    pub fn new(buf: Arc<SharedBuf>) -> Self {
+        Self { buf, seen: 0 }
+    }
+
+    pub fn buf(&self) -> &Arc<SharedBuf> {
+        &self.buf
+    }
+
+    /// The buf's lines, if they changed since this watch last looked. The
+    /// copy may already hold a later change, which the next look reads again.
+    pub fn changed(&mut self) -> Option<BufferSnapshot> {
+        let version = self.buf.version.load(Ordering::Acquire);
+        (version != self.seen).then(|| {
+            self.seen = version;
+            self.buf.take()
+        })
     }
 }
 
@@ -1809,28 +1826,19 @@ mod tests {
     }
 
     #[test]
-    fn shared_buf_lifecycle() {
-        let buf = SharedBuf::new();
+    fn every_watch_sees_each_change_once() {
+        let buf = Arc::new(SharedBuf::new());
+        let mut row = BufWatch::new(Arc::clone(&buf));
+        let mut tab = BufWatch::new(Arc::clone(&buf));
+        assert!(row.changed().is_none(), "an untouched buf has nothing new");
 
-        assert!(buf.is_empty());
-        assert!(buf.read_if_dirty().is_none());
+        buf.append(line("a"));
+        buf.append(line("b"));
 
-        for i in 0..3 {
-            buf.append(line(&format!("l{i}")));
+        for watch in [&mut row, &mut tab] {
+            assert_eq!(watch.changed().unwrap().text(), "a\nb");
+            assert!(watch.changed().is_none());
         }
-        assert_eq!(buf.len(), 3);
-
-        let snap = buf.read_if_dirty().expect("dirty after appends");
-        assert_eq!(snap.len(), 3);
-        assert_eq!(snap[0].spans[0].text, "l0");
-        assert!(buf.read_if_dirty().is_none(), "clean after read");
-
-        buf.append(line("l3"));
-        let _ = buf.take();
-        assert!(
-            buf.read_if_dirty().is_some(),
-            "take must leave the flag for the UI"
-        );
     }
 
     #[test]
@@ -1838,11 +1846,10 @@ mod tests {
         let buf = SharedBuf::new();
         buf.append(line("a"));
         buf.append(line("b"));
-        let snap = buf.read_if_dirty().unwrap();
+        let snap = buf.read();
         buf.append(line("c"));
         assert_eq!(snap.len(), 2, "held Arc must not see new appends");
-        let snap2 = buf.read_if_dirty().unwrap();
-        assert_eq!(snap2.len(), 3);
+        assert_eq!(buf.read().len(), 3);
     }
 
     #[test]

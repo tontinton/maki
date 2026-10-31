@@ -8298,7 +8298,7 @@ streams in the task's tab. Without a head the row keeps just its title.
 
 ```lua
 buf:set_lines({ "new content", "replaces everything" })
-buf:set_lines({ "cargo test", "──────", "running 3 tests" }, { head = 2 })
+buf:set_lines({ "cargo test", "──────", "running 3 tests" }, { head = 1 })
 ```
 
 ---

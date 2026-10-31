@@ -18,7 +18,6 @@ local RTK_UNSUPPORTED_FLAGS = {
   " -fls ",
   " -fprintf ",
 }
-local SEPARATOR = "──────"
 -- Lines up to this size reach bash whole, so the log keeps long JSON or
 -- minified code intact. A line that never ends still stays out of the
 -- shared heap.
@@ -92,15 +91,6 @@ local function relative_path(p)
     end
   end
   return p
-end
-
-local function build_header_lines(lines)
-  local header = {}
-  for _, line in ipairs(lines) do
-    header[#header + 1] = line
-  end
-  header[#header + 1] = { { SEPARATOR, "dim" } }
-  return header
 end
 
 local function rtk_find_unsupported(cmd)
@@ -228,11 +218,11 @@ local function create_bash_view(command, ctx)
     keep = "tail",
     max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
   })
-  view:set_header(build_header_lines(maki.split(command, "\n")))
+  view:set_header(maki.split(command, "\n"))
   maki.async.run(function()
     local highlighted = maki.ui.highlight(command, "bash")
     if highlighted then
-      view:set_header(build_header_lines(highlighted))
+      view:set_header(highlighted)
     end
   end)
   buf:on("click", function()

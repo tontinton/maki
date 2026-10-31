@@ -773,9 +773,7 @@ end
 local function legacy_restore(children, output, tol)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, { max_lines = tol.other, keep = "head" })
-  local header = render_children(children)
-  append_separator(header)
-  view:set_header(header)
+  view:set_header(render_children(children))
   for _, line in ipairs(maki.split(output, "\n")) do
     view:append(BODY_INDENT .. line)
   end

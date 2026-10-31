@@ -15,6 +15,7 @@ ToolView.__index = ToolView
 -- plus the transcript's scrollbar column.
 local BODY_CHROME_COLS = 5
 local MIN_MD_WIDTH = 20
+local SEPARATOR = { { "──────", "dim" } }
 
 local function format_line_nr(fmt, idx)
   return { string.format(fmt, idx), "line_nr" }
@@ -246,6 +247,9 @@ function ToolView:flush()
   for _, h in ipairs(self.header) do
     lines[#lines + 1] = truncate_line(h, self.max_line_bytes)
   end
+  if #self.header > 0 then
+    lines[#lines + 1] = SEPARATOR
+  end
 
   if self.expanded then
     for _, line in ipairs(self.all_lines) do
@@ -276,7 +280,8 @@ function ToolView:flush()
     end
   end
 
-  -- The header names the call, so a row that moved to the background keeps it.
+  -- The header says what runs, so a row that moved to the background keeps
+  -- it. The separator stays out: with the output gone it divides nothing.
   self.buf:set_lines(lines, { head = #self.header })
 end
 

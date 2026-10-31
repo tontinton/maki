@@ -208,7 +208,7 @@ fn lines(_lua: &Lua, this: &BufHandle, lines: Table) -> LuaResult<()> {
 /// @return
 /// @example
 /// buf:set_lines({ "new content", "replaces everything" })
-/// buf:set_lines({ "cargo test", "──────", "running 3 tests" }, { head = 2 })
+/// buf:set_lines({ "cargo test", "──────", "running 3 tests" }, { head = 1 })
 #[lua_fn]
 fn set_lines(_lua: &Lua, this: &BufHandle, lines: Table, opts: Option<Table>) -> LuaResult<()> {
     let mut parsed = Vec::with_capacity(lines.raw_len());

@@ -18,7 +18,6 @@ local INSPECT_HOOKED_ERR = "os and pathlib cannot look at files while a plugin h
 local MKDIR_BASH_HINT = ", create the directory with the bash tool instead"
 local OPEN_APPEND_UNSUPPORTED_ERR = "open() cannot append because the write tool has no append option"
 local NO_OUTPUT = "(no output)"
-local SEPARATOR = "──────"
 local CANCELLED_ERR = "cancelled"
 local TIME_LIMIT_SUBSTR = "time limit exceeded"
 -- Same marker the batch tool uses for a failed child, so a failure reads the
@@ -105,7 +104,6 @@ local function build_body(ctx, code)
     if shown < total then
       out[#out + 1] = { { "... (" .. (total - shown) .. " lines) (click to expand)", "dim" } }
     end
-    out[#out + 1] = { { SEPARATOR, "dim" } }
     return out
   end
 

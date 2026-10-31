@@ -899,11 +899,19 @@ pub fn search_text_for(msg: &DisplayMessage) -> String {
         Some((h, b)) => (h, Some(b)),
         None => (msg.text.as_str(), None),
     };
-    let mut out = header_search_text(
-        msg.role.tool_name().unwrap_or(UNNAMED_TOOL),
-        header,
-        msg.annotation.as_deref(),
-    );
+    let tool_name = msg.role.tool_name().unwrap_or(UNNAMED_TOOL);
+    if msg.background.is_some() {
+        let mut out = header_search_text(tool_name, header, None);
+        if let Some(head) = msg
+            .render_snapshot
+            .as_ref()
+            .and_then(BufferSnapshot::head_only)
+        {
+            push_section(&mut out, &head.text());
+        }
+        return out;
+    }
+    let mut out = header_search_text(tool_name, header, msg.annotation.as_deref());
 
     let output = msg.tool_output.as_deref();
     if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) =
@@ -1283,6 +1291,11 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(RECEIPT_ANNOTATION), "{text}");
+
+        let searched = search_text_for(&msg);
+        assert_eq!(searched.contains(MOVED_COMMAND), head > 0, "{searched}");
+        assert!(!searched.contains(MOVED_OUTPUT), "{searched}");
+        assert!(!searched.contains(RECEIPT_BODY), "{searched}");
     }
 
     #[test]

@@ -313,6 +313,23 @@ fn the_background_param_moves_the_command_at_once() {
     assert!(notice.contains(FINISHED_LATE), "{notice}");
 }
 
+/// The chat row a call moved out of shows only the head of its buf, so the
+/// head must be the command, nothing more and nothing less.
+#[test]
+fn a_moved_command_is_the_head_of_its_buf() {
+    let gate = Gate::closed();
+    let command = gate.command(READY_COMMAND, "true");
+    let mut input = json!({ "command": command });
+    input[BACKGROUND_PARAM] = json!(true);
+    let mut run = Run::launch(json!({}), BASH_TOOL, input, gate);
+    run.reply().expect("a receipt is a success");
+
+    run.wait_for_output(READY_LINE);
+
+    let snapshot = run.live.as_ref().unwrap().take();
+    assert_eq!(snapshot.head_only().map(|head| head.text()), Some(command));
+}
+
 #[test]
 fn memory_stays_bounded_while_the_log_keeps_everything() {
     let mut run = Run::start(
