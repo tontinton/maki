@@ -1,11 +1,13 @@
 -- task_message reaches a subagent the task tool moved to the background. The
 -- task tool tracks its moved calls here, since only it holds their sessions.
 
-local DESCRIPTION = [[Message a running background subagent by id. It reads the message after its current step.
+local DESCRIPTION =
+  [[Message a running background subagent by id. It reads the message after its current step, or right away with interrupt.
 
 Use it when the subagent should act on something new, like a fact, a changed scope, or "wrap up now", instead of waiting for a stale result or starting over.]]
 local ID_DESCRIPTION = "Id of the background subagent, as named in its receipt"
 local MESSAGE_DESCRIPTION = "What the subagent should know or do"
+local INTERRUPT_DESCRIPTION = "Cut the current step short"
 local NOT_RUNNING = "no running background subagent with id "
 local QUEUED = "Message queued for %s."
 
@@ -44,6 +46,7 @@ maki.api.register_tool({
     properties = {
       id = { type = "string", description = ID_DESCRIPTION },
       message = { type = "string", description = MESSAGE_DESCRIPTION },
+      interrupt = { type = "boolean", description = INTERRUPT_DESCRIPTION },
     },
   },
   header = function(input)
@@ -65,7 +68,7 @@ maki.api.register_tool({
     -- A stopped task stays tracked here until its handler unwinds, and
     -- `send` already refuses it then. Answering the same as after the
     -- untrack means the reply does not depend on that timing.
-    if not task.sess:send(input.message) then
+    if not task.sess:send(input.message, { interrupt = input.interrupt }) then
       return { llm_output = NOT_RUNNING .. input.id, is_error = true }
     end
     return QUEUED:format(task.name)

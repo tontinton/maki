@@ -317,13 +317,9 @@ impl<'h> Agent<'h> {
             prompt: _,
             source,
         } = input;
-        self.rollback_len = self.history.len();
-        self.carry_from = self.history.len();
-        self.stop_continuations = 0;
-        self.moved_last_round = false;
+        self.begin(RequestOptions { thinking, fast });
         self.mode = mode;
         self.workflow = workflow;
-        self.opts = RequestOptions { thinking, fast };
         // Each message of a burst is judged on its own, and one kept message is
         // enough for the run to go on.
         let burst = earlier
@@ -361,10 +357,7 @@ impl<'h> Agent<'h> {
             message_len = message.len(),
             "agent run started"
         );
-        // Subagents are prompted by the machine inside the parent's window;
-        // counting them would inflate prompts and busy time.
-        let top_level = self.audience.contains(ToolAudience::MAIN);
-        if top_level {
+        if self.top_level() {
             // Tabs and frontends share one process, so attribution follows
             // whichever session actually runs a turn, not whoever last
             // called `set_session_id`.
@@ -373,7 +366,30 @@ impl<'h> Agent<'h> {
             }
             maki_otel::emit::user_prompt(&message);
         }
+        self.drive().await
+    }
 
+    /// Picks up after a run an interrupt cut short. The queued message lands
+    /// the way it would at a turn boundary, so the model reads it as an
+    /// interrupt from its sender. A layer that drops it leaves the cut work to
+    /// go on, the way a message dropped between turns is skipped.
+    pub async fn resume(&mut self, opts: RequestOptions) -> Result<DoneReason, AgentError> {
+        self.begin(opts);
+        match self.handle_queued_command().await {
+            Ok(_) => self.drive().await,
+            Err(e) => self.finish(Err(e)),
+        }
+    }
+
+    fn begin(&mut self, opts: RequestOptions) {
+        self.rollback_len = self.history.len();
+        self.carry_from = self.history.len();
+        self.stop_continuations = 0;
+        self.moved_last_round = false;
+        self.opts = opts;
+    }
+
+    async fn drive(&mut self) -> Result<DoneReason, AgentError> {
         if let Some((system, tools)) = self.history.request_prefix() {
             self.gauge
                 .seed_if_empty(self.history.as_slice(), system, tools);
@@ -383,10 +399,16 @@ impl<'h> Agent<'h> {
         // that failed was still busy.
         let busy_since = Instant::now();
         let result = self.run_loop().await;
-        if top_level {
+        if self.top_level() {
             maki_otel::emit::active_time(busy_since.elapsed());
         }
         self.finish(result)
+    }
+
+    /// Subagents are prompted by the machine inside the parent's window;
+    /// counting them would inflate prompts and busy time.
+    fn top_level(&self) -> bool {
+        self.audience.contains(ToolAudience::MAIN)
     }
 
     fn finish(&mut self, result: Result<DoneReason, AgentError>) -> Result<DoneReason, AgentError> {
@@ -4138,6 +4160,33 @@ mod tests {
         script(&agent.registry, drop_blocked);
 
         let reason = agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(reason, DoneReason::EndTurn);
+        assert!(matches!(
+            history.as_slice().last().unwrap().role,
+            Role::Assistant
+        ));
+    }
+
+    /// The run before was cut for this message, so ending here would fail the
+    /// whole prompt over a note the caller sent on the side.
+    #[tokio::test]
+    async fn resume_goes_on_when_the_interrupt_is_dropped() {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![
+            ExtractedCommand::Interrupt(vec![AgentInput {
+                message: BLOCKED.into(),
+                ..default_input()
+            }]),
+        ]));
+        script(&agent.registry, drop_blocked);
+
+        let reason = agent.resume(RequestOptions::default()).await.unwrap();
         drop(agent);
 
         assert_eq!(reason, DoneReason::EndTurn);

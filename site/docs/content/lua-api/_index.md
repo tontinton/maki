@@ -1882,7 +1882,7 @@ print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 ### `Session:send()` {#Session-send}
 
 ```lua
-Session:send({message})
+Session:send({message}, {opts?})
 ```
 
 Hand the subagent a message without waiting, delivered the same way as a
@@ -1895,9 +1895,19 @@ With no prompt running, or one already past its last turn, the message
 waits. The next `:prompt()` sends it in the same request as its own
 message, just before it, so the first reply already reads it.
 
+With `interrupt`, a running `:prompt()` does not wait for the turn to end,
+nor for moved calls. The reply stops and running tools are cancelled (bash
+returns what it printed so far). The subagent then reads the message and
+carries on with its history intact, and `:prompt()` returns its answer as
+usual. If an `agent.user_message` layer drops the message, the subagent
+picks up the cut work instead. With no prompt running, the message waits
+like any other.
+
 **Parameters:**
 
 - `{message}` (`string`) Message to deliver.
+- `{opts?}` (`table?`) Optional fields:
+  - `interrupt` (`boolean?`) cut the running turn short. Default: `false`.
 
 **Returns:** (`boolean?`, `string?`) `true`, or `(nil, err)` when the session takes
 no more messages. The errors are the ones `:prompt()` refuses with. `true`
@@ -1910,6 +1920,8 @@ closes is dropped.
 -- From another task, while `sess:prompt()` is still running.
 local ok, err = sess:send("New finding: the bug is in parser.rs, focus there.")
 if not ok then maki.log.warn(err) end
+-- Stop a subagent heading the wrong way, mid tool call.
+sess:send("Stop, the bug is in lexer.rs, not parser.rs.", { interrupt = true })
 ```
 
 ---

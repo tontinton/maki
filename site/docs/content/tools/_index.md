@@ -189,11 +189,12 @@ Stop a background task (a moved command or subagent) by id.
 
 ### `task_message` <span class="badge badge-optin">opt-in</span> {#task_message}
 
-Message a running background subagent by id. It reads the message after its current step.
+Message a running background subagent by id. It reads the message after its current step, or right away with interrupt.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | yes | Id of the background subagent, as named in its receipt |
+| `interrupt` | boolean | no | Cut the current step short |
 | `message` | string | yes | What the subagent should know or do |
 
 ### `todo_write` {#todo_write}
