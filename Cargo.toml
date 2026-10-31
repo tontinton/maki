@@ -134,7 +134,7 @@ arboard = { version = "3", default-features = false, features = ["image-data"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 flume = { version = "0.12", default-features = false, features = ["async", "select"] }
 pin-project-lite = "0.2"
-rustix = { version = "1", features = ["event", "fs", "process"] }
+rustix = { version = "1", features = ["event", "fs", "process", "stdio"] }
 semver = "1"
 toml = "1.1"
 toml_edit = "0.25"
