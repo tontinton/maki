@@ -91,6 +91,11 @@ pub struct OpenAiWire {
     /// Model id prefix to what the model can do about thinking, for a
     /// provider whose API knows better than the model table.
     pub thinking_overrides: BTreeMap<String, ThinkingSupport>,
+    /// Resend assistant thinking as a plaintext reasoning item. Mistral's
+    /// responses API keeps no server-side history and has no encrypted
+    /// reasoning to round-trip. Other responses APIs carry that themselves,
+    /// so this stays off unless a declaration asks.
+    pub replay_reasoning: bool,
 }
 
 /// The effort half of [`OpenAiWire`]. Its own table, because `field` and
@@ -145,10 +150,21 @@ pub struct RequestCtx<'a> {
 }
 
 impl OpenAiWire {
-    /// Everything this declaration adds to a body the codec built. The static
-    /// fragment goes in first, so a thinking pass that writes the same key
-    /// has the last word, and the session id last of all.
+    /// Everything this declaration adds to a chat body the codec built. The
+    /// static fragment goes in first, so a thinking pass that writes the same
+    /// key has the last word, and the session id last of all.
     pub(crate) fn apply_body(&self, body: &mut Value, ctx: &RequestCtx) {
+        self.apply(body, ctx, true);
+    }
+
+    /// The responses half of [`Self::apply_body`]. A declaration with no
+    /// dialect sends no effort: the chat fallback writes a `thinking` block
+    /// a responses endpoint rejects.
+    pub(crate) fn apply_responses_body(&self, body: &mut Value, ctx: &RequestCtx) {
+        self.apply(body, ctx, false);
+    }
+
+    fn apply(&self, body: &mut Value, ctx: &RequestCtx, undeclared_thinking: bool) {
         let Self {
             max_tokens_field: _,
             include_stream_usage: _,
@@ -157,6 +173,7 @@ impl OpenAiWire {
             extra_body,
             session_id,
             thinking_overrides: _,
+            replay_reasoning: _,
         } = self;
         if let (Some(extra), Some(object)) = (extra_body, body.as_object_mut()) {
             merge_body(object, extra);
@@ -166,10 +183,12 @@ impl OpenAiWire {
         // the model said about itself, so it skips the `thinking_fields` merge.
         match thinking {
             Some(thinking) => thinking.apply(body, ctx),
-            None => ctx
-                .opts
-                .thinking
-                .apply_thinking(body, ctx.model, ThinkingFallback::None),
+            None if undeclared_thinking => {
+                ctx.opts
+                    .thinking
+                    .apply_thinking(body, ctx.model, ThinkingFallback::None)
+            }
+            None => {}
         }
         if let Some(carrier) = session_id
             && let Some(field) = &carrier.body_field
@@ -194,6 +213,7 @@ impl OpenAiWire {
             extra_body: _,
             session_id,
             thinking_overrides: _,
+            replay_reasoning: _,
         } = self;
         let session = match (session_id, session) {
             (Some(carrier), Some(session)) => carrier
@@ -493,6 +513,21 @@ pub fn build(
 
 /// The same order [`OpenAiCompatProvider::base_url`] keeps under a hook's
 /// origin, for the codecs that otherwise only know their vendor's host.
+/// Declaration headers ride along with the credentials. A header the auth
+/// layer already set wins, the same rule the chat path keeps.
+fn apply_request_headers(auth: &mut ResolvedAuth, headers: &[(&str, &str)]) {
+    for &(name, value) in headers {
+        if auth
+            .headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        auth.set_header(name, value.to_owned());
+    }
+}
+
 fn fallback_base_url(options: &CodecOptions) -> Option<String> {
     let config = ProvidersConfig::load();
     configured_base_url(&options.slug, config.get(&options.slug))
@@ -601,11 +636,22 @@ impl Provider for CompatProvider {
                 if !resolved.is_empty() {
                     auth.base_url = Some(resolved);
                 }
-                let mut body = responses::build_body(model, messages, system, tools);
-                // TODO: wire thinking budget into responses API when llama.cpp supports it
+                let mut body = if self.openai.replay_reasoning {
+                    responses::build_body_replaying(model, messages, system, tools)
+                } else {
+                    responses::build_body(model, messages, system, tools)
+                };
+                if let Some(max_output) = model.output_tokens() {
+                    body["max_output_tokens"] = json!(max_output);
+                }
+                // A declared dialect writes `reasoning.effort`. An undeclared
+                // model sends nothing: llama.cpp's responses endpoint has no
+                // thinking field yet, and the chat fallback would add one.
+                self.openai.apply_responses_body(&mut body, &ctx);
                 if let Some(hook) = &self.build_body {
                     body = hook.call(body, &ctx).await?;
                 }
+                apply_request_headers(&mut auth, &self.openai.request_headers(session_id));
                 return responses::do_stream(
                     self.compat.client(),
                     model,

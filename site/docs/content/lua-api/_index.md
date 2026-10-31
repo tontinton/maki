@@ -4845,13 +4845,18 @@ it does for a built-in provider.
   the model table when `models` is empty.
 - `system_prefix` (`string`) Text prepended to the system prompt. The
   `google` codec refuses it.
-- `openai` (`table`) Options for `codec = "openai"`, all optional:
+- `openai` (`table`) Options for `codec = "openai"` and
+  `"openai-responses"`, all optional. `max_tokens_field` and
+  `include_stream_usage` are chat-only and refused on
+  `"openai-responses"`.
   - `max_tokens_field` (`string`) Body field carrying the output cap.
-    Defaults to `max_tokens`.
+    Defaults to `max_tokens`. Chat only.
   - `include_stream_usage` (`boolean`) Ask for usage on the stream.
-    Defaults to `true`.
-  - `thinking` (`table`) How the API spells reasoning effort. Without it,
-    each model's `thinking_fields` decides.
+    Defaults to `true`. Chat only.
+  - `thinking` (`table`) How the API spells reasoning effort. Without it
+    on `"openai"`, each model's `thinking_fields` decides. On
+    `"openai-responses"`, effort is sent only when this table
+    is set. Point `field` at `reasoning.effort` there.
     - `dialect` (`string`) Required. One of `"standard"`, `"codex"`,
       `"codex-5-1"`, `"coding-plan"`, `"gpt-5-6"`, `"gpt-6"`,
       `"prefer-high"`, `"high-only"`, `"glm"`, `"deepseek"`,
@@ -4868,6 +4873,9 @@ it does for a built-in provider.
   - `session_id` (`table`) Sends the session id, as
     `{ header = "x-affinity" }`, `{ body_field = "prompt_cache_key" }`,
     or both at once.
+  - `replay_reasoning` (`boolean`) On `"openai-responses"`, resend assistant
+    thinking as a reasoning item and assistant text as
+    `input_text`. Defaults to `false`.
   - `thinking_overrides` (`table`) Model id prefix to `"no"`, `"yes"` or
     `"required"`, overriding the model table. Longest prefix wins.
 - `models` (`table`) Static model rows, read once at registration. They

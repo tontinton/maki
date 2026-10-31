@@ -36,6 +36,8 @@ mod spec;
 const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const OPENAI_OPTION: &str = "openai";
+const MAX_TOKENS_FIELD_OPTION: &str = "openai.max_tokens_field";
+const STREAM_USAGE_OPTION: &str = "openai.include_stream_usage";
 const BASE_URL_OPTION: &str = "base_url";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
@@ -396,14 +398,25 @@ fn honours_build_body(target: Target) -> bool {
     }
 }
 
-/// The `openai` table is the chat codec's own vocabulary. The responses codec
-/// spells neither effort nor extra body the same way, so it is refused there
-/// rather than half honoured.
+/// Both openai codecs read the `openai` table. Chat-only keys are refused on
+/// the responses codec rather than dropped, see [`chat_only_option`].
 fn honours_openai_wire(target: Target) -> bool {
     match target {
-        Target::Codec(Protocol::Openai) => true,
-        Target::Codec(Protocol::OpenaiResponses | Protocol::Anthropic | Protocol::Google)
-        | Target::Base(_) => false,
+        Target::Codec(Protocol::Openai | Protocol::OpenaiResponses) => true,
+        Target::Codec(Protocol::Anthropic | Protocol::Google) | Target::Base(_) => false,
+    }
+}
+
+/// `max_tokens` and `stream_options` belong to chat completions. The responses
+/// API spells the cap `max_output_tokens` and returns usage on
+/// `response.completed`, so a declaration that sets either would be ignored.
+fn chat_only_option(wire: &OpenAiWire) -> Option<&'static str> {
+    if wire.max_tokens_field.is_some() {
+        Some(MAX_TOKENS_FIELD_OPTION)
+    } else if wire.include_stream_usage.is_some() {
+        Some(STREAM_USAGE_OPTION)
+    } else {
+        None
     }
 }
 
@@ -715,6 +728,12 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     }
     if decl.openai.is_some() && !honours_openai_wire(target) {
         return Err(unsupported(OPENAI_OPTION));
+    }
+    if matches!(target, Target::Codec(Protocol::OpenaiResponses))
+        && let Some(wire) = &decl.openai
+        && let Some(option) = chat_only_option(wire)
+    {
+        return Err(unsupported(option));
     }
     let states_origin =
         decl.base_url.is_some() || decl.plans.iter().any(|plan| plan.base_url.is_some());
@@ -3094,6 +3113,15 @@ mod tests {
         reg.decl.openai = Some(OpenAiWire::default());
     }
 
+    /// A chat field on the responses codec would be dropped on the floor.
+    fn max_tokens_field_on_responses(reg: &mut Registration) {
+        reg.decl.codec = Some(Protocol::OpenaiResponses);
+        reg.decl.openai = Some(
+            serde_json::from_value(serde_json::json!({ "max_tokens_field": "max_tokens" }))
+                .unwrap(),
+        );
+    }
+
     fn system_prefix_on_google(reg: &mut Registration) {
         reg.decl.codec = Some(Protocol::Google);
         reg.decl.system_prefix = Some(SOME_SYSTEM_PREFIX.to_string());
@@ -3135,6 +3163,7 @@ mod tests {
     #[test_case(outside_a_load, |e| matches!(e, RegisterError::Closed(_)) ; "registration_outside_a_load")]
     #[test_case(body_hook_on_anthropic, |e| matches!(e, RegisterError::Unsupported { .. }) ; "build_body_needs_an_openai_codec")]
     #[test_case(openai_wire_on_anthropic, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "openai_table_needs_the_openai_codec")]
+    #[test_case(max_tokens_field_on_responses, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == MAX_TOKENS_FIELD_OPTION) ; "responses_refuses_the_chat_cap_field")]
     #[test_case(system_prefix_on_google, |e| matches!(e, RegisterError::Unsupported { .. }) ; "google_drops_the_system_prefix")]
     #[test_case(system_prefix_on_the_google_base, |e| matches!(e, RegisterError::Unsupported { .. }) ; "so_does_the_google_base")]
     #[test_case(base_url_on_a_base, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == BASE_URL_OPTION) ; "base_url_needs_a_codec")]

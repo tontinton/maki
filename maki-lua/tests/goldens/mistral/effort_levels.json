@@ -16,7 +16,7 @@
       "status": 200
     },
     {
-      "body": "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"weighing the options\"}]}]}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17}}\n\ndata: [DONE]\n\n",
+      "body": "event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"weighing the options\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"there\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":1}}}}\n\n",
       "headers": {
         "content-type": "text/event-stream"
       },
@@ -104,18 +104,18 @@
         "path": "/v1/models"
       },
       {
-        "body": "{\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"}],\"model\":\"mistral-large-4\",\"reasoning_effort\":\"low\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+        "body": "{\"input\":[{\"content\":[{\"text\":\"read a.txt\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}],\"instructions\":\"You are a replay fixture.\",\"model\":\"mistral-large-4\",\"reasoning\":{\"effort\":\"low\"},\"store\":false,\"stream\":true,\"tools\":[{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"strict\":false,\"type\":\"function\"}]}",
         "headers": {
           "accept": "*/*",
           "accept-encoding": "deflate, gzip",
           "authorization": "Bearer sk-replay",
-          "content-length": "390",
+          "content-length": "402",
           "content-type": "application/json",
           "host": "<volatile>",
           "user-agent": "<volatile>"
         },
         "method": "POST",
-        "path": "/v1/chat/completions"
+        "path": "/v1/responses"
       }
     ]
   }

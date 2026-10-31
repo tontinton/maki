@@ -1,4 +1,6 @@
--- Mistral, as a declaration plus the two hooks the openai codec cannot spell.
+-- Mistral on the Responses API. The codec already speaks the item format.
+-- Effort, the session key and reasoning replay are the parts it does not
+-- spell on its own.
 
 local parse = require("maki.provider_parse")
 
@@ -27,29 +29,6 @@ local function effort_ladder(id)
   end
 end
 
--- Mistral takes reasoning back as a `thinking` part at the front of the
--- assistant turn's `content`, not as the `reasoning_content` the codec writes.
--- A non-string `reasoning_content` is dropped.
-local function convert_assistant_messages(messages)
-  for _, message in ipairs(messages) do
-    if type(message) == "table" and message.role == "assistant" then
-      local reasoning = message.reasoning_content
-      message.reasoning_content = nil
-      if type(reasoning) == "string" then
-        local thinking = { type = "thinking", thinking = { { type = "text", text = reasoning } } }
-        local content = message.content
-        if type(content) == "string" and content ~= "" then
-          message.content = { thinking, { type = "text", text = content } }
-        elseif type(content) == "table" and content[1] ~= nil then
-          table.insert(content, 1, thinking)
-        else
-          message.content = { thinking }
-        end
-      end
-    end
-  end
-end
-
 -- Only chat-capable rows survive. `vision` defaults to off, where an unstated
 -- `reasoning` stays unstated.
 local function parse_model(m)
@@ -69,7 +48,7 @@ end
 maki.provider.register({
   slug = "mistral",
   display_name = "Mistral",
-  codec = "openai",
+  codec = "openai-responses",
   base_url = "https://api.mistral.ai/v1",
   api_key_env = "MISTRAL_API_KEY",
   login_url = "https://admin.mistral.ai/organization/api-keys",
@@ -159,20 +138,16 @@ maki.provider.register({
     },
   },
   openai = {
-    thinking = { dialect = "high-only" },
+    -- Responses spells effort as `reasoning.effort` and has no summary field.
+    thinking = { dialect = "high-only", field = "reasoning.effort" },
     -- Mistral caches on the `prompt_cache_key` body field and routes a
     -- session to one backend by the `x-affinity` header; send both.
     session_id = { header = "x-affinity", body_field = "prompt_cache_key" },
     -- Mistral's small models refuse reasoning whatever the model table says.
     thinking_overrides = { ["ministral-"] = "no" },
+    -- The API is stateless. Prior thinking goes back as a reasoning item.
+    replay_reasoning = true,
   },
-
-  build_body = function(_, body)
-    if type(body.messages) == "table" then
-      convert_assistant_messages(body.messages)
-    end
-    return body
-  end,
 
   -- Mistral's `/models` lists embedding, OCR and moderation models too, and
   -- names its fields its own way.

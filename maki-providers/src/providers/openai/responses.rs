@@ -21,6 +21,12 @@ use crate::{
 
 const RESPONSES_PATH: &str = "/responses";
 const FAILED_RESPONSE_STATUS: u16 = 500;
+/// A reasoning item's `id` is required and we never saw the provider's, so
+/// the replayed one is local to the request.
+const SYNTHETIC_REASONING_ID_PREFIX: &str = "rs_";
+const IMAGE_DETAIL_AUTO: &str = "auto";
+const ASSISTANT_TEXT_REPLAYED: &str = "input_text";
+const ASSISTANT_TEXT_OUTPUT: &str = "output_text";
 
 pub(crate) fn build_body(
     model: &Model,
@@ -28,7 +34,28 @@ pub(crate) fn build_body(
     system: &str,
     tools: &Value,
 ) -> Value {
-    let input = convert_input(messages);
+    assemble(model, messages, system, tools, false)
+}
+
+/// [`build_body`], plus prior assistant thinking as reasoning items. Mistral's
+/// responses API is stateless and asks for those items back on the next turn.
+pub(crate) fn build_body_replaying(
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+) -> Value {
+    assemble(model, messages, system, tools, true)
+}
+
+fn assemble(
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    replay: bool,
+) -> Value {
+    let input = convert_input(messages, replay);
     let wire_tools = convert_tools(tools);
 
     let mut body = json!({
@@ -59,8 +86,9 @@ pub(crate) fn apply_responses_reasoning(
     }
 }
 
-pub(crate) fn convert_input(messages: &[Message]) -> Value {
+pub(crate) fn convert_input(messages: &[Message], replay: bool) -> Value {
     let mut input = Vec::new();
+    let mut reasoning_index = 0u32;
 
     for msg in messages {
         match msg.role {
@@ -75,10 +103,17 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                             }));
                         }
                         ContentBlock::Image { source } => {
+                            let mut image = json!({
+                                "type": "input_image",
+                                "image_url": source.to_data_url(),
+                            });
+                            if replay {
+                                image["detail"] = json!(IMAGE_DETAIL_AUTO);
+                            }
                             input.push(json!({
                                 "type": "message",
                                 "role": "user",
-                                "content": [{"type": "input_image", "image_url": source.to_data_url()}]
+                                "content": [image]
                             }));
                         }
                         ContentBlock::ToolResult {
@@ -101,15 +136,36 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
             }
             Role::Assistant => {
                 let mut text_parts = Vec::new();
-                let mut tool_calls = Vec::new();
 
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } => text_parts.push(text.as_str()),
+                        ContentBlock::Thinking { thinking, .. }
+                            if replay && !thinking.is_empty() =>
+                        {
+                            push_assistant_text(&mut input, &mut text_parts, replay);
+                            let id = format!("{SYNTHETIC_REASONING_ID_PREFIX}{reasoning_index}");
+                            reasoning_index += 1;
+                            input.push(json!({
+                                "type": "reasoning",
+                                "id": id,
+                                "summary": [],
+                                "content": [{ "type": "reasoning_text", "text": thinking }],
+                            }));
+                        }
                         ContentBlock::ToolUse {
-                            id, name, input, ..
+                            id,
+                            name,
+                            input: args,
+                            ..
                         } => {
-                            tool_calls.push((id, name, input));
+                            push_assistant_text(&mut input, &mut text_parts, replay);
+                            input.push(json!({
+                                "type": "function_call",
+                                "call_id": id,
+                                "name": name,
+                                "arguments": args.to_string(),
+                            }));
                         }
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
@@ -119,28 +175,30 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                     }
                 }
 
-                if !text_parts.is_empty() {
-                    let joined = text_parts.join("");
-                    input.push(json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": joined}]
-                    }));
-                }
-
-                for (id, name, args) in tool_calls {
-                    input.push(json!({
-                        "type": "function_call",
-                        "call_id": id,
-                        "name": name,
-                        "arguments": args.to_string(),
-                    }));
-                }
+                push_assistant_text(&mut input, &mut text_parts, replay);
             }
         }
     }
 
     Value::Array(input)
+}
+
+fn push_assistant_text(input: &mut Vec<Value>, text_parts: &mut Vec<&str>, replay: bool) {
+    if text_parts.is_empty() {
+        return;
+    }
+    let joined = text_parts.join("");
+    text_parts.clear();
+    let part_type = if replay {
+        ASSISTANT_TEXT_REPLAYED
+    } else {
+        ASSISTANT_TEXT_OUTPUT
+    };
+    input.push(json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": part_type, "text": joined}]
+    }));
 }
 
 pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
@@ -601,15 +659,19 @@ fn parse_usage(u: &Value) -> TokenUsage {
     let input_tokens = u["input_tokens"].as_u64().unwrap_or(0) as u32;
     let output_tokens = u["output_tokens"].as_u64().unwrap_or(0) as u32;
 
-    let cached = u["input_tokens_details"]["cached_tokens"]
-        .as_u64()
-        .unwrap_or(0) as u32;
+    let details = &u["input_tokens_details"];
+    let cached = details["cached_tokens"].as_u64().unwrap_or(0) as u32;
+    // Mistral reports a cache write beside the OpenAI read. Both are included
+    // in `input_tokens`, the same way `cached_tokens` is.
+    let cache_write = details["cache_write_tokens"].as_u64().unwrap_or(0) as u32;
 
     TokenUsage {
-        input: input_tokens.saturating_sub(cached),
+        input: input_tokens
+            .saturating_sub(cached)
+            .saturating_sub(cache_write),
         output: output_tokens,
         cache_read: cached,
-        cache_creation: 0,
+        cache_creation: cache_write,
         cost: None,
     }
 }
@@ -870,7 +932,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             },
         ];
 
-        let input = convert_input(&messages);
+        let input = convert_input(&messages, false);
         let items = input.as_array().unwrap();
 
         assert_eq!(items[0]["type"], "message");
@@ -890,6 +952,56 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         assert_eq!(items[3]["type"], "function_call_output");
         assert_eq!(items[3]["call_id"], "tc_1");
         assert_eq!(items[3]["output"], "file.txt");
+    }
+
+    /// Mistral asks for the previous output items back. Thinking has no item
+    /// id of its own, and an assistant message without one is an easy input.
+    #[test]
+    fn convert_input_replays_reasoning_as_an_item() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "look first".to_string(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "on it".to_string(),
+                },
+                ContentBlock::tool_use("tc_1", "bash", json!({"command": "ls"})),
+            ],
+            ..Default::default()
+        }];
+
+        let input = convert_input(&messages, true);
+        let items = input.as_array().unwrap();
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["type"], "reasoning");
+        assert_eq!(items[0]["id"], "rs_0");
+        assert_eq!(items[0]["summary"], json!([]));
+        assert_eq!(items[0]["content"][0]["type"], "reasoning_text");
+        assert_eq!(items[0]["content"][0]["text"], "look first");
+        assert_eq!(items[1]["content"][0]["type"], "input_text");
+        assert_eq!(items[1]["content"][0]["text"], "on it");
+        assert_eq!(items[2]["type"], "function_call");
+    }
+
+    #[test]
+    fn parse_sse_counts_cache_write_beside_the_read() {
+        smol::block_on(async {
+            let sse = "\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":3}}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let usage = resp.unwrap().usage;
+            assert_eq!(usage.input, 5);
+            assert_eq!(usage.cache_read, 4);
+            assert_eq!(usage.cache_creation, 3);
+            assert_eq!(usage.output, 5);
+        })
     }
 
     #[test]

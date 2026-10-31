@@ -1,11 +1,6 @@
 {
   "call": {
     "endpoint": "stream",
-    "model": "mistral/mistral-medium-latest",
-    "thinking": {
-      "kind": "effort",
-      "level": "high"
-    },
     "messages": [
       {
         "content": [
@@ -106,15 +101,20 @@
         ],
         "role": "user"
       }
-    ]
+    ],
+    "model": "mistral/mistral-medium-latest",
+    "thinking": {
+      "kind": "effort",
+      "level": "high"
+    }
   },
   "script": [
     {
-      "status": 200,
+      "body": "event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"weighing the options\"}\n\nevent: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\" and a plan\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" there\"}\n\nevent: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_9\",\"name\":\"read\",\"arguments\":\"\"}}\n\nevent: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_9\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"c.txt\\\"}\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\n\n",
       "headers": {
         "content-type": "text/event-stream"
       },
-      "body": "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"weighing the options\"}]}]}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[\" and a plan\"]},{\"type\":\"text\",\"text\":\"Hello\"}]}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"c.txt\\\"}\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\ndata: [DONE]\n\n"
+      "status": 200
     }
   ],
   "expected": {
@@ -179,18 +179,18 @@
     },
     "requests": [
       {
-        "body": "{\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"},{\"content\":[{\"thinking\":[{\"text\":\"a.txt first\",\"type\":\"text\"}],\"type\":\"thinking\"},{\"text\":\"on it\",\"type\":\"text\"}],\"role\":\"assistant\"},{\"content\":[{\"thinking\":[{\"text\":\"nothing to say yet\",\"type\":\"text\"}],\"type\":\"thinking\"}],\"role\":\"assistant\"},{\"content\":\"\",\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\",\"name\":\"read\"},\"id\":\"call_1\",\"type\":\"function\"}]},{\"content\":\"contents of a.txt\",\"role\":\"tool\",\"tool_call_id\":\"call_1\"},{\"content\":[{\"thinking\":[{\"text\":\"b.txt next\",\"type\":\"text\"}],\"type\":\"thinking\"}],\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"path\\\":\\\"b.txt\\\"}\",\"name\":\"read\"},\"id\":\"call_2\",\"type\":\"function\"}]},{\"content\":\"contents of b.txt\",\"role\":\"tool\",\"tool_call_id\":\"call_2\"},{\"content\":\"both read\",\"role\":\"assistant\"},{\"content\":\"now summarise them\",\"role\":\"user\"}],\"model\":\"mistral-medium-latest\",\"reasoning_effort\":\"high\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+        "body": "{\"input\":[{\"content\":[{\"text\":\"read a.txt\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"},{\"content\":[{\"text\":\"a.txt first\",\"type\":\"reasoning_text\"}],\"id\":\"rs_0\",\"summary\":[],\"type\":\"reasoning\"},{\"content\":[{\"text\":\"on it\",\"type\":\"input_text\"}],\"role\":\"assistant\",\"type\":\"message\"},{\"content\":[{\"text\":\"nothing to say yet\",\"type\":\"reasoning_text\"}],\"id\":\"rs_1\",\"summary\":[],\"type\":\"reasoning\"},{\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\",\"call_id\":\"call_1\",\"name\":\"read\",\"type\":\"function_call\"},{\"call_id\":\"call_1\",\"output\":\"contents of a.txt\",\"type\":\"function_call_output\"},{\"content\":[{\"text\":\"b.txt next\",\"type\":\"reasoning_text\"}],\"id\":\"rs_2\",\"summary\":[],\"type\":\"reasoning\"},{\"arguments\":\"{\\\"path\\\":\\\"b.txt\\\"}\",\"call_id\":\"call_2\",\"name\":\"read\",\"type\":\"function_call\"},{\"call_id\":\"call_2\",\"output\":\"contents of b.txt\",\"type\":\"function_call_output\"},{\"content\":[{\"text\":\"both read\",\"type\":\"input_text\"}],\"role\":\"assistant\",\"type\":\"message\"},{\"content\":[{\"text\":\"now summarise them\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}],\"instructions\":\"You are a replay fixture.\",\"model\":\"mistral-medium-latest\",\"reasoning\":{\"effort\":\"high\"},\"store\":false,\"stream\":true,\"tools\":[{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"strict\":false,\"type\":\"function\"}]}",
         "headers": {
           "accept": "*/*",
           "accept-encoding": "deflate, gzip",
           "authorization": "Bearer sk-replay",
-          "content-length": "1229",
+          "content-length": "1349",
           "content-type": "application/json",
           "host": "<volatile>",
           "user-agent": "<volatile>"
         },
         "method": "POST",
-        "path": "/v1/chat/completions"
+        "path": "/v1/responses"
       }
     ]
   }
