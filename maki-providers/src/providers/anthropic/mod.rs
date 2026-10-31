@@ -1019,6 +1019,28 @@ data: {{\"type\":\"message_stop\"}}\n"
         })
     }
 
+    const BILLED_COST: f64 = 0.00042;
+
+    #[test_case("\"cost\":0.00042" ; "cost")]
+    #[test_case("\"response_cost\":0.00042" ; "response_cost")]
+    #[test_case("\"cost\":0.00042,\"response_cost\":0.5" ; "cost_and_response_cost")]
+    #[test_case("\"cost\":0.00002,\"cost_details\":{\"upstream_inference_cost\":0.0004}" ; "byok")]
+    fn parse_sse_billed_cost(cost_fields: &str) {
+        smol::block_on(async {
+            let sse = format!(
+                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":42}}}}}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":10,{cost_fields}}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n"
+            );
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(mock_response(sse.into_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+            let cost = resp.usage.cost.expect("billed cost should be captured");
+            assert!((cost - BILLED_COST).abs() < 1e-9);
+            assert_eq!(resp.usage.output, 10);
+            assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+        })
+    }
+
     const DROPPED_PATH: &str = "messages.1.content.0";
     const PREFIX_MISMATCH: &str = "prefix_binding_mismatch";
     const THINKING_DROPPED: &str = "thinking_dropped";

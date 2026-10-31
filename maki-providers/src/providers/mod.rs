@@ -7,7 +7,7 @@ use futures_lite::StreamExt;
 use futures_lite::io::AsyncBufRead;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::http::request::Builder;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -42,6 +42,80 @@ pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
 const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+const UPSTREAM_COST_KEY: &str = "upstream_inference_cost";
+const COST_COMMENT_TAG: &str = "cost";
+const COMMENT_COST_KEY: &str = "request_cost_usd";
+
+/// What a gateway billed for one turn, read from its `usage` object. Only the
+/// shapes a gateway documents are read: OpenRouter's `cost` and
+/// `cost_details.upstream_inference_cost`, and LiteLLM's `response_cost`.
+/// Zeros and unparsable values read as no bill, which is how `billed_cost`
+/// already treats them.
+#[derive(Deserialize, Default, Clone, Copy, Debug)]
+pub(crate) struct BilledCost {
+    #[serde(default, deserialize_with = "lenient_cost")]
+    cost: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_cost")]
+    response_cost: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_upstream_cost")]
+    cost_details: Option<f64>,
+}
+
+impl BilledCost {
+    pub(crate) fn from_usage(usage: &Value) -> Self {
+        Self::deserialize(usage).unwrap_or_default()
+    }
+
+    /// OpenRouter charges `cost` to the account, and for BYOK that is only its
+    /// own fee: the provider's charge is `upstream_inference_cost`, null
+    /// otherwise, so the turn's real cost is the sum.
+    pub(crate) fn total(self) -> Option<f64> {
+        match (self.cost, self.cost_details) {
+            (None, None) => self.response_cost,
+            (cost, upstream) => Some(cost.unwrap_or(0.0) + upstream.unwrap_or(0.0)),
+        }
+    }
+}
+
+/// Neuralwatt sends its bill as an SSE comment just before `data: [DONE]`:
+/// `: cost {"request_cost_usd": 1.04e-05, ...}`
+/// (<https://docs.neuralwatt.com/guides/streaming>). Comments are invisible to
+/// strict `data:` consumers, which is why it chose them.
+pub(crate) fn parse_cost_comment(line: &str) -> Option<f64> {
+    let payload = line
+        .strip_prefix(':')?
+        .trim_start()
+        .strip_prefix(COST_COMMENT_TAG)?;
+    let cost: Value = serde_json::from_str(payload).ok()?;
+    cost.get(COMMENT_COST_KEY).and_then(cost_from_value)
+}
+
+fn cost_from_value(value: &Value) -> Option<f64> {
+    let cost = match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    };
+    cost.filter(|c| c.is_finite() && *c > 0.0)
+}
+
+/// A gateway may quote a price as a string or in a shape we have never seen. A
+/// usage object we cannot parse is dropped whole, and it carries the turn's
+/// token counts, so reading the price has to be allowed to fail on its own.
+fn lenient_cost<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(cost_from_value))
+}
+
+fn lenient_upstream_cost<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error> {
+    let details = Option::<Value>::deserialize(deserializer)?;
+    Ok(details
+        .as_ref()
+        .and_then(|d| d.get(UPSTREAM_COST_KEY))
+        .and_then(cost_from_value))
+}
 
 fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")
@@ -997,5 +1071,41 @@ mod tests {
 
         assert!(!KeyRotation::new(&pool, &auth, KeyHeader::Bearer).rotate());
         assert_eq!(pool.current(), KEY_1);
+    }
+
+    const BILLED: f64 = 0.00045;
+    const BYOK_FEE: f64 = 0.00002;
+    const UPSTREAM: f64 = 0.0004;
+
+    #[test_case(serde_json::json!({"cost": BILLED}), Some(BILLED) ; "number")]
+    #[test_case(serde_json::json!({"cost": "0.00045"}), Some(BILLED) ; "quoted_number")]
+    #[test_case(serde_json::json!({"response_cost": BILLED}), Some(BILLED) ; "litellm_response_cost")]
+    #[test_case(serde_json::json!({"cost": BILLED, "response_cost": 1.0}), Some(BILLED) ; "cost_wins_over_response_cost")]
+    #[test_case(serde_json::json!({"cost": BYOK_FEE, "cost_details": {"upstream_inference_cost": UPSTREAM}}), Some(BYOK_FEE + UPSTREAM) ; "byok_adds_fee_to_upstream")]
+    #[test_case(serde_json::json!({"cost": 0, "cost_details": {"upstream_inference_cost": UPSTREAM}}), Some(UPSTREAM) ; "upstream_only")]
+    #[test_case(serde_json::json!({"cost": BILLED, "cost_details": {"upstream_inference_cost": null}}), Some(BILLED) ; "null_upstream")]
+    #[test_case(serde_json::json!({"cost": 0}), None ; "zero")]
+    #[test_case(serde_json::json!({"cost": -1.0}), None ; "negative")]
+    #[test_case(serde_json::json!({"cost": "free"}), None ; "unparsable_string")]
+    #[test_case(serde_json::json!({"cost": {"usd": BILLED}}), None ; "object")]
+    #[test_case(serde_json::json!({"amount": BILLED, "total": BILLED}), None ; "undocumented_keys")]
+    #[test_case(serde_json::json!({"cost_details": "n/a"}), None ; "malformed_details")]
+    #[test_case(serde_json::json!("0.00045"), None ; "not_an_object")]
+    fn billed_cost_from_usage(usage: Value, expected: Option<f64>) {
+        match (BilledCost::from_usage(&usage).total(), expected) {
+            (Some(got), Some(want)) => assert!((got - want).abs() < 1e-9, "{got} vs {want}"),
+            (got, want) => assert_eq!(got, want),
+        }
+    }
+
+    #[test_case(r#": cost {"request_cost_usd": 1.04e-05, "cache_savings_usd": 0.0}"#, Some(1.04e-05) ; "neuralwatt_documented")]
+    #[test_case(r#":cost {"request_cost_usd": 0.5}"#, Some(0.5) ; "no_space_after_colon")]
+    #[test_case(r#": cost {"request_cost_usd": 0}"#, None ; "free_request")]
+    #[test_case(r#": cost {"amount": 0.5}"#, None ; "undocumented_key")]
+    #[test_case(r#": energy {"request_cost_usd": 0.5}"#, None ; "other_comment")]
+    #[test_case(": cost 0.5", None ; "not_an_object")]
+    #[test_case(": keepalive", None ; "keepalive")]
+    fn cost_comment(line: &str, expected: Option<f64>) {
+        assert_eq!(parse_cost_comment(line), expected);
     }
 }
