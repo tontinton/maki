@@ -4,6 +4,8 @@ use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use color_eyre::Result;
 use crossterm::Command;
 use crossterm::ExecutableCommand;
@@ -28,6 +30,14 @@ const POP_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[23;2t";
 /// Raw mode is already on when the tmux query runs, so a wedged tmux server
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+const PROGRAM_STATUS_APP: &str = "maki";
+const PROGRAM_STATUS_TITLE_MAX_BYTES: usize = 192;
+const PROGRAM_STATUS_MSG_MAX_BYTES: usize = 2048;
+const PROGRAM_STATUS_CLEAR: &str = "state=clear";
+const PROGRAM_STATUS_ID_MAX_LEN: usize = 32;
+const PROGRAM_STATUS_ID_PUNCTUATION: &str = "_.+-";
+const TMUX_PANE_VAR: &str = "TMUX_PANE";
+const SCREEN_WINDOW_VAR: &str = "WINDOW";
 
 pub(crate) struct TerminalGuard;
 
@@ -219,6 +229,147 @@ fn window_title_sequence(mux: TerminalMux, title: &str) -> String {
 
 pub(crate) fn set_window_title(title: &str) -> std::io::Result<()> {
     write_sequence(&window_title_sequence(TerminalMux::detect(), title))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProgramState {
+    Idle,
+    Working,
+    Blocked(BlockedKind),
+    Done,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockedKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+impl ProgramState {
+    fn fields(self) -> &'static str {
+        match self {
+            Self::Idle => "state=idle",
+            Self::Working => "state=working",
+            Self::Blocked(BlockedKind::Permission) => "state=blocked:kind=permission",
+            Self::Blocked(BlockedKind::Question) => "state=blocked:kind=question",
+            Self::Blocked(BlockedKind::Auth) => "state=blocked:kind=auth",
+            Self::Done => "state=done",
+            Self::Error => "state=error",
+        }
+    }
+}
+
+struct ProgramStatusReport {
+    state: ProgramState,
+    title: String,
+    msg: Option<String>,
+}
+
+pub(crate) struct ProgramStatusReporter {
+    mux: TerminalMux,
+    id: Option<String>,
+    last: Option<ProgramStatusReport>,
+}
+
+impl ProgramStatusReporter {
+    pub(crate) fn new() -> Self {
+        let mux = TerminalMux::detect();
+        Self {
+            mux,
+            id: program_status_id(mux, |key| std::env::var(key).ok()),
+            last: None,
+        }
+    }
+
+    pub(crate) fn report(
+        &mut self,
+        state: ProgramState,
+        title: &str,
+        msg: Option<&str>,
+    ) -> std::io::Result<()> {
+        if self.last.as_ref().is_some_and(|last| {
+            last.state == state && last.title == title && last.msg.as_deref() == msg
+        }) {
+            return Ok(());
+        }
+        let body = program_status_body(self.id.as_deref(), state, title, msg);
+        write_sequence(&self.mux.wrap_for_mux(program_status_osc(&body)))?;
+        self.last = Some(ProgramStatusReport {
+            state,
+            title: title.to_owned(),
+            msg: msg.map(str::to_owned),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) -> std::io::Result<()> {
+        self.last = None;
+        let body = program_status_clear_body(self.id.as_deref());
+        write_sequence(&self.mux.wrap_for_mux(program_status_osc(&body)))
+    }
+}
+
+fn program_status_id(mux: TerminalMux, var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let raw = match mux {
+        TerminalMux::Tmux => var(TMUX_PANE_VAR)?,
+        TerminalMux::Screen => var(SCREEN_WINDOW_VAR)?,
+        TerminalMux::Zellij | TerminalMux::None => return None,
+    };
+    let id = raw.trim_start_matches('%');
+    let valid = !id.is_empty()
+        && id.len() <= PROGRAM_STATUS_ID_MAX_LEN
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || PROGRAM_STATUS_ID_PUNCTUATION.contains(c));
+    valid.then(|| id.to_owned())
+}
+
+fn program_status_osc(body: &str) -> String {
+    format!("\u{1b}]7501;{body}\u{7}")
+}
+
+fn program_status_clear_body(id: Option<&str>) -> String {
+    let mut body = PROGRAM_STATUS_CLEAR.to_owned();
+    push_program_status_id(&mut body, id);
+    body
+}
+
+fn program_status_body(
+    id: Option<&str>,
+    state: ProgramState,
+    title: &str,
+    msg: Option<&str>,
+) -> String {
+    let mut body = state.fields().to_owned();
+    push_program_status_id(&mut body, id);
+    body.push_str(":app=");
+    body.push_str(PROGRAM_STATUS_APP);
+    push_program_status_text(&mut body, "title", title, PROGRAM_STATUS_TITLE_MAX_BYTES);
+    if let Some(msg) = msg {
+        push_program_status_text(&mut body, "msg", msg, PROGRAM_STATUS_MSG_MAX_BYTES);
+    }
+    body
+}
+
+fn push_program_status_id(body: &mut String, id: Option<&str>) {
+    if let Some(id) = id {
+        body.push_str(":id=");
+        body.push_str(id);
+    }
+}
+
+fn push_program_status_text(body: &mut String, key: &str, text: &str, max_bytes: usize) {
+    let text = visible_text(text);
+    let text = &text[..text.floor_char_boundary(max_bytes)];
+    if text.is_empty() {
+        return;
+    }
+    body.push(':');
+    body.push_str(key);
+    body.push('=');
+    STANDARD.encode_string(text, body);
 }
 
 fn write_mux_sequence(sequence: &str) {
@@ -591,6 +742,56 @@ mod tests {
         };
         assert!(auto_supports_osc9(&terminal, Some(&ghostty_name)));
         assert!(!auto_supports_osc9(&terminal, None));
+    }
+
+    #[test_case(None, ProgramState::Working, "", None, "state=working:app=maki" ; "empty_title_omitted")]
+    #[test_case(None, ProgramState::Blocked(BlockedKind::Question), "fix\nbug", Some("Ask"), "state=blocked:kind=question:app=maki:title=Zml4IGJ1Zw==:msg=QXNr" ; "blocked_kind_title_and_msg")]
+    #[test_case(Some("3"), ProgramState::Done, "\u{7}\t", None, "state=done:id=3:app=maki" ; "id_and_control_only_title")]
+    fn program_status_body_cases(
+        id: Option<&str>,
+        state: ProgramState,
+        title: &str,
+        msg: Option<&str>,
+        expected: &str,
+    ) {
+        assert_eq!(program_status_body(id, state, title, msg), expected);
+    }
+
+    #[test_case(None, "state=clear" ; "root_clears_everything")]
+    #[test_case(Some("3"), "state=clear:id=3" ; "pane_clears_only_its_record")]
+    fn program_status_clear_body_cases(id: Option<&str>, expected: &str) {
+        assert_eq!(program_status_clear_body(id), expected);
+    }
+
+    #[test_case(TerminalMux::Tmux, Some("%3"), Some("3") ; "tmux_pane_without_percent")]
+    #[test_case(TerminalMux::Screen, Some("2"), Some("2") ; "screen_window")]
+    #[test_case(TerminalMux::None, Some("%3"), None ; "no_mux_uses_root")]
+    #[test_case(TerminalMux::Zellij, Some("%3"), None ; "zellij_uses_root")]
+    #[test_case(TerminalMux::Tmux, Some("%a b"), None ; "invalid_id_uses_root")]
+    #[test_case(TerminalMux::Tmux, None, None ; "missing_var_uses_root")]
+    fn program_status_id_cases(mux: TerminalMux, value: Option<&str>, expected: Option<&str>) {
+        let id = program_status_id(mux, |_| value.map(str::to_owned));
+        assert_eq!(id.as_deref(), expected);
+    }
+
+    #[test]
+    fn program_status_title_caps_decoded_bytes_on_char_boundary() {
+        let long = format!("a{}", "あ".repeat(PROGRAM_STATUS_TITLE_MAX_BYTES));
+        let kept = format!("a{}", "あ".repeat((PROGRAM_STATUS_TITLE_MAX_BYTES - 1) / 3));
+        let body = program_status_body(None, ProgramState::Idle, &long, None);
+        assert!(body.ends_with(&format!(":title={}", STANDARD.encode(&kept))));
+    }
+
+    #[test]
+    fn program_status_roundtrips_mux_passthrough() {
+        let plain = program_status_osc(&program_status_body(
+            Some("3"),
+            ProgramState::Error,
+            "x",
+            None,
+        ));
+        let tmux = TerminalMux::Tmux.wrap_for_mux(plain.clone());
+        assert_eq!(parse_dcs_passthrough(&tmux, "\u{1b}Ptmux;"), plain);
     }
 
     #[test]

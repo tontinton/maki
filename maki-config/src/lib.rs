@@ -664,6 +664,7 @@ pub struct UiFileConfig {
     pub scrollbar: Option<bool>,
     pub inline_images: Option<bool>,
     pub notifications: Option<NotificationMethod>,
+    pub program_status: Option<bool>,
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
@@ -686,6 +687,7 @@ impl UiFileConfig {
             scrollbar,
             inline_images,
             notifications,
+            program_status,
             flash_duration_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
@@ -1335,6 +1337,12 @@ pub struct UiConfig {
     )]
     pub notifications: NotificationMethod,
 
+    #[config(
+        default = true,
+        desc = "Report session state (idle, working, blocked, done, error) to the terminal with OSC 7501"
+    )]
+    pub program_status: bool,
+
     #[config(default = DEFAULT_FLASH_DURATION_MS, desc = "Duration of flash messages (ms)")]
     pub flash_duration_ms: u64,
 
@@ -1376,6 +1384,7 @@ impl UiConfig {
             scrollbar: f.scrollbar.unwrap_or(true),
             inline_images: f.inline_images.unwrap_or(true),
             notifications: f.notifications.unwrap_or_default(),
+            program_status: f.program_status.unwrap_or(true),
             flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
             typewriter_ms_per_char: f
                 .typewriter_ms_per_char
