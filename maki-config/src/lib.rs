@@ -95,6 +95,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
     "batch",
     "code_execution",
+    "cursor",
     "deepseek",
     "edit",
     "glob",
@@ -124,6 +125,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
 /// The [`DEFAULT_BUILTINS`] that declare a provider and register no tool, so
 /// their names stay free for MCP servers and are not valid tool names.
 pub const PROVIDER_BUILTINS: &[&str] = &[
+    "cursor",
     "deepseek",
     "mistral",
     "openrouter",

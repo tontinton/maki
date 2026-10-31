@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use include_dir::{Dir, File, include_dir};
+use include_dir::{Dir, DirEntry, File, include_dir};
 use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
@@ -198,6 +198,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     // the same surface a third-party plugin declares one with, which is what
     // keeps that surface honest.
     BundledPlugin {
+        name: "cursor",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/cursor"),
+    },
+    BundledPlugin {
         name: "synthetic",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
     },
@@ -232,6 +236,36 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
 /// down the other's registrations.
 pub(crate) fn is_bundled(name: &str) -> bool {
     BUNDLED_PLUGINS.iter().any(|p| p.name == name)
+}
+
+fn write_included_dir(dir: &Dir, dest: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in dir.entries() {
+        match entry {
+            DirEntry::Dir(sub) => {
+                if sub
+                    .path()
+                    .file_name()
+                    .is_some_and(|name| name == "node_modules")
+                {
+                    continue;
+                }
+                let name = sub
+                    .path()
+                    .file_name()
+                    .ok_or_else(|| std::io::Error::other("bundled directory has no name"))?;
+                write_included_dir(sub, &dest.join(name))?;
+            }
+            DirEntry::File(file) => {
+                let name = file
+                    .path()
+                    .file_name()
+                    .ok_or_else(|| std::io::Error::other("bundled file has no name"))?;
+                fs::write(dest.join(name), file.contents())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A bundled plugin declares its permissions the same way an external one
@@ -522,6 +556,26 @@ impl PluginHost {
         result
     }
 
+    /// A bundled plugin that ships a helper program has no directory of its
+    /// own at runtime, because the bytes live in the binary. Copy them into
+    /// the cache so the plugin can start that program. `node_modules` is
+    /// installed there later and must survive the next copy.
+    fn materialize_proxy_plugin(plugin: &BundledPlugin) -> Result<Option<PathBuf>, PluginError> {
+        if plugin.dir.get_dir("proxy").is_none() {
+            return Ok(None);
+        }
+        let cache = maki_storage::paths::cache_dir().map_err(|source| PluginError::Io {
+            path: PathBuf::from("cache"),
+            source,
+        })?;
+        let dest = cache.join("bundled-plugins").join(plugin.name);
+        write_included_dir(&plugin.dir, &dest).map_err(|source| PluginError::Io {
+            path: dest.clone(),
+            source,
+        })?;
+        Ok(Some(dest))
+    }
+
     fn send_builtin_loads(&self, config: &PluginsConfig) -> Result<(), PluginError> {
         for (plugin, opts) in &config.opts {
             // An enabled package takes its options when the package itself
@@ -577,6 +631,7 @@ impl PluginHost {
                 .cloned()
                 .map(Arc::new)
                 .unwrap_or_default();
+            let asset_dir = Self::materialize_proxy_plugin(bundled)?;
             self.send_load(
                 Arc::clone(&name),
                 vec![LoadChunk::bundled(name.as_ref(), init)],
@@ -585,7 +640,7 @@ impl PluginHost {
                     // The one load that ships inside the binary, and so the
                     // one that may declare a provider under a built-in slug.
                     authority: DeclAuthority::Bundled,
-                    ..LoadContext::plain(None, permissions)
+                    ..LoadContext::plain(asset_dir, permissions)
                 },
             )?;
         }

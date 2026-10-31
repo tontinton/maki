@@ -1,0 +1,5 @@
+[permissions]
+net = true
+run = true
+env = true
+net_hosts = ["127.0.0.1"]
