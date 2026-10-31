@@ -458,6 +458,7 @@ static CATALOG_PROVIDER_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     base_url: Cow::Borrowed(""),
     max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
     include_stream_usage: true,
+    usage_cost: false,
     provider_name: Cow::Borrowed("catalog"),
 };
 

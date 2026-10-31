@@ -270,6 +270,7 @@ impl Copilot {
                     super::body_reader(response),
                     event_tx,
                     self.stream_timeout,
+                    false,
                 )
                 .await
             } else {

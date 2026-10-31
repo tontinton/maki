@@ -75,6 +75,8 @@ pub struct OpenAiWire {
     /// `None` asks for `stream_options.include_usage`, which every openai
     /// endpoint worth billing for supports.
     pub include_stream_usage: Option<bool>,
+    /// Read `usage.cost` from the stream as the turn's USD bill.
+    pub usage_cost: bool,
     /// How this provider's API spells reasoning effort. Stating it replaces
     /// the generic thinking pass, see [`Self::apply_body`].
     pub thinking: Option<ThinkingWire>,
@@ -152,6 +154,7 @@ impl OpenAiWire {
         let Self {
             max_tokens_field: _,
             include_stream_usage: _,
+            usage_cost: _,
             thinking,
             headers: _,
             extra_body,
@@ -189,6 +192,7 @@ impl OpenAiWire {
         let Self {
             max_tokens_field: _,
             include_stream_usage: _,
+            usage_cost: _,
             thinking: _,
             headers,
             extra_body: _,
@@ -458,6 +462,7 @@ fn compat_config(options: &CodecOptions) -> OpenAiCompatConfig {
             .clone()
             .map_or(Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD), Cow::Owned),
         include_stream_usage: options.openai.include_stream_usage.unwrap_or(true),
+        usage_cost: options.openai.usage_cost,
         provider_name: options.provider_name.clone(),
     }
 }
@@ -935,5 +940,15 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(wire.thinking_override(model_id), expected);
+    }
+
+    #[test_case(json!({}), false ; "off_by_default")]
+    #[test_case(json!({ "usage_cost": true }), true ; "enabled_when_declared")]
+    fn compat_config_forwards_usage_cost(authored: Value, expected: bool) {
+        let options = CodecOptions {
+            openai: wire(authored).unwrap(),
+            ..CodecOptions::new(Protocol::Openai, DECLARED_SLUG)
+        };
+        assert_eq!(compat_config(&options).usage_cost, expected);
     }
 }
