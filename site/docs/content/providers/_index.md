@@ -300,7 +300,6 @@ Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 | Strong | **mistral-large-4, mistral-large-4-0** (default) | $0.70 / $2.10 | 1000K ctx |
 | Strong | mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604 | $1.50 / $7.50 | 262K ctx |
 | Strong | zai-glm-latest, zai-glm-5-3, zai-glm-5 | $1.40 / $4.40 | 1000K ctx / 131K out |
-| Strong | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx / 131K out |
 
 Defaults: mistral-large-4 (strong), mistral-small-latest (medium), zai-glm-5-3-flash (weak)
 

@@ -6,14 +6,12 @@ local MODELS_PATH = "/models"
 
 -- Rows whose cards publish an effort ladder wider than the provider default,
 -- as the API answers when asked: medium is refused outside Large 4, and the
--- GLM rows split between a full and a low/high/max ladder. The /models
--- listing says nothing about effort, so the knowledge rides on the row and
--- narrows `openai.thinking` for that model at request time; adaptive keeps
--- the dialect's high. Longest prefix first.
+-- GLM rows take low/high/max. The /models listing says nothing about effort,
+-- so the knowledge rides on the row and narrows `openai.thinking` for that
+-- model at request time; adaptive keeps the dialect's high. Longest prefix
+-- first.
 local LADDERS = {
   { "mistral-large-4", { supported = { "low", "medium", "high" } } },
-  { "zai-glm-5-2", { supported = { "low", "medium", "high", "xhigh", "max" } } },
-  { "glm-5-2", { supported = { "low", "medium", "high", "xhigh", "max" } } },
   { "zai-glm-5", { supported = { "low", "high", "max" } } },
   { "zai-glm-latest", { supported = { "low", "high", "max" } } },
   { "deepseek-", { supported = { "low", "high", "xhigh", "max" } } },
@@ -99,6 +97,9 @@ maki.provider.register({
       context_window = 1000000,
       pricing = { input = 0.7, output = 2.1, cache_write = 0.0, cache_read = 0.07 },
     },
+    -- Mistral Medium 3.5 retires 2027-04-30. The Mistral model deprecation
+    -- mail from Oct 30 2026 names only `mistral-medium-3-5`, so re-check
+    -- whether `-latest` and `-2604` survive before dropping this row.
     {
       prefixes = { "mistral-medium-latest", "mistral-medium-3.5", "mistral-medium-3-5", "mistral-medium-2604" },
       tier = "strong",
@@ -108,15 +109,6 @@ maki.provider.register({
     },
     {
       prefixes = { "zai-glm-latest", "zai-glm-5-3", "zai-glm-5" },
-      tier = "strong",
-      family = "glm",
-      supports_vision = false,
-      max_output_tokens = 131072,
-      context_window = 1000000,
-      pricing = { input = 1.4, output = 4.4, cache_write = 0.0, cache_read = 0.14 },
-    },
-    {
-      prefixes = { "glm-5-2", "zai-glm-5-2" },
       tier = "strong",
       family = "glm",
       supports_vision = false,
