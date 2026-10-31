@@ -19,7 +19,6 @@ use flume::Sender;
 use maki_config::providers::ProvidersConfig;
 use reqwest::Client;
 use serde_json::Value;
-use tokio::runtime::Handle;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
@@ -34,7 +33,7 @@ use crate::providers::openai_compat::{
 };
 use crate::providers::{
     ResolvedAuth, Timeouts, body_reader, http_client, opencode, plugin, send_request,
-    status_and_text, user_agent,
+    status_and_text, user_agent, wait,
 };
 use crate::spec::ProviderRegistry;
 use crate::{
@@ -719,9 +718,9 @@ fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
 /// Runs on the cli thread or the blocking pool, never on a worker: a worker
 /// cannot block on the fetch.
 fn fetch_catalog_blocking(state_dir: &StateDir) -> Result<CatalogData, AgentError> {
-    let index = Handle::current().block_on(fetch_remote_catalog_async(&http_client(
-        Timeouts::default(),
-    )))?;
+    let index = wait(fetch_remote_catalog_async(
+        &http_client(Timeouts::default()),
+    ))?;
     save_cached_catalog(&index);
     Ok(CatalogData::from_index(index, state_dir))
 }
