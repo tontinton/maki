@@ -20,7 +20,6 @@ use maki_storage::id::SessionRef;
 
 use self::run_cancels::RunCancels;
 use maki_providers::Message;
-use tokio::runtime::Handle;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{info, warn};
 
@@ -91,6 +90,7 @@ impl AgentHandles {
             timeouts,
             lua_handle,
             model_policy,
+            false,
         )
     }
 
@@ -170,10 +170,6 @@ impl AgentHandles {
         // thing that makes the old loop's in-flight envelopes stale. It lives
         // here so no caller can respawn without it.
         app.run_id += 1;
-        let slot = model_slot.load();
-        if let Err(e) = Handle::current().block_on(slot.provider.reload_auth()) {
-            warn!(error = %e, "failed to reload auth, continuing with existing credentials");
-        }
         let new = spawn_agent_internal(
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
@@ -194,6 +190,7 @@ impl AgentHandles {
             self.timeouts,
             lua_handle,
             Arc::clone(&self.model_policy),
+            true,
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -222,16 +219,17 @@ impl AgentHandles {
 }
 
 /// Wait for every agent task under one shared timeout, not one per task.
-pub(crate) fn join_all(tasks: Vec<AbortOnDropHandle<()>>, timeout: Duration) {
+pub(crate) async fn join_all(tasks: Vec<AbortOnDropHandle<()>>, timeout: Duration) {
     info!(
         count = tasks.len(),
         "waiting for agents to finish (timeout {timeout:?})"
     );
-    let joined = Handle::current().block_on(tokio::time::timeout(timeout, async {
+    let joined = tokio::time::timeout(timeout, async {
         for task in tasks {
             task.await.expect("agent task panicked");
         }
-    }));
+    })
+    .await;
     if joined.is_err() {
         warn!("agents did not finish within {timeout:?}, forcing shutdown");
     }
@@ -250,6 +248,7 @@ fn spawn_agent_internal(
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
+    reload_auth: bool,
 ) -> AgentHandles {
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
@@ -282,7 +281,15 @@ fn spawn_agent_internal(
         Arc::clone(&model_policy),
     );
 
-    let task = AbortOnDropHandle::new(tokio::spawn(agent_loop.run()));
+    let provider = Arc::clone(&model_slot.load().provider);
+    let task = AbortOnDropHandle::new(tokio::spawn(async move {
+        // A loop respawned after a login runs on the new credentials from
+        // its first request on.
+        if reload_auth && let Err(e) = provider.reload_auth().await {
+            warn!(error = %e, "failed to reload auth, continuing with existing credentials");
+        }
+        agent_loop.run().await;
+    }));
 
     AgentHandles {
         agent_rx,
@@ -778,21 +785,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn join_all_returns_when_all_tasks_complete() {
-        let _runtime = enter_runtime();
-        join_all(Vec::new(), LONG_TIMEOUT);
+    #[tokio::test]
+    async fn join_all_returns_when_all_tasks_complete() {
+        join_all(Vec::new(), LONG_TIMEOUT).await;
         join_all(
             (0..3)
                 .map(|_| AbortOnDropHandle::new(tokio::spawn(async {})))
                 .collect(),
             LONG_TIMEOUT,
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn join_all_stuck_task_returns_after_shared_timeout() {
-        let _runtime = enter_runtime();
+    #[tokio::test]
+    async fn join_all_stuck_task_returns_after_shared_timeout() {
         let start = Instant::now();
         join_all(
             vec![
@@ -800,7 +806,8 @@ mod tests {
                 AbortOnDropHandle::new(tokio::spawn(std::future::pending::<()>())),
             ],
             SHORT_TIMEOUT,
-        );
+        )
+        .await;
         assert!(start.elapsed() >= SHORT_TIMEOUT);
     }
 }

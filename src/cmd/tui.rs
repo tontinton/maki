@@ -475,51 +475,52 @@ pub fn run(mut cli: Cli) -> Result<()> {
             }
         }
 
-        let outcome = maki_ui::run(
-            maki_ui::EventLoopParams {
-                // The startup default only (`--model`, then last-used, then
-                // config). It seeds `ModelSlots` and catches a session whose
-                // model will not resolve. Otherwise each tab runs on its own
-                // recorded spec.
-                model: stack.model.clone(),
-                needs_login: stack.needs_login,
-                commands: std::mem::take(&mut stack.commands),
-                sessions: std::mem::take(&mut tabs),
-                focused,
-                startup_warnings: std::mem::take(&mut warnings),
-                startup_notice: notice.take(),
-                // Read per run: plugins have just (re)loaded, and a script one
-                // of them now replaces is no longer worth a word.
-                startup_alert: provider_scripts::startup_warning(),
-                storage: storage.clone(),
-                config: stack.config.agent.clone(),
-                ui_config: stack.config.ui.clone(),
-                input_history_size: stack.config.storage.input_history_size,
-                permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
-                    stack.config.permissions.clone(),
-                    cwd.clone(),
-                    trust.project_config.clone(),
-                    stack.plugin_host.plugin_rules(),
-                )),
-                timeouts: stack.timeouts(),
-                exit_on_done: cli.exit_on_done,
-                background_wait: cli.background_wait(),
-                lua_command_reader: stack.plugin_host.command_reader(),
-                keymap_reader: stack.plugin_host.keymap_reader(),
-                hint_reader: stack.plugin_host.hint_reader(),
-                input_rules_reader: stack.plugin_host.input_rules_reader(),
-                ui_action_rx: stack.plugin_host.ui_action_rx(),
-                ui_wake_rx: stack.plugin_host.ui_wake_rx(),
-                ui_attachment: stack.plugin_host.ui_attachment(),
-                lua_event_handle: stack.plugin_host.event_handle(),
-                model_policy: Arc::new(stack.config.provider.model_policy.clone()),
-                project_config: trust.project_config.clone(),
-                trust_question: trust.state.question().cloned(),
-                handed_over: std::mem::take(&mut handed_over),
-            },
-            initial_prompt.take(),
-        )
-        .context("run UI")?;
+        let outcome = Handle::current()
+            .block_on(maki_ui::run(
+                maki_ui::EventLoopParams {
+                    // The startup default only (`--model`, then last-used, then
+                    // config). It seeds `ModelSlots` and catches a session whose
+                    // model will not resolve. Otherwise each tab runs on its own
+                    // recorded spec.
+                    model: stack.model.clone(),
+                    needs_login: stack.needs_login,
+                    commands: std::mem::take(&mut stack.commands),
+                    sessions: std::mem::take(&mut tabs),
+                    focused,
+                    startup_warnings: std::mem::take(&mut warnings),
+                    startup_notice: notice.take(),
+                    // Read per run: plugins have just (re)loaded, and a script one
+                    // of them now replaces is no longer worth a word.
+                    startup_alert: provider_scripts::startup_warning(),
+                    storage: storage.clone(),
+                    config: stack.config.agent.clone(),
+                    ui_config: stack.config.ui.clone(),
+                    input_history_size: stack.config.storage.input_history_size,
+                    permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
+                        stack.config.permissions.clone(),
+                        cwd.clone(),
+                        trust.project_config.clone(),
+                        stack.plugin_host.plugin_rules(),
+                    )),
+                    timeouts: stack.timeouts(),
+                    exit_on_done: cli.exit_on_done,
+                    background_wait: cli.background_wait(),
+                    lua_command_reader: stack.plugin_host.command_reader(),
+                    keymap_reader: stack.plugin_host.keymap_reader(),
+                    hint_reader: stack.plugin_host.hint_reader(),
+                    input_rules_reader: stack.plugin_host.input_rules_reader(),
+                    ui_action_rx: stack.plugin_host.ui_action_rx(),
+                    ui_wake_rx: stack.plugin_host.ui_wake_rx(),
+                    ui_attachment: stack.plugin_host.ui_attachment(),
+                    lua_event_handle: stack.plugin_host.event_handle(),
+                    model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                    project_config: trust.project_config.clone(),
+                    trust_question: trust.state.question().cloned(),
+                    handed_over: std::mem::take(&mut handed_over),
+                },
+                initial_prompt.take(),
+            ))
+            .context("run UI")?;
 
         match outcome {
             RunOutcome::Exit { session_id, code } => {
