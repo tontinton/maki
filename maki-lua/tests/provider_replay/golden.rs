@@ -33,6 +33,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use maki_config::providers::base_url_env_var;
 use maki_lua::PluginHost;
+use maki_lua::test_support::runtime;
 use maki_providers::model::ModelInfo;
 use maki_providers::model_registry;
 use maki_providers::plugin;
@@ -353,7 +354,7 @@ impl Replay {
 
     fn usage(&self) -> Value {
         let before = Timestamp::now();
-        let result = smol::block_on(self.provider.fetch_usage());
+        let result = runtime().block_on(self.provider.fetch_usage());
         let after = Timestamp::now();
         let mut observed = json!({
             REQUESTS_KEY: self.recorded(),
@@ -367,7 +368,7 @@ impl Replay {
     }
 
     fn models(&self) -> Value {
-        let listed = smol::block_on(self.provider.list_models());
+        let listed = runtime().block_on(self.provider.list_models());
         json!({
             REQUESTS_KEY: self.recorded(),
             OUTCOME_KEY: listing(&listed),
@@ -379,7 +380,7 @@ impl Replay {
     /// through the request path alone.
     fn discovered(&self, slug: &str, turn: &Turn) -> Value {
         let model = turn.model();
-        let listed = smol::block_on(self.provider.list_models());
+        let listed = runtime().block_on(self.provider.list_models());
         if let Ok(models) = &listed {
             model_registry::set_known_models(slug, models.clone());
         }
@@ -403,7 +404,7 @@ impl Replay {
             .unwrap_or_else(|| vec![Message::user(PROMPT.to_owned())]);
         let tools = turn.tools.clone().unwrap_or_else(tools);
         let (tx, rx) = flume::unbounded();
-        let result = smol::block_on(self.provider.stream_message(
+        let result = runtime().block_on(self.provider.stream_message(
             model,
             &messages,
             SYSTEM,

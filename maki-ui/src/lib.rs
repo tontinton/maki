@@ -1,4 +1,4 @@
-//! Single-threaded ratatui event loop; the agent runs on smol tasks in a separate thread.
+//! Single-threaded ratatui event loop; the agent runs on tokio tasks off the UI thread.
 //! `AgentHandles` bundles all flume channels to the agent. `dispatch()` processes
 //! `Action`s returned by `App::update()`. Scroll and drag events are coalesced from
 //! the queue to avoid jank.

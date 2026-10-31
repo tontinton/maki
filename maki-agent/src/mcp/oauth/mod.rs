@@ -5,13 +5,12 @@ mod store;
 use std::path::Path;
 use std::time::Duration;
 
-use async_compat::Compat;
-use futures_lite::future;
 use maki_storage::StateDir;
 use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
 use reqwest::Client;
 use rmcp::transport::auth::{AuthorizationMetadata, OAuthClientConfig};
 use rmcp::transport::{AuthError, AuthorizationManager};
+use tokio::time::timeout;
 use tracing::{info, warn};
 use url::{Host, Url};
 
@@ -55,7 +54,7 @@ pub async fn authenticate(
     static_client: Option<OauthClientConfig>,
     ca_file: Option<&Path>,
 ) -> Result<(), McpError> {
-    Compat::new(async {
+    async {
         let client = http_client(ca_file, Some(LOGIN_TIMEOUT)).map_err(OAuthError::Other)?;
 
         // We only get here after the server turned the token down, or when the
@@ -87,7 +86,7 @@ pub async fn authenticate(
             client,
         )
         .await
-    })
+    }
     .await
     .map_err(|e| McpError::OAuthFailed {
         server: server_name.into(),
@@ -328,8 +327,15 @@ async fn wait_for_code(
             eprintln!("If this machine has no browser, log in on another device and paste");
             eprintln!("the full redirect URL ({redirect_uri}?...) here:");
 
-            let callback_or_paste = future::race(wait_callback, manual::wait_for_paste(state));
-            future::race(callback_or_paste, auth_timeout()).await
+            let callback_or_paste = async {
+                tokio::select! {
+                    callback = wait_callback => callback,
+                    pasted = manual::wait_for_paste(state) => pasted,
+                }
+            };
+            timeout(AUTH_TIMEOUT, callback_or_paste)
+                .await
+                .unwrap_or_else(|_| Err(auth_timed_out()))
         }
         Interaction::Background => {
             let cause = if is_headless() {
@@ -341,18 +347,19 @@ async fn wait_for_code(
             };
             match cause {
                 Some(cause) => Err(format!("{cause}; run 'maki mcp auth {server_name}'")),
-                None => future::race(wait_callback, auth_timeout()).await,
+                None => timeout(AUTH_TIMEOUT, wait_callback)
+                    .await
+                    .unwrap_or_else(|_| Err(auth_timed_out())),
             }
         }
     }
 }
 
-async fn auth_timeout() -> Result<CallbackResult, String> {
-    smol::Timer::after(AUTH_TIMEOUT).await;
-    Err(format!(
+fn auth_timed_out() -> String {
+    format!(
         "OAuth flow timed out after {} minutes",
         AUTH_TIMEOUT.as_secs() / 60
-    ))
+    )
 }
 
 fn is_headless() -> bool {

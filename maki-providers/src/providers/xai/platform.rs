@@ -6,6 +6,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::OAuthTokens;
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
+use tokio::task::spawn_blocking;
 use tracing::debug;
 
 use crate::model::Model;
@@ -88,7 +89,7 @@ impl Xai {
         let rejected = self.auth.lock().unwrap().access_token().map(str::to_owned);
         let shared = Arc::clone(&self.auth);
         let held = Arc::clone(&self.tokens);
-        smol::unblock(move || {
+        spawn_blocking(move || {
             match refreshed_tokens(
                 &storage,
                 auth::PROVIDER,
@@ -111,7 +112,7 @@ impl Xai {
                 }
             }
         })
-        .await?;
+        .await??;
         debug!("refreshed xAI OAuth token");
         Ok(())
     }
@@ -254,7 +255,7 @@ impl Provider for Xai {
                         let access = bearer_token(&auth).ok_or_else(|| AgentError::Config {
                             message: "xAI OAuth token missing from resolved auth".into(),
                         })?;
-                        smol::unblock(move || catalog::list_models(&access, false)).await
+                        spawn_blocking(move || catalog::list_models(&access, false)).await?
                     })
                     .await;
             }
@@ -285,7 +286,7 @@ impl Provider for Xai {
             let Some(storage) = self.storage.clone() else {
                 return Ok(());
             };
-            let (resolved, tokens) = smol::unblock(move || auth::resolve(&storage)).await?;
+            let (resolved, tokens) = spawn_blocking(move || auth::resolve(&storage)).await??;
             *self.auth.lock().unwrap() = resolved;
             *self.tokens.lock().unwrap() = tokens;
             debug!("reloaded xAI auth from storage");

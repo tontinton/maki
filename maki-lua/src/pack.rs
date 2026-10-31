@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use maki_pack::approvals::Entry;
+use tokio::runtime::Handle;
 
 use crate::error::PluginError;
 use crate::loader::is_bundled;
@@ -675,7 +676,7 @@ pub fn install_declared(
             ));
             continue;
         }
-        let result = match smol::block_on(manager.ensure_installed(spec, &mut lock)) {
+        let result = match Handle::current().block_on(manager.ensure_installed(spec, &mut lock)) {
             Ok(result) => result,
             Err(e) => {
                 let message = redact_error(&e);
@@ -1095,7 +1096,7 @@ fn prepare_pack_ops_at(
                             .unwrap_or_default(),
                     )
                 };
-                let proposal = match smol::block_on(manager.prepare_update(
+                let proposal = match Handle::current().block_on(manager.prepare_update(
                     spec,
                     &lock,
                     options.target == UpdateTarget::Lockfile,
@@ -1230,7 +1231,7 @@ pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
                 name,
                 update,
                 approve,
-            } => match smol::block_on(manager.apply_update(&update, &mut lock)) {
+            } => match Handle::current().block_on(manager.apply_update(&update, &mut lock)) {
                 Ok(installed) => {
                     report.updated.push((name.clone(), installed.rev));
                     let Some(approve) = approve else { continue };
@@ -1630,8 +1631,10 @@ mod tests {
 
     use maki_pack::approvals::Entry;
     use test_case::test_case;
+    use tokio::runtime::{EnterGuard, Handle};
 
     use crate::error::PluginError;
+    use crate::loader::HOST_RUNTIME;
     use crate::plugin_permissions::{Permission, Requested};
 
     use super::{
@@ -2193,7 +2196,9 @@ mod tests {
         }
     }
 
+    /// Holds the runtime the sync pack functions block on, as `main` does.
     struct UpdateFixture {
+        _runtime: EnterGuard<'static>,
         _temp: tempfile::TempDir,
         site: PathBuf,
         lock_path: PathBuf,
@@ -2203,11 +2208,12 @@ mod tests {
     }
 
     fn run_git(repo: &Path, args: &[&str]) -> maki_pack::git::GitOutput {
-        smol::block_on(maki_pack::git::run(
-            args.iter().map(|arg| (*arg).to_owned()).collect(),
-            repo.to_path_buf(),
-        ))
-        .unwrap()
+        Handle::current()
+            .block_on(maki_pack::git::run(
+                args.iter().map(|arg| (*arg).to_owned()).collect(),
+                repo.to_path_buf(),
+            ))
+            .unwrap()
     }
 
     fn update_fixture() -> UpdateFixture {
@@ -2218,6 +2224,7 @@ mod tests {
         old_manifest: Option<&str>,
         new_manifest: Option<&str>,
     ) -> UpdateFixture {
+        let runtime = HOST_RUNTIME.enter();
         let temp = tempfile::TempDir::new().unwrap();
         let origin = temp.path().join("origin");
         fs::create_dir_all(origin.join("plugin")).unwrap();
@@ -2235,10 +2242,9 @@ mod tests {
         let lock_path = temp.path().join("pack-lock.json");
         let spec = maki_pack::Spec::new(origin.display().to_string()).with_name("demo");
         let mut lock = maki_pack::lockfile::Lockfile::default();
-        let installed = smol::block_on(
-            maki_pack::manager::Manager::new(&site).ensure_installed(&spec, &mut lock),
-        )
-        .unwrap();
+        let installed = Handle::current()
+            .block_on(maki_pack::manager::Manager::new(&site).ensure_installed(&spec, &mut lock))
+            .unwrap();
         assert!(write_lockfile(&lock_path, &lock));
 
         fs::write(origin.join("plugin").join("later.lua"), "-- later\n").unwrap();
@@ -2263,6 +2269,7 @@ mod tests {
         }];
 
         UpdateFixture {
+            _runtime: runtime,
             _temp: temp,
             site,
             lock_path,
@@ -2273,6 +2280,7 @@ mod tests {
     }
 
     struct SiteFixture {
+        _runtime: EnterGuard<'static>,
         _temp: tempfile::TempDir,
         site: PathBuf,
         lock_path: PathBuf,
@@ -2291,6 +2299,7 @@ mod tests {
         }
         assert!(write_lockfile(&lock_path, &lock));
         SiteFixture {
+            _runtime: HOST_RUNTIME.enter(),
             _temp: temp,
             site,
             lock_path,

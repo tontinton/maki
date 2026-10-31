@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use flume::{Receiver, Sender};
-use futures_lite::future::or;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
@@ -15,8 +14,9 @@ use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde_json::Value;
-use smol::Timer;
-use smol::lock::Mutex;
+use tokio::sync::Mutex;
+use tokio::time::{sleep_until, timeout};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
 use crate::agent::{self, RunContext, RunContextBuilder};
@@ -168,16 +168,23 @@ impl KeepAlive {
         let wait = self.wait?;
         let deadline = *self.deadline.get_or_insert_with(|| Instant::now() + wait);
         let mailbox = &self.mailbox;
-        let lapsed = async {
-            Timer::at(deadline).await;
-            // This also counts results that came in but would wake a turn
-            // past the deadline: they die with the process all the same.
+        // This also counts results that came in but would wake a turn
+        // past the deadline: they die with the process all the same.
+        let lapsed = || {
             warn_unreported(mailbox.unsettled().len(), LAPSED_CAUSE);
             None
         };
-        // Lapsed first: `or` prefers its first future when both are ready,
-        // and a wake queued during the last turn is ready at once.
-        or(lapsed, mailbox.next_wake()).await
+        // Lapsed first: a wake queued during the last turn is ready at once.
+        // A deadline already behind us is checked against the clock, since
+        // the timer only reports it after a trip through the driver.
+        if Instant::now() >= deadline {
+            return lapsed();
+        }
+        tokio::select! {
+            biased;
+            () = sleep_until(deadline.into()) => lapsed(),
+            wake = mailbox.next_wake() => wake,
+        }
     }
 
     /// The next woken turn, or `None` once the session may end. What still
@@ -236,10 +243,6 @@ impl Inputs {
     /// stopped session never takes notices it would not deliver.
     async fn next(&mut self) -> Option<Next> {
         let stop = self.stop.clone();
-        let stopped = async {
-            stop.cancelled().await;
-            None
-        };
         let next = async {
             if let Ok(input) = self.prompts.recv_async().await {
                 return Some(Next::Prompt(input));
@@ -249,7 +252,11 @@ impl Inputs {
             }
             self.keep_alive.next_input().await.map(Next::Woken)
         };
-        or(stopped, next).await
+        tokio::select! {
+            biased;
+            () = stop.cancelled() => None,
+            next = next => next,
+        }
     }
 
     /// What never reached the model dies with the process once stopped.
@@ -307,7 +314,7 @@ pub struct SessionEnd {
     mcp: Option<McpHandle>,
 }
 
-pub type SessionTask = smol::Task<SessionEnd>;
+pub type SessionTask = AbortOnDropHandle<SessionEnd>;
 
 /// Read once at startup. A headless host has no `/cd` and its slots come from
 /// the caller, so nothing here changes mid-session.
@@ -510,7 +517,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let task_permissions = Arc::clone(&permissions);
     let spend = Arc::<RunLedger>::default();
     let track_spend = Arc::clone(&spend);
-    let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
+    let task = tokio::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let mut provider = connect(&mut model, params.timeouts, &base_tx).await?;
         let mut track = SessionTrack::open(
@@ -549,7 +556,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
         while let Some(next) = inputs.next().await {
             let (trigger, cancel) = params.stop.child();
-            let cancel_task = smol::spawn({
+            let cancel_task = tokio::spawn({
                 let cancel_rx = cancel_rx.clone();
                 async move {
                     if cancel_rx.recv_async().await.is_ok() {
@@ -599,7 +606,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             // taker. A call moved to the background can still be parked on
             // it after its run ended: then whatever is queued may be its
             // answer, and the new run must not wait for it to arrive.
-            if let Some(answers) = answer_rx.try_lock() {
+            if let Ok(answers) = answer_rx.try_lock() {
                 while answers.try_recv().is_ok() {}
             }
 
@@ -641,7 +648,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
             let result = agent.run(input).await;
             drop(agent);
-            cancel_task.cancel().await;
+            cancel_task.abort();
+            let _ = cancel_task.await;
 
             if let Err(ref e) = result {
                 error!(error = %e, "agent error");
@@ -665,7 +673,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             mode_tx,
             session_id: session_ref,
             permissions,
-            task,
+            task: AbortOnDropHandle::new(task),
             spend,
         },
         events,
@@ -675,17 +683,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 /// Waits for a session task, then tears its MCP down. The task itself is
 /// never bounded: one with work left would drop prompts stdin already queued.
 pub async fn await_shutdown(task: SessionTask) -> Option<SessionTrack> {
-    task.await.shut_down().await
+    task.await.expect("session task panicked").shut_down().await
 }
 
 impl SessionEnd {
     /// Gives up on a teardown that wedges. The track comes back either way.
     async fn shut_down(self) -> Option<SessionTrack> {
         if let Some(mcp) = self.mcp {
-            let wedged = async {
-                Timer::after(SESSION_SHUTDOWN_TIMEOUT).await;
-            };
-            or(mcp.shutdown(), wedged).await;
+            let _ = timeout(SESSION_SHUTDOWN_TIMEOUT, mcp.shutdown()).await;
         }
         self.track
     }
@@ -720,7 +725,7 @@ mod tests {
     use std::pin::pin;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use futures_lite::future::poll_once;
+    use futures::FutureExt;
     use maki_storage::id::MakiId;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -860,8 +865,8 @@ mod tests {
     /// starts, so a wedged teardown can neither hold the consumer nor drop
     /// the track on an executor thread. The retained sender is the Lua tool
     /// context an idle VM never collects.
-    #[test]
-    fn the_run_ends_the_stream_and_hands_back_its_track_before_mcp_teardown() {
+    #[tokio::test]
+    async fn the_run_ends_the_stream_and_hands_back_its_track_before_mcp_teardown() {
         let tmp = TempDir::new().unwrap();
         let id = MakiId::generate();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
@@ -880,42 +885,37 @@ mod tests {
         let event_tx = retained.clone();
         let (cmd_tx, cmd_rx) = flume::unbounded();
 
-        let ended = smol::block_on(run_session(
-            guard,
-            Some(McpHandle::for_test(cmd_tx)),
-            async move {
-                let _ = event_tx.send(AgentEvent::Error {
-                    message: PROVIDER_ERROR.into(),
-                    auth: false,
-                    totals: RunTotals::default(),
-                });
-                Some(track)
-            },
-        ));
+        let ended = run_session(guard, Some(McpHandle::for_test(cmd_tx)), async move {
+            let _ = event_tx.send(AgentEvent::Error {
+                message: PROVIDER_ERROR.into(),
+                auth: false,
+                totals: RunTotals::default(),
+            });
+            Some(track)
+        })
+        .await;
         assert!(cmd_rx.is_empty(), "{TEARDOWN_AFTER_TRACK}");
 
-        smol::block_on(async {
-            let envelope = events.next().await.expect(BODY_EVENT);
-            assert!(matches!(
-                envelope.event,
-                AgentEvent::Error { message, .. } if message == PROVIDER_ERROR
-            ));
-            assert!(
-                matches!(poll_once(events.next()).await, Some(None)),
-                "{STREAM_ENDED}"
-            );
+        let envelope = events.next().await.expect(BODY_EVENT);
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::Error { message, .. } if message == PROVIDER_ERROR
+        ));
+        assert!(
+            matches!(events.next().now_or_never(), Some(None)),
+            "{STREAM_ENDED}"
+        );
 
-            let mut shutdown = pin!(ended.shut_down());
-            assert!(
-                poll_once(shutdown.as_mut()).await.is_none(),
-                "{SHUTDOWN_WEDGED}"
-            );
-            let Ok(McpCommand::Shutdown { ack }) = cmd_rx.try_recv() else {
-                panic!("{SHUTDOWN_WEDGED}");
-            };
-            ack.send(()).unwrap();
-            assert!(shutdown.await.is_some(), "{TRACK_RETURNED}");
-        });
+        let mut shutdown = pin!(ended.shut_down());
+        assert!(
+            shutdown.as_mut().now_or_never().is_none(),
+            "{SHUTDOWN_WEDGED}"
+        );
+        let Ok(McpCommand::Shutdown { ack }) = cmd_rx.try_recv() else {
+            panic!("{SHUTDOWN_WEDGED}");
+        };
+        ack.send(()).unwrap();
+        assert!(shutdown.await.is_some(), "{TRACK_RETURNED}");
         assert!(retained.send(AgentEvent::Nudge).is_ok());
     }
 
@@ -969,8 +969,8 @@ mod tests {
     /// the input ends, the result wakes a turn of its own, and that turn's
     /// notices are already out of the mailbox, so a failed model switch must
     /// not skip it the way it skips a prompt.
-    #[test]
-    fn only_input_end_wakes_a_turn_and_a_failed_switch_keeps_it() {
+    #[tokio::test]
+    async fn only_input_end_wakes_a_turn_and_a_failed_switch_keeps_it() {
         let mailbox = SessionMailbox::register(MakiId::generate());
         let (mut inputs, prompt_tx, _mode_tx) = inputs_for(
             &mailbox,
@@ -979,35 +979,33 @@ mod tests {
         );
         mailbox.track(TASK_ID);
 
-        smol::block_on(async {
-            prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
-            let prompt = inputs.next().await.expect(PROMPT_ARRIVES);
-            assert!(
-                !prompt.survives_failed_switch(),
-                "{PROMPT_ANSWERED_BY_ERROR}"
-            );
-            inputs.keep_alive.follow(&prompt.into_input());
+        prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        let prompt = inputs.next().await.expect(PROMPT_ARRIVES);
+        assert!(
+            !prompt.survives_failed_switch(),
+            "{PROMPT_ANSWERED_BY_ERROR}"
+        );
+        inputs.keep_alive.follow(&prompt.into_input());
 
-            settle_waking(&mailbox);
-            assert!(
-                poll_once(inputs.next()).await.is_none(),
-                "{NO_WAKE_WHILE_OPEN}"
-            );
+        settle_waking(&mailbox);
+        assert!(
+            inputs.next().now_or_never().is_none(),
+            "{NO_WAKE_WHILE_OPEN}"
+        );
 
-            drop(prompt_tx);
-            let woken = inputs.next().await.expect(WAKES_AFTER_INPUT_END);
-            assert!(woken.survives_failed_switch(), "{WOKEN_NOTICES_KEPT}");
-            let woken = woken.into_input();
-            assert_eq!(woken.preamble.len(), 1);
-            assert_eq!(woken.preamble[0].first_text_content(), Some(NOTICE_BODY));
-        });
+        drop(prompt_tx);
+        let woken = inputs.next().await.expect(WAKES_AFTER_INPUT_END);
+        assert!(woken.survives_failed_switch(), "{WOKEN_NOTICES_KEPT}");
+        let woken = woken.into_input();
+        assert_eq!(woken.preamble.len(), 1);
+        assert_eq!(woken.preamble[0].first_text_content(), Some(NOTICE_BODY));
     }
 
     /// The host switched to plan mode after its last prompt, then ended its
     /// input. The woken turn must run in plan mode, and adopting its settings
     /// must leave background work blocked from writing.
-    #[test]
-    fn a_woken_turn_runs_in_the_mode_switched_to_after_the_last_prompt() {
+    #[tokio::test]
+    async fn a_woken_turn_runs_in_the_mode_switched_to_after_the_last_prompt() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
         let background = BackgroundMode::KeepAlive(LONG_WAIT);
@@ -1016,7 +1014,7 @@ mod tests {
             inputs_for(&mailbox, background, CancelToken::none());
         mailbox.track(TASK_ID);
 
-        let woken = smol::block_on(async {
+        let woken = async {
             prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
             let prompt = inputs.next().await.expect(PROMPT_ARRIVES).into_input();
             adopt_chat_settings(seed.as_deref(), &prompt);
@@ -1030,7 +1028,8 @@ mod tests {
                 .await
                 .expect(WAKES_AFTER_INPUT_END)
                 .into_input()
-        });
+        }
+        .await;
         adopt_chat_settings(seed.as_deref(), &woken);
 
         assert_eq!(woken.mode, plan_mode(), "{RUNS_IN_CURRENT_MODE}");
@@ -1044,8 +1043,8 @@ mod tests {
     /// `-p` is this with one prompt. A failed run is never woken again, so
     /// the session ends at once, and the result it would have woken with
     /// stays unsettled for the warning and the session meta.
-    #[test]
-    fn a_failed_run_ends_the_session_once_the_input_ends() {
+    #[tokio::test]
+    async fn a_failed_run_ends_the_session_once_the_input_ends() {
         let mailbox = SessionMailbox::register(MakiId::generate());
         let (mut inputs, prompt_tx, _mode_tx) = inputs_for(
             &mailbox,
@@ -1054,16 +1053,14 @@ mod tests {
         );
         mailbox.track(TASK_ID);
 
-        smol::block_on(async {
-            prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
-            drop(prompt_tx);
-            let prompt = inputs.next().await.expect(PROMPT_ARRIVES).into_input();
-            inputs.keep_alive.follow(&prompt);
-            inputs.keep_alive.fail();
+        prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        drop(prompt_tx);
+        let prompt = inputs.next().await.expect(PROMPT_ARRIVES).into_input();
+        inputs.keep_alive.follow(&prompt);
+        inputs.keep_alive.fail();
 
-            settle_waking(&mailbox);
-            assert!(inputs.next().await.is_none(), "{FAILED_RUN_ENDS_SESSION}");
-        });
+        settle_waking(&mailbox);
+        assert!(inputs.next().await.is_none(), "{FAILED_RUN_ENDS_SESSION}");
         assert_eq!(mailbox.unsettled(), [TASK_ID], "{KEPT_FOR_META}");
     }
 
@@ -1091,29 +1088,27 @@ mod tests {
         assert_eq!(AgentSeed::live(id).is_some(), seeded);
     }
 
-    #[test]
-    fn keep_alive_runs_a_woken_turn_after_a_settled_receipt_then_ends() {
+    #[tokio::test]
+    async fn keep_alive_runs_a_woken_turn_after_a_settled_receipt_then_ends() {
         let mailbox = SessionMailbox::register(MakiId::generate());
         let mut keep_alive = KeepAlive::new(mailbox.clone(), BackgroundMode::KeepAlive(LONG_WAIT));
         mailbox.track(TASK_ID);
         keep_alive.follow(&prompt_input());
 
-        smol::block_on(async {
-            let woken = {
-                let mut next = pin!(keep_alive.next_input());
-                assert!(poll_once(next.as_mut()).await.is_none(), "{WAITS_FOR_WORK}");
-                settle_waking(&mailbox);
-                next.await.expect(WAKES_AFTER_INPUT_END)
-            };
+        let woken = {
+            let mut next = pin!(keep_alive.next_input());
+            assert!(next.as_mut().now_or_never().is_none(), "{WAITS_FOR_WORK}");
+            settle_waking(&mailbox);
+            next.await.expect(WAKES_AFTER_INPUT_END)
+        };
 
-            assert!(woken.message.is_empty());
-            assert_eq!(woken.mode, plan_mode());
-            assert_eq!(woken.preamble.len(), 1);
-            assert_eq!(woken.preamble[0].first_text_content(), Some(NOTICE_BODY));
+        assert!(woken.message.is_empty());
+        assert_eq!(woken.mode, plan_mode());
+        assert_eq!(woken.preamble.len(), 1);
+        assert_eq!(woken.preamble[0].first_text_content(), Some(NOTICE_BODY));
 
-            keep_alive.follow(&woken);
-            assert!(keep_alive.next_input().await.is_none(), "{ENDS_WHEN_IDLE}");
-        });
+        keep_alive.follow(&woken);
+        assert!(keep_alive.next_input().await.is_none(), "{ENDS_WHEN_IDLE}");
     }
 
     /// With a zero wait the deadline has passed by the first wake. A wake
@@ -1121,7 +1116,8 @@ mod tests {
     /// outrun the deadline, or a chain of them would keep the process up.
     #[test_case(false ; "while_work_is_still_out")]
     #[test_case(true ; "over_a_queued_wake")]
-    fn keep_alive_lapses(wake_queued: bool) {
+    #[tokio::test]
+    async fn keep_alive_lapses(wake_queued: bool) {
         let mailbox = SessionMailbox::register(MakiId::generate());
         mailbox.track(TASK_ID);
         if wake_queued {
@@ -1131,12 +1127,12 @@ mod tests {
             KeepAlive::new(mailbox.clone(), BackgroundMode::KeepAlive(Duration::ZERO));
         keep_alive.follow(&prompt_input());
 
-        assert!(smol::block_on(keep_alive.next_input()).is_none());
+        assert!(keep_alive.next_input().await.is_none());
         assert_eq!(mailbox.unsettled(), [TASK_ID], "{KEPT_FOR_META}");
     }
 
-    #[test]
-    fn a_stop_ends_the_keep_alive_wait_while_work_is_out() {
+    #[tokio::test]
+    async fn a_stop_ends_the_keep_alive_wait_while_work_is_out() {
         let mailbox = SessionMailbox::register(MakiId::generate());
         mailbox.track(TASK_ID);
         let (trigger, stop) = CancelToken::new();
@@ -1145,12 +1141,10 @@ mod tests {
         drop(prompt_tx);
         inputs.keep_alive.follow(&prompt_input());
 
-        smol::block_on(async {
-            let mut next = pin!(inputs.next());
-            assert!(poll_once(next.as_mut()).await.is_none(), "{WAITS_FOR_WORK}");
-            trigger.cancel();
-            assert!(next.await.is_none(), "{STOP_ENDS_SESSION}");
-        });
+        let mut next = pin!(inputs.next());
+        assert!(next.as_mut().now_or_never().is_none(), "{WAITS_FOR_WORK}");
+        trigger.cancel();
+        assert!(next.await.is_none(), "{STOP_ENDS_SESSION}");
         assert_eq!(mailbox.unsettled(), [TASK_ID], "{KEPT_FOR_META}");
     }
 
@@ -1158,7 +1152,8 @@ mod tests {
     /// queued, and no woken notices, which then stay unsettled for the meta.
     #[test_case(true ; "a_queued_prompt")]
     #[test_case(false ; "a_queued_wake")]
-    fn a_stop_wins_over_a_ready_input(prompt_queued: bool) {
+    #[tokio::test]
+    async fn a_stop_wins_over_a_ready_input(prompt_queued: bool) {
         let mailbox = SessionMailbox::register(MakiId::generate());
         mailbox.track(TASK_ID);
         let (trigger, stop) = CancelToken::new();
@@ -1173,51 +1168,46 @@ mod tests {
         settle_waking(&mailbox);
         trigger.cancel();
 
-        assert!(
-            smol::block_on(inputs.next()).is_none(),
-            "{STOP_ENDS_SESSION}"
-        );
+        assert!(inputs.next().await.is_none(), "{STOP_ENDS_SESSION}");
         assert_eq!(mailbox.unsettled(), [TASK_ID], "{KEPT_FOR_META}");
     }
 
     /// ACP's mode: results ride the next prompt, and nothing holds the
     /// session open once its input ends.
-    #[test]
-    fn detached_never_keeps_the_session_alive() {
+    #[tokio::test]
+    async fn detached_never_keeps_the_session_alive() {
         let mailbox = SessionMailbox::register(MakiId::generate());
         mailbox.track(TASK_ID);
         let mut keep_alive = KeepAlive::new(mailbox, BackgroundMode::Detached);
 
         keep_alive.follow(&prompt_input());
 
-        assert!(smol::block_on(keep_alive.next_input()).is_none());
+        assert!(keep_alive.next_input().await.is_none());
     }
 
     /// `await_shutdown` bounds teardown, not the session: a task with work left
     /// runs to completion. Dropping it here would cancel prompts stdin already
     /// queued.
-    #[test]
-    fn await_shutdown_waits_for_a_task_that_still_works() {
+    #[tokio::test]
+    async fn await_shutdown_waits_for_a_task_that_still_works() {
         let (release_tx, release_rx) = flume::bounded::<()>(1);
         let finished = Arc::new(AtomicBool::new(false));
-        let task = smol::spawn({
+        let task = AbortOnDropHandle::new(tokio::spawn({
             let finished = Arc::clone(&finished);
             async move {
                 let _ = release_rx.recv_async().await;
                 finished.store(true, Ordering::SeqCst);
                 SessionEnd::default()
             }
-        });
+        }));
 
-        smol::block_on(async {
-            let mut shutdown = pin!(await_shutdown(task));
-            assert!(
-                poll_once(shutdown.as_mut()).await.is_none(),
-                "{STILL_WORKING}"
-            );
-            release_tx.send(()).unwrap();
-            shutdown.await;
-        });
+        let mut shutdown = pin!(await_shutdown(task));
+        assert!(
+            shutdown.as_mut().now_or_never().is_none(),
+            "{STILL_WORKING}"
+        );
+        release_tx.send(()).unwrap();
+        shutdown.await;
         assert!(finished.load(Ordering::SeqCst), "{TASK_DROPPED}");
     }
 }

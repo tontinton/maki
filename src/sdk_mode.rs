@@ -36,9 +36,8 @@ use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
-use smol::Unblock;
-use smol::io::{AsyncBufReadExt, BufReader};
-use smol::stream::StreamExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::cli::Cli;
@@ -545,7 +544,7 @@ struct Shared {
 
 /// Hands back the interrupt it ran under, for the caller to exit with once
 /// the plugin host is down.
-pub fn run(params: SdkParams) -> Result<Interrupt> {
+pub async fn run(params: SdkParams) -> Result<Interrupt> {
     let SdkParams {
         cli,
         resumed,
@@ -573,8 +572,7 @@ pub fn run(params: SdkParams) -> Result<Interrupt> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
 
-    let (mcp_handle, mcp_config_errors) =
-        smol::block_on(mcp::start_connected(&cwd, project_config.clone()));
+    let (mcp_handle, mcp_config_errors) = mcp::start_connected(&cwd, project_config.clone()).await;
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -677,10 +675,12 @@ pub fn run(params: SdkParams) -> Result<Interrupt> {
     }
     .spawn(events);
 
-    // Read off the main thread, so a stop does not wait for the next line.
-    let mut lines = BufReader::new(Unblock::new(io::stdin())).lines();
-    while let Ok(Some(line)) = smol::block_on(stop.race(lines.next())) {
-        let line = line.context("read stdin")?;
+    // Read on a blocking thread, so a stop does not wait for the next line.
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    while let Ok(next) = stop.race(lines.next_line()).await {
+        let Some(line) = next.context("read stdin")? else {
+            break;
+        };
         if line.is_empty() {
             continue;
         }
@@ -775,12 +775,10 @@ pub fn run(params: SdkParams) -> Result<Interrupt> {
         ..
     } = handle;
     drop(input_tx);
-    let (reported, track) = smol::block_on(async {
-        // Unbounded: the pump ends at the stream marker, which the session
-        // emits once it has answered every prompt stdin queued.
-        let reported = pump.await;
-        (reported, headless::await_shutdown(task).await)
-    });
+    // Unbounded: the pump ends at the stream marker, which the session
+    // emits once it has answered every prompt stdin queued.
+    let reported = pump.await.context("event pump")?;
+    let track = headless::await_shutdown(task).await;
     // Reaps session-owned plugin jobs before the writer thread joins: an
     // orphan inheriting stdout would keep an orchestrator's read blocked
     // after maki exits.
@@ -987,8 +985,8 @@ struct EventPump {
 
 impl EventPump {
     /// Ends with what its results reported.
-    fn spawn(mut self, mut events: SessionEvents) -> smol::Task<RunTotals> {
-        smol::spawn(async move {
+    fn spawn(mut self, mut events: SessionEvents) -> JoinHandle<RunTotals> {
+        tokio::spawn(async move {
             while let Some(envelope) = events.next().await {
                 // Folded in first, so a plugin handling `TurnEnd` finds the
                 // finished totals when it calls `maki.session.read()`.
@@ -1755,8 +1753,8 @@ mod tests {
     /// The SDK hang: `retained` is the Lua tool context that keeps a sender
     /// alive on an idle VM, so the pump has to end on the stream marker and
     /// still report everything queued ahead of it.
-    #[test]
-    fn pump_ends_at_stream_close_with_a_retained_sender() {
+    #[tokio::test]
+    async fn pump_ends_at_stream_close_with_a_retained_sender() {
         let (guard, events) = maki_agent::event_stream();
         let retained = guard.sender(0);
         let (pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
@@ -1770,7 +1768,7 @@ mod tests {
             })
             .unwrap();
         drop(guard);
-        smol::block_on(pump);
+        pump.await.unwrap();
 
         let line = out_rx.try_recv().expect(PUMP_FORWARDED);
         assert!(line.contains(PUMP_ERROR), "got: {line}");

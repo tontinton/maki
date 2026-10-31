@@ -16,6 +16,7 @@ use maki_agent::{
     AgentEvent, AgentMode, AgentSeed, CallScope, CancelToken, Envelope, EventSender,
     SessionMailbox, SharedBuf, ToolDoneEvent,
 };
+use maki_lua::test_support::runtime;
 use maki_lua::{EventHandle, MoveOutcome, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -80,7 +81,7 @@ pub fn exec(reg: &Arc<ToolRegistry>, name: &str, input: Value, ctx: &ToolContext
         ..ctx.clone()
     };
     let id = ctx.tool_use_id.clone().unwrap_or_default();
-    smol::block_on(tool_dispatch::run(
+    runtime().block_on(tool_dispatch::run(
         id,
         name,
         &input,

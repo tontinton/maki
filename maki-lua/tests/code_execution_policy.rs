@@ -13,6 +13,7 @@ use maki_agent::tools::{
 };
 use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::PluginHost;
+use maki_lua::test_support::runtime;
 
 const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init.lua");
 
@@ -192,7 +193,8 @@ fn run_tool(
 ) -> Result<String, String> {
     let entry = reg.get(name).unwrap_or_else(|| panic!("{name} registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(async { inv.execute(ctx).await })
+    runtime()
+        .block_on(inv.execute(ctx))
         .output
         .map(|out| match out {
             maki_agent::ToolOutput::Plain(s) => s.text,
@@ -569,7 +571,7 @@ fn start_preview_text(code: &str) -> String {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, code);
     let (ctx, rx) = event_ctx(&reg);
-    smol::block_on(inv.start(&ctx));
+    runtime().block_on(inv.start(&ctx));
     let body = rx
         .drain()
         .find_map(|env| match env.event {
@@ -635,7 +637,8 @@ fn handler_renders_script_when_start_never_ran() {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, "print('hi')");
     let (ctx, rx) = event_ctx(&reg);
-    smol::block_on(inv.execute(&ctx))
+    runtime()
+        .block_on(inv.execute(&ctx))
         .output
         .expect("execute ok");
     let text = final_body_text(&rx);
@@ -662,7 +665,8 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, "print(boom_undefined)");
     let (ctx, rx) = event_ctx(&reg);
-    let err = smol::block_on(inv.execute(&ctx))
+    let err = runtime()
+        .block_on(inv.execute(&ctx))
         .output
         .expect_err("undefined name must error");
     let text = final_body_text(&rx);

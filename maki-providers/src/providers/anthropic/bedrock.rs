@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use async_compat::Compat;
 use base64::Engine;
 use flume::Sender;
 use hmac::{Hmac, KeyInit, Mac};
@@ -12,6 +11,8 @@ use maki_storage::id::SessionRef;
 use reqwest::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::runtime::Handle;
+use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
 use crate::model::Model;
@@ -200,7 +201,8 @@ fn fetch_container_credentials(
     }
     let request = builder.build()?;
 
-    let (status, body_text) = smol::block_on(super::super::status_and_text(&client, request))
+    let (status, body_text) = Handle::current()
+        .block_on(super::super::status_and_text(&client, request))
         .map_err(|e| AgentError::Config {
             message: format!("container creds request: {e}"),
         })?;
@@ -544,10 +546,10 @@ impl Provider for Bedrock {
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(Compat::new(async move {
+        Box::pin(async move {
             if self.needs_refresh() {
                 debug!("Bedrock container creds missing or near expiry, fetching before request");
-                let kind = smol::unblock(fetch_container_auth).await?;
+                let kind = spawn_blocking(fetch_container_auth).await??;
                 self.auth.lock().unwrap().kind = kind;
             }
             let auth = self.auth.lock().unwrap().clone();
@@ -689,7 +691,7 @@ impl Provider for Bedrock {
             }
 
             Ok(parser.finish())
-        }))
+        })
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -705,7 +707,7 @@ impl Provider for Bedrock {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let new_auth = smol::unblock(resolve_bedrock_auth).await?;
+            let new_auth = spawn_blocking(resolve_bedrock_auth).await??;
             *self.auth.lock().unwrap() = new_auth;
             debug!("reloaded Bedrock auth from env");
             Ok(())
@@ -976,53 +978,49 @@ aws_session_token = MYTOKEN\n";
         assert_eq!(parse_iso8601_to_epoch(input), expected);
     }
 
-    #[test]
-    fn event_parser_text_stream() {
-        smol::block_on(async {
-            let (tx, rx) = flume::unbounded();
-            let mut parser = shared::EventParser::new();
+    #[tokio::test]
+    async fn event_parser_text_stream() {
+        let (tx, rx) = flume::unbounded();
+        let mut parser = shared::EventParser::new();
 
-            let steps: &[(&str, &str)] = &[
-                (
-                    "message_start",
-                    r#"{"type":"message_start","message":{"usage":{"input_tokens":10}}}"#,
-                ),
-                (
-                    "content_block_start",
-                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
-                ),
-                (
-                    "content_block_delta",
-                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
-                ),
-            ];
-            for (event, data) in steps {
-                assert!(
-                    parser
-                        .process(event, data, &tx)
-                        .await
-                        .unwrap()
-                        .is_continue()
-                );
-            }
+        let steps: &[(&str, &str)] = &[
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":10}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
+            ),
+        ];
+        for (event, data) in steps {
             assert!(
                 parser
-                    .process("message_stop", r#"{"type":"message_stop"}"#, &tx)
+                    .process(event, data, &tx)
                     .await
                     .unwrap()
-                    .is_break()
+                    .is_continue()
             );
+        }
+        assert!(
+            parser
+                .process("message_stop", r#"{"type":"message_stop"}"#, &tx)
+                .await
+                .unwrap()
+                .is_break()
+        );
 
-            let resp = parser.finish();
-            assert_eq!(resp.usage.input, 10);
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello")
-            );
-            assert!(
-                rx.drain()
-                    .any(|e| matches!(e, ProviderEvent::TextDelta { text } if text == "Hello"))
-            );
-        })
+        let resp = parser.finish();
+        assert_eq!(resp.usage.input, 10);
+        assert!(matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello"));
+        assert!(
+            rx.drain()
+                .any(|e| matches!(e, ProviderEvent::TextDelta { text } if text == "Hello"))
+        );
     }
 
     #[test_case("https://host.com/path?q=1", "host.com", "/path", "q=1" ; "with_query")]

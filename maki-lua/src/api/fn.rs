@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -18,6 +19,7 @@ use maki_providers::{shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
+use tokio::time::sleep;
 
 use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
 use crate::api::keymap::{InputMode, KeymapWriter};
@@ -1419,18 +1421,17 @@ async fn jobwait(
     let receiver = CheckedOutReceiver::new(&lua, job_id, receiver);
 
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_WAIT_MS));
-    let deadline = smol::Timer::after(timeout);
-    futures_lite::pin!(deadline);
+    let mut deadline = pin!(sleep(timeout));
 
     let mut stdout_lines = Vec::new();
     let mut stderr_lines = Vec::new();
 
     let exit_code = loop {
-        let event = futures_lite::future::or(async { receiver.get().recv_async().await }, async {
-            (&mut deadline).await;
-            None
-        })
-        .await;
+        let event = tokio::select! {
+            biased;
+            event = receiver.get().recv_async() => event,
+            () = &mut deadline => None,
+        };
 
         let Some(event) = event else {
             return Ok(err_pair(JOB_WAIT_TIMEOUT_ERR));
@@ -1473,7 +1474,7 @@ fn wait_result(
 /// both deliver events identically.
 ///
 /// The callback runs in a fresh coroutine so it may suspend (the
-/// `maki.fs.*` helpers park on `smol::unblock`); resumed inline from a
+/// `maki.fs.*` helpers park on `spawn_blocking`); resumed inline from a
 /// poll loop it would die with "attempt to yield across metamethod /
 /// C-call boundary" on its first suspension.
 pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) -> LuaResult<()> {
@@ -1986,16 +1987,16 @@ mod tests {
 
     #[test_case::test_case("return f.winsaveview()" ; "winsaveview")]
     #[test_case::test_case("return f.winrestview({ topline = 3 })" ; "winrestview")]
-    fn view_without_ui_returns_error_pair(code: &str) {
+    #[tokio::test]
+    async fn view_without_ui_returns_error_pair(code: &str) {
         let lua = lua_with_view(None);
-        let (val, err): (Value, Option<String>) =
-            smol::block_on(lua.load(code).eval_async()).unwrap();
+        let (val, err): (Value, Option<String>) = lua.load(code).eval_async().await.unwrap();
         assert!(val.is_nil());
         assert_eq!(err.as_deref(), Some(NO_UI_ERR));
     }
 
-    #[test]
-    fn winsaveview_reports_the_viewport_one_based() {
+    #[tokio::test]
+    async fn winsaveview_reports_the_viewport_one_based() {
         const SCROLL_TOP: u32 = 6;
         const LINE_COUNT: u32 = 100;
         const HEIGHT: u16 = 24;
@@ -2015,8 +2016,11 @@ mod tests {
                 })
                 .unwrap();
         });
-        let (view, err): (Table, Option<String>) =
-            smol::block_on(lua.load("return f.winsaveview()").eval_async()).unwrap();
+        let (view, err): (Table, Option<String>) = lua
+            .load("return f.winsaveview()")
+            .eval_async()
+            .await
+            .unwrap();
         assert_eq!(err, None);
         assert_eq!(view.get::<u32>("topline").unwrap(), SCROLL_TOP + 1);
         assert_eq!(view.get::<u32>("line_count").unwrap(), LINE_COUNT);
@@ -2027,14 +2031,15 @@ mod tests {
     #[test_case::test_case("{ topline = 12 }", 11 ; "explicit_topline")]
     #[test_case::test_case("{}", 0 ; "missing_topline_defaults_to_first_line")]
     #[test_case::test_case("{ topline = -5 }", 0 ; "below_range_clamps_to_first_line")]
-    fn winrestview_forwards_zero_based_scroll_top(arg: &str, expected: u32) {
+    #[tokio::test]
+    async fn winrestview_forwards_zero_based_scroll_top(arg: &str, expected: u32) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_view(Some(tx));
-        let (ok, err): (bool, Option<String>) = smol::block_on(
-            lua.load(format!("return f.winrestview({arg})"))
-                .eval_async(),
-        )
-        .unwrap();
+        let (ok, err): (bool, Option<String>) = lua
+            .load(format!("return f.winrestview({arg})"))
+            .eval_async()
+            .await
+            .unwrap();
         assert!(ok);
         assert_eq!(err, None);
         let Ok(UiAction::WinRestView { scroll_top }) = rx.recv() else {
@@ -2043,8 +2048,8 @@ mod tests {
         assert_eq!(scroll_top, expected);
     }
 
-    #[test]
-    fn exit_cleanup_runs_before_a_failing_callback() {
+    #[tokio::test]
+    async fn exit_cleanup_runs_before_a_failing_callback() {
         let lua = Lua::new();
         lua.set_app_data(JobStore::new());
         let callback = lua
@@ -2057,7 +2062,11 @@ mod tests {
                 .insert(1, stub_job(task_owner(1), None, Some(callback_key)));
         });
 
-        assert!(smol::block_on(deliver_job_event(&lua, 1, &JobEvent::Exit(0))).is_err());
+        assert!(
+            deliver_job_event(&lua, 1, &JobEvent::Exit(0))
+                .await
+                .is_err()
+        );
         assert!(with_jobs(&lua, |store| store.is_empty(&task_owner(1))));
     }
 

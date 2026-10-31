@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use flume::Sender;
 use maki_storage::id::SessionRef;
 use serde_json::Value;
+use tokio::task::spawn_blocking;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
@@ -182,13 +183,13 @@ impl Opencode {
     }
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
-        Ok(smol::unblock(move || {
+        Ok(spawn_blocking(move || {
             let guard = init_shared_catalog_if_needed().lock().unwrap();
             guard.provider(ZEN_SLUG).map_or_else(Vec::new, |data| {
                 data.available_models(&guard.state_dir, data.free_models_enabled())
             })
         })
-        .await)
+        .await?)
     }
 
     async fn lookup(
@@ -201,7 +202,7 @@ impl Opencode {
         let actual_id = actual_id.to_string();
         let session_id = session_id.cloned();
         let auth_override = self.auth.clone();
-        smol::unblock(move || {
+        spawn_blocking(move || {
             let guard = init_shared_catalog_if_needed().lock().unwrap();
             let (meta, provider_data) = guard.lookup(&sub_provider, &actual_id)?;
             let override_auth = auth_override
@@ -223,7 +224,7 @@ impl Opencode {
             let auth = provider_data.request_auth(auth, session_id.as_ref());
             Ok((meta.clone(), provider_data.api_format, auth))
         })
-        .await
+        .await?
     }
 }
 

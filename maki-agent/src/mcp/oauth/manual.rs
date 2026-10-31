@@ -1,5 +1,4 @@
-use futures_lite::{AsyncBufReadExt, StreamExt, io::BufReader};
-use smol::Unblock;
+use tokio::io::{AsyncBufReadExt, BufReader, stdin};
 
 use super::callback::{CallbackResult, parse_query};
 
@@ -8,13 +7,16 @@ const MISSING_PARAMS: &str = "missing code or state parameter";
 const STATE_MISMATCH: &str = "state mismatch (wrong or stale login attempt)";
 
 pub(crate) async fn wait_for_paste(expected_state: &str) -> Result<CallbackResult, String> {
-    // If the callback server wins the race, the Unblock stdin thread is dropped
-    // mid-read and may swallow one buffered line. Fine here: this only runs in the
-    // CLI flow, which exits right after authentication completes.
-    let mut lines = BufReader::new(Unblock::new(std::io::stdin())).lines();
+    // If the callback server wins the race, the blocking stdin read is dropped
+    // mid-line and may swallow one buffered line. Fine here: this only runs in
+    // the CLI flow, which exits right after authentication completes.
+    let mut lines = BufReader::new(stdin()).lines();
 
-    while let Some(line) = lines.next().await {
-        let line = line.map_err(|e| format!("stdin read failed: {e}"))?;
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("stdin read failed: {e}"))?
+    {
         let line = line.trim();
 
         if line.is_empty() {

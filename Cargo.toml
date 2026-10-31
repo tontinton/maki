@@ -30,11 +30,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-smol = { workspace = true }
-async-signal = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
-async-compat = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
@@ -139,26 +138,24 @@ rustix = { version = "1", features = ["event", "fs", "process"] }
 semver = "1"
 toml = "1.1"
 toml_edit = "0.25"
-smol = "2"
-async-signal = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "net", "io-util", "io-std", "signal", "fs"] }
 arc-swap = "1"
 bitflags = "2"
 event-listener = "5"
-futures-lite = "2"
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-async-compat = "0.2"
 rmcp = { version = "3", default-features = false, features = ["client", "auth", "reqwest", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
 oauth2 = { version = "5", default-features = false }
 async-trait = "0.1"
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+socket2 = "0.6"
 opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["metrics", "logs", "grpc-tonic", "gzip-tonic", "tls-aws-lc", "tls-roots", "http-proto", "http-json", "gzip-http", "reqwest-blocking-client", "reqwest-rustls", "internal-logs"] }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "with-serde", "metrics", "logs"] }
 http = "1"
 percent-encoding = "2"
-futures-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Globalization"] }

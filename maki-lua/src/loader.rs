@@ -12,6 +12,9 @@ use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::{DeclAuthority, keep_granted};
+#[cfg(any(test, feature = "test-support"))]
+use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
+use tokio::task::spawn_blocking;
 
 use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
@@ -36,6 +39,27 @@ use maki_agent::prompt::ResolvedPrompts;
 use maki_storage::id::MakiId;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// The runtime a host built outside `main`'s gets, which is every test.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) static HOST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for plugin hosts")
+});
+/// A `#[tokio::test]` runtime is single-threaded and only advances while the
+/// test awaits, so a host on it could not wake a sleeping Lua task while the
+/// test thread blocks on the host; only a multi-thread runtime is kept.
+#[cfg(any(test, feature = "test-support"))]
+fn enter_test_runtime() -> Option<EnterGuard<'static>> {
+    let on_workers = Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == RuntimeFlavor::MultiThread);
+    (!on_workers).then(|| HOST_RUNTIME.enter())
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn enter_test_runtime() {}
+
 const PACK_STATE_UNAVAILABLE: &str = "could not read package state: plugin host stopped";
 const USER_PLUGIN: &str = "user";
 pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
@@ -325,11 +349,15 @@ impl PluginHost {
     /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
+    ///
+    /// Runs on the current tokio runtime, which `main` enters; a test that
+    /// builds a host without one gets [`HOST_RUNTIME`].
     pub fn start(
         registry: Arc<ToolRegistry>,
         interaction: Interaction,
         jit: bool,
     ) -> Result<Self, PluginError> {
+        let _runtime = enter_test_runtime();
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
@@ -1378,7 +1406,9 @@ impl EventHandle {
     /// whole grace period.
     pub async fn end_session_async(&self, session: MakiId, reason: SessionEndReason) {
         let handle = self.clone();
-        smol::unblock(move || handle.end_sessions_blocking([session], reason)).await;
+        spawn_blocking(move || handle.end_sessions_blocking([session], reason))
+            .await
+            .expect("end_sessions_blocking panicked");
     }
 
     fn send_end_session(

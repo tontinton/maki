@@ -22,8 +22,6 @@ pub use mcp::{
 };
 pub mod inbox;
 pub mod session;
-pub use inbox::SubagentInbox;
-pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, DisplayItem, History, HistorySnapshot, Instructions,
     LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages, Transcript,
@@ -32,6 +30,7 @@ pub use agent::{
 };
 pub use call_scope::{AlreadyMoved, CallGuard, CallScope, SessionStub, TaskHome};
 pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};
+pub use inbox::SubagentInbox;
 pub use live_session::{
     AgentSeed, BackgroundNotice, MailboxError, SessionMailbox, TaskLabel, receipt_tag,
     result_notice,

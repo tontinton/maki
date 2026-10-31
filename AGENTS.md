@@ -52,7 +52,7 @@ Rust workspace, key crates in root dir:
 
 - maki-ui: Uses ratatui for an interactive UI (elm like architecture)
 - maki-providers: Integration with LLM providers via APIs (e.g. Anthropic, Z.AI, xAI)
-- maki-agent: An async agent loop that runs on smol
+- maki-agent: An async agent loop that runs on tokio
 - maki-interpreter: code_execution tool implementation using pydantic/monty (a minimal python sandbox)
 - maki-storage: Persistent state across runs (e.g. sessions, auth)
 - maki-config: User config

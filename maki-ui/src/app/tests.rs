@@ -69,6 +69,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use test_case::test_case;
+use tokio::runtime::EnterGuard;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_OUTPUT_CAP: u32 = 8192;
@@ -221,6 +222,12 @@ fn build_app_with_session(
 
 fn test_writer(dir: StateDir) -> StorageWriter {
     StorageWriter::new(dir, flume::unbounded().0)
+}
+
+/// A synchronous test that spawns tasks or blocks on them the way the UI
+/// thread does holds this for its whole body.
+pub(crate) fn enter_runtime() -> EnterGuard<'static> {
+    maki_lua::test_support::runtime().enter()
 }
 
 pub(crate) fn test_app() -> App {

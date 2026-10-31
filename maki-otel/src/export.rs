@@ -8,7 +8,6 @@ use std::env;
 use std::str::FromStr;
 use std::time::Duration;
 
-use async_compat::Compat;
 use http::{HeaderMap, HeaderValue};
 use maki_config::TelemetryConfig;
 use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
@@ -354,10 +353,7 @@ fn otlp_metrics(
     let otlp = Otlp::new(lua, Signal::Metrics)?;
     let builder = MetricExporter::builder().with_temporality(temporality);
     Ok(match otlp.transport {
-        Transport::Grpc => {
-            let builder = otlp.grpc(builder.with_tonic())?;
-            in_tokio(|| builder.build())?
-        }
+        Transport::Grpc => otlp.grpc(builder.with_tonic())?.build()?,
         Transport::Http(protocol) => otlp.http(builder.with_http(), protocol)?.build()?,
     })
 }
@@ -366,18 +362,9 @@ fn otlp_logs(lua: &TelemetryConfig) -> Result<LogExporter, InitError> {
     let otlp = Otlp::new(lua, Signal::Logs)?;
     let builder = LogExporter::builder();
     Ok(match otlp.transport {
-        Transport::Grpc => {
-            let builder = otlp.grpc(builder.with_tonic())?;
-            in_tokio(|| builder.build())?
-        }
+        Transport::Grpc => otlp.grpc(builder.with_tonic())?.build()?,
         Transport::Http(protocol) => otlp.http(builder.with_http(), protocol)?.build()?,
     })
-}
-
-/// tonic's channel spawns its worker onto the current tokio runtime, so a
-/// gRPC exporter is built inside async-compat's.
-fn in_tokio<T>(build: impl FnOnce() -> T) -> T {
-    smol::block_on(Compat::new(async { build() }))
 }
 
 impl Otlp {
@@ -889,7 +876,8 @@ mod tests {
     #[test_case(OTLP, GRPC, "unix:///tmp/maki-otel.sock"; "grpc_unix_socket")]
     #[test_case(OTLP, HTTP_PROTOBUF, "https://127.0.0.1:9"; "http_tls")]
     #[test_case(CONSOLE, GRPC, ""; "console")]
-    fn providers_build_for_every_exporter(exporter: &str, protocol: &str, endpoint: &str) {
+    #[tokio::test]
+    async fn providers_build_for_every_exporter(exporter: &str, protocol: &str, endpoint: &str) {
         isolate_env();
         let config = TelemetryConfig {
             enabled: Some(true),

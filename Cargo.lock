@@ -298,19 +298,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-compat"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c97d7ff3c25d6c10d64170c12acaf5d4245e76dece3779c1d92b153a64f11df"
-dependencies = [
- "futures-core",
- "futures-io",
- "once_cell",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
 name = "async-compression"
 version = "0.4.51"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -334,17 +321,6 @@ dependencies = [
  "futures-lite",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "async-fs"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8034a681df4aed8b8edbd7fbe472401ecf009251c8b40556b304567052e294c5"
-dependencies = [
- "async-lock",
- "blocking",
- "futures-lite",
 ]
 
 [[package]]
@@ -374,17 +350,6 @@ dependencies = [
  "event-listener",
  "event-listener-strategy",
  "pin-project-lite",
-]
-
-[[package]]
-name = "async-net"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b948000fad4873c1c9339d60f2623323a0cfd3816e5181033c6a5cb68b2accf7"
-dependencies = [
- "async-io",
- "blocking",
- "futures-lite",
 ]
 
 [[package]]
@@ -1895,17 +1860,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "futures-rustls"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8f2f12607f92c69b12ed746fabf9ca4f5c482cba46679c1a75b874ed7c26adb"
-dependencies = [
- "futures-io",
- "rustls",
- "rustls-pki-types",
-]
-
-[[package]]
 name = "futures-sink"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3173,11 +3127,10 @@ dependencies = [
 name = "maki"
 version = "0.6.5"
 dependencies = [
- "async-compat",
- "async-signal",
  "clap",
  "color-eyre",
  "flume",
+ "futures",
  "libc",
  "maki-acp",
  "maki-agent",
@@ -3192,10 +3145,10 @@ dependencies = [
  "rustix 1.1.6",
  "serde",
  "serde_json",
- "smol",
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "unicode-width",
@@ -3209,6 +3162,7 @@ dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
  "flume",
+ "futures",
  "jiff",
  "maki-agent",
  "maki-config",
@@ -3217,9 +3171,10 @@ dependencies = [
  "maki-storage",
  "serde",
  "serde_json",
- "smol",
  "tempfile",
  "test-case",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -3228,13 +3183,11 @@ name = "maki-agent"
 version = "0.6.5"
 dependencies = [
  "arc-swap",
- "async-compat",
  "async-trait",
  "bitflags 2.13.2",
  "event-listener",
  "flume",
- "futures-lite",
- "futures-rustls",
+ "futures",
  "grep-regex",
  "grep-searcher",
  "ignore",
@@ -3257,11 +3210,12 @@ dependencies = [
  "serde_path_to_error",
  "sha2 0.11.1",
  "similar",
- "smol",
  "strum 0.28.0",
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml",
  "toml_edit",
@@ -3311,6 +3265,7 @@ dependencies = [
  "regex",
  "serde_json",
  "test-case",
+ "tokio",
 ]
 
 [[package]]
@@ -3344,7 +3299,6 @@ name = "maki-lua"
 version = "0.6.5"
 dependencies = [
  "arc-swap",
- "async-compat",
  "base64 0.23.1",
  "criterion",
  "crossterm",
@@ -3352,7 +3306,6 @@ dependencies = [
  "fastrand",
  "flume",
  "futures",
- "futures-lite",
  "htmd",
  "image",
  "include_dir",
@@ -3381,11 +3334,12 @@ dependencies = [
  "serde-value",
  "serde_json",
  "shell-words",
- "smol",
+ "socket2",
  "strum 0.28.0",
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
+ "tokio",
  "toml",
  "tracing",
  "tree-sitter",
@@ -3452,7 +3406,6 @@ dependencies = [
 name = "maki-otel"
 version = "0.6.5"
 dependencies = [
- "async-compat",
  "http",
  "maki-config",
  "opentelemetry",
@@ -3461,9 +3414,9 @@ dependencies = [
  "opentelemetry_sdk",
  "percent-encoding",
  "serde_json",
- "smol",
  "test-case",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
 ]
 
@@ -3474,10 +3427,10 @@ dependencies = [
  "maki-storage",
  "serde",
  "serde_json",
- "smol",
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
 ]
 
@@ -3485,12 +3438,10 @@ dependencies = [
 name = "maki-providers"
 version = "0.6.5"
 dependencies = [
- "async-compat",
  "base64 0.23.1",
  "fastrand",
  "flume",
  "futures",
- "futures-lite",
  "getrandom 0.4.3",
  "hmac",
  "image",
@@ -3506,11 +3457,12 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "sha2 0.11.1",
- "smol",
  "strum 0.28.0",
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -3521,7 +3473,6 @@ dependencies = [
 name = "maki-storage"
 version = "0.6.5"
 dependencies = [
- "async-compat",
  "bs58",
  "etcetera",
  "getrandom 0.4.3",
@@ -3547,7 +3498,6 @@ dependencies = [
  "crossterm",
  "fastrand",
  "flume",
- "futures-lite",
  "getrandom 0.4.3",
  "image",
  "jiff",
@@ -3571,12 +3521,13 @@ dependencies = [
  "serde",
  "serde_json",
  "shell-words",
- "smol",
  "strum 0.28.0",
  "syntect",
  "tempfile",
  "termini",
  "test-case",
+ "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "unicode-segmentation",
@@ -6230,23 +6181,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "smol"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a33bd3e260892199c3ccfc487c88b2da2265080acb316cd920da72fdfd7c599f"
-dependencies = [
- "async-channel",
- "async-executor",
- "async-fs",
- "async-io",
- "async-lock",
- "async-net",
- "async-process",
- "blocking",
- "futures-lite",
-]
-
-[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6784,6 +6718,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -6829,8 +6764,8 @@ checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
 dependencies = [
  "bytes",
  "futures-core",
- "futures-io",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

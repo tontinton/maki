@@ -36,12 +36,11 @@ serde-value = { workspace = true }
 semver = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-smol = { workspace = true }
+tokio = { workspace = true }
 strum = { workspace = true }
 event-listener = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
-futures-lite = { workspace = true }
 pin-project-lite = { workspace = true }
 tree-sitter = { workspace = true }
 unicode-width = { workspace = true }
@@ -50,7 +49,7 @@ regex = { workspace = true }
 include_dir = { workspace = true }
 maki-storage = { workspace = true }
 reqwest = { workspace = true, features = ["socks", "gzip", "deflate"] }
-async-compat = { workspace = true }
+socket2 = { workspace = true }
 htmd = { workspace = true }
 jsonschema = { workspace = true }
 toml = { workspace = true }

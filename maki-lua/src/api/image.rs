@@ -15,6 +15,7 @@ use maki_providers::{ImageMediaType, ImageSource};
 use mlua::{
     AnyUserData, Lua, LuaString, Result as LuaResult, Table, UserDataRef, Value as LuaValue,
 };
+use tokio::task::spawn_blocking;
 
 use super::base64::bytes_arg;
 use super::util::pair::{Pair, try_pair};
@@ -246,8 +247,9 @@ async fn resize(
     if max_w == 0 || max_h == 0 {
         return Err(mlua::Error::runtime("resize: dimensions must be positive"));
     }
-    let resized = smol::unblock(move || state.resized(max_w, max_h))
+    let resized = spawn_blocking(move || state.resized(max_w, max_h))
         .await
+        .map_err(mlua::Error::external)?
         .map_err(|e| mlua::Error::runtime(format!("resize: {e}")))?;
     Ok(LuaImage(resized))
 }
@@ -275,8 +277,9 @@ async fn encode(lua: Lua, this: UserDataRef<LuaImage>, format: String) -> LuaRes
             )));
         }
     };
-    let encoded = smol::unblock(move || state.encode(media_type))
+    let encoded = spawn_blocking(move || state.encode(media_type))
         .await
+        .map_err(mlua::Error::external)?
         .map_err(|e| mlua::Error::runtime(format!("encode: {e}")))?;
     lua.create_string(encoded)
 }
@@ -331,7 +334,11 @@ fn probe(lua: &Lua, data: LuaValue) -> LuaResult<Pair<Table>> {
 #[lua_fn]
 async fn decode(lua: Lua, data: LuaValue) -> LuaResult<Pair<AnyUserData>> {
     let bytes = bytes_arg(&data, "image.decode")?;
-    let state = try_pair!(smol::unblock(move || ImageState::from_bytes(&bytes)).await);
+    let state = try_pair!(
+        spawn_blocking(move || ImageState::from_bytes(&bytes))
+            .await
+            .map_err(mlua::Error::external)?
+    );
     Ok((Some(lua.create_userdata(LuaImage(Arc::new(state)))?), None))
 }
 

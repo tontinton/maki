@@ -995,7 +995,7 @@ pub(crate) async fn ui_json_roundtrip(
 mod tests {
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
-    use futures_lite::future::{poll_once, zip};
+    use futures::FutureExt;
     use mlua::Lua;
     use test_case::test_case;
 
@@ -1066,16 +1066,14 @@ mod tests {
     /// The loop's receiver is a clone and the runtime keeps another one for
     /// the whole process, so the channel never disconnects: without the bit a
     /// roundtrip would park on a reply nobody is left to send.
-    #[test]
-    fn ui_roundtrip_fails_once_the_loop_detaches() {
+    #[tokio::test]
+    async fn ui_roundtrip_fails_once_the_loop_detaches() {
         let (tx, rx) = flume::unbounded();
         let attachment = UiAttachment::default();
         install_ui_attachment(attachment.clone());
 
         attachment.detach();
-        let detached = smol::block_on(ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView {
-            reply_tx,
-        }));
+        let detached = ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView { reply_tx }).await;
         assert_eq!(detached.err(), Some(NO_UI_ERR));
         assert!(
             !rx.is_disconnected(),
@@ -1088,12 +1086,12 @@ mod tests {
     }
 
     /// The load is refused, while a task that runs as the load waits is not.
-    #[test]
-    fn only_the_plugin_load_itself_is_refused_a_roundtrip() {
+    #[tokio::test]
+    async fn only_the_plugin_load_itself_is_refused_a_roundtrip() {
         let (tx, rx) = flume::unbounded();
         let (resume_tx, resume_rx) = flume::bounded::<()>(1);
 
-        let (in_load, beside_load) = smol::block_on(zip(
+        let (in_load, beside_load) = tokio::join!(
             as_plugin_load(async {
                 let refused =
                     ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView { reply_tx }).await;
@@ -1101,14 +1099,12 @@ mod tests {
                 refused
             }),
             async {
-                let sent = poll_once(ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView {
-                    reply_tx,
-                }))
-                .await;
+                let sent = ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView { reply_tx })
+                    .now_or_never();
                 resume_tx.send(()).ok();
                 sent
             },
-        ));
+        );
 
         assert_eq!(in_load.err(), Some(PLUGIN_LOADING_ERR));
         assert!(beside_load.is_none(), "still waiting for the UI's answer");

@@ -306,9 +306,8 @@ mod tests {
     }
 
     /// The value comes back as JSON so assertions outlive the Lua state.
-    fn eval(lua: &Lua, script: &str) -> (Json, Option<String>) {
-        let (val, err): (Value, Option<String>) =
-            smol::block_on(lua.load(script).eval_async()).unwrap();
+    async fn eval(lua: &Lua, script: &str) -> (Json, Option<String>) {
+        let (val, err): (Value, Option<String>) = lua.load(script).eval_async().await.unwrap();
         (lua_to_json(lua, &val).unwrap(), err)
     }
 
@@ -322,8 +321,12 @@ mod tests {
     #[test_case("return model.set({ thinking = 8192, fast = true })", json!({ "thinking": "8192", "fast": true }) ; "set_table_without_spec")]
     #[test_case("return model.set({ thinking = '', fast = false })", json!({ "thinking": "", "fast": false }) ; "set_empty_thinking_and_false_fast")]
     #[test_case("local m = model.get() return model.set(m)", json!({ "spec": SPEC, "thinking": THINKING, "fast": true }) ; "set_fed_by_get")]
-    fn requests_cross_the_channel_and_answer_with_the_new_state(script: &str, expected: Json) {
-        assert_eq!(eval(&stub_ui(echo), script), (expected, None));
+    #[tokio::test]
+    async fn requests_cross_the_channel_and_answer_with_the_new_state(
+        script: &str,
+        expected: Json,
+    ) {
+        assert_eq!(eval(&stub_ui(echo), script).await, (expected, None));
     }
 
     /// Every way of not getting an answer lands in the error slot, instead of
@@ -332,19 +335,20 @@ mod tests {
     #[test_case(closed_ui(), NO_UI_ERR ; "event_loop_closed")]
     #[test_case(stub_ui(|_| None), UI_DROPPED_ERR ; "reply_channel_dropped")]
     #[test_case(stub_ui(|_| Some(Err(UI_FAILURE.to_owned()))), UI_FAILURE ; "ui_refused")]
-    fn unanswered_request_returns_an_error_pair(lua: Lua, expected: &str) {
+    #[tokio::test]
+    async fn unanswered_request_returns_an_error_pair(lua: Lua, expected: &str) {
         assert_eq!(
-            eval(&lua, "return model.get()"),
+            eval(&lua, "return model.get()").await,
             (Json::Null, Some(expected.to_owned()))
         );
     }
 
     /// `info` resolves locally: no UI required, and a builtin model answers
     /// with its identity and price table.
-    #[test]
-    fn info_resolves_a_builtin_model_without_a_ui() {
+    #[tokio::test]
+    async fn info_resolves_a_builtin_model_without_a_ui() {
         let lua = lua_with_model(None);
-        let (val, err) = eval(&lua, "return model.info('anthropic/claude-sonnet-4-5')");
+        let (val, err) = eval(&lua, "return model.info('anthropic/claude-sonnet-4-5')").await;
         assert_eq!(err, None);
         assert_eq!(val["spec"], json!("anthropic/claude-sonnet-4-5"));
         assert_eq!(val["provider"], json!("anthropic"));
@@ -360,19 +364,20 @@ mod tests {
     #[test_case("zai/glm-4.7-flash",       json!(true)  ; "builtin_zero_priced_is_free")]
     #[test_case("anthropic/claude-sonnet-4-5", json!(false) ; "metered_is_not_free")]
     #[test_case("ollama/my-custom-model", Json::Null   ; "no_price_table_is_unknown")]
-    fn info_free_separates_zero_from_unknown(spec: &str, expected: Json) {
+    #[tokio::test]
+    async fn info_free_separates_zero_from_unknown(spec: &str, expected: Json) {
         let lua = lua_with_model(None);
-        let (val, err) = eval(&lua, &format!("return model.info('{spec}')"));
+        let (val, err) = eval(&lua, &format!("return model.info('{spec}')")).await;
         assert_eq!(err, None);
         assert_eq!(val["free"], expected);
     }
 
     /// `tier` answers the assigned model in the same shape `info` does, so a
     /// plugin can hand the spec straight to `set`.
-    #[test]
-    fn tier_returns_the_assigned_model() {
+    #[tokio::test]
+    async fn tier_returns_the_assigned_model() {
         let (lua, tier, spec) = assign_tier(SPEC, ModelTier::Strong);
-        let (val, err) = eval(&lua, "return model.tier('strong')");
+        let (val, err) = eval(&lua, "return model.tier('strong')").await;
         clear_tier(tier, spec);
         assert_eq!(err, None);
         assert_eq!(val["spec"], json!(SPEC));
@@ -382,49 +387,50 @@ mod tests {
 
     /// An untouched slot still answers the curated default a subagent would
     /// get, flagged so a plugin can tell it from a real pick.
-    #[test]
-    fn tier_without_an_assignment_falls_back_to_the_default() {
+    #[tokio::test]
+    async fn tier_without_an_assignment_falls_back_to_the_default() {
         let (val, err) = eval(
             &lua_with_model(None),
             "return model.tier('weak', 'anthropic')",
-        );
+        )
+        .await;
         assert_eq!(err, None);
         assert_eq!(val["provider"], json!("anthropic"));
         assert_eq!(val["tier"], json!("weak"));
         assert_eq!(val["assigned"], json!(false));
     }
 
-    #[test]
-    fn tier_with_nothing_to_resolve_answers_nil() {
-        let (val, err) = eval(&lua_with_model(None), "return model.tier('compaction')");
+    #[tokio::test]
+    async fn tier_with_nothing_to_resolve_answers_nil() {
+        let (val, err) = eval(&lua_with_model(None), "return model.tier('compaction')").await;
         assert_eq!((val, err), (Json::Null, None));
     }
 
     /// A name maki does not know reports through the error slot, the same way
     /// `set` reports a spec it cannot parse.
-    #[test]
-    fn tier_with_an_unknown_name_returns_an_error_pair() {
-        let (val, err) = eval(&lua_with_model(None), "return model.tier('turbo')");
+    #[tokio::test]
+    async fn tier_with_an_unknown_name_returns_an_error_pair() {
+        let (val, err) = eval(&lua_with_model(None), "return model.tier('turbo')").await;
         assert_eq!(val, Json::Null);
         assert!(err.is_some());
     }
 
     /// An assignment left over from a provider that is gone is an error, not a
     /// silent `nil`: the user did pick something, it just no longer resolves.
-    #[test]
-    fn tier_with_a_stale_assignment_returns_an_error_pair() {
+    #[tokio::test]
+    async fn tier_with_a_stale_assignment_returns_an_error_pair() {
         let (lua, tier, spec) = assign_tier("no-such-provider/nope", ModelTier::Weak);
-        let (val, err) = eval(&lua, "return model.tier('weak')");
+        let (val, err) = eval(&lua, "return model.tier('weak')").await;
         clear_tier(tier, spec);
         assert_eq!(val, Json::Null);
         assert!(err.is_some());
     }
 
     /// An unresolvable spec answers `(nil, err)` instead of throwing.
-    #[test]
-    fn info_unknown_provider_returns_an_error_pair() {
+    #[tokio::test]
+    async fn info_unknown_provider_returns_an_error_pair() {
         let lua = lua_with_model(None);
-        let (val, err) = eval(&lua, "return model.info('no-such-provider/nope')");
+        let (val, err) = eval(&lua, "return model.info('no-such-provider/nope')").await;
         assert_eq!(val, Json::Null);
         assert!(err.is_some());
     }
@@ -460,9 +466,10 @@ mod tests {
     #[test_case("return model.set(42)" ; "number")]
     #[test_case("return model.set()" ; "no_argument")]
     #[test_case("return model.set(nil)" ; "explicit_nil")]
-    fn set_throws_on_a_non_spec_argument(script: &str) {
+    #[tokio::test]
+    async fn set_throws_on_a_non_spec_argument(script: &str) {
         let lua = lua_with_model(None);
-        let err = smol::block_on(lua.load(script).eval_async::<Value>()).unwrap_err();
+        let err = lua.load(script).eval_async::<Value>().await.unwrap_err();
         assert!(err.to_string().contains(SET_ARG_ERR));
     }
 }

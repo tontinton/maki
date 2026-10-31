@@ -23,6 +23,7 @@ use maki_storage::auth::{
     load_tokens, lock_credentials, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
+use tokio::runtime::Handle;
 
 use crate::provider_scripts;
 
@@ -69,7 +70,7 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     // A plugin with neither has no way in, which `plugin::login` reports.
     let hooked = plugin::auth_providers().iter().any(|(s, _)| s == slug);
     if hooked || (builtin.is_none() && plugin::is_registered(slug)) {
-        plugin::login(slug)?;
+        Handle::current().block_on(plugin::login(slug))?;
         return Ok(());
     }
 
@@ -454,7 +455,7 @@ pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
             // cooperating. The hook goes first, while a token it may want to
             // revoke upstream still exists, and a hook that fails is reported
             // only once the local credentials are gone.
-            let hook = plugin::logout(&slug);
+            let hook = Handle::current().block_on(plugin::logout(&slug));
             let removed_key =
                 delete_provider_credentials(storage, &slug).context("delete credentials")?;
             let removed_login = {
@@ -610,7 +611,7 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
         }
     }
 
-    smol::block_on(fetch_all_models(
+    Handle::current().block_on(fetch_all_models(
         &config.provider.model_policy,
         |batch| {
             for model in batch.models {
@@ -647,7 +648,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
         .parse(&input)
         .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
     let ctx = maki_agent::tools::cli_tool_ctx();
-    let result = smol::block_on(async { inv.execute(&ctx).await });
+    let result = Handle::current().block_on(inv.execute(&ctx));
     match result.output {
         Ok(output) => print!("{}", output.as_text()),
         Err(e) => bail!("index failed: {e}"),
@@ -656,7 +657,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
 }
 
 pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
-    smol::block_on(async {
+    Handle::current().block_on(async {
         let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
         let trust = project::resolve(storage, &cwd, trust_mode);
         super::report_warnings(trust.notices());

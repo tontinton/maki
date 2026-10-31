@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use maki_storage::auth::now_millis;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
 use tracing::{debug, warn};
 
 use crate::AgentError;
@@ -212,7 +213,7 @@ fn fetch_catalog(access: &str) -> FetchOutcome {
         return FetchOutcome::Transient;
     };
 
-    let (status, body) = match smol::block_on(status_and_text(&client, request)) {
+    let (status, body) = match Handle::current().block_on(status_and_text(&client, request)) {
         Ok(result) => result,
         Err(e) => {
             debug!(error = %e, "xAI catalog request failed");

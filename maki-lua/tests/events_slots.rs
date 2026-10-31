@@ -10,13 +10,14 @@ use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
 use maki_lua::agent_autocmd::host_event_fields;
-use maki_lua::test_support::{content_omitted_message, layer_skipped_message};
+use maki_lua::test_support::{content_omitted_message, layer_skipped_message, runtime};
 use maki_lua::{
     Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
     PluginPermissions, SessionEndReason, UiAction,
 };
 use maki_storage::id::MakiId;
 use test_case::test_case;
+use tokio::time::timeout;
 
 const PROBE_SCHEMA: &str = r#"{ type = "object", properties = {}, additionalProperties = false }"#;
 /// Generous on purpose. A bound a slow machine can trip is a bound that fails
@@ -44,7 +45,8 @@ fn exec_tool(reg: &ToolRegistry, name: &str) -> String {
         .parse(&serde_json::json!({}))
         .expect("parse failed");
     let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    let out = smol::block_on(async { inv.execute(&ctx).await })
+    let out = runtime()
+        .block_on(inv.execute(&ctx))
         .output
         .unwrap_or_else(|e| panic!("tool {name} failed: {e}"));
     match out {
@@ -611,14 +613,9 @@ fn fire_call(
 /// Bounded, so a seam that stops answering fails the test instead of hanging
 /// the suite.
 fn within<T>(work: impl Future<Output = T>) -> T {
-    smol::block_on(async {
-        let work = async { Some(work.await) };
-        let give_up = async {
-            smol::Timer::after(DISPATCH_TIMEOUT).await;
-            None
-        };
-        smol::future::or(work, give_up).await.expect(NEVER_ANSWERED)
-    })
+    runtime()
+        .block_on(async { timeout(DISPATCH_TIMEOUT, work).await })
+        .expect(NEVER_ANSWERED)
 }
 
 /// Fires one stage the way `tool_dispatch::run` does, with the authority the

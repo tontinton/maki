@@ -6,12 +6,10 @@ use std::future::Future;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use async_compat::Compat;
-use futures_lite::io::BufReader;
-use futures_lite::{AsyncBufReadExt, StreamExt, future};
 use maki_providers::http::error_chain;
 use maki_providers::strip_provider_keys;
 use maki_storage::StateDir;
@@ -36,9 +34,10 @@ use rmcp::transport::{
 use rmcp::{RoleClient, ServiceError, ServiceExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use smol::process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use smol::{Task, Timer};
-use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::time::timeout;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{info, warn};
 
 use super::config::{ServerConfig, Transport};
@@ -94,43 +93,38 @@ pub struct Connection {
 
 struct StdioProcess {
     child: ChildGuard,
-    _stderr: Task<()>,
+    _stderr: AbortOnDropHandle<()>,
 }
 
-/// rmcp spawns its session tasks on tokio, even while building a transport,
-/// so all of it runs inside [`Compat`]. `timeout` bounds the handshake and each
-/// request after it, as the server config says.
+/// `timeout` bounds the handshake and each request after it, as the server
+/// config says.
 pub async fn connect(
     config: &ServerConfig,
     storage: Option<&StateDir>,
 ) -> Result<Connection, McpError> {
     let name = config.name.as_str();
-    let (service, process) = within(
-        config.timeout,
-        name,
-        Compat::new(async {
-            match &config.transport {
-                Transport::Stdio {
-                    program,
-                    args,
-                    environment,
-                } => {
-                    let (stdout, stdin, process) = spawn_stdio(name, program, args, environment)?;
-                    let service = serve(name, (stdout.compat(), stdin.compat_write())).await?;
-                    Ok((service, Some(process)))
-                }
-                Transport::Http {
-                    url,
-                    headers,
-                    ca_file,
-                    ..
-                } => Ok((
-                    connect_http(name, url, headers, ca_file.as_deref(), storage).await?,
-                    None,
-                )),
+    let (service, process) = within(config.timeout, name, async {
+        match &config.transport {
+            Transport::Stdio {
+                program,
+                args,
+                environment,
+            } => {
+                let (stdout, stdin, process) = spawn_stdio(name, program, args, environment)?;
+                let service = serve(name, (stdout, stdin)).await?;
+                Ok((service, Some(process)))
             }
-        }),
-    )
+            Transport::Http {
+                url,
+                headers,
+                ca_file,
+                ..
+            } => Ok((
+                connect_http(name, url, headers, ca_file.as_deref(), storage).await?,
+                None,
+            )),
+        }
+    })
     .await?;
     Ok(Connection {
         name: Arc::from(name),
@@ -201,9 +195,7 @@ impl Connection {
         call: impl Future<Output = Result<T, ServiceError>>,
     ) -> Result<T, McpError> {
         within(self.timeout, &self.name, async {
-            Compat::new(call)
-                .await
-                .map_err(|e| service_error(&self.name, e))
+            call.await.map_err(|e| service_error(&self.name, e))
         })
         .await
     }
@@ -277,7 +269,7 @@ impl McpTransport for Connection {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
             if let Some(mut service) = service {
-                let _ = Compat::new(service.close()).await;
+                let _ = service.close().await;
             }
         })
     }
@@ -328,7 +320,7 @@ fn spawn_stdio(
         });
     }
 
-    let mut cmd: Command = std_cmd.into();
+    let mut cmd = Command::from(std_cmd);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -340,14 +332,14 @@ fn spawn_stdio(
     };
     let process = StdioProcess {
         child: ChildGuard::new(child),
-        _stderr: smol::spawn(log_stderr(Arc::from(name), stderr)),
+        _stderr: AbortOnDropHandle::new(tokio::spawn(log_stderr(Arc::from(name), stderr))),
     };
     Ok((stdout, stdin, process))
 }
 
 async fn log_stderr(name: Arc<str>, stderr: ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
-    while let Some(Ok(line)) = lines.next().await {
+    while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim();
         if !line.is_empty() {
             warn!(server = &*name, "{line}");
@@ -456,18 +448,16 @@ fn is_reserved(header: &HeaderName) -> bool {
 }
 
 async fn within<T>(
-    timeout: Duration,
+    limit: Duration,
     server: &str,
     work: impl Future<Output = Result<T, McpError>>,
 ) -> Result<T, McpError> {
-    future::or(work, async {
-        Timer::after(timeout).await;
+    timeout(limit, work).await.unwrap_or_else(|_| {
         Err(McpError::Timeout {
             server: server.into(),
-            timeout_ms: timeout.as_millis() as u64,
+            timeout_ms: limit.as_millis() as u64,
         })
     })
-    .await
 }
 
 async fn paginate<T, F>(
@@ -818,20 +808,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lists_and_calls_tools_over_http() {
+    #[tokio::test]
+    async fn lists_and_calls_tools_over_http() {
         let base = spawn_server(mcp_reply);
-        smol::block_on(async {
-            let connection = connect(&http_config(&base, &[]), None).await.unwrap();
-            assert!(connection.declares_tools());
-            assert_eq!(connection.list_tools().await.unwrap().len(), 1);
-            let text = connection.call_tool("echo", &json!({})).await.unwrap();
-            assert_eq!(text, TOOL_TEXT);
-        });
+        let connection = connect(&http_config(&base, &[]), None).await.unwrap();
+        assert!(connection.declares_tools());
+        assert_eq!(connection.list_tools().await.unwrap().len(), 1);
+        let text = connection.call_tool("echo", &json!({})).await.unwrap();
+        assert_eq!(text, TOOL_TEXT);
     }
 
-    #[test]
-    fn list_tools_follows_the_cursor() {
+    #[tokio::test]
+    async fn list_tools_follows_the_cursor() {
         let base = spawn_server(|req| {
             if req.body["method"] != "tools/list" {
                 return mcp_reply(req);
@@ -846,23 +834,29 @@ mod tests {
             });
             rpc_result(&req.body["id"], page)
         });
-        let tools = smol::block_on(async {
+        let tools = async {
             let connection = connect(&http_config(&base, &[]), None).await.unwrap();
             connection.list_tools().await.unwrap()
-        });
+        }
+        .await;
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert_eq!(names, [FIRST_TOOL, LAST_TOOL]);
     }
 
     #[test_case("", 1 ; "empty_cursor")]
     #[test_case("same", 2 ; "repeated_cursor")]
-    fn paginate_stops_on_a_cursor_that_does_not_advance(stuck_cursor: &str, expected_calls: usize) {
+    #[tokio::test]
+    async fn paginate_stops_on_a_cursor_that_does_not_advance(
+        stuck_cursor: &str,
+        expected_calls: usize,
+    ) {
         let mut calls = 0;
-        let items = smol::block_on(paginate(|_| {
+        let items = paginate(|_| {
             calls += 1;
             let page = Ok((vec![calls], Some(stuck_cursor.to_owned())));
             async move { page }
-        }))
+        })
+        .await
         .unwrap();
         assert_eq!(items.len(), expected_calls);
     }
@@ -885,16 +879,22 @@ mod tests {
         "prompts[0]: missing field `name`"
         ; "prompt_without_name"
     )]
-    fn invalid_reply_names_server_and_field(method: &'static str, result: Value, reason: &str) {
+    #[tokio::test]
+    async fn invalid_reply_names_server_and_field(
+        method: &'static str,
+        result: Value,
+        reason: &str,
+    ) {
         let base = spawn_server(move |req| match req.body["method"].as_str() {
             Some(m) if m == method => rpc_result(&req.body["id"], result.clone()),
             _ => mcp_reply(req),
         });
-        let listed = smol::block_on(async {
+        let listed = async {
             let connection = connect(&http_config(&base, &[]), None).await?;
             connection.list_tools().await?;
             connection.list_prompts().await
-        });
+        }
+        .await;
         let Err(McpError::InvalidReply {
             server,
             method: failed,
@@ -909,8 +909,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn config_authorization_header_wins_over_stored_tokens() {
+    #[tokio::test]
+    async fn config_authorization_header_wins_over_stored_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(dir.path().to_path_buf());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -923,17 +923,17 @@ mod tests {
         });
         save_mcp_auth(&storage, SERVER, &stored_record(&base, HOUR_MS)).unwrap();
         let config = http_config(&base, &[("Authorization", CONFIG_BEARER)]);
-        smol::block_on(connect(&config, Some(&storage))).unwrap();
+        connect(&config, Some(&storage)).await.unwrap();
         let seen = seen.lock().unwrap();
         assert!(!seen.is_empty());
         assert!(seen.iter().all(|a| a.as_deref() == Some(CONFIG_BEARER)));
     }
 
-    #[test]
-    fn unauthorized_connect_carries_the_challenge() {
+    #[tokio::test]
+    async fn unauthorized_connect_carries_the_challenge() {
         let base = spawn_server(|_| Reply::unauthorized());
         let Err(McpError::HttpError { status, reason, .. }) =
-            smol::block_on(connect(&http_config(&base, &[]), None))
+            connect(&http_config(&base, &[]), None).await
         else {
             panic!("expected a 401");
         };
@@ -943,13 +943,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bare_unauthorized_connect_needs_a_login() {
+    #[tokio::test]
+    async fn bare_unauthorized_connect_needs_a_login() {
         let base = spawn_server(|_| Reply {
             body: json!({"error": "unauthorized"}).to_string(),
             ..Reply::empty(401)
         });
-        let result = smol::block_on(connect(&http_config(&base, &[]), None));
+        let result = connect(&http_config(&base, &[]), None).await;
         assert!(
             matches!(result, Err(McpError::OAuthRequired { .. })),
             "got: {:?}",
@@ -957,18 +957,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn headers_mcp_sets_itself_are_dropped_from_config() {
+    #[tokio::test]
+    async fn headers_mcp_sets_itself_are_dropped_from_config() {
         let base = spawn_server(mcp_reply);
         let config = http_config(
             &base,
             &[("Accept", "text/plain"), ("Mcp-Session-Id", "from-config")],
         );
-        smol::block_on(connect(&config, None)).unwrap();
+        connect(&config, None).await.unwrap();
     }
 
-    #[test]
-    fn shutdown_ends_the_http_session() {
+    #[tokio::test]
+    async fn shutdown_ends_the_http_session() {
         let deleted = Arc::new(Mutex::new(false));
         let base = spawn_server({
             let deleted = Arc::clone(&deleted);
@@ -979,17 +979,16 @@ mod tests {
                 mcp_reply(req)
             }
         });
-        smol::block_on(async {
-            let connection = connect(&http_config(&base, &[]), None).await.unwrap();
-            connection.shutdown().await;
-        });
+        let connection = connect(&http_config(&base, &[]), None).await.unwrap();
+        connection.shutdown().await;
         assert!(*deleted.lock().unwrap());
     }
 
     #[test_case(HOUR_MS, false, OLD_TOKEN ; "valid_token_is_sent")]
     #[test_case(0,       false, NEW_TOKEN ; "expired_token_is_refreshed_first")]
     #[test_case(HOUR_MS, true,  NEW_TOKEN ; "rejected_token_is_refreshed_and_retried")]
-    fn stored_oauth_tokens(lifetime_ms: u64, reject_old: bool, sent: &str) {
+    #[tokio::test]
+    async fn stored_oauth_tokens(lifetime_ms: u64, reject_old: bool, sent: &str) {
         let dir = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(dir.path().to_path_buf());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1008,7 +1007,9 @@ mod tests {
         });
         save_mcp_auth(&storage, SERVER, &stored_record(&base, lifetime_ms)).unwrap();
 
-        smol::block_on(connect(&http_config(&base, &[]), Some(&storage))).unwrap();
+        connect(&http_config(&base, &[]), Some(&storage))
+            .await
+            .unwrap();
 
         let bearer = format!("Bearer {sent}");
         let last_seen = seen.lock().unwrap().last().cloned().flatten();
@@ -1020,7 +1021,11 @@ mod tests {
 
     #[test_case(Some(TOKEN_PATH), true  ; "matching_endpoint_is_pinned")]
     #[test_case(None,             false ; "moved_endpoint_needs_a_login")]
-    fn legacy_record_pins_the_auth_server_it_discovers(token_path: Option<&str>, usable: bool) {
+    #[tokio::test]
+    async fn legacy_record_pins_the_auth_server_it_discovers(
+        token_path: Option<&str>,
+        usable: bool,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(dir.path().to_path_buf());
         let base = spawn_server(mcp_reply);
@@ -1033,7 +1038,7 @@ mod tests {
         };
         save_mcp_auth(&storage, SERVER, &record).unwrap();
 
-        let result = smol::block_on(connect(&http_config(&base, &[]), Some(&storage)));
+        let result = connect(&http_config(&base, &[]), Some(&storage)).await;
 
         assert_eq!(result.is_ok(), usable);
         assert_eq!(
@@ -1046,7 +1051,8 @@ mod tests {
 
     #[test_case(None                 ; "server_url_for_older_logins")]
     #[test_case(Some(LOGIN_RESOURCE) ; "resource_of_the_login")]
-    fn refresh_names_the_resource(pinned: Option<&str>) {
+    #[tokio::test]
+    async fn refresh_names_the_resource(pinned: Option<&str>) {
         let dir = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(dir.path().to_path_buf());
         let resources = Arc::new(Mutex::new(Vec::new()));
@@ -1070,7 +1076,9 @@ mod tests {
         };
         save_mcp_auth(&storage, SERVER, &record).unwrap();
 
-        smol::block_on(connect(&http_config(&base, &[]), Some(&storage))).unwrap();
+        connect(&http_config(&base, &[]), Some(&storage))
+            .await
+            .unwrap();
 
         let expected = pinned.map_or_else(|| format!("{base}/mcp"), Into::into);
         assert_eq!(*resources.lock().unwrap(), [expected]);
@@ -1078,8 +1086,8 @@ mod tests {
 
     /// A bare 401 isn't retried by rmcp, so `authenticate` is what replaces a
     /// token the server turned down before it expired.
-    #[test]
-    fn authenticate_refreshes_a_token_that_has_not_expired() {
+    #[tokio::test]
+    async fn authenticate_refreshes_a_token_that_has_not_expired() {
         let dir = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(dir.path().to_path_buf());
         let refreshes = Arc::new(Mutex::new(0));
@@ -1096,7 +1104,7 @@ mod tests {
         let url = format!("{base}/mcp");
         save_mcp_auth(&storage, SERVER, &stored_record(&base, HOUR_MS)).unwrap();
 
-        smol::block_on(oauth::authenticate(
+        oauth::authenticate(
             SERVER,
             &url,
             None,
@@ -1104,7 +1112,8 @@ mod tests {
             oauth::Interaction::Background,
             None,
             None,
-        ))
+        )
+        .await
         .unwrap();
 
         assert_eq!(*refreshes.lock().unwrap(), 1);
@@ -1112,8 +1121,8 @@ mod tests {
         assert_eq!(saved.tokens.unwrap().access, NEW_TOKEN);
     }
 
-    #[test]
-    fn dropped_call_sends_cancelled_to_the_server() {
+    #[tokio::test]
+    async fn dropped_call_sends_cancelled_to_the_server() {
         let (entered_tx, entered_rx) = flume::bounded(1);
         let (cancelled_tx, cancelled_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded::<()>(1);
@@ -1131,31 +1140,30 @@ mod tests {
             mcp_reply(req)
         });
 
-        let (call_id, cancelled_id) = smol::block_on(async {
+        let (call_id, cancelled_id) = async {
             let connection = connect(&http_config(&base, &[]), None).await.unwrap();
             let args = json!({});
-            let call_id = future::or(
-                async {
-                    connection.call_tool("echo", &args).await.unwrap();
+            let call_id = tokio::select! {
+                call = connection.call_tool("echo", &args) => {
+                    call.unwrap();
                     Value::Null
-                },
-                async { entered_rx.recv_async().await.unwrap() },
-            )
-            .await;
-            let cancelled_id = future::or(async { cancelled_rx.recv_async().await.ok() }, async {
-                Timer::after(TIMEOUT).await;
-                None
-            })
-            .await;
+                }
+                entered = entered_rx.recv_async() => entered.unwrap(),
+            };
+            let cancelled_id = timeout(TIMEOUT, cancelled_rx.recv_async())
+                .await
+                .ok()
+                .and_then(Result::ok);
             (call_id, cancelled_id)
-        });
+        }
+        .await;
 
         assert_eq!(cancelled_id, Some(call_id));
         drop(release_tx);
     }
 
-    #[test]
-    fn unreachable_server_names_the_cause_without_the_url() {
+    #[tokio::test]
+    async fn unreachable_server_names_the_cause_without_the_url() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
@@ -1163,8 +1171,7 @@ mod tests {
         if let Transport::Http { url, .. } = &mut config.transport {
             url.push_str("?key=secret");
         }
-        let Err(McpError::StartFailed { reason, .. }) = smol::block_on(connect(&config, None))
-        else {
+        let Err(McpError::StartFailed { reason, .. }) = connect(&config, None).await else {
             panic!("expected StartFailed");
         };
         assert!(!reason.contains("secret"), "got: {reason}");
@@ -1173,15 +1180,15 @@ mod tests {
 
     #[test_case("missing.pem" ; "missing_file")]
     #[test_case(""            ; "directory")]
-    fn unreadable_ca_file_fails_the_start(file_name: &str) {
+    #[tokio::test]
+    async fn unreadable_ca_file_fails_the_start(file_name: &str) {
         let dir = tempfile::tempdir().unwrap();
         let ca_file = dir.path().join(file_name);
         let mut config = http_config("http://127.0.0.1:1", &[]);
         if let Transport::Http { ca_file: slot, .. } = &mut config.transport {
             *slot = Some(ca_file.clone());
         }
-        let Err(McpError::StartFailed { reason, .. }) = smol::block_on(connect(&config, None))
-        else {
+        let Err(McpError::StartFailed { reason, .. }) = connect(&config, None).await else {
             panic!("expected StartFailed");
         };
         assert!(

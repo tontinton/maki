@@ -1283,13 +1283,17 @@ mod tests {
 
         #[test_case(LOADED, Some(SERVED) ; "loaded_model_reports_and_records")]
         #[test_case(NO_PS, None ; "server_without_api_ps")]
-        fn ollama_reports_the_served_window(script: &'static [Canned], expected: Option<u32>) {
+        #[tokio::test]
+        async fn ollama_reports_the_served_window(
+            script: &'static [Canned],
+            expected: Option<u32>,
+        ) {
             const ID: &str = "llama3.2";
             model_registry::set_known_models(OLLAMA_SLUG, vec![ModelInfo::id_only(ID.into())]);
             let (ep, _) = endpoint(&OLLAMA, script);
             let model = Model::from_spec(&format!("ollama/{ID}")).unwrap();
 
-            assert_eq!(smol::block_on(ep.served_context_window(&model)), expected);
+            assert_eq!(ep.served_context_window(&model).await, expected);
             assert_eq!(
                 model_registry::discovered(OLLAMA_SLUG, ID).and_then(|info| info.context_window),
                 expected
@@ -1297,12 +1301,12 @@ mod tests {
         }
 
         /// A stray request on every turn would go unnoticed, so pin it.
-        #[test]
-        fn llamacpp_never_asks() {
+        #[tokio::test]
+        async fn llamacpp_never_asks() {
             let (ep, requests) = endpoint(&LLAMACPP, LOADED);
             let model = Model::from_spec("llama-cpp/default").unwrap();
 
-            assert_eq!(smol::block_on(ep.served_context_window(&model)), None);
+            assert_eq!(ep.served_context_window(&model).await, None);
             assert!(requests.lock().unwrap().is_empty());
         }
 
@@ -1319,9 +1323,10 @@ mod tests {
 
         #[test_case(DISCOVERY_LOADED, SERVED ; "loaded_model_lists_its_served_window")]
         #[test_case(DISCOVERY_UNLOADED, SHOW_TRAINED ; "unloaded_model_lists_its_declared_window")]
-        fn discovery_prefers_the_served_window(script: &'static [Canned], expected: u32) {
+        #[tokio::test]
+        async fn discovery_prefers_the_served_window(script: &'static [Canned], expected: u32) {
             let (ep, _) = endpoint(&OLLAMA, script);
-            let models = smol::block_on(ep.list_models()).unwrap();
+            let models = ep.list_models().await.unwrap();
 
             assert_eq!(models[0].context_window, Some(expected));
         }

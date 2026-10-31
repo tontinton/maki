@@ -7,6 +7,7 @@ pub mod translate;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::{AgentConfig, CancelToken, SessionEndReason};
@@ -16,9 +17,10 @@ use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
-use smol::future::Boxed;
+use tokio::runtime::Handle;
 
-pub type SessionEndHook = Arc<dyn Fn(MakiId, SessionEndReason) -> Boxed<()> + Send + Sync>;
+pub type SessionEndHook =
+    Arc<dyn Fn(MakiId, SessionEndReason) -> BoxFuture<'static, ()> + Send + Sync>;
 
 pub struct AcpParams {
     pub model: Model,
@@ -53,5 +55,5 @@ pub struct AcpParams {
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {
-    smol::block_on(server::serve(params))
+    Handle::current().block_on(server::serve(params))
 }

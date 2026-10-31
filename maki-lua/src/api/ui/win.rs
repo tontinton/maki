@@ -5,6 +5,7 @@ use std::time::Duration;
 use maki_agent::UiWaker;
 use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{AnyUserData, Lua, Result as LuaResult, Table};
+use tokio::time::timeout;
 
 use super::{parse_footer, try_parse_dimension};
 use crate::api::util::command::{
@@ -171,17 +172,10 @@ fn win_extra<M: mlua::UserDataMethods<WinHandle>>(methods: &mut M) {
                 this.event_rx.clone()
             };
             let event = match timeout_ms {
-                Some(ms) => {
-                    let recv = async { Some(rx.recv_async().await) };
-                    let timeout = async {
-                        smol::Timer::after(Duration::from_millis(ms)).await;
-                        None
-                    };
-                    match smol::future::or(recv, timeout).await {
-                        Some(res) => res,
-                        None => return Ok(mlua::Value::Table(tagged(&lua, "timeout")?)),
-                    }
-                }
+                Some(ms) => match timeout(Duration::from_millis(ms), rx.recv_async()).await {
+                    Ok(res) => res,
+                    Err(_) => return Ok(mlua::Value::Table(tagged(&lua, "timeout")?)),
+                },
                 None => rx.recv_async().await,
             };
             match event {
@@ -389,6 +383,7 @@ mod tests {
     use super::*;
     use crate::api::util::command::FloatConfig;
     use crate::key::Key;
+    use tokio::task::{LocalSet, spawn_local, yield_now};
 
     const NOT_WOKEN: &str = "a command the UI only reads on a tick has to wake it";
 
@@ -467,17 +462,21 @@ mod tests {
         assert!(handle.closed.load(Relaxed));
     }
 
-    #[test]
-    fn recv_timeout_returns_timeout_event() {
+    #[tokio::test]
+    async fn recv_timeout_returns_timeout_event() {
         let lua = mlua::Lua::new();
         let (_event_tx, _cmd_rx, handle) = make_channels();
         lua.globals().set("win", handle).unwrap();
-        let ty: String = smol::block_on(lua.load("return win:recv(5).type").eval_async()).unwrap();
+        let ty: String = lua
+            .load("return win:recv(5).type")
+            .eval_async()
+            .await
+            .unwrap();
         assert_eq!(ty, "timeout");
     }
 
-    #[test]
-    fn recv_timeout_delivers_pending_event() {
+    #[tokio::test]
+    async fn recv_timeout_delivers_pending_event() {
         let lua = mlua::Lua::new();
         let (event_tx, _cmd_rx, handle) = make_channels();
         event_tx
@@ -486,37 +485,38 @@ mod tests {
             })
             .unwrap();
         lua.globals().set("win", handle).unwrap();
-        let got: String = smol::block_on(
-            lua.load("local ev = win:recv(1000) return ev.type .. ':' .. ev.key")
-                .eval_async(),
-        )
-        .unwrap();
+        let got: String = lua
+            .load("local ev = win:recv(1000) return ev.type .. ':' .. ev.key")
+            .eval_async()
+            .await
+            .unwrap();
         assert_eq!(got, "key:<CR>");
     }
 
-    #[test]
-    fn win_methods_work_while_recv_is_parked() {
+    #[tokio::test]
+    async fn win_methods_work_while_recv_is_parked() {
         let lua = mlua::Lua::new();
         let (event_tx, cmd_rx, handle) = make_channels();
         lua.globals().set("win", handle).unwrap();
-        let ex = smol::LocalExecutor::new();
-        let recv_task = ex.spawn(
-            lua.load("return win:recv(5000).type")
-                .eval_async::<String>(),
-        );
-        smol::block_on(ex.run(async {
-            for _ in 0..10 {
-                smol::future::yield_now().await;
-            }
-            lua.load("win:set_cursor(3)").exec_async().await.unwrap();
-            event_tx
-                .send_async(WinEvent::Key {
-                    key: Key::parse("x").unwrap(),
-                })
-                .await
-                .unwrap();
-            assert_eq!(recv_task.await.unwrap(), "key");
-        }));
+        LocalSet::new()
+            .run_until(async {
+                let recv_task = spawn_local(
+                    lua.load("return win:recv(5000).type")
+                        .eval_async::<String>(),
+                );
+                for _ in 0..10 {
+                    yield_now().await;
+                }
+                lua.load("win:set_cursor(3)").exec_async().await.unwrap();
+                event_tx
+                    .send_async(WinEvent::Key {
+                        key: Key::parse("x").unwrap(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(recv_task.await.unwrap().unwrap(), "key");
+            })
+            .await;
         assert!(matches!(cmd_rx.try_recv(), Ok(WinCommand::SetCursor(2))));
     }
 

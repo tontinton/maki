@@ -5,14 +5,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use async_compat::Compat;
 use futures::TryStreamExt;
-use futures_lite::StreamExt;
-use futures_lite::io::AsyncBufRead;
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::io::{AsyncBufRead, Lines};
+use tokio::time::timeout;
+use tokio_util::io::StreamReader;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
@@ -394,21 +394,17 @@ impl SseErrorPayload {
 }
 
 pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
-    lines: &mut futures_lite::io::Lines<R>,
+    lines: &mut Lines<R>,
     deadline: &mut Instant,
     stream_timeout: Duration,
 ) -> Result<Option<String>, AgentError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let result = futures_lite::future::or(
-        async { lines.next().await.transpose().map_err(AgentError::from) },
-        async {
-            smol::Timer::after(remaining).await;
-            Err(AgentError::Timeout {
-                secs: stream_timeout.as_secs(),
-            })
-        },
-    )
-    .await;
+    let result = match timeout(remaining, lines.next_line()).await {
+        Ok(line) => line.map_err(AgentError::from),
+        Err(_) => Err(AgentError::Timeout {
+            secs: stream_timeout.as_secs(),
+        }),
+    };
     if let Ok(Some(_)) = &result {
         *deadline = Instant::now() + stream_timeout;
     }
@@ -463,11 +459,9 @@ pub(crate) fn http_client(timeouts: Timeouts) -> Client {
         })
 }
 
-/// reqwest runs on tokio: `Client::execute` arms the timeouts as it is called,
-/// the body is polled on the same runtime, and a cancelled stream has to drop
-/// there too. So everything from the send to the last byte runs inside one
-/// [`Compat`], and this is the only place `execute` appears (bedrock excepted,
-/// where the whole stream block is the `Compat` future).
+/// `Client::execute` arms the timeouts as it is called, so the send and the
+/// read of the response sit together here, the one place `execute` appears
+/// (bedrock excepted, which signs and sends its own request).
 pub(crate) async fn send_request<T, F, Fut>(
     client: &Client,
     request: Request,
@@ -477,11 +471,8 @@ where
     F: FnOnce(Response) -> Fut,
     Fut: Future<Output = Result<T, AgentError>>,
 {
-    Compat::new(async move {
-        let response = client.execute(request).await?;
-        read(response).await
-    })
-    .await
+    let response = client.execute(request).await?;
+    read(response).await
 }
 
 /// For the flows that decide per status themselves.
@@ -511,17 +502,14 @@ pub(crate) async fn ok_text(client: &Client, request: Request) -> Result<String,
 /// so it retries as transient and never as the stream deadline, and the URL is
 /// left out before the error is worded.
 pub(crate) fn body_reader(response: Response) -> impl AsyncBufRead + Unpin {
-    response
-        .bytes_stream()
-        .map_err(|e| {
-            let kind = if e.is_timeout() {
-                io::ErrorKind::TimedOut
-            } else {
-                io::ErrorKind::Other
-            };
-            io::Error::new(kind, error_chain(&e.without_url()))
-        })
-        .into_async_read()
+    StreamReader::new(response.bytes_stream().map_err(|e| {
+        let kind = if e.is_timeout() {
+            io::ErrorKind::TimedOut
+        } else {
+            io::ErrorKind::Other
+        };
+        io::Error::new(kind, error_chain(&e.without_url()))
+    }))
 }
 
 #[derive(Clone, Debug)]
@@ -688,8 +676,8 @@ mod tests {
 
     use super::*;
     use crate::retry::RetryKind;
-    use futures_lite::io::AsyncBufReadExt;
     use test_case::test_case;
+    use tokio::io::{AsyncBufReadExt, AsyncRead, ReadBuf};
 
     use crate::test_support::{Canned, serve, transport::LOOPBACK_HOST};
 
@@ -863,17 +851,17 @@ mod tests {
 
     struct NeverReader;
 
-    impl futures_lite::io::AsyncRead for NeverReader {
+    impl AsyncRead for NeverReader {
         fn poll_read(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
-            _buf: &mut [u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
+            _buf: &mut ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
             std::task::Poll::Pending
         }
     }
 
-    impl futures_lite::io::AsyncBufRead for NeverReader {
+    impl AsyncBufRead for NeverReader {
         fn poll_fill_buf(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
@@ -884,17 +872,15 @@ mod tests {
         fn consume(self: std::pin::Pin<&mut Self>, _amt: usize) {}
     }
 
-    #[test]
-    fn next_sse_line_expired_deadline_returns_timeout() {
-        smol::block_on(async {
-            let mut lines = NeverReader.lines();
-            let mut past = Instant::now() - Duration::from_secs(1);
-            let stream_timeout = Duration::from_secs(300);
-            let err = next_sse_line(&mut lines, &mut past, stream_timeout)
-                .await
-                .unwrap_err();
-            assert!(matches!(err, AgentError::Timeout { .. }));
-        })
+    #[tokio::test]
+    async fn next_sse_line_expired_deadline_returns_timeout() {
+        let mut lines = NeverReader.lines();
+        let mut past = Instant::now() - Duration::from_secs(1);
+        let stream_timeout = Duration::from_secs(300);
+        let err = next_sse_line(&mut lines, &mut past, stream_timeout)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Timeout { .. }));
     }
 
     /// Reads the request head, answers `head` and then sends nothing until
@@ -924,20 +910,18 @@ mod tests {
         timeouts.bound(builder).build().unwrap()
     }
 
-    fn first_sse_line(
+    async fn first_sse_line(
         client: &Client,
         url: &str,
         stream: Duration,
     ) -> Result<Option<String>, AgentError> {
-        smol::block_on(async {
-            let request = client.get(url).build()?;
-            send_request(client, request, |response| async move {
-                let mut lines = body_reader(response).lines();
-                let mut deadline = Instant::now() + stream;
-                next_sse_line(&mut lines, &mut deadline, stream).await
-            })
-            .await
+        let request = client.get(url).build()?;
+        send_request(client, request, |response| async move {
+            let mut lines = body_reader(response).lines();
+            let mut deadline = Instant::now() + stream;
+            next_sse_line(&mut lines, &mut deadline, stream).await
         })
+        .await
     }
 
     fn is_io_timeout(error: &AgentError) -> bool {
@@ -950,7 +934,8 @@ mod tests {
 
     #[test_case(SHORT, LONG, is_io_timeout, RetryKind::Transient  ; "a_stalled_body_is_an_io_timeout")]
     #[test_case(LONG, SHORT, is_stream_timeout, RetryKind::Timeout ; "the_stream_deadline_is_its_own_kind")]
-    fn the_shorter_bound_fires_first(
+    #[tokio::test]
+    async fn the_shorter_bound_fires_first(
         low_speed: Duration,
         stream: Duration,
         expected: fn(&AgentError) -> bool,
@@ -962,17 +947,17 @@ mod tests {
             stream,
             ..Timeouts::default()
         });
-        let error = first_sse_line(&client, &url, stream).unwrap_err();
+        let error = first_sse_line(&client, &url, stream).await.unwrap_err();
         assert!(expected(&error), "{error}");
         assert_eq!(error.retry_kind(), Some(kind));
     }
 
-    #[test]
-    fn a_body_cut_mid_stream_retries_as_transient() {
+    #[tokio::test]
+    async fn a_body_cut_mid_stream_retries_as_transient() {
         let (url, hold) = stalled_sse_server(CHUNKED_HEAD);
         drop(hold);
         let client = direct_client(Timeouts::default());
-        let error = first_sse_line(&client, &url, LONG).unwrap_err();
+        let error = first_sse_line(&client, &url, LONG).await.unwrap_err();
         assert!(
             matches!(&error, AgentError::Io(e) if e.kind() == io::ErrorKind::Other),
             "{error}"
@@ -980,14 +965,15 @@ mod tests {
         assert_eq!(error.retry_kind(), Some(RetryKind::Transient));
     }
 
-    #[test]
-    fn a_redirect_is_read_as_the_api_error_it_is() {
+    #[tokio::test]
+    async fn a_redirect_is_read_as_the_api_error_it_is() {
         let (base_url, requests) = serve(REDIRECT_SCRIPT);
         let client = direct_client(Timeouts::default());
-        let error = smol::block_on(async {
+        let error = async {
             let request = client.get(base_url.as_str()).build()?;
             ok_text(&client, request).await
-        })
+        }
+        .await
         .unwrap_err();
         assert!(
             matches!(

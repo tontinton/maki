@@ -65,7 +65,7 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 /// One dispatch path for host-fired and plugin-fired events. Never throws.
 /// Each callback runs in its own coroutine under its own detached task
 /// scope, so it may suspend (the `maki.fs.*` helpers park on
-/// `smol::unblock`); an inline resume would die with "attempt to yield
+/// `spawn_blocking`); an inline resume would die with "attempt to yield
 /// across metamethod / C-call boundary". The per-callback scope also means
 /// task-owned jobs a handler starts die with that handler instead of
 /// outliving it to the end of the batch.

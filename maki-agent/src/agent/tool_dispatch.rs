@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_lite::FutureExt;
+use futures::future::join_all;
 use serde_json::{Value, json};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
@@ -18,7 +19,6 @@ use crate::mcp::{
     McpSession, TOOL_SEARCH_TOOL_NAME, ToolDeferral, UNKNOWN_MCP, internal_tool_name, is_wire_name,
 };
 use crate::permissions::{LayerAnswer, PermissionCheck, PromptLayers};
-use crate::task_set::TaskSet;
 use crate::tools::hook::{
     Authority, ChainCut, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict, bounded,
 };
@@ -354,7 +354,7 @@ impl MovedPipeline {
             return;
         }
         let MovedCall { result, land } = moved;
-        smol::spawn(self.land(result, Landing(Some(land)))).detach();
+        tokio::spawn(self.land(result, Landing(Some(land))));
     }
 
     async fn land(self, result: BoxFuture<'static, Option<ToolExecResult>>, landing: Landing) {
@@ -1274,7 +1274,12 @@ async fn gate(
     };
     let allowed_by = ctx
         .deadline
-        .paused_while(decision.or(withdrawn))
+        .paused_while(async {
+            tokio::select! {
+                decision = decision => decision,
+                never = withdrawn => never,
+            }
+        })
         .await
         .map_err(|e| e.to_string())?;
     if let Some(plugin) = allowed_by {
@@ -1411,10 +1416,9 @@ pub(super) async fn process_tool_calls(
         event_tx.try_send(AgentEvent::ToolDone(Box::new(err.clone())));
     }
 
-    let mut set = TaskSet::new();
-    let mut spawned_ids: Vec<String> = Vec::new();
+    let mut ids = Vec::with_capacity(runnable.len());
+    let mut calls = Vec::with_capacity(runnable.len());
     for (id, name, input) in runnable {
-        spawned_ids.push(id.clone());
         let event_tx_clone = ctx.event_tx.clone();
         let scope = Arc::new(CallScope::new(id.clone(), &ctx.cancel));
         let tool_ctx = ToolContext {
@@ -1425,25 +1429,26 @@ pub(super) async fn process_tool_calls(
             ..ctx.clone()
         };
         let guard = CallGuard::new(scope);
-        set.spawn(async move {
+        ids.push(id.clone());
+        // Abort on drop, so a run that ends mid-turn takes its calls with it.
+        calls.push(AbortOnDropHandle::new(tokio::spawn(async move {
             let _guard = guard;
             let done = run(id, &name, &input, &tool_ctx, CallOrigin::Model).await;
             event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
             done
-        });
+        })));
     }
 
-    let results: Vec<ToolDoneEvent> = set
-        .join_all()
+    // In the order the model issued the calls, whatever order they finished in.
+    let results: Vec<ToolDoneEvent> = join_all(calls)
         .await
         .into_iter()
-        .zip(spawned_ids)
-        .map(|(r, id)| match r {
-            Ok(out) => out,
-            Err(e) => {
+        .zip(ids)
+        .map(|(joined, id)| {
+            joined.unwrap_or_else(|e| {
                 error!(error = %e, "tool task panicked");
                 ToolDoneEvent::error(id, format!("internal error: tool panicked: {e}"))
-            }
+            })
         })
         .collect();
 
@@ -1539,14 +1544,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use flume::Receiver;
-    use futures_lite::future::poll_once;
+    use futures::FutureExt;
     use maki_config::{
         Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     };
     use maki_providers::{ContentBlock, Message, Role, StreamResponse};
     use maki_storage::id::MakiId;
-    use smol::lock::Mutex as AsyncMutex;
     use test_case::test_case;
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::time::sleep;
 
     use super::*;
     use crate::agent::history::History;
@@ -1776,7 +1782,7 @@ mod tests {
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async move {
                 if self.0 == HOOK_SLOW_COMMAND {
-                    smol::Timer::after(HOOK_SLOW_RUN).await;
+                    sleep(HOOK_SLOW_RUN).await;
                 }
                 Ok(output_of(&self.0)).into()
             })
@@ -1971,7 +1977,7 @@ mod tests {
             match self.reply {
                 Reply::Answers(answer) => Box::pin(std::future::ready(answer(stage, &value))),
                 Reply::Late(answer) => Box::pin(async move {
-                    smol::future::yield_now().await;
+                    tokio::task::yield_now().await;
                     answer(stage, &value)
                 }),
                 Reply::Pending => Box::pin(std::future::pending()),
@@ -2026,66 +2032,59 @@ mod tests {
     /// way to run anything.
     #[test_case(build_ctx                                       , false ; "reaches_execute")]
     #[test_case(|| denying_ctx(ToolKey::native(HOOK_TOOL_NAME))  , true  ; "reaches_the_permission_prompt")]
-    fn an_input_rewrite_is_the_call_that_runs(build: fn() -> ToolContext, is_error: bool) {
-        smol::block_on(async {
-            let (ctx, _hook) = hooked_ctx(build());
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_REWRITTEN_FROM)).await;
+    #[tokio::test]
+    async fn an_input_rewrite_is_the_call_that_runs(build: fn() -> ToolContext, is_error: bool) {
+        let (ctx, _hook) = hooked_ctx(build());
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_REWRITTEN_FROM)).await;
 
-            let text = done.output.as_text();
-            assert_eq!(done.is_error, is_error, "{text}");
-            assert!(
-                text.contains(HOOK_REWRITTEN_TO) && !text.contains(HOOK_REWRITTEN_FROM),
-                "everything downstream names the rewritten command: {text}"
-            );
-        });
+        let text = done.output.as_text();
+        assert_eq!(done.is_error, is_error, "{text}");
+        assert!(
+            text.contains(HOOK_REWRITTEN_TO) && !text.contains(HOOK_REWRITTEN_FROM),
+            "everything downstream names the rewritten command: {text}"
+        );
     }
 
-    #[test]
-    fn input_hook_denial_never_runs_the_tool() {
-        smol::block_on(async {
-            let (ctx, hook) = hooked_ctx(stub_ctx(&AgentMode::Build));
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_DENIED)).await;
+    #[tokio::test]
+    async fn input_hook_denial_never_runs_the_tool() {
+        let (ctx, hook) = hooked_ctx(stub_ctx(&AgentMode::Build));
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_DENIED)).await;
 
-            assert!(done.is_error);
-            assert_eq!(done.output.as_text(), HOOK_DENY_REASON);
-            assert_eq!(
-                hook.stages(),
-                vec![(HookStage::Input, Authority::Unbounded)],
-                "a stopped call has no output to hook"
-            );
-        });
+        assert!(done.is_error);
+        assert_eq!(done.output.as_text(), HOOK_DENY_REASON);
+        assert_eq!(
+            hook.stages(),
+            vec![(HookStage::Input, Authority::Unbounded)],
+            "a stopped call has no output to hook"
+        );
     }
 
     /// Everything the model reads passes the output stage, so a hook that
     /// redacts or trims cannot be walked around by failing the call.
-    #[test]
-    fn a_refused_call_still_reaches_the_output_stage() {
-        smol::block_on(async {
-            let (ctx, hook) = hooked_ctx(denying_ctx(ToolKey::native(HOOK_TOOL_NAME)));
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+    #[tokio::test]
+    async fn a_refused_call_still_reaches_the_output_stage() {
+        let (ctx, hook) = hooked_ctx(denying_ctx(ToolKey::native(HOOK_TOOL_NAME)));
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            assert!(done.is_error);
-            assert!(done.output.as_text().contains(PERMISSION_DENIED_PREFIX));
-            assert_eq!(hook.stages(), both_stages(Authority::Unbounded));
+        assert!(done.is_error);
+        assert!(done.output.as_text().contains(PERMISSION_DENIED_PREFIX));
+        assert_eq!(hook.stages(), both_stages(Authority::Unbounded));
 
-            let firing = hook.at(HookStage::Output).expect("the output stage fired");
-            assert_eq!(firing.value[OUTPUT_IS_ERROR], Value::Bool(true));
-            let text = firing.value[OUTPUT_TEXT].as_str().unwrap_or_default();
-            assert!(text.contains(PERMISSION_DENIED_PREFIX), "got: {text}");
-        });
+        let firing = hook.at(HookStage::Output).expect("the output stage fired");
+        assert_eq!(firing.value[OUTPUT_IS_ERROR], Value::Bool(true));
+        let text = firing.value[OUTPUT_TEXT].as_str().unwrap_or_default();
+        assert!(text.contains(PERMISSION_DENIED_PREFIX), "got: {text}");
     }
 
     /// A name that routes nowhere lends no authority, so nothing fires.
-    #[test]
-    fn unknown_names_are_not_hooked() {
-        smol::block_on(async {
-            let (ctx, hook) = hooked_ctx(stub_ctx(&AgentMode::Build));
-            let done = dispatch(&ctx, "nope", &call_input(HOOK_DENIED)).await;
+    #[tokio::test]
+    async fn unknown_names_are_not_hooked() {
+        let (ctx, hook) = hooked_ctx(stub_ctx(&AgentMode::Build));
+        let done = dispatch(&ctx, "nope", &call_input(HOOK_DENIED)).await;
 
-            assert!(done.is_error);
-            assert!(done.output.as_text().contains(UNKNOWN_TOOL_PREFIX));
-            assert!(hook.stages().is_empty());
-        });
+        assert!(done.is_error);
+        assert!(done.output.as_text().contains(UNKNOWN_TOOL_PREFIX));
+        assert!(hook.stages().is_empty());
     }
 
     fn mcp_route_ctx() -> ToolContext {
@@ -2106,36 +2105,34 @@ mod tests {
     #[test_case(mcp_route_ctx,  TOOL_SEARCH_TOOL_NAME, None,                  Authority::Unbounded                   ; "search_declares_nothing_either")]
     #[test_case(mcp_route_ctx,  PROBE_WIRE,            None,                  Authority::Unbounded                   ; "an_mcp_tool_is_code_maki_does_not_own")]
     #[test_case(host_route_ctx, CLIENT_NAME,           None,                  Authority::Unbounded                   ; "a_host_tool_is_code_maki_does_not_own")]
-    fn a_route_lends_the_authority_it_declares(
+    #[tokio::test]
+    async fn a_route_lends_the_authority_it_declares(
         build: fn() -> ToolContext,
         name: &str,
         permission: Option<Permission>,
         expected: Authority,
     ) {
-        smol::block_on(async {
-            let (ctx, hook) = hooked_with(build(), permission, RecordingHook::default());
-            dispatch(&ctx, name, &call_input(HOOK_PLAIN)).await;
+        let (ctx, hook) = hooked_with(build(), permission, RecordingHook::default());
+        dispatch(&ctx, name, &call_input(HOOK_PLAIN)).await;
 
-            let firing = hook.at(HookStage::Input).expect("the input stage fired");
-            assert_eq!(firing.authority, expected);
-            assert_eq!(firing.tool, name, "hooked under the name the model called");
-        });
+        let firing = hook.at(HookStage::Input).expect("the input stage fired");
+        assert_eq!(firing.authority, expected);
+        assert_eq!(firing.tool, name, "hooked under the name the model called");
     }
 
     /// `wraps` is why an unwrapped slot costs nothing: a stage the hook
     /// declines never reaches `run` at all.
     #[test_case(&[HookStage::Input]  ; "input_only")]
     #[test_case(&[HookStage::Output] ; "output_only")]
-    fn a_stage_the_hook_declines_never_fires(wrapped: &'static [HookStage]) {
-        smol::block_on(async {
-            let (ctx, hook) = plain_hooked_ctx(RecordingHook::wrapping(wrapped));
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+    #[tokio::test]
+    async fn a_stage_the_hook_declines_never_fires(wrapped: &'static [HookStage]) {
+        let (ctx, hook) = plain_hooked_ctx(RecordingHook::wrapping(wrapped));
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            assert!(!done.is_error);
-            assert_eq!(done.output.as_text(), ran(HOOK_PLAIN));
-            let fired: Vec<HookStage> = hook.seen().iter().map(|s| s.stage).collect();
-            assert_eq!(fired, wrapped);
-        });
+        assert!(!done.is_error);
+        assert_eq!(done.output.as_text(), ran(HOOK_PLAIN));
+        let fired: Vec<HookStage> = hook.seen().iter().map(|s| s.stage).collect();
+        assert_eq!(fired, wrapped);
     }
 
     /// Nobody is left reading the answer, so waiting on a verdict that never
@@ -2143,39 +2140,36 @@ mod tests {
     /// input was judged, and an output already produced stands.
     #[test_case(&[HookStage::Input],  true,  ERROR_CANCELLED.to_owned() ; "input")]
     #[test_case(&[HookStage::Output], false, ran(HOOK_PLAIN)            ; "output")]
-    fn a_cancelled_call_does_not_wait_for_a_verdict(
+    #[tokio::test]
+    async fn a_cancelled_call_does_not_wait_for_a_verdict(
         wrapped: &'static [HookStage],
         is_error: bool,
         expected: String,
     ) {
-        smol::block_on(async {
-            let mut ctx = build_ctx();
-            ctx.cancel = cancelled_token();
-            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::never_answering(wrapped));
+        let mut ctx = build_ctx();
+        ctx.cancel = cancelled_token();
+        let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::never_answering(wrapped));
 
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            assert_eq!(done.is_error, is_error);
-            assert_eq!(done.output.as_text(), expected);
-        });
+        assert_eq!(done.is_error, is_error);
+        assert_eq!(done.output.as_text(), expected);
     }
 
     /// A host that never answers (one mid-reload) cannot hold the call. The
     /// chain gives up a short grace after its window and lets the value
     /// through unchanged, just like a chain the host dropped there.
-    #[test]
-    fn a_chain_that_never_answers_ends_at_its_window() {
-        smol::block_on(async {
-            let mut ctx = build_ctx();
-            ctx.deadline = Deadline::after(Duration::ZERO);
-            let never = RecordingHook::never_answering(&[HookStage::Input]);
-            let (ctx, _hook) = hooked_with(ctx, None, never);
+    #[tokio::test]
+    async fn a_chain_that_never_answers_ends_at_its_window() {
+        let mut ctx = build_ctx();
+        ctx.deadline = Deadline::after(Duration::ZERO);
+        let never = RecordingHook::never_answering(&[HookStage::Input]);
+        let (ctx, _hook) = hooked_with(ctx, None, never);
 
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            assert!(!done.is_error, "{}", done.output.as_text());
-            assert_eq!(done.output.as_text(), ran(HOOK_PLAIN));
-        });
+        assert!(!done.is_error, "{}", done.output.as_text());
+        assert_eq!(done.output.as_text(), ran(HOOK_PLAIN));
     }
 
     /// The host polls a chain before it checks the deadline, so a verdict can
@@ -2184,68 +2178,63 @@ mod tests {
     /// there would hand back the raw text.
     #[test_case(HOOK_DENIED, steer_the_call,     HOOK_DENY_REASON ; "input_deny")]
     #[test_case(HOOK_PLAIN,  replace_the_output, HOOK_OUTPUT_TEXT ; "output_redaction")]
-    fn a_late_answer_past_the_calls_deadline_is_heard(
+    #[tokio::test]
+    async fn a_late_answer_past_the_calls_deadline_is_heard(
         command: &str,
         answer: fn(HookStage, &Value) -> Verdict,
         expected: &str,
     ) {
-        smol::block_on(async {
-            let mut ctx = build_ctx();
-            ctx.deadline = Deadline::after(Duration::ZERO);
-            let late = RecordingHook {
-                reply: Reply::Late(answer),
-                ..RecordingHook::default()
-            };
-            let (ctx, _hook) = hooked_with(ctx, None, late);
+        let mut ctx = build_ctx();
+        ctx.deadline = Deadline::after(Duration::ZERO);
+        let late = RecordingHook {
+            reply: Reply::Late(answer),
+            ..RecordingHook::default()
+        };
+        let (ctx, _hook) = hooked_with(ctx, None, late);
 
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(command)).await;
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(command)).await;
 
-            assert!(done.is_error);
-            assert_eq!(done.output.as_text(), expected);
-        });
+        assert!(done.is_error);
+        assert_eq!(done.output.as_text(), expected);
     }
 
     /// A tool that overran its deadline does not take its output layers'
     /// window with it, or the layers that redact it would be skipped.
-    #[test]
-    fn an_output_chain_gets_a_window_past_the_calls_deadline() {
-        smol::block_on(async {
-            let mut ctx = build_ctx();
-            ctx.deadline = Deadline::after(Duration::ZERO);
-            let at = ctx.deadline.at();
-            let (ctx, hook) = hooked_ctx(ctx);
-            let before = Instant::now();
+    #[tokio::test]
+    async fn an_output_chain_gets_a_window_past_the_calls_deadline() {
+        let mut ctx = build_ctx();
+        ctx.deadline = Deadline::after(Duration::ZERO);
+        let at = ctx.deadline.at();
+        let (ctx, hook) = hooked_ctx(ctx);
+        let before = Instant::now();
 
-            dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+        dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            let input = hook.at(HookStage::Input).expect("the input stage fired");
-            let output = hook.at(HookStage::Output).expect("the output stage fired");
-            assert_eq!(Some(input.deadline), at);
-            assert!(output.deadline >= before + HOOK_CHAIN_MAX);
-        });
+        let input = hook.at(HookStage::Input).expect("the input stage fired");
+        let output = hook.at(HookStage::Output).expect("the output stage fired");
+        assert_eq!(Some(input.deadline), at);
+        assert!(output.deadline >= before + HOOK_CHAIN_MAX);
     }
 
     /// A chain runs off this thread, so it only dies with the call it filters
     /// when it is handed that call's own token and an instant to be killed at.
-    #[test]
-    fn a_firing_carries_the_calls_cancellation_and_deadline() {
-        smol::block_on(async {
-            let mut ctx = build_ctx();
-            ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
-            let at = ctx.deadline.at();
-            ctx.cancel = cancelled_token();
-            let (ctx, hook) = hooked_ctx(ctx);
+    #[tokio::test]
+    async fn a_firing_carries_the_calls_cancellation_and_deadline() {
+        let mut ctx = build_ctx();
+        ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
+        let at = ctx.deadline.at();
+        ctx.cancel = cancelled_token();
+        let (ctx, hook) = hooked_ctx(ctx);
 
-            dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+        dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            let firing = hook.at(HookStage::Input).expect("the input stage fired");
-            assert!(firing.cancelled, "the call's own token, not a fresh one");
-            assert_eq!(
-                Some(firing.deadline),
-                at,
-                "and no later than the call itself"
-            );
-        });
+        let firing = hook.at(HookStage::Input).expect("the input stage fired");
+        assert!(firing.cancelled, "the call's own token, not a fresh one");
+        assert_eq!(
+            Some(firing.deadline),
+            at,
+            "and no later than the call itself"
+        );
     }
 
     /// A call with no deadline of its own still bounds each chain, or a layer
@@ -2253,25 +2242,23 @@ mod tests {
     /// too: the input chain and the tool spend from the same budget, and an
     /// output chain handed the entry-time answer would get whatever they left,
     /// which for a slow tool is nothing.
-    #[test]
-    fn a_call_without_a_deadline_bounds_each_stage_from_where_it_starts() {
-        smol::block_on(async {
-            let (ctx, hook) = hooked_ctx(build_ctx());
-            let before = Instant::now();
+    #[tokio::test]
+    async fn a_call_without_a_deadline_bounds_each_stage_from_where_it_starts() {
+        let (ctx, hook) = hooked_ctx(build_ctx());
+        let before = Instant::now();
 
-            dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_SLOW_COMMAND)).await;
+        dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_SLOW_COMMAND)).await;
 
-            let input = hook.at(HookStage::Input).expect("the input stage fired");
-            let output = hook.at(HookStage::Output).expect("the output stage fired");
-            assert!(
-                input.deadline >= before && input.deadline <= Instant::now() + HOOK_CHAIN_MAX,
-                "a deadline already past kills every chain"
-            );
-            assert!(
-                output.deadline - input.deadline >= HOOK_SLOW_RUN,
-                "the output chain inherited a window the call had already spent"
-            );
-        });
+        let input = hook.at(HookStage::Input).expect("the input stage fired");
+        let output = hook.at(HookStage::Output).expect("the output stage fired");
+        assert!(
+            input.deadline >= before && input.deadline <= Instant::now() + HOOK_CHAIN_MAX,
+            "a deadline already past kills every chain"
+        );
+        assert!(
+            output.deadline - input.deadline >= HOOK_SLOW_RUN,
+            "the output chain inherited a window the call had already spent"
+        );
     }
 
     fn replace_the_output(stage: HookStage, _value: &Value) -> Verdict {
@@ -2302,35 +2289,32 @@ mod tests {
     #[test_case(replace_the_output,              true,  HOOK_OUTPUT_TEXT.to_owned() ; "a_replacement_moves_text_and_flag")]
     #[test_case(replace_the_output_without_text, false, ran(HOOK_PLAIN)             ; "a_replacement_without_text_changes_neither")]
     #[test_case(deny_the_output,                 true,  HOOK_DENY_REASON.to_owned() ; "a_denial_becomes_the_result")]
-    fn the_output_stage_decides_what_the_model_reads(
+    #[tokio::test]
+    async fn the_output_stage_decides_what_the_model_reads(
         answer: fn(HookStage, &Value) -> Verdict,
         is_error: bool,
         expected: String,
     ) {
-        smol::block_on(async {
-            let (ctx, _hook) = plain_hooked_ctx(RecordingHook::answering(answer));
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+        let (ctx, _hook) = plain_hooked_ctx(RecordingHook::answering(answer));
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            assert_eq!(done.is_error, is_error);
-            assert_eq!(done.output.as_text(), expected);
-        });
+        assert_eq!(done.is_error, is_error);
+        assert_eq!(done.output.as_text(), expected);
     }
 
     /// An output the UI renders from fields carries no prose to lend, and
     /// editing it would desync the fields from the text.
-    #[test]
-    fn a_rendered_output_skips_the_output_stage() {
-        smol::block_on(async {
-            let (ctx, hook) = plain_hooked_ctx(RecordingHook::answering(deny_the_output));
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_DIFF_COMMAND)).await;
+    #[tokio::test]
+    async fn a_rendered_output_skips_the_output_stage() {
+        let (ctx, hook) = plain_hooked_ctx(RecordingHook::answering(deny_the_output));
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_DIFF_COMMAND)).await;
 
-            assert!(!done.is_error);
-            assert_eq!(done.output.as_text(), HOOK_DIFF_SUMMARY);
-            assert_eq!(
-                hook.stages(),
-                vec![(HookStage::Input, Authority::Unbounded)]
-            );
-        });
+        assert!(!done.is_error);
+        assert_eq!(done.output.as_text(), HOOK_DIFF_SUMMARY);
+        assert_eq!(
+            hook.stages(),
+            vec![(HookStage::Input, Authority::Unbounded)]
+        );
     }
 
     fn instruction(path: &str) -> InstructionBlock {
@@ -2459,58 +2443,55 @@ mod tests {
     /// sees it as well as the final result, and can tell the two apart. A
     /// stop that came first does not cut the final's layer short, and each
     /// output carries the instructions found before it.
-    #[test]
-    fn a_moved_calls_receipt_and_final_result_both_take_the_output_pipeline() {
-        smol::block_on(async {
-            let (receipt, landed, scope, hook) =
-                dispatch_moved(MovedEnding::Replies, redact_the_output).await;
-            let landed = landed
-                .recv_async()
-                .await
-                .expect("the tail landed")
-                .expect("the call replied");
+    #[tokio::test]
+    async fn a_moved_calls_receipt_and_final_result_both_take_the_output_pipeline() {
+        let (receipt, landed, scope, hook) =
+            dispatch_moved(MovedEnding::Replies, redact_the_output).await;
+        let landed = landed
+            .recv_async()
+            .await
+            .expect("the tail landed")
+            .expect("the call replied");
 
-            assert!(receipt.backgrounded);
-            assert!(!landed.backgrounded);
-            assert!(scope.cancel().is_cancelled());
-            for done in [&receipt, &landed] {
-                assert!(!done.is_error);
-                let text = done.output.as_text();
-                assert!(text.starts_with(HOOK_OUTPUT_TEXT), "{text}");
-            }
-            assert_eq!(instruction_paths(&receipt), [INSTRUCTION_PATH]);
-            assert_eq!(instruction_paths(&landed), [MOVED_INSTRUCTION_PATH]);
-            let outputs = output_firings(&hook);
-            let filtered: Vec<_> = outputs
-                .iter()
-                .map(|seen| (seen.value[OUTPUT_TEXT].clone(), seen.receipt))
-                .collect();
-            assert_eq!(
-                filtered,
-                [(json!(MOVED_RECEIPT), true), (json!(MOVED_FINAL), false)]
-            );
-            assert!(outputs.iter().all(|seen| !seen.cancelled));
-        });
+        assert!(receipt.backgrounded);
+        assert!(!landed.backgrounded);
+        assert!(scope.cancel().is_cancelled());
+        for done in [&receipt, &landed] {
+            assert!(!done.is_error);
+            let text = done.output.as_text();
+            assert!(text.starts_with(HOOK_OUTPUT_TEXT), "{text}");
+        }
+        assert_eq!(instruction_paths(&receipt), [INSTRUCTION_PATH]);
+        assert_eq!(instruction_paths(&landed), [MOVED_INSTRUCTION_PATH]);
+        let outputs = output_firings(&hook);
+        let filtered: Vec<_> = outputs
+            .iter()
+            .map(|seen| (seen.value[OUTPUT_TEXT].clone(), seen.receipt))
+            .collect();
+        assert_eq!(
+            filtered,
+            [(json!(MOVED_RECEIPT), true), (json!(MOVED_FINAL), false)]
+        );
+        assert!(outputs.iter().all(|seen| !seen.cancelled));
     }
 
     /// Once the model read the receipt it is owed an end, even when the work
     /// gave no reply or the pipeline died on the way to landing it.
     #[test_case(MovedEnding::Silent ; "the_work_ends_without_a_reply")]
     #[test_case(MovedEnding::Panics ; "the_pipeline_dies")]
-    fn a_published_move_always_lands(ending: MovedEnding) {
-        smol::block_on(async {
-            let (receipt, landed, _scope, hook) = dispatch_moved(ending, redact_the_output).await;
+    #[tokio::test]
+    async fn a_published_move_always_lands(ending: MovedEnding) {
+        let (receipt, landed, _scope, hook) = dispatch_moved(ending, redact_the_output).await;
 
-            assert!(receipt.backgrounded);
-            assert!(
-                landed
-                    .recv_async()
-                    .await
-                    .expect("the tail landed")
-                    .is_none()
-            );
-            assert_eq!(hook.stages(), both_stages(Authority::Unbounded));
-        });
+        assert!(receipt.backgrounded);
+        assert!(
+            landed
+                .recv_async()
+                .await
+                .expect("the tail landed")
+                .is_none()
+        );
+        assert_eq!(hook.stages(), both_stages(Authority::Unbounded));
     }
 
     /// A receipt the model reads as an error tells it the call failed, so
@@ -2518,23 +2499,23 @@ mod tests {
     /// model has likely retried.
     #[test_case(deny_the_output    ; "a_denied_receipt")]
     #[test_case(replace_the_output ; "a_receipt_rewritten_as_a_failure")]
-    fn a_receipt_failed_by_a_layer_unpublishes_the_move(answer: fn(HookStage, &Value) -> Verdict) {
-        smol::block_on(async {
-            let (receipt, landed, _scope, hook) =
-                dispatch_moved(MovedEnding::Replies, answer).await;
+    #[tokio::test]
+    async fn a_receipt_failed_by_a_layer_unpublishes_the_move(
+        answer: fn(HookStage, &Value) -> Verdict,
+    ) {
+        let (receipt, landed, _scope, hook) = dispatch_moved(MovedEnding::Replies, answer).await;
 
-            assert!(receipt.is_error);
-            assert!(!receipt.backgrounded);
-            assert!(
-                landed.recv_async().await.is_err(),
-                "dropped unlanded, which abandons the move"
-            );
-            let receipts: Vec<_> = output_firings(&hook)
-                .iter()
-                .map(|seen| seen.receipt)
-                .collect();
-            assert_eq!(receipts, [true], "the final result never ran");
-        });
+        assert!(receipt.is_error);
+        assert!(!receipt.backgrounded);
+        assert!(
+            landed.recv_async().await.is_err(),
+            "dropped unlanded, which abandons the move"
+        );
+        let receipts: Vec<_> = output_firings(&hook)
+            .iter()
+            .map(|seen| seen.receipt)
+            .collect();
+        assert_eq!(receipts, [true], "the final result never ran");
     }
 
     fn drop_the_field(stage: HookStage, _value: &Value) -> Verdict {
@@ -2547,15 +2528,13 @@ mod tests {
     /// The rewrite lands before the schema check, so a shape the tool cannot
     /// parse is an ordinary parse error rather than something dispatch has to
     /// survive.
-    #[test]
-    fn a_rewrite_the_tool_cannot_parse_is_a_parse_error() {
-        smol::block_on(async {
-            let (ctx, _hook) = plain_hooked_ctx(RecordingHook::answering(drop_the_field));
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+    #[tokio::test]
+    async fn a_rewrite_the_tool_cannot_parse_is_a_parse_error() {
+        let (ctx, _hook) = plain_hooked_ctx(RecordingHook::answering(drop_the_field));
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            assert!(done.is_error);
-            assert_eq!(done.output.as_text(), missing_command().to_string());
-        });
+        assert!(done.is_error);
+        assert_eq!(done.output.as_text(), missing_command().to_string());
     }
 
     fn rewrite_the_target(stage: HookStage, _value: &Value) -> Verdict {
@@ -2571,14 +2550,13 @@ mod tests {
     /// some unrelated reason.
     #[test_case(RecordingHook::answering(rewrite_the_target), crate::tools::PLAN_WRITE_RESTRICTED.to_owned() ; "rewritten_away_from_the_plan_file")]
     #[test_case(RecordingHook::default(),                     ran(PLAN_PATH)                                 ; "left_on_the_plan_file")]
-    fn a_rewritten_write_target_is_still_plan_gated(hook: RecordingHook, expected: String) {
-        smol::block_on(async {
-            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
-            let (ctx, _hook) = hooked_with(stub_ctx(&plan), None, hook);
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(PLAN_PATH)).await;
+    #[tokio::test]
+    async fn a_rewritten_write_target_is_still_plan_gated(hook: RecordingHook, expected: String) {
+        let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+        let (ctx, _hook) = hooked_with(stub_ctx(&plan), None, hook);
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(PLAN_PATH)).await;
 
-            assert_eq!(done.output.as_text(), expected);
-        });
+        assert_eq!(done.output.as_text(), expected);
     }
 
     fn planning() -> AgentMode {
@@ -2592,54 +2570,51 @@ mod tests {
     #[test_case(planning(),       PLAN_PATH,         CallOrigin::Model,  BACKGROUND_PLAN_WRITE_DENIED.to_owned() ; "plan_file_while_the_chat_plans")]
     #[test_case(planning(),       HOOK_ESCAPED_PATH, CallOrigin::Nested, BACKGROUND_PLAN_WRITE_DENIED.to_owned() ; "nested_write_while_the_chat_plans")]
     #[test_case(AgentMode::Build, PLAN_PATH,         CallOrigin::Model,  ran(PLAN_PATH)                          ; "building_chat_follows_the_rules")]
-    fn background_write_follows_the_chat_mode(
+    #[tokio::test]
+    async fn background_write_follows_the_chat_mode(
         chat_mode: AgentMode,
         target: &str,
         origin: CallOrigin,
         expected: String,
     ) {
-        smol::block_on(async {
-            let chat = MakiId::generate();
-            let mailbox = SessionMailbox::register(chat);
-            let seed = mailbox.publish_seed(stub_seed(chat));
-            seed.set_chat_settings(Default::default(), &chat_mode);
-            let mut ctx = build_ctx();
-            ctx.registry = registered(Arc::new(HookMock(None)));
-            ctx.background_for = BackgroundFor::Chat(chat);
+        let chat = MakiId::generate();
+        let mailbox = SessionMailbox::register(chat);
+        let seed = mailbox.publish_seed(stub_seed(chat));
+        seed.set_chat_settings(Default::default(), &chat_mode);
+        let mut ctx = build_ctx();
+        ctx.registry = registered(Arc::new(HookMock(None)));
+        ctx.background_for = BackgroundFor::Chat(chat);
 
-            let done = run(
-                TEST_ID.into(),
-                HOOK_TOOL_NAME,
-                &call_input(target),
-                &ctx,
-                origin,
-            )
-            .await;
+        let done = run(
+            TEST_ID.into(),
+            HOOK_TOOL_NAME,
+            &call_input(target),
+            &ctx,
+            origin,
+        )
+        .await;
 
-            assert_eq!(done.output.as_text(), expected);
-        });
+        assert_eq!(done.output.as_text(), expected);
     }
 
     /// A plugin keys its state on these, so a stage firing under another
     /// call's identity would write onto that other call.
-    #[test]
-    fn both_stages_carry_the_call_id_the_session_and_the_origin() {
-        smol::block_on(async {
-            let session = SessionRef::generate();
-            let mut ctx = build_ctx();
-            ctx.session_id = Some(session.clone());
-            let (ctx, hook) = hooked_ctx(ctx);
+    #[tokio::test]
+    async fn both_stages_carry_the_call_id_the_session_and_the_origin() {
+        let session = SessionRef::generate();
+        let mut ctx = build_ctx();
+        ctx.session_id = Some(session.clone());
+        let (ctx, hook) = hooked_ctx(ctx);
 
-            dispatch_nested(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+        dispatch_nested(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            let seen = hook.seen();
-            assert_eq!(seen.len(), HookStage::ALL.len(), "both stages fire");
-            for firing in seen {
-                assert_eq!(firing.tool_id, TEST_ID);
-                assert_eq!(firing.session_id.as_deref(), Some(session.as_str()));
-                assert_eq!(firing.origin, CallOrigin::Nested);
-            }
-        });
+        let seen = hook.seen();
+        assert_eq!(seen.len(), HookStage::ALL.len(), "both stages fire");
+        for firing in seen {
+            assert_eq!(firing.tool_id, TEST_ID);
+            assert_eq!(firing.session_id.as_deref(), Some(session.as_str()));
+            assert_eq!(firing.origin, CallOrigin::Nested);
+        }
     }
 
     /// The call record is what plugins read back later, so it has to name the
@@ -2647,34 +2622,31 @@ mod tests {
     #[test_case(HOOK_PLAIN,          Some(HOOK_PLAIN)        ; "an_untouched_call_records_its_input")]
     #[test_case(HOOK_REWRITTEN_FROM, Some(HOOK_REWRITTEN_TO) ; "a_rewritten_call_records_the_rewrite")]
     #[test_case(HOOK_DENIED,         None                    ; "a_stopped_call_records_nothing")]
-    fn the_call_record_holds_the_input_that_ran(command: &str, expected: Option<&str>) {
-        smol::block_on(async {
-            let (ctx, _hook) = hooked_ctx(build_ctx());
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(command)).await;
+    #[tokio::test]
+    async fn the_call_record_holds_the_input_that_ran(command: &str, expected: Option<&str>) {
+        let (ctx, _hook) = hooked_ctx(build_ctx());
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(command)).await;
 
-            assert_eq!(done.call.map(|c| c.input), expected.map(call_input));
-        });
+        assert_eq!(done.call.map(|c| c.input), expected.map(call_input));
     }
 
     /// A layer judging a result sees the call that produced it, not the one
     /// the model sent before the input stage had its say.
-    #[test]
-    fn the_output_stage_sees_the_input_that_ran_and_the_tool_kind() {
-        smol::block_on(async {
-            let (ctx, hook) = hooked_ctx(build_ctx());
-            dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_REWRITTEN_FROM)).await;
+    #[tokio::test]
+    async fn the_output_stage_sees_the_input_that_ran_and_the_tool_kind() {
+        let (ctx, hook) = hooked_ctx(build_ctx());
+        dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_REWRITTEN_FROM)).await;
 
-            let input = hook.at(HookStage::Input).expect("the input stage fired");
-            let output = hook.at(HookStage::Output).expect("the output stage fired");
-            assert_eq!(
-                input.input, None,
-                "the input stage gets the input as its value"
-            );
-            assert_eq!(output.input, Some(call_input(HOOK_REWRITTEN_TO)));
-            for firing in [input, output] {
-                assert_eq!(firing.tool_kind.as_deref(), Some(HOOK_TOOL_KIND));
-            }
-        });
+        let input = hook.at(HookStage::Input).expect("the input stage fired");
+        let output = hook.at(HookStage::Output).expect("the output stage fired");
+        assert_eq!(
+            input.input, None,
+            "the input stage gets the input as its value"
+        );
+        assert_eq!(output.input, Some(call_input(HOOK_REWRITTEN_TO)));
+        for firing in [input, output] {
+            assert_eq!(firing.tool_kind.as_deref(), Some(HOOK_TOOL_KIND));
+        }
     }
 
     #[derive(Debug, PartialEq)]
@@ -2767,68 +2739,63 @@ mod tests {
     #[test_case(allow_ruled_ctx, PermissionAnswer::AllowOnce, ran(HOOK_PLAIN)                     ; "an_allow_rule_still_asks")]
     #[test_case(yolo_ctx,        PermissionAnswer::AllowOnce, ran(HOOK_PLAIN)                     ; "yolo_still_asks")]
     #[test_case(allow_ruled_ctx, PermissionAnswer::Deny,      PERMISSION_DENIED_PREFIX.to_owned() ; "the_user_can_refuse")]
-    fn an_input_ask_prompts_whatever_the_rules_allow(
+    #[tokio::test]
+    async fn an_input_ask_prompts_whatever_the_rules_allow(
         build: fn() -> ToolContext,
         answer: PermissionAnswer,
         expected_start: String,
     ) {
-        smol::block_on(async {
-            let (ctx, events) = answered(build(), answer);
-            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+        let (ctx, events) = answered(build(), answer);
+        let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            assert_eq!(
-                prompts(&events),
-                vec![asked(
-                    ToolKey::native(HOOK_TOOL_NAME),
-                    HOOK_PLAIN.to_owned()
-                )]
-            );
-            let text = done.output.as_text();
-            assert!(text.starts_with(&expected_start), "got: {text}");
-        });
+        assert_eq!(
+            prompts(&events),
+            vec![asked(
+                ToolKey::native(HOOK_TOOL_NAME),
+                HOOK_PLAIN.to_owned()
+            )]
+        );
+        let text = done.output.as_text();
+        assert!(text.starts_with(&expected_start), "got: {text}");
     }
 
     /// The rewrite riding along with an ask is what the user approves and what
     /// runs, or approving one command would run another.
-    #[test]
-    fn an_ask_with_a_rewrite_prompts_for_and_runs_the_rewrite() {
-        smol::block_on(async {
-            let (ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
-            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_with_a_rewrite));
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+    #[tokio::test]
+    async fn an_ask_with_a_rewrite_prompts_for_and_runs_the_rewrite() {
+        let (ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
+        let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_with_a_rewrite));
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            assert_eq!(
-                prompts(&events),
-                vec![asked(
-                    ToolKey::native(HOOK_TOOL_NAME),
-                    HOOK_REWRITTEN_TO.to_owned()
-                )]
-            );
-            assert_eq!(done.output.as_text(), ran(HOOK_REWRITTEN_TO));
-            assert_eq!(
-                done.call.map(|c| c.input),
-                Some(call_input(HOOK_REWRITTEN_TO))
-            );
-        });
+        assert_eq!(
+            prompts(&events),
+            vec![asked(
+                ToolKey::native(HOOK_TOOL_NAME),
+                HOOK_REWRITTEN_TO.to_owned()
+            )]
+        );
+        assert_eq!(done.output.as_text(), ran(HOOK_REWRITTEN_TO));
+        assert_eq!(
+            done.call.map(|c| c.input),
+            Some(call_input(HOOK_REWRITTEN_TO))
+        );
     }
 
     /// The queued allow is the control: were the user asked, the call would run.
-    #[test]
-    fn a_deny_rule_refuses_an_ask_without_prompting() {
-        smol::block_on(async {
-            let (ctx, events) = answered(
-                denying_ctx(ToolKey::native(HOOK_TOOL_NAME)),
-                PermissionAnswer::AllowOnce,
-            );
-            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+    #[tokio::test]
+    async fn a_deny_rule_refuses_an_ask_without_prompting() {
+        let (ctx, events) = answered(
+            denying_ctx(ToolKey::native(HOOK_TOOL_NAME)),
+            PermissionAnswer::AllowOnce,
+        );
+        let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
+        let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            assert!(done.is_error);
-            let text = done.output.as_text();
-            assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
-            assert!(prompts(&events).is_empty());
-        });
+        assert!(done.is_error);
+        let text = done.output.as_text();
+        assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
+        assert!(prompts(&events).is_empty());
     }
 
     fn moved_away(scope: &CallScope) -> CancelTrigger {
@@ -2842,44 +2809,40 @@ mod tests {
     }
 
     /// The queued allow is the control: were the user asked, the call would run.
-    #[test]
-    fn a_moved_call_asks_nobody() {
-        smol::block_on(async {
-            let (mut ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
-            let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
-            let _task = moved_away(&scope);
-            ctx.call = Some(scope);
-            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
-            let done = dispatch_nested(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+    #[tokio::test]
+    async fn a_moved_call_asks_nobody() {
+        let (mut ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
+        let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
+        let _task = moved_away(&scope);
+        ctx.call = Some(scope);
+        let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
+        let done = dispatch_nested(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
-            assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
-            assert!(prompts(&events).is_empty());
-        });
+        assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
+        assert!(prompts(&events).is_empty());
     }
 
-    #[test]
-    fn a_move_withdraws_the_ask_and_frees_the_prompt_channel() {
-        smol::block_on(async {
-            let (event_tx, events) = flume::unbounded();
-            let (_answer_tx, answer_rx) = flume::unbounded::<String>();
-            let mut ctx = build_ctx();
-            ctx.event_tx = EventSender::new(event_tx, 0);
-            let channel = Arc::new(AsyncMutex::new(answer_rx));
-            ctx.user_response_rx = Some(Arc::clone(&channel));
-            let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
-            ctx.call = Some(Arc::clone(&scope));
-            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
+    #[tokio::test]
+    async fn a_move_withdraws_the_ask_and_frees_the_prompt_channel() {
+        let (event_tx, events) = flume::unbounded();
+        let (_answer_tx, answer_rx) = flume::unbounded::<String>();
+        let mut ctx = build_ctx();
+        ctx.event_tx = EventSender::new(event_tx, 0);
+        let channel = Arc::new(AsyncMutex::new(answer_rx));
+        ctx.user_response_rx = Some(Arc::clone(&channel));
+        let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
+        ctx.call = Some(Arc::clone(&scope));
+        let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
 
-            let input = call_input(HOOK_PLAIN);
-            let mut done = pin!(dispatch_nested(&ctx, HOOK_TOOL_NAME, &input));
-            assert!(poll_once(&mut done).await.is_none());
-            assert_eq!(prompts(&events).len(), 1);
+        let input = call_input(HOOK_PLAIN);
+        let mut done = pin!(dispatch_nested(&ctx, HOOK_TOOL_NAME, &input));
+        assert!(done.as_mut().now_or_never().is_none());
+        assert_eq!(prompts(&events).len(), 1);
 
-            let _task = moved_away(&scope);
-            let done = done.await;
-            assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
-            assert!(channel.try_lock().is_some());
-        });
+        let _task = moved_away(&scope);
+        let done = done.await;
+        assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
+        assert!(channel.try_lock().is_ok());
     }
 
     fn scopeless_route_ctx() -> ToolContext {
@@ -2902,92 +2865,41 @@ mod tests {
     #[test_case(scopeless_route_ctx, SCOPELESS_TOOL_NAME,   ToolKey::native(SCOPELESS_TOOL_NAME),   call_input(HOOK_PLAIN) ; "a_native_tool_without_scopes")]
     #[test_case(mcp_route_ctx,       PROBE_WIRE,            ToolKey::parse(PROBE_QUALIFIED).unwrap(), call_input(HOOK_PLAIN) ; "an_mcp_tool")]
     #[test_case(mcp_route_ctx,       TOOL_SEARCH_TOOL_NAME, ToolKey::native(TOOL_SEARCH_TOOL_NAME), search_input()         ; "tool_search")]
-    fn an_ask_on_a_route_without_scopes_prompts_on_the_input(
+    #[tokio::test]
+    async fn an_ask_on_a_route_without_scopes_prompts_on_the_input(
         build: fn() -> ToolContext,
         name: &str,
         tool: ToolKey,
         input: Value,
     ) {
-        smol::block_on(async {
-            let (ctx, events) = answered(build(), PermissionAnswer::AllowOnce);
-            ctx.registry.set_hook(RecordingHook::answering(ask_as_is));
-            dispatch(&ctx, name, &input).await;
+        let (ctx, events) = answered(build(), PermissionAnswer::AllowOnce);
+        ctx.registry.set_hook(RecordingHook::answering(ask_as_is));
+        dispatch(&ctx, name, &input).await;
 
-            assert_eq!(prompts(&events), vec![asked(tool, input.to_string())]);
-        });
+        assert_eq!(prompts(&events), vec![asked(tool, input.to_string())]);
     }
 
-    #[test]
-    fn local_tool_shadows_registry_and_maps_errors() {
-        smol::block_on(async {
-            let mut ctx = local_ctx(SHADOWED_NAME, |input| {
-                Ok(format!("local:{}", input["path"]))
-            });
-            ctx.registry = registry_with(&[SHADOWED_NAME]);
-            let done = dispatch(&ctx, SHADOWED_NAME, &serde_json::json!({"path": "/a"})).await;
-            assert!(!done.is_error);
-            assert_eq!(done.output.as_text(), r#"local:"/a""#);
-
-            let ctx = local_ctx("boom", |_| Err("nope".into()));
-            let done = dispatch(&ctx, "boom", &serde_json::json!({})).await;
-            assert!(done.is_error);
-            assert_eq!(done.output.as_text(), "nope");
+    #[tokio::test]
+    async fn local_tool_shadows_registry_and_maps_errors() {
+        let mut ctx = local_ctx(SHADOWED_NAME, |input| {
+            Ok(format!("local:{}", input["path"]))
         });
+        ctx.registry = registry_with(&[SHADOWED_NAME]);
+        let done = dispatch(&ctx, SHADOWED_NAME, &serde_json::json!({"path": "/a"})).await;
+        assert!(!done.is_error);
+        assert_eq!(done.output.as_text(), r#"local:"/a""#);
+
+        let ctx = local_ctx("boom", |_| Err("nope".into()));
+        let done = dispatch(&ctx, "boom", &serde_json::json!({})).await;
+        assert!(done.is_error);
+        assert_eq!(done.output.as_text(), "nope");
     }
 
-    #[test]
-    fn nested_call_instructions_surface_once_on_the_model_call() {
-        smol::block_on(async {
-            let mut ctx = stub_ctx(&AgentMode::Build);
-            ctx.local_tools = Arc::new(HashMap::from([
-                (
-                    INSTRUCTED_TOOL.to_owned(),
-                    local_tool(ToolAudience::all(), |_, ctx| {
-                        Box::pin(async move {
-                            ctx.call_instructions.record(vec![InstructionBlock {
-                                path: INSTRUCTION_PATH.into(),
-                                content: INSTRUCTION_CONTENT.into(),
-                            }]);
-                            Ok(CHILD_TEXT.into())
-                        })
-                    }),
-                ),
-                (
-                    PARENT_TOOL.to_owned(),
-                    local_tool(ToolAudience::all(), |_, ctx| {
-                        Box::pin(async move {
-                            let child =
-                                dispatch_nested(&ctx, INSTRUCTED_TOOL, &serde_json::json!({}))
-                                    .await;
-                            Ok(child.output.as_text())
-                        })
-                    }),
-                ),
-            ]));
-
-            let done = dispatch(&ctx, PARENT_TOOL, &serde_json::json!({})).await;
-            let text = done.output.as_text();
-            assert_eq!(done.output.instructions().map(<[_]>::len), Some(1));
-            assert!(text.starts_with(CHILD_TEXT));
-            assert_eq!(
-                text.matches(INSTRUCTION_CONTENT).count(),
-                1,
-                "the parent forwards the child's text verbatim, so a block in it would show twice"
-            );
-            assert!(ctx.call_instructions.take().is_empty());
-            assert!(
-                ctx.loaded_instructions
-                    .contains(&PathBuf::from(INSTRUCTION_PATH)),
-                "attaching is what marks the file seen"
-            );
-        });
-    }
-
-    #[test]
-    fn sibling_model_calls_carry_a_found_file_once() {
-        smol::block_on(async {
-            let mut ctx = stub_ctx(&AgentMode::Build);
-            ctx.local_tools = Arc::new(HashMap::from([(
+    #[tokio::test]
+    async fn nested_call_instructions_surface_once_on_the_model_call() {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.local_tools = Arc::new(HashMap::from([
+            (
                 INSTRUCTED_TOOL.to_owned(),
                 local_tool(ToolAudience::all(), |_, ctx| {
                     Box::pin(async move {
@@ -2998,106 +2910,143 @@ mod tests {
                         Ok(CHILD_TEXT.into())
                     })
                 }),
-            )]));
-            let sibling = |ctx: &ToolContext| ToolContext {
-                call_instructions: CallInstructions::default(),
-                ..ctx.clone()
-            };
-
-            let first = dispatch(&sibling(&ctx), INSTRUCTED_TOOL, &serde_json::json!({})).await;
-            let second = dispatch(&sibling(&ctx), INSTRUCTED_TOOL, &serde_json::json!({})).await;
-            assert_eq!(first.output.instructions().map(<[_]>::len), Some(1));
-            assert!(
-                second.output.instructions().is_none(),
-                "both found the file before either was marked; only the first attaches"
-            );
-        });
-    }
-
-    #[test]
-    fn functions_prefixed_name_dispatches_to_canonical_tool() {
-        smol::block_on(async {
-            let ctx = local_ctx("ok", |_| Ok("ran".into()));
-            let done = dispatch(&ctx, "functions.ok", &serde_json::json!({})).await;
-            assert!(!done.is_error);
-            assert_eq!(done.output.as_text(), "ran");
-        });
-    }
-
-    #[test]
-    fn local_tool_notify_emits_tool_start_with_raw_input() {
-        smol::block_on(async {
-            let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let event_tx = crate::EventSender::new(tx, 0);
-            let mut ctx =
-                crate::tools::test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
-            ctx.local_tools = Arc::new(HashMap::from([(
-                "local_echo".to_owned(),
-                local_tool(ToolAudience::all(), |input: Value, _ctx| {
-                    let out = input.to_string();
-                    Box::pin(async move { Ok(out) })
+            ),
+            (
+                PARENT_TOOL.to_owned(),
+                local_tool(ToolAudience::all(), |_, ctx| {
+                    Box::pin(async move {
+                        let child =
+                            dispatch_nested(&ctx, INSTRUCTED_TOOL, &serde_json::json!({})).await;
+                        Ok(child.output.as_text())
+                    })
                 }),
-            )]));
+            ),
+        ]));
 
-            let input = serde_json::json!({"path": "/a"});
-            let done = dispatch(&ctx, "local_echo", &input).await;
-            assert!(!done.is_error);
-
-            let envelope = rx
-                .try_recv()
-                .expect("ToolStart must be emitted before the tool completes");
-            let AgentEvent::ToolStart(start) = envelope.event else {
-                panic!("expected ToolStart, got {:?}", envelope.event);
-            };
-            assert_eq!(start.tool.as_ref(), "local_echo");
-            assert_eq!(start.summary, "local_echo");
-            assert_eq!(start.raw_input, Some(input));
-        });
+        let done = dispatch(&ctx, PARENT_TOOL, &serde_json::json!({})).await;
+        let text = done.output.as_text();
+        assert_eq!(done.output.instructions().map(<[_]>::len), Some(1));
+        assert!(text.starts_with(CHILD_TEXT));
+        assert_eq!(
+            text.matches(INSTRUCTION_CONTENT).count(),
+            1,
+            "the parent forwards the child's text verbatim, so a block in it would show twice"
+        );
+        assert!(ctx.call_instructions.take().is_empty());
+        assert!(
+            ctx.loaded_instructions
+                .contains(&PathBuf::from(INSTRUCTION_PATH)),
+            "attaching is what marks the file seen"
+        );
     }
 
-    #[test]
-    fn tool_search_routes_and_loads_matches() {
-        smol::block_on(async {
-            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
-            let done = dispatch(
-                &mcp_ctx(&mcp),
-                TOOL_SEARCH_TOOL_NAME,
-                &serde_json::json!({"query": "probe"}),
-            )
-            .await;
-            assert!(!done.is_error, "got: {}", done.output.as_text());
-            assert_eq!(done.tool.as_ref(), TOOL_SEARCH_TOOL_NAME);
-            assert!(done.output.as_text().contains(PROBE_WIRE));
+    #[tokio::test]
+    async fn sibling_model_calls_carry_a_found_file_once() {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.local_tools = Arc::new(HashMap::from([(
+            INSTRUCTED_TOOL.to_owned(),
+            local_tool(ToolAudience::all(), |_, ctx| {
+                Box::pin(async move {
+                    ctx.call_instructions.record(vec![InstructionBlock {
+                        path: INSTRUCTION_PATH.into(),
+                        content: INSTRUCTION_CONTENT.into(),
+                    }]);
+                    Ok(CHILD_TEXT.into())
+                })
+            }),
+        )]));
+        let sibling = |ctx: &ToolContext| ToolContext {
+            call_instructions: CallInstructions::default(),
+            ..ctx.clone()
+        };
 
-            let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
-            assert!(
-                tool_names(&tools).contains(&PROBE_WIRE),
-                "searched tool must join the next request"
-            );
-        });
+        let first = dispatch(&sibling(&ctx), INSTRUCTED_TOOL, &serde_json::json!({})).await;
+        let second = dispatch(&sibling(&ctx), INSTRUCTED_TOOL, &serde_json::json!({})).await;
+        assert_eq!(first.output.instructions().map(<[_]>::len), Some(1));
+        assert!(
+            second.output.instructions().is_none(),
+            "both found the file before either was marked; only the first attaches"
+        );
+    }
+
+    #[tokio::test]
+    async fn functions_prefixed_name_dispatches_to_canonical_tool() {
+        let ctx = local_ctx("ok", |_| Ok("ran".into()));
+        let done = dispatch(&ctx, "functions.ok", &serde_json::json!({})).await;
+        assert!(!done.is_error);
+        assert_eq!(done.output.as_text(), "ran");
+    }
+
+    #[tokio::test]
+    async fn local_tool_notify_emits_tool_start_with_raw_input() {
+        let (tx, rx) = flume::unbounded::<crate::Envelope>();
+        let event_tx = crate::EventSender::new(tx, 0);
+        let mut ctx =
+            crate::tools::test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+        ctx.local_tools = Arc::new(HashMap::from([(
+            "local_echo".to_owned(),
+            local_tool(ToolAudience::all(), |input: Value, _ctx| {
+                let out = input.to_string();
+                Box::pin(async move { Ok(out) })
+            }),
+        )]));
+
+        let input = serde_json::json!({"path": "/a"});
+        let done = dispatch(&ctx, "local_echo", &input).await;
+        assert!(!done.is_error);
+
+        let envelope = rx
+            .try_recv()
+            .expect("ToolStart must be emitted before the tool completes");
+        let AgentEvent::ToolStart(start) = envelope.event else {
+            panic!("expected ToolStart, got {:?}", envelope.event);
+        };
+        assert_eq!(start.tool.as_ref(), "local_echo");
+        assert_eq!(start.summary, "local_echo");
+        assert_eq!(start.raw_input, Some(input));
+    }
+
+    #[tokio::test]
+    async fn tool_search_routes_and_loads_matches() {
+        let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+        let done = dispatch(
+            &mcp_ctx(&mcp),
+            TOOL_SEARCH_TOOL_NAME,
+            &serde_json::json!({"query": "probe"}),
+        )
+        .await;
+        assert!(!done.is_error, "got: {}", done.output.as_text());
+        assert_eq!(done.tool.as_ref(), TOOL_SEARCH_TOOL_NAME);
+        assert!(done.output.as_text().contains(PROBE_WIRE));
+
+        let mut tools = serde_json::json!([]);
+        mcp.extend_tools(&mut tools, ToolDeferral::Client);
+        assert!(
+            tool_names(&tools).contains(&PROBE_WIRE),
+            "searched tool must join the next request"
+        );
     }
 
     #[test_case(serde_json::json!({"query": "  "}) ; "blank_query")]
     #[test_case(serde_json::json!({}) ; "missing_query")]
-    fn tool_search_bad_query_is_error_event(input: Value) {
-        smol::block_on(async {
-            let done = dispatch(
-                &mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED])),
-                TOOL_SEARCH_TOOL_NAME,
-                &input,
-            )
-            .await;
-            assert!(done.is_error);
-            assert_eq!(done.output.as_text(), crate::mcp::SEARCH_EMPTY_QUERY);
-        });
+    #[tokio::test]
+    async fn tool_search_bad_query_is_error_event(input: Value) {
+        let done = dispatch(
+            &mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED])),
+            TOOL_SEARCH_TOOL_NAME,
+            &input,
+        )
+        .await;
+        assert!(done.is_error);
+        assert_eq!(done.output.as_text(), crate::mcp::SEARCH_EMPTY_QUERY);
     }
 
     /// Lua draws a batch child from `routed_view`, so the standalone call
     /// must emit the same summary and body format.
     #[test_case(TOOL_SEARCH_TOOL_NAME, search_input(), SEARCH_QUERY,     true  ; "tool_search_shows_query_as_markdown")]
     #[test_case(PROBE_WIRE,            json!({}),      "mcp: srv.probe", false ; "mcp_tool_shows_qualified_name_as_plain")]
-    fn routed_view_matches_the_dispatched_call(
+    #[tokio::test]
+    async fn routed_view_matches_the_dispatched_call(
         name: &str,
         input: Value,
         summary: &str,
@@ -3112,7 +3061,7 @@ mod tests {
             stub_ctx_with(&AgentMode::Build, Some(&EventSender::new(tx, 0)), None),
             &stub_mcp(&[PROBE_QUALIFIED]),
         );
-        let done = smol::block_on(dispatch(&ctx, name, &input));
+        let done = dispatch(&ctx, name, &input).await;
         let start = events
             .try_iter()
             .find_map(|envelope| match envelope.event {
@@ -3124,22 +3073,20 @@ mod tests {
         assert_eq!(done.output.is_markdown(), view.markdown);
     }
 
-    #[test]
-    fn calling_deferred_mcp_tool_loads_it_and_records_the_load_in_its_result() {
-        smol::block_on(async {
-            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
-            let done = dispatch(&mcp_ctx(&mcp), PROBE_WIRE, &serde_json::json!({})).await;
-            assert_eq!(done.tool.as_ref(), PROBE_QUALIFIED, "must route to MCP");
-            assert_eq!(done.output.loaded_tools(), [PROBE_WIRE]);
+    #[tokio::test]
+    async fn calling_deferred_mcp_tool_loads_it_and_records_the_load_in_its_result() {
+        let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+        let done = dispatch(&mcp_ctx(&mcp), PROBE_WIRE, &serde_json::json!({})).await;
+        assert_eq!(done.tool.as_ref(), PROBE_QUALIFIED, "must route to MCP");
+        assert_eq!(done.output.loaded_tools(), [PROBE_WIRE]);
 
-            let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
-            assert_eq!(
-                tool_names(&tools),
-                vec![PROBE_WIRE],
-                "called tool must join the next request"
-            );
-        });
+        let mut tools = serde_json::json!([]);
+        mcp.extend_tools(&mut tools, ToolDeferral::Client);
+        assert_eq!(
+            tool_names(&tools),
+            vec![PROBE_WIRE],
+            "called tool must join the next request"
+        );
     }
 
     /// `McpSession::new` rebuilds the loaded set from history, which holds no
@@ -3147,62 +3094,61 @@ mod tests {
     /// from the resumed one.
     #[test_case(PROBE_WIRE, serde_json::json!({}), PROBE_QUALIFIED ; "tool_call")]
     #[test_case(TOOL_SEARCH_TOOL_NAME, serde_json::json!({"query": "probe"}), TOOL_SEARCH_TOOL_NAME ; "tool_search")]
-    fn nested_call_reaches_mcp_without_loading_anything(name: &str, input: Value, routed: &str) {
-        smol::block_on(async {
-            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
-            let done = dispatch_nested(&mcp_ctx(&mcp), name, &input).await;
-            assert_eq!(done.tool.as_ref(), routed, "must route to MCP");
-            assert!(done.output.loaded_tools().is_empty());
+    #[tokio::test]
+    async fn nested_call_reaches_mcp_without_loading_anything(
+        name: &str,
+        input: Value,
+        routed: &str,
+    ) {
+        let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+        let done = dispatch_nested(&mcp_ctx(&mcp), name, &input).await;
+        assert_eq!(done.tool.as_ref(), routed, "must route to MCP");
+        assert!(done.output.loaded_tools().is_empty());
 
-            let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
-            assert_eq!(
-                tool_names(&tools),
-                vec![TOOL_SEARCH_TOOL_NAME],
-                "a nested call must not change the next request"
-            );
-        });
+        let mut tools = serde_json::json!([]);
+        mcp.extend_tools(&mut tools, ToolDeferral::Client);
+        assert_eq!(
+            tool_names(&tools),
+            vec![TOOL_SEARCH_TOOL_NAME],
+            "a nested call must not change the next request"
+        );
     }
 
-    #[test]
-    fn denied_mcp_call_does_not_load_definition() {
-        smol::block_on(async {
-            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
-            let ctx = with_mcp(denying_ctx(ToolKey::parse(PROBE_QUALIFIED).unwrap()), &mcp);
-            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
-            assert!(done.is_error);
-            assert!(
-                done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
-                "got: {}",
-                done.output.as_text()
-            );
+    #[tokio::test]
+    async fn denied_mcp_call_does_not_load_definition() {
+        let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+        let ctx = with_mcp(denying_ctx(ToolKey::parse(PROBE_QUALIFIED).unwrap()), &mcp);
+        let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+        assert!(done.is_error);
+        assert!(
+            done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
+            "got: {}",
+            done.output.as_text()
+        );
 
-            let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
-            assert_eq!(
-                tool_names(&tools),
-                vec![TOOL_SEARCH_TOOL_NAME],
-                "denied call must not load the definition"
-            );
-        });
+        let mut tools = serde_json::json!([]);
+        mcp.extend_tools(&mut tools, ToolDeferral::Client);
+        assert_eq!(
+            tool_names(&tools),
+            vec![TOOL_SEARCH_TOOL_NAME],
+            "denied call must not load the definition"
+        );
     }
 
-    #[test]
-    fn local_tool_named_tool_search_shadows_mcp_search() {
-        smol::block_on(async {
-            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
-            let ctx = with_mcp(
-                local_ctx(TOOL_SEARCH_TOOL_NAME, |_| Ok("local wins".into())),
-                &mcp,
-            );
-            let done = dispatch(
-                &ctx,
-                TOOL_SEARCH_TOOL_NAME,
-                &serde_json::json!({"query": "probe"}),
-            )
-            .await;
-            assert_eq!(done.output.as_text(), "local wins");
-        });
+    #[tokio::test]
+    async fn local_tool_named_tool_search_shadows_mcp_search() {
+        let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+        let ctx = with_mcp(
+            local_ctx(TOOL_SEARCH_TOOL_NAME, |_| Ok("local wins".into())),
+            &mcp,
+        );
+        let done = dispatch(
+            &ctx,
+            TOOL_SEARCH_TOOL_NAME,
+            &serde_json::json!({"query": "probe"}),
+        )
+        .await;
+        assert_eq!(done.output.as_text(), "local wins");
     }
 
     #[test]
@@ -3295,18 +3241,16 @@ mod tests {
     /// The filter gates dispatch, not only the list the sandbox sees, or a
     /// plugin pricing a session by the array it hands over would pay for less
     /// than the session reaches.
-    #[test]
-    fn dispatch_refuses_a_registry_name_the_filter_left_out() {
-        smol::block_on(async {
-            let mut ctx = stub_ctx(&AgentMode::Build);
-            ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
-            ctx.tool_filter = Arc::new(ToolFilter::Only(vec![OTHER_WIRE.to_owned()]));
+    #[tokio::test]
+    async fn dispatch_refuses_a_registry_name_the_filter_left_out() {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
+        ctx.tool_filter = Arc::new(ToolFilter::Only(vec![OTHER_WIRE.to_owned()]));
 
-            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+        let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
 
-            assert!(done.is_error);
-            assert!(done.output.as_text().starts_with(UNKNOWN_TOOL_PREFIX));
-        });
+        assert!(done.is_error);
+        assert!(done.output.as_text().starts_with(UNKNOWN_TOOL_PREFIX));
     }
 
     /// A host that trims the array it publishes (a Lua caller passing `except`)
@@ -3379,25 +3323,24 @@ mod tests {
     /// The model only fixes names it recognizes, so it hears back what it sent.
     #[test_case(None, "nonexistent.tool", false ; "without_mcp")]
     #[test_case(Some(PROBE_QUALIFIED), OTHER_WIRE, true ; "unpublished_wire_name")]
-    fn unknown_tool_errors_and_echoes_the_name_verbatim(
+    #[tokio::test]
+    async fn unknown_tool_errors_and_echoes_the_name_verbatim(
         published: Option<&str>,
         name: &str,
         server_gone: bool,
     ) {
-        smol::block_on(async {
-            let mcp = published.map(|tool| stub_mcp(&[tool]));
-            let ctx = match &mcp {
-                Some(mcp) => mcp_ctx(mcp),
-                None => stub_ctx(&AgentMode::Build),
-            };
-            let done = dispatch(&ctx, name, &serde_json::json!({})).await;
-            assert!(done.is_error);
-            assert_eq!(done.tool.as_ref(), UNKNOWN_MCP);
-            let text = done.output.as_text();
-            assert!(text.starts_with(UNKNOWN_TOOL_PREFIX), "got: {text}");
-            assert!(text.contains(name), "got: {text}");
-            assert_eq!(text.contains(MCP_SERVER_GONE), server_gone, "got: {text}");
-        });
+        let mcp = published.map(|tool| stub_mcp(&[tool]));
+        let ctx = match &mcp {
+            Some(mcp) => mcp_ctx(mcp),
+            None => stub_ctx(&AgentMode::Build),
+        };
+        let done = dispatch(&ctx, name, &serde_json::json!({})).await;
+        assert!(done.is_error);
+        assert_eq!(done.tool.as_ref(), UNKNOWN_MCP);
+        let text = done.output.as_text();
+        assert!(text.starts_with(UNKNOWN_TOOL_PREFIX), "got: {text}");
+        assert!(text.contains(name), "got: {text}");
+        assert_eq!(text.contains(MCP_SERVER_GONE), server_gone, "got: {text}");
     }
 
     /// Outside the project only a rule lets the write through, since there is
@@ -3431,142 +3374,129 @@ mod tests {
 
     /// Plan mode puts MCP behind the user, it does not block it outright. An
     /// allow rule is the user's answer already, so the call goes through.
-    #[test]
-    fn mcp_tool_allowed_by_rule_in_plan_mode() {
-        smol::block_on(async {
-            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
-            let ctx = with_mcp(
-                ruled_ctx(
-                    &plan,
-                    ToolKey::parse(PROBE_QUALIFIED).unwrap(),
-                    Effect::Allow,
-                ),
-                &stub_mcp(&[PROBE_QUALIFIED]),
-            );
-            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
-            // The stub transport fails every call, so a successful run surfaces
-            // its error: the proof the call was neither plan-blocked nor
-            // permission-denied and actually reached MCP.
-            assert_eq!(done.tool.as_ref(), PROBE_QUALIFIED, "must route to MCP");
-            let text = done.output.as_text();
-            assert!(
-                !text.starts_with(PERMISSION_DENIED_PREFIX)
-                    && text != crate::tools::PLAN_WRITE_RESTRICTED,
-                "plan mode must not block or deny the call, got: {text}"
-            );
-            let mut tools = serde_json::json!([]);
-            ctx.mcp
-                .as_ref()
-                .unwrap()
-                .extend_tools(&mut tools, ToolDeferral::Client);
-            assert!(
-                tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
-                "a permitted plan-mode call must load the definition"
-            );
-        });
+    #[tokio::test]
+    async fn mcp_tool_allowed_by_rule_in_plan_mode() {
+        let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+        let ctx = with_mcp(
+            ruled_ctx(
+                &plan,
+                ToolKey::parse(PROBE_QUALIFIED).unwrap(),
+                Effect::Allow,
+            ),
+            &stub_mcp(&[PROBE_QUALIFIED]),
+        );
+        let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+        // The stub transport fails every call, so a successful run surfaces
+        // its error: the proof the call was neither plan-blocked nor
+        // permission-denied and actually reached MCP.
+        assert_eq!(done.tool.as_ref(), PROBE_QUALIFIED, "must route to MCP");
+        let text = done.output.as_text();
+        assert!(
+            !text.starts_with(PERMISSION_DENIED_PREFIX)
+                && text != crate::tools::PLAN_WRITE_RESTRICTED,
+            "plan mode must not block or deny the call, got: {text}"
+        );
+        let mut tools = serde_json::json!([]);
+        ctx.mcp
+            .as_ref()
+            .unwrap()
+            .extend_tools(&mut tools, ToolDeferral::Client);
+        assert!(
+            tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
+            "a permitted plan-mode call must load the definition"
+        );
     }
 
     /// An MCP server can write without announcing it, so a plan-mode session
     /// asks first even where everything else is approved automatically. The
     /// stub has no channel to ask on, hence the denial below.
-    #[test]
-    fn mcp_tool_in_plan_mode_is_never_auto_approved() {
-        smol::block_on(async {
-            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
-            let ctx = with_mcp(stub_ctx(&plan), &stub_mcp(&[PROBE_QUALIFIED]));
-            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
-            assert!(done.is_error);
-            let text = done.output.as_text();
-            assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
-            assert!(done.output.loaded_tools().is_empty());
-            let mut tools = serde_json::json!([]);
-            ctx.mcp
-                .as_ref()
-                .unwrap()
-                .extend_tools(&mut tools, ToolDeferral::Client);
-            assert!(
-                !tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
-                "an unapproved call must not load the definition"
-            );
-        });
+    #[tokio::test]
+    async fn mcp_tool_in_plan_mode_is_never_auto_approved() {
+        let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+        let ctx = with_mcp(stub_ctx(&plan), &stub_mcp(&[PROBE_QUALIFIED]));
+        let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+        assert!(done.is_error);
+        let text = done.output.as_text();
+        assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
+        assert!(done.output.loaded_tools().is_empty());
+        let mut tools = serde_json::json!([]);
+        ctx.mcp
+            .as_ref()
+            .unwrap()
+            .extend_tools(&mut tools, ToolDeferral::Client);
+        assert!(
+            !tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
+            "an unapproved call must not load the definition"
+        );
     }
 
-    #[test]
-    fn mcp_tool_denied_by_rule_in_plan_mode() {
-        smol::block_on(async {
-            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
-            let ctx = with_mcp(
-                ruled_ctx(
-                    &plan,
-                    ToolKey::parse(PROBE_QUALIFIED).unwrap(),
-                    Effect::Deny,
-                ),
-                &stub_mcp(&[PROBE_QUALIFIED]),
-            );
-            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
-            assert!(done.is_error, "plan mode must not bypass deny rules");
-            assert!(
-                done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
-                "got: {}",
-                done.output.as_text()
-            );
-        });
+    #[tokio::test]
+    async fn mcp_tool_denied_by_rule_in_plan_mode() {
+        let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+        let ctx = with_mcp(
+            ruled_ctx(
+                &plan,
+                ToolKey::parse(PROBE_QUALIFIED).unwrap(),
+                Effect::Deny,
+            ),
+            &stub_mcp(&[PROBE_QUALIFIED]),
+        );
+        let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+        assert!(done.is_error, "plan mode must not bypass deny rules");
+        assert!(
+            done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
+            "got: {}",
+            done.output.as_text()
+        );
     }
 
-    #[test]
-    fn permission_denial_short_circuits_execute() {
-        smol::block_on(async {
-            let mut ctx = denying_ctx(ToolKey::native(GUARDED_TOOL_NAME));
-            ctx.registry = registered(Arc::new(GuardedMock));
+    #[tokio::test]
+    async fn permission_denial_short_circuits_execute() {
+        let mut ctx = denying_ctx(ToolKey::native(GUARDED_TOOL_NAME));
+        ctx.registry = registered(Arc::new(GuardedMock));
 
-            let done = dispatch(&ctx, GUARDED_TOOL_NAME, &serde_json::json!({})).await;
+        let done = dispatch(&ctx, GUARDED_TOOL_NAME, &serde_json::json!({})).await;
 
-            assert!(done.is_error, "permission denial must produce error event");
-            assert!(
-                done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
-                "error should be the permission-denied message, got: {}",
-                done.output.as_text()
-            );
-        });
+        assert!(done.is_error, "permission denial must produce error event");
+        assert!(
+            done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
+            "error should be the permission-denied message, got: {}",
+            done.output.as_text()
+        );
     }
 
     /// We measure the pause on the call's deadline instead of racing the tool
     /// against a tiny budget, so a slow machine can't fail this.
-    #[test]
-    fn time_on_a_permission_prompt_does_not_spend_the_deadline() {
-        smol::block_on(async {
-            let mut ctx = rules_ctx(&AgentMode::Build, Vec::new());
-            ctx.registry = registered(Arc::new(GuardedMock));
-            let (event_tx, events) = flume::unbounded();
-            let (answer_tx, answer_rx) = flume::unbounded();
-            ctx.event_tx = EventSender::new(event_tx, 0);
-            ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(answer_rx)));
-            ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
-            let at = ctx.deadline.at().expect("the call has a deadline");
+    #[tokio::test]
+    async fn time_on_a_permission_prompt_does_not_spend_the_deadline() {
+        let mut ctx = rules_ctx(&AgentMode::Build, Vec::new());
+        ctx.registry = registered(Arc::new(GuardedMock));
+        let (event_tx, events) = flume::unbounded();
+        let (answer_tx, answer_rx) = flume::unbounded();
+        ctx.event_tx = EventSender::new(event_tx, 0);
+        ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(answer_rx)));
+        ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
+        let at = ctx.deadline.at().expect("the call has a deadline");
 
-            let user = async {
-                while !matches!(
-                    events.recv_async().await.unwrap().event,
-                    AgentEvent::PermissionRequest { .. }
-                ) {}
-                smol::Timer::after(PROMPT_THINK_TIME).await;
-                answer_tx
-                    .send(TaggedAnswer::new(TEST_ID, PermissionAnswer::AllowOnce).encode())
-                    .unwrap();
-            };
-            let (done, ()) = futures_lite::future::zip(
-                dispatch(&ctx, GUARDED_TOOL_NAME, &serde_json::json!({})),
-                user,
-            )
-            .await;
+        let user = async {
+            while !matches!(
+                events.recv_async().await.unwrap().event,
+                AgentEvent::PermissionRequest { .. }
+            ) {}
+            sleep(PROMPT_THINK_TIME).await;
+            answer_tx
+                .send(TaggedAnswer::new(TEST_ID, PermissionAnswer::AllowOnce).encode())
+                .unwrap();
+        };
+        let input = serde_json::json!({});
+        let (done, ()) = tokio::join!(dispatch(&ctx, GUARDED_TOOL_NAME, &input), user);
 
-            assert!(!done.is_error, "got: {}", done.output.as_text());
-            let moved = ctx.deadline.at().expect("the call has a deadline");
-            assert!(
-                moved - at >= PROMPT_THINK_TIME,
-                "the prompt ate into the call's budget"
-            );
-        });
+        assert!(!done.is_error, "got: {}", done.output.as_text());
+        let moved = ctx.deadline.at().expect("the call has a deadline");
+        assert!(
+            moved - at >= PROMPT_THINK_TIME,
+            "the prompt ate into the call's budget"
+        );
     }
 
     #[derive(Default)]
@@ -3620,26 +3550,24 @@ mod tests {
     }
 
     /// A denied tool should still get its preview, but never its `execute`.
-    #[test]
-    fn start_runs_before_permission_denial_blocks_execute() {
-        smol::block_on(async {
-            let mut ctx = denying_ctx(ToolKey::native(START_PROBE_NAME));
-            let probe = StartProbe::default();
-            let (started, executed) = (Arc::clone(&probe.started), Arc::clone(&probe.executed));
-            ctx.registry = registered(Arc::new(probe));
+    #[tokio::test]
+    async fn start_runs_before_permission_denial_blocks_execute() {
+        let mut ctx = denying_ctx(ToolKey::native(START_PROBE_NAME));
+        let probe = StartProbe::default();
+        let (started, executed) = (Arc::clone(&probe.started), Arc::clone(&probe.executed));
+        ctx.registry = registered(Arc::new(probe));
 
-            let done = dispatch(&ctx, START_PROBE_NAME, &serde_json::json!({})).await;
+        let done = dispatch(&ctx, START_PROBE_NAME, &serde_json::json!({})).await;
 
-            assert!(done.is_error, "denial must error");
-            assert!(
-                started.load(Ordering::SeqCst),
-                "start must run before permission enforcement"
-            );
-            assert!(
-                !executed.load(Ordering::SeqCst),
-                "execute must not run after denial"
-            );
-        });
+        assert!(done.is_error, "denial must error");
+        assert!(
+            started.load(Ordering::SeqCst),
+            "start must run before permission enforcement"
+        );
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "execute must not run after denial"
+        );
     }
 
     const PROBE_TOOL: &str = "probe";
@@ -3668,7 +3596,7 @@ mod tests {
     }
 
     /// Runs one model turn of {ids} under {run}, with {on_call} inside each call.
-    fn run_turn(
+    async fn run_turn(
         ids: &[&str],
         run: CancelToken,
         on_call: impl Fn(&ToolContext) + Send + Sync + 'static,
@@ -3693,21 +3621,22 @@ mod tests {
             }),
         )]));
 
-        smol::block_on(process_tool_calls(
+        process_tool_calls(
             probe_turn(ids),
             &mut RecentCalls::new(),
             &mut History::new(Vec::new()),
             &event_tx,
             &ctx,
-        ))
+        )
+        .await
         .unwrap();
         std::mem::take(&mut *views.lock().unwrap())
     }
 
-    #[test]
-    fn parallel_calls_each_get_their_own_scope_and_token_that_ends_with_the_call() {
+    #[tokio::test]
+    async fn parallel_calls_each_get_their_own_scope_and_token_that_ends_with_the_call() {
         let (_run_trigger, run) = CancelToken::new();
-        let views = run_turn(&PARALLEL_IDS, run.clone(), |_| {});
+        let views = run_turn(&PARALLEL_IDS, run.clone(), |_| {}).await;
 
         assert_eq!(views.len(), PARALLEL_IDS.len());
         for view in &views {
@@ -3720,15 +3649,80 @@ mod tests {
         assert!(!run.is_cancelled(), "a call ending must not end the run");
     }
 
-    #[test]
-    fn cancelling_the_run_cancels_an_unmoved_call() {
+    /// Results keep the model's call order whatever order the calls finish
+    /// in, and a panicking call still answers, so the turn can go on.
+    #[tokio::test]
+    async fn results_keep_call_order_and_a_panicking_call_still_answers() {
+        const SLOW_ID: &str = "slow";
+        const PANICKING_ID: &str = "boom";
+        const FAST_ID: &str = "fast";
+        const SLOW_DELAY: Duration = Duration::from_millis(50);
+        const PANIC_MESSAGE: &str = "probe exploded";
+
+        let (tx, _rx) = flume::unbounded::<Envelope>();
+        let event_tx = EventSender::new(tx, 0);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+        ctx.local_tools = Arc::new(HashMap::from([(
+            PROBE_TOOL.to_owned(),
+            local_tool(ToolAudience::all(), |input, _ctx| {
+                Box::pin(async move {
+                    match input["id"].as_str() {
+                        Some(SLOW_ID) => {
+                            tokio::time::sleep(SLOW_DELAY).await;
+                            Ok(SLOW_ID.to_owned())
+                        }
+                        Some(PANICKING_ID) => panic!("{PANIC_MESSAGE}"),
+                        _ => Ok(FAST_ID.to_owned()),
+                    }
+                })
+            }),
+        )]));
+        let mut history = History::new(Vec::new());
+
+        process_tool_calls(
+            probe_turn(&[SLOW_ID, PANICKING_ID, FAST_ID]),
+            &mut RecentCalls::new(),
+            &mut history,
+            &event_tx,
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let results = history.as_slice().last().unwrap();
+        let answers: Vec<(&str, bool, &str)> = results
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => (tool_use_id.as_str(), *is_error, content.as_str()),
+                other => panic!("not a tool result: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            answers
+                .iter()
+                .map(|(id, is_error, _)| (*id, *is_error))
+                .collect::<Vec<_>>(),
+            [(SLOW_ID, false), (PANICKING_ID, true), (FAST_ID, false)]
+        );
+        assert!(answers[1].2.contains(PANIC_MESSAGE), "{}", answers[1].2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_run_cancels_an_unmoved_call() {
         let (run_trigger, run) = CancelToken::new();
         let run_trigger = Mutex::new(Some(run_trigger));
         let views = run_turn(&PARALLEL_IDS[..1], run, move |_| {
             if let Some(trigger) = run_trigger.lock().unwrap().take() {
                 trigger.cancel();
             }
-        });
+        })
+        .await;
 
         assert!(views[0].cancelled_while_running);
     }

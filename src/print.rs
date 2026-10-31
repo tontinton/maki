@@ -237,7 +237,7 @@ pub struct PrintParams {
 
 /// Hands back the interrupt it ran under, for the caller to exit with once
 /// the plugin host is down.
-pub fn run(params: PrintParams) -> Result<Interrupt> {
+pub async fn run(params: PrintParams) -> Result<Interrupt> {
     let PrintParams {
         model,
         prompt,
@@ -275,10 +275,8 @@ pub fn run(params: PrintParams) -> Result<Interrupt> {
 
     let initial_wd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let cwd = initial_wd.to_string_lossy().into_owned();
-    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(
-        &initial_wd,
-        project_config.clone(),
-    ));
+    let (mcp_handle, mcp_config_errors) =
+        maki_agent::mcp::start_connected(&initial_wd, project_config.clone()).await;
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -362,7 +360,7 @@ pub fn run(params: PrintParams) -> Result<Interrupt> {
         || MODE_BUILD,
     );
 
-    while let Some(envelope) = smol::block_on(events.next()) {
+    while let Some(envelope) = events.next().await {
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
         // totals when it calls `maki.session.read()`.
         snapshot.observe(&envelope);
@@ -470,7 +468,7 @@ pub fn run(params: PrintParams) -> Result<Interrupt> {
             }
         }
     }
-    let track = smol::block_on(headless::await_shutdown(task));
+    let track = headless::await_shutdown(task).await;
     lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
     // Background work and plugin jobs are stopped by now, so nothing spends
     // any more. Dropping the track saves the full bill, also what no turn

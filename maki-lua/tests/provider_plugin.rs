@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
+use maki_lua::test_support::runtime;
 use maki_lua::{DiscoveredPackage, Origin, PluginHost, PluginPermissions, Requested};
 use maki_providers::model::{Model, ModelTier};
 use maki_providers::provider::Provider;
@@ -294,7 +295,7 @@ fn stream(
 ) -> (Vec<ProviderEvent>, Result<StreamResponse, AgentError>) {
     let messages = [Message::user(PROMPT.to_owned())];
     let (tx, rx) = flume::unbounded();
-    let result = smol::block_on(provider.stream_message(
+    let result = runtime().block_on(provider.stream_message(
         model,
         &messages,
         SYSTEM,
@@ -369,7 +370,9 @@ fn the_auth_hooks_drive_the_credential_lifecycle() {
     let fixture = Fixture::start(REFRESH_SCRIPT);
 
     fixture.stream(ThinkingConfig::Off).1.expect(STREAM_FAILED);
-    smol::block_on(fixture.provider.reload_auth()).expect(HOOK_FAILED);
+    runtime()
+        .block_on(fixture.provider.reload_auth())
+        .expect(HOOK_FAILED);
     fixture.stream(ThinkingConfig::Off).1.expect(STREAM_FAILED);
 
     assert_eq!(
@@ -390,7 +393,9 @@ fn the_auth_hooks_drive_the_credential_lifecycle() {
 fn a_refresh_hook_persists_the_token_it_minted() {
     let fixture = Fixture::start(NO_REQUESTS);
 
-    smol::block_on(fixture.provider.refresh_auth()).expect(HOOK_FAILED);
+    runtime()
+        .block_on(fixture.provider.refresh_auth())
+        .expect(HOOK_FAILED);
 
     let dir = StateDir::resolve().expect(NO_STATE_DIR);
     let stored = load_plugin_auth(&dir, SLUG).expect(NO_CREDENTIALS);
@@ -405,7 +410,9 @@ fn a_refresh_hook_persists_the_token_it_minted() {
 fn list_models_and_fetch_usage_answer_from_their_hooks() {
     let fixture = Fixture::start(MODELS_SCRIPT);
 
-    let models = smol::block_on(fixture.provider.list_models()).expect(HOOK_FAILED);
+    let models = runtime()
+        .block_on(fixture.provider.list_models())
+        .expect(HOOK_FAILED);
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, MODEL);
     assert_eq!(models[0].context_window, Some(LISTED_WINDOW));
@@ -417,7 +424,8 @@ fn list_models_and_fetch_usage_answer_from_their_hooks() {
     assert_eq!(asked[0].authorization(), bearer(ANON_TOKEN));
     drop(asked);
 
-    let usage = smol::block_on(fixture.provider.fetch_usage())
+    let usage = runtime()
+        .block_on(fixture.provider.fetch_usage())
         .expect(HOOK_FAILED)
         .expect(NO_USAGE);
     assert_eq!(usage.plan.as_deref(), Some("team"));
@@ -459,7 +467,9 @@ fn map_error_restates_the_status_and_keeps_retry_after(
 fn a_refused_side_request_is_the_native_error() {
     let fixture = Fixture::start(OVERLOADED_SCRIPT);
 
-    let error = smol::block_on(fixture.provider.list_models()).unwrap_err();
+    let error = runtime()
+        .block_on(fixture.provider.list_models())
+        .unwrap_err();
 
     assert!(
         matches!(error, AgentError::Api { status: 503, .. }),
@@ -478,7 +488,9 @@ fn a_side_request_that_cannot_connect_is_a_transport_error() {
     drop(closed);
     let fixture = Fixture::at(&base_url, Requests::default());
 
-    let error = smol::block_on(fixture.provider.list_models()).unwrap_err();
+    let error = runtime()
+        .block_on(fixture.provider.list_models())
+        .unwrap_err();
 
     assert_eq!(error.retry_kind(), Some(RetryKind::Connect), "{error:?}");
 }
@@ -494,8 +506,11 @@ fn a_login_hook_is_what_makes_the_slug_an_auth_target() {
         "{:?}",
         plugin::auth_providers()
     );
-    plugin::login(SLUG).expect(HOOK_FAILED);
-    assert!(plugin::logout(SLUG).expect(HOOK_FAILED), "{HOOK_FAILED}");
+    runtime().block_on(plugin::login(SLUG)).expect(HOOK_FAILED);
+    assert!(
+        runtime().block_on(plugin::logout(SLUG)).expect(HOOK_FAILED),
+        "{HOOK_FAILED}"
+    );
 }
 
 fn responses_plugin(base_url: &str) -> String {
@@ -637,11 +652,11 @@ fn a_credential_write_does_not_park_the_plugin_host() {
 
     let dir = StateDir::resolve().expect(NO_STATE_DIR);
     let held = lock_plugin_store(&dir, LOCKED_SLUG).expect(NO_TOKEN_LOCK);
-    let locked = std::thread::spawn(|| plugin::login(LOCKED_SLUG));
+    let locked = std::thread::spawn(|| runtime().block_on(plugin::login(LOCKED_SLUG)));
     wait_for(&entered);
 
     let (served, free_login) = flume::bounded(1);
-    std::thread::spawn(move || served.send(plugin::login(FREE_SLUG)));
+    std::thread::spawn(move || served.send(runtime().block_on(plugin::login(FREE_SLUG))));
     free_login
         .recv_timeout(STUCK_AFTER)
         .expect(HOST_THREAD_PARKED)
@@ -666,7 +681,7 @@ fn an_in_flight_hook_call_survives_a_plugin_reload() {
     load_inline(&host, &parking, PARKING_HOST, &[PARKING_SLUG]);
     plugin::commit_load();
 
-    let login = std::thread::spawn(|| plugin::login(PARKING_SLUG));
+    let login = std::thread::spawn(|| runtime().block_on(plugin::login(PARKING_SLUG)));
     wait_for(&started);
     load_inline(&host, RELOADED_SOURCE, PARKING_HOST, &[PARKING_SLUG]);
     std::fs::write(&release, "1").expect(IO_FAILED);

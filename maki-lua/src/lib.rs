@@ -72,6 +72,15 @@ pub mod test_support {
     use crate::{KeybindTicket, KeymapReader, PluginPermissions, SessionEndReason};
     use maki_agent::SharedBuf;
     use maki_storage::id::MakiId;
+    #[cfg(any(test, feature = "test-support"))]
+    use tokio::runtime::Runtime;
+
+    /// The runtime [`crate::PluginHost::start`] puts a host on, for the sync
+    /// side of a test to drive futures with.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn runtime() -> &'static Runtime {
+        &crate::loader::HOST_RUNTIME
+    }
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);
 

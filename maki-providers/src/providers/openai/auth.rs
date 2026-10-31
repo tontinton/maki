@@ -7,6 +7,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
 use reqwest::Client;
 use serde::Deserialize;
+use tokio::runtime::Handle;
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
@@ -111,8 +112,9 @@ fn request_device_code() -> Result<DeviceCodeResponse, AgentError> {
         .body(json_body)
         .build()?;
 
-    let (status, body_text) =
-        smol::block_on(status_and_text(&client, request)).map_err(|e| AgentError::Config {
+    let (status, body_text) = Handle::current()
+        .block_on(status_and_text(&client, request))
+        .map_err(|e| AgentError::Config {
             message: format!("device code request: {e}"),
         })?;
 
@@ -152,8 +154,9 @@ fn poll_device_token(device: &DeviceCodeResponse) -> Result<DeviceTokenResponse,
             .body(json_body.clone())
             .build()?;
 
-        let (status, body_text) =
-            smol::block_on(status_and_text(&client, request)).map_err(|e| AgentError::Config {
+        let (status, body_text) = Handle::current()
+            .block_on(status_and_text(&client, request))
+            .map_err(|e| AgentError::Config {
                 message: format!("device token poll: {e}"),
             })?;
 
@@ -194,8 +197,9 @@ fn exchange_authorization_code(
         .body(form_body)
         .build()?;
 
-    let (status, body_text) =
-        smol::block_on(status_and_text(&client, request)).map_err(|e| AgentError::Config {
+    let (status, body_text) = Handle::current()
+        .block_on(status_and_text(&client, request))
+        .map_err(|e| AgentError::Config {
             message: format!("token exchange: {e}"),
         })?;
 
@@ -252,7 +256,7 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
         .build()?;
 
     // A transport error, not `Config`: only the token endpoint's answer may clear the tokens.
-    let (status, body_text) = smol::block_on(status_and_text(&client, request))?;
+    let (status, body_text) = Handle::current().block_on(status_and_text(&client, request))?;
 
     if status != 200 {
         return Err(AgentError::api(

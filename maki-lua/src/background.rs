@@ -21,6 +21,7 @@ use maki_agent::{
 use maki_storage::id::MakiId;
 use mlua::Lua;
 use serde::Serialize;
+use tokio::time::{Instant, timeout_at};
 
 use crate::api::session::not_live;
 use crate::api::util::command::UiAction;
@@ -347,13 +348,12 @@ impl BackgroundTasks {
     ) -> Result<ModelStop, String> {
         // Armed before the stop fires, so a call that ignores the stop is
         // abandoned (cancel + the same wait) only after this gives up.
-        let timer = smol::Timer::after(wait);
+        let deadline = Instant::now() + wait;
         let (reply, name) = self.begin_model_stop(mailbox, id)?;
-        let arrived = futures_lite::future::or(async { reply.recv_async().await.ok() }, async {
-            timer.await;
-            None
-        })
-        .await;
+        let arrived = timeout_at(deadline, reply.recv_async())
+            .await
+            .ok()
+            .and_then(Result::ok);
         let output = arrived.or_else(|| {
             lock(&self.waiters).remove(id);
             reply.try_recv().ok()
@@ -907,16 +907,16 @@ pub(crate) mod tests {
         ));
     }
 
-    #[test]
-    fn model_stop_that_gets_the_output_leaves_the_chat_no_notice() {
+    #[tokio::test]
+    async fn model_stop_that_gets_the_output_leaves_the_chat_no_notice() {
         let session = MakiId::generate();
         let (mailbox, _seed) = live(session);
         let (registry, token, mark) = registry_with_call(session);
 
-        let (stopped, ()) = smol::block_on(futures_lite::future::zip(
+        let (stopped, ()) = tokio::join!(
             registry.stop_by_model(Some(session), CALL_ID, FOREVER),
             async { registry.deliver(CALL_ID, done(OUTPUT, true), None) },
-        ));
+        );
 
         assert_eq!(stopped.map(|stop| stop.output), Ok(Some(OUTPUT.to_owned())));
         assert_eq!(mark.get(), Stop::Model);
@@ -926,14 +926,15 @@ pub(crate) mod tests {
         assert!(!registry.contains(CALL_ID));
     }
 
-    #[test]
-    fn model_stop_that_times_out_gets_the_late_output_as_a_quiet_notice() {
+    #[tokio::test]
+    async fn model_stop_that_times_out_gets_the_late_output_as_a_quiet_notice() {
         let session = MakiId::generate();
         let (mailbox, _seed) = live(session);
         let (registry, ..) = registry_with_call(session);
 
-        let stopped =
-            smol::block_on(registry.stop_by_model(Some(session), CALL_ID, Duration::ZERO));
+        let stopped = registry
+            .stop_by_model(Some(session), CALL_ID, Duration::ZERO)
+            .await;
 
         assert_eq!(stopped.map(|stop| stop.output), Ok(None));
         assert!(registry.contains(CALL_ID));
@@ -969,7 +970,8 @@ pub(crate) mod tests {
     #[test_case(Asker::Owner, UNKNOWN_CALL_ID, true ; "unknown_id_lists_the_runs_tasks")]
     #[test_case(Asker::Subagent, CALL_ID, false ; "another_runs_id_is_refused")]
     #[test_case(Asker::NoRun, CALL_ID, false ; "no_run_moved_nothing")]
-    fn model_stop_refuses_what_the_callers_run_did_not_move(
+    #[tokio::test]
+    async fn model_stop_refuses_what_the_callers_run_did_not_move(
         asker: Asker,
         target: &str,
         lists_running: bool,
@@ -989,7 +991,7 @@ pub(crate) mod tests {
             Asker::NoRun => None,
         };
 
-        let stopped = smol::block_on(registry.stop_by_model(asker, target, FOREVER));
+        let stopped = registry.stop_by_model(asker, target, FOREVER).await;
 
         let listing = if lists_running {
             format!("{RUNNING_LIST} {CALL_ID}, {OTHER_CALL_ID}")

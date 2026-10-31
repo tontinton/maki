@@ -29,6 +29,7 @@ use mlua::{
     Value as LuaValue,
 };
 use serde_json::{Value, json};
+use tokio::time::sleep;
 
 use crate::api::image::LuaImage;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
@@ -546,13 +547,10 @@ impl ToolInvocation for LuaToolInvocation {
             let call = ctx.call.as_deref();
             let own_call = call.is_some_and(|call| ctx.tool_use_id.as_deref() == Some(call.id()));
             let result = match effective_secs {
-                Some(secs) => {
-                    futures_lite::future::race(recv, async move {
-                        backstop(Duration::from_secs(secs), call, own_call).await;
-                        None
-                    })
-                    .await
-                }
+                Some(secs) => tokio::select! {
+                    reply = recv => reply,
+                    () = backstop(Duration::from_secs(secs), call, own_call) => None,
+                },
                 None => recv.await,
             };
 
@@ -601,11 +599,11 @@ impl ToolInvocation for LuaToolInvocation {
 /// the call already ended.
 async fn backstop(timeout: Duration, call: Option<&CallScope>, own_call: bool) {
     let Some(call) = call else {
-        smol::Timer::after(timeout).await;
+        sleep(timeout).await;
         return;
     };
     let lapsed = async {
-        smol::Timer::after(timeout).await;
+        sleep(timeout).await;
         if own_call {
             call.end()
         } else {
@@ -616,7 +614,12 @@ async fn backstop(timeout: Duration, call: Option<&CallScope>, own_call: bool) {
         call.moved().await;
         false
     };
-    if !futures_lite::future::or(lapsed, moved).await {
+    let ended = tokio::select! {
+        biased;
+        ended = lapsed => ended,
+        ended = moved => ended,
+    };
+    if !ended {
         std::future::pending::<()>().await;
     }
 }
@@ -2063,8 +2066,9 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::block_on_or_fail;
     use crate::runtime::test_support::{call_scope, moved_home};
+    use crate::runtime::wake_or_fail;
+    use tokio::task::yield_now;
 
     const BACKGROUND_PARAM: &str = "background";
 
@@ -2231,13 +2235,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn permission_scope_extracted_at_parse_time() {
+    #[tokio::test]
+    async fn permission_scope_extracted_at_parse_time() {
         let tool = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from("url"))));
         let inv = tool
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
-        let scopes = smol::block_on(inv.permission_scopes());
+        let scopes = inv.permission_scopes().await;
         assert_eq!(
             scopes.unwrap().scopes,
             vec!["https://example.com".to_string()]
@@ -2246,22 +2250,23 @@ mod tests {
 
     #[test_case::test_case("format" ; "absent_field")]
     #[test_case::test_case("count" ; "non_string_field")]
-    fn permission_scope_field_invalid_forces_prompt(field: &str) {
+    #[tokio::test]
+    async fn permission_scope_field_invalid_forces_prompt(field: &str) {
         let input = serde_json::json!({"url": "https://example.com", "count": 42});
         let inv = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from(field))))
             .parse(&input)
             .unwrap();
-        let scopes = smol::block_on(inv.permission_scopes()).expect("should fail closed");
+        let scopes = inv.permission_scopes().await.expect("should fail closed");
         assert!(scopes.force_prompt);
         assert_eq!(scopes.scopes, vec![input.to_string()]);
     }
 
-    #[test]
-    fn permission_scope_none_when_unconfigured() {
+    #[tokio::test]
+    async fn permission_scope_none_when_unconfigured() {
         let unconfigured = make_lua_tool(None)
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
-        assert!(smol::block_on(unconfigured.permission_scopes()).is_none());
+        assert!(unconfigured.permission_scopes().await.is_none());
     }
 
     #[test]
@@ -2314,8 +2319,8 @@ mod tests {
         assert_eq!(extract_format(&t), LuaOutputFormat::Plain);
     }
 
-    #[test]
-    fn needs_compute_fallback_on_failure() {
+    #[tokio::test]
+    async fn needs_compute_fallback_on_failure() {
         // Closed channel → fallback to force_prompt
         let (tx, rx) = flume::bounded(0);
         drop(rx);
@@ -2331,7 +2336,7 @@ mod tests {
             start_annotation: None,
             has_start_fn: false,
         };
-        let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
+        let scopes = inv.permission_scopes().await.expect("should fallback");
         assert!(scopes.force_prompt);
         assert!(!scopes.scopes.is_empty());
 
@@ -2354,12 +2359,12 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        let scopes2 = smol::block_on(inv2.permission_scopes()).expect("should fallback");
+        let scopes2 = inv2.permission_scopes().await.expect("should fallback");
         assert!(scopes2.force_prompt);
     }
 
-    #[test]
-    fn needs_compute_returns_callback_result() {
+    #[tokio::test]
+    async fn needs_compute_returns_callback_result() {
         let (tx, rx) = flume::bounded(1);
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
@@ -2381,7 +2386,7 @@ mod tests {
                 }));
             }
         });
-        let result = smol::block_on(inv.permission_scopes());
+        let result = inv.permission_scopes().await;
         let scopes = result.unwrap();
         assert_eq!(scopes.scopes, vec!["cargo", "test"]);
         assert!(!scopes.force_prompt);
@@ -2555,23 +2560,24 @@ mod tests {
         assert_eq!(inv.start_annotation(), expected.map(String::from));
     }
 
-    #[test]
-    fn start_without_tool_use_id_is_noop() {
+    #[tokio::test]
+    async fn start_without_tool_use_id_is_noop() {
         let inv = LuaToolInvocation {
             has_start_fn: true,
             ..invocation(serde_json::json!({"code": "x"}))
         };
         let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-        smol::block_on(inv.start(&ctx));
+        inv.start(&ctx).await;
     }
 
     /// Once the timeout ended the model call, a move landing late finds
     /// nothing to move, so the two never both answer it.
     #[test_case::test_case(true ; "own_call")]
     #[test_case::test_case(false ; "nested_call")]
-    fn the_backstop_fires_for_a_call_still_in_the_foreground(own_call: bool) {
+    #[tokio::test]
+    async fn the_backstop_fires_for_a_call_still_in_the_foreground(own_call: bool) {
         let (call, _run, _task) = call_scope(false);
-        block_on_or_fail(backstop(Duration::ZERO, Some(&*call), own_call));
+        wake_or_fail(backstop(Duration::ZERO, Some(&*call), own_call)).await;
         assert_eq!(call.cancel().is_cancelled(), own_call);
         assert_eq!(call.move_to(moved_home()).is_err(), own_call);
     }
@@ -2579,18 +2585,17 @@ mod tests {
     /// A bash nested in a moved batch would otherwise die at its own timeout.
     #[test_case::test_case(true ; "own_call")]
     #[test_case::test_case(false ; "nested_call")]
-    fn the_backstop_never_fires_once_the_call_moved(own_call: bool) {
+    #[tokio::test]
+    async fn the_backstop_never_fires_once_the_call_moved(own_call: bool) {
         let (call, _run, _task) = call_scope(true);
-        let fired = block_on_or_fail(futures_lite::future::or(
-            async {
-                backstop(Duration::ZERO, Some(&*call), own_call).await;
-                true
-            },
-            async {
-                smol::future::yield_now().await;
-                false
-            },
-        ));
+        let fired = wake_or_fail(async {
+            tokio::select! {
+                biased;
+                () = backstop(Duration::ZERO, Some(&*call), own_call) => true,
+                () = yield_now() => false,
+            }
+        })
+        .await;
         assert!(!fired);
     }
 }

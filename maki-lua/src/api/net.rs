@@ -2,15 +2,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use async_compat::Compat;
-use futures_lite::FutureExt;
-use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use maki_config::split_host_port;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::http::{
@@ -22,9 +19,11 @@ use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef};
 use regex::bytes::Regex;
 use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Error as ReqwestError, Method, Request, Response};
-use smol::lock::Mutex as AsyncMutex;
-use smol::{Async, Timer};
+use socket2::SockRef;
 use thiserror::Error;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::timeout;
 use url::Url;
 
 use crate::api::util::pair::{Pair, err_pair, try_pair};
@@ -384,7 +383,7 @@ async fn request(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let params = try_pair!(extract_request_params(&url, egress, opts.as_ref()).await);
-    let resp = try_pair!(Compat::new(do_request(params)).await);
+    let resp = try_pair!(do_request(params).await);
     Ok((Some(resp.into_table(&lua)?), None))
 }
 /// Open a plain TCP connection to {host}:{port}, such as a dashboard or a
@@ -427,21 +426,19 @@ async fn connect(
     port: u16,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Conn>> {
-    let timeout = opts
+    let secs = opts
         .and_then(|o| o.get::<u64>("timeout").ok())
         .map_or(DEFAULT_CONNECT_TIMEOUT_SECS, |secs| {
             secs.min(MAX_CONNECT_TIMEOUT_SECS)
         });
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
     let stream = try_pair!(
-        open_stream(&host, port, &egress, &allowed)
-            .or(async {
-                Timer::after(Duration::from_secs(timeout)).await;
-                Err(format!(
-                    "connect to {host}:{port} timed out after {timeout}s"
-                ))
-            })
-            .await
+        timeout(
+            Duration::from_secs(secs),
+            open_stream(&host, port, &egress, &allowed)
+        )
+        .await
+        .unwrap_or_else(|_| Err(format!("connect to {host}:{port} timed out after {secs}s")))
     );
     Ok((Some(Conn::track(plugin, stream)), None))
 }
@@ -451,7 +448,7 @@ async fn open_stream(
     port: u16,
     egress: &NetEgress,
     allowed: &HostAllowlist,
-) -> Result<Async<TcpStream>, String> {
+) -> Result<TcpStream, String> {
     if egress.declared().is_none() {
         return Err(format!(
             "{CONNECT_NEEDS_NET_HOSTS} ({UNDECLARED_HOST_HINT})"
@@ -469,16 +466,15 @@ async fn open_stream(
         .await
         .map_err(|e| format!("cannot connect to {host}:{port}: {e}"))?;
     stream
-        .get_ref()
         .set_nodelay(true)
         .map_err(|e| format!("cannot set TCP_NODELAY: {e}"))?;
     Ok(stream)
 }
 
-async fn dial(addrs: &[SocketAddr]) -> io::Result<Async<TcpStream>> {
+async fn dial(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
     let mut last_err = io::Error::from(io::ErrorKind::AddrNotAvailable);
     for addr in addrs {
-        match Async::<TcpStream>::connect(*addr).await {
+        match TcpStream::connect(*addr).await {
             Ok(stream) => return Ok(stream),
             Err(e) => last_err = e,
         }
@@ -489,7 +485,7 @@ async fn dial(addrs: &[SocketAddr]) -> io::Result<Async<TcpStream>> {
 /// A read or write in flight holds its own `Arc`, so the Lua handle can be
 /// collected under it without closing the socket mid-call.
 struct ConnState {
-    stream: Async<TcpStream>,
+    stream: TcpStream,
     closed: AtomicBool,
     /// Reads don't wait in line like writes do. Two readers of one stream
     /// would each get a random slice of it, so a second read is refused.
@@ -505,7 +501,7 @@ impl ConnState {
     /// `Arc`.
     fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel)
-            && let Err(e) = self.stream.get_ref().shutdown(Shutdown::Both)
+            && let Err(e) = SockRef::from(&self.stream).shutdown(Shutdown::Both)
         {
             tracing::debug!(error = %e, "tcp shutdown failed");
         }
@@ -535,7 +531,7 @@ impl Drop for TornWrite<'_> {
 pub(crate) struct Conn(Arc<ConnState>);
 
 impl Conn {
-    fn track(plugin: Arc<str>, stream: Async<TcpStream>) -> Self {
+    fn track(plugin: Arc<str>, stream: TcpStream) -> Self {
         let state = Arc::new(ConnState {
             stream,
             closed: AtomicBool::new(false),
@@ -573,13 +569,12 @@ pub(crate) fn close_plugin_conns(plugin: &str) {
 async fn read(lua: Lua, this: UserDataRef<Conn>) -> LuaResult<Pair<LuaString>> {
     let conn = Arc::clone(&this.0);
     drop(this);
-    let Some(mut buf) = conn.read_buf.try_lock() else {
+    let Ok(mut buf) = conn.read_buf.try_lock() else {
         return Ok(err_pair(READ_IN_PROGRESS));
     };
     try_pair!(conn.ensure_open());
     buf.resize(READ_CHUNK, 0);
-    let mut stream = &conn.stream;
-    let read = stream.read(&mut buf[..]).await;
+    let read = read_some(&conn.stream, &mut buf[..]).await;
     try_pair!(conn.ensure_open());
     match read {
         Ok(0) => Ok((None, None)),
@@ -606,8 +601,7 @@ async fn write(_lua: Lua, this: UserDataRef<Conn>, data: LuaString) -> LuaResult
     let _turn = conn.write_turn.lock().await;
     try_pair!(conn.ensure_open());
     let mut torn = TornWrite(Some(&conn));
-    let mut stream = &conn.stream;
-    match stream.write_all(&data).await {
+    match write_all(&conn.stream, &data).await {
         Ok(()) => {
             torn.0 = None;
             Ok((Some(true), None))
@@ -615,6 +609,31 @@ async fn write(_lua: Lua, this: UserDataRef<Conn>, data: LuaString) -> LuaResult
         Err(_) if conn.ensure_open().is_err() => Ok(err_pair(CONN_CLOSED)),
         Err(e) => Ok(err_pair(format!("write failed: {e}"))),
     }
+}
+
+/// The stream is shared by a read and a write at once, so both go through
+/// its readiness API instead of the exclusive `AsyncRead`/`AsyncWrite` one.
+async fn read_some(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        stream.readable().await?;
+        match stream.try_read(buf) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            read => return read,
+        }
+    }
+}
+
+async fn write_all(stream: &TcpStream, mut data: &[u8]) -> io::Result<()> {
+    while !data.is_empty() {
+        stream.writable().await?;
+        match stream.try_write(data) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => data = &data[written..],
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Close the connection. A read or write in flight ends with an error.
@@ -1023,7 +1042,7 @@ pub(crate) async fn provider_get(
 ) -> Result<ResponseData, NetError> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
     let (url, route) = vet(url, &allowed, &egress).await?;
-    Compat::new(do_request(RequestParams {
+    do_request(RequestParams {
         url,
         method: GET.to_owned(),
         headers,
@@ -1034,11 +1053,10 @@ pub(crate) async fn provider_get(
         line_match: None,
         route,
         egress,
-    }))
+    })
     .await
 }
 
-/// reqwest runs on tokio, so callers await this inside [`Compat`].
 async fn do_request(mut params: RequestParams) -> Result<ResponseData, NetError> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
     let client = pooled_client(&params)?;
@@ -1299,11 +1317,10 @@ fn validate_and_upgrade_url(url: &str, allowed: &HostAllowlist) -> Result<String
 mod tests {
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
-    use futures_lite::future::zip;
     use reqwest::Body;
     use std::collections::HashMap;
     use std::io::{Read, Write};
-    use std::net::{Ipv6Addr, TcpListener};
+    use std::net::{Ipv6Addr, TcpListener, TcpStream as StdTcpStream};
     use std::thread::JoinHandle;
     use test_case::test_case;
 
@@ -1381,21 +1398,21 @@ mod tests {
 
     /// The guard went async when the name lookup moved off the executor thread.
     /// Driving it to completion here keeps the tests below about the verdict.
-    fn ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, String> {
-        smol::block_on(check_ssrf(url, allowed, &ProxyEnv::default()))
+    async fn ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, String> {
+        check_ssrf(url, allowed, &ProxyEnv::default()).await
     }
 
-    fn redirect(
+    async fn redirect(
         params: &mut RequestParams,
         status: u16,
         location: &str,
         allowed: &HostAllowlist,
     ) -> Result<(), String> {
-        smol::block_on(params.follow_redirect(status, location, allowed))
+        params.follow_redirect(status, location, allowed).await
     }
 
-    fn request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
-        smol::block_on(extract_request_params(url, NetEgress::default(), opts))
+    async fn request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
+        extract_request_params(url, NetEgress::default(), opts).await
     }
 
     #[test_case(&[], "https://example.com/", "https://example.com/" ; "https_passthrough")]
@@ -1434,8 +1451,9 @@ mod tests {
     #[test_case(&[PRIVATE_CIDR_ENTRY], IN_CIDR_URL, true ; "cidr_range_allowed")]
     #[test_case(&[PRIVATE_CIDR_ENTRY], OUT_OF_CIDR_URL, false ; "outside_cidr_still_blocked")]
     #[test_case(&[PRIVATE_CIDR_ENTRY], METADATA_URL, false ; "metadata_never_allowed_by_a_range")]
-    fn check_ssrf_cases(entries: &[&str], url: &str, allowed: bool) {
-        let result = ssrf(url, &allowlist(entries));
+    #[tokio::test]
+    async fn check_ssrf_cases(entries: &[&str], url: &str, allowed: bool) {
+        let result = ssrf(url, &allowlist(entries)).await;
         assert_eq!(
             result.is_ok(),
             allowed,
@@ -1449,25 +1467,32 @@ mod tests {
     #[test_case("https://127.0.0.1.:11434/" ; "trailing_dot_with_a_port")]
     #[test_case("https://127.0.0.1:/" ; "empty_port")]
     #[test_case("https://[fe80::1%25eth0]/" ; "percent_encoded_zone_id")]
-    fn normalised_bypass_is_refused(url: &str) {
+    #[tokio::test]
+    async fn normalised_bypass_is_refused(url: &str) {
         let allowed = HostAllowlist::default();
-        let result = validate_and_upgrade_url(url, &allowed).and_then(|u| ssrf(&u, &allowed));
+        let result = match validate_and_upgrade_url(url, &allowed) {
+            Ok(url) => ssrf(&url, &allowed).await,
+            Err(e) => Err(e),
+        };
         assert!(result.is_err(), "{url}");
     }
 
     #[test_case(LOOPBACK_URL ; "private_address")]
-    fn blocked_message_points_at_the_config_option(url: &str) {
-        let err = ssrf(url, &HostAllowlist::default()).unwrap_err();
+    #[tokio::test]
+    async fn blocked_message_points_at_the_config_option(url: &str) {
+        let err = ssrf(url, &HostAllowlist::default()).await.unwrap_err();
         assert!(err.starts_with(BLOCKED_PREFIX), "{err}");
         assert!(err.contains(ALLOWLIST_HINT), "{err}");
     }
 
     /// A resolver with no answer has reached no verdict, so pointing at the
     /// allowlist would send the caller after the wrong problem.
-    #[test]
-    fn an_unresolvable_host_reads_as_a_network_failure() {
+    #[tokio::test]
+    async fn an_unresolvable_host_reads_as_a_network_failure() {
         let url = format!("https://{UNRESOLVABLE_HOST}/");
-        let err = ssrf(&url, &HostAllowlist::default()).expect_err(UNRESOLVABLE_HOST);
+        let err = ssrf(&url, &HostAllowlist::default())
+            .await
+            .expect_err(UNRESOLVABLE_HOST);
         assert!(!err.starts_with(BLOCKED_PREFIX), "{err}");
         assert!(err.contains(UNRESOLVABLE_HOST), "{err}");
     }
@@ -1480,23 +1505,26 @@ mod tests {
         })
     }
 
-    fn ssrf_via(url: &str, proxy_env: &ProxyEnv) -> Result<Option<DnsPin>, String> {
-        smol::block_on(check_ssrf(url, &HostAllowlist::default(), proxy_env))
+    async fn ssrf_via(url: &str, proxy_env: &ProxyEnv) -> Result<Option<DnsPin>, String> {
+        check_ssrf(url, &HostAllowlist::default(), proxy_env).await
     }
 
     #[test_case("", true ; "left_to_the_proxy")]
     #[test_case(UNRESOLVABLE_HOST, false ; "no_proxy_keeps_the_strict_lookup")]
-    fn an_unresolvable_host_behind_a_proxy(no_proxy: &str, left_to_proxy: bool) {
+    #[tokio::test]
+    async fn an_unresolvable_host_behind_a_proxy(no_proxy: &str, left_to_proxy: bool) {
         let url = format!("https://{UNRESOLVABLE_HOST}/");
         assert_eq!(
-            ssrf_via(&url, &https_proxy(no_proxy)).is_ok(),
+            ssrf_via(&url, &https_proxy(no_proxy)).await.is_ok(),
             left_to_proxy
         );
     }
 
-    #[test]
-    fn a_proxy_does_not_open_a_name_resolving_to_loopback() {
-        let err = ssrf_via("https://localhost/", &https_proxy("")).unwrap_err();
+    #[tokio::test]
+    async fn a_proxy_does_not_open_a_name_resolving_to_loopback() {
+        let err = ssrf_via("https://localhost/", &https_proxy(""))
+            .await
+            .unwrap_err();
         assert!(err.starts_with(BLOCKED_PREFIX), "{err}");
     }
 
@@ -1535,10 +1563,11 @@ mod tests {
 
     /// The whole point of the pin: the client is handed the address the guard read,
     /// so a second lookup cannot answer with a different one.
-    #[test]
-    fn a_resolved_host_is_pinned_to_the_address_the_guard_vetted() {
+    #[tokio::test]
+    async fn a_resolved_host_is_pinned_to_the_address_the_guard_vetted() {
         let allowed = allowlist(&[LOOPBACK_CIDR_ENTRY, IPV6_LOOPBACK_ENTRY]);
         let pin = ssrf(LOCALHOST_URL, &allowed)
+            .await
             .unwrap()
             .expect("a resolved host must be pinned");
         assert_eq!(pin.host, LOCALHOST_ENTRY);
@@ -1548,16 +1577,17 @@ mod tests {
 
     #[test_case(PUBLIC_URL ; "literal_address_needs_no_lookup")]
     #[test_case(LOCALHOST_URL ; "allowlisted_name_is_trusted_however_it_resolves")]
-    fn hosts_the_guard_never_resolved_are_not_pinned(url: &str) {
-        let pin = ssrf(url, &allowlist(&[LOCALHOST_ENTRY])).unwrap();
+    #[tokio::test]
+    async fn hosts_the_guard_never_resolved_are_not_pinned(url: &str) {
+        let pin = ssrf(url, &allowlist(&[LOCALHOST_ENTRY])).await.unwrap();
         assert!(pin.is_none(), "{pin:?}");
     }
 
     /// A hop is only followed once it has been vetted, so the pin has to move
     /// with the URL: the address vetted for the previous host must not decide
     /// where the next one connects.
-    #[test]
-    fn a_followed_redirect_replaces_the_pin() {
+    #[tokio::test]
+    async fn a_followed_redirect_replaces_the_pin() {
         let mut params = redirect_params(LOOPBACK_PORT_URL);
         params.route = Route::Guarded(Some(DnsPin {
             host: LOCALHOST_ENTRY.to_string(),
@@ -1570,6 +1600,7 @@ mod tests {
             LOOPBACK_PORT_URL,
             &allowlist(&[LOOPBACK_PORT_ENTRY]),
         )
+        .await
         .unwrap();
         assert!(
             matches!(params.route, Route::Guarded(None)),
@@ -1578,8 +1609,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn redirect_hop_into_a_private_address_is_refused() {
+    #[tokio::test]
+    async fn redirect_hop_into_a_private_address_is_refused() {
         let mut params = redirect_params(LOOPBACK_PORT_URL);
         let err = redirect(
             &mut params,
@@ -1587,6 +1618,7 @@ mod tests {
             METADATA_URL,
             &allowlist(&[LOOPBACK_PORT_ENTRY]),
         )
+        .await
         .unwrap_err();
         assert!(err.starts_with(BLOCKED_PREFIX), "{err}");
         assert_eq!(
@@ -1595,8 +1627,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn relative_redirect_on_an_allowlisted_host_is_followed() {
+    #[tokio::test]
+    async fn relative_redirect_on_an_allowlisted_host_is_followed() {
         let mut params = redirect_params(LOOPBACK_PORT_URL);
         redirect(
             &mut params,
@@ -1604,6 +1636,7 @@ mod tests {
             "/results",
             &allowlist(&[LOOPBACK_PORT_ENTRY]),
         )
+        .await
         .unwrap();
         assert_eq!(params.url, "http://127.0.0.1:8888/results");
     }
@@ -1612,13 +1645,16 @@ mod tests {
     #[test_case(OTHER_PUBLIC_URL, false ; "other_host_drops_credentials")]
     #[test_case(PUBLIC_HTTP_URL, true ; "same_host_upgraded_back_to_https_keeps_credentials")]
     #[test_case(PUBLIC_URL_OTHER_PORT, false ; "other_port_drops_credentials")]
-    fn redirect_scrubs_credentials_across_authorities(location: &str, kept: bool) {
+    #[tokio::test]
+    async fn redirect_scrubs_credentials_across_authorities(location: &str, kept: bool) {
         let mut params = redirect_params(PUBLIC_URL);
         params.headers = vec![
             (AUTH_HEADER.to_string(), AUTH_VALUE.to_string()),
             (ACCEPT_HEADER.to_string(), ACCEPT_VALUE.to_string()),
         ];
-        redirect(&mut params, 302, location, &HostAllowlist::default()).unwrap();
+        redirect(&mut params, 302, location, &HostAllowlist::default())
+            .await
+            .unwrap();
         assert_eq!(
             params.headers.iter().any(|(k, _)| k == AUTH_HEADER),
             kept,
@@ -1630,11 +1666,14 @@ mod tests {
 
     #[test_case(303, "GET", "" ; "303_rewrites_a_post_into_a_get")]
     #[test_case(308, "POST", PAYLOAD ; "308_keeps_method_and_body")]
-    fn redirect_rewrites_the_method_per_status(status: u16, method: &str, body: &str) {
+    #[tokio::test]
+    async fn redirect_rewrites_the_method_per_status(status: u16, method: &str, body: &str) {
         let mut params = redirect_params(PUBLIC_URL);
         params.method = "POST".to_string();
         params.body = PAYLOAD.into();
-        redirect(&mut params, status, PUBLIC_URL, &HostAllowlist::default()).unwrap();
+        redirect(&mut params, status, PUBLIC_URL, &HostAllowlist::default())
+            .await
+            .unwrap();
         assert_eq!(params.method, method);
         assert_eq!(params.body, body.as_bytes());
     }
@@ -1705,13 +1744,17 @@ mod tests {
     #[test_case("HEAD", false ; "head_sends_no_length")]
     #[test_case("POST", true ; "post_states_its_zero_length")]
     #[test_case("DELETE", true ; "delete_states_its_zero_length")]
-    fn an_empty_body_states_its_length_only_where_it_means_something(method: &str, sent: bool) {
+    #[tokio::test]
+    async fn an_empty_body_states_its_length_only_where_it_means_something(
+        method: &str,
+        sent: bool,
+    ) {
         let (port, server) = serve_one();
         let params = RequestParams {
             method: method.to_string(),
             ..redirect_params(&format!("http://{LOOPBACK_HOST}:{port}/"))
         };
-        send_on_its_own_client(&params).unwrap();
+        send_on_its_own_client(&params).await.unwrap();
         let request = server.join().unwrap().to_ascii_lowercase();
         assert_eq!(request.contains(ZERO_CONTENT_LENGTH), sent, "{request}");
     }
@@ -1812,18 +1855,17 @@ mod tests {
 
     /// A client of its own instead of the pooled one, whose pool the test
     /// suite shares and counts.
-    fn send_on_its_own_client(params: &RequestParams) -> Result<u16, NetError> {
+    async fn send_on_its_own_client(params: &RequestParams) -> Result<u16, NetError> {
         let client = build_client(&ClientKey::of(params)).unwrap();
-        smol::block_on(Compat::new(async {
-            send_with_retries(&client, params)
-                .await
-                .map(|response| response.status().as_u16())
-        }))
+        send_with_retries(&client, params)
+            .await
+            .map(|response| response.status().as_u16())
     }
 
     #[test_case(&[], USER_P_AT_SS_BASIC ; "credentials_come_from_the_url_userinfo")]
     #[test_case(&[(AUTH_HEADER, AUTH_VALUE)], AUTH_VALUE ; "a_callers_header_wins_over_the_userinfo")]
-    fn authorization_sent_for_url_userinfo(headers: &[(&str, &str)], expected: &str) {
+    #[tokio::test]
+    async fn authorization_sent_for_url_userinfo(headers: &[(&str, &str)], expected: &str) {
         let (port, server) = serve_one();
         let params = RequestParams {
             headers: headers
@@ -1834,7 +1876,7 @@ mod tests {
                 "http://user:p%40ss@{LOOPBACK_HOST}:{port}{AUTH_PROBE_PATH}"
             ))
         };
-        assert_eq!(send_on_its_own_client(&params).unwrap(), 200);
+        assert_eq!(send_on_its_own_client(&params).await.unwrap(), 200);
 
         let request = server.join().unwrap();
         let auth: Vec<_> = request
@@ -1849,8 +1891,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_pinned_hop_connects_to_the_vetted_address() {
+    #[tokio::test]
+    async fn a_pinned_hop_connects_to_the_vetted_address() {
         let (port, server) = serve_one();
         let params = RequestParams {
             route: Route::Guarded(Some(DnsPin {
@@ -1860,14 +1902,17 @@ mod tests {
             })),
             ..redirect_params(&format!("http://{UNRESOLVABLE_HOST}:{port}/"))
         };
-        assert_eq!(send_on_its_own_client(&params).unwrap(), 200);
+        assert_eq!(send_on_its_own_client(&params).await.unwrap(), 200);
         server.join().unwrap();
     }
 
-    #[test]
-    fn a_transport_error_leaves_out_the_url() {
+    #[tokio::test]
+    async fn a_transport_error_leaves_out_the_url() {
         let params = redirect_params(&format!("https://{UNRESOLVABLE_HOST}/?key={QUERY_SECRET}"));
-        let error = send_on_its_own_client(&params).unwrap_err().to_string();
+        let error = send_on_its_own_client(&params)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains(UNRESOLVABLE_HOST), "{error}");
         assert!(!error.contains(QUERY_SECRET), "{error}");
     }
@@ -1905,8 +1950,9 @@ mod tests {
     #[test_case(Some(&[OTHER_PUBLIC_HOST]), false ; "undeclared_host_is_denied")]
     #[test_case(Some(&[PUBLIC_HOST_ON_HTTPS]), true ; "the_default_port_is_the_declared_one")]
     #[test_case(Some(&[PUBLIC_HOST_ON_OTHER_PORT]), false ; "another_declared_port_is_denied")]
-    fn declared_net_hosts_gate_requests(hosts: Option<&[&str]>, allowed: bool) {
-        let result = smol::block_on(extract_request_params(PUBLIC_URL, declared(hosts), None));
+    #[tokio::test]
+    async fn declared_net_hosts_gate_requests(hosts: Option<&[&str]>, allowed: bool) {
+        let result = extract_request_params(PUBLIC_URL, declared(hosts), None).await;
         match result {
             Ok(_) => assert!(allowed, "{hosts:?} should be blocked"),
             Err(e) => assert!(
@@ -1921,20 +1967,27 @@ mod tests {
     /// own list, however ordinary that hop looks to the SSRF guard.
     #[test_case(Some(&[PUBLIC_HOST]), false ; "a_hop_off_the_list_is_refused")]
     #[test_case(Some(&[PUBLIC_HOST, OTHER_PUBLIC_HOST]), true ; "a_declared_hop_is_followed")]
-    fn a_redirect_is_vetted_against_the_declared_hosts(hosts: Option<&[&str]>, allowed: bool) {
+    #[tokio::test]
+    async fn a_redirect_is_vetted_against_the_declared_hosts(
+        hosts: Option<&[&str]>,
+        allowed: bool,
+    ) {
         const MOVED: u16 = 302;
-        let mut params =
-            smol::block_on(extract_request_params(PUBLIC_URL, declared(hosts), None)).unwrap();
+        let mut params = extract_request_params(PUBLIC_URL, declared(hosts), None)
+            .await
+            .unwrap();
         let allowlist = ALLOWED_PRIVATE_HOSTS.load_full();
 
-        let hop = smol::block_on(params.follow_redirect(MOVED, OTHER_PUBLIC_URL, &allowlist));
+        let hop = params
+            .follow_redirect(MOVED, OTHER_PUBLIC_URL, &allowlist)
+            .await;
 
         assert_eq!(hop.is_ok(), allowed, "{hosts:?}");
     }
 
-    #[test]
-    fn extract_params_defaults_no_opts() {
-        let params = request_params(PUBLIC_URL, None).unwrap();
+    #[tokio::test]
+    async fn extract_params_defaults_no_opts() {
+        let params = request_params(PUBLIC_URL, None).await.unwrap();
         assert_eq!(params.url, PUBLIC_URL);
         assert_eq!(params.method, "GET");
         assert!(params.headers.is_empty());
@@ -1949,39 +2002,40 @@ mod tests {
 
     /// http's method parsing is case-sensitive, so `head` would go out as an
     /// extension method the server does not know.
-    #[test]
-    fn extract_params_method_goes_out_in_upper_case() {
+    #[tokio::test]
+    async fn extract_params_method_goes_out_in_upper_case() {
         let lua = Lua::new();
         let opts = lua.create_table().unwrap();
         opts.set("method", "head").unwrap();
-        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).await.unwrap();
         assert_eq!(params.method, "HEAD");
     }
 
     #[test_case(MAX_TIMEOUT_SECS + 100, Some(Duration::from_secs(MAX_TIMEOUT_SECS)) ; "clamped_to_max")]
     #[test_case(0, None ; "zero_counts_as_unset")]
-    fn extract_params_timeout(secs: u64, expected: Option<Duration>) {
+    #[tokio::test]
+    async fn extract_params_timeout(secs: u64, expected: Option<Duration>) {
         let lua = Lua::new();
         let opts = lua.create_table().unwrap();
         opts.set("timeout", secs).unwrap();
-        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).await.unwrap();
         assert_eq!(params.timeout, expected);
     }
 
-    #[test]
-    fn extract_params_post_with_body() {
+    #[tokio::test]
+    async fn extract_params_post_with_body() {
         let lua = Lua::new();
         let opts = lua.create_table().unwrap();
         opts.set("method", "POST").unwrap();
         opts.set("body", r#"{"key":"val"}"#).unwrap();
-        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).await.unwrap();
         assert_eq!(params.method, "POST");
         assert_eq!(params.body, br#"{"key":"val"}"#);
     }
 
-    #[test]
-    fn extract_params_http_upgraded_to_https() {
-        let params = request_params(PUBLIC_HTTP_URL, None).unwrap();
+    #[tokio::test]
+    async fn extract_params_http_upgraded_to_https() {
+        let params = request_params(PUBLIC_HTTP_URL, None).await.unwrap();
         assert_eq!(params.url, PUBLIC_URL);
     }
 
@@ -2028,15 +2082,15 @@ mod tests {
         assert_eq!(retry_after, RETRY_AFTER_SECS);
     }
 
-    #[test]
-    fn extract_params_headers_collected() {
+    #[tokio::test]
+    async fn extract_params_headers_collected() {
         let lua = Lua::new();
         let headers = lua.create_table().unwrap();
         headers.set(AUTH_HEADER, AUTH_VALUE).unwrap();
         headers.set(ACCEPT_HEADER, ACCEPT_VALUE).unwrap();
         let opts = lua.create_table().unwrap();
         opts.set("headers", headers).unwrap();
-        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).await.unwrap();
         assert_eq!(params.headers.len(), 2);
         assert!(
             params
@@ -2058,30 +2112,32 @@ mod tests {
         opts
     }
 
-    #[test]
-    fn extract_params_line_match_default_none() {
+    #[tokio::test]
+    async fn extract_params_line_match_default_none() {
         assert!(
             request_params(PUBLIC_URL, None)
+                .await
                 .unwrap()
                 .line_match
                 .is_none()
         );
     }
 
-    #[test]
-    fn extract_params_line_match_compiled() {
+    #[tokio::test]
+    async fn extract_params_line_match_compiled() {
         let lua = Lua::new();
         let opts = line_match_opts(&lua, KEEP_PATTERN);
-        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).await.unwrap();
         assert_eq!(params.line_match.unwrap().as_str(), KEEP_PATTERN);
     }
 
     #[test_case("(" ; "unclosed_group")]
     #[test_case("[a-" ; "unclosed_class")]
-    fn extract_params_line_match_invalid_errors(pattern: &str) {
+    #[tokio::test]
+    async fn extract_params_line_match_invalid_errors(pattern: &str) {
         let lua = Lua::new();
         let opts = line_match_opts(&lua, pattern);
-        let Err(err) = request_params(PUBLIC_URL, Some(&opts)) else {
+        let Err(err) = request_params(PUBLIC_URL, Some(&opts)).await else {
             panic!("invalid line_match accepted");
         };
         assert!(err.starts_with(INVALID_LINE_MATCH), "{err}");
@@ -2294,19 +2350,15 @@ mod tests {
     #[test_case(LOOPBACK_HOST, Some(&[PUBLIC_HOST]), &[LOOPBACK_HOST], Err(UNDECLARED_HOST_HINT) ; "an_undeclared_host_is_refused")]
     #[test_case(LOOPBACK_HOST, Some(&[LOOPBACK_HOST]), &[], Err(ALLOWLIST_HINT) ; "a_private_literal_needs_the_allowlist")]
     #[test_case(LOCALHOST_ENTRY, Some(&[LOCALHOST_ENTRY]), &[LOCALHOST_ENTRY], Ok(()) ; "an_allowlisted_name_connects")]
-    fn connect_host_policy(
+    #[tokio::test]
+    async fn connect_host_policy(
         host: &str,
         net_hosts: Option<&[&str]>,
         private: &[&str],
         expected: Result<(), &str>,
     ) {
         let (_listener, port) = loopback_listener();
-        let result = smol::block_on(open_stream(
-            host,
-            port,
-            &declared(net_hosts),
-            &allowlist(private),
-        ));
+        let result = open_stream(host, port, &declared(net_hosts), &allowlist(private)).await;
         match (result, expected) {
             (Ok(_), Ok(())) => {}
             (Err(err), Err(hint)) => assert!(err.contains(hint), "got: {err}"),
@@ -2314,23 +2366,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_refused_connection_is_an_error() {
+    #[tokio::test]
+    async fn a_refused_connection_is_an_error() {
         let port = loopback_listener().1;
-        let err = smol::block_on(open_stream(
+        let err = open_stream(
             LOOPBACK_HOST,
             port,
             &declared(Some(&[LOOPBACK_HOST])),
             &allowlist(&[LOOPBACK_HOST]),
-        ))
+        )
+        .await
         .unwrap_err();
         assert!(err.contains(CANNOT_CONNECT), "got: {err}");
     }
 
-    fn conn_in_lua() -> (Lua, TcpStream) {
+    async fn conn_in_lua() -> (Lua, StdTcpStream) {
         let listener = loopback_listener().0;
         let addr = listener.local_addr().unwrap();
-        let stream = smol::block_on(Async::<TcpStream>::connect(addr)).unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().unwrap();
         let lua = Lua::new();
         let conn = Conn::track(Arc::from(TEST_PLUGIN), stream);
@@ -2338,25 +2391,25 @@ mod tests {
         (lua, server)
     }
 
-    fn eval_pair(lua: &Lua, code: &str) -> LuaPair {
-        smol::block_on(lua.load(code).call_async(())).unwrap()
+    async fn eval_pair(lua: &Lua, code: &str) -> LuaPair {
+        lua.load(code).call_async(()).await.unwrap()
     }
 
-    #[test]
-    fn read_returns_nil_nil_once_the_peer_closes() {
-        let (lua, mut server) = conn_in_lua();
+    #[tokio::test]
+    async fn read_returns_nil_nil_once_the_peer_closes() {
+        let (lua, mut server) = conn_in_lua().await;
         server.write_all(PING.as_bytes()).unwrap();
         drop(server);
         assert_eq!(
-            eval_pair(&lua, "return conn:read()"),
+            eval_pair(&lua, "return conn:read()").await,
             (Some(PING.into()), None)
         );
-        assert_eq!(eval_pair(&lua, "return conn:read()"), (None, None));
+        assert_eq!(eval_pair(&lua, "return conn:read()").await, (None, None));
     }
 
-    #[test]
-    fn concurrent_writes_arrive_whole_and_in_call_order() {
-        let (lua, mut server) = conn_in_lua();
+    #[tokio::test]
+    async fn concurrent_writes_arrive_whole_and_in_call_order() {
+        let (lua, mut server) = conn_in_lua().await;
         let reader = std::thread::spawn(move || {
             let mut got = Vec::new();
             server.read_to_end(&mut got).unwrap();
@@ -2370,7 +2423,7 @@ mod tests {
         let second = lua
             .load(format!("assert(conn:write('{SECOND_WRITE}'))"))
             .exec_async();
-        let (first, second) = smol::block_on(zip(first, second));
+        let (first, second) = tokio::join!(first, second);
         first.unwrap();
         second.unwrap();
         lua.load("conn:close()").exec().unwrap();
@@ -2383,9 +2436,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_parked_read_refuses_a_second_and_ends_on_unload() {
-        let (lua, _server) = conn_in_lua();
+    #[tokio::test]
+    async fn a_parked_read_refuses_a_second_and_ends_on_unload() {
+        let (lua, _server) = conn_in_lua().await;
         let parked = lua.load("return conn:read()").call_async::<LuaPair>(());
         let second_then_unload = async {
             let second = lua
@@ -2395,21 +2448,22 @@ mod tests {
             close_plugin_conns(TEST_PLUGIN);
             second
         };
-        let (parked, second) = smol::block_on(zip(parked, second_then_unload));
+        let (parked, second) = tokio::join!(parked, second_then_unload);
         assert_eq!(second.unwrap(), (None, Some(READ_IN_PROGRESS.into())));
         assert_eq!(parked.unwrap(), (None, Some(CONN_CLOSED.into())));
     }
 
-    #[test]
-    fn a_closed_conn_refuses_reads_and_writes() {
-        let (lua, _server) = conn_in_lua();
+    #[tokio::test]
+    async fn a_closed_conn_refuses_reads_and_writes() {
+        let (lua, _server) = conn_in_lua().await;
         let errs = eval_pair(
             &lua,
             "conn:close(); conn:close()
              local _, read_err = conn:read()
              local _, write_err = conn:write('x')
              return read_err, write_err",
-        );
+        )
+        .await;
         assert_eq!(errs, (Some(CONN_CLOSED.into()), Some(CONN_CLOSED.into())));
     }
 }

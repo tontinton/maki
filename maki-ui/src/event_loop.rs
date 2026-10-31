@@ -50,6 +50,9 @@ use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
+use tokio::runtime::Handle;
+use tokio::task::{JoinHandle, spawn_blocking};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, warn};
 
 use crate::agent::{
@@ -520,7 +523,7 @@ pub(crate) struct EventLoop<'t> {
     /// without this a second `/packupdate` would race the first over the same
     /// clones and locks.
     pack_running: bool,
-    _model_fetch_task: smol::Task<()>,
+    _model_fetch_task: AbortOnDropHandle<()>,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -548,7 +551,7 @@ struct BackgroundModels {
     warn_tx: flume::Sender<String>,
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
-    task: smol::Task<()>,
+    task: AbortOnDropHandle<()>,
 }
 
 /// The one way discovery starts, so startup and `/models refresh` cannot drift
@@ -561,8 +564,8 @@ fn fetch_models(
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
-) -> smol::Task<()> {
-    smol::spawn(async move {
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         fetch_all_models_cached(&policy, |list, warnings| {
             for w in warnings {
                 let _ = warn_tx.try_send(w);
@@ -578,12 +581,12 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
     let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let (models_tx, models_rx) = flume::bounded::<()>(1);
-    let task = fetch_models(
+    let task = AbortOnDropHandle::new(fetch_models(
         Arc::clone(&available),
         policy,
         warn_tx.clone(),
         models_tx.clone(),
-    );
+    ));
     BackgroundModels {
         available,
         warn_rx,
@@ -653,7 +656,8 @@ impl<'t> EventLoop<'t> {
         });
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd, project_config));
+        let (mcp_handle, mcp_config_errors) =
+            Handle::current().block_on(mcp::start(&cwd, project_config));
 
         let provider: Arc<dyn Provider> = if needs_login {
             Arc::from(maki_providers::provider::from_model_fallback(
@@ -1331,14 +1335,13 @@ impl<'t> EventLoop<'t> {
         match req {
             SessionRequest::List => {
                 let storage = self.ctx.storage.clone();
-                smol::unblock(move || {
+                spawn_blocking(move || {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let reply = AppSession::list(&cwd.to_string_lossy(), &storage)
                         .map_err(|e| e.to_string())
                         .and_then(|list| serde_json::to_value(list).map_err(|e| e.to_string()));
                     let _ = reply_tx.send(reply);
-                })
-                .detach();
+                });
             }
             // Deletes run on the storage writer thread after any queued
             // flushes, so the loop never blocks on disk and a queued save
@@ -1591,11 +1594,10 @@ impl<'t> EventLoop<'t> {
         };
         if prompt.is_none() && !focus {
             let storage = self.ctx.storage.clone();
-            smol::unblock(move || {
+            spawn_blocking(move || {
                 let reply = open.store(&storage).map(|id| json!(id));
                 let _ = reply_tx.send(reply.map_err(|e| e.to_string()));
-            })
-            .detach();
+            });
             return;
         }
         // An inherited model's slot is already built and sitting right here.
@@ -1628,13 +1630,12 @@ impl<'t> EventLoop<'t> {
         answer: impl FnOnce(AppSession) -> Result<T, String> + Send + 'static,
     ) {
         let storage = self.ctx.storage.clone();
-        smol::unblock(move || {
+        spawn_blocking(move || {
             let reply = AppSession::read_only(id, &storage)
                 .map_err(|e| e.to_string())
                 .and_then(answer);
             let _ = reply_tx.send(reply);
-        })
-        .detach();
+        });
     }
 
     fn position(&self, id: MakiId) -> Option<usize> {
@@ -2086,7 +2087,9 @@ impl<'t> EventLoop<'t> {
         self.sessions[idx].app.flash(PACK_PREPARING.to_owned());
         let handle = self.ctx.lua_event_handle.clone();
         let tx = self.pack_tx.clone();
+        let runtime = Handle::current();
         std::thread::spawn(move || {
+            let _runtime = runtime.enter();
             // Without this a panic drops the sender with no answer, and
             // `pack_running` stays set for the rest of the process, so every
             // later package command reports "already running".
@@ -2114,8 +2117,7 @@ impl<'t> EventLoop<'t> {
             Arc::clone(&self.ctx.model_policy),
             self.warn_tx.clone(),
             self.models_tx.clone(),
-        )
-        .detach();
+        );
     }
 
     fn refresh_usage(&mut self) {
@@ -2123,15 +2125,14 @@ impl<'t> EventLoop<'t> {
         let provider = Arc::clone(&rt.slot.load().provider);
         let slot = Arc::clone(&rt.app.usage_slot);
         slot.store(Some(Arc::new(UsageFetchState::Loading)));
-        smol::spawn(async move {
+        tokio::spawn(async move {
             let state = match provider.fetch_usage().await {
                 Ok(Some(usage)) => UsageFetchState::Ready(usage),
                 Ok(None) => UsageFetchState::Unsupported,
                 Err(e) => UsageFetchState::Error(e.user_message()),
             };
             slot.store(Some(Arc::new(state)));
-        })
-        .detach();
+        });
     }
 
     /// Re-login rebuilds the provider for every tab on it, not just the focused
@@ -2205,7 +2206,7 @@ impl<'t> EventLoop<'t> {
         crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
         let join_agents_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
-            smol::block_on(h.shutdown());
+            Handle::current().block_on(h.shutdown());
         }
         let mcp_shutdown_ms = lap();
         let unsaved = match Arc::try_unwrap(self.ctx.storage_writer) {

@@ -9,6 +9,7 @@ use maki_config::{
 };
 use maki_storage::id::SessionRef;
 use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 
 use crate::tools::PermissionScopes;
@@ -801,7 +802,7 @@ impl PermissionManager {
         scopes: &PermissionScopes,
         session: Option<&SessionRef>,
         event_tx: &EventSender,
-        user_response_rx: Option<&smol::lock::Mutex<flume::Receiver<String>>>,
+        user_response_rx: Option<&AsyncMutex<flume::Receiver<String>>>,
         request_id: &str,
         cancel: &CancelToken,
         plan_path: Option<&Path>,
@@ -1245,22 +1246,24 @@ mod tests {
         mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"))
     }
 
-    #[test]
-    fn unattended_denies_prompt_without_parking() {
+    #[tokio::test]
+    async fn unattended_denies_prompt_without_parking() {
         let (event_tx, events) = flume::unbounded();
-        let err = smol::block_on(default_mgr().enforce(
-            &ToolKey::native(BASH_TOOL),
-            &PermissionScopes::single("cargo test".to_owned()),
-            None,
-            &EventSender::new(event_tx, 0),
-            None,
-            TAGGED_REQUEST_ID,
-            &CancelToken::none(),
-            None,
-            None,
-            None,
-        ))
-        .unwrap_err();
+        let err = default_mgr()
+            .enforce(
+                &ToolKey::native(BASH_TOOL),
+                &PermissionScopes::single("cargo test".to_owned()),
+                None,
+                &EventSender::new(event_tx, 0),
+                None,
+                TAGGED_REQUEST_ID,
+                &CancelToken::none(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
 
         assert_eq!(err.reason, UNATTENDED_REASON);
         assert!(events.is_empty(), "no prompt may go out");
@@ -1268,28 +1271,30 @@ mod tests {
 
     /// The asker moved where nobody watches, so whoever dropped its prompt
     /// answers that nobody will, and the call needs an allow rule instead.
-    #[test]
-    fn an_unattended_answer_denies_like_a_missing_channel() {
+    #[tokio::test]
+    async fn an_unattended_answer_denies_like_a_missing_channel() {
         let (event_tx, _events) = flume::unbounded();
         let (answer_tx, answer_rx) = flume::unbounded();
-        let answers = smol::lock::Mutex::new(answer_rx);
+        let answers = AsyncMutex::new(answer_rx);
         answer_tx
             .send(TaggedAnswer::new(TAGGED_REQUEST_ID, PermissionAnswer::Unattended).encode())
             .unwrap();
 
-        let err = smol::block_on(default_mgr().enforce(
-            &ToolKey::native(BASH_TOOL),
-            &PermissionScopes::single("cargo test".to_owned()),
-            None,
-            &EventSender::new(event_tx, 0),
-            Some(&answers),
-            TAGGED_REQUEST_ID,
-            &CancelToken::none(),
-            None,
-            None,
-            None,
-        ))
-        .unwrap_err();
+        let err = default_mgr()
+            .enforce(
+                &ToolKey::native(BASH_TOOL),
+                &PermissionScopes::single("cargo test".to_owned()),
+                None,
+                &EventSender::new(event_tx, 0),
+                Some(&answers),
+                TAGGED_REQUEST_ID,
+                &CancelToken::none(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
 
         assert_eq!(err.reason, UNATTENDED_REASON);
     }
@@ -1522,9 +1527,13 @@ mod tests {
     }
 
     /// Through `enforce` with nobody to answer, so only an allow gets through.
-    fn read_allowed(mgr: &PermissionManager, path: &Path, session: Option<&SessionRef>) -> bool {
+    async fn read_allowed(
+        mgr: &PermissionManager,
+        path: &Path,
+        session: Option<&SessionRef>,
+    ) -> bool {
         let (guard, _events) = crate::event_stream();
-        smol::block_on(mgr.enforce(
+        mgr.enforce(
             &ToolKey::native(READ_TOOL),
             &PermissionScopes::single(path.to_string_lossy().into_owned()),
             session,
@@ -1535,7 +1544,8 @@ mod tests {
             None,
             None,
             None,
-        ))
+        )
+        .await
         .is_ok()
     }
 
@@ -1545,7 +1555,8 @@ mod tests {
     #[test_case("{own}/../{other}/call.log" => false ; "dotdot_into_another_session")]
     #[test_case("{own}_sibling/call.log" => false ; "sibling_of_own_dir")]
     #[test_case("call.log" => false ; "logs_root")]
-    fn read_of_task_logs_is_allowed_only_for_the_calling_session(relative: &str) -> bool {
+    #[tokio::test]
+    async fn read_of_task_logs_is_allowed_only_for_the_calling_session(relative: &str) -> bool {
         let tmp = tempfile::tempdir().unwrap();
         let own = SessionRef::generate();
         let other = SessionRef::generate();
@@ -1553,24 +1564,25 @@ mod tests {
             .replace(OWN_SESSION, &own.id().to_string())
             .replace(OTHER_SESSION, &other.id().to_string());
         let path = tmp.path().join(TASK_LOGS_DIR).join(relative);
-        read_allowed(&mgr_with_task_logs(tmp.path()), &path, Some(&own))
+        read_allowed(&mgr_with_task_logs(tmp.path()), &path, Some(&own)).await
     }
 
-    #[test]
-    fn read_of_task_logs_without_a_session_is_not_allowed() {
+    #[tokio::test]
+    async fn read_of_task_logs_without_a_session_is_not_allowed() {
         let tmp = tempfile::tempdir().unwrap();
         let session = SessionRef::generate();
         let log =
             maki_storage::paths::session_task_logs_dir(tmp.path(), session.id()).join(TASK_LOG);
         let mgr = mgr_with_task_logs(tmp.path());
-        assert!(read_allowed(&mgr, &log, Some(&session)));
-        assert!(!read_allowed(&mgr, &log, None));
+        assert!(read_allowed(&mgr, &log, Some(&session)).await);
+        assert!(!read_allowed(&mgr, &log, None).await);
     }
 
     #[test_case(true ; "read_through_the_link")]
     #[test_case(false ; "read_through_the_target")]
     #[cfg(unix)]
-    fn task_logs_rule_resolves_a_symlinked_state_dir(through_link: bool) {
+    #[tokio::test]
+    async fn task_logs_rule_resolves_a_symlinked_state_dir(through_link: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("state");
         let link = tmp.path().join("state_link");
@@ -1581,7 +1593,7 @@ mod tests {
         let mgr = mgr_with_task_logs(&link);
         let state = if through_link { link } else { real };
         let log = maki_storage::paths::session_task_logs_dir(&state, session.id()).join(TASK_LOG);
-        assert!(read_allowed(&mgr, &log, Some(&session)), "{log:?}");
+        assert!(read_allowed(&mgr, &log, Some(&session)).await, "{log:?}");
     }
 
     #[test]
@@ -2672,13 +2684,13 @@ mod tests {
 
     /// No answer channel, like `maki -p`, so whatever the layer leaves to the
     /// prompt gets denied.
-    fn enforce_behind(
+    async fn enforce_behind(
         mgr: &PermissionManager,
         layer: Layer,
         ask: Option<&str>,
     ) -> Result<Option<Arc<str>>, PermissionError> {
         let (guard, _events) = crate::event_stream();
-        smol::block_on(mgr.enforce(
+        mgr.enforce(
             &ToolKey::native(BASH_TOOL),
             &crate::tools::PermissionScopes::single(LAYER_SCOPE.to_owned()),
             None,
@@ -2689,7 +2701,8 @@ mod tests {
             None,
             ask,
             Some(&layer),
-        ))
+        )
+        .await
     }
 
     /// The next call on the same scope still prompts, so an allow saved no
@@ -2697,9 +2710,10 @@ mod tests {
     #[test_case(Some(LayerVerdict::Allow), true ; "allow")]
     #[test_case(Some(LayerVerdict::Deny { guidance: None }), false ; "deny")]
     #[test_case(None, false ; "no_answer_falls_to_the_prompt")]
-    fn a_layer_answers_in_place_of_the_prompt(verdict: Option<LayerVerdict>, allowed: bool) {
+    #[tokio::test]
+    async fn a_layer_answers_in_place_of_the_prompt(verdict: Option<LayerVerdict>, allowed: bool) {
         let mgr = default_mgr();
-        let result = enforce_behind(&mgr, Layer(verdict), None);
+        let result = enforce_behind(&mgr, Layer(verdict), None).await;
         assert_eq!(result.is_ok(), allowed, "{result:?}");
         assert_eq!(
             result.unwrap_or_default().is_some(),
@@ -2716,8 +2730,9 @@ mod tests {
     /// answer it, whichever way it would go.
     #[test_case(LayerVerdict::Allow ; "allow")]
     #[test_case(LayerVerdict::Deny { guidance: None } ; "deny")]
-    fn an_escalated_call_never_reaches_a_layer(verdict: LayerVerdict) {
-        let result = enforce_behind(&default_mgr(), Layer(Some(verdict)), Some(ESCALATION));
+    #[tokio::test]
+    async fn an_escalated_call_never_reaches_a_layer(verdict: LayerVerdict) {
+        let result = enforce_behind(&default_mgr(), Layer(Some(verdict)), Some(ESCALATION)).await;
         let err = result
             .expect_err("no channel, so the prompt cannot answer")
             .to_string();
@@ -2728,12 +2743,14 @@ mod tests {
     /// know it came from the plugin rather than the user.
     #[test_case(None, DEFAULT_DENY_GUIDANCE ; "bare")]
     #[test_case(Some(LAYER_GUIDANCE.to_owned()), LAYER_GUIDANCE ; "with_guidance")]
-    fn a_layer_deny_is_labelled_by_plugin(guidance: Option<String>, expected: &str) {
+    #[tokio::test]
+    async fn a_layer_deny_is_labelled_by_plugin(guidance: Option<String>, expected: &str) {
         let result = enforce_behind(
             &default_mgr(),
             Layer(Some(LayerVerdict::Deny { guidance })),
             None,
-        );
+        )
+        .await;
         let err = result.expect_err("a deny").to_string();
         assert!(
             err.contains(&format!("Plugin `{LAYER_PLUGIN}` denied it")),

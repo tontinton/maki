@@ -5,7 +5,7 @@ use maki_storage::paths::canonicalize_clean;
 use maki_storage::version::{self, VersionError};
 use maki_storage::{StateDir, StorageError};
 
-use async_compat::Compat;
+use tokio::runtime::Handle;
 
 #[cfg(not(windows))]
 const INSTALLER: Installer = Installer {
@@ -82,14 +82,15 @@ pub enum UpdateError {
 }
 
 fn fetch_script() -> Result<String, UpdateError> {
-    smol::block_on(Compat::new(async {
-        let response = version::client().build()?.get(INSTALLER.url).send().await?;
-        response.text().await
-    }))
-    .map_err(|source| UpdateError::Fetch {
-        url: INSTALLER.url,
-        source,
-    })
+    Handle::current()
+        .block_on(async {
+            let response = version::client().build()?.get(INSTALLER.url).send().await?;
+            response.text().await
+        })
+        .map_err(|source| UpdateError::Fetch {
+            url: INSTALLER.url,
+            source,
+        })
 }
 
 /// Where `maki update` keeps the binary it replaced, for `maki rollback`.
@@ -211,7 +212,7 @@ fn prompt_yes(install_dir: &Path) -> bool {
 }
 
 pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
-    let latest = smol::block_on(version::fetch_latest())?;
+    let latest = Handle::current().block_on(version::fetch_latest())?;
     if !version::is_newer(&latest, version::CURRENT) {
         println!("Already up to date (v{})", version::CURRENT);
         return Ok(());

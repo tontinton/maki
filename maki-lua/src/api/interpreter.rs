@@ -1,5 +1,5 @@
 //! Runs Python in the monty sandbox with Lua fns as tools. Monty blocks on
-//! a `smol::unblock` thread. Stdout and tool-call batches share one FIFO
+//! a `spawn_blocking` thread. Stdout and tool-call batches share one FIFO
 //! channel so ordering is preserved and cancellation (dropped channel) makes
 //! the blocked thread unwind instead of leaking.
 
@@ -17,6 +17,7 @@ use mlua::{
     Function, IntoLuaMulti, Lua, MultiValue, Result as LuaResult, Table, Value as LuaValue,
 };
 use serde_json::Value;
+use tokio::task::{spawn_blocking, yield_now};
 
 use crate::api::util::convert::{TableExt, json_to_lua, lua_tool_result, required};
 use crate::api::util::pair::Pair;
@@ -176,7 +177,7 @@ async fn interpreter_run(
     let limits = runner::limits(timeout, max_memory_mb * 1024 * 1024);
 
     let (tx, rx) = flume::unbounded::<BridgeMsg>();
-    let run = smol::unblock(move || {
+    let run = spawn_blocking(move || {
         let tools: HashMap<String, ToolFn> = names
             .into_iter()
             .map(|name| {
@@ -245,7 +246,7 @@ async fn interpreter_run(
                     on_output.call::<()>(line)?;
                     lines += 1;
                     if lines.is_multiple_of(LINES_PER_YIELD) {
-                        smol::future::yield_now().await;
+                        yield_now().await;
                     }
                 }
                 BridgeMsg::Calls(batch, reply) => {
@@ -289,11 +290,12 @@ async fn interpreter_run(
 
     // A cancel comes back as a pair error, not a raise, so the caller can
     // still report the lines it streamed before the cut.
-    let (result, cb) = match cancel.race(futures_lite::future::zip(run, recv_loop)).await {
+    let (result, cb) = match cancel.race(async { tokio::join!(run, recv_loop) }).await {
         Ok(v) => v,
         Err(e) => return Ok((None, Some(e))),
     };
     cb?;
+    let result = result.map_err(mlua::Error::external)?;
 
     let tbl = lua.create_table()?;
     match result {

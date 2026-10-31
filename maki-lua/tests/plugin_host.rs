@@ -26,6 +26,7 @@ use maki_config::{
     AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
     ThinkingLines, ToolKey, ToolOutputLines,
 };
+use maki_lua::test_support::runtime;
 use maki_lua::{
     InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, NO_UI_ERR, PERMISSION_NAME_WARNING,
     PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
@@ -187,7 +188,7 @@ fn exec_output_in(
     if let Some(r) = registry_override {
         ctx.registry = r;
     }
-    smol::block_on(async { inv.execute(&ctx).await }).output
+    runtime().block_on(inv.execute(&ctx)).output
 }
 
 const ECHO_PLUGIN: &str = r#"
@@ -381,7 +382,8 @@ fn exec_with_ctx(
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(async { inv.execute(ctx).await })
+    runtime()
+        .block_on(inv.execute(ctx))
         .output
         .map(|out| match out {
             maki_agent::ToolOutput::Plain(s) => s.text,
@@ -716,7 +718,7 @@ fn permission_without_scopes_declares_reach_and_never_prompts() {
             prompted: false,
         })
     );
-    assert!(smol::block_on(inv.permission_scopes()).is_none());
+    assert!(runtime().block_on(inv.permission_scopes()).is_none());
 }
 
 #[test]
@@ -877,9 +879,7 @@ fn handler_state_flows_to_tool_output_and_serde() {
     let entry = reg.get("stateful").unwrap();
     let inv = entry.tool.parse(&serde_json::json!({})).unwrap();
     let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    let out = smol::block_on(async { inv.execute(&ctx).await })
-        .output
-        .unwrap();
+    let out = runtime().block_on(inv.execute(&ctx)).output.unwrap();
     let expected = serde_json::json!({ "n": 3, "tag": "hi" });
     assert_eq!(out.state(), Some(&expected));
 
@@ -1190,7 +1190,7 @@ maki.api.register_tool({{
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.deadline = maki_agent::tools::Deadline::after(std::time::Duration::from_secs(5));
 
-    let result = smol::block_on(async { inv.execute(&ctx).await });
+    let result = runtime().block_on(inv.execute(&ctx));
 
     assert!(result.output.is_err(), "expected error from timed-out loop");
 
@@ -2029,7 +2029,7 @@ fn click_until_finished(
             None,
             Some(click_id),
         );
-        smol::block_on(inv.execute(&ctx)).output
+        runtime().block_on(inv.execute(&ctx)).output
     });
     for _ in 0..500 {
         if worker.is_finished() {
@@ -2226,7 +2226,7 @@ fn exec_warm_tool(
         .tool
         .parse(&serde_json::json!({}))
         .expect("parse failed");
-    smol::block_on(inv.execute(ctx)).output
+    runtime().block_on(inv.execute(ctx)).output
 }
 
 /// A click on a finished tool takes the warm path: it mutates the live
@@ -2640,7 +2640,7 @@ maki.api.register_tool({{
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
     let dispatch = || {
-        smol::block_on(maki_agent::agent::tool_dispatch::run(
+        runtime().block_on(maki_agent::agent::tool_dispatch::run(
             String::new(),
             "driver",
             &json!({}),
@@ -5766,7 +5766,8 @@ fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
     let input = serde_json::json!({ "command": command });
     let entry = reg.get("bash").expect("bash registered");
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let scopes = smol::block_on(inv.permission_scopes())
+    let scopes = runtime()
+        .block_on(inv.permission_scopes())
         .expect("permission_scopes returned None (would fall back to raw JSON)");
 
     assert!(
@@ -5806,7 +5807,9 @@ fn bash_permission_scopes_split_per_command(command: &str, expected: &[&str]) {
     let input = serde_json::json!({ "command": command });
     let entry = reg.get("bash").expect("bash registered");
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let scopes = smol::block_on(inv.permission_scopes()).expect("permission_scopes returned None");
+    let scopes = runtime()
+        .block_on(inv.permission_scopes())
+        .expect("permission_scopes returned None");
 
     assert!(!scopes.force_prompt, "command: {command}");
     assert_eq!(scopes.scopes, expected, "command: {command}");
@@ -6236,7 +6239,7 @@ fn run_start(
         .tool
         .parse(&input)
         .expect("parse failed");
-    smol::block_on(inv.start(&ctx));
+    runtime().block_on(inv.start(&ctx));
     rx
 }
 
@@ -6846,12 +6849,13 @@ fn interpreter_bridge_flattens_image_with_visibility_note() {
 
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
-    let out = smol::block_on(maki_agent::tools::interpreter_bridge::dispatch(
-        &ctx,
-        "img_probe",
-        &serde_json::json!({}),
-    ))
-    .unwrap();
+    let out = runtime()
+        .block_on(maki_agent::tools::interpreter_bridge::dispatch(
+            &ctx,
+            "img_probe",
+            &serde_json::json!({}),
+        ))
+        .unwrap();
     assert!(out.starts_with("[image: test 1x1]"), "got: {out}");
     assert!(
         out.contains(maki_agent::tools::interpreter_bridge::IMAGE_NOT_VISIBLE_NOTE),
@@ -8749,9 +8753,9 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
         .unwrap();
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     let (_answer_tx, answer_rx) = flume::unbounded::<String>();
-    ctx.user_response_rx = answerable.then(|| Arc::new(smol::lock::Mutex::new(answer_rx)));
+    ctx.user_response_rx = answerable.then(|| Arc::new(tokio::sync::Mutex::new(answer_rx)));
 
-    let result = smol::block_on(inv.execute(&ctx)).output;
+    let result = runtime().block_on(inv.execute(&ctx)).output;
 
     let Ok(maki_agent::ToolOutput::Plain(text)) = result else {
         panic!("unexpected output: {result:?}");

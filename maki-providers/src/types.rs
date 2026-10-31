@@ -1941,13 +1941,13 @@ mod tests {
         }
     }
 
-    fn adapt(model: &Model, content: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    async fn adapt(model: &Model, content: Vec<ContentBlock>) -> Vec<ContentBlock> {
         let messages = vec![Message {
             role: Role::User,
             content,
             ..Default::default()
         }];
-        smol::block_on(adapt_images_for_model(model, &messages))[0]
+        adapt_images_for_model(model, &messages).await[0]
             .content
             .clone()
     }
@@ -1959,8 +1959,8 @@ mod tests {
             .count()
     }
 
-    #[test]
-    fn adapt_images_borrows_when_nothing_has_to_change() {
+    #[tokio::test]
+    async fn adapt_images_borrows_when_nothing_has_to_change() {
         let model = clamp_test_model(anthropic_spec());
         let with_image = vec![Message {
             role: Role::User,
@@ -1968,7 +1968,7 @@ mod tests {
             ..Default::default()
         }];
         assert!(matches!(
-            smol::block_on(adapt_images_for_model(&model, &with_image)),
+            adapt_images_for_model(&model, &with_image).await,
             Cow::Borrowed(_)
         ));
 
@@ -1976,7 +1976,7 @@ mod tests {
         text_only_model.supports_vision_override = Some(false);
         let no_images = vec![Message::user("hi".into())];
         assert!(matches!(
-            smol::block_on(adapt_images_for_model(&text_only_model, &no_images)),
+            adapt_images_for_model(&text_only_model, &no_images).await,
             Cow::Borrowed(_)
         ));
     }
@@ -1984,8 +1984,8 @@ mod tests {
     /// A repaired image is repaired for the rest of the session, so this path
     /// is walked on every later turn: the messages the repair does not reach
     /// must come out of it untouched, and history must keep its own pixels.
-    #[test]
-    fn adapt_images_rebuilds_only_the_messages_that_change() {
+    #[tokio::test]
+    async fn adapt_images_rebuilds_only_the_messages_that_change() {
         const CAPTION: &str = "look";
         const OVERSIZED: u32 = 2600;
         let model = clamp_test_model(anthropic_spec());
@@ -2016,7 +2016,7 @@ mod tests {
             ]),
         ];
 
-        let adapted = smol::block_on(adapt_images_for_model(&model, &history));
+        let adapted = adapt_images_for_model(&model, &history).await;
         assert!(matches!(adapted, Cow::Owned(_)), "the repair needs a copy");
         assert_eq!(adapted[0].first_user_text(), Some(CAPTION));
         let ContentBlock::Image { source } = &adapted[1].content[0] else {
@@ -2040,8 +2040,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn adapt_images_shrinks_what_a_provider_would_refuse() {
+    #[tokio::test]
+    async fn adapt_images_shrinks_what_a_provider_would_refuse() {
         let model = clamp_test_model(anthropic_spec());
         let oversized = ContentBlock::Image {
             source: ImageSource::new(
@@ -2052,7 +2052,7 @@ mod tests {
         let text = ContentBlock::Text {
             text: "look".into(),
         };
-        let blocks = adapt(&model, vec![text, oversized]);
+        let blocks = adapt(&model, vec![text, oversized]).await;
         assert!(matches!(&blocks[0], ContentBlock::Text { .. }));
         let ContentBlock::Image { source } = &blocks[1] else {
             panic!("an image block must stay an image block");
@@ -2068,16 +2068,16 @@ mod tests {
     /// bound to them. So each new image must leave the request an append of
     /// the one before, except at most once per step when the oldest images
     /// make way, and the API cap is never crossed.
-    #[test]
-    fn adapt_images_moves_the_prefix_once_per_step() {
+    #[tokio::test]
+    async fn adapt_images_moves_the_prefix_once_per_step() {
         const LAST_TOTAL: usize = MAX_IMAGES + 2 * IMAGE_EVICTION_STEP + 1;
         let model = clamp_test_model(anthropic_spec());
         let images: Vec<ContentBlock> = (1..=LAST_TOTAL).map(png_block).collect();
         let wire = |blocks: &[ContentBlock]| serde_json::to_value(blocks).unwrap();
-        let mut before = adapt(&model, images[..MAX_IMAGES].to_vec());
+        let mut before = adapt(&model, images[..MAX_IMAGES].to_vec()).await;
         let mut last_move: Option<usize> = None;
         for total in MAX_IMAGES + 1..=LAST_TOTAL {
-            let after = adapt(&model, images[..total].to_vec());
+            let after = adapt(&model, images[..total].to_vec()).await;
             let kept = image_count(&after);
             assert!(kept <= MAX_IMAGES, "{kept} images sent");
             assert!(
@@ -2104,8 +2104,8 @@ mod tests {
     /// Readability must not decide what is evicted: an unreadable image that
     /// freed its slot would pull an evicted one back in, editing an early
     /// message outside the step schedule.
-    #[test]
-    fn adapt_images_evicts_the_same_images_whatever_decodes() {
+    #[tokio::test]
+    async fn adapt_images_evicts_the_same_images_whatever_decodes() {
         let model = clamp_test_model(anthropic_spec());
         let readable: Vec<ContentBlock> = (1..=MAX_IMAGES + 1).map(png_block).collect();
         let mut content = readable.clone();
@@ -2120,19 +2120,19 @@ mod tests {
                 .map(|(i, _)| i)
                 .collect()
         };
-        let blocks = adapt(&model, content);
-        assert_eq!(evicted(&blocks), evicted(&adapt(&model, readable)));
+        let blocks = adapt(&model, content).await;
+        assert_eq!(evicted(&blocks), evicted(&adapt(&model, readable).await));
         assert!(
             matches!(&blocks[MAX_IMAGES], ContentBlock::Text { text } if text == IMAGE_UNUSABLE_NOTE)
         );
     }
 
-    #[test]
-    fn adapt_images_replaces_blocks_for_text_only_model() {
+    #[tokio::test]
+    async fn adapt_images_replaces_blocks_for_text_only_model() {
         let mut model = clamp_test_model(anthropic_spec());
         model.supports_vision_override = Some(false);
         let tool_result = ContentBlock::tool_result("t1", "[image: pic.png 1KB]", false);
-        let blocks = adapt(&model, vec![tool_result, unreadable_block()]);
+        let blocks = adapt(&model, vec![tool_result, unreadable_block()]).await;
         assert_eq!(blocks.len(), 2);
         assert!(matches!(&blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_OMITTED_NOTE));

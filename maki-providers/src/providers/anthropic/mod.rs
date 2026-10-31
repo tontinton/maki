@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufRead, AsyncBufReadExt};
 use maki_storage::id::SessionRef;
 use reqwest::{Client, Method, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::debug;
 use url::Url;
 
@@ -694,9 +694,9 @@ mod tests {
         ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, ProviderEvent, Role, StopReason,
         TokenUsage,
     };
-    use futures_lite::io::Cursor;
     use serde_json::{Value, json};
     use shared::{DISPLACED_ERROR_PREFIX, build_wire_messages};
+    use std::io::Cursor;
     use std::time::Duration;
     use test_case::test_case;
 
@@ -815,8 +815,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn reload_auth_keeps_caller_owned_credentials() {
+    #[tokio::test]
+    async fn reload_auth_keeps_caller_owned_credentials() {
         let headers = vec![("authorization".to_owned(), "Bearer gateway".to_owned())];
         let auth = crate::providers::ResolvedAuth::for_test(None, headers.clone());
         let provider = Anthropic::with_auth(
@@ -824,7 +824,7 @@ mod tests {
             crate::providers::Timeouts::default(),
         )
         .with_fallback_base_url(Some(THIRD_PARTY_BASE_URL.into()));
-        smol::block_on(provider.reload_auth()).unwrap();
+        provider.reload_auth().await.unwrap();
         assert_eq!(provider.auth.lock().unwrap().headers, headers);
     }
 
@@ -864,10 +864,9 @@ mod tests {
         assert_eq!(origin(input), expected);
     }
 
-    #[test]
-    fn parse_sse_text_and_usage() {
-        smol::block_on(async {
-            let sse_data = b"\
+    #[tokio::test]
+    async fn parse_sse_text_and_usage() {
+        let sse_data = b"\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":8}}}\n\
 \n\
@@ -889,34 +888,33 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n";
 
-            let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+        let (tx, rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
 
-            assert_eq!(
-                resp.usage,
-                TokenUsage {
-                    input: 42,
-                    output: 10,
-                    cache_creation: 5,
-                    cache_read: 8,
-                    cost: None,
-                }
-            );
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello world")
-            );
-            assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
-
-            let mut deltas = Vec::new();
-            while let Ok(e) = rx.try_recv() {
-                if let ProviderEvent::TextDelta { text: t } = e {
-                    deltas.push(t);
-                }
+        assert_eq!(
+            resp.usage,
+            TokenUsage {
+                input: 42,
+                output: 10,
+                cache_creation: 5,
+                cache_read: 8,
+                cost: None,
             }
-            assert_eq!(deltas, vec!["Hello", " world"]);
-        })
+        );
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello world")
+        );
+        assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+
+        let mut deltas = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            if let ProviderEvent::TextDelta { text: t } = e {
+                deltas.push(t);
+            }
+        }
+        assert_eq!(deltas, vec!["Hello", " world"]);
     }
 
     #[test_case(
@@ -927,10 +925,10 @@ data: {\"type\":\"message_stop\"}\n";
         r#"{"input_tokens":42,"cache_creation_input_tokens":5,"cache_read_input_tokens":8}"# ;
         "same_counts_in_message_start"
     )]
-    fn parse_sse_usage_in_message_delta(start_usage: &str) {
-        smol::block_on(async {
-            let sse_data = format!(
-                "event: message_start\n\
+    #[tokio::test]
+    async fn parse_sse_usage_in_message_delta(start_usage: &str) {
+        let sse_data = format!(
+            "event: message_start\n\
 data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{start_usage}}}}}\n\
 \n\
 event: message_delta\n\
@@ -938,24 +936,23 @@ data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"
 \n\
 event: message_stop\n\
 data: {{\"type\":\"message_stop\"}}\n"
-            );
+        );
 
-            let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
 
-            assert_eq!(
-                resp.usage,
-                TokenUsage {
-                    input: 42,
-                    output: 10,
-                    cache_creation: 5,
-                    cache_read: 8,
-                    cost: None,
-                }
-            );
-        })
+        assert_eq!(
+            resp.usage,
+            TokenUsage {
+                input: 42,
+                output: 10,
+                cache_creation: 5,
+                cache_read: 8,
+                cost: None,
+            }
+        );
     }
 
     const COPILOT_NANO_AIU: u64 = 380_000;
@@ -966,43 +963,42 @@ data: {{\"type\":\"message_stop\"}}\n"
     #[test_case(json!({"total_nano_aiu": COPILOT_NANO_AIU as f64}), Some(COPILOT_USD) ; "float_total")]
     #[test_case(json!({"total_nano_aiu": "375000"}), None ; "string_total")]
     #[test_case(json!("billed"), None ; "not_an_object")]
-    fn parse_sse_copilot_usage_prices_the_turn(copilot_usage: Value, cost: Option<f64>) {
-        smol::block_on(async {
-            let sse_data = [
-                sse_event(
-                    "message_start",
-                    &json!({"type": "message_start", "message": {"usage": {"input_tokens": 42}}}),
-                ),
-                sse_event(
-                    "message_delta",
-                    &json!({
-                        "type": "message_delta",
-                        "delta": {"stop_reason": "end_turn"},
-                        "usage": {"output_tokens": 10},
-                        "copilot_usage": copilot_usage,
-                    }),
-                ),
-                sse_event("message_stop", &json!({"type": "message_stop"})),
-            ]
-            .concat();
+    #[tokio::test]
+    async fn parse_sse_copilot_usage_prices_the_turn(copilot_usage: Value, cost: Option<f64>) {
+        let sse_data = [
+            sse_event(
+                "message_start",
+                &json!({"type": "message_start", "message": {"usage": {"input_tokens": 42}}}),
+            ),
+            sse_event(
+                "message_delta",
+                &json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 10},
+                    "copilot_usage": copilot_usage,
+                }),
+            ),
+            sse_event("message_stop", &json!({"type": "message_stop"})),
+        ]
+        .concat();
 
-            let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
 
-            assert_eq!(
-                resp.usage,
-                TokenUsage {
-                    input: 42,
-                    output: 10,
-                    cache_creation: 0,
-                    cache_read: 0,
-                    cost,
-                }
-            );
-            assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
-        })
+        assert_eq!(
+            resp.usage,
+            TokenUsage {
+                input: 42,
+                output: 10,
+                cache_creation: 0,
+                cache_read: 0,
+                cost,
+            }
+        );
+        assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
     }
 
     const DROPPED_PATH: &str = "messages.1.content.0";
@@ -1028,7 +1024,7 @@ data: {{\"type\":\"message_stop\"}}\n"
 
     /// `start` and `delta` are the `input_transformations` arrays of the two
     /// events. `None` leaves the field out of the delta.
-    fn parse_transformations(start: &str, delta: Option<&str>) -> StreamResponse {
+    async fn parse_transformations(start: &str, delta: Option<&str>) -> StreamResponse {
         let delta_field = delta
             .map(|list| format!(",\"input_transformations\":{list}"))
             .unwrap_or_default();
@@ -1042,18 +1038,17 @@ data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"
 event: message_stop\n\
 data: {{\"type\":\"message_stop\"}}\n"
         );
-        smol::block_on(async {
-            let (tx, _rx) = flume::unbounded();
-            parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap()
-        })
+        let (tx, _rx) = flume::unbounded();
+        parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap()
     }
 
     #[test_case(None, true ; "from_message_start")]
     #[test_case(Some("[]"), false ; "fallback_delta_replaces_start")]
-    fn parse_sse_input_transformations(delta: Option<&str>, kept: bool) {
-        let resp = parse_transformations(&format!("[{}]", dropped_thinking_entry()), delta);
+    #[tokio::test]
+    async fn parse_sse_input_transformations(delta: Option<&str>, kept: bool) {
+        let resp = parse_transformations(&format!("[{}]", dropped_thinking_entry()), delta).await;
         let expected = if kept {
             vec![dropped_thinking()]
         } else {
@@ -1064,10 +1059,10 @@ data: {{\"type\":\"message_stop\"}}\n"
 
     /// The field is in beta, so one odd entry must not cost the whole event,
     /// with the usage billed and the stop reason that keeps a tool loop going.
-    #[test]
-    fn parse_sse_odd_input_transformation_keeps_the_event() {
+    #[tokio::test]
+    async fn parse_sse_odd_input_transformation_keeps_the_event() {
         let list = format!(r#"[{{"path":"p"}},{}]"#, dropped_thinking_entry());
-        let resp = parse_transformations(&list, Some(&list));
+        let resp = parse_transformations(&list, Some(&list)).await;
 
         assert_eq!(
             (resp.usage.input, resp.usage.output),
@@ -1077,10 +1072,9 @@ data: {{\"type\":\"message_stop\"}}\n"
         assert_eq!(resp.input_transformations, vec![dropped_thinking()]);
     }
 
-    #[test]
-    fn parse_sse_no_space_after_colon() {
-        smol::block_on(async {
-            let sse_data = b"\
+    #[tokio::test]
+    async fn parse_sse_no_space_after_colon() {
+        let sse_data = b"\
 event:message_start\n\
 data:{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\
 \n\
@@ -1096,24 +1090,20 @@ data:{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usag
 event:message_stop\n\
 data:{\"type\":\"message_stop\"}\n";
 
-            let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
 
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "OK")
-            );
-            assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
-            assert_eq!(resp.usage.input, 7);
-            assert_eq!(resp.usage.output, 1);
-        })
+        assert!(matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "OK"));
+        assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(resp.usage.input, 7);
+        assert_eq!(resp.usage.output, 1);
     }
 
-    #[test]
-    fn parse_sse_tool_use() {
-        smol::block_on(async {
-            let sse_data = "\
+    #[tokio::test]
+    async fn parse_sse_tool_use() {
+        let sse_data = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\
 \n\
@@ -1132,25 +1122,24 @@ data: {\"type\":\"content_block_stop\"}\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
 
-            let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+        let (tx, rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
 
-            let tools: Vec<_> = resp.message.tool_uses().collect();
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0].0, "tu_1");
-            assert_eq!(tools[0].1, "bash");
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "tu_1");
+        assert_eq!(tools[0].1, "bash");
 
-            let starts: Vec<_> = rx
-                .drain()
-                .filter_map(|e| match e {
-                    ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(starts, vec![("tu_1".to_string(), "bash".to_string())]);
-        })
+        let starts: Vec<_> = rx
+            .drain()
+            .filter_map(|e| match e {
+                ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec![("tu_1".to_string(), "bash".to_string())]);
     }
 
     fn text_block(text: &str) -> ContentBlock {
@@ -1641,7 +1630,8 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
     #[test_case(PAGE_WITHOUT_CURSOR, &["a"] ; "stops_when_has_more_without_last_id")]
     #[test_case(IGNORED_CURSOR, &["a"] ; "stops_when_server_ignores_after_id")]
     #[test_case(TWO_PAGES, &["a", "b"] ; "follows_last_id_cursor")]
-    fn list_models_pagination(script: &'static [Canned], expected: &[&str]) {
+    #[tokio::test]
+    async fn list_models_pagination(script: &'static [Canned], expected: &[&str]) {
         let (base_url, requests) = serve(script);
         let auth = crate::providers::ResolvedAuth::for_test(Some(base_url), Vec::new());
         let provider = Anthropic::with_auth(
@@ -1649,57 +1639,52 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             crate::providers::Timeouts::default(),
         );
 
-        let models = smol::block_on(provider.list_models()).unwrap();
+        let models = provider.list_models().await.unwrap();
 
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, expected);
         assert_eq!(requests.lock().unwrap().len(), script.len());
     }
 
-    #[test]
-    fn parse_sse_overloaded_error() {
-        smol::block_on(async {
-            let input = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
-            let (tx, _rx) = flume::unbounded();
-            let err = parse_sse(Cursor::new(input), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap_err();
-            match err {
-                AgentError::Api {
-                    status, message, ..
-                } => {
-                    assert_eq!(status, 529);
-                    assert_eq!(message, "Overloaded");
-                }
-                other => panic!("expected Api error, got: {other:?}"),
+    #[tokio::test]
+    async fn parse_sse_overloaded_error() {
+        let input = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
+        let (tx, _rx) = flume::unbounded();
+        let err = parse_sse(Cursor::new(input), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap_err();
+        match err {
+            AgentError::Api {
+                status, message, ..
+            } => {
+                assert_eq!(status, 529);
+                assert_eq!(message, "Overloaded");
             }
-        })
+            other => panic!("expected Api error, got: {other:?}"),
+        }
     }
 
-    #[test]
-    fn parse_sse_unparseable_error() {
-        smol::block_on(async {
-            let input = b"event: error\ndata: not-json\n";
-            let (tx, _rx) = flume::unbounded();
-            let err = parse_sse(Cursor::new(input), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap_err();
-            match err {
-                AgentError::Api {
-                    status, message, ..
-                } => {
-                    assert_eq!(status, 400);
-                    assert_eq!(message, "not-json");
-                }
-                other => panic!("expected Api error, got: {other:?}"),
+    #[tokio::test]
+    async fn parse_sse_unparseable_error() {
+        let input = b"event: error\ndata: not-json\n";
+        let (tx, _rx) = flume::unbounded();
+        let err = parse_sse(Cursor::new(input), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap_err();
+        match err {
+            AgentError::Api {
+                status, message, ..
+            } => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "not-json");
             }
-        })
+            other => panic!("expected Api error, got: {other:?}"),
+        }
     }
 
-    #[test]
-    fn parse_sse_malformed_tool_json_yields_empty_object() {
-        smol::block_on(async {
-            let sse_data = "\
+    #[tokio::test]
+    async fn parse_sse_malformed_tool_json_yields_empty_object() {
+        let sse_data = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\
 \n\
@@ -1715,22 +1700,20 @@ data: {\"type\":\"content_block_stop\"}\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n";
 
-            let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
 
-            let tools: Vec<_> = resp.message.tool_uses().collect();
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0].1, "read");
-            assert_eq!(*tools[0].2, Value::Object(Default::default()));
-        })
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, "read");
+        assert_eq!(*tools[0].2, Value::Object(Default::default()));
     }
 
-    #[test]
-    fn parse_sse_thinking_blocks() {
-        smol::block_on(async {
-            let sse_data = b"\
+    #[tokio::test]
+    async fn parse_sse_thinking_blocks() {
+        let sse_data = b"\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\
 \n\
@@ -1761,34 +1744,30 @@ data: {\"type\":\"content_block_stop\"}\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n";
 
-            let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+        let (tx, rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
 
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature }
-                    if thinking == "Let me think" && *signature == Some("sig123".to_string()))
-            );
-            assert!(
-                matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello")
-            );
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature }
+                if thinking == "Let me think" && *signature == Some("sig123".to_string()))
+        );
+        assert!(matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello"));
 
-            let thinking_deltas: Vec<_> = rx
-                .drain()
-                .filter_map(|e| match e {
-                    ProviderEvent::ThinkingDelta { text } => Some(text),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(thinking_deltas, vec!["Let me", " think"]);
-        })
+        let thinking_deltas: Vec<_> = rx
+            .drain()
+            .filter_map(|e| match e {
+                ProviderEvent::ThinkingDelta { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_deltas, vec!["Let me", " think"]);
     }
 
-    #[test]
-    fn parse_sse_redacted_thinking() {
-        smol::block_on(async {
-            let sse_data = b"\
+    #[tokio::test]
+    async fn parse_sse_redacted_thinking() {
+        let sse_data = b"\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\
 \n\
@@ -1810,18 +1789,15 @@ data: {\"type\":\"content_block_stop\"}\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n";
 
-            let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
 
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::RedactedThinking { data } if data == "opaque_data")
-            );
-            assert!(
-                matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hi")
-            );
-        })
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::RedactedThinking { data } if data == "opaque_data")
+        );
+        assert!(matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hi"));
     }
 
     #[test]

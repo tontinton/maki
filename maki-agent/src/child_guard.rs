@@ -6,7 +6,8 @@ use std::time::Duration;
 use rustix::io::Errno;
 #[cfg(unix)]
 use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpid};
-use smol::process::Child;
+use tokio::process::Child;
+use tokio::time::timeout;
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -18,7 +19,9 @@ pub struct ChildGuard {
 impl ChildGuard {
     pub fn new(child: Child) -> Self {
         Self {
-            pid: child.id(),
+            pid: child
+                .id()
+                .expect("a child that was not waited on has a pid"),
             child: Some(child),
         }
     }
@@ -30,7 +33,7 @@ impl ChildGuard {
     pub async fn status(&mut self) -> io::Result<ExitStatus> {
         match self.child.as_mut() {
             Some(child) => {
-                let result = child.status().await;
+                let result = child.wait().await;
                 if result.is_ok() {
                     self.child = None;
                 }
@@ -46,15 +49,7 @@ impl ChildGuard {
     pub async fn kill_and_reap(&mut self) {
         self.signal_kill();
         if let Some(mut child) = self.child.take() {
-            futures_lite::future::or(
-                async {
-                    let _ = child.status().await;
-                },
-                async {
-                    smol::Timer::after(REAP_TIMEOUT).await;
-                },
-            )
-            .await;
+            let _ = timeout(REAP_TIMEOUT, child.wait()).await;
         }
     }
 
@@ -68,7 +63,7 @@ impl ChildGuard {
     #[cfg(not(unix))]
     fn signal_kill(&mut self) {
         if let Some(child) = &mut self.child {
-            let _ = child.kill();
+            let _ = child.start_kill();
         }
     }
 
@@ -88,7 +83,7 @@ impl ChildGuard {
     #[cfg(not(unix))]
     fn reap_nonblocking(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.try_status();
+            let _ = child.try_wait();
         }
     }
 }
@@ -124,9 +119,9 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
 
-    use smol::process::Child;
-
     use rustix::process::{setsid, test_kill_process};
+    use tokio::process::{Child, Command};
+    use tokio::time::sleep;
 
     use super::{ChildGuard, unix_pid};
 
@@ -139,53 +134,52 @@ mod tests {
                 Ok(())
             });
         }
-        let mut cmd: smol::process::Command = std_cmd.into();
-        cmd.spawn().expect("failed to spawn sleep")
+        Command::from(std_cmd)
+            .spawn()
+            .expect("failed to spawn sleep")
     }
 
     fn is_alive(pid: u32) -> bool {
         unix_pid(pid).is_some_and(|pid| test_kill_process(pid).is_ok())
     }
 
-    fn wait_for_death(pid: u32) {
+    /// Awaits between polls so the runtime reaps the child once it is dead:
+    /// `kill(pid, 0)` still succeeds on a zombie.
+    async fn wait_for_death(pid: u32) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             if !is_alive(pid) {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            sleep(Duration::from_millis(10)).await;
         }
         panic!("process {pid} still alive after 2s");
     }
 
-    #[test]
-    fn drop_kills_child_process() {
+    #[tokio::test]
+    async fn drop_kills_child_process() {
         let child = spawn_sleep();
-        let pid = child.id();
+        let pid = child.id().unwrap();
         assert!(is_alive(pid));
         drop(ChildGuard::new(child));
-        wait_for_death(pid);
+        wait_for_death(pid).await;
     }
 
-    #[test]
-    fn kill_and_reap_kills_process() {
-        smol::block_on(async {
-            let child = spawn_sleep();
-            let pid = child.id();
-            assert!(is_alive(pid));
-            let mut guard = ChildGuard::new(child);
-            guard.kill_and_reap().await;
-            wait_for_death(pid);
-        });
+    #[tokio::test]
+    async fn kill_and_reap_kills_process() {
+        let child = spawn_sleep();
+        let pid = child.id().unwrap();
+        assert!(is_alive(pid));
+        let mut guard = ChildGuard::new(child);
+        guard.kill_and_reap().await;
+        wait_for_death(pid).await;
     }
 
-    #[test]
-    fn status_after_reap_returns_error() {
-        smol::block_on(async {
-            let child = spawn_sleep();
-            let mut guard = ChildGuard::new(child);
-            guard.kill_and_reap().await;
-            assert!(guard.status().await.is_err());
-        });
+    #[tokio::test]
+    async fn status_after_reap_returns_error() {
+        let child = spawn_sleep();
+        let mut guard = ChildGuard::new(child);
+        guard.kill_and_reap().await;
+        assert!(guard.status().await.is_err());
     }
 }

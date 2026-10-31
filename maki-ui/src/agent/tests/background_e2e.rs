@@ -25,9 +25,11 @@ use maki_providers::{
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
+use tokio::runtime::EnterGuard;
 
 use crate::agent::AgentHandles;
 use crate::agent::shared_queue::{QueueItem, QueuedInput};
+use crate::app::tests::enter_runtime;
 
 use super::push_prompt;
 
@@ -318,11 +320,13 @@ struct World {
     requests: flume::Receiver<SeenRequest>,
     seen: Vec<AgentEvent>,
     _serial: MutexGuard<'static, ()>,
+    _runtime: EnterGuard<'static>,
 }
 
 impl World {
     fn start(steps: Vec<Step>) -> Self {
         let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let runtime = enter_runtime();
         let mut host = PluginHost::new(Arc::clone(ToolRegistry::global_arc())).expect(HOST_STARTS);
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .and_then(|()| host.load_source(PLUGIN, PLUGIN_SRC))
@@ -364,6 +368,7 @@ impl World {
             requests,
             seen: Vec::new(),
             _serial: serial,
+            _runtime: runtime,
         }
     }
 

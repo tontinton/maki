@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 maki-storage = { workspace = true }
 serde = { workspace = true }
-smol = { workspace = true }
+tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

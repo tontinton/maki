@@ -17,6 +17,7 @@ use maki_agent::{
     AgentEvent, AgentMode, BufferSnapshot, CancelToken, Envelope, SharedBuf, ToolDoneEvent,
     ToolOutput,
 };
+use maki_lua::test_support::runtime;
 use maki_lua::{MoveOutcome, PluginHost};
 use serde_json::{Value, json};
 
@@ -391,7 +392,8 @@ fn exec_tool_with_ctx(
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(inv.execute(ctx))
+    runtime()
+        .block_on(inv.execute(ctx))
         .output
         .map(|out| match out {
             ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,

@@ -16,6 +16,7 @@ use maki_agent::{
     SessionMailbox, SharedBuf, SpanStyle, ToolDoneEvent, ToolOutput,
 };
 use maki_config::ToolOutputLines;
+use maki_lua::test_support::runtime;
 use maki_lua::{KILL_GRACE, MoveOutcome, PluginHost, PluginPermissions, UiAction};
 use serde_json::{Value, json};
 
@@ -240,7 +241,7 @@ fn exec_with_ctx(
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(async { inv.execute(ctx).await }).output
+    runtime().block_on(inv.execute(ctx)).output
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str, input: Value) -> Result<String, String> {
@@ -1265,7 +1266,7 @@ fn exec_live(
         .tool
         .parse(input)
         .expect("parse failed");
-    let result = smol::block_on(async { inv.execute(&ctx).await });
+    let result = runtime().block_on(inv.execute(&ctx));
     barrier(host);
     (result, drain_snapshots(&rx, tool_use_id))
 }
@@ -1316,7 +1317,7 @@ fn parallel_edits_to_one_file_all_apply() {
 }
 
 /// Overlapping edits cannot both apply, so the contract is that the loser
-/// says so. Which one loses is `async_lock`'s business, not ours.
+/// says so. Which one loses is the lock's business, not ours.
 #[test]
 fn overlapping_parallel_edits_fail_loudly() {
     let dir = tempfile::TempDir::new().unwrap();

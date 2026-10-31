@@ -8,6 +8,7 @@ use maki_storage::id::SessionRef;
 use maki_storage::sessions::Effort;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
 use crate::ThinkingConfig;
@@ -367,7 +368,7 @@ impl OpenAi {
         let rejected = self.auth.lock().unwrap().access_token().map(str::to_owned);
         let shared = Arc::clone(&self.auth);
         let held = Arc::clone(&self.tokens);
-        smol::unblock(move || {
+        spawn_blocking(move || {
             match refreshed_tokens(
                 &storage,
                 auth::PROVIDER,
@@ -389,7 +390,7 @@ impl OpenAi {
                 }
             }
         })
-        .await?;
+        .await??;
         debug!("refreshed OpenAI OAuth token");
         Ok(())
     }
@@ -685,7 +686,7 @@ impl Provider for OpenAi {
             let Some(storage) = self.storage.clone() else {
                 return Ok(());
             };
-            let (resolved, tokens) = smol::unblock(move || auth::resolve(&storage)).await?;
+            let (resolved, tokens) = spawn_blocking(move || auth::resolve(&storage)).await??;
             *self.auth.lock().unwrap() = resolved;
             *self.tokens.lock().unwrap() = tokens;
             debug!("reloaded OpenAI auth from storage");

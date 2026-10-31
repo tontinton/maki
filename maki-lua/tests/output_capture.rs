@@ -9,6 +9,7 @@ use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolContext, ToolOutputMode, ToolRegistry};
 use maki_config::{DEFAULT_BUILTINS, PluginFileConfig, PluginsConfig};
 use maki_lua::PluginHost;
+use maki_lua::test_support::runtime;
 use serde_json::{Value, json};
 use test_case::test_case;
 
@@ -59,7 +60,7 @@ fn setup(output_mode: ToolOutputMode) -> (PluginHost, ToolContext) {
 }
 
 fn run(ctx: &ToolContext, input: Value) -> Result<String, String> {
-    let done = smol::block_on(tool_dispatch::run(
+    let done = runtime().block_on(tool_dispatch::run(
         CALL_ID.into(),
         "bash",
         &input,

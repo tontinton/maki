@@ -12,6 +12,7 @@ name = "maki-docgen"
 path = "src/main.rs"
 
 [dependencies]
+tokio = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
 maki-lua = { workspace = true }

@@ -13,8 +13,9 @@ use std::time::Duration;
 use maki_config::split_host_port;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Error as ReqwestError, Proxy};
-use smol::{Timer, unblock};
 use thiserror::Error as ThisError;
+use tokio::task::spawn_blocking;
+use tokio::time::sleep;
 
 pub const HTTP_SCHEME: &str = "http://";
 pub const HTTPS_SCHEME: &str = "https://";
@@ -163,15 +164,15 @@ pub fn extract_host_port(url: &str) -> Option<(&str, u16)> {
     Some((host, port.unwrap_or(default_port)))
 }
 
-/// getaddrinfo blocks, so it runs on the blocking pool rather than on the
-/// executor thread every other future shares. A resolver saying "try again"
+/// getaddrinfo blocks, so it runs on the blocking pool rather than on a
+/// worker thread. A resolver saying "try again"
 /// (a cold cache, a link that just came back) has not answered yet, so a few
 /// retries go out before the lookup counts as a failure.
 pub async fn resolve(host: &str, port: u16, attempts: u32) -> io::Result<Vec<SocketAddr>> {
     let mut attempt = 1;
     loop {
         let target = (host.to_string(), port);
-        match unblock(move || target.to_socket_addrs()).await {
+        match spawn_blocking(move || target.to_socket_addrs()).await? {
             Ok(addrs) => return Ok(addrs.collect()),
             Err(e) if attempt >= attempts => return Err(e),
             Err(e) => {
@@ -179,7 +180,7 @@ pub async fn resolve(host: &str, port: u16, attempts: u32) -> io::Result<Vec<Soc
             }
         }
         attempt += 1;
-        Timer::after(DNS_RETRY_DELAY).await;
+        sleep(DNS_RETRY_DELAY).await;
     }
 }
 
@@ -253,7 +254,6 @@ impl Resolve for Lookup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_compat::Compat;
     use reqwest::Client;
     use std::sync::Arc;
     use test_case::test_case;
@@ -268,19 +268,19 @@ mod tests {
     const PUBLIC_URL: &str = "https://8.8.8.8/";
     const PUBLIC_HTTP_URL: &str = "http://8.8.8.8/";
 
-    /// reqwest arms its timeouts as `send` is called, so the call has to
-    /// happen inside the future `Compat` runs, never before. The shell's
-    /// proxy is left out, so the request goes where the test points it.
-    fn failed_request(url: &str) -> ReqwestError {
+    /// The shell's proxy is left out, so the request goes where the test points it.
+    async fn failed_request(url: &str) -> ReqwestError {
         let client = Client::builder()
             .no_proxy()
             .dns_resolver(Arc::new(Lookup))
             .build()
             .unwrap();
-        smol::block_on(Compat::new(async {
-            client.get(url).send().await.map(|r| r.status())
-        }))
-        .unwrap_err()
+        client
+            .get(url)
+            .send()
+            .await
+            .map(|r| r.status())
+            .unwrap_err()
     }
 
     #[test_case("HTTPS_PROXY", PROXY_URL, false, true ; "uppercase_https_proxy")]
@@ -359,8 +359,9 @@ mod tests {
     #[test_case(closed_port_url, true ; "a_closed_port_draws_on_the_connect_budget")]
     #[test_case(unresolvable_url, true ; "an_unresolvable_name_draws_on_the_connect_budget")]
     #[test_case(plain_tcp_behind_https_url, false ; "a_failed_handshake_retries_as_transient")]
-    fn transport_failures_classify_like_a_providers(url: fn() -> String, expected: bool) {
-        let error = failed_request(&url());
+    #[tokio::test]
+    async fn transport_failures_classify_like_a_providers(url: fn() -> String, expected: bool) {
+        let error = failed_request(&url()).await;
         assert_eq!(
             is_connect_failure(&error),
             expected,
@@ -369,9 +370,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn error_chain_leaves_out_the_url() {
-        let error = failed_request(&format!("{}?key={QUERY_SECRET}", closed_port_url()));
+    #[tokio::test]
+    async fn error_chain_leaves_out_the_url() {
+        let error = failed_request(&format!("{}?key={QUERY_SECRET}", closed_port_url())).await;
         let chain = error_chain(&error);
         assert!(!chain.contains(QUERY_SECRET), "{chain}");
         assert!(!chain.contains(URL_MARKER), "{chain}");

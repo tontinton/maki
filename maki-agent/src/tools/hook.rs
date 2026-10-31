@@ -8,8 +8,8 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use futures_lite::FutureExt;
 use serde_json::Value;
+use tokio::time::timeout_at;
 
 use super::registry::{BoxFuture, ToolReach};
 use super::{CallOrigin, ToolContext, ToolOutputMode};
@@ -132,12 +132,11 @@ pub async fn bounded<T>(
     grace: Duration,
     chain: impl Future<Output = T>,
 ) -> Result<T, ChainCut> {
-    let answered = async { cancel.race(chain).await.map_err(|_| ChainCut::Cancelled) };
-    let lapsed = async {
-        smol::Timer::at(deadline.max(Instant::now()) + grace).await;
-        Err(ChainCut::Lapsed)
-    };
-    answered.or(lapsed).await
+    let latest = deadline.max(Instant::now()) + grace;
+    match timeout_at(latest.into(), cancel.race(chain)).await {
+        Ok(answered) => answered.map_err(|_| ChainCut::Cancelled),
+        Err(_) => Err(ChainCut::Lapsed),
+    }
 }
 
 pub trait ToolHook: Send + Sync + 'static {
@@ -174,8 +173,8 @@ pub trait ToolHook: Send + Sync + 'static {
 mod tests {
     use std::future::pending;
 
-    use smol::future::yield_now;
     use test_case::test_case;
+    use tokio::task::yield_now;
 
     use super::*;
 
@@ -189,27 +188,26 @@ mod tests {
     /// case gets a grace it never reaches, so a slow machine cannot fail it.
     #[test_case(true,  LONG_GRACE,  Ok(VERDICT)           ; "a_late_answer_is_heard")]
     #[test_case(false, SHORT_GRACE, Err(ChainCut::Lapsed) ; "silence_ends_after_the_grace")]
-    fn a_lapsed_deadline_waits_on_the_host(
+    #[tokio::test]
+    async fn a_lapsed_deadline_waits_on_the_host(
         answers: bool,
         grace: Duration,
         expected: Result<&str, ChainCut>,
     ) {
-        smol::block_on(async {
-            let started = Instant::now();
-            let chain = async {
-                if !answers {
-                    pending::<()>().await;
-                }
-                yield_now().await;
-                VERDICT
-            };
-
-            let got = bounded(&CancelToken::none(), started, grace, chain).await;
-
-            assert_eq!(got, expected);
+        let started = Instant::now();
+        let chain = async {
             if !answers {
-                assert!(started.elapsed() >= grace, "gave up inside the grace");
+                pending::<()>().await;
             }
-        });
+            yield_now().await;
+            VERDICT
+        };
+
+        let got = bounded(&CancelToken::none(), started, grace, chain).await;
+
+        assert_eq!(got, expected);
+        if !answers {
+            assert!(started.elapsed() >= grace, "gave up inside the grace");
+        }
     }
 }

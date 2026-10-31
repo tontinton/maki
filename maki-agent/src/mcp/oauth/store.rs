@@ -153,16 +153,14 @@ mod tests {
         (storage, store)
     }
 
-    #[test]
-    fn round_trips_tokens_through_the_auth_file() {
+    #[tokio::test]
+    async fn round_trips_tokens_through_the_auth_file() {
         let dir = tempfile::tempdir().unwrap();
         let expires = now_millis() + HOUR_MS;
         let (storage, store) = store(&dir, tokens(REFRESH, expires));
 
-        smol::block_on(async {
-            let loaded = store.load().await.unwrap().unwrap();
-            store.save(loaded).await.unwrap();
-        });
+        let loaded = store.load().await.unwrap().unwrap();
+        store.save(loaded).await.unwrap();
 
         let saved = load_mcp_auth(&storage, SERVER, URL).unwrap();
         let saved_tokens = saved.tokens.unwrap();
@@ -174,18 +172,19 @@ mod tests {
 
     #[test_case(REFRESH, true  ; "with_refresh")]
     #[test_case("",      false ; "without_refresh")]
-    fn expiry_is_only_reported_with_a_refresh_token(refresh: &str, reported: bool) {
+    #[tokio::test]
+    async fn expiry_is_only_reported_with_a_refresh_token(refresh: &str, reported: bool) {
         let dir = tempfile::tempdir().unwrap();
         let (_, store) = store(&dir, tokens(refresh, now_millis()));
-        let loaded = smol::block_on(store.load()).unwrap().unwrap();
+        let loaded = store.load().await.unwrap().unwrap();
         assert_eq!(
             loaded.token_response.unwrap().expires_in().is_some(),
             reported
         );
     }
 
-    #[test]
-    fn refresh_picks_up_a_token_another_process_rotated() {
+    #[tokio::test]
+    async fn refresh_picks_up_a_token_another_process_rotated() {
         let dir = tempfile::tempdir().unwrap();
         let (storage, store) = store(&dir, tokens(REFRESH, now_millis()));
         save_mcp_auth(
@@ -195,10 +194,11 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = smol::block_on(async {
+        let loaded = async {
             let _guard = store.acquire_refresh_guard().await.unwrap();
             store.load().await.unwrap().unwrap()
-        });
+        }
+        .await;
 
         let response = loaded.token_response.unwrap();
         assert_eq!(response.refresh_token().unwrap().secret(), ROTATED);

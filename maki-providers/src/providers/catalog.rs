@@ -19,6 +19,7 @@ use flume::Sender;
 use maki_config::providers::ProvidersConfig;
 use reqwest::Client;
 use serde_json::Value;
+use tokio::runtime::Handle;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
@@ -580,14 +581,9 @@ fn catalog_cache_path() -> Option<PathBuf> {
     Some(dir.join(CATALOG_CACHE_FILE))
 }
 
-async fn load_cached_catalog_async() -> Option<schema::CatalogIndex> {
+fn load_cached_catalog() -> Option<schema::CatalogIndex> {
     let path = catalog_cache_path()?;
-    let meta = smol::unblock({
-        let path = path.clone();
-        move || fs::metadata(&path)
-    })
-    .await
-    .ok()?;
+    let meta = fs::metadata(&path).ok()?;
 
     let modified = meta.modified().ok()?;
     let age = SystemTime::now().duration_since(modified).ok()?;
@@ -596,22 +592,19 @@ async fn load_cached_catalog_async() -> Option<schema::CatalogIndex> {
         return None;
     }
 
-    let text = smol::unblock(move || fs::read_to_string(&path))
-        .await
-        .ok()?;
+    let text = fs::read_to_string(&path).ok()?;
     let index: schema::CatalogIndex = serde_json::from_str(&text).ok()?;
     debug!("loaded catalog from cache");
     Some(index)
 }
 
-async fn save_cached_catalog_async(index: &schema::CatalogIndex) {
+fn save_cached_catalog(index: &schema::CatalogIndex) {
     let path = match catalog_cache_path() {
         Some(p) => p,
         None => return,
     };
     if let Some(dir) = path.parent() {
-        let dir = dir.to_path_buf();
-        let _ = smol::unblock(move || fs::create_dir_all(&dir)).await;
+        let _ = fs::create_dir_all(dir);
     }
     let text = match serde_json::to_string_pretty(index) {
         Ok(t) => t,
@@ -620,14 +613,11 @@ async fn save_cached_catalog_async(index: &schema::CatalogIndex) {
             return;
         }
     };
-    smol::unblock(move || {
-        if let Err(e) = fs::write(&path, &text) {
-            warn!(error = %e, path = %path.display(), "failed to write catalog cache");
-        } else {
-            debug!(path = %path.display(), "cached catalog");
-        }
-    })
-    .await;
+    if let Err(e) = fs::write(&path, &text) {
+        warn!(error = %e, path = %path.display(), "failed to write catalog cache");
+    } else {
+        debug!(path = %path.display(), "cached catalog");
+    }
 }
 
 async fn fetch_remote_catalog_async(client: &Client) -> Result<schema::CatalogIndex, AgentError> {
@@ -726,11 +716,13 @@ fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
     }
 }
 
+/// Runs on the cli thread or the blocking pool, never on a worker: a worker
+/// cannot block on the fetch.
 fn fetch_catalog_blocking(state_dir: &StateDir) -> Result<CatalogData, AgentError> {
-    let index = smol::block_on(fetch_remote_catalog_async(
-        &http_client(Timeouts::default()),
-    ))?;
-    smol::block_on(save_cached_catalog_async(&index));
+    let index = Handle::current().block_on(fetch_remote_catalog_async(&http_client(
+        Timeouts::default(),
+    )))?;
+    save_cached_catalog(&index);
     Ok(CatalogData::from_index(index, state_dir))
 }
 
@@ -744,7 +736,7 @@ fn init_catalog_blocking() -> CatalogData {
         }
     };
 
-    if let Some(index) = smol::block_on(load_cached_catalog_async()) {
+    if let Some(index) = load_cached_catalog() {
         return CatalogData::from_index(index, &state_dir);
     }
 
@@ -988,7 +980,8 @@ impl LazyCatalogProvider {
         if self.inner.get().is_none() {
             let slug = self.slug.clone();
             let timeouts = self.timeouts;
-            let created = smol::unblock(move || create_resolved(&slug, timeouts)).await;
+            let created =
+                tokio::task::spawn_blocking(move || create_resolved(&slug, timeouts)).await?;
             let _ = self.inner.set(created.map_err(|e| e.to_string()));
         }
         match self.inner.get().expect("set above") {
@@ -1199,13 +1192,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gated_free_fallback_hides_models_and_refuses_streaming() {
+    #[tokio::test]
+    async fn gated_free_fallback_hides_models_and_refuses_streaming() {
         let (_tmp, state_dir) = temp_state_dir();
         let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_52814");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
-        assert!(smol::block_on(provider.list_models()).unwrap().is_empty());
+        assert!(provider.list_models().await.unwrap().is_empty());
 
         let model = Model {
             id: "free-model".into(),
@@ -1225,40 +1218,42 @@ mod tests {
             thinking_fields: None,
         };
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(provider.stream_message(
-            &model,
-            &[],
-            "",
-            &serde_json::json!([]),
-            &tx,
-            RequestOptions::default(),
-            None,
-        ));
+        let result = provider
+            .stream_message(
+                &model,
+                &[],
+                "",
+                &serde_json::json!([]),
+                &tx,
+                RequestOptions::default(),
+                None,
+            )
+            .await;
         assert!(matches!(
             result,
             Err(AgentError::Config { message }) if message.contains(OPT_IN_HINT)
         ));
     }
 
-    #[test]
-    fn catalog_provider_list_models_free_fallback_hides_paid_models() {
+    #[tokio::test]
+    async fn catalog_provider_list_models_free_fallback_hides_paid_models() {
         let (_tmp, state_dir) = temp_state_dir();
         let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_91472");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
-        let models = smol::block_on(provider.list_models()).unwrap();
+        let models = provider.list_models().await.unwrap();
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["free-model"]);
     }
 
-    #[test]
-    fn catalog_provider_list_models_with_key_shows_all() {
+    #[tokio::test]
+    async fn catalog_provider_list_models_with_key_shows_all() {
         let (_tmp, state_dir) = temp_state_dir();
         unsafe { std::env::set_var("MAKI_TEST_OPENCODE_GO_KEY_41827", "real-key") };
         let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_KEY_41827");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
-        let models = smol::block_on(provider.list_models()).unwrap();
+        let models = provider.list_models().await.unwrap();
         let mut ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(ids, ["free-model", "paid-model"]);

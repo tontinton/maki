@@ -33,6 +33,7 @@ use ignore::WalkBuilder;
 use jiff::fmt::friendly::{Designator, Spacing, SpanPrinter};
 use maki_config::ProjectConfig;
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::agent::{CallInstructions, LoadedInstructions, default_instruction_files};
 use crate::call_scope::CallScope;
@@ -373,7 +374,7 @@ pub struct ToolContext {
     /// otel), so this is what tells their chats apart.
     pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
-    pub user_response_rx: Option<Arc<smol::lock::Mutex<flume::Receiver<String>>>>,
+    pub user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
     /// See [`crate::Agent::with_reauth`]. Carried here so a subagent session
     /// offers a re-login only where its parent does.
     pub reauth: bool,
@@ -634,7 +635,7 @@ pub fn interpreter_ctx(
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_access: Arc<FileAccess>,
-    user_response_rx: Option<Arc<smol::lock::Mutex<flume::Receiver<String>>>>,
+    user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));

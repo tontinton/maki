@@ -17,6 +17,7 @@ use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use mlua::{IntoLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::{Map, Value as JsonValue};
+use tokio::task::{spawn_blocking, yield_now};
 
 use crate::api::image::LuaImage;
 use crate::api::util::command::{
@@ -117,8 +118,10 @@ async fn from_disk<T: Send + 'static>(
     answer: impl FnOnce(StoredSession) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     let dir = state_dir(lua)?;
-    smol::unblock(move || answer(StoredSession::read_only(id, &dir).map_err(|e| e.to_string())?))
+    spawn_blocking(move || answer(StoredSession::read_only(id, &dir).map_err(|e| e.to_string())?))
         .await
+        .map_err(|e| e.to_string())
+        .flatten()
 }
 
 async fn roundtrip(
@@ -348,7 +351,7 @@ async fn messages_table(lua: &Lua, messages: &[Message]) -> LuaResult<Table> {
     let out = lua.create_table_with_capacity(messages.len(), 0)?;
     for (index, message) in messages.iter().enumerate() {
         if index > 0 && index % MESSAGES_PER_YIELD == 0 {
-            smol::future::yield_now().await;
+            yield_now().await;
         }
         out.raw_set(index + 1, message_table(lua, message)?)?;
     }
@@ -528,7 +531,7 @@ async fn messages_json(lua: &Lua, messages: &Table) -> LuaResult<Result<JsonValu
     let mut out = Vec::with_capacity(len);
     for index in 0..len {
         if index > 0 && index % MESSAGES_PER_YIELD == 0 {
-            smol::future::yield_now().await;
+            yield_now().await;
         }
         let message: Value = messages.raw_get(index + 1)?;
         if let Value::Table(fields) = &message
@@ -666,7 +669,9 @@ async fn new(
     }
     let doc = try_pair!(document_json(&lua, &opts).await?);
     // Off the Lua thread, since parsing a long history is real work.
-    let parsed = smol::unblock(move || serde_json::from_value::<Transcript>(doc)).await;
+    let parsed = spawn_blocking(move || serde_json::from_value::<Transcript>(doc))
+        .await
+        .map_err(mlua::Error::external)?;
     let transcript = try_pair!(parsed.map_err(|e| e.to_string()));
     if transcript.messages.iter().any(runs_on_enter) {
         require(&lua, &grants, Permission::Agent)?;
@@ -682,11 +687,12 @@ async fn new(
     let base = StoredSession::new("", &try_pair!(headless_cwd(&lua)));
     let dir = try_pair!(state_dir(&lua));
     let id = try_pair!(
-        smol::unblock(move || {
+        spawn_blocking(move || {
             let session = transcript.into_session(base).map_err(|e| e.to_string())?;
             store_new(session, &dir).map_err(|e| e.to_string())
         })
         .await
+        .map_err(mlua::Error::external)?
     );
     Ok((Some(id.to_string().into_lua(&lua)?), None))
 }
@@ -883,17 +889,20 @@ mod tests {
         lua
     }
 
-    #[test]
-    fn live_without_ui_returns_error_pair() {
+    #[tokio::test]
+    async fn live_without_ui_returns_error_pair() {
         let lua = lua_with_session(None);
-        let (val, err): (Value, Option<String>) =
-            smol::block_on(lua.load("return session.live()").eval_async()).unwrap();
+        let (val, err): (Value, Option<String>) = lua
+            .load("return session.live()")
+            .eval_async()
+            .await
+            .unwrap();
         assert!(val.is_nil());
         assert_eq!(err.as_deref(), Some(NO_UI_ERR));
     }
 
-    #[test]
-    fn focus_roundtrips_through_ui_channel() {
+    #[tokio::test]
+    async fn focus_roundtrips_through_ui_channel() {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
         std::thread::spawn(move || {
@@ -906,15 +915,19 @@ mod tests {
             };
             reply_tx.send(Ok(json!({ "focused": id }))).unwrap();
         });
-        let (val, err): (Table, Option<String>) =
-            smol::block_on(lua.load("return session.focus('abc')").eval_async()).unwrap();
+        let (val, err): (Table, Option<String>) = lua
+            .load("return session.focus('abc')")
+            .eval_async()
+            .await
+            .unwrap();
         assert_eq!(err, None);
         assert_eq!(val.get::<String>("focused").unwrap(), "abc");
     }
 
     #[test_case("return session.prompt('hi', { session = 'abc' })", Some("abc") ; "explicit_session_id")]
     #[test_case("return session.prompt('hi')", None ; "defaults_to_focused")]
-    fn prompt_forwards_text_and_session_id(code: &str, expected_id: Option<&str>) {
+    #[tokio::test]
+    async fn prompt_forwards_text_and_session_id(code: &str, expected_id: Option<&str>) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let expected_id = expected_id.map(str::to_owned);
@@ -930,8 +943,7 @@ mod tests {
             assert_eq!(text, "hi");
             reply_tx.send(Ok(json!("queued"))).unwrap();
         });
-        let (val, err): (String, Option<String>) =
-            smol::block_on(lua.load(code).eval_async()).unwrap();
+        let (val, err): (String, Option<String>) = lua.load(code).eval_async().await.unwrap();
         checker.join().unwrap();
         assert_eq!(err, None);
         assert_eq!(val, "queued");
@@ -941,7 +953,8 @@ mod tests {
     /// for a background tab has to be able to name it.
     #[test_case(r#"return session.set_mode('build', { session = 'abc' })"#, Some("abc"), "build" ; "explicit_session_id")]
     #[test_case("return session.set_mode('plan')", None, "plan" ; "defaults_to_focused")]
-    fn set_mode_forwards_the_mode_and_session_id(
+    #[tokio::test]
+    async fn set_mode_forwards_the_mode_and_session_id(
         code: &str,
         expected_id: Option<&str>,
         expected_mode: &str,
@@ -962,8 +975,7 @@ mod tests {
             assert_eq!(mode, expected_mode);
             reply_tx.send(Ok(json!(true))).unwrap();
         });
-        let (val, err): (bool, Option<String>) =
-            smol::block_on(lua.load(code).eval_async()).unwrap();
+        let (val, err): (bool, Option<String>) = lua.load(code).eval_async().await.unwrap();
         checker.join().unwrap();
         assert_eq!(err, None);
         assert!(val);
@@ -1077,8 +1089,8 @@ mod tests {
         History::new(messages).with_mirror(mirror)
     }
 
-    #[test]
-    fn messages_reads_a_live_transcript() {
+    #[tokio::test]
+    async fn messages_reads_a_live_transcript() {
         const FIRST: &str = "first";
         const ANSWER: &str = "done";
         let id = MakiId::generate();
@@ -1098,8 +1110,7 @@ mod tests {
         let lua = lua_with_session(None);
 
         let code = format!("return session.messages({{ session = '{id}', last = 1 }})");
-        let (msgs, err): (Table, Option<String>) =
-            smol::block_on(lua.load(&code).eval_async()).unwrap();
+        let (msgs, err): (Table, Option<String>) = lua.load(&code).eval_async().await.unwrap();
         assert_eq!(err, None);
         assert_eq!(msgs.raw_len(), 1);
         let last: Table = msgs.get(1).unwrap();
@@ -1110,12 +1121,12 @@ mod tests {
 
     #[test_case("messages" ; "messages")]
     #[test_case("export" ; "export")]
-    fn reading_a_session_that_does_not_exist_is_an_error_pair(call: &str) {
+    #[tokio::test]
+    async fn reading_a_session_that_does_not_exist_is_an_error_pair(call: &str) {
         let (lua, _dir) = headless();
         let id = MakiId::generate();
         let code = format!("return session.{call}({{ session = '{id}' }})");
-        let (value, err): (Value, Option<String>) =
-            smol::block_on(lua.load(&code).eval_async()).unwrap();
+        let (value, err): (Value, Option<String>) = lua.load(&code).eval_async().await.unwrap();
         assert!(value.is_nil());
         assert!(err.is_some_and(|err| err.contains(&id.to_string())));
     }
@@ -1149,24 +1160,32 @@ mod tests {
 
     #[test_case(headless_focused_on ; "headless_snapshot_id")]
     #[test_case(ui_focused_on ; "ui_current_bare_id")]
-    fn current_names_the_focused_session(focused_on: fn(MakiId) -> Lua) {
+    #[tokio::test]
+    async fn current_names_the_focused_session(focused_on: fn(MakiId) -> Lua) {
         let id = MakiId::generate();
         let lua = focused_on(id);
-        let (got, err): (Option<String>, Option<String>) =
-            smol::block_on(lua.load("return session.current()").eval_async()).unwrap();
+        let (got, err): (Option<String>, Option<String>) = lua
+            .load("return session.current()")
+            .eval_async()
+            .await
+            .unwrap();
         assert_eq!(err, None);
         assert_eq!(got, Some(id.to_string()));
     }
 
     #[test_case(headless_focused_on ; "headless_snapshot_id")]
     #[test_case(ui_focused_on ; "ui_current_bare_id")]
-    fn messages_defaults_to_the_focused_session(focused_on: fn(MakiId) -> Lua) {
+    #[tokio::test]
+    async fn messages_defaults_to_the_focused_session(focused_on: fn(MakiId) -> Lua) {
         let id = MakiId::generate();
         let _history = live(id, vec![Message::user(FOCUSED_TEXT.into())]);
         let lua = focused_on(id);
 
-        let (msgs, err): (Table, Option<String>) =
-            smol::block_on(lua.load("return session.messages()").eval_async()).unwrap();
+        let (msgs, err): (Table, Option<String>) = lua
+            .load("return session.messages()")
+            .eval_async()
+            .await
+            .unwrap();
         assert_eq!(err, None);
         assert_eq!(msgs.raw_len(), 1);
         let block: Table = msgs
@@ -1179,8 +1198,8 @@ mod tests {
         assert_eq!(block.get::<String>("text").unwrap(), FOCUSED_TEXT);
     }
 
-    #[test]
-    fn messages_without_a_focused_session_is_an_error_pair() {
+    #[tokio::test]
+    async fn messages_without_a_focused_session_is_an_error_pair() {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
         std::thread::spawn(move || {
@@ -1189,8 +1208,11 @@ mod tests {
             };
             reply_tx.send(Ok(serde_json::Value::Null)).unwrap();
         });
-        let (_, err): (Value, Option<String>) =
-            smol::block_on(lua.load("return session.messages()").eval_async()).unwrap();
+        let (_, err): (Value, Option<String>) = lua
+            .load("return session.messages()")
+            .eval_async()
+            .await
+            .unwrap();
         assert_eq!(err.as_deref(), Some(NO_FOCUSED_ERR));
     }
 
@@ -1314,8 +1336,8 @@ mod tests {
         store_new(session, &storage(lua)).unwrap()
     }
 
-    fn eval<T: mlua::FromLuaMulti>(lua: &Lua, code: &str) -> T {
-        smol::block_on(lua.load(code).eval_async()).unwrap()
+    async fn eval<T: mlua::FromLuaMulti>(lua: &Lua, code: &str) -> T {
+        lua.load(code).eval_async().await.unwrap()
     }
 
     fn json_of(lua: &Lua, value: Value) -> JsonValue {
@@ -1339,8 +1361,8 @@ mod tests {
         doc
     }
 
-    #[test]
-    fn messages_are_the_serde_shape_with_nulls_kept() {
+    #[tokio::test]
+    async fn messages_are_the_serde_shape_with_nulls_kept() {
         let id = MakiId::generate();
         let history = rich_history();
         let _live = live(id, history.clone());
@@ -1349,7 +1371,8 @@ mod tests {
         let msgs: Table = eval(
             &lua,
             &format!("return session.messages({{ session = '{id}' }})"),
-        );
+        )
+        .await;
 
         assert_eq!(
             json_of(&lua, Value::Table(msgs)),
@@ -1357,8 +1380,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_image_source_is_a_handle_sharing_the_payload() {
+    #[tokio::test]
+    async fn an_image_source_is_a_handle_sharing_the_payload() {
         let id = MakiId::generate();
         let block = image();
         let ContentBlock::Image { source } = &block else {
@@ -1371,7 +1394,8 @@ mod tests {
         let handle: mlua::AnyUserData = eval(
             &lua,
             &format!("return session.messages({{ session = '{id}' }})[1].content[1].source"),
-        );
+        )
+        .await;
 
         let shared = handle.borrow::<LuaImage>().unwrap().to_source();
         assert!(Arc::ptr_eq(&shared.data, &payload));
@@ -1380,8 +1404,8 @@ mod tests {
     /// The document goes out and comes back as one table, through
     /// `maki.deepcopy` like a redactor would copy it, and only what `new`
     /// drops on purpose is gone.
-    #[test]
-    fn export_new_export_round_trips_minus_thinking() {
+    #[tokio::test]
+    async fn export_new_export_round_trips_minus_thinking() {
         let (lua, _dir) = headless();
         let id = stored(&lua, rich_history());
         lua.globals().set("origin", id.to_string()).unwrap();
@@ -1393,15 +1417,16 @@ mod tests {
             local copy = assert(session.new(maki.deepcopy(doc)))
             return doc, assert(session.export({ session = copy }))
             "#,
-        );
+        )
+        .await;
 
         let after = json_of(&lua, after);
         assert_eq!(after, without_thinking(json_of(&lua, before)));
         assert_eq!(after["facts"]["cwd"], FACTS_CWD);
     }
 
-    #[test]
-    fn messages_reads_the_tail_of_a_stored_transcript() {
+    #[tokio::test]
+    async fn messages_reads_the_tail_of_a_stored_transcript() {
         let (lua, _dir) = headless();
         let history = rich_history();
         let id = stored(&lua, history.clone());
@@ -1409,7 +1434,8 @@ mod tests {
         let msgs: Value = eval(
             &lua,
             &format!("return session.messages({{ session = '{id}', last = 2 }})"),
-        );
+        )
+        .await;
 
         assert_eq!(
             json_of(&lua, msgs),
@@ -1417,15 +1443,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_of_a_stored_session_reports_its_settings() {
+    #[tokio::test]
+    async fn read_of_a_stored_session_reports_its_settings() {
         let (lua, _dir) = headless();
         let id = stored(&lua, vec![Message::user(TEXT.into())]);
 
         let snapshot: Table = eval(
             &lua,
             &format!("return session.read({{ session = '{id}' }})"),
-        );
+        )
+        .await;
 
         assert_eq!(snapshot.get::<String>("status").unwrap(), STATUS_STORED);
         assert_eq!(snapshot.get::<String>("thinking").unwrap(), THINKING);
@@ -1448,9 +1475,11 @@ mod tests {
     #[test_case(r#"{ messages = maki.json.decode('[{"role":"user","content":[]}]') }"#, NOTHING_TO_STORE.to_owned() ; "empty_after_repair")]
     #[test_case("{ prompt = 'go', messages = one_message }", NO_UI_ERR.to_owned() ; "headless_prompt")]
     #[test_case("{ focus = true, messages = one_message }", NO_UI_ERR.to_owned() ; "headless_focus")]
-    fn new_refuses(opts: &str, expected: String) {
+    #[tokio::test]
+    async fn new_refuses(opts: &str, expected: String) {
         let (lua, _dir) = headless();
-        let (id, err): (Value, Option<String>) = eval(&lua, &format!("return session.new({opts})"));
+        let (id, err): (Value, Option<String>) =
+            eval(&lua, &format!("return session.new({opts})")).await;
         assert!(id.is_nil());
         assert_eq!(err, Some(expected));
         assert!(StoredSession::list_all(&storage(&lua)).unwrap().is_empty());
@@ -1462,12 +1491,13 @@ mod tests {
     #[test_case("/compact" => false ; "a_command")]
     #[test_case("!ls" => false ; "a_shell_line")]
     #[test_case(" exit " => false ; "the_exit_word")]
-    fn new_with_session_write_alone_imports(text: &str) -> bool {
+    #[tokio::test]
+    async fn new_with_session_write_alone_imports(text: &str) -> bool {
         let (lua, _dir) = headless_granted(PluginPermissions::from_approved(["session_write"]));
         let code = format!(
             "return session.new({{ messages = {{ {{ role = 'user', content = {{ {{ type = 'text', text = '{text}' }} }} }} }} }})"
         );
-        match smol::block_on(lua.load(code).eval_async::<(Value, Option<String>)>()) {
+        match lua.load(code).eval_async::<(Value, Option<String>)>().await {
             Ok((id, err)) => {
                 assert_eq!(err, None);
                 !id.is_nil()
@@ -1489,14 +1519,15 @@ mod tests {
 
     #[test_case("{ type = 'base64', media_type = 'image/png', data = image_data }" ; "base64_table")]
     #[test_case("maki.image.decode(maki.base64.decode(image_data))" ; "handle")]
-    fn headless_new_stores_an_image_given_either_way(source: &str) {
+    #[tokio::test]
+    async fn headless_new_stores_an_image_given_either_way(source: &str) {
         let (lua, _dir) = headless();
         lua.globals().set("image_data", tiny_png()).unwrap();
         let code = format!(
             "return assert(session.new({{ messages = {} }}))",
             image_history(source)
         );
-        let id: String = eval(&lua, &code);
+        let id: String = eval(&lua, &code).await;
 
         let session = StoredSession::read_only(id.parse().unwrap(), &storage(&lua)).unwrap();
         let [Message { content, .. }] = session.messages() else {
@@ -1519,8 +1550,8 @@ mod tests {
 
     /// Validation is the UI's: it lays the transcript over the focused tab's
     /// blank session, so the transcript arrives as parsed.
-    #[test]
-    fn new_with_a_ui_hands_it_the_parsed_transcript() {
+    #[tokio::test]
+    async fn new_with_a_ui_hands_it_the_parsed_transcript() {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = plugin_lua(Some(tx));
         let id = MakiId::generate();
@@ -1547,14 +1578,14 @@ mod tests {
         let code = format!(
             "return session.new({{ title = '{TITLE}', focus = true, messages = one_message }})"
         );
-        let (got, err): (String, Option<String>) = eval(&lua, &code);
+        let (got, err): (String, Option<String>) = eval(&lua, &code).await;
         checker.join().unwrap();
         assert_eq!(err, None);
         assert_eq!(got, id.to_string());
     }
 
-    #[test]
-    fn export_with_a_ui_is_answered_by_it() {
+    #[tokio::test]
+    async fn export_with_a_ui_is_answered_by_it() {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let id = MakiId::generate();
@@ -1576,7 +1607,8 @@ mod tests {
         let doc: Value = eval(
             &lua,
             &format!("return session.export({{ session = '{id}' }})"),
-        );
+        )
+        .await;
 
         let doc = json_of(&lua, doc);
         assert_eq!(doc["title"], TITLE);
@@ -1596,8 +1628,8 @@ mod tests {
         (History::new(messages).with_mirror(mirror), header)
     }
 
-    #[test]
-    fn headless_reads_of_a_live_unsaved_session_need_no_file() {
+    #[tokio::test]
+    async fn headless_reads_of_a_live_unsaved_session_need_no_file() {
         let (lua, _dir) = headless();
         let id = MakiId::generate();
         let history = vec![Message::user(TEXT.into())];
@@ -1607,7 +1639,7 @@ mod tests {
         let (doc, snapshot): (Value, Table) = eval(
             &lua,
             "return assert(session.export({ session = id })), assert(session.read({ session = id }))",
-        );
+        ).await;
 
         let doc = json_of(&lua, doc);
         assert_eq!(doc["title"], TITLE);
@@ -1620,8 +1652,8 @@ mod tests {
 
     /// A stored-only session lands in the project of the session the driver
     /// runs, not wherever the process started.
-    #[test]
-    fn headless_new_lands_in_the_driver_session_cwd() {
+    #[tokio::test]
+    async fn headless_new_lands_in_the_driver_session_cwd() {
         const DRIVER_CWD: &str = "/driver/project";
         let (lua, _dir) = headless();
         let provider: SessionSnapshotFn =
@@ -1631,7 +1663,8 @@ mod tests {
         let id: String = eval(
             &lua,
             "return assert(session.new({ messages = one_message }))",
-        );
+        )
+        .await;
 
         let session = StoredSession::read_only(id.parse().unwrap(), &storage(&lua)).unwrap();
         assert_eq!(session.cwd, DRIVER_CWD);
@@ -1639,26 +1672,29 @@ mod tests {
 
     /// ACP installs no slot. The one session it happens to have open must not
     /// decide where an import lands, or a second open session would move it.
-    #[test]
-    fn headless_new_without_a_driver_session_lands_where_maki_runs() {
+    #[tokio::test]
+    async fn headless_new_without_a_driver_session_lands_where_maki_runs() {
         let (lua, _dir) = headless();
         let _live = live_unsaved(MakiId::generate(), Vec::new());
 
         let id: String = eval(
             &lua,
             "return assert(session.new({ messages = one_message }))",
-        );
+        )
+        .await;
 
         let session = StoredSession::read_only(id.parse().unwrap(), &storage(&lua)).unwrap();
         let here = std::env::current_dir().unwrap();
         assert_eq!(session.cwd, here.to_string_lossy());
     }
 
-    #[test]
-    fn set_title_with_wrong_type_throws() {
+    #[tokio::test]
+    async fn set_title_with_wrong_type_throws() {
         let lua = lua_with_session(None);
-        let result: LuaResult<Value> =
-            smol::block_on(lua.load("return session.set_title('oops')").eval_async());
+        let result: LuaResult<Value> = lua
+            .load("return session.set_title('oops')")
+            .eval_async()
+            .await;
         assert!(result.unwrap_err().to_string().contains("table"));
     }
 }

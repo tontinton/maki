@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use color_eyre::Result;
 use color_eyre::eyre::Context;
+use tokio::runtime::Handle;
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
@@ -277,8 +278,8 @@ fn rebuild(
         // This calls `std::env::set_var`. On the startup grant path nothing
         // long-lived exists yet, so the join above is the whole story. The only
         // site that reaches it with threads alive is `/trust`, a rare explicit
-        // action, and only after the join: smol's worker pool and any telemetry
-        // exporter may still be parked.
+        // action, and only after the join: tokio's worker threads and any
+        // telemetry exporter may still be parked.
         load_env_files(&trust.project_config);
     }
 
@@ -395,23 +396,24 @@ pub fn run(mut cli: Cli) -> Result<()> {
         let (resumed, claim) = resolved.into_resumed();
         let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
-        let interrupt = crate::sdk_mode::run(crate::sdk_mode::SdkParams {
-            cli,
-            resumed,
-            claim,
-            storage: storage.clone(),
-            model: stack.model,
-            config: stack.config.agent,
-            permissions_config: stack.config.permissions,
-            timeouts,
-            prompt_slots,
-            defaults: stack.config.session_defaults,
-            model_policy: Arc::new(stack.config.provider.model_policy.clone()),
-            plugin_rules: stack.plugin_host.plugin_rules(),
-            lua_handle: stack.plugin_host.event_handle(),
-            project_config: trust.project_config.clone(),
-        })
-        .context("run sdk mode")?;
+        let interrupt = Handle::current()
+            .block_on(crate::sdk_mode::run(crate::sdk_mode::SdkParams {
+                cli,
+                resumed,
+                claim,
+                storage: storage.clone(),
+                model: stack.model,
+                config: stack.config.agent,
+                permissions_config: stack.config.permissions,
+                timeouts,
+                prompt_slots,
+                defaults: stack.config.session_defaults,
+                model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                plugin_rules: stack.plugin_host.plugin_rules(),
+                lua_handle: stack.plugin_host.event_handle(),
+                project_config: trust.project_config.clone(),
+            }))
+            .context("run sdk mode")?;
         drop(stack.plugin_host);
         teardown.join();
         interrupt.exit_if_caught();
@@ -422,26 +424,27 @@ pub fn run(mut cli: Cli) -> Result<()> {
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
         let background_wait = cli.background_wait();
-        let interrupt = crate::print::run(crate::print::PrintParams {
-            model: stack.model,
-            prompt: cli.initial_prompt,
-            image_paths: cli.images,
-            format: cli.output_format,
-            verbose: cli.verbose,
-            config: stack.config.agent,
-            permissions_config: stack.config.permissions,
-            timeouts,
-            lua_handle: stack.plugin_host.event_handle(),
-            defaults: stack.config.session_defaults,
-            model_policy: Arc::new(stack.config.provider.model_policy.clone()),
-            plugin_rules: stack.plugin_host.plugin_rules(),
-            project_config: trust.project_config.clone(),
-            resumed,
-            claim,
-            storage: storage.clone(),
-            background_wait,
-        })
-        .context("run print mode")?;
+        let interrupt = Handle::current()
+            .block_on(crate::print::run(crate::print::PrintParams {
+                model: stack.model,
+                prompt: cli.initial_prompt,
+                image_paths: cli.images,
+                format: cli.output_format,
+                verbose: cli.verbose,
+                config: stack.config.agent,
+                permissions_config: stack.config.permissions,
+                timeouts,
+                lua_handle: stack.plugin_host.event_handle(),
+                defaults: stack.config.session_defaults,
+                model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                plugin_rules: stack.plugin_host.plugin_rules(),
+                project_config: trust.project_config.clone(),
+                resumed,
+                claim,
+                storage: storage.clone(),
+                background_wait,
+            }))
+            .context("run print mode")?;
         drop(stack.plugin_host);
         teardown.join();
         interrupt.exit_if_caught();

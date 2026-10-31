@@ -196,7 +196,7 @@ impl Drop for CallGuard {
 mod tests {
     use std::pin::pin;
 
-    use futures_lite::future::poll_once;
+    use futures::FutureExt;
     use test_case::test_case;
 
     use super::*;
@@ -291,18 +291,18 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_move_wakes_its_waiters_and_names_the_chat() {
+    #[tokio::test]
+    async fn a_move_wakes_its_waiters_and_names_the_chat() {
         let (_run_trigger, run) = CancelToken::new();
         let (scope, _guard) = scope_under(&run);
         let background_for = BackgroundFor::Call(Arc::clone(&scope));
         let mut moved = pin!(scope.moved());
-        assert!(smol::block_on(poll_once(&mut moved)).is_none());
+        assert!(moved.as_mut().now_or_never().is_none());
         assert_eq!(background_for.chat(), None);
 
         let chat = MakiId::generate();
         let _trigger = scope.move_to(home(chat)).unwrap();
-        assert!(smol::block_on(poll_once(&mut moved)).is_some());
+        assert!(moved.as_mut().now_or_never().is_some());
         assert_eq!(background_for.chat(), Some(chat));
     }
 }

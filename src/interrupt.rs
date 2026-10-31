@@ -8,39 +8,42 @@
 
 use std::process;
 use std::sync::{Arc, OnceLock};
-use std::thread;
 
-use async_signal::{Signal, Signals};
+use futures::future::select_all;
 use maki_agent::{CancelToken, CancelTrigger};
+#[cfg(unix)]
+use tokio::signal::unix::{Signal, SignalKind, signal};
+#[cfg(not(unix))]
+use tokio::signal::windows::{CtrlC, ctrl_c};
 use tracing::{info, warn};
 
 #[cfg(unix)]
-const WATCHED: [Signal; 2] = [Signal::Int, Signal::Term];
+const WATCHED: [SignalKind; 2] = [SignalKind::interrupt(), SignalKind::terminate()];
+/// Windows has no signal numbers; a Ctrl-C exits as SIGINT does elsewhere.
 #[cfg(not(unix))]
-const WATCHED: [Signal; 1] = [Signal::Int];
+const CTRL_C_NUMBER: i32 = 2;
 /// A shell reports a process a signal killed as 128 plus the signal number.
 const SIGNAL_EXIT_BASE: i32 = 128;
 const FORCED_EXIT: &str = "maki: signalled again, exiting without stopping background work";
 
+#[cfg(unix)]
+type SignalStream = Signal;
+#[cfg(not(unix))]
+type SignalStream = CtrlC;
+
 pub struct Interrupt {
     stop: CancelToken,
-    caught: Arc<OnceLock<Signal>>,
+    /// The number of the signal caught first.
+    caught: Arc<OnceLock<i32>>,
 }
 
 impl Interrupt {
     pub fn install() -> Self {
         let (trigger, stop) = CancelToken::new();
         let caught = Arc::new(OnceLock::new());
-        match Signals::new(
-            WATCHED
-                .into_iter()
-                .filter(|&signal| !inherited_ignore(signal)),
-        ) {
-            Ok(signals) => {
-                let caught = Arc::clone(&caught);
-                thread::spawn(move || watch(signals, trigger, &caught));
-            }
-            Err(error) => warn!(%error, "cannot catch SIGINT/SIGTERM, a signal kills maki at once"),
+        let signals = watched();
+        if !signals.is_empty() {
+            tokio::spawn(watch(signals, trigger, Arc::clone(&caught)));
         }
         Self { stop, caught }
     }
@@ -60,39 +63,73 @@ impl Interrupt {
     }
 }
 
-fn watch(signals: Signals, trigger: CancelTrigger, caught: &OnceLock<Signal>) {
-    let mut signals = smol::stream::block_on(signals).filter_map(Result::ok);
-    let Some(first) = signals.next() else {
+/// The signal streams to watch, each with its number for the exit code.
+#[cfg(unix)]
+fn watched() -> Vec<(i32, SignalStream)> {
+    WATCHED
+        .into_iter()
+        .filter(|&kind| !inherited_ignore(kind))
+        .filter_map(|kind| match signal(kind) {
+            Ok(stream) => Some((kind.as_raw_value(), stream)),
+            Err(error) => {
+                warn!(%error, signal = kind.as_raw_value(), "cannot catch the signal, it kills maki at once");
+                None
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn watched() -> Vec<(i32, SignalStream)> {
+    match ctrl_c() {
+        Ok(stream) => vec![(CTRL_C_NUMBER, stream)],
+        Err(error) => {
+            warn!(%error, "cannot catch Ctrl-C, it kills maki at once");
+            Vec::new()
+        }
+    }
+}
+
+async fn watch(
+    mut signals: Vec<(i32, SignalStream)>,
+    trigger: CancelTrigger,
+    caught: Arc<OnceLock<i32>>,
+) {
+    let Some(first) = next_signal(&mut signals).await else {
         return;
     };
-    info!(signal = ?first, "signal caught, stopping the session");
+    info!(signal = first, "signal caught, stopping the session");
     let _ = caught.set(first);
     trigger.cancel();
-    if let Some(second) = signals.next() {
+    if let Some(second) = next_signal(&mut signals).await {
         eprintln!("{FORCED_EXIT}");
         process::exit(exit_code(second));
     }
 }
 
+/// `None` once a stream closes, which ends the watch.
+async fn next_signal(signals: &mut [(i32, SignalStream)]) -> Option<i32> {
+    let waits = signals
+        .iter_mut()
+        .map(|(number, stream)| Box::pin(async move { stream.recv().await.map(|()| *number) }));
+    let (caught, _, _) = select_all(waits).await;
+    caught
+}
+
 /// Non-interactive shells start background jobs with SIGINT ignored, and
 /// installing a handler would replace that.
 #[cfg(unix)]
-fn inherited_ignore(signal: Signal) -> bool {
+fn inherited_ignore(kind: SignalKind) -> bool {
     // SAFETY: a null `act` only reads the current action into `current`.
     unsafe {
         let mut current: libc::sigaction = std::mem::zeroed();
-        libc::sigaction(signal as i32, std::ptr::null(), &mut current) == 0
+        libc::sigaction(kind.as_raw_value(), std::ptr::null(), &mut current) == 0
             && current.sa_sigaction == libc::SIG_IGN
     }
 }
 
-#[cfg(not(unix))]
-fn inherited_ignore(_: Signal) -> bool {
-    false
-}
-
-fn exit_code(signal: Signal) -> i32 {
-    SIGNAL_EXIT_BASE + signal as i32
+fn exit_code(signal: i32) -> i32 {
+    SIGNAL_EXIT_BASE + signal
 }
 
 #[cfg(all(test, unix))]
@@ -101,10 +138,10 @@ mod tests {
 
     use super::*;
 
-    #[test_case(Signal::Int, 130 ; "sigint")]
-    #[test_case(Signal::Term, 143 ; "sigterm")]
-    fn exits_as_a_shell_reports_the_signal(signal: Signal, expected: i32) {
-        assert_eq!(exit_code(signal), expected);
+    #[test_case(SignalKind::interrupt(), 130 ; "sigint")]
+    #[test_case(SignalKind::terminate(), 143 ; "sigterm")]
+    fn exits_as_a_shell_reports_the_signal(kind: SignalKind, expected: i32) {
+        assert_eq!(exit_code(kind.as_raw_value()), expected);
     }
 
     /// One test, so no other thread flips the disposition between a set and
@@ -113,9 +150,9 @@ mod tests {
     fn reads_whether_the_parent_ignored_the_signal() {
         for (action, ignored) in [(libc::SIG_IGN, true), (libc::SIG_DFL, false)] {
             // SAFETY: SIGUSR1 is not watched or handled anywhere else in maki.
-            unsafe { libc::signal(Signal::Usr1 as i32, action) };
+            unsafe { libc::signal(SignalKind::user_defined1().as_raw_value(), action) };
 
-            assert_eq!(inherited_ignore(Signal::Usr1), ignored);
+            assert_eq!(inherited_ignore(SignalKind::user_defined1()), ignored);
         }
     }
 }

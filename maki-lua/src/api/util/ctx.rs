@@ -15,6 +15,7 @@ use mlua::{
     AnyUserData, Function, LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods,
     Value as LuaValue,
 };
+use tokio::task::spawn_blocking;
 
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
@@ -583,12 +584,13 @@ impl UserData for LuaCtx {
                 // hook firing meanwhile needs `ctx:finish`, which takes it
                 // mutably.
                 drop(this);
-                let blocks = smol::unblock(move || {
+                let blocks = spawn_blocking(move || {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let abs = resolve_abs_with_cwd(dir_path, &cwd);
                     maki_agent::find_subdirectory_instructions(&abs, &cwd, &loaded, &files)
                 })
-                .await;
+                .await
+                .map_err(mlua::Error::external)?;
                 call.record(blocks);
                 Ok((Some(true), None))
             },

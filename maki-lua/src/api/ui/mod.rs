@@ -2491,9 +2491,10 @@ mod tests {
     /// claim another plugin's.
     #[test_case(decorate_script(PUSHED_MARKS) ; "input_decorate")]
     #[test_case(edit_script(&format!(r#"start = 0, stop = 0, text = "x", {PUSHED_MARKS}"#)) ; "input_edit")]
-    fn marks_reach_the_ui_with_the_guards_and_the_plugin(script: String) {
+    #[tokio::test]
+    async fn marks_reach_the_ui_with_the_guards_and_the_plugin(script: String) {
         let lua = ui_with_input(echo_edit);
-        let (val, err) = eval(&lua, &script);
+        let (val, err) = eval(&lua, &script).await;
         assert_eq!(err, None);
         assert_eq!(
             serde_json::json!({
@@ -2521,9 +2522,10 @@ mod tests {
     /// marks pushed after it would stay for good.
     #[test_case(decorate_script(PUSHED_MARKS) ; "input_decorate")]
     #[test_case(edit_script(&format!(r#"start = 0, stop = 0, text = "x", {PUSHED_MARKS}"#)) ; "input_edit")]
-    fn a_plugin_whose_load_is_gone_pushes_no_marks(script: String) {
+    #[tokio::test]
+    async fn a_plugin_whose_load_is_gone_pushes_no_marks(script: String) {
         let lua = ui_with_input_of_unloaded(echo_edit, PluginPermissions::trusted());
-        let (val, err) = eval(&lua, &script);
+        let (val, err) = eval(&lua, &script).await;
         assert_eq!(val, serde_json::Value::Null);
         assert_eq!(err.as_deref(), Some(UNLOADED_MARKS_ERR));
     }
@@ -2547,18 +2549,20 @@ mod tests {
     #[test_case(edit_script(r#"start = 0, stop = 0, text = "x", strcit = true"#), UNKNOWN_FIELD_ERR ; "edit_a_misspelled_option")]
     #[test_case(edit_script(r#"edits = { { start = 0, stop = 0, text = "x", cursor = 1 } }"#), UNKNOWN_FIELD_ERR ; "edit_an_option_inside_an_edit")]
     #[test_case(r#"return ui.input_submit({ version = 7, session_id = "s", text = "hi" })"#.to_owned(), UNKNOWN_FIELD_ERR ; "submit_a_text_to_send")]
-    fn input_calls_throw_on(script: String, expected: &str) {
+    #[tokio::test]
+    async fn input_calls_throw_on(script: String, expected: &str) {
         let lua = ui_with_input(echo_edit);
-        let err = eval_err(&lua, &script);
+        let err = eval_err(&lua, &script).await;
         assert!(err.contains(expected), "{err}");
     }
 
     #[test_case(r#"ui.input_decorate({ ns = "a", marks = {}, version = 0, session_id = "s" })"# ; "input_decorate")]
     #[test_case(r#"ui.input_submit({ version = 0, session_id = "s" })"# ; "input_submit")]
-    fn without_a_ui_answers_the_error_slot(call: &str) {
+    #[tokio::test]
+    async fn without_a_ui_answers_the_error_slot(call: &str) {
         let lua = lua_with_ui(None);
         mark_loaded(&lua, INPUT_PLUGIN);
-        let (val, err) = eval(&lua, &format!("return {call}"));
+        let (val, err) = eval(&lua, &format!("return {call}")).await;
         assert_eq!(val, serde_json::Value::Null);
         assert_eq!(err.as_deref(), Some(NO_UI_ERR));
     }
@@ -2569,11 +2573,14 @@ mod tests {
     #[test_case(r#"start = 0, stop = 0, text = "x""# => true ; "inserting_text")]
     #[test_case(r#"start = 0, stop = 5, text = """# => true ; "deleting_text")]
     #[test_case(r#"edits = {}, cursor = 2"# => false ; "moving_the_cursor")]
-    fn changing_the_text_needs_what_a_message_needs(range: &str) -> bool {
+    #[tokio::test]
+    async fn changing_the_text_needs_what_a_message_needs(range: &str) -> bool {
         let grants = PluginPermissions::from_approved(["input", "session_read"]);
         let lua = ui_with_input_granted(echo_edit, grants);
         let denied = denied_error(Permission::Agent).to_string();
-        smol::block_on(lua.load(edit_script(range)).eval_async::<mlua::Value>())
+        lua.load(edit_script(range))
+            .eval_async::<mlua::Value>()
+            .await
             .is_err_and(|err| err.to_string().contains(&denied))
     }
 
@@ -2588,22 +2595,24 @@ mod tests {
         )
     }
 
-    fn eval(lua: &Lua, script: &str) -> (serde_json::Value, Option<String>) {
+    async fn eval(lua: &Lua, script: &str) -> (serde_json::Value, Option<String>) {
         let (val, err): (mlua::Value, Option<String>) =
-            smol::block_on(lua.load(script).eval_async()).unwrap();
+            lua.load(script).eval_async().await.unwrap();
         (lua_to_json(lua, &val).unwrap(), err)
     }
 
-    fn eval_err(lua: &Lua, script: &str) -> String {
-        smol::block_on(lua.load(script).eval_async::<mlua::Value>())
+    async fn eval_err(lua: &Lua, script: &str) -> String {
+        lua.load(script)
+            .eval_async::<mlua::Value>()
+            .await
             .unwrap_err()
             .to_string()
     }
 
-    #[test]
-    fn input_reports_text_cursor_and_version() {
+    #[tokio::test]
+    async fn input_reports_text_cursor_and_version() {
         let lua = ui_with_input(echo_edit);
-        let (val, err) = eval(&lua, "return ui.input()");
+        let (val, err) = eval(&lua, "return ui.input()").await;
         assert_eq!(err, None);
         assert_eq!(val["text"], "hello");
         assert_eq!(val["cursor"], 5);
@@ -2630,9 +2639,10 @@ mod tests {
         serde_json::json!({ "edits": [], "cursor": 2, "strict": false })
         ; "no_edits_with_a_cursor"
     )]
-    fn input_edit_forwards_the_edits_and_options(fields: &str, expected: serde_json::Value) {
+    #[tokio::test]
+    async fn input_edit_forwards_the_edits_and_options(fields: &str, expected: serde_json::Value) {
         let lua = ui_with_input(echo_edit);
-        let (val, err) = eval(&lua, &edit_script(fields));
+        let (val, err) = eval(&lua, &edit_script(fields)).await;
         assert_eq!(err, None);
         assert_eq!(
             serde_json::json!({ "edits": val["edits"], "cursor": val["cursor"], "strict": val["strict"] }),
@@ -2646,7 +2656,8 @@ mod tests {
     #[test_case("version" ; "version")]
     #[test_case("session_id" ; "session_id")]
     #[test_case("text" ; "text")]
-    fn input_edit_refuses_to_write_without_a_required_key(missing: &str) {
+    #[tokio::test]
+    async fn input_edit_refuses_to_write_without_a_required_key(missing: &str) {
         let lua = ui_with_input(echo_edit);
         let kept = [
             "version = st.version",
@@ -2664,16 +2675,17 @@ mod tests {
                 r#"local st = ui.input()
                    return ui.input_edit({{ start = 0, stop = 5, {kept} }})"#
             ),
-        );
+        )
+        .await;
         assert!(err.contains(missing), "the error has to name it: {err}");
     }
 
     /// A handler writes after the key that woke it, so a range the user has
     /// typed past comes back as an error instead of landing somewhere else.
-    #[test]
-    fn input_edit_answers_a_stale_range_in_the_error_slot() {
+    #[tokio::test]
+    async fn input_edit_answers_a_stale_range_in_the_error_slot() {
         let lua = ui_with_input(|_| Err(STALE_RANGE_ERR.into()));
-        let (val, err) = eval(&lua, &edit_script("start = 0, stop = 99, text = \"x\""));
+        let (val, err) = eval(&lua, &edit_script("start = 0, stop = 99, text = \"x\"")).await;
         assert_eq!(val, serde_json::Value::Null);
         assert_eq!(err.as_deref(), Some(STALE_RANGE_ERR));
     }
@@ -2683,7 +2695,8 @@ mod tests {
     #[test_case("plan_toggle", None ; "plan_toggle_is_free")]
     #[test_case("pop_queue", Some(Permission::SessionWrite) ; "pop_queue_needs_session_write")]
     #[test_case("file_picker", None ; "file_picker_is_free")]
-    fn action_charges_what_its_api_would(name: &str, needed: Option<Permission>) {
+    #[tokio::test]
+    async fn action_charges_what_its_api_would(name: &str, needed: Option<Permission>) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         std::thread::spawn(move || {
             while let Ok(action) = rx.recv() {
@@ -2692,19 +2705,18 @@ mod tests {
                 }
             }
         });
-        let run = |perms: &PluginPermissions| {
+        let run = async |perms: &PluginPermissions| {
             let lua = Lua::new();
             let reach = PluginReach::new(perms.clone());
             let t =
                 create_ui_table(&lua, Some(tx.clone()), Arc::from(INPUT_PLUGIN), reach).unwrap();
             lua.globals().set("ui", t).unwrap();
-            smol::block_on(
-                lua.load(format!("return ui.action('{name}')"))
-                    .eval_async::<Option<bool>>(),
-            )
-            .map_err(|e| e.to_string())
+            lua.load(format!("return ui.action('{name}')"))
+                .eval_async::<Option<bool>>()
+                .await
+                .map_err(|e| e.to_string())
         };
-        let denied = run(&PluginPermissions::denied());
+        let denied = run(&PluginPermissions::denied()).await;
         let Some(perm) = needed else {
             assert_eq!(denied, Ok(Some(true)));
             return;
@@ -2713,6 +2725,6 @@ mod tests {
         assert!(err.contains(&denied_error(perm).to_string()), "{err}");
         let mut granted = PluginPermissions::denied();
         granted.set(perm, true);
-        assert_eq!(run(&granted), Ok(Some(true)));
+        assert_eq!(run(&granted).await, Ok(Some(true)));
     }
 }

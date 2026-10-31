@@ -5,6 +5,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, LuaString, Result as LuaResult, Table};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+use tokio::task::spawn_blocking;
 
 use super::util::convert::TableExt;
 use super::util::pair::{Pair, pair, try_pair};
@@ -30,8 +31,9 @@ thread_local! {
 async fn html_to_markdown(_lua: Lua, html: LuaString) -> LuaResult<Pair<String>> {
     let html = try_pair!(html.to_str()).to_owned();
     Ok(pair(
-        smol::unblock(move || htmd::convert(&html))
+        spawn_blocking(move || htmd::convert(&html))
             .await
+            .map_err(mlua::Error::external)?
             .map_err(|e| format!("html_to_markdown: {e}")),
     ))
 }

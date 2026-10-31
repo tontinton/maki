@@ -449,11 +449,10 @@ impl SessionMailbox {
         });
         for (id, tool, header) in late {
             let mailbox = self.clone();
-            smol::spawn(async move {
+            tokio::spawn(async move {
                 let label = TaskLabel::new(&tool, Some(&header.await.text()));
                 mailbox.change(|state| state.relabel_lost(&id, &label));
-            })
-            .detach();
+            });
         }
     }
 
@@ -634,7 +633,7 @@ impl AgentSeed {
 mod tests {
     use std::fs;
 
-    use futures_lite::future::poll_once;
+    use futures::FutureExt;
     use maki_providers::{ContentBlock, Role, ThinkingConfig};
     use test_case::test_case;
 
@@ -861,8 +860,8 @@ mod tests {
         assert!(mailbox.drain().is_empty());
     }
 
-    #[test]
-    fn forgetting_the_only_waking_result_leaves_nothing_to_wake_for() {
+    #[tokio::test]
+    async fn forgetting_the_only_waking_result_leaves_nothing_to_wake_for() {
         let mailbox = SessionMailbox::register(MakiId::generate());
         mailbox.track(TASK_ID);
         mailbox.settle(TASK_ID, result(true));
@@ -870,7 +869,7 @@ mod tests {
         mailbox.forget(TASK_ID);
 
         assert!(mailbox.claim_wake().is_empty());
-        assert!(smol::block_on(mailbox.next_wake()).is_none());
+        assert!(mailbox.next_wake().await.is_none());
     }
 
     #[test]
@@ -1063,40 +1062,36 @@ mod tests {
         assert_eq!(notice_body(&spanning), spanning);
     }
 
-    #[test]
-    fn next_wake_waits_while_work_is_outstanding() {
+    #[tokio::test]
+    async fn next_wake_waits_while_work_is_outstanding() {
         let mailbox = SessionMailbox::register(MakiId::generate());
-        smol::block_on(async {
-            SessionMailbox::notify(mailbox.session_id(), QUIET_NOTICE.into(), None, false).unwrap();
-            assert!(mailbox.next_wake().await.is_none());
+        SessionMailbox::notify(mailbox.session_id(), QUIET_NOTICE.into(), None, false).unwrap();
+        assert!(mailbox.next_wake().await.is_none());
 
-            mailbox.track(TASK_ID);
-            let mut wake = Box::pin(mailbox.next_wake());
-            assert!(poll_once(&mut wake).await.is_none());
+        mailbox.track(TASK_ID);
+        let mut wake = Box::pin(mailbox.next_wake());
+        assert!(wake.as_mut().now_or_never().is_none());
 
-            mailbox.settle(TASK_ID, result(true));
-            let woken = wake.await.unwrap();
-            assert_eq!(
-                woken.iter().map(text).collect::<Vec<_>>(),
-                [QUIET_NOTICE, NOTICE_BODY]
-            );
-            assert!(mailbox.next_wake().await.is_none());
-        });
+        mailbox.settle(TASK_ID, result(true));
+        let woken = wake.await.unwrap();
+        assert_eq!(
+            woken.iter().map(text).collect::<Vec<_>>(),
+            [QUIET_NOTICE, NOTICE_BODY]
+        );
+        assert!(mailbox.next_wake().await.is_none());
     }
 
-    #[test]
-    fn next_wake_before_answer_takes_a_quiet_last_result() {
+    #[tokio::test]
+    async fn next_wake_before_answer_takes_a_quiet_last_result() {
         let mailbox = SessionMailbox::register(MakiId::generate());
-        smol::block_on(async {
-            mailbox.track(TASK_ID);
-            let mut wake = Box::pin(mailbox.next_wake_before_answer());
-            assert!(poll_once(&mut wake).await.is_none());
+        mailbox.track(TASK_ID);
+        let mut wake = Box::pin(mailbox.next_wake_before_answer());
+        assert!(wake.as_mut().now_or_never().is_none());
 
-            mailbox.settle(TASK_ID, result(false));
-            let woken = wake.await.unwrap();
-            assert_eq!(woken.iter().map(text).collect::<Vec<_>>(), [NOTICE_BODY]);
-            assert!(mailbox.next_wake_before_answer().await.is_none());
-        });
+        mailbox.settle(TASK_ID, result(false));
+        let woken = wake.await.unwrap();
+        assert_eq!(woken.iter().map(text).collect::<Vec<_>>(), [NOTICE_BODY]);
+        assert!(mailbox.next_wake_before_answer().await.is_none());
     }
 
     #[test]
@@ -1185,8 +1180,8 @@ mod tests {
     /// The loop reads a file, the user edits it, and a monitor reads it too.
     /// The loop must still be told its view is stale. After a rewind the
     /// monitor's edits must still wait for the new loop's.
-    #[test]
-    fn background_reads_stay_apart_but_locks_survive_a_respawn() {
+    #[tokio::test]
+    async fn background_reads_stay_apart_but_locks_survive_a_respawn() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join(EDITED_FILE);
         fs::write(&path, "").unwrap();
@@ -1203,13 +1198,13 @@ mod tests {
 
         let respawned = mailbox.publish_seed(stub_seed(id));
         drop(old);
-        smol::block_on(async {
-            let _held = respawned.file_access.acquire(&key).await;
-            assert!(
-                poll_once(background.file_access.acquire(&key))
-                    .await
-                    .is_none()
-            );
-        });
+        let _held = respawned.file_access.acquire(&key).await;
+        assert!(
+            background
+                .file_access
+                .acquire(&key)
+                .now_or_never()
+                .is_none()
+        );
     }
 }

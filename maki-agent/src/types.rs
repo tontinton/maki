@@ -1471,8 +1471,9 @@ impl SessionEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_lite::future::poll_once;
     use std::pin::pin;
+
+    use futures::FutureExt;
     use test_case::test_case;
 
     #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 line")      ; "plain_short_annotates")]
@@ -2140,55 +2141,54 @@ mod tests {
     const STILL_PENDING: &str = "an empty stream must not resolve `next()`";
     const NO_LATE_EVENTS: &str = "events queued after the marker must stay invisible";
 
-    fn drain(events: &mut SessionEvents) -> Vec<u64> {
-        smol::block_on(async {
-            let mut seen = Vec::new();
-            while let Some(envelope) = events.next().await {
-                seen.push(envelope.run_id);
-            }
-            seen
-        })
+    async fn drain(events: &mut SessionEvents) -> Vec<u64> {
+        let mut seen = Vec::new();
+        while let Some(envelope) = events.next().await {
+            seen.push(envelope.run_id);
+        }
+        seen
     }
 
     /// The ordering the whole design rests on: the marker rides the same FIFO
     /// as the events, so nothing queued before it is lost. The first `next()`
     /// is polled on an empty queue and then dropped, the way a `select!` arm
     /// in the SDK pump does, and it must not swallow what lands afterwards.
-    #[test]
-    fn queued_events_arrive_in_order_before_the_close() {
+    #[tokio::test]
+    async fn queued_events_arrive_in_order_before_the_close() {
         let (guard, mut events) = event_stream();
-        smol::block_on(async {
+        {
             let mut pending = pin!(events.next());
-            assert!(
-                poll_once(pending.as_mut()).await.is_none(),
-                "{STILL_PENDING}"
-            );
+            assert!(pending.as_mut().now_or_never().is_none(), "{STILL_PENDING}");
             for run_id in STREAM_RUN_IDS {
                 guard.sender(run_id).send(AgentEvent::Nudge).unwrap();
             }
-        });
+        }
         drop(guard);
-        assert_eq!(drain(&mut events), STREAM_RUN_IDS);
+        assert_eq!(drain(&mut events).await, STREAM_RUN_IDS);
     }
 
     /// The marker is a point of no return, even for a reader that has not
     /// polled yet. A Lua tool context parks a sender on an idle VM forever, so
     /// its late send has to look fine to it and stay invisible to the reader.
-    #[test]
-    fn events_sent_after_the_close_are_never_observed() {
+    #[tokio::test]
+    async fn events_sent_after_the_close_are_never_observed() {
         let (guard, mut events) = event_stream();
         let retained = guard.sender(STREAM_RUN_IDS[0]);
         retained.send(AgentEvent::Nudge).unwrap();
         drop(guard);
         retained.send(AgentEvent::Nudge).unwrap();
-        assert_eq!(drain(&mut events), [STREAM_RUN_IDS[0]], "{NO_LATE_EVENTS}");
-        assert!(smol::block_on(events.next()).is_none(), "{NO_LATE_EVENTS}");
+        assert_eq!(
+            drain(&mut events).await,
+            [STREAM_RUN_IDS[0]],
+            "{NO_LATE_EVENTS}"
+        );
+        assert!(events.next().await.is_none(), "{NO_LATE_EVENTS}");
     }
 
     /// A derived sender is just another clone: it stamps its own run id on the
     /// same FIFO, and dropping it neither ends nor extends the stream.
-    #[test]
-    fn with_run_id_restamps_without_forking_the_stream() {
+    #[tokio::test]
+    async fn with_run_id_restamps_without_forking_the_stream() {
         let (guard, mut events) = event_stream();
         let original = guard.sender(STREAM_RUN_IDS[0]);
         let derived = original.with_run_id(STREAM_RUN_IDS[1]);
@@ -2197,7 +2197,7 @@ mod tests {
         original.send(AgentEvent::Nudge).unwrap();
         drop(guard);
         assert_eq!(
-            drain(&mut events),
+            drain(&mut events).await,
             [STREAM_RUN_IDS[1], STREAM_RUN_IDS[0]],
             "{NO_LATE_EVENTS}"
         );

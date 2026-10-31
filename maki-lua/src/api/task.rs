@@ -232,10 +232,10 @@ mod tests {
     #[test_case(LIST_CALL ; "list")]
     #[test_case(FOCUS_CALL ; "focus")]
     #[test_case(REMOVE_CALL ; "remove")]
-    fn without_ui_returns_error_pair(code: &str) {
+    #[tokio::test]
+    async fn without_ui_returns_error_pair(code: &str) {
         let lua = lua_with_task(None);
-        let (val, err): (Value, Option<String>) =
-            smol::block_on(lua.load(code).eval_async()).unwrap();
+        let (val, err): (Value, Option<String>) = lua.load(code).eval_async().await.unwrap();
         assert!(val.is_nil());
         assert_eq!(err.as_deref(), Some(NO_UI_ERR));
     }
@@ -245,13 +245,17 @@ mod tests {
     #[test_case(LIST_CALL ; "list")]
     #[test_case(FOCUS_CALL ; "focus")]
     #[test_case(REMOVE_CALL ; "remove")]
-    fn host_error_reply_surfaces_as_error_pair(code: &str) {
+    #[tokio::test]
+    async fn host_error_reply_surfaces_as_error_pair(code: &str) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_task(Some(tx));
         let host = spawn_host(rx, Err(UNKNOWN_TASK_ERR.to_owned()));
 
-        let (val, err): (Value, Option<String>) =
-            smol::block_on(lua.load(code).eval_async()).expect("error reply must not throw");
+        let (val, err): (Value, Option<String>) = lua
+            .load(code)
+            .eval_async()
+            .await
+            .expect("error reply must not throw");
         assert!(val.is_nil());
         assert_eq!(err.as_deref(), Some(UNKNOWN_TASK_ERR));
 
@@ -261,8 +265,8 @@ mod tests {
 
     /// `plugins/task/picker_rows.lua` spots the main chat with `if not task.status`,
     /// so a missing key has to stay missing on the Lua side.
-    #[test]
-    fn list_passes_host_array_through_unchanged() {
+    #[tokio::test]
+    async fn list_passes_host_array_through_unchanged() {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_task(Some(tx));
         let host = spawn_host(
@@ -276,7 +280,7 @@ mod tests {
         );
 
         let (ids, statuses, main_name): (String, String, String) =
-            smol::block_on(lua.load(LIST_SCRIPT).eval_async()).unwrap();
+            lua.load(LIST_SCRIPT).eval_async().await.unwrap();
         assert_eq!(ids, format!("{MAIN_ID},{TASK_ID},{DONE_ID},{ERROR_ID}"));
         assert_eq!(
             statuses,
@@ -288,8 +292,8 @@ mod tests {
         assert!(matches!(host.join().unwrap(), TaskRequest::List));
     }
 
-    #[test]
-    fn focus_roundtrips_through_ui_channel() {
+    #[tokio::test]
+    async fn focus_roundtrips_through_ui_channel() {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_task(Some(tx));
         std::thread::spawn(move || {
@@ -302,23 +306,22 @@ mod tests {
             };
             reply_tx.send(Ok(json!({ "focused": id }))).unwrap();
         });
-        let (val, err): (Table, Option<String>) = smol::block_on(
-            lua.load(format!("return task.focus('{TASK_ID}')"))
-                .eval_async(),
-        )
-        .unwrap();
+        let (val, err): (Table, Option<String>) = lua
+            .load(format!("return task.focus('{TASK_ID}')"))
+            .eval_async()
+            .await
+            .unwrap();
         assert_eq!(err, None);
         assert_eq!(val.get::<String>("focused").unwrap(), TASK_ID);
     }
 
-    #[test]
-    fn remove_roundtrips_through_ui_channel() {
+    #[tokio::test]
+    async fn remove_roundtrips_through_ui_channel() {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_task(Some(tx));
         let host = spawn_host(rx, Ok(json!(true)));
 
-        let (val, err): (bool, Option<String>) =
-            smol::block_on(lua.load(REMOVE_CALL).eval_async()).unwrap();
+        let (val, err): (bool, Option<String>) = lua.load(REMOVE_CALL).eval_async().await.unwrap();
         assert!(val);
         assert_eq!(err, None);
 
@@ -326,18 +329,16 @@ mod tests {
         assert!(matches!(host.join().unwrap(), TaskRequest::Remove { id } if id == TASK_ID));
     }
 
-    #[test]
-    fn stop_from_a_user_command_roundtrips_through_ui_channel() {
+    #[tokio::test]
+    async fn stop_from_a_user_command_roundtrips_through_ui_channel() {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_task(Some(tx));
         let host = spawn_host(rx, Ok(json!(true)));
 
-        let (val, err): (bool, Option<String>) = smol::block_on(run_command_scoped(
-            &lua,
-            0,
-            lua.load(STOP_CALL).eval_async(),
-        ))
-        .unwrap();
+        let (val, err): (bool, Option<String>) =
+            run_command_scoped(&lua, 0, lua.load(STOP_CALL).eval_async())
+                .await
+                .unwrap();
         assert!(val);
         assert_eq!(err, None);
 
@@ -357,11 +358,12 @@ mod tests {
     #[test_case(Caller::Hook ; "hook_outside_any_command")]
     #[test_case(Caller::CommandAlias ; "command_run_by_run_command")]
     #[test_case(Caller::ChildOfUserCommand ; "task_nested_in_a_user_command")]
-    fn stop_without_user_authority_never_reaches_the_host(caller: Caller) {
+    #[tokio::test]
+    async fn stop_without_user_authority_never_reaches_the_host(caller: Caller) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_task(Some(tx));
         let stop = lua.load(STOP_CALL).eval_async();
-        let (val, err): (Value, Option<String>) = smol::block_on(async {
+        let (val, err): (Value, Option<String>) = async {
             match caller {
                 Caller::Hook => stop.await,
                 Caller::CommandAlias => run_command_scoped(&lua, 1, stop).await,
@@ -374,7 +376,8 @@ mod tests {
                     .await
                 }
             }
-        })
+        }
+        .await
         .unwrap();
         assert!(val.is_nil());
         assert_eq!(err.as_deref(), Some(USER_ACTION_ERR));

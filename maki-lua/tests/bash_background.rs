@@ -21,6 +21,7 @@ use maki_agent::{
     SessionMailbox, SharedBuf,
 };
 use maki_config::{PluginFileConfig, PluginsConfig};
+use maki_lua::test_support::runtime;
 use maki_lua::{EventHandle, MoveOutcome, PluginHost};
 use maki_storage::id::MakiId;
 use maki_storage::paths::{session_task_logs_dir, state_dir};
@@ -157,7 +158,7 @@ impl Run {
                 if !ctx.permissions.is_yolo() {
                     ctx.permissions.toggle_yolo();
                 }
-                let done = smol::block_on(tool_dispatch::run(
+                let done = runtime().block_on(tool_dispatch::run(
                     call_id,
                     &tool,
                     &input,

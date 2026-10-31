@@ -13,6 +13,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use image::imageops::{self, FilterType};
 use image::{DynamicImage, ImageFormat, ImageReader, RgbImage, Rgba, RgbaImage};
+use tokio::task::spawn_blocking;
 use tracing::warn;
 
 use crate::types::{ImageMediaType, ImageSource};
@@ -235,8 +236,9 @@ pub(crate) async fn fix_for_wire(source: &ImageSource) -> Fix {
     }
     let declared = source.media_type;
     let data = Arc::clone(&source.data);
-    let fix = smol::unblock(move || decide(data, declared))
+    let fix = spawn_blocking(move || decide(data, declared))
         .await
+        .expect("image inspection panicked")
         .unwrap_or_else(|error| {
             warn!(
                 %error,
@@ -306,8 +308,8 @@ mod tests {
         ImageSource::new(ImageMediaType::Png, Arc::from(data))
     }
 
-    fn rewrite(source: &ImageSource) -> ImageSource {
-        let Fix::Replace(fixed) = smol::block_on(fix_for_wire(source)) else {
+    async fn rewrite(source: &ImageSource) -> ImageSource {
+        let Fix::Replace(fixed) = fix_for_wire(source).await else {
             panic!("expected a rewrite");
         };
         fixed
@@ -316,34 +318,35 @@ mod tests {
     #[test_case(3000, 100 ; "wide")]
     #[test_case(100, 3000 ; "tall")]
     #[test_case(2001, 2001 ; "just_over_the_many_image_cap")]
-    fn oversized_images_are_shrunk_to_fit(width: u32, height: u32) {
-        let (w, h) = dimensions(&rewrite(&png(width, height)));
+    #[tokio::test]
+    async fn oversized_images_are_shrunk_to_fit(width: u32, height: u32) {
+        let (w, h) = dimensions(&rewrite(&png(width, height)).await);
         assert_eq!(w.max(h), MAX_EDGE, "the long edge must land on the cap");
         assert_eq!(w > h, width > height, "orientation must survive");
     }
 
     /// The lossy encoder at the full edge comes before any shrink, or an
     /// image JPEG alone would have fit loses half its resolution for nothing.
-    #[test]
-    fn a_payload_too_heavy_for_lossless_keeps_its_resolution() {
-        let fixed = rewrite(&noise_png());
+    #[tokio::test]
+    async fn a_payload_too_heavy_for_lossless_keeps_its_resolution() {
+        let fixed = rewrite(&noise_png()).await;
         assert_eq!(fixed.media_type, ImageMediaType::Jpeg);
         assert_eq!(dimensions(&fixed), (MAX_EDGE, NOISE_HEIGHT));
     }
 
-    #[test]
-    fn images_within_the_limits_are_left_alone() {
+    #[tokio::test]
+    async fn images_within_the_limits_are_left_alone() {
         let source = png(MAX_EDGE, 10);
-        assert!(matches!(smol::block_on(fix_for_wire(&source)), Fix::Keep));
+        assert!(matches!(fix_for_wire(&source).await, Fix::Keep));
     }
 
     /// Extensions lie (a JPEG saved as `.png`), and ACP hands us whatever mime
     /// the client claimed. The bytes are fine, so only the label moves.
-    #[test]
-    fn a_mislabelled_payload_is_relabelled_rather_than_re_encoded() {
+    #[tokio::test]
+    async fn a_mislabelled_payload_is_relabelled_rather_than_re_encoded() {
         let pixels = png(32, 32).data;
         let source = ImageSource::new(ImageMediaType::Jpeg, Arc::clone(&pixels));
-        let fixed = rewrite(&source);
+        let fixed = rewrite(&source).await;
         assert_eq!(fixed.media_type, ImageMediaType::Png);
         assert!(
             Arc::ptr_eq(&fixed.data, &pixels),
@@ -353,31 +356,41 @@ mod tests {
 
     #[test_case(NOT_AN_IMAGE ; "not_an_image")]
     #[test_case(NOT_TEXT ; "not_even_text")]
-    fn undecodable_payloads_are_dropped(data: &str) {
+    #[tokio::test]
+    async fn undecodable_payloads_are_dropped(data: &str) {
         let source = ImageSource::new(ImageMediaType::Png, Arc::from(data));
-        assert!(matches!(smol::block_on(fix_for_wire(&source)), Fix::Drop));
+        assert!(matches!(fix_for_wire(&source).await, Fix::Drop));
     }
 
     /// Every request walks the whole history, and the copy it carries is a
     /// clone of the one history holds, so a verdict either one reaches has to
     /// be visible to the other or a repair is paid for again on every turn.
-    #[test]
-    fn a_verdict_is_reached_once_and_shared_with_every_clone() {
+    #[tokio::test]
+    async fn a_verdict_is_reached_once_and_shared_with_every_clone() {
         let source = png(MAX_EDGE + 1, 4);
-        let first = rewrite(&source);
-        assert!(Arc::ptr_eq(&rewrite(&source).data, &first.data));
-        assert!(Arc::ptr_eq(&rewrite(&source.clone()).data, &first.data));
+        let first = rewrite(&source).await;
+        assert!(Arc::ptr_eq(&rewrite(&source).await.data, &first.data));
+        assert!(Arc::ptr_eq(
+            &rewrite(&source.clone()).await.data,
+            &first.data
+        ));
     }
 
     /// Truncating the payload to a header proves the megabytes behind it are
     /// never decoded to answer the question every turn asks: does this fit.
-    #[test_case(noise_png(), PNG_HEADER_CHARS, ImageFormat::Png ; "png_signature_and_ihdr")]
-    #[test_case(rewrite(&noise_png()), JPEG_HEADER_CHARS, ImageFormat::Jpeg ; "jpeg_up_to_its_frame_header")]
-    fn dimensions_are_read_from_a_prefix_of_the_payload(
-        source: ImageSource,
+    #[test_case(false, PNG_HEADER_CHARS, ImageFormat::Png ; "png_signature_and_ihdr")]
+    #[test_case(true, JPEG_HEADER_CHARS, ImageFormat::Jpeg ; "jpeg_up_to_its_frame_header")]
+    #[tokio::test]
+    async fn dimensions_are_read_from_a_prefix_of_the_payload(
+        rewritten: bool,
         chars: usize,
         format: ImageFormat,
     ) {
+        let source = if rewritten {
+            rewrite(&noise_png()).await
+        } else {
+            noise_png()
+        };
         assert!(
             source.data.len() > chars,
             "the prefix must be a fraction of the payload"

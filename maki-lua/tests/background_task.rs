@@ -323,7 +323,7 @@ fn a_background_subagent_asks_for_permission_instead_of_being_denied() {
         Arc::default(),
     ));
     let (_answer_tx, answer_rx) = flume::unbounded::<String>();
-    ctx.user_response_rx = Some(Arc::new(smol::lock::Mutex::new(answer_rx)));
+    ctx.user_response_rx = Some(Arc::new(tokio::sync::Mutex::new(answer_rx)));
 
     assert!(exec(&reg, TASK_TOOL, task_input(), &ctx).backgrounded);
 

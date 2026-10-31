@@ -5,7 +5,8 @@ use futures::future::join_all;
 use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
-use smol::lock::{Semaphore, SemaphoreGuardArc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::yield_now;
 
 use crate::docs::{FnDoc, ParamDoc};
 use crate::runtime::{
@@ -23,7 +24,7 @@ struct LuaSemaphore {
 }
 
 struct LuaPermit {
-    guard: std::sync::Mutex<Option<SemaphoreGuardArc>>,
+    guard: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
 }
 
 /// Wait for a permit from the semaphore. Your coroutine suspends until a slot
@@ -44,9 +45,10 @@ async fn acquire(lua: Lua, this: mlua::UserDataRef<LuaSemaphore>) -> LuaResult<L
         .map(|h| lock_cell(&h).cancel.clone())
         .unwrap_or_else(CancelToken::none);
     let guard = cancel
-        .race(sem.acquire_arc())
+        .race(sem.acquire_owned())
         .await
-        .map_err(mlua::Error::runtime)?;
+        .map_err(mlua::Error::runtime)?
+        .map_err(mlua::Error::external)?;
     Ok(LuaPermit {
         guard: std::sync::Mutex::new(Some(guard)),
     })
@@ -63,9 +65,12 @@ async fn acquire(lua: Lua, this: mlua::UserDataRef<LuaSemaphore>) -> LuaResult<L
 /// end
 #[lua_fn]
 fn try_acquire(_lua: &Lua, this: &LuaSemaphore) -> LuaResult<Option<LuaPermit>> {
-    Ok(this.sem.try_acquire_arc().map(|guard| LuaPermit {
-        guard: std::sync::Mutex::new(Some(guard)),
-    }))
+    Ok(Arc::clone(&this.sem)
+        .try_acquire_owned()
+        .ok()
+        .map(|guard| LuaPermit {
+            guard: std::sync::Mutex::new(Some(guard)),
+        }))
 }
 
 lua_class! {
@@ -301,7 +306,7 @@ async fn sleep(lua: Lua, ms: i64) -> LuaResult<()> {
     }
     // A zero timer is ready on its first poll and never hands the thread back.
     if ms == 0 {
-        smol::future::yield_now().await;
+        yield_now().await;
         return Ok(());
     }
     let cancel = lua
@@ -309,7 +314,7 @@ async fn sleep(lua: Lua, ms: i64) -> LuaResult<()> {
         .map(|h| lock_cell(&h).cancel.clone())
         .unwrap_or_else(CancelToken::none);
     cancel
-        .race(smol::Timer::after(Duration::from_millis(ms as u64)))
+        .race(tokio::time::sleep(Duration::from_millis(ms as u64)))
         .await
         .map_err(mlua::Error::runtime)?;
     Ok(())
@@ -329,7 +334,7 @@ async fn sleep(lua: Lua, ms: i64) -> LuaResult<()> {
 #[lua_fn]
 fn semaphore(_lua: &Lua, n: usize) -> LuaResult<LuaSemaphore> {
     Ok(LuaSemaphore {
-        sem: Arc::new(Semaphore::new(n.max(1))),
+        sem: Arc::new(Semaphore::new(n.clamp(1, Semaphore::MAX_PERMITS))),
     })
 }
 
@@ -530,13 +535,14 @@ mod tests {
     use std::pin::pin;
     use std::sync::Mutex;
 
-    use futures_lite::future::{or, poll_once};
+    use futures::FutureExt;
     use maki_agent::cancel::CancelTrigger;
     use mlua::Lua;
     use test_case::test_case;
+    use tokio::task::{LocalSet, spawn_local};
 
     use super::*;
-    use crate::runtime::{CANCELLED_MSG, TaskCell, TaskScope, block_on_or_fail};
+    use crate::runtime::{CANCELLED_MSG, TaskCell, TaskScope, wake_or_fail};
 
     const ERR_TOO_FEW_ARGS: &str = "maki.async.await requires at least 2 arguments: argc, fun, ...";
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";
@@ -555,204 +561,190 @@ mod tests {
     #[test_case(r#"return async_tbl.await(0, function() end)"#, ERR_ARGC_GE_1 ; "argc_below_one")]
     #[test_case(r#"return async_tbl.await(nil, function() end)"#, ERR_ARGC_INTEGER ; "argc_non_integer")]
     #[test_case(r#"return async_tbl.await(1, 42)"#, ERR_SECOND_ARG_FN ; "second_arg_not_fn")]
-    fn await_validation(code: &str, expected_err: &str) {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            let err = lua.load(code).eval_async::<Value>().await.unwrap_err();
-            let msg = err.to_string();
-            assert!(
-                msg.contains(expected_err),
-                "expected error containing {expected_err:?}, got: {msg}"
-            );
-        });
+    #[tokio::test]
+    async fn await_validation(code: &str, expected_err: &str) {
+        let (lua, _tbl) = setup();
+        let err = lua.load(code).eval_async::<Value>().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected_err),
+            "expected error containing {expected_err:?}, got: {msg}"
+        );
     }
 
     #[test_case(1, &[], 0 ; "no_extra_args")]
     #[test_case(3, &["a", "b"], 2 ; "with_extra_args")]
-    fn await_callback_insertion_position(argc: usize, extra: &[&str], expected_pos: usize) {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
+    #[tokio::test]
+    async fn await_callback_insertion_position(argc: usize, extra: &[&str], expected_pos: usize) {
+        let (lua, _tbl) = setup();
 
-            let extra_str = extra
-                .iter()
-                .map(|s| format!(r#""{s}""#))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let trailing = if extra_str.is_empty() {
-                String::new()
-            } else {
-                format!(", {extra_str}")
-            };
+        let extra_str = extra
+            .iter()
+            .map(|s| format!(r#""{s}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let trailing = if extra_str.is_empty() {
+            String::new()
+        } else {
+            format!(", {extra_str}")
+        };
 
-            let code = format!(
-                r#"
-                local pos = -1
-                local function target(...)
-                    local args = {{...}}
-                    for i, v in ipairs(args) do
-                        if type(v) == "function" then
-                            pos = i - 1
-                            v()
-                            return
-                        end
+        let code = format!(
+            r#"
+            local pos = -1
+            local function target(...)
+                local args = {{...}}
+                for i, v in ipairs(args) do
+                    if type(v) == "function" then
+                        pos = i - 1
+                        v()
+                        return
                     end
                 end
-                async_tbl.await({argc}, target{trailing})
-                return pos
-                "#
-            );
+            end
+            async_tbl.await({argc}, target{trailing})
+            return pos
+            "#
+        );
 
-            let result = lua.load(&code).eval_async::<i64>().await.unwrap();
-            assert_eq!(result, expected_pos as i64);
-        });
+        let result = lua.load(&code).eval_async::<i64>().await.unwrap();
+        assert_eq!(result, expected_pos as i64);
     }
 
-    #[test]
-    fn await_returns_multivalue_from_callback() {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            let code = r#"
-                local function producer(cb)
-                    cb("hello", 42, true)
-                end
-                return async_tbl.await(1, producer)
-            "#;
-            let results = lua.load(code).eval_async::<MultiValue>().await.unwrap();
-            let vals: Vec<Value> = results.into_vec();
-            assert_eq!(vals.len(), 3);
-            assert_eq!(vals[0].as_string().unwrap().to_string_lossy(), "hello");
-            assert_eq!(vals[1].as_integer().unwrap(), 42);
-            assert!(vals[2].as_boolean().unwrap());
-        });
+    #[tokio::test]
+    async fn await_returns_multivalue_from_callback() {
+        let (lua, _tbl) = setup();
+        let code = r#"
+            local function producer(cb)
+                cb("hello", 42, true)
+            end
+            return async_tbl.await(1, producer)
+        "#;
+        let results = lua.load(code).eval_async::<MultiValue>().await.unwrap();
+        let vals: Vec<Value> = results.into_vec();
+        assert_eq!(vals.len(), 3);
+        assert_eq!(vals[0].as_string().unwrap().to_string_lossy(), "hello");
+        assert_eq!(vals[1].as_integer().unwrap(), 42);
+        assert!(vals[2].as_boolean().unwrap());
     }
 
-    #[test]
-    fn wrap_creates_callable_wrapper() {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            let code = r#"
-                local function async_add(a, b, cb)
-                    cb(a + b)
-                end
-                local wrapped = async_tbl.wrap(3, async_add)
-                return wrapped(10, 32)
-            "#;
-            let result = lua.load(code).eval_async::<i64>().await.unwrap();
-            assert_eq!(result, 42);
-        });
+    #[tokio::test]
+    async fn wrap_creates_callable_wrapper() {
+        let (lua, _tbl) = setup();
+        let code = r#"
+            local function async_add(a, b, cb)
+                cb(a + b)
+            end
+            local wrapped = async_tbl.wrap(3, async_add)
+            return wrapped(10, 32)
+        "#;
+        let result = lua.load(code).eval_async::<i64>().await.unwrap();
+        assert_eq!(result, 42);
     }
 
-    #[test]
-    fn gather_preserves_input_order_and_values() {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            let code = r#"
-                local r = async_tbl.gather({
-                    function() return "a" end,
-                    function() error("boom") end,
-                    function() return 42 end,
-                })
-                return r[1].ok, r[1].value, r[2].ok, tostring(r[2].err), r[3].value
-            "#;
-            let vals: Vec<Value> = lua
-                .load(code)
-                .eval_async::<MultiValue>()
-                .await
+    #[tokio::test]
+    async fn gather_preserves_input_order_and_values() {
+        let (lua, _tbl) = setup();
+        let code = r#"
+            local r = async_tbl.gather({
+                function() return "a" end,
+                function() error("boom") end,
+                function() return 42 end,
+            })
+            return r[1].ok, r[1].value, r[2].ok, tostring(r[2].err), r[3].value
+        "#;
+        let vals: Vec<Value> = lua
+            .load(code)
+            .eval_async::<MultiValue>()
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(vals[0].as_boolean().unwrap());
+        assert_eq!(vals[1].as_string().unwrap().to_string_lossy(), "a");
+        assert!(!vals[2].as_boolean().unwrap());
+        assert!(
+            vals[3]
+                .as_string()
                 .unwrap()
-                .into_vec();
-            assert!(vals[0].as_boolean().unwrap());
-            assert_eq!(vals[1].as_string().unwrap().to_string_lossy(), "a");
-            assert!(!vals[2].as_boolean().unwrap());
-            assert!(
-                vals[3]
-                    .as_string()
-                    .unwrap()
-                    .to_string_lossy()
-                    .contains("boom"),
-                "err should contain the child's message"
-            );
-            assert_eq!(vals[4].as_integer().unwrap(), 42);
-        });
+                .to_string_lossy()
+                .contains("boom"),
+            "err should contain the child's message"
+        );
+        assert_eq!(vals[4].as_integer().unwrap(), 42);
     }
 
-    #[test]
-    fn gather_rejects_non_function_entries() {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            let msg = lua
-                .load(r#"return async_tbl.gather({ function() end, 42 })"#)
-                .eval_async::<Value>()
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(msg.contains("funs[2] must be a function"), "got: {msg}");
-        });
+    #[tokio::test]
+    async fn gather_rejects_non_function_entries() {
+        let (lua, _tbl) = setup();
+        let msg = lua
+            .load(r#"return async_tbl.gather({ function() end, 42 })"#)
+            .eval_async::<Value>()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("funs[2] must be a function"), "got: {msg}");
     }
 
-    #[test]
-    fn gather_runs_children_concurrently() {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            // child 1 parks on a held semaphore; child 2 releases it.
-            // Sequential execution would deadlock here.
-            lua.load("sem = async_tbl.semaphore(1); held = sem:acquire()")
-                .exec_async()
-                .await
-                .unwrap();
-            let code = r#"
-                local r = async_tbl.gather({
-                    function()
-                        local p = sem:acquire()
-                        p:release()
-                        return "waited"
-                    end,
-                    function()
-                        held:release()
-                        return "released"
-                    end,
-                })
-                return r[1].value, r[2].value
-            "#;
-            let vals: Vec<Value> = lua
-                .load(code)
-                .eval_async::<MultiValue>()
-                .await
+    #[tokio::test]
+    async fn gather_runs_children_concurrently() {
+        let (lua, _tbl) = setup();
+        // child 1 parks on a held semaphore; child 2 releases it.
+        // Sequential execution would deadlock here.
+        lua.load("sem = async_tbl.semaphore(1); held = sem:acquire()")
+            .exec_async()
+            .await
+            .unwrap();
+        let code = r#"
+            local r = async_tbl.gather({
+                function()
+                    local p = sem:acquire()
+                    p:release()
+                    return "waited"
+                end,
+                function()
+                    held:release()
+                    return "released"
+                end,
+            })
+            return r[1].value, r[2].value
+        "#;
+        let vals: Vec<Value> = lua
+            .load(code)
+            .eval_async::<MultiValue>()
+            .await
+            .unwrap()
+            .into_vec();
+        assert_eq!(vals[0].as_string().unwrap().to_string_lossy(), "waited");
+        assert_eq!(vals[1].as_string().unwrap().to_string_lossy(), "released");
+    }
+
+    #[tokio::test]
+    async fn gather_children_see_caller_cancel() {
+        let (lua, _tbl) = setup();
+        lua.load("sem = async_tbl.semaphore(1); held = sem:acquire()")
+            .exec_async()
+            .await
+            .unwrap();
+        lua.set_app_data::<TaskHandle>(cancelled_task_handle());
+        let code = r#"
+            local r = async_tbl.gather({ function() return sem:acquire() end })
+            return r[1].ok, tostring(r[1].err)
+        "#;
+        let vals: Vec<Value> = lua
+            .load(code)
+            .eval_async::<MultiValue>()
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(!vals[0].as_boolean().unwrap());
+        assert!(
+            vals[1]
+                .as_string()
                 .unwrap()
-                .into_vec();
-            assert_eq!(vals[0].as_string().unwrap().to_string_lossy(), "waited");
-            assert_eq!(vals[1].as_string().unwrap().to_string_lossy(), "released");
-        });
-    }
-
-    #[test]
-    fn gather_children_see_caller_cancel() {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            lua.load("sem = async_tbl.semaphore(1); held = sem:acquire()")
-                .exec_async()
-                .await
-                .unwrap();
-            lua.set_app_data::<TaskHandle>(cancelled_task_handle());
-            let code = r#"
-                local r = async_tbl.gather({ function() return sem:acquire() end })
-                return r[1].ok, tostring(r[1].err)
-            "#;
-            let vals: Vec<Value> = lua
-                .load(code)
-                .eval_async::<MultiValue>()
-                .await
-                .unwrap()
-                .into_vec();
-            assert!(!vals[0].as_boolean().unwrap());
-            assert!(
-                vals[1]
-                    .as_string()
-                    .unwrap()
-                    .to_string_lossy()
-                    .contains(CANCELLED_MSG),
-                "child should observe caller's cancel token"
-            );
-        });
+                .to_string_lossy()
+                .contains(CANCELLED_MSG),
+            "child should observe caller's cancel token"
+        );
     }
 
     fn cancelled_task_handle() -> TaskHandle {
@@ -763,80 +755,73 @@ mod tests {
 
     #[test_case(0 ; "zero_clamps_to_capacity_one")]
     #[test_case(1 ; "capacity_one")]
-    fn semaphore_acquire_blocks_at_capacity_until_release(n: usize) {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            lua.load(format!(
-                "sem = async_tbl.semaphore({n}); p1 = sem:acquire()"
-            ))
+    #[tokio::test]
+    async fn semaphore_acquire_blocks_at_capacity_until_release(n: usize) {
+        let (lua, _tbl) = setup();
+        lua.load(format!(
+            "sem = async_tbl.semaphore({n}); p1 = sem:acquire()"
+        ))
+        .exec_async()
+        .await
+        .unwrap();
+        let mut second = pin!(lua.load("p2 = sem:acquire()").exec_async());
+        assert!(
+            second.as_mut().now_or_never().is_none(),
+            "second acquire must block while first permit is held"
+        );
+        lua.load("p1:release()").exec().unwrap();
+        second.await.unwrap();
+        lua.load("assert(p2 ~= nil)").exec().unwrap();
+    }
+
+    #[tokio::test]
+    async fn semaphore_double_release_errors() {
+        let (lua, _tbl) = setup();
+        lua.load("local sem = async_tbl.semaphore(1); p = sem:acquire(); p:release()")
             .exec_async()
             .await
             .unwrap();
-            let mut second = pin!(lua.load("p2 = sem:acquire()").exec_async());
-            assert!(
-                poll_once(second.as_mut()).await.is_none(),
-                "second acquire must block while first permit is held"
-            );
-            lua.load("p1:release()").exec().unwrap();
-            second.await.unwrap();
-            lua.load("assert(p2 ~= nil)").exec().unwrap();
-        });
+        let msg = lua.load("p:release()").exec().unwrap_err().to_string();
+        assert!(
+            msg.contains(PERMIT_RELEASED_ERR),
+            "expected error containing {PERMIT_RELEASED_ERR:?}, got: {msg}"
+        );
     }
 
-    #[test]
-    fn semaphore_double_release_errors() {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            lua.load("local sem = async_tbl.semaphore(1); p = sem:acquire(); p:release()")
-                .exec_async()
-                .await
-                .unwrap();
-            let msg = lua.load("p:release()").exec().unwrap_err().to_string();
-            assert!(
-                msg.contains(PERMIT_RELEASED_ERR),
-                "expected error containing {PERMIT_RELEASED_ERR:?}, got: {msg}"
-            );
-        });
+    #[tokio::test]
+    async fn semaphore_gc_of_permit_releases_slot() {
+        let (lua, _tbl) = setup();
+        lua.load("sem = async_tbl.semaphore(1); do local p = sem:acquire() end")
+            .exec_async()
+            .await
+            .unwrap();
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+        let reacquire = pin!(lua.load("return sem:acquire() ~= nil").eval_async::<bool>());
+        match reacquire.now_or_never() {
+            Some(result) => assert!(result.unwrap()),
+            None => panic!("acquire must complete immediately after permit was gc'd"),
+        }
     }
 
-    #[test]
-    fn semaphore_gc_of_permit_releases_slot() {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            lua.load("sem = async_tbl.semaphore(1); do local p = sem:acquire() end")
-                .exec_async()
-                .await
-                .unwrap();
-            lua.gc_collect().unwrap();
-            lua.gc_collect().unwrap();
-            let reacquire = pin!(lua.load("return sem:acquire() ~= nil").eval_async::<bool>());
-            match poll_once(reacquire).await {
-                Some(result) => assert!(result.unwrap()),
-                None => panic!("acquire must complete immediately after permit was gc'd"),
-            }
-        });
-    }
-
-    #[test]
-    fn semaphore_acquire_errors_when_task_cancelled() {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            lua.load("sem = async_tbl.semaphore(1); held = sem:acquire()")
-                .exec_async()
-                .await
-                .unwrap();
-            lua.set_app_data::<TaskHandle>(cancelled_task_handle());
-            let msg = lua
-                .load("return sem:acquire()")
-                .eval_async::<Value>()
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(
-                msg.contains(CANCELLED_MSG),
-                "expected error containing {CANCELLED_MSG:?}, got: {msg}"
-            );
-        });
+    #[tokio::test]
+    async fn semaphore_acquire_errors_when_task_cancelled() {
+        let (lua, _tbl) = setup();
+        lua.load("sem = async_tbl.semaphore(1); held = sem:acquire()")
+            .exec_async()
+            .await
+            .unwrap();
+        lua.set_app_data::<TaskHandle>(cancelled_task_handle());
+        let msg = lua
+            .load("return sem:acquire()")
+            .eval_async::<Value>()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(CANCELLED_MSG),
+            "expected error containing {CANCELLED_MSG:?}, got: {msg}"
+        );
     }
 
     const HOOK_NEVER_FIRED: &str = "cancel hook never fired";
@@ -881,7 +866,8 @@ mod tests {
     /// the task's own result.
     #[test_case(HOOK_RAW_YIELD ; "raw_yield")]
     #[test_case(HOOK_AWAIT ; "awaiting")]
-    fn on_cancel_hook_fires_while_gather_is_still_parked(bad_hook_body: &str) {
+    #[tokio::test]
+    async fn on_cancel_hook_fires_while_gather_is_still_parked(bad_hook_body: &str) {
         let (lua, _tbl) = setup();
         let (trigger, scope) = live_scope(&lua);
         let fired_rx = install_notify(&lua);
@@ -901,23 +887,27 @@ mod tests {
             "#
         );
 
-        let vals: Vec<Value> = block_on_or_fail(or(
-            scope.scope_future(lua.load(&code).eval_async::<MultiValue>()),
-            async {
-                trigger.cancel();
-                fired_rx.recv_async().await.expect(HOOK_NEVER_FIRED);
-                assert!(
-                    !lua.globals().get::<bool>("gather_returned").unwrap(),
-                    "{HOOK_LATE_MSG}"
-                );
-                assert!(
-                    !lua.globals().get::<bool>("bad_hook_finished").unwrap(),
-                    "{HOOK_SURVIVED_MSG}"
-                );
-                lua.load(RELEASE_PARKED_CHILD).exec().unwrap();
-                std::future::pending().await
-            },
-        ))
+        let vals: Vec<Value> = wake_or_fail(async {
+            tokio::select! {
+                biased;
+                vals = scope.scope_future(lua.load(&code).eval_async::<MultiValue>()) => vals,
+                vals = async {
+                    trigger.cancel();
+                    fired_rx.recv_async().await.expect(HOOK_NEVER_FIRED);
+                    assert!(
+                        !lua.globals().get::<bool>("gather_returned").unwrap(),
+                        "{HOOK_LATE_MSG}"
+                    );
+                    assert!(
+                        !lua.globals().get::<bool>("bad_hook_finished").unwrap(),
+                        "{HOOK_SURVIVED_MSG}"
+                    );
+                    lua.load(RELEASE_PARKED_CHILD).exec().unwrap();
+                    std::future::pending().await
+                } => vals,
+            }
+        })
+        .await
         .unwrap()
         .into_vec();
 
@@ -933,8 +923,8 @@ mod tests {
     /// nothing about the token, so the hook is the only cleanup that can run
     /// before the acquire gives up. The Lua-side flag pins the order: the hook
     /// ran while the acquire was still parked.
-    #[test]
-    fn on_cancel_hook_fires_while_a_semaphore_acquire_is_still_parked() {
+    #[tokio::test]
+    async fn on_cancel_hook_fires_while_a_semaphore_acquire_is_still_parked() {
         let (lua, _tbl) = setup();
         let (trigger, scope) = live_scope(&lua);
 
@@ -947,13 +937,17 @@ mod tests {
             return hook_fired, ok, tostring(err)
         "#;
 
-        let vals: Vec<Value> = block_on_or_fail(or(
-            scope.scope_future(lua.load(code).eval_async::<MultiValue>()),
-            async {
-                trigger.cancel();
-                std::future::pending().await
-            },
-        ))
+        let vals: Vec<Value> = wake_or_fail(async {
+            tokio::select! {
+                biased;
+                vals = scope.scope_future(lua.load(code).eval_async::<MultiValue>()) => vals,
+                vals = async {
+                    trigger.cancel();
+                    std::future::pending().await
+                } => vals,
+            }
+        })
+        .await
         .unwrap()
         .into_vec();
 
@@ -969,84 +963,80 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sleep_zero_lets_a_ready_task_run_first() {
+    #[tokio::test]
+    async fn sleep_zero_lets_a_ready_task_run_first() {
         let (lua, _tbl) = setup();
         lua.load("order = {}").exec().unwrap();
         let sleeper = lua
             .load("table.insert(order, 'before'); async_tbl.sleep(0); table.insert(order, 'after')")
             .exec_async();
         let other = lua.load("table.insert(order, 'other')").exec_async();
-        let ex = smol::LocalExecutor::new();
-        smol::block_on(ex.run(async {
-            let sleeper = ex.spawn(sleeper);
-            let other = ex.spawn(other);
-            sleeper.await.unwrap();
-            other.await.unwrap();
-        }));
+        LocalSet::new()
+            .run_until(async {
+                let sleeper = spawn_local(sleeper);
+                let other = spawn_local(other);
+                sleeper.await.unwrap().unwrap();
+                other.await.unwrap().unwrap();
+            })
+            .await;
         let order: Vec<String> = lua.load("return order").eval().unwrap();
         assert_eq!(order, ["before", "other", "after"]);
     }
 
     #[test_case(-1; "negative_ms")]
-    fn sleep_validation(ms: i64) {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            let err = lua
-                .load(format!("return async_tbl.sleep({ms})"))
-                .eval_async::<Value>()
-                .await
-                .unwrap_err();
-            let msg = err.to_string();
-            assert!(
-                msg.contains(SLEEP_NEGATIVE_ERR),
-                "expected error containing {SLEEP_NEGATIVE_ERR:?}, got: {msg}"
-            );
-        });
+    #[tokio::test]
+    async fn sleep_validation(ms: i64) {
+        let (lua, _tbl) = setup();
+        let err = lua
+            .load(format!("return async_tbl.sleep({ms})"))
+            .eval_async::<Value>()
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(SLEEP_NEGATIVE_ERR),
+            "expected error containing {SLEEP_NEGATIVE_ERR:?}, got: {msg}"
+        );
     }
 
-    #[test]
-    fn sleep_suspends_for_the_requested_duration() {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            let began = std::time::Instant::now();
-            lua.load("async_tbl.sleep(30)").exec_async().await.unwrap();
-            assert!(
-                began.elapsed() >= Duration::from_millis(30),
-                "sleep(30) returned early after {:?}",
-                began.elapsed()
-            );
-        });
+    #[tokio::test]
+    async fn sleep_suspends_for_the_requested_duration() {
+        let (lua, _tbl) = setup();
+        let began = std::time::Instant::now();
+        lua.load("async_tbl.sleep(30)").exec_async().await.unwrap();
+        assert!(
+            began.elapsed() >= Duration::from_millis(30),
+            "sleep(30) returned early after {:?}",
+            began.elapsed()
+        );
     }
 
-    #[test]
-    fn sleep_observes_caller_cancel() {
-        smol::block_on(async {
-            let (lua, _tbl) = setup();
-            let (trigger, token) = CancelToken::new();
-            trigger.cancel();
-            lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(TaskCell::new(token, None, None))));
+    #[tokio::test]
+    async fn sleep_observes_caller_cancel() {
+        let (lua, _tbl) = setup();
+        let (trigger, token) = CancelToken::new();
+        trigger.cancel();
+        lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(TaskCell::new(token, None, None))));
 
-            let code = r#"
-                local ok, err = pcall(async_tbl.sleep, 60_000)
-                return ok, tostring(err)
-            "#;
-            let vals: Vec<Value> = lua
-                .load(code)
-                .eval_async::<MultiValue>()
-                .await
-                .unwrap()
-                .into_vec();
+        let code = r#"
+            local ok, err = pcall(async_tbl.sleep, 60_000)
+            return ok, tostring(err)
+        "#;
+        let vals: Vec<Value> = lua
+            .load(code)
+            .eval_async::<MultiValue>()
+            .await
+            .unwrap()
+            .into_vec();
 
-            assert!(
-                !vals[0].as_boolean().unwrap(),
-                "a cancelled sleep must not complete"
-            );
-            let err = vals[1].as_string().unwrap().to_string_lossy();
-            assert!(
-                err.contains(CANCELLED_MSG),
-                "expected error containing {CANCELLED_MSG:?}, got: {err}"
-            );
-        });
+        assert!(
+            !vals[0].as_boolean().unwrap(),
+            "a cancelled sleep must not complete"
+        );
+        let err = vals[1].as_string().unwrap().to_string_lossy();
+        assert!(
+            err.contains(CANCELLED_MSG),
+            "expected error containing {CANCELLED_MSG:?}, got: {err}"
+        );
     }
 }

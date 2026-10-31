@@ -9,6 +9,7 @@ use std::{io, time::Duration};
 
 use reqwest::Response;
 use serde_json::Value;
+use tokio::task::JoinError;
 
 use crate::{
     http::{error_chain, is_connect_failure},
@@ -476,6 +477,16 @@ impl From<maki_storage::StorageError> for AgentError {
 /// the query (Gemini's model listing) would otherwise reach maki.log through
 /// `error = %e`. A request that cannot be built, from a malformed URL or a
 /// header value the wire cannot carry, is a config mistake that no retry fixes.
+/// A panicked or aborted blocking task is a bug, not a transient failure, so
+/// it is never retried.
+impl From<JoinError> for AgentError {
+    fn from(e: JoinError) -> Self {
+        Self::Config {
+            message: e.to_string(),
+        }
+    }
+}
+
 impl From<reqwest::Error> for AgentError {
     fn from(e: reqwest::Error) -> Self {
         if e.is_builder() {
@@ -504,7 +515,6 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 mod tests {
     use std::{collections::HashSet, mem::discriminant, sync::Arc};
 
-    use async_compat::Compat;
     use maki_config::DEFAULT_MAX_RETRIES;
     use reqwest::{
         Client, ClientBuilder,
@@ -563,43 +573,44 @@ mod tests {
         }
     }
 
-    /// reqwest arms its timeouts as `send` is called, so the call has to
-    /// happen inside the future `Compat` runs, never before. The shell's
-    /// proxy is left out, so the request goes where the test points it.
-    fn failed_request(url: &str, builder: ClientBuilder) -> reqwest::Error {
+    /// The shell's proxy is left out, so the request goes where the test points it.
+    async fn failed_request(url: &str, builder: ClientBuilder) -> reqwest::Error {
         let client = builder.no_proxy().build().unwrap();
-        let request = Compat::new(async { client.get(url).send().await });
-        smol::block_on(request).unwrap_err()
+        client.get(url).send().await.unwrap_err()
     }
 
-    fn refused() -> reqwest::Error {
+    async fn refused() -> reqwest::Error {
         failed_request(
             &format!("http://{LOOPBACK_HOST}:{}/", closed_port()),
             client_builder(),
         )
+        .await
     }
 
-    fn unresolved() -> reqwest::Error {
+    async fn unresolved() -> reqwest::Error {
         failed_request(
             &format!("https://{UNRESOLVABLE_HOST}/"),
             client_builder().dns_resolver(Arc::new(Unresolvable)),
         )
+        .await
     }
 
-    fn connect_timeout() -> reqwest::Error {
+    async fn connect_timeout() -> reqwest::Error {
         failed_request(
             &format!("https://{UNRESOLVABLE_HOST}/"),
             client_builder()
                 .dns_resolver(Arc::new(NeverResolves))
                 .connect_timeout(CONNECT_TIMEOUT),
         )
+        .await
     }
 
-    fn tls_failure() -> reqwest::Error {
+    async fn tls_failure() -> reqwest::Error {
         failed_request(
             &format!("https://{LOOPBACK_HOST}:{}/", plain_http_port()),
             client_builder(),
         )
+        .await
     }
 
     fn builder() -> reqwest::Error {
@@ -786,11 +797,12 @@ mod tests {
     #[test_case(unresolved, DEFAULT_MAX_RETRIES ; "an_unresolvable_host_gives_up")]
     #[test_case(tls_failure, ROUNDS             ; "a_tls_failure_keeps_retrying")]
     #[test_case(connect_timeout, ROUNDS         ; "a_connect_timeout_keeps_retrying")]
-    fn a_transport_failure_is_waited_out_only_once_connected(
-        error: fn() -> reqwest::Error,
+    #[tokio::test]
+    async fn a_transport_failure_is_waited_out_only_once_connected(
+        error: impl AsyncFn() -> reqwest::Error,
         expected: u32,
     ) {
-        assert_eq!(retries_granted(&AgentError::from(error())), expected);
+        assert_eq!(retries_granted(&AgentError::from(error().await)), expected);
     }
 
     #[test_case(io::ErrorKind::ConnectionRefused, DEFAULT_MAX_RETRIES ; "a_refused_socket_gives_up")]
@@ -801,8 +813,9 @@ mod tests {
 
     #[test_case(refused, CONNECT_FAILED_MESSAGE    ; "connect_failure_names_the_server")]
     #[test_case(tls_failure, NETWORK_ERROR_MESSAGE ; "other_transport_blames_the_network")]
-    fn user_message_transport(error: fn() -> reqwest::Error, expected: &str) {
-        assert_eq!(AgentError::from(error()).user_message(), expected);
+    #[tokio::test]
+    async fn user_message_transport(error: impl AsyncFn() -> reqwest::Error, expected: &str) {
+        assert_eq!(AgentError::from(error().await).user_message(), expected);
     }
 
     #[test]
@@ -816,12 +829,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_transport_error_leaves_out_the_url() {
-        let error = AgentError::from(failed_request(
+    #[tokio::test]
+    async fn a_transport_error_leaves_out_the_url() {
+        let transport = failed_request(
             &format!("https://{UNRESOLVABLE_HOST}/?key={QUERY_SECRET}"),
             client_builder().dns_resolver(Arc::new(Unresolvable)),
-        ));
+        )
+        .await;
+        let error = AgentError::from(transport);
         let message = error.to_string();
         let debug = format!("{error:?}");
         assert!(message.contains(UNRESOLVABLE_HOST), "{message}");
@@ -964,7 +979,7 @@ mod tests {
 
     /// Every variant, and for `Api` every wording and status the answers are
     /// known to turn on, crossed with both `Retry-After` shapes.
-    fn corpus() -> Vec<AgentError> {
+    async fn corpus() -> Vec<AgentError> {
         let quota = opencode_body("GoUsageLimitError", QUOTA_MESSAGE);
         let model = opencode_body("ModelError", MODEL_MESSAGE);
         let messages = [
@@ -998,7 +1013,9 @@ mod tests {
             ]
             .map(|kind| AgentError::Io(kind.into())),
         );
-        corpus.extend([refused(), unresolved(), tls_failure()].map(AgentError::Http));
+        corpus.extend(
+            [refused().await, unresolved().await, tls_failure().await].map(AgentError::Http),
+        );
         corpus.extend([
             AgentError::Config {
                 message: CONFIG_MESSAGE.into(),
@@ -1048,13 +1065,13 @@ mod tests {
     /// Why [`AgentError::projection`] earns its keep: the answers above are a
     /// function of the projection, so a replay golden that pins the projection
     /// pins the behaviour, and no provider needs retry fixtures of its own.
-    #[test]
-    fn equal_projections_agree_on_every_observable() {
+    #[tokio::test]
+    async fn equal_projections_agree_on_every_observable() {
         let mut seen: Vec<(ErrorProjection, Observables)> = Vec::new();
         let mut variants = HashSet::new();
         let mut shared_projections = false;
 
-        for error in corpus() {
+        for error in corpus().await {
             variants.insert(discriminant(&error));
             let projection = error.projection();
             let observed = Observables::of(&error);

@@ -2,11 +2,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufRead, AsyncBufReadExt};
 use maki_storage::id::{MakiId, SessionRef};
 use reqwest::{Client, Method, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::warn;
 
 use maki_config::providers::Protocol;
@@ -715,7 +715,7 @@ mod tests {
     use super::*;
     use crate::error::ErrorProjection;
     use crate::model::{ModelPricing, ModelTier};
-    use futures_lite::io::Cursor;
+    use std::io::Cursor;
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -762,11 +762,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn list_models_on_a_malformed_base_url_is_a_config_error() {
+    #[tokio::test]
+    async fn list_models_on_a_malformed_base_url_is_a_config_error() {
         let google = Google::with_auth(test_auth(), test_timeouts())
             .with_fallback_base_url(Some(MALFORMED_BASE_URL.into()));
-        let error = smol::block_on(google.list_models()).unwrap_err();
+        let error = google.list_models().await.unwrap_err();
         assert_eq!(error.projection(), ErrorProjection::Config);
     }
 
@@ -1145,12 +1145,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_sse_plain_text() {
+    #[tokio::test]
+    async fn parse_sse_plain_text() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":10}}\n\n";
         let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, TEST_STREAM_TIMEOUT)).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(result.usage.input, 5);
         assert_eq!(result.usage.output, 10);
@@ -1160,8 +1160,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_coalesces_text_deltas_into_one_block() {
+    #[tokio::test]
+    async fn parse_sse_coalesces_text_deltas_into_one_block() {
         let event = |text: &str| {
             format!(
                 "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\"}}]}}}}]}}\n\n",
@@ -1173,7 +1173,7 @@ mod tests {
         data.push_str(&event("world."));
         let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, TEST_STREAM_TIMEOUT)).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(
             result.message.content.len(),
             1,
@@ -1185,8 +1185,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_coalesces_thinking_deltas_keeps_last_signature() {
+    #[tokio::test]
+    async fn parse_sse_coalesces_thinking_deltas_keeps_last_signature() {
         let event = |text: &str, sig: Option<&str>| match sig {
             Some(s) => format!(
                 "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\",\"thought\":true,\"thoughtSignature\":\"{}\"}}]}}}}]}}\n\n",
@@ -1202,7 +1202,7 @@ mod tests {
         data.push_str(&event("more.", Some("sig-final")));
         let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, TEST_STREAM_TIMEOUT)).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.message.content.len(), 1);
         assert!(matches!(
             &result.message.content[0],
@@ -1211,14 +1211,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_parallel_same_name_tool_calls_get_unique_ids() {
+    #[tokio::test]
+    async fn parse_sse_parallel_same_name_tool_calls_get_unique_ids() {
         let part = r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"}}}"#;
         let payload = format!(r#"{{"candidates":[{{"content":{{"parts":[{part},{part}]}}}}]}}"#,);
         let data = format!("data: {payload}\n\n");
         let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, TEST_STREAM_TIMEOUT)).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         let ids: Vec<&str> = result
             .message
             .content
@@ -1232,12 +1232,12 @@ mod tests {
         assert_ne!(ids[0], ids[1], "ids must be unique for parallel calls");
     }
 
-    #[test]
-    fn parse_sse_thinking_part() {
+    #[tokio::test]
+    async fn parse_sse_thinking_part() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":30}}\n\n";
         let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, TEST_STREAM_TIMEOUT)).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.usage.output, 50);
         assert!(matches!(
             &result.message.content[0],
@@ -1249,12 +1249,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_tool_call() {
+    #[tokio::test]
+    async fn parse_sse_tool_call() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{\"cmd\":\"ls\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":15}}\n\n";
         let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, TEST_STREAM_TIMEOUT)).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
         assert!(matches!(
             &result.message.content[0],
@@ -1270,7 +1270,8 @@ mod tests {
         r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"},"thoughtSignature":"CvcQAdHtim/pKv/c0ClPFkYA=="}}"#
         ; "nested_fallback"
     )]
-    fn parse_sse_tool_call_captures_thought_signature(part_json: &str) {
+    #[tokio::test]
+    async fn parse_sse_tool_call_captures_thought_signature(part_json: &str) {
         const SIG: &str = "CvcQAdHtim/pKv/c0ClPFkYA==";
         let payload = format!(
             r#"{{"candidates":[{{"content":{{"parts":[{part_json}]}},"finishReason":"STOP"}}],"usageMetadata":{{"promptTokenCount":5,"candidatesTokenCount":15}}}}"#,
@@ -1278,7 +1279,7 @@ mod tests {
         let data = format!("data: {payload}\n\n");
         let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, TEST_STREAM_TIMEOUT)).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::ToolUse { thought_signature: Some(s), .. } if s == SIG
@@ -1290,7 +1291,8 @@ mod tests {
     #[test_case(Some(50), 50 ; "partially_cached")]
     #[test_case(Some(100), 0 ; "fully_cached")]
     #[test_case(Some(150), 0 ; "cache_exceeds_prompt")]
-    fn parse_sse_cached_tokens(cached: Option<u32>, expected_input: u32) {
+    #[tokio::test]
+    async fn parse_sse_cached_tokens(cached: Option<u32>, expected_input: u32) {
         let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
         if let Some(cached) = cached {
             metadata["cachedContentTokenCount"] = json!(cached);
@@ -1298,7 +1300,7 @@ mod tests {
         let data = format!("data: {}\n\n", json!({"usageMetadata": metadata}));
         let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, TEST_STREAM_TIMEOUT)).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, cached.unwrap_or_default());
@@ -1307,7 +1309,8 @@ mod tests {
     #[test_case(None, 50, 50 ; "missing_cache_preserves_previous")]
     #[test_case(Some(0), 100, 0 ; "zero_cache_clears_previous")]
     #[test_case(Some(25), 75, 25 ; "present_cache_replaces_previous")]
-    fn parse_sse_cached_tokens_across_chunks(
+    #[tokio::test]
+    async fn parse_sse_cached_tokens_across_chunks(
         cached: Option<u32>,
         expected_input: u32,
         expected_cache_read: u32,
@@ -1328,7 +1331,7 @@ mod tests {
         );
         let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, TEST_STREAM_TIMEOUT)).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, expected_cache_read);

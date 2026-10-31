@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use async_compat::Compat;
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder, RequestBuilder};
 
@@ -34,8 +33,7 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     matches!((parse(latest), parse(current)), (Some(l), Some(c)) if l > c)
 }
 
-/// Redirects stay off. reqwest runs on tokio, so a request
-/// built from this has to be awaited through [`Compat`].
+/// Redirects stay off.
 pub fn client() -> ClientBuilder {
     Client::builder()
         .redirect(Policy::none())
@@ -65,14 +63,11 @@ fn parse_tag(bytes: &[u8]) -> Result<String, VersionError> {
 }
 
 pub async fn fetch_latest() -> Result<String, VersionError> {
-    Compat::new(async {
-        let resp = request(&version_client()?).send().await?;
-        if !resp.status().is_success() {
-            return Err(VersionError::Status(resp.status().as_u16()));
-        }
-        parse_tag(&resp.bytes().await?)
-    })
-    .await
+    let resp = request(&version_client()?).send().await?;
+    if !resp.status().is_success() {
+        return Err(VersionError::Status(resp.status().as_u16()));
+    }
+    parse_tag(&resp.bytes().await?)
 }
 
 #[cfg(test)]
