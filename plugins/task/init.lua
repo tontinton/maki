@@ -14,7 +14,7 @@ local Message = Runner.allow_background and require("message")
 
 local DEFAULT_OUTPUT_LINES = 5
 local WAITING_FOR_SLOT = "waiting for a free subagent slot"
-local MOVED_RECEIPT = "Subagent %s moved to the background"
+local MOVED_RECEIPT = "Subagent %s moved to the background. Don't wait or poll for it; end your turn once you have nothing else to do."
 local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground."
 
 local description = [[Launch an autonomous subagent to perform tasks independently. Best combined with batch.
