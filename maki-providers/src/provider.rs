@@ -34,6 +34,10 @@ pub trait Provider: Send + Sync {
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
+    /// The models this provider serves right now. A failed listing must return
+    /// an error, never a static or cached fallback: discovery reads a clean
+    /// answer as proof that a model missing from it is retired, and hides that
+    /// model from the picker's recents.
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
 
     /// The context window the server runs `model` with right now. Only a
@@ -166,7 +170,25 @@ pub async fn from_model_async(
 
 pub struct ModelBatch {
     pub models: Vec<String>,
+    /// The providers this batch covers, independent of `ModelPolicy`: the
+    /// policy filters `models`, but the picker still needs to know which
+    /// providers answered.
+    pub providers: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+pub(crate) fn provider_of(spec: &str) -> &str {
+    spec.split_once('/').map_or(spec, |(provider, _)| provider)
+}
+
+fn providers_of(specs: &[String]) -> Vec<String> {
+    let mut providers: Vec<String> = Vec::new();
+    for provider in specs.iter().map(|spec| provider_of(spec)) {
+        if !providers.iter().any(|known| known == provider) {
+            providers.push(provider.to_string());
+        }
+    }
+    providers
 }
 
 /// The offline twin of [`fetch_all_models`]. It never waits for the catalog
@@ -247,6 +269,7 @@ pub async fn fetch_all_models(
                     }
                     ModelBatch {
                         models: specs,
+                        providers: vec![slug.to_string()],
                         warnings: Vec::new(),
                     }
                 }
@@ -260,6 +283,7 @@ pub async fn fetch_all_models(
                         .collect();
                     ModelBatch {
                         models: fallback,
+                        providers: vec![slug.to_string()],
                         warnings: vec![format!("{display_name}: {e} (using static fallback)")],
                     }
                 }
@@ -289,6 +313,7 @@ pub async fn fetch_all_models(
             let _ = tx_catalog
                 .send_async(ModelBatch {
                     models,
+                    providers: vec![slug],
                     warnings: Vec::new(),
                 })
                 .await;
@@ -297,10 +322,11 @@ pub async fn fetch_all_models(
 
     let tx_custom = tx.clone();
     tokio::spawn(async move {
-        let declared = custom::declared_model_specs();
+        let (declared, declared_providers) = custom::declared_batch();
         if !declared.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
+                    providers: declared_providers,
                     models: declared,
                     warnings: Vec::new(),
                 })
@@ -310,6 +336,7 @@ pub async fn fetch_all_models(
         if !custom_specs.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
+                    providers: providers_of(&custom_specs),
                     models: custom_specs,
                     warnings: Vec::new(),
                 })

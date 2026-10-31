@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use crate::provider::{ModelBatch, fetch_all_models, provider_available};
+use crate::provider::{ModelBatch, fetch_all_models, provider_available, provider_of};
 use crate::providers::custom;
 use crate::spec::ProviderRegistry;
 
@@ -44,6 +44,10 @@ struct ModelsCache {
 /// What the model picker should show right now.
 pub struct ModelList {
     pub specs: Vec<String>,
+    /// Providers that answered live this run. A recent from one of these that
+    /// is missing from `specs` is retired; a recent from any other provider
+    /// may simply have failed its probe.
+    pub live_providers: Vec<String>,
     /// Some provider has not answered yet, so the list may still grow.
     pub loading: bool,
 }
@@ -54,15 +58,12 @@ pub struct ModelList {
 struct Listing {
     replayed: Vec<String>,
     live: Vec<String>,
+    live_providers: Vec<String>,
     /// A provider that cannot be reached warns and falls back to its static
     /// specs, so warnings are how discovery reports a failed probe. Without
     /// this, an empty run reads as "offline" even when the real cause is an
     /// expired token or a revoked key.
     degraded: bool,
-}
-
-fn provider_of(spec: &str) -> &str {
-    spec.split_once('/').map_or(spec, |(provider, _)| provider)
 }
 
 impl Listing {
@@ -81,11 +82,19 @@ impl Listing {
                 self.live.push(spec.clone());
             }
         }
+        if batch.warnings.is_empty() {
+            for provider in &batch.providers {
+                if !self.live_providers.contains(provider) {
+                    self.live_providers.push(provider.clone());
+                }
+            }
+        }
     }
 
     fn snapshot(&self) -> ModelList {
         ModelList {
             specs: self.live.iter().chain(&self.replayed).cloned().collect(),
+            live_providers: self.live_providers.clone(),
             loading: true,
         }
     }
@@ -96,6 +105,7 @@ impl Listing {
         self.replayed.clear();
         ModelList {
             specs: self.live,
+            live_providers: self.live_providers,
             loading: false,
         }
     }
@@ -317,6 +327,10 @@ mod tests {
     fn batch(models: &[&str], warnings: &[&str]) -> ModelBatch {
         ModelBatch {
             models: specs(models),
+            providers: models
+                .iter()
+                .map(|spec| provider_of(spec).to_string())
+                .collect(),
             warnings: specs(warnings),
         }
     }
@@ -369,6 +383,17 @@ mod tests {
             ["a/kept", "a/new"],
             "a provider that never answered live must not keep its cached specs"
         );
+        assert_eq!(done.live_providers, ["a"]);
+    }
+
+    /// A probe that fell back to static specs says nothing about which models
+    /// the provider still serves, so its recents must not look retired.
+    #[test]
+    fn only_a_clean_batch_marks_its_providers_live() {
+        let mut listing = Listing::default();
+        listing.add_live(&batch(&["a/fallback"], &["A: timeout"]));
+        listing.add_live(&batch(&["b/live"], &[]));
+        assert_eq!(listing.finish().live_providers, ["b"]);
     }
 
     #[test_case(&[],            true,  &["good/model"] ; "degraded_empty_keeps_cache")]

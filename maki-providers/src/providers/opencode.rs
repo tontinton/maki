@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
+use maki_storage::StateDir;
+use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tokio::task::spawn_blocking;
@@ -32,6 +34,7 @@ const GO_API_URL: &str = "https://opencode.ai/zen/go/v1";
 const ZEN_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API";
 const GO_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API";
 const GO_DISCOVERY_NOTE: &str = "No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.";
+const CATALOG_UNAVAILABLE: &str = "the models.dev catalog is unavailable";
 
 const FREE_MODELS_NOTE: &str = r#"By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
 
@@ -183,13 +186,20 @@ impl Opencode {
     }
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
-        Ok(spawn_blocking(move || {
+        spawn_blocking(move || {
             let guard = init_shared_catalog_if_needed().lock().unwrap();
-            guard.provider(ZEN_SLUG).map_or_else(Vec::new, |data| {
-                data.available_models(&guard.state_dir, data.free_models_enabled())
-            })
+            let Some(data) = guard.provider(ZEN_SLUG) else {
+                return if zen_has_key(&guard.state_dir) {
+                    Err(AgentError::Config {
+                        message: CATALOG_UNAVAILABLE.into(),
+                    })
+                } else {
+                    Ok(Vec::new())
+                };
+            };
+            Ok(data.available_models(&guard.state_dir, data.free_models_enabled()))
         })
-        .await?)
+        .await?
     }
 
     async fn lookup(
@@ -226,6 +236,13 @@ impl Opencode {
         })
         .await?
     }
+}
+
+/// Zen is listed for everyone, so a missing catalog only deserves a warning
+/// for someone who configured a key. Without one there is nothing to list and
+/// nothing to fix.
+fn zen_has_key(state_dir: &StateDir) -> bool {
+    std::env::var(ENV_VAR).is_ok() || load_provider_credentials(state_dir, ZEN_SLUG).is_some()
 }
 
 impl Provider for Opencode {

@@ -3158,6 +3158,7 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
     assert_owes_one_frame(&mut app, || {
         models.store(Some(Arc::new(ModelList {
             specs: vec![LATE_MODEL_SPEC.into()],
+            live_providers: Vec::new(),
             loading: false,
         })));
     });

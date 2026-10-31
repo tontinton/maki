@@ -286,6 +286,7 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
+    #[cfg(test)]
     pub(crate) fn canonical_id(&self) -> Option<&str> {
         self.prefixes.first().map(String::as_str)
     }
