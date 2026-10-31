@@ -664,6 +664,10 @@ pub(crate) async fn parse_sse(
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
+        if let Some(cost) = super::parse_cost_comment(&line) {
+            parser.set_cost(cost);
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("event:") {
             current_event = rest.strip_prefix(' ').unwrap_or(rest).to_string();
             continue;
@@ -674,13 +678,10 @@ pub(crate) async fn parse_sse(
             None => continue,
         };
 
-        if parser
-            .process(&current_event, data, event_tx)
-            .await?
-            .is_break()
-        {
+        if data == "[DONE]" {
             break;
         }
+        let _ = parser.process(&current_event, data, event_tx).await?;
     }
 
     Ok(parser.finish())
@@ -1005,8 +1006,7 @@ data: {{\"type\":\"message_stop\"}}\n"
 
     #[test_case("\"cost\":0.00042" ; "cost")]
     #[test_case("\"response_cost\":0.00042" ; "response_cost")]
-    #[test_case("\"cost\":0.00042,\"response_cost\":0.5" ; "cost_and_response_cost")]
-    #[test_case("\"cost\":0.00002,\"cost_details\":{\"upstream_inference_cost\":0.0004}" ; "byok")]
+    #[test_case("\"cost\":0.00002,\"is_byok\":true,\"cost_details\":{\"upstream_inference_cost\":0.0004}" ; "byok")]
     #[tokio::test]
     async fn parse_sse_billed_cost(cost_fields: &str) {
         let sse = format!(
@@ -1021,6 +1021,37 @@ data: {{\"type\":\"message_stop\"}}\n"
         assert_eq!(resp.usage.output, 10);
         assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
     }
+    #[test_case(json!({"cost": 0.00002, "is_byok": true}), None ; "incomplete_byok_clears_previous")]
+    #[test_case(json!({"cost": "invalid"}), None ; "invalid_clears_previous")]
+    #[test_case(json!({"output_tokens": 10}), Some(BILLED_COST) ; "no_new_bill_preserves_previous")]
+    #[test_case(json!({"cost": 0}), Some(0.0) ; "zero_clears_previous")]
+    #[tokio::test]
+    async fn later_billing_updates_previous_bill(billing: Value, expected: Option<f64>) {
+        let sse = format!(
+            "event: message_start\ndata: {{\"message\":{{\"usage\":{{\"input_tokens\":42,\"cost\":{BILLED_COST}}}}}}}\n\nevent: message_delta\ndata: {{\"usage\":{billing}}}\n\nevent: message_stop\ndata: {{}}\n"
+        );
+        let (tx, _rx) = flume::unbounded();
+        let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(response.usage.cost, expected);
+        assert_eq!(response.usage.input, 42);
+    }
+
+    #[test_case("0", Some(0.0) ; "free")]
+    #[test_case("0.5", Some(0.5) ; "paid")]
+    #[tokio::test]
+    async fn cost_comment_after_message_stop(cost: &str, expected: Option<f64>) {
+        let sse = format!(
+            "event: message_stop\ndata: {{}}\n\n: cost {{\"request_cost_usd\": {cost}}}\n\ndata: [DONE]\n"
+        );
+        let (tx, _rx) = flume::unbounded();
+        let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(response.usage.cost, expected);
+    }
+
     const DROPPED_PATH: &str = "messages.1.content.0";
     const PREFIX_MISMATCH: &str = "prefix_binding_mismatch";
     const THINKING_DROPPED: &str = "thinking_dropped";

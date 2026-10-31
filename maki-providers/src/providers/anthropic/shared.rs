@@ -430,6 +430,10 @@ impl EventParser {
         }
     }
 
+    pub fn set_cost(&mut self, cost: Option<f64>) {
+        self.usage.cost = cost;
+    }
+
     pub async fn process(
         &mut self,
         event_type: &str,
@@ -537,6 +541,7 @@ impl EventParser {
             }
             "message_delta" => {
                 if let Ok(ev) = serde_json::from_str::<MessageDeltaEvent>(data) {
+                    let has_billing = ev.usage.as_ref().is_some_and(|u| u.billed.is_present());
                     if let Some(u) = ev.usage {
                         self.usage.output = u.output_tokens;
                         // Gateways like Bifrost send zeros in message_start and the real
@@ -555,11 +560,13 @@ impl EventParser {
                                 *dst = src;
                             }
                         }
-                        if let Some(cost) = u.billed.total() {
-                            self.usage.cost = Some(cost);
+                        if u.billed.is_present() {
+                            self.usage.cost = u.billed.total();
                         }
                     }
-                    if let Some(usd) = ev.copilot_usage.as_ref().and_then(copilot_usd) {
+                    if !has_billing
+                        && let Some(usd) = ev.copilot_usage.as_ref().and_then(copilot_usd)
+                    {
                         self.usage.cost = Some(usd);
                     }
                     if let Some(t) = ev.input_transformations {
