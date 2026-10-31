@@ -6,7 +6,6 @@ use maki_storage::id::SessionRef;
 use maki_storage::sessions::Effort;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::warn;
 
 use crate::ThinkingConfig;
 use crate::model::{FastSupport, Model, ModelInfo};
@@ -269,16 +268,6 @@ fn apply_session_affinity(body: &mut Value, auth: &mut ResolvedAuth, session: &S
     for header in SESSION_AFFINITY_HEADERS {
         auth.set_header(header, session.to_string());
     }
-}
-
-fn static_plan_models() -> Vec<ModelInfo> {
-    super::SPEC
-        .models()
-        .iter()
-        .flat_map(|e| &e.prefixes)
-        .filter(|id| is_codex_model(id))
-        .map(|id| ModelInfo::id_only(id.clone()))
-        .collect()
 }
 
 #[derive(Deserialize, Default)]
@@ -553,15 +542,7 @@ impl Provider for OpenAi {
         Box::pin(async {
             self.auth.refresh_if_stale().await?;
             if self.auth.is_oauth() {
-                return Ok(
-                    match self.auth.with_retry(|| self.fetch_plan_models()).await {
-                        Ok(models) => models,
-                        Err(e) => {
-                            warn!(error = %e, "Codex model listing failed, using static plan models");
-                            static_plan_models()
-                        }
-                    },
-                );
+                return self.auth.with_retry(|| self.fetch_plan_models()).await;
             }
             self.auth
                 .with_retry(|| async {
@@ -624,6 +605,16 @@ mod tests {
     use super::super::responses;
     use super::*;
     use crate::ThinkingConfig;
+
+    fn static_plan_models() -> Vec<ModelInfo> {
+        super::super::SPEC
+            .models()
+            .iter()
+            .flat_map(|e| &e.prefixes)
+            .filter(|id| is_codex_model(id))
+            .map(|id| ModelInfo::id_only(id.clone()))
+            .collect()
+    }
 
     #[test_case("gpt-5.6-luna")]
     #[test_case("gpt-5.6-terra")]

@@ -208,17 +208,38 @@ impl ModelPicker {
     }
 
     fn load_entries(&self) -> Vec<ModelEntry> {
-        let specs = self.available.get().map(|list| &list.specs);
+        let list = self.available.get();
+        // A model the provider has retired must not linger in Recent. Only a
+        // provider that answered live can say it is gone: a failed probe falls
+        // back to a short static list, and snapshots taken while discovery is
+        // still running are missing the providers that have yet to answer.
+        let retired = |spec: &String| {
+            list.is_some_and(|l| {
+                !l.loading
+                    && !l.specs.contains(spec)
+                    && spec
+                        .split_once('/')
+                        .is_some_and(|(provider, _)| l.live_providers.iter().any(|p| p == provider))
+            })
+        };
         let mut entries = Vec::new();
         for spec in &self.recents {
+            if retired(spec) {
+                continue;
+            }
             if let Some(mut e) = parse_model_entry(spec) {
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
                 entries.push(e);
             }
         }
-        let mut full: Vec<ModelEntry> = specs
-            .map(|s| s.iter().filter_map(|s| parse_model_entry(s)).collect())
+        let mut full: Vec<ModelEntry> = list
+            .map(|l| {
+                l.specs
+                    .iter()
+                    .filter_map(|s| parse_model_entry(s))
+                    .collect()
+            })
             .unwrap_or_default();
         full.sort_by(|a, b| {
             a.provider_display
@@ -449,6 +470,7 @@ mod tests {
 
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
     const SWAPPED_SPEC: &str = "zai/glm-5";
+    const RETIRED_SPEC: &str = "anthropic/claude-retired";
 
     /// A provider that republishes the same number of specs has still changed
     /// the list. Comparing lengths calls that no change, and the picker goes on
@@ -473,8 +495,16 @@ mod tests {
     }
 
     fn loaded(specs: Vec<String>) -> Arc<ModelList> {
+        let live_providers = specs
+            .iter()
+            .filter_map(|spec| {
+                spec.split_once('/')
+                    .map(|(provider, _)| provider.to_string())
+            })
+            .collect();
         Arc::new(ModelList {
             specs,
+            live_providers,
             loading: false,
         })
     }
@@ -491,6 +521,7 @@ mod tests {
         let models = Arc::new(ArcSwapOption::empty());
         models.store(Some(Arc::new(ModelList {
             specs: vec![SWAPPED_SPEC.into()],
+            live_providers: Vec::new(),
             loading: true,
         })));
         let mut p = ModelPicker::new(Arc::clone(&models));
@@ -865,6 +896,7 @@ mod tests {
         ] {
             models.store(Some(Arc::new(ModelList {
                 specs,
+                live_providers: Vec::new(),
                 loading: true,
             })));
             let _ = p.refresh();
@@ -875,6 +907,59 @@ mod tests {
                 "an intermediate snapshot must not move the cursor to the provider entry",
             );
         }
+    }
+
+    #[test]
+    fn recents_drop_models_the_provider_no_longer_lists() {
+        let models = Arc::new(ArcSwapOption::empty());
+        let mut p = ModelPicker::new(models.clone());
+        p.set_recents(vec![RETIRED_SPEC.into(), SWAPPED_SPEC.into()]);
+        p.open(SWAPPED_SPEC);
+
+        models.store(Some(Arc::new(ModelList {
+            specs: vec![SWAPPED_SPEC.into()],
+            live_providers: vec!["anthropic".into(), "zai".into()],
+            loading: false,
+        })));
+        let _ = p.refresh();
+
+        let entries = p.load_entries();
+        assert!(!entries.iter().any(|e| e.spec == RETIRED_SPEC));
+        assert!(entries.iter().any(|e| e.spec == SWAPPED_SPEC));
+    }
+
+    /// A failed probe falls back to the provider's static specs, so a recent
+    /// outside that short list is missing without being retired.
+    #[test]
+    fn recents_survive_a_failed_probe() {
+        let models = Arc::new(ArcSwapOption::empty());
+        let mut p = ModelPicker::new(models.clone());
+        p.set_recents(vec![RETIRED_SPEC.into()]);
+        p.open(RETIRED_SPEC);
+
+        models.store(Some(loaded(vec![SWAPPED_SPEC.into()])));
+        let _ = p.refresh();
+
+        assert!(p.load_entries().iter().any(|e| e.spec == RETIRED_SPEC));
+    }
+
+    /// A snapshot from a discovery still in flight is missing providers, so a
+    /// recent absent from it may simply not have answered yet.
+    #[test]
+    fn recents_survive_an_incomplete_list() {
+        let models = Arc::new(ArcSwapOption::empty());
+        let mut p = ModelPicker::new(models.clone());
+        p.set_recents(vec![RETIRED_SPEC.into()]);
+        p.open(RETIRED_SPEC);
+
+        models.store(Some(Arc::new(ModelList {
+            specs: vec![SWAPPED_SPEC.into()],
+            live_providers: Vec::new(),
+            loading: true,
+        })));
+        let _ = p.refresh();
+
+        assert!(p.load_entries().iter().any(|e| e.spec == RETIRED_SPEC));
     }
 
     #[test]
