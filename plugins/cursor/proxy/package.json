@@ -1,0 +1,13 @@
+{
+  "name": "maki-cursor-proxy",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.10.2",
+    "zod": "^3.25.76"
+  }
+}

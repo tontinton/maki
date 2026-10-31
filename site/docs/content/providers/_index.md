@@ -45,7 +45,7 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 
 ## Built-in Providers
 
-`deepseek`, `mistral`, `openrouter`, `regolo`, `requesty`, `synthetic` and `tensorx` ship as bundled [plugins](/docs/plugins/) and are listed last. Turn one off with `plugins = { tensorx = { enabled = false } }` in [`maki.setup`](/docs/configuration/#plugins).
+`cursor`, `deepseek`, `mistral`, `openrouter`, `regolo`, `requesty`, `synthetic` and `tensorx` ship as bundled [plugins](/docs/plugins/) and are listed last. Turn one off with `plugins = { tensorx = { enabled = false } }` in [`maki.setup`](/docs/configuration/#plugins).
 
 ### Anthropic
 
@@ -271,6 +271,19 @@ Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailsca
 - **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API
 
 No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
+
+### Cursor
+
+- **Env var**: none. Sign in with `maki auth login cursor`
+- **API**: `http://127.0.0.1:53621/v1`
+- **Features**: Cursor subscription models. Maki runs the tools.
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Medium | **auto** (default) |  | 200K ctx / 64K out |
+| Strong | **composer-2.5** (default) |  | 200K ctx / 64K out |
+
+Defaults: composer-2.5 (strong), auto (medium)
 
 ### DeepSeek
 

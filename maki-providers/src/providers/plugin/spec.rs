@@ -105,7 +105,14 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
         docs: GeneratedDocs {
             api_urls: leak_slice(decl.base_url.iter().map(|url| leak_str(url)).collect()),
             features: decl.docs.features.as_deref().map(leak_str),
-            auth: AuthDoc::EnvVar,
+            auth: if decl.api_key_env.as_deref().unwrap_or("").is_empty() {
+                AuthDoc::Custom(leak_str(&format!(
+                    "none. Sign in with `maki auth login {}`",
+                    decl.slug
+                )))
+            } else {
+                AuthDoc::EnvVar
+            },
             catalog: if models.is_empty() {
                 CatalogDoc::Discovered(
                     decl.docs

@@ -4002,6 +4002,14 @@ impl LuaRuntime {
         )
         .map_err(map_err)?;
 
+        if let Some(dir) = plugin_dir.as_deref() {
+            let text = dir
+                .to_str()
+                .ok_or_else(|| mlua::Error::runtime("plugin directory is not utf-8"))
+                .map_err(map_err)?;
+            maki.set("plugin_dir", text).map_err(map_err)?;
+        }
+
         if let Some(config) = config {
             let setup_fn =
                 crate::api::util::setup::create_setup_fn(&self.lua, Arc::clone(config.store))
