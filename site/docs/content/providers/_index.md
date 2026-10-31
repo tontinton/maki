@@ -528,6 +528,12 @@ Current plans:
 
 Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file.
 
+### Setup from the model picker
+
+A provider declared here appears in `/model` even without a key. That row reads `no key` and `Enter` opens the provider's setup flow. The flow edits `base_url` first, then asks for the key, so a moved endpoint is fixed before authenticating. An empty key is accepted when the env var or a stored credential already provides one, and `Esc` goes back to the picker.
+
+Built-in providers with a `base_url` and no key, such as a local server, keep their models and never ask for one. Otherwise a provider row reads `offline` when the probe failed, `fallback` when that provider serves its static models after the failure, and `no models` when the probe returned an empty list.
+
 ## Plugin Providers
 
 A [Lua plugin](/docs/plugins/) can add a provider. Call `maki.provider.register` at the top level of the plugin file, and its models become `{slug}/{model_id}` (e.g. `acme/acme-large`) in `/model` and the picker. They get the same retries, pricing and usage accounting as a built-in provider.

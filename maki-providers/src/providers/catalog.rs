@@ -248,9 +248,11 @@ impl ProviderData {
             Authentication::FreeKey(_, tier) => CatalogAuth::Gated(tier),
             Authentication::NoAuth => {
                 let slug = &self.slug;
-                return Err(config_error(format!(
-                    "no API key configured for provider '{slug}'; run `maki auth login {slug}`"
-                )));
+                return Err(AgentError::MissingCredentials {
+                    message: format!(
+                        "no API key configured for provider '{slug}'; run `maki auth login {slug}`"
+                    ),
+                });
             }
         })
     }
@@ -1141,7 +1143,7 @@ mod tests {
             quirks: ProviderQuirks::default(),
         };
         let result = super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true);
-        assert!(matches!(result, Err(AgentError::Config { .. })));
+        assert!(matches!(result, Err(AgentError::MissingCredentials { .. })));
     }
 
     #[test_case("opencode",    true,  true  ; "zen_with_session")]

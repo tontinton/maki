@@ -905,7 +905,7 @@ impl AuthState {
             DeclaredKeys::Resolved { pool, .. } => Ok(Some(pool.clone())),
             DeclaredKeys::Missing { env_var, message } => {
                 debug!(slug, env_var, "declared api key did not resolve");
-                Err(AgentError::Config {
+                Err(AgentError::MissingCredentials {
                     message: message.clone(),
                 })
             }

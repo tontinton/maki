@@ -116,6 +116,11 @@ pub enum AgentError {
     },
     #[error("{message}")]
     Config { message: String },
+    /// No credential source resolved for this provider. Kept apart from
+    /// [`AgentError::Config`] so discovery can say it skipped the provider for
+    /// want of a key without re-deriving where keys come from.
+    #[error("{message}")]
+    MissingCredentials { message: String },
     #[error("tool error in {tool}: {message}")]
     Tool { tool: String, message: String },
     #[error(transparent)]
@@ -181,7 +186,7 @@ impl AgentError {
                 auth_error: self.is_auth_error(),
                 thinking_unbound: self.is_thinking_unbound(),
             },
-            Self::Config { .. } => ErrorProjection::Config,
+            Self::Config { .. } | Self::MissingCredentials { .. } => ErrorProjection::Config,
             Self::Tool { .. } => ErrorProjection::Tool,
             Self::Io(e) => ErrorProjection::Io(e.kind()),
             Self::Http(e) => ErrorProjection::Http {
@@ -221,6 +226,7 @@ impl AgentError {
             Self::Timeout { .. } => Some(RetryKind::Timeout),
             Self::Api { .. }
             | Self::Config { .. }
+            | Self::MissingCredentials { .. }
             | Self::Tool { .. }
             | Self::Channel
             | Self::Json(_)
@@ -374,7 +380,7 @@ impl AgentError {
             return error.message;
         }
         match self {
-            Self::Config { message } => message.clone(),
+            Self::Config { message } | Self::MissingCredentials { message } => message.clone(),
             Self::Api { status: 429, .. } => "rate limited, try again in a moment".into(),
             Self::Api { status: 529, .. } => "provider is overloaded, try again later".into(),
             Self::Api { status, .. } if *status >= 500 => format!("server error ({status})"),
@@ -946,7 +952,7 @@ mod tests {
 
     /// One sample per `AgentError` variant. A new variant means a new sample
     /// in [`corpus`] and a bump here, or the corpus quietly stops covering it.
-    const VARIANT_COUNT: usize = 10;
+    const VARIANT_COUNT: usize = 11;
     /// One status per branch the answers below split on: refused for size
     /// (400, 413), stale token (401), dead key but live account (403), rate
     /// limit (429), server trouble (500). The rest behave like one of these.
@@ -1001,6 +1007,9 @@ mod tests {
         corpus.extend([refused(), unresolved(), tls_failure()].map(AgentError::Http));
         corpus.extend([
             AgentError::Config {
+                message: CONFIG_MESSAGE.into(),
+            },
+            AgentError::MissingCredentials {
                 message: CONFIG_MESSAGE.into(),
             },
             AgentError::Tool {

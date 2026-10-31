@@ -67,8 +67,10 @@ pub(crate) fn is_declared(slug: &str) -> bool {
 
 /// The credentials and the env var they came out of, which the codec carries
 /// as part of this provider's wire config.
-fn resolve_custom_auth(slug: &str) -> Result<(ResolvedAuth, String), AgentError> {
-    let config = ProvidersConfig::load();
+fn resolve_custom_auth_from(
+    config: &ProvidersConfig,
+    slug: &str,
+) -> Result<(ResolvedAuth, String), AgentError> {
     let def = config.get(slug).ok_or_else(|| AgentError::Config {
         message: format!("unknown custom provider '{slug}'"),
     })?;
@@ -84,14 +86,21 @@ fn resolve_custom_auth(slug: &str) -> Result<(ResolvedAuth, String), AgentError>
 }
 
 pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    let config = ProvidersConfig::load();
+    create_from(&ProvidersConfig::load(), slug, timeouts)
+}
+
+fn create_from(
+    config: &ProvidersConfig,
+    slug: &str,
+    timeouts: Timeouts,
+) -> Result<Box<dyn Provider>, AgentError> {
     let protocol = config
         .get(slug)
         .and_then(|def| def.protocol)
         .ok_or_else(|| AgentError::Config {
             message: format!("unknown custom provider '{slug}'"),
         })?;
-    let (resolved, api_key_env) = resolve_custom_auth(slug)?;
+    let (resolved, api_key_env) = resolve_custom_auth_from(config, slug)?;
     let auth = Arc::new(Mutex::new(resolved));
 
     // No `base_url`: `resolve_custom_auth` already put the configured origin in
@@ -311,24 +320,52 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
     }
 }
 
-/// Skip definitions handled by [`declared_model_specs`]; only HTTP `/models`
-/// goes through here, so an empty `discover_models = false` provider returns
-/// nothing and never hits the network.
-pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
-    let config = ProvidersConfig::load();
-    let mut all_specs = Vec::new();
+/// HTTP `/models` runs only when `discover_models` is set. Every declared
+/// provider still has its credentials resolved first, so a missing key is
+/// reported whether or not the entry lists its own models, and neither path
+/// hits the network without a key.
+pub fn discover_models(timeouts: Timeouts) -> DiscoveredCustom {
+    discover_models_from(&ProvidersConfig::load(), timeouts)
+}
+
+/// What one discovery pass over `providers.toml` found: the `/models` specs it
+/// listed, and the slugs it could not even build for want of credentials. The
+/// picker turns the second half into a `no key` row with a working setup flow,
+/// so a declared provider without a key can never masquerade as healthy.
+#[derive(Default, Debug)]
+pub struct DiscoveredCustom {
+    pub specs: Vec<String>,
+    pub missing_credentials: Vec<String>,
+}
+
+fn discover_models_from(config: &ProvidersConfig, timeouts: Timeouts) -> DiscoveredCustom {
+    let mut out = DiscoveredCustom::default();
     for slug in config.providers.keys() {
         if is_builtin_slug(slug) {
             continue;
         }
         let def = config.get(slug).unwrap();
-        if !def.discover_models {
-            continue;
-        }
         if resolve_protocol(slug, Some(def)).is_none() {
             continue;
         }
-        match create(slug, timeouts) {
+        // The `/models` probe is optional. The credential check is not: a
+        // declared list is the default, and that row must still read `no key`.
+        match resolve_custom_auth_from(config, slug) {
+            Ok(_) => {}
+            Err(e @ AgentError::MissingCredentials { .. }) => {
+                out.missing_credentials.push(slug.clone());
+                tracing::warn!(slug, error = %e, "skipped custom provider without credentials");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(slug, error = %e, "failed to resolve custom provider credentials");
+                continue;
+            }
+        }
+        if !def.discover_models {
+            continue;
+        }
+        match create_from(config, slug, timeouts) {
             Ok(provider) => {
                 let slug_c = slug.clone();
                 let result = smol::block_on(provider.list_models());
@@ -337,7 +374,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
                         overlay_declared_tiers(def, &mut models);
                         crate::model_registry::set_known_models(&slug_c, models.clone());
                         for m in models {
-                            all_specs.push(format!("{slug_c}/{}", m.id));
+                            out.specs.push(format!("{slug_c}/{}", m.id));
                         }
                     }
                     Err(e) => {
@@ -345,12 +382,16 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
                     }
                 }
             }
+            Err(e @ AgentError::MissingCredentials { .. }) => {
+                out.missing_credentials.push(slug.clone());
+                tracing::warn!(slug, error = %e, "skipped custom provider without credentials");
+            }
             Err(e) => {
                 tracing::warn!(slug, error = %e, "failed to create custom provider");
             }
         }
     }
-    all_specs
+    out
 }
 
 /// Discovery via the openai compat layer never reports tiers, so stored models
@@ -414,6 +455,42 @@ mod tests {
         // Resolution owns the builtin slug regardless of the providers.toml entry.
         let model = Model::from_spec("opencode/shadow-model").unwrap();
         assert_eq!(model.provider.as_ref(), "opencode");
+    }
+
+    /// An entry whose key never resolves must come out of discovery as
+    /// skipped, not as healthy. `discover_models` defaults to false, and that
+    /// entry still lists its declared models, so the picker's `no key` row
+    /// and its setup flow hang off this report either way.
+    #[test_case(true ; "probes_models")]
+    #[test_case(false ; "declares_models_only")]
+    fn discover_reports_entry_without_credentials_as_skipped(discover_models: bool) {
+        let mut config = ProvidersConfig::default();
+        let mut def = openai_def("m");
+        def.discover_models = discover_models;
+        def.api_key_env = Some("MAKI_TEST_DISCOVERY_MISSING_KEY".to_string());
+        def.base_url = Some("http://127.0.0.1:9".to_string());
+        config.upsert("no-creds-test".to_string(), def);
+
+        let err = match create_from(&config, "no-creds-test", Timeouts::default()) {
+            Ok(_) => panic!("no key source can resolve for this slug"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, AgentError::MissingCredentials { .. }),
+            "unexpected create error: {err}"
+        );
+
+        let found = discover_models_from(&config, Timeouts::default());
+
+        assert!(
+            found.specs.is_empty(),
+            "a provider that never resolved credentials cannot list models: {found:?}"
+        );
+        assert_eq!(
+            found.missing_credentials,
+            vec!["no-creds-test".to_string()],
+            "the skipped slug is what the picker turns into a `no key` row"
+        );
     }
 
     #[test_case("[localai]", &[] ; "entry_without_protocol_is_skipped")]

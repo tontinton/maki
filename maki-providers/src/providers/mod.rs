@@ -564,7 +564,7 @@ impl KeyPool {
             debug!(slug, "resolved API key from providers.toml");
             return Ok(Self::from_keys(vec![key]));
         }
-        Err(AgentError::Config {
+        Err(AgentError::MissingCredentials {
             message: format!(
                 "{env_var} not set and no saved credentials for '{slug}': run `maki auth login {slug}`"
             ),
