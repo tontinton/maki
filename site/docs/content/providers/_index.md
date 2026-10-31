@@ -45,7 +45,7 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 
 ## Built-in Providers
 
-`deepseek`, `mistral`, `openrouter`, `regolo`, `requesty`, `synthetic` and `tensorx` ship as bundled [plugins](/docs/plugins/) and are listed last. Turn one off with `plugins = { tensorx = { enabled = false } }` in [`maki.setup`](/docs/configuration/#plugins).
+`deepseek`, `mistral`, `openrouter`, `regolo`, `requesty`, `synthetic`, `tensorx` and `tenstorrent` ship as bundled [plugins](/docs/plugins/) and are listed last. Turn one off with `plugins = { tenstorrent = { enabled = false } }` in [`maki.setup`](/docs/configuration/#plugins).
 
 ### Anthropic
 
@@ -355,6 +355,29 @@ Defaults: hf:moonshotai/Kimi-K2.5 (strong), hf:deepseek-ai/DeepSeek-V3.2 (medium
 - **Features**: Open-weight models, zero data retention, prompt caching
 
 No hardcoded model catalog. Use any model ID supported by this provider.
+
+### Tenstorrent
+
+- **Env var**: `TENSTORRENT_API_KEY`
+- **API**: `https://console.tenstorrent.com/v1`
+- **Features**: Open-weight models, tool calls, prompt caching
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Medium | MiniMaxAI/MiniMax-M3 | $0.60 / $2.40 |  |
+| Medium | MiniMaxAI/MiniMax-M3.1-Flash | $0.15 / $0.60 | 1048K ctx / 16K out |
+| Medium | Qwen/Qwen3-32B | $0.14 / $0.40 | 131K ctx / 16K out |
+| Medium | Qwen/Qwen3-VL-32B-Instruct | $0.90 / $0.90 | 131K ctx / 16K out |
+| Medium | **Qwen/Qwen3.8-27B** (default) | $0.02 / $0.50 | 262K ctx / 16K out |
+| Medium | moonshotai/Kimi-K2.6 | $0.95 / $4.00 |  |
+| Medium | moonshotai/Kimi-K2.7-Code | $0.85 / $3.00 |  |
+| Medium | openai/gpt-oss-120b | $0.15 / $0.60 |  |
+| Strong | deepseek-ai/DeepSeek-R1-0528 | $3.00 / $8.00 |  |
+| Strong | moonshotai/Kimi-K3 | $3.00 / $15.00 |  |
+| Strong | zai-org/GLM-5.2 | $2.10 / $6.60 |  |
+| Strong | **zai-org/GLM-5.3** (default) | $0.60 / $2.50 | 1048K ctx / 16K out |
+
+Defaults: Qwen/Qwen3.8-27B (medium), zai-org/GLM-5.3 (strong)
 
 ## Model Identifiers
 

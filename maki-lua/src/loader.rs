@@ -201,6 +201,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "openrouter",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
     },
+    BundledPlugin {
+        name: "tenstorrent",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tenstorrent"),
+    },
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package
