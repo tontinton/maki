@@ -11,7 +11,6 @@ use maki_storage::id::SessionRef;
 use reqwest::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::runtime::Handle;
 use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
@@ -201,11 +200,10 @@ fn fetch_container_credentials(
     }
     let request = builder.build()?;
 
-    let (status, body_text) = Handle::current()
-        .block_on(super::super::status_and_text(&client, request))
+    let (status, body_text) = super::super::wait(super::super::status_and_text(&client, request))
         .map_err(|e| AgentError::Config {
-            message: format!("container creds request: {e}"),
-        })?;
+        message: format!("container creds request: {e}"),
+    })?;
 
     if status != 200 {
         return Err(AgentError::Config {
