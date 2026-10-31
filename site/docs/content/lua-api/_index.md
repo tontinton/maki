@@ -5715,6 +5715,40 @@ local _, err = maki.task.stop(task.id, { session = task.session })
 local stopped, err = maki.task.stop(ctx, input.id)
 ```
 
+---
+
+### `maki.task.messages()` {#maki-task-messages}
+
+```lua
+maki.task.messages({id}, {opts?})
+```
+
+Reads a background subagent's transcript, oldest first, while it works.
+The messages have the shape `maki.session.messages` returns. A subagent is
+readable while it runs under a call moved to the background, or in a
+session a plugin opened with `maki.agent.session({ session = id })`, until
+it closes. When one call runs several subagents under its id, this reads
+the newest one still open. Works without an interactive UI.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{id}` (`string`) Task id, as returned by `list()`.
+- `{opts?}` (`table?`) `last` (integer?) only the newest `last` messages.
+
+**Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and an error.
+
+**Example:**
+
+```lua
+local msgs = maki.task.messages(task.id, { last = 1 })
+local last = msgs and msgs[1]
+if last and last.content[1].type == "text" then
+  print(last.content[1].text)
+end
+```
+
 
 ## maki.text {#maki-text}
 

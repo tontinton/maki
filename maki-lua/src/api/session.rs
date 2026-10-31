@@ -359,6 +359,15 @@ async fn messages_table(lua: &Lua, messages: &[Message]) -> LuaResult<Table> {
     Ok(out)
 }
 
+pub(crate) async fn newest_messages_table(
+    lua: &Lua,
+    messages: &[Message],
+    last: Option<usize>,
+) -> LuaResult<Table> {
+    let skip = last.map_or(0, |n| messages.len().saturating_sub(n));
+    messages_table(lua, &messages[skip..]).await
+}
+
 async fn transcript_table(lua: &Lua, export: SessionExport) -> LuaResult<Table> {
     let envelope = serde_json::to_value(export.envelope()).map_err(mlua::Error::external)?;
     let table = lua.unpack::<Table>(json_to_lua_exact(lua, &envelope)?)?;
@@ -466,8 +475,10 @@ async fn messages(
         Some(history) => history,
         None => try_pair!(transcript(&lua, tx.as_ref(), session).await).messages,
     };
-    let skip = last.map_or(0, |n| history.len().saturating_sub(n));
-    Ok((Some(messages_table(&lua, &history[skip..]).await?), None))
+    Ok((
+        Some(newest_messages_table(&lua, &history, last).await?),
+        None,
+    ))
 }
 
 /// Returns the id of the focused session. Under `maki -p` and the sdk,
