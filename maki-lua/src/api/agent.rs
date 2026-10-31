@@ -59,6 +59,7 @@ use crate::plugin_permissions::{Permission, PluginPermissions, require};
 use crate::runtime::{CANCELLED_MSG, active_task_cancel, host_ui};
 
 const SESSION_CLOSED_ERR: &str = "session closed";
+const INTERRUPT_OPT: &str = "interrupt";
 /// Esc in the task's tab. Distinct from [`CANCELLED_MSG`], so a loop can tell
 /// user intent from the end of its own task and not reopen.
 pub(crate) const STOPPED_BY_USER_ERR: &str = "stopped by user";
@@ -1631,7 +1632,7 @@ impl SessionState {
         );
     }
 
-    fn agent(&mut self, inbox: &Arc<SubagentInbox>) -> Agent<'_> {
+    fn agent(&mut self, inbox: &Arc<SubagentInbox>, cancel: CancelToken) -> Agent<'_> {
         let agent = Agent::new(
             self.params.clone(),
             AgentRunParams {
@@ -1647,7 +1648,7 @@ impl SessionState {
             self.loaded_instructions.clone(),
             Arc::clone(&self.instruction_files),
         )
-        .with_cancel(self.child_cancel.clone())
+        .with_cancel(cancel)
         .with_mcp(self.mcp.clone())
         .with_local_tools(Arc::clone(&self.local_tools));
         match &self.answer_rx {
@@ -1683,30 +1684,55 @@ fn cut_short_err(result: &Result<DoneReason, AgentError>, stopped_by_user: bool)
     }
 }
 
-/// The notices that wake the session's next turn, or `None` once none of its
-/// moved calls is still out and nothing they reported is left unread. A sent
-/// message wakes it with no notices while a moved call is still out. `Err`
-/// when the session or the caller is cancelled first.
-async fn next_wake(
-    mailbox: &SessionMailbox,
+enum NextRun {
+    /// The notices of moved calls that reported back.
+    Wake(Vec<Message>),
+    /// An interrupting `send` queued a message.
+    Interrupted,
+}
+
+/// What starts the session's next turn, or `None` once none of its moved
+/// calls is still out and nothing they reported is left unread. A sent
+/// message wakes it with no notices while a moved call is still out. `Err` when
+/// the session or the caller is cancelled first. {interrupted} means the run
+/// before was cut short by an interrupt.
+async fn next_run(
     inbox: &SubagentInbox,
+    mailbox: &SessionMailbox,
     session: &CancelToken,
     caller: Option<&CancelToken>,
-) -> Result<Option<Vec<Message>>, String> {
-    let sent = async {
-        inbox.wait_nonempty().await;
-        Some(Vec::new())
-    };
-    let wake = session.race(async {
-        tokio::select! {
-            biased;
-            wake = mailbox.next_wake_before_answer() => wake,
-            wake = sent => wake,
+    mut interrupted: bool,
+) -> Result<Option<NextRun>, String> {
+    loop {
+        // The tab can take the message back before we get here, and a run
+        // with nothing new would only repeat the cut turn.
+        if interrupted && !inbox.is_empty() {
+            return Ok(Some(NextRun::Interrupted));
         }
-    });
-    match caller {
-        Some(caller) => caller.race(wake).await?,
-        None => wake.await,
+        let run_cancel = inbox.run_cancel(session);
+        let sent = async {
+            inbox.wait_nonempty().await;
+            Some(Vec::new())
+        };
+        let wake = run_cancel.race(async {
+            tokio::select! {
+                biased;
+                wake = mailbox.next_wake_before_answer() => wake,
+                wake = sent => wake,
+            }
+        });
+        let woken = match caller {
+            Some(caller) => caller.race(wake).await?,
+            None => wake.await,
+        };
+        match woken {
+            Ok(Some(notices)) if notices.is_empty() && run_cancel.is_cancelled() => {
+                interrupted = true
+            }
+            Ok(notices) => return Ok(notices.map(NextRun::Wake)),
+            Err(e) if session.is_cancelled() => return Err(e),
+            Err(_) => interrupted = true,
+        }
     }
 }
 
@@ -1959,18 +1985,23 @@ async fn prompt(
     // on, so we close them before going again.
     s.history.close_dangling_tool_calls(UNAVAILABLE_RESULT);
     let history_len = s.history.len();
-    let mut input = AgentInput {
+    let mut input = Some(AgentInput {
         earlier,
         ..plugin_input(message, s.opts)
-    };
+    });
     // A call moved off a run reports to the session's mailbox, and the caller
     // is owed the answer that comes after it. So the prompt waits for every
     // moved call, and each wake runs one more turn on the same history.
     let mut last_run_start;
     let cut_short = loop {
         last_run_start = s.history.len();
-        let mut agent = s.agent(&inbox);
-        let run = agent.run(input);
+        let opts = s.opts;
+        let run_cancel = inbox.run_cancel(&s.child_cancel);
+        let mut agent = s.agent(&inbox, run_cancel.clone());
+        let run = match input.take() {
+            Some(input) => Either::Left(agent.run(input)),
+            None => Either::Right(agent.resume(opts)),
+        };
         let finished = match &watch {
             Some((caller_cancel, _)) => caller_cancel.race(run).await.ok(),
             None => Some(run.await),
@@ -1993,31 +2024,40 @@ async fn prompt(
             s.upstream
                 .send_history(&s.cancellation.ui_id, s.history.as_slice().to_vec());
         }
-        let result = finished.unwrap_or(Ok(DoneReason::Cancelled));
-        if let Some(err) = cut_short_err(&result, s.stopped_by_user()) {
-            break Some(err);
+        // Only an interrupting `send` fires the run's token but not the
+        // session's. A run that failed or lost the caller's race still ends.
+        let interrupted = matches!(finished, Some(Ok(_)))
+            && run_cancel.is_cancelled()
+            && !s.child_cancel.is_cancelled();
+        if !interrupted {
+            let result = finished.unwrap_or(Ok(DoneReason::Cancelled));
+            if let Some(err) = cut_short_err(&result, s.stopped_by_user()) {
+                break Some(err);
+            }
         }
         let caller_cancel = watch.as_ref().map(|(caller_cancel, _)| caller_cancel);
-        match next_wake(
-            &s.cancellation.mailbox,
+        let next = next_run(
             &inbox,
+            &s.cancellation.mailbox,
             &s.child_cancel,
             caller_cancel,
+            interrupted,
         )
-        .await
-        {
-            Ok(Some(notices)) => {
-                if let Some((_, settle)) = &mut watch {
-                    settle.outcome = Some(cancelled_run());
-                }
-                input = AgentInput {
+        .await;
+        match next {
+            Ok(Some(NextRun::Wake(notices))) => {
+                input = Some(AgentInput {
                     preamble: notices,
                     earlier: take_waiting(&inbox, &s.sub_event_tx),
                     ..plugin_input(String::new(), s.opts)
-                };
+                });
             }
+            Ok(Some(NextRun::Interrupted)) => {}
             Ok(None) => break None,
             Err(_) => break cut_short_err(&Ok(DoneReason::Cancelled), s.stopped_by_user()),
+        }
+        if let Some((_, settle)) = &mut watch {
+            settle.outcome = Some(cancelled_run());
         }
     };
     drop(watch);
@@ -2086,7 +2126,17 @@ async fn prompt(
 /// waits. The next `:prompt()` sends it in the same request as its own
 /// message, just before it, so the first reply already reads it.
 ///
+/// With `interrupt`, a running `:prompt()` does not wait for the turn to end,
+/// nor for moved calls. The reply stops and running tools are cancelled (bash
+/// returns what it printed so far). The subagent then reads the message and
+/// carries on with its history intact, and `:prompt()` returns its answer as
+/// usual. If an `agent.user_message` layer drops the message, the subagent
+/// picks up the cut work instead. With no prompt running, the message waits
+/// like any other.
+///
 /// @param message string Message to deliver.
+/// @param opts table? Optional fields:
+///   `interrupt` (boolean?) - cut the running turn short. Default: `false`.
 /// @return (boolean?, string?) `true`, or `(nil, err)` when the session takes
 /// no more messages. The errors are the ones `:prompt()` refuses with. `true`
 /// means queued, not delivered: a message still waiting when the session
@@ -2095,21 +2145,38 @@ async fn prompt(
 /// -- From another task, while `sess:prompt()` is still running.
 /// local ok, err = sess:send("New finding: the bug is in parser.rs, focus there.")
 /// if not ok then maki.log.warn(err) end
+/// -- Stop a subagent heading the wrong way, mid tool call.
+/// sess:send("Stop, the bug is in lexer.rs, not parser.rs.", { interrupt = true })
 #[lua_fn]
-fn send(_lua: &Lua, this: &LuaSession, message: String) -> LuaResult<Pair<bool>> {
+fn send(
+    _lua: &Lua,
+    this: &LuaSession,
+    message: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<bool>> {
+    let interrupt = match opts {
+        Some(opts) => opts.opt::<bool>(INTERRUPT_OPT)?.unwrap_or(false),
+        None => false,
+    };
     // A held lock means a prompt is running, and a task stopped mid-prompt
     // holds it until the prompt unwinds. Without the fallback its message
     // would queue for a run that never reads it.
-    let refusal = match this.inner.try_lock() {
-        Ok(s) => s.refusal(),
-        Err(_) => this.cancellation.refusal(),
+    let (refusal, prompting) = match this.inner.try_lock() {
+        Ok(s) => (s.refusal(), false),
+        Err(_) => (this.cancellation.refusal(), true),
     };
     if let Some(refusal) = refusal {
         return Ok(err_pair(refusal));
     }
     // A sent message never picks the run's settings, so these are inert.
-    this.inbox
-        .push(plugin_input(message, RequestOptions::default()));
+    let input = plugin_input(message, RequestOptions::default());
+    // With no prompt there is nothing to cut, and firing the run token anyway
+    // would kill what tools left running past the last reply.
+    if interrupt && prompting {
+        this.inbox.interrupt(input);
+    } else {
+        this.inbox.push(input);
+    }
     Ok((Some(true), None))
 }
 
@@ -2210,6 +2277,11 @@ mod tests {
     const MOVED_CALL_ID: &str = "toolu_moved";
     const NOTICE_TEXT: &str = "Background bash toolu_moved (cargo build) finished:\n\nok";
     const SENT_MESSAGE: &str = "Wrap up now.";
+    const HANG_TOOL: &str = "hang";
+    const HANG_CALL_ID: &str = "toolu_hang";
+    const TOOL_CUT: &str = "cut short";
+    const CANCEL_MARKER: &str = "[Cancelled by user]";
+    const CUT_REPLY_NOTE: &str = "[Response cut off by user cancel]";
 
     #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
     #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
@@ -2366,7 +2438,7 @@ mod tests {
                             .unwrap();
                     assert_eq!(error.as_deref(), Some(SESSION_CLOSED_ERR));
                     let (_, error) =
-                        send(&lua, &sess.borrow().unwrap(), SESSION_PROMPT.into()).unwrap();
+                        send(&lua, &sess.borrow().unwrap(), SESSION_PROMPT.into(), None).unwrap();
                     assert_eq!(error.as_deref(), Some(SESSION_CLOSED_ERR));
                     assert!(started_rx.is_empty());
                 }
@@ -2552,7 +2624,7 @@ mod tests {
             release: release_rx,
         });
         let nudge = |sess: &AnyUserData| {
-            let sent = send(&lua, &sess.borrow().unwrap(), NUDGE.into()).unwrap();
+            let sent = send(&lua, &sess.borrow().unwrap(), NUDGE.into(), None).unwrap();
             assert_eq!(sent, (Some(true), None));
         };
         let run = async {
@@ -2596,6 +2668,158 @@ mod tests {
                     .subagent
                     .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
         }));
+    }
+
+    #[derive(Clone, Copy)]
+    enum Cut {
+        Reply,
+        ToolCall,
+    }
+
+    /// The first request streams a little and hangs, or calls a tool that
+    /// hangs, until the run is cancelled. Every later one answers.
+    struct SteeredProvider {
+        cut: Cut,
+        started: Sender<()>,
+        requests: Sender<Vec<Message>>,
+    }
+
+    impl Provider for SteeredProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a JsonValue,
+            events: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.requests.send(messages.to_vec()).unwrap();
+                let first = !messages.iter().any(|m| matches!(m.role, Role::Assistant));
+                let content = match (first, self.cut) {
+                    (false, _) => vec![ContentBlock::Text {
+                        text: CHILD_RESPONSE.into(),
+                    }],
+                    (true, Cut::Reply) => {
+                        events
+                            .send(ProviderEvent::TextDelta {
+                                text: PARTIAL_TEXT.into(),
+                            })
+                            .unwrap();
+                        self.started.send(()).unwrap();
+                        return std::future::pending().await;
+                    }
+                    (true, Cut::ToolCall) => {
+                        vec![ContentBlock::tool_use(HANG_CALL_ID, HANG_TOOL, json!({}))]
+                    }
+                };
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content,
+                        ..Default::default()
+                    },
+                    stop_reason: Some(StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn hang_tool(started: Sender<()>) -> LocalTool {
+        maki_agent::tools::local_tool(ToolAudience::all(), move |_, ctx| {
+            let started = started.clone();
+            Box::pin(async move {
+                started.send(()).unwrap();
+                ctx.cancel.cancelled().await;
+                Err(TOOL_CUT.into())
+            })
+        })
+    }
+
+    /// The cut turn stays in history, every tool call answered, and the
+    /// message follows the cancel marker. The same prompt then answers it.
+    #[test_case(Cut::Reply ; "mid_reply")]
+    #[test_case(Cut::ToolCall ; "mid_tool_call")]
+    #[tokio::test]
+    async fn an_interrupting_send_cuts_the_turn_and_the_prompt_goes_on(cut: Cut) {
+        let lua = Lua::new();
+        let (started_tx, started) = flume::unbounded();
+        let (requests_tx, requests) = flume::unbounded();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.provider = Arc::new(SteeredProvider {
+            cut,
+            started: started_tx.clone(),
+            requests: requests_tx,
+        });
+        let run = async {
+            let sess = native_session(&lua, &ctx).await;
+            sess.borrow::<LuaSession>()
+                .unwrap()
+                .inner
+                .lock()
+                .await
+                .local_tools = Arc::new(HashMap::from([(
+                HANG_TOOL.to_owned(),
+                hang_tool(started_tx),
+            )]));
+            let (result, ()) = futures::future::join(prompt_text(&lua, &sess), async {
+                started.recv_async().await.unwrap();
+                let sent = send(
+                    &lua,
+                    &sess.borrow().unwrap(),
+                    NUDGE.into(),
+                    Some(interrupt_opts(&lua)),
+                )
+                .unwrap();
+                assert_eq!(sent, (Some(true), None));
+            })
+            .await;
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+            assert_eq!(result, (Some(CHILD_RESPONSE.to_owned()), None));
+        };
+        timeout(SESSION_TIMEOUT, run)
+            .await
+            .expect("the interrupt never cut the turn");
+
+        let [first, second] = &requests.drain().collect::<Vec<_>>()[..] else {
+            panic!("expected the cut request and the one after it");
+        };
+        assert!(second.starts_with(first), "earlier messages were edited");
+        let answered: Vec<_> = second
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let called: Vec<_> = second
+            .iter()
+            .flat_map(|m| m.tool_uses().map(|(id, _, _)| id))
+            .collect();
+        assert_eq!(answered, called);
+        let appended = texts(&second[first.len()..]);
+        let (interrupt, cut_turn) = appended.split_last().unwrap();
+        assert!(interrupt.starts_with(INTERRUPT_OPEN) && interrupt.contains(NUDGE));
+        let cut_reply = format!("{PARTIAL_TEXT}\n\n{CUT_REPLY_NOTE}");
+        let expected = match cut {
+            Cut::Reply => vec![cut_reply.as_str(), CANCEL_MARKER],
+            Cut::ToolCall => vec![CANCEL_MARKER],
+        };
+        assert_eq!(cut_turn, expected);
+    }
+
+    fn interrupt_opts(lua: &Lua) -> Table {
+        let opts = lua.create_table().unwrap();
+        opts.set(INTERRUPT_OPT, true).unwrap();
+        opts
     }
 
     fn call(src: &str, input: JsonValue) -> Result<String, String> {
@@ -3565,7 +3789,7 @@ mod tests {
         let ((text, error), woken) = futures::future::join(prompt_text(&lua, &sess), async {
             requests.recv_async().await.unwrap();
             let session = sess.borrow::<LuaSession>().unwrap();
-            let (sent, _) = send(&lua, &session, SENT_MESSAGE.into()).unwrap();
+            let (sent, _) = send(&lua, &session, SENT_MESSAGE.into(), None).unwrap();
             assert_eq!(sent, Some(true));
             let woken = requests.recv_async().await.unwrap();
             mailbox.settle(MOVED_CALL_ID, None);
@@ -3581,6 +3805,23 @@ mod tests {
                 .iter()
                 .any(|text| text.contains(SENT_MESSAGE))
         );
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_with_no_prompt_running_only_queues() {
+        let lua = Lua::new();
+        let (ctx, _requests) = scripted_ctx();
+        let sess = native_session(&lua, &ctx).await;
+        assert_eq!(prompt_text(&lua, &sess).await.1, None);
+        {
+            let this = sess.borrow::<LuaSession>().unwrap();
+            let session_cancel = this.inner.lock().await.child_cancel.clone();
+            let run_cancel = this.inbox.run_cancel(&session_cancel);
+            send(&lua, &this, NUDGE.into(), Some(interrupt_opts(&lua))).unwrap();
+            assert!(!run_cancel.is_cancelled());
+            assert_eq!(this.inbox.texts(), [NUDGE]);
+        }
+        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
     }
 
     /// Its token fired with no prompt left to notice, so nothing would ever
@@ -3628,6 +3869,32 @@ mod tests {
         close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
     }
 
+    /// An interrupt does not wait for the moved call, unless the tab took its
+    /// message back and there is nothing new to run on.
+    #[test_case(false ; "wakes_now")]
+    #[test_case(true ; "taken_back_keeps_waiting")]
+    #[tokio::test]
+    async fn an_interrupt_ends_the_wait_for_moved_calls(taken_back: bool) {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(MOVED_CALL_ID);
+        let session = CancelToken::none();
+        let inbox = SubagentInbox::default();
+        let mut wait = pin!(next_run(&inbox, &mailbox, &session, None, false));
+        assert!((&mut wait).now_or_never().is_none());
+        inbox.interrupt(plugin_input(NUDGE.into(), RequestOptions::default()));
+        if taken_back {
+            inbox.remove(0);
+            assert!((&mut wait).now_or_never().is_none());
+            mailbox.settle(MOVED_CALL_ID, Some(moved_call_notice(true)));
+        }
+        let next = wait.await.unwrap();
+        if taken_back {
+            assert!(matches!(next, Some(NextRun::Wake(_))));
+        } else {
+            assert!(matches!(next, Some(NextRun::Interrupted)));
+        }
+    }
+
     #[tokio::test]
     async fn a_caller_cancel_ends_the_wait_for_moved_calls() {
         let mailbox = SessionMailbox::register(MakiId::generate());
@@ -3635,7 +3902,7 @@ mod tests {
         let session = CancelToken::none();
         let (caller_trigger, caller) = CancelToken::new();
         let inbox = SubagentInbox::default();
-        let mut wake = pin!(next_wake(&mailbox, &inbox, &session, Some(&caller)));
+        let mut wake = pin!(next_run(&inbox, &mailbox, &session, Some(&caller), false));
         assert!((&mut wake).now_or_never().is_none());
         caller_trigger.cancel();
         assert!(wake.await.is_err());
