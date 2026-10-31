@@ -474,6 +474,10 @@ impl Chat {
         self.messages_panel.toggle_click(row, area)
     }
 
+    pub fn has_tool(&self, tool_id: &str) -> bool {
+        self.messages_panel.has_tool(tool_id)
+    }
+
     pub fn tool_snapshot(
         &mut self,
         tool_id: &str,

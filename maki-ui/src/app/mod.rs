@@ -2465,8 +2465,9 @@ impl App {
         }
     }
 
-    /// Run-scoped delivery for the tab's own agent: restore snapshots fan out
-    /// to every chat, stale runs are dropped, the rest goes to [`Self::deliver`].
+    /// Run-scoped delivery for the tab's own agent: restore snapshots go to
+    /// the chats that have the tool, stale runs are dropped, the rest goes to
+    /// [`Self::deliver`].
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
@@ -2482,12 +2483,17 @@ impl App {
                 } => (id, snapshot, theme_gen, true),
                 _ => return vec![],
             };
-            for chat in &mut self.chats {
+            let mut delivered = false;
+            for chat in self.chats.iter_mut().filter(|chat| chat.has_tool(&id)) {
+                delivered = true;
                 if is_header {
                     chat.tool_header_snapshot(&id, snapshot.clone(), theme_gen);
                 } else {
                     chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
                 }
+            }
+            if !delivered {
+                tracing::debug!(tool_id = %id, "restore snapshot dropped: no chat has this tool");
             }
             return vec![];
         }
