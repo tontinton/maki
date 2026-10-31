@@ -23,7 +23,6 @@ use maki_storage::auth::{
     load_tokens, lock_credentials, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
-use tokio::runtime::Handle;
 
 use crate::provider_scripts;
 
@@ -34,7 +33,7 @@ const FROM_ENV: &str = "\x1b[33m~\x1b[0m";
 const UNCONFIGURED: &str = " ";
 const PLAN_PREVIEW_PATH: &str = "plan.md";
 
-pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
+pub async fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
         Some("openai") => openai_auth::login(storage)?,
         Some("xai") => xai_auth::login(storage)?,
@@ -48,15 +47,15 @@ pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
             {
                 login_catalog_provider(&provider_data, storage)?;
             } else {
-                login_provider(&slug, storage)?;
+                login_provider(&slug, storage).await?;
             }
         }
-        None => login_interactive(storage)?,
+        None => login_interactive(storage).await?,
     }
     Ok(())
 }
 
-fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
+async fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     let builtin = builtin_provider(slug);
     let is_custom = ProvidersConfig::load().get(slug).is_some();
     if builtin.is_none() && !plugin::is_registered(slug) && !is_custom {
@@ -70,7 +69,7 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     // A plugin with neither has no way in, which `plugin::login` reports.
     let hooked = plugin::auth_providers().iter().any(|(s, _)| s == slug);
     if hooked || (builtin.is_none() && plugin::is_registered(slug)) {
-        Handle::current().block_on(plugin::login(slug))?;
+        plugin::login(slug).await?;
         return Ok(());
     }
 
@@ -176,7 +175,7 @@ fn known_outside_catalog(slug: &str, catalog_slugs: &[String]) -> bool {
     !catalog_slugs.is_empty() && !catalog_slugs.iter().any(|known| known == slug)
 }
 
-fn login_interactive(storage: &StateDir) -> Result<()> {
+async fn login_interactive(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
     // Status, slug, display name, and the models.dev entry a catalog row logs
     // in through.
@@ -238,7 +237,7 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
     };
     match catalog {
         Some(provider) => login_catalog_provider(&provider, storage),
-        None => login_provider(&slug, storage),
+        None => login_provider(&slug, storage).await,
     }
 }
 
@@ -443,7 +442,7 @@ fn prompt_api_key(url: Option<&str>, display_name: &str, optional: bool) -> Resu
     Ok(api_key)
 }
 
-pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
+pub async fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     let slug = slugify(provider);
     match provider {
         "openai" => openai_auth::logout(storage)?,
@@ -455,7 +454,7 @@ pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
             // cooperating. The hook goes first, while a token it may want to
             // revoke upstream still exists, and a hook that fails is reported
             // only once the local credentials are gone.
-            let hook = Handle::current().block_on(plugin::logout(&slug));
+            let hook = plugin::logout(&slug).await;
             let removed_key =
                 delete_provider_credentials(storage, &slug).context("delete credentials")?;
             let removed_login = {
@@ -599,9 +598,14 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMode) -> Result<()> {
+pub async fn models(
+    no_plugins: bool,
+    no_jit: bool,
+    refresh: bool,
+    trust_mode: TrustMode,
+) -> Result<()> {
     // Model listing calls plugin hooks, so the host outlives the fetch.
-    let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
+    let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode).await?;
 
     let mut refresh_failure = None;
     if refresh {
@@ -611,7 +615,7 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
         }
     }
 
-    Handle::current().block_on(fetch_all_models(
+    fetch_all_models(
         &config.provider.model_policy,
         |batch| {
             for model in batch.models {
@@ -622,7 +626,8 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
             }
         },
         None,
-    ));
+    )
+    .await;
 
     if let Some(e) = refresh_failure {
         bail!("catalog refresh failed, keeping existing cache: {e}");
@@ -630,10 +635,15 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
     Ok(())
 }
 
-pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
+pub async fn index(
+    path: &str,
+    no_plugins: bool,
+    no_jit: bool,
+    trust_mode: TrustMode,
+) -> Result<()> {
     // Load-bearing binding: `index` is a Lua builtin, and dropping the host
     // stops the Lua thread the tool runs on.
-    let (_host, _config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
+    let (_host, _config) = super::cli_stack(no_plugins, no_jit, trust_mode).await?;
 
     let abs_path = Path::new(path)
         .canonicalize()
@@ -648,7 +658,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
         .parse(&input)
         .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
     let ctx = maki_agent::tools::cli_tool_ctx();
-    let result = Handle::current().block_on(inv.execute(&ctx));
+    let result = inv.execute(&ctx).await;
     match result.output {
         Ok(output) => print!("{}", output.as_text()),
         Err(e) => bail!("index failed: {e}"),
@@ -656,40 +666,38 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
     Ok(())
 }
 
-pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
-    Handle::current().block_on(async {
-        let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-        let trust = project::resolve(storage, &cwd, trust_mode);
-        super::report_warnings(trust.notices());
-        let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
-        let raw = config
-            .mcp
-            .get(server)
-            .ok_or_else(|| color_eyre::eyre::eyre!("unknown MCP server: {server}"))?;
-        let origin = config.origins.get(server).cloned().unwrap_or_default();
-        let (url, oauth, ca_file) =
-            match mcp_config::parse_server(server.to_owned(), raw.clone(), &origin)?.transport {
-                mcp_config::Transport::Http {
-                    url,
-                    oauth,
-                    ca_file,
-                    ..
-                } => (url, oauth, ca_file),
-                _ => color_eyre::eyre::bail!("server '{server}' is not an HTTP transport"),
-            };
-        mcp_oauth::authenticate(
-            server,
-            &url,
-            None,
-            storage,
-            mcp_oauth::Interaction::Cli,
-            oauth,
-            ca_file.as_deref(),
-        )
-        .await?;
-        eprintln!("Successfully authenticated with MCP server '{server}'");
-        Ok(())
-    })
+pub async fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    let trust = project::resolve(storage, &cwd, trust_mode);
+    super::report_warnings(trust.notices());
+    let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
+    let raw = config
+        .mcp
+        .get(server)
+        .ok_or_else(|| color_eyre::eyre::eyre!("unknown MCP server: {server}"))?;
+    let origin = config.origins.get(server).cloned().unwrap_or_default();
+    let (url, oauth, ca_file) =
+        match mcp_config::parse_server(server.to_owned(), raw.clone(), &origin)?.transport {
+            mcp_config::Transport::Http {
+                url,
+                oauth,
+                ca_file,
+                ..
+            } => (url, oauth, ca_file),
+            _ => color_eyre::eyre::bail!("server '{server}' is not an HTTP transport"),
+        };
+    mcp_oauth::authenticate(
+        server,
+        &url,
+        None,
+        storage,
+        mcp_oauth::Interaction::Cli,
+        oauth,
+        ca_file.as_deref(),
+    )
+    .await?;
+    eprintln!("Successfully authenticated with MCP server '{server}'");
+    Ok(())
 }
 
 pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
@@ -702,7 +710,7 @@ pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn prompt(
+pub async fn prompt(
     variant: &crate::cli::PromptVariant,
     plan: bool,
     tools: bool,
@@ -722,7 +730,7 @@ pub fn prompt(
         bail!("--plan can only be used with the 'system' prompt variant");
     }
 
-    let (host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
+    let (host, config) = super::cli_stack(no_plugins, no_jit, trust_mode).await?;
 
     let vars = template::env_vars();
     let reg = ToolRegistry::global_arc();
