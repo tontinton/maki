@@ -19,6 +19,7 @@ use maki_providers::{shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
+use tokio::sync::watch;
 use tokio::time::sleep;
 
 use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
@@ -288,6 +289,11 @@ pub(crate) struct JobStore {
     /// Id served by the last [`JobStore::next_matching`], so the next scan
     /// starts past it.
     scan_cursor: u32,
+    /// Bumped by anything a pump could act on, so pumps park instead of
+    /// polling. A `watch`, because each pump keeps its own place in it: a bump
+    /// landing while a pump is busy delivering still wakes it afterwards. The
+    /// store outlives every pump, each one holds the `Lua` that owns it.
+    changed: watch::Sender<()>,
 }
 
 struct CheckedOutReceiver {
@@ -302,7 +308,14 @@ impl JobStore {
             jobs: HashMap::new(),
             next_id: 1,
             scan_cursor: 0,
+            changed: watch::Sender::new(()),
         }
+    }
+
+    /// Subscribe before the first scan: a change after this point wakes the
+    /// next `changed()`, even if it landed before the scan finished.
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        self.changed.subscribe()
     }
 
     pub fn start(&mut self, spec: JobSpec) -> Result<u32, String> {
@@ -357,7 +370,7 @@ impl JobStore {
 
         // The owner exists before any thread does, so a failed spawn below
         // still closes the queue on a reader that is already waiting on it.
-        let (sender, events, queue) = job_queue();
+        let (sender, events, queue) = job_queue(self.changed.clone());
 
         macro_rules! spawn_reader {
             ($stream:expr, $name:expr, $variant:ident) => {
@@ -479,6 +492,7 @@ impl JobStore {
             && job.event_rx.is_none()
         {
             job.event_rx = Some(receiver);
+            self.changed.send_replace(());
         }
     }
 
@@ -637,6 +651,7 @@ impl JobStore {
         }
         if matches!(updates.on_exit, CallbackUpdate::Set(_)) {
             job.replay_exit = job.exit_code;
+            self.changed.send_replace(());
         }
         updates.on_stdout.apply(lua, &mut job.on_stdout);
         updates.on_stderr.apply(lua, &mut job.on_stderr);
@@ -727,6 +742,7 @@ impl JobStore {
             {
                 lua.remove_registry_value(key).ok();
             }
+            self.changed.send_replace(());
         }
     }
 
@@ -908,12 +924,13 @@ impl Drop for QueueOwner {
 }
 
 /// The sending, receiving and owning ends of one job's queue.
-fn job_queue() -> (JobEventSender, JobEvents, QueueOwner) {
+fn job_queue(changed: watch::Sender<()>) -> (JobEventSender, JobEvents, QueueOwner) {
     let (tx, rx) = flume::unbounded();
     let queue = Arc::new(JobQueue::default());
     let sender = JobEventSender {
         tx,
         queue: Arc::clone(&queue),
+        changed,
     };
     let events = JobEvents {
         rx,
@@ -926,6 +943,7 @@ fn job_queue() -> (JobEventSender, JobEvents, QueueOwner) {
 struct JobEventSender {
     tx: flume::Sender<JobEvent>,
     queue: Arc<JobQueue>,
+    changed: watch::Sender<()>,
 }
 
 impl JobEventSender {
@@ -944,7 +962,10 @@ impl JobEventSender {
         self.queue
             .bytes
             .fetch_add(queued_bytes(&event), Ordering::AcqRel);
-        self.tx.send(event).is_ok()
+        self.tx
+            .send(event)
+            .inspect(|()| self.changed.send_replace(()))
+            .is_ok()
     }
 }
 
@@ -1017,8 +1038,8 @@ fn kill_job(job: &JobMeta) {
 ///     with the current call. `"plugin"` keeps it alive until the plugin
 ///     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
 ///     session ends, and survives plugin reload.
-///   `tail` (integer?) trailing lines per stream kept for `jobinfo`
-///     (default 20, 0 disables, max 1024).
+///   `tail` (integer?) trailing lines per stream kept for `jobinfo` and
+///     `jobwait` (default 20, 0 disables, max 1024).
 ///   `max_line_bytes` (integer?) longest line delivered, in bytes. A longer
 ///     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
 ///     skipped without being read into memory (default and `0`: 64 MiB, the
@@ -1371,12 +1392,12 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 }
 
 /// Wait for a job to finish and collect its output. Returns a result
-/// table with `stdout`, `stderr`, `exit_code`, and `truncated`. A job that
-/// already exited answers from its captured tail, so `truncated` says
-/// whether that tail ever lost a line (`tail` too small or 0, or the stream
-/// redirected away). Waiting on a live job collects every line and is never
-/// truncated. Neither counts lines cut by `max_line_bytes`: those still
-/// arrive, ending in `...`.
+/// table with `stdout`, `stderr`, `exit_code`, and `truncated`. The output
+/// starts from the job's captured tail, which holds what was delivered before
+/// the wait, and a live job adds every line from then on. `truncated` says
+/// whether that tail had already lost a line by then (`tail` too small or 0,
+/// or the stream redirected away). It doesn't count lines cut by
+/// `max_line_bytes`: those still arrive, ending in `...`.
 ///
 /// While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 /// callbacks fire as events arrive (like Neovim), so you can stream
@@ -1403,9 +1424,10 @@ async fn jobwait(
     timeout_ms: Option<u64>,
 ) -> LuaResult<Pair<Table>> {
     let task_id = active_task_id(&lua);
-    if let Some(snap) = with_jobs(&lua, |store| store.snapshot(job_id, task_id, &plugin))
-        && let Some(code) = snap.exit_code
-    {
+    let Some(snap) = with_jobs(&lua, |store| store.snapshot(job_id, task_id, &plugin)) else {
+        return Ok(err_pair(JOB_UNWAITABLE_ERR));
+    };
+    if let Some(code) = snap.exit_code {
         return wait_result(
             &lua,
             &snap.stdout_lines,
@@ -1423,8 +1445,10 @@ async fn jobwait(
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_WAIT_MS));
     let mut deadline = pin!(sleep(timeout));
 
-    let mut stdout_lines = Vec::new();
-    let mut stderr_lines = Vec::new();
+    // A pump delivers until the receiver is checked out, and only the tail
+    // remembers those lines.
+    let mut stdout_lines = snap.stdout_lines;
+    let mut stderr_lines = snap.stderr_lines;
 
     let exit_code = loop {
         let event = tokio::select! {
@@ -1449,7 +1473,13 @@ async fn jobwait(
         }
     };
 
-    wait_result(&lua, &stdout_lines, &stderr_lines, exit_code, false)
+    wait_result(
+        &lua,
+        &stdout_lines,
+        &stderr_lines,
+        exit_code,
+        snap.dropped_output,
+    )
 }
 
 /// The single shape `jobwait` answers with, so its two paths cannot drift
@@ -1628,6 +1658,7 @@ mod tests {
     #[cfg(unix)]
     use crate::api::fs::LINE_CUT_MARKER;
     use crate::api::util::command::{NO_UI_ERR, WinView};
+    use futures::FutureExt;
 
     const TEST_PLUGIN: &str = "test-plugin";
     const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1959,7 +1990,7 @@ mod tests {
         const QUEUED_PER_JOB: usize = 2;
         let mut store = make_store();
         for id in [1, 2] {
-            let (sender, events, queue) = job_queue();
+            let (sender, events, queue) = job_queue(store.changed.clone());
             for _ in 0..QUEUED_PER_JOB {
                 sender.send(JobEvent::Stdout("spam".into()));
             }
@@ -2387,6 +2418,35 @@ mod tests {
             (false, false, false),
             "completing on the replay must release the callback it used"
         );
+    }
+
+    #[test]
+    fn every_change_a_pump_can_act_on_wakes_it() {
+        let lua = Lua::new();
+        let mut store = make_store();
+        let (sender, events, queue) = job_queue(store.changed.clone());
+        let mut job = stub_job(plugin_owner(), None, None);
+        job.event_rx = Some(events);
+        job._queue = queue;
+        job.exit_code = Some(0);
+        store.jobs.insert(1, job);
+        let mut changed = store.subscribe();
+        let mut woke = || changed.changed().now_or_never().is_some();
+        assert!(!woke(), "subscribing is not a change");
+
+        sender.send(JobEvent::Stdout("line".into()));
+        assert!(woke(), "a queued event");
+
+        let receiver = store.take_receiver(1, None, TEST_PLUGIN).unwrap();
+        assert!(!woke(), "checking the receiver out hides events");
+        store.restore_receiver(1, receiver);
+        assert!(woke(), "a returned receiver may hold events");
+
+        assert!(store.attach(&lua, 1, None, TEST_PLUGIN, exit_updates(&lua)));
+        assert!(woke(), "an exit replayed to a new on_exit");
+
+        store.finish(&lua, 1);
+        assert!(woke(), "a job leaving is what ends a dispatch");
     }
 
     #[test]
