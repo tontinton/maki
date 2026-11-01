@@ -1,0 +1,104 @@
+{
+  "call": {
+    "endpoint": "discovered",
+    "model": "mistral/mistral-medium-latest",
+    "thinking": {
+      "kind": "effort",
+      "level": "medium"
+    }
+  },
+  "script": [
+    {
+      "body": "{\"object\": \"list\", \"data\": [{\"id\": \"mistral-medium-latest\", \"object\": \"model\", \"capabilities\": {\"completion_chat\": true, \"reasoning\": true, \"vision\": true}, \"max_context_length\": 1000000}, {\"id\": \"mistral-small-latest\", \"object\": \"model\", \"capabilities\": {\"completion_chat\": true, \"reasoning\": true, \"vision\": true}, \"max_context_length\": 1000000}]}\n",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "status": 200
+    },
+    {
+      "body": "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\" there\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n\n",
+      "headers": {
+        "content-type": "text/event-stream"
+      },
+      "status": 200
+    }
+  ],
+  "expected": {
+    "discovery": {
+      "models": [
+        {
+          "context_window": 1000000,
+          "id": "mistral-medium-latest",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": true,
+          "supports_vision": true,
+          "tier": null
+        },
+        {
+          "context_window": 1000000,
+          "id": "mistral-small-latest",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": true,
+          "supports_vision": true,
+          "tier": null
+        }
+      ]
+    },
+    "events": [
+      {
+        "TextDelta": {
+          "text": "there"
+        }
+      }
+    ],
+    "outcome": {
+      "context_size": 3,
+      "message": {
+        "content": [
+          {
+            "text": "there",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      "stop_reason": "end_turn",
+      "usage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 3,
+        "output_tokens": 1
+      }
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/models"
+      },
+      {
+        "body": "{\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"}],\"model\":\"mistral-medium-latest\",\"reasoning_effort\":\"high\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "content-length": "397",
+          "content-type": "application/json",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "POST",
+        "path": "/v1/chat/completions"
+      }
+    ]
+  }
+}

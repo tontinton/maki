@@ -1,5 +1,6 @@
 mod child_env;
 pub(crate) mod error;
+pub mod http;
 pub(crate) mod image;
 pub(crate) mod manifest;
 pub mod model;
@@ -30,6 +31,7 @@ pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,
     catalog_providers_if_available, refresh_catalog, warm_catalog,
 };
+pub use providers::client_builder;
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::custom;
 pub use providers::openai::auth as openai_auth;
@@ -43,7 +45,7 @@ pub use types::{
     EffortDialect, FACTS_WITHOUT_CONTEXT_UPDATE, IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE,
     IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource, InputTransformation,
     Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ThinkingFallback,
-    UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model, dialect,
-    is_deferred_tool,
+    StopReason, StreamResponse, THINKING_USAGE, TaskEnd, TaskSettled, ThinkingConfig,
+    ThinkingFallback, UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model,
+    dialect, is_deferred_tool,
 };

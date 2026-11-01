@@ -8,7 +8,7 @@
 //! `MakiId` canonical form.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::mem;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ use std::time::Instant;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::Sender;
-use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
+use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedPrompts;
@@ -25,24 +25,28 @@ use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, InputSource,
-    PermissionsConfig, SessionEndReason, SessionEvents, SteerKind,
+    PermissionsConfig, RunTotals, SessionEndReason, SessionEvents, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
-use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
+use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::cli::Cli;
+use crate::interrupt::Interrupt;
 
 /// An accepted observation's line, such as a background result. It goes out
 /// live only, since the SDK has no history replay.
-const NOTICE_SUBTYPE: &str = "notice";
+pub(crate) const NOTICE_SUBTYPE: &str = "notice";
+const BACKGROUND_USAGE_SUBTYPE: &str = "background_usage";
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("bash", "Bash"),
     ("read", "Read"),
@@ -520,11 +524,6 @@ impl Permissions {
         }
     }
 
-    /// The turn is over, so the agent is no longer parked on any of these.
-    fn forget_outstanding(&mut self) {
-        self.outstanding.clear();
-    }
-
     /// No further answers can arrive. Idempotent.
     fn close(&mut self) {
         self.answerable = false;
@@ -537,11 +536,15 @@ impl Permissions {
 struct Shared {
     model: Model,
     permission_mode: PermissionMode,
-    turn_start: Instant,
+    /// When the turn the next result answers started: the prompt that sent
+    /// it, or the first event of a turn nobody prompted. Taken by the result.
+    turn_start: Option<Instant>,
     permissions: Permissions,
 }
 
-pub fn run(params: SdkParams) -> Result<()> {
+/// Hands back the interrupt it ran under, for the caller to exit with once
+/// the plugin host is down.
+pub async fn run(params: SdkParams) -> Result<Interrupt> {
     let SdkParams {
         cli,
         resumed,
@@ -563,12 +566,13 @@ pub fn run(params: SdkParams) -> Result<()> {
         config.max_turns = Some(max);
     }
     let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
+    let interrupt = Interrupt::install();
+    let stop = interrupt.stop();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
 
-    let (mcp_handle, mcp_config_errors) =
-        smol::block_on(mcp::start_connected(&cwd, project_config.clone()));
+    let (mcp_handle, mcp_config_errors) = mcp::start_connected(&cwd, project_config.clone()).await;
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -587,6 +591,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         claim,
         storage,
         yolo: permission_mode == PermissionMode::BypassPermissions,
+        unattended: false,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         defaults,
@@ -594,6 +599,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         plugin_rules,
         project_config,
         local_tools: Default::default(),
+        background: BackgroundMode::from_wait(cli.background_wait()),
+        stop: stop.clone(),
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -632,7 +639,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let shared = Arc::new(Mutex::new(Shared {
         model: startup_model.clone(),
         permission_mode,
-        turn_start: Instant::now(),
+        turn_start: None,
         permissions: Permissions::new(handle.answer_tx.clone()),
     }));
 
@@ -659,7 +666,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         synth: StreamSynth::new(),
         tool_inputs: HashMap::new(),
         result_text: String::new(),
-        cost: None,
+        reported: RunTotals::default(),
+        run_id: None,
         request_counter: 0,
         lua_handle: lua_handle.clone(),
         session_id: handle.session_id.to_string(),
@@ -667,8 +675,12 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
     .spawn(events);
 
-    for line in io::stdin().lock().lines() {
-        let line = line.context("read stdin")?;
+    // Read on a blocking thread, so a stop does not wait for the next line.
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    while let Ok(next) = stop.race(lines.next_line()).await {
+        let Some(line) = next.context("read stdin")? else {
+            break;
+        };
         if line.is_empty() {
             continue;
         }
@@ -691,7 +703,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                 let images = content_images(&content);
                 let mode = {
                     let mut shared = shared.lock().unwrap();
-                    shared.turn_start = Instant::now();
+                    shared.turn_start.get_or_insert_with(Instant::now);
                     shared.permission_mode
                 };
                 let input = AgentInput::from_defaults(
@@ -718,6 +730,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                     &shared,
                     &startup_model,
                     &model_policy,
+                    &cwd,
                 )?;
             }
             "control_response" => {
@@ -758,22 +771,43 @@ pub fn run(params: SdkParams) -> Result<()> {
         input_tx,
         task,
         session_id,
+        spend,
         ..
     } = handle;
     drop(input_tx);
-    smol::block_on(async {
-        // Unbounded: the pump ends at the stream marker, which the session
-        // emits once it has answered every prompt stdin queued.
-        pump.await;
-        headless::await_shutdown(task).await;
-    });
+    // Unbounded: the pump ends at the stream marker, which the session
+    // emits once it has answered every prompt stdin queued.
+    let reported = pump.await.context("event pump")?;
+    let track = headless::await_shutdown(task).await;
     // Reaps session-owned plugin jobs before the writer thread joins: an
     // orphan inheriting stdout would keep an orchestrator's read blocked
     // after maki exits.
     lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+    // Background work and plugin jobs are stopped by now, so nothing spends
+    // any more. Dropping the track saves the full bill, also what no result
+    // was left to report.
+    drop(track);
+    if let Err(e) = emit_unreported(&writer, spend.totals().since(&reported)) {
+        warn!(error = %e, "failed to report background usage");
+    }
     drop(writer);
     let _ = writer_thread.join();
-    Ok(())
+    Ok(interrupt)
+}
+
+/// What background work spent that no result carried, because it paid after
+/// the last one. Results keep their shape, so it gets a message of its own.
+fn emit_unreported(writer: &SdkWriter, unreported: RunTotals) -> Result<()> {
+    if unreported.usage == TokenUsage::default() {
+        return Ok(());
+    }
+    writer.emit_system(
+        BACKGROUND_USAGE_SUBTYPE,
+        serde_json::json!({
+            "total_cost_usd": unreported.cost.unwrap_or_default(),
+            "usage": unreported.usage,
+        }),
+    )
 }
 
 fn parse_or_warn<T: serde::de::DeserializeOwned>(payload: Value, what: &str) -> Option<T> {
@@ -825,6 +859,7 @@ fn handle_control_request(
     shared: &Mutex<Shared>,
     startup_model: &Model,
     model_policy: &ModelPolicy,
+    cwd: &Path,
 ) -> Result<()> {
     let ok = Some(Value::Object(Default::default()));
     match cr.request.subtype.as_str() {
@@ -849,6 +884,7 @@ fn handle_control_request(
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
                     shared.lock().unwrap().permission_mode = mode;
+                    handle.switch_mode(mode.agent_mode(cwd));
                     writer.emit_control_response(&cr.request_id, ok, None)
                 }
                 None => writer.emit_control_response(
@@ -937,9 +973,10 @@ struct EventPump {
     synth: StreamSynth,
     tool_inputs: HashMap<String, (String, Value)>,
     result_text: String,
-    /// Summed as the turns land: rates move mid-prompt, and only a turn knows
-    /// the rate it paid.
-    cost: Option<f64>,
+    /// What every result so far reported.
+    reported: RunTotals,
+    /// The run the last event belonged to. A new one starts a turn.
+    run_id: Option<u64>,
     request_counter: u64,
     lua_handle: maki_lua::EventHandle,
     session_id: String,
@@ -947,8 +984,9 @@ struct EventPump {
 }
 
 impl EventPump {
-    fn spawn(mut self, mut events: SessionEvents) -> smol::Task<()> {
-        smol::spawn(async move {
+    /// Ends with what its results reported.
+    fn spawn(mut self, mut events: SessionEvents) -> JoinHandle<RunTotals> {
+        tokio::spawn(async move {
             while let Some(envelope) = events.next().await {
                 // Folded in first, so a plugin handling `TurnEnd` finds the
                 // finished totals when it calls `maki.session.read()`.
@@ -964,6 +1002,7 @@ impl EventPump {
                     break;
                 }
             }
+            self.reported
         })
     }
 
@@ -982,8 +1021,6 @@ impl EventPump {
         self.synth.reset();
         self.tool_inputs.clear();
         self.result_text.clear();
-        self.cost = None;
-        self.shared.lock().unwrap().permissions.forget_outstanding();
     }
 
     fn emit_turn_result(
@@ -991,11 +1028,18 @@ impl EventPump {
         is_error: bool,
         result: String,
         num_turns: u32,
-        usage: TokenUsage,
+        totals: RunTotals,
     ) -> Result<()> {
-        let duration_ms = self.shared.lock().unwrap().turn_start.elapsed().as_millis();
+        let duration_ms = self
+            .shared
+            .lock()
+            .unwrap()
+            .turn_start
+            .take()
+            .map_or(0, |start| start.elapsed().as_millis());
+        self.reported += totals;
         // Zero on an unpriced model, which is what its turns reported too.
-        let total_cost_usd = self.cost.unwrap_or_default();
+        let total_cost_usd = totals.cost.unwrap_or_default();
         self.writer.emit(WireInner::Result(ResultPayload {
             subtype: if is_error {
                 "error_during_execution"
@@ -1008,7 +1052,7 @@ impl EventPump {
             num_turns,
             result,
             total_cost_usd,
-            usage,
+            usage: totals.usage,
             permission_denials: Vec::new(),
         }))?;
         self.reset_turn();
@@ -1016,6 +1060,14 @@ impl EventPump {
     }
 
     fn handle(&mut self, envelope: Envelope) -> Result<()> {
+        // A woken turn has no prompt to time it from.
+        if self.run_id.replace(envelope.run_id) != Some(envelope.run_id) {
+            self.shared
+                .lock()
+                .unwrap()
+                .turn_start
+                .get_or_insert_with(Instant::now);
+        }
         let parent_tool_use_id = envelope
             .subagent
             .as_ref()
@@ -1055,6 +1107,8 @@ impl EventPump {
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
+            | AgentEvent::ToolMovable { .. }
+            | AgentEvent::ToolParts { .. }
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
@@ -1076,7 +1130,7 @@ impl EventPump {
                 text,
             } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
             AgentEvent::Steered { .. } => {}
-            AgentEvent::ObservationLine { text } if parent_tool_use_id.is_none() => {
+            AgentEvent::ObservationLine { text, .. } if parent_tool_use_id.is_none() => {
                 self.writer
                     .emit_system(NOTICE_SUBTYPE, serde_json::json!({ "text": text }))?;
             }
@@ -1096,7 +1150,6 @@ impl EventPump {
                 )?;
             }
             AgentEvent::TurnComplete(tc) => {
-                add_cost(&mut self.cost, tc.cost);
                 if self.include_partial_messages {
                     let events = self.synth.finish_message(&tc.usage);
                     self.emit_stream(events)?;
@@ -1169,6 +1222,8 @@ impl EventPump {
             }
             AgentEvent::Done {
                 usage,
+                cost,
+                list_cost,
                 num_turns,
                 reason,
                 ..
@@ -1183,10 +1238,17 @@ impl EventPump {
                     | DoneReason::Compact => false,
                 };
                 let result = mem::take(&mut self.result_text);
-                self.emit_turn_result(is_error, result, *num_turns, *usage)?;
+                let totals = RunTotals {
+                    usage: *usage,
+                    cost: *cost,
+                    list_cost: *list_cost,
+                };
+                self.emit_turn_result(is_error, result, *num_turns, totals)?;
             }
-            AgentEvent::Error { message, .. } => {
-                self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
+            AgentEvent::Error {
+                message, totals, ..
+            } => {
+                self.emit_turn_result(true, message.clone(), 0, *totals)?;
             }
         }
         Ok(())
@@ -1217,6 +1279,8 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use flume::Receiver;
     use maki_agent::SubagentInfo;
     use maki_config::ToolKey;
@@ -1620,9 +1684,21 @@ mod tests {
     const NOTICE_CHILD: &str = "child-1";
     const NO_CONTROL_REQUEST: &str = "a request nobody can answer must not go on the wire";
     const NO_ANSWER: &str = "answer sent with nobody parked on it";
-    const SOURCE_OPEN: &str = "a turn end must not close the answer source";
+    const STALE_PROMPT_AGE: Duration = Duration::from_secs(10);
+    const WOKEN_RUN: u64 = 1;
+    const TIMED_FROM_PROMPT: &str = "a prompted turn is timed from its prompt";
+    const TIMED_FROM_WAKE: &str = "a woken turn must not be timed from the last prompt";
+    const ANSWER_OUTLIVES_TURN: &str =
+        "a call moved off its turn can still be parked on its ask after the turn result";
     const OUTSTANDING_REQ: &str = "req_1";
+    const RESULT_INPUT_TOKENS: u32 = 1_000;
+    const RESULT_COST: f64 = 0.25;
+    const LATE_INPUT_TOKENS: u32 = 300;
+    const LATE_COST: f64 = 0.5;
+    const UNREPORTED_ONLY: &str =
+        "only spend that no result carried may be reported after the last one";
     const LATE_REQ: &str = "req_2";
+    const RESULT_BILLED: &str = "a result must carry its run's bill, also when the run failed";
 
     /// Every answer in these tests belongs to the one ask `permission_request`
     /// makes, and the agent only takes an answer naming it.
@@ -1644,14 +1720,15 @@ mod tests {
             shared: Arc::new(Mutex::new(Shared {
                 model: Model::from_spec(TEST_MODEL_SPEC).unwrap(),
                 permission_mode,
-                turn_start: Instant::now(),
+                turn_start: None,
                 permissions: Permissions::new(answer_tx),
             })),
             include_partial_messages: false,
             synth: StreamSynth::new(),
             tool_inputs: HashMap::new(),
             result_text: String::new(),
-            cost: None,
+            reported: RunTotals::default(),
+            run_id: None,
             request_counter: 0,
             lua_handle: maki_lua::EventHandle::disconnected_for_test(),
             session_id: session_id.to_string(),
@@ -1676,8 +1753,8 @@ mod tests {
     /// The SDK hang: `retained` is the Lua tool context that keeps a sender
     /// alive on an idle VM, so the pump has to end on the stream marker and
     /// still report everything queued ahead of it.
-    #[test]
-    fn pump_ends_at_stream_close_with_a_retained_sender() {
+    #[tokio::test]
+    async fn pump_ends_at_stream_close_with_a_retained_sender() {
         let (guard, events) = maki_agent::event_stream();
         let retained = guard.sender(0);
         let (pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
@@ -1687,10 +1764,11 @@ mod tests {
             .send(AgentEvent::Error {
                 message: PUMP_ERROR.into(),
                 auth: false,
+                totals: RunTotals::default(),
             })
             .unwrap();
         drop(guard);
-        smol::block_on(pump);
+        pump.await.unwrap();
 
         let line = out_rx.try_recv().expect(PUMP_FORWARDED);
         assert!(line.contains(PUMP_ERROR), "got: {line}");
@@ -1719,8 +1797,7 @@ mod tests {
 
     /// Every answer has to match an id the agent is actually parked on. A
     /// spare one would be picked up by the *next* turn's request and
-    /// auto-answer it, which is also why a turn end forgets its ids silently
-    /// instead of denying them the way `close` does.
+    /// auto-answer it.
     #[test]
     fn only_requests_the_agent_waits_on_get_answered() {
         let (answer_tx, answer_rx) = flume::unbounded();
@@ -1738,19 +1815,30 @@ mod tests {
 
         permissions.resolve(OUTSTANDING_REQ, PermissionAnswer::AllowOnce);
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+    }
 
-        assert!(permissions.ask(LATE_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
-        permissions.forget_outstanding();
-        permissions.resolve(LATE_REQ, PermissionAnswer::AllowOnce);
-        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+    /// Background work outlives the turn that started it, and so does an ask
+    /// it is parked on. Stale answers are harmless anyway: the agent only
+    /// takes the one naming its ask.
+    #[test]
+    fn a_turn_result_keeps_requests_outstanding() {
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let (mut pump, _out_rx) = test_pump(PermissionMode::Default, answer_tx);
+        pump.handle(permission_request()).unwrap();
 
-        assert!(
-            permissions.ask(OUTSTANDING_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()),
-            "{SOURCE_OPEN}"
+        pump.emit_turn_result(false, String::new(), 1, RunTotals::default())
+            .unwrap();
+        pump.shared
+            .lock()
+            .unwrap()
+            .permissions
+            .resolve(OUTSTANDING_REQ, PermissionAnswer::AllowOnce);
+
+        assert_eq!(
+            answer_rx.try_recv(),
+            Ok(tagged(PermissionAnswer::AllowOnce)),
+            "{ANSWER_OUTLIVES_TURN}"
         );
-        permissions.forget_outstanding();
-        permissions.close();
-        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
     }
 
     /// Bypass answers on the spot, so recording the id or emitting a control
@@ -1857,6 +1945,8 @@ mod tests {
 
         pump.handle(top_level(AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
+            detail: None,
+            end: None,
         }))
         .unwrap();
         pump.handle(top_level(AgentEvent::Notice {
@@ -1866,6 +1956,8 @@ mod tests {
         pump.handle(Envelope {
             event: AgentEvent::ObservationLine {
                 text: CHILD_NOTICE_LINE.into(),
+                detail: None,
+                end: None,
             },
             subagent: Some(SubagentInfo {
                 parent_tool_use_id: NOTICE_CHILD.into(),
@@ -1875,6 +1967,7 @@ mod tests {
                 opts: None,
                 answer_tx: None,
                 inbox: None,
+                parent_call: None,
             }),
             run_id: 0,
         })
@@ -1903,5 +1996,121 @@ mod tests {
             pump.writer.session_id.to_string().as_str()
         );
         assert_eq!(wire[1]["type"], RESULT_TYPE);
+    }
+
+    fn run_done(totals: RunTotals) -> AgentEvent {
+        AgentEvent::Done {
+            usage: totals.usage,
+            cost: totals.cost,
+            list_cost: totals.list_cost,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }
+    }
+
+    /// A turn woken once stdin closed has no prompt, so it is timed from its
+    /// own first event.
+    #[test]
+    fn a_woken_turn_is_timed_from_its_own_start() {
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        pump.shared.lock().unwrap().turn_start = Instant::now().checked_sub(STALE_PROMPT_AGE);
+
+        pump.handle(top_level(run_done(RunTotals::default())))
+            .unwrap();
+        pump.handle(Envelope {
+            event: run_done(RunTotals::default()),
+            subagent: None,
+            run_id: WOKEN_RUN,
+        })
+        .unwrap();
+
+        let durations: Vec<u128> = out_rx
+            .try_iter()
+            .map(|line| {
+                let result: Value = serde_json::from_str(&line).unwrap();
+                u128::from(result["duration_ms"].as_u64().unwrap())
+            })
+            .collect();
+        assert!(
+            durations[0] >= STALE_PROMPT_AGE.as_millis(),
+            "{TIMED_FROM_PROMPT}"
+        );
+        assert!(
+            durations[1] < STALE_PROMPT_AGE.as_millis(),
+            "{TIMED_FROM_WAKE}"
+        );
+    }
+
+    /// Background work can pay after the last result, when no turn is left
+    /// to carry it. That spend gets a message of its own, and only that spend.
+    /// A failed run bills its result just like a finished one.
+    #[test_case(0, 0.0, false ; "nothing_after_the_last_result")]
+    #[test_case(LATE_INPUT_TOKENS, LATE_COST, false ; "spend_after_the_last_result")]
+    #[test_case(LATE_INPUT_TOKENS, LATE_COST, true ; "spend_after_a_failed_run")]
+    fn only_spend_no_result_carried_is_reported_at_the_end(
+        late_input: u32,
+        late_cost: f64,
+        failed: bool,
+    ) {
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        let tokens = |input| TokenUsage {
+            input,
+            ..Default::default()
+        };
+        let run = RunTotals {
+            usage: tokens(RESULT_INPUT_TOKENS),
+            cost: Some(RESULT_COST),
+            list_cost: None,
+        };
+        let ending = if failed {
+            AgentEvent::Error {
+                message: PUMP_ERROR.into(),
+                auth: false,
+                totals: run,
+            }
+        } else {
+            run_done(run)
+        };
+        pump.handle(top_level(ending)).unwrap();
+        let spent = RunTotals {
+            usage: tokens(RESULT_INPUT_TOKENS + late_input),
+            cost: Some(RESULT_COST + late_cost),
+            list_cost: None,
+        };
+
+        emit_unreported(&pump.writer, spent.since(&pump.reported)).unwrap();
+
+        let result: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(result["type"], RESULT_TYPE);
+        assert_eq!(result["is_error"], failed);
+        assert_eq!(
+            result["usage"]["input_tokens"].as_u64(),
+            Some(u64::from(RESULT_INPUT_TOKENS)),
+            "{RESULT_BILLED}"
+        );
+        assert_eq!(
+            result["total_cost_usd"].as_f64(),
+            Some(RESULT_COST),
+            "{RESULT_BILLED}"
+        );
+
+        let unreported: Vec<(u64, f64)> = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .filter(|message| {
+                message["type"] == SYSTEM_TYPE && message["subtype"] == BACKGROUND_USAGE_SUBTYPE
+            })
+            .map(|message| {
+                (
+                    message["usage"]["input_tokens"].as_u64().unwrap(),
+                    message["total_cost_usd"].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        let expected =
+            Vec::from_iter((late_input > 0).then_some((u64::from(late_input), late_cost)));
+        assert_eq!(unreported, expected, "{UNREPORTED_ONLY}");
     }
 }

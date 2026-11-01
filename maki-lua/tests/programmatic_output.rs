@@ -1,6 +1,8 @@
 #[cfg(unix)]
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -8,8 +10,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
 use std::sync::Arc;
-
-use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+use std::thread;
 
 use maki_agent::agent::tool_dispatch;
 use maki_agent::permissions::PermissionManager;
@@ -21,9 +22,9 @@ use maki_config::{
     DEFAULT_BUILTINS, Effect, PermissionRule, PermissionsConfig, PluginFileConfig, PluginsConfig,
     ProjectConfig, ToolKey,
 };
+use maki_lua::test_support::runtime;
 use maki_lua::{PluginHost, set_allowed_private_hosts};
 use serde_json::{Value, json};
-use smol::net::TcpListener;
 
 const TOOLS: &[&str] = &[
     "bash",
@@ -35,6 +36,7 @@ const TOOLS: &[&str] = &[
     "batch",
     "webfetch",
 ];
+const NO_OUTPUT: &str = "(no output)";
 const MODEL_BYTES: usize = 1024;
 const MODEL_LINES: usize = 8;
 const COMPACT_GLOB_LIMIT: usize = 100;
@@ -104,7 +106,7 @@ fn setup() -> (Arc<ToolRegistry>, PluginHost, ToolContext) {
 }
 
 fn run(ctx: &ToolContext, name: &str, input: Value) -> Result<String, String> {
-    let done = smol::block_on(tool_dispatch::run(
+    let done = runtime().block_on(tool_dispatch::run(
         CALL_ID.into(),
         name,
         &input,
@@ -151,6 +153,13 @@ fn python_parses_complete_bash_json_with_bounded_final_output() {
     assert!(returned.len() < MODEL_BYTES * 2);
 }
 
+#[test_case::test_case("pass" ; "nothing")]
+#[test_case::test_case("print()" ; "an_empty_line")]
+fn python_without_output_says_so(code: &str) {
+    let (_registry, _host, ctx) = setup();
+    assert_eq!(python(&ctx, code).unwrap(), NO_OUTPUT);
+}
+
 #[test]
 fn final_python_output_keeps_model_limits() {
     let (_registry, _host, ctx) = setup();
@@ -165,8 +174,14 @@ fn final_python_output_keeps_model_limits() {
         ),
     )
     .unwrap();
-    assert!(output.contains("[truncated"));
-    assert!(!output.contains(&format!("\n{}\n", MODEL_LINES * 3 - 1)));
+    let last = MODEL_LINES * 3 - 1;
+    assert!(output.starts_with("0\n1\n"), "head kept: {output}");
+    assert!(output.contains("[truncated "), "middle cut: {output}");
+    assert!(output.contains(&format!("\n{last}")), "tail kept: {output}");
+    assert!(
+        !output.contains(&format!("\n{}\n", MODEL_LINES * 2)),
+        "middle dropped: {output}"
+    );
 }
 
 #[test_case::test_case(1, 0, MODEL_LINES * 3 ; "through_eof")]
@@ -272,7 +287,10 @@ fn python_bash_returns_full_output_and_keeps_complete_error_output() {
     let uncaught = python(&ctx, &format!("await bash(command={failing:?})")).unwrap_err();
     assert!(uncaught.contains("[truncated"));
     assert!(uncaught.len() < MODEL_BYTES);
-    assert!(!uncaught.contains(lines.last().unwrap()));
+    assert!(
+        uncaught.contains("Exit code: 7"),
+        "error tail kept: {uncaught}"
+    );
 }
 
 #[test]
@@ -450,28 +468,28 @@ fn a_write_a_plugin_allowed_inside_python_marks_the_code_execution_row() {
 fn python_webfetch_parses_complete_response_text() {
     let (_registry, _host, ctx) = setup();
     set_allowed_private_hosts(&["127.0.0.1".to_owned()]);
-    let listener = smol::block_on(TcpListener::bind(("127.0.0.1", 0))).unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let url = format!("http://{}/payload", listener.local_addr().unwrap());
     let payload = json!({ "padding": "x".repeat(MODEL_BYTES * 2), "last": LAST_ITEM }).to_string();
-    let server = smol::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
         let mut request = Vec::new();
         while !request.ends_with(b"\r\n\r\n") {
             let mut byte = [0];
-            stream.read_exact(&mut byte).await.unwrap();
+            stream.read_exact(&mut byte).unwrap();
             request.push(byte[0]);
         }
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
             payload.len()
         );
-        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.write_all(response.as_bytes()).unwrap();
     });
     let code = format!(
         "data = json.loads(await webfetch(url={url:?}, format='text'))\nprint(data['last'])"
     );
     let output = python(&ctx, &code).unwrap();
-    smol::block_on(server);
+    server.join().unwrap();
     assert_eq!(output.trim(), LAST_ITEM);
 }
 

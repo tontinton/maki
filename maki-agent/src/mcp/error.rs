@@ -18,8 +18,12 @@ pub enum McpError {
         message: String,
     },
 
-    #[error("invalid response from server {server}: {reason}")]
-    InvalidResponse { server: String, reason: String },
+    #[error("server {server} sent an invalid {method} reply: {reason}")]
+    InvalidReply {
+        server: String,
+        method: &'static str,
+        reason: String,
+    },
 
     #[error("unknown MCP tool: {name}")]
     UnknownTool { name: String },

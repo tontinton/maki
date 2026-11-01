@@ -252,6 +252,8 @@ pub async fn adapt_images_for_model<'a>(
             content,
             display_text: message.display_text.clone(),
             kind: message.kind.clone(),
+            receipts: message.receipts.clone(),
+            settles: message.settles.clone(),
         });
     }
     Cow::Owned(adapted)
@@ -465,9 +467,29 @@ impl ContentBlock {
     }
 }
 
+/// How a background task ended, as the notice that settled its receipt tells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskEnd {
+    Finished,
+    Failed,
+    /// Stopped by the user or `task_stop`. Only the transcript line says so:
+    /// the model reads `finished` or `failed`, and the output names the stop.
+    Cancelled,
+    Lost,
+}
+
+/// The receipt a background notice answers and how its task ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSettled {
+    pub task: String,
+    pub end: TaskEnd,
+}
+
 /// Part of the frozen session surface (disk, exports, Lua), written flat:
-/// `{"role", "content", "display_text"?, "kind"?, "facts"?}`, with `kind` as
-/// a bare tag and `facts` beside a `context_update`. Older logs nest it as
+/// `{"role", "content", "display_text"?, "kind"?, "facts"?, "receipts"?,
+/// "settles"?}`, with `kind` as a bare tag and `facts` beside a
+/// `context_update`. Older logs nest it as
 /// `{"kind": {"context_update": facts}}`. Those still load, and are not
 /// rewritten just for that.
 ///
@@ -479,6 +501,11 @@ pub struct Message {
     pub content: Vec<ContentBlock>,
     pub display_text: Option<String>,
     pub kind: MessageKind,
+    /// Calls whose results here are background receipts: each moved, and a
+    /// later notice [`settles`](Self::settles) it.
+    pub receipts: Vec<String>,
+    /// Set on the notice that answers a receipt.
+    pub settles: Option<TaskSettled>,
 }
 
 /// [`Message`] as stored, before `kind` and `facts` are paired up.
@@ -492,6 +519,23 @@ struct RawMessage {
     kind: Option<RawKind>,
     #[serde(default)]
     facts: Option<Arc<FactsUpdate>>,
+    #[serde(default)]
+    receipts: Vec<String>,
+    #[serde(default, deserialize_with = "settles_or_none")]
+    settles: Option<TaskSettled>,
+}
+
+/// A newer build may write a [`TaskEnd`] this one does not know. Only the
+/// mark is dropped then, never the message, and the task reads as cancelled.
+fn settles_or_none<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<TaskSettled>, D::Error> {
+    let Some(raw) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(TaskSettled::deserialize(raw)
+        .inspect_err(|error| debug!(%error, "dropping a task mark this build cannot read"))
+        .ok())
 }
 
 /// [`MessageKind`] reads every kind but the flat `context_update` tag, whose
@@ -528,6 +572,8 @@ impl TryFrom<RawMessage> for Message {
             content: raw.content,
             display_text: raw.display_text,
             kind,
+            receipts: raw.receipts,
+            settles: raw.settles,
         })
     }
 }
@@ -540,7 +586,9 @@ impl Serialize for Message {
         let len = 2
             + usize::from(self.display_text.is_some())
             + usize::from(!self.kind.is_turn())
-            + usize::from(facts.is_some());
+            + usize::from(facts.is_some())
+            + usize::from(!self.receipts.is_empty())
+            + usize::from(self.settles.is_some());
         let mut state = serializer.serialize_struct("Message", len)?;
         state.serialize_field("role", &self.role)?;
         state.serialize_field("content", &self.content)?;
@@ -552,6 +600,12 @@ impl Serialize for Message {
         }
         if let Some(facts) = facts {
             state.serialize_field("facts", facts)?;
+        }
+        if !self.receipts.is_empty() {
+            state.serialize_field("receipts", &self.receipts)?;
+        }
+        if let Some(settles) = &self.settles {
+            state.serialize_field("settles", settles)?;
         }
         state.end()
     }
@@ -772,6 +826,11 @@ pub(crate) const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
 /// generation early, at 4.7; the other families joined at 5.
 const ADAPTIVE_SINCE: (u32, u32) = (5, 0);
 const ADAPTIVE_SINCE_OPUS: (u32, u32) = (4, 7);
+/// From 5 on every Claude model thinks when `thinking` is left out. Opus 5.5,
+/// Fable and Mythos can't turn it off at all, and for the rest Anthropic
+/// advises a low effort over `disabled`, which can make Opus 5 write its tool
+/// calls as plain text.
+const THINKS_BY_DEFAULT_SINCE: (u32, u32) = (5, 0);
 const GEMINI_LEVEL_SINCE: u32 = 3;
 const OPUS: &str = "opus";
 const CLAUDE: &str = "claude";
@@ -821,6 +880,12 @@ fn requires_adaptive(model_id: &str) -> bool {
     })
 }
 
+/// Read off the id like [`requires_adaptive`], so `off` is gone for these
+/// models on every provider that serves them.
+pub(crate) fn thinks_by_default(model_id: &str) -> bool {
+    claude_version(model_id).is_some_and(|(_, version)| version >= THINKS_BY_DEFAULT_SINCE)
+}
+
 /// The releases that made thinking adaptive-only also reject any sampling
 /// parameter (`top_p`, `temperature`) with a 400, even with thinking off.
 pub(crate) fn rejects_sampling(model_id: &str) -> bool {
@@ -868,6 +933,27 @@ impl EffortDialect<'_> {
     pub fn adaptive_effort(&self) -> Option<Effort> {
         self.adaptive.map(|level| level.snap(self.supported))
     }
+
+    /// Mirrors [`ThinkingConfig::effort_str`], so the badge can name what the
+    /// request will carry.
+    pub fn sends(&self, choice: ThinkingConfig) -> ThinkingConfig {
+        match choice {
+            ThinkingConfig::Adaptive => self
+                .adaptive_effort()
+                .map_or(choice, ThinkingConfig::Effort),
+            ThinkingConfig::Effort(level) => ThinkingConfig::Effort(level.snap(self.supported)),
+            ThinkingConfig::Off | ThinkingConfig::Budget(_) => choice,
+        }
+    }
+
+    /// Discovery may list other levels than the dialect knows. The wire and
+    /// the badge both read them through here, so the two never disagree.
+    fn as_discovered<R>(&self, model: &Model, render: impl FnOnce(&EffortDialect) -> R) -> R {
+        match model.discovered_effort() {
+            Some(effort) => render(&effort.refine(self)),
+            None => render(self),
+        }
+    }
 }
 
 /// The model's own spelling of each thinking mode, parsed and validated by
@@ -899,16 +985,19 @@ pub enum ThinkingFallback {
 }
 
 impl ThinkingFallback {
-    /// The level [`ThinkingConfig::apply_thinking`] sends for `Adaptive` on
-    /// `model`. `None` where the model spells the mode itself, or where the
-    /// endpoint is left to decide.
-    pub(crate) fn adaptive_effort(self, model: &Model) -> Option<Effort> {
-        let spelled = model
-            .effective_thinking_fields()
-            .is_some_and(|(fields, _)| fields.adaptive.is_some());
+    /// What [`ThinkingConfig::apply_thinking`] sends `choice` as on `model`.
+    /// A model that spells `Adaptive` itself keeps it, and an endpoint left
+    /// to decide gets every choice as it is.
+    pub(crate) fn sends(self, model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
+        let spelled = choice == ThinkingConfig::Adaptive
+            && model
+                .effective_thinking_fields()
+                .is_some_and(|(fields, _)| fields.adaptive.is_some());
         match self {
-            Self::Dialect(dialect) if !spelled => dialect.adaptive_effort(),
-            Self::None | Self::Dialect(_) | Self::BudgetField => None,
+            Self::Dialect(dialect) if !spelled => {
+                dialect.as_discovered(model, |dialect| dialect.sends(choice))
+            }
+            Self::None | Self::Dialect(_) | Self::BudgetField => choice,
         }
     }
 }
@@ -1268,7 +1357,9 @@ impl ThinkingConfig {
             ThinkingFallback::None => {}
             ThinkingFallback::Dialect(dialect) => {
                 if model.supports_thinking() {
-                    self.apply_reasoning_effort(body, dialect, model);
+                    dialect.as_discovered(model, |dialect| {
+                        self.apply_reasoning_effort(body, dialect, model);
+                    });
                 }
             }
             // The model has no way to spell this mode, so the budget field
@@ -1387,19 +1478,32 @@ impl ThinkingConfig {
     }
 
     /// The picker and badge follow the wire while stored intent keeps its
-    /// delegation ceiling. Declared fields keep `Adaptive` separate because
+    /// delegation ceiling, so a level the model does not take shows as the
+    /// one it goes out as. Declared fields keep `Adaptive` separate because
     /// their level fragments can differ from the provider fallback.
     pub fn shown(self, model: &Model) -> Self {
+        let config = if self.is_enabled() {
+            self
+        } else {
+            self.clamped(model)
+        };
         let fields = model.effective_thinking_fields();
         if let Some((fields, fallback)) = fields
-            && let Some(shown) = declared_thinking(fields, self, model, fallback)
+            && let Some(shown) = declared_thinking(fields, config, model, fallback)
         {
             return shown;
         }
-        if self == Self::Adaptive && fields.is_none_or(|(fields, _)| fields.levels.is_empty()) {
-            return model.adaptive_effort().map_or(self, Self::Effort);
+        if config == Self::Adaptive && fields.is_some_and(|(fields, _)| !fields.levels.is_empty()) {
+            return config;
         }
-        self
+        model.thinking_sent(config)
+    }
+
+    pub fn level(self) -> Option<Effort> {
+        match self {
+            Self::Effort(level) => Some(level),
+            Self::Off | Self::Adaptive | Self::Budget(_) => None,
+        }
     }
 
     pub fn status_label(self) -> Option<Cow<'static, str>> {
@@ -1596,6 +1700,7 @@ mod tests {
     const LARGE_BUDGET: u32 = 16_384;
 
     const PROMPT: &str = "fix the flaky login test";
+    const TASK_ID: &str = "toolu_moved";
     const UPDATE_TEXT: &str = "<context-update>plan mode is on</context-update>";
     const UPDATE_DATE: &str = "2026-10-02";
     const UPDATE_PLAN: &str = "/project/.maki/plan.md";
@@ -1721,6 +1826,38 @@ mod tests {
         assert!(err.to_string().contains(expected), "{err}");
     }
 
+    /// A resume reads how each background task ended off these marks.
+    #[test]
+    fn task_marks_write_the_flat_shape() {
+        let stored = json!({
+            "role": "user",
+            "content": [],
+            "receipts": [TASK_ID],
+            "settles": { "task": TASK_ID, "end": "cancelled" }
+        });
+        let message = Message {
+            receipts: vec![TASK_ID.into()],
+            settles: Some(TaskSettled {
+                task: TASK_ID.into(),
+                end: TaskEnd::Cancelled,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(&message).unwrap(), stored);
+        assert_eq!(serde_json::from_value::<Message>(stored).unwrap(), message);
+    }
+
+    #[test]
+    fn an_unknown_task_end_drops_only_the_mark() {
+        let stored = json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": PROMPT }],
+            "settles": { "task": TASK_ID, "end": "timed_out" }
+        });
+        let loaded: Message = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded, Message::user(PROMPT.into()));
+    }
+
     #[test_case(|_: &mut Message| {}, true ; "as_built")]
     #[test_case(|m: &mut Message| m.role = Role::Assistant, false ; "from_assistant")]
     #[test_case(|m: &mut Message| m.display_text = Some(PROMPT.into()), false ; "visible")]
@@ -1820,13 +1957,13 @@ mod tests {
         }
     }
 
-    fn adapt(model: &Model, content: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    async fn adapt(model: &Model, content: Vec<ContentBlock>) -> Vec<ContentBlock> {
         let messages = vec![Message {
             role: Role::User,
             content,
             ..Default::default()
         }];
-        smol::block_on(adapt_images_for_model(model, &messages))[0]
+        adapt_images_for_model(model, &messages).await[0]
             .content
             .clone()
     }
@@ -1838,8 +1975,8 @@ mod tests {
             .count()
     }
 
-    #[test]
-    fn adapt_images_borrows_when_nothing_has_to_change() {
+    #[tokio::test]
+    async fn adapt_images_borrows_when_nothing_has_to_change() {
         let model = clamp_test_model(anthropic_spec());
         let with_image = vec![Message {
             role: Role::User,
@@ -1847,7 +1984,7 @@ mod tests {
             ..Default::default()
         }];
         assert!(matches!(
-            smol::block_on(adapt_images_for_model(&model, &with_image)),
+            adapt_images_for_model(&model, &with_image).await,
             Cow::Borrowed(_)
         ));
 
@@ -1855,7 +1992,7 @@ mod tests {
         text_only_model.supports_vision_override = Some(false);
         let no_images = vec![Message::user("hi".into())];
         assert!(matches!(
-            smol::block_on(adapt_images_for_model(&text_only_model, &no_images)),
+            adapt_images_for_model(&text_only_model, &no_images).await,
             Cow::Borrowed(_)
         ));
     }
@@ -1863,8 +2000,8 @@ mod tests {
     /// A repaired image is repaired for the rest of the session, so this path
     /// is walked on every later turn: the messages the repair does not reach
     /// must come out of it untouched, and history must keep its own pixels.
-    #[test]
-    fn adapt_images_rebuilds_only_the_messages_that_change() {
+    #[tokio::test]
+    async fn adapt_images_rebuilds_only_the_messages_that_change() {
         const CAPTION: &str = "look";
         const OVERSIZED: u32 = 2600;
         let model = clamp_test_model(anthropic_spec());
@@ -1895,7 +2032,7 @@ mod tests {
             ]),
         ];
 
-        let adapted = smol::block_on(adapt_images_for_model(&model, &history));
+        let adapted = adapt_images_for_model(&model, &history).await;
         assert!(matches!(adapted, Cow::Owned(_)), "the repair needs a copy");
         assert_eq!(adapted[0].first_user_text(), Some(CAPTION));
         let ContentBlock::Image { source } = &adapted[1].content[0] else {
@@ -1919,8 +2056,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn adapt_images_shrinks_what_a_provider_would_refuse() {
+    #[tokio::test]
+    async fn adapt_images_shrinks_what_a_provider_would_refuse() {
         let model = clamp_test_model(anthropic_spec());
         let oversized = ContentBlock::Image {
             source: ImageSource::new(
@@ -1931,7 +2068,7 @@ mod tests {
         let text = ContentBlock::Text {
             text: "look".into(),
         };
-        let blocks = adapt(&model, vec![text, oversized]);
+        let blocks = adapt(&model, vec![text, oversized]).await;
         assert!(matches!(&blocks[0], ContentBlock::Text { .. }));
         let ContentBlock::Image { source } = &blocks[1] else {
             panic!("an image block must stay an image block");
@@ -1947,16 +2084,16 @@ mod tests {
     /// bound to them. So each new image must leave the request an append of
     /// the one before, except at most once per step when the oldest images
     /// make way, and the API cap is never crossed.
-    #[test]
-    fn adapt_images_moves_the_prefix_once_per_step() {
+    #[tokio::test]
+    async fn adapt_images_moves_the_prefix_once_per_step() {
         const LAST_TOTAL: usize = MAX_IMAGES + 2 * IMAGE_EVICTION_STEP + 1;
         let model = clamp_test_model(anthropic_spec());
         let images: Vec<ContentBlock> = (1..=LAST_TOTAL).map(png_block).collect();
         let wire = |blocks: &[ContentBlock]| serde_json::to_value(blocks).unwrap();
-        let mut before = adapt(&model, images[..MAX_IMAGES].to_vec());
+        let mut before = adapt(&model, images[..MAX_IMAGES].to_vec()).await;
         let mut last_move: Option<usize> = None;
         for total in MAX_IMAGES + 1..=LAST_TOTAL {
-            let after = adapt(&model, images[..total].to_vec());
+            let after = adapt(&model, images[..total].to_vec()).await;
             let kept = image_count(&after);
             assert!(kept <= MAX_IMAGES, "{kept} images sent");
             assert!(
@@ -1983,8 +2120,8 @@ mod tests {
     /// Readability must not decide what is evicted: an unreadable image that
     /// freed its slot would pull an evicted one back in, editing an early
     /// message outside the step schedule.
-    #[test]
-    fn adapt_images_evicts_the_same_images_whatever_decodes() {
+    #[tokio::test]
+    async fn adapt_images_evicts_the_same_images_whatever_decodes() {
         let model = clamp_test_model(anthropic_spec());
         let readable: Vec<ContentBlock> = (1..=MAX_IMAGES + 1).map(png_block).collect();
         let mut content = readable.clone();
@@ -1999,19 +2136,19 @@ mod tests {
                 .map(|(i, _)| i)
                 .collect()
         };
-        let blocks = adapt(&model, content);
-        assert_eq!(evicted(&blocks), evicted(&adapt(&model, readable)));
+        let blocks = adapt(&model, content).await;
+        assert_eq!(evicted(&blocks), evicted(&adapt(&model, readable).await));
         assert!(
             matches!(&blocks[MAX_IMAGES], ContentBlock::Text { text } if text == IMAGE_UNUSABLE_NOTE)
         );
     }
 
-    #[test]
-    fn adapt_images_replaces_blocks_for_text_only_model() {
+    #[tokio::test]
+    async fn adapt_images_replaces_blocks_for_text_only_model() {
         let mut model = clamp_test_model(anthropic_spec());
         model.supports_vision_override = Some(false);
         let tool_result = ContentBlock::tool_result("t1", "[image: pic.png 1KB]", false);
-        let blocks = adapt(&model, vec![tool_result, unreadable_block()]);
+        let blocks = adapt(&model, vec![tool_result, unreadable_block()]).await;
         assert_eq!(blocks.len(), 2);
         assert!(matches!(&blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_OMITTED_NOTE));
@@ -2242,6 +2379,53 @@ mod tests {
     fn dialect_fallback_follows_thinking_support(support: Support, expected: Value) {
         let mut model = thinking_model("ollama-model");
         model.thinking_override = Some(support);
+        let mut body = json!({});
+        ThinkingConfig::Off.apply_thinking(&mut body, &model, DIALECT);
+        assert_eq!(body, expected);
+    }
+
+    fn discovered_ollama(model_id: &str, supported: &[Effort], send_off: bool) -> Model {
+        use crate::model::{ModelEffort, ModelInfo};
+
+        crate::model_registry::set_known_models(
+            "ollama",
+            vec![ModelInfo {
+                supports_thinking: Some(true),
+                effort: Some(ModelEffort {
+                    supported: supported.to_vec(),
+                    send_off: Some(send_off),
+                }),
+                ..ModelInfo::id_only(model_id.into())
+            }],
+        );
+        Model::from_spec(&format!("ollama/{model_id}")).unwrap()
+    }
+
+    /// The badge has to name what goes out, or a level the model does not
+    /// take would show as itself while another one is sent.
+    #[test_case(&[Low, Medium, High, XHigh] ; "named_levels")]
+    #[test_case(&[Medium] ; "toggle")]
+    fn ollama_shows_the_level_on_the_wire(supported: &[Effort]) {
+        let model = discovered_ollama("badge", supported, true);
+
+        for choice in Effort::ALL
+            .map(ThinkingConfig::Effort)
+            .into_iter()
+            .chain([ThinkingConfig::Adaptive])
+        {
+            let mut body = json!({});
+            choice.apply_thinking(&mut body, &model, DIALECT);
+            let shown = choice.shown(&model).level().map(Effort::as_str);
+            assert_eq!(body["reasoning_effort"].as_str(), shown, "{choice:?}");
+        }
+    }
+
+    /// A model that cannot stop thinking gets nothing for off, rather than a
+    /// "none" it would ignore.
+    #[test_case(true, json!({"reasoning_effort": "none"}) ; "can_turn_off")]
+    #[test_case(false, json!({}) ; "cannot_turn_off")]
+    fn ollama_off_follows_discovery(send_off: bool, expected: Value) {
+        let model = discovered_ollama("off", &[Low, Medium, High], send_off);
         let mut body = json!({});
         ThinkingConfig::Off.apply_thinking(&mut body, &model, DIALECT);
         assert_eq!(body, expected);
@@ -2566,6 +2750,34 @@ mod tests {
         assert_eq!(opts.clamped(&model).thinking, expected);
     }
 
+    #[test_case("claude-opus-5.5", ThinkingConfig::Effort(Minimal) ; "copilot_opus_5_5")]
+    #[test_case("anthropic.claude-opus-5", ThinkingConfig::Effort(Minimal) ; "bedrock_opus_5")]
+    #[test_case("claude-sonnet-5.5", ThinkingConfig::Effort(Minimal) ; "sonnet_5_5")]
+    #[test_case("claude-fable-5-1", ThinkingConfig::Effort(Minimal) ; "fable")]
+    #[test_case("claude-opus-4.8", ThinkingConfig::Off ; "opus_4_8_turns_it_off")]
+    fn off_rises_to_minimal_where_the_model_thinks_by_default(
+        model_id: &str,
+        expected: ThinkingConfig,
+    ) {
+        let mut model = thinking_model(model_id);
+        model.thinking_override = Some(Support::Yes);
+
+        assert_eq!(ThinkingConfig::Off.clamped(&model), expected);
+        assert_eq!(ThinkingConfig::Off.shown(&model), expected);
+    }
+
+    #[test]
+    fn a_spelled_off_survives_where_the_model_thinks_by_default() {
+        let mut model = native_thinking_model(
+            "claude-opus-5",
+            json!({"off": {"thinking": {"type": "disabled"}}}),
+        );
+        model.thinking_override = Some(Support::Yes);
+
+        assert_eq!(ThinkingConfig::Off.clamped(&model), ThinkingConfig::Off);
+        assert_eq!(ThinkingConfig::Off.shown(&model), ThinkingConfig::Off);
+    }
+
     /// The picker and the status bar read the level, but the session keeps
     /// `Adaptive`: a stored level would cap subagents where `Adaptive` does not.
     #[test_case(ThinkingConfig::Adaptive,    ThinkingConfig::Effort(High) ; "adaptive_reads_as_the_fixed_level")]
@@ -2594,8 +2806,10 @@ mod tests {
     ) {
         let mut model = native_thinking_model("partial", fields);
         model.provider = Arc::from(provider);
-        assert_eq!(DIALECT.adaptive_effort(&model), expected);
-        assert_eq!(ThinkingFallback::None.adaptive_effort(&model), None);
+        let adaptive =
+            |fallback: ThinkingFallback| fallback.sends(&model, ThinkingConfig::Adaptive).level();
+        assert_eq!(adaptive(DIALECT), expected);
+        assert_eq!(adaptive(ThinkingFallback::None), None);
     }
 
     #[test_case(None,                           ThinkingConfig::Off      ; "absent_means_off")]

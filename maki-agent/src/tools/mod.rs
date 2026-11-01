@@ -17,9 +17,9 @@ pub use deadline::Deadline;
 pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
-    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
-    RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation, ToolReach,
-    ToolRegistry, ToolSource,
+    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, MovedCall, MovedLand, ParseError,
+    PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult,
+    ToolInvocation, ToolReach, ToolRegistry, ToolSource,
 };
 
 use std::collections::HashMap;
@@ -33,9 +33,12 @@ use ignore::WalkBuilder;
 use jiff::fmt::friendly::{Designator, Spacing, SpanPrinter};
 use maki_config::ProjectConfig;
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::agent::{CallInstructions, LoadedInstructions, default_instruction_files};
+use crate::call_scope::CallScope;
 use crate::cancel::{CancelMap, CancelToken};
+use crate::live_session::SessionMailbox;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
@@ -50,6 +53,8 @@ pub(crate) const TOOL_NAME_FIELD: &str = "name";
 const COMPACT_DURATION: SpanPrinter = SpanPrinter::new()
     .designator(Designator::Compact)
     .spacing(Spacing::None);
+const COMPACT_DURATION_UNITS: [char; 3] = ['h', 'm', 's'];
+const TIMEOUT_SUFFIX: &str = " timeout";
 /// What `maki.task` calls the session's own chat.
 pub const MAIN_TASK_ID: &str = "main";
 
@@ -203,6 +208,23 @@ impl RequestTools {
         workflow: bool,
         mcp: bool,
     ) -> Self {
+        Self::build_with_background(registry, vars, model, config, excluded, workflow, mcp, true)
+    }
+
+    /// [`Self::build`] for a session whose `background` is known: when it is
+    /// off, tools and parameters that only exist to move a call to the
+    /// background stay out of the array for the whole session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_background(
+        registry: &ToolRegistry,
+        vars: &crate::template::Vars,
+        model: &Model,
+        config: &AgentConfig,
+        excluded: &[&str],
+        workflow: bool,
+        mcp: bool,
+        background: bool,
+    ) -> Self {
         let filter = ToolFilter::from_config(config, model, excluded);
         let ctx = DescriptionContext {
             filter: &filter,
@@ -211,7 +233,12 @@ impl RequestTools {
             mcp,
         };
         Self {
-            definitions: registry.definitions(vars, &ctx, model.supports_tool_examples()),
+            definitions: registry.definitions_with_background(
+                vars,
+                &ctx,
+                model.supports_tool_examples(),
+                background,
+            ),
             filter: Arc::new(filter),
         }
     }
@@ -289,7 +316,17 @@ pub fn compact_duration(secs: u64) -> String {
 }
 
 pub fn timeout_annotation(secs: u64) -> String {
-    format!("{} timeout", compact_duration(secs))
+    format!("{}{TIMEOUT_SUFFIX}", compact_duration(secs))
+}
+
+/// Whether {note} is what [`timeout_annotation`] writes.
+pub fn is_timeout_annotation(note: &str) -> bool {
+    note.strip_suffix(TIMEOUT_SUFFIX).is_some_and(|span| {
+        !span.is_empty()
+            && span
+                .chars()
+                .all(|c| c.is_ascii_digit() || COMPACT_DURATION_UNITS.contains(&c))
+    })
 }
 
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
@@ -330,14 +367,14 @@ pub struct ToolContext {
     pub session_id: Option<SessionRef>,
     /// See [`crate::AgentParams::background_for`]. Every nested call clones
     /// this context, so batch and code_execution children carry it too.
-    pub background_for: Option<MakiId>,
+    pub background_for: BackgroundFor,
     /// `None` in the agent that owns the session ([`MAIN_TASK_ID`]), the
     /// spawning call's `tool_use_id` in a subagent. A subagent shares
     /// `session_id` with its parent on purpose (provider affinity, hooks,
     /// otel), so this is what tells their chats apart.
     pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
-    pub user_response_rx: Option<Arc<smol::lock::Mutex<flume::Receiver<String>>>>,
+    pub user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
     /// See [`crate::Agent::with_reauth`]. Carried here so a subagent session
     /// offers a re-login only where its parent does.
     pub reauth: bool,
@@ -348,6 +385,13 @@ pub struct ToolContext {
     pub instruction_files: Arc<Vec<String>>,
     /// Per model call, shared with its nested calls.
     pub call_instructions: CallInstructions,
+    /// The model call this context serves, shared by its nested calls. `None`
+    /// outside a model call (one-shots, plugin-opened sessions).
+    pub call: Option<Arc<CallScope>>,
+    /// Where a call moved off this run reports its result: the run's own
+    /// mailbox. `None` outside an agent run (one-shots, the interpreter), so
+    /// nothing there moves.
+    pub mailbox: Option<SessionMailbox>,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
     pub deadline: Deadline,
@@ -382,6 +426,32 @@ pub enum ToolLive {
     Usage(String),
     /// The plugin that answered the child's permission prompt.
     AllowedBy(Arc<str>),
+    /// The child registered (`true`) or lost (`false`) a background hook.
+    Movable(bool),
+    /// The child runs as this subagent task, which `/tasks` lists on its own.
+    Task(String),
+}
+
+/// The chat whose plan mode blocks this work's writes, see
+/// [`crate::AgentSeed::background_write_block`].
+#[derive(Clone, Default)]
+pub enum BackgroundFor {
+    /// Watched by the user: never blocked.
+    #[default]
+    None,
+    Chat(MakiId),
+    /// Foreground until the call moves, then the chat it moved to.
+    Call(Arc<CallScope>),
+}
+
+impl BackgroundFor {
+    pub fn chat(&self) -> Option<MakiId> {
+        match self {
+            Self::None => None,
+            Self::Chat(chat) => Some(*chat),
+            Self::Call(scope) => scope.home().map(|home| home.chat),
+        }
+    }
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -565,7 +635,7 @@ pub fn interpreter_ctx(
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_access: Arc<FileAccess>,
-    user_response_rx: Option<Arc<smol::lock::Mutex<flume::Receiver<String>>>>,
+    user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
@@ -577,7 +647,7 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
-        background_for: None,
+        background_for: BackgroundFor::None,
         task_id: None,
         tool_use_id: None,
         user_response_rx,
@@ -585,6 +655,8 @@ pub fn interpreter_ctx(
         loaded_instructions: LoadedInstructions::new(),
         instruction_files: Arc::new(default_instruction_files()),
         call_instructions: CallInstructions::default(),
+        call: None,
+        mailbox: None,
         cancel,
         mcp: None,
         deadline: Deadline::default(),
@@ -891,6 +963,14 @@ mod tests {
     #[test_case(90,  "1m30s timeout" ; "mixed")]
     fn timeout_annotation_cases(secs: u64, expected: &str) {
         assert_eq!(timeout_annotation(secs), expected);
+        assert!(is_timeout_annotation(expected));
+    }
+
+    #[test_case("network timeout" ; "words")]
+    #[test_case(" timeout"        ; "no_span")]
+    #[test_case("24 lines"        ; "another_note")]
+    fn is_timeout_annotation_rejects(note: &str) {
+        assert!(!is_timeout_annotation(note));
     }
 
     #[test_case(0,     "0s"     ; "zero")]

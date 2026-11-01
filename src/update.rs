@@ -5,8 +5,6 @@ use maki_storage::paths::canonicalize_clean;
 use maki_storage::version::{self, VersionError};
 use maki_storage::{StateDir, StorageError};
 
-use async_compat::Compat;
-
 #[cfg(not(windows))]
 const INSTALLER: Installer = Installer {
     url: "https://maki.sh/install.sh",
@@ -81,15 +79,19 @@ pub enum UpdateError {
     VersionCheck(#[from] VersionError),
 }
 
-fn fetch_script() -> Result<String, UpdateError> {
-    smol::block_on(Compat::new(async {
-        let response = version::client().build()?.get(INSTALLER.url).send().await?;
-        response.text().await
-    }))
-    .map_err(|source| UpdateError::Fetch {
+async fn fetch_script() -> Result<String, UpdateError> {
+    let fetch = |source| UpdateError::Fetch {
         url: INSTALLER.url,
         source,
-    })
+    };
+    let response = version::client()
+        .build()
+        .map_err(fetch)?
+        .get(INSTALLER.url)
+        .send()
+        .await
+        .map_err(fetch)?;
+    response.text().await.map_err(fetch)
 }
 
 /// Where `maki update` keeps the binary it replaced, for `maki rollback`.
@@ -210,8 +212,8 @@ fn prompt_yes(install_dir: &Path) -> bool {
     std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
 }
 
-pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
-    let latest = smol::block_on(version::fetch_latest())?;
+pub async fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
+    let latest = version::fetch_latest().await?;
     if !version::is_newer(&latest, version::CURRENT) {
         println!("Already up to date (v{})", version::CURRENT);
         return Ok(());
@@ -235,7 +237,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
     };
     let backup_path = backup_path()?;
 
-    let script = fetch_script()?;
+    let script = fetch_script().await?;
 
     if no_color {
         println!("{script}");

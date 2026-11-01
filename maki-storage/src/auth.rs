@@ -27,7 +27,7 @@ const LOCK_POLL: Duration = Duration::from_millis(50);
 /// expires. Atlassian's MCP server registers clients this way.
 const CLIENT_SECRET_NEVER_EXPIRES: u64 = 0;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub access: String,
     pub refresh: String,
@@ -46,7 +46,7 @@ impl OAuthTokens {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpAuthData {
     pub server_url: String,
     pub tokens: Option<OAuthTokens>,
@@ -60,6 +60,15 @@ pub struct McpAuthData {
     /// cannot redirect the refresh token and client secret elsewhere.
     #[serde(default)]
     pub token_endpoint: Option<String>,
+    /// The auth server's RFC 8414 metadata as discovered at interactive auth,
+    /// pinned for the same reason as `token_endpoint`. Records from before it
+    /// existed fall back to discovery checked against `token_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_server: Option<serde_json::Value>,
+    /// The RFC 8707 resource named at interactive auth, which refreshes name
+    /// again. Records from before it existed named the server URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -335,6 +344,8 @@ mod tests {
             client_secret_expires_at: None,
             redirect_uri: None,
             token_endpoint: None,
+            auth_server: None,
+            resource: None,
         }
     }
 

@@ -4,6 +4,27 @@ local parse = require("maki.provider_parse")
 
 local MODELS_PATH = "/models"
 
+-- Rows whose cards publish an effort ladder wider than the provider default,
+-- as the API answers when asked: medium is refused outside Large 4, and the
+-- GLM rows take low/high/max. The /models listing says nothing about effort,
+-- so the knowledge rides on the row and narrows `openai.thinking` for that
+-- model at request time; adaptive keeps the dialect's high. Longest prefix
+-- first.
+local LADDERS = {
+  { "mistral-large-4", { supported = { "low", "medium", "high" } } },
+  { "zai-glm-5", { supported = { "low", "high", "max" } } },
+  { "zai-glm-latest", { supported = { "low", "high", "max" } } },
+  { "deepseek-", { supported = { "low", "high", "xhigh", "max" } } },
+}
+
+local function effort_ladder(id)
+  for _, ladder in ipairs(LADDERS) do
+    if id:sub(1, #ladder[1]) == ladder[1] then
+      return ladder[2]
+    end
+  end
+end
+
 -- Mistral takes reasoning back as a `thinking` part at the front of the
 -- assistant turn's `content`, not as the `reasoning_content` the codec writes.
 -- A non-string `reasoning_content` is dropped.
@@ -39,6 +60,7 @@ local function parse_model(m)
     context_window = parse.as_u32(m.max_context_length),
     supports_thinking = parse.as_bool(capabilities.reasoning),
     supports_vision = capabilities.vision == true,
+    effort = effort_ladder(m.id),
   }
 end
 
@@ -49,9 +71,9 @@ maki.provider.register({
   base_url = "https://api.mistral.ai/v1",
   api_key_env = "MISTRAL_API_KEY",
   login_url = "https://admin.mistral.ai/organization/api-keys",
-  default_model = "mistral-medium-latest",
+  default_model = "mistral-large-4",
   plans = {
-    { key = "standard", display_name = "Standard", default_model = "mistral-medium-latest" },
+    { key = "standard", display_name = "Standard", default_model = "mistral-large-4" },
     {
       key = "coding",
       display_name = "Vibe / Coding",
@@ -61,7 +83,8 @@ maki.provider.register({
   },
   family = "generic",
   accepts_arbitrary_models = true,
-  -- Mistral publishes no output caps.
+  -- The /models listing only reports max_context_length; rows whose model card
+  -- publishes an output cap state it themselves.
   max_output_tokens = false,
   context_window = 128000,
   aperture = { path_prefix = "/v1" },
@@ -69,14 +92,17 @@ maki.provider.register({
     {
       prefixes = { "mistral-large-4", "mistral-large-4-0" },
       tier = "strong",
+      default = true,
       supports_vision = true,
       context_window = 1000000,
-      pricing = { input = 1.36, output = 4.18, cache_write = 0.0, cache_read = 0.14 },
+      pricing = { input = 0.7, output = 2.1, cache_write = 0.0, cache_read = 0.07 },
     },
+    -- Mistral Medium 3.5 retires 2027-04-30. The Mistral model deprecation
+    -- mail from Oct 30 2026 names only `mistral-medium-3-5`, so re-check
+    -- whether `-latest` and `-2604` survive before dropping this row.
     {
       prefixes = { "mistral-medium-latest", "mistral-medium-3.5", "mistral-medium-3-5", "mistral-medium-2604" },
       tier = "strong",
-      default = true,
       supports_vision = true,
       context_window = 262144,
       pricing = { input = 1.5, output = 7.5, cache_write = 0.0, cache_read = 0.0 },
@@ -86,14 +112,7 @@ maki.provider.register({
       tier = "strong",
       family = "glm",
       supports_vision = false,
-      context_window = 1000000,
-      pricing = { input = 1.4, output = 4.4, cache_write = 0.0, cache_read = 0.14 },
-    },
-    {
-      prefixes = { "glm-5-2", "zai-glm-5-2" },
-      tier = "strong",
-      family = "glm",
-      supports_vision = false,
+      max_output_tokens = 131072,
       context_window = 1000000,
       pricing = { input = 1.4, output = 4.4, cache_write = 0.0, cache_read = 0.14 },
     },
@@ -106,8 +125,17 @@ maki.provider.register({
       pricing = { input = 0.15, output = 0.6, cache_write = 0.0, cache_read = 0.0 },
     },
     {
+      prefixes = { "deepseek-v4-1-flash-1017" },
+      tier = "medium",
+      supports_vision = true,
+      max_output_tokens = 131072,
+      context_window = 1000000,
+      pricing = { input = 0.3, output = 1.2, cache_write = 0.0, cache_read = 0.007 },
+    },
+    {
       prefixes = { "zai-glm-5-3-flash" },
       tier = "weak",
+      default = true,
       family = "glm",
       supports_vision = true,
       max_output_tokens = 131072,
@@ -117,7 +145,6 @@ maki.provider.register({
     {
       prefixes = { "ministral-14b-latest", "ministral-14b-2512" },
       tier = "weak",
-      default = true,
       supports_vision = false,
       context_window = 262144,
       pricing = { input = 0.2, output = 0.2, cache_write = 0.0, cache_read = 0.0 },

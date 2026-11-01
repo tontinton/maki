@@ -3,7 +3,10 @@
 -- wording and the painting, so every tool says it the same way.
 local M = {}
 
+local TIMEOUT_REASON = "timeout"
+local STOPPED_REASON = "stopped"
 local CANCELLED_FMT = "[cancelled by user after %s, %s]"
+local STOPPED_FMT = "[stopped by task_stop after %s, %s]"
 local TIMEOUT_FMT = "[timed out after %ds, %s]"
 -- Never claim output the model cannot see above the marker: it would go
 -- looking for it, or invent it.
@@ -13,14 +16,15 @@ local NO_OUTPUT = "no output before the cut"
 --- Close {view} on the marker and build the tool reply. {out} is everything
 --- the tool streamed, already truncated; empty means the view still shows a
 --- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
---- "timeout"). {started_at} is the `os.time()` the tool began at.
+--- "timeout" | "stopped"). {started_at} is the `os.time()` the tool began at.
 function M.cut(view, out, reason, timeout_secs, started_at)
   local tail = out ~= "" and SOME_OUTPUT or NO_OUTPUT
   local marker
-  if reason == "timeout" then
+  if reason == TIMEOUT_REASON then
     marker = TIMEOUT_FMT:format(timeout_secs, tail)
   else
-    marker = CANCELLED_FMT:format(maki.ui.humantime(math.max(os.time() - started_at, 0)), tail)
+    local elapsed = maki.ui.humantime(math.max(os.time() - started_at, 0))
+    marker = (reason == STOPPED_REASON and STOPPED_FMT or CANCELLED_FMT):format(elapsed, tail)
   end
 
   if out == "" then

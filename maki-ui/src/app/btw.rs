@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use flume::Sender;
-use futures_lite::future;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
@@ -54,15 +53,14 @@ impl App {
         self.open_prompt(|app| app.btw_modal.open(&question, rx));
 
         let session_id = SessionRef::from(self.state.session.id);
-        smol::spawn(run_btw(
+        tokio::spawn(run_btw(
             provider,
             model,
             system,
             messages,
             tx,
             Some(session_id),
-        ))
-        .detach();
+        ));
     }
 }
 
@@ -101,7 +99,7 @@ async fn run_btw(
         }
     };
 
-    let (result, _) = future::zip(stream_fut, forward_fut).await;
+    let (result, _) = tokio::join!(stream_fut, forward_fut);
 
     match result {
         Ok(_) => {
@@ -163,7 +161,8 @@ mod tests {
     #[test_case(None, BTW_FALLBACK_SYSTEM ; "native_fallback")]
     #[test_case(Some(rendered_frame()), FRAME_POLICY ; "stored_frame_precedence")]
     #[test_case(Some(StoredFrame::facts_only(PromptFacts::default())), BTW_FALLBACK_SYSTEM ; "imported_before_first_run")]
-    fn side_question_uses_the_selected_policy(frame: Option<StoredFrame>, expected: &str) {
+    #[tokio::test]
+    async fn side_question_uses_the_selected_policy(frame: Option<StoredFrame>, expected: &str) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "persona",
@@ -189,7 +188,7 @@ mod tests {
             Arc::new(RecordingProvider(sent)),
             crate::components::test_model(),
         );
-        let (system, tools) = smol::block_on(requests.recv_async()).unwrap();
+        let (system, tools) = requests.recv_async().await.unwrap();
         assert_eq!(system, expected);
         assert!(tools.as_array().unwrap().is_empty());
         let prompts = host.event_handle().collect_prompt_slots();

@@ -10,16 +10,17 @@ test-support = []
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true, features = ["deserialize"] }
+indexmap = { workspace = true }
 maki-storage = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 strum = { workspace = true }
-smol = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 flume = { workspace = true }
-futures-lite = { workspace = true }
 futures = { workspace = true }
-isahc = { workspace = true }
+reqwest = { workspace = true, features = ["socks", "gzip", "deflate", "stream"] }
 base64 = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 sha2 = { workspace = true }

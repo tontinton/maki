@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
-use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
+use maki_agent::{BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput};
 use maki_lua::{PackCommand, PackPlan};
 use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};
@@ -221,6 +221,8 @@ pub enum Action {
     /// Esc in a plugin task's tab: closes the plugin session behind it.
     CancelPluginTask {
         id: String,
+        /// Read at the stop: a rewind drops the tab before this runs.
+        plugin: Arc<str>,
     },
     /// The history under this runtime changed (reset, load, rewind), so the
     /// agent has to be respawned on it.
@@ -329,6 +331,59 @@ pub struct DisplayMessage {
     /// Only a click sets it, so thinking starts the way `ui.thinking_lines`
     /// says however the message got here.
     pub thinking_expanded: bool,
+    /// A running row a Ctrl+B press would move now.
+    pub movable: bool,
+    /// Set once the call moved: the row keeps its receipt and follows the task.
+    pub background: Option<BackgroundBadge>,
+    /// The full body behind a one-line notice, shown when the row expands.
+    pub detail: Option<String>,
+    /// Whether [`Self::detail`] is shown. Only a click sets it, so a notice
+    /// starts collapsed however it got here.
+    pub detail_expanded: bool,
+    /// On a notice that answers a background task: how the task ended.
+    pub task_end: Option<BackgroundOutcome>,
+}
+
+/// How a moved call's row tracks its background task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundBadge {
+    pub id: String,
+    /// `None` after a restore: the row shows a neutral marker.
+    pub started_at: Option<Instant>,
+    pub outcome: Option<BackgroundOutcome>,
+}
+
+impl BackgroundBadge {
+    /// The badge {receipt} puts on its row. It counts from the call's start,
+    /// as the call's own marks do, not from the move.
+    pub fn moved(receipt: &ToolDoneEvent) -> Self {
+        let now = Instant::now();
+        Self {
+            id: receipt.id.clone(),
+            started_at: Some(now.checked_sub(receipt.ran_for()).unwrap_or(now)),
+            outcome: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundOutcome {
+    Done,
+    Error,
+    Cancelled,
+    /// The task died with the maki that ran it and never reported back.
+    Lost,
+}
+
+impl From<TaskEnd> for BackgroundOutcome {
+    fn from(end: TaskEnd) -> Self {
+        match end {
+            TaskEnd::Finished => Self::Done,
+            TaskEnd::Failed => Self::Error,
+            TaskEnd::Cancelled => Self::Cancelled,
+            TaskEnd::Lost => Self::Lost,
+        }
+    }
 }
 
 impl DisplayMessage {
@@ -350,6 +405,11 @@ impl DisplayMessage {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_expanded: false,
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -383,6 +443,11 @@ impl DisplayMessage {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_expanded: false,
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         }
     }
 

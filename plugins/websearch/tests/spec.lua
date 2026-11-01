@@ -148,37 +148,39 @@ case("providers_count_argument_matches_the_backend", function()
   eq(providers.kagi.arguments(QUERY, 5).numResults, nil)
 end)
 
-local KAGI_RESULT = table.concat({
-  "### [Tokio vs Smol: The Battle That&#39;s Dividing Rust](https://youtu.be/x)",
-  "**URL:** https://youtu.be/x",
-  "**Published:** 2025-10-15",
-  "",
-  "<strong>Smol</strong> &amp; <strong>async</strong> &lt;3 &#x2014; done",
-}, "\n")
+-- Video ahead of search, so only the category order can put search first.
+local KAGI_JSON = '{"video":[{"title":"Tokio vs Smol","url":"https://youtu.be/x","published":"2025-10-15",'
+  .. '"snippet":"Smol & async"}],"search":[{"title":"smol","url":"https://docs.rs/smol",'
+  .. '"snippet":"A small and fast async runtime."},{"title":"smol-rs","url":"https://github.com/smol-rs/smol",'
+  .. '"snippet":"Contribute to smol-rs/smol."}]}'
 
-case("kagi_clean_strips_highlights_url_lines_and_entities", function()
+case("kagi_format_lists_every_category_in_kagimcp_order", function()
   eq(
-    providers.kagi.clean(KAGI_RESULT),
+    providers.kagi.format(KAGI_JSON),
     table.concat({
-      "### [Tokio vs Smol: The Battle That's Dividing Rust](https://youtu.be/x)",
-      "**Published:** 2025-10-15",
-      "",
-      "Smol & async <3 \u{2014} done",
+      "1. smol",
+      "   https://docs.rs/smol",
+      "   A small and fast async runtime.",
+      "2. smol-rs",
+      "   https://github.com/smol-rs/smol",
+      "   Contribute to smol-rs/smol.",
+      "3. Tokio vs Smol (2025-10-15)",
+      "   https://youtu.be/x",
+      "   Smol & async",
     }, "\n")
   )
 end)
 
--- Decoding is one pass, so an escaped entity in a snippet stays readable as
--- the entity it spells instead of collapsing into the character.
-case("kagi_clean_decodes_once", function()
-  eq(providers.kagi.clean("&amp;#39; &amp;lt;strong&amp;gt;"), "&#39; &lt;strong&gt;")
+case("kagi_format_empty_object_is_no_results", function()
+  eq(providers.kagi.format("{}"), NO_RESULTS_MSG)
 end)
 
-case("kagi_clean_keeps_entities_it_cannot_decode", function()
-  eq(
-    providers.kagi.clean("&bogus; &#x110000; &#xD800; &#xDFFF; &#0; &#xD7FF;&#xE000;"),
-    "&bogus; &#x110000; &#xD800; &#xDFFF; &#0; \u{D7FF}\u{E000}"
-  )
+case("kagi_format_passes_through_what_it_cannot_read", function()
+  local markdown = "## Search Results\n\n### [smol](https://docs.rs/smol)"
+  eq(providers.kagi.format(markdown), markdown)
+  eq(providers.kagi.format(NO_RESULTS_MSG), NO_RESULTS_MSG)
+  local renamed = '{"web":[{"title":"smol","url":"https://docs.rs/smol"}]}'
+  eq(providers.kagi.format(renamed), renamed)
 end)
 
 -- ── searxng (plain GET /search?format=json backend) ──

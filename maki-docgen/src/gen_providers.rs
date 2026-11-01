@@ -233,7 +233,7 @@ high = {{ reasoning_effort = "xhigh" }}
 max = {{ reasoning_effort = "xhigh" }}
 ```
 
-A mode you left out sends nothing. To get Ollama's own effort words (`low`, `medium`, `high`, and `none` when thinking is off) instead of writing every fragment yourself, use the built-in `ollama` slug: set `[ollama].base_url` (or `OLLAMA_HOST`) and give `[[ollama.models]]` the thinking keys. Only `supports_thinking`, `requires_thinking` and `thinking_fields` overlay onto a built-in slug. The rest of the entry stays ignored, and startup names the keys it dropped.
+A mode you left out sends nothing. The built-in `ollama` slug needs no thinking keys, because it asks Ollama which levels each model takes (see [Ollama](#ollama)). To override that for a model, set `[ollama].base_url` (or `OLLAMA_HOST`) and give `[[ollama.models]]` the thinking keys. Only `supports_thinking`, `requires_thinking` and `thinking_fields` overlay onto a built-in slug. The rest of the entry stays ignored, and startup names the keys it dropped.
 
 Without `thinking_fields`, maki sends `"thinking": {{"type": "disabled"}}` when thinking is off and nothing when it is on. GLM and Kimi gateways need this block to stop reasoning. Declaring `thinking_fields` replaces it, so add an `off` key if your gateway needs one. Some gateways, such as LiteLLM in front of Azure, reject the block. Maki then retries without it, and if the retry works, leaves the block out for that model until restart.
 

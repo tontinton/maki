@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use flume::Sender;
 use serde_json::Value;
+use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
 use maki_config::ModelPolicy;
@@ -34,6 +35,13 @@ pub trait Provider: Send + Sync {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
+
+    /// The context window the server runs `model` with right now. Only a
+    /// server that sizes the window when it loads a model can differ from
+    /// discovery, so everyone else says `None`. Asked before every request.
+    fn served_context_window<'a>(&'a self, _model: &'a Model) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async { None })
+    }
 
     /// Fetch provider-side usage quota (remaining percentage / reset times).
     /// `Ok(None)` means the provider does not expose a programmatic usage endpoint.
@@ -150,7 +158,7 @@ pub async fn from_model_async(
 ) -> Result<Box<dyn Provider>, AgentError> {
     let slug = Arc::clone(&model.provider);
     let id = model.id.clone();
-    let provider = smol::unblock(move || provider_for_slug(&slug, timeouts)).await?;
+    let provider = spawn_blocking(move || provider_for_slug(&slug, timeouts)).await??;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %id, "provider created");
     Ok(provider)
@@ -214,13 +222,16 @@ pub async fn fetch_all_models(
 
     for spec in ProviderRegistry::all() {
         let slug = spec.slug;
-        let Ok(provider) = smol::unblock(move || provider_for_slug(slug, timeouts)).await else {
+        let Ok(provider) = spawn_blocking(move || provider_for_slug(slug, timeouts))
+            .await
+            .expect("provider construction panicked")
+        else {
             warn!(provider = slug, "failed to create provider, skipping");
             continue;
         };
         let display_name = spec.display_name;
         let tx = tx.clone();
-        smol::spawn(async move {
+        tokio::spawn(async move {
             let batch = match provider.list_models().await {
                 Ok(models) => {
                     let mut specs: Vec<String> =
@@ -249,20 +260,19 @@ pub async fn fetch_all_models(
                         .collect();
                     ModelBatch {
                         models: fallback,
-                        warnings: vec![format!(
-                            "{display_name}: {e} (using static fallback)"
-                        )],
+                        warnings: vec![format!("{display_name}: {e} (using static fallback)")],
                     }
                 }
             };
             let _ = tx.send_async(batch).await;
-        })
-        .detach();
+        });
     }
 
     let tx_catalog = tx.clone();
-    smol::spawn(async move {
-        let catalog = smol::unblock(catalog_providers).await;
+    tokio::spawn(async move {
+        let catalog = spawn_blocking(catalog_providers)
+            .await
+            .expect("catalog load panicked");
         for cat in catalog {
             // No `Owner::Custom` here, unlike `available_model_specs` above:
             // a long-standing asymmetry, changing it is a behaviour change.
@@ -283,11 +293,10 @@ pub async fn fetch_all_models(
                 })
                 .await;
         }
-    })
-    .detach();
+    });
 
     let tx_custom = tx.clone();
-    smol::spawn(async move {
+    tokio::spawn(async move {
         let declared = custom::declared_model_specs();
         if !declared.is_empty() {
             let _ = tx_custom
@@ -297,7 +306,7 @@ pub async fn fetch_all_models(
                 })
                 .await;
         }
-        let custom_specs = smol::unblock(move || custom::discover_models(timeouts)).await;
+        let custom_specs = custom::discover_models(timeouts).await;
         if !custom_specs.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
@@ -306,8 +315,7 @@ pub async fn fetch_all_models(
                 })
                 .await;
         }
-    })
-    .detach();
+    });
 
     drop(tx);
 

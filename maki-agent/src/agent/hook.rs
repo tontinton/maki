@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::cancel::CancelToken;
 use crate::tools::ToolRegistry;
-use crate::tools::hook::Verdict;
+use crate::tools::hook::{Verdict, bounded};
 use crate::tools::registry::BoxFuture;
 
 /// A layer may shell out before it decides, but the user is waiting on every
@@ -56,6 +56,10 @@ pub trait AgentHook: Send + Sync + 'static {
     /// value. A slot nobody wrapped then costs a single lookup.
     fn wraps(&self, slot: AgentSlot) -> bool;
 
+    /// How long past a chain's deadline this host may still answer, see
+    /// [`bounded`].
+    fn answer_grace(&self) -> Duration;
+
     fn run<'a>(
         &'a self,
         slot: AgentSlot,
@@ -80,9 +84,9 @@ impl AgentHooks<'_> {
         self.registry.agent_hook().is_some_and(|h| h.wraps(slot))
     }
 
-    /// `value` is only built when a layer is there to read it. A cancelled or
-    /// absent chain answers [`Verdict::Unchanged`], because a layer is an
-    /// opinion about the run and never a precondition for it.
+    /// `value` is only built when a layer is there to read it. A cancelled,
+    /// lapsed or absent chain answers [`Verdict::Unchanged`], because a layer
+    /// is an opinion about the run and never a precondition for it.
     pub async fn fire(&self, slot: AgentSlot, value: impl FnOnce() -> Value) -> Verdict {
         let Some(hook) = self.registry.agent_hook().filter(|h| h.wraps(slot)) else {
             return Verdict::Unchanged;
@@ -97,8 +101,8 @@ impl AgentHooks<'_> {
             cancel: self.cancel,
             deadline: Instant::now() + AGENT_CHAIN_MAX,
         };
-        self.cancel
-            .race(hook.run(slot, value(), &call))
+        let chain = hook.run(slot, value(), &call);
+        bounded(self.cancel, call.deadline, hook.answer_grace(), chain)
             .await
             .unwrap_or(Verdict::Unchanged)
     }
@@ -107,6 +111,7 @@ impl AgentHooks<'_> {
 #[cfg(test)]
 pub(crate) mod testing {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use serde_json::Value;
 
@@ -128,6 +133,10 @@ pub(crate) mod testing {
     impl AgentHook for ScriptedHook {
         fn wraps(&self, _: AgentSlot) -> bool {
             true
+        }
+
+        fn answer_grace(&self) -> Duration {
+            Duration::ZERO
         }
 
         fn run<'a>(

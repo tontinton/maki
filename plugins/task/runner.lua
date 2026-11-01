@@ -1,5 +1,5 @@
--- Everything the blocking and the background path share, from input checks to
--- the prompt loop, so the two cannot drift apart.
+-- What the task tool runs, from input checks to the prompt loop. A background
+-- task is the same call moved off its turn, so it shares all of it.
 --
 -- Structured-output story: the subagent gets a session-local structured_output
 -- tool whose handler validates the result and keeps it in `capture`. Invalid
@@ -30,7 +30,7 @@ local Runner = {}
 local opts = maki.api.register_options({
   max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
   allow_background = {
-    default = false,
+    default = true,
     desc = "Expose a `background` input that pushes subagent results to the chat when they finish.",
   },
   allow_model = {
@@ -82,13 +82,26 @@ end
 if opts.allow_background then
   schema.properties.background = {
     type = "boolean",
-    description = "Run in the background and continue other work. The result arrives later in a notice. End your turn to wait for it. Background tasks cannot ask for permissions.",
+    description = "Run in the background. The result arrives as a message when it ends. End your turn to wait for it.",
+    needs_background = true,
   }
 end
 
 Runner.allow_background = opts.allow_background
 Runner.schema = schema
-Runner.semaphore = maki.async.semaphore(opts.max_concurrent)
+
+local slots = maki.async.semaphore(opts.max_concurrent)
+
+-- {on_wait} runs only when every slot is taken, right before the call parks
+-- for one.
+function Runner.acquire_slot(on_wait)
+  local permit = slots:try_acquire()
+  if permit then
+    return permit
+  end
+  on_wait()
+  return slots:acquire()
+end
 
 local function bounded_errors(errors)
   local out = {}
@@ -131,14 +144,6 @@ function Runner.prepare(input, ctx)
 
   local audience = subagent_type == "research" and "research_sub" or "general_sub"
   local prompt_id = subagent_type == "research" and "research" or "general"
-  local system, system_err = maki.agent.system_prompt(ctx, {
-    prompt_id = prompt_id,
-    instructions = true,
-  })
-  if system_err then
-    return nil, system_err
-  end
-
   local tool_defs, tools_err = maki.agent.tools(ctx, {
     audience = audience,
     spec = model.spec,
@@ -146,6 +151,15 @@ function Runner.prepare(input, ctx)
   })
   if tools_err then
     return nil, tools_err
+  end
+
+  local system, system_err = maki.agent.system_prompt(ctx, {
+    prompt_id = prompt_id,
+    instructions = true,
+    tools = tool_defs,
+  })
+  if system_err then
+    return nil, system_err
   end
 
   local capture = validator and {} or nil

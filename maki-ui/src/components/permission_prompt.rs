@@ -164,8 +164,9 @@ impl Overlay for PermissionPrompt {
         false
     }
 
-    /// Only reached when the run those asks belonged to is gone (cancel,
-    /// session switch), which is what unparks their tool calls anyway.
+    /// Only reached by a cancel or a session reset, and the prompt takes every
+    /// key while it holds an ask, so neither runs over one: an ask from a task
+    /// that outlives them would wait on an answer that never comes.
     fn close(&mut self) {
         self.queue.clear();
         self.reset_entry();
@@ -220,6 +221,10 @@ impl PermissionPrompt {
             self.reset_entry();
         }
         self.queue.retain(|request| !owns(request));
+    }
+
+    pub(crate) fn is_asking(&self, id: &str) -> bool {
+        self.queue.iter().any(|request| request.id == id)
     }
 
     pub(crate) fn tool(&self) -> Option<&ToolKey> {

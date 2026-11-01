@@ -5,6 +5,7 @@ use maki_config::providers::{
     resolve_base_url, resolve_protocol,
 };
 use serde_json::{Value, json};
+use tokio::task::spawn_blocking;
 use tracing::warn;
 
 use super::ResolvedAuth;
@@ -314,8 +315,10 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
 /// Skip definitions handled by [`declared_model_specs`]; only HTTP `/models`
 /// goes through here, so an empty `discover_models = false` provider returns
 /// nothing and never hits the network.
-pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
-    let config = ProvidersConfig::load();
+pub async fn discover_models(timeouts: Timeouts) -> Vec<String> {
+    let config = spawn_blocking(ProvidersConfig::load)
+        .await
+        .expect("providers config load panicked");
     let mut all_specs = Vec::new();
     for slug in config.providers.keys() {
         if is_builtin_slug(slug) {
@@ -331,7 +334,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
         match create(slug, timeouts) {
             Ok(provider) => {
                 let slug_c = slug.clone();
-                let result = smol::block_on(provider.list_models());
+                let result = provider.list_models().await;
                 match result {
                     Ok(mut models) => {
                         overlay_declared_tiers(def, &mut models);
@@ -565,17 +568,19 @@ mod tests {
             }
         }
 
-        fn ask(&self) -> Result<StreamResponse, AgentError> {
+        async fn ask(&self) -> Result<StreamResponse, AgentError> {
             let (tx, _rx) = flume::unbounded();
-            smol::block_on(self.provider.stream_message(
-                &self.model,
-                &[Message::user(PROMPT.to_owned())],
-                "",
-                &json!([]),
-                &tx,
-                RequestOptions::default(),
-                None,
-            ))
+            self.provider
+                .stream_message(
+                    &self.model,
+                    &[Message::user(PROMPT.to_owned())],
+                    "",
+                    &json!([]),
+                    &tx,
+                    RequestOptions::default(),
+                    None,
+                )
+                .await
         }
 
         fn sent_thinking(&self) -> Vec<bool> {
@@ -589,32 +594,33 @@ mod tests {
     }
 
     /// #1302. The last refusal fails the test if the block ever goes out again.
-    #[test]
-    fn a_refused_default_thinking_block_is_dropped_and_remembered() {
+    #[tokio::test]
+    async fn a_refused_default_thinking_block_is_dropped_and_remembered() {
         const SCRIPT: &[Canned] = &[LITELLM_REFUSAL, ANSWER, ANSWER, LITELLM_REFUSAL];
         let gateway = Gateway::serve(Value::Null, SCRIPT);
 
-        assert!(gateway.ask().is_ok());
-        assert!(gateway.ask().is_ok());
+        assert!(gateway.ask().await.is_ok());
+        assert!(gateway.ask().await.is_ok());
         assert_eq!(gateway.sent_thinking(), [true, false, false]);
     }
 
     #[test_case(&[LITELLM_REFUSAL, UNAVAILABLE, LITELLM_REFUSAL, ANSWER] ; "replay_unavailable")]
     #[test_case(&[UNRELATED_REFUSAL, UNRELATED_REFUSAL, LITELLM_REFUSAL, ANSWER] ; "refusal_that_only_mentions_thinking")]
-    fn a_failed_replay_is_not_remembered(script: &'static [Canned]) {
+    #[tokio::test]
+    async fn a_failed_replay_is_not_remembered(script: &'static [Canned]) {
         let gateway = Gateway::serve(Value::Null, script);
 
-        assert!(gateway.ask().is_err());
-        assert!(gateway.ask().is_ok());
+        assert!(gateway.ask().await.is_err());
+        assert!(gateway.ask().await.is_ok());
         assert_eq!(gateway.sent_thinking(), [true, false, true, false]);
     }
 
-    #[test]
-    fn a_declared_thinking_block_is_never_dropped() {
+    #[tokio::test]
+    async fn a_declared_thinking_block_is_never_dropped() {
         const SCRIPT: &[Canned] = &[LITELLM_REFUSAL; 2];
         let gateway = Gateway::serve(json!({"off": {THINKING_FIELD: {"type": "off"}}}), SCRIPT);
 
-        assert!(gateway.ask().is_err());
+        assert!(gateway.ask().await.is_err());
         assert_eq!(gateway.sent_thinking(), [true]);
     }
 

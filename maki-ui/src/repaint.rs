@@ -170,6 +170,20 @@ impl Cadence {
         moves: false,
     };
 
+    /// Text that changes on the wall clock, like an elapsed time, owes its
+    /// frame once {due} is up. Further off than [`IDLE_POLL`] it asks for
+    /// nothing yet: the idle loop wakes sooner anyway and asks again, so a
+    /// clock that changes once a second costs one paint a second.
+    pub fn clock(due: Duration) -> Self {
+        if due > IDLE_POLL {
+            return Self::IDLE;
+        }
+        Self {
+            frame: Some(due),
+            moves: true,
+        }
+    }
+
     /// `cadence` while `applies`, else [`Cadence::IDLE`].
     pub fn when(applies: bool, cadence: Self) -> Self {
         if applies { cadence } else { Self::IDLE }
@@ -203,8 +217,10 @@ impl Cadence {
 #[cfg(test)]
 mod tests {
     use super::expect::{OWED, QUIET};
-    use super::{Cadence, Dirty, Watch};
+    use super::{Cadence, Dirty, IDLE_POLL, Watch};
     use std::sync::Arc;
+    use std::time::Duration;
+    use test_case::test_case;
 
     const EXPECT_SETTLED: &str = "nothing to combine must leave the loop asleep";
     const EXPECT_SOONEST: &str = "the soonest source must win over the whole list";
@@ -243,6 +259,13 @@ mod tests {
         let mixed = Cadence::any([Cadence::SPINNER, Cadence::PENDING]);
         assert_eq!(mixed.frame(), Cadence::PENDING.frame(), "{EXPECT_SOONEST}");
         assert!(mixed.moves(), "{EXPECT_MOTION_KEPT}");
+    }
+
+    #[test_case(IDLE_POLL * 5, Cadence::IDLE ; "far_off_waits_for_the_idle_poll")]
+    #[test_case(IDLE_POLL, Cadence { frame: Some(IDLE_POLL), moves: true } ; "due_within_the_idle_poll")]
+    #[test_case(Duration::ZERO, Cadence { frame: Some(Duration::ZERO), moves: true } ; "stale_paints_at_once")]
+    fn clock_owes_a_frame_only_once_due_is_near(due: Duration, expected: Cadence) {
+        assert_eq!(Cadence::clock(due), expected);
     }
 
     /// A generation counter answers this too, as long as every publisher

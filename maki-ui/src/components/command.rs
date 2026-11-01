@@ -80,9 +80,9 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/new",
-        description: "Start a new session",
+        description: "Start a new session (! stops background tasks)",
         max_args: 0,
-        bang: false,
+        bang: true,
         plugin_access: WRITES_SESSION,
     },
     BuiltinCommand {
@@ -185,9 +185,9 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/reload",
-        description: "Reload plugins and config",
+        description: "Reload plugins and config (! stops background tasks)",
         max_args: 0,
-        bang: false,
+        bang: true,
         plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
@@ -1284,7 +1284,8 @@ mod tests {
     /// A full name the input rules out empties the palette instead of leaving
     /// its fuzzy neighbors, which Enter would then run.
     #[test_case("/packdel! demo", true ; "bang_on_a_command_that_reads_one")]
-    #[test_case("/reload!", false      ; "bang_on_a_command_that_ignores_it")]
+    #[test_case("/reload!", true        ; "bang_on_reload")]
+    #[test_case("/exit!", false        ; "bang_on_a_command_that_ignores_it")]
     #[test_case("/cd one two", false   ; "more_args_than_the_command_takes")]
     fn bang_and_arg_count_decide_what_the_palette_offers(input: &str, active: bool) {
         assert_eq!(synced(input).is_open(), active);

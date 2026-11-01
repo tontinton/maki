@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use maki_config::PROVIDER_BUILTINS;
 use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
 
+use crate::AgentError;
 use crate::manifest;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
@@ -11,8 +12,7 @@ use crate::providers::{
     ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, google, llama_cpp, ollama,
     openai, opencode, plugin, xai, zai,
 };
-use crate::types::ThinkingFallback;
-use crate::{AgentError, Effort};
+use crate::types::{ThinkingConfig, ThinkingFallback};
 
 /// The slugs a plugin may name as its `base`, in documentation order. A `base`
 /// borrows a bespoke `impl Provider` whole, so every entry must be a
@@ -59,10 +59,10 @@ pub struct ProviderSpec {
     /// borrows this row's protocol does not inherit it; see
     /// [`crate::Model::supports_deferred_tools`].
     pub supports_deferred_tools: bool,
-    /// The level a model here is sent `adaptive` as, or `None` where the API
-    /// picks the depth itself. A fn, because one provider can serve both
-    /// kinds of model. Read through [`Model::adaptive_effort`].
-    pub adaptive_effort: fn(&Model) -> Option<Effort>,
+    /// What a model here is sent for a thinking choice, so the badge and the
+    /// picker can show it. A fn, because one provider can serve models with
+    /// different levels. Read through [`crate::ThinkingConfig::shown`].
+    pub sends_thinking: fn(&Model, ThinkingConfig) -> ThinkingConfig,
     /// How the selected endpoint handles modes outside `thinking_fields`.
     /// `None` ignores the fields, `Some` names their fallback. This also says
     /// whether a toggle fragment can carry an explicit token budget.
@@ -91,9 +91,9 @@ pub struct ProviderSpec {
     pub docs: GeneratedDocs,
 }
 
-/// For a provider whose API has an adaptive mode of its own.
-pub(crate) fn api_decides(_: &Model) -> Option<Effort> {
-    None
+/// For a provider whose API takes every choice as it is, `adaptive` included.
+pub(crate) fn sends_as_chosen(_: &Model, choice: ThinkingConfig) -> ThinkingConfig {
+    choice
 }
 
 /// For a provider whose ids all come from a live catalog.

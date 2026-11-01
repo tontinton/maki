@@ -823,13 +823,13 @@ mod tests {
         assert!(store.handler(SESSION, installed_later, 0).is_ok());
     }
 
-    #[test]
-    fn plan_read_without_ui_returns_error_pair() {
+    #[tokio::test]
+    async fn plan_read_without_ui_returns_error_pair() {
         let lua = Lua::new();
         let table = create_plan_table(&lua, None, &PluginPermissions::trusted()).unwrap();
         lua.globals().set("plan", table).unwrap();
         let (val, err): (Value, Option<String>) =
-            smol::block_on(lua.load("return plan.read()").eval_async()).unwrap();
+            lua.load("return plan.read()").eval_async().await.unwrap();
         assert!(val.is_nil());
         assert_eq!(err.as_deref(), Some(NO_UI_ERR));
     }
@@ -837,7 +837,8 @@ mod tests {
     /// Plan state is per session, so the call has to be able to name one.
     #[test_case(r#"plan.read({ session = "s1" })"#, Some("s1") ; "explicit_session")]
     #[test_case("plan.read()", None ; "focused_session")]
-    fn the_session_option_travels_to_the_ui(call: &str, expected: Option<&str>) {
+    #[tokio::test]
+    async fn the_session_option_travels_to_the_ui(call: &str, expected: Option<&str>) {
         let lua = Lua::new();
         let (tx, rx) = flume::unbounded::<UiAction>();
         let table = create_plan_table(&lua, Some(tx), &PluginPermissions::trusted()).unwrap();
@@ -849,7 +850,10 @@ mod tests {
             reply_tx.send(Ok(serde_json::json!(true))).unwrap();
             req
         });
-        smol::block_on(lua.load(format!("return {call}")).eval_async::<Value>()).unwrap();
+        lua.load(format!("return {call}"))
+            .eval_async::<Value>()
+            .await
+            .unwrap();
         assert_eq!(served.join().unwrap().session(), expected);
     }
 }

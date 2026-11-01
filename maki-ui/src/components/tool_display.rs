@@ -1,4 +1,4 @@
-use super::{DisplayMessage, ToolStatus};
+use super::{BackgroundBadge, BackgroundOutcome, DisplayMessage, ToolStatus};
 
 use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
@@ -9,6 +9,7 @@ use maki_config::{ClockFormat, ToolOutputLines};
 
 use std::borrow::Cow;
 use std::fmt::Write;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,6 +19,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::markdown::{should_truncate, text_to_lines, truncate_output, truncation_notice};
+use maki_agent::tools::is_timeout_annotation;
 use maki_agent::{
     BufferSnapshot, InstructionBlock, SnapshotSpan, SpanColor, SpanStyle, ToolInput, ToolOutput,
 };
@@ -37,6 +39,17 @@ const ASSISTANT_MARKER: &str = TOOL_INDICATOR;
 const USER_MARKER: &str = "❯ ";
 const BLANK_MARKER: &str = "  ";
 const THINKING_LABEL: &str = "thinking> ";
+pub const BACKGROUND_INDICATOR: &str = "↗ ";
+pub const MOVABLE_HINT: &str = "ctrl+b background";
+const BACKGROUND_LABEL: &str = "background";
+const BACKGROUND_CLICK_HINT: &str = "click to open";
+const BACKGROUND_DONE_LABEL: &str = "done";
+const BACKGROUND_FAILED_LABEL: &str = "failed";
+const BACKGROUND_CANCELLED_LABEL: &str = "cancelled";
+const BACKGROUND_LOST_LABEL: &str = "lost";
+const SECS_PER_MINUTE: u64 = 60;
+const SECS_PER_HOUR: u64 = 3600;
+const RIGHT_INFO_GAP: &str = "  ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
@@ -143,6 +156,31 @@ pub struct ToolLines {
     /// pass that lays out `lines`, so click rows can never drift from them.
     pub snapshot_base: Option<usize>,
     pub truncation: SectionFlags,
+    pub elapsed: Option<ElapsedSpan>,
+}
+
+/// The header span that shows how long a moved call has been running.
+pub struct ElapsedSpan {
+    pub span: usize,
+    pub since: Instant,
+    pub shown_secs: u64,
+    pub width: u16,
+}
+
+impl ElapsedSpan {
+    pub fn text(secs: u64) -> String {
+        background_annotation(None, Some(secs))
+    }
+
+    /// Shows `secs` on the header. The text can grow, so the right info that
+    /// follows it is re-fitted instead of being left to overflow and wrap.
+    pub fn refit(&self, header: &mut Line<'static>, secs: u64) {
+        let Some(span) = header.spans.get_mut(self.span) else {
+            return;
+        };
+        span.content = Self::text(secs).into();
+        refit_right_info(header, self.span + 1, self.width);
+    }
 }
 
 pub struct HighlightRequest {
@@ -199,44 +237,145 @@ pub fn format_timestamp_now(format: ClockFormat) -> String {
     zoned.strftime(crate::clock::hms(format)).to_string()
 }
 
+type RightPart<'a> = Option<(&'a str, Style)>;
+
+fn right_parts_len(parts: &[RightPart]) -> Option<usize> {
+    let (count, width) = parts
+        .iter()
+        .flatten()
+        .fold((0, 0), |(count, width), (text, _)| {
+            (count + 1, width + UnicodeWidthStr::width(*text))
+        });
+    (count > 0).then(|| width + RIGHT_INFO_GAP.len() * (count - 1) + 1)
+}
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum()
+}
+
+/// Right-aligns the hint, usage and timestamp on the header line. Whole
+/// pieces are dropped from the left (hint, then usage) when there is no room
+/// for all of them, so the header text never moves and nothing wraps.
 pub fn append_right_info(
     line: &mut Line<'static>,
+    hint: Option<&str>,
     usage: Option<&str>,
     timestamp: Option<&str>,
     width: u16,
 ) {
-    if usage.is_none() && timestamp.is_none() {
-        return;
-    }
-    let separator = if usage.is_some() && timestamp.is_some() {
-        2
-    } else {
-        0
-    };
-    let suffix_len =
-        usage.map_or(0, UnicodeWidthStr::width) + timestamp.map_or(0, str::len) + separator + 1;
-    let header_width: usize = line
-        .spans
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum();
+    let palette = theme::current();
+    let parts: [RightPart; 3] = [
+        hint.map(|h| (h, palette.tool_dim)),
+        usage.map(|u| (u, palette.tool_dim)),
+        timestamp.map(|t| (t, palette.timestamp)),
+    ];
+    let header_width = spans_width(&line.spans);
     let w = width as usize;
-    if header_width + 1 + suffix_len > w {
+    let Some((parts, suffix_len)) = (0..parts.len()).find_map(|dropped| {
+        let kept = &parts[dropped..];
+        let len = right_parts_len(kept)?;
+        (header_width + 1 + len <= w).then_some((kept, len))
+    }) else {
+        return;
+    };
+    line.spans
+        .push(Span::raw(" ".repeat(w - header_width - suffix_len)));
+    for (i, (text, style)) in parts.iter().flatten().enumerate() {
+        if i > 0 {
+            line.spans.push(Span::raw(RIGHT_INFO_GAP));
+        }
+        line.spans.push(Span::styled((*text).to_owned(), *style));
+    }
+}
+
+/// Re-fits the right info laid out by `append_right_info` after the header
+/// grew: `pad_idx` is its padding span. Re-pads when it still fits, otherwise
+/// drops whole pieces from the left, and everything when none fit.
+fn refit_right_info(line: &mut Line<'static>, pad_idx: usize, width: u16) {
+    if pad_idx >= line.spans.len() {
         return;
     }
-    let pad = w - header_width - suffix_len;
-    line.spans.push(Span::raw(" ".repeat(pad)));
-    if let Some(u) = usage {
-        line.spans
-            .push(Span::styled(u.to_owned(), theme::current().tool_dim));
-        if timestamp.is_some() {
-            line.spans.push(Span::raw("  "));
+    let header_width = spans_width(&line.spans[..pad_idx]);
+    let mut right_width = spans_width(&line.spans[pad_idx + 1..]) + 1;
+    let w = width as usize;
+    while header_width + 1 + right_width > w {
+        let first = pad_idx + 1;
+        if line.spans.len() <= first + 1 {
+            line.spans.truncate(pad_idx);
+            return;
+        }
+        right_width -= spans_width(&line.spans[first..first + 2]);
+        line.spans.drain(first..first + 2);
+    }
+    line.spans[pad_idx].content = " ".repeat(w - header_width - right_width).into();
+}
+
+/// Columns the movable hint covers on a header line, if it was drawn.
+pub fn hint_columns(header: &Line<'_>) -> Option<Range<u16>> {
+    let mut col = 0usize;
+    for span in &header.spans {
+        let width = UnicodeWidthStr::width(span.content.as_ref());
+        if span.content == MOVABLE_HINT {
+            return Some(col as u16..(col + width) as u16);
+        }
+        col += width;
+    }
+    None
+}
+
+fn format_elapsed(secs: u64) -> String {
+    if secs < SECS_PER_MINUTE {
+        format!("{secs}s")
+    } else if secs < SECS_PER_HOUR {
+        format!("{}m{:02}s", secs / SECS_PER_MINUTE, secs % SECS_PER_MINUTE)
+    } else {
+        format!(
+            "{}h{:02}m",
+            secs / SECS_PER_HOUR,
+            secs % SECS_PER_HOUR / SECS_PER_MINUTE
+        )
+    }
+}
+
+/// A running task says how long it has run and where to watch it. An ended
+/// one says how it ended in words, since two endings share a color.
+fn background_annotation(outcome: Option<BackgroundOutcome>, elapsed_secs: Option<u64>) -> String {
+    let mut text = format!(" ({BACKGROUND_LABEL}");
+    match outcome {
+        None => {
+            if let Some(secs) = elapsed_secs {
+                text.push_str(ANNOTATION_SEP);
+                text.push_str(&format_elapsed(secs));
+            }
+            text.push_str(ANNOTATION_SEP);
+            text.push_str(BACKGROUND_CLICK_HINT);
+        }
+        Some(outcome) => {
+            text.push_str(ANNOTATION_SEP);
+            text.push_str(outcome_label(outcome));
         }
     }
-    if let Some(ts) = timestamp {
-        line.spans
-            .push(Span::styled(ts.to_owned(), theme::current().timestamp));
+    text.push(')');
+    text
+}
+
+fn outcome_label(outcome: BackgroundOutcome) -> &'static str {
+    match outcome {
+        BackgroundOutcome::Done => BACKGROUND_DONE_LABEL,
+        BackgroundOutcome::Error => BACKGROUND_FAILED_LABEL,
+        BackgroundOutcome::Cancelled => BACKGROUND_CANCELLED_LABEL,
+        BackgroundOutcome::Lost => BACKGROUND_LOST_LABEL,
     }
+}
+
+/// The dot a background task's result notice opens with, colored the way
+/// the moved row's own dot ends.
+pub fn outcome_glyph(outcome: BackgroundOutcome) -> Span<'static> {
+    let indicator = Indicator::from(Some(outcome));
+    Span::styled(finished_glyph(indicator), finished_style(indicator))
 }
 
 #[derive(Clone, Copy)]
@@ -244,6 +383,8 @@ enum Indicator {
     InProgress,
     Success,
     Error,
+    Cancelled,
+    Moved,
 }
 
 impl From<ToolStatus> for Indicator {
@@ -252,6 +393,17 @@ impl From<ToolStatus> for Indicator {
             ToolStatus::InProgress => Self::InProgress,
             ToolStatus::Success => Self::Success,
             ToolStatus::Error => Self::Error,
+        }
+    }
+}
+
+impl From<Option<BackgroundOutcome>> for Indicator {
+    fn from(outcome: Option<BackgroundOutcome>) -> Self {
+        match outcome {
+            None => Self::Moved,
+            Some(BackgroundOutcome::Done) => Self::Success,
+            Some(BackgroundOutcome::Error) => Self::Error,
+            Some(BackgroundOutcome::Cancelled | BackgroundOutcome::Lost) => Self::Cancelled,
         }
     }
 }
@@ -329,6 +481,7 @@ struct ToolLineBuilder {
     limits: RenderLimits,
     markdown: bool,
     indicator: Indicator,
+    elapsed: Option<ElapsedSpan>,
 }
 
 impl ToolLineBuilder {
@@ -350,6 +503,7 @@ impl ToolLineBuilder {
             limits,
             markdown: false,
             indicator,
+            elapsed: None,
         }
     }
 
@@ -367,7 +521,7 @@ impl ToolLineBuilder {
         render_header: Option<&BufferSnapshot>,
     ) {
         let mut spans = vec![Span::styled(
-            format!("{tool_name}> "),
+            header_prefix(tool_name, header),
             theme::current().tool_prefix,
         )];
         if let Some(snapshot) = render_header {
@@ -396,13 +550,33 @@ impl ToolLineBuilder {
         self.lines.push(Line::from(spans));
     }
 
+    fn push_background_annotation(&mut self, badge: &BackgroundBadge) {
+        let Some(header) = self.lines.first_mut() else {
+            return;
+        };
+        let ticking = badge
+            .started_at
+            .filter(|_| badge.outcome.is_none())
+            .map(|since| (since, since.elapsed().as_secs()));
+        self.elapsed = ticking.map(|(since, shown_secs)| ElapsedSpan {
+            span: header.spans.len(),
+            since,
+            shown_secs,
+            width: self.width,
+        });
+        header.spans.push(Span::styled(
+            background_annotation(badge.outcome, ticking.map(|(_, secs)| secs)),
+            theme::current().tool_dim,
+        ));
+    }
+
     fn set_gutter(&mut self, started_at: Instant) {
         self.gutter = Some(match self.indicator {
             Indicator::InProgress => {
                 let ch = spinner_frame(started_at.elapsed().as_millis());
                 Span::styled(format!("{ch} "), theme::current().spinner)
             }
-            finished => Span::styled(TOOL_INDICATOR, finished_style(finished)),
+            finished => Span::styled(finished_glyph(finished), finished_style(finished)),
         });
     }
 
@@ -480,6 +654,7 @@ impl ToolLineBuilder {
             gutter_spins: matches!(self.indicator, Indicator::InProgress),
             snapshot_base: self.snapshot_base,
             truncation: self.truncation,
+            elapsed: self.elapsed,
         }
     }
 }
@@ -511,7 +686,10 @@ fn bake_spans(
                     on_spinner(out.len());
                     out.push(Span::styled(spinner_frame, theme::current().spinner));
                 }
-                finished => out.push(Span::styled(TOOL_INDICATOR, finished_style(finished))),
+                finished => out.push(Span::styled(
+                    finished_glyph(finished),
+                    finished_style(finished),
+                )),
             }
         } else {
             out.push(Span::styled(
@@ -522,11 +700,24 @@ fn bake_spans(
     }
 }
 
-fn finished_style(indicator: Indicator) -> Style {
-    if matches!(indicator, Indicator::Error) {
-        theme::current().tool_error
+fn finished_glyph(indicator: Indicator) -> &'static str {
+    if matches!(indicator, Indicator::Moved) {
+        BACKGROUND_INDICATOR
     } else {
-        theme::current().tool_success
+        TOOL_INDICATOR
+    }
+}
+
+fn finished_style(indicator: Indicator) -> Style {
+    match indicator {
+        Indicator::Error => theme::current().tool_error,
+        // The color of a cancelled todo, without its strike, which would run
+        // through the space after the dot as a stray line.
+        Indicator::Cancelled => theme::current()
+            .todo_cancelled
+            .remove_modifier(Modifier::CROSSED_OUT),
+        Indicator::Moved => theme::current().tool_dim,
+        Indicator::InProgress | Indicator::Success => theme::current().tool_success,
     }
 }
 
@@ -612,8 +803,27 @@ pub fn build_tool_lines(
         rctx.width,
         expanded,
         rctx.tool_output_lines.get(tool_name),
-        status.into(),
+        msg.background
+            .as_ref()
+            .map_or_else(|| status.into(), |badge| badge.outcome.into()),
     );
+    // A moved row only points at its task. The output streams in the task's
+    // tab and the result comes back as a notice. The row keeps the head, like
+    // a bash command, so you can still tell what runs. The rest of its text is
+    // the receipt, which is meant for the model, not for you.
+    if let Some(badge) = &msg.background {
+        b.push_header(tool_name, header, None, msg.render_header.as_ref());
+        b.push_background_annotation(badge);
+        b.set_gutter(rctx.started_at);
+        if let Some(head) = msg
+            .render_snapshot
+            .as_ref()
+            .and_then(BufferSnapshot::head_only)
+        {
+            b.push_snapshot(&head, rctx.started_at);
+        }
+        return b.finish(None, None);
+    }
     b.apply_output_format(msg.tool_output.as_deref());
     b.push_header(
         tool_name,
@@ -676,11 +886,19 @@ pub fn search_text_for(msg: &DisplayMessage) -> String {
         Some((h, b)) => (h, Some(b)),
         None => (msg.text.as_str(), None),
     };
-    let mut out = header_search_text(
-        msg.role.tool_name().unwrap_or(UNNAMED_TOOL),
-        header,
-        msg.annotation.as_deref(),
-    );
+    let tool_name = msg.role.tool_name().unwrap_or(UNNAMED_TOOL);
+    if msg.background.is_some() {
+        let mut out = header_search_text(tool_name, header, None);
+        if let Some(head) = msg
+            .render_snapshot
+            .as_ref()
+            .and_then(BufferSnapshot::head_only)
+        {
+            push_section(&mut out, &head.text());
+        }
+        return out;
+    }
+    let mut out = header_search_text(tool_name, header, msg.annotation.as_deref());
 
     let output = msg.tool_output.as_deref();
     if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) =
@@ -715,10 +933,21 @@ pub fn instructions_search_text(blocks: &[InstructionBlock]) -> String {
     out
 }
 
+/// A bash call without a description has an empty title, and a trailing
+/// space here would sit next to the one the annotation starts with.
+fn header_prefix(tool: &str, header: &str) -> String {
+    if header.is_empty() {
+        format!("{tool}>")
+    } else {
+        format!("{tool}> ")
+    }
+}
+
 fn header_search_text(tool: &str, header: &str, annotation: Option<&str>) -> String {
+    let prefix = header_prefix(tool, header);
     match annotation {
-        Some(ann) => format!("{tool}> {header} ({ann})"),
-        None => format!("{tool}> {header}"),
+        Some(ann) => format!("{prefix}{header} ({ann})"),
+        None => format!("{prefix}{header}"),
     }
 }
 
@@ -741,6 +970,15 @@ fn plain_output_text(output: &ToolOutput) -> Option<&str> {
 pub fn truncate_to_header(text: &mut String) {
     let end = text.find('\n').unwrap_or(text.len());
     text.truncate(end);
+}
+
+/// A moved call has no deadline left, so its timeout note would mislead.
+pub(crate) fn without_timeout(annotation: &str) -> Option<String> {
+    let kept: Vec<&str> = annotation
+        .split(ANNOTATION_SEP)
+        .filter(|note| !is_timeout_annotation(note))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join(ANNOTATION_SEP))
 }
 
 /// Skips a note the row already shows. A `code_execution` run sends the same
@@ -865,6 +1103,11 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -944,7 +1187,7 @@ mod tests {
             SectionFlags::default(),
         );
         let span_count_before = tl.lines[0].spans.len();
-        append_right_info(&mut tl.lines[0], None, Some("12:34:56"), width);
+        append_right_info(&mut tl.lines[0], None, None, Some("12:34:56"), width);
         if expect_timestamp {
             let last = tl.lines[0].spans.last().unwrap();
             assert_eq!(last.style, theme::current().timestamp);
@@ -966,6 +1209,77 @@ mod tests {
         );
         let text = lines_text(&tl);
         assert!(text.contains("(2m timeout)"));
+    }
+
+    #[test_case("",          "bash> (3 lines)"          ; "untitled")]
+    #[test_case("run tests", "bash> run tests (3 lines)" ; "titled")]
+    fn header_has_one_space_before_the_annotation(header: &str, expected: &str) {
+        let mut msg = bash_msg(header, ToolStatus::Success, None, None);
+        msg.annotation = Some("3 lines".into());
+
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+
+        assert!(lines_text(&tl).contains(expected), "{}", lines_text(&tl));
+        assert!(search_text_for(&msg).starts_with(expected));
+    }
+    const MOVED_HEADER: &str = "Run the tests";
+    const RECEIPT_ANNOTATION: &str = "3 lines";
+    const RECEIPT_BODY: &str = "Running in the background. Last 2 lines:";
+
+    const MOVED_COMMAND: &str = "cargo test";
+    const MOVED_OUTPUT: &str = "running 3 tests";
+
+    #[test_case(None, 0                          ; "running")]
+    #[test_case(Some(BackgroundOutcome::Done), 0 ; "ended")]
+    #[test_case(None, 1                          ; "with_a_head")]
+    fn a_moved_row_keeps_only_its_header_and_head(outcome: Option<BackgroundOutcome>, head: usize) {
+        let mut msg = bash_msg(
+            &format!("{MOVED_HEADER}\n{RECEIPT_BODY}"),
+            ToolStatus::Success,
+            None,
+            Some(ToolOutput::Plain(RECEIPT_BODY.into())),
+        );
+        msg.annotation = Some(RECEIPT_ANNOTATION.into());
+        msg.background = Some(BackgroundBadge {
+            id: "t1".into(),
+            started_at: None,
+            outcome,
+        });
+        msg.render_snapshot = Some(BufferSnapshot {
+            lines: Arc::new(vec![
+                SnapshotLine::plain(MOVED_COMMAND.into()),
+                SnapshotLine::plain(MOVED_OUTPUT.into()),
+            ]),
+            head,
+        });
+
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+
+        let text = lines_text(&tl);
+        assert_eq!(tl.lines.len(), 1 + head, "{text}");
+        assert!(text.contains(MOVED_HEADER), "{text}");
+        assert_eq!(text.contains(MOVED_COMMAND), head > 0, "{text}");
+        assert!(!text.contains(MOVED_OUTPUT), "{text}");
+        assert!(
+            text.contains(&background_annotation(outcome, None)),
+            "{text}"
+        );
+        assert!(!text.contains(RECEIPT_ANNOTATION), "{text}");
+
+        let searched = search_text_for(&msg);
+        assert_eq!(searched.contains(MOVED_COMMAND), head > 0, "{searched}");
+        assert!(!searched.contains(MOVED_OUTPUT), "{searched}");
+        assert!(!searched.contains(RECEIPT_BODY), "{searched}");
     }
 
     #[test]
@@ -1004,6 +1318,11 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -1100,6 +1419,11 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -1141,18 +1465,21 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         }
     }
 
     fn make_snapshot(lines: Vec<Vec<SnapshotSpan>>) -> BufferSnapshot {
-        BufferSnapshot {
-            lines: Arc::new(
-                lines
-                    .into_iter()
-                    .map(|spans| SnapshotLine { spans })
-                    .collect(),
-            ),
-        }
+        BufferSnapshot::from_arc(Arc::new(
+            lines
+                .into_iter()
+                .map(|spans| SnapshotLine { spans })
+                .collect(),
+        ))
     }
 
     #[test]
@@ -1467,6 +1794,11 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -1569,6 +1901,11 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -1680,6 +2017,11 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         };
         assert!(
             search_text_for(&msg).contains("llm_output_here"),
@@ -1714,6 +2056,11 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         };
         assert!(
             search_text_for(&msg).contains("body_fallback"),
@@ -1745,6 +2092,11 @@ mod tests {
             snapshot_theme_gen: 0,
             thinking_expanded: false,
             images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         };
         assert!(
             search_text_for(&msg).contains(LIVE_TEXT),
@@ -1897,6 +2249,71 @@ mod tests {
         let header_line = tl.lines.first().expect("header line");
         let dot = header_line.spans.last().expect("baked dot span");
         assert_eq!(dot.content.as_ref(), TOOL_INDICATOR);
+    }
+
+    const HEADER_TEXT: &str = "head";
+    const TIMESTAMP: &str = "12:34:56";
+
+    fn right_info_text(width: u16) -> (String, Option<Range<u16>>) {
+        let mut line = Line::from(HEADER_TEXT);
+        append_right_info(&mut line, Some(MOVABLE_HINT), None, Some(TIMESTAMP), width);
+        let text = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        (text, hint_columns(&line))
+    }
+
+    #[test_case(33, true,  true  ; "room_for_both")]
+    #[test_case(20, false, true  ; "hint_dropped_first")]
+    #[test_case(10, false, false ; "room_for_neither")]
+    fn right_info_drops_the_hint_before_the_timestamp(
+        width: u16,
+        expect_hint: bool,
+        expect_timestamp: bool,
+    ) {
+        let (text, hint) = right_info_text(width);
+        assert!(text.starts_with(HEADER_TEXT));
+        assert_eq!(text.contains(MOVABLE_HINT), expect_hint);
+        assert_eq!(text.contains(TIMESTAMP), expect_timestamp);
+        assert_eq!(hint.is_some(), expect_hint);
+        if expect_timestamp {
+            assert_eq!(UnicodeWidthStr::width(text.as_str()), width as usize - 1);
+        }
+    }
+
+    #[test_case(30, true,  true  ; "room_for_usage_and_timestamp")]
+    #[test_case(20, false, true  ; "usage_dropped_before_timestamp")]
+    fn right_info_drops_whole_pieces_and_never_exceeds_width(
+        width: u16,
+        expect_usage: bool,
+        expect_timestamp: bool,
+    ) {
+        const USAGE: &str = "148↓ $0.009";
+        let mut line = Line::from(HEADER_TEXT);
+        append_right_info(&mut line, None, Some(USAGE), Some(TIMESTAMP), width);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text.contains(USAGE), expect_usage);
+        assert_eq!(text.contains(TIMESTAMP), expect_timestamp);
+        assert!(UnicodeWidthStr::width(text.as_str()) < width as usize);
+    }
+
+    #[test_case(5,    "5s"     ; "seconds")]
+    #[test_case(72,   "1m12s"  ; "minutes")]
+    #[test_case(3725, "1h02m"  ; "hours")]
+    fn format_elapsed_cases(secs: u64, expected: &str) {
+        assert_eq!(format_elapsed(secs), expected);
+    }
+
+    #[test_case(None, Some(72),                               " (background · 1m12s · click to open)" ; "running")]
+    #[test_case(None, None,                                   " (background · click to open)"         ; "restored")]
+    #[test_case(Some(BackgroundOutcome::Done), None,          " (background · done)"                  ; "done")]
+    #[test_case(Some(BackgroundOutcome::Error), None,         " (background · failed)"                ; "failed")]
+    #[test_case(Some(BackgroundOutcome::Cancelled), None,     " (background · cancelled)"             ; "cancelled")]
+    #[test_case(Some(BackgroundOutcome::Lost), Some(72),      " (background · lost)"                  ; "lost")]
+    fn background_annotation_cases(
+        outcome: Option<BackgroundOutcome>,
+        secs: Option<u64>,
+        expected: &str,
+    ) {
+        assert_eq!(background_annotation(outcome, secs), expected);
     }
 }
 

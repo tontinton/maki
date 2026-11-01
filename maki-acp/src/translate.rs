@@ -793,6 +793,7 @@ mod tests {
             is_error,
             annotation: None,
             written_path: written.map(str::to_owned),
+            backgrounded: false,
         }
     }
 

@@ -36,7 +36,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Gpt,
     supports_thinking: true,
     supports_deferred_tools: false,
-    adaptive_effort: platform::adaptive_effort,
+    sends_thinking: platform::sends_thinking,
     thinking_fields_fallback: platform::thinking_fields_fallback,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(100_000),

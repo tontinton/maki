@@ -7,6 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
+use tokio::task::spawn_blocking;
+
 /// Peels whatever a ref names down to a commit.
 const COMMIT_PEEL: &str = "^{commit}";
 const PLUGIN_MANIFEST: &str = "plugin.toml";
@@ -218,7 +220,7 @@ pub fn redact(text: &str) -> String {
 /// `maki.pack.add` runs while `init.lua` is being sourced, and `init.lua`
 /// executes on the single Lua thread inside an async call. A blocking
 /// `Command::output` there would stall the whole VM, the watchdog included, so
-/// every invocation goes through `smol::unblock` and the caller awaits it. On a
+/// every invocation goes through `spawn_blocking` and the caller awaits it. On a
 /// first start a clone can take seconds, which is exactly when this matters.
 ///
 /// The directory is required, never optional. Git reads the config of whatever
@@ -229,7 +231,7 @@ pub fn redact(text: &str) -> String {
 /// owns and the question goes away.
 pub async fn run(args: Vec<String>, cwd: PathBuf) -> Result<GitOutput, GitError> {
     let display = redact(&args.join(" "));
-    let output = smol::unblock(move || {
+    let output = spawn_blocking(move || {
         let mut cmd = std::process::Command::new("git");
         cmd.args(&args);
         cmd.current_dir(cwd);
@@ -238,7 +240,8 @@ pub async fn run(args: Vec<String>, cwd: PathBuf) -> Result<GitOutput, GitError>
         }
         cmd.output()
     })
-    .await;
+    .await
+    .unwrap_or_else(|e| Err(e.into()));
 
     let output = match output {
         Ok(output) => output,
@@ -453,16 +456,17 @@ mod tests {
         assert!(msg.contains("repository not found"));
     }
 
-    #[test]
-    fn a_failing_command_reports_rather_than_panicking() {
+    #[tokio::test]
+    async fn a_failing_command_reports_rather_than_panicking() {
         let dir = tempfile::TempDir::new().unwrap();
         let hooks = dir.path().join("nohooks");
         std::fs::create_dir_all(&hooks).unwrap();
 
-        let result = smol::block_on(run(
+        let result = run(
             rev_parse_args(&hooks, "definitely-not-a-ref"),
             dir.path().to_path_buf(),
-        ));
+        )
+        .await;
         assert!(result.is_err(), "an unknown revision must be an error");
     }
 }

@@ -1,15 +1,16 @@
 use super::mouse::FLASH_COPIED;
 use super::session::{FORK_EMPTY_MSG, FORK_TITLE_PREFIX};
+use super::view::FINISHED_TAB_HINT;
 use super::*;
 use crate::AppSession;
 use crate::agent::shared_queue;
-use crate::app::tasks::TaskStatus;
-use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX};
+use crate::app::tasks::{TaskParent, TaskStatus};
+use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX, LOST_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::{PROMPT_NEEDS, ParsedCommand, USER_ONLY_SUFFIX};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
-use crate::components::messages::ScrollPos;
+use crate::components::messages::{ClickOutcome, ScrollPos};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
@@ -27,10 +28,10 @@ use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{
-    AgentMode, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors, McpPromptArg,
-    McpPromptInfo, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, SharedBuf,
-    SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript,
-    TurnCompleteEvent,
+    AgentMode, BackgroundNotice, CallRecord, DoneReason, HistorySnapshot, ImageMediaType,
+    McpConfigErrors, McpPromptArg, McpPromptInfo, McpServerInfo, McpServerStatus, McpSnapshot,
+    McpSnapshotReader, RunTotals, SharedBuf, SteerKind, SubagentInbox, TaskLabel, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
 };
 use maki_config::{
     Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
@@ -46,14 +47,14 @@ use maki_lua::{
     SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
 };
 use maki_providers::{
-    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
-    TokenUsage,
+    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TaskSettled,
+    ThinkingSupport, TokenUsage,
 };
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
 use maki_storage::sessions::{
-    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, StoredWriters,
-    THINKING_ADAPTIVE, ThinkingParseError,
+    SessionClaim, SessionMeta, StoredMode, StoredSubagent, StoredThinking, StoredTokenUsage,
+    StoredWriters, THINKING_ADAPTIVE, ThinkingParseError,
 };
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
@@ -65,14 +66,18 @@ use std::env;
 use std::fs;
 use std::iter;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use test_case::test_case;
+use tokio::runtime::EnterGuard;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_OUTPUT_CAP: u32 = 8192;
 const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
 const TASK_ID: &str = "task1";
+pub(crate) const STARTED_AT_KEY: &str = "started_at";
+const ENDED_AT_KEY: &str = "ended_at";
+const COST_KEY: &str = "cost";
 const PACKUPDATE: &str = "/packupdate";
 const PACK_NAME: &str = "demo";
 const PACKDEL_USAGE: &str = "/packdel: name a package, or pass ++all";
@@ -219,6 +224,12 @@ fn test_writer(dir: StateDir) -> StorageWriter {
     StorageWriter::new(dir, flume::unbounded().0)
 }
 
+/// A synchronous test that spawns tasks or blocks on them the way the UI
+/// thread does holds this for its whole body.
+pub(crate) fn enter_runtime() -> EnterGuard<'static> {
+    maki_lua::test_support::runtime().enter()
+}
+
 pub(crate) fn test_app() -> App {
     spawned_app(
         tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
@@ -303,7 +314,7 @@ fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {
     })
 }
 
-fn agent_msg(event: AgentEvent) -> Msg {
+pub(crate) fn agent_msg(event: AgentEvent) -> Msg {
     agent_msg_with_run_id(event, 1)
 }
 
@@ -352,6 +363,7 @@ fn subagent_info_with_tx(
         opts: None,
         answer_tx,
         inbox: None,
+        parent_call: None,
     }
 }
 
@@ -397,7 +409,7 @@ fn subagent_msg_with_model(event: AgentEvent, parent_id: &str, name: &str, model
     }))
 }
 
-fn tool_start(id: &str, tool: &str) -> AgentEvent {
+pub(crate) fn tool_start(id: &str, tool: &str) -> AgentEvent {
     AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: id.into(),
         tool: tool.into(),
@@ -480,6 +492,8 @@ fn a_notice_line_appears_when_the_loop_accepts_it() {
     app.update(agent_msg_with_run_id(
         AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
+            detail: None,
+            end: None,
         },
         app.run_id,
     ));
@@ -560,7 +574,11 @@ fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedSte
                 kind: SteerKind::MessageRewritten,
                 text: STEERED_TEXT.into(),
             },
-            LiveStep::Accepted(text) => AgentEvent::ObservationLine { text: text.into() },
+            LiveStep::Accepted(text) => AgentEvent::ObservationLine {
+                text: text.into(),
+                detail: None,
+                end: None,
+            },
             LiveStep::Done => done(),
         };
         app.update(agent_msg_with_run_id(event, app.run_id));
@@ -694,7 +712,7 @@ fn ctrl_c_after_a_copy(between: &[KeyCode]) -> CtrlC {
 }
 
 #[test_case(done(), ExitRequest::Success ; "done_exits_success")]
-#[test_case(AgentEvent::Error { message: "boom".into(), auth: false }, ExitRequest::Error ; "error_exits_error")]
+#[test_case(AgentEvent::Error { message: "boom".into(), auth: false, totals: RunTotals::default() }, ExitRequest::Error ; "error_exits_error")]
 fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     let mut app = test_app();
     app.exit_on_done = true;
@@ -782,6 +800,7 @@ fn tool_done_transitions_plan_to_ready(
         is_error: false,
         annotation: None,
         written_path,
+        backgrounded: false,
     }))));
 
     assert_eq!(app.state.plan.is_ready(), expect_ready);
@@ -937,6 +956,7 @@ fn agent_error_lands_in_chat(message: String, expected: String) {
     app.update(agent_msg(AgentEvent::Error {
         message,
         auth: false,
+        totals: RunTotals::default(),
     }));
     assert_eq!(app.chats[0].last_message_role(), Some(&DisplayRole::Error));
     assert_eq!(app.chats[0].last_message_text(), expected);
@@ -1034,6 +1054,7 @@ pub(crate) fn error_app(app: &mut App) {
     app.update(agent_msg(AgentEvent::Error {
         message: AGENT_ERROR_MSG.into(),
         auth: false,
+        totals: RunTotals::default(),
     }));
 }
 
@@ -1969,6 +1990,7 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     }))));
 
     let (event, data) = probe.try_recv_autocmd().expect("ToolDone fired");
@@ -2402,6 +2424,7 @@ fn agent_error() -> AgentEvent {
     AgentEvent::Error {
         message: AGENT_ERROR_MSG.into(),
         auth: false,
+        totals: RunTotals::default(),
     }
 }
 
@@ -2507,14 +2530,14 @@ fn esc_in_a_plugin_task_tab_stops_its_session() {
 
     assert!(matches!(
         actions.as_slice(),
-        [Action::CancelPluginTask { id }] if id == MONITOR_ID
+        [Action::CancelPluginTask { id, .. }] if id == MONITOR_ID
     ));
-    assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Cancelled);
     assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
     assert_eq!(app.chats[0].last_message_role(), None);
 
     plugin_event(&mut app, AgentEvent::StreamClosed);
-    assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Cancelled);
 }
 
 /// The transcript lands after every prompt, so a monitor that dies with the
@@ -2550,6 +2573,38 @@ fn plugin_task_restores_with_its_owner_and_cost() {
     assert_eq!(chat.cost, MONITOR_TURN.cost);
     assert_eq!(chat.task_status(), TaskStatus::Done);
     assert!(app.chat_index.is_empty());
+}
+
+/// The picker's clock and price tag. The main chat reports none of them, and
+/// a reload, which never learns the times, keeps only the cost.
+#[test]
+fn tasks_report_running_time_and_cost() {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, monitor_turn());
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    for key in [STARTED_AT_KEY, ENDED_AT_KEY, COST_KEY] {
+        assert_eq!(tasks[0].get(key), None);
+    }
+    assert!(tasks[1][STARTED_AT_KEY].is_u64());
+    assert_eq!(tasks[1].get(ENDED_AT_KEY), None);
+    assert_eq!(tasks[1][COST_KEY].as_f64(), MONITOR_TURN.cost);
+
+    plugin_event(&mut app, monitor_history(vec![]));
+    plugin_event(&mut app, AgentEvent::StreamClosed);
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    let started = tasks[1][STARTED_AT_KEY].as_u64().unwrap();
+    assert!(
+        tasks[1][ENDED_AT_KEY]
+            .as_u64()
+            .is_some_and(|ended| ended >= started)
+    );
+
+    app.reset_ui_chrome();
+    app.restore_display();
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert_eq!(tasks[1].get(STARTED_AT_KEY), None);
+    assert_eq!(tasks[1].get(ENDED_AT_KEY), None);
+    assert_eq!(tasks[1][COST_KEY].as_f64(), MONITOR_TURN.cost);
 }
 
 /// A rewind rebuilds the main chat, not the monitor a plugin runs beside it.
@@ -2644,6 +2699,7 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
         is_error,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     }))));
 }
 
@@ -2693,7 +2749,7 @@ fn batch_subagent_done_marker(is_error: bool, expected_text: &str, expected_role
     assert_eq!(app.chats[1].last_message_role(), Some(expected_role));
 }
 
-fn streaming_app() -> App {
+pub(crate) fn streaming_app() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -2733,7 +2789,12 @@ fn tasks_report_main_chat_then_subagent_outcomes() {
     finish_subagent(&mut app, "task1", false);
     finish_subagent(&mut app, "task2", true);
 
-    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    let mut tasks = serde_json::to_value(app.tasks()).unwrap();
+    for task in tasks.as_array_mut().unwrap() {
+        let task = task.as_object_mut().unwrap();
+        task.remove(STARTED_AT_KEY);
+        task.remove(ENDED_AT_KEY);
+    }
     assert_eq!(
         tasks,
         serde_json::json!([
@@ -2746,16 +2807,16 @@ fn tasks_report_main_chat_then_subagent_outcomes() {
 }
 
 /// Escaping out of a subagent takes the single-chat cancel path instead of the
-/// sweep over the whole turn, and that path has to land the task in `error`
-/// too, or it spins forever.
+/// sweep over the whole turn, and that path has to land the task in
+/// `cancelled` too, or it spins forever.
 #[test]
-fn cancelling_from_inside_a_subagent_reports_error() {
+fn cancelling_from_inside_a_subagent_reports_cancelled() {
     let mut app = app_with_subagent();
     app.focus_task(TASK_ID).unwrap();
     cancel_app(&mut app);
     assert_eq!(
         serde_json::to_value(app.tasks()).unwrap()[1]["status"],
-        serde_json::json!("error")
+        serde_json::json!("cancelled")
     );
 }
 
@@ -2870,13 +2931,11 @@ fn compact_during_streaming_queues_item(cmdline: &str) {
 }
 
 #[test]
-fn cancel_clears_pending_input() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+fn cancel_clears_main_auth_park() {
+    let mut app = streaming_app();
+    app.chats[MAIN_CHAT].auth_parked = true;
     cancel_app(&mut app);
-    assert_eq!(app.pending_input, PendingInput::None);
+    assert!(!app.awaiting_input());
 }
 
 #[test]
@@ -4383,6 +4442,54 @@ fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
     assert_eq!(app.state.session.meta.queued_messages, ["q1", "q2"]);
 }
 
+const LOST_ID: &str = "toolu_lost";
+const STORED_RECEIPT_ID: &str = "toolu_stored";
+const RECEIPTS_KEPT: &str = "a checkpoint must never erase receipts it cannot read";
+
+/// What the agent hands the app, see `AgentHandles::apply_to_app`.
+fn hold_mailbox(app: &mut App) -> SessionMailbox {
+    let mailbox = SessionMailbox::register(app.state.session.id);
+    app.mailbox = Some(mailbox.clone());
+    mailbox
+}
+
+/// The app holds its agent's mailbox, so a receipt outlives every other
+/// clone of it. Before any agent hands one over, the stored receipts stay.
+#[test_case(true, &[LOST_ID] ; "held_mailbox_outlives_its_other_clones")]
+#[test_case(false, &[STORED_RECEIPT_ID] ; "no_mailbox_keeps_the_stored_receipts")]
+fn checkpoint_keeps_pending_background(held: bool, expected: &[&str]) {
+    let mut app = test_app();
+    app.state.session_mut().meta.pending_background = vec![STORED_RECEIPT_ID.into()];
+    if held {
+        hold_mailbox(&mut app).track(LOST_ID);
+    }
+
+    app.checkpoint();
+    assert_eq!(
+        app.state.session.meta.pending_background, expected,
+        "{RECEIPTS_KEPT}"
+    );
+}
+
+/// Receipts the stored session left unanswered come back as lost notices,
+/// once however often it is installed, and the meta keeps them until a run
+/// takes them.
+#[test]
+fn restore_resumed_session_queues_lost_notices_the_meta_keeps_until_drained() {
+    let mut app = test_app();
+    let mailbox = hold_mailbox(&mut app);
+    app.state.session_mut().meta.pending_background = vec![LOST_ID.into()];
+
+    app.restore_resumed_session();
+    app.restore_lost_background();
+    app.checkpoint();
+    assert_eq!(app.state.session.meta.pending_background, [LOST_ID]);
+
+    assert_eq!(mailbox.drain().len(), 1);
+    app.checkpoint();
+    assert!(app.state.session.meta.pending_background.is_empty());
+}
+
 #[test]
 fn apply_loaded_session_defers_queued_messages_until_respawn() {
     let mut app = test_app();
@@ -5076,14 +5183,11 @@ fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     app.answer_tx = Some(tx);
 
     app.update(agent_msg(AgentEvent::AuthRequired));
-    assert!(matches!(
-        app.pending_input,
-        PendingInput::AuthRetry { subagent_id: None }
-    ));
+    assert!(app.awaiting_input());
 
     let actions = submit(&mut app);
     assert!(actions.is_empty());
-    assert_eq!(app.pending_input, PendingInput::None);
+    assert!(!app.awaiting_input());
     assert_eq!(rx.try_recv().unwrap(), "");
 }
 
@@ -5143,7 +5247,7 @@ fn concurrent_subagent_permission_requests_are_each_answered() {
 
 #[test]
 fn auth_required_in_subagent_shows_in_both_chats() {
-    let mut app = app_with_subagent_id("sub1");
+    let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx("sub1");
     app.update(subagent_msg(
         AgentEvent::AuthRequired,
         "sub1",
@@ -5152,10 +5256,8 @@ fn auth_required_in_subagent_shows_in_both_chats() {
 
     assert_eq!(app.chats[1].last_message_text(), AUTH_EXPIRED_MSG);
     assert_eq!(app.chats[0].last_message_text(), AUTH_EXPIRED_MSG);
-    assert!(matches!(
-        app.pending_input,
-        PendingInput::AuthRetry { subagent_id: Some(ref id) } if id == "sub1"
-    ));
+    assert!(app.chats[1].auth_parked);
+    assert!(app.awaiting_input(), "a subagent on the turn holds it");
 }
 
 #[test]
@@ -5169,7 +5271,7 @@ fn auth_retry_in_subagent_routes_to_subagent_channel() {
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
 
     assert!(actions.is_empty());
-    assert_eq!(app.pending_input, PendingInput::None);
+    assert!(!app.chats[1].auth_parked);
     assert_eq!(sub_rx.try_recv().unwrap(), "");
     assert!(main_rx.try_recv().is_err());
 }
@@ -5185,7 +5287,8 @@ fn cancel_clears_subagent_auth_retry() {
 
     cancel_app(&mut app);
 
-    assert_eq!(app.pending_input, PendingInput::None);
+    assert!(!app.chats[1].auth_parked);
+    assert!(!app.awaiting_input());
     assert!(sub_rx.try_recv().is_err());
 }
 
@@ -5200,25 +5303,8 @@ fn stale_auth_required_after_cancel_is_dropped() {
         subagent: None,
         run_id: 1,
     })));
-    assert_eq!(app.pending_input, PendingInput::None);
+    assert!(!app.awaiting_input());
     assert_eq!(app.chats[0].message_count(), count_before);
-}
-
-#[test]
-fn send_to_agent_unknown_subagent_falls_back_to_main() {
-    let (main_tx, main_rx) = flume::unbounded();
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.answer_tx = Some(main_tx);
-
-    app.pending_input = PendingInput::AuthRetry {
-        subagent_id: Some("nonexistent".into()),
-    };
-    app.update(Msg::Key(key(KeyCode::Enter)));
-
-    assert_eq!(main_rx.try_recv().unwrap(), "");
-    assert_eq!(app.pending_input, PendingInput::None);
 }
 
 /// Output that mutates a segment already on screen, rather than appending a
@@ -5242,6 +5328,7 @@ fn search_reaches_output_that_lands_in_an_existing_segment() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     }))));
     rendered(&mut app);
     for c in LATE_TEXT.chars() {
@@ -5489,7 +5576,7 @@ fn streaming_app_with_history() -> App {
 /// next frame's checkpoint syncs the mirror whatever event arrived.
 #[test_case(done() ; "stale_done")]
 #[test_case(
-    AgentEvent::Error { message: "timeout".into(), auth: false } ; "stale_error"
+    AgentEvent::Error { message: "timeout".into(), auth: false, totals: RunTotals::default() } ; "stale_error"
 )]
 fn checkpoint_after_cancel_persists_the_cancelled_turn(event: AgentEvent) {
     let mut app = streaming_app_with_history();
@@ -5586,6 +5673,7 @@ fn parent_error_refreshes_picker_and_persists_every_child() {
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
         auth: false,
+        totals: RunTotals::default(),
     }));
 
     app.checkpoint();
@@ -5672,6 +5760,7 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
     app.update(agent_msg(AgentEvent::Error {
         message: "provider overloaded".into(),
         auth: false,
+        totals: RunTotals::default(),
     }));
 
     assert_eq!(app.chats[0].in_progress_count(), 1);
@@ -5727,6 +5816,7 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
         auth: false,
+        totals: RunTotals::default(),
     }));
     app.checkpoint();
 
@@ -5748,6 +5838,7 @@ fn flush_restored_queue_drops_recovery_snapshot() {
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
         auth: false,
+        totals: RunTotals::default(),
     }));
     app.checkpoint();
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
@@ -5786,6 +5877,7 @@ fn plan_app() -> App {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        backgrounded: false,
     }))));
     app
 }
@@ -5808,6 +5900,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
         is_error: false,
         annotation: None,
         written_path: Some("/tmp/plans/test.md".into()),
+        backgrounded: false,
     }))));
     assert_eq!(app.plan_form.is_visible(), expect_form);
     if expect_form {
@@ -5841,6 +5934,7 @@ fn re_edit_keeps_plan_form_visible() {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        backgrounded: false,
     }))));
     assert!(matches!(app.state.plan, PlanState::Ready(_)));
     assert!(app.plan_form.is_visible());
@@ -5912,6 +6006,7 @@ fn rewrite_plan(app: &mut App) {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        backgrounded: false,
     }))));
 }
 
@@ -6281,7 +6376,7 @@ fn a_modal_toggled_open_counts_as_a_prompt_opened(cmdline: &str) {
 fn held_keys_follow_a_window_the_handler_opened_over_a_prompt() {
     let mut app = test_app();
     let probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    app.chats[MAIN_CHAT].auth_parked = true;
 
     let tab = press_bound(&mut app, &probe, KeyCode::Tab);
     type_keys(&mut app, "x");
@@ -7471,11 +7566,11 @@ fn a_command_a_plugin_wrote_runs_once_the_user_retypes_it() {
 #[test]
 fn a_login_retry_leaves_the_input_alone() {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
-    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    app.chats[MAIN_CHAT].auth_parked = true;
     write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
 
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.pending_input, PendingInput::None);
+    assert!(!app.chats[MAIN_CHAT].auth_parked);
     assert_eq!(app.input_box.buffer.value(), SHELL_LINE);
     assert!(app.input_box.history().is_empty());
 }
@@ -9596,6 +9691,19 @@ fn set_thinking_toggles_on_blank_input() {
     assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Off);
 }
 
+#[test]
+fn set_thinking_toggles_back_on_where_off_rises_to_minimal() {
+    let mut app = test_app();
+    app.state.model.id = "claude-opus-5".into();
+
+    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Adaptive);
+    assert_eq!(
+        app.set_thinking("").unwrap(),
+        ThinkingConfig::Effort(Effort::Minimal)
+    );
+    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Adaptive);
+}
+
 #[test_case(true, "garbage", THINKING_USAGE ; "unknown_word")]
 #[test_case(true, "0", THINKING_USAGE ; "zero_budget")]
 #[test_case(false, "low", THINKING_UNSUPPORTED_MSG ; "model_without_thinking")]
@@ -9658,6 +9766,7 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
     app.update(agent_msg(AgentEvent::Error {
         message: error_msg.into(),
         auth: false,
+        totals: RunTotals::default(),
     }));
 
     assert_eq!(app.main_chat().in_progress_count(), 0);
@@ -9960,15 +10069,31 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
     assert!(!matches!(&actions[0], Action::CancelSubagent { .. }));
 }
 
-#[test]
-fn cancel_subagent_removes_answer_sender() {
-    let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
-    assert!(!app.subagent_answers.is_empty());
-    app.run_builtin(BuiltinAction::NextChat);
-    assert_eq!(app.active_chat, 1);
+fn new_session(app: &mut App) {
+    app.reset_session();
+}
+
+fn stop_in_its_tab(app: &mut App) {
+    app.focus_task(TASK_ID).unwrap();
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(!app.subagent_answers.contains_key(TASK_ID));
+}
+
+/// The answer sender lives on the chat, so whatever ends the chat or drops
+/// it lets go of the sender, adopted or not.
+#[test_case(|_| {}, stop_in_its_tab         ; "stopped")]
+#[test_case(|_| {}, end_turn                ; "swept_at_turn_end")]
+#[test_case(|_| {}, new_session             ; "dropped_by_new_session")]
+#[test_case(receive_receipt, stop_in_its_tab ; "adopted_then_stopped")]
+#[test_case(receive_receipt, new_session     ; "adopted_then_new_session")]
+fn an_ended_task_lets_go_of_its_answer_sender(setup: fn(&mut App), end: fn(&mut App)) {
+    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
+    setup(&mut app);
+    assert!(!sub_rx.is_disconnected());
+
+    end(&mut app);
+
+    assert!(sub_rx.is_disconnected());
 }
 
 #[test]
@@ -10146,15 +10271,12 @@ fn finished_subagent_reports_undelivered_messages() {
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
 }
 
-/// A finished subagent's chat is a transcript: no box to type into, and a
-/// draft typed elsewhere is left alone.
+/// A finished subagent's chat is a transcript: no box to type into, and
+/// Enter sends nothing.
 #[test]
 fn finished_subagent_chat_takes_no_prompt() {
     let mut app = app_with_active_subagent();
     finish_subagent_task(&mut app, false);
-    app.update(Msg::Key(key(KeyCode::Char('q'))));
-    app.update(Msg::Paste("hi".into()));
-    assert!(app.input_box.is_empty());
     assert!(!app.input_live(Rect::new(0, 0, 80, 24)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(actions.is_empty());
@@ -10304,7 +10426,7 @@ fn notification_message_and_urgency(
 #[test]
 fn attention_prioritizes_permission_and_normalizes_tool() {
     let mut app = test_app();
-    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    app.chats[MAIN_CHAT].auth_parked = true;
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.plan_form.on_plan_ready();
@@ -10341,10 +10463,10 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
 #[test]
 fn attention_classifies_auth_and_ready_plan() {
     let mut app = test_app();
-    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    app.chats[MAIN_CHAT].auth_parked = true;
     assert_eq!(app.attention(), Some(Notification::AuthenticationRequired));
 
-    app.pending_input = PendingInput::None;
+    app.chats[MAIN_CHAT].auth_parked = false;
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.plan_form.on_plan_ready();
@@ -10651,6 +10773,29 @@ fn fork_to_prompt_opens_a_truncated_copy_and_leaves_the_original_alone() {
     assert_eq!(app.state.context_size, MEASURED_CONTEXT);
 }
 
+const DROPPED_RECEIPT_ID: &str = "toolu_after_the_cut";
+
+/// The copy keeps only the receipts its history still holds: a lost notice
+/// for a call it never made would confuse its model.
+#[test]
+fn fork_to_prompt_keeps_only_the_pending_receipts_it_still_holds() {
+    let mut app = test_app();
+    seed_rewind_session(app.state.session_mut());
+    app.state
+        .session_mut()
+        .push_message(tool_use_msg(DROPPED_RECEIPT_ID));
+    let mailbox = hold_mailbox(&mut app);
+    mailbox.track(RECEIPT_TURN_ID);
+    mailbox.track(DROPPED_RECEIPT_ID);
+
+    let fork = opened_fork(app.fork_to(rewind_to_second_turn()));
+    assert_eq!(fork.meta.pending_background, [RECEIPT_TURN_ID]);
+    assert_eq!(
+        app.state.session.meta.pending_background,
+        [RECEIPT_TURN_ID, DROPPED_RECEIPT_ID],
+    );
+}
+
 const ONE_RESTART: &str = "the gesture must hand the loop exactly one restart";
 const RESTART_MATCHES_SESSION: &str =
     "the respawned agent must run on the history the session now holds";
@@ -10935,6 +11080,7 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
             is_error: false,
             annotation: None,
             written_path: None,
+            backgrounded: false,
         }))));
         app.checkpoint();
     }
@@ -11061,4 +11207,1283 @@ fn ctrl_l_opens_model_picker() {
     };
     app.update(Msg::Key(key));
     assert!(app.model_picker.is_open());
+}
+
+pub(crate) const MOVED_ID: &str = "toolu_moved";
+pub(crate) const SLOW_TOOL: &str = "slow_build";
+pub(crate) const MOVE_RECEIPT: &str = "Running in the background.";
+const SECOND_CALL_ID: &str = "toolu_second";
+
+pub(crate) fn moved_done(id: &str) -> AgentEvent {
+    slow_tool_done(id, true)
+}
+
+fn slow_tool_done(id: &str, backgrounded: bool) -> AgentEvent {
+    AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
+        id: id.into(),
+        tool: SLOW_TOOL.into(),
+        output: Arc::new(ToolOutput::Plain(MOVE_RECEIPT.into())),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        backgrounded,
+    }))
+}
+
+/// A call of the running turn that streamed into {buf}, then moved.
+pub(crate) fn move_call(app: &mut App, id: &str, buf: &Arc<SharedBuf>) {
+    app.update(agent_msg(tool_start(id, SLOW_TOOL)));
+    app.update(agent_msg(AgentEvent::LiveToolBuf {
+        id: id.into(),
+        body: Arc::clone(buf),
+    }));
+    app.update(agent_msg(moved_done(id)));
+}
+
+pub(crate) fn app_with_moved_call() -> (App, Arc<SharedBuf>) {
+    let mut app = streaming_app();
+    let buf = Arc::new(SharedBuf::new());
+    move_call(&mut app, MOVED_ID, &buf);
+    (app, buf)
+}
+
+const RAN_BEFORE_MOVE: Duration = Duration::from_secs(40);
+
+/// A moved call's task counts from the call's start, as its stop marker
+/// ("cancelled by user after 40s") does, not from the move.
+#[test]
+fn a_moved_call_task_counts_from_the_call_start() {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
+    let AgentEvent::ToolDone(mut receipt) = moved_done(MOVED_ID) else {
+        unreachable!()
+    };
+    receipt.call = Some(Box::new(CallRecord {
+        input: serde_json::json!({}),
+        duration: RAN_BEFORE_MOVE,
+    }));
+    app.update(agent_msg(AgentEvent::ToolDone(receipt)));
+
+    let after = SystemTime::now();
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    let started = UNIX_EPOCH + Duration::from_secs(tasks[1][STARTED_AT_KEY].as_u64().unwrap());
+    let ran = after.duration_since(started).unwrap();
+    assert!(ran >= RAN_BEFORE_MOVE, "{ran:?}");
+    let badge = app.chats[MAIN_CHAT]
+        .tool_message(MOVED_ID)
+        .and_then(|row| row.background)
+        .and_then(|badge| badge.started_at)
+        .expect("a ticking badge");
+    assert!(badge.elapsed() >= RAN_BEFORE_MOVE);
+}
+
+fn press_background(app: &mut App) -> Vec<Action> {
+    app.update(Msg::Key(kb::BACKGROUND.to_key_event()))
+}
+
+#[test]
+fn background_key_without_running_calls_does_nothing() {
+    let mut app = streaming_app();
+    assert!(press_background(&mut app).is_empty());
+    assert!(app.background_moves.pending.is_empty());
+    assert_eq!(app.tick_background_moves(), Dirty::NO);
+    assert_eq!(app.status_bar.flash_text(), None);
+}
+
+/// A moved call's tab runs no calls of its own, so a press there asks the
+/// main chat's. A call already moved is not asked again.
+#[test]
+fn background_key_asks_the_main_chats_running_calls_from_any_tab() {
+    let (mut app, _buf) = app_with_moved_call();
+    app.update(agent_msg(tool_start(TASK_ID, SLOW_TOOL)));
+    app.update(agent_msg(tool_start(SECOND_CALL_ID, SLOW_TOOL)));
+    app.focus_task(MOVED_ID).unwrap();
+
+    press_background(&mut app);
+
+    assert_eq!(app.background_moves.pending.len(), 2);
+    assert_eq!(app.tick_background_moves(), Dirty::YES);
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(tasks::NOTHING_TO_MOVE_MSG),
+        "a host that went away moved nothing"
+    );
+}
+
+#[test]
+fn clicking_a_calls_hint_asks_that_call_alone() {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, SLOW_TOOL)));
+    app.update(agent_msg(tool_start(SECOND_CALL_ID, SLOW_TOOL)));
+
+    app.handle_click_outcome(ClickOutcome::MoveCall(SECOND_CALL_ID.into()));
+
+    assert_eq!(app.background_moves.pending.len(), 1);
+}
+
+#[test]
+fn clicking_a_moved_row_opens_its_task() {
+    let (mut app, _buf) = app_with_moved_call();
+    app.handle_click_outcome(ClickOutcome::OpenTask(MOVED_ID.into()));
+    assert_eq!(app.active_task_id().as_ref(), MOVED_ID);
+}
+
+#[test_case(true  ; "gains_a_hook")]
+#[test_case(false ; "loses_it")]
+fn tool_movable_sets_the_rows_flag(movable: bool) {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, SLOW_TOOL)));
+    app.update(agent_msg(AgentEvent::ToolMovable {
+        id: TASK_ID.into(),
+        movable: !movable,
+    }));
+    app.update(agent_msg(AgentEvent::ToolMovable {
+        id: TASK_ID.into(),
+        movable,
+    }));
+    assert_eq!(
+        app.chats[0].tool_message(TASK_ID).map(|row| row.movable),
+        Some(movable)
+    );
+}
+
+/// A quit ends every open session, so it asks twice, the way Esc does, and
+/// counts the tasks of the other sessions with this one's.
+#[test_case(true,  0, QUIT_ONE_RUNNING.to_owned()                  ; "only_here")]
+#[test_case(false, 2, format!("2{QUIT_MANY_RUNNING_SUFFIX}")        ; "only_elsewhere")]
+#[test_case(true,  2, format!("3{QUIT_MANY_RUNNING_SUFFIX}")        ; "here_and_elsewhere")]
+fn quit_with_running_background_tasks_takes_a_second_press(
+    here: bool,
+    elsewhere: usize,
+    flash: String,
+) {
+    let mut app = if here {
+        app_with_moved_call().0
+    } else {
+        streaming_app()
+    };
+    end_turn(&mut app);
+    app.background_elsewhere = elsewhere;
+
+    let first = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(first.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(app.status_bar.flash_text(), Some(flash.as_str()));
+
+    let second = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(matches!(second.as_slice(), [Action::ManualExit]));
+    assert_eq!(app.exit_request, ExitRequest::Success);
+}
+
+/// `/reload` replaces the Lua host the tasks run in and `/new` ends their
+/// session. Retyping a command is not a second press, so going ahead takes
+/// the bang.
+#[test_case("/reload", false, RELOAD_ONE_RUNNING ; "reload_refused")]
+#[test_case("/reload", true,  RELOAD_ONE_RUNNING ; "reload_bang")]
+#[test_case("/new",    false, NEW_ONE_RUNNING    ; "new_refused")]
+#[test_case("/new",    true,  NEW_ONE_RUNNING    ; "new_bang")]
+fn ending_running_background_tasks_by_command_needs_the_bang(
+    command: &str,
+    bang: bool,
+    refusal: &str,
+) {
+    let (mut app, _buf) = app_with_moved_call();
+    end_turn(&mut app);
+    let session = app.state.session.id;
+
+    let actions = app.execute_command(
+        ParsedCommand {
+            bang,
+            ..cmd(command)
+        },
+        0,
+    );
+
+    assert_eq!(actions.is_empty(), !bang);
+    assert_eq!(app.status_bar.flash_text(), (!bang).then_some(refusal));
+    if !bang {
+        assert_eq!(app.exit_request, ExitRequest::None);
+        assert_eq!(app.state.session.id, session);
+    }
+}
+
+#[test]
+fn esc_says_background_tasks_keep_running() {
+    let (mut app, _buf) = app_with_moved_call();
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(format!("{FLASH_CANCEL} {ESC_ONE_RUNNING}").as_str())
+    );
+}
+
+/// A moved call keeps the agent waiting after its turn. While the agent
+/// streams, queuing a prompt is what the box is for.
+#[test_case(Status::Idle,      Some(2) ; "idle_says_what_it_waits_on")]
+#[test_case(Status::Streaming, None    ; "streaming_queues")]
+fn the_main_input_tells_what_the_agent_waits_on(status: Status, waiting: Option<usize>) {
+    let mut app = test_app();
+    let mailbox = hold_mailbox(&mut app);
+    mailbox.track(MOVED_ID);
+    mailbox.track(LOST_ID);
+    app.status = status;
+
+    let shown = match app.input_placeholder() {
+        Placeholder::Background(count) => Some(count),
+        _ => None,
+    };
+
+    assert_eq!(shown, waiting);
+}
+
+/// The tab has no inbox, so Esc is what its input does: twice, it stops the
+/// task by its id.
+#[test]
+fn a_moved_calls_tab_offers_esc_and_stops_on_it() {
+    let (mut app, _buf) = app_with_moved_call();
+    app.focus_task(MOVED_ID).unwrap();
+    assert!(matches!(app.input_placeholder(), Placeholder::TaskStop));
+
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelPluginTask { id, .. }] if id == MOVED_ID
+    ));
+}
+
+#[test]
+fn a_notice_keeps_its_detail_live_and_on_restore() {
+    let mut app = test_app();
+    app.start_mailbox_run(vec![labelled_notice(NOTICE_LINE)]);
+    app.update(agent_msg_with_run_id(
+        AgentEvent::ObservationLine {
+            text: NOTICE_LINE.into(),
+            detail: Some(NOTICE_BODY.into()),
+            end: None,
+        },
+        app.run_id,
+    ));
+    let chat = app.main_chat();
+    let live = chat
+        .message_at(chat.message_count() - 1)
+        .and_then(|row| row.detail.clone());
+
+    let (restored, _) = crate::chat::history_to_display(
+        &[labelled_notice(NOTICE_LINE)],
+        &HashMap::new(),
+        &app.ui_config.tool_output_lines,
+    );
+    let restored = restored
+        .into_iter()
+        .find(|row| row.role == DisplayRole::Notice)
+        .and_then(|row| row.detail);
+
+    assert_eq!(live.as_deref(), Some(NOTICE_BODY));
+    assert_eq!(restored.as_deref(), Some(NOTICE_BODY));
+}
+
+const RECEIPT_TURN_ID: &str = "tool-1";
+
+/// The seeded history names [`RECEIPT_TURN_ID`] in its first turn, so a
+/// rewind to that turn drops the receipt and one to the second keeps it. A
+/// dropped receipt is forgotten first, so no result can answer it.
+#[test_case(0, true  ; "dropping_the_receipt_stops_the_task")]
+#[test_case(2, false ; "keeping_the_receipt_keeps_the_task")]
+fn rewind_stops_the_tasks_whose_receipt_it_drops(turn_index: usize, stops: bool) {
+    let mut app = build_rewind_app();
+    let mailbox = hold_mailbox(&mut app);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    move_call(&mut app, RECEIPT_TURN_ID, &Arc::new(SharedBuf::new()));
+    mailbox.track(RECEIPT_TURN_ID);
+    end_turn(&mut app);
+
+    let actions = app.rewind_to(RewindEntry {
+        turn_index,
+        prompt_preview: String::new(),
+        prompt_text: String::new(),
+    });
+
+    let cancelled = actions.iter().any(|action| {
+        matches!(action, Action::CancelPluginTask { id, plugin }
+            if id == RECEIPT_TURN_ID && &**plugin == SLOW_TOOL)
+    });
+    assert_eq!(
+        cancelled, stops,
+        "the stop names the task's plugin, its tab is gone by then"
+    );
+    assert!(matches!(actions.last(), Some(Action::RestartAgent(_))));
+    assert_eq!(app.chat_of_task(RECEIPT_TURN_ID).is_ok(), !stops);
+    assert_eq!(
+        app.chats[MAIN_CHAT].has_background_badge(RECEIPT_TURN_ID),
+        !stops,
+        "a kept receipt row still leads to its running task"
+    );
+    assert_eq!(mailbox.unsettled().is_empty(), stops);
+}
+
+fn move_receipt_turn_call(app: &mut App, subagent: bool) {
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    if subagent {
+        app.update(agent_msg(tool_start(RECEIPT_TURN_ID, SLOW_TOOL)));
+        start_subagent(app, RECEIPT_TURN_ID, RESEARCH_NAME);
+        app.update(agent_msg(moved_done(RECEIPT_TURN_ID)));
+    } else {
+        move_call(app, RECEIPT_TURN_ID, &Arc::new(SharedBuf::new()));
+    }
+    end_turn(app);
+}
+
+fn receipt_outcome(app: &App) -> Option<BackgroundOutcome> {
+    app.chats[MAIN_CHAT]
+        .tool_message(RECEIPT_TURN_ID)
+        .and_then(|row| row.background)
+        .and_then(|badge| badge.outcome)
+}
+
+/// A rewind that keeps the receipt keeps its task as it was: one the user
+/// stopped still reads as cancelled, in its tab and on its receipt row.
+#[test_case(false ; "moved_call")]
+#[test_case(true  ; "moved_subagent")]
+fn rewind_keeps_a_stopped_task_whose_receipt_stays(subagent: bool) {
+    let mut app = build_rewind_app();
+    move_receipt_turn_call(&mut app, subagent);
+    app.stop_task(RECEIPT_TURN_ID).unwrap();
+
+    app.rewind_to(rewind_to_second_turn());
+
+    let idx = app
+        .chat_of_task(RECEIPT_TURN_ID)
+        .expect("a kept receipt keeps its tab");
+    assert_eq!(app.chats[idx].task_status(), TaskStatus::Cancelled);
+    assert_eq!(receipt_outcome(&app), Some(BackgroundOutcome::Cancelled));
+}
+
+/// The receipts a stored session left unanswered died with the maki that
+/// ran them, so neither their row nor their tab may read as a success.
+#[test]
+fn a_restored_receipt_nobody_answered_reads_lost() {
+    let mut app = build_rewind_app();
+    let session = app.state.session_mut();
+    session.meta.pending_background = vec![RECEIPT_TURN_ID.into()];
+    session.set_subagents(vec![StoredSubagent {
+        tool_use_id: RECEIPT_TURN_ID.into(),
+        name: RESEARCH_NAME.into(),
+        model: None,
+        thinking: None,
+        fast: false,
+        plugin: Some(Arc::from(SLOW_TOOL)),
+        cost: None,
+    }]);
+    session.set_subagent_messages(RECEIPT_TURN_ID.into(), vec![]);
+
+    app.restore_resumed_session();
+
+    assert_eq!(receipt_outcome(&app), Some(BackgroundOutcome::Lost));
+    let chat = &app.chats[app.chat_of_task(RECEIPT_TURN_ID).unwrap()];
+    assert_eq!(chat.task_status(), TaskStatus::Error);
+    assert_eq!(chat.last_message_text(), LOST_TEXT);
+}
+
+const MOVED_SUMMARY: &str = "Long background task";
+
+/// A stored session where `bash` call [`MOVED_ID`] got a result, a receipt
+/// when {receipt}, then {notice} (`failed`, `stopped`) answered it.
+fn moved_call_history(receipt: bool, notice: Option<(bool, bool)>) -> Vec<Message> {
+    let mut messages = vec![
+        Message::user("first prompt".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                MOVED_ID,
+                "bash",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::tool_result(MOVED_ID, MOVE_RECEIPT, false)],
+            receipts: receipt.then(|| MOVED_ID.into()).into_iter().collect(),
+            ..Default::default()
+        },
+    ];
+    if let Some((failed, stopped)) = notice {
+        let (text, display, end) = result_notice(
+            &TaskLabel::new("bash", Some(MOVED_SUMMARY)),
+            MOVED_ID,
+            failed,
+            stopped,
+            "output",
+        );
+        let mut message = Message::observation(text);
+        message.display_text = Some(display);
+        message.settles = Some(TaskSettled {
+            task: MOVED_ID.into(),
+            end,
+        });
+        messages.push(message);
+    }
+    messages.push(Message::user("second prompt".into()));
+    messages
+}
+
+/// A restored history draws every receipt as a success, so each moved row
+/// gets its ending back from the history: the notice that answered it, the
+/// stored receipts nobody answered, or a receipt `task_stop` answered.
+#[test_case(true,  Some((false, false)), false, Some(BackgroundOutcome::Done)      ; "finished")]
+#[test_case(true,  Some((true,  false)), false, Some(BackgroundOutcome::Error)     ; "failed")]
+#[test_case(true,  Some((true,  true)),  false, Some(BackgroundOutcome::Cancelled) ; "cancelled_by_the_user")]
+#[test_case(true,  None,                 true,  Some(BackgroundOutcome::Lost)      ; "never_answered")]
+#[test_case(true,  None,                 false, Some(BackgroundOutcome::Cancelled) ; "output_taken_by_task_stop")]
+#[test_case(false, None,                 false, None                               ; "an_ordinary_result")]
+fn a_restored_moved_row_tells_how_its_task_ended(
+    receipt: bool,
+    notice: Option<(bool, bool)>,
+    pending: bool,
+    expected: Option<BackgroundOutcome>,
+) {
+    let mut app = test_app();
+    let session = app.state.session_mut();
+    session.replace_messages(moved_call_history(receipt, notice));
+    if pending {
+        session.meta.pending_background = vec![MOVED_ID.into()];
+    }
+
+    app.restore_resumed_session();
+
+    let badge = app.chats[MAIN_CHAT]
+        .tool_message(MOVED_ID)
+        .expect("the call's row")
+        .background;
+    assert_eq!(badge.map(|badge| badge.outcome), expected.map(Some));
+}
+
+/// A `/reload` hands the mailbox over with every result no run took yet, and
+/// the model reads that result next, so the row tells the same ending. Only a
+/// receipt with nothing queued reads lost.
+#[test_case(Some((false, false)), BackgroundOutcome::Done      ; "finished_before_the_reload")]
+#[test_case(Some((true,  true)),  BackgroundOutcome::Cancelled ; "stopped_before_the_reload")]
+#[test_case(None,                 BackgroundOutcome::Lost      ; "nothing_queued")]
+fn a_reloaded_moved_row_tells_the_ending_its_queued_result_gives(
+    notice: Option<(bool, bool)>,
+    expected: BackgroundOutcome,
+) {
+    let mut app = test_app();
+    let mailbox = hold_mailbox(&mut app);
+    mailbox.track(MOVED_ID);
+    if let Some((failed, stopped)) = notice {
+        let (text, display, end) = result_notice(
+            &TaskLabel::new("bash", Some(MOVED_SUMMARY)),
+            MOVED_ID,
+            failed,
+            stopped,
+            "output",
+        );
+        let notice = BackgroundNotice {
+            text,
+            display: Some(&display),
+            wake: false,
+            end,
+        };
+        mailbox.settle(MOVED_ID, Some(notice));
+    }
+    let session = app.state.session_mut();
+    session.replace_messages(moved_call_history(true, None));
+    session.meta.pending_background = mailbox.unsettled();
+
+    app.restore_resumed_session();
+
+    let badge = app.chats[MAIN_CHAT]
+        .tool_message(MOVED_ID)
+        .expect("the call's row")
+        .background;
+    assert_eq!(badge.and_then(|badge| badge.outcome), Some(expected));
+}
+
+/// A finished tab has no input box, so Esc is the way back, and the tab
+/// says so.
+#[test]
+fn esc_in_a_finished_tab_goes_back_to_the_main_chat() {
+    let mut app = app_with_subagent();
+    finish_subagent(&mut app, TASK_ID, false);
+    app.focus_task(TASK_ID).unwrap();
+    assert!(rendered(&mut app).contains(FINISHED_TAB_HINT.trim()));
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(app.active_chat, MAIN_CHAT);
+}
+
+/// Nothing in a finished tab takes text, so a typed message, or a `/`
+/// command, starts in the main chat rather than going nowhere.
+#[test_case(false ; "typed")]
+#[test_case(true ; "pasted")]
+fn text_for_a_finished_tab_lands_in_the_main_chat(pasted: bool) {
+    let mut app = app_with_subagent();
+    finish_subagent(&mut app, TASK_ID, false);
+    app.focus_task(TASK_ID).unwrap();
+
+    if pasted {
+        app.update(Msg::Paste("hi".into()));
+    } else {
+        app.update(Msg::Key(key(KeyCode::Char('h'))));
+        app.update(Msg::Key(key(KeyCode::Char('i'))));
+    }
+
+    assert_eq!(app.active_chat, MAIN_CHAT);
+    assert_eq!(app.input_box.buffer.value(), "hi");
+}
+
+/// Normal mode belongs to a vim plugin, so its keys never type, even after
+/// they hop to the main chat.
+#[test]
+fn a_key_from_a_finished_tab_in_normal_mode_types_nothing() {
+    let mut app = app_with_subagent();
+    finish_subagent(&mut app, TASK_ID, false);
+    app.focus_task(TASK_ID).unwrap();
+    set_mode(&app.keymap_reader, InputMode::Normal);
+
+    app.update(Msg::Key(key(KeyCode::Char('x'))));
+
+    assert!(app.input_box.is_empty());
+}
+
+/// A stopped batch takes the subagents it started down with it, and a
+/// subagent that already finished keeps its ending.
+#[test]
+fn stopping_a_task_cancels_the_subagents_it_started() {
+    const CHILD_ID: &str = "toolu_child";
+    const DONE_CHILD_ID: &str = "toolu_done_child";
+    let (mut app, _buf) = app_with_moved_call();
+    for id in [CHILD_ID, DONE_CHILD_ID] {
+        app.update(subagent_msg(
+            AgentEvent::TextDelta { text: "y".into() },
+            id,
+            Some(id),
+        ));
+        let idx = app.chat_of_task(id).unwrap();
+        app.chats[idx].parent = Some(TaskParent::Started(MOVED_ID.into()));
+    }
+    finish_subagent(&mut app, DONE_CHILD_ID, false);
+
+    app.stop_task(MOVED_ID).unwrap();
+
+    let status = |app: &App, id| app.chats[app.chat_of_task(id).unwrap()].task_status();
+    assert_eq!(status(&app, CHILD_ID), TaskStatus::Cancelled);
+    assert_eq!(status(&app, DONE_CHILD_ID), TaskStatus::Done);
+}
+
+const NESTED_ID: &str = "toolu_batch_child";
+const LATE_SUB_TOOL_ID: &str = "sub_t2";
+const NEXT_RUN_PROMPT: &str = "meanwhile";
+
+/// What a subagent's relay sends once its call moved: the plugin task way,
+/// bound to no run.
+pub(crate) fn moved_subagent_event(app: &mut App, id: &str, event: AgentEvent) {
+    app.deliver(
+        Envelope {
+            event,
+            subagent: Some(subagent_info(id, RESEARCH_NAME)),
+            run_id: 0,
+        },
+        Some(Arc::from(SLOW_TOOL)),
+    );
+}
+
+/// A running call of the turn whose subagent already spoke the run's way.
+pub(crate) fn app_with_subagent_call(id: &str) -> App {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(id, SLOW_TOOL)));
+    start_subagent(&mut app, id, RESEARCH_NAME);
+    app
+}
+
+fn receive_receipt(app: &mut App) {
+    app.update(agent_msg(moved_done(TASK_ID)));
+}
+
+fn receive_moved_event(app: &mut App) {
+    moved_subagent_event(app, TASK_ID, AgentEvent::TextDelta { text: "x".into() });
+}
+
+/// The receipt comes the run's way and the subagent's first moved event the
+/// plugin task way, so either can land first. Whichever does adopts the chat,
+/// the rest change nothing, and the turn's end leaves it running.
+#[test_case(receive_receipt, receive_moved_event ; "receipt_first")]
+#[test_case(receive_moved_event, receive_receipt ; "moved_event_first")]
+fn a_moved_subagents_chat_is_adopted_once_in_either_order(
+    first: fn(&mut App),
+    second: fn(&mut App),
+) {
+    let mut app = app_with_subagent_call(TASK_ID);
+    first(&mut app);
+    second(&mut app);
+    first(&mut app);
+    end_turn(&mut app);
+
+    assert_eq!(app.chats.len(), 2);
+    let chat = &app.chats[1];
+    assert_eq!(chat.plugin.as_deref(), Some(SLOW_TOOL));
+    assert_eq!(chat.task_status(), TaskStatus::Working);
+    assert!(!app.chat_index.contains_key(TASK_ID));
+    assert!(
+        app.chats[0]
+            .tool_message(TASK_ID)
+            .is_some_and(|row| row.background.is_some())
+    );
+}
+
+/// Neither what the subagent sends after its move nor what it sent the
+/// run's way before is dropped once the next run started.
+#[test]
+fn an_adopted_subagents_events_outlive_its_run() {
+    let mut app = app_with_subagent_call(TASK_ID);
+    receive_receipt(&mut app);
+    end_turn(&mut app);
+    let moved_run = app.run_id;
+    type_and_submit(&mut app, NEXT_RUN_PROMPT);
+    assert_ne!(app.run_id, moved_run);
+
+    moved_subagent_event(&mut app, TASK_ID, tool_start(SUB_TOOL_ID, SLOW_TOOL));
+    app.update(subagent_msg_with_run_id(
+        tool_start(LATE_SUB_TOOL_ID, SLOW_TOOL),
+        TASK_ID,
+        Some(RESEARCH_NAME),
+        moved_run,
+    ));
+
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[1].in_progress_count(), 2);
+}
+
+/// The sender lives on the chat, not the turn, so a moved subagent asking
+/// after the turn ended still gets its answer, and the main agent none.
+#[test]
+fn a_moved_subagent_asking_after_its_turn_ended_gets_its_answer() {
+    let (mut app, sub_rx, main_rx) = app_with_subagent_tx(TASK_ID);
+    receive_receipt(&mut app);
+    end_turn(&mut app);
+
+    moved_subagent_event(
+        &mut app,
+        TASK_ID,
+        AgentEvent::PermissionRequest {
+            id: FIRST_ASK.into(),
+            tool: ToolKey::native("bash"),
+            scopes: vec!["ls".into()],
+            reason: None,
+        },
+    );
+    assert!(app.permission_prompt.is_open());
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+
+    assert_eq!(sub_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
+    assert!(main_rx.is_empty());
+}
+
+/// Cancelling the turn and the rewind picker both clear every queued ask, so
+/// neither may be reachable while a moved subagent, which outlives both, waits
+/// on one: the prompt takes the keys first, Esc included.
+#[test]
+fn esc_cannot_cancel_the_turn_over_a_moved_subagents_ask() {
+    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
+    receive_receipt(&mut app);
+    moved_subagent_event(
+        &mut app,
+        TASK_ID,
+        AgentEvent::PermissionRequest {
+            id: FIRST_ASK.into(),
+            tool: ToolKey::native("bash"),
+            scopes: vec!["ls".into()],
+            reason: None,
+        },
+    );
+
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status, Status::Streaming);
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert_eq!(sub_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
+}
+
+fn nested_first_event(app: &mut App) {
+    moved_subagent_event(app, NESTED_ID, AgentEvent::TextDelta { text: "x".into() });
+}
+
+fn nested_opened_by_the_host(app: &mut App) {
+    app.open_plugin_task(
+        &subagent_info(NESTED_ID, RESEARCH_NAME),
+        Arc::from(SLOW_TOOL),
+    );
+}
+
+/// A subagent nested in a moved batch has no receipt of its own. Its first
+/// event the plugin task way adopts its tab, and so does the host opening
+/// it at the move, which keeps a quiet one from failing at the turn's end.
+/// Esc there stops it by its own id, not the batch's.
+#[test_case(nested_first_event        ; "first_event")]
+#[test_case(nested_opened_by_the_host ; "opened_at_the_move")]
+fn esc_in_an_adopted_nested_subagents_tab_stops_it_by_its_own_id(adopt: fn(&mut App)) {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
+    start_subagent(&mut app, NESTED_ID, RESEARCH_NAME);
+    app.update(agent_msg(moved_done(MOVED_ID)));
+    adopt(&mut app);
+    end_turn(&mut app);
+
+    app.focus_task(NESTED_ID).unwrap();
+    assert_eq!(
+        app.chats[app.active_chat].task_status(),
+        TaskStatus::Working
+    );
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelPluginTask { id, .. }] if id == NESTED_ID
+    ));
+    assert_eq!(
+        app.chats[app.active_chat].task_status(),
+        TaskStatus::Cancelled
+    );
+}
+
+const NESTED_TASK_ID: &str = "toolu_nested_task";
+
+/// A `task` call inside a moved subagent's session names a task of its own
+/// when it ends, but it is that session's row, not a moved call's result.
+#[test]
+fn a_nested_calls_result_in_an_adopted_session_finishes_its_row() {
+    let mut app = app_with_subagent_call(MOVED_ID);
+    start_subagent(&mut app, NESTED_TASK_ID, RESEARCH_NAME);
+    app.update(agent_msg(moved_done(MOVED_ID)));
+    moved_subagent_event(&mut app, MOVED_ID, tool_start(NESTED_TASK_ID, SLOW_TOOL));
+    let session = app.chat_of_task(MOVED_ID).unwrap();
+    assert_eq!(app.chats[session].in_progress_count(), 1);
+
+    moved_subagent_event(&mut app, MOVED_ID, slow_tool_done(NESTED_TASK_ID, false));
+
+    assert_eq!(app.chats[session].in_progress_count(), 0);
+    assert_eq!(app.chats[session].task_status(), TaskStatus::Working);
+}
+
+const MOVED_MODEL: &str = "anthropic/claude-haiku";
+const MOVED_OPTS: RequestOptions = RequestOptions {
+    thinking: ThinkingConfig::Effort(Effort::High),
+    fast: true,
+};
+
+fn speak_after_the_move(app: &mut App, info: SubagentInfo) {
+    app.deliver(
+        Envelope {
+            event: AgentEvent::TextDelta { text: "x".into() },
+            subagent: Some(info),
+            run_id: 0,
+        },
+        Some(Arc::from(SLOW_TOOL)),
+    );
+}
+
+fn opened_at_the_move(app: &mut App, info: SubagentInfo) {
+    app.open_plugin_task(&info, Arc::from(SLOW_TOOL));
+}
+
+/// A `task` call that moved before its subagent spoke got a tab copied from
+/// its row. Whatever names the session first, its first event or the host
+/// opening it, completes the tab: it takes messages and answers prompts.
+#[test_case(speak_after_the_move ; "first_event")]
+#[test_case(opened_at_the_move   ; "opened_by_the_host")]
+fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
+    name_session: fn(&mut App, SubagentInfo),
+) {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
+    app.update(agent_msg(moved_done(MOVED_ID)));
+    let inbox = Arc::new(SubagentInbox::default());
+    let (answer_tx, _answer_rx) = flume::unbounded();
+    let mut info = subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx));
+    info.model = Some(MOVED_MODEL.into());
+    info.opts = Some(MOVED_OPTS);
+    info.inbox = Some(Arc::clone(&inbox));
+
+    name_session(&mut app, info);
+
+    assert_eq!(app.chats.len(), 2);
+    let tab = &app.chats[1];
+    assert!(
+        tab.inbox
+            .as_ref()
+            .is_some_and(|tab_inbox| Arc::ptr_eq(tab_inbox, &inbox))
+    );
+    assert!(tab.answer_tx.is_some());
+    assert_eq!(tab.model_id.as_deref(), Some(MOVED_MODEL));
+    assert_eq!(tab.opts, Some(MOVED_OPTS));
+    assert_eq!(tab.task_status(), TaskStatus::Working);
+}
+
+/// A call of the running turn that streams into the buf it hands back.
+fn running_call(app: &mut App) -> Option<Arc<SharedBuf>> {
+    let buf = Arc::new(SharedBuf::new());
+    app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
+    app.update(agent_msg(AgentEvent::LiveToolBuf {
+        id: MOVED_ID.into(),
+        body: Arc::clone(&buf),
+    }));
+    Some(buf)
+}
+
+fn running_subagent_call(app: &mut App) -> Option<Arc<SharedBuf>> {
+    app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
+    start_subagent(app, MOVED_ID, RESEARCH_NAME);
+    None
+}
+
+/// What the plugin that took the call sends when the call ends.
+fn deliver_moved_result(app: &mut App) {
+    app.deliver(
+        Envelope {
+            event: slow_tool_done(MOVED_ID, false),
+            subagent: None,
+            run_id: 0,
+        },
+        Some(Arc::from(SLOW_TOOL)),
+    );
+}
+
+fn moved_badge_outcome(app: &App) -> Option<Option<BackgroundOutcome>> {
+    app.chats[MAIN_CHAT]
+        .tool_message(MOVED_ID)
+        .and_then(|row| row.background)
+        .map(|badge| badge.outcome)
+}
+
+/// A move racing Esc lands after the run it left was cancelled. The task
+/// lives on, so its receipt still opens its tab, on the same live buf, and
+/// takes back what Esc did to a subagent's. The tab runs until the call's
+/// result ends it.
+#[test_case(running_call          ; "call")]
+#[test_case(running_subagent_call ; "subagent")]
+fn a_receipt_landing_after_esc_still_opens_its_task(start: fn(&mut App) -> Option<Arc<SharedBuf>>) {
+    let mut app = streaming_app();
+    let buf = start(&mut app);
+    cancel_app(&mut app);
+    app.update(agent_msg(moved_done(MOVED_ID)));
+
+    let tab = app.chat_of_task(MOVED_ID).unwrap();
+    assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
+    assert_eq!(app.running_background_tasks().count(), 1);
+    assert_eq!(moved_badge_outcome(&app), Some(None));
+    if let Some(buf) = buf {
+        assert_eq!(app.chats[tab].in_progress_count(), 1);
+        assert!(
+            app.chats[tab]
+                .live_buf(MOVED_ID)
+                .is_some_and(|shared| Arc::ptr_eq(&shared, &buf))
+        );
+    }
+
+    deliver_moved_result(&mut app);
+
+    assert_eq!(app.chats[tab].task_status(), TaskStatus::Done);
+    assert_eq!(
+        moved_badge_outcome(&app),
+        Some(Some(BackgroundOutcome::Done))
+    );
+}
+
+/// The result can come between Esc and the receipt. It waits for the
+/// receipt, so Esc's ending of a subagent's tab is not taken for its own.
+#[test_case(running_call          ; "call")]
+#[test_case(running_subagent_call ; "subagent")]
+fn a_result_landing_between_esc_and_its_receipt_still_ends_the_task(
+    start: fn(&mut App) -> Option<Arc<SharedBuf>>,
+) {
+    let mut app = streaming_app();
+    start(&mut app);
+    cancel_app(&mut app);
+    deliver_moved_result(&mut app);
+    app.update(agent_msg(moved_done(MOVED_ID)));
+
+    let tab = app.chat_of_task(MOVED_ID).unwrap();
+    assert_eq!(app.chats[tab].task_status(), TaskStatus::Done);
+    assert_eq!(app.running_background_tasks().count(), 0);
+    assert_eq!(
+        moved_badge_outcome(&app),
+        Some(Some(BackgroundOutcome::Done))
+    );
+}
+
+const SUB_MOVED_ID: &str = "toolu_sub_moved";
+
+/// A call moved out of a subagent gets a task of its own beside the
+/// subagent's tab, which stays on its turn and carries the badge. The call's
+/// final result ends the task and the badge.
+#[test]
+fn a_call_moved_out_of_a_subagent_gets_its_own_task() {
+    let mut app = app_with_subagent_call(TASK_ID);
+    let buf = Arc::new(SharedBuf::new());
+    for event in [
+        tool_start(SUB_MOVED_ID, SLOW_TOOL),
+        AgentEvent::LiveToolBuf {
+            id: SUB_MOVED_ID.into(),
+            body: Arc::clone(&buf),
+        },
+        moved_done(SUB_MOVED_ID),
+    ] {
+        app.update(subagent_msg(event, TASK_ID, Some(RESEARCH_NAME)));
+    }
+
+    let subagent = app.chat_of_task(TASK_ID).unwrap();
+    let tab = app.chat_of_task(SUB_MOVED_ID).unwrap();
+    assert_ne!(tab, subagent);
+    assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
+    assert!(
+        app.chats[tab]
+            .live_buf(SUB_MOVED_ID)
+            .is_some_and(|shared| Arc::ptr_eq(&shared, &buf))
+    );
+    assert!(app.chats[subagent].plugin.is_none());
+    assert_eq!(app.chat_index.get(TASK_ID), Some(&subagent));
+    assert_eq!(app.running_background_tasks().count(), 1);
+    let badge_outcome = |app: &App| {
+        app.chats[subagent]
+            .tool_message(SUB_MOVED_ID)
+            .and_then(|row| row.background)
+            .map(|badge| badge.outcome)
+    };
+    assert_eq!(badge_outcome(&app), Some(None));
+
+    for event in [
+        slow_tool_done(SUB_MOVED_ID, false),
+        AgentEvent::StreamClosed,
+    ] {
+        app.deliver(
+            Envelope {
+                event,
+                subagent: None,
+                run_id: 0,
+            },
+            Some(Arc::from(SLOW_TOOL)),
+        );
+    }
+
+    assert_eq!(app.chats[tab].task_status(), TaskStatus::Done);
+    assert_eq!(badge_outcome(&app), Some(Some(BackgroundOutcome::Done)));
+    assert_eq!(app.chats[subagent].task_status(), TaskStatus::Working);
+}
+
+/// `--exit-on-done` holds its exit while a moved call is out. A quit by
+/// hand never waits.
+#[test_case(true,  false, true  ; "outstanding")]
+#[test_case(false, false, false ; "settled")]
+#[test_case(true,  true,  false ; "quit_by_hand")]
+fn exit_on_done_awaits_background_work(outstanding: bool, quit: bool, awaits: bool) {
+    let (mut app, mailbox) = exit_on_done_app(Some(BACKGROUND_WAIT));
+    if !outstanding {
+        mailbox.settle(MOVED_ID, None);
+    }
+    end_turn(&mut app);
+    if quit {
+        app.update(Msg::Key(kb::QUIT.to_key_event()));
+    }
+
+    assert_eq!(app.exit_request, ExitRequest::Success);
+    assert_eq!(app.awaits_background(Instant::now()), awaits);
+}
+
+const BACKGROUND_WAIT: Duration = Duration::from_secs(600);
+
+/// An `--exit-on-done` app whose run holds a receipt for [`MOVED_ID`].
+fn exit_on_done_app(background_wait: Option<Duration>) -> (App, SessionMailbox) {
+    let mut app = streaming_app();
+    let mailbox = hold_mailbox(&mut app);
+    app.exit_on_done = true;
+    app.background_wait = background_wait;
+    mailbox.track(MOVED_ID);
+    (app, mailbox)
+}
+
+/// A failed turn exits with its error: neither the wait nor a woken run may
+/// turn it into a success.
+#[test]
+fn exit_on_done_exits_a_failed_turn_without_waiting() {
+    let (mut app, _mailbox) = exit_on_done_app(Some(BACKGROUND_WAIT));
+    app.update(agent_msg(AgentEvent::Error {
+        message: AGENT_ERROR_MSG.into(),
+        auth: false,
+        totals: RunTotals::default(),
+    }));
+
+    assert_eq!(app.exit_request, ExitRequest::Error);
+    assert!(!app.awaits_background(Instant::now()));
+    assert!(!app.takes_mailbox_runs());
+}
+
+/// One deadline from the first held exit covers the whole wait, so a woken
+/// run does not extend it. No wait at all exits at once.
+#[test_case(Some(BACKGROUND_WAIT) ; "lapses")]
+#[test_case(None ; "zero_timeout_does_not_wait")]
+fn exit_on_done_stops_waiting_for_background_work(background_wait: Option<Duration>) {
+    let (mut app, _mailbox) = exit_on_done_app(background_wait);
+    end_turn(&mut app);
+    let first_exit = Instant::now();
+    assert_eq!(app.awaits_background(first_exit), background_wait.is_some());
+
+    app.status = Status::Streaming;
+    end_turn(&mut app);
+    let lapsed = first_exit + background_wait.unwrap_or_default();
+    assert_eq!(app.exit_request, ExitRequest::Success);
+    assert!(!app.awaits_background(lapsed));
+}
+
+/// The final result comes from the Lua thread and the receipt from the
+/// dispatcher, so a call that ends right after its move can report first.
+/// The task must still end, or its tab would run forever.
+#[test]
+fn a_final_result_that_beats_its_receipt_still_ends_the_task() {
+    let mut app = streaming_app();
+    let buf = Arc::new(SharedBuf::new());
+    app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
+    app.update(agent_msg(AgentEvent::LiveToolBuf {
+        id: MOVED_ID.into(),
+        body: Arc::clone(&buf),
+    }));
+    app.deliver(
+        Envelope {
+            event: slow_tool_done(MOVED_ID, false),
+            subagent: None,
+            run_id: 0,
+        },
+        Some(Arc::from(SLOW_TOOL)),
+    );
+
+    app.update(agent_msg(moved_done(MOVED_ID)));
+
+    let tab = app.chat_of_task(MOVED_ID).unwrap();
+    assert_eq!(app.chats[tab].task_status(), TaskStatus::Done);
+    assert_eq!(app.running_background_tasks().count(), 0);
+    assert_eq!(
+        app.chats[MAIN_CHAT]
+            .tool_message(MOVED_ID)
+            .and_then(|row| row.background)
+            .and_then(|badge| badge.outcome),
+        Some(BackgroundOutcome::Done)
+    );
+}
+
+/// The user stopped the task and deleted its tab before the call honoured
+/// the stop: the badge settles at the stop, and the late final is dropped.
+#[test]
+fn a_final_result_after_its_tab_was_deleted_is_dropped() {
+    let (mut app, _buf) = app_with_moved_call();
+    end_turn(&mut app);
+    app.stop_task(MOVED_ID).unwrap();
+    app.remove_task(MOVED_ID).unwrap();
+
+    app.deliver(
+        Envelope {
+            event: slow_tool_done(MOVED_ID, false),
+            subagent: None,
+            run_id: 0,
+        },
+        Some(Arc::from(SLOW_TOOL)),
+    );
+
+    assert!(app.early_finals.is_empty());
+    assert_eq!(
+        app.chats[MAIN_CHAT]
+            .tool_message(MOVED_ID)
+            .and_then(|row| row.background)
+            .and_then(|badge| badge.outcome),
+        Some(BackgroundOutcome::Cancelled)
+    );
+}
+
+/// A moved row whose tab was deleted has no task to open, so a click takes
+/// the row's own click rather than flashing an unknown task.
+#[test]
+fn clicking_a_moved_row_whose_tab_is_gone_takes_the_rows_own_click() {
+    let (mut app, _buf) = app_with_moved_call();
+    end_turn(&mut app);
+    app.deliver(
+        Envelope {
+            event: slow_tool_done(MOVED_ID, false),
+            subagent: None,
+            run_id: 0,
+        },
+        Some(Arc::from(SLOW_TOOL)),
+    );
+    app.remove_task(MOVED_ID).unwrap();
+    let zone = Rect::new(0, 0, 80, 20);
+    set_zone(&mut app, SelectionZone::Messages, zone);
+    let mut terminal = Terminal::new(TestBackend::new(zone.width, zone.bottom())).unwrap();
+    terminal
+        .draw(|frame| app.active_chat().view(frame, zone, false, true, &[]))
+        .unwrap();
+    app.active_chat().scroll_to_top();
+    let area = app.msg_area();
+    assert_eq!(
+        app.chats[MAIN_CHAT].handle_click(0, 0, area),
+        ClickOutcome::OpenTask(MOVED_ID.into()),
+        "the click lands on the moved row"
+    );
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0));
+
+    assert_eq!(app.status_bar.flash_text(), None);
+    assert_eq!(app.active_chat, MAIN_CHAT);
+}
+
+/// A `task` call moved off its turn, whose subagent asks the user through a
+/// channel of its own.
+fn app_with_moved_subagent() -> (App, flume::Receiver<String>, flume::Receiver<String>) {
+    let mut app = streaming_app();
+    let (main_tx, main_rx) = flume::unbounded();
+    app.answer_tx = Some(main_tx);
+    app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
+    app.update(agent_msg(moved_done(MOVED_ID)));
+    let (answer_tx, answer_rx) = flume::unbounded();
+    speak_after_the_move(
+        &mut app,
+        subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx)),
+    );
+    (app, answer_rx, main_rx)
+}
+
+/// Every run that parked gets the retry: one left out would wait forever.
+/// Esc ends the turn's run, not the task moved off it, so the task keeps its.
+#[test_case(false ; "enter")]
+#[test_case(true  ; "esc_then_enter")]
+fn one_enter_retries_every_run_parked_on_auth(esc_first: bool) {
+    let (mut app, sub_rx, main_rx) = app_with_moved_subagent();
+    app.update(agent_msg(AgentEvent::AuthRequired));
+    moved_subagent_event(&mut app, MOVED_ID, AgentEvent::AuthRequired);
+    let tab = app.chat_of_task(MOVED_ID).unwrap();
+
+    if esc_first {
+        cancel_app(&mut app);
+        assert!(!app.chats[MAIN_CHAT].auth_parked);
+        assert!(app.chats[tab].auth_parked);
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(sub_rx.try_recv(), Ok(String::new()));
+    assert_eq!(main_rx.try_recv().is_ok(), !esc_first);
+    assert!(!app.chats[MAIN_CHAT].auth_parked);
+    assert!(!app.chats[tab].auth_parked);
+}
+
+/// A task off the turn waiting on auth holds nothing of the main session:
+/// no needs-input status to block its wakes, and the next message is the
+/// user's, sent as usual on top of the retry.
+#[test]
+fn a_task_awaiting_auth_lets_the_main_chat_go_on() {
+    let (mut app, sub_rx, _main_rx) = app_with_moved_subagent();
+    end_turn(&mut app);
+    moved_subagent_event(&mut app, MOVED_ID, AgentEvent::AuthRequired);
+
+    assert!(!app.awaiting_input());
+    assert_eq!(app.attention(), None);
+
+    let actions = type_and_submit(&mut app, QUEUED_PROMPT);
+
+    assert_eq!(sub_rx.try_recv(), Ok(String::new()));
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == QUEUED_PROMPT));
+}
+
+/// A task that ended while parked, or whose run went on, has no retry left
+/// to wait for, and the next message reaches the main chat untouched.
+#[test_case(|app: &mut App| { app.stop_task(MOVED_ID).unwrap(); } ; "stopped")]
+#[test_case(|app: &mut App| moved_subagent_event(app, MOVED_ID, AgentEvent::StreamClosed) ; "session_closed")]
+#[test_case(|app: &mut App| moved_subagent_event(app, MOVED_ID, AgentEvent::TextDelta { text: TOOL_OUTPUT_LINE.into() }) ; "run_went_on")]
+fn a_task_auth_park_never_goes_stale(lift: fn(&mut App)) {
+    let (mut app, sub_rx, _main_rx) = app_with_moved_subagent();
+    end_turn(&mut app);
+    moved_subagent_event(&mut app, MOVED_ID, AgentEvent::AuthRequired);
+
+    lift(&mut app);
+    let actions = type_and_submit(&mut app, QUEUED_PROMPT);
+
+    assert!(sub_rx.is_empty());
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == QUEUED_PROMPT));
+}
+
+/// An auth ask still in flight when its subagent ended has no run to retry,
+/// and the main run's channel is not its to borrow.
+#[test]
+fn a_finished_subagent_late_auth_ask_never_parks() {
+    let (mut app, sub_rx, main_rx) = app_with_subagent_tx("sub1");
+    app.stop_task("sub1").unwrap();
+
+    app.update(subagent_msg(
+        AgentEvent::AuthRequired,
+        "sub1",
+        Some(RESEARCH_NAME),
+    ));
+
+    assert!(!app.chats[1].auth_parked);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(sub_rx.is_empty());
+    assert!(main_rx.is_empty());
+}
+
+/// A plugin's own session has nobody to ask, so its run fails instead of
+/// parking, and its plugin hears the error. The main run's channel is not
+/// its to borrow.
+#[test]
+fn a_plugin_task_nobody_can_answer_gets_no_auth_retry() {
+    let mut app = app_with_plugin_task();
+    let (main_tx, main_rx) = flume::unbounded();
+    app.answer_tx = Some(main_tx);
+
+    plugin_event(&mut app, AgentEvent::AuthRequired);
+
+    assert_eq!(app.chats[1].last_message_text(), AUTH_EXPIRED_MSG);
+    assert!(!app.chats[1].auth_parked);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(main_rx.is_empty());
+}
+
+/// A moved subagent's run can end while its call is out: a woken run follows,
+/// or its handler prompts again. Until the call's final result it works, so
+/// quitting warns of it and a rewind stops it.
+#[test]
+fn a_moved_subagent_works_until_its_call_ends() {
+    let (mut app, _sub_rx, _main_rx) = app_with_moved_subagent();
+    let tab = app.chat_of_task(MOVED_ID).unwrap();
+
+    moved_subagent_event(&mut app, MOVED_ID, done());
+
+    assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
+    assert_eq!(app.running_background_tasks().count(), 1);
+}
+
+/// A session a moved call opens shows up idle, and no prompt of it says so
+/// when it starts. Its run's own events are what mark it working.
+#[test]
+fn a_session_opened_under_a_moved_call_works_once_it_runs() {
+    let mut app = test_app();
+    app.open_plugin_task(
+        &subagent_info(NESTED_TASK_ID, RESEARCH_NAME),
+        Arc::from(SLOW_TOOL),
+    );
+    let tab = app.chat_of_task(NESTED_TASK_ID).unwrap();
+    assert_eq!(app.chats[tab].task_status(), TaskStatus::Idle);
+
+    moved_subagent_event(
+        &mut app,
+        NESTED_TASK_ID,
+        AgentEvent::TextDelta { text: "x".into() },
+    );
+
+    assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
 }

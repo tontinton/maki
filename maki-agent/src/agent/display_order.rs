@@ -3,6 +3,8 @@
 
 use maki_providers::{Message, Role};
 
+use crate::live_session::notice_body;
+
 /// One step of a session, in the order frontends show it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayItem<'a> {
@@ -22,6 +24,19 @@ pub fn observation_line(message: &Message) -> Option<&str> {
         .display_text
         .as_deref()
         .filter(|text| message.is_observation() && !text.is_empty())
+}
+
+/// What an observation's line unfolds to. A background result opens with a
+/// head that names the task for the model, but the line already names it
+/// for the user, so only the output is left to show.
+pub fn observation_detail(message: &Message) -> Option<&str> {
+    let text = message.first_text_content()?;
+    let detail = if message.settles.is_some() {
+        notice_body(text)
+    } else {
+        text
+    };
+    (!detail.is_empty()).then_some(detail)
 }
 
 /// History keeps an observation ahead of the prompts it landed with, but

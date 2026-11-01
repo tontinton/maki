@@ -11,8 +11,7 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry-proto = { workspace = true }
 http = { workspace = true }
 percent-encoding = { workspace = true }
-async-compat = { workspace = true }
-smol = { workspace = true }
+tokio = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

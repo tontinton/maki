@@ -1,6 +1,7 @@
 mod decor;
 mod layout;
 
+use std::borrow::Cow;
 use std::cell::{RefCell, RefMut};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -48,9 +49,13 @@ const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
 ];
 const QUEUE_PLACEHOLDER: &str = "Queue another prompt...";
 const SUBAGENT_QUEUE_PLACEHOLDER: &str = "Queue a message for this subagent...";
+const TASK_STOP_PLACEHOLDER: &str = "esc esc stop";
 const ASK_PREFIX: &str = "Ask maki to ";
 const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";
+const BACKGROUND_WAIT_PREFIX: &str = "Waiting on ";
+const BACKGROUND_WAIT_ONE: &str = " background task...";
+const BACKGROUND_WAIT_MANY: &str = " background tasks...";
 
 /// What opens the command palette at the start of [`sent_text`].
 pub(crate) const COMMAND_PREFIX: char = '/';
@@ -68,6 +73,11 @@ pub enum Placeholder {
     Blank,
     Queue,
     SubagentQueue,
+    /// A task that takes no messages, where Esc is all the input does.
+    TaskStop,
+    /// An idle agent whose moved work is still out. Without it the chat
+    /// looks done, while the results will still wake the agent.
+    Background(usize),
 }
 
 pub enum InputAction {
@@ -619,17 +629,19 @@ impl InputBox {
         let mut cursor_cell: Option<Position> = None;
         let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
             let base = theme::current().input_placeholder;
-            let (head, tail) = match placeholder {
+            let (head, tail): (Cow<str>, _) = match placeholder {
                 Placeholder::Suggestion => (
-                    ASK_PREFIX,
+                    ASK_PREFIX.into(),
                     vec![
                         Span::styled(self.placeholder_hint, base.add_modifier(Modifier::ITALIC)),
                         Span::styled(ASK_SUFFIX, base),
                     ],
                 ),
-                Placeholder::Queue => (QUEUE_PLACEHOLDER, Vec::new()),
-                Placeholder::SubagentQueue => (SUBAGENT_QUEUE_PLACEHOLDER, Vec::new()),
-                Placeholder::Blank => (BLANK_PLACEHOLDER, Vec::new()),
+                Placeholder::Queue => (QUEUE_PLACEHOLDER.into(), Vec::new()),
+                Placeholder::SubagentQueue => (SUBAGENT_QUEUE_PLACEHOLDER.into(), Vec::new()),
+                Placeholder::TaskStop => (TASK_STOP_PLACEHOLDER.into(), Vec::new()),
+                Placeholder::Blank => (BLANK_PLACEHOLDER.into(), Vec::new()),
+                Placeholder::Background(count) => (background_wait(count).into(), Vec::new()),
             };
             let mut spans = vec![super::chevron_span()];
             let head = Span::styled(head, base);
@@ -832,6 +844,15 @@ impl Hit {
         };
         self.row.text.start + at
     }
+}
+
+fn background_wait(count: usize) -> String {
+    let noun = if count == 1 {
+        BACKGROUND_WAIT_ONE
+    } else {
+        BACKGROUND_WAIT_MANY
+    };
+    format!("{BACKGROUND_WAIT_PREFIX}{count}{noun}")
 }
 
 fn random_placeholder_hint() -> &'static str {
@@ -1356,6 +1377,9 @@ mod tests {
     #[test_case(Placeholder::Blank, "" ; "blank_shows_only_the_chevron")]
     #[test_case(Placeholder::Queue, QUEUE_PLACEHOLDER ; "queue_asks_for_another_prompt")]
     #[test_case(Placeholder::SubagentQueue, SUBAGENT_QUEUE_PLACEHOLDER ; "subagent_queue_names_the_subagent")]
+    #[test_case(Placeholder::TaskStop, TASK_STOP_PLACEHOLDER ; "task_stop_names_the_key")]
+    #[test_case(Placeholder::Background(1), "Waiting on 1 background task..." ; "one_background_task")]
+    #[test_case(Placeholder::Background(2), "Waiting on 2 background tasks..." ; "background_tasks")]
     fn placeholder_row(placeholder: Placeholder, expected: &str) {
         let mut input = InputBox::new(InputHistory::default(), 20);
         let terminal = render_input_with(&mut input, 40, 4, placeholder);

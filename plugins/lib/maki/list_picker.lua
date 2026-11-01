@@ -578,6 +578,7 @@ ListPicker.split_words = split_words
 ListPicker.matches = matches
 ListPicker.highlight_spans = highlight_spans
 ListPicker.range_spans = range_spans
+ListPicker.clamp_parts = clamp_parts
 
 ListPicker._render_lines = render_lines
 ListPicker._filter_items = filter_items

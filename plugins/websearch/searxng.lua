@@ -1,5 +1,5 @@
 local M = {}
-local NO_RESULTS_MSG = require("constants").NO_RESULTS_MSG
+local numbered_list = require("numbered_list")
 
 -- Operator config wins over env; both are trimmed because a padded blank is
 -- truthy in lua yet means "unset" to whoever exported it.
@@ -42,19 +42,7 @@ function M.format_results(data, num_results)
     local why = type(data) == "table" and (data.error or data.message) or nil
     return nil, "SearXNG returned no results array" .. (why ~= nil and (": " .. tostring(why)) or "")
   end
-  local lines, n = {}, 0
-  for _, item in ipairs(data.results) do
-    if n < num_results and type(item) == "table" and type(item.url) == "string" and item.url ~= "" then
-      n = n + 1
-      local title = type(item.title) == "string" and item.title or item.url
-      local content = type(item.content) == "string" and item.content or ""
-      lines[n] = string.format("%d. %s\n   %s\n   %s", n, title, item.url, content)
-    end
-  end
-  if n == 0 then
-    return NO_RESULTS_MSG
-  end
-  return table.concat(lines, "\n")
+  return numbered_list(data.results, num_results)
 end
 
 return M

@@ -16,7 +16,7 @@ pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
 pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
-pub(crate) const NO_INBOX_ERR: &str = "subagent is not taking messages";
+pub(crate) const NO_INBOX_ERR: &str = "this task takes no messages";
 
 pub(crate) enum SubmitOutcome {
     Started(Vec<Action>),

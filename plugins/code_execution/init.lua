@@ -3,7 +3,6 @@
 -- dispatch live in Rust, which exposes primitives only (`maki.api.get_tools`,
 -- `maki.agent.call_tool`); orchestration policy is here.
 
-local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local partial = require("maki.partial")
@@ -19,7 +18,6 @@ local INSPECT_HOOKED_ERR = "os and pathlib cannot look at files while a plugin h
 local MKDIR_BASH_HINT = ", create the directory with the bash tool instead"
 local OPEN_APPEND_UNSUPPORTED_ERR = "open() cannot append because the write tool has no append option"
 local NO_OUTPUT = "(no output)"
-local SEPARATOR = "──────"
 local CANCELLED_ERR = "cancelled"
 local TIME_LIMIT_SUBSTR = "time limit exceeded"
 -- Same marker the batch tool uses for a failed child, so a failure reads the
@@ -106,7 +104,6 @@ local function build_body(ctx, code)
     if shown < total then
       out[#out + 1] = { { "... (" .. (total - shown) .. " lines) (click to expand)", "dim" } }
     end
-    out[#out + 1] = { { SEPARATOR, "dim" } }
     return out
   end
 
@@ -350,31 +347,24 @@ local function handler(input, ctx)
 
   view:append({ { "Waiting for output...", "dim" } })
 
+  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+
   local waiting = true
-  local output_parts = {}
+  local collected = output_limits.collector(max_lines, max_bytes)
   local function show(line)
     if waiting then
       waiting = false
       view:clear()
     end
-    output_parts[#output_parts + 1] = line
+    collected:append(line)
     view:append(line)
   end
-
-  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
   -- Memoized, because a cancel reaches us twice: once through the hook and
   -- again as the interpreter's error, and the view is painted only once.
   local cut_reply
   local function cut(reason)
-    cut_reply = cut_reply
-      or partial.cut(
-        view,
-        truncate(table.concat(output_parts, "\n"), max_lines, max_bytes),
-        reason,
-        timeout,
-        started_at
-      )
+    cut_reply = cut_reply or partial.cut(view, collected:result(), reason, timeout, started_at)
     return cut_reply
   end
 
@@ -434,24 +424,28 @@ local function handler(input, ctx)
     -- The run is already paid for, so point a script that reached for
     -- `asyncio.gather` at the wrapper that would have kept its other results.
     local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
-    return { llm_output = truncate(err .. hint, max_lines, max_bytes), is_error = true, body = buf }
+    return { llm_output = output_limits.cut_middle(err .. hint, max_lines, max_bytes), is_error = true, body = buf }
   end
 
-  local output = result.stdout or ""
   if result.output then
     show("return: " .. result.output)
-    output = (#output > 0 and output .. "\n" or "") .. "return: " .. result.output
   end
-  if #output == 0 then
-    output = NO_OUTPUT
+
+  -- Every line already went through `show`, so the collector holds the
+  -- reply and a finished run keeps its tail just like a cut one. Full mode
+  -- promises the whole output, so a cut there is an error.
+  local over_full_limit = not max_bytes and collected:truncated()
+  local llm_output = collected:result()
+  if llm_output == "" then
+    llm_output = NO_OUTPUT
     view:clear()
     view:append({ { "No output", "dim" } })
+  elseif over_full_limit then
+    llm_output = llm_output .. "\n" .. output_limits.FULL_LIMIT_NOTE
   end
-
-  local llm_output = truncate(output, max_lines, max_bytes)
   view:finish()
 
-  return { llm_output = llm_output, body = buf }
+  return { llm_output = llm_output, is_error = over_full_limit, body = buf }
 end
 
 local function header(input)

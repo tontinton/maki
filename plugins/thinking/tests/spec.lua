@@ -278,6 +278,28 @@ end)
 
 -- Proof that the ladder lives in Rust: a level this plugin has never heard of
 -- is navigable and drawn like any other.
+-- A level the model does not take stays pickable, since it is a ceiling a
+-- subagent on another model may reach, but it reads as the row it sends.
+case("a_level_the_model_does_not_take_names_the_row_it_sends", function()
+  local options = {
+    { name = "off", sends = "off" },
+    { name = "medium", tokens = 13107, sends = MEDIUM },
+    { name = "high", tokens = 19660, sends = MEDIUM },
+  }
+  local state = picker_on(MEDIUM, options)
+  local lines = Picker.render(state, WIDE)
+  local high
+  for i, row in ipairs(state.rows) do
+    if row.option and row.option.name == HIGH then
+      high = lines[i]
+    end
+  end
+  eq(high[2][2], "dim")
+  eq(line_text(high):match("sends medium") ~= nil, true, line_text(high))
+  eq(line_text(high):find(TOKENS_LABEL, 1, true), nil, "an alias claims no budget of its own")
+  eq(press(picker_on(MEDIUM, options), { "<Down>", "<CR>" }), HIGH)
+end)
+
 case("an_option_the_plugin_never_heard_of_renders_as_a_normal_row", function()
   local extended = {}
   for i, option in ipairs(LADDER) do

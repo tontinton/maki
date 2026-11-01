@@ -2,11 +2,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufReadExt, BufReader};
-use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_storage::id::{MakiId, SessionRef};
+use reqwest::{Client, Method, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::warn;
 
 use maki_config::providers::Protocol;
@@ -17,14 +17,17 @@ use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
 use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
-    api_decides,
+    sends_as_chosen,
 };
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line};
+use super::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, body_reader, http_client, next_sse_line,
+    ok_text, send_request,
+};
 
 pub(crate) const SLUG: &str = "google";
 const DISPLAY_NAME: &str = "Google";
@@ -55,7 +58,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Gemini,
     supports_thinking: true,
     supports_deferred_tools: false,
-    adaptive_effort: api_decides,
+    sends_thinking: sends_as_chosen,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(65_536),
@@ -115,7 +118,7 @@ fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> Result<Resolved
 }
 
 pub struct Google {
-    client: HttpClient,
+    client: Client,
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     stream_timeout: Duration,
@@ -170,12 +173,11 @@ impl Google {
             .to_string()
     }
 
-    fn build_request(&self, method: &str, url: &str) -> isahc::http::request::Builder {
+    fn build_request(&self, method: Method, url: &str) -> RequestBuilder {
         let auth = self.auth.lock().unwrap();
         auth.configure_request(
-            Request::builder()
-                .method(method)
-                .uri(url)
+            self.client
+                .request(method, url)
                 .header("user-agent", super::user_agent()),
         )
     }
@@ -253,18 +255,19 @@ impl Google {
         let json_body = serde_json::to_vec(&body)?;
 
         let request = self
-            .build_request("POST", &url)
+            .build_request(Method::POST, &url)
             .header("content-type", "application/json")
-            .body(json_body)?;
+            .body(json_body)
+            .build()?;
 
-        let response = self.client.send_async(request).await?;
-        let status = response.status().as_u16();
-
-        if status == 200 {
-            parse_sse(response, event_tx, self.stream_timeout).await
-        } else {
-            Err(AgentError::from_response(response).await)
-        }
+        send_request(&self.client, request, |response| async move {
+            if response.status().as_u16() == 200 {
+                parse_sse(body_reader(response), event_tx, self.stream_timeout).await
+            } else {
+                Err(AgentError::from_response(response).await)
+            }
+        })
+        .await
     }
 }
 
@@ -284,14 +287,10 @@ impl Provider for Google {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
-        let request = self.build_request("GET", &url).body(()).unwrap();
+        let request = self.build_request(Method::GET, &url).build();
         let client = self.client.clone();
         Box::pin(async move {
-            let mut response = client.send_async(request).await?;
-            if response.status().as_u16() != 200 {
-                return Err(AgentError::from_response(response).await);
-            }
-            let body_text = response.text().await?;
+            let body_text = ok_text(&client, request?).await?;
             let models_response: ModelsListResponse = serde_json::from_str(&body_text)?;
             let mut infos: Vec<crate::model::ModelInfo> = models_response
                 .models
@@ -609,11 +608,10 @@ fn push_or_extend_thinking(
 }
 
 async fn parse_sse(
-    response: isahc::Response<isahc::AsyncBody>,
+    reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let reader = BufReader::new(response.into_body());
     let mut lines = reader.lines();
 
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
@@ -715,11 +713,15 @@ async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorProjection;
     use crate::model::{ModelPricing, ModelTier};
+    use std::io::Cursor;
     use std::sync::Arc;
     use test_case::test_case;
 
+    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
     const GEMINI_API_KEY: &str = "test-key";
+    const MALFORMED_BASE_URL: &str = "http://[";
     const TOOL_NAME: &str = "word_count";
     const TOOL_DESCRIPTION: &str = "Count words.";
     const PATH_PROP: &str = "path";
@@ -758,6 +760,14 @@ mod tests {
             context_window: 1_048_576,
             thinking_fields: None,
         }
+    }
+
+    #[tokio::test]
+    async fn list_models_on_a_malformed_base_url_is_a_config_error() {
+        let google = Google::with_auth(test_auth(), test_timeouts())
+            .with_fallback_base_url(Some(MALFORMED_BASE_URL.into()));
+        let error = google.list_models().await.unwrap_err();
+        assert_eq!(error.projection(), ErrorProjection::Config);
     }
 
     #[test_case(json!({"type": "object", "properties": {}}) ; "empty_properties")]
@@ -1135,17 +1145,12 @@ mod tests {
         );
     }
 
-    fn mock_response(data: &'static [u8]) -> isahc::Response<isahc::AsyncBody> {
-        let body = isahc::AsyncBody::from_bytes_static(data);
-        isahc::Response::builder().status(200).body(body).unwrap()
-    }
-
-    #[test]
-    fn parse_sse_plain_text() {
+    #[tokio::test]
+    async fn parse_sse_plain_text() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":10}}\n\n";
-        let response = mock_response(data);
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(result.usage.input, 5);
         assert_eq!(result.usage.output, 10);
@@ -1155,8 +1160,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_coalesces_text_deltas_into_one_block() {
+    #[tokio::test]
+    async fn parse_sse_coalesces_text_deltas_into_one_block() {
         let event = |text: &str| {
             format!(
                 "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\"}}]}}}}]}}\n\n",
@@ -1166,9 +1171,9 @@ mod tests {
         let mut data = String::new();
         data.push_str(&event("Hello, "));
         data.push_str(&event("world."));
-        let response = mock_response(data.leak().as_bytes());
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(
             result.message.content.len(),
             1,
@@ -1180,8 +1185,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_coalesces_thinking_deltas_keeps_last_signature() {
+    #[tokio::test]
+    async fn parse_sse_coalesces_thinking_deltas_keeps_last_signature() {
         let event = |text: &str, sig: Option<&str>| match sig {
             Some(s) => format!(
                 "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\",\"thought\":true,\"thoughtSignature\":\"{}\"}}]}}}}]}}\n\n",
@@ -1195,9 +1200,9 @@ mod tests {
         let mut data = String::new();
         data.push_str(&event("reasoning... ", None));
         data.push_str(&event("more.", Some("sig-final")));
-        let response = mock_response(data.leak().as_bytes());
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.message.content.len(), 1);
         assert!(matches!(
             &result.message.content[0],
@@ -1206,14 +1211,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_parallel_same_name_tool_calls_get_unique_ids() {
+    #[tokio::test]
+    async fn parse_sse_parallel_same_name_tool_calls_get_unique_ids() {
         let part = r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"}}}"#;
         let payload = format!(r#"{{"candidates":[{{"content":{{"parts":[{part},{part}]}}}}]}}"#,);
         let data = format!("data: {payload}\n\n");
-        let response = mock_response(data.leak().as_bytes());
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         let ids: Vec<&str> = result
             .message
             .content
@@ -1227,12 +1232,12 @@ mod tests {
         assert_ne!(ids[0], ids[1], "ids must be unique for parallel calls");
     }
 
-    #[test]
-    fn parse_sse_thinking_part() {
+    #[tokio::test]
+    async fn parse_sse_thinking_part() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":30}}\n\n";
-        let response = mock_response(data);
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.usage.output, 50);
         assert!(matches!(
             &result.message.content[0],
@@ -1244,12 +1249,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_tool_call() {
+    #[tokio::test]
+    async fn parse_sse_tool_call() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{\"cmd\":\"ls\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":15}}\n\n";
-        let response = mock_response(data);
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
         assert!(matches!(
             &result.message.content[0],
@@ -1265,15 +1270,16 @@ mod tests {
         r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"},"thoughtSignature":"CvcQAdHtim/pKv/c0ClPFkYA=="}}"#
         ; "nested_fallback"
     )]
-    fn parse_sse_tool_call_captures_thought_signature(part_json: &str) {
+    #[tokio::test]
+    async fn parse_sse_tool_call_captures_thought_signature(part_json: &str) {
         const SIG: &str = "CvcQAdHtim/pKv/c0ClPFkYA==";
         let payload = format!(
             r#"{{"candidates":[{{"content":{{"parts":[{part_json}]}},"finishReason":"STOP"}}],"usageMetadata":{{"promptTokenCount":5,"candidatesTokenCount":15}}}}"#,
         );
         let data = format!("data: {payload}\n\n");
-        let response = mock_response(data.leak().as_bytes());
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::ToolUse { thought_signature: Some(s), .. } if s == SIG
@@ -1285,15 +1291,16 @@ mod tests {
     #[test_case(Some(50), 50 ; "partially_cached")]
     #[test_case(Some(100), 0 ; "fully_cached")]
     #[test_case(Some(150), 0 ; "cache_exceeds_prompt")]
-    fn parse_sse_cached_tokens(cached: Option<u32>, expected_input: u32) {
+    #[tokio::test]
+    async fn parse_sse_cached_tokens(cached: Option<u32>, expected_input: u32) {
         let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
         if let Some(cached) = cached {
             metadata["cachedContentTokenCount"] = json!(cached);
         }
         let data = format!("data: {}\n\n", json!({"usageMetadata": metadata}));
-        let response = mock_response(data.leak().as_bytes());
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, cached.unwrap_or_default());
@@ -1302,7 +1309,8 @@ mod tests {
     #[test_case(None, 50, 50 ; "missing_cache_preserves_previous")]
     #[test_case(Some(0), 100, 0 ; "zero_cache_clears_previous")]
     #[test_case(Some(25), 75, 25 ; "present_cache_replaces_previous")]
-    fn parse_sse_cached_tokens_across_chunks(
+    #[tokio::test]
+    async fn parse_sse_cached_tokens_across_chunks(
         cached: Option<u32>,
         expected_input: u32,
         expected_cache_read: u32,
@@ -1321,9 +1329,9 @@ mod tests {
             json!({"usageMetadata": initial_metadata}),
             json!({"usageMetadata": metadata}),
         );
-        let response = mock_response(data.leak().as_bytes());
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, expected_cache_read);

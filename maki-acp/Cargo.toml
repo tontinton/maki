@@ -11,7 +11,9 @@ maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 agent-client-protocol-schema = { workspace = true }
 jiff = { workspace = true }
-smol = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }
 flume = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

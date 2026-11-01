@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 getrandom = { workspace = true }
 reqwest = { workspace = true }
-async-compat = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

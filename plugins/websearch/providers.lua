@@ -3,38 +3,32 @@
 -- argument names, and how a key rides along. searxng is the exception: a
 -- plain GET /search?format=json, built and read in searxng.lua.
 
-local MAX_CODEPOINT = 0x10FFFF
-local SURROGATE_MIN, SURROGATE_MAX = 0xD800, 0xDFFF
-local NAMED_ENTITIES = { amp = "&", lt = "<", gt = ">", quot = '"', apos = "'", nbsp = " " }
+local numbered_list = require("numbered_list")
 
--- Luau's utf8.char encodes surrogates and NUL without complaint, and either
--- byte sequence fails the UTF-8 check on the way to Rust, taking the whole
--- result with it. Such an entity stays as written, like an unknown one.
-local function codepoint(code)
-  if code == 0 or code > MAX_CODEPOINT or (code >= SURROGATE_MIN and code <= SURROGATE_MAX) then
-    return nil
+-- A decoded object has lost kagimcp's key order, so this restores it.
+local KAGI_CATEGORIES = { "search", "news", "video", "podcast", "image" }
+
+-- kagimcp sends compact JSON grouped by category, and the numbered list
+-- drops its keys and quotes. Every result it sent is kept, as its markdown
+-- did. Text it can't read, not JSON or only unknown categories, passes
+-- through, so a format change upstream doesn't read as "no results".
+local function format_kagi(text)
+  local data = maki.json.decode(text)
+  if type(data) ~= "table" then
+    return text
   end
-  return utf8.char(code)
-end
-
-local function decode_entities(text)
-  return (
-    text
-      :gsub("&#[xX](%x+);", function(hex)
-        return codepoint(tonumber(hex, 16))
-      end)
-      :gsub("&#(%d+);", function(dec)
-        return codepoint(tonumber(dec))
-      end)
-      :gsub("&(%a+);", NAMED_ENTITIES)
-  )
-end
-
--- Kagi's markdown keeps the HTML of its search page: every query term wrapped
--- in <strong> and entity-encoded titles, plus a URL line repeating the link
--- in the heading above it. Together about a third of the response.
-local function clean_kagi(text)
-  return decode_entities(text:gsub("</?strong>", ""):gsub("\n%*%*URL:%*%* [^\n]*", ""))
+  local results = {}
+  for _, category in ipairs(KAGI_CATEGORIES) do
+    if type(data[category]) == "table" then
+      for _, result in ipairs(data[category]) do
+        table.insert(results, result)
+      end
+    end
+  end
+  if #results == 0 and next(data) ~= nil then
+    return text
+  end
+  return numbered_list(results, #results)
 end
 
 return {
@@ -84,7 +78,7 @@ return {
         limit = num_results,
       }
     end,
-    clean = clean_kagi,
+    format = format_kagi,
   },
   searxng = {
     label = "SearXNG",

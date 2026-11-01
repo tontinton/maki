@@ -2,6 +2,7 @@
 //! path, no parallel lists that can drift.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -14,11 +15,11 @@ use maki_config::Permission;
 use serde_json::{Value, json};
 
 use crate::template::Vars;
-use crate::{BufferSnapshot, ToolOutput};
+use crate::{BufferSnapshot, ToolDoneEvent, ToolOutput};
 
 use super::hook::ToolHook;
 use super::schema::sanitize_tool_input_schema;
-use super::{DescriptionContext, ToolContext};
+use super::{DescriptionContext, ToolContext, ToolFilter};
 use crate::agent::AgentHook;
 
 bitflags! {
@@ -98,6 +99,27 @@ pub struct ToolExecResult {
     pub output: Result<ToolOutput, String>,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
+    /// Set when `output` is a receipt: the call moved and finishes in the
+    /// background.
+    pub moved: Option<MovedCall>,
+}
+
+/// Settles a moved call with its filtered final reply, `None` when there is
+/// none to give.
+pub type MovedLand = Box<dyn FnOnce(Option<ToolDoneEvent>) + Send>;
+
+/// The rest of a call that moved to the background. Dispatch runs the receipt
+/// and then `result` through the output pipeline every call's output takes,
+/// and hands the result to `land`, so no output of a moved call reaches the
+/// model unfiltered.
+pub struct MovedCall {
+    /// `None` when the work ended without a reply.
+    pub result: BoxFuture<'static, Option<ToolExecResult>>,
+    /// Dropped uncalled exactly when the receipt was never published to the
+    /// model: the call never moved as far as anyone was told. Once published,
+    /// it is called exactly once, with `None` when the work or the pipeline
+    /// died, so the model hears what became of the call.
+    pub land: MovedLand,
 }
 
 impl From<Result<ToolOutput, String>> for ToolExecResult {
@@ -106,6 +128,7 @@ impl From<Result<ToolOutput, String>> for ToolExecResult {
             output,
             annotation: None,
             written_path: None,
+            moved: None,
         }
     }
 }
@@ -236,6 +259,14 @@ pub trait Tool: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str>;
     fn schema(&self) -> Value;
+    /// The schema the model is shown, or `None` to leave the tool out of its
+    /// array. `background` is whether the model can move a call to the
+    /// background itself. A tool that offers a parameter only for that
+    /// narrows it here, so the decision is made when the array is built and
+    /// the array never changes after.
+    fn offered_schema(&self, _background: bool) -> Option<Value> {
+        Some(self.schema())
+    }
     fn examples(&self) -> Option<Value> {
         None
     }
@@ -479,10 +510,32 @@ impl ToolRegistry {
     /// Human-friendly summary of an invocation; the raw tool name when
     /// there is nothing better.
     pub fn resolve_header(&self, name: &str, input: &Value) -> String {
+        self.start_header(name, input)
+            .map(|header| header.into_ready().text())
+            .unwrap_or_else(|| name.to_owned())
+    }
+
+    /// The header of a call to `name`, which a plugin tool answers later.
+    pub fn start_header(&self, name: &str, input: &Value) -> Option<HeaderFuture> {
         self.get(name)
             .and_then(|e| e.try_parse(input))
-            .map(|inv| inv.start_header().into_ready().text())
-            .unwrap_or_else(|| name.to_owned())
+            .map(|inv| inv.start_header())
+    }
+
+    /// Plugins that registered tools of which `filter` lets none through.
+    pub fn plugins_filtered_out(&self, filter: &ToolFilter) -> Vec<Arc<str>> {
+        let tools = self.tools.load();
+        let mut visible: BTreeMap<&Arc<str>, bool> = BTreeMap::new();
+        for tool in tools.iter() {
+            if let ToolSource::Lua { plugin } = &tool.source {
+                *visible.entry(plugin).or_default() |= filter.matches(tool.name());
+            }
+        }
+        visible
+            .into_iter()
+            .filter(|(_, visible)| !visible)
+            .map(|(plugin, _)| Arc::clone(plugin))
+            .collect()
     }
 
     pub fn names(&self) -> Vec<Arc<str>> {
@@ -501,6 +554,20 @@ impl ToolRegistry {
         ctx: &DescriptionContext,
         supports_examples: bool,
     ) -> Value {
+        self.definitions_with_background(vars, ctx, supports_examples, true)
+    }
+
+    /// `background` is whether the session can move calls to the background.
+    /// Only the main agent ever moves one itself, so every other audience is
+    /// built as if it were off.
+    pub fn definitions_with_background(
+        &self,
+        vars: &Vars,
+        ctx: &DescriptionContext,
+        supports_examples: bool,
+        background: bool,
+    ) -> Value {
+        let background = background && ctx.audience.contains(ToolAudience::MAIN);
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
@@ -510,11 +577,14 @@ impl ToolRegistry {
             if !ctx.filter.matches(entry.name()) {
                 continue;
             }
+            let Some(schema) = entry.tool.offered_schema(background) else {
+                continue;
+            };
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();
             let mut def = json!({
                 "name": entry.name(),
                 "description": description,
-                "input_schema": sanitize_tool_input_schema(entry.tool.schema()),
+                "input_schema": sanitize_tool_input_schema(schema),
             });
             if let Some(examples) = entry.tool.examples() {
                 if supports_examples {

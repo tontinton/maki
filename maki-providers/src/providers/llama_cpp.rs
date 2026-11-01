@@ -27,7 +27,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: true,
     supports_deferred_tools: false,
-    adaptive_effort: |model| LLAMACPP.adaptive_effort(model),
+    sends_thinking: |model, choice| LLAMACPP.sends_thinking(model, choice),
     thinking_fields_fallback: |_| LLAMACPP.fields_fallback(),
     accepts_arbitrary_models: true,
     fallback_max_output: None,

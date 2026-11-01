@@ -41,6 +41,17 @@ A call an input layer stopped never reaches the output slot: the reason came
 from a layer, so there is nothing left to filter. A name that resolves to no
 tool fires neither slot.
 
+A call [moved to the background](/docs/background-tasks/) fires `output`
+twice. The first time is on the receipt the model gets at the move, with
+`ctx.receipt = true`. Redact receipts too, since they can carry output such as
+the last lines of a command. The second time is on the final result, before
+the model, the task tab or `task_stop` sees it. A stop or a timeout cuts
+neither layer short, so a stopped call is filtered as well.
+
+If the receipt leaves the layers as an error (a layer returned `nil, reason`
+or set `is_error`), the move is undone. The work stops, and the model gets that
+error and no later result.
+
 Layers take `function(prev, value, ctx)` and answer in one of these ways:
 
 - return a table: it replaces the value for the rest of the call
@@ -66,6 +77,7 @@ already done, so `reason` only replaces the text the model reads.
 | `session_id` | session of the call. A subagent's calls arrive as `"model"` under its own session. |
 | `deadline_ms` | milliseconds left before the layer is dropped |
 | `input` | `output` only: the input the call ran with, after every input layer |
+| `receipt` | `true` when `output` fires on the receipt of a call that moved to the background |
 
 ### Rewriting a command
 
@@ -184,10 +196,13 @@ maximum instead. See [plugin permissions](/docs/lua-api/#plugin-permissions).
 
 **A layer may wait, within a window.** Chains are async, so a layer can read a
 file or run a job before it decides. It runs inside the call it is filtering, so
-cancelling the call cancels the layer too. Each stage gets whatever the call has
-left of its own deadline, capped at 60 seconds. A layer still running when the
-window closes is dropped, and the call proceeds as if that layer had passed the
-value along.
+cancelling the call cancels the layer too, except for a moved call. The `input`
+stage gets whatever the call has left of its own deadline, capped at 60
+seconds. The `output` stage always gets 60 seconds, so a tool that overruns its
+deadline still has its result redacted. A layer still running when the window
+closes is dropped, and the call proceeds as if that layer had passed the value
+along. If the plugin host never answers, during a reload for example, the call
+moves on a few seconds after the window closes.
 
 Cancellation lands differently on the two stages. An input layer cut short stops
 the call, because nothing has run yet and nobody is left to read a result. An

@@ -178,6 +178,16 @@ Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), claude-opus-5 (strong)
 
 This provider talks the OpenAI-compatible `/v1` API, so it also works with llama.cpp's server, LocalAI, or anything else that speaks the same protocol. Just point `OLLAMA_HOST` to the right address (e.g. `http://localhost:8080` for llama.cpp).
 
+#### Context window
+
+Ollama picks the context window when it loads a model, from available VRAM unless a Modelfile `num_ctx` or `OLLAMA_CONTEXT_LENGTH` sets it. That is often less than the model supports. Before every request maki reads the window from `/api/ps` and compacts to fit, so Ollama does not cut the start of a long chat. A model that is not loaded yet starts from its Modelfile `num_ctx`, or from the trained length without one.
+
+For more room, raise the window on the server, where the memory is: `OLLAMA_CONTEXT_LENGTH` or a Modelfile `num_ctx`. maki does not set it per request, because a larger window reloads the model and can run out of VRAM mid-session.
+
+#### Thinking
+
+maki reads from `/api/show` whether each model thinks and which levels it takes. `/thinking` lists every level, and a level the model does not take is dimmed and names the level it sends instead: the closest one below, or else the lowest. A model that can only turn thinking on or off shows `medium`, the level Ollama reads any request as. `adaptive` sends `medium`, snapped the same way, and `off` sends `none` to a model that can turn thinking off.
+
 ### LlamaCpp
 
 - **Env var**: `LLAMA_CPP_API_KEY`
@@ -283,15 +293,15 @@ Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Weak | zai-glm-5-3-flash | $0.15 / $0.50 | 1000K ctx / 131K out |
-| Weak | **ministral-14b-latest, ministral-14b-2512** (default) | $0.20 / $0.20 | 262K ctx |
+| Weak | **zai-glm-5-3-flash** (default) | $0.15 / $0.50 | 1000K ctx / 131K out |
+| Weak | ministral-14b-latest, ministral-14b-2512 | $0.20 / $0.20 | 262K ctx |
 | Medium | **mistral-small-latest, mistral-small-2603** (default) | $0.15 / $0.60 | 262K ctx |
-| Strong | mistral-large-4, mistral-large-4-0 | $1.36 / $4.18 | 1000K ctx |
-| Strong | **mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604** (default) | $1.50 / $7.50 | 262K ctx |
-| Strong | zai-glm-latest, zai-glm-5-3, zai-glm-5 | $1.40 / $4.40 | 1000K ctx |
-| Strong | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
+| Medium | deepseek-v4-1-flash-1017 | $0.30 / $1.20 | 1000K ctx / 131K out |
+| Strong | **mistral-large-4, mistral-large-4-0** (default) | $0.70 / $2.10 | 1000K ctx |
+| Strong | mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604 | $1.50 / $7.50 | 262K ctx |
+| Strong | zai-glm-latest, zai-glm-5-3, zai-glm-5 | $1.40 / $4.40 | 1000K ctx / 131K out |
 
-Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministral-14b-latest (weak)
+Defaults: mistral-large-4 (strong), mistral-small-latest (medium), zai-glm-5-3-flash (weak)
 
 ### OpenRouter
 
@@ -469,7 +479,7 @@ high = { reasoning_effort = "xhigh" }
 max = { reasoning_effort = "xhigh" }
 ```
 
-A mode you left out sends nothing. To get Ollama's own effort words (`low`, `medium`, `high`, and `none` when thinking is off) instead of writing every fragment yourself, use the built-in `ollama` slug: set `[ollama].base_url` (or `OLLAMA_HOST`) and give `[[ollama.models]]` the thinking keys. Only `supports_thinking`, `requires_thinking` and `thinking_fields` overlay onto a built-in slug. The rest of the entry stays ignored, and startup names the keys it dropped.
+A mode you left out sends nothing. The built-in `ollama` slug needs no thinking keys, because it asks Ollama which levels each model takes (see [Ollama](#ollama)). To override that for a model, set `[ollama].base_url` (or `OLLAMA_HOST`) and give `[[ollama.models]]` the thinking keys. Only `supports_thinking`, `requires_thinking` and `thinking_fields` overlay onto a built-in slug. The rest of the entry stays ignored, and startup names the keys it dropped.
 
 Without `thinking_fields`, maki sends `"thinking": {"type": "disabled"}` when thinking is off and nothing when it is on. GLM and Kimi gateways need this block to stop reasoning. Declaring `thinking_fields` replaces it, so add an `off` key if your gateway needs one. Some gateways, such as LiteLLM in front of Azure, reject the block. Maki then retries without it, and if the retry works, leaves the block out for that model until restart.
 
@@ -510,7 +520,7 @@ Current plans:
 
 | Provider | Plan | What it does |
 |----------|------|--------------|
-| Mistral | `standard` | Standard at `https://api.mistral.ai/v1`, default `mistral/mistral-medium-latest` |
+| Mistral | `standard` | Standard at `https://api.mistral.ai/v1`, default `mistral/mistral-large-4` |
 | Mistral | `coding` | Vibe / Coding at `https://api.mistral.ai/v1`, default `mistral/mistral-vibe-cli-latest` |
 | Z.AI | `standard` | Pay-as-you-go at `https://api.z.ai/api/paas/v4`, default `zai/glm-5.1` |
 | Z.AI | `coding` | Coding plan at `https://api.z.ai/api/coding/paas/v4`, default `zai/glm-5-code` |

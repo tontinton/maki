@@ -8,6 +8,7 @@ use maki_providers::{
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
+use tokio::time::sleep;
 use tracing::warn;
 
 use crate::cancel::CancelToken;
@@ -232,7 +233,7 @@ pub(crate) async fn stream_with_retry(
         let model = &fitted;
         let started = Instant::now();
         let (ptx, prx) = flume::unbounded();
-        let forwarder = smol::spawn({
+        let forwarder = tokio::spawn({
             let event_tx = event_tx.clone();
             async move { forward_provider_events(prx, &event_tx).await }
         });
@@ -244,7 +245,7 @@ pub(crate) async fn stream_with_retry(
             .await
             .unwrap_or(Err(AgentError::Cancelled));
         drop(ptx);
-        let streamed = forwarder.await;
+        let streamed = forwarder.await.expect("provider event forwarder panicked");
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
@@ -324,7 +325,7 @@ pub(crate) async fn stream_with_retry(
                     delay_ms,
                 })?;
                 if !delay.is_zero() {
-                    let _ = cancel.race(smol::Timer::after(delay)).await;
+                    let _ = cancel.race(sleep(delay)).await;
                 }
             }
         }
@@ -700,41 +701,39 @@ mod tests {
     /// A race wakes from whichever side gets there first, so racing the token
     /// against the request still sent it about half the time. `race` checks the
     /// token before it polls at all.
-    #[test]
-    fn a_cancelled_run_is_never_billed_for_a_request() {
-        smol::block_on(async {
-            let server = StrictServer {
-                window: STRICT_WINDOW,
-                requests: Mutex::default(),
-            };
-            let (trigger, cancel) = CancelToken::new();
-            trigger.cancel();
-            let (tx, _rx) = flume::unbounded();
+    #[tokio::test]
+    async fn a_cancelled_run_is_never_billed_for_a_request() {
+        let server = StrictServer {
+            window: STRICT_WINDOW,
+            requests: Mutex::default(),
+        };
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+        let (tx, _rx) = flume::unbounded();
 
-            let result = stream_with_retry(
-                StreamRequest {
-                    provider: &server,
-                    model: &strict_model(STRICT_WINDOW),
-                    messages: &transcript(),
-                    system: "",
-                    tools: &json!([]),
-                    opts: RequestOptions::default(),
-                    output_budget: TURN_BUDGET,
-                    session_id: None,
-                    retry: RetryPolicy::default(),
-                },
-                None,
-                &EventSender::new(tx, 0),
-                &cancel,
-            )
-            .await;
+        let result = stream_with_retry(
+            StreamRequest {
+                provider: &server,
+                model: &strict_model(STRICT_WINDOW),
+                messages: &transcript(),
+                system: "",
+                tools: &json!([]),
+                opts: RequestOptions::default(),
+                output_budget: TURN_BUDGET,
+                session_id: None,
+                retry: RetryPolicy::default(),
+            },
+            None,
+            &EventSender::new(tx, 0),
+            &cancel,
+        )
+        .await;
 
-            assert!(matches!(result, Err(StreamError::Cancelled { .. })));
-            assert!(
-                server.requests.lock().unwrap().is_empty(),
-                "a cancelled run reached the provider"
-            );
-        });
+        assert!(matches!(result, Err(StreamError::Cancelled { .. })));
+        assert!(
+            server.requests.lock().unwrap().is_empty(),
+            "a cancelled run reached the provider"
+        );
     }
 
     /// `AgentEvent::Retry` is the only thing that makes the view drop what the
@@ -743,68 +742,66 @@ mod tests {
     /// replaces it to be appended to.
     #[test_case(STRICT_WINDOW, &[] ; "a_request_that_fits_reports_nothing")]
     #[test_case(CROWDED_WINDOW, &[(FIRST_ATTEMPT, BUDGET_RETRY_MESSAGE, NO_WAIT)] ; "a_shrunk_budget_is_reported_like_any_other_retry")]
-    fn every_way_round_the_loop_tells_the_view_to_start_over(
+    #[tokio::test]
+    async fn every_way_round_the_loop_tells_the_view_to_start_over(
         window: u32,
         expected: &[(u32, &str, u64)],
     ) {
-        smol::block_on(async {
-            let server = StrictServer {
-                window,
-                requests: Mutex::default(),
-            };
-            let mut gauge = ContextGauge::default();
+        let server = StrictServer {
+            window,
+            requests: Mutex::default(),
+        };
+        let mut gauge = ContextGauge::default();
 
-            let (result, events) = send(
-                &server,
-                &strict_model(window),
-                Some(&mut gauge),
-                RetryPolicy::default(),
-            )
-            .await;
+        let (result, events) = send(
+            &server,
+            &strict_model(window),
+            Some(&mut gauge),
+            RetryPolicy::default(),
+        )
+        .await;
 
-            result.expect("a shrunk budget is answered");
-            assert_eq!(retries_of(&events), expected);
-        });
+        result.expect("a shrunk budget is answered");
+        assert_eq!(retries_of(&events), expected);
     }
 
     #[test_case(STRICT_WINDOW, 1 ; "a_window_sized_cap_still_leaves_room_for_the_prompt")]
     // A retry is cheap and compaction is not, so a budget that genuinely does
     // not fit comes back smaller, with nothing summarized away to get there.
     #[test_case(CROWDED_WINDOW, 2 ; "a_budget_that_does_not_fit_is_retried_smaller")]
-    fn a_strict_server_is_answered_without_dropping_context(window: u32, attempts: usize) {
-        smol::block_on(async {
-            let server = StrictServer {
-                window,
-                requests: Mutex::default(),
-            };
-            let mut gauge = ContextGauge::default();
+    #[tokio::test]
+    async fn a_strict_server_is_answered_without_dropping_context(window: u32, attempts: usize) {
+        let server = StrictServer {
+            window,
+            requests: Mutex::default(),
+        };
+        let mut gauge = ContextGauge::default();
 
-            let response = send(
-                &server,
-                &strict_model(window),
-                Some(&mut gauge),
-                RetryPolicy::default(),
-            )
-            .await
-            .0
-            .expect("a flat budget leaves the window room for the prompt");
+        let response = send(
+            &server,
+            &strict_model(window),
+            Some(&mut gauge),
+            RetryPolicy::default(),
+        )
+        .await
+        .0
+        .expect("a flat budget leaves the window room for the prompt");
 
-            let asks = server.requests.lock().unwrap().clone();
-            assert_eq!(asks.len(), attempts, "asked for {asks:?}");
-            assert!(
-                asks[0] <= TURN_BUDGET,
-                "the first ask is a turn budget, not the window"
-            );
-            assert!(
-                asks.windows(2).all(|pair| pair[1] < pair[0]),
-                "every retry asks for less than the ask that was refused"
-            );
-            assert_eq!(
-                gauge.size(),
-                response.usage.input,
-                "the session keeps the server's count, not the estimate under it"
-            );
-        });
+        let asks = server.requests.lock().unwrap().clone();
+        assert_eq!(asks.len(), attempts, "asked for {asks:?}");
+        assert!(
+            asks[0] <= TURN_BUDGET,
+            "the first ask is a turn budget, not the window"
+        );
+        assert!(
+            asks.windows(2).all(|pair| pair[1] < pair[0]),
+            "every retry asks for less than the ask that was refused"
+        );
+        assert_eq!(
+            gauge.size(),
+            response.usage.input,
+            "the session keeps the server's count, not the estimate under it"
+        );
     }
 
     const POOL_KEYS: [&str; 3] = ["sk-first", "sk-second", "sk-third"];
@@ -921,21 +918,19 @@ mod tests {
     /// The reported regression: a 429 on the first key used to spend the rate
     /// limit budget before anything rotated, so a pool whose budget was zero
     /// never reached its other keys at all.
-    #[test]
-    fn a_fresh_key_is_tried_without_spending_the_retry_budget() {
-        smol::block_on(async {
-            let server = PooledServer::new(FULL_POOL, RATE_LIMITED, Some(POOL_KEYS[FULL_POOL - 1]));
+    #[tokio::test]
+    async fn a_fresh_key_is_tried_without_spending_the_retry_budget() {
+        let server = PooledServer::new(FULL_POOL, RATE_LIMITED, Some(POOL_KEYS[FULL_POOL - 1]));
 
-            send_pooled(&server)
-                .await
-                .expect("the last key in the pool answers");
+        send_pooled(&server)
+            .await
+            .expect("the last key in the pool answers");
 
-            assert_eq!(
-                server.keys_seen(),
-                POOL_KEYS,
-                "the walk tries each key once, in the pool's order"
-            );
-        });
+        assert_eq!(
+            server.keys_seen(),
+            POOL_KEYS,
+            "the walk tries each key once, in the pool's order"
+        );
     }
 
     /// A 401 and a 403 carry no retry kind at all, which is why rotation is
@@ -946,14 +941,13 @@ mod tests {
     #[test_case(UNAUTHORIZED, FULL_POOL  ; "unauthorized_walks_the_whole_pool")]
     #[test_case(FORBIDDEN, FULL_POOL     ; "forbidden_walks_the_whole_pool")]
     #[test_case(UNAUTHORIZED, SINGLE_KEY ; "a_lone_key_is_tried_once")]
-    fn a_spent_pool_is_walked_once_and_then_gives_up(status: u16, keys: usize) {
-        smol::block_on(async {
-            let server = PooledServer::new(keys, status, None);
+    #[tokio::test]
+    async fn a_spent_pool_is_walked_once_and_then_gives_up(status: u16, keys: usize) {
+        let server = PooledServer::new(keys, status, None);
 
-            let result = send_pooled(&server).await;
+        let result = send_pooled(&server).await;
 
-            assert!(result.is_err(), "no key in the pool is accepted");
-            assert_eq!(server.keys_seen().len(), keys, "and no key is tried twice");
-        });
+        assert!(result.is_err(), "no key in the pool is accepted");
+        assert_eq!(server.keys_seen().len(), keys, "and no key is tried twice");
     }
 }

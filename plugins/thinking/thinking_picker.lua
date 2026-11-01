@@ -32,6 +32,7 @@ local DIGIT = "^%d$"
 -- Rows without a budget fill the wide column with this. A mode we have never
 -- heard of gets nothing rather than invented prose.
 local MODE_NOTES = { off = "no reasoning", adaptive = "model decides" }
+local SENDS_PREFIX = "sends "
 
 local STYLE_NAME = "item"
 local STYLE_NAME_PICKED = "bold"
@@ -200,9 +201,21 @@ function M.click(state, row)
   end
 end
 
+-- A level the model does not take goes out as another row. Its cost is that
+-- row's, so it names the row rather than drawing a gauge of its own.
+local function alias_of(row)
+  local sends = row.option and row.option.sends
+  return sends ~= nil and sends ~= row.option.name and sends or nil
+end
+
 -- What a budget-less row says in the wide column where the gauges are: a mode
--- describes itself, the custom row shows what is typed.
+-- describes itself, an alias names the row it sends, the custom row shows what
+-- is typed.
 local function note_spans(state, row)
+  local alias = alias_of(row)
+  if alias then
+    return { { SENDS_PREFIX .. alias, STYLE_DIM } }
+  end
   if row.option then
     return { { MODE_NOTES[row.option.name] or "", STYLE_DIM } }
   end
@@ -238,11 +251,12 @@ local function layout(state, width)
 end
 
 local function row_spans(state, row, picked, cols)
+  local alias = alias_of(row)
   local spans = {
     { INDENT .. (picked and PICKED or UNPICKED), picked and STYLE_PICKED or STYLE_DIM },
-    { pad_right(row_name(row), cols.name), picked and STYLE_NAME_PICKED or STYLE_NAME },
+    { pad_right(row_name(row), cols.name), picked and STYLE_NAME_PICKED or (alias and STYLE_DIM or STYLE_NAME) },
   }
-  local tokens = row.option and row.option.tokens
+  local tokens = not alias and row.option and row.option.tokens
   if not tokens then
     local left = cols.room
     for _, span in ipairs(note_spans(state, row)) do

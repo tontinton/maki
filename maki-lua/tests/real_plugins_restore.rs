@@ -2,6 +2,7 @@
 //! A broken restore silently falls back to raw LLM output, so we assert
 //! things only the real views produce (gutters, command headers, truncation).
 
+use std::env::current_dir;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,17 +10,25 @@ use maki_agent::tools::ToolRegistry;
 use maki_agent::{AgentEvent, EventSender, SpanStyle};
 use maki_config::ToolOutputLines;
 use maki_highlight::highlight_code;
+use maki_lua::test_support::runtime;
 use maki_lua::{PluginHost, RestoreReason, Split, UiAction};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
+use test_case::test_case;
 
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
+/// The bash restore cases all run `echo`, and their output `hi` does not contain it.
+const COMMAND_WORD: &str = "echo";
 const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
 const TODO_SRC: &str = include_str!("../../plugins/todo_write/init.lua");
 const READ_SRC: &str = include_str!("../../plugins/read/init.lua");
+/// Deeper than the 200 lines of context the read plugin highlights.
 const READ_PADDING_LINES: usize = 300;
-const READ_PADDING_BYTES: usize = 128;
+/// Kept short, so the context stays far below the highlighter's 16 KiB
+/// prefix cut, which `maki-highlight` tests on its own. Long lines made a
+/// loaded CI runner miss the 10 s restore deadline and lose the colors.
+const READ_PADDING_BYTES: usize = 8;
 const READ_COMMENT: &str = "/* comment";
 const READ_EXCERPT: &str = "let value = 1;";
 const READ_LANG: &str = "rust";
@@ -194,23 +203,49 @@ fn read_restore_keeps_nearby_comment_colors_with_large_context(ending: &str) {
     assert_eq!(render(&deep, READ_PADDING_LINES + 2), render(&shallow, 2));
 }
 
-#[test]
-fn bash_restore_renders_real_view() {
+/// The body shows the highlighted command, so the title only carries what
+/// the model says the command does. A description that is blank or just the
+/// command says nothing. The directory of a leading `cd` stays, since the
+/// body leaves the `cd` out.
+#[test_case(Some("print hi"), "echo hi", "print hi" ; "described")]
+#[test_case(None, "echo hi", "" ; "undescribed")]
+#[test_case(Some("echo hi"), "echo hi", "" ; "described_by_its_command")]
+#[test_case(Some(" "), "echo hi", "" ; "blank_description")]
+#[test_case(None, "cd src && echo hi", "in src" ; "undescribed_past_a_cd")]
+#[test_case(Some("print hi"), "cd src && echo hi", "print hi in src" ; "described_past_a_cd")]
+#[test_case(Some("echo hi"), "cd src && echo hi", "in src" ; "described_by_its_command_past_a_cd")]
+fn bash_restore_titles_a_call_and_shows_its_command(
+    description: Option<&str>,
+    command: &str,
+    header: &str,
+) {
     let host = load_host();
     let r = restore(
         &host,
         "bash",
-        json!({ "command": "echo hi", "description": "print hi" }),
+        json!({ "command": command, "description": description }),
         "hi",
         None,
         Vec::new(),
     );
-    assert!(
-        r.body.contains("echo hi"),
-        "real view renders the command header; the fallback body is raw output only: {}",
-        r.body
+    assert_eq!(r.header, header);
+    assert!(r.body.contains(COMMAND_WORD), "{}", r.body);
+}
+
+/// The session's own directory tells the reader nothing.
+#[test]
+fn bash_title_leaves_out_the_session_directory() {
+    let cwd = current_dir().unwrap();
+    let host = load_host();
+    let r = restore(
+        &host,
+        "bash",
+        json!({ "command": "echo hi", "description": "print hi", "workdir": cwd }),
+        "hi",
+        None,
+        Vec::new(),
     );
-    assert!(r.header.contains("print hi"), "header: {}", r.header);
+    assert_eq!(r.header, "print hi");
 }
 
 /// Phase 1: children render through their own real views (grep gutter,
@@ -377,7 +412,7 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
         .tool
         .parse(&input)
         .expect("parse failed");
-    let result = smol::block_on(async { inv.execute(&ctx).await });
+    let result = runtime().block_on(inv.execute(&ctx));
     host.load_source("live_barrier", "").unwrap();
     let mut body = String::new();
     for env in rx.drain() {
@@ -519,7 +554,7 @@ fn todo_panel_opens_in_the_tab_of_each_writing_session() {
     for session in sessions {
         let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
         ctx.session_id = Some(SessionRef::from_id(session));
-        smol::block_on(tool.parse(&input).unwrap().execute(&ctx));
+        runtime().block_on(tool.parse(&input).unwrap().execute(&ctx));
     }
 
     let owners: Vec<_> = host

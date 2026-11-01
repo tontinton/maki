@@ -63,6 +63,7 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `edit_lines` | `<cwd>/**` | Outside cwd requires permission |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `task` | `*` | Subagent spawning always allowed |
+| `read` | `<state>/tasks/<session>/**` | The calling session's [bash logs](/docs/background-tasks/#bash-logs). Subagents share their parent's session. Other sessions' logs prompt like any path outside cwd |
 
 The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under maki's state dir), so the agent can edit memory notes directly without a prompt.
 

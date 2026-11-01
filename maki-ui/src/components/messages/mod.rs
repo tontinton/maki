@@ -12,13 +12,14 @@ use self::scroll::Layout;
 use self::segment::{Segment, SegmentCache, body_width};
 
 use super::tool_display::{
-    RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info, assistant_style,
-    build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
-    gutter_marker, instructions_search_text, notice_style, search_text_for, thinking_style,
-    truncate_to_header, user_style,
+    MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info,
+    assistant_style, build_instructions_lines, build_tool_lines, done_style, error_style,
+    format_timestamp_now, gutter_marker, hint_columns, instructions_search_text, notice_style,
+    outcome_glyph, search_text_for, thinking_style, truncate_to_header, user_style,
 };
 use super::{
-    DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole, ToolStatus, code_view::SectionFlags,
+    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole,
+    ToolStatus, code_view::SectionFlags,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -35,14 +36,14 @@ use ratatui_image::picker::Picker;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
 use super::thinking;
 use maki_agent::{
-    BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
-    ToolDoneEvent, ToolOutput, ToolStartEvent,
+    BufWatch, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND,
+    SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use maki_lua::{EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
 use maki_storage::id::{MakiId, SessionRef};
@@ -60,6 +61,20 @@ const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 const IMAGE_KEEP_MARGIN_SEGMENTS: usize = 8;
 /// A click on transcript thinking expands or collapses it.
 const CLICKABLE: bool = true;
+const NOTICE_COLLAPSED_MARK: &str = " ▸";
+const NOTICE_EXPANDED_MARK: &str = " ▾";
+const NOTICE_DETAIL_INDENT: &str = "  ";
+
+/// What a click in the transcript asks of the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClickOutcome {
+    None,
+    Handled,
+    /// A moved row: open its task tab.
+    OpenTask(String),
+    /// A running row's hint: move only this call.
+    MoveCall(String),
+}
 
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
@@ -89,12 +104,12 @@ pub struct MessagesPanel {
     expanded_tools: HashMap<String, SectionFlags>,
     /// Per-tool log of post-completion click rows, replayed on restore.
     lua_clicks: HashMap<String, Vec<usize>>,
-    live_bufs: HashMap<String, Arc<SharedBuf>>,
+    live_bufs: HashMap<String, BufWatch>,
     /// Bufs of finished tools we keep polling so runtime-side warm
     /// clicks stay visible. Purely local: every finished-tool click
     /// carries a restore fallback, so we never track the runtime's
     /// warm cache.
-    watched_bufs: VecDeque<(String, Arc<SharedBuf>)>,
+    watched_bufs: VecDeque<(String, BufWatch)>,
     tool_output_lines: ToolOutputLines,
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
@@ -319,6 +334,10 @@ impl MessagesPanel {
                 ToolStatus::Success
             };
         }
+        msg.movable = false;
+        if event.backgrounded && msg.background.is_none() {
+            msg.background = Some(BackgroundBadge::moved(&event));
+        }
         truncate_to_header(&mut msg.text);
         let done_annotation = event
             .annotation
@@ -333,7 +352,7 @@ impl MessagesPanel {
             ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
                 if msg.render_snapshot.is_none() =>
             {
-                if had_live_buf {
+                if had_live_buf && !event.backgrounded {
                     // The plugin streamed a body buf but no snapshot ever
                     // landed: this is the raw llm_output glitch users report.
                     warn!(
@@ -357,6 +376,61 @@ impl MessagesPanel {
         msg.tool_output = Some(event.output);
         msg.live_output = None;
         self.rebuild_tool_segment(&event.id);
+    }
+
+    /// Ends a row that no `ToolDone` will reach.
+    pub fn settle_tool(&mut self, tool_id: &str, status: ToolStatus) {
+        self.retire_live_buf(tool_id);
+        self.update_tool(tool_id, |msg| {
+            if let DisplayRole::Tool(tool) = &mut msg.role {
+                tool.status = status;
+            }
+        });
+    }
+
+    pub fn set_tool_movable(&mut self, tool_id: &str, movable: bool) {
+        self.update_tool(tool_id, |msg| msg.movable = movable);
+    }
+
+    pub fn set_tool_background(&mut self, tool_id: &str, badge: BackgroundBadge) {
+        self.update_tool(tool_id, |msg| msg.background = Some(badge));
+    }
+
+    pub fn set_background_outcome(&mut self, tool_id: &str, outcome: BackgroundOutcome) {
+        self.update_tool(tool_id, |msg| {
+            if let Some(badge) = &mut msg.background {
+                badge.outcome = Some(outcome);
+            }
+        });
+    }
+
+    pub fn has_background_badge(&self, tool_id: &str) -> bool {
+        self.find_tool_msg(tool_id)
+            .is_some_and(|m| m.background.is_some())
+    }
+
+    pub fn background_badges(&self) -> Vec<BackgroundBadge> {
+        self.messages
+            .iter()
+            .filter_map(|m| m.background.clone())
+            .collect()
+    }
+
+    /// A copy of the tool's row, for a task tab that shows the same call.
+    pub fn tool_message(&self, tool_id: &str) -> Option<DisplayMessage> {
+        self.find_tool_msg(tool_id).cloned()
+    }
+
+    /// The buf a running tool streams into, live or still watched.
+    pub fn live_buf(&self, tool_id: &str) -> Option<Arc<SharedBuf>> {
+        self.live_bufs
+            .get(tool_id)
+            .or_else(|| {
+                self.watched_bufs
+                    .iter()
+                    .find_map(|(id, watch)| (id == tool_id).then_some(watch))
+            })
+            .map(|watch| Arc::clone(watch.buf()))
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
@@ -473,6 +547,7 @@ impl MessagesPanel {
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                backgrounded: false,
             });
         }
     }
@@ -680,7 +755,46 @@ impl MessagesPanel {
         self.accent.set(color);
     }
 
-    pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
+    /// {col} is the screen column, for the right-aligned move hint.
+    pub fn handle_click(&mut self, row: u16, col: u16, area: Rect) -> ClickOutcome {
+        self.tool_target_at(row, col, area)
+            .unwrap_or_else(|| self.toggle_click(row, area))
+    }
+
+    /// The click a row takes when it targets no task, for a moved row whose
+    /// task is gone.
+    pub fn toggle_click(&mut self, row: u16, area: Rect) -> ClickOutcome {
+        if self.toggle_at(row, area) {
+            ClickOutcome::Handled
+        } else {
+            ClickOutcome::None
+        }
+    }
+
+    /// A moved row opens its task from anywhere on it. On a running row only
+    /// the hint moves that one call, so the rest of the row keeps its clicks.
+    fn tool_target_at(&self, row: u16, col: u16, area: Rect) -> Option<ClickOutcome> {
+        if area.height == 0 {
+            return None;
+        }
+        let pos = self
+            .layout()
+            .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
+        if pos.seg >= self.live_start {
+            return None;
+        }
+        let seg = self.cache.get(pos.seg)?;
+        let tool_id = seg.tool_id.as_deref()?;
+        let msg = self.find_tool_msg(tool_id)?;
+        if let Some(badge) = &msg.background {
+            return Some(ClickOutcome::OpenTask(badge.id.clone()));
+        }
+        let col = col.checked_sub(area.x + seg.gutter_cols(area.width))?;
+        (pos.row == 0 && hint_columns(seg.lines().first()?)?.contains(&col))
+            .then(|| ClickOutcome::MoveCall(tool_id.to_owned()))
+    }
+
+    fn toggle_at(&mut self, row: u16, area: Rect) -> bool {
         if area.height == 0 {
             return false;
         }
@@ -698,8 +812,16 @@ impl MessagesPanel {
             return false;
         }
         let Some(tool_id) = seg.tool_id.as_deref() else {
-            return self.try_toggle_cached_thinking(pos.seg, width);
+            return self.try_toggle_cached_thinking(pos.seg, width)
+                || self.try_toggle_cached_notice(pos.seg, width);
         };
+        // A moved row draws only its header, so there is nothing to unfold.
+        if self
+            .find_tool_msg(tool_id)
+            .is_some_and(|msg| msg.background.is_some())
+        {
+            return false;
+        }
 
         if self.has_snapshot(tool_id) {
             let buf_row = seg
@@ -760,11 +882,6 @@ impl MessagesPanel {
         true
     }
 
-    #[cfg(test)]
-    pub fn toggle_expansion_at(&mut self, row: u16, area: Rect) -> bool {
-        self.handle_click(row, area)
-    }
-
     fn rebuild_expanded_tool(&mut self, tool_id: &str) {
         if segment::is_instruction_segment(tool_id) {
             if let Some(parent_id) = segment::instruction_parent(tool_id)
@@ -806,6 +923,9 @@ impl MessagesPanel {
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
             Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
+            // A moved row's elapsed time only changes once a second, and it
+            // may tick for hours.
+            self.elapsed_due().map_or(Cadence::IDLE, Cadence::clock),
             Cadence::when(smooth, Cadence::SMOOTH),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
         ])
@@ -898,7 +1018,7 @@ impl MessagesPanel {
             );
         }
         self.rebuild_line_cache();
-        if self.in_progress_count() > 0 {
+        if self.in_progress_count() > 0 || self.elapsed_due().is_some() {
             self.update_spinners();
         }
 
@@ -1132,13 +1252,15 @@ impl MessagesPanel {
     /// watched set keeps what `tick` polls bounded.
     /// Returns whether a live buf existed for this id.
     fn retire_live_buf(&mut self, id: &str) -> bool {
-        let Some(buf) = self.live_bufs.remove(id) else {
+        let Some(mut watch) = self.live_bufs.remove(id) else {
             return false;
         };
-        if let Some(lines) = buf.read_if_dirty() {
-            self.store_snapshot(id, BufferSnapshot::from_arc(lines), false, None);
+        if let Some(snapshot) = watch.changed() {
+            self.store_snapshot(id, snapshot, false, None);
         }
-        self.watched_bufs.push_back((id.to_owned(), buf));
+        // A part's tab registers the same buf again on every report.
+        self.watched_bufs.retain(|(watched, _)| watched != id);
+        self.watched_bufs.push_back((id.to_owned(), watch));
         if self.watched_bufs.len() > WARM_TOOL_CAP {
             self.watched_bufs.pop_front();
         }
@@ -1260,6 +1382,12 @@ impl MessagesPanel {
         }
     }
 
+    fn find_tool_msg(&self, tool_id: &str) -> Option<&DisplayMessage> {
+        self.messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+    }
+
     fn find_tool_msg_mut(&mut self, tool_id: &str) -> Option<&mut DisplayMessage> {
         self.messages
             .iter_mut()
@@ -1275,7 +1403,13 @@ impl MessagesPanel {
     }
 
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
-        self.live_bufs.insert(id, body);
+        let mut watch = BufWatch::new(body);
+        if self.find_tool_msg(&id).is_some()
+            && let Some(snapshot) = watch.changed()
+        {
+            self.store_snapshot(&id, snapshot, false, None);
+        }
+        self.live_bufs.insert(id, watch);
     }
 
     /// Snapshots are baked at the last width `view` saw, and a resize
@@ -1284,13 +1418,17 @@ impl MessagesPanel {
     fn poll_live_bufs(&mut self) -> Dirty {
         let updated: Vec<_> = self
             .live_bufs
-            .iter()
-            .chain(self.watched_bufs.iter().map(|(id, buf)| (id, buf)))
-            .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
+            .iter_mut()
+            .chain(
+                self.watched_bufs
+                    .iter_mut()
+                    .map(|(id, watch)| (&*id, watch)),
+            )
+            .filter_map(|(id, watch)| watch.changed().map(|snapshot| (id.clone(), snapshot)))
             .collect();
         let dirty = Dirty::from(!updated.is_empty());
-        for (tool_id, lines) in updated {
-            self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines), false, None);
+        for (tool_id, snapshot) in updated {
+            self.store_snapshot(&tool_id, snapshot, false, None);
         }
         dirty
     }
@@ -1302,15 +1440,14 @@ impl MessagesPanel {
         exp: SectionFlags,
     ) -> ToolLines {
         let mut tl = build_tool_lines(msg, status, rctx, exp);
-        if let Some(ts) = &msg.timestamp
-            && !tl.lines.is_empty()
-        {
-            append_right_info(
-                &mut tl.lines[0],
-                msg.turn_usage.as_deref(),
-                Some(ts),
-                rctx.width,
-            );
+        if let Some(header) = tl.lines.first_mut() {
+            let running = status == ToolStatus::InProgress;
+            let hint = (msg.movable && running).then_some(MOVABLE_HINT);
+            let usage = msg
+                .turn_usage
+                .as_deref()
+                .filter(|_| msg.timestamp.is_some());
+            append_right_info(header, hint, usage, msg.timestamp.as_deref(), rctx.width);
         }
         tl
     }
@@ -1360,6 +1497,27 @@ impl MessagesPanel {
         true
     }
 
+    fn try_toggle_cached_notice(&mut self, seg_idx: usize, width: u16) -> bool {
+        let msg_index = self.cache.get(seg_idx).and_then(|seg| seg.msg_index);
+        let Some(msg) = msg_index
+            .and_then(|idx| self.messages.get_mut(idx))
+            .filter(|m| matches!(m.role, DisplayRole::Notice) && m.detail.is_some())
+        else {
+            return false;
+        };
+        msg.detail_expanded = !msg.detail_expanded;
+        self.reflow_text_segment(seg_idx, width);
+        true
+    }
+
+    fn elapsed_due(&self) -> Option<Duration> {
+        self.cache
+            .segments()
+            .iter()
+            .filter_map(Segment::elapsed_due)
+            .min()
+    }
+
     fn update_spinners(&mut self) {
         let spinner_span = Span::styled(
             spinner_str(self.started_at.elapsed().as_millis()),
@@ -1367,6 +1525,7 @@ impl MessagesPanel {
         );
         for seg in self.cache.segments_mut() {
             seg.update_spinners(&spinner_span);
+            seg.update_elapsed();
         }
     }
 
@@ -1598,6 +1757,8 @@ fn message_label(msg: &DisplayMessage, style: &RoleStyle) -> &'static str {
 fn message_gutter(msg: &DisplayMessage, style: &RoleStyle) -> Option<Span<'static>> {
     if msg.plan_path.is_some() {
         None
+    } else if let Some(end) = msg.task_end {
+        Some(outcome_glyph(end))
     } else {
         gutter_marker(style)
     }
@@ -1643,10 +1804,35 @@ fn message_view(msg: &DisplayMessage, mode: ThinkingLines, width: u16) -> Messag
             collapsed: true,
         };
     }
+    let mut lines = build_message_lines(msg, &style, body, width);
+    if matches!(msg.role, DisplayRole::Notice)
+        && let Some(detail) = &msg.detail
+    {
+        push_notice_detail(&mut lines, detail, msg.detail_expanded);
+    }
     MessageView {
-        lines: build_message_lines(msg, &style, body, width),
+        lines,
         gutter,
         collapsed: false,
+    }
+}
+
+fn push_notice_detail(lines: &mut Vec<Line<'static>>, detail: &str, expanded: bool) {
+    let style = notice_style().text_style;
+    let mark = if expanded {
+        NOTICE_EXPANDED_MARK
+    } else {
+        NOTICE_COLLAPSED_MARK
+    };
+    if let Some(last) = lines.last_mut() {
+        last.spans.push(Span::styled(mark, style));
+    }
+    if expanded {
+        lines.extend(
+            detail.lines().map(|line| {
+                Line::from(Span::styled(format!("{NOTICE_DETAIL_INDENT}{line}"), style))
+            }),
+        );
     }
 }
 

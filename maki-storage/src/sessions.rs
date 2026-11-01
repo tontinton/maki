@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::frame::StoredFrame;
 use crate::id::{MakiId, MakiIdParseError};
-use crate::paths::canonical_key;
+use crate::paths::{canonical_key, session_task_logs_dir};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -394,6 +394,11 @@ pub struct SessionMeta {
     /// makes `--yolo` a property of the invocation rather than of the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yolo: Option<bool>,
+    /// Background tasks the model holds a receipt for and has not read the
+    /// result of. Whatever is left here on resume died with the process that
+    /// ran it, and the model is told so instead of waiting forever.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_background: Vec<String>,
 }
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells
@@ -2319,7 +2324,14 @@ where
 
     pub fn delete(claim: &SessionClaim, dir: &StateDir) -> Result<(), SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::delete_from(claim, &sessions_dir)
+        Self::delete_from(claim, &sessions_dir)?;
+        let task_logs = session_task_logs_dir(dir.path(), claim.id());
+        if let Err(e) = fs::remove_dir_all(&task_logs)
+            && e.kind() != ErrorKind::NotFound
+        {
+            warn!(error = %e, session_id = %claim.id(), "task logs remain after delete");
+        }
+        Ok(())
     }
 
     pub fn delete_from(claim: &SessionClaim, dir: &Path) -> Result<(), SessionError> {
@@ -2367,6 +2379,7 @@ mod tests {
     use crate::StateDir;
     use crate::frame::PromptFacts;
     use crate::id::MakiId;
+    use crate::paths::session_task_logs_dir;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, HashMap};
     use std::fs::{self, OpenOptions};
@@ -3218,6 +3231,32 @@ mod tests {
         assert!(archives.contains(&fakes[2]));
         assert!(!fakes[0].exists());
         assert!(!fakes[1].exists());
+    }
+
+    #[test]
+    fn delete_removes_task_logs_of_that_session_only() {
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().to_path_buf());
+        let sessions_dir = state.ensure_subdir(SESSIONS_DIR).unwrap();
+        let mut doomed: TestSession = Session::new("model", "/p");
+        let mut kept: TestSession = Session::new("model", "/p");
+        for session in [&mut doomed, &mut kept] {
+            session
+                .save_to(&claim_for(&sessions_dir, session), &sessions_dir)
+                .unwrap();
+            let logs = session_task_logs_dir(tmp.path(), session.id);
+            fs::create_dir_all(&logs).unwrap();
+            fs::write(logs.join("call.log"), "output").unwrap();
+        }
+
+        TestSession::delete(&claim_id(&sessions_dir, doomed.id), &state).unwrap();
+
+        assert!(!session_task_logs_dir(tmp.path(), doomed.id).exists());
+        assert!(
+            session_task_logs_dir(tmp.path(), kept.id)
+                .join("call.log")
+                .exists()
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ use super::instructions::build_system_prompt;
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::prompt::{PromptId, ResolvedPrompts, Slot, SlotKind};
 use crate::template::Vars;
-use crate::tools::RequestTools;
+use crate::tools::{RequestTools, ToolRegistry};
 
 const UPDATE_OPEN: &str = "<context-update>\nThis changed since the conversation started and replaces what the system prompt says about it.\n\n";
 const UPDATE_CLOSE: &str = "\n</context-update>";
@@ -59,7 +59,8 @@ impl RunContext {
         model: &Model,
         tools: RequestTools,
     ) -> Self {
-        let system = build_system_prompt(vars, instructions, slots, model);
+        let slots = slots.for_tools(ToolRegistry::global(), tools.filter());
+        let system = build_system_prompt(vars, instructions, &slots, model);
         Self {
             system,
             tools,
@@ -72,11 +73,11 @@ impl RunContext {
                 } else {
                     String::new()
                 },
-                hints: hint_facts(slots),
+                hints: hint_facts(&slots),
             }),
             authored: String::new(),
         }
-        .with_prompt_policy(slots)
+        .with_prompt_policy(&slots)
     }
 
     /// For a prompt the host wrote itself.

@@ -30,10 +30,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-smol = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
-async-compat = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
@@ -41,10 +41,12 @@ open = { workspace = true }
 unicode-width = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
 maki-config = { workspace = true, features = ["test-util"] }
+maki-lua = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 
 [workspace]
@@ -68,7 +70,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.6.5"
+version = "0.7.0"
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
@@ -98,7 +100,7 @@ bs58 = "0.5"
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
-crossterm = { version = "0.29", features = ["osc52"] }
+crossterm = { version = "0.29", features = ["osc52", "event-stream"] }
 color-eyre = { version = "0.6", default-features = false, features = ["track-caller"] }
 termini = "1"
 thiserror = "2"
@@ -137,22 +139,24 @@ rustix = { version = "1", features = ["event", "fs", "process"] }
 semver = "1"
 toml = "1.1"
 toml_edit = "0.25"
-smol = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "net", "io-util", "io-std", "signal", "fs"] }
 arc-swap = "1"
 bitflags = "2"
 event-listener = "5"
-futures-lite = "2"
 futures = "0.3"
-isahc = { version = "2.0", default-features = false, features = ["text-decoding", "static-curl", "rustls-tls", "http2"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-async-compat = "0.2"
+rmcp = { version = "3", default-features = false, features = ["client", "auth", "reqwest", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
+oauth2 = { version = "5", default-features = false }
+async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+socket2 = "0.6"
 opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["metrics", "logs", "grpc-tonic", "gzip-tonic", "tls-aws-lc", "tls-roots", "http-proto", "http-json", "gzip-http", "reqwest-blocking-client", "reqwest-rustls", "internal-logs"] }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "with-serde", "metrics", "logs"] }
 http = "1"
 percent-encoding = "2"
-futures-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
@@ -203,7 +207,10 @@ monty = "1"
 monty-types = "1"
 notify = { version = "9.0.0-rc.5", default-features = false, features = ["flume", "macos_fsevent"] }
 notify-rust = "4.18.1"
-serde_yaml = "0.9"
+serde-saphyr = { version = "2", default-features = false }
+serde-value = "0.7"
+serde_path_to_error = "0.1"
+indexmap = { version = "2", features = ["serde"] }
 shell-words = "1"
 agent-client-protocol-schema = "1.10"
 wait-timeout = "0.2"
@@ -219,10 +226,15 @@ debug = true
 debug = false
 
 # `cc` reads DEBUG from here and passes -g when it is on, which covers the C
-# and C++ we build from source: aws-lc, curl, Luau and 30 tree-sitter
+# and C++ we build from source: aws-lc, Luau and 30 tree-sitter
 # grammars. Those static archives held the bulk of the bytes.
 [profile.dev.build-override]
 debug = false
+
+# Fat LTO makes the UI hot paths about 8% faster and the binary 8% smaller. Only
+# release builds pay for it, about 2.5 minutes on an M3 Pro.
+[profile.release]
+lto = true
 
 # crossterm 0.29.0 has no VT input on Windows, so bracketed paste never decodes and a
 # multiline paste submits at the first newline (#336). Pinned to the head of

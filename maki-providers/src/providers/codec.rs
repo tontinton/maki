@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use flume::Sender;
-use isahc::http::header::{CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
-use isahc::http::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{
+    CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, TRANSFER_ENCODING,
+};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
@@ -23,7 +24,8 @@ use crate::provider::{BoxFuture, Provider};
 use crate::spec::ProviderSpec;
 use crate::types::{EffortDialect, ThinkingFallback, dialect, merge_body};
 use crate::{
-    AgentError, Effort, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    ThinkingConfig,
 };
 
 /// Where effort goes when a declaration names a dialect and no field: the
@@ -234,8 +236,12 @@ impl ThinkingWire {
         }
     }
 
-    pub(crate) fn adaptive_effort(&self, discovered: Option<&ModelInfo>) -> Option<Effort> {
-        self.dialect_for(discovered).adaptive_effort()
+    pub(crate) fn sends(
+        &self,
+        discovered: Option<&ModelInfo>,
+        choice: ThinkingConfig,
+    ) -> ThinkingConfig {
+        self.dialect_for(discovered).sends(choice)
     }
 
     /// The declared dialect, narrowed by what discovery listed for the model,
@@ -653,6 +659,10 @@ impl Provider for CompatProvider {
 
     fn adjust_model(&self, model: &mut Model) {
         self.openai.adjust_model(model);
+    }
+
+    fn served_context_window<'a>(&'a self, _model: &'a Model) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async { None })
     }
 }
 

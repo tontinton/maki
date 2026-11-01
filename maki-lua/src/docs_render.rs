@@ -570,6 +570,7 @@ fn field_item(text: &str) -> Option<String> {
 
 fn push_fields_block<'a>(out: &mut String, block: impl Iterator<Item = &'a str>, depth: usize) {
     let mut levels: Vec<usize> = Vec::new();
+    let mut after_list = false;
     for raw in block {
         let line = raw.strip_prefix("  ").unwrap_or(raw);
         let text = line.trim_start();
@@ -578,6 +579,10 @@ fn push_fields_block<'a>(out: &mut String, block: impl Iterator<Item = &'a str>,
         }
         let indent = line.len() - text.len();
         if let Some(item) = field_item(text) {
+            if after_list {
+                out.push('\n');
+                after_list = false;
+            }
             while levels.last().is_some_and(|&i| i > indent) {
                 levels.pop();
             }
@@ -590,9 +595,17 @@ fn push_fields_block<'a>(out: &mut String, block: impl Iterator<Item = &'a str>,
             let pad = "  ".repeat(depth + levels.len());
             out.push_str(&format!("{pad}{text}\n"));
         } else {
-            levels.clear();
-            out.push_str(&format!("\n{}{text}\n\n", "  ".repeat(depth)));
+            let pad = "  ".repeat(depth);
+            if !levels.is_empty() {
+                levels.clear();
+                out.push('\n');
+                after_list = true;
+            }
+            out.push_str(&format!("{pad}{text}\n"));
         }
+    }
+    if after_list {
+        out.push('\n');
     }
 }
 
@@ -735,8 +748,8 @@ fn render(compact: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_NOTES, PERMISSIONS_ANCHOR, REFERENCE_URL, guide_page, push_desc, reference,
-        reference_index, site_page, skeleton, skill_content,
+        AGENT_NOTES, PERMISSIONS_ANCHOR, REFERENCE_URL, guide_page, push_desc, push_fields_block,
+        reference, reference_index, site_page, skeleton, skill_content,
     };
 
     const AGENT_VOICE: &str = "ask the user";
@@ -756,6 +769,14 @@ mod tests {
         let mut out = String::new();
         push_desc(&mut out, desc);
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn wrapped_param_text_stays_one_paragraph() {
+        let rest = "  ctx, for the model's stop.\n  More words.";
+        let mut out = String::new();
+        push_fields_block(&mut out, rest.lines(), 1);
+        assert_eq!(out, "  ctx, for the model's stop.\n  More words.\n");
     }
 
     #[test]

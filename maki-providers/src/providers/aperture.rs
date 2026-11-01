@@ -14,7 +14,7 @@ use crate::spec::{
     ProviderRegistry, ProviderSpec,
 };
 use crate::types::ThinkingFallback;
-use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 use maki_storage::id::SessionRef;
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -57,7 +57,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
-    adaptive_effort,
+    sends_thinking,
     thinking_fields_fallback,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
@@ -115,18 +115,23 @@ fn load_overrides() -> Overrides {
 
 /// Runs on every frame of the status bar, so a broken `providers.toml` reads
 /// as no overrides instead of exiting.
-fn adaptive_effort(model: &Model) -> Option<Effort> {
+fn sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
     let config = ProvidersConfig::load_or_default();
     let overrides = config.get(SLUG).map(|def| &def.overrides);
-    routed_adaptive_effort(overrides.unwrap_or(&Overrides::new()), model)
+    routed_sends_thinking(overrides.unwrap_or(&Overrides::new()), model, choice)
 }
 
 /// The routed provider builds the request, so it answers, about the model as
 /// its own: a plugin codec finds its declaration and discovery by its slug.
 /// A model that routes nowhere takes the generic path, which sends no effort.
-fn routed_adaptive_effort(overrides: &Overrides, model: &Model) -> Option<Effort> {
-    let (spec, routed) = routed_model(overrides, model)?;
-    (spec.adaptive_effort)(&routed)
+fn routed_sends_thinking(
+    overrides: &Overrides,
+    model: &Model,
+    choice: ThinkingConfig,
+) -> ThinkingConfig {
+    routed_model(overrides, model).map_or(choice, |(spec, routed)| {
+        (spec.sends_thinking)(&routed, choice)
+    })
 }
 
 fn thinking_fields_fallback(model: &Model) -> Option<ThinkingFallback> {
@@ -485,6 +490,7 @@ impl Provider for Aperture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Effort;
     use crate::model::ModelFamily;
     use crate::test_support::register_bundled;
     use serde_json::json;
@@ -601,7 +607,10 @@ mod tests {
                 },
             )
         }));
-        assert_eq!(routed_adaptive_effort(&overrides, &model), expected);
+        assert_eq!(
+            routed_sends_thinking(&overrides, &model, ThinkingConfig::Adaptive).level(),
+            expected
+        );
     }
 
     #[test]

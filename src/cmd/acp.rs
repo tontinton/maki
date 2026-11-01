@@ -10,15 +10,17 @@ use maki_config::project::{self, TrustMode};
 use maki_lua::{InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
 
+use crate::interrupt::Interrupt;
 use crate::provider_scripts;
 use crate::setup;
 
-pub fn run(
+pub async fn run(
     model_arg: Option<String>,
     yolo: bool,
     no_plugins: bool,
     no_jit: bool,
     trust_mode: TrustMode,
+    background: bool,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
@@ -53,7 +55,8 @@ pub fn run(
             config.validate()?;
             Ok(config)
         },
-    )?;
+    )
+    .await?;
     warnings.extend(provider_scripts::startup_warning());
     super::report_warnings(warnings);
 
@@ -63,7 +66,7 @@ pub fn run(
     super::report_warnings(Vec::from_iter(warning));
     setup::remember_thinking(&mut config.session_defaults, &storage);
 
-    setup::init_logging(&config.storage);
+    setup::init_logging(&config.storage, trust.project_config.config_root());
     setup::init_telemetry(&config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
@@ -71,6 +74,7 @@ pub fn run(
     let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
 
     let event_handle = plugin_host.event_handle();
+    let interrupt = Interrupt::install();
     maki_acp::run(maki_acp::AcpParams {
         model,
         config: config.agent,
@@ -88,5 +92,11 @@ pub fn run(
             Box::pin(async move { handle.end_session_async(id, reason).await })
         })),
         storage,
+        background,
+        stop: interrupt.stop(),
     })
+    .await?;
+    drop(plugin_host);
+    interrupt.exit_if_caught();
+    Ok(())
 }

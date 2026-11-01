@@ -1,6 +1,7 @@
 use std::collections::HashSet;
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use color_eyre::Result;
@@ -14,9 +15,13 @@ use maki_providers::{AgentError, Timeouts, custom, plugin};
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
 use maki_storage::model::{read_model, read_thinking};
+use serde_json::Value;
+use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
+use tracing_subscriber::registry::LookupSpan;
 
 use crate::provider_scripts;
 
@@ -298,10 +303,37 @@ fn sets_a_level(value: &str) -> bool {
         .any(|part| !part.is_empty() && part.parse::<LevelFilter>().is_ok())
 }
 
+struct ProjectJson<E> {
+    inner: E,
+    project: Value,
+}
+
+impl<S, N, E> FormatEvent<S, N> for ProjectJson<E>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+    E: FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let mut line = String::new();
+        self.inner
+            .format_event(ctx, Writer::new(&mut line), event)?;
+        // Keep the JSON formatter's fields and spans verbatim instead of
+        // parsing and serializing every event a second time.
+        let fields = line.strip_prefix('{').ok_or(fmt::Error)?;
+        write!(writer, "{{\"project\":{},{}", self.project, fields)
+    }
+}
+
 /// Logging is the first thing to set up and the last thing allowed to stop the
 /// program, but a failure here used to be swallowed whole, so an unwritable log
 /// dir looked exactly like an idle one: no logs, no reason, no clue.
-pub fn init_logging(storage_config: &maki_config::StorageConfig) {
+pub fn init_logging(storage_config: &maki_config::StorageConfig, project: &Path) {
     let writer =
         match RotatingFileWriter::new(storage_config.max_log_bytes, storage_config.max_log_files) {
             Ok(writer) => writer,
@@ -312,6 +344,12 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
         };
     tracing_subscriber::fmt()
         .json()
+        // The config belongs to the launch project even after `/cd`. Binding
+        // it here also covers worker threads without carrying a span to each.
+        .map_event_format(|inner| ProjectJson {
+            inner,
+            project: project.to_string_lossy().into_owned().into(),
+        })
         .with_env_filter(log_filter())
         .with_writer(SharedWriter(Mutex::new(writer)))
         .init();
@@ -319,13 +357,74 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Seek};
+    use std::sync::Arc;
+    use std::thread;
+
+    use serde_json::Value;
     use test_case::test_case;
 
-    use super::{DEFAULT_LOG_LEVEL, build_log_filter};
+    use super::{DEFAULT_LOG_LEVEL, ProjectJson, build_log_filter};
 
     const FOREIGN: &str = "other_crate=debug";
     const FOREIGN_EMPTY_PIECES: &str = ",other_crate=debug,,";
     const BROKEN: &str = "not a directive=!!";
+    const PROJECT: &str = "/workspace/项目 \"quoted\"\\path";
+    const SPAN: &str = "turn";
+    const MESSAGE: &str = "tool finished\nwith output";
+    const SESSION: u64 = 7;
+    const BYTES: u64 = 42;
+    const WORKER_PLUGIN: &str = "background";
+
+    #[test]
+    fn project_tags_span_scoped_and_unscoped_worker_logs() {
+        let output = Arc::new(tempfile::tempfile().unwrap());
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .map_event_format(|inner| ProjectJson {
+                inner,
+                project: PROJECT.into(),
+            })
+            .with_writer(Arc::clone(&output))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            let _span = tracing::info_span!(SPAN, session = SESSION).entered();
+            tracing::info!(success = true, bytes = BYTES, "{MESSAGE}");
+        });
+        thread::spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                tracing::warn!(plugin = WORKER_PLUGIN, "{MESSAGE}");
+            });
+        })
+        .join()
+        .unwrap();
+
+        let mut reader = output.try_clone().unwrap();
+        reader.rewind().unwrap();
+        let mut text = String::new();
+        reader.read_to_string(&mut text).unwrap();
+        let records: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            assert_eq!(record["project"], PROJECT);
+            assert_eq!(record["fields"]["message"], MESSAGE);
+            assert!(record["timestamp"].is_string());
+            assert_eq!(record["target"], module_path!());
+        }
+        assert_eq!(records[0]["level"], "INFO");
+        assert_eq!(records[0]["fields"]["success"], true);
+        assert_eq!(records[0]["fields"]["bytes"], BYTES);
+        assert_eq!(records[0]["span"]["name"], SPAN);
+        assert_eq!(records[0]["spans"][0]["session"], SESSION);
+        assert_eq!(records[1]["level"], "WARN");
+        assert_eq!(records[1]["fields"]["plugin"], WORKER_PLUGIN);
+        assert!(records[1].get("span").is_none());
+    }
 
     #[test_case(None, None, "info" ; "nothing_set_logs_at_info")]
     #[test_case(Some("warn"), None, "warn" ; "our_variable_wins")]

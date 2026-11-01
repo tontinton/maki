@@ -14,7 +14,7 @@ use crate::spec::{
     NO_CURATED_MODELS, ProviderSpec,
 };
 
-use super::{ProviderDecl, Target, declared_adaptive_effort, declared_thinking_fields_fallback};
+use super::{ProviderDecl, Target, declared_sends_thinking, declared_thinking_fields_fallback};
 
 /// What a codec-backed provider assumes about a model nobody described, the
 /// same conservative limits the other bring-your-own-endpoint providers use.
@@ -82,9 +82,9 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
         family: decl.family.unwrap_or(native.family),
         supports_thinking: native.supports_thinking,
         supports_deferred_tools: false,
-        adaptive_effort: match target {
-            Target::Base(spec) => spec.adaptive_effort,
-            Target::Codec(_) => declared_adaptive_effort,
+        sends_thinking: match target {
+            Target::Base(spec) => spec.sends_thinking,
+            Target::Codec(_) => declared_sends_thinking,
         },
         thinking_fields_fallback: match target {
             Target::Base(spec) => spec.thinking_fields_fallback,

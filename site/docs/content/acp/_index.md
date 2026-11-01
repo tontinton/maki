@@ -61,3 +61,11 @@ maki --no-jit acp
 `maki acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`maki --no-jit acp`, not `maki acp --no-jit`).
 
 Plan mode in ACP uses the same state-directory plan files as the TUI (`…/plans/<slug>.md`), not the SDK's `./plan.md`.
+
+## Background tasks
+
+`background = true` and `background_on_timeout` move work to the background as in the TUI. No turn starts on its own, so results arrive with the next prompt. Closing the ACP session stops the work.
+
+Moves are on unless you pass `--background-timeout 0`, which turns them off. ACP only checks whether they are on, since results arrive with the next prompt. It is a global flag: `maki --background-timeout 0 acp`. See [Background Tasks](/docs/background-tasks/#headless-sdk-and-acp).
+
+SIGINT or SIGTERM closes the session like the end of input, then exits with 130 or 143.

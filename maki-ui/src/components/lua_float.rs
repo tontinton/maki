@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
-use maki_agent::{SharedBuf, SnapshotLine, SpanStyle};
+use maki_agent::{BufWatch, SharedBuf, SnapshotLine, SpanStyle};
 use maki_lua::{Anchor, Axis, Border, FloatConfig, Key, Split, TitlePos, WinCommand, WinEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -63,7 +63,7 @@ impl Layout {
 ///    on every frame.
 struct FloatWindow {
     id: u32,
-    buf: Arc<SharedBuf>,
+    buf: BufWatch,
     config: FloatConfig,
     scroll_offset: usize,
     cached_lines: Arc<Vec<SnapshotLine>>,
@@ -241,7 +241,11 @@ impl FloatManager {
         event_tx: flume::Sender<WinEvent>,
         cmd_rx: flume::Receiver<WinCommand>,
     ) {
-        let cached_lines = buf.read_if_dirty().unwrap_or_default();
+        let mut buf = BufWatch::new(buf);
+        let cached_lines = buf
+            .changed()
+            .map(|snapshot| snapshot.lines)
+            .unwrap_or_default();
         let id = self.next_id;
         self.next_id += 1;
 
@@ -284,8 +288,8 @@ impl FloatManager {
     pub fn tick(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         for win in &mut self.windows {
-            if let Some(lines) = win.buf.read_if_dirty() {
-                win.cached_lines = lines;
+            if let Some(snapshot) = win.buf.changed() {
+                win.cached_lines = snapshot.lines;
                 win.bring_cursor_into_view();
                 dirty = Dirty::YES;
             }
@@ -385,7 +389,7 @@ impl FloatManager {
     }
 
     pub fn focused_buf(&self) -> Option<Arc<SharedBuf>> {
-        self.focused().map(|w| Arc::clone(&w.buf))
+        self.focused().map(|w| Arc::clone(w.buf.buf()))
     }
 
     /// Front first, so a popup opened over another popup gets the key.
@@ -404,7 +408,7 @@ impl FloatManager {
             .iter()
             .rev()
             .filter(|w| w.on_screen)
-            .map(|w| (w.id, Arc::clone(&w.buf)))
+            .map(|w| (w.id, Arc::clone(w.buf.buf())))
             .collect()
     }
 
@@ -2583,8 +2587,11 @@ mod tests {
         let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
         let lines: Vec<String> = (0..line_count).map(|i| format!("l{i}")).collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        let buf = make_buf(&refs);
-        let cached_lines = buf.read_if_dirty().unwrap_or_default();
+        let mut buf = BufWatch::new(make_buf(&refs));
+        let cached_lines = buf
+            .changed()
+            .map(|snapshot| snapshot.lines)
+            .unwrap_or_default();
         FloatWindow {
             id: 0,
             buf,

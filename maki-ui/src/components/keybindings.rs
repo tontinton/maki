@@ -130,6 +130,7 @@ pub mod key {
     pub const HELP: Bind = ctrl_bind!('h');
     pub const SESSIONS: Bind = ctrl_bind!('p');
     pub const TASKS: Bind = ctrl_bind!('x');
+    pub const BACKGROUND: Bind = ctrl_bind!('b');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!('d');
     pub const SCROLL_PAGE_UP: Bind = Bind {
@@ -499,6 +500,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single("Esc Esc"),
         description: "Cancel agent",
+        context: KeybindContext::Streaming,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::BACKGROUND.label),
+        description: "Move running calls to the background (tmux: press twice)",
         context: KeybindContext::Streaming,
         platform: Platform::All,
     },

@@ -90,13 +90,13 @@ mod tests {
         assert_eq!(expired.check().unwrap_err(), DEADLINE_EXCEEDED);
     }
 
-    #[test]
-    fn a_wait_pushes_every_clone_back_by_its_length() {
+    #[tokio::test]
+    async fn a_wait_pushes_every_clone_back_by_its_length() {
         let deadline = Deadline::after(BUDGET);
         let before = deadline.at().unwrap();
         let clone = deadline.clone();
 
-        smol::block_on(deadline.paused_while(smol::Timer::after(WAIT)));
+        deadline.paused_while(tokio::time::sleep(WAIT)).await;
 
         assert!(clone.at().unwrap() - before >= WAIT);
     }

@@ -273,6 +273,8 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
+| `background_log_bytes` | integer | `33554432` | 1024 | Size at which the output log of a command rotates to `.log.1`. A command gets a log once its output outgrows the reply or it moves to the background. Values above 1 GiB count as 1 GiB. |
+| `background_on_timeout` | boolean | `false` | - | Move a command that hits its timeout to the background instead of killing it. Applies to the main agent while background tasks are on; elsewhere the command is killed. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
@@ -340,7 +342,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `allow_background` | boolean | `false` | - | Expose a `background` input that pushes subagent results to the chat when they finish. |
+| `allow_background` | boolean | `true` | - | Expose a `background` input that pushes subagent results to the chat when they finish. |
 | `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
 | `max_concurrent` | integer | `8` | 1 | Max concurrently running subagents. |
 

@@ -65,7 +65,7 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 /// One dispatch path for host-fired and plugin-fired events. Never throws.
 /// Each callback runs in its own coroutine under its own detached task
 /// scope, so it may suspend (the `maki.fs.*` helpers park on
-/// `smol::unblock`); an inline resume would die with "attempt to yield
+/// `spawn_blocking`); an inline resume would die with "attempt to yield
 /// across metamethod / C-call boundary". The per-callback scope also means
 /// task-owned jobs a handler starts die with that handler instead of
 /// outliving it to the end of the batch.
@@ -276,7 +276,7 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"SessionCwdChanged"`: `data.cwd`, the session's new working
 ///   directory, when `/cd` changes it.
 /// - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
-///   (`"working"`, `"idle"`, `"done"`, or `"error"`), when a subagent starts
+///   (`"working"`, `"idle"`, `"done"`, `"error"`, or `"cancelled"`), when a subagent starts
 ///   or changes status. A task a plugin opened with `maki.agent.session`
 ///   carries `data.plugin`, and `"idle"` is such a task between prompts. A
 ///   task that comes back from disk already finished stays quiet, so

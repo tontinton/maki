@@ -391,7 +391,7 @@ function M.format_tag_line(dir, max_tags)
   return line
 end
 
--- serde_yaml renders an empty list as an empty mapping; extract_tags treats both as empty.
+-- maki.yaml.encode renders an empty list as an empty mapping; extract_tags treats both as empty.
 function M.encode_frontmatter(tags)
   local yaml, _ = maki.yaml.encode({ tags = tags })
   return "---\n" .. yaml .. "---\n"
