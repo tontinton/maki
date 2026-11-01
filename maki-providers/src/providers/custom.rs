@@ -222,13 +222,20 @@ fn model_from_def(
     // rates -- it is free at the point of use -- so fall back to the
     // published list price purely as the reference shown alongside the $0
     // bill.
-    let pricing = row.pricing.take().unwrap_or_default();
+    let declared_pricing = row.pricing.take();
+    let using_discovered_pricing = declared_pricing.is_none();
+    let discovered_pricing = discovered.and_then(|d| d.pricing.as_ref());
+    let pricing = declared_pricing
+        .or_else(|| discovered_pricing.cloned())
+        .unwrap_or_default();
     row.pricing = catalog_fallback_id(base, &pricing, subsidy_source.is_some(), model_id)
         .and_then(|base_id| catalog::model_meta_if_available(super::anthropic::SLUG, base_id))
         .and_then(|meta| meta.pricing)
         .or(Some(pricing));
     Model {
         subsidised_by: subsidy_source.map(Arc::from),
+        discovered_free: using_discovered_pricing
+            && discovered_pricing.is_some_and(ModelPricing::is_zero),
         ..row.to_model(slug, base, model_id.to_string())
     }
 }
@@ -463,6 +470,64 @@ mod tests {
         let model = model_from_def(&def, openai_spec(), slug, model_id);
         assert_eq!(model.context_window, expected_window);
         assert_eq!(model.max_output_tokens, Some(expected_output));
+    }
+
+    const ENDPOINT_INPUT_PRICE: f64 = 0.5;
+    const ENDPOINT_OUTPUT_PRICE: f64 = 1.5;
+    const DECLARED_INPUT_PRICE: f64 = 3.0;
+    const DECLARED_OUTPUT_PRICE: f64 = 15.0;
+
+    fn seed_discovered_pricing(slug: &str, model_id: &str, pricing: ModelPricing) {
+        crate::model_registry::set_known_models(
+            slug,
+            vec![ModelInfo {
+                pricing: Some(pricing),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+    }
+
+    #[test]
+    fn discovered_pricing_fills_a_model_with_no_declared_rates() {
+        let slug = "custom-discovery-pricing-test";
+        let model_id = "endpoint-priced";
+        seed_discovered_pricing(
+            slug,
+            model_id,
+            ModelPricing::per_million(ENDPOINT_INPUT_PRICE, ENDPOINT_OUTPUT_PRICE, 0.0, 0.0),
+        );
+
+        let model = model_from_def(&openai_def(model_id), openai_spec(), slug, model_id);
+        assert_eq!(model.pricing.input, ENDPOINT_INPUT_PRICE);
+        assert_eq!(model.pricing.output, ENDPOINT_OUTPUT_PRICE);
+    }
+
+    #[test]
+    fn declared_pricing_wins_over_discovered_pricing() {
+        let slug = "custom-declared-pricing-test";
+        let model_id = "declared-price-wins";
+        seed_discovered_pricing(
+            slug,
+            model_id,
+            ModelPricing::per_million(ENDPOINT_INPUT_PRICE, ENDPOINT_OUTPUT_PRICE, 0.0, 0.0),
+        );
+        let mut def = openai_def(model_id);
+        def.models[0].pricing_input = Some(DECLARED_INPUT_PRICE);
+        def.models[0].pricing_output = Some(DECLARED_OUTPUT_PRICE);
+
+        let model = model_from_def(&def, openai_spec(), slug, model_id);
+        assert_eq!(model.pricing.input, DECLARED_INPUT_PRICE);
+        assert_eq!(model.pricing.output, DECLARED_OUTPUT_PRICE);
+    }
+
+    #[test]
+    fn discovered_zero_price_marks_the_model_free() {
+        let slug = "custom-discovery-free-test";
+        let model_id = "endpoint-free";
+        seed_discovered_pricing(slug, model_id, ModelPricing::ZERO);
+
+        let model = model_from_def(&openai_def(model_id), openai_spec(), slug, model_id);
+        assert!(model.is_free());
     }
 
     #[test]
