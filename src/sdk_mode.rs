@@ -1691,9 +1691,9 @@ mod tests {
     const ANSWER_OUTLIVES_TURN: &str =
         "a call moved off its turn can still be parked on its ask after the turn result";
     const OUTSTANDING_REQ: &str = "req_1";
-    const RESULT_INPUT_TOKENS: u32 = 1_000;
+    const RESULT_INPUT_TOKENS: u64 = 1_000;
     const RESULT_COST: f64 = 0.25;
-    const LATE_INPUT_TOKENS: u32 = 300;
+    const LATE_INPUT_TOKENS: u64 = 300;
     const LATE_COST: f64 = 0.5;
     const UNREPORTED_ONLY: &str =
         "only spend that no result carried may be reported after the last one";
@@ -2050,7 +2050,7 @@ mod tests {
     #[test_case(LATE_INPUT_TOKENS, LATE_COST, false ; "spend_after_the_last_result")]
     #[test_case(LATE_INPUT_TOKENS, LATE_COST, true ; "spend_after_a_failed_run")]
     fn only_spend_no_result_carried_is_reported_at_the_end(
-        late_input: u32,
+        late_input: u64,
         late_cost: f64,
         failed: bool,
     ) {
@@ -2087,7 +2087,7 @@ mod tests {
         assert_eq!(result["is_error"], failed);
         assert_eq!(
             result["usage"]["input_tokens"].as_u64(),
-            Some(u64::from(RESULT_INPUT_TOKENS)),
+            Some(RESULT_INPUT_TOKENS),
             "{RESULT_BILLED}"
         );
         assert_eq!(
@@ -2109,8 +2109,7 @@ mod tests {
                 )
             })
             .collect();
-        let expected =
-            Vec::from_iter((late_input > 0).then_some((u64::from(late_input), late_cost)));
+        let expected = Vec::from_iter((late_input > 0).then_some((late_input, late_cost)));
         assert_eq!(unreported, expected, "{UNREPORTED_ONLY}");
     }
 }

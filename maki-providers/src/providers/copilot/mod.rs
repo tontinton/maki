@@ -1068,7 +1068,7 @@ mod tests {
     #[test_case("copilot/gpt-5.6-luna", 1_000_000, 1_000_000, 0.20 + 1.20; "luna default rates")]
     #[test_case("copilot/gpt-5.4-mini", 100_000, 100_000, 0.075 + 0.45; "gpt-5.4-mini beats gpt-5.4 prefix")]
     #[test_case("copilot/claude-opus-4.8-fast", 100_000, 100_000, 1.00 + 5.00; "opus 4.8 fast beats opus prefix")]
-    fn manifest_models_report_cost(spec: &str, input: u32, output: u32, expected: f64) {
+    fn manifest_models_report_cost(spec: &str, input: u64, output: u64, expected: f64) {
         let usage = TokenUsage {
             input,
             output,

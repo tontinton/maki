@@ -533,19 +533,19 @@ struct ChunkChoice {
 #[derive(Deserialize)]
 struct PromptTokensDetails {
     #[serde(default)]
-    cached_tokens: u32,
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize)]
 struct ChunkUsage {
     #[serde(default)]
-    prompt_tokens: u32,
+    prompt_tokens: u64,
     #[serde(default)]
-    completion_tokens: u32,
+    completion_tokens: u64,
     prompt_tokens_details: Option<PromptTokensDetails>,
     /// DeepSeek reports cache hits here instead of `prompt_tokens_details`.
     #[serde(default)]
-    prompt_cache_hit_tokens: u32,
+    prompt_cache_hit_tokens: u64,
     /// What the request billed, which routers like OpenRouter attach to usage.
     #[serde(default, deserialize_with = "lenient_cost")]
     cost: Option<f64>,
