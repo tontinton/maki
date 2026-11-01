@@ -66,13 +66,13 @@ pub(crate) const EPHEMERAL: CacheControl = CacheControl {
 #[derive(Deserialize)]
 struct Usage {
     #[serde(default)]
-    input_tokens: u32,
+    input_tokens: u64,
     #[serde(default)]
-    output_tokens: u32,
+    output_tokens: u64,
     #[serde(default)]
-    cache_creation_input_tokens: u32,
+    cache_creation_input_tokens: u64,
     #[serde(default)]
-    cache_read_input_tokens: u32,
+    cache_read_input_tokens: u64,
 }
 
 impl From<Usage> for TokenUsage {
