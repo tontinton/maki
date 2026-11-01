@@ -8,13 +8,13 @@ use flume::Sender;
 use maki_storage::id::MakiId;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, Method, RequestBuilder};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::{debug, warn};
 
-use super::ResolvedAuth;
 use super::copilot::copilot_usd;
+use super::{BilledCost, ResolvedAuth};
 use crate::model::ModelFamily;
 use crate::types::rejects_sampling;
 use crate::{
@@ -547,20 +547,8 @@ struct ChunkUsage {
     #[serde(default)]
     prompt_cache_hit_tokens: u32,
     /// What the request billed, which routers like OpenRouter attach to usage.
-    #[serde(default, deserialize_with = "lenient_cost")]
-    cost: Option<f64>,
-}
-
-/// No standard covers `cost`, so a gateway may quote it as a string or in a
-/// shape we have never seen. A chunk we cannot parse is dropped whole, and this
-/// is the chunk carrying the turn's token counts, so reading the price has to
-/// be allowed to fail on its own.
-fn lenient_cost<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
-    Ok(match Option::<Value>::deserialize(deserializer)? {
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::String(s)) => s.parse().ok(),
-        _ => None,
-    })
+    #[serde(flatten)]
+    billed: BilledCost,
 }
 
 #[derive(Deserialize)]
@@ -615,6 +603,11 @@ pub async fn parse_sse(
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
+        if let Some(cost) = super::parse_cost_comment(&line) {
+            usage.cost = cost;
+            continue;
+        }
+
         let data = match line.strip_prefix("data:") {
             Some(d) => d.trim(),
             None => continue,
@@ -649,9 +642,15 @@ pub async fn parse_sse(
                 output: u.completion_tokens,
                 cache_read: cached,
                 cache_creation: 0,
-                cost: u
-                    .cost
-                    .or_else(|| chunk.copilot_usage.as_ref().and_then(copilot_usd)),
+                cost: if u.billed.is_present() {
+                    u.billed.total()
+                } else {
+                    chunk
+                        .copilot_usage
+                        .as_ref()
+                        .and_then(copilot_usd)
+                        .or(usage.cost)
+                },
             };
         }
 
@@ -977,6 +976,98 @@ data: [DONE]\n";
         assert_eq!(resp.usage.input, 100, "{COUNTS_SURVIVE_A_BAD_COST}");
         assert_eq!(resp.usage.output, 10, "{COUNTS_SURVIVE_A_BAD_COST}");
         assert_eq!(resp.usage.cost, expected);
+    }
+
+    #[test_case(json!({"cost": 0.00002, "is_byok": true, "cost_details": {"upstream_inference_cost": 0.0004}}), Some(0.00042) ; "byok_fee_plus_upstream")]
+    #[test_case(json!({"cost": 0.00042, "response_cost": 0.5}), None ; "conflicting_costs")]
+    #[test_case(json!({"response_cost": 0.00042}), Some(0.00042) ; "response_cost")]
+    #[test_case(json!({"cost": 0}), Some(0.0) ; "zero_is_a_bill")]
+    #[tokio::test]
+    async fn parse_sse_billed_cost_shapes(billing: Value, expected: Option<f64>) {
+        let mut usage = json!({"prompt_tokens": 100, "completion_tokens": 10});
+        usage
+            .as_object_mut()
+            .unwrap()
+            .extend(billing.as_object().unwrap().clone());
+        let chunk = json!({
+            "choices": [{"finish_reason": "stop", "delta": {}}],
+            "usage": usage,
+        });
+        let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
+
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.usage.input, 100, "{COUNTS_SURVIVE_A_BAD_COST}");
+        assert_eq!(resp.usage.output, 10, "{COUNTS_SURVIVE_A_BAD_COST}");
+        match (resp.usage.cost, expected) {
+            (Some(got), Some(want)) => assert!((got - want).abs() < 1e-9),
+            (got, want) => assert_eq!(got, want),
+        }
+    }
+
+    #[test_case(None, Some(0.0000104) ; "comment_prices_the_turn")]
+    #[test_case(Some(0.5), Some(0.0000104) ; "later_comment_wins")]
+    #[tokio::test]
+    async fn parse_sse_cost_comment(usage_cost: Option<f64>, expected: Option<f64>) {
+        let mut usage = json!({"prompt_tokens": 100, "completion_tokens": 10});
+        if let Some(cost) = usage_cost {
+            usage["cost"] = json!(cost);
+        }
+        let chunk = json!({"choices": [], "usage": usage});
+        let sse = format!(
+            "data: {chunk}\n\n: energy {{\"energy_joules\": 4.99}}\n\n: cost {{\"request_cost_usd\": 1.04e-05}}\n\ndata: [DONE]\n"
+        );
+
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.usage.input, 100);
+        assert_eq!(resp.usage.cost, expected);
+    }
+
+    #[test_case(json!({"cost": 0.00002, "is_byok": true}), None ; "incomplete_byok")]
+    #[test_case(json!({"cost": "invalid"}), None ; "invalid")]
+    #[test_case(json!({"prompt_tokens": 100}), Some(0.5) ; "no_new_bill")]
+    #[test_case(json!({"cost": 0}), Some(0.0) ; "zero")]
+    #[tokio::test]
+    async fn later_usage_updates_previous_bill(billing: Value, expected: Option<f64>) {
+        let first = json!({"usage": {"prompt_tokens": 100, "cost": 0.5}});
+        let second = json!({"usage": billing});
+        let sse = format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n");
+        let (tx, _rx) = flume::unbounded();
+        let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(response.usage.cost, expected);
+    }
+
+    #[test_case(": cost {\"request_cost_usd\":-1}", None ; "invalid_clears")]
+    #[test_case(": cost {\"request_cost_usd\":0}", Some(0.0) ; "zero")]
+    #[test_case(": keepalive", Some(0.5) ; "unrelated_comment")]
+    #[tokio::test]
+    async fn later_comment_updates_previous_bill(comment: &str, expected: Option<f64>) {
+        let sse = format!("data: {{\"usage\":{{\"cost\":0.5}}}}\n\n{comment}\n\ndata: [DONE]\n");
+        let (tx, _rx) = flume::unbounded();
+        let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(response.usage.cost, expected);
+    }
+
+    #[tokio::test]
+    async fn free_cost_comment_is_authoritative() {
+        let sse =
+            "data: {\"usage\":{\"cost\":0.5}}\n\n: cost {\"request_cost_usd\":0}\n\ndata: [DONE]\n";
+        let (tx, _rx) = flume::unbounded();
+        let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(response.usage.cost, Some(0.0));
     }
 
     const COPILOT_NANO_AIU: u64 = 375_000;

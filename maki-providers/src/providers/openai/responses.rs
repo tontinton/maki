@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 use crate::model::Model;
 use crate::providers::copilot::copilot_usd;
 use crate::providers::openai_compat::tool_parameters;
-use crate::providers::{ResolvedAuth, sse_error_status};
+use crate::providers::{BilledCost, ResolvedAuth, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -505,10 +505,7 @@ pub(crate) async fn parse_sse(
                 };
                 let resp = &parsed["response"];
 
-                if let Some(u) = resp.get("usage") {
-                    usage = parse_usage(u);
-                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
-                }
+                update_terminal_usage(&mut usage, resp, &parsed);
 
                 let status = resp["status"].as_str().unwrap_or("completed");
                 stop_reason = Some(match status {
@@ -530,10 +527,7 @@ pub(crate) async fn parse_sse(
                     Err(_) => continue,
                 };
                 let resp = &parsed["response"];
-                if let Some(u) = resp.get("usage") {
-                    usage = parse_usage(u);
-                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
-                }
+                update_terminal_usage(&mut usage, resp, &parsed);
                 stop_reason = Some(StopReason::MaxTokens);
             }
 
@@ -597,6 +591,31 @@ pub(crate) async fn parse_sse(
     })
 }
 
+fn update_terminal_usage(usage: &mut TokenUsage, response: &Value, event: &Value) {
+    let billing = response.get("usage").map(BilledCost::from_usage);
+    if let Some(u) = response.get("usage") {
+        let previous_cost = usage.cost;
+        *usage = parse_usage(u);
+        if !billing.as_ref().is_some_and(BilledCost::is_present) {
+            usage.cost = previous_cost;
+        }
+    }
+    let response_billing = BilledCost::from_response(response);
+    if response_billing.is_present() {
+        let response_cost = response_billing.total();
+        usage.cost = if billing.as_ref().is_some_and(BilledCost::is_present) {
+            usage
+                .cost
+                .zip(response_cost)
+                .and_then(|(a, b)| (a == b).then_some(a))
+        } else {
+            response_cost
+        };
+    } else if !billing.as_ref().is_some_and(BilledCost::is_present) {
+        usage.cost = copilot_usd(&event["copilot_usage"]).or(usage.cost);
+    }
+}
+
 fn parse_usage(u: &Value) -> TokenUsage {
     let input_tokens = u["input_tokens"].as_u64().unwrap_or(0) as u32;
     let output_tokens = u["output_tokens"].as_u64().unwrap_or(0) as u32;
@@ -610,7 +629,7 @@ fn parse_usage(u: &Value) -> TokenUsage {
         output: output_tokens,
         cache_read: cached,
         cache_creation: 0,
-        cost: None,
+        cost: BilledCost::from_usage(u).total(),
     }
 }
 
@@ -742,6 +761,54 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
             })
             .collect();
         assert_eq!(deltas, vec!["Hello", " world"]);
+    }
+
+    const BILLED_COST: f64 = 0.00042;
+
+    #[test_case("\"cost\":0.00042" ; "cost")]
+    #[test_case("\"response_cost\":0.00042" ; "response_cost")]
+    #[test_case("\"cost\":0.00002,\"is_byok\":true,\"cost_details\":{\"upstream_inference_cost\":0.0004}" ; "byok")]
+    #[tokio::test]
+    async fn parse_sse_billed_cost(cost_fields: &str) {
+        let frame = format!(
+            "event: response.completed\ndata: {{\"response\":{{\"status\":\"completed\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,{cost_fields}}}}}}}\n\n"
+        );
+        let (resp, _) = run_sse(&frame).await;
+        let resp = resp.unwrap();
+        let cost = resp.usage.cost.expect("billed cost should be captured");
+        assert!((cost - BILLED_COST).abs() < 1e-9);
+        assert_eq!(resp.usage.input, 10);
+        assert_eq!(resp.usage.output, 2);
+    }
+
+    #[test_case("response.completed", json!({"cost": {"request_cost_usd": 0.5, "cache_savings_usd": 0.1}}), Some(0.5) ; "neuralwatt_response_cost")]
+    #[test_case("response.incomplete", json!({"cost": {"request_cost_usd": 0}}), Some(0.0) ; "neuralwatt_free")]
+    #[test_case("response.completed", json!({"cost": {"request_cost_usd": -1}}), None ; "neuralwatt_invalid")]
+    #[test_case("response.completed", json!({"cost": 0.5}), Some(0.5) ; "completed_response_cost")]
+    #[test_case("response.incomplete", json!({"cost": 0}), Some(0.0) ; "incomplete_free")]
+    #[test_case("response.completed", json!({"cost": 0.5, "usage": {"cost": 0.5}}), Some(0.5) ; "matching_costs")]
+    #[test_case("response.completed", json!({"cost": 0.5, "usage": {"cost": 0.1}}), None ; "conflicting_costs")]
+    #[test_case("response.completed", json!({"cost": "invalid"}), None ; "invalid_cost")]
+    #[tokio::test]
+    async fn terminal_response_cost(event: &str, response: Value, expected: Option<f64>) {
+        let frame = format!("event: {event}\ndata: {{\"response\":{response}}}\n\n");
+        let (resp, _) = run_sse(&frame).await;
+        assert_eq!(resp.unwrap().usage.cost, expected);
+    }
+
+    #[test_case(json!({"usage": {"cost": "invalid"}}), None ; "invalid_usage")]
+    #[test_case(json!({"usage": {"cost": 0.1, "is_byok": true}}), None ; "incomplete_byok")]
+    #[test_case(json!({"cost": "invalid"}), None ; "invalid_response_cost")]
+    #[test_case(json!({"usage": {"input_tokens": 5}}), Some(0.5) ; "no_new_bill")]
+    #[tokio::test]
+    async fn later_terminal_cost_updates_previous(response: Value, expected: Option<f64>) {
+        let first = json!({"response": {"cost": 0.5}});
+        let second = json!({"response": response});
+        let sse = format!(
+            "event: response.completed\ndata: {first}\n\nevent: response.incomplete\ndata: {second}\n\n"
+        );
+        let (resp, _) = run_sse(&sse).await;
+        assert_eq!(resp.unwrap().usage.cost, expected);
     }
 
     #[tokio::test]

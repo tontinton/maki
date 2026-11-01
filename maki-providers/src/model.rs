@@ -891,9 +891,7 @@ impl Model {
     ///
     /// A bill the provider sent us is the whole answer, so it skips both the
     /// table and the surcharge: it is already the price at this hour, and we
-    /// have one even for a model nothing ever quoted a rate for. Except a bill
-    /// of zero, which is all a free model ever sends, and free has always shown
-    /// no cost rather than "$0.000".
+    /// have one even for a model nothing ever quoted a rate for.
     pub fn billed_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
         if self.subsidised_by.is_some() {
             // Prepaid via a flat subscription: the turn ran, but nothing was
@@ -901,12 +899,15 @@ impl Model {
             // unpriced model does not report a false "$0.000".
             return self.list_cost(usage, fast).map(|_| 0.0);
         }
-        usage.cost.filter(|bill| *bill > 0.0).or_else(|| {
-            let cost = self.list_cost(usage, fast)?;
-            let schedule =
-                ProviderRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
-            Some(schedule.map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())))
-        })
+        usage
+            .cost
+            .filter(|bill| bill.is_finite() && *bill >= 0.0)
+            .or_else(|| {
+                let cost = self.list_cost(usage, fast)?;
+                let schedule =
+                    ProviderRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
+                Some(schedule.map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())))
+            })
     }
 
     /// The quoted rates, with no wall-clock surcharge. Deterministic, which is
@@ -1509,6 +1510,11 @@ mod tests {
             "{TABLE_MUST_NOT_AGREE_BY_LUCK}"
         );
         assert_eq!(model.billed_cost(&billed, false), Some(RECORDED_COST));
+        let free = TokenUsage {
+            cost: Some(0.0),
+            ..INPUT_ONLY
+        };
+        assert_eq!(model.billed_cost(&free, false), Some(0.0));
     }
 
     /// Only some responses arrive with a bill, so a total of them would be part
@@ -1957,9 +1963,7 @@ mod tests {
         );
     }
 
-    /// A schedule must not turn "no price" into "$0.000". Callers hide `None`,
-    /// and any multiple of nothing is still nothing. A free model billing us
-    /// zero lands in the same place, which is where it has always been.
+    /// A schedule must not turn an absent price into "$0.000".
     #[test]
     fn unpriced_models_stay_unpriced_under_a_schedule() {
         register_scheduled();
@@ -1971,7 +1975,7 @@ mod tests {
         assert!(model.pricing.is_zero());
         assert_eq!(model.list_cost(&INPUT_ONLY, false), None);
         assert_eq!(model.billed_cost(&INPUT_ONLY, false), None);
-        assert_eq!(model.billed_cost(&free, false), None);
+        assert_eq!(model.billed_cost(&free, false), Some(0.0));
     }
 
     /// Every later total is rebuilt from what was stored, so storing a turn must

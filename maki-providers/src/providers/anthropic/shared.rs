@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
+use crate::providers::BilledCost;
 use crate::providers::copilot::copilot_usd;
 use crate::types::{is_deferred_tool, rejects_sampling};
 use crate::{
@@ -73,6 +74,9 @@ struct Usage {
     cache_creation_input_tokens: u32,
     #[serde(default)]
     cache_read_input_tokens: u32,
+    /// What a gateway in front of the API billed.
+    #[serde(flatten)]
+    billed: BilledCost,
 }
 
 impl From<Usage> for TokenUsage {
@@ -82,7 +86,7 @@ impl From<Usage> for TokenUsage {
             output: u.output_tokens,
             cache_creation: u.cache_creation_input_tokens,
             cache_read: u.cache_read_input_tokens,
-            ..Default::default()
+            cost: u.billed.total(),
         }
     }
 }
@@ -426,6 +430,10 @@ impl EventParser {
         }
     }
 
+    pub fn set_cost(&mut self, cost: Option<f64>) {
+        self.usage.cost = cost;
+    }
+
     pub async fn process(
         &mut self,
         event_type: &str,
@@ -533,6 +541,7 @@ impl EventParser {
             }
             "message_delta" => {
                 if let Ok(ev) = serde_json::from_str::<MessageDeltaEvent>(data) {
+                    let has_billing = ev.usage.as_ref().is_some_and(|u| u.billed.is_present());
                     if let Some(u) = ev.usage {
                         self.usage.output = u.output_tokens;
                         // Gateways like Bifrost send zeros in message_start and the real
@@ -551,8 +560,13 @@ impl EventParser {
                                 *dst = src;
                             }
                         }
+                        if u.billed.is_present() {
+                            self.usage.cost = u.billed.total();
+                        }
                     }
-                    if let Some(usd) = ev.copilot_usage.as_ref().and_then(copilot_usd) {
+                    if !has_billing
+                        && let Some(usd) = ev.copilot_usage.as_ref().and_then(copilot_usd)
+                    {
                         self.usage.cost = Some(usd);
                     }
                     if let Some(t) = ev.input_transformations {
