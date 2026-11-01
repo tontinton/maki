@@ -38,6 +38,7 @@ Type `/` in the input box to open the command palette.
 | `/sessions` | Browse and switch sessions |
 | `/tasks` | Browse and search tasks |
 | `/thinking` | Extended thinking: pick an effort level, or set one directly |
+| `/todo` | Show this session's full todo list |
 
 ## Sessions
 
