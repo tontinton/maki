@@ -598,12 +598,12 @@ pub(crate) async fn parse_sse(
 }
 
 fn parse_usage(u: &Value) -> TokenUsage {
-    let input_tokens = u["input_tokens"].as_u64().unwrap_or(0) as u32;
-    let output_tokens = u["output_tokens"].as_u64().unwrap_or(0) as u32;
+    let input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
 
     let cached = u["input_tokens_details"]["cached_tokens"]
         .as_u64()
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
 
     TokenUsage {
         input: input_tokens.saturating_sub(cached),

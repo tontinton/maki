@@ -2029,15 +2029,15 @@ mod tests {
 
     const FIRST_COST: f64 = 0.5;
     const SECOND_COST: f64 = 0.25;
-    const FIRST_INPUT: u32 = 10;
-    const SECOND_INPUT: u32 = 5;
+    const FIRST_INPUT: u64 = 10;
+    const SECOND_INPUT: u64 = 5;
     const OWN_SUBTREE_MSG: &str = "a child ledger reports only what it spent itself";
     const ROLLUP_MSG: &str = "a child's spend has to land in the parent's totals";
     const CARRIED_ONCE_MSG: &str =
         "a carried balance shows on the child and stays counted once on the parent";
     const FLOAT_RESIDUE: f64 = 1e-12;
 
-    fn usage(input: u32) -> TokenUsage {
+    fn usage(input: u64) -> TokenUsage {
         TokenUsage {
             input,
             ..Default::default()
@@ -2120,7 +2120,7 @@ mod tests {
 
     #[test_case(SECOND_INPUT, Some(SECOND_COST) ; "spent_rounds_are_the_difference")]
     #[test_case(0, None ; "no_tokens_means_no_spend_despite_cost_residue")]
-    fn totals_since_an_earlier_reading(input: u32, expected_cost: Option<f64>) {
+    fn totals_since_an_earlier_reading(input: u64, expected_cost: Option<f64>) {
         let earlier = RunTotals {
             usage: usage(FIRST_INPUT),
             cost: Some(FIRST_COST),

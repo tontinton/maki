@@ -311,13 +311,13 @@ fn lock_path(dir: &Path, id: MakiId) -> PathBuf {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StoredTokenUsage {
     #[serde(default)]
-    pub input: u32,
+    pub input: u64,
     #[serde(default)]
-    pub output: u32,
+    pub output: u64,
     #[serde(default)]
-    pub cache_creation: u32,
+    pub cache_creation: u64,
     #[serde(default)]
-    pub cache_read: u32,
+    pub cache_read: u64,
     /// What the turns billed, in USD. Prices move (some providers by the hour),
     /// so re-pricing these counters later would be fiction. `None` on unpriced
     /// models, and on entries written before we recorded it until the next load
@@ -333,13 +333,13 @@ pub struct StoredTokenUsage {
 }
 
 impl StoredTokenUsage {
-    pub fn total_input(&self) -> u32 {
+    pub fn total_input(&self) -> u64 {
         self.input
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_creation)
     }
 
-    pub fn total(&self) -> u32 {
+    pub fn total(&self) -> u64 {
         self.total_input().saturating_add(self.output)
     }
 }
@@ -2589,6 +2589,33 @@ mod tests {
         );
     }
 
+    /// A per-model entry accumulates every turn for the life of the session.
+    /// It has to keep counting past u32::MAX and round-trip that value, so a
+    /// long `/usage` history never saturates.
+    #[test]
+    fn per_model_usage_counts_past_u32_max_and_roundtrips() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("anthropic/claude-sonnet-4", "/project");
+        let mut acc = super::StoredTokenUsage {
+            input: u32::MAX as u64,
+            ..Default::default()
+        };
+        acc += super::StoredTokenUsage {
+            input: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(acc.total(), u32::MAX as u64 + 1_000);
+        session.add_model_usage("claude-sonnet-4", acc);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(
+            loaded.usage_by_model()["claude-sonnet-4"].total(),
+            u32::MAX as u64 + 1_000
+        );
+    }
+
     /// A turn that reports no price must not erase what was already billed.
     #[test_case(None, None, None ; "unpriced_stays_unpriced")]
     #[test_case(None, Some(SONNET_COST), Some(SONNET_COST) ; "first_price_starts_the_total")]
@@ -2603,7 +2630,7 @@ mod tests {
         assert_eq!(total, expected);
     }
 
-    fn usage(input: u32, cost: Option<f64>) -> super::StoredTokenUsage {
+    fn usage(input: u64, cost: Option<f64>) -> super::StoredTokenUsage {
         super::StoredTokenUsage {
             input,
             cost,

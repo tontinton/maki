@@ -251,7 +251,7 @@ pub(crate) async fn stream_with_retry(
                 canonicalize_tool_names(&mut r.message);
                 emit_api_request(model, &r, opts, started.elapsed());
                 if let Some(gauge) = gauge.as_deref_mut() {
-                    gauge.record(r.usage.total_input());
+                    gauge.record(r.usage.total_input().min(u32::MAX as u64) as u32);
                 }
                 return Ok(r);
             }
@@ -340,10 +340,10 @@ fn emit_api_request(model: &Model, r: &StreamResponse, opts: RequestOptions, too
     maki_otel::emit::api_request(&maki_otel::emit::ApiRequest {
         model: &model.id,
         provider: &model.provider,
-        input_tokens: u64::from(usage.input),
-        output_tokens: u64::from(usage.output),
-        cache_read_tokens: u64::from(usage.cache_read),
-        cache_creation_tokens: u64::from(usage.cache_creation),
+        input_tokens: usage.input,
+        output_tokens: usage.output,
+        cache_read_tokens: usage.cache_read,
+        cache_creation_tokens: usage.cache_creation,
         cost_usd: model.billed_cost(usage, opts.fast).unwrap_or(0.0),
         duration: took,
         stop_reason: r.stop_reason.map(<&'static str>::from),
@@ -615,7 +615,7 @@ mod tests {
                 Ok(StreamResponse {
                     message: Message::user("ok".into()),
                     usage: TokenUsage {
-                        input: prompt,
+                        input: u64::from(prompt),
                         ..Default::default()
                     },
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
@@ -798,7 +798,7 @@ mod tests {
             "every retry asks for less than the ask that was refused"
         );
         assert_eq!(
-            gauge.size(),
+            u64::from(gauge.size()),
             response.usage.input,
             "the session keeps the server's count, not the estimate under it"
         );

@@ -530,13 +530,13 @@ struct SseFunctionCall {
 #[serde(rename_all = "camelCase")]
 struct SseUsageMetadata {
     #[serde(default)]
-    prompt_token_count: u32,
+    prompt_token_count: u64,
     #[serde(default)]
-    candidates_token_count: u32,
+    candidates_token_count: u64,
     #[serde(default)]
-    thoughts_token_count: u32,
+    thoughts_token_count: u64,
     #[serde(default)]
-    cached_content_token_count: Option<u32>,
+    cached_content_token_count: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1219,7 +1219,7 @@ mod tests {
     #[test_case(Some(100), 0 ; "fully_cached")]
     #[test_case(Some(150), 0 ; "cache_exceeds_prompt")]
     #[tokio::test]
-    async fn parse_sse_cached_tokens(cached: Option<u32>, expected_input: u32) {
+    async fn parse_sse_cached_tokens(cached: Option<u64>, expected_input: u64) {
         let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
         if let Some(cached) = cached {
             metadata["cachedContentTokenCount"] = json!(cached);
@@ -1238,9 +1238,9 @@ mod tests {
     #[test_case(Some(25), 75, 25 ; "present_cache_replaces_previous")]
     #[tokio::test]
     async fn parse_sse_cached_tokens_across_chunks(
-        cached: Option<u32>,
-        expected_input: u32,
-        expected_cache_read: u32,
+        cached: Option<u64>,
+        expected_input: u64,
+        expected_cache_read: u64,
     ) {
         let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
         if let Some(cached) = cached {

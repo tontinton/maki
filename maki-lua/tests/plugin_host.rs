@@ -7759,7 +7759,7 @@ const CANCELLED_MSG: &str = "cancelled";
 const STOPPED_BY_USER_ERR: &str = "stopped by user";
 const PAID_TOOL_USE_ID: &str = "toolu_paid";
 const PAID_TOOL_NAME: &str = "not_a_tool";
-const PAID_TURN_INPUT: u32 = 1234;
+const PAID_TURN_INPUT: u64 = 1234;
 const COST_DECIMALS: usize = 12;
 
 /// The spawned task outlives the tool call that started it, so only the chat

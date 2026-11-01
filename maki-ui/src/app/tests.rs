@@ -2109,8 +2109,11 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
 
     assert_eq!(app.state.token_usage.input, 300);
     assert_eq!(app.state.token_usage.output, 125);
-    assert_eq!(app.chats[0].context_size, main_usage.context_tokens());
-    assert_eq!(app.chats[1].context_size, sub_usage.context_tokens());
+    assert_eq!(
+        app.chats[0].context_size,
+        main_usage.context_tokens() as u32
+    );
+    assert_eq!(app.chats[1].context_size, sub_usage.context_tokens() as u32);
 }
 
 const SUBAGENT_NAME: &str = "research";
