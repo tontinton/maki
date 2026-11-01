@@ -846,6 +846,7 @@ pub struct AgentFileConfig {
     pub stale_read_check: Option<bool>,
     pub rtk: Option<bool>,
     pub shell: Option<ShellPreference>,
+    pub model_in_prompt: Option<bool>,
 }
 
 impl AgentFileConfig {
@@ -862,7 +863,8 @@ impl AgentFileConfig {
             post_compaction_instructions,
             stale_read_check,
             rtk,
-            shell
+            shell,
+            model_in_prompt
         );
     }
 }
@@ -1564,6 +1566,12 @@ pub struct AgentConfig {
     )]
     pub shell: ShellPreference,
 
+    #[config(
+        default = true,
+        desc = "Include the model identifier in the default system prompt environment and in switch updates. A custom system template that uses `{model}` always states it"
+    )]
+    pub model_in_prompt: bool,
+
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
 
@@ -1597,6 +1605,7 @@ impl AgentConfig {
             stale_read_check: file.stale_read_check.unwrap_or(true),
             rtk: file.rtk.unwrap_or(true),
             shell: file.shell.unwrap_or_default(),
+            model_in_prompt: file.model_in_prompt.unwrap_or(true),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
@@ -3169,6 +3178,22 @@ mod tests {
         let config = raw.into_config(&[]).unwrap();
         assert_eq!(config.agent.max_output_lines, 5000);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn agent_config_model_in_prompt_default_and_override() {
+        let default_config = RawConfig::default().into_config(&[]).unwrap();
+        assert!(default_config.agent.model_in_prompt);
+
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                model_in_prompt: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = raw.into_config(&[]).unwrap();
+        assert!(!config.agent.model_in_prompt);
     }
 
     #[test]
