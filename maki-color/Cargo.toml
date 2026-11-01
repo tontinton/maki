@@ -1,0 +1,10 @@
+[package]
+name = "maki-color"
+description = "Theme color vocabulary and the running theme's published style registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]

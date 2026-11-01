@@ -7004,6 +7004,7 @@ still work. The calls that need a screen behave like this:
 - `flash` writes to the log.
 - `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
   `input_rules` still throws on a bad rule, so a plugin's tests catch it.
+- `set_theme_color` returns `nil, "no interactive UI attached"`.
 
 ### Chat input
 
@@ -7253,6 +7254,59 @@ foreground over a background of your own.
 local sel = maki.ui.theme_style("item_selected")
 local dim = maki.ui.theme_style("dim")
 buf:line({ { "note", { fg = dim.fg, bg = sel.bg } } })
+```
+
+---
+
+### `maki.ui.get_theme_color()` {#maki-ui-get_theme_color}
+
+```lua
+maki.ui.get_theme_color({name})
+```
+
+Reads the foreground color a named theme style paints with, after every
+`maki.ui.set_theme_color` override. The names are the ones
+`maki.ui.theme_style` accepts, plus "mode_build", "mode_plan", and
+"mode_bash".
+
+**Parameters:**
+
+- `{name}` (`string`) Style name, e.g. "input_border".
+
+**Returns:** (`string|nil`, `string|nil`) The color as `maki.ui.theme_color` spells it, or nil and an error for an unknown name.
+
+**Example:**
+
+```lua
+local c = maki.ui.get_theme_color("mode_build")
+if c then
+  buf:line({ { "border color", { fg = c } } })
+end
+```
+
+---
+
+### `maki.ui.get_theme_palette()` {#maki-ui-get_theme_palette}
+
+```lua
+maki.ui.get_theme_palette()
+```
+
+Reads the running theme's `[palette]`: color name to `#rrggbb`, e.g.
+`{ blue = "#7aa2f7", comment = "#565f89" }`. The map matches what
+`maki.ui.set_theme_color` and span colors resolve names against, so a
+picker built from it always offers the colors the active theme actually
+paints with. Empty when the running theme has no `[palette]`.
+
+**Returns:** (`table`) Map of palette name to `#rrggbb` hex string.
+
+**Example:**
+
+```lua
+local pal = maki.ui.get_theme_palette()
+for name, hex in pairs(pal) do
+  print(name .. " = " .. hex)
+end
 ```
 
 ---
@@ -7688,6 +7742,41 @@ shell, on terminals that support the title stack.
 maki.ui.set_window_title("maki: " .. session_name)
 -- Give the title back to the shell:
 maki.ui.set_window_title("")
+```
+
+---
+
+### `maki.ui.set_theme_color()` {#maki-ui-set_theme_color}
+
+```lua
+maki.ui.set_theme_color({name}, {color?})
+```
+
+Overrides the foreground color of a named theme style at runtime, or
+restores the theme's own color when the {color} is nil. The change is
+live: the next frame repaints with it, and it survives theme switches,
+because it patches whatever theme is running rather than replacing it.
+
+Valid names are the ones `maki.ui.theme_style` accepts ("dim",
+"input_border", "accent", ...), except "background" and "foreground",
+which have no foreground field of their own, plus the three mode colors
+"mode_build", "mode_plan", and "mode_bash" that paint the input box
+border. Only the foreground changes; modifiers and backgrounds stay.
+A name outside that list returns `nil` and an error.
+
+**Parameters:**
+
+- `{name}` (`string`) Style name, e.g. "input_border" or "mode_build".
+- `{color?}` (`string|nil`) `#rrggbb`, an ANSI palette index like "4", or nil to restore the theme color.
+
+**Returns:** (`boolean|nil`, `string|nil`) true when applied, or nil and an error for an unknown name or a missing UI.
+
+**Example:**
+
+```lua
+maki.ui.set_theme_color("mode_build", "#1e6bb8")
+-- and back to the theme's own color:
+maki.ui.set_theme_color("mode_build")
 ```
 
 ---
@@ -8235,10 +8324,13 @@ plain string for unstyled text, or a table of `{text, style?}` spans
 for rich content. Style can be a named string like "bold" or
 "keyword", or an inline table `{fg?, bg?, bold?, italic?, underline?, dim?, strikethrough?, reversed?}`.
 Colors accept "#rrggbb", a terminal color name like "blue" or "light-gray",
-or a palette index as a string like "4". Names must be spelled exactly,
-hyphens included. Named and indexed colors are left for the terminal to
-resolve, so they follow the user's palette. To mix a named style with colors
-of your own, `maki.ui.theme_style` hands back its parts.
+or a palette index as a string like "4". A name the running theme's
+`[palette]` defines wins over the terminal name, so "blue" paints that
+theme's blue and falls back to ANSI blue on a theme without one. Names
+must be spelled exactly, hyphens included. Named and indexed colors are
+left for the terminal to resolve, so they follow the user's palette. To
+mix a named style with colors of your own, `maki.ui.theme_style` hands
+back its parts.
 
 **Parameters:**
 

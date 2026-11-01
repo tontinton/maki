@@ -672,14 +672,18 @@ impl<'t> EventLoop<'t> {
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme. Only the
         // in-memory name is set, so the user's saved pick survives.
-        if let Some(ref name) = ui_config.theme {
-            match crate::theme::load_by_name(name) {
+        match ui_config.theme {
+            Some(ref name) => match crate::theme::load_by_name(name) {
                 Ok(theme) => {
                     crate::theme::set_current_name(name);
                     crate::theme::set(theme);
                 }
                 Err(e) => startup_warnings.push(format!("config ui.theme: {e}")),
-            }
+            },
+            // Install the default theme too, so `maki.ui.theme_style`,
+            // `get_theme_color` and the span palette all have something
+            // published on a first run with no `ui.theme`.
+            None => crate::theme::set((**crate::theme::current()).clone()),
         }
 
         static PROCESS_WARMUP: std::sync::Once = std::sync::Once::new();
@@ -1066,6 +1070,16 @@ impl<'t> EventLoop<'t> {
             UiAction::SetWindowTitle(title) => {
                 if let Err(error) = terminal::set_window_title(&title) {
                     warn!(%error, "failed to set window title");
+                }
+            }
+            UiAction::SetThemeColor { name, color } => {
+                let parsed = color
+                    .as_deref()
+                    .and_then(maki_color::Registry::resolve_color);
+                if !maki_color::Registry::set_override(&name, parsed) {
+                    warn!(style = %name, "set_theme_color: unknown style");
+                } else {
+                    theme::patch_running_theme();
                 }
             }
             UiAction::OpenEditor { path, reply_tx } => {
