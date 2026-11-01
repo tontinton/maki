@@ -701,6 +701,12 @@ pub struct StoredSubagent {
     pub plugin: Option<Arc<str>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
+    /// Unix seconds. Absent on subagents written before they were recorded,
+    /// and `ended_at` on one killed mid-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2481,6 +2487,8 @@ mod tests {
                 fast: false,
                 plugin: plugin.map(Arc::from),
                 cost: None,
+                started_at: None,
+                ended_at: None,
             }
         }
 

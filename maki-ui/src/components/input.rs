@@ -49,7 +49,6 @@ const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
 ];
 const QUEUE_PLACEHOLDER: &str = "Queue another prompt...";
 const SUBAGENT_QUEUE_PLACEHOLDER: &str = "Queue a message for this subagent...";
-const TASK_STOP_PLACEHOLDER: &str = "esc esc stop";
 const ASK_PREFIX: &str = "Ask maki to ";
 const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";
@@ -73,8 +72,6 @@ pub enum Placeholder {
     Blank,
     Queue,
     SubagentQueue,
-    /// A task that takes no messages, where Esc is all the input does.
-    TaskStop,
     /// An idle agent whose moved work is still out. Without it the chat
     /// looks done, while the results will still wake the agent.
     Background(usize),
@@ -639,7 +636,6 @@ impl InputBox {
                 ),
                 Placeholder::Queue => (QUEUE_PLACEHOLDER.into(), Vec::new()),
                 Placeholder::SubagentQueue => (SUBAGENT_QUEUE_PLACEHOLDER.into(), Vec::new()),
-                Placeholder::TaskStop => (TASK_STOP_PLACEHOLDER.into(), Vec::new()),
                 Placeholder::Blank => (BLANK_PLACEHOLDER.into(), Vec::new()),
                 Placeholder::Background(count) => (background_wait(count).into(), Vec::new()),
             };
@@ -1377,7 +1373,6 @@ mod tests {
     #[test_case(Placeholder::Blank, "" ; "blank_shows_only_the_chevron")]
     #[test_case(Placeholder::Queue, QUEUE_PLACEHOLDER ; "queue_asks_for_another_prompt")]
     #[test_case(Placeholder::SubagentQueue, SUBAGENT_QUEUE_PLACEHOLDER ; "subagent_queue_names_the_subagent")]
-    #[test_case(Placeholder::TaskStop, TASK_STOP_PLACEHOLDER ; "task_stop_names_the_key")]
     #[test_case(Placeholder::Background(1), "Waiting on 1 background task..." ; "one_background_task")]
     #[test_case(Placeholder::Background(2), "Waiting on 2 background tasks..." ; "background_tasks")]
     fn placeholder_row(placeholder: Placeholder, expected: &str) {

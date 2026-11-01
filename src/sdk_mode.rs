@@ -1966,7 +1966,7 @@ mod tests {
                 model: None,
                 opts: None,
                 answer_tx: None,
-                inbox: None,
+                inbox: Arc::default(),
                 parent_call: None,
             }),
             run_id: 0,

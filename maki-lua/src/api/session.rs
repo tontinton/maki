@@ -148,8 +148,8 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 }
 
 /// Lists the sessions currently running in this UI. Status is "working",
-/// "needs_input", or "idle". A mailbox follow-up stays "working" without an
-/// intermediate "idle" status.
+/// "needs_input", or "idle". Background work a turn moved out keeps the
+/// session "working" until its result is in, with no "idle" in between.
 ///
 /// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
 /// @example

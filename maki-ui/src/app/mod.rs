@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::OpenSession;
-use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, TaskParent, count_phrase};
+use crate::app::tasks::{
+    BackgroundMoves, TaskClock, TaskOutcome, TaskParent, TaskStatus, count_phrase,
+};
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
@@ -452,10 +454,10 @@ fn started_by(info: &SubagentInfo) -> Option<TaskParent> {
         .map(|call| TaskParent::Started(Arc::from(call)))
 }
 
-/// A chat can open before its session speaks: a moved call's tab, or a
-/// subagent a plugin adopted. The first info naming it fills in what it
-/// lacks: the sender its permission answers go to, the inbox its input
-/// feeds, and the model and options its header shows.
+/// The one path from a `SubagentInfo` into a chat, at its birth and on
+/// every later event. A chat can open before its session speaks (a moved
+/// call's tab, a subagent a plugin adopted), so each field fills in from
+/// the first info that names it.
 fn fill_missing_subagent_info(chat: &mut Chat, info: &SubagentInfo) {
     if chat.parent.is_none() {
         chat.parent = started_by(info);
@@ -466,8 +468,16 @@ fn fill_missing_subagent_info(chat: &mut Chat, info: &SubagentInfo) {
     if chat.answer_tx.is_none() {
         chat.answer_tx.clone_from(&info.answer_tx);
     }
+    // Every subagent has an inbox, so none yet means this is its first word,
+    // unless an ending took the inbox and `Chat::reopen` brought the tab
+    // back: that transcript already opens with the prompt.
     if chat.inbox.is_none() {
-        chat.inbox.clone_from(&info.inbox);
+        chat.inbox = Some(Arc::clone(&info.inbox));
+        if let Some(prompt) = &info.prompt
+            && !chat.has_user_message()
+        {
+            chat.push_user_message(prompt);
+        }
     }
     if chat.model_id.is_none() {
         chat.model_id.clone_from(&info.model);
@@ -799,9 +809,21 @@ impl App {
 
     /// Whether the chat in front shows the input box. A running subagent's
     /// chat does, so a message can be queued for that subagent while it is
-    /// watched. A finished one is a transcript, so it does not.
+    /// watched. A finished one, or a task with no inbox like a moved `bash`,
+    /// is a transcript, so it does not: Esc leaves it and `/tasks` stops it.
     pub(super) fn chat_accepts_input(&self) -> bool {
-        self.is_main_chat() || !self.chats[self.active_chat].is_finished()
+        self.is_main_chat() || self.chats[self.active_chat].takes_messages()
+    }
+
+    /// Whether the agent behind the chat in front is at work: the main
+    /// chat's turn, or a task still working. The main chat waiting on a
+    /// background task is not, since a prompt starts right away.
+    pub(super) fn active_chat_working(&self) -> bool {
+        if self.is_main_chat() {
+            self.status == Status::Streaming
+        } else {
+            self.chats[self.active_chat].task_status() == TaskStatus::Working
+        }
     }
 
     /// Stores this tab's focus into the mode every tab shares, so only the
@@ -865,18 +887,12 @@ impl App {
         }
     }
 
-    /// A running task with no inbox takes no messages, so its input says how
-    /// to stop it instead. The background count is the receipts the model
-    /// holds, so it leaves out a plugin's own sessions, which wake nobody.
+    /// The background count is the receipts the model holds, so it leaves
+    /// out a plugin's own sessions, which wake nobody.
     pub(super) fn input_placeholder(&self) -> Placeholder {
-        let chat = &self.chats[self.active_chat];
         let waiting_on = self.live_mailbox().map_or(0, SessionMailbox::outstanding);
         if !self.is_main_chat() {
-            if chat.inbox.is_none() && !chat.is_finished() {
-                Placeholder::TaskStop
-            } else {
-                Placeholder::SubagentQueue
-            }
+            Placeholder::SubagentQueue
         } else if self.status == Status::Streaming {
             Placeholder::Queue
         } else if waiting_on > 0 {
@@ -2146,14 +2162,14 @@ impl App {
     /// A message typed while watching a running subagent is for that
     /// subagent, see [`Self::queue_for_subagent`]. `Esc` follows the chat in front
     /// too: armed twice in a running subagent's chat it cancels that subagent
-    /// alone. A finished subagent's chat has no input, so only the mode
-    /// toggle answers there.
+    /// alone. A chat without an input box, see [`Self::chat_accepts_input`],
+    /// answers only the mode toggle, and Esc goes back to the main chat.
     ///
-    /// While a turn runs, `Esc` drops a selection and arms the cancel in the
-    /// same press, for the reason [`Self::reserved_by_host`] gives: a plugin
-    /// that keeps setting a selection must not be able to keep the user from
-    /// stopping. Idle, it only drops the selection, so it never arms the
-    /// rewind.
+    /// While the agent in front works, `Esc` drops a selection and arms the
+    /// cancel in the same press, for the reason [`Self::reserved_by_host`]
+    /// gives: a plugin that keeps setting a selection must not be able to
+    /// keep the user from stopping. Idle, it only drops the selection, so it
+    /// never arms the rewind.
     ///
     /// {mode} is the one the key was pressed in. A fallback must not type in
     /// insert mode a key a plugin matched in normal mode.
@@ -2166,8 +2182,8 @@ impl App {
                     self.set_active_chat(MAIN_CHAT);
                     vec![]
                 }
-                // A finished tab has no input box. Typing there used to do
-                // nothing at all, so the keys go to the main chat instead.
+                // A tab without an input box used to swallow typing, so the
+                // keys go to the main chat instead.
                 // Without an input box the mode always reads normal, so the
                 // real one is read again once the main chat has focus.
                 KeyCode::Char(_)
@@ -2212,10 +2228,10 @@ impl App {
             return vec![];
         }
 
-        let streaming = self.status == Status::Streaming;
-        if streaming && key.code == KeyCode::Esc {
+        let working = self.active_chat_working();
+        if working && key.code == KeyCode::Esc {
             self.input_box.buffer.deselect();
-            return self.handle_esc(streaming);
+            return self.handle_esc(working);
         }
         match self.input_box.handle_key(key, mode) {
             InputAction::Submit => self
@@ -2233,16 +2249,16 @@ impl App {
                     self.last_esc = None;
                 }
                 match key.code {
-                    KeyCode::Up if streaming => {
+                    KeyCode::Up if working => {
                         self.active_chat().scroll(1);
                         vec![]
                     }
-                    KeyCode::Down if streaming => {
+                    KeyCode::Down if working => {
                         self.active_chat().scroll(-1);
                         vec![]
                     }
                     KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                    KeyCode::Esc => self.handle_esc(streaming),
+                    KeyCode::Esc => self.handle_esc(working),
                     _ => vec![],
                 }
             }
@@ -2250,7 +2266,7 @@ impl App {
         }
     }
 
-    fn handle_esc(&mut self, streaming: bool) -> Vec<Action> {
+    fn handle_esc(&mut self, working: bool) -> Vec<Action> {
         let in_subagent = !self.is_main_chat();
         let armed = self
             .last_esc
@@ -2259,14 +2275,14 @@ impl App {
         if armed {
             return if in_subagent {
                 self.handle_subagent_cancel()
-            } else if streaming {
+            } else if working {
                 self.handle_cancel()
             } else {
                 self.open_rewind_picker()
             };
         }
         self.last_esc = Some(Instant::now());
-        let hint = if in_subagent || streaming {
+        let hint = if in_subagent || working {
             FLASH_CANCEL
         } else {
             FLASH_REWIND
@@ -2284,12 +2300,21 @@ impl App {
         vec![]
     }
 
-    /// Wider than [`Status::Streaming`]: a background task keeps the bar
-    /// spinning after the turn ends, but it never blocks input.
+    /// The turn, or background work that outlives it. Never a bar on input:
+    /// the bar spins and the session reads "working", but a prompt still
+    /// starts right away. Receipts count too, so a task whose tab closed
+    /// before its result woke the agent leaves no idle gap in between.
+    pub(crate) fn is_working(&self) -> bool {
+        self.status == Status::Streaming
+            || self.running_background_tasks().next().is_some()
+            || self
+                .live_mailbox()
+                .is_some_and(|mailbox| mailbox.outstanding() > 0)
+    }
+
     fn status_motion(&self) -> Motion<'_> {
         Motion {
-            working: self.status == Status::Streaming
-                || self.running_background_tasks().next().is_some(),
+            working: self.is_working(),
             restoring: self.restoring.load(Ordering::Relaxed),
             retry: self.retry_info.as_ref(),
         }
@@ -2474,11 +2499,6 @@ impl App {
             usage.subsidised_list_cost,
         );
         self.state.session_mut().add_model_usage(model, usage);
-        // A task's cost outlives it on disk, and nothing else writes the meta
-        // between a plugin task's turns.
-        if chat_idx != MAIN_CHAT {
-            self.sync_subagents();
-        }
     }
 
     /// Run-scoped delivery for the tab's own agent: restore snapshots fan out
@@ -2886,16 +2906,8 @@ impl App {
         chat.set_restore_channel(self.restore_event_tx.clone());
         chat.plugin = plugin.clone();
         chat.clock = Some(TaskClock::start());
-        chat.model_id = subagent.model.clone();
-        chat.opts = subagent.opts;
-        chat.inbox = subagent.inbox.clone();
-        chat.answer_tx = subagent.answer_tx.clone();
-        chat.parent = started_by(subagent);
-        if let Some(ref prompt) = subagent.prompt {
-            chat.push_user_message(prompt);
-        }
+        fill_missing_subagent_info(&mut chat, subagent);
         self.chats.push(chat);
-        self.sync_subagents();
         idx
     }
 
@@ -3545,7 +3557,7 @@ impl App {
     }
 
     /// Marks unfinished subagent chats as ended and drops them from
-    /// `chat_index`, then mirrors the tabs into the session meta.
+    /// `chat_index`.
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.chat_index.retain(|_, &mut sub_idx| {
             if self.chats[sub_idx].is_finished() {
@@ -3556,7 +3568,6 @@ impl App {
             }
         });
         self.forget_untasked_parts();
-        self.sync_subagents();
     }
 
     pub fn flush_all_chats(&mut self) {

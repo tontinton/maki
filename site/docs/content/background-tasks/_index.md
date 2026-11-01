@@ -122,7 +122,9 @@ Other moved calls cannot prompt. A tool they call after the move is denied unles
 | `Ctrl+D` | Delete a finished task from the list. |
 | `Esc` | Close the picker. |
 
-A moved bash or batch takes no messages, and its tab shows `esc esc stop`. A moved subagent still reads what you type in its tab. In a finished tab, `Esc` goes back to the main chat. So does typing or pasting, and the text goes to the main chat as if typed there.
+A moved subagent reads what you type in its tab. A moved bash or batch takes no messages, so its tab has no input box, like a finished tab: its borders stay dim while it runs, `Esc` goes back to the main chat, and `Ctrl+S` in `/tasks` stops it. Typing or pasting in such a tab goes to the main chat as if typed there.
+
+The session counts as working until the last task it waits on has reported: the status bar keeps its spinner and `/sessions` lists the session as working, even after the turn itself ended.
 
 ## Stop a task
 

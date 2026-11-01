@@ -8,7 +8,7 @@ local ListPicker = require("maki.list_picker")
 local RUNNING_SECTION = "Running"
 local FINISHED_SECTION = "Finished"
 local COST_FMT = "$%.3f"
-local TRAILER_SEP = " · "
+local COL_GAP = "  "
 
 local M = {}
 
@@ -116,26 +116,65 @@ function M.stopped_parent(task, tasks)
   return parent and alive(parent.status) and parent or nil
 end
 
--- The dim text at a row's right edge: how long the task has run (its total
--- once finished), what it cost, and the plugin that owns it. A row with less
--- than {room} columns to spare keeps only the owner. {humantime} formats
--- seconds, passed in so this file stays free of host calls.
-function M.trailer(task, now, room, humantime)
-  local owner = task.plugin and (task.plugin .. " ") or ""
-  local parts = {}
+local function dispw(s)
+  return utf8.len(s) or #s
+end
+
+-- How long the task has run (its total once finished), what it cost, and who
+-- runs it: the tool behind its call, or else the plugin that opened it.
+-- {humantime} formats seconds, passed in so this file stays free of host
+-- calls.
+local function cells(task, now, humantime)
   local until_at = alive(task.status) and now or task.ended_at
-  if task.started_at and until_at then
-    parts[#parts + 1] = humantime(math.max(until_at - task.started_at, 0))
+  local time = task.started_at and until_at and humantime(math.max(until_at - task.started_at, 0)) or ""
+  return {
+    time = time,
+    cost = task.cost and COST_FMT:format(task.cost) or "",
+    owner = task.tool or task.plugin or "",
+  }
+end
+
+-- The widest cell of each kind over {tasks}, so every trailer lays out in the
+-- same columns and the eye can run down each.
+function M.columns(tasks, now, humantime)
+  local widths = { time = 0, cost = 0, owner = 0 }
+  for _, task in ipairs(tasks) do
+    local cell = cells(task, now, humantime)
+    for kind, width in pairs(widths) do
+      widths[kind] = math.max(width, dispw(cell[kind]))
+    end
   end
-  if task.cost then
-    parts[#parts + 1] = COST_FMT:format(task.cost)
+  return widths
+end
+
+local function pad_left(s, width)
+  return string.rep(" ", width - dispw(s)) .. s
+end
+
+local function pad_right(s, width)
+  return s .. string.rep(" ", width - dispw(s))
+end
+
+-- Numbers right-aligned, the owner left-aligned, so a row missing a value
+-- leaves its column blank instead of shifting the rest.
+local COLUMNS = { { "time", pad_left }, { "cost", pad_left }, { "owner", pad_right } }
+
+-- The dim text at a row's right edge, in {columns} from M.columns(). A row
+-- with less than {room} columns to spare keeps only the owner.
+function M.trailer(task, now, room, humantime, columns)
+  local cell = cells(task, now, humantime)
+  local parts = {}
+  for _, column in ipairs(COLUMNS) do
+    local kind, pad = column[1], column[2]
+    if columns[kind] > 0 then
+      parts[#parts + 1] = pad(cell[kind], columns[kind])
+    end
   end
-  if #parts == 0 then
-    return owner
+  local full = #parts > 0 and table.concat(parts, COL_GAP) .. " " or ""
+  if dispw(full) < room then
+    return full
   end
-  parts[#parts + 1] = task.plugin
-  local full = table.concat(parts, TRAILER_SEP) .. " "
-  return (utf8.len(full) or #full) < room and full or owner
+  return columns.owner > 0 and pad_right(cell.owner, columns.owner) .. " " or ""
 end
 
 -- Whether a row's running time still ticks.

@@ -201,23 +201,46 @@ local function secs(n)
   return n .. "s"
 end
 
+local function trailer(task, room, tasks)
+  return Rows.trailer(task, NOW, room, secs, Rows.columns(tasks or { task }, NOW, secs))
+end
+
 case("a_running_task_shows_its_running_time_and_cost", function()
   local task = { id = "toolu_06", name = "lint", status = "working", started_at = NOW - 12, cost = 0.0421 }
-  eq(Rows.trailer(task, NOW, WIDE, secs), "12s · $0.042 ")
+  eq(trailer(task, WIDE), "12s  $0.042 ")
 end)
 
 case("a_finished_task_shows_its_total_time_not_a_growing_one", function()
   local task = { id = "toolu_07", name = "lint", status = "done", started_at = NOW - 30, ended_at = NOW - 10 }
-  eq(Rows.trailer(task, NOW, WIDE, secs), "20s ")
+  eq(trailer(task, WIDE), "20s ")
   task.ended_at = nil
-  eq(Rows.trailer(task, NOW, WIDE, secs), "", "no end time means no total to show")
+  eq(trailer(task, WIDE), "", "no end time means no total to show")
 end)
 
 case("the_owner_closes_the_trailer_and_survives_a_narrow_row", function()
   local task = { id = "session-02", name = "ci", status = "idle", plugin = "ci", started_at = NOW - 5 }
-  eq(Rows.trailer(task, NOW, WIDE, secs), "5s · ci ")
-  eq(Rows.trailer(task, NOW, 4, secs), "ci ", "no room for the stats")
-  eq(Rows.trailer(MAIN, NOW, WIDE, secs), "", "the main chat has no clock")
+  eq(trailer(task, WIDE), "5s  ci ")
+  eq(trailer(task, 4), "ci ", "no room for the stats")
+  eq(trailer(MAIN, WIDE), "", "the main chat has no clock")
+end)
+
+case("the_owner_is_the_tool_behind_the_call_before_the_plugin", function()
+  eq(trailer({ id = "toolu_08", name = "x", status = "done", tool = "task" }, WIDE), "task ")
+  eq(trailer({ id = "toolu_09", name = "x", status = "done", tool = "bash", plugin = "bash" }, WIDE), "bash ")
+  eq(trailer(MONITOR, WIDE), "ci ")
+end)
+
+-- A value a row lacks leaves its column blank, so the eye can run down each
+-- column whatever a row has to say.
+case("trailers_line_up_in_columns_over_every_task", function()
+  local moved =
+    { id = "toolu_10", name = "pull", status = "done", started_at = NOW - 3601, ended_at = NOW, tool = "bash" }
+  local loaded = { id = "toolu_11", name = "review", status = "done", cost = 12.5, tool = "task" }
+  local tasks = { MAIN, moved, loaded }
+  eq(trailer(moved, WIDE, tasks), "3601s           bash ")
+  eq(trailer(loaded, WIDE, tasks), "       $12.500  task ")
+  eq(trailer(MAIN, WIDE, tasks), "                     ", "the main chat keeps the columns blank")
+  eq(trailer(loaded, 8, tasks), "task ", "a narrow row keeps only the owner")
 end)
 
 case("only_a_live_task_with_a_start_keeps_the_clock_ticking", function()

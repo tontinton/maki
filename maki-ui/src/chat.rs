@@ -599,6 +599,11 @@ impl Chat {
         self.finish.is_some()
     }
 
+    /// A moved call's task has no inbox, a finished one nothing to read it.
+    pub(crate) fn takes_messages(&self) -> bool {
+        self.inbox.is_some() && !self.is_finished()
+    }
+
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
         self.messages_panel.update_tool_summary(tool_id, summary);
     }
@@ -630,6 +635,10 @@ impl Chat {
         self.messages_panel.live_buf(tool_id)
     }
 
+    pub(crate) fn tool_name(&self, tool_id: &str) -> Option<Arc<str>> {
+        self.messages_panel.tool_name(tool_id)
+    }
+
     pub(crate) fn register_live_buf(&mut self, tool_id: String, buf: Arc<SharedBuf>) {
         self.messages_panel.register_live_buf(tool_id, buf);
     }
@@ -657,6 +666,11 @@ impl Chat {
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.running_calls.clear();
         self.messages_panel.load_messages(msgs);
+    }
+
+    /// Whether the transcript already shows what the subagent was asked.
+    pub(crate) fn has_user_message(&self) -> bool {
+        self.messages_panel.has_user_message()
     }
 
     pub fn push_user_message(&mut self, text: impl Into<String>) {

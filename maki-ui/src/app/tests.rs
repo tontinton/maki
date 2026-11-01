@@ -1,6 +1,6 @@
 use super::mouse::FLASH_COPIED;
 use super::session::{FORK_EMPTY_MSG, FORK_TITLE_PREFIX};
-use super::view::FINISHED_TAB_HINT;
+use super::view::NO_INPUT_TAB_HINT;
 use super::*;
 use crate::AppSession;
 use crate::agent::shared_queue;
@@ -78,6 +78,8 @@ const TASK_ID: &str = "task1";
 pub(crate) const STARTED_AT_KEY: &str = "started_at";
 const ENDED_AT_KEY: &str = "ended_at";
 const COST_KEY: &str = "cost";
+const TOOL_KEY: &str = "tool";
+const TASK_TOOL: &str = "task";
 const PACKUPDATE: &str = "/packupdate";
 const PACK_NAME: &str = "demo";
 const PACKDEL_USAGE: &str = "/packdel: name a package, or pass ++all";
@@ -346,6 +348,14 @@ pub(crate) fn end_turn(app: &mut App) {
     app.update(done_event());
 }
 
+/// A reload shows what the last checkpoint saw, as every real one follows a
+/// checkpoint: quitting, `/new`, picking another session.
+pub(crate) fn reload(app: &mut App) {
+    app.checkpoint();
+    app.reset_ui_chrome();
+    app.restore_display();
+}
+
 pub(crate) fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
     subagent_info_with_tx(parent_id, name, None)
 }
@@ -362,7 +372,7 @@ fn subagent_info_with_tx(
         model: None,
         opts: None,
         answer_tx,
-        inbox: None,
+        inbox: Arc::default(),
         parent_call: None,
     }
 }
@@ -2565,8 +2575,7 @@ fn plugin_task_restores_with_its_owner_and_cost() {
     plugin_event(&mut app, monitor_history(vec![]));
     plugin_event(&mut app, AgentEvent::StreamClosed);
 
-    app.reset_ui_chrome();
-    app.restore_display();
+    reload(&mut app);
 
     let chat = &app.chats[1];
     assert_eq!(chat.plugin.as_deref(), Some(MONITOR_PLUGIN));
@@ -2576,7 +2585,7 @@ fn plugin_task_restores_with_its_owner_and_cost() {
 }
 
 /// The picker's clock and price tag. The main chat reports none of them, and
-/// a reload, which never learns the times, keeps only the cost.
+/// a reload keeps all of them, the clock as the checkpoint last saw it.
 #[test]
 fn tasks_report_running_time_and_cost() {
     let mut app = app_with_plugin_task();
@@ -2593,18 +2602,45 @@ fn tasks_report_running_time_and_cost() {
     plugin_event(&mut app, AgentEvent::StreamClosed);
     let tasks = serde_json::to_value(app.tasks()).unwrap();
     let started = tasks[1][STARTED_AT_KEY].as_u64().unwrap();
-    assert!(
-        tasks[1][ENDED_AT_KEY]
-            .as_u64()
-            .is_some_and(|ended| ended >= started)
-    );
+    let ended = tasks[1][ENDED_AT_KEY].as_u64().unwrap();
+    assert!(ended >= started);
 
-    app.reset_ui_chrome();
-    app.restore_display();
+    reload(&mut app);
     let tasks = serde_json::to_value(app.tasks()).unwrap();
-    assert_eq!(tasks[1].get(STARTED_AT_KEY), None);
-    assert_eq!(tasks[1].get(ENDED_AT_KEY), None);
+    assert_eq!(tasks[1][STARTED_AT_KEY].as_u64(), Some(started));
+    assert_eq!(tasks[1][ENDED_AT_KEY].as_u64(), Some(ended));
     assert_eq!(tasks[1][COST_KEY].as_f64(), MONITOR_TURN.cost);
+}
+
+/// A reload of a task the file left running, killed mid-run, has a start
+/// and no end: the duration would otherwise count to the reload.
+#[test]
+fn a_restored_task_killed_mid_run_shows_no_end_time() {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, monitor_turn());
+    plugin_event(&mut app, monitor_history(vec![]));
+
+    reload(&mut app);
+
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert!(tasks[1][STARTED_AT_KEY].is_u64());
+    assert_eq!(tasks[1].get(ENDED_AT_KEY), None);
+}
+
+/// Every row says who runs it the same way: a subagent names `task` whether
+/// it moved or not, a moved command its tool, and the main chat nothing.
+#[test]
+fn tasks_name_the_tool_behind_their_call() {
+    let (mut app, _buf) = app_with_moved_call();
+    app.update(agent_msg(tool_start(TASK_ID, TASK_TOOL)));
+    start_subagent(&mut app, TASK_ID, RESEARCH_NAME);
+
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    let tool = |i: usize| tasks[i][TOOL_KEY].as_str();
+
+    assert_eq!(tool(0), None);
+    assert_eq!(tool(1), Some(SLOW_TOOL));
+    assert_eq!(tool(2), Some(TASK_TOOL));
 }
 
 /// A rewind rebuilds the main chat, not the monitor a plugin runs beside it.
@@ -2629,6 +2665,7 @@ fn rewind_leaves_a_live_plugin_task_alone() {
             .subagent_messages()
             .contains_key(MONITOR_ID)
     );
+    app.checkpoint();
     assert_eq!(app.state.session.subagents()[0].cost, MONITOR_TURN.cost);
     plugin_event(&mut app, next_prompt());
     assert_eq!(app.chats.len(), 2);
@@ -10145,17 +10182,8 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
 /// A subagent whose session handed the UI its inbox, the way `sess:prompt`
 /// does through `SubagentInfo`, with that chat in front.
 fn app_with_subagent_inbox() -> (App, Arc<SubagentInbox>) {
-    let inbox = Arc::new(SubagentInbox::default());
-    let mut app = streaming_app();
-    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
-    info.inbox = Some(Arc::clone(&inbox));
-    app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TextDelta { text: "x".into() },
-        subagent: Some(info),
-        run_id: 1,
-    })));
-    app.run_builtin(BuiltinAction::NextChat);
-    assert_eq!(app.active_chat, 1);
+    let app = app_with_active_subagent();
+    let inbox = Arc::clone(app.chats[1].inbox.as_ref().expect("a subagent's inbox"));
     (app, inbox)
 }
 
@@ -10235,15 +10263,6 @@ fn inbox_consumed_draws_in_subagent_chat() {
     assert_eq!(app.chats[1].last_message_text(), "q");
     assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::User));
     assert_eq!(app.chats[0].message_count(), main_messages);
-}
-
-#[test]
-fn submit_in_subagent_chat_without_inbox_flashes() {
-    let mut app = app_with_active_subagent();
-    let actions = type_and_submit(&mut app, "q");
-    assert!(actions.is_empty());
-    assert_eq!(app.status_bar.flash_text().unwrap(), queue::NO_INBOX_ERR);
-    assert!(app.queue.is_empty());
 }
 
 #[test]
@@ -11116,6 +11135,7 @@ fn turn_end_keeps_every_subagent_tab_in_the_meta() {
         ));
     }
     finish_subagent(&mut app, FINISHED_TASK_ID, false);
+    app.checkpoint();
     assert_eq!(app.state.session.subagents().len(), 2);
 
     app.update(done_event());
@@ -11437,21 +11457,36 @@ fn the_main_input_tells_what_the_agent_waits_on(status: Status, waiting: Option<
     assert_eq!(shown, waiting);
 }
 
-/// The tab has no inbox, so Esc is what its input does: twice, it stops the
-/// task by its id.
+/// The tab has no inbox, so it has no input box either, the way a finished
+/// tab has none: Esc goes back, and `/tasks` is where the stop is. Its
+/// borders dim while it runs, since the chat in front is busy.
 #[test]
-fn a_moved_calls_tab_offers_esc_and_stops_on_it() {
+fn a_moved_calls_tab_is_a_transcript_while_it_runs() {
     let (mut app, _buf) = app_with_moved_call();
+    app.status = Status::Idle;
     app.focus_task(MOVED_ID).unwrap();
-    assert!(matches!(app.input_placeholder(), Placeholder::TaskStop));
+    assert!(!app.chat_accepts_input());
+    assert!(app.active_chat_working());
+    assert!(rendered(&mut app).contains(NO_INPUT_TAB_HINT.trim()));
 
-    app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
-    assert!(matches!(
-        actions.as_slice(),
-        [Action::CancelPluginTask { id, .. }] if id == MOVED_ID
-    ));
+    assert!(actions.is_empty());
+    assert_eq!(app.active_chat, MAIN_CHAT);
+}
+
+/// The borders follow the chat in front: dim while its agent works, whatever
+/// the main chat is doing.
+#[test_case(Status::Idle,      true  => true  ; "a_working_subagent_dims_under_an_idle_main")]
+#[test_case(Status::Streaming, false => false ; "a_finished_subagent_does_not_under_a_streaming_main")]
+fn the_chat_in_front_decides_whether_the_borders_dim(status: Status, running: bool) -> bool {
+    let mut app = app_with_subagent();
+    if !running {
+        finish_subagent(&mut app, TASK_ID, false);
+    }
+    app.status = status;
+    app.focus_task(TASK_ID).unwrap();
+    app.active_chat_working()
 }
 
 #[test]
@@ -11578,6 +11613,8 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
         fast: false,
         plugin: Some(Arc::from(SLOW_TOOL)),
         cost: None,
+        started_at: None,
+        ended_at: None,
     }]);
     session.set_subagent_messages(RECEIPT_TURN_ID.into(), vec![]);
 
@@ -11712,7 +11749,7 @@ fn esc_in_a_finished_tab_goes_back_to_the_main_chat() {
     let mut app = app_with_subagent();
     finish_subagent(&mut app, TASK_ID, false);
     app.focus_task(TASK_ID).unwrap();
-    assert!(rendered(&mut app).contains(FINISHED_TAB_HINT.trim()));
+    assert!(rendered(&mut app).contains(NO_INPUT_TAB_HINT.trim()));
 
     app.update(Msg::Key(key(KeyCode::Esc)));
 
@@ -11976,6 +12013,7 @@ fn a_nested_calls_result_in_an_adopted_session_finishes_its_row() {
 }
 
 const MOVED_MODEL: &str = "anthropic/claude-haiku";
+const SUBAGENT_PROMPT: &str = "find the auth middleware";
 const MOVED_OPTS: RequestOptions = RequestOptions {
     thinking: ThinkingConfig::Effort(Effort::High),
     fast: true,
@@ -11998,7 +12036,9 @@ fn opened_at_the_move(app: &mut App, info: SubagentInfo) {
 
 /// A `task` call that moved before its subagent spoke got a tab copied from
 /// its row. Whatever names the session first, its first event or the host
-/// opening it, completes the tab: it takes messages and answers prompts.
+/// opening it, completes the tab: it takes messages and answers prompts,
+/// and shows the prompt the subagent was given, once, the way a tab the
+/// subagent opened itself does.
 #[test_case(speak_after_the_move ; "first_event")]
 #[test_case(opened_at_the_move   ; "opened_by_the_host")]
 fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
@@ -12012,9 +12052,11 @@ fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
     let mut info = subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx));
     info.model = Some(MOVED_MODEL.into());
     info.opts = Some(MOVED_OPTS);
-    info.inbox = Some(Arc::clone(&inbox));
+    info.inbox = Arc::clone(&inbox);
+    info.prompt = Some(SUBAGENT_PROMPT.into());
 
-    name_session(&mut app, info);
+    name_session(&mut app, info.clone());
+    speak_after_the_move(&mut app, info);
 
     assert_eq!(app.chats.len(), 2);
     let tab = &app.chats[1];
@@ -12027,6 +12069,16 @@ fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
     assert_eq!(tab.model_id.as_deref(), Some(MOVED_MODEL));
     assert_eq!(tab.opts, Some(MOVED_OPTS));
     assert_eq!(tab.task_status(), TaskStatus::Working);
+    let prompts = (0..tab.message_count())
+        .filter_map(|i| tab.message_at(i))
+        .filter(|m| m.role == DisplayRole::User)
+        .count();
+    assert_eq!(prompts, 1, "shown once");
+    assert_eq!(
+        tab.message_at(1).map(|m| m.text.as_str()),
+        Some(SUBAGENT_PROMPT),
+        "right after the call's row"
+    );
 }
 
 /// A call of the running turn that streams into the buf it hands back.
@@ -12097,6 +12149,30 @@ fn a_receipt_landing_after_esc_still_opens_its_task(start: fn(&mut App) -> Optio
         moved_badge_outcome(&app),
         Some(Some(BackgroundOutcome::Done))
     );
+}
+
+/// Esc's ending took the tab's inbox, and the receipt reopened the tab. The
+/// subagent's next word brings the inbox back without showing the prompt a
+/// second time: the transcript already opens with it.
+#[test]
+fn a_reopened_tab_does_not_show_its_prompt_again() {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
+    let mut info = subagent_info(MOVED_ID, RESEARCH_NAME);
+    info.prompt = Some(SUBAGENT_PROMPT.into());
+    speak_after_the_move(&mut app, info.clone());
+    cancel_app(&mut app);
+    app.update(agent_msg(moved_done(MOVED_ID)));
+
+    speak_after_the_move(&mut app, info);
+
+    let tab = &app.chats[app.chat_of_task(MOVED_ID).unwrap()];
+    assert!(tab.inbox.is_some());
+    let prompts = (0..tab.message_count())
+        .filter_map(|i| tab.message_at(i))
+        .filter(|m| m.role == DisplayRole::User)
+        .count();
+    assert_eq!(prompts, 1);
 }
 
 /// The result can come between Esc and the receipt. It waits for the

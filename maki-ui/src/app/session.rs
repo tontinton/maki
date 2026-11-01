@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use crate::app::tasks::{BackgroundMoves, TaskOutcome, tab_ending};
+use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, tab_ending};
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::command::PROMPT_NEEDS;
 use crate::components::input::{COMMAND_PREFIX, sent_text};
@@ -166,6 +166,7 @@ impl App {
     }
 
     pub(super) fn checkpoint_with(&mut self, soft_delay: Duration) {
+        self.sync_subagents();
         let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
         let meta = self.build_meta();
         AppSession::checkpoint(
@@ -246,8 +247,10 @@ impl App {
 
     /// Mirrors every subagent tab into the session meta. Walks `chats`, not
     /// `chat_index`: that one is a per-turn routing cache, and a finished
-    /// task dropped from it must still come back on reload.
-    pub(super) fn sync_subagents(&mut self) {
+    /// task dropped from it must still come back on reload. Called only
+    /// where the meta is read, every checkpoint and a rewind, so no
+    /// transition has to remember it.
+    fn sync_subagents(&mut self) {
         let subagents = self
             .chats
             .iter()
@@ -262,6 +265,8 @@ impl App {
                     fast: chat.opts.is_some_and(|o| o.fast),
                     plugin: chat.plugin.clone(),
                     cost: chat.cost,
+                    started_at: chat.clock.as_ref().and_then(TaskClock::started_at),
+                    ended_at: chat.clock.as_ref().and_then(TaskClock::ended_at),
                 })
             })
             .collect();
@@ -353,7 +358,7 @@ impl App {
             // when it ends, so one without an entry here never got to finish:
             // leftovers from a kill mid-turn. It has nothing to show, and
             // restoring it would park a task no agent backs at the top of the
-            // picker, running forever. `sync_subagents` below drops it for good.
+            // picker, running forever. The next checkpoint drops it for good.
             let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) else {
                 continue;
             };
@@ -389,11 +394,12 @@ impl App {
             // The session file keeps the transcript but never how it ended,
             // so a reload admits that instead of guessing.
             chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+            // After mark_finished, which would stop a still-running clock at
+            // the reload instead of the task's end.
+            chat.clock = TaskClock::from_unix(sa.started_at, sa.ended_at);
             chat.request_restores(items);
             self.chats.push(chat);
         }
-
-        self.sync_subagents();
 
         let eh = &self.lua_event_handle;
         if eh.is_disconnected() {
@@ -702,6 +708,8 @@ impl App {
         let badges = self.chats[MAIN_CHAT].background_badges();
         let deleted = mem::take(&mut self.deleted_tasks);
 
+        // The prune and the rebuild below read the meta.
+        self.sync_subagents();
         let measured = self.state.context_size;
         let session = self.state.session_mut();
         let context_size = truncate_to_turn(session, entry.turn_index, measured);
