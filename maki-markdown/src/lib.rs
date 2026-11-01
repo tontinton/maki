@@ -119,6 +119,7 @@ pub enum Block {
     Code {
         lang: String,
         code: String,
+        closed: bool,
     },
     Table {
         rows: Vec<Vec<String>>,
@@ -137,6 +138,7 @@ pub fn parse(text: &str) -> Vec<Block> {
         blocks.push(Block::Code {
             lang: fence.lang.to_owned(),
             code: fence.code.to_owned(),
+            closed: fence.closed,
         });
     }
     let rest = &text[fences.pos..];
@@ -432,6 +434,7 @@ struct CodeFence<'a> {
     lang: &'a str,
     code: &'a str,
     block_end: usize,
+    closed: bool,
 }
 
 fn find_code_fence(text: &str) -> Option<CodeFence<'_>> {
@@ -498,6 +501,7 @@ fn find_code_fence(text: &str) -> Option<CodeFence<'_>> {
             lang,
             code,
             block_end,
+            closed: close.is_some(),
         });
     }
     None
@@ -955,11 +959,12 @@ mod tests {
     fn parse_fenced_code_block_emits_code_block() {
         let blocks = parse("```rust\nfn x() {}\nlet y;\n```");
         assert_eq!(blocks.len(), 1);
-        let Block::Code { lang, code } = &blocks[0] else {
+        let Block::Code { lang, code, closed } = &blocks[0] else {
             panic!("expected Code")
         };
         assert_eq!(lang, "rust");
         assert_eq!(code, "fn x() {}\nlet y;");
+        assert!(*closed);
     }
 
     #[test]
@@ -1136,11 +1141,12 @@ mod tests {
     #[test]
     fn four_backtick_fence_wraps_inner_three_backtick_block() {
         let blocks = parse(FOUR_BACKTICK_FENCE);
-        let Block::Code { lang, code } = &blocks[0] else {
+        let Block::Code { lang, code, closed } = &blocks[0] else {
             panic!("expected Code")
         };
         assert_eq!(lang, "");
         assert_eq!(code, "```\ninner\n```");
+        assert!(*closed);
     }
 
     const FENCED: &str = "intro\n```rust\nlet a = 1;\n```\nafter";
@@ -1160,10 +1166,24 @@ mod tests {
     #[test]
     fn unclosed_code_fence_runs_to_eof() {
         let blocks = parse("```\nfoo\nbar");
-        let Block::Code { code, .. } = &blocks[0] else {
+        let Block::Code { code, closed, .. } = &blocks[0] else {
             panic!("expected Code")
         };
         assert_eq!(code, "foo\nbar");
+        assert!(!closed);
+    }
+
+    #[test_case("```mermaid\na --> b\n```", true; "closed_at_eof")]
+    #[test_case("```mermaid\na --> b\n```   \n", true; "closed_with_trailing_spaces")]
+    #[test_case("```mermaid\na --> b\n``", false; "partial_closing_fence")]
+    #[test_case("````mermaid\na --> b\n```", false; "shorter_closing_fence")]
+    #[test_case("```mermaid\na --> b\n  ```", false; "indented_closing_fence")]
+    fn parsed_code_records_fence_completion(input: &str, expected_closed: bool) {
+        let blocks = parse(input);
+        let Block::Code { closed, .. } = &blocks[0] else {
+            panic!("expected Code")
+        };
+        assert_eq!(*closed, expected_closed);
     }
 
     #[test]
@@ -1178,7 +1198,7 @@ mod tests {
     #[test]
     fn code_fence_language_is_optional() {
         let blocks = parse("```\ncode\n```");
-        let Block::Code { lang, code } = &blocks[0] else {
+        let Block::Code { lang, code, .. } = &blocks[0] else {
             panic!("expected Code")
         };
         assert_eq!(lang, "");

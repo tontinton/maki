@@ -232,6 +232,26 @@ pub fn text_to_lines(
     width: u16,
     max_line_bytes: Option<usize>,
 ) -> Vec<Line<'static>> {
+    text_to_lines_with_code_blocks(
+        text,
+        prefix,
+        text_style,
+        prefix_style,
+        width,
+        max_line_bytes,
+        |_, _, _| None,
+    )
+}
+
+pub(crate) fn text_to_lines_with_code_blocks(
+    text: &str,
+    prefix: &str,
+    text_style: Style,
+    prefix_style: Style,
+    width: u16,
+    max_line_bytes: Option<usize>,
+    callback: impl FnMut(&str, &str, u16) -> Option<Vec<String>>,
+) -> Vec<Line<'static>> {
     let truncated;
     let text = match max_line_bytes {
         Some(limit) => {
@@ -240,7 +260,7 @@ pub fn text_to_lines(
         }
         None => text,
     };
-    let semantic = render::Renderer::unwrapped().render(text, width);
+    let semantic = render::Renderer::unwrapped().render_with_code_blocks(text, width, callback);
     paint_semantic(&semantic, prefix, text_style, prefix_style)
 }
 

@@ -30,13 +30,16 @@ use maki_agent::{
     SnapshotLine, SnapshotSpan, SpanStyle, TaskHome, UiWaker, receipt_tag,
 };
 use mlua::chunk::{Chunk, ChunkMode, Compiler};
-use mlua::{Function, Lua, MaybeSend, MultiValue, RegistryKey, Table, Value as LuaValue, ffi};
+use mlua::{
+    Function, Lua, LuaString, MaybeSend, MultiValue, RegistryKey, Table, Value as LuaValue, ffi,
+};
 use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{LocalSet, spawn_local, yield_now};
 use tokio::time::{sleep, sleep_until, timeout, timeout_at};
+use unicode_width::UnicodeWidthStr;
 
 use maki_config::RawConfig;
 use maki_providers::plugin::DeclAuthority;
@@ -58,7 +61,8 @@ use crate::api::plan::{
 };
 use crate::api::slot::{
     ChainObserver, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, PLAN_FORM_ACTIONS_SLOT,
-    PLAN_FORM_SLOT, SlotLayer, SlotStore, layer_plugins, run_host_chain, run_host_chain_with,
+    PLAN_FORM_SLOT, SlotLayer, SlotStore, code_block_slot, layer_plugins, run_host_chain,
+    run_host_chain_with,
 };
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
@@ -174,6 +178,12 @@ const FINAL_DRAIN_BUDGET: usize = 256;
 /// from. Two budgets would add up to a host worst case no reader of either
 /// constant could predict.
 pub const PLAN_FORM_SLOT_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const CODE_BLOCK_DEADLINE: Duration = Duration::from_secs(2);
+const CODE_BLOCK_COST: LayerCost<'static> = LayerCost::Named(&[Permission::SessionRead]);
+pub const MAX_CODE_BLOCK_SOURCE_BYTES: usize = 32 * 1024;
+const MAX_CODE_BLOCK_LINES: usize = 256;
+const MAX_CODE_BLOCK_OUTPUT_BYTES: usize = 64 * 1024;
+const INVALID_CODE_BLOCK_ERR: &str = "code block renderer must return a dense, nonempty array of plain text lines within the display limits";
 /// What layering either `ui.plan_form*` chain costs. A layer decides what the
 /// menu says and what pressing Enter on a row does, up to a build-mode turn
 /// with every tool behind it, and it can keep a built-in row's wording while
@@ -511,6 +521,14 @@ pub enum Request {
         rows: Vec<PlanFormRow>,
         /// The menu to draw, or `None` when a layer took the form over.
         reply: flume::Sender<Option<PlanMenu>>,
+    },
+    RenderCodeBlock {
+        language: String,
+        code: String,
+        width: u16,
+        generation: u64,
+        cancel: CancelToken,
+        reply: flume::Sender<Option<Vec<String>>>,
     },
     ComputeHeader {
         plugin: Arc<str>,
@@ -4772,6 +4790,48 @@ fn plan_form_event(lua: &Lua, path: &str, session: &str) -> mlua::Result<MultiVa
     Ok(MultiValue::from_vec(vec![LuaValue::Table(ev)]))
 }
 
+fn code_block_lines(values: Option<MultiValue>, width: u16) -> mlua::Result<Option<Vec<String>>> {
+    let value = values.and_then(|values| values.into_iter().next());
+    let table = match value {
+        None | Some(LuaValue::Nil) => return Ok(None),
+        Some(LuaValue::Table(table)) => table,
+        _ => return Err(mlua::Error::runtime(INVALID_CODE_BLOCK_ERR)),
+    };
+    let len = table.raw_len();
+    if !(1..=MAX_CODE_BLOCK_LINES).contains(&len) {
+        return Err(mlua::Error::runtime(INVALID_CODE_BLOCK_ERR));
+    }
+    let mut count = 0;
+    let mut bytes = 0;
+    for pair in table.pairs::<LuaValue, LuaValue>() {
+        let (key, value) = pair?;
+        count += 1;
+        let valid_key =
+            matches!(key, LuaValue::Integer(index) if index > 0 && index as usize <= len);
+        let LuaValue::String(line) = value else {
+            return Err(mlua::Error::runtime(INVALID_CODE_BLOCK_ERR));
+        };
+        let line = line.to_str()?;
+        bytes += line.len();
+        if !valid_key
+            || count > len
+            || bytes > MAX_CODE_BLOCK_OUTPUT_BYTES
+            || line.chars().any(char::is_control)
+            || UnicodeWidthStr::width(line.as_ref()) > usize::from(width)
+        {
+            return Err(mlua::Error::runtime(INVALID_CODE_BLOCK_ERR));
+        }
+    }
+    if count != len {
+        return Err(mlua::Error::runtime(INVALID_CODE_BLOCK_ERR));
+    }
+    // Validate the entire table before copying any plugin-controlled text.
+    (1..=len)
+        .map(|index| Ok(table.raw_get::<LuaString>(index)?.to_str()?.to_owned()))
+        .collect::<mlua::Result<Vec<_>>>()
+        .map(Some)
+}
+
 /// A `ui.plan_form*` chain that ended without an answer, logged with the
 /// plugins layering it, since a chain that never came back cannot say which
 /// of them parked.
@@ -5440,7 +5500,7 @@ pub fn spawn(
                 hint_writer,
                 jit,
                 plugin_rules,
-                layered_thread,
+                Arc::clone(&layered_thread),
             ) {
                 Ok(r) => {
                     r.lua.set_app_data(key_lint_thread);
@@ -5779,6 +5839,65 @@ pub fn spawn(
                                     // ever draw go with it.
                                     clear_menu_generation(&lua, &session, generation);
                                 }
+                            });
+                        }
+                        Request::RenderCodeBlock {
+                            language,
+                            code,
+                            width,
+                            generation,
+                            cancel,
+                            reply,
+                        } => {
+                            let lua = rt.lua.clone();
+                            let plugins = Rc::clone(&rt.plugins);
+                            let gate = Rc::clone(&gate);
+                            let layered = Arc::clone(&layered_thread);
+                            spawn_local(async move {
+                                let slot = code_block_slot(&language);
+                                if cancel.is_cancelled()
+                                    || generation != layered.revision()
+                                    || width == 0
+                                    || code.len() > MAX_CODE_BLOCK_SOURCE_BYTES
+                                    || !layered.layers_surface(&slot)
+                                {
+                                    let _ = reply.send(None);
+                                    return;
+                                }
+                                let deadline = Instant::now() + CODE_BLOCK_DEADLINE;
+                                let run = async {
+                                    let event = lua.create_table()?;
+                                    event.set("language", language)?;
+                                    event.set("code", code)?;
+                                    event.set("width", width)?;
+                                    let default = lua.create_function(|_, _: MultiValue| Ok(LuaValue::Nil))?;
+                                    let allow_layer = layer_delegation(&lua, &plugins, CODE_BLOCK_COST);
+                                    run_host_chain_with(
+                                        &lua,
+                                        &[&slot],
+                                        default,
+                                        MultiValue::from_vec(vec![LuaValue::Table(event)]),
+                                        &allow_layer,
+                                        None,
+                                    )
+                                    .await
+                                    .and_then(|values| code_block_lines(values, width))
+                                };
+                                let result =
+                                    run_awaited(&lua, &gate, cancel.clone(), deadline, run).await;
+                                let lines = match result {
+                                    Ok(Ok(lines)) if generation == layered.revision() => lines,
+                                    Ok(Ok(_)) => None,
+                                    Ok(Err(error)) => {
+                                        tracing::warn!(slot = %slot, plugins = %layer_plugins(&lua, &slot), error = %strip_traceback(&error), "code block renderer failed");
+                                        None
+                                    }
+                                    Err(reason) => {
+                                        tracing::debug!(slot = %slot, plugins = %layer_plugins(&lua, &slot), reason, "code block rendering abandoned");
+                                        None
+                                    }
+                                };
+                                let _ = reply.send(lines);
                             });
                         }
                         Request::RunCommand {
