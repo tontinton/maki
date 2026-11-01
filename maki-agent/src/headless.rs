@@ -20,7 +20,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
 use crate::agent::{self, RunContext, RunContextBuilder};
-use crate::cancel::{CancelMap, CancelToken};
+use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
 use crate::session::{Resumed, SessionTrack};
@@ -556,14 +556,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
         while let Some(next) = inputs.next().await {
             let (trigger, cancel) = params.stop.child();
-            let cancel_task = tokio::spawn({
-                let cancel_rx = cancel_rx.clone();
-                async move {
-                    if cancel_rx.recv_async().await.is_ok() {
-                        trigger.cancel();
-                    }
-                }
-            });
+            let cancel_task = relay_cancel(&cancel_rx, trigger);
 
             // MCP connects in the background, so a prompt that beats it waits
             // here instead of shipping a turn without the MCP tools. The wait
@@ -680,6 +673,21 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     )
 }
 
+/// Fires the turn's token on the host's next cancel. Whatever is in the
+/// channel when a turn starts was sent while none ran, so it is dropped as
+/// meant for the turn before. Prompt and cancel ride separate channels, so a
+/// cancel sent right after a prompt, before the loop picked that prompt up,
+/// is dropped with it.
+fn relay_cancel(cancel_rx: &Receiver<()>, trigger: CancelTrigger) -> AbortOnDropHandle<()> {
+    while cancel_rx.try_recv().is_ok() {}
+    let cancel_rx = cancel_rx.clone();
+    AbortOnDropHandle::new(tokio::spawn(async move {
+        if cancel_rx.recv_async().await.is_ok() {
+            trigger.cancel();
+        }
+    }))
+}
+
 /// Waits for a session task, then tears its MCP down. The task itself is
 /// never bounded: one with work left would drop prompts stdin already queued.
 pub async fn await_shutdown(task: SessionTask) -> Option<SessionTrack> {
@@ -765,6 +773,11 @@ mod tests {
     const RUNS_IN_CURRENT_MODE: &str = "a woken turn must run in the mode the host switched to";
     const STOP_ENDS_SESSION: &str = "a stop must end the session without another turn";
     const FAILED_RUN_ENDS_SESSION: &str = "a failed run must not be woken once the input ended";
+    const STALE_CANCEL_IGNORED: &str = "a cancel sent before the turn started must not end it";
+    const LIVE_CANCEL_ENDS_TURN: &str = "a cancel sent during the turn must end it";
+    const DROPPED_RELAY_FREES_CHANNEL: &str =
+        "a dropped relay must not take the next turn's cancel";
+    const RELAY_WAIT: Duration = Duration::from_secs(5);
 
     /// A host-written prompt never had maki's facts in it. If the frame
     /// claimed it did, a later edit would be announced to a model that never
@@ -917,6 +930,37 @@ mod tests {
         ack.send(()).unwrap();
         assert!(shutdown.await.is_some(), "{TRACK_RETURNED}");
         assert!(retained.send(AgentEvent::Nudge).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_sent_between_turns_does_not_end_the_next_one() {
+        let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
+        cancel_tx.try_send(()).unwrap();
+        let (trigger, cancel) = CancelToken::none().child();
+        let relay = relay_cancel(&cancel_rx, trigger);
+        assert!(cancel_rx.is_empty(), "{STALE_CANCEL_IGNORED}");
+        assert!(!cancel.is_cancelled(), "{STALE_CANCEL_IGNORED}");
+
+        cancel_tx.send_async(()).await.unwrap();
+        relay.await.unwrap();
+        assert!(cancel.is_cancelled(), "{LIVE_CANCEL_ENDS_TURN}");
+    }
+
+    /// A turn skipped by a failed model switch drops its relay unawaited.
+    #[tokio::test]
+    async fn a_dropped_relay_does_not_take_the_next_turns_cancel() {
+        let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
+        let (stale_trigger, _stale) = CancelToken::none().child();
+        drop(relay_cancel(&cancel_rx, stale_trigger));
+        let (trigger, cancel) = CancelToken::none().child();
+        let relay = relay_cancel(&cancel_rx, trigger);
+
+        cancel_tx.send_async(()).await.unwrap();
+        assert!(
+            timeout(RELAY_WAIT, relay).await.is_ok(),
+            "{DROPPED_RELAY_FREES_CHANNEL}"
+        );
+        assert!(cancel.is_cancelled(), "{LIVE_CANCEL_ENDS_TURN}");
     }
 
     fn prompt_input() -> AgentInput {
