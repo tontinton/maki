@@ -19,6 +19,7 @@ use maki_providers::{shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
+use tokio::sync::watch;
 use tokio::time::sleep;
 
 use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
@@ -288,6 +289,11 @@ pub(crate) struct JobStore {
     /// Id served by the last [`JobStore::next_matching`], so the next scan
     /// starts past it.
     scan_cursor: u32,
+    /// Bumped by anything a pump could act on, so pumps park instead of
+    /// polling. A `watch`, because each pump keeps its own place in it: a bump
+    /// landing while a pump is busy delivering still wakes it afterwards. The
+    /// store outlives every pump, each one holds the `Lua` that owns it.
+    changed: watch::Sender<()>,
 }
 
 struct CheckedOutReceiver {
@@ -302,7 +308,14 @@ impl JobStore {
             jobs: HashMap::new(),
             next_id: 1,
             scan_cursor: 0,
+            changed: watch::Sender::new(()),
         }
+    }
+
+    /// Subscribe before the first scan: a change after this point wakes the
+    /// next `changed()`, even if it landed before the scan finished.
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        self.changed.subscribe()
     }
 
     pub fn start(&mut self, spec: JobSpec) -> Result<u32, String> {
@@ -357,7 +370,7 @@ impl JobStore {
 
         // The owner exists before any thread does, so a failed spawn below
         // still closes the queue on a reader that is already waiting on it.
-        let (sender, events, queue) = job_queue();
+        let (sender, events, queue) = job_queue(self.changed.clone());
 
         macro_rules! spawn_reader {
             ($stream:expr, $name:expr, $variant:ident) => {
@@ -479,6 +492,7 @@ impl JobStore {
             && job.event_rx.is_none()
         {
             job.event_rx = Some(receiver);
+            self.changed.send_replace(());
         }
     }
 
@@ -637,6 +651,7 @@ impl JobStore {
         }
         if matches!(updates.on_exit, CallbackUpdate::Set(_)) {
             job.replay_exit = job.exit_code;
+            self.changed.send_replace(());
         }
         updates.on_stdout.apply(lua, &mut job.on_stdout);
         updates.on_stderr.apply(lua, &mut job.on_stderr);
@@ -727,6 +742,7 @@ impl JobStore {
             {
                 lua.remove_registry_value(key).ok();
             }
+            self.changed.send_replace(());
         }
     }
 
@@ -908,12 +924,13 @@ impl Drop for QueueOwner {
 }
 
 /// The sending, receiving and owning ends of one job's queue.
-fn job_queue() -> (JobEventSender, JobEvents, QueueOwner) {
+fn job_queue(changed: watch::Sender<()>) -> (JobEventSender, JobEvents, QueueOwner) {
     let (tx, rx) = flume::unbounded();
     let queue = Arc::new(JobQueue::default());
     let sender = JobEventSender {
         tx,
         queue: Arc::clone(&queue),
+        changed,
     };
     let events = JobEvents {
         rx,
@@ -926,6 +943,7 @@ fn job_queue() -> (JobEventSender, JobEvents, QueueOwner) {
 struct JobEventSender {
     tx: flume::Sender<JobEvent>,
     queue: Arc<JobQueue>,
+    changed: watch::Sender<()>,
 }
 
 impl JobEventSender {
@@ -944,7 +962,10 @@ impl JobEventSender {
         self.queue
             .bytes
             .fetch_add(queued_bytes(&event), Ordering::AcqRel);
-        self.tx.send(event).is_ok()
+        self.tx
+            .send(event)
+            .inspect(|()| self.changed.send_replace(()))
+            .is_ok()
     }
 }
 
@@ -1628,6 +1649,7 @@ mod tests {
     #[cfg(unix)]
     use crate::api::fs::LINE_CUT_MARKER;
     use crate::api::util::command::{NO_UI_ERR, WinView};
+    use futures::FutureExt;
 
     const TEST_PLUGIN: &str = "test-plugin";
     const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1959,7 +1981,7 @@ mod tests {
         const QUEUED_PER_JOB: usize = 2;
         let mut store = make_store();
         for id in [1, 2] {
-            let (sender, events, queue) = job_queue();
+            let (sender, events, queue) = job_queue(store.changed.clone());
             for _ in 0..QUEUED_PER_JOB {
                 sender.send(JobEvent::Stdout("spam".into()));
             }
@@ -2387,6 +2409,35 @@ mod tests {
             (false, false, false),
             "completing on the replay must release the callback it used"
         );
+    }
+
+    #[test]
+    fn every_change_a_pump_can_act_on_wakes_it() {
+        let lua = Lua::new();
+        let mut store = make_store();
+        let (sender, events, queue) = job_queue(store.changed.clone());
+        let mut job = stub_job(plugin_owner(), None, None);
+        job.event_rx = Some(events);
+        job._queue = queue;
+        job.exit_code = Some(0);
+        store.jobs.insert(1, job);
+        let mut changed = store.subscribe();
+        let mut woke = || changed.changed().now_or_never().is_some();
+        assert!(!woke(), "subscribing is not a change");
+
+        sender.send(JobEvent::Stdout("line".into()));
+        assert!(woke(), "a queued event");
+
+        let receiver = store.take_receiver(1, None, TEST_PLUGIN).unwrap();
+        assert!(!woke(), "checking the receiver out hides events");
+        store.restore_receiver(1, receiver);
+        assert!(woke(), "a returned receiver may hold events");
+
+        assert!(store.attach(&lua, 1, None, TEST_PLUGIN, exit_updates(&lua)));
+        assert!(woke(), "an exit replayed to a new on_exit");
+
+        store.finish(&lua, 1);
+        assert!(woke(), "a job leaving is what ends a dispatch");
     }
 
     #[test]
