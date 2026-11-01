@@ -399,9 +399,10 @@ fn honours_build_body(target: Target) -> bool {
 }
 
 /// The `openai` table is the chat codec's own vocabulary. The responses codec
-/// honours its `thinking` dialect (rendered as the `reasoning` block) and
-/// `thinking_overrides`, but not its body or header options, so those are
-/// refused there rather than half honoured. The other codecs read none of it.
+/// honours the whole of it in the shapes that endpoint spells (see
+/// [`OpenAiWire::apply_responses_body`]); what it refuses is a custom
+/// thinking `field`, since it writes the standard `reasoning` block. The
+/// other codecs read none of the table.
 fn honours_openai_wire(target: Target, wire: &OpenAiWire) -> bool {
     match target {
         Target::Codec(Protocol::Openai) => true,
@@ -3120,12 +3121,13 @@ mod tests {
 
     /// The chat-only body/header fields, on the responses codec, which
     /// honours only `thinking` and `thinking_overrides`.
-    fn openai_wire_chat_fields_on_responses(reg: &mut Registration) {
+    /// The responses pass writes the standard `reasoning` block, so a
+    /// declaration spelling effort somewhere else would be dropped there.
+    fn openai_wire_custom_effort_field_on_responses(reg: &mut Registration) {
         reg.decl.codec = Some(Protocol::OpenaiResponses);
         reg.decl.openai = Some(
             serde_json::from_value(serde_json::json!({
-                "thinking": { "dialect": "high-only" },
-                "session_id": { "header": "x-affinity" },
+                "thinking": { "dialect": "high-only", "field": "custom_effort" },
             }))
             .unwrap(),
         );
@@ -3172,7 +3174,7 @@ mod tests {
     #[test_case(outside_a_load, |e| matches!(e, RegisterError::Closed(_)) ; "registration_outside_a_load")]
     #[test_case(body_hook_on_anthropic, |e| matches!(e, RegisterError::Unsupported { .. }) ; "build_body_needs_an_openai_codec")]
     #[test_case(openai_wire_on_anthropic, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "openai_table_needs_the_openai_codec")]
-    #[test_case(openai_wire_chat_fields_on_responses, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "responses_codec_refuses_chat_only_fields")]
+    #[test_case(openai_wire_custom_effort_field_on_responses, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "responses_codec_refuses_a_custom_effort_field")]
     #[test_case(system_prefix_on_google, |e| matches!(e, RegisterError::Unsupported { .. }) ; "google_drops_the_system_prefix")]
     #[test_case(system_prefix_on_the_google_base, |e| matches!(e, RegisterError::Unsupported { .. }) ; "so_does_the_google_base")]
     #[test_case(base_url_on_a_base, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == BASE_URL_OPTION) ; "base_url_needs_a_codec")]

@@ -609,6 +609,7 @@ impl Provider for OpenAi {
                             self.compat.client(),
                             model,
                             &body,
+                            &[],
                             event_tx,
                             &codex_auth,
                             stream_timeout,

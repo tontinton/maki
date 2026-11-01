@@ -331,7 +331,11 @@ impl Replay {
     /// The recorded server goes in `<SLUG>_BASE_URL` because it is the only
     /// origin a test can set. The declared `base_url` is the real provider, and
     /// `auth.base_url` only comes from an auth hook.
-    fn open(slug: &str, script: &'static [Canned], opts: HashMap<String, JsonMap<String, JsonValue>>) -> Self {
+    fn open(
+        slug: &str,
+        script: &'static [Canned],
+        opts: HashMap<String, JsonMap<String, JsonValue>>,
+    ) -> Self {
         let home = isolated_state();
         let (base_url, requests) = serve(script);
         unsafe { env::set_var(base_url_env_var(slug), base_url) };

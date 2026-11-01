@@ -145,7 +145,39 @@ pub struct RequestCtx<'a> {
 }
 
 impl OpenAiWire {
-    /// Everything this declaration adds to a body the codec built. The static
+    /// [`Self::apply_body`] for the responses API: the same declaration, in
+    /// the shapes that endpoint spells. Effort renders only through a
+    /// declared dialect, since a model's own `thinking_fields` name
+    /// chat-completions paths, and it lands as `reasoning.effort` (see
+    /// [`responses::apply_responses_reasoning`]).
+    pub(crate) fn apply_responses_body(&self, body: &mut Value, ctx: &RequestCtx) {
+        let Self {
+            max_tokens_field: _,
+            include_stream_usage: _,
+            thinking,
+            headers: _,
+            extra_body,
+            session_id,
+            thinking_overrides: _,
+        } = self;
+        if let (Some(extra), Some(object)) = (extra_body, body.as_object_mut()) {
+            merge_body(object, extra);
+        }
+        if let Some(thinking) = thinking
+            && (!thinking.requires_support || ctx.model.supports_thinking())
+        {
+            let dialect = thinking.dialect_for(ctx.discovered.as_ref());
+            responses::apply_responses_reasoning(body, ctx.opts.thinking, ctx.model, &dialect);
+        }
+        if let Some(carrier) = session_id
+            && let Some(field) = &carrier.body_field
+            && let Some(session) = ctx.session
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert(field.clone(), json!(session.as_str()));
+        }
+    }
+
     /// fragment goes in first, so a thinking pass that writes the same key
     /// has the last word, and the session id last of all.
     pub(crate) fn apply_body(&self, body: &mut Value, ctx: &RequestCtx) {
@@ -210,20 +242,13 @@ impl OpenAiWire {
     }
 
     /// Whether every field set here is one the responses codec honours. The
-    /// body and header options shape the chat wire only; `thinking` renders
-    /// the responses `reasoning` block, and `thinking_overrides` shapes the
-    /// picker on both. A custom thinking `field` is refused too, since the
-    /// responses pass writes the standard `reasoning` block and would drop it.
+    /// responses pass renders the dialect, carries the session and sends the
+    /// static headers and `extra_body`; what it cannot spell is a custom
+    /// thinking `field`, since it writes the standard `reasoning` block.
     pub(crate) fn responses_compatible(&self) -> bool {
-        self.max_tokens_field.is_none()
-            && self.include_stream_usage.is_none()
-            && self.headers.is_empty()
-            && self.extra_body.is_none()
-            && self.session_id.is_none()
-            && self
-                .thinking
-                .as_ref()
-                .is_none_or(|t| t.field == EffortField::default())
+        self.thinking
+            .as_ref()
+            .is_none_or(|t| t.field == EffortField::default())
     }
 
     /// Applied after everything else that shapes the model, so the provider's
@@ -619,24 +644,16 @@ impl Provider for CompatProvider {
                     auth.base_url = Some(resolved);
                 }
                 let mut body = responses::build_body(model, messages, system, tools);
-                // A declared dialect renders `reasoning.effort` here, narrowed
-                // by what discovery listed for the model, exactly as the chat
-                // path's thinking pass does. Without one, nothing is sent:
-                // the responses wire's own field, not a fallback the codec
-                // invents.
-                if let Some(thinking) = &self.openai.thinking
-                    && (!thinking.requires_support || model.supports_thinking())
-                {
-                    let dialect = thinking.dialect_for(ctx.discovered.as_ref());
-                    responses::apply_responses_reasoning(&mut body, opts.thinking, model, &dialect);
-                }
+                self.openai.apply_responses_body(&mut body, &ctx);
                 if let Some(hook) = &self.build_body {
                     body = hook.call(body, &ctx).await?;
                 }
+                let headers = self.openai.request_headers(session_id);
                 return responses::do_stream(
                     self.compat.client(),
                     model,
                     &body,
+                    &headers,
                     event_tx,
                     &auth,
                     self.compat.stream_timeout(),
@@ -901,6 +918,40 @@ mod tests {
         assert_eq!(
             wire.request_headers(Some(&session)),
             [(AFFINITY_HEADER, session.as_str())]
+        );
+    }
+
+    /// The responses codec spells the same declaration differently: effort
+    /// lands as `reasoning.effort`, and the session body field rides along
+    /// beside the extra body the declaration merges.
+    #[test]
+    fn the_responses_body_renders_effort_and_the_session_field() {
+        const CACHE_KEY_FIELD: &str = "prompt_cache_key";
+        let wire = wire(json!({
+            "thinking": { "dialect": "standard" },
+            "extra_body": { "cache_control": { "type": "ephemeral" } },
+            "session_id": { "body_field": CACHE_KEY_FIELD },
+        }))
+        .unwrap();
+        let model = curated_model();
+        let session = SessionRef::generate();
+        let ctx = RequestCtx {
+            session: Some(&session),
+            ..ctx(&model, ThinkingConfig::Effort(Effort::Low))
+        };
+        let mut body = json!({ "model": model.id, "store": false });
+
+        wire.apply_responses_body(&mut body, &ctx);
+
+        assert_eq!(
+            body,
+            json!({
+                "model": model.id,
+                "store": false,
+                "reasoning": { "effort": "low", "summary": "auto" },
+                "cache_control": { "type": "ephemeral" },
+                CACHE_KEY_FIELD: session.as_str(),
+            })
         );
     }
 

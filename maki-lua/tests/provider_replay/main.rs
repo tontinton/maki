@@ -73,7 +73,10 @@ fn load_bundled(slug: &str) -> PluginHost {
 
 /// `opts` is the `plugins.<name>` table from `maki.setup`, so a golden can
 /// load its plugin the way a user who set that option would.
-fn load_bundled_with_opts(slug: &str, opts: HashMap<String, JsonMap<String, JsonValue>>) -> PluginHost {
+fn load_bundled_with_opts(
+    slug: &str,
+    opts: HashMap<String, JsonMap<String, JsonValue>>,
+) -> PluginHost {
     let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).expect(HOST_FAILED);
     plugin::begin_load();
     host.load_builtins(&PluginsConfig {

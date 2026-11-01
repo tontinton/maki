@@ -65,17 +65,15 @@ local function convert_assistant_messages(messages)
   end
 end
 
--- The chat wire's own vocabulary. Mistral caches on the `prompt_cache_key`
--- body field and routes a session to one backend by the `x-affinity` header;
--- send both. The responses codec refuses a session carrier, so it stays chat.
+-- Mistral caches on the `prompt_cache_key` body field and routes a session to
+-- one backend by the `x-affinity` header; both codecs send them, the
+-- responses path renders them in the shapes its endpoint spells.
 local openai = {
   thinking = { dialect = "high-only" },
   -- Mistral's small models refuse reasoning whatever the model table says.
   thinking_overrides = { ["ministral-"] = "no" },
+  session_id = { header = "x-affinity", body_field = "prompt_cache_key" },
 }
-if not opts.responses_api then
-  openai.session_id = { header = "x-affinity", body_field = "prompt_cache_key" }
-end
 
 -- Only chat-capable rows survive. `vision` defaults to off, where an unstated
 -- `reasoning` stays unstated.

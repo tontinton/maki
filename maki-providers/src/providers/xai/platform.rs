@@ -220,6 +220,7 @@ impl Provider for Xai {
                             self.compat.client(),
                             model,
                             &body,
+                            &[],
                             event_tx,
                             &auth,
                             stream_timeout,
