@@ -12,7 +12,8 @@ use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, Lines};
-use tokio::task::spawn_blocking;
+use tokio::runtime::Handle;
+use tokio::task::{block_in_place, spawn_blocking};
 use tokio::time::timeout;
 use tokio_util::io::StreamReader;
 use tracing::{debug, warn};
@@ -440,7 +441,7 @@ impl Timeouts {
 }
 
 /// Where every client in the crate starts, so a side request (OAuth, the
-/// catalogs) shares the providers' redirect, proxy,
+/// catalogs, container credentials) shares the providers' redirect, proxy,
 /// DNS and trust rules. Redirects stay off: a 3xx reaches
 /// [`AgentError::from_response`] and a key header is never replayed
 /// cross-origin. HTTP/1.1 stays pinned in case a dependency turns on reqwest's
@@ -471,6 +472,13 @@ pub(crate) fn http_client(timeouts: Timeouts) -> Client {
                 .build()
                 .expect("an HTTP client without trust roots always builds")
         })
+}
+
+/// For a flow that still blocks on one request. Works from a worker, from the main thread's
+/// `block_on` and from the blocking pool alike; panics on a current_thread
+/// runtime (every `#[tokio::test]`) and inside a `LocalSet` (the Lua thread).
+pub(crate) fn wait<T>(future: impl Future<Output = T>) -> T {
+    block_in_place(|| Handle::current().block_on(future))
 }
 
 /// `Client::execute` arms the timeouts as it is called, so the send and the
