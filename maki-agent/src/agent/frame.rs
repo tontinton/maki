@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator;
 
 use super::history::History;
-use super::instructions::build_system_prompt;
+use super::instructions::{MODEL_VAR, build_system_prompt};
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::prompt::{PromptId, ResolvedPrompts, Slot, SlotKind};
 use crate::template::Vars;
@@ -58,16 +58,28 @@ impl RunContext {
         slots: &ResolvedPrompts,
         model: &Model,
         tools: RequestTools,
+        model_in_prompt: bool,
     ) -> Self {
         let slots = slots.for_tools(ToolRegistry::global(), tools.filter());
-        let system = build_system_prompt(vars, instructions, &slots, model);
+        let system = build_system_prompt(vars, instructions, &slots, model, model_in_prompt);
+        // A custom template states the model wherever it names `{model}`,
+        // whatever `model_in_prompt` says, so a switch has to be told then.
+        let states_model = if slots.has_template(PromptId::System) {
+            slots.template(PromptId::System).contains(MODEL_VAR)
+        } else {
+            model_in_prompt
+        };
         Self {
             system,
             tools,
             facts: Some(PromptFacts {
                 date: vars.apply("{date}").into_owned(),
                 cwd: vars.apply("{cwd}").into_owned(),
-                model: model.spec(),
+                model: if states_model {
+                    model.spec()
+                } else {
+                    String::new()
+                },
                 instructions: if slots.renders_instructions(PromptId::System) {
                     instructions.to_owned()
                 } else {
@@ -302,7 +314,9 @@ pub(crate) fn context_update(
     if let Some(date) = &update.date {
         parts.push(format!("Date is now {date}."));
     }
-    if let Some(model) = &update.model {
+    if let Some(model) = &update.model
+        && !model.is_empty()
+    {
         parts.push(format!("You are now running as {model}."));
     }
     if let Some(cwd) = &update.cwd {
@@ -367,6 +381,17 @@ mod tests {
         assert!(context_update(&facts(), &facts(), &ResolvedPrompts::default()).is_none());
     }
 
+    #[test]
+    fn empty_model_tells_nothing() {
+        let mut now = facts();
+        prompt(&mut now).model.clear();
+        assert!(context_update(&facts(), &now, &ResolvedPrompts::default()).is_none());
+
+        let mut told = facts();
+        prompt(&mut told).model.clear();
+        assert!(context_update(&told, &now, &ResolvedPrompts::default()).is_none());
+    }
+
     #[test_case(|f: &mut LiveFacts| prompt(f).date = NEXT_DATE.into(), NEXT_DATE ; "date")]
     #[test_case(|f: &mut LiveFacts| prompt(f).model = "openai/gpt-6".into(), "openai/gpt-6" ; "model")]
     #[test_case(|f: &mut LiveFacts| prompt(f).cwd = "/other".into(), "/other" ; "cwd")]
@@ -397,6 +422,105 @@ mod tests {
                 &model(NATIVE_MODEL),
             ),
         )
+    }
+
+    fn rendered(model: &Model, enabled: bool, template: Option<&str>) -> RunContext {
+        let mut slots = ResolvedPrompts::default();
+        if let Some(template) = template {
+            slots.set_template(PromptId::System, template.into());
+        }
+        RunContext::render(
+            &Vars::new(),
+            "",
+            &slots,
+            model,
+            RequestTools::default(),
+            enabled,
+        )
+    }
+
+    #[test_case("Running on {model}.", false, true ; "legacy_missing_model")]
+    #[test_case("A static policy.", true, false ; "legacy_spurious_model")]
+    fn legacy_template_policy_keeps_frame(template: &str, old_enabled: bool, states_model: bool) {
+        let first = model(NATIVE_MODEL);
+        let next = model(CLIENT_MODEL);
+        let mut old = rendered(&first, old_enabled, Some(template));
+        old.facts.as_mut().unwrap().model = if old_enabled {
+            first.spec()
+        } else {
+            String::new()
+        };
+        let hash = fingerprint(&old, None, &first);
+        let stored = StoredFrame::new(old.system, hash, old.facts, Vec::new());
+        let mut history = History::new(Vec::new()).with_frame(Some(Arc::new(stored)));
+        let candidate = rendered(&next, !old_enabled, Some(template));
+        assert_eq!(
+            fit_frame(
+                &mut history,
+                rendered(&next, !old_enabled, Some(template)),
+                None,
+                &next
+            ),
+            FrameFit::Kept
+        );
+        let now = LiveFacts {
+            plan: None,
+            prompt: candidate.facts,
+        };
+        let update = context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default());
+        assert_eq!(update.is_some(), states_model);
+        if let Some(update) = update {
+            assert_eq!(
+                update.facts_update().unwrap().model.as_deref(),
+                Some(next.spec().as_str())
+            );
+            history.push(update);
+            assert!(
+                context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default())
+                    .is_none()
+            );
+            history.truncate(0);
+            assert!(
+                context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default())
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_unknown_model_survives_rebuild_and_rewind() {
+        let first = model(NATIVE_MODEL);
+        let next = model(CLIENT_MODEL);
+        let template = Some("Running on {model}.");
+        let mut old = rendered(&first, false, template);
+        old.facts.as_mut().unwrap().model.clear();
+        let hash = fingerprint(&old, None, &first);
+        let stored = StoredFrame::new(old.system, hash, old.facts, Vec::new());
+        let mut history = History::new(Vec::new()).with_frame(Some(Arc::new(stored)));
+        let mut candidate = rendered(&next, true, template);
+        candidate.authored.push_str(" changed");
+        let now = LiveFacts {
+            plan: None,
+            prompt: candidate.facts.clone(),
+        };
+        assert_eq!(
+            fit_frame(&mut history, candidate, None, &next),
+            FrameFit::Rebuilt
+        );
+        let update =
+            context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default()).unwrap();
+        assert_eq!(
+            update.facts_update().unwrap().model.as_deref(),
+            Some(next.spec().as_str())
+        );
+        history.push(update);
+        assert!(
+            context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default()).is_none()
+        );
+        history.truncate(0);
+        assert!(
+            context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default()).is_some()
+        );
     }
 
     #[test]
