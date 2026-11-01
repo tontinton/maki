@@ -275,8 +275,8 @@ No hardcoded model catalog. Use any model ID supported by this provider. An API 
 ### Cursor
 
 - **Env var**: none. Sign in with `maki auth login cursor`
-- **API**: `http://127.0.0.1:53621/v1`
-- **Features**: Cursor subscription models. Maki runs the tools.
+- **API**: `http://127.0.0.1:9/v1`
+- **Features**: Cursor subscription models. Maki runs the tools. The address above is a placeholder; each process listens on its own port.
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|

@@ -76,8 +76,7 @@ import {
 import { spawn, type ChildProcess } from "node:child_process";
 import http from "node:http";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { chmod, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
 import { deriveBridgeKey, deriveConversationKey } from "./session-key.ts";
@@ -178,11 +177,12 @@ const CONVERSATION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 // Conversation state also persists to disk so context survives proxy/opencode
 // restarts instead of failing with "Blob not found" (issues #22/#29).
 const CONVERSATION_DISK_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-const CONVERSATION_DIR = pathResolve(
-  process.env.XDG_CACHE_HOME ?? pathResolve(homedir(), ".cache"),
-  "maki-cursor",
-  "conversations",
-);
+
+function conversationDir(): string {
+  const configured = process.env.MAKI_CURSOR_CONVERSATIONS;
+  if (configured) return configured;
+  return pathResolve(import.meta.dirname, "..", "..", "conversations");
+}
 
 const PersistedConversationSchema = z.object({
   conversationId: z.string(),
@@ -191,8 +191,13 @@ const PersistedConversationSchema = z.object({
   lastAccessMs: z.number(),
 });
 
-/** Fire-and-forget write of a conversation snapshot to the disk cache. */
-function persistConversation(convKey: string, stored: StoredConversation): void {
+/** Write a conversation snapshot where only this user can read it. */
+export async function saveConversation(
+  convKey: string,
+  stored: StoredConversation,
+  dir = conversationDir(),
+): Promise<string | undefined> {
+  if (!/^[a-f0-9]+$/.test(convKey)) return undefined;
   const payload = {
     conversationId: stored.conversationId,
     checkpoint: stored.checkpoint
@@ -206,14 +211,16 @@ function persistConversation(convKey: string, stored: StoredConversation): void 
     ),
     lastAccessMs: stored.lastAccessMs,
   } satisfies z.infer<typeof PersistedConversationSchema>;
-  void mkdir(CONVERSATION_DIR, { recursive: true })
-    .then(() =>
-      writeFile(
-        pathResolve(CONVERSATION_DIR, `${convKey}.json`),
-        JSON.stringify(payload),
-      ),
-    )
-    .catch(() => {});
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await chmod(dir, 0o700);
+  const file = pathResolve(dir, `${convKey}.json`);
+  await writeFile(file, JSON.stringify(payload), { mode: 0o600 });
+  await chmod(file, 0o600);
+  return file;
+}
+
+function persistConversation(convKey: string, stored: StoredConversation): void {
+  void saveConversation(convKey, stored).catch(() => {});
 }
 
 async function loadPersistedConversation(
@@ -221,7 +228,7 @@ async function loadPersistedConversation(
 ): Promise<StoredConversation | undefined> {
   try {
     const raw = await readFile(
-      pathResolve(CONVERSATION_DIR, `${convKey}.json`),
+      pathResolve(conversationDir(), `${convKey}.json`),
       "utf8",
     );
     const parsed = PersistedConversationSchema.parse(JSON.parse(raw));
@@ -250,10 +257,10 @@ async function loadPersistedConversation(
 function pruneStaleConversationFiles(): void {
   void (async () => {
     try {
-      const entries = await readdir(CONVERSATION_DIR);
+      const entries = await readdir(conversationDir());
       const cutoff = Date.now() - CONVERSATION_DISK_TTL_MS;
       for (const entry of entries) {
-        const file = pathResolve(CONVERSATION_DIR, entry);
+        const file = pathResolve(conversationDir(), entry);
         const info = await stat(file);
         if (info.mtimeMs < cutoff) await unlink(file);
       }
@@ -447,6 +454,7 @@ let proxyServer: http.Server | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
+let proxyToken = "";
 
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
   id: string;
@@ -512,8 +520,32 @@ async function writeNodeResponse(res: http.ServerResponse, response: Response): 
   res.end();
 }
 
+function loopbackHost(req: Request): boolean {
+  const host = (req.headers.get("host") ?? "").toLowerCase();
+  const name = host.startsWith("[")
+    ? host.slice(1, host.indexOf("]"))
+    : host.split(":")[0];
+  return name === "127.0.0.1" || name === "localhost";
+}
+
+function bearerOk(req: Request): boolean {
+  return proxyToken !== "" && req.headers.get("authorization") === `Bearer ${proxyToken}`;
+}
+
 async function proxyFetch(req: Request): Promise<Response> {
   const url = new URL(req.url);
+  if (!loopbackHost(req)) {
+    return new Response("Forbidden", { status: 403 });
+  }
+  if (!bearerOk(req)) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+  if (req.method === "POST") {
+    const type = (req.headers.get("content-type") ?? "").toLowerCase();
+    if (!type.startsWith("application/json")) {
+      return new Response("Unsupported Media Type", { status: 415 });
+    }
+  }
   if (req.method === "GET" && url.pathname === "/health") {
     return new Response("ok");
   }
@@ -551,8 +583,11 @@ export async function startProxy(
   getAccessToken: () => Promise<string>,
   models: ReadonlyArray<{ id: string; name: string }> = [],
   listenPort = 0,
+  token = "",
 ): Promise<number> {
+  if (!token) throw new Error("cursor proxy requires a token");
   proxyAccessTokenProvider = getAccessToken;
+  proxyToken = token;
   proxyModels = models.map((model) => ({
     id: model.id,
     name: model.name,
@@ -601,6 +636,7 @@ export function stopProxy(): void {
     proxyServer = undefined;
     proxyPort = undefined;
     proxyAccessTokenProvider = undefined;
+    proxyToken = "";
     proxyModels = [];
   }
   for (const active of activeBridges.values()) {
@@ -1640,19 +1676,24 @@ function handleStreamingResponse(
   );
 }
 
-/** Resume a paused bridge by sending MCP results and continuing to stream. */
-function handleToolResultResume(
-  active: ActiveBridge,
+export interface AnsweredExec {
+  execId: string;
+  execMsgId: number;
+  toolCallId: string;
+  native?: NativeExecBinding;
+}
+
+/**
+ * Send each paused exec's tool result. A native result that cannot be typed
+ * faithfully, including every write and shell, is an mcpResult carrying
+ * maki's text.
+ */
+export function answerPendingExecs(
+  pendingExecs: AnsweredExec[],
   toolResults: ToolResultInfo[],
   userText: string,
-  modelId: string,
-  bridgeKey: string,
-  convKey: string,
-): Response {
-  const { bridge, heartbeatTimer, blobStore, mcpTools, cloudRule, pendingExecs } = active;
-
-  // Answer each pending exec with a matching tool result: redirected native
-  // execs get their typed native result frame, MCP execs get an mcpResult.
+  write: (frame: Uint8Array) => void,
+): void {
   const lastExecId = pendingExecs[pendingExecs.length - 1]?.execId;
   for (const exec of pendingExecs) {
     const result = toolResults.find(
@@ -1669,7 +1710,7 @@ function handleToolResultResume(
 
     if (result && exec.native) {
       const sent = sendNativeExecResult(exec, exec.native, text, (bytes) =>
-        bridge.write(frameConnectMessage(bytes)),
+        write(frameConnectMessage(bytes)),
       );
       if (sent) continue;
     }
@@ -1711,10 +1752,22 @@ function handleToolResultResume(
       message: { case: "execClientMessage", value: execClientMessage },
     });
 
-    bridge.write(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
-    );
+    write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
   }
+}
+
+/** Resume a paused bridge by sending MCP results and continuing to stream. */
+function handleToolResultResume(
+  active: ActiveBridge,
+  toolResults: ToolResultInfo[],
+  userText: string,
+  modelId: string,
+  bridgeKey: string,
+  convKey: string,
+): Response {
+  const { bridge, heartbeatTimer, blobStore, mcpTools, cloudRule, pendingExecs } = active;
+
+  answerPendingExecs(pendingExecs, toolResults, userText, (frame) => bridge.write(frame));
 
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { access, chmod, readFile, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
@@ -11,7 +12,14 @@ import { startFixture } from "./fixture.ts";
 
 const root = resolve(import.meta.dirname, "..");
 const credentialsPath = process.env.MAKI_CURSOR_CREDENTIALS ?? resolve(root, "credentials.json");
-const port = Number(process.env.MAKI_CURSOR_PORT ?? "53621");
+
+function listenPort(): number {
+  const requested = Number(process.env.MAKI_CURSOR_PORT ?? "0");
+  if (!Number.isInteger(requested) || requested < 0 || requested > 65535) {
+    throw new Error("MAKI_CURSOR_PORT is not a port");
+  }
+  return requested;
+}
 
 interface StoredCredentials {
   access: string;
@@ -59,6 +67,7 @@ async function serve(): Promise<void> {
   const { getCursorModels } = await import("./models.ts");
   const current = await readCredentials();
   const models = await getCursorModels(current?.access ?? "");
+  const token = randomBytes(32).toString("base64url");
   const bound = await startProxy(
     async () => {
       const creds = await readCredentials();
@@ -71,9 +80,14 @@ async function serve(): Promise<void> {
       return creds.access;
     },
     models,
-    port,
+    listenPort(),
+    token,
   );
-  console.log(`listening ${bound}`);
+  const ready = process.env.MAKI_CURSOR_READY;
+  if (ready) {
+    await writeFile(ready, JSON.stringify({ port: bound, token }), { mode: 0o600 });
+    await chmod(ready, 0o600);
+  }
   await new Promise(() => {});
 }
 
@@ -126,29 +140,50 @@ async function deps(): Promise<void> {
 
 async function logout(): Promise<void> {
   await rm(credentialsPath, { force: true });
+  const dir = process.env.MAKI_CURSOR_CONVERSATIONS;
+  if (dir) await rm(dir, { recursive: true, force: true });
 }
 
 async function health(): Promise<void> {
-  const response = await fetch(`http://127.0.0.1:${port}/health`);
+  const listen = process.env.MAKI_CURSOR_PORT;
+  const token = process.env.MAKI_CURSOR_TOKEN;
+  if (!listen || !token) process.exit(1);
+  const response = await fetch(`http://127.0.0.1:${listen}/health`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
   if (!response.ok) process.exit(1);
 }
 
-async function waitUntilReady(): Promise<void> {
+async function nonce(): Promise<void> {
+  console.log(randomBytes(16).toString("hex"));
+}
+
+async function waitReady(): Promise<void> {
+  const file = process.argv[3];
+  if (!file) throw new Error("wait-ready needs a ready file");
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/health`);
-      if (response.ok) return;
+      const parsed = JSON.parse(await readFile(file, "utf8")) as { port?: number; token?: string };
+      if (!parsed.port || !parsed.token) throw new Error("ready file is incomplete");
+      const response = await fetch(`http://127.0.0.1:${parsed.port}/health`, {
+        headers: { authorization: `Bearer ${parsed.token}` },
+      });
+      if (response.ok) {
+        console.log(`${parsed.port} ${parsed.token}`);
+        await rm(file, { force: true });
+        return;
+      }
     } catch {
       // The server is still starting.
     }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
   }
   throw new Error("cursor proxy did not become ready");
 }
 
 async function fixture(): Promise<void> {
-  const bound = await startFixture(port);
+  const bound = await startFixture(listenPort());
   console.log(`listening ${bound.port}`);
   await new Promise(() => {});
 }
@@ -164,7 +199,8 @@ try {
   else if (command === "deps") await deps();
   else if (command === "logout") await logout();
   else if (command === "health") await health();
-  else if (command === "wait") await waitUntilReady();
+  else if (command === "nonce") await nonce();
+  else if (command === "wait-ready") await waitReady();
   else if (command === "fixture") await fixture();
   else {
     throw new Error(`unknown command ${command ?? ""}`);

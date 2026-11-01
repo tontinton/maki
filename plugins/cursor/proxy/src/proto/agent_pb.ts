@@ -14532,27 +14532,12 @@ export const BidiRequestIdSchema: GenMessage<BidiRequestId> = /*@__PURE__*/ mess
 /**
  * @generated from enum agent.v1.AppliedAgentChange_ChangeType
  */
-export enum AppliedAgentChange_ChangeType {
-	/**
-	 * @generated from enum value: CHANGE_TYPE_UNSPECIFIED = 0;
-	 */
-	CHANGE_TYPE_UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: CHANGE_TYPE_CREATED = 1;
-	 */
-	CHANGE_TYPE_CREATED = 1,
-
-	/**
-	 * @generated from enum value: CHANGE_TYPE_MODIFIED = 2;
-	 */
-	CHANGE_TYPE_MODIFIED = 2,
-
-	/**
-	 * @generated from enum value: CHANGE_TYPE_DELETED = 3;
-	 */
-	CHANGE_TYPE_DELETED = 3,
-}
+export const AppliedAgentChange_ChangeType = {
+	CHANGE_TYPE_UNSPECIFIED: 0,
+	CHANGE_TYPE_CREATED: 1,
+	CHANGE_TYPE_MODIFIED: 2,
+	CHANGE_TYPE_DELETED: 3,
+} as const;
 
 /**
  * Describes the enum agent.v1.AppliedAgentChange_ChangeType.
@@ -14564,37 +14549,14 @@ export const AppliedAgentChange_ChangeTypeSchema: GenEnum<AppliedAgentChange_Cha
 /**
  * @generated from enum agent.v1.MouseButton
  */
-export enum MouseButton {
-	/**
-	 * @generated from enum value: MOUSE_BUTTON_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: MOUSE_BUTTON_LEFT = 1;
-	 */
-	LEFT = 1,
-
-	/**
-	 * @generated from enum value: MOUSE_BUTTON_RIGHT = 2;
-	 */
-	RIGHT = 2,
-
-	/**
-	 * @generated from enum value: MOUSE_BUTTON_MIDDLE = 3;
-	 */
-	MIDDLE = 3,
-
-	/**
-	 * @generated from enum value: MOUSE_BUTTON_BACK = 4;
-	 */
-	BACK = 4,
-
-	/**
-	 * @generated from enum value: MOUSE_BUTTON_FORWARD = 5;
-	 */
-	FORWARD = 5,
-}
+export const MouseButton = {
+	UNSPECIFIED: 0,
+	LEFT: 1,
+	RIGHT: 2,
+	MIDDLE: 3,
+	BACK: 4,
+	FORWARD: 5,
+} as const;
 
 /**
  * Describes the enum agent.v1.MouseButton.
@@ -14604,32 +14566,13 @@ export const MouseButtonSchema: GenEnum<MouseButton> = /*@__PURE__*/ enumDesc(fi
 /**
  * @generated from enum agent.v1.ScrollDirection
  */
-export enum ScrollDirection {
-	/**
-	 * @generated from enum value: SCROLL_DIRECTION_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: SCROLL_DIRECTION_UP = 1;
-	 */
-	UP = 1,
-
-	/**
-	 * @generated from enum value: SCROLL_DIRECTION_DOWN = 2;
-	 */
-	DOWN = 2,
-
-	/**
-	 * @generated from enum value: SCROLL_DIRECTION_LEFT = 3;
-	 */
-	LEFT = 3,
-
-	/**
-	 * @generated from enum value: SCROLL_DIRECTION_RIGHT = 4;
-	 */
-	RIGHT = 4,
-}
+export const ScrollDirection = {
+	UNSPECIFIED: 0,
+	UP: 1,
+	DOWN: 2,
+	LEFT: 3,
+	RIGHT: 4,
+} as const;
 
 /**
  * Describes the enum agent.v1.ScrollDirection.
@@ -14639,22 +14582,11 @@ export const ScrollDirectionSchema: GenEnum<ScrollDirection> = /*@__PURE__*/ enu
 /**
  * @generated from enum agent.v1.CursorRuleSource
  */
-export enum CursorRuleSource {
-	/**
-	 * @generated from enum value: CURSOR_RULE_SOURCE_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: CURSOR_RULE_SOURCE_TEAM = 1;
-	 */
-	TEAM = 1,
-
-	/**
-	 * @generated from enum value: CURSOR_RULE_SOURCE_USER = 2;
-	 */
-	USER = 2,
-}
+export const CursorRuleSource = {
+	UNSPECIFIED: 0,
+	TEAM: 1,
+	USER: 2,
+} as const;
 
 /**
  * Describes the enum agent.v1.CursorRuleSource.
@@ -14664,32 +14596,13 @@ export const CursorRuleSourceSchema: GenEnum<CursorRuleSource> = /*@__PURE__*/ e
 /**
  * @generated from enum agent.v1.DiagnosticSeverity
  */
-export enum DiagnosticSeverity {
-	/**
-	 * @generated from enum value: DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: DIAGNOSTIC_SEVERITY_ERROR = 1;
-	 */
-	ERROR = 1,
-
-	/**
-	 * @generated from enum value: DIAGNOSTIC_SEVERITY_WARNING = 2;
-	 */
-	WARNING = 2,
-
-	/**
-	 * @generated from enum value: DIAGNOSTIC_SEVERITY_INFORMATION = 3;
-	 */
-	INFORMATION = 3,
-
-	/**
-	 * @generated from enum value: DIAGNOSTIC_SEVERITY_HINT = 4;
-	 */
-	HINT = 4,
-}
+export const DiagnosticSeverity = {
+	UNSPECIFIED: 0,
+	ERROR: 1,
+	WARNING: 2,
+	INFORMATION: 3,
+	HINT: 4,
+} as const;
 
 /**
  * Describes the enum agent.v1.DiagnosticSeverity.
@@ -14699,27 +14612,12 @@ export const DiagnosticSeveritySchema: GenEnum<DiagnosticSeverity> = /*@__PURE__
 /**
  * @generated from enum agent.v1.RecordingMode
  */
-export enum RecordingMode {
-	/**
-	 * @generated from enum value: RECORDING_MODE_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: RECORDING_MODE_START_RECORDING = 1;
-	 */
-	START_RECORDING = 1,
-
-	/**
-	 * @generated from enum value: RECORDING_MODE_SAVE_RECORDING = 2;
-	 */
-	SAVE_RECORDING = 2,
-
-	/**
-	 * @generated from enum value: RECORDING_MODE_DISCARD_RECORDING = 3;
-	 */
-	DISCARD_RECORDING = 3,
-}
+export const RecordingMode = {
+	UNSPECIFIED: 0,
+	START_RECORDING: 1,
+	SAVE_RECORDING: 2,
+	DISCARD_RECORDING: 3,
+} as const;
 
 /**
  * Describes the enum agent.v1.RecordingMode.
@@ -14729,17 +14627,10 @@ export const RecordingModeSchema: GenEnum<RecordingMode> = /*@__PURE__*/ enumDes
 /**
  * @generated from enum agent.v1.RequestedFilePathRejectedReason
  */
-export enum RequestedFilePathRejectedReason {
-	/**
-	 * @generated from enum value: REQUESTED_FILE_PATH_REJECTED_REASON_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: REQUESTED_FILE_PATH_REJECTED_REASON_SLASHES_NOT_ALLOWED = 1;
-	 */
-	SLASHES_NOT_ALLOWED = 1,
-}
+export const RequestedFilePathRejectedReason = {
+	UNSPECIFIED: 0,
+	SLASHES_NOT_ALLOWED: 1,
+} as const;
 
 /**
  * Describes the enum agent.v1.RequestedFilePathRejectedReason.
@@ -14751,32 +14642,13 @@ export const RequestedFilePathRejectedReasonSchema: GenEnum<RequestedFilePathRej
 /**
  * @generated from enum agent.v1.PackageType
  */
-export enum PackageType {
-	/**
-	 * @generated from enum value: PACKAGE_TYPE_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: PACKAGE_TYPE_CURSOR_PROJECT = 1;
-	 */
-	CURSOR_PROJECT = 1,
-
-	/**
-	 * @generated from enum value: PACKAGE_TYPE_CURSOR_PERSONAL = 2;
-	 */
-	CURSOR_PERSONAL = 2,
-
-	/**
-	 * @generated from enum value: PACKAGE_TYPE_CLAUDE_SKILL = 3;
-	 */
-	CLAUDE_SKILL = 3,
-
-	/**
-	 * @generated from enum value: PACKAGE_TYPE_CLAUDE_PLUGIN = 4;
-	 */
-	CLAUDE_PLUGIN = 4,
-}
+export const PackageType = {
+	UNSPECIFIED: 0,
+	CURSOR_PROJECT: 1,
+	CURSOR_PERSONAL: 2,
+	CLAUDE_SKILL: 3,
+	CLAUDE_PLUGIN: 4,
+} as const;
 
 /**
  * Describes the enum agent.v1.PackageType.
@@ -14786,27 +14658,12 @@ export const PackageTypeSchema: GenEnum<PackageType> = /*@__PURE__*/ enumDesc(fi
 /**
  * @generated from enum agent.v1.SandboxPolicy_Type
  */
-export enum SandboxPolicy_Type {
-	/**
-	 * @generated from enum value: TYPE_UNSPECIFIED = 0;
-	 */
-	TYPE_UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: TYPE_INSECURE_NONE = 1;
-	 */
-	TYPE_INSECURE_NONE = 1,
-
-	/**
-	 * @generated from enum value: TYPE_WORKSPACE_READWRITE = 2;
-	 */
-	TYPE_WORKSPACE_READWRITE = 2,
-
-	/**
-	 * @generated from enum value: TYPE_WORKSPACE_READONLY = 3;
-	 */
-	TYPE_WORKSPACE_READONLY = 3,
-}
+export const SandboxPolicy_Type = {
+	TYPE_UNSPECIFIED: 0,
+	TYPE_INSECURE_NONE: 1,
+	TYPE_WORKSPACE_READWRITE: 2,
+	TYPE_WORKSPACE_READONLY: 3,
+} as const;
 
 /**
  * Describes the enum agent.v1.SandboxPolicy_Type.
@@ -14816,22 +14673,11 @@ export const SandboxPolicy_TypeSchema: GenEnum<SandboxPolicy_Type> = /*@__PURE__
 /**
  * @generated from enum agent.v1.TimeoutBehavior
  */
-export enum TimeoutBehavior {
-	/**
-	 * @generated from enum value: TIMEOUT_BEHAVIOR_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: TIMEOUT_BEHAVIOR_CANCEL = 1;
-	 */
-	CANCEL = 1,
-
-	/**
-	 * @generated from enum value: TIMEOUT_BEHAVIOR_BACKGROUND = 2;
-	 */
-	BACKGROUND = 2,
-}
+export const TimeoutBehavior = {
+	UNSPECIFIED: 0,
+	CANCEL: 1,
+	BACKGROUND: 2,
+} as const;
 
 /**
  * Describes the enum agent.v1.TimeoutBehavior.
@@ -14841,22 +14687,11 @@ export const TimeoutBehaviorSchema: GenEnum<TimeoutBehavior> = /*@__PURE__*/ enu
 /**
  * @generated from enum agent.v1.ShellAbortReason
  */
-export enum ShellAbortReason {
-	/**
-	 * @generated from enum value: SHELL_ABORT_REASON_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: SHELL_ABORT_REASON_USER_ABORT = 1;
-	 */
-	USER_ABORT = 1,
-
-	/**
-	 * @generated from enum value: SHELL_ABORT_REASON_TIMEOUT = 2;
-	 */
-	TIMEOUT = 2,
-}
+export const ShellAbortReason = {
+	UNSPECIFIED: 0,
+	USER_ABORT: 1,
+	TIMEOUT: 2,
+} as const;
 
 /**
  * Describes the enum agent.v1.ShellAbortReason.
@@ -14866,22 +14701,11 @@ export const ShellAbortReasonSchema: GenEnum<ShellAbortReason> = /*@__PURE__*/ e
 /**
  * @generated from enum agent.v1.CustomSubagentPermissionMode
  */
-export enum CustomSubagentPermissionMode {
-	/**
-	 * @generated from enum value: CUSTOM_SUBAGENT_PERMISSION_MODE_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: CUSTOM_SUBAGENT_PERMISSION_MODE_DEFAULT = 1;
-	 */
-	DEFAULT = 1,
-
-	/**
-	 * @generated from enum value: CUSTOM_SUBAGENT_PERMISSION_MODE_READONLY = 2;
-	 */
-	READONLY = 2,
-}
+export const CustomSubagentPermissionMode = {
+	UNSPECIFIED: 0,
+	DEFAULT: 1,
+	READONLY: 2,
+} as const;
 
 /**
  * Describes the enum agent.v1.CustomSubagentPermissionMode.
@@ -14893,32 +14717,13 @@ export const CustomSubagentPermissionModeSchema: GenEnum<CustomSubagentPermissio
 /**
  * @generated from enum agent.v1.TodoStatus
  */
-export enum TodoStatus {
-	/**
-	 * @generated from enum value: TODO_STATUS_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: TODO_STATUS_PENDING = 1;
-	 */
-	PENDING = 1,
-
-	/**
-	 * @generated from enum value: TODO_STATUS_IN_PROGRESS = 2;
-	 */
-	IN_PROGRESS = 2,
-
-	/**
-	 * @generated from enum value: TODO_STATUS_COMPLETED = 3;
-	 */
-	COMPLETED = 3,
-
-	/**
-	 * @generated from enum value: TODO_STATUS_CANCELLED = 4;
-	 */
-	CANCELLED = 4,
-}
+export const TodoStatus = {
+	UNSPECIFIED: 0,
+	PENDING: 1,
+	IN_PROGRESS: 2,
+	COMPLETED: 3,
+	CANCELLED: 4,
+} as const;
 
 /**
  * Describes the enum agent.v1.TodoStatus.
@@ -14928,27 +14733,12 @@ export const TodoStatusSchema: GenEnum<TodoStatus> = /*@__PURE__*/ enumDesc(file
 /**
  * @generated from enum agent.v1.ClientOS
  */
-export enum ClientOS {
-	/**
-	 * @generated from enum value: CLIENT_OS_UNSPECIFIED = 0;
-	 */
-	CLIENT_OS_UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: CLIENT_OS_WINDOWS = 1;
-	 */
-	CLIENT_OS_WINDOWS = 1,
-
-	/**
-	 * @generated from enum value: CLIENT_OS_MACOS = 2;
-	 */
-	CLIENT_OS_MACOS = 2,
-
-	/**
-	 * @generated from enum value: CLIENT_OS_LINUX = 3;
-	 */
-	CLIENT_OS_LINUX = 3,
-}
+export const ClientOS = {
+	CLIENT_OS_UNSPECIFIED: 0,
+	CLIENT_OS_WINDOWS: 1,
+	CLIENT_OS_MACOS: 2,
+	CLIENT_OS_LINUX: 3,
+} as const;
 
 /**
  * Describes the enum agent.v1.ClientOS.
@@ -14958,27 +14748,12 @@ export const ClientOSSchema: GenEnum<ClientOS> = /*@__PURE__*/ enumDesc(file_age
 /**
  * @generated from enum agent.v1.ArtifactUploadDispatchStatus
  */
-export enum ArtifactUploadDispatchStatus {
-	/**
-	 * @generated from enum value: ARTIFACT_UPLOAD_DISPATCH_STATUS_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: ARTIFACT_UPLOAD_DISPATCH_STATUS_ACCEPTED = 1;
-	 */
-	ACCEPTED = 1,
-
-	/**
-	 * @generated from enum value: ARTIFACT_UPLOAD_DISPATCH_STATUS_REJECTED = 2;
-	 */
-	REJECTED = 2,
-
-	/**
-	 * @generated from enum value: ARTIFACT_UPLOAD_DISPATCH_STATUS_SKIPPED_ALREADY_IN_PROGRESS = 3;
-	 */
-	SKIPPED_ALREADY_IN_PROGRESS = 3,
-}
+export const ArtifactUploadDispatchStatus = {
+	UNSPECIFIED: 0,
+	ACCEPTED: 1,
+	REJECTED: 2,
+	SKIPPED_ALREADY_IN_PROGRESS: 3,
+} as const;
 
 /**
  * Describes the enum agent.v1.ArtifactUploadDispatchStatus.
@@ -14990,27 +14765,12 @@ export const ArtifactUploadDispatchStatusSchema: GenEnum<ArtifactUploadDispatchS
 /**
  * @generated from enum agent.v1.Frame_Kind
  */
-export enum Frame_Kind {
-	/**
-	 * @generated from enum value: KIND_UNSPECIFIED = 0;
-	 */
-	KIND_UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: KIND_REQUEST = 1;
-	 */
-	KIND_REQUEST = 1,
-
-	/**
-	 * @generated from enum value: KIND_RESPONSE = 2;
-	 */
-	KIND_RESPONSE = 2,
-
-	/**
-	 * @generated from enum value: KIND_ERROR = 3;
-	 */
-	KIND_ERROR = 3,
-}
+export const Frame_Kind = {
+	KIND_UNSPECIFIED: 0,
+	KIND_REQUEST: 1,
+	KIND_RESPONSE: 2,
+	KIND_ERROR: 3,
+} as const;
 
 /**
  * Describes the enum agent.v1.Frame_Kind.
@@ -15020,37 +14780,14 @@ export const Frame_KindSchema: GenEnum<Frame_Kind> = /*@__PURE__*/ enumDesc(file
 /**
  * @generated from enum agent.v1.BugbotDeeplinkEventKind
  */
-export enum BugbotDeeplinkEventKind {
-	/**
-	 * @generated from enum value: BUGBOT_DEEPLINK_EVENT_KIND_UNSPECIFIED = 0;
-	 */
-	UNSPECIFIED = 0,
-
-	/**
-	 * @generated from enum value: BUGBOT_DEEPLINK_EVENT_KIND_CLICKED = 1;
-	 */
-	CLICKED = 1,
-
-	/**
-	 * @generated from enum value: BUGBOT_DEEPLINK_EVENT_KIND_HANDLED_DIALOG_SHOWN = 2;
-	 */
-	HANDLED_DIALOG_SHOWN = 2,
-
-	/**
-	 * @generated from enum value: BUGBOT_DEEPLINK_EVENT_KIND_HANDLED_CHAT_CREATED = 3;
-	 */
-	HANDLED_CHAT_CREATED = 3,
-
-	/**
-	 * @generated from enum value: BUGBOT_DEEPLINK_EVENT_KIND_ERROR = 4;
-	 */
-	ERROR = 4,
-
-	/**
-	 * @generated from enum value: BUGBOT_DEEPLINK_EVENT_KIND_HANDLED_FIX_IN_WEB = 5;
-	 */
-	HANDLED_FIX_IN_WEB = 5,
-}
+export const BugbotDeeplinkEventKind = {
+	UNSPECIFIED: 0,
+	CLICKED: 1,
+	HANDLED_DIALOG_SHOWN: 2,
+	HANDLED_CHAT_CREATED: 3,
+	ERROR: 4,
+	HANDLED_FIX_IN_WEB: 5,
+} as const;
 
 /**
  * Describes the enum agent.v1.BugbotDeeplinkEventKind.

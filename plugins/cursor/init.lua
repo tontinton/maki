@@ -1,20 +1,16 @@
 -- Cursor subscription as a model. Tool calls come back here and maki runs them.
+-- Each process starts its own proxy on a free port. The registered URL is only
+-- a placeholder until `auth` returns the real one.
 
-local DEFAULT_PORT = 53621
-local NODE_FLAG = "--experimental-transform-types"
+local PLACEHOLDER_PORT = 9
+local NODE_FLAG = "--experimental-strip-types"
 local PROXY_JOB = "cursor-proxy"
 
-local function port()
-  local raw = maki.uv.os_getenv("MAKI_CURSOR_PORT")
-  local parsed = tonumber(raw)
-  if parsed and parsed > 0 then
-    return math.floor(parsed)
-  end
-  return DEFAULT_PORT
-end
+local bound_port = nil
+local bound_token = nil
 
 local function base_url()
-  return "http://127.0.0.1:" .. port() .. "/v1"
+  return "http://127.0.0.1:" .. (bound_port or PLACEHOLDER_PORT) .. "/v1"
 end
 
 local function plugin_dir()
@@ -27,6 +23,28 @@ end
 
 local function proxy_root()
   return plugin_dir() .. "/proxy"
+end
+
+local function conversations_dir()
+  return plugin_dir() .. "/conversations"
+end
+
+local function proxy_env(extra)
+  local env = {
+    MAKI_CURSOR_CONVERSATIONS = conversations_dir(),
+  }
+  if bound_port then
+    env.MAKI_CURSOR_PORT = tostring(bound_port)
+  end
+  if bound_token then
+    env.MAKI_CURSOR_TOKEN = bound_token
+  end
+  if extra then
+    for key, value in pairs(extra) do
+      env[key] = value
+    end
+  end
+  return env
 end
 
 local function node_bin()
@@ -52,7 +70,7 @@ end
 local function run(command, extra, timeout_ms)
   local id, err = maki.fn.jobstart(argv(command, extra), {
     cwd = proxy_root(),
-    env = { MAKI_CURSOR_PORT = tostring(port()) },
+    env = proxy_env(),
   })
   if not id then
     return nil, err
@@ -86,34 +104,56 @@ local function ensure_deps()
 end
 
 local function server_up()
+  if not bound_port or not bound_token then
+    return false
+  end
   local result = run("health", nil, 2000)
   return result and result.exit_code == 0
 end
 
-local function ensure_running()
-  local ready, err = ensure_deps()
-  if not ready then
-    return nil, err
+local function stop_proxy()
+  local id = maki.fn.jobfind(PROXY_JOB)
+  if id then
+    maki.fn.jobstop(id)
   end
+  bound_port = nil
+  bound_token = nil
+end
+
+local function ensure_running()
   if server_up() then
     return true
   end
+  stop_proxy()
+  local nonce, nonce_err = run("nonce", nil, 5000)
+  if not nonce or nonce.exit_code ~= 0 then
+    return nil, nonce_err or failed(nonce, "could not start the cursor proxy")
+  end
+  local ready = proxy_root() .. "/ready-" .. trimmed(nonce.stdout) .. ".json"
   local _, start_err = maki.fn.jobstart(argv("serve"), {
     cwd = proxy_root(),
     scope = "plugin",
     name = PROXY_JOB,
-    env = { MAKI_CURSOR_PORT = tostring(port()) },
+    env = proxy_env({
+      MAKI_CURSOR_PORT = "0",
+      MAKI_CURSOR_READY = ready,
+    }),
   })
-  if start_err and not tostring(start_err):find("already held", 1, true) then
+  if start_err then
     return nil, start_err
   end
-  local waited, wait_err = run("wait", nil, 12000)
-  if not waited then
-    return nil, wait_err
+  local waited, wait_err = run("wait-ready", { ready }, 12000)
+  if not waited or waited.exit_code ~= 0 then
+    stop_proxy()
+    return nil, wait_err or failed(waited, "cursor proxy did not become ready")
   end
-  if waited.exit_code ~= 0 then
-    return nil, failed(waited, "cursor proxy did not become ready")
+  local port_text, token = trimmed(waited.stdout):match("^(%d+)%s+(%S+)$")
+  if not port_text or not token then
+    stop_proxy()
+    return nil, "cursor proxy did not report a port"
   end
+  bound_port = tonumber(port_text)
+  bound_token = token
   return true
 end
 
@@ -144,7 +184,7 @@ maki.provider.register({
   max_output_tokens = 64000,
   context_window = 200000,
   docs = {
-    features = "Cursor subscription models. Maki runs the tools.",
+    features = "Cursor subscription models. Maki runs the tools. The address above is a placeholder; each process listens on its own port.",
     discovery_note = "Models come from the signed-in Cursor account. The list below is the offline fallback.",
   },
   openai = { session_id = { header = "x-maki-session" } },
@@ -190,7 +230,10 @@ maki.provider.register({
     if not running then
       return nil, run_err
     end
-    return { base_url = base_url() }
+    return {
+      base_url = base_url(),
+      headers = { Authorization = "Bearer " .. bound_token },
+    }
   end,
 
   list_models = function(ctx)
@@ -235,10 +278,7 @@ maki.provider.register({
   end,
 
   logout = function()
-    local id = maki.fn.jobfind(PROXY_JOB)
-    if id then
-      maki.fn.jobstop(id)
-    end
+    stop_proxy()
     run("logout", nil, 5000)
   end,
 })

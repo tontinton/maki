@@ -238,6 +238,13 @@ pub(crate) fn is_bundled(name: &str) -> bool {
     BUNDLED_PLUGINS.iter().any(|p| p.name == name)
 }
 
+fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if fs::read(path).is_ok_and(|existing| existing == bytes) {
+        return Ok(());
+    }
+    fs::write(path, bytes)
+}
+
 fn write_included_dir(dir: &Dir, dest: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dest)?;
     for entry in dir.entries() {
@@ -261,7 +268,7 @@ fn write_included_dir(dir: &Dir, dest: &Path) -> std::io::Result<()> {
                     .path()
                     .file_name()
                     .ok_or_else(|| std::io::Error::other("bundled file has no name"))?;
-                fs::write(dest.join(name), file.contents())?;
+                write_if_changed(&dest.join(name), file.contents())?;
             }
         }
     }
@@ -631,7 +638,20 @@ impl PluginHost {
                 .cloned()
                 .map(Arc::new)
                 .unwrap_or_default();
-            let asset_dir = Self::materialize_proxy_plugin(bundled)?;
+            // A copy failure belongs to the plugin that ships the helper.
+            // Cursor is the one that does. Returning here used to skip every
+            // builtin that loads after it.
+            let asset_dir = match Self::materialize_proxy_plugin(bundled) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    tracing::warn!(
+                        plugin = bundled.name,
+                        %error,
+                        "skipping this bundled plugin because its files could not be copied into the cache"
+                    );
+                    continue;
+                }
+            };
             self.send_load(
                 Arc::clone(&name),
                 vec![LoadChunk::bundled(name.as_ref(), init)],
@@ -3494,5 +3514,26 @@ mod bundled_manifests {
             "the walk reached past init.lua"
         );
         assert!(findings.is_empty(), "{findings:#?}");
+    }
+}
+
+#[cfg(test)]
+mod bundled_copy {
+    use super::write_if_changed;
+
+    #[test]
+    fn matching_bytes_are_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, b"return true").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        write_if_changed(&path, b"return true").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"return true");
+
+        let error = write_if_changed(&path, b"return false").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

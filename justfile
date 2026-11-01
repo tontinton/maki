@@ -57,5 +57,9 @@ gen-docs-check:
 machete:
     cargo machete
 
+# The cursor proxy is TypeScript run by Node, so cargo never sees it.
+node-test:
+    cd plugins/cursor/proxy && npm ci --omit=dev && node --experimental-strip-types --disable-warning=ExperimentalWarning --test --test-concurrency=1 test/*.test.ts
+
 # Full CI check
-ci: fmt-check lint pylint test gen-docs-check machete
+ci: fmt-check lint pylint test gen-docs-check machete node-test

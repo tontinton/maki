@@ -30,16 +30,6 @@ import {
   LsSuccessSchema,
   ReadResultSchema,
   ReadSuccessSchema,
-  ShellResultSchema,
-  ShellStreamExitSchema,
-  ShellStreamSchema,
-  ShellStreamStartSchema,
-  ShellStreamStdoutSchema,
-  ShellSuccessSchema,
-  WriteResultSchema,
-  WriteSuccessSchema,
-  ExecClientControlMessageSchema,
-  ExecClientStreamCloseSchema,
   type ExecServerMessage,
   type LsDirectoryTreeNode,
   type McpToolDefinition,
@@ -204,22 +194,12 @@ export function sendNativeExecResult(
       return true;
     }
 
-    case "writeResult": {
-      sendExec(
-        "writeResult",
-        create(WriteResultSchema, {
-          result: {
-            case: "success",
-            value: create(WriteSuccessSchema, {
-              path: args.path ?? "",
-              fileSize: Number(args.fileSize ?? 0),
-              linesCreated: Number(args.linesCreated ?? 0),
-            }),
-          },
-        }),
-      );
-      return true;
-    }
+    case "writeResult":
+    case "shellResult":
+    case "shellStreamResult":
+      // A typed success would hide a denial. maki's text, including a
+      // rejected write or a non-zero shell, goes back as an mcpResult.
+      return false;
 
     case "fetchResult": {
       sendExec(
@@ -235,63 +215,6 @@ export function sendNativeExecResult(
           },
         }),
       );
-      return true;
-    }
-
-    case "shellResult": {
-      sendExec(
-        "shellResult",
-        create(ShellResultSchema, {
-          result: {
-            case: "success",
-            value: create(ShellSuccessSchema, {
-              command: args.command ?? "",
-              workingDirectory: args.workingDirectory ?? "",
-              exitCode: 0,
-              signal: "",
-              stdout: text,
-              stderr: "",
-            }),
-          },
-        }),
-      );
-      return true;
-    }
-
-    case "shellStreamResult": {
-      sendExec(
-        "shellStream",
-        create(ShellStreamSchema, {
-          event: { case: "start", value: create(ShellStreamStartSchema, {}) },
-        }),
-      );
-      if (text) {
-        sendExec(
-          "shellStream",
-          create(ShellStreamSchema, {
-            event: {
-              case: "stdout",
-              value: create(ShellStreamStdoutSchema, { data: text }),
-            },
-          }),
-        );
-      }
-      sendExec(
-        "shellStream",
-        create(ShellStreamSchema, {
-          event: { case: "exit", value: create(ShellStreamExitSchema, { code: 0 }) },
-        }),
-      );
-      const controlMessage = create(ExecClientControlMessageSchema, {
-        message: {
-          case: "streamClose",
-          value: create(ExecClientStreamCloseSchema, { id: exec.execMsgId }),
-        },
-      });
-      const clientMessage = create(AgentClientMessageSchema, {
-        message: { case: "execClientControlMessage", value: controlMessage },
-      });
-      sendMessage(toBinary(AgentClientMessageSchema, clientMessage));
       return true;
     }
 
