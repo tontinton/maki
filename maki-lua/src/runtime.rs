@@ -92,7 +92,8 @@ use crate::plugin_permissions::{
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
 const INTERRUPT_DEADLINE_MSG: &str = "plugin interrupted: deadline exceeded";
-const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long a handler whose jobs are all gone still has to call `ctx:finish()`.
+const FINISH_GRACE: Duration = Duration::from_millis(50);
 const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 pub(crate) const CANCELLED_MSG: &str = "cancelled";
@@ -2292,13 +2293,14 @@ pub(crate) async fn run_command_scoped<F: Future>(lua: &Lua, depth: u8, fut: F) 
 async fn run_scoped<F: Future>(lua: &Lua, scope: TaskScope, fut: F) -> F::Output {
     let handle = Arc::clone(scope.handle());
     let owner = JobOwner::Task(lock_cell(&handle).id);
+    let mut jobs_changed = with_jobs(lua, |store| store.subscribe());
+    jobs_changed.mark_changed();
     let pump = async {
-        loop {
+        while jobs_changed.changed().await.is_ok() {
             deliver_pending(lua, usize::MAX, || {
                 with_jobs(lua, |store| store.next_event(&owner))
             })
             .await;
-            sleep(DISPATCH_POLL_INTERVAL).await;
         }
     };
     let out = scope
@@ -3140,6 +3142,40 @@ impl DeferQueue {
     }
 }
 
+/// Resolves once the task's live deadline passes, following it as it moves.
+async fn deadline_lapsed(handle: &TaskHandle) {
+    loop {
+        // Listen before reading: a `ctx:set_deadline` or a move landing
+        // between the two wakes us instead of leaving us armed on the
+        // stale deadline. Scoped so the guard never outlives an await.
+        let (changed, moved, deadline) = {
+            let cell = lock_cell(handle);
+            (
+                cell.deadline_changed.listen(),
+                cell.call.as_ref().map(|call| call.moved_listener()),
+                cell.live_deadline(),
+            )
+        };
+        let rearmed = async {
+            tokio::select! {
+                biased;
+                () = changed => {}
+                () = async {
+                    match moved {
+                        Some(moved) => moved.await,
+                        None => pending().await,
+                    }
+                } => {}
+            }
+        };
+        match deadline {
+            Some(dl) if dl <= Instant::now() => break,
+            Some(dl) => _ = timeout_at(dl.into(), rearmed).await,
+            None => rearmed.await,
+        }
+    }
+}
+
 /// Ends `fut` once nobody waits for its reply any more: at `deadline`, or
 /// [`CANCEL_ABANDON_AFTER`] past a cancel, answering with why. The watchdog
 /// cannot do this on its own, because a task parked in an await runs no Lua
@@ -3153,38 +3189,7 @@ async fn until_abandoned<T>(
     handle: &TaskHandle,
 ) -> Result<T, &'static str> {
     let cancel = lock_cell(handle).cancel.clone();
-    let timed_out = async {
-        loop {
-            // Listen before reading: a `ctx:set_deadline` or a move landing
-            // between the two wakes us instead of leaving us armed on the
-            // stale deadline. Scoped so the guard never outlives an await.
-            let (changed, moved, deadline) = {
-                let cell = lock_cell(handle);
-                (
-                    cell.deadline_changed.listen(),
-                    cell.call.as_ref().map(|call| call.moved_listener()),
-                    cell.live_deadline(),
-                )
-            };
-            let rearmed = async {
-                tokio::select! {
-                    biased;
-                    () = changed => {}
-                    () = async {
-                        match moved {
-                            Some(moved) => moved.await,
-                            None => pending().await,
-                        }
-                    } => {}
-                }
-            };
-            match deadline {
-                Some(dl) if dl <= Instant::now() => break,
-                Some(dl) => _ = timeout_at(dl.into(), rearmed).await,
-                None => rearmed.await,
-            }
-        }
-    };
+    let timed_out = deadline_lapsed(handle);
     let cancelled = async {
         cancel.cancelled().await;
         sleep(CANCEL_ABANDON_AFTER).await;
@@ -4554,7 +4559,17 @@ fn cancel_hook_reply(
     finish_rx.try_recv().ok()
 }
 
-/// Handler returned nil, meaning it went async. Polls job events
+/// The jobs are gone, so all that can still answer is a `ctx:finish()` already
+/// on its way. A dropped `ctx` ends the wait early: nothing can finish any more.
+async fn late_finish(finish_rx: &flume::Receiver<ToolCallReply>) -> ToolCallReply {
+    timeout(FINISH_GRACE, finish_rx.recv_async())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| ToolCallReply::err(NIL_WITHOUT_FINISH_MSG))
+}
+
+/// Handler returned nil, meaning it went async. Delivers job events
 /// until `ctx:finish()`, all jobs die, or the deadline expires.
 async fn dispatch_async(
     lua: &Lua,
@@ -4563,14 +4578,14 @@ async fn dispatch_async(
     tool: &str,
     finish_rx: flume::Receiver<ToolCallReply>,
 ) -> ToolCallReply {
-    let owner = JobOwner::Task(lock_cell(&handle).id);
+    let (owner, cancel) = {
+        let cell = lock_cell(&handle);
+        (JobOwner::Task(cell.id), cell.cancel.clone())
+    };
+    let mut jobs_changed = with_jobs(lua, |store| store.subscribe());
     if with_jobs(lua, |store| store.is_empty(&owner)) {
         lua.gc_collect().ok();
-        sleep(DISPATCH_POLL_INTERVAL).await;
-        return match finish_rx.try_recv() {
-            Ok(reply) => reply,
-            _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
-        };
+        return late_finish(&finish_rx).await;
     }
 
     loop {
@@ -4605,13 +4620,20 @@ async fn dispatch_async(
         }
 
         if with_jobs(lua, |store| store.is_empty(&owner)) {
-            sleep(DISPATCH_POLL_INTERVAL).await;
-            return match finish_rx.try_recv() {
-                Ok(reply) => reply,
-                _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
-            };
+            return late_finish(&finish_rx).await;
         }
-        sleep(DISPATCH_POLL_INTERVAL).await;
+
+        // A doomed task goes first, so its cancel hooks still get the last word
+        // on a reply landing at the same moment. The next pass reads which it was.
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {}
+            () = deadline_lapsed(&handle) => {}
+            reply = finish_rx.recv_async() => {
+                return reply.unwrap_or_else(|_| ToolCallReply::err(NIL_WITHOUT_FINISH_MSG));
+            }
+            Ok(()) = jobs_changed.changed() => {}
+        }
     }
 }
 
@@ -5474,14 +5496,15 @@ pub fn spawn(
                     // One task per job, so a callback parked on a prompt or a
                     // request holds back only its own job's events.
                     let delivering = Rc::new(RefCell::new(HashSet::new()));
-                    loop {
+                    let mut jobs_changed = with_jobs(&lua, |s| s.subscribe());
+                    jobs_changed.mark_changed();
+                    while jobs_changed.changed().await.is_ok() {
                         for job_id in with_jobs(&lua, |s| s.plugin_jobs_with_events()) {
                             if delivering.borrow_mut().insert(job_id) {
                                 let delivering = Rc::clone(&delivering);
                                 spawn_local(deliver_job(lua.clone(), job_id, delivering));
                             }
                         }
-                        sleep(DISPATCH_POLL_INTERVAL).await;
                     }
                 });
             }
@@ -6126,7 +6149,8 @@ mod tests {
     use futures::FutureExt;
     use maki_agent::cancel::CancelTrigger;
     use std::future::poll_fn;
-    use std::task::Poll;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Wake, Waker};
     use test_case::test_case;
 
     fn make_buf_handle(text: &str) -> BufHandle {
@@ -7633,7 +7657,7 @@ mod tests {
     const DISPATCH_TEST_TOOL: &str = "run";
     const DISPATCH_TEST_DEADLINE_SECS: u64 = 7;
 
-    /// Drives the job-polling loop of [`dispatch_async`] to its reply. The
+    /// Drives the job loop of [`dispatch_async`] to its reply. The
     /// cell needs a live job or the loop is never entered. Helper thread
     /// again: `timeout_reply` locks the very cell the loop inspects, so a
     /// regression there deadlocks and must fail rather than hang the suite.
@@ -7708,6 +7732,91 @@ mod tests {
             elapsed < KILL_GRACE,
             "dispatch loop must not wait out a grace"
         );
+    }
+
+    const PARKED_DISPATCH_JOB: &str = "sleep 600";
+    const PARKED_DISPATCH_REPLY: &str = "finished while parked";
+
+    enum ParkedWake {
+        Cancel,
+        DeadlineMoved,
+        Finish,
+        ContextDropped,
+        JobsGone,
+    }
+
+    #[derive(Default)]
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The job outlives the test, so nothing but `wake` can end the park. The
+    /// flag is what catches a lost wakeup: `.await` polls again regardless, and
+    /// this loop used to find each of these by polling.
+    #[test_case(ParkedWake::Cancel, Err(CANCELLED_MSG.to_owned()) ; "cancel")]
+    #[test_case(
+        ParkedWake::DeadlineMoved,
+        Err(format!("tool {DISPATCH_TEST_PLUGIN}.{DISPATCH_TEST_TOOL} timed out after {DISPATCH_TEST_DEADLINE_SECS}s"))
+        ; "deadline_moved"
+    )]
+    #[test_case(ParkedWake::Finish, Ok(PARKED_DISPATCH_REPLY.to_owned()) ; "finish")]
+    #[test_case(ParkedWake::ContextDropped, Err(NIL_WITHOUT_FINISH_MSG.to_owned()) ; "context_dropped")]
+    #[test_case(ParkedWake::JobsGone, Err(NIL_WITHOUT_FINISH_MSG.to_owned()) ; "jobs_gone")]
+    fn dispatch_async_wakes_from_its_park(wake: ParkedWake, expected: Result<String, String>) {
+        let (tx, rx) = flume::bounded(1);
+        thread::spawn(move || {
+            let (trigger, token) = CancelToken::new();
+            let cell = TaskCell::new(token, None, None);
+            cell.deadline_secs.set(Some(DISPATCH_TEST_DEADLINE_SECS));
+            let lua = Lua::new();
+            let scope = TaskScope::new(&lua, cell);
+            let owner = JobOwner::Task(lock_cell(scope.handle()).id);
+            with_jobs(&lua, |store| {
+                store.start(JobSpec::new(owner.clone(), PARKED_DISPATCH_JOB))
+            })
+            .unwrap();
+            let (finish_tx, finish_rx) = flume::bounded(1);
+            let reply = HOST_RUNTIME.block_on(async {
+                let mut dispatch = pin!(dispatch_async(
+                    &lua,
+                    Arc::clone(scope.handle()),
+                    DISPATCH_TEST_PLUGIN,
+                    DISPATCH_TEST_TOOL,
+                    finish_rx,
+                ));
+                let woken = Arc::new(WakeFlag::default());
+                let waker = Waker::from(Arc::clone(&woken));
+                let parked = dispatch.as_mut().poll(&mut Context::from_waker(&waker));
+                assert!(parked.is_pending());
+                match wake {
+                    ParkedWake::Cancel => trigger.cancel(),
+                    ParkedWake::DeadlineMoved => {
+                        let cell = lock_cell(scope.handle());
+                        cell.deadline.set(Some(Instant::now()));
+                        cell.deadline_changed.notify(usize::MAX);
+                    }
+                    ParkedWake::Finish => finish_tx
+                        .send(ToolCallReply::plain(Ok(PARKED_DISPATCH_REPLY.to_owned())))
+                        .unwrap(),
+                    ParkedWake::ContextDropped => drop(finish_tx),
+                    ParkedWake::JobsGone => {
+                        with_jobs(&lua, |store| store.kill_owner(&lua, &owner));
+                    }
+                }
+                assert!(woken.0.load(Ordering::Relaxed), "the park was never woken");
+                dispatch.await
+            });
+            drop(scope);
+            drop(tx.send(reply.result));
+        });
+        let result = rx
+            .recv_timeout(WATCHDOG_TEST_TIMEOUT)
+            .expect("dispatch_async stayed parked");
+        assert_eq!(result, expected);
     }
 
     const PARTIAL_REPLY_OUTPUT: &str = "partial output";
