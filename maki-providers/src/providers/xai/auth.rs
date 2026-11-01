@@ -1,19 +1,20 @@
+use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::str;
 use std::time::{Duration, Instant};
-use std::{fs, thread};
 
 use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
 use reqwest::Client;
 use serde::Deserialize;
+use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
 use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
 use crate::providers::{
-    KeyPool, ResolvedAuth, UNAUTHORIZED_STATUS, client_builder, status_and_text, urlenc, wait,
+    KeyPool, ResolvedAuth, UNAUTHORIZED_STATUS, client_builder, status_and_text, urlenc,
 };
 
 use super::catalog;
@@ -108,7 +109,7 @@ fn oauth_form_headers() -> Vec<(&'static str, String)> {
     ]
 }
 
-fn post_form(url: &str, body: &str, timeout: Duration) -> Result<(u16, String), AgentError> {
+async fn post_form(url: &str, body: &str, timeout: Duration) -> Result<(u16, String), AgentError> {
     if url != TOKEN_URL && url != DEVICE_URL {
         return Err(AgentError::Config {
             message: "refusing to send xAI credentials to an untrusted endpoint".into(),
@@ -121,7 +122,7 @@ fn post_form(url: &str, body: &str, timeout: Duration) -> Result<(u16, String), 
     }
     let request = builder.body(body.to_owned()).build()?;
     // A transport error, not `Config`: only the token endpoint's answer may clear the tokens.
-    wait(status_and_text(&client, request))
+    status_and_text(&client, request).await
 }
 
 fn into_oauth_tokens(
@@ -144,7 +145,7 @@ fn into_oauth_tokens(
     })
 }
 
-pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
+pub(crate) async fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
     if tokens.refresh.is_empty() {
         return Err(AgentError::api(
             UNAUTHORIZED_STATUS,
@@ -158,7 +159,7 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
         urlenc(&tokens.refresh),
         urlenc(CLIENT_ID),
     );
-    let (status, body_text) = post_form(TOKEN_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT)?;
+    let (status, body_text) = post_form(TOKEN_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT).await?;
     if status != 200 {
         return Err(AgentError::api(
             status,
@@ -216,13 +217,14 @@ pub fn resolve(dir: &StateDir) -> Result<(ResolvedAuth, Option<OAuthTokens>), Ag
     })
 }
 
-pub fn login(dir: &StateDir) -> Result<(), AgentError> {
+pub async fn login(dir: &StateDir) -> Result<(), AgentError> {
     if let Some(existing) = grok_cli_credentials() {
         println!("Found official Grok CLI credentials in ~/.grok/auth.json.");
-        let answer = oauth_loopback::prompt("Use them instead of a new xAI OAuth login? [Y/n] ")?;
+        let answer =
+            oauth_loopback::prompt("Use them instead of a new xAI OAuth login? [Y/n] ").await?;
         if answer.is_empty() || answer.to_ascii_lowercase().starts_with('y') {
-            match ensure_fresh(existing) {
-                Ok(tokens) => return finish_login(dir, tokens),
+            match ensure_fresh(existing).await {
+                Ok(tokens) => return finish_login(dir, tokens).await,
                 Err(e) => {
                     warn!(error = %e, "existing Grok CLI credentials could not be refreshed");
                     println!(
@@ -233,12 +235,12 @@ pub fn login(dir: &StateDir) -> Result<(), AgentError> {
         }
     }
 
-    let method = oauth_loopback::select_login_method(DISPLAY_NAME)?;
+    let method = oauth_loopback::select_login_method(DISPLAY_NAME).await?;
     let tokens = match method {
-        LoginMethod::Device => device_login()?,
-        LoginMethod::Browser => browser_login()?,
+        LoginMethod::Device => device_login().await?,
+        LoginMethod::Browser => browser_login().await?,
     };
-    finish_login(dir, tokens)
+    finish_login(dir, tokens).await
 }
 
 pub fn logout(dir: &StateDir) -> Result<(), AgentError> {
@@ -253,10 +255,10 @@ pub fn logout(dir: &StateDir) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn finish_login(dir: &StateDir, tokens: OAuthTokens) -> Result<(), AgentError> {
+async fn finish_login(dir: &StateDir, tokens: OAuthTokens) -> Result<(), AgentError> {
     save_tokens(dir, PROVIDER, &tokens)?;
     println!("Authenticated successfully.");
-    match catalog::refresh(&tokens.access) {
+    match catalog::refresh(&tokens.access).await {
         Ok(models) => {
             println!("Loaded {} models from your xAI catalog.", models.len());
         }
@@ -270,35 +272,35 @@ fn finish_login(dir: &StateDir, tokens: OAuthTokens) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn ensure_fresh(tokens: OAuthTokens) -> Result<OAuthTokens, AgentError> {
+async fn ensure_fresh(tokens: OAuthTokens) -> Result<OAuthTokens, AgentError> {
     if !tokens.is_expired() {
         return Ok(tokens);
     }
-    refresh_tokens(&tokens)
+    refresh_tokens(&tokens).await
 }
 
-fn device_login() -> Result<OAuthTokens, AgentError> {
-    let device = request_device_code()?;
+async fn device_login() -> Result<OAuthTokens, AgentError> {
+    let device = request_device_code().await?;
     println!(
         "Open this URL in your browser:\n\n  {}\n",
         device.verification_uri
     );
     println!("Enter code: {}\n", device.user_code);
     println!("Waiting for authorization...");
-    poll_device_token(&device).map_err(|e| {
+    poll_device_token(&device).await.map_err(|e| {
         error!(error = %e, "xAI device authorization failed");
         e
     })
 }
 
-fn request_device_code() -> Result<DeviceCodeResponse, AgentError> {
+async fn request_device_code() -> Result<DeviceCodeResponse, AgentError> {
     let form_body = format!(
         "client_id={}&scope={}&referrer={}",
         urlenc(CLIENT_ID),
         urlenc(SCOPE),
         urlenc(CLIENT_IDENTIFIER),
     );
-    let (status, body_text) = post_form(DEVICE_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT)?;
+    let (status, body_text) = post_form(DEVICE_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT).await?;
     if status == 404 {
         return Err(AgentError::Config {
             message: "xAI device authorization is not available; choose browser login".into(),
@@ -361,7 +363,7 @@ fn url_origin(uri: &str) -> Result<String, ()> {
     Ok(format!("https://{host}"))
 }
 
-fn poll_device_token(device: &DeviceCodeResponse) -> Result<OAuthTokens, AgentError> {
+async fn poll_device_token(device: &DeviceCodeResponse) -> Result<OAuthTokens, AgentError> {
     let mut interval = Duration::from_secs(
         device
             .interval
@@ -389,9 +391,9 @@ fn poll_device_token(device: &DeviceCodeResponse) -> Result<OAuthTokens, AgentEr
                 message: DEVICE_EXPIRED.into(),
             });
         }
-        thread::sleep(interval.min(deadline.saturating_duration_since(Instant::now())));
+        sleep(interval.min(deadline.saturating_duration_since(Instant::now()))).await;
 
-        let (status, body_text) = post_form(TOKEN_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT)?;
+        let (status, body_text) = post_form(TOKEN_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT).await?;
         if status == 200 {
             let token_resp: TokenResponse = serde_json::from_str(&body_text)?;
             return into_oauth_tokens(token_resp, None);
@@ -437,7 +439,7 @@ fn poll_device_token(device: &DeviceCodeResponse) -> Result<OAuthTokens, AgentEr
     }
 }
 
-fn browser_login() -> Result<OAuthTokens, AgentError> {
+async fn browser_login() -> Result<OAuthTokens, AgentError> {
     let (verifier, challenge) = oauth_loopback::pkce_pair()?;
     let state = oauth_loopback::random_token()?;
     let nonce = oauth_loopback::random_token()?;
@@ -468,7 +470,7 @@ fn browser_login() -> Result<OAuthTokens, AgentError> {
     println!("Waiting for xAI OAuth callback on {redirect_uri}...");
     println!("If the redirect cannot reach this process, paste the complete redirect URL below.");
 
-    let callback = server.wait(&state)?;
+    let callback = server.wait(&state).await?;
     if let Some(error) = callback.error {
         return Err(AgentError::Config {
             message: format!("xAI authorization failed: {error}"),
@@ -485,7 +487,7 @@ fn browser_login() -> Result<OAuthTokens, AgentError> {
         urlenc(CLIENT_ID),
         urlenc(&verifier),
     );
-    let (status, body_text) = post_form(TOKEN_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT)?;
+    let (status, body_text) = post_form(TOKEN_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT).await?;
     if status != 200 {
         return Err(AgentError::Config {
             message: format!("xAI token exchange failed ({status}): {body_text}"),
@@ -597,15 +599,15 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    #[test]
-    fn refresh_without_refresh_token_is_a_dead_token() {
+    #[tokio::test]
+    async fn refresh_without_refresh_token_is_a_dead_token() {
         let tokens = OAuthTokens {
             access: "legacy-access".into(),
             refresh: String::new(),
             expires: 0,
             account_id: None,
         };
-        let err = refresh_tokens(&tokens).unwrap_err();
+        let err = refresh_tokens(&tokens).await.unwrap_err();
         assert!(matches!(
             err,
             AgentError::Api {

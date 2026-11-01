@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use crate::AgentError;
 use crate::model::{ModelInfo, ModelPricing};
-use crate::providers::{status_and_text, user_agent, wait};
+use crate::providers::{status_and_text, user_agent};
 
 use super::auth;
 
@@ -106,15 +106,16 @@ pub(crate) fn cached_model(model_id: &str) -> Option<CachedModel> {
         .find(|model| model.id.eq_ignore_ascii_case(model_id))
 }
 
-pub(crate) fn list_models(access: &str, force: bool) -> Result<Vec<ModelInfo>, AgentError> {
-    Ok(select_models(Some(access), force)?
+pub(crate) async fn list_models(access: &str, force: bool) -> Result<Vec<ModelInfo>, AgentError> {
+    Ok(select_models(Some(access), force)
+        .await?
         .into_iter()
         .map(ModelInfo::from)
         .collect())
 }
 
-pub(crate) fn refresh(access: &str) -> Result<Vec<ModelInfo>, AgentError> {
-    list_models(access, true)
+pub(crate) async fn refresh(access: &str) -> Result<Vec<ModelInfo>, AgentError> {
+    list_models(access, true).await
 }
 
 pub(crate) fn invalidate() {
@@ -123,7 +124,7 @@ pub(crate) fn invalidate() {
     }
 }
 
-fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, AgentError> {
+async fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, AgentError> {
     let now = now_millis();
     let cache = load_cache(now);
 
@@ -142,7 +143,7 @@ fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, 
         return Ok(curated_fallback());
     };
 
-    match fetch_catalog(access) {
+    match fetch_catalog(access).await {
         FetchOutcome::Success(models) => {
             save_cache(&models, now);
             Ok(models)
@@ -192,7 +193,7 @@ fn curated_fallback() -> Vec<CachedModel> {
         .collect()
 }
 
-fn fetch_catalog(access: &str) -> FetchOutcome {
+async fn fetch_catalog(access: &str) -> FetchOutcome {
     let Ok(client) = auth::http_client(FETCH_TIMEOUT) else {
         return FetchOutcome::Transient;
     };
@@ -212,7 +213,7 @@ fn fetch_catalog(access: &str) -> FetchOutcome {
         return FetchOutcome::Transient;
     };
 
-    let (status, body) = match wait(status_and_text(&client, request)) {
+    let (status, body) = match status_and_text(&client, request).await {
         Ok(result) => result,
         Err(e) => {
             debug!(error = %e, "xAI catalog request failed");
