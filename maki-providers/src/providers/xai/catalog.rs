@@ -30,6 +30,7 @@ const RESPONSES_BACKEND: &str = "responses";
 
 pub(crate) const INVALID_CATALOG: &str = "xAI model catalog response was invalid";
 pub(crate) const CATALOG_UNAUTHORIZED: &str = "xAI model catalog request was unauthorized";
+const CATALOG_UNAVAILABLE: &str = "xAI model catalog could not be fetched";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CachedModel {
@@ -107,7 +108,7 @@ pub(crate) fn cached_model(model_id: &str) -> Option<CachedModel> {
 }
 
 pub(crate) fn list_models(access: &str, force: bool) -> Result<Vec<ModelInfo>, AgentError> {
-    Ok(select_models(Some(access), force)?
+    Ok(select_models(access, force)?
         .into_iter()
         .map(ModelInfo::from)
         .collect())
@@ -123,7 +124,7 @@ pub(crate) fn invalidate() {
     }
 }
 
-fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, AgentError> {
+fn select_models(access: &str, force: bool) -> Result<Vec<CachedModel>, AgentError> {
     let now = now_millis();
     let cache = load_cache(now);
 
@@ -138,10 +139,6 @@ fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, 
         return Ok(cache.models.clone());
     }
 
-    let Some(access) = access else {
-        return Ok(curated_fallback());
-    };
-
     match fetch_catalog(access) {
         FetchOutcome::Success(models) => {
             save_cache(&models, now);
@@ -149,47 +146,29 @@ fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, 
         }
         FetchOutcome::Auth => Err(AgentError::api(401, CATALOG_UNAUTHORIZED)),
         FetchOutcome::Permanent => {
-            warn!("xAI catalog refresh rejected, using curated fallback");
             invalidate();
-            Ok(curated_fallback())
+            Err(unavailable())
         }
         FetchOutcome::Transient | FetchOutcome::Invalid => {
             if force {
-                warn!("xAI catalog force refresh failed, using curated fallback");
                 invalidate();
-                return Ok(curated_fallback());
+                return Err(unavailable());
             }
             if let Some(cache) = cache {
                 warn!("xAI catalog refresh failed transiently, using stale cache");
                 return Ok(cache.models);
             }
-            warn!("xAI catalog refresh failed, using curated fallback");
-            Ok(curated_fallback())
+            Err(unavailable())
         }
     }
 }
 
-fn curated_fallback() -> Vec<CachedModel> {
-    super::SPEC
-        .models()
-        .iter()
-        .filter_map(|entry| {
-            Some(CachedModel {
-                id: entry.canonical_id()?.to_string(),
-                reasoning: true,
-                vision: entry.supports_vision.unwrap_or_default(),
-                pricing: entry
-                    .pricing
-                    .as_ref()
-                    .map(ModelPricingDto::from)
-                    .unwrap_or_default(),
-                context_window: entry.context_window?,
-                max_tokens: entry
-                    .max_output_tokens
-                    .unwrap_or(DEFAULT_UNKNOWN_MAX_TOKENS),
-            })
-        })
-        .collect()
+/// A failed listing is not an empty catalog: callers fall back to the static
+/// specs and warn, and discovery must not read it as a live answer.
+fn unavailable() -> AgentError {
+    AgentError::Config {
+        message: CATALOG_UNAVAILABLE.into(),
+    }
 }
 
 fn fetch_catalog(access: &str) -> FetchOutcome {
@@ -610,12 +589,5 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert!(!models[0].reasoning);
         assert_eq!(models[0].context_window, 1_000_000);
-    }
-
-    #[test]
-    fn fallback_models_include_curated_defaults() {
-        let ids: Vec<_> = curated_fallback().into_iter().map(|m| m.id).collect();
-        assert!(ids.contains(&"grok-4.6".into()));
-        assert!(ids.contains(&"grok-4.3".into()));
     }
 }

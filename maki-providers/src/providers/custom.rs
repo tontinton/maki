@@ -254,6 +254,29 @@ fn declared_specs_from(config: &ProvidersConfig) -> Vec<String> {
     specs
 }
 
+/// The declared specs, plus the providers whose list they fully describe.
+/// A `discover_models` provider is left out of the second list: its declared
+/// specs show before discovery finishes, but only a successful probe proves
+/// which models it still serves.
+pub fn declared_batch() -> (Vec<String>, Vec<String>) {
+    declared_batch_from(&ProvidersConfig::load())
+}
+
+fn declared_batch_from(config: &ProvidersConfig) -> (Vec<String>, Vec<String>) {
+    let specs = declared_specs_from(config);
+    let providers = config
+        .providers
+        .iter()
+        .filter(|(slug, def)| {
+            !def.discover_models
+                && !is_builtin_slug(slug)
+                && resolve_protocol(slug, Some(*def)).is_some()
+        })
+        .map(|(slug, _)| slug.clone())
+        .collect();
+    (specs, providers)
+}
+
 /// Models a custom provider can start on: its own `default_model`, then one
 /// declared model per tier. Never the protocol's default model, because a local
 /// server or proxy rarely serves it. Sorted by slug, since `providers.toml` is a
@@ -417,6 +440,23 @@ mod tests {
         // Resolution owns the builtin slug regardless of the providers.toml entry.
         let model = Model::from_spec("opencode/shadow-model").unwrap();
         assert_eq!(model.provider.as_ref(), "opencode");
+    }
+
+    /// A `discover_models` provider's declared specs still show before its
+    /// probe lands, but the batch must not claim it answered: a failed probe
+    /// would otherwise mark its undiscovered recents retired.
+    #[test]
+    fn declared_batch_leaves_discovering_providers_out() {
+        let mut config = ProvidersConfig::default();
+        config.upsert("declared".to_string(), openai_def("small"));
+        let mut discovering = openai_def("small");
+        discovering.discover_models = true;
+        config.upsert("discovering".to_string(), discovering);
+
+        let (specs, providers) = declared_batch_from(&config);
+        assert!(specs.contains(&"declared/small".to_string()));
+        assert!(specs.contains(&"discovering/small".to_string()));
+        assert_eq!(providers, ["declared"]);
     }
 
     #[test_case("[localai]", &[] ; "entry_without_protocol_is_skipped")]
