@@ -1,6 +1,7 @@
 //! A recorded loopback server: the one copy every replay suite in the
 //! workspace serves its transcripts from. Also the one way a test registers a
-//! declared provider, see [`register_bundled`].
+//! declared provider, see [`register_bundled`], and hides this machine's own
+//! provider setup, see [`isolated_home`].
 //!
 //! Synchronous and dependency-light on purpose. It is the thing a provider is
 //! compared *against*, so it shares nothing with the async stack under test:
@@ -15,6 +16,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
+use tempfile::TempDir;
 
 use crate::providers::plugin::{self, DeclAuthority, ProviderDecl, ProviderHooks, Registration};
 
@@ -26,6 +28,16 @@ const BIND_FAILED: &str = "cannot bind loopback";
 const IO_FAILED: &str = "the recorded connection broke";
 const QUERY_START: char = '?';
 const BAD_DECLARATION: &str = "the test declaration must register";
+const TEMPDIR_FAILED: &str = "cannot create the isolated home";
+const BASE_URL_SUFFIX: &str = "_BASE_URL";
+const HOME_ENV: &str = "HOME";
+// Logs sit beside the state base, so keep its parent inside the guard.
+const XDG_DIRS: &[(&str, &str)] = &[
+    ("XDG_CONFIG_HOME", "config"),
+    ("XDG_STATE_HOME", "state"),
+    ("XDG_DATA_HOME", "data"),
+    ("XDG_CACHE_HOME", "cache"),
+];
 const MIXED_SCRIPT: &str =
     "a script is either all routed with `Canned::at` or all sequential, never a mix";
 
@@ -278,10 +290,40 @@ pub(crate) mod transport {
     }
 }
 
+/// Points every per-user directory at a fresh temp dir and clears every
+/// `<SLUG>_BASE_URL` override, so a test reads none of this machine's provider
+/// config or credentials and writes its own. Call it first, since the base
+/// dirs are resolved once per process, and keep the guard for the whole test.
+pub fn isolated_home() -> TempDir {
+    let home = TempDir::new().expect(TEMPDIR_FAILED);
+    let overrides: Vec<_> = std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| {
+            key.to_str()
+                .is_some_and(|key| key.ends_with(BASE_URL_SUFFIX))
+        })
+        .collect();
+    // SAFETY: Nextest runs each test in its own process. Callers set up the
+    // environment before starting work that can read it.
+    unsafe {
+        for key in overrides {
+            std::env::remove_var(key);
+        }
+        std::env::set_var(HOME_ENV, home.path());
+        for (var, dir) in XDG_DIRS {
+            std::env::set_var(var, home.path().join(dir));
+        }
+    }
+    home
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::panic::catch_unwind;
+    use std::path::PathBuf;
 
+    use maki_storage::paths;
     use test_case::test_case;
 
     use super::*;
@@ -290,6 +332,7 @@ mod tests {
     const B_PATH: &str = "/v1/b";
     const A_BODY: &str = r#"{"route":"a"}"#;
     const B_BODY: &str = r#"{"route":"b"}"#;
+    const DIRECTORY_ESCAPED: &str = "a user directory escaped the isolated home";
     const ROUTED: &[Canned] = &[
         Canned::at(B_PATH, Canned::json(200, B_BODY)),
         Canned::at(A_PATH, Canned::json(200, A_BODY)),
@@ -298,6 +341,22 @@ mod tests {
         Canned::at(A_PATH, Canned::json(200, A_BODY)),
         Canned::json(200, B_BODY),
     ];
+
+    #[test_case(paths::config_dir ; "config")]
+    #[test_case(paths::xdg_config_dir ; "xdg_config")]
+    #[test_case(paths::data_dir ; "data")]
+    #[test_case(paths::state_dir ; "state")]
+    #[test_case(paths::logs_dir ; "logs")]
+    #[test_case(paths::cache_dir ; "cache")]
+    fn isolated_home_contains_user_directories(resolve: fn() -> io::Result<PathBuf>) {
+        let home = isolated_home();
+        let directory = resolve().unwrap();
+        assert!(
+            directory.starts_with(home.path()),
+            "{DIRECTORY_ESCAPED}: {}",
+            directory.display()
+        );
+    }
 
     /// One raw request on its own connection, answered by the status line and
     /// the body.

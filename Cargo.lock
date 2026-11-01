@@ -3451,6 +3451,7 @@ dependencies = [
  "jiff",
  "keyring",
  "maki-config",
+ "maki-providers",
  "maki-storage",
  "open",
  "reqwest",
