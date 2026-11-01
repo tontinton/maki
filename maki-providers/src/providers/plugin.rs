@@ -3212,7 +3212,8 @@ mod tests {
 
         assert!(is_registered(CATALOG_SLUG), "{TAKEOVER_FAILED}");
         assert!(
-            !catalog::catalog_providers()
+            !catalog::catalog_providers_if_available()
+                .expect("seeded")
                 .iter()
                 .any(|provider| provider.slug == CATALOG_SLUG),
             "{REPLACED}"
@@ -3258,7 +3259,8 @@ mod tests {
         );
         assert!(!is_registered(CATALOG_SLUG), "{NOT_TAKEN}");
         assert!(
-            catalog::catalog_providers()
+            catalog::catalog_providers_if_available()
+                .expect("seeded")
                 .iter()
                 .any(|provider| provider.slug == CATALOG_SLUG),
             "{STILL_LISTED}"
