@@ -76,15 +76,14 @@ Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token 
 
 If you already use Claude through AWS Bedrock, you can point Maki at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Maki will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
 
-The region comes from `AWS_REGION`, then `AWS_DEFAULT_REGION`, then your AWS profile, and falls back to `us-east-1`. Auth uses the first of these that is set:
+You will need `AWS_REGION` and one of the following for auth:
 
 | Method | Env vars |
 |--------|----------|
+| IAM credentials | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) |
+| Credentials file | `AWS_PROFILE` (defaults to `default`), reads `~/.aws/credentials` |
 | Bearer token | `AWS_BEARER_TOKEN_BEDROCK` |
 | Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, useful behind a proxy that handles auth) |
-| AWS credentials | The AWS SDK's default chain: `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE` (static keys, SSO, `credential_process`, assumed roles, `aws login`), web identity, container and instance credentials |
-
-Temporary AWS credentials are refreshed 5 minutes before they expire. After `aws sso login`, the next request picks up the new session.
 
 You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here.
 
