@@ -14,9 +14,9 @@ on:
 
 env:
   # renovate: datasource=pypi depName=ruff
-  RUFF_VERSION: 0.16.2
+  RUFF_VERSION: 0.17.2
   # renovate: datasource=pypi depName=ty
-  TY_VERSION: 0.0.90
+  TY_VERSION: 0.0.91
 
 jobs:
   lint:
