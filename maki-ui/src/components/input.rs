@@ -964,6 +964,7 @@ mod tests {
     use maki_providers::ImageMediaType;
     use ratatui::layout::{Position, Rect};
     use ratatui::style::Color;
+    use std::io::Write;
     use std::ops::Range;
     use std::sync::Arc;
     use test_case::test_case;
@@ -1660,6 +1661,34 @@ mod tests {
     #[test_case("a漢b", 2, Position::new(3, 1)  ; "on_a_wide_char")]
     fn terminal_cursor_tracks_the_software_cursor(text: &str, left: usize, expected: Position) {
         assert_cursor_at(&render_with_cursor_left(text, left), Some(expected));
+    }
+
+    const IME_SEES_THE_WIDE_CELL: &str =
+        "the frame's last cursor position is the cell reversed for the wide char";
+    const IME_IGNORES_THE_DIFF_WALK: &str =
+        "the diff may walk the cursor, but only inside the synchronized update";
+
+    /// The caret on `漢` in `a漢b` is the cell the IME has to keep. A diff that
+    /// first moves the cursor to the origin still leaves that cell as the last
+    /// position inside the frame, and none outside it.
+    #[test]
+    fn wide_char_caret_is_the_last_cursor_position_in_the_frame() {
+        let rendered = render_with_cursor_left("a漢b", 2);
+        let caret = rendered.cursor.expect("the wide char caret has a cell");
+        let mut draw = Vec::new();
+        crossterm::queue!(draw, crossterm::cursor::MoveTo(0, 0)).expect("the diff encodes");
+        let mut frame = Vec::new();
+        crate::present::present(&mut frame, |writer| writer.write_all(&draw), Some(caret))
+            .expect("the frame presents");
+        assert!(
+            crate::present::cursor_positions_outside(&frame).is_empty(),
+            "{IME_IGNORES_THE_DIFF_WALK}"
+        );
+        assert_eq!(
+            crate::present::last_cursor_inside(&frame),
+            Some(caret),
+            "{IME_SEES_THE_WIDE_CELL}"
+        );
     }
 
     #[test_case(CURSOR_EW, 0, Position::new(0, 2)         ; "at_the_boundary_it_starts_the_next_row")]
