@@ -50,7 +50,6 @@ use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
 use maki_storage::sessions::normalize_title;
-use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
 use tokio::runtime::Handle;
@@ -75,6 +74,7 @@ use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest};
 use crate::decor_worker;
 use crate::input::InputReader;
+use crate::present::present;
 use crate::repaint::{Dirty, IDLE_POLL};
 use crate::theme;
 use crate::{AppSession, OpenSession};
@@ -794,28 +794,13 @@ impl<'t> EventLoop<'t> {
         &mut self.sessions[self.focused].app
     }
 
-    /// Paints a frame and parks the terminal cursor on the cell the input box
-    /// reversed, without showing it. macOS anchors IME preedit text to the
-    /// cursor, so it has to sit there, but a visible one would invert that
-    /// already reversed cell back to plain text and ride along with every cell
-    /// the next diff writes.
-    ///
-    /// `Frame::set_cursor_position` cannot do this: ratatui shows the cursor
-    /// whenever a frame asks for a position. Hence the move after the draw,
-    /// and the hide that goes with it, so a widget that does ask for one
-    /// cannot bring the block cursor back.
     fn paint(&mut self) -> Result<()> {
         let app = &mut self.sessions[self.focused].app;
-        let mut cursor = None;
-        self.terminal.draw(|f| {
-            cursor = app.view(f);
-            color_compat::downgrade_if_needed(f.buffer_mut());
+        present(self.terminal, |frame| {
+            let caret = app.view(frame);
+            color_compat::downgrade_if_needed(frame.buffer_mut());
+            caret
         })?;
-        if let Some(pos) = cursor {
-            self.terminal.hide_cursor()?;
-            self.terminal.set_cursor_position(pos)?;
-            self.terminal.backend_mut().flush()?;
-        }
         Ok(())
     }
 

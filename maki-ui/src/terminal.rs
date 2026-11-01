@@ -14,7 +14,9 @@ use crossterm::event::{
 };
 #[cfg(not(windows))]
 use crossterm::event::{DisableFocusChange, EnableFocusChange};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    self, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use maki_config::NotificationMethod;
 
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Maki needs attention";
@@ -336,6 +338,9 @@ fn teardown() {
 
 fn pop_terminal_modes() {
     write_mux_sequence(POP_WINDOW_TITLE_SEQUENCE);
+    // An error or panic mid-frame leaves the synchronized update open, and the
+    // terminal would hold its output until its own timeout.
+    stdout().execute(EndSynchronizedUpdate).ok();
     stdout().execute(crossterm::cursor::Show).ok();
     stdout().execute(PopKeyboardEnhancementFlags).ok();
     disable_focus_change();
