@@ -50,7 +50,6 @@ use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
 use maki_storage::sessions::normalize_title;
-use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
 use tokio::runtime::Handle;
@@ -804,11 +803,24 @@ impl<'t> EventLoop<'t> {
     /// already reversed cell back to plain text and ride along with every cell
     /// the next diff writes.
     ///
+    /// The diff moves that cursor onto every changed cell, and `hide_cursor`
+    /// and `set_cursor_position` each flush on their own. Those positions stay
+    /// inside one synchronized update, so the IME sees the caret and not the
+    /// path the diff took. The update is closed when the draw fails too: a
+    /// terminal that honors it would otherwise keep the previous frame up.
+    ///
     /// `Frame::set_cursor_position` cannot do this: ratatui shows the cursor
     /// whenever a frame asks for a position. Hence the move after the draw,
     /// and the hide that goes with it, so a widget that does ask for one
     /// cannot bring the block cursor back.
     fn paint(&mut self) -> Result<()> {
+        crate::present::begin(self.terminal.backend_mut())?;
+        let presented = self.draw_and_park();
+        crate::present::end(self.terminal.backend_mut())?;
+        presented
+    }
+
+    fn draw_and_park(&mut self) -> Result<()> {
         let app = &mut self.sessions[self.focused].app;
         let mut cursor = None;
         self.terminal.draw(|f| {
@@ -818,7 +830,6 @@ impl<'t> EventLoop<'t> {
         if let Some(pos) = cursor {
             self.terminal.hide_cursor()?;
             self.terminal.set_cursor_position(pos)?;
-            self.terminal.backend_mut().flush()?;
         }
         Ok(())
     }

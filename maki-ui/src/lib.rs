@@ -37,6 +37,7 @@ pub mod wrap;
 mod agent;
 mod event_loop;
 mod input;
+mod present;
 mod terminal;
 mod terminal_image;
 
