@@ -43,7 +43,7 @@ pub async fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()
             if builtin_provider(&slug).is_none()
                 && !plugin::is_registered(&slug)
                 && ProvidersConfig::load().get(&slug).is_none()
-                && let Some(provider_data) = maki_providers::catalog_provider(&slug)
+                && let Some(provider_data) = maki_providers::catalog_provider(&slug).await
             {
                 login_catalog_provider(&provider_data, storage)?;
             } else {
@@ -79,7 +79,9 @@ async fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     // Past the check above, an `Unknown` owner is a `providers.toml` entry with
     // no `protocol`. Login would say "Configured" and it would never work,
     // unless the slug is a models.dev provider, which brings its own protocol.
-    if matches!(Owner::of(slug), Owner::Unknown) && known_outside_catalog(slug, &catalog_slugs()) {
+    if matches!(Owner::of(slug), Owner::Unknown)
+        && known_outside_catalog(slug, &catalog_slugs().await)
+    {
         bail!(
             "providers.toml entry [{slug}] has no `protocol` and is not a models.dev provider, so maki cannot talk to it\n\
              add `protocol` ({PROTOCOL_CHOICES}) and `base_url`, or run `maki auth login` and pick \"Custom provider...\"\n\n\
@@ -161,8 +163,9 @@ async fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-fn catalog_slugs() -> Vec<String> {
+async fn catalog_slugs() -> Vec<String> {
     catalog_providers()
+        .await
         .into_iter()
         .map(|provider| provider.slug)
         .collect()
@@ -207,7 +210,7 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         let display = def.display_name.clone().unwrap_or_else(|| slug.clone());
         rows.push((mark(saved(slug)), slug.clone(), display, None));
     }
-    for cat in catalog_providers() {
+    for cat in catalog_providers().await {
         let (slug, display) = (cat.slug.clone(), cat.display_name.clone());
         rows.push((mark(saved(&slug)), slug, display, Some(cat)));
     }
@@ -482,7 +485,7 @@ pub async fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn auth_status(storage: &StateDir) -> Result<()> {
+pub async fn auth_status(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
     let builtins = all_builtins();
 
@@ -569,7 +572,7 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
         }
     }
     // Catalog providers from models.dev
-    let catalog_entries = catalog_providers();
+    let catalog_entries = catalog_providers().await;
     if !catalog_entries.is_empty() {
         println!("  \x1b[1mCatalog Providers (models.dev):\x1b[0m");
         for entry in &catalog_entries {
@@ -609,7 +612,7 @@ pub async fn models(
 
     let mut refresh_failure = None;
     if refresh {
-        match maki_providers::refresh_catalog() {
+        match maki_providers::refresh_catalog().await {
             Ok(()) => eprintln!("models.dev catalog has been refreshed"),
             Err(e) => refresh_failure = Some(e),
         }

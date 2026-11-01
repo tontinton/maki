@@ -222,7 +222,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                     subcmd::auth_login(provider.as_deref(), &storage).await?
                 }
                 AuthAction::Logout { provider } => subcmd::auth_logout(&provider, &storage).await?,
-                AuthAction::Status => subcmd::auth_status(&storage)?,
+                AuthAction::Status => subcmd::auth_status(&storage).await?,
             }
         }
         Some(Command::Index { path }) => {

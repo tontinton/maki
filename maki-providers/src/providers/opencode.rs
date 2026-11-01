@@ -3,13 +3,12 @@ use std::sync::{Arc, Mutex};
 use flume::Sender;
 use maki_storage::id::SessionRef;
 use serde_json::Value;
-use tokio::task::spawn_blocking;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::catalog::{
-    CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks,
-    init_shared_catalog_if_needed, sends_if_available,
+    CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks, sends_if_available,
+    shared_catalog,
 };
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, NO_CURATED_MODELS, Native,
@@ -183,13 +182,10 @@ impl Opencode {
     }
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
-        Ok(spawn_blocking(move || {
-            let guard = init_shared_catalog_if_needed().lock().unwrap();
-            guard.provider(ZEN_SLUG).map_or_else(Vec::new, |data| {
-                data.available_models(&guard.state_dir, data.free_models_enabled())
-            })
-        })
-        .await?)
+        let guard = shared_catalog().await.lock().unwrap();
+        Ok(guard.provider(ZEN_SLUG).map_or_else(Vec::new, |data| {
+            data.available_models(&guard.state_dir, data.free_models_enabled())
+        }))
     }
 
     async fn lookup(
@@ -198,33 +194,28 @@ impl Opencode {
         actual_id: &str,
         session_id: Option<&SessionRef>,
     ) -> Result<(CatalogMeta, EndpointType, ResolvedAuth), AgentError> {
-        let sub_provider = sub_provider.to_string();
-        let actual_id = actual_id.to_string();
-        let session_id = session_id.cloned();
-        let auth_override = self.auth.clone();
-        spawn_blocking(move || {
-            let guard = init_shared_catalog_if_needed().lock().unwrap();
-            let (meta, provider_data) = guard.lookup(&sub_provider, &actual_id)?;
-            let override_auth = auth_override
-                .filter(|_| SLUGS.contains(&provider_data.slug.as_str()))
-                .map(|auth| {
-                    let mut auth = auth.lock().unwrap().clone();
-                    if auth.base_url.is_none() {
-                        auth.base_url = provider_data.base_url.clone();
-                    }
-                    auth
-                });
-            let auth = match override_auth {
-                Some(auth) => auth,
-                None => provider_data
-                    .catalog_auth(&guard.state_dir, provider_data.free_models_enabled())?
-                    .unlocked(&sub_provider)?
-                    .clone(),
-            };
-            let auth = provider_data.request_auth(auth, session_id.as_ref());
-            Ok((meta.clone(), provider_data.api_format, auth))
-        })
-        .await?
+        let guard = shared_catalog().await.lock().unwrap();
+        let (meta, provider_data) = guard.lookup(sub_provider, actual_id)?;
+        let override_auth = self
+            .auth
+            .clone()
+            .filter(|_| SLUGS.contains(&provider_data.slug.as_str()))
+            .map(|auth| {
+                let mut auth = auth.lock().unwrap().clone();
+                if auth.base_url.is_none() {
+                    auth.base_url = provider_data.base_url.clone();
+                }
+                auth
+            });
+        let auth = match override_auth {
+            Some(auth) => auth,
+            None => provider_data
+                .catalog_auth(&guard.state_dir, provider_data.free_models_enabled())?
+                .unlocked(sub_provider)?
+                .clone(),
+        };
+        let auth = provider_data.request_auth(auth, session_id);
+        Ok((meta.clone(), provider_data.api_format, auth))
     }
 }
 

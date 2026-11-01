@@ -43,7 +43,7 @@ const STARTUP_TIERS: [ModelTier; 2] = [ModelTier::Strong, ModelTier::Medium];
 
 /// The model to start on, plus a warning when the saved one had to be skipped.
 /// Logging is not up this early, so the caller has to show the warning.
-pub fn resolve_model(
+pub async fn resolve_model(
     explicit: Option<&str>,
     provider_config: &ProviderConfig,
     storage: &StateDir,
@@ -55,17 +55,19 @@ pub fn resolve_model(
                 "model {spec:?} is not allowed by provider model policy"
             ));
         }
-        let model = from_spec_or_warm_catalog(spec).context("invalid --model spec")?;
+        let model = from_spec_or_warm_catalog(spec)
+            .await
+            .context("invalid --model spec")?;
         return Ok((model, None));
     }
     let Some(spec) = read_model(storage) else {
-        return Ok((fallback_model(provider_config)?, None));
+        return Ok((fallback_model(provider_config).await?, None));
     };
-    let skipped = match saved_model(&spec, policy) {
+    let skipped = match saved_model(&spec, policy).await {
         Ok(model) => return Ok((model, None)),
         Err(reason) => format!("saved model {spec} unavailable ({reason:#})"),
     };
-    match fallback_model(provider_config) {
+    match fallback_model(provider_config).await {
         Ok(model) => {
             let warning = format!("{skipped}, using {}", model.spec());
             Ok((model, Some(warning)))
@@ -74,16 +76,16 @@ pub fn resolve_model(
     }
 }
 
-fn saved_model(spec: &str, policy: &ModelPolicy) -> Result<Model> {
+async fn saved_model(spec: &str, policy: &ModelPolicy) -> Result<Model> {
     if !policy.allows(spec) {
         bail!("not allowed by provider model policy");
     }
-    let model = from_spec_or_warm_catalog(spec)?;
+    let model = from_spec_or_warm_catalog(spec).await?;
     provider_ready(&model.provider)?;
     Ok(model)
 }
 
-fn fallback_model(provider_config: &ProviderConfig) -> Result<Model> {
+async fn fallback_model(provider_config: &ProviderConfig) -> Result<Model> {
     let policy = &provider_config.model_policy;
     if let Some(spec) = provider_config.default_model.as_deref() {
         if !policy.allows(spec) {
@@ -91,7 +93,9 @@ fn fallback_model(provider_config: &ProviderConfig) -> Result<Model> {
                 "default model {spec:?} is not allowed by provider model policy"
             ));
         }
-        return from_spec_or_warm_catalog(spec).context("invalid default_model in config");
+        return from_spec_or_warm_catalog(spec)
+            .await
+            .context("invalid default_model in config");
     }
     auto_detect_model(policy).ok_or_else(|| {
         let policy_note = if policy.is_restrictive() {
@@ -124,10 +128,10 @@ pub fn remember_thinking(defaults: &mut SessionDefaults, storage: &StateDir) {
 /// An unknown slug may just mean the models.dev catalog has not been loaded
 /// yet, so retry once with a warm catalog. `Model::from_spec` itself must stay
 /// non-blocking: the UI draws with it.
-fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
+async fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
     let result = match Model::from_spec(spec) {
         Err(ModelError::UnsupportedProvider(_)) => {
-            maki_providers::warm_catalog();
+            maki_providers::warm_catalog().await;
             Model::from_spec(spec)
         }
         result => result,

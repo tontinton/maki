@@ -270,10 +270,7 @@ pub async fn fetch_all_models(
 
     let tx_catalog = tx.clone();
     tokio::spawn(async move {
-        let catalog = spawn_blocking(catalog_providers)
-            .await
-            .expect("catalog load panicked");
-        for cat in catalog {
+        for cat in catalog_providers().await {
             // No `Owner::Custom` here, unlike `available_model_specs` above:
             // a long-standing asymmetry, changing it is a behaviour change.
             if ProviderRegistry::get(&cat.slug).is_some()

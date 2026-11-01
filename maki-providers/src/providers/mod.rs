@@ -462,8 +462,7 @@ pub(crate) fn http_client(timeouts: Timeouts) -> Client {
         })
 }
 
-/// For the credential and catalog flows that are still synchronous and have
-/// to block on one request. Works from a worker, from the main thread's
+/// For a flow that still blocks on one request. Works from a worker, from the main thread's
 /// `block_on` and from the blocking pool alike; panics on a current_thread
 /// runtime (every `#[tokio::test]`) and inside a `LocalSet` (the Lua thread).
 pub(crate) fn wait<T>(future: impl Future<Output = T>) -> T {
