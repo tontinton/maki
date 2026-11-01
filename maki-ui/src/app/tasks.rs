@@ -1044,16 +1044,25 @@ mod tests {
     }
 
     /// A moved call may run for hours, and its tab keeps the spinner of the
-    /// row it copied. Only the tab on screen may claim that motion, or an
-    /// idle session paints at spinner rate for as long as the task lives.
+    /// row it copied. Only the tab on screen may claim that motion.
     #[test]
     fn a_background_task_spins_only_while_its_tab_is_on_screen() {
         let (mut app, _buf) = app_with_moved_call();
         end_turn(&mut app);
-        assert_eq!(app.cadence(), Cadence::IDLE);
+        assert_eq!(app.chats[app.active_chat].cadence(), Cadence::IDLE);
 
         app.focus_task(MOVED_ID).unwrap();
+        assert_eq!(app.chats[app.active_chat].cadence(), Cadence::SPINNER);
+    }
+
+    #[test]
+    fn the_status_bar_spins_while_a_background_task_runs() {
+        let (mut app, _buf) = app_with_moved_call();
+        end_turn(&mut app);
         assert_eq!(app.cadence(), Cadence::SPINNER);
+
+        app.end_task(MOVED_ID, BackgroundOutcome::Done);
+        assert_eq!(app.cadence(), Cadence::IDLE);
     }
 
     /// A reply wakes nothing, so the loop keeps looking without painting
@@ -1062,6 +1071,7 @@ mod tests {
     fn a_pending_move_is_looked_for_until_it_answers() {
         let (mut app, _buf) = app_with_moved_call();
         end_turn(&mut app);
+        app.end_task(MOVED_ID, BackgroundOutcome::Done);
         let (reply, answer) = flume::bounded(1);
         app.background_moves.pending = vec![answer];
         assert_eq!(app.cadence(), Cadence::PENDING);

@@ -50,7 +50,7 @@ use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_menu, built
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
-use crate::components::status_bar::StatusBar;
+use crate::components::status_bar::{Motion, StatusBar};
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
@@ -2284,6 +2284,17 @@ impl App {
         vec![]
     }
 
+    /// Wider than [`Status::Streaming`]: a background task keeps the bar
+    /// spinning after the turn ends, but it never blocks input.
+    fn status_motion(&self) -> Motion<'_> {
+        Motion {
+            working: self.status == Status::Streaming
+                || self.running_background_tasks().next().is_some(),
+            restoring: self.restoring.load(Ordering::Relaxed),
+            retry: self.retry_info.as_ref(),
+        }
+    }
+
     /// Background tasks of every open session. They all run in the one Lua
     /// host, which a quit or a reload ends.
     fn background_everywhere(&self) -> usize {
@@ -3506,11 +3517,7 @@ impl App {
     pub fn cadence(&self) -> Cadence {
         Cadence::any([
             Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
-            self.status_bar.cadence(
-                &self.status,
-                self.restoring.load(Ordering::Relaxed),
-                self.retry_info.is_some(),
-            ),
+            self.status_bar.cadence(&self.status_motion()),
             self.selection_state
                 .as_ref()
                 .map_or(Cadence::IDLE, SelectionState::cadence),

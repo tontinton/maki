@@ -46,15 +46,24 @@ pub struct UsageStats {
     pub show_global: bool,
 }
 
+/// Everything on the bar that moves with the clock. The view draws from it and
+/// the cadence asks for frames from it, so a spinner can't freeze and an idle
+/// bar can't keep painting.
+pub struct Motion<'a> {
+    pub working: bool,
+    pub restoring: bool,
+    pub retry: Option<&'a RetryInfo>,
+}
+
 pub struct StatusBarContext<'a> {
     pub status: &'a Status,
+    pub motion: Motion<'a>,
     pub mode_label: Cow<'static, str>,
     pub mode_style: Style,
     pub model_id: &'a str,
     pub stats: UsageStats,
     pub auto_scroll: bool,
     pub chat_name: Option<&'a str>,
-    pub retry_info: Option<&'a RetryInfo>,
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
     pub workflow: bool,
@@ -63,7 +72,6 @@ pub struct StatusBarContext<'a> {
     /// with no `.maki` at all.
     pub restricted: bool,
     pub yolo: bool,
-    pub restoring: bool,
 }
 
 pub struct StatusBar {
@@ -159,15 +167,11 @@ impl StatusBar {
         self.flash = self.queued.pop_front().map(|msg| (msg, Instant::now()));
     }
 
-    /// The bar spins for a whole turn, again while a restore is in flight, and
-    /// it counts a retry down by the second. It sits next to [`Self::view`] so
-    /// a new moving span cannot forget to claim its frames.
-    ///
     /// A queue claims frames too. Startup fills it and then the UI sits idle,
     /// so without frames the next message would never get its turn.
-    pub fn cadence(&self, status: &Status, restoring: bool, retrying: bool) -> Cadence {
+    pub fn cadence(&self, motion: &Motion) -> Cadence {
         Cadence::when(
-            *status == Status::Streaming || restoring || retrying || !self.queued.is_empty(),
+            motion.working || motion.restoring || motion.retry.is_some() || !self.queued.is_empty(),
             Cadence::SPINNER,
         )
     }
@@ -175,12 +179,12 @@ impl StatusBar {
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
         let mut left_spans = Vec::new();
 
-        if *ctx.status == Status::Streaming {
+        if ctx.motion.working {
             let ch = spinner_frame(self.started_at.elapsed().as_millis());
             left_spans.push(Span::styled(format!(" {ch}"), theme::current().spinner));
         }
 
-        if ctx.restoring {
+        if ctx.motion.restoring {
             let ch = spinner_frame(self.started_at.elapsed().as_millis());
             left_spans.push(Span::styled(
                 format!(" {ch}"),
@@ -204,7 +208,7 @@ impl StatusBar {
             ));
         }
 
-        if let Some(retry) = ctx.retry_info {
+        if let Some(retry) = ctx.motion.retry {
             left_spans.push(Span::styled(
                 format!(" {}", retry.message),
                 theme::current().status_retry_error,
@@ -470,6 +474,11 @@ mod tests {
     const RETRY_MESSAGE: &str = "rate limited";
     const RETRY_ATTEMPT: u32 = 2;
     const COUNTDOWN: &str = "retrying in";
+    const STILL: Motion = Motion {
+        working: false,
+        restoring: false,
+        retry: None,
+    };
     /// Long enough that the countdown cannot lapse mid-render.
     const RETRY_DELAY: Duration = Duration::from_secs(600);
 
@@ -505,6 +514,7 @@ mod tests {
     ) -> StatusBarContext<'a> {
         StatusBarContext {
             status,
+            motion: STILL,
             mode_label: "build".into(),
             mode_style: Style::new(),
             model_id: MODEL_ID,
@@ -519,13 +529,11 @@ mod tests {
             },
             auto_scroll: true,
             chat_name: None,
-            retry_info: None,
             thinking_label: None,
             fast: false,
             workflow: false,
             restricted: false,
             yolo,
-            restoring: false,
         }
     }
 
@@ -685,11 +693,7 @@ mod tests {
         bar.flash("disabled".into());
 
         assert_eq!(bar.flash_text(), Some("disabled"), "{EXPECT_NEWEST}");
-        assert_eq!(
-            bar.cadence(&Status::Idle, false, false),
-            Cadence::IDLE,
-            "{EXPECT_IDLE}"
-        );
+        assert_eq!(bar.cadence(&STILL), Cadence::IDLE, "{EXPECT_IDLE}");
     }
 
     #[test]
@@ -715,19 +719,11 @@ mod tests {
     fn a_queue_claims_frames() {
         let mut bar = StatusBar::new(FLASH_TTL);
         bar.queue_flash(FLASH_MSG.into());
-        assert_eq!(
-            bar.cadence(&Status::Idle, false, false),
-            Cadence::IDLE,
-            "{EXPECT_IDLE}"
-        );
+        assert_eq!(bar.cadence(&STILL), Cadence::IDLE, "{EXPECT_IDLE}");
 
         bar.queue_flash(FLASH_MSG.into());
 
-        assert_eq!(
-            bar.cadence(&Status::Idle, false, false),
-            Cadence::SPINNER,
-            "{EXPECT_TICKING}"
-        );
+        assert_eq!(bar.cadence(&STILL), Cadence::SPINNER, "{EXPECT_TICKING}");
     }
 
     #[test]
@@ -741,11 +737,7 @@ mod tests {
 
         bar.clear_flash();
         assert_eq!(bar.flash_text(), None, "{EXPECT_DRAINS}");
-        assert_eq!(
-            bar.cadence(&Status::Idle, false, false),
-            Cadence::IDLE,
-            "{EXPECT_IDLE}"
-        );
+        assert_eq!(bar.cadence(&STILL), Cadence::IDLE, "{EXPECT_IDLE}");
     }
 
     /// The watcher fires for any write near `.git/HEAD`, most of which leave
@@ -787,7 +779,7 @@ mod tests {
             deadline: Instant::now() + delay,
         };
         let mut ctx = context(&Status::Streaming, None, false, false);
-        ctx.retry_info = Some(&retry);
+        ctx.motion.retry = Some(&retry);
 
         let text = draw(&ctx);
         assert!(text.contains(RETRY_MESSAGE), "{text}");
@@ -796,6 +788,24 @@ mod tests {
             "the attempt number survives either way: {text}"
         );
         text.contains(COUNTDOWN)
+    }
+
+    #[test_case(false, false ; "still")]
+    #[test_case(true,  false ; "working")]
+    #[test_case(false, true  ; "restoring")]
+    fn a_spinner_is_drawn_exactly_while_the_bar_claims_frames(working: bool, restoring: bool) {
+        let bar = StatusBar::new(FLASH_TTL);
+        let still = context(&Status::Idle, None, false, false);
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.motion = Motion {
+            working,
+            restoring,
+            retry: None,
+        };
+        let drawn = draw_bar(&bar, &ctx) != draw_bar(&bar, &still);
+        let ticking = bar.cadence(&ctx.motion) == Cadence::SPINNER;
+        let moving = working || restoring;
+        assert_eq!((drawn, ticking), (moving, moving));
     }
 
     #[test]

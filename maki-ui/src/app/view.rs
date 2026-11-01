@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use crate::components::Overlay;
 use crate::components::input::BORDER_ROWS;
 #[cfg(test)]
@@ -351,6 +349,7 @@ impl App {
         let (mode_label, mode_style) = self.mode_label();
         let ctx = StatusBarContext {
             status: &self.status,
+            motion: self.status_motion(),
             mode_label,
             mode_style,
             model_id: chat
@@ -368,13 +367,11 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
-            retry_info: self.retry_info.as_ref(),
             thinking_label: opts.thinking.status_label(),
             fast: opts.fast,
             workflow: self.state.workflow,
             restricted: self.trust_question.is_some(),
             yolo: self.permissions.is_yolo(),
-            restoring: self.restoring.load(Ordering::Relaxed),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }
