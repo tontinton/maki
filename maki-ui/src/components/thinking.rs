@@ -11,7 +11,7 @@ use crate::theme;
 use maki_config::ThinkingLines;
 use maki_markdown::code_block_start;
 use maki_markdown::render::{Line as RLine, Renderer};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use std::iter;
@@ -76,10 +76,7 @@ fn header(line_count: usize, expandable: bool) -> Line<'static> {
         notice.push_str(EXPAND_HINT);
     }
     Line::from(vec![
-        Span::styled(
-            style.prefix,
-            style.prefix_style.add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(style.label, style.label_style()),
         Span::styled(notice, theme::current().tool_dim),
     ])
 }

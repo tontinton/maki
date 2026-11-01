@@ -102,6 +102,7 @@ user               = { fg = "blue" }
 assistant          = { fg = "foreground" }
 assistant_prefix   = { fg = "pink" }
 thinking           = { fg = "comment", modifiers = ["italic"] }
+user_message_bg    = { bg = "#252733" }
 tool_bg            = { bg = "#191a22" }
 tool               = { fg = "foreground" }
 tool_path          = { fg = "orange" }
