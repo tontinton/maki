@@ -217,6 +217,8 @@ declare maki: {
     input_decorate: @checked (opts: any) -> (any, string?),
     input_edit: @checked (opts: any) -> (any, string?),
     input_submit: @checked (opts: any) -> (boolean?, string?),
+    chat_item: @checked (opts: any) -> (),
+    status_segment: @checked (opts: any) -> (),
   },
   uv: {
     cwd: @checked () -> (string?),

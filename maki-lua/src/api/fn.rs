@@ -21,11 +21,13 @@ use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
 use tokio::time::sleep;
 
+use crate::agent_autocmd::HostEvent;
 use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
 use crate::api::keymap::{InputMode, KeymapWriter};
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::loader::EventHandle;
 use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, require};
 use crate::runtime::{Narrowed, active_task_id, job_task_id, strip_traceback, with_jobs};
 
@@ -51,9 +53,16 @@ const NO_TASK_SCOPE_ERR: &str =
     "jobstart: no active task; use scope = \"plugin\" or { session = ... }";
 const TABLE_SCOPE_ERR: &str = "jobstart: table scope must be { session = <id> }";
 const SCOPE_TYPE_ERR: &str = "jobstart: scope must be \"task\", \"plugin\", or { session = <id> }";
+const SHARED_SCOPE_ERR: &str = "jobstart: shared requires a session scope";
 const JOB_NOT_FOUND_ERR: &str = "job: not found";
 const JOB_UNWAITABLE_ERR: &str = "jobwait: unknown job id or already waited";
 const JOB_WAIT_TIMEOUT_ERR: &str = "jobwait: timed out";
+/// The wait thread reports unreapable children as -1; a killed job reuses it.
+const JOB_KILLED_EXIT_CODE: i32 = -1;
+#[cfg(test)]
+const JOB_START_EVENT: &str = "JobStart";
+#[cfg(test)]
+const JOB_EXIT_EVENT: &str = "JobExit";
 const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
 const EMPTY_ARGV_ERR: &str = "jobstart: argv table must not be empty";
 const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv table";
@@ -64,6 +73,47 @@ static SHELL: LazyLock<ArcSwap<ShellPreference>> = LazyLock::new(ArcSwap::defaul
 
 pub fn set_shell_preference(shell: ShellPreference) {
     SHELL.store(Arc::new(shell));
+}
+
+/// The `JobStart` event for a session-owned job, or `None` for the transient
+/// task and plugin jobs the autocmds skip.
+fn job_started_event<'a>(
+    job_id: u32,
+    owner: &'a JobOwner,
+    name: &'a Option<String>,
+    command: &'a str,
+) -> Option<(&'a MakiId, HostEvent<'a>)> {
+    let JobOwner::Session { session, plugin } = owner else {
+        return None;
+    };
+    Some((
+        session,
+        HostEvent::JobStart {
+            id: job_id,
+            plugin,
+            name: name.as_deref(),
+            command,
+        },
+    ))
+}
+
+/// The `JobExit` counterpart, same ownership rule.
+fn job_exit_event<'a>(
+    job_id: u32,
+    owner: &'a JobOwner,
+    code: i32,
+) -> Option<(&'a MakiId, HostEvent<'a>)> {
+    let JobOwner::Session { session, plugin } = owner else {
+        return None;
+    };
+    Some((
+        session,
+        HostEvent::JobExit {
+            id: job_id,
+            plugin,
+            exit_code: code,
+        },
+    ))
 }
 
 #[derive(Clone)]
@@ -155,6 +205,9 @@ pub(crate) struct JobSpec {
     pub on_stdout: Option<RegistryKey>,
     pub on_stderr: Option<RegistryKey>,
     pub on_exit: Option<RegistryKey>,
+    /// Other plugins may list and stop this job, so it can appear in a job
+    /// picker it does not own. Session scope only.
+    pub shared: bool,
     /// The [`Ceiling`] the job was started under, which its callbacks run
     /// under too.
     pub ceiling: Option<Ceiling>,
@@ -176,6 +229,7 @@ impl JobSpec {
             on_stdout: None,
             on_stderr: None,
             on_exit: None,
+            shared: false,
             ceiling: None,
             max_line_bytes: MAX_READ_BYTES,
         }
@@ -188,6 +242,9 @@ struct JobMeta {
     /// A reloaded plugin looks its job up by this instead of matching on the
     /// command string. See [`JobStore::find_named`].
     name: Option<String>,
+    /// Session jobs only: lets [`JobStore::list`] answer plugins other than
+    /// the owner.
+    shared: bool,
     pid: u32,
     started: Instant,
     on_stdout: Option<RegistryKey>,
@@ -230,6 +287,20 @@ impl JobMeta {
             JobOwner::Session { plugin, .. } => Some(plugin),
             _ => None,
         }
+    }
+
+    /// Listed by plugins other than the owner. A session filter always has to
+    /// name the job's own session, so sharing never reaches past it.
+    fn shared_in(&self, session: Option<MakiId>) -> bool {
+        self.shared && session.is_some_and(|s| self.session() == Some(s))
+    }
+
+    fn lifecycle_started(&self, job_id: u32) -> Option<(&MakiId, HostEvent<'_>)> {
+        job_started_event(job_id, &self.owner, &self.name, &self.command)
+    }
+
+    fn lifecycle_exit(&self, job_id: u32, code: i32) -> Option<(&MakiId, HostEvent<'_>)> {
+        job_exit_event(job_id, &self.owner, code)
     }
 
     fn record_line(&mut self, stdout: bool, line: &str) {
@@ -288,6 +359,9 @@ pub(crate) struct JobStore {
     /// Id served by the last [`JobStore::next_matching`], so the next scan
     /// starts past it.
     scan_cursor: u32,
+    /// Where the `JobStart` / `JobExit` autocmds go, the same request channel
+    /// every other host autocmd rides.
+    events: Option<EventHandle>,
 }
 
 struct CheckedOutReceiver {
@@ -297,15 +371,25 @@ struct CheckedOutReceiver {
 }
 
 impl JobStore {
-    pub fn new() -> Self {
+    pub fn new(events: Option<EventHandle>) -> Self {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
             scan_cursor: 0,
+            events,
+        }
+    }
+
+    fn emit_lifecycle(&self, notice: Option<(&MakiId, HostEvent<'_>)>) {
+        if let (Some(events), Some((session, event))) = (&self.events, notice) {
+            events.fire(Some(session), event);
         }
     }
 
     pub fn start(&mut self, spec: JobSpec) -> Result<u32, String> {
+        if spec.shared && !matches!(spec.owner, JobOwner::Session { .. }) {
+            return Err(SHARED_SCOPE_ERR.to_string());
+        }
         let JobSpec {
             owner,
             cmd,
@@ -317,6 +401,7 @@ impl JobStore {
             on_stdout,
             on_stderr,
             on_exit,
+            shared,
             ceiling,
             max_line_bytes,
         } = spec;
@@ -413,6 +498,7 @@ impl JobStore {
                 owner,
                 command: cmd.display(),
                 name,
+                shared,
                 pid,
                 started: Instant::now(),
                 on_stdout,
@@ -434,6 +520,8 @@ impl JobStore {
                 replay_exit: None,
             },
         );
+        let notice = self.jobs.get(&id).and_then(|job| job.lifecycle_started(id));
+        self.emit_lifecycle(notice);
 
         Ok(id)
     }
@@ -547,6 +635,8 @@ impl JobStore {
     /// Session-owned jobs stay inspectable after exit. Task/plugin jobs are
     /// removed the way they always were.
     pub fn complete(&mut self, lua: &Lua, job_id: u32, code: i32) {
+        // Cloned out first: the event borrows the job, which borrows the map.
+        let events = self.events.clone();
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -560,6 +650,10 @@ impl JobStore {
         job.elapsed_secs = Some(job.started.elapsed().as_secs());
         let session_plugin = job.session_plugin().cloned();
         drop_callbacks(lua, job);
+        if let (Some(events), Some((session, event))) = (&events, job.lifecycle_exit(job_id, code))
+        {
+            events.fire(Some(session), event);
+        }
         match session_plugin {
             Some(plugin) => self.evict_completed(lua, &plugin),
             None => self.finish(lua, job_id),
@@ -667,6 +761,11 @@ impl JobStore {
     /// List jobs this plugin can see. Task and plugin jobs leave the map on
     /// exit; session-owned jobs stay so exited ids stay findable. Tails live
     /// on `snapshot` / `jobinfo`.
+    ///
+    /// List jobs this plugin can see, narrowed to one session when asked.
+    /// Jobs stay private to the plugin that started them unless they opted
+    /// into sharing: a session filter only ever widens to the session's shared
+    /// jobs, so a plugin still never reads another's private command lines.
     pub fn list(
         &self,
         session: Option<MakiId>,
@@ -675,7 +774,7 @@ impl JobStore {
     ) -> Vec<JobSnapshot> {
         self.jobs
             .iter()
-            .filter(|(_, job)| job.can_access(task_id, plugin))
+            .filter(|(_, job)| job.can_access(task_id, plugin) || job.shared_in(session))
             .filter(|(_, job)| session.is_none_or(|s| job.session() == Some(s)))
             .map(|(&id, job)| JobSnapshot::from_job(id, job, false))
             .collect()
@@ -694,7 +793,7 @@ impl JobStore {
 
     pub fn kill(&mut self, job_id: u32, task_id: Option<u64>, plugin: &str) {
         if let Some(job) = self.jobs.get(&job_id)
-            && job.can_access(task_id, plugin)
+            && (job.can_access(task_id, plugin) || job.shared)
         {
             kill_job(job);
         }
@@ -718,7 +817,16 @@ impl JobStore {
 
     fn remove(&mut self, lua: &Lua, job_id: u32, kill: bool) {
         if let Some(job) = self.jobs.remove(&job_id) {
-            if kill {
+            // A killed or forgotten job never runs [`Self::complete`], so the
+            // autocmd pair would be left without a close; already-booked exits
+            // were reported there.
+            if job.exit_code.is_none() {
+                if kill {
+                    kill_job(&job);
+                }
+                let notice = job.lifecycle_exit(job_id, JOB_KILLED_EXIT_CODE);
+                self.emit_lifecycle(notice);
+            } else if kill {
                 kill_job(&job);
             }
             for key in [job.on_stdout, job.on_stderr, job.on_exit]
@@ -1017,6 +1125,9 @@ fn kill_job(job: &JobMeta) {
 ///     with the current call. `"plugin"` keeps it alive until the plugin
 ///     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
 ///     session ends, and survives plugin reload.
+///   `shared` (boolean?) session jobs only: let other plugins list and stop
+///     this job, the way `JobStart` already announces it. Defaults to false,
+///     which keeps the job private to the plugin that started it.
 ///   `tail` (integer?) trailing lines per stream kept for `jobinfo`
 ///     (default 20, 0 disables, max 1024).
 ///   `max_line_bytes` (integer?) longest line delivered, in bytes. A longer
@@ -1054,6 +1165,7 @@ fn jobstart(
 
     if let Some(ref opts) = opts {
         spec.cwd = opts.opt("cwd").ok().flatten();
+        spec.shared = opts.opt_bool("shared").unwrap_or(false);
         spec.env = opts
             .get::<Table>("env")
             .ok()
@@ -1284,8 +1396,10 @@ fn callback_update(lua: &Lua, opts: &Table, key: &str) -> LuaResult<CallbackUpda
 
 /// List jobs this plugin can see, including exited session-owned jobs (so an
 /// id started before a reload stays findable). Rows identify the job; call
-/// `jobinfo` for tails. Pass a session id to list only that session's jobs.
-/// Plugin and task jobs carry no session, so a filter never matches them.
+/// `jobinfo` for tails. Pass a session id to list only that session's jobs:
+/// its shared jobs from other plugins come with it, while their private ones
+/// stay out. Plugin and task jobs carry no session, so a filter never matches
+/// them.
 ///
 /// @param session string? Session id filter.
 /// @return (table) array of `{ id, command, name, pid, session, status,
@@ -1343,7 +1457,9 @@ fn snapshot_table(lua: &Lua, snap: &JobSnapshot, tails: bool) -> LuaResult<Table
 }
 
 /// Kill a running job immediately (SIGKILL on Unix). Safe to call on
-/// jobs that already exited or on unknown ids.
+/// jobs that already exited or on unknown ids. A session job started with
+/// `shared = true` can be killed by any plugin, which is how a job picker
+/// stops a job it did not start.
 ///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @return
@@ -1628,6 +1744,8 @@ mod tests {
     #[cfg(unix)]
     use crate::api::fs::LINE_CUT_MARKER;
     use crate::api::util::command::{NO_UI_ERR, WinView};
+    use crate::runtime::Request;
+    use serde_json::Value as JsonValue;
 
     const TEST_PLUGIN: &str = "test-plugin";
     const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1661,7 +1779,7 @@ mod tests {
     }
 
     fn make_store() -> JobStore {
-        JobStore::new()
+        JobStore::new(None)
     }
 
     fn next_plugin_event(store: &mut JobStore) -> Option<(u32, JobEvent)> {
@@ -1693,6 +1811,7 @@ mod tests {
             owner,
             command: String::new(),
             name: None,
+            shared: false,
             pid: 0,
             started: Instant::now(),
             on_stdout,
@@ -2051,7 +2170,7 @@ mod tests {
     #[tokio::test]
     async fn exit_cleanup_runs_before_a_failing_callback() {
         let lua = Lua::new();
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(None));
         let callback = lua
             .create_function(|_, ()| Err::<(), _>(mlua::Error::runtime("callback failed")))
             .unwrap();
@@ -2154,6 +2273,98 @@ mod tests {
             .collect();
         assert_eq!(live, [plugin]);
         assert!(store.snapshot(task, Some(1), TEST_PLUGIN).is_none());
+    }
+
+    fn listed(store: &JobStore, session: Option<MakiId>, plugin: &str) -> Vec<u32> {
+        let mut ids: Vec<u32> = store
+            .list(session, None, plugin)
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn shared_session_jobs_reach_other_plugins_but_private_ones_do_not() {
+        const OTHER_PLUGIN: &str = "other-plugin";
+        let session = MakiId::generate();
+        let elsewhere = MakiId::generate();
+        let mut store = make_store();
+        let shared = store
+            .start(JobSpec {
+                shared: true,
+                ..JobSpec::new(session_owner(session), "echo shared")
+            })
+            .unwrap();
+        let private = store
+            .start(JobSpec::new(session_owner(session), "echo private"))
+            .unwrap();
+
+        assert_eq!(listed(&store, Some(session), OTHER_PLUGIN), [shared]);
+        assert!(
+            listed(&store, None, OTHER_PLUGIN).is_empty(),
+            "sharing needs the session named, an absent filter never widens"
+        );
+        assert!(listed(&store, Some(elsewhere), OTHER_PLUGIN).is_empty());
+        assert_eq!(
+            listed(&store, Some(session), TEST_PLUGIN),
+            [shared, private],
+            "the owner still sees both"
+        );
+    }
+
+    #[test]
+    fn shared_outside_a_session_scope_is_rejected() {
+        let mut store = make_store();
+        let err = store
+            .start(JobSpec {
+                shared: true,
+                ..JobSpec::new(plugin_owner(), "echo hi")
+            })
+            .unwrap_err();
+        assert_eq!(err, SHARED_SCOPE_ERR);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_session_job_can_be_stopped_by_another_plugin() {
+        const OTHER_PLUGIN: &str = "other-plugin";
+        let session = MakiId::generate();
+        let mut store = make_store();
+        let shared = store
+            .start(JobSpec {
+                shared: true,
+                ..JobSpec::new(session_owner(session), "sleep 30")
+            })
+            .unwrap();
+        let private = store
+            .start(JobSpec::new(session_owner(session), "sleep 30"))
+            .unwrap();
+        let pid_of = |store: &JobStore, id: u32, plugin: &str| {
+            store
+                .list(Some(session), None, plugin)
+                .iter()
+                .find(|snap| snap.id == id)
+                .unwrap()
+                .pid
+        };
+        let shared_pid = pid_of(&store, shared, OTHER_PLUGIN);
+        let private_pid = pid_of(&store, private, TEST_PLUGIN);
+
+        store.kill(private, None, OTHER_PLUGIN);
+        assert!(
+            group_alive(private_pid),
+            "a private job ignores plugins that do not own it"
+        );
+        store.kill(shared, None, OTHER_PLUGIN);
+        assert!(
+            wait_for_group_exit(shared_pid),
+            "a shared job stops for the picker that listed it"
+        );
+
+        store.kill(private, None, TEST_PLUGIN);
+        assert!(wait_for_group_exit(private_pid));
     }
 
     #[cfg(unix)]
@@ -2739,5 +2950,136 @@ mod tests {
             store.forget(&lua, id, None, TEST_PLUGIN);
             assert!(store.snapshot(id, None, TEST_PLUGIN).is_none());
         }
+    }
+
+    const TEST_JOB_NAME: &str = "watcher";
+    #[cfg(unix)]
+    const TEST_MONITOR_PLUGIN: &str = "monitor";
+
+    fn make_lifecycle_store() -> (JobStore, flume::Receiver<Request>) {
+        let (tx, rx) = flume::unbounded();
+        (JobStore::new(Some(EventHandle::from_tx(tx))), rx)
+    }
+
+    fn fired_autocmd(req: Request) -> (String, JsonValue) {
+        let Request::FireAutocmd { event, data } = req else {
+            panic!("expected a fired autocmd");
+        };
+        (event, data)
+    }
+
+    fn lifecycle_started(store: &mut JobStore, session: MakiId) -> u32 {
+        let mut spec = JobSpec::new(session_owner(session), "echo hi");
+        spec.name = Some(TEST_JOB_NAME.into());
+        store.start(spec).unwrap()
+    }
+
+    #[test]
+    fn session_job_reports_started_and_exited_lifecycle() {
+        let lua = Lua::new();
+        let (mut store, lifecycle_rx) = make_lifecycle_store();
+        let session = MakiId::generate();
+
+        let id = lifecycle_started(&mut store, session);
+        let (event, data) = fired_autocmd(lifecycle_rx.try_recv().unwrap());
+        assert_eq!(event, JOB_START_EVENT);
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "id": id,
+                "session_id": session.to_string(),
+                "plugin": TEST_PLUGIN,
+                "name": TEST_JOB_NAME,
+                "command": "echo hi",
+            })
+        );
+
+        store.complete(&lua, id, 3);
+        let (event, data) = fired_autocmd(lifecycle_rx.try_recv().unwrap());
+        assert_eq!(event, JOB_EXIT_EVENT);
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "id": id,
+                "session_id": session.to_string(),
+                "plugin": TEST_PLUGIN,
+                "exit_code": 3,
+            })
+        );
+        assert!(
+            lifecycle_rx.try_recv().is_err(),
+            "exit must be reported once"
+        );
+    }
+
+    #[test]
+    fn transient_jobs_never_report_lifecycle() {
+        let (mut store, lifecycle_rx) = make_lifecycle_store();
+        start_echo(&mut store);
+        assert!(lifecycle_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn killed_session_job_reports_exit_without_complete() {
+        let lua = Lua::new();
+        let (mut store, lifecycle_rx) = make_lifecycle_store();
+        let session = MakiId::generate();
+        let id = lifecycle_started(&mut store, session);
+        let _ = lifecycle_rx.try_recv();
+
+        store.remove(&lua, id, true);
+        let (event, data) = fired_autocmd(lifecycle_rx.try_recv().unwrap());
+        assert_eq!(event, JOB_EXIT_EVENT);
+        assert_eq!(data["exit_code"], serde_json::json!(JOB_KILLED_EXIT_CODE));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_filter_keeps_jobs_private_to_their_owner() {
+        let session = MakiId::generate();
+        let other = MakiId::generate();
+        let mut store = make_store();
+        let monitor = store
+            .start(JobSpec::new(
+                JobOwner::Session {
+                    session,
+                    plugin: Arc::from(TEST_MONITOR_PLUGIN),
+                },
+                "sleep 0",
+            ))
+            .unwrap();
+        let foreign_session = store
+            .start(JobSpec::new(
+                JobOwner::Session {
+                    session: other,
+                    plugin: Arc::from(TEST_MONITOR_PLUGIN),
+                },
+                "sleep 0",
+            ))
+            .unwrap();
+
+        let from_task_plugin: Vec<u32> = store
+            .list(Some(session), None, "task")
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(
+            from_task_plugin.is_empty(),
+            "a session filter narrows, it does not cross owners"
+        );
+
+        let from_monitor: Vec<u32> = store
+            .list(Some(session), None, TEST_MONITOR_PLUGIN)
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(from_monitor, [monitor]);
+
+        let other_session: Vec<u32> = store
+            .list(Some(other), None, TEST_MONITOR_PLUGIN)
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(other_session, [foreign_session]);
     }
 }
