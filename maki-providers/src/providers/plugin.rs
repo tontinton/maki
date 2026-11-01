@@ -39,6 +39,7 @@ const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const OPENAI_OPTION: &str = "openai";
 const BASE_URL_OPTION: &str = "base_url";
+const CODECS_OPTION: &str = "codecs";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
 const LOCALHOST: &str = "localhost";
@@ -173,6 +174,12 @@ pub struct ProviderDecl {
     pub slug: String,
     pub display_name: String,
     pub codec: Option<Protocol>,
+    /// Extra codecs a `[slug] protocol` entry in `providers.toml` may switch
+    /// this plugin to. The declared `codec` is always supported and stays the
+    /// default. Only with `codec`: a `base` serves the native provider whole,
+    /// so there is no wire to swap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codecs: Option<Vec<Protocol>>,
     pub base: Option<String>,
     /// The declaration's static origin, below the user's `<SLUG>_BASE_URL` and
     /// `providers.toml`. An origin a hook returns is a different thing and
@@ -643,6 +650,8 @@ fn register_owned(
         declared_base_url(&slug, origin.clone(), &decl.net_hosts)
             .map_err(RegisterError::UndeclaredBaseUrl)?;
     }
+    let mut decl = decl;
+    apply_protocol_override(&mut decl);
     let target = target_of(&decl, &hooks)?;
     let built = spec::build(&decl, target).map_err(|message| RegisterError::InvalidModels {
         slug: slug.clone(),
@@ -704,11 +713,32 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
         ),
         _ => return Err(RegisterError::CodecOrBase(decl.slug.clone())),
     };
-    let unsupported = |option| RegisterError::Unsupported {
+    if let Some(codecs) = &decl.codecs {
+        if decl.codec.is_none() {
+            return Err(unsupported_option(decl, CODECS_OPTION, target));
+        }
+        for protocol in codecs {
+            check_options(decl, hooks, Target::Codec(*protocol))?;
+        }
+    }
+    check_options(decl, hooks, target)?;
+    Ok(target)
+}
+
+fn unsupported_option(decl: &ProviderDecl, option: &'static str, target: Target) -> RegisterError {
+    RegisterError::Unsupported {
         slug: decl.slug.clone(),
         option,
         target: target.describe(),
-    };
+    }
+}
+
+fn check_options(
+    decl: &ProviderDecl,
+    hooks: &ProviderHooks,
+    target: Target,
+) -> Result<(), RegisterError> {
+    let unsupported = |option| unsupported_option(decl, option, target);
     if hooks.build_body.is_some() && !honours_build_body(target) {
         return Err(unsupported(BUILD_BODY_OPTION));
     }
@@ -723,7 +753,54 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     if states_origin && !honours_base_url(target) {
         return Err(unsupported(BASE_URL_OPTION));
     }
-    Ok(target)
+    Ok(())
+}
+
+/// Whether a `[slug] protocol` entry in `providers.toml` can switch this
+/// plugin's wire: only a declaration that lists the codecs it supports.
+/// A slug nobody registered answers `false`.
+pub fn honours_protocol_override(slug: &str) -> bool {
+    entry(slug).is_some_and(|e| e.decl.codecs.is_some())
+}
+
+/// The wire this slug's requests speak right now: the declared codec with a
+/// `providers.toml` `[slug] protocol` override already applied. `None` for a
+/// slug nobody registered or a declaration serving a native `base`.
+pub fn codec(slug: &str) -> Option<Protocol> {
+    entry(slug).and_then(|e| e.decl.codec)
+}
+
+/// Applies a `[slug] protocol` override to a bundled declaration. Only a
+/// bundled plugin gets here with one: a third party loses the slug to the
+/// entry outright (`RegisterError::ConfiguredSlug`), so the user's protocol
+/// serves through the custom provider instead. An unsupported ask is a
+/// warning and keeps the declared codec — an error would abort the whole
+/// bundled load and stop maki from starting.
+fn apply_protocol_override(decl: &mut ProviderDecl) {
+    let slug = decl.slug.clone();
+    let Some(user) = ProvidersConfig::load_or_default()
+        .get(&slug)
+        .and_then(|def| def.protocol)
+    else {
+        return;
+    };
+    if decl.codec.is_none_or(|declared| declared == user) {
+        return;
+    }
+    if decl
+        .codecs
+        .as_deref()
+        .is_some_and(|supported| supported.contains(&user))
+    {
+        debug!(slug, codec = ?user, "providers.toml protocol override applied");
+        decl.codec = Some(user);
+    } else {
+        warn!(
+            slug,
+            protocol = ?user,
+            "providers.toml protocol is not among the codecs the plugin lists; keeping the declared one"
+        );
+    }
 }
 
 /// One cell of credentials per slug, for the life of the process. Reusing it
@@ -1644,7 +1721,7 @@ mod tests {
 
     use futures::FutureExt;
     use maki_config::PROVIDER_BUILTINS;
-    use maki_config::providers::base_url_env_var;
+    use maki_config::providers::{ProviderDef, base_url_env_var};
     use maki_storage::auth::{PluginAuthData, save_plugin_auth};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -3122,10 +3199,83 @@ mod tests {
         reg.decl.base_url = Some(format!("http://{EXAMPLE_HOST}/v1"));
     }
 
+    /// A `base` serves the native provider whole: there is no wire to swap.
+    fn codecs_on_a_base(reg: &mut Registration) {
+        *reg = based("based-with-codecs", "anthropic");
+        reg.decl.codecs = Some(vec![Protocol::Openai]);
+    }
+
+    /// Every listed codec has to honour the declaration's options, not just
+    /// the default one: a chat-only field on the responses wire would
+    /// silently vanish for a user who switched.
+    fn listed_codec_that_drops_an_option(reg: &mut Registration) {
+        reg.decl.codecs = Some(vec![Protocol::OpenaiResponses]);
+        reg.decl.openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "max_tokens_field": "max_tokens",
+            }))
+            .unwrap(),
+        );
+    }
+
+    /// Writes a `providers.toml` into the isolated home, the way a user would.
+    fn write_providers_toml(slug: &str, protocol: Protocol) {
+        let mut config = ProvidersConfig::default();
+        config.upsert(
+            slug.to_owned(),
+            ProviderDef {
+                protocol: Some(protocol),
+                ..ProviderDef::default()
+            },
+        );
+        config.save().unwrap();
+    }
+
+    /// A `[slug] protocol` naming a listed codec swaps the wire.
+    #[test]
+    fn a_listed_protocol_override_switches_the_codec() {
+        const SLUG: &str = "switchable";
+        let _home = isolated_home();
+        write_providers_toml(SLUG, Protocol::OpenaiResponses);
+        let mut reg = registration(SLUG);
+        reg.decl.codecs = Some(vec![Protocol::Openai, Protocol::OpenaiResponses]);
+        register_loaded_as(reg, DeclAuthority::Bundled, &[]).unwrap();
+
+        assert_eq!(codec(SLUG), Some(Protocol::OpenaiResponses));
+    }
+
+    /// An override the declaration does not list keeps the declared codec: the
+    /// plugin's upstream may not speak it, and a bundled load failing here
+    /// would stop maki from starting.
+    #[test]
+    fn an_unlisted_protocol_override_keeps_the_declared_codec() {
+        const SLUG: &str = "unswitchable";
+        let _home = isolated_home();
+        write_providers_toml(SLUG, Protocol::Anthropic);
+        let mut reg = registration(SLUG);
+        reg.decl.codecs = Some(vec![Protocol::Openai, Protocol::OpenaiResponses]);
+        register_loaded_as(reg, DeclAuthority::Bundled, &[]).unwrap();
+
+        assert_eq!(codec(SLUG), Some(Protocol::Openai));
+    }
+
+    /// A declaration that lists no codecs takes no override, even a harmless
+    /// looking one.
+    #[test]
+    fn an_override_without_a_codecs_list_changes_nothing() {
+        const SLUG: &str = "single-codec";
+        let _home = isolated_home();
+        write_providers_toml(SLUG, Protocol::OpenaiResponses);
+        register_loaded_as(registration(SLUG), DeclAuthority::Bundled, &[]).unwrap();
+
+        assert_eq!(codec(SLUG), Some(Protocol::Openai));
+    }
+
     /// `ConfiguredSlug` and `Credentials` have no row: both need a
     /// `providers.toml` entry for the slug, and the process-wide config is not
     /// a test fixture. They are covered out of line, in
-    /// `tests/configured_overlay.rs`.
+    /// `tests/configured_overlay.rs` — and so is the `[slug] protocol`
+    /// override a `codecs` list accepts.
     #[test_case(bad_slug, |e| matches!(e, RegisterError::InvalidSlug(_)) ; "invalid_slug")]
     #[test_case(already_registered, |e| matches!(e, RegisterError::DuplicateSlug(_)) ; "duplicate")]
     #[test_case(codec_and_base, |e| matches!(e, RegisterError::CodecOrBase(_)) ; "codec_and_base_together")]
@@ -3141,6 +3291,8 @@ mod tests {
     #[test_case(base_url_over_plain_http, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "base_url_must_be_https")]
     #[test_case(plan_off_the_declared_hosts, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "plan_base_url_must_be_declared")]
     #[test_case(two_defaults_for_a_tier, |e| matches!(e, RegisterError::InvalidModels { .. }) ; "one_default_per_tier")]
+    #[test_case(codecs_on_a_base, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == CODECS_OPTION) ; "codecs_needs_a_codec")]
+    #[test_case(listed_codec_that_drops_an_option, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "a_listed_codec_must_honour_the_options")]
     fn registration_rejects(mutate: fn(&mut Registration), expected: fn(&RegisterError) -> bool) {
         const SLUG: &str = "rejected-plugin";
         begin_load();

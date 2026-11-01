@@ -658,6 +658,10 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///   `display_name` (string) Required. Shown in the UI.
 ///   `codec` (string) Wire format: `"openai"`, `"openai-responses"`,
 ///           `"anthropic"` or `"google"`.
+///   `codecs` (table) Extra wire formats a `[slug] protocol` entry in
+///           `providers.toml` may switch this provider to. The declared
+///           `codec` is always supported and stays the default. Only with
+///           `codec`; every listed codec must honour the other options.
 ///   `base` (string) A native provider to borrow whole, e.g. `"ollama"`.
 ///           Prefer `codec` for a new provider.
 ///   `base_url` (string) Default origin. Must be `https`, or `http` on
