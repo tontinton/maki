@@ -358,6 +358,7 @@ pub enum ToolInputErrorKind {
     NotInEnum {
         expected: &'static [&'static str],
         got: String,
+        suggested_variant: Option<&'static str>,
     },
     InternalBug {
         detail: String,
@@ -403,7 +404,11 @@ impl Display for ToolInputError {
                 }
                 Ok(())
             }
-            ToolInputErrorKind::NotInEnum { expected, got } => {
+            ToolInputErrorKind::NotInEnum {
+                expected,
+                got,
+                suggested_variant,
+            } => {
                 f.write_str("expected one of [")?;
                 for (i, v) in expected.iter().enumerate() {
                     if i > 0 {
@@ -411,7 +416,15 @@ impl Display for ToolInputError {
                     }
                     f.write_str(v)?;
                 }
-                write!(f, "], got \"{got}\"")
+                write!(f, "], got {got}")?;
+                if let Some(variant) = suggested_variant {
+                    write!(
+                        f,
+                        ". Use {} alone. Pass other arguments as separate fields.",
+                        preview(variant)
+                    )?;
+                }
+                Ok(())
             }
             ToolInputErrorKind::InternalBug { detail } => {
                 write!(f, "internal validator bug: {detail}")
@@ -506,6 +519,10 @@ fn validate_enum(
             ToolInputErrorKind::NotInEnum {
                 expected: variants,
                 got: preview(s),
+                suggested_variant: variants.iter().copied().find(|variant| {
+                    s.strip_prefix(variant)
+                        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+                }),
             },
         )),
         other => Err(ToolInputError::at(
@@ -858,7 +875,10 @@ mod tests {
     const MSG_MISSING: &str = "required, expected";
     const MSG_EXPECTED_ARRAY: &str = "expected array";
     const MSG_JSON_ENCODED_HINT: &str = "Pass a JSON array";
-    const MSG_EXPECTED_ONE_OF: &str = "expected one of";
+    const MSG_ENUM_ERROR: &str =
+        "invalid tool input: expected one of [research, general], got \"human\"";
+    const MSG_ENUM_ARGUMENTS_HINT: &str =
+        ". Use \"research\" alone. Pass other arguments as separate fields.";
 
     const ANY_DESCRIPTION: &str = "Any value";
     const ANY_PROP: &str = "value";
@@ -1037,9 +1057,31 @@ mod tests {
 
         let value_err = validate(&MODE_ENUM, json!("human")).unwrap_err();
         let rendered = value_err.to_string();
-        assert!(rendered.contains(MSG_EXPECTED_ONE_OF));
-        assert!(rendered.contains("research"));
-        assert!(rendered.contains("human"));
+        assert_eq!(rendered, MSG_ENUM_ERROR);
+    }
+
+    #[test_case("research notes.md tags: [a]", true ; "space_separated_arguments")]
+    #[test_case("research\tnotes.md", true ; "tab_separated_arguments")]
+    #[test_case("research\nnotes.md", true ; "newline_separated_arguments")]
+    #[test_case("research\u{2003}notes.md", true ; "unicode_whitespace")]
+    #[test_case("research ", true ; "trailing_whitespace")]
+    #[test_case("researcher notes.md", false ; "partial_variant")]
+    #[test_case("research=notes.md", false ; "no_whitespace")]
+    #[test_case("human notes.md", false ; "unknown_variant")]
+    fn enum_errors_hint_when_arguments_follow_a_variant(input: &str, has_hint: bool) {
+        let err = validate(&MODE_ENUM, json!(input)).unwrap_err();
+        assert!(matches!(err.kind, ToolInputErrorKind::NotInEnum { .. }));
+        assert_eq!(err.to_string().contains(MSG_ENUM_ARGUMENTS_HINT), has_hint);
+    }
+
+    #[test]
+    fn enum_accepts_exact_multiword_variant() {
+        const SCHEMA: ParamSchema = ParamSchema::Enum {
+            variants: &["research", "research notes"],
+            description: "",
+        };
+        let input = json!("research notes");
+        assert_eq!(validate(&SCHEMA, input.clone()).unwrap(), input);
     }
 
     #[test]
