@@ -1121,6 +1121,28 @@ impl<'t> EventLoop<'t> {
             UiAction::WinRestView { scroll_top } => {
                 self.focused_app().scroll_to_row(scroll_top);
             }
+            UiAction::ScrollToBlock { position, reply_tx } => {
+                let ok = self.focused_app().scroll_to_block(position);
+                let _ = reply_tx.send(if ok {
+                    Ok(json!(true))
+                } else {
+                    Err(format!(
+                        "no transcript block at position {position} of the outline"
+                    ))
+                });
+            }
+            UiAction::TranscriptOutline { reply_tx } => {
+                let entries: Vec<_> = self
+                    .focused_app()
+                    .transcript_outline()
+                    .into_iter()
+                    .map(|(kind, text)| {
+                        let kind: &'static str = kind.into();
+                        json!({ "kind": kind, "text": text })
+                    })
+                    .collect();
+                let _ = reply_tx.send(Ok(json!(entries)));
+            }
             // Answered before dispatching, which can hold the loop for as long
             // as `$EDITOR` is open.
             UiAction::Builtin {

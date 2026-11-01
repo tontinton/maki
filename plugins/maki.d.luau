@@ -208,6 +208,8 @@ declare maki: {
     set_mode: @checked (mode: string) -> (),
     flash: @checked (msg: string) -> (),
     action: @checked (name: string) -> (boolean?, string?),
+    scroll_to_block: @checked (position: number) -> (boolean?, string?),
+    transcript_outline: @checked () -> (any, string?),
     open_editor: @checked (path: string) -> (number),
     open_win: @checked (buf: any, opts: any) -> (any),
     set_status_hint: @checked (spans: any, opts: any) -> (),

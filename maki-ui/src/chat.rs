@@ -22,7 +22,7 @@ use maki_agent::{
     ToolOutput, ToolStartEvent, display_order, observation_detail,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
-use maki_lua::{LuaCommandInfo, WinView};
+use maki_lua::{BlockKind, LuaCommandInfo, WinView};
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
@@ -412,6 +412,14 @@ impl Chat {
 
     pub fn scroll_to_segment(&mut self, segment_index: usize) {
         self.messages_panel.scroll_to_segment(segment_index);
+    }
+
+    pub fn scroll_to_block(&mut self, position: usize) -> bool {
+        self.messages_panel.scroll_to_block(position)
+    }
+
+    pub fn outline(&self) -> Vec<(BlockKind, String)> {
+        self.messages_panel.outline()
     }
 
     pub fn restore_scroll(&mut self, scroll: ScrollPos, auto_scroll: bool) {

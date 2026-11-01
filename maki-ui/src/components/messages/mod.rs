@@ -45,7 +45,7 @@ use maki_agent::{
     BufWatch, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND,
     SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
-use maki_lua::{EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
+use maki_lua::{BlockKind, EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
 use maki_storage::id::{MakiId, SessionRef};
 
 use ratatui::Frame;
@@ -74,6 +74,36 @@ pub enum ClickOutcome {
     OpenTask(String),
     /// A running row's hint: move only this call.
     MoveCall(String),
+}
+
+/// Bytes of a block's first line a transcript outline entry carries.
+const OUTLINE_PREVIEW_BYTES: usize = 200;
+
+/// The jumpable kind a display message shows as, or None when the transcript
+/// gives it no line to land on. Plan announcements are Assistant bubbles on
+/// the live path only (history keeps the plan write as a tool call), so
+/// `plan_path` ones are not replies; skipping them keeps live and restored
+/// counts identical. This is the one home of that rule: `scroll_to_block`
+/// steps over exactly what `outline` lists.
+fn shown_kind(msg: &DisplayMessage) -> Option<BlockKind> {
+    match &msg.role {
+        DisplayRole::User => Some(BlockKind::Turn),
+        DisplayRole::Thinking => Some(BlockKind::Thinking),
+        DisplayRole::Assistant if msg.plan_path.is_none() => Some(BlockKind::Reply),
+        _ => None,
+    }
+}
+
+fn first_line_preview(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default();
+    if line.len() <= OUTLINE_PREVIEW_BYTES {
+        return line.to_string();
+    }
+    let mut end = OUTLINE_PREVIEW_BYTES;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line[..end].to_string()
 }
 
 #[derive(Clone, Copy)]
@@ -725,6 +755,43 @@ impl MessagesPanel {
             seg: segment_index,
             row: 0,
         });
+    }
+
+    /// Jumps to the top of the 1-based outline entry, backing
+    /// `maki.ui.scroll_to_block`. The blocks are walked in the order and by
+    /// the rule `outline` lists, so entry `n` of one is exactly what this
+    /// call answers to at `n`.
+    pub fn scroll_to_block(&mut self, position: usize) -> bool {
+        let Some(msg_idx) = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| shown_kind(m).is_some())
+            .nth(position.wrapping_sub(1))
+            .map(|(i, _)| i)
+        else {
+            return false;
+        };
+        let Some(seg_idx) = self
+            .cache
+            .segments()
+            .iter()
+            .position(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none())
+        else {
+            return false;
+        };
+        self.scroll_to_segment(seg_idx);
+        true
+    }
+
+    /// The jumpable transcript, backing `maki.ui.transcript_outline`: every
+    /// block `scroll_to_block` answers to, in display order, with a
+    /// first-line preview. The array position is the address the jump takes.
+    pub fn outline(&self) -> Vec<(BlockKind, String)> {
+        self.messages
+            .iter()
+            .filter_map(|m| Some((shown_kind(m)?, first_line_preview(&m.text))))
+            .collect()
     }
 
     /// Backs `maki.fn.winrestview`, the one caller that still speaks in
