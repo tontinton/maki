@@ -1052,7 +1052,9 @@ impl<'h> Agent<'h> {
 
     async fn try_auto_compact(&mut self) -> Result<(), AgentError> {
         let context_size = self.gauge.size();
-        if !self.auto_compact || !compaction::is_overflow(context_size, &self.model, &self.config) {
+        if !self.auto_compact
+            || !compaction::is_overflow(u64::from(context_size), &self.model, &self.config)
+        {
             return Ok(());
         }
         info!(context_size, "auto-compacting");
@@ -2427,7 +2429,7 @@ mod tests {
     async fn same_model_refresh_updates_auto_compaction(
         initial_window: u32,
         discovered_window: u32,
-        context_size: u32,
+        context_size: u64,
         expected_compaction: bool,
     ) {
         let mut h = Harness::new(Vec::new());
@@ -3200,7 +3202,7 @@ mod tests {
         };
         let big_turn = StreamResponse {
             usage: TokenUsage {
-                input: TINY_CONTEXT_WINDOW * 10,
+                input: u64::from(TINY_CONTEXT_WINDOW) * 10,
                 ..Default::default()
             },
             ..tool_call_response("glob", "t1")
@@ -3354,7 +3356,7 @@ mod tests {
             cache_creation: 50,
             ..Default::default()
         };
-        let expected = response.usage.total_input();
+        let expected = response.usage.total_input() as u32;
         let mut history = History::new(vec![Message::user("go".into())]);
         let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
         agent.run(default_input()).await.unwrap();
@@ -3652,7 +3654,7 @@ mod tests {
         let mut history = History::new(Vec::new());
         let filling = StreamResponse {
             usage: TokenUsage {
-                input: TINY_CONTEXT_WINDOW,
+                input: u64::from(TINY_CONTEXT_WINDOW),
                 ..Default::default()
             },
             ..text_response(StopReason::EndTurn)

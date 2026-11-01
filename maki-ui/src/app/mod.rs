@@ -2698,7 +2698,9 @@ impl App {
                 tc.usage
                     .billed_with_subsidised_list_cost(tc.cost, tc.subsidised_list_cost),
             );
-            let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
+            let ctx_size = tc
+                .context_size
+                .unwrap_or_else(|| tc.usage.context_tokens().min(u32::MAX as u64) as u32);
             self.set_context_size(chat_idx, ctx_size);
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {

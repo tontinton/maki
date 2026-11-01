@@ -426,8 +426,8 @@ mod tests {
     const FRAME_MCP_TOOL: &str = "srv__tool";
     const FRAME_KEPT: &str = "a resumed process must send the prefix the transcript was sent under";
     const THINKING: StoredThinking = StoredThinking::Adaptive;
-    const TURN_INPUT_TOKENS: u32 = 1_000;
-    const TURNS: u32 = 2;
+    const TURN_INPUT_TOKENS: u64 = 1_000;
+    const TURNS: u64 = 2;
     const SETTINGS_TRACKED: &str = "readers and the file must report what the last turn ran under";
     const USAGE_SUMMED: &str =
         "every turn's bill must add up on the session, in memory and on disk";
@@ -437,7 +437,7 @@ mod tests {
     const SETTLED_CLEARED: &str = "a result a run read must leave the meta";
     const TURN_COST: f64 = 0.25;
     const LATE_COST: f64 = 0.5;
-    const LATE_INPUT_TOKENS: u32 = 300;
+    const LATE_INPUT_TOKENS: u64 = 300;
     const LATE_REPORTED: &str = "the next turn must report what moved work spent after its turn";
     const LATE_REPORTED_ONCE: &str = "late spend already reported must not be billed twice";
     const LATE_STORED: &str =
@@ -863,7 +863,7 @@ mod tests {
         }
     }
 
-    fn tokens(input: u32) -> TokenUsage {
+    fn tokens(input: u64) -> TokenUsage {
         TokenUsage {
             input,
             ..Default::default()
@@ -960,7 +960,7 @@ mod tests {
         moved.add(tokens(LATE_INPUT_TOKENS), Some(LATE_COST), None);
         drop(track);
 
-        let late_rounds = turns_after_move + 1;
+        let late_rounds = u64::from(turns_after_move) + 1;
         let expected_input = TURN_INPUT_TOKENS + LATE_INPUT_TOKENS * late_rounds;
         assert_eq!(
             SessionHeader::of(&load(&tmp)).usage.input,
@@ -971,7 +971,7 @@ mod tests {
         assert_eq!(spent.usage.input, expected_input, "{LATE_STORED}");
         assert_eq!(
             spent.cost,
-            Some(TURN_COST + LATE_COST * f64::from(late_rounds)),
+            Some(TURN_COST + LATE_COST * late_rounds as f64),
             "{LATE_STORED}"
         );
     }

@@ -301,7 +301,7 @@ mod tests {
     const SURVIVED: &str = "a refused run must leave the session it pointed at alone";
     const COPY_ON_DISK: &str = "a copy has to be a session on disk before the run starts";
     const FORK_CWD: &str = "/project/fork";
-    const STORED_INPUT_TOKENS: u32 = 1_234;
+    const STORED_INPUT_TOKENS: u64 = 1_234;
     /// A session id spelled as the hex uuid a Claude Code compatible client
     /// sends, rather than the base58 a `MakiId` renders.
     const HEX_SESSION_ID: &str = "01965087-4c71-7f00-8000-0000000000aa";

@@ -278,7 +278,7 @@ fn finish_compact(
         model: model.id.clone(),
         cost: model.billed_cost(&response.usage, false),
         subsidised_list_cost: model.subsidised_list_cost(&response.usage, false),
-        context_size: Some(response.usage.output),
+        context_size: Some(response.usage.output.min(u32::MAX as u64) as u32),
         context_window: model.context_window,
     })));
 
@@ -381,7 +381,7 @@ pub async fn compact(
     // The summariser read a subset of the session's prompt, so its own count is
     // a floor on the size before, and the only number a gauge that has not seen
     // a turn yet can offer.
-    let context_size_before = size_before.max(usage.total_input());
+    let context_size_before = size_before.max(usage.total_input().min(u32::MAX as u64) as u32);
     let context_size_after = gauge.size();
     event_tx.send(AgentEvent::CompactionDone {
         context_size_before,
@@ -423,8 +423,8 @@ pub(super) fn usable(model: &Model, config: &AgentConfig) -> u32 {
     model.context_window - reserved(model, config)
 }
 
-pub(super) fn is_overflow(context_tokens: u32, model: &Model, config: &AgentConfig) -> bool {
-    context_tokens >= usable(model, config)
+pub(super) fn is_overflow(context_tokens: u64, model: &Model, config: &AgentConfig) -> bool {
+    context_tokens >= u64::from(usable(model, config))
 }
 
 fn strip_images(messages: &mut [Message]) {
@@ -826,6 +826,7 @@ mod tests {
     }
 
     const SUMMARISED_PROMPT: u32 = 150_000;
+    const SUMMARISED_INPUT: u64 = 150_000;
 
     /// The measurement the gauge holds is of the transcript compaction just
     /// deleted, so left in place it sizes every later turn against a session
@@ -834,7 +835,7 @@ mod tests {
     async fn compact_leaves_the_gauge_describing_the_summary() {
         let provider = MockProvider::new(vec![Ok(StreamResponse {
             usage: TokenUsage {
-                input: SUMMARISED_PROMPT,
+                input: SUMMARISED_INPUT,
                 ..Default::default()
             },
             ..text_response(StopReason::EndTurn)
@@ -872,7 +873,7 @@ mod tests {
                 ..Default::default()
             },
             usage: TokenUsage {
-                input: SUMMARISED_PROMPT / 2,
+                input: SUMMARISED_INPUT / 2,
                 ..Default::default()
             },
             stop_reason: Some(StopReason::EndTurn),
@@ -1219,10 +1220,10 @@ mod tests {
     #[test_case(2_048,   0,       0,       0,      4_096,   true  ; "llama_cpp_default_window_still_compacts")]
     #[test_case(0,       0,       0,       0,      1_024,   false ; "an_empty_transcript_never_overflows")]
     fn overflow_detection(
-        input: u32,
-        cache_read: u32,
-        cache_creation: u32,
-        output: u32,
+        input: u64,
+        cache_read: u64,
+        cache_creation: u64,
+        output: u64,
         ctx_window: u32,
         expected: bool,
     ) {
@@ -1245,7 +1246,7 @@ mod tests {
     #[test_case(CompactionBuffer::Percent(50),    32_000, true  ; "explicit_percent_at_threshold")]
     // A buffer under the output floor cannot leave a turn room to answer.
     #[test_case(CompactionBuffer::Tokens(1_000),  60_000, true  ; "buffer_below_the_output_floor_is_raised")]
-    fn overflow_with_explicit_buffer(buffer: CompactionBuffer, input: u32, expected: bool) {
+    fn overflow_with_explicit_buffer(buffer: CompactionBuffer, input: u64, expected: bool) {
         let model = small_context_model(64_000);
         let config = AgentConfig {
             compaction_buffer: buffer,

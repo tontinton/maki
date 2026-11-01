@@ -275,7 +275,7 @@ mod tests {
     fn done(input: u32) -> Envelope {
         envelope(AgentEvent::Done {
             usage: TokenUsage {
-                input,
+                input: u64::from(input),
                 ..Default::default()
             },
             cost: Some(TURN_COST),
@@ -307,7 +307,7 @@ mod tests {
         assert!(!totals.working);
         assert_eq!(
             totals.usage.input,
-            FIRST_TURN_INPUT + SECOND_TURN_INPUT,
+            u64::from(FIRST_TURN_INPUT + SECOND_TURN_INPUT),
             "{GROWS_MSG}"
         );
         assert_eq!(totals.cost, Some(TURN_COST * 2.0), "{GROWS_MSG}");
@@ -324,7 +324,7 @@ mod tests {
             auth: false,
             totals: RunTotals {
                 usage: TokenUsage {
-                    input: SECOND_TURN_INPUT,
+                    input: u64::from(SECOND_TURN_INPUT),
                     ..Default::default()
                 },
                 cost: Some(TURN_COST),
@@ -334,7 +334,10 @@ mod tests {
 
         let totals = lock(&snapshot.0);
         assert!(!totals.working);
-        assert_eq!(totals.usage.input, FIRST_TURN_INPUT + SECOND_TURN_INPUT);
+        assert_eq!(
+            totals.usage.input,
+            u64::from(FIRST_TURN_INPUT + SECOND_TURN_INPUT)
+        );
         assert_eq!(totals.cost, Some(TURN_COST * 2.0));
         assert_eq!(totals.context_size, FIRST_TURN_INPUT);
     }

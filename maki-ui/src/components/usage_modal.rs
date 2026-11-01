@@ -345,7 +345,7 @@ fn model_row(
     fg: Style,
     dim: Style,
 ) -> Vec<Span<'static>> {
-    let num = |v: u32| Span::styled(format!("{:>NUM_COL$}", format_tokens(v)), fg);
+    let num = |v: u64| Span::styled(format!("{:>NUM_COL$}", format_tokens(v)), fg);
     let gap = || Span::raw(" ".repeat(COL_GAP));
     vec![
         Span::raw(PREFIX),
@@ -482,7 +482,7 @@ mod tests {
     /// 1M input tokens at the test model's $3/1M: what the modal would print if
     /// it re-priced the counters.
     const REPRICED_TEXT: &str = "3.000";
-    const ONE_MILLION: u32 = 1_000_000;
+    const ONE_MILLION: u64 = 1_000_000;
     const ONE_MILLION_TEXT: &str = "1.0m";
     const UNKNOWN_MODEL: &str = "a-model-no-table-has-ever-heard-of";
     const NO_COST_TEXT: &str = "-";

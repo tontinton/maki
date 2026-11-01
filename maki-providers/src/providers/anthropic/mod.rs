@@ -1066,7 +1066,10 @@ data: {{\"type\":\"message_stop\"}}\n"
 
         assert_eq!(
             (resp.usage.input, resp.usage.output),
-            (STARTED_INPUT_TOKENS, DELTA_OUTPUT_TOKENS)
+            (
+                u64::from(STARTED_INPUT_TOKENS),
+                u64::from(DELTA_OUTPUT_TOKENS)
+            )
         );
         assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
         assert_eq!(resp.input_transformations, vec![dropped_thinking()]);
