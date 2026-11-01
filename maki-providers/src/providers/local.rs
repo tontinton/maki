@@ -700,6 +700,7 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
         base_url: Cow::Borrowed(OLLAMA_BASE_URL),
         max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
         include_stream_usage: true,
+        usage_cost: false,
         provider_name: Cow::Borrowed("Ollama"),
     },
     // Ollama ignores the budget field, so effort is the only thing it hears.
@@ -721,6 +722,7 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
         base_url: Cow::Borrowed(LLAMACPP_BASE_URL),
         max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
         include_stream_usage: true,
+        usage_cost: false,
         provider_name: Cow::Borrowed("LlamaCpp"),
     },
     thinking_fallback: ThinkingFallback::BudgetField,

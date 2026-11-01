@@ -31,6 +31,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     base_url: Cow::Borrowed("https://api.openai.com/v1"),
     max_tokens_field: Cow::Borrowed("max_completion_tokens"),
     include_stream_usage: true,
+    usage_cost: false,
     provider_name: Cow::Borrowed("OpenAI"),
 };
 
