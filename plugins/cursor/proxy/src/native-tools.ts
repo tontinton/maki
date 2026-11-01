@@ -10,6 +10,7 @@
  */
 import { makiToolArgs, type NativeCall } from "./maki-args.ts";
 import { create, toBinary } from "@bufbuild/protobuf";
+import { lengthDelimited } from "./proto-wire.ts";
 import {
   AgentClientMessageSchema,
   ExecClientMessageSchema,
@@ -30,6 +31,17 @@ import {
   LsSuccessSchema,
   ReadResultSchema,
   ReadSuccessSchema,
+  ShellFailureSchema,
+  ShellPermissionDeniedSchema,
+  ShellResultSchema,
+  ShellStreamExitSchema,
+  ShellStreamSchema,
+  ShellStreamStartSchema,
+  ShellStreamStdoutSchema,
+  ShellSuccessSchema,
+  WritePermissionDeniedSchema,
+  WriteResultSchema,
+  WriteSuccessSchema,
   type ExecServerMessage,
   type LsDirectoryTreeNode,
   type McpToolDefinition,
@@ -49,6 +61,8 @@ export interface NativeExecBinding {
   resultType: NativeResultType;
   /** Native arg values needed to shape the typed result frame. */
   args: Record<string, string>;
+  /** ShellResult field used by a shell variant this schema does not name. */
+  resultField?: number;
 }
 
 export interface NativeRedirect {
@@ -194,12 +208,37 @@ export function sendNativeExecResult(
       return true;
     }
 
-    case "writeResult":
-    case "shellResult":
-    case "shellStreamResult":
-      // A typed success would hide a denial. maki's text, including a
-      // rejected write or a non-zero shell, goes back as an mcpResult.
-      return false;
+    case "writeResult": {
+      sendExec("writeResult", writeResult(args, text));
+      return true;
+    }
+
+    case "shellResult": {
+      const built = shellResult(args, text);
+      if (binding.resultField) {
+        const message = create(ExecClientMessageSchema, {
+          id: exec.execMsgId,
+          execId: exec.execId,
+        });
+        message.$unknown = [{
+          no: binding.resultField,
+          wireType: 2,
+          data: lengthDelimited(toBinary(ShellResultSchema, built)),
+        }];
+        const clientMessage = create(AgentClientMessageSchema, {
+          message: { case: "execClientMessage", value: message },
+        });
+        sendMessage(toBinary(AgentClientMessageSchema, clientMessage));
+        return true;
+      }
+      sendExec("shellResult", built);
+      return true;
+    }
+
+    case "shellStreamResult": {
+      sendShellStream(args, text, sendExec);
+      return true;
+    }
 
     case "fetchResult": {
       sendExec(
@@ -231,6 +270,147 @@ export function sendNativeExecResult(
       sendExec("grepResult", built);
       return true;
     }
+  }
+}
+
+const PERMISSION_DENIED = "Permission denied";
+
+function isDenied(text: string): boolean {
+  return text.startsWith(PERMISSION_DENIED);
+}
+
+/** bash puts a non-zero status on its own line. A clean command has no such line. */
+function shellOutcome(text: string): { stdout: string; exitCode: number } {
+  const lined = text.match(/^(.*)\nExit code: (\d+)$/s);
+  if (lined) return { stdout: lined[1], exitCode: Number(lined[2]) };
+  const only = text.match(/^Exit code: (\d+)$/);
+  if (only) return { stdout: "", exitCode: Number(only[1]) };
+  return { stdout: text, exitCode: 0 };
+}
+
+function writeResult(args: Record<string, string>, text: string) {
+  if (isDenied(text)) {
+    return create(WriteResultSchema, {
+      result: {
+        case: "permissionDenied",
+        value: create(WritePermissionDeniedSchema, {
+          path: args.path ?? "",
+          directory: "",
+          operation: "create_file",
+          error: text,
+          isReadonly: false,
+        }),
+      },
+    });
+  }
+  return create(WriteResultSchema, {
+    result: {
+      case: "success",
+      value: create(WriteSuccessSchema, {
+        path: args.path ?? "",
+        fileSize: Number(args.fileSize ?? 0),
+        linesCreated: Number(args.linesCreated ?? 0),
+      }),
+    },
+  });
+}
+
+function shellResult(args: Record<string, string>, text: string) {
+  const command = args.command ?? "";
+  const workingDirectory = args.workingDirectory ?? "";
+  if (isDenied(text)) {
+    return create(ShellResultSchema, {
+      result: {
+        case: "permissionDenied",
+        value: create(ShellPermissionDeniedSchema, {
+          command,
+          workingDirectory,
+          error: text,
+          isReadonly: false,
+        }),
+      },
+    });
+  }
+  const { stdout, exitCode } = shellOutcome(text);
+  if (exitCode !== 0) {
+    return create(ShellResultSchema, {
+      result: {
+        case: "failure",
+        value: create(ShellFailureSchema, {
+          command,
+          workingDirectory,
+          exitCode,
+          signal: "",
+          stdout,
+          stderr: "",
+          executionTime: 0,
+        }),
+      },
+    });
+  }
+  return create(ShellResultSchema, {
+    result: {
+      case: "success",
+      value: create(ShellSuccessSchema, {
+        command,
+        workingDirectory,
+        exitCode: 0,
+        signal: "",
+        stdout,
+        stderr: "",
+        executionTime: 0,
+      }),
+    },
+  });
+}
+
+function sendShellStream(
+  args: Record<string, string>,
+  text: string,
+  sendExec: (messageCase: string, value: unknown) => void,
+): void {
+  const command = args.command ?? "";
+  const workingDirectory = args.workingDirectory ?? "";
+  if (isDenied(text)) {
+    sendExec(
+      "shellStream",
+      create(ShellStreamSchema, {
+        event: {
+          case: "permissionDenied",
+          value: create(ShellPermissionDeniedSchema, {
+            command,
+            workingDirectory,
+            error: text,
+            isReadonly: false,
+          }),
+        },
+      }),
+    );
+  } else {
+    const { stdout, exitCode } = shellOutcome(text);
+    sendExec(
+      "shellStream",
+      create(ShellStreamSchema, {
+        event: { case: "start", value: create(ShellStreamStartSchema, {}) },
+      }),
+    );
+    if (stdout) {
+      sendExec(
+        "shellStream",
+        create(ShellStreamSchema, {
+          event: { case: "stdout", value: create(ShellStreamStdoutSchema, { data: stdout }) },
+        }),
+      );
+    }
+    sendExec(
+      "shellStream",
+      create(ShellStreamSchema, {
+        event: {
+          case: "exit",
+          value: create(ShellStreamExitSchema, { code: exitCode, cwd: workingDirectory }),
+        },
+      }),
+    );
   }
 }
 

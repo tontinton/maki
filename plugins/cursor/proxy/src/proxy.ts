@@ -80,6 +80,7 @@ import { chmod, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:f
 import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
 import { deriveBridgeKey, deriveConversationKey } from "./session-key.ts";
+import { classifyExec, streamCloseMessage, unavailableExec } from "./exec-reply.ts";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -1244,9 +1245,24 @@ function handleExecMessage(
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
 ): void {
-  const execCase = execMsg.message.case;
+  const disposition = classifyExec(execMsg, mcpTools);
+  if (disposition.kind === "immediate") {
+    if (process.env.CURSOR_PROXY_DEBUG) {
+      const fields = (execMsg.$unknown ?? []).map((field) => field.no).join(",") || "none";
+      console.error(`[proxy] closed exec id=${execMsg.id} fields=${fields}`);
+    }
+    for (const frame of disposition.frames) sendFrame(frameConnectMessage(frame));
+    return;
+  }
+  const effective = disposition.kind === "shell" ? disposition.variant.message : execMsg;
+  const resultField = disposition.kind === "shell" ? disposition.variant.resultField : undefined;
+  if (process.env.CURSOR_PROXY_DEBUG && resultField) {
+    console.error(`[proxy] shell variant result field ${resultField}`);
+  }
+  const execCase = effective.message.case;
   if (process.env.CURSOR_PROXY_DEBUG) {
-    console.error(`[proxy] exec: ${execCase}`);
+    const extra = (execMsg.$unknown ?? []).map((field) => field.no).join(",");
+    console.error(`[proxy] exec: ${execCase}${extra ? ` extra=${extra}` : ""}`);
   }
 
   if (execCase === "requestContextArgs") {
@@ -1290,8 +1306,9 @@ function handleExecMessage(
   // The model tries these before the MCP tools. When the client provides an
   // equivalent tool, redirect the call to it; otherwise reject so the model
   // falls back to the MCP tools registered via RequestContext.
-  const redirect = redirectNativeExec(execMsg, mcpTools);
+  const redirect = redirectNativeExec(effective, mcpTools);
   if (redirect) {
+    if (resultField) redirect.binding.resultField = resultField;
     if (process.env.CURSOR_PROXY_DEBUG) {
       console.error(`[proxy] redirect ${execCase} -> ${redirect.toolName}`);
     }
@@ -1309,7 +1326,7 @@ function handleExecMessage(
   const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "readArgs") {
-    const args = execMsg.message.value;
+    const args = effective.message.value;
     const result = create(ReadResultSchema, {
       result: { case: "rejected", value: create(ReadRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
     });
@@ -1348,7 +1365,7 @@ function handleExecMessage(
     return;
   }
   if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
-    const args = execMsg.message.value;
+    const args = effective.message.value;
     const result = create(ShellResultSchema, {
       result: {
         case: "rejected",
@@ -1413,8 +1430,12 @@ function handleExecMessage(
     return;
   }
 
-  // Unknown exec type — log and ignore
-  console.error(`[proxy] unhandled exec: ${execCase}`);
+  for (const frame of unavailableExec(
+    execMsg.id,
+    "Tool not available in this environment. Use the MCP tools provided instead.",
+  )) {
+    sendFrame(frameConnectMessage(frame));
+  }
 }
 
 /** Send an exec client message back to Cursor. */
@@ -1433,6 +1454,7 @@ function sendExecResult(
     message: { case: "execClientMessage", value: execClientMessage },
   });
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  sendFrame(frameConnectMessage(streamCloseMessage(execMsg.id)));
 }
 
 /** Deterministic v4-shaped UUID from a seed (first 16 bytes of SHA-256).
@@ -1712,7 +1734,10 @@ export function answerPendingExecs(
       const sent = sendNativeExecResult(exec, exec.native, text, (bytes) =>
         write(frameConnectMessage(bytes)),
       );
-      if (sent) continue;
+      if (sent) {
+        write(frameConnectMessage(streamCloseMessage(exec.execMsgId)));
+        continue;
+      }
     }
 
     const mcpResult = result
@@ -1753,6 +1778,7 @@ export function answerPendingExecs(
     });
 
     write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+    write(frameConnectMessage(streamCloseMessage(exec.execMsgId)));
   }
 }
 

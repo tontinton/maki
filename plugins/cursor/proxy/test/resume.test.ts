@@ -32,37 +32,74 @@ function exec(kind: AnsweredExec["native"], id: string): AnsweredExec {
   };
 }
 
-test("a denied write and a failed shell reach the model as text, not a typed success", () => {
+test("a denied write is a permission denial, not a successful write", () => {
   const frames: Uint8Array[] = [];
   answerPendingExecs(
-    [
-      exec({ resultType: "writeResult", args: { path: "/tmp/a.rs", fileSize: "4", linesCreated: "1" } }, "write"),
-      exec(
-        { resultType: "shellResult", args: { command: "false", workingDirectory: "/tmp" } },
-        "shell",
-      ),
-      exec({ resultType: "readResult", args: { path: "/tmp/a.rs" } }, "read"),
-    ],
-    [
-      { toolCallId: "call_write", content: "permission denied" },
-      { toolCallId: "call_shell", content: "exit 1" },
-      { toolCallId: "call_read", content: "fn main() {}\n" },
-    ],
+    [exec({ resultType: "writeResult", args: { path: "/tmp/a.rs", fileSize: "4", linesCreated: "1" } }, "write")],
+    [{ toolCallId: "call_write", content: "Permission denied for write" }],
     "",
     (frame) => frames.push(frame),
   );
-  assert.equal(frames.length, 3);
+  assert.equal(frames.length, 2);
   const write = messageJson(frames[0]);
-  const shell = messageJson(frames[1]);
-  const read = messageJson(frames[2]);
-  assert.match(write, /permission denied/);
-  assert.match(write, /mcpResult/);
-  assert.doesNotMatch(write, /writeResult/);
-  assert.match(shell, /exit 1/);
-  assert.match(shell, /mcpResult/);
-  assert.doesNotMatch(shell, /shellResult/);
-  assert.match(read, /readResult/);
-  assert.match(read, /fn main\(\)/);
+  assert.match(write, /writeResult/);
+  assert.match(write, /permissionDenied/);
+  assert.match(write, /Permission denied for write/);
+  assert.doesNotMatch(write, /"success"/);
+  assert.match(messageJson(frames[1]), /streamClose/);
+});
+
+test("a failed shell reports its exit code and keeps the output", () => {
+  const frames: Uint8Array[] = [];
+  answerPendingExecs(
+    [exec({ resultType: "shellResult", args: { command: "false", workingDirectory: "/tmp" } }, "shell")],
+    [{ toolCallId: "call_shell", content: "boom\nExit code: 1" }],
+    "",
+    (frame) => frames.push(frame),
+  );
+  assert.equal(frames.length, 2);
+  const shell = messageJson(frames[0]);
+  assert.match(shell, /shellResult/);
+  assert.match(shell, /failure/);
+  assert.match(shell, /boom/);
+  assert.match(shell, /"exitCode":1/);
+  assert.doesNotMatch(shell, /"success"/);
+  assert.match(messageJson(frames[1]), /streamClose/);
+});
+
+test("a finished shell returns its stdout as a typed shell result", () => {
+  const frames: Uint8Array[] = [];
+  answerPendingExecs(
+    [exec({ resultType: "shellResult", args: { command: "ls", workingDirectory: "/repo" } }, "ls")],
+    [{ toolCallId: "call_ls", content: "Cargo.toml\nsrc\n" }],
+    "",
+    (frame) => frames.push(frame),
+  );
+  assert.equal(frames.length, 2);
+  const shell = messageJson(frames[0]);
+  assert.match(shell, /shellResult/);
+  assert.match(shell, /"success"/);
+  assert.match(shell, /Cargo.toml/);
+  assert.match(shell, /src/);
+  assert.doesNotMatch(shell, /failure/);
+  assert.doesNotMatch(shell, /permissionDenied/);
+  assert.match(messageJson(frames[1]), /streamClose/);
+});
+
+test("a shell stream closes after the same exit code", () => {
+  const frames: Uint8Array[] = [];
+  answerPendingExecs(
+    [exec({ resultType: "shellStreamResult", args: { command: "false", workingDirectory: "/tmp" } }, "stream")],
+    [{ toolCallId: "call_stream", content: "boom\nExit code: 2" }],
+    "",
+    (frame) => frames.push(frame),
+  );
+  const joined = frames.map(messageJson).join("\n");
+  assert.match(joined, /shellStream/);
+  assert.match(joined, /boom/);
+  assert.match(joined, /"code":2/);
+  assert.equal(joined.match(/streamClose/g)?.length, 1);
+  assert.doesNotMatch(joined, /"success"/);
 });
 
 test("conversation snapshots are readable only by this user", async () => {
