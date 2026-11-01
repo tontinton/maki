@@ -35,8 +35,8 @@ const PLAN_PREVIEW_PATH: &str = "plan.md";
 
 pub async fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
-        Some("openai") => openai_auth::login(storage)?,
-        Some("xai") => xai_auth::login(storage)?,
+        Some("openai") => openai_auth::login(storage).await?,
+        Some("xai") => xai_auth::login(storage).await?,
         Some("copilot") => copilot_auth::login(storage)?,
         Some(slug) => {
             let slug = slugify(slug);

@@ -360,7 +360,8 @@ impl OpenAi {
         self.storage.as_ref().is_some_and(auth::is_oauth)
     }
 
-    /// Installs the result inside the closure so a dropped caller still leaves it in use.
+    /// Installs the result inside a task of its own, so a dropped caller still
+    /// leaves it in use.
     async fn refresh_oauth(&self) -> Result<(), AgentError> {
         let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
             message: "OAuth refresh not available for externally-managed auth".into(),
@@ -368,13 +369,15 @@ impl OpenAi {
         let rejected = self.auth.lock().unwrap().access_token().map(str::to_owned);
         let shared = Arc::clone(&self.auth);
         let held = Arc::clone(&self.tokens);
-        spawn_blocking(move || {
+        tokio::spawn(async move {
             match refreshed_tokens(
                 &storage,
                 auth::PROVIDER,
                 rejected.as_deref(),
                 auth::refresh_tokens,
-            ) {
+            )
+            .await
+            {
                 Ok(fresh) => {
                     *shared.lock().unwrap() = auth::build_oauth_resolved(&fresh)?;
                     *held.lock().unwrap() = Some(fresh);

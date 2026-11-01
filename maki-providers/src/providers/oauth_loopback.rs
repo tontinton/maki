@@ -1,20 +1,23 @@
-use std::io::{self, IsTerminal, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver};
+use std::env;
+use std::future::{pending, poll_fn};
+use std::io::{self, IsTerminal, Write};
+use std::net::{Ipv4Addr, Ipv6Addr, TcpListener as StdListener};
+use std::task::Poll;
 use std::time::{Duration, Instant};
-use std::{env, thread};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::task::spawn_blocking;
+use tokio::time::{timeout, timeout_at};
 
 use crate::AgentError;
 
-const ACCEPT_POLL: Duration = Duration::from_millis(100);
-const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
-/// `REQUEST_READ_TIMEOUT` is per read, so a peer trickling a byte at a time
-/// resets it forever and holds up the single-threaded accept loop. This is the
-/// budget for the whole head.
+/// The budget for the whole head, so a peer trickling a byte at a time cannot
+/// hold up the login.
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_CHUNK: usize = 1024;
 const MAX_REQUEST_SIZE: usize = 8192;
@@ -82,6 +85,7 @@ pub(crate) struct Server {
 }
 
 impl Loopback {
+    /// Needs a runtime, which registers the listeners with its reactor.
     pub(crate) fn bind(self) -> Result<Server, AgentError> {
         let bound = bind_localhost(self.port).or_else(|e| {
             if self.fallback_to_ephemeral {
@@ -96,6 +100,13 @@ impl Loopback {
                 self.port
             ),
         })?;
+        let listeners = listeners
+            .into_iter()
+            .map(TcpListener::from_std)
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(|e| AgentError::Config {
+                message: format!("OAuth callback listener: {e}"),
+            })?;
         Ok(Server {
             listeners,
             port,
@@ -109,54 +120,47 @@ impl Server {
         self.port
     }
 
-    pub(crate) fn wait(&self, expected_state: &str) -> Result<CallbackResult, AgentError> {
-        let deadline = Instant::now() + self.config.timeout;
-        let pastes = self.config.paste_fallback.then(spawn_paste_reader);
-
-        while Instant::now() < deadline {
-            if let Some(rx) = &pastes
-                && let Ok(pasted) = rx.try_recv()
-            {
-                return parse_callback_input(&pasted, expected_state);
-            }
-
-            let mut accepted = false;
-            for listener in &self.listeners {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        accepted = true;
-                        if let Some(result) = self.serve(stream, expected_state) {
+    /// A pasted redirect URL wins over a connection that arrives in the same
+    /// moment, since the user typed it on purpose.
+    pub(crate) async fn wait(&self, expected_state: &str) -> Result<CallbackResult, AgentError> {
+        let mut pastes = self.config.paste_fallback.then(paste_lines);
+        let callback = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(pasted) = next_paste(&mut pastes) => {
+                        return parse_callback_input(&pasted, expected_state);
+                    }
+                    accepted = accept_any(&self.listeners) => {
+                        let stream = accepted.map_err(|e| AgentError::Config {
+                            message: format!("OAuth callback: {e}"),
+                        })?;
+                        if let Some(result) = self.serve(stream, expected_state).await {
                             return Ok(result);
                         }
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        return Err(AgentError::Config {
-                            message: format!("OAuth callback: {e}"),
-                        });
-                    }
                 }
             }
-            if !accepted {
-                thread::sleep(ACCEPT_POLL);
-            }
-        }
-
-        Err(AgentError::Config {
-            message: CALLBACK_TIMEOUT_MSG.into(),
-        })
+        };
+        timeout(self.config.timeout, callback)
+            .await
+            .unwrap_or_else(|_| {
+                Err(AgentError::Config {
+                    message: CALLBACK_TIMEOUT_MSG.into(),
+                })
+            })
     }
 
     /// `None` keeps waiting: a stale tab or a stray request must not end the login.
-    fn serve(&self, mut stream: TcpStream, expected_state: &str) -> Option<CallbackResult> {
-        stream.set_nonblocking(false).ok();
-        stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT)).ok();
-        let head = read_request_head(&mut stream, Instant::now() + REQUEST_HEAD_TIMEOUT).ok()?;
+    async fn serve(&self, mut stream: TcpStream, expected_state: &str) -> Option<CallbackResult> {
+        let head = read_request_head(&mut stream, Instant::now() + REQUEST_HEAD_TIMEOUT)
+            .await
+            .ok()?;
         let head = String::from_utf8_lossy(&head);
         let target = head.split_whitespace().nth(1)?;
 
         if request_path(target) != self.config.path {
-            let _ = write_http(&mut stream, Status::NotFound, NOT_FOUND_HTML);
+            let _ = write_http(&mut stream, Status::NotFound, NOT_FOUND_HTML).await;
             return None;
         }
 
@@ -169,24 +173,45 @@ impl Server {
                     Status::BadRequest
                 };
                 let body = if complete { SUCCESS_HTML } else { FAILURE_HTML };
-                let _ = write_http(&mut stream, status, body);
+                let _ = write_http(&mut stream, status, body).await;
                 Some(result)
             }
             Err(_) => {
-                let _ = write_http(&mut stream, Status::Forbidden, FAILURE_HTML);
+                let _ = write_http(&mut stream, Status::Forbidden, FAILURE_HTML).await;
                 None
             }
         }
     }
 }
 
+/// The first connection on any of the listeners.
+async fn accept_any(listeners: &[TcpListener]) -> io::Result<TcpStream> {
+    poll_fn(|cx| {
+        for listener in listeners {
+            if let Poll::Ready(accepted) = listener.poll_accept(cx) {
+                return Poll::Ready(accepted.map(|(stream, _)| stream));
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// `None` once stdin is closed; without a paste reader it never answers.
+async fn next_paste(pastes: &mut Option<UnboundedReceiver<String>>) -> Option<String> {
+    match pastes {
+        Some(lines) => lines.recv().await,
+        None => pending().await,
+    }
+}
+
 /// Browsers resolve `localhost` to either stack, so both have to answer.
-fn bind_localhost(port: u16) -> io::Result<(Vec<TcpListener>, u16)> {
-    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+fn bind_localhost(port: u16) -> io::Result<(Vec<StdListener>, u16)> {
+    let v4 = StdListener::bind((Ipv4Addr::LOCALHOST, port))?;
     let bound = v4.local_addr()?.port();
     let mut listeners = vec![v4];
 
-    match TcpListener::bind((Ipv6Addr::LOCALHOST, bound)) {
+    match StdListener::bind((Ipv6Addr::LOCALHOST, bound)) {
         Ok(v6) => listeners.push(v6),
         // Another process owns the v6 half of the port we were told to use, so a browser
         // resolving `localhost` to ::1 would hand our code to them and we would hang.
@@ -201,54 +226,65 @@ fn bind_localhost(port: u16) -> io::Result<(Vec<TcpListener>, u16)> {
     Ok((listeners, bound))
 }
 
-fn read_request_head(stream: &mut impl Read, deadline: Instant) -> io::Result<Vec<u8>> {
-    let mut request = Vec::with_capacity(READ_CHUNK);
-    let mut buffer = [0u8; READ_CHUNK];
-    while request.len() < MAX_REQUEST_SIZE {
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, SLOW_REQUEST_MSG));
+/// The deadline is checked between reads as well as awaited, so a peer that
+/// never stalls but never finishes is cut off too.
+async fn read_request_head(
+    stream: &mut (impl AsyncRead + Unpin),
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    let slow = || io::Error::new(io::ErrorKind::TimedOut, SLOW_REQUEST_MSG);
+    let read = async {
+        let mut request = Vec::with_capacity(READ_CHUNK);
+        let mut buffer = [0u8; READ_CHUNK];
+        while request.len() < MAX_REQUEST_SIZE {
+            if Instant::now() >= deadline {
+                return Err(slow());
+            }
+            let size = stream.read(&mut buffer).await?;
+            if size == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..size]);
+            if request
+                .windows(HEADER_TERMINATOR.len())
+                .any(|bytes| bytes == HEADER_TERMINATOR)
+            {
+                break;
+            }
         }
-        let size = stream.read(&mut buffer)?;
-        if size == 0 {
-            break;
-        }
-        request.extend_from_slice(&buffer[..size]);
-        if request
-            .windows(HEADER_TERMINATOR.len())
-            .any(|bytes| bytes == HEADER_TERMINATOR)
-        {
-            break;
-        }
-    }
-    Ok(request)
+        Ok(request)
+    };
+    timeout_at(deadline.into(), read)
+        .await
+        .unwrap_or_else(|_| Err(slow()))
 }
 
-fn write_http(stream: &mut impl Write, status: Status, body: &str) -> io::Result<()> {
-    write!(
-        stream,
+async fn write_http(
+    stream: &mut (impl AsyncWrite + Unpin),
+    status: Status,
+    body: &str,
+) -> io::Result<()> {
+    let response = format!(
         "HTTP/1.1 {}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         status.line(),
         body.len(),
-    )
+    );
+    stream.write_all(response.as_bytes()).await
 }
 
 fn request_path(target: &str) -> &str {
     target.split_once('?').map_or(target, |(path, _)| path)
 }
 
-fn spawn_paste_reader() -> Receiver<String> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        loop {
-            let mut line = String::new();
-            match io::stdin().read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {
-                    let pasted = line.trim().to_string();
-                    if !pasted.is_empty() && tx.send(pasted).is_err() {
-                        return;
-                    }
-                }
+/// Non-empty lines typed on stdin, until it closes or nobody listens.
+fn paste_lines() -> UnboundedReceiver<String> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let pasted = line.trim().to_owned();
+            if !pasted.is_empty() && tx.send(pasted).is_err() {
+                return;
             }
         }
     });
@@ -345,7 +381,7 @@ fn prefer_device() -> bool {
         || !io::stdin().is_terminal()
 }
 
-pub(crate) fn select_login_method(provider: &str) -> Result<LoginMethod, AgentError> {
+pub(crate) async fn select_login_method(provider: &str) -> Result<LoginMethod, AgentError> {
     let default_device = prefer_device();
     println!("{provider} login method:");
     if default_device {
@@ -355,7 +391,7 @@ pub(crate) fn select_login_method(provider: &str) -> Result<LoginMethod, AgentEr
         println!("  1. Browser login (default)");
         println!("  2. Device code login (remote/headless)");
     }
-    match prompt("Select [1-2]: ")?.as_str() {
+    match prompt("Select [1-2]: ").await?.as_str() {
         "" if default_device => Ok(LoginMethod::Device),
         "" | "1" | "browser" => Ok(LoginMethod::Browser),
         "2" | "device" => Ok(LoginMethod::Device),
@@ -365,17 +401,21 @@ pub(crate) fn select_login_method(provider: &str) -> Result<LoginMethod, AgentEr
     }
 }
 
-pub(crate) fn prompt(message: &str) -> Result<String, AgentError> {
-    print!("{message}");
-    io::stdout().flush().map_err(|e| AgentError::Config {
+/// Reads through std's stdin, whose buffer is shared by every prompt, so a
+/// piped answer that arrives together with the next one is not lost.
+pub(crate) async fn prompt(message: &str) -> Result<String, AgentError> {
+    let message = message.to_owned();
+    let line = spawn_blocking(move || {
+        print!("{message}");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        io::Result::Ok(line)
+    })
+    .await?
+    .map_err(|e| AgentError::Config {
         message: format!("prompt: {e}"),
     })?;
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| AgentError::Config {
-            message: format!("prompt: {e}"),
-        })?;
     Ok(line.trim().to_string())
 }
 
@@ -383,7 +423,11 @@ pub(crate) fn prompt(message: &str) -> Result<String, AgentError> {
 mod tests {
     use std::io::{ErrorKind, Read, Write as _};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::thread;
+
+    use tokio::io::{AsyncRead, ReadBuf};
 
     use test_case::test_case;
 
@@ -396,16 +440,22 @@ mod tests {
     /// A peer that keeps the connection alive but never ends the head.
     struct Trickle;
 
-    impl Read for Trickle {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            buf[0] = b'x';
-            Ok(1)
+    impl AsyncRead for Trickle {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            buf.put_slice(b"x");
+            Poll::Ready(Ok(()))
         }
     }
 
-    #[test]
-    fn a_head_that_outlives_its_deadline_is_dropped() {
-        let error = read_request_head(&mut Trickle, Instant::now()).unwrap_err();
+    #[tokio::test]
+    async fn a_head_that_outlives_its_deadline_is_dropped() {
+        let error = read_request_head(&mut Trickle, Instant::now())
+            .await
+            .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert_eq!(error.to_string(), SLOW_REQUEST_MSG);
     }
@@ -499,7 +549,7 @@ mod tests {
     const TEST_CODE: &str = "authorization-code";
 
     /// `None` when the host has no listener, which is a valid setup for ipv6.
-    fn callback_over(host: IpAddr) -> Option<CallbackResult> {
+    async fn callback_over(host: IpAddr) -> Option<CallbackResult> {
         let server = Loopback {
             port: 0,
             fallback_to_ephemeral: false,
@@ -526,7 +576,7 @@ mod tests {
             std::io::Result::Ok(response)
         });
 
-        let result = server.wait(EXPECTED_STATE).unwrap();
+        let result = server.wait(EXPECTED_STATE).await.unwrap();
         assert!(
             redirect
                 .join()
@@ -537,16 +587,16 @@ mod tests {
         Some(result)
     }
 
-    #[test]
-    fn serves_the_callback_over_ipv4() {
-        let result = callback_over(Ipv4Addr::LOCALHOST.into()).unwrap();
+    #[tokio::test]
+    async fn serves_the_callback_over_ipv4() {
+        let result = callback_over(Ipv4Addr::LOCALHOST.into()).await.unwrap();
         assert_eq!(result.code.as_deref(), Some(TEST_CODE));
     }
 
     /// `localhost` resolves to `::1` first on some systems, so the v6 socket has to answer too.
-    #[test]
-    fn serves_the_callback_over_ipv6() {
-        if let Some(result) = callback_over(Ipv6Addr::LOCALHOST.into()) {
+    #[tokio::test]
+    async fn serves_the_callback_over_ipv6() {
+        if let Some(result) = callback_over(Ipv6Addr::LOCALHOST.into()).await {
             assert_eq!(result.code.as_deref(), Some(TEST_CODE));
         }
     }
