@@ -19,9 +19,9 @@ use ratatui::widgets::{Block, Borders, Widget};
 use super::Status;
 use super::{App, Mode};
 
-/// A finished task's tab has no input box, so only this hint says how to
-/// get out.
-pub(super) const FINISHED_TAB_HINT: &str = " esc back · ctrl+x tasks ";
+/// A tab without an input box, a finished task's or a moved call's, has
+/// only this hint to say how to get out and where to stop it.
+pub(super) const NO_INPUT_TAB_HINT: &str = " esc back · ctrl+x tasks ";
 
 struct ViewLayout {
     msg_area: Rect,
@@ -195,10 +195,10 @@ impl App {
     }
 
     /// Returns the cell the input box drew its caret in, when it drew one at
-    /// all: a prompt, a form, a `below` split or a finished subagent's chat
-    /// all take the box off screen, and a box scrolled off its own viewport
-    /// draws without a caret. A running subagent's chat keeps the box, so a
-    /// message can be queued for that subagent while watching it.
+    /// all: a prompt, a form, a `below` split or a chat that takes no
+    /// messages all take the box off screen, and a box scrolled off its own
+    /// viewport draws without a caret. A running subagent's chat keeps the
+    /// box, so a message can be queued for that subagent while watching it.
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Option<Position> {
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
@@ -222,7 +222,7 @@ impl App {
             } else {
                 layout.bottom_area
             };
-            let hint = Line::from(Span::styled(FINISHED_TAB_HINT, theme::current().tool_dim));
+            let hint = Line::from(Span::styled(NO_INPUT_TAB_HINT, theme::current().tool_dim));
             let sep = Block::default()
                 .borders(Borders::TOP)
                 .border_style(self.separator_style())

@@ -421,6 +421,13 @@ impl MessagesPanel {
         self.find_tool_msg(tool_id).cloned()
     }
 
+    pub fn tool_name(&self, tool_id: &str) -> Option<Arc<str>> {
+        match &self.find_tool_msg(tool_id)?.role {
+            DisplayRole::Tool(tool) => Some(Arc::clone(&tool.name)),
+            _ => None,
+        }
+    }
+
     /// The buf a running tool streams into, live or still watched.
     pub fn live_buf(&self, tool_id: &str) -> Option<Arc<SharedBuf>> {
         self.live_bufs
@@ -619,6 +626,10 @@ impl MessagesPanel {
     #[cfg(test)]
     pub fn message_at(&self, index: usize) -> Option<&DisplayMessage> {
         self.messages.get(index)
+    }
+
+    pub fn has_user_message(&self) -> bool {
+        self.messages.iter().any(|m| m.role == DisplayRole::User)
     }
 
     pub fn last_message_text(&self) -> &str {

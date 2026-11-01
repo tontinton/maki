@@ -126,8 +126,9 @@ impl From<TaskOutcome> for TaskStatus {
     }
 }
 
-/// When a task started, or moved to the background, and when it ended. A
-/// task loaded from disk has none: the session file keeps neither.
+/// When a task started, or moved to the background, and when it ended. The
+/// session file keeps both as Unix seconds, so a reloaded task still says
+/// how long it ran; one written before that was recorded has no clock.
 pub(crate) struct TaskClock {
     started: SystemTime,
     ended: Option<SystemTime>,
@@ -136,6 +137,22 @@ pub(crate) struct TaskClock {
 impl TaskClock {
     pub(crate) fn start() -> Self {
         Self::started_ago(Duration::ZERO)
+    }
+
+    pub(crate) fn from_unix(started_at: Option<u64>, ended_at: Option<u64>) -> Option<Self> {
+        let at = |secs| UNIX_EPOCH + Duration::from_secs(secs);
+        Some(Self {
+            started: at(started_at?),
+            ended: ended_at.map(at),
+        })
+    }
+
+    pub(crate) fn started_at(&self) -> Option<u64> {
+        unix_secs(self.started)
+    }
+
+    pub(crate) fn ended_at(&self) -> Option<u64> {
+        self.ended.and_then(unix_secs)
     }
 
     /// A moved call's task counts from the call's start, as the call's own
@@ -192,6 +209,11 @@ pub(crate) struct TaskInfo {
     status: Option<TaskStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plugin: Option<Arc<str>>,
+    /// The tool whose call the task runs: `task` for a subagent, moved or
+    /// not, `bash` for a moved command. A session a plugin opened on its own
+    /// has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<Arc<str>>,
     /// See [`Chat::parent`].
     #[serde(skip_serializing_if = "Option::is_none")]
     parent: Option<Arc<str>>,
@@ -634,18 +656,14 @@ impl App {
                 name: chat.name.clone(),
                 status: chat.task_id().map(|_| chat.task_status()),
                 plugin: chat.plugin.clone(),
+                tool: chat
+                    .task_id()
+                    .and_then(|id| self.chats[MAIN_CHAT].tool_name(id)),
                 parent: chat.parent.as_ref().map(TaskParent::call).cloned(),
                 part: chat.part_of().is_some(),
                 focused: idx == self.active_chat,
-                started_at: chat
-                    .clock
-                    .as_ref()
-                    .and_then(|clock| unix_secs(clock.started)),
-                ended_at: chat
-                    .clock
-                    .as_ref()
-                    .and_then(|clock| clock.ended)
-                    .and_then(unix_secs),
+                started_at: chat.clock.as_ref().and_then(TaskClock::started_at),
+                ended_at: chat.clock.as_ref().and_then(TaskClock::ended_at),
                 cost: chat.task_id().and(chat.cost),
             })
             .collect()
@@ -872,7 +890,7 @@ mod tests {
         STARTED_AT_KEY, agent_msg, app_with_moved_call, app_with_plugin_task,
         app_with_subagent_call, app_with_subagent_id, cancel_app, close_subagent_transcript, done,
         end_turn, error_app, finish_subagent, moved_done, moved_subagent_event, plugin_event,
-        start_subagent, streaming_app, subagent_info, test_app, tool_start,
+        reload, start_subagent, streaming_app, subagent_info, test_app, tool_start,
     };
     use crate::chat::{DONE_TEXT, ERROR_TEXT};
     use crate::components::Overlay;
@@ -1440,8 +1458,7 @@ mod tests {
         // so both have to close before the session is written.
         close_subagent_transcript(&mut app, OTHER_ID);
         close_subagent_transcript(&mut app, TASK_ID);
-        app.reset_ui_chrome();
-        app.restore_display();
+        reload(&mut app);
         app
     }
 
@@ -1532,14 +1549,14 @@ mod tests {
         start_subagent(&mut app, OTHER_ID, BUILD_NAME);
         close_subagent_transcript(&mut app, OTHER_ID);
 
-        app.reset_ui_chrome();
-        app.restore_display();
+        reload(&mut app);
 
         let restored: Vec<_> = app
             .task_states()
             .map(|task| (task.id.to_string(), task.status))
             .collect();
         assert_eq!(restored, vec![(OTHER_ID.to_owned(), TaskStatus::Done)]);
+        app.checkpoint();
         let recorded: Vec<_> = app
             .state
             .session
@@ -1689,6 +1706,7 @@ mod tests {
         assert!(app.state.session.subagent_messages().contains_key(TASK_ID));
 
         app.remove_task(TASK_ID).unwrap();
+        app.checkpoint();
 
         let listed: Vec<_> = app.task_states().map(|task| task.id.to_string()).collect();
         assert_eq!(listed, [OTHER_ID]);

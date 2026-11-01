@@ -1331,9 +1331,11 @@ pub struct SubagentInfo {
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
     /// Where a host queues messages for this subagent. Its loop drains the
-    /// queue between turns, so a message lands as an interrupt.
+    /// queue between turns, so a message lands as an interrupt. Every
+    /// subagent has one, so a chat without one has not heard from its
+    /// subagent yet.
     #[serde(skip)]
-    pub inbox: Option<Arc<crate::SubagentInbox>>,
+    pub inbox: Arc<crate::SubagentInbox>,
     /// The model's call this session runs under when that is not its own
     /// `task` call, like the `batch` it is a child of. Once that call moves,
     /// `/tasks` lists the session under it.
