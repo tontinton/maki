@@ -290,6 +290,7 @@ Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 
 - **Env var**: `MISTRAL_API_KEY`
 - **API**: `https://api.mistral.ai/v1`
+- **Features**: Chat or Responses API (`plugins.mistral.responses_api = true`); reasoning effort high-only, or the ladder each model's card publishes with `plugins.mistral.effort_ladders = true`
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
@@ -300,6 +301,7 @@ Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 | Strong | **mistral-large-4, mistral-large-4-0** (default) | $0.70 / $2.10 | 1000K ctx |
 | Strong | mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604 | $1.50 / $7.50 | 262K ctx |
 | Strong | zai-glm-latest, zai-glm-5-3, zai-glm-5 | $1.40 / $4.40 | 1000K ctx / 131K out |
+| Strong | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx / 131K out |
 
 Defaults: mistral-large-4 (strong), mistral-small-latest (medium), zai-glm-5-3-flash (weak)
 

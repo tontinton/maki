@@ -399,13 +399,15 @@ fn honours_build_body(target: Target) -> bool {
 }
 
 /// The `openai` table is the chat codec's own vocabulary. The responses codec
-/// spells neither effort nor extra body the same way, so it is refused there
-/// rather than half honoured.
-fn honours_openai_wire(target: Target) -> bool {
+/// honours the whole of it in the shapes that endpoint spells (see
+/// [`OpenAiWire::apply_responses_body`]); what it refuses is a custom
+/// thinking `field`, since it writes the standard `reasoning` block. The
+/// other codecs read none of the table.
+fn honours_openai_wire(target: Target, wire: &OpenAiWire) -> bool {
     match target {
         Target::Codec(Protocol::Openai) => true,
-        Target::Codec(Protocol::OpenaiResponses | Protocol::Anthropic | Protocol::Google)
-        | Target::Base(_) => false,
+        Target::Codec(Protocol::OpenaiResponses) => wire.responses_compatible(),
+        Target::Codec(Protocol::Anthropic | Protocol::Google) | Target::Base(_) => false,
     }
 }
 
@@ -715,7 +717,9 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     if decl.system_prefix.is_some() && !honours_system_prefix(target) {
         return Err(unsupported(SYSTEM_PREFIX_OPTION));
     }
-    if decl.openai.is_some() && !honours_openai_wire(target) {
+    if let Some(wire) = &decl.openai
+        && !honours_openai_wire(target, wire)
+    {
         return Err(unsupported(OPENAI_OPTION));
     }
     let states_origin =
@@ -2682,7 +2686,6 @@ mod tests {
         assert_eq!(requested.clamped(&model), requested);
         assert_eq!(requested.shown(&model), expected);
         assert!(!model.thinking_options().is_empty());
-
         let ctx = RequestCtx {
             model: &model,
             opts: RequestOptions {
@@ -2703,6 +2706,29 @@ mod tests {
             serde_json::json!({"reasoning_effort": "xhigh"})
         };
         assert_eq!(body, expected_body);
+    }
+
+    /// The responses codec honours the `openai.thinking` dialect: adaptive
+    /// renders at the dialect's level, and the codec's thinking pass snaps
+    /// effort against it on the wire, narrowed by the discovered row.
+    #[test]
+    fn responses_codec_honours_the_declared_thinking_dialect() {
+        let slug = "responses-dialect-plugin";
+        let mut reg = registration(slug);
+        reg.decl.codec = Some(Protocol::OpenaiResponses);
+        reg.decl.models[0].supports_thinking = Some(true);
+        reg.decl.openai = Some(
+            serde_json::from_value(serde_json::json!({"thinking": {"dialect": "high-only"}}))
+                .unwrap(),
+        );
+        register_loaded(reg).unwrap();
+
+        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
+        assert_eq!(model.adaptive_effort(), Some(Effort::High));
+        assert_eq!(
+            ThinkingConfig::Effort(Effort::Low).effort_str(&dialect::HIGH_ONLY, &model),
+            Some(Effort::High.as_str())
+        );
     }
 
     #[test_case(false, ThinkingConfig::Effort(Effort::Max), serde_json::json!({"reasoning_effort": "xhigh"}) ; "named_fields_send_an_effort")]
@@ -3093,6 +3119,20 @@ mod tests {
         reg.decl.openai = Some(OpenAiWire::default());
     }
 
+    /// The chat-only body/header fields, on the responses codec, which
+    /// honours only `thinking` and `thinking_overrides`.
+    /// The responses pass writes the standard `reasoning` block, so a
+    /// declaration spelling effort somewhere else would be dropped there.
+    fn openai_wire_custom_effort_field_on_responses(reg: &mut Registration) {
+        reg.decl.codec = Some(Protocol::OpenaiResponses);
+        reg.decl.openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "thinking": { "dialect": "high-only", "field": "custom_effort" },
+            }))
+            .unwrap(),
+        );
+    }
+
     fn system_prefix_on_google(reg: &mut Registration) {
         reg.decl.codec = Some(Protocol::Google);
         reg.decl.system_prefix = Some(SOME_SYSTEM_PREFIX.to_string());
@@ -3134,6 +3174,7 @@ mod tests {
     #[test_case(outside_a_load, |e| matches!(e, RegisterError::Closed(_)) ; "registration_outside_a_load")]
     #[test_case(body_hook_on_anthropic, |e| matches!(e, RegisterError::Unsupported { .. }) ; "build_body_needs_an_openai_codec")]
     #[test_case(openai_wire_on_anthropic, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "openai_table_needs_the_openai_codec")]
+    #[test_case(openai_wire_custom_effort_field_on_responses, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "responses_codec_refuses_a_custom_effort_field")]
     #[test_case(system_prefix_on_google, |e| matches!(e, RegisterError::Unsupported { .. }) ; "google_drops_the_system_prefix")]
     #[test_case(system_prefix_on_the_google_base, |e| matches!(e, RegisterError::Unsupported { .. }) ; "so_does_the_google_base")]
     #[test_case(base_url_on_a_base, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == BASE_URL_OPTION) ; "base_url_needs_a_codec")]

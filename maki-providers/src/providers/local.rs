@@ -170,6 +170,7 @@ impl Provider for LocalEndpoint {
                     self.compat.client(),
                     model,
                     &body,
+                    &[],
                     event_tx,
                     &auth,
                     self.compat.stream_timeout(),

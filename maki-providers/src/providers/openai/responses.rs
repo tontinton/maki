@@ -197,6 +197,7 @@ pub(crate) async fn do_stream(
     client: &Client,
     model: &crate::model::Model,
     body: &Value,
+    extra_headers: &[(&str, &str)],
     event_tx: &Sender<ProviderEvent>,
     auth: &ResolvedAuth,
     stream_timeout: Duration,
@@ -208,12 +209,32 @@ pub(crate) async fn do_stream(
     if summary_rejected(base) && has_summary(&body) {
         strip_summary(body.to_mut());
     }
-    let result = post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await;
+    let result = post_responses(
+        client,
+        model,
+        &body,
+        extra_headers,
+        event_tx,
+        auth,
+        base,
+        stream_timeout,
+    )
+    .await;
     match result {
         Err(err) if has_summary(&body) && err.is_unsupported_reasoning_summary() => {
             reject_summary(base);
             strip_summary(body.to_mut());
-            post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await
+            post_responses(
+                client,
+                model,
+                &body,
+                extra_headers,
+                event_tx,
+                auth,
+                base,
+                stream_timeout,
+            )
+            .await
         }
         result => result,
     }
@@ -224,6 +245,7 @@ async fn post_responses(
     client: &Client,
     model: &crate::model::Model,
     body: &Value,
+    extra_headers: &[(&str, &str)],
     event_tx: &Sender<ProviderEvent>,
     auth: &ResolvedAuth,
     base: &str,
@@ -231,15 +253,14 @@ async fn post_responses(
 ) -> Result<StreamResponse, AgentError> {
     let json_body = serde_json::to_vec(body)?;
 
-    let request = auth
-        .configure_request(
-            client
-                .post(format!("{base}{RESPONSES_PATH}"))
-                .header("content-type", "application/json")
-                .header("user-agent", super::super::user_agent()),
-        )
-        .body(json_body)
-        .build()?;
+    let builder = extra_headers.iter().fold(
+        client
+            .post(format!("{base}{RESPONSES_PATH}"))
+            .header("content-type", "application/json")
+            .header("user-agent", super::super::user_agent()),
+        |builder, (name, value)| builder.header(*name, *value),
+    );
+    let request = auth.configure_request(builder).body(json_body).build()?;
 
     debug!(
         model = %model.id,

@@ -325,6 +325,13 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MB. |
 
+### `plugins.mistral`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `effort_ladders` | boolean | `false` | - | Attach each discovered model's published reasoning-effort ladder (the Large 4, DeepSeek and GLM rows), so those models accept low/medium effort instead of the high-only default. |
+| `responses_api` | boolean | `false` | - | Speak the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). The thinking dialect and effort ladder apply to both. |
+
 ### `plugins.read`
 
 | Field | Type | Default | Min | Description |
