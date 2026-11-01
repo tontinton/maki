@@ -337,7 +337,7 @@ Models are listed live from the API. Managed policies come first, with short ids
 
 - **Env var**: `SYNTHETIC_API_KEY`
 - **API**: `https://api.synthetic.new/openai/v1`
-- **Features**: Reasoning effort (low, medium, high), open-weight models
+- **Features**: Reasoning effort (minimal, low, medium, high, xhigh, max), open-weight models
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
