@@ -183,7 +183,10 @@ pub fn warn_ignored_provider_fields() {
         if !ProviderRegistry::is_shipped(slug) || ProviderRegistry::get(slug).is_none() {
             continue;
         }
-        let ignored = maki_config::providers::ignored_builtin_fields(slug, def);
+        let mut ignored = maki_config::providers::ignored_builtin_fields(slug, def);
+        if maki_providers::plugin::honours_protocol_override(slug) {
+            ignored.retain(|field| *field != "protocol");
+        }
         if ignored.is_empty() {
             continue;
         }

@@ -41,7 +41,18 @@ You can also set `base_url` for a built-in provider in `~/.config/maki/providers
 base_url = "http://xxxx:1234/v1"
 ```
 
-The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
+The built-in provider still owns the slug, so `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
+
+### Picking the wire protocol
+
+Providers that speak more than one protocol say which in their docs. A bundled plugin lists the codecs it supports, and a `providers.toml` entry picks among them:
+
+```toml
+[mistral]
+protocol = "openai-responses"
+```
+
+The entry overrides the plugin's declared `codec` — the wire, its thinking dialect and the model rows resolve as if the plugin had declared it. A protocol the plugin does not list only warns and keeps the declared one. For a built-in without a protocol choice, or to declare models beside it, use a custom slug.
 
 ## Built-in Providers
 
@@ -429,7 +440,7 @@ supports_vision = false
 | Field | Type | Notes |
 |-------|------|-------|
 | `display_name` | string | Shown in pickers and auth status |
-| `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs |
+| `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs. On a bundled-plugin slug it picks among the codecs the plugin lists |
 | `base_url` | string | Origin of the API. Maki appends the protocol paths |
 | `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
