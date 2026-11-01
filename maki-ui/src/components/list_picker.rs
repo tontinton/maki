@@ -50,6 +50,11 @@ pub trait PickerItem {
     fn is_highlighted(&self) -> bool {
         false
     }
+    /// Left out of the list until the search reaches for it: a model inside
+    /// a provider group the user folded.
+    fn is_hidden(&self) -> bool {
+        false
+    }
     /// Drawn in place of its section header, so the cursor can land on the
     /// section itself.
     fn is_section_row(&self) -> bool {
@@ -93,10 +98,9 @@ struct State<T> {
 
 impl<T: PickerItem> State<T> {
     fn new(items: Vec<T>) -> Self {
-        let filtered = (0..items.len()).collect();
-        Self {
+        let mut this = Self {
             items,
-            filtered,
+            filtered: Vec::new(),
             selected: 0,
             search: TextBuffer::new(String::new()),
             scroll_offset: 0,
@@ -105,7 +109,9 @@ impl<T: PickerItem> State<T> {
             enabled: None,
             matcher: Matcher::new(Config::DEFAULT),
             notice: None,
-        }
+        };
+        this.rebuild_filter();
+        this
     }
 
     fn replace_items(&mut self, items: Vec<T>) {
@@ -117,7 +123,9 @@ impl<T: PickerItem> State<T> {
     fn rebuild_filter(&mut self) {
         let query = self.search.value();
         if query.is_empty() {
-            self.filtered = (0..self.items.len()).collect();
+            self.filtered = (0..self.items.len())
+                .filter(|&idx| !self.items[idx].is_hidden())
+                .collect();
         } else {
             let pattern = Pattern::new(
                 query,
@@ -742,14 +750,18 @@ fn render_list<T: PickerItem>(
         if let Some(sec) = item.section()
             && last_section.is_none_or(|prev| prev != sec)
         {
-            if !lines.is_empty() && lines.len() < viewport_height {
-                lines.push(Line::raw(""));
-            }
-            if !item.is_section_row() && lines.len() < viewport_height {
-                lines.push(Line::from(Span::styled(
-                    format!("  {sec}"),
-                    theme::current().keybind_section,
-                )));
+            // A section row is itself the header, styled to stand out, so it
+            // does not also get the blank line and the header text.
+            if !item.is_section_row() {
+                if !lines.is_empty() && lines.len() < viewport_height {
+                    lines.push(Line::raw(""));
+                }
+                if lines.len() < viewport_height {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {sec}"),
+                        theme::current().keybind_section,
+                    )));
+                }
             }
             last_section = Some(sec);
         }

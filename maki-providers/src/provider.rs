@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -165,8 +166,29 @@ pub async fn from_model_async(
 }
 
 pub struct ModelBatch {
+    /// The slug whose live answer this batch carries. The catalog and custom
+    /// sources send one batch per slug.
+    pub provider: String,
     pub models: Vec<String>,
     pub warnings: Vec<String>,
+    /// The provider could not be built for want of credentials. The picker
+    /// says so instead of resolving auth a second time.
+    pub missing_credentials: bool,
+}
+
+/// Splits qualified specs into per-slug batches, keeping the order within a
+/// slug and sorting slugs so the batches are deterministic.
+fn group_by_slug(specs: Vec<String>) -> BTreeMap<String, Vec<String>> {
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for spec in specs {
+        let slug = provider_of_spec(&spec).to_string();
+        groups.entry(slug).or_default().push(spec);
+    }
+    groups
+}
+
+fn provider_of_spec(spec: &str) -> &str {
+    spec.split_once('/').map_or(spec, |(provider, _)| provider)
 }
 
 /// The offline twin of [`fetch_all_models`]. It never waits for the catalog
@@ -222,12 +244,25 @@ pub async fn fetch_all_models(
 
     for spec in ProviderRegistry::all() {
         let slug = spec.slug;
-        let Ok(provider) = spawn_blocking(move || provider_for_slug(slug, timeouts))
+        let provider = match spawn_blocking(move || provider_for_slug(slug, timeouts))
             .await
             .expect("provider construction panicked")
-        else {
-            warn!(provider = slug, "failed to create provider, skipping");
-            continue;
+        {
+            Ok(provider) => provider,
+            Err(e) => {
+                warn!(provider = slug, error = %e, "failed to create provider, skipping");
+                if matches!(e, AgentError::MissingCredentials { .. }) {
+                    let _ = tx
+                        .send_async(ModelBatch {
+                            provider: slug.to_string(),
+                            models: Vec::new(),
+                            warnings: Vec::new(),
+                            missing_credentials: true,
+                        })
+                        .await;
+                }
+                continue;
+            }
         };
         let display_name = spec.display_name;
         let tx = tx.clone();
@@ -246,8 +281,10 @@ pub async fn fetch_all_models(
                         }
                     }
                     ModelBatch {
+                        provider: slug.to_string(),
                         models: specs,
                         warnings: Vec::new(),
+                        missing_credentials: false,
                     }
                 }
                 Err(e) => {
@@ -259,8 +296,10 @@ pub async fn fetch_all_models(
                         .map(|p| format!("{slug}/{p}"))
                         .collect();
                     ModelBatch {
+                        provider: slug.to_string(),
                         models: fallback,
                         warnings: vec![format!("{display_name}: {e} (using static fallback)")],
+                        missing_credentials: false,
                     }
                 }
             };
@@ -285,8 +324,10 @@ pub async fn fetch_all_models(
             let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
             let _ = tx_catalog
                 .send_async(ModelBatch {
+                    provider: slug,
                     models,
                     warnings: Vec::new(),
+                    missing_credentials: false,
                 })
                 .await;
         }
@@ -294,21 +335,34 @@ pub async fn fetch_all_models(
 
     let tx_custom = tx.clone();
     tokio::spawn(async move {
-        let declared = custom::declared_model_specs();
-        if !declared.is_empty() {
+        for (provider, models) in group_by_slug(custom::declared_model_specs()) {
             let _ = tx_custom
                 .send_async(ModelBatch {
-                    models: declared,
+                    provider,
+                    models,
                     warnings: Vec::new(),
+                    missing_credentials: false,
                 })
                 .await;
         }
-        let custom_specs = custom::discover_models(timeouts).await;
-        if !custom_specs.is_empty() {
+        let custom = custom::discover_models(timeouts).await;
+        for (provider, models) in group_by_slug(custom.specs) {
             let _ = tx_custom
                 .send_async(ModelBatch {
-                    models: custom_specs,
+                    provider,
+                    models,
                     warnings: Vec::new(),
+                    missing_credentials: false,
+                })
+                .await;
+        }
+        for slug in custom.missing_credentials {
+            let _ = tx_custom
+                .send_async(ModelBatch {
+                    provider: slug,
+                    models: Vec::new(),
+                    warnings: Vec::new(),
+                    missing_credentials: true,
                 })
                 .await;
         }
