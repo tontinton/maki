@@ -193,6 +193,7 @@ pub(crate) struct PendingTool {
     pub(crate) start_key: Option<RegistryKey>,
     pub(crate) permission: Option<ToolPermission<PermissionScopeSpec>>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
+    pub(crate) durable_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
@@ -247,6 +248,7 @@ pub(crate) struct LuaTool {
     pub(crate) has_start_fn: bool,
     pub(crate) permission: Option<ToolPermission<PermissionScopeKind>>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
+    pub(crate) durable_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
@@ -324,6 +326,13 @@ impl Tool for LuaTool {
 
     fn examples(&self) -> Option<Value> {
         self.examples.clone()
+    }
+
+    fn durable_key<'a>(&self, input: &'a Value) -> Option<&'a str> {
+        input
+            .get(self.durable_field.as_deref()?)?
+            .as_str()
+            .filter(|key| !key.trim().is_empty())
     }
 
     fn reach(&self) -> Option<ToolReach> {
@@ -785,6 +794,7 @@ fn register_prompt(
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
 ///   permission      (string)   The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
+///   durable         (string)   Optional string field in the recorded tool input that identifies this result. Core retains the latest non-empty successful result text per tool and field value verbatim across compaction, including results restored from older sessions. The key uses the recorded input, before any input-hook rewrite.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 ///   needs_background (boolean) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
@@ -1681,6 +1691,7 @@ fn register_tool_from_lua(
         ));
     }
     let mutable_path_field = require_schema_field(spec, "mutable_path", &schema_val)?;
+    let durable_field = require_schema_field(spec, "durable", &schema_val)?;
     let permission = parse_tool_permission(lua, spec, &name, &schema_val, permissions)?;
     if mutable_path_field.is_none()
         && permission
@@ -1743,6 +1754,7 @@ fn register_tool_from_lua(
             start_key,
             permission,
             mutable_path_field,
+            durable_field,
             timeout,
             start_annotation,
             examples,
@@ -2226,6 +2238,7 @@ mod tests {
                 scopes: Some(scopes),
             }),
             mutable_path_field: None,
+            durable_field: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
             has_start_fn: false,

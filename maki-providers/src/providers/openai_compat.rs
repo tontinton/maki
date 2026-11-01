@@ -823,6 +823,7 @@ pub async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DurableContent;
     use std::io::Cursor;
     use std::sync::Arc;
     use test_case::test_case;
@@ -1065,6 +1066,20 @@ data: [DONE]\n";
 
         assert!(
             matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "think")
+        );
+    }
+
+    #[test]
+    fn durable_host_metadata_never_reaches_the_wire() {
+        let plain = Message::user("instructions".into());
+        let mut marked = plain.clone();
+        marked.durable = Some(DurableContent {
+            key: "remember:release".into(),
+            text: "instructions".into(),
+        });
+        assert_eq!(
+            convert_messages(&[marked], ""),
+            convert_messages(&[plain], "")
         );
     }
 

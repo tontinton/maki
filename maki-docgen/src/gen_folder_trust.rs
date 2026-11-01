@@ -36,13 +36,14 @@ your global configuration.
 
 ## What Trust Does Not Cover
 
-Trust gates code. Text that a project puts into the prompt loads at any trust
-level:
+Project skills under `.maki/skills`, `.claude/skills`, `.opencode/skills`,
+and `.agents/skills` require folder trust. All these locations share the same
+gate. Personal and builtin skills remain available without project trust.
+
+These project instructions load at any trust level:
 
 - `AGENTS.md` and the other instruction files
 - Commands under `.maki/commands` and `.claude/commands`
-- Skills under `.maki/skills`, `.claude/skills`, `.opencode/skills` and
-  `.agents/skills`
 
 A repository can still steer the agent through what the model reads, so trust
 is not a sandbox. What limits the agent on each tool call is

@@ -317,6 +317,7 @@ fn message_table(lua: &Lua, message: &Message) -> LuaResult<Value> {
         role: message.role.clone(),
         content: Vec::new(),
         display_text: message.display_text.clone(),
+        durable: message.durable.clone(),
         kind: message.kind.clone(),
         receipts: message.receipts.clone(),
         settles: message.settles.clone(),
@@ -846,7 +847,7 @@ mod tests {
         publish_live_session,
     };
     use maki_agent::session::{NOTHING_TO_STORE, SessionHeader};
-    use maki_providers::{ImageMediaType, ImageSource, MessageKind, Role};
+    use maki_providers::{DurableContent, ImageMediaType, ImageSource, MessageKind, Role};
     use maki_storage::frame::{FactsUpdate, PromptFacts, StoredFrame};
     use maki_storage::sessions::{StoredMode, StoredThinking};
     use tempfile::TempDir;
@@ -1279,7 +1280,13 @@ mod tests {
     /// and a null inside a tool input included.
     fn rich_history() -> Vec<Message> {
         vec![
-            Message::user(TEXT.into()),
+            Message {
+                durable: Some(DurableContent {
+                    key: TOOL_NAME.into(),
+                    text: TEXT.into(),
+                }),
+                ..Message::user(TEXT.into())
+            },
             assistant(vec![
                 ContentBlock::Thinking {
                     thinking: THOUGHT.into(),

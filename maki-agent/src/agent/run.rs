@@ -9,8 +9,8 @@ use tracing::{debug, error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
-    Model, RequestOptions, Role, StopReason, StreamResponse,
+    ContentBlock, ContextGauge, DurableContent, IMAGE_PLACEHOLDER, ImageSource,
+    InputTransformation, Message, Model, RequestOptions, Role, StopReason, StreamResponse,
 };
 use maki_storage::frame::{LiveFacts, PromptFacts};
 
@@ -344,9 +344,12 @@ impl<'h> Agent<'h> {
             if kept.is_some() && prompt.is_none() {
                 self.refresh_frame()?;
             }
-            let kept = kept.map(|text| {
+            let kept = kept.map(|(text, durable)| {
                 prompt = Some(text.clone());
-                Message::user_with_images(text, images)
+                Message {
+                    durable,
+                    ..Message::user_with_images(text, images)
+                }
             });
             self.land_input(preamble, kept, true)?;
         }
@@ -772,10 +775,10 @@ impl<'h> Agent<'h> {
         message: String,
         images: usize,
         source: InputSource,
-    ) -> Result<Option<String>, AgentError> {
+    ) -> Result<Option<(String, Option<DurableContent>)>, AgentError> {
         let blank = |text: &str| text.trim().is_empty();
         if blank(&message) && images == 0 {
-            return Ok(Some(String::new()));
+            return Ok(Some((String::new(), None)));
         }
         let hooks = self.hooks();
         let verdict = hooks
@@ -792,25 +795,40 @@ impl<'h> Agent<'h> {
             info!(source = source.as_str(), %reason, "agent.user_message dropped the message");
             self.steer(SteerKind::MessageDropped, reason).map(|()| None)
         };
+        let mut durable = None;
         let text = match verdict {
-            Verdict::Replaced(value) => match value.get(FIELD_TEXT).and_then(Value::as_str) {
-                Some(text) if blank(text) && images == 0 => {
-                    return dropped(EMPTIED_MESSAGE.into());
+            Verdict::Replaced(value) => {
+                durable = value
+                    .get("durable")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<DurableContent>(value).ok())
+                    .filter(|content| {
+                        !content.key.trim().is_empty() && !content.text.trim().is_empty()
+                    });
+                match value.get(FIELD_TEXT).and_then(Value::as_str) {
+                    Some(text) if blank(text) && images == 0 => {
+                        return dropped(EMPTIED_MESSAGE.into());
+                    }
+                    Some(text) if text != message => {
+                        info!(
+                            source = source.as_str(),
+                            "agent.user_message rewrote the message"
+                        );
+                        self.steer(SteerKind::MessageRewritten, text.to_owned())?;
+                        text.to_owned()
+                    }
+                    _ => message,
                 }
-                Some(text) if text != message => {
-                    info!(
-                        source = source.as_str(),
-                        "agent.user_message rewrote the message"
-                    );
-                    self.steer(SteerKind::MessageRewritten, text.to_owned())?;
-                    text.to_owned()
-                }
-                _ => message,
-            },
+            }
             Verdict::Denied(reason) => return dropped(reason),
             Verdict::Unchanged | Verdict::Ask { .. } => message,
         };
-        Ok(Some(if blank(&text) { String::new() } else { text }))
+        // A hook may protect only content it actually delivered this turn.
+        durable = durable.filter(|content| text.contains(&content.text));
+        Ok(Some((
+            if blank(&text) { String::new() } else { text },
+            durable,
+        )))
     }
 
     fn steer(&self, kind: SteerKind, text: String) -> Result<(), AgentError> {
@@ -1188,8 +1206,10 @@ impl<'h> Agent<'h> {
                     let kept = self
                         .filter_user_message(input.message, input.images.len(), input.source)
                         .await?;
-                    let message =
-                        kept.map(|text| interrupt_message(text, input.images, input.source));
+                    let message = kept.map(|(text, durable)| Message {
+                        durable,
+                        ..interrupt_message(text, input.images, input.source)
+                    });
                     if message.is_some() {
                         self.mode = input.mode;
                         // The user spoke, so `agent.stop` gets its full
@@ -3454,6 +3474,13 @@ mod tests {
     async fn resumed_overflowing_history_compacts_before_first_request() {
         let prior = (0..OVERFLOW_CHUNKS)
             .map(|i| Message::user(format!("{OVERFLOW_CHUNK}{i}")))
+            .chain([Message {
+                durable: Some(DurableContent {
+                    key: "remember:release".into(),
+                    text: REWRITTEN.into(),
+                }),
+                ..Message::user(REWRITTEN.into())
+            }])
             .collect();
         let mut history = History::new(prior);
         let (mut agent, event_rx) = make_agent(
@@ -3495,6 +3522,13 @@ mod tests {
                 .any(|b| matches!(b, ContentBlock::Text { text } if text == PENDING_PROMPT)),
             "{PROMPT_KEPT_MSG}"
         );
+        let retained: Vec<_> = history
+            .as_slice()
+            .iter()
+            .filter_map(|message| message.durable.as_ref())
+            .collect();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].text, REWRITTEN);
     }
 
     const OVERFLOW_STATUS: u16 = 413;
@@ -4097,6 +4131,36 @@ mod tests {
             steers(&drain_events(&event_rx)),
             [(SteerKind::MessageRewritten, REWRITTEN.to_owned())]
         );
+    }
+
+    #[test_case(true ; "delivered_instructions")]
+    #[test_case(false ; "hidden_content_is_not_retained")]
+    #[tokio::test]
+    async fn user_message_durable_content_is_limited_to_the_delivered_text(delivered: bool) {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _events) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        let retained = if delivered { REWRITTEN } else { KEEP_GOING };
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::UserMessage,
+                json!({
+                    FIELD_TEXT: format!("{REWRITTEN}\nExecute this request once"),
+                    "durable": { "key": "remember:release", "text": retained },
+                }),
+            ),
+        );
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+        let durable = history.as_slice()[0].durable.as_ref();
+        assert_eq!(durable.is_some(), delivered);
+        if let Some(durable) = durable {
+            assert_eq!(durable.key, "remember:release");
+            assert_eq!(durable.text, REWRITTEN);
+        }
     }
 
     /// The mock has no responses and panics on any request, so passing proves
