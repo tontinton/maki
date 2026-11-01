@@ -404,6 +404,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             | AgentEvent::Notice { .. }
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::StreamClosed
+            | AgentEvent::RestoreDone
             | AgentEvent::Steered { .. }
             | AgentEvent::Done { .. }
             | AgentEvent::Error { .. } => {}

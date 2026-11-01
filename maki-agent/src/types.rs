@@ -825,6 +825,10 @@ pub enum AgentEvent {
         id: String,
         body: Arc<SharedBuf>,
     },
+    /// The restore batch that rebuilt a reloaded session's tool renders is
+    /// done. Sent after the batch's last render on the same channel, so a
+    /// consumer that waited for it sees final heights.
+    RestoreDone,
     PromptProgress {
         processed: u32,
         total: u32,

@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
 use crate::components::input::Draft;
-use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, ScrollPos};
+use crate::components::messages::{
+    ClickOutcome, MessagesPanel, PromptProgress, ScrollAnchor, ScrollPos,
+};
 use crate::components::tool_display::append_annotation;
 use crate::components::{
     BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, ToolRole, ToolStatus,
@@ -359,6 +361,8 @@ impl Chat {
                 ));
             }
             AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
+            // Handled where the restore run is told apart, in `App`.
+            AgentEvent::RestoreDone => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }
@@ -402,6 +406,15 @@ impl Chat {
         self.messages_panel.auto_scroll()
     }
 
+    /// Where the reader sits, anchored to the nearest tool call at or above
+    /// the view whose id the session transcript holds — the ids a `/reload`
+    /// still finds after rebuilding from history — so lines that only ever
+    /// existed live cannot shift the tab's reopening. Pairs with
+    /// [`Self::restore_anchor`].
+    pub fn scroll_anchor(&self, shared: &HashSet<String>) -> ScrollAnchor {
+        self.messages_panel.scroll_anchor(shared)
+    }
+
     pub fn scroll_to_top(&mut self) {
         self.messages_panel.scroll_to_top();
     }
@@ -416,6 +429,14 @@ impl Chat {
 
     pub fn restore_scroll(&mut self, scroll: ScrollPos, auto_scroll: bool) {
         self.messages_panel.restore_scroll(scroll, auto_scroll);
+    }
+
+    pub fn restore_anchor(&mut self, anchor: ScrollAnchor) {
+        self.messages_panel.restore_anchor(anchor);
+    }
+
+    pub fn settle_scroll_anchor(&mut self) {
+        self.messages_panel.settle_scroll_anchor();
     }
 
     pub fn set_highlight_segment(&mut self, idx: Option<usize>) {
