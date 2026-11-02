@@ -9729,6 +9729,39 @@ fn set_thinking_toggles_on_blank_input() {
 }
 
 #[test]
+fn relative_thinking_updates_only_the_session_ceiling_and_its_preference() {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let spec = app.state.model.spec();
+    app.set_thinking("medium").unwrap();
+    app.state.fast = true;
+
+    assert_eq!(
+        app.set_thinking("+").unwrap(),
+        ThinkingConfig::Effort(Effort::High)
+    );
+    assert_eq!(read_thinking(&app.storage), Some(app.state.thinking.into()));
+    assert_eq!(app.request_options().thinking, app.state.thinking);
+    assert_eq!(app.state.model.spec(), spec);
+    assert!(app.state.fast);
+    assert_eq!(
+        app.set_thinking("-").unwrap(),
+        ThinkingConfig::Effort(Effort::Medium)
+    );
+}
+
+#[test]
+fn a_relative_boundary_does_not_replace_another_sessions_preference() {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    app.set_thinking("low").unwrap();
+    app.state.thinking = ThinkingConfig::Adaptive;
+    assert_eq!(app.set_thinking("+").unwrap(), ThinkingConfig::Adaptive);
+    assert_eq!(
+        read_thinking(&app.storage),
+        Some(StoredThinking::Effort { level: Effort::Low })
+    );
+}
+
+#[test]
 fn set_thinking_toggles_back_on_where_off_rises_to_minimal() {
     let mut app = test_app();
     app.state.model.id = "claude-opus-5".into();
@@ -9744,6 +9777,8 @@ fn set_thinking_toggles_back_on_where_off_rises_to_minimal() {
 #[test_case(true, "garbage", THINKING_USAGE ; "unknown_word")]
 #[test_case(true, "0", THINKING_USAGE ; "zero_budget")]
 #[test_case(false, "low", THINKING_UNSUPPORTED_MSG ; "model_without_thinking")]
+#[test_case(false, "+", THINKING_UNSUPPORTED_MSG ; "raise_without_thinking")]
+#[test_case(false, "-", THINKING_UNSUPPORTED_MSG ; "lower_without_thinking")]
 fn set_thinking_keeps_state_on_rejected_input(supported: bool, input: &str, expected: &str) {
     let mut app = test_app();
     app.set_thinking("high").unwrap();

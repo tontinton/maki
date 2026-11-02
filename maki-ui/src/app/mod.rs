@@ -972,9 +972,17 @@ impl App {
         let current = Some(self.state.thinking)
             .filter(|&thinking| thinking != ThinkingConfig::Off.clamped(&self.state.model))
             .unwrap_or(ThinkingConfig::Off);
-        self.state.thinking = ThinkingConfig::parse(input.trim(), current)
-            .map_err(str::to_owned)?
-            .clamped(&self.state.model);
+        let input = input.trim();
+        let thinking = match input {
+            "+" => self.state.thinking.stepped(&self.state.model, true),
+            "-" => self.state.thinking.stepped(&self.state.model, false),
+            _ => ThinkingConfig::parse(input, current).map_err(str::to_owned)?,
+        }
+        .clamped(&self.state.model);
+        if matches!(input, "+" | "-") && thinking == self.state.thinking {
+            return Ok(thinking);
+        }
+        self.state.thinking = thinking;
         self.state.pending_thinking = None;
         persist_thinking(&self.storage, self.state.thinking.into());
         Ok(self.state.thinking)

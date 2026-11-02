@@ -37,7 +37,7 @@ Type `/` in the input box to open the command palette.
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
 | `/tasks` | Browse and search tasks |
-| `/thinking` | Extended thinking: pick an effort level, or set one directly |
+| `/thinking` | Extended thinking: pick a level, set one, or step with + / - |
 
 ## Sessions
 

@@ -32,6 +32,8 @@ const PLUGIN_BINDS: &[(&str, &str)] = &[
     ("`Ctrl+P`", "Browse sessions"),
     ("`Ctrl+X`", "Open tasks"),
     ("`Alt+T`", "Thinking effort"),
+    ("`Alt+,`", "Less thinking"),
+    ("`Alt+.`", "More thinking"),
 ];
 
 const MAIN_CONTEXTS: &[KeybindContext] = &[
@@ -124,6 +126,18 @@ fn write_plugin_binds(out: &mut String) {
     for (key, desc) in PLUGIN_BINDS {
         out.push_str(&format!("| {key} | {desc} |\n"));
     }
+    out.push_str(
+        "\n`Alt+,` and `Alt+.` lower or raise the session's thinking ceiling. \
+         `/thinking -` and `/thinking +` do the same. They stop at the ends \
+         of the model's choices. `adaptive` has no explicit ceiling, so it \
+         sits above the named efforts. Numeric budgets step through the \
+         model's budget sizes as token counts, preserving the limit inherited \
+         by subagents. `off` and `adaptive` are the endpoints when offered. \
+         When the model sends another level, the \
+         confirmation names both the choice and the level sent.\n\n\
+         On macOS, enable Option as Meta in your terminal profile to send \
+         Alt bindings.\n",
+    );
 }
 
 fn write_inheritance(out: &mut String) {
