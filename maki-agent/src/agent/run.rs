@@ -339,9 +339,10 @@ impl<'h> Agent<'h> {
                 Err(AgentError::Cancelled) => return self.finish(Err(AgentError::Cancelled)),
                 kept => kept?,
             };
-            // A burst dropped whole sends nothing, so it must not rebuild the
-            // frame either. The next run sees the same change.
-            if kept.is_some() && prompt.is_none() {
+            // A burst dropped whole or a run already cancelled sends nothing,
+            // so it must not rebuild the frame either. The next run sees the
+            // same change.
+            if kept.is_some() && prompt.is_none() && !self.cancel.is_cancelled() {
                 self.refresh_frame()?;
             }
             let kept = kept.map(|text| {
@@ -2742,6 +2743,34 @@ mod tests {
             &e.event,
             AgentEvent::Notice { text } if text == FRAME_REBUILT
         )));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_leaves_the_frame_to_the_next_one() {
+        let rebuilt = |events: &[Envelope]| {
+            events.iter().any(|e| {
+                matches!(
+                    &e.event,
+                    AgentEvent::Notice { text } if text == FRAME_REBUILT
+                )
+            })
+        };
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build).await;
+        let first_frame = h.history.frame().cloned();
+        *h.world.tool.lock().unwrap() = "reloaded";
+
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+        let (reason, events) = h
+            .run(default_input(), Vec::new(), |agent| agent.cancel = cancel)
+            .await;
+        assert_eq!(reason, DoneReason::Cancelled);
+        assert!(!rebuilt(&events));
+        assert_eq!(h.history.frame().cloned(), first_frame);
+
+        assert!(rebuilt(&h.run_in(AgentMode::Build).await));
+        assert_ne!(h.history.frame().cloned(), first_frame);
     }
 
     /// Swapping maki's prompt for one the host wrote, or back, rebuilds the
