@@ -16,7 +16,7 @@ use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 use tokio::task::spawn_blocking;
 
 use crate::agent_autocmd::HostEvent;
-use crate::api::util::convert::TableExt;
+use crate::api::util::convert::{TableExt, bytes_arg};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::loader::EventHandle;
 use crate::plugin_permissions::PluginPermissions;
@@ -790,13 +790,14 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 /// or overwriting it if it does.
 ///
 /// @param path string Destination file path. `~/` is expanded.
-/// @param content string Text to write.
+/// @param content string|buffer Bytes to write.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
 /// local ok, err = maki.fs.write("out.txt", "hello world")
 /// if err then print("write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+    let content = bytes_arg(&content, "fs.write")?;
     let abs = try_pair!(make_absolute(&path));
     let result = tokio::fs::write(&abs, content).await;
     Ok(pair(touched(abs, result).await.map(|()| true)))
@@ -806,13 +807,14 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
 /// directory) if it does not exist.
 ///
 /// @param path string Destination file path. `~/` is expanded.
-/// @param content string Text to append.
+/// @param content string|buffer Bytes to append.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
 /// local ok, err = maki.fs.append("out.log", "line\n")
 /// if err then print("append failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn append(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+    let content = bytes_arg(&content, "fs.append")?;
     let abs = try_pair!(make_absolute(&path));
     let appended = abs.clone();
     let result = spawn_blocking(move || {
@@ -821,7 +823,7 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
             .create(true)
             .append(true)
             .open(&abs)
-            .and_then(|mut f| f.write_all(content.as_bytes()))
+            .and_then(|mut f| f.write_all(&content))
     })
     .await
     .map_err(mlua::Error::external)?;
@@ -833,16 +835,17 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
 /// Existing file permissions are preserved. On Unix, new files use mode 0600.
 ///
 /// @param path string Destination file path. `~/` is expanded.
-/// @param content string Text to write.
+/// @param content string|buffer Bytes to write.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
 /// local ok, err = maki.fs.atomic_write("state.json", encoded)
 /// if err then print("atomic write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn atomic_write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+    let content = bytes_arg(&content, "fs.atomic_write")?;
     let abs = try_pair!(make_absolute(&path));
     let written = abs.clone();
-    let result = spawn_blocking(move || maki_storage::atomic_write(&abs, content.as_bytes()))
+    let result = spawn_blocking(move || maki_storage::atomic_write(&abs, &content))
         .await
         .map_err(mlua::Error::external)?;
     Ok(pair(touched(written, result).await.map(|()| true)))
@@ -1494,6 +1497,7 @@ mod tests {
     use test_case::test_case;
 
     const FIRST_CONTENT: &str = "first";
+    const BINARY_CONTENT: &[u8] = b"\0\xff\x80\r\n";
     const REPLACEMENT_CONTENT: &str = "replacement";
     const FS_WRITE_PERMISSION: &str = "fs_write";
     const READ_LIMIT_ERROR: &str = "file exceeds the 67108864-byte read limit";
@@ -2173,6 +2177,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+    }
+
+    #[test_case("write", false ; "write_string")]
+    #[test_case("write", true ; "write_buffer")]
+    #[test_case("append", false ; "append_string")]
+    #[test_case("append", true ; "append_buffer")]
+    #[test_case("atomic_write", false ; "atomic_string")]
+    #[test_case("atomic_write", true ; "atomic_buffer")]
+    #[tokio::test]
+    async fn file_writes_preserve_binary_content(method: &str, buffer: bool) {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("bytes.bin");
+        std::fs::write(&file, FIRST_CONTENT).unwrap();
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let write: mlua::Function = table.get(method).unwrap();
+        let content = if buffer {
+            Value::Buffer(lua.create_buffer(BINARY_CONTENT).unwrap())
+        } else {
+            Value::String(lua.create_string(BINARY_CONTENT).unwrap())
+        };
+        let (ok, error): (bool, Option<String>) = write
+            .call_async((file.to_str().unwrap(), content))
+            .await
+            .unwrap();
+        assert!(ok);
+        assert_eq!(error, None);
+        let expected = if method == "append" {
+            [FIRST_CONTENT.as_bytes(), BINARY_CONTENT].concat()
+        } else {
+            BINARY_CONTENT.to_vec()
+        };
+        assert_eq!(std::fs::read(&file).unwrap(), expected);
     }
 
     #[tokio::test]

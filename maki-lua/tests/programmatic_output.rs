@@ -42,6 +42,13 @@ const MODEL_LINES: usize = 8;
 const COMPACT_GLOB_LIMIT: usize = 100;
 const TEST_TIMEOUT_SECS: u64 = 60;
 const LAST_ITEM: &str = "final-item";
+const LATIN1_HTML: &[u8] = b"<h1>caf\xe9</h1>";
+const LATIN1_TEXT: &[u8] = b"caf\xe9";
+const LOSSY_TEXT: &str = "caf\u{fffd}";
+const LOSSY_MARKDOWN: &str = "# caf\u{fffd}";
+const LOSSY_HTML: &str = "<h1>caf\u{fffd}</h1>";
+const LEGACY_HTML_TYPE: &str = "text/html; charset=ISO-8859-1";
+const LEGACY_TEXT_TYPE: &str = "text/plain; charset=ISO-8859-1";
 const CALL_ID: &str = "output-test";
 const PROMPT_PLUGIN: &str = "guard";
 const ALLOW_EVERY_PROMPT: &str =
@@ -491,6 +498,40 @@ fn python_webfetch_parses_complete_response_text() {
     let output = python(&ctx, &code).unwrap();
     server.join().unwrap();
     assert_eq!(output.trim(), LAST_ITEM);
+}
+
+#[test_case::test_case("markdown", LEGACY_HTML_TYPE, LATIN1_HTML, LOSSY_MARKDOWN ; "legacy_html_to_markdown")]
+#[test_case::test_case("text", LEGACY_HTML_TYPE, LATIN1_HTML, LOSSY_TEXT ; "legacy_html_to_text")]
+#[test_case::test_case("html", LEGACY_HTML_TYPE, LATIN1_HTML, LOSSY_HTML ; "legacy_html_raw")]
+#[test_case::test_case("text", LEGACY_TEXT_TYPE, LATIN1_TEXT, LOSSY_TEXT ; "legacy_plain_text")]
+fn webfetch_decodes_legacy_bytes_for_display(
+    format: &str,
+    content_type: &'static str,
+    payload: &'static [u8],
+    expected: &str,
+) {
+    let (_registry, _host, ctx) = setup();
+    set_allowed_private_hosts(&["127.0.0.1".to_owned()]);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let url = format!("http://{}/legacy", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(headers.as_bytes()).unwrap();
+        stream.write_all(payload).unwrap();
+    });
+    let output = run(&ctx, "webfetch", json!({ "url": url, "format": format })).unwrap();
+    server.join().unwrap();
+    assert_eq!(output.trim(), expected);
 }
 
 #[test]

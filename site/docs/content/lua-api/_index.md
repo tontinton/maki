@@ -470,6 +470,7 @@ Your {spec} table must include a name, a description (the model reads it
 to decide when to use the tool), a JSON Schema for the input, and a handler
 function. The handler receives `(input, ctx)` and returns either a plain
 string or a table with richer output fields.
+Returned text replaces invalid UTF-8 bytes with replacement characters.
 
 `ctx:output_mode()` returns "compact" when the result goes to the model and
 "full" when code such as `code_execution` made the call. Apply output limits
@@ -3300,7 +3301,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to write.
+- `{content}` (`string|buffer`) Bytes to write.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -3327,7 +3328,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to append.
+- `{content}` (`string|buffer`) Bytes to append.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -3355,7 +3356,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to write.
+- `{content}` (`string|buffer`) Bytes to write.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -4584,7 +4585,7 @@ one. This holds only for an origin the user set (`<SLUG>_BASE_URL`,
 {opts} fields:
 - `method` (`string`) HTTP verb, in any case (default `"GET"`).
 - `headers` (`table`) Header name/value pairs.
-- `body` (`string`) Request body.
+- `body` (`string|buffer`) Raw request bytes.
 - `timeout` (`integer`) Total timeout in seconds, max 120 (default 30,
   none on a provider's origin). 0 means the default.
 - `max_bytes` (`integer`) Max response size in bytes (default 5 MB).
@@ -4600,6 +4601,9 @@ response's headers under lowercase names, as in
 which breaks `set-cookie`. A compressed response arrives decoded, without
 its `content-encoding` and `content-length`. A failed response can go
 straight to `maki.provider.http_error`.
+`body` is a byte string, including NUL and non-UTF-8 bytes. Save it
+with `maki.fs.write`. Tool results and `maki.text.html_to_markdown`
+replace invalid UTF-8 when turning bytes into text.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -5743,6 +5747,7 @@ maki.text.html_to_markdown({html})
 
 Convert an HTML string to Markdown.
 Useful for cleaning up web content fetched with `maki.webfetch`.
+Invalid UTF-8 bytes are replaced before conversion.
 
 **Parameters:**
 
@@ -8242,6 +8247,8 @@ or a palette index as a string like "4". Names must be spelled exactly,
 hyphens included. Named and indexed colors are left for the terminal to
 resolve, so they follow the user's palette. To mix a named style with colors
 of your own, `maki.ui.theme_style` hands back its parts.
+
+Invalid UTF-8 in text is replaced for display.
 
 **Parameters:**
 
