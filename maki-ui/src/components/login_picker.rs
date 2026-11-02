@@ -3,7 +3,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Wrap;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use maki_config::providers::{self, Protocol, ProviderDef, ProvidersConfig, slugify};
 use maki_providers::catalog_providers_if_available;
@@ -664,53 +664,34 @@ impl LoginPicker {
             Step::Closed => Rect::default(),
             Step::PickProvider(picker) => picker.view(frame, area),
             Step::PickPlan { picker, .. } => picker.view(frame, area),
-            Step::CustomName { input } => {
-                let modal = step_modal(" Provider name ");
-                let (popup, inner) = modal.render(frame, area, 2);
-                let t = theme::current();
-                let hint = Span::styled("Enter provider name, then Enter", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
-                popup
-            }
+            Step::CustomName { input } => input_step_view(
+                frame,
+                area,
+                " Provider name ",
+                "Enter provider name, then Enter",
+                input,
+            ),
             Step::CustomProtocol { picker, .. } => picker.view(frame, area),
-            Step::CustomUrl { input, .. } => {
-                let modal = step_modal(" Base URL ");
-                let (popup, inner) = modal.render(frame, area, 2);
-                let t = theme::current();
-                let hint = Span::styled("Enter base URL, then Enter", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
-                popup
-            }
+            Step::CustomUrl { input, .. } => input_step_view(
+                frame,
+                area,
+                " Base URL ",
+                "Enter base URL, then Enter",
+                input,
+            ),
             Step::BuiltinUrl {
                 input,
                 display_name,
                 ..
             } => {
                 let title = format!(" {display_name} ");
-                let modal = step_modal(&title);
-                let (popup, inner) = modal.render(frame, area, 2);
-                let t = theme::current();
-                let hint = Span::styled("Edit host URL, or Enter to confirm", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
-                popup
+                input_step_view(
+                    frame,
+                    area,
+                    &title,
+                    "Edit host URL, or Enter to confirm",
+                    input,
+                )
             }
             Step::EnterKey {
                 input,
@@ -719,23 +700,12 @@ impl LoginPicker {
                 ..
             } => {
                 let title = format!(" {display_name} ");
-                let modal = step_modal(&title);
-                let (popup, inner) = modal.render(frame, area, 2);
-                let t = theme::current();
-                let hint_text = if *api_key_optional {
+                let hint = if *api_key_optional {
                     "Paste API key, or Enter to skip"
                 } else {
                     "Paste API key, then Enter"
                 };
-                let hint = Span::styled(hint_text, t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
-                popup
+                input_step_view(frame, area, &title, hint, input)
             }
             Step::Done { message } => {
                 let modal = Modal {
@@ -746,7 +716,7 @@ impl LoginPicker {
                 };
                 let (popup, inner) = modal.render(frame, area, 1);
                 frame.render_widget(
-                    ratatui::widgets::Paragraph::new(Line::from(message.clone()))
+                    Paragraph::new(Line::from(message.clone()))
                         .style(Style::new().bg(theme::current().background)),
                     inner,
                 );
@@ -777,6 +747,26 @@ fn step_modal(title: &str) -> Modal<'_> {
         min_width: 0,
         max_height_percent: 40,
     }
+}
+
+fn input_step_view(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    hint: &'static str,
+    input: &TextBuffer,
+) -> Rect {
+    let (popup, inner) = step_modal(title).render(frame, area, 2);
+    let t = theme::current();
+    let hint = Span::styled(hint, t.input_placeholder);
+    let input_line = input_line_with_cursor(input);
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(hint), input_line])
+            .style(Style::new().bg(t.background))
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
+    popup
 }
 
 fn input_line_with_cursor(input: &TextBuffer) -> Line<'static> {
