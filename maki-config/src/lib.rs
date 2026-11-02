@@ -675,6 +675,8 @@ pub struct UiFileConfig {
     pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
+    pub cursor_shape_normal: Option<CursorShape>,
+    pub cursor_shape_insert: Option<CursorShape>,
 }
 
 impl UiFileConfig {
@@ -693,7 +695,9 @@ impl UiFileConfig {
             show_thinking,
             theme,
             clock_format,
-            max_input_lines
+            max_input_lines,
+            cursor_shape_normal,
+            cursor_shape_insert
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -731,6 +735,20 @@ pub enum NotificationMethod {
     Bell,
     Notify,
     Off,
+}
+
+/// `Terminal` leaves the cursor as the terminal is configured to draw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorShape {
+    #[default]
+    Terminal,
+    Block,
+    Bar,
+    Underline,
+    BlinkingBlock,
+    BlinkingBar,
+    BlinkingUnderline,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -1358,6 +1376,22 @@ pub struct UiConfig {
     #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
     pub clock_format: ClockFormat,
 
+    #[config(
+        default = CursorShape::Block,
+        ty = "string",
+        default_doc = "block",
+        desc = "Cursor shape while a plugin keeps the chat input in normal mode: terminal (as your terminal draws it), block, bar, underline, blinking_block, blinking_bar, or blinking_underline"
+    )]
+    pub cursor_shape_normal: CursorShape,
+
+    #[config(
+        default = CursorShape::Terminal,
+        ty = "string",
+        default_doc = "terminal",
+        desc = "Cursor shape in insert mode, where typed keys go into the chat input. Takes the same values as cursor_shape_normal"
+    )]
+    pub cursor_shape_insert: CursorShape,
+
     #[config(skip, default = "None")]
     pub theme: Option<String>,
 
@@ -1386,6 +1420,8 @@ impl UiConfig {
                 .thinking_lines
                 .unwrap_or(ThinkingLines::Tail(DEFAULT_THINKING_LINES)),
             clock_format: f.clock_format.unwrap_or_default(),
+            cursor_shape_normal: f.cursor_shape_normal.unwrap_or(CursorShape::Block),
+            cursor_shape_insert: f.cursor_shape_insert.unwrap_or_default(),
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
         }
@@ -3149,6 +3185,18 @@ mod tests {
         let raw: RawConfig =
             toml::from_str(&format!("[ui]\nnotifications = \"{value}\"\n")).unwrap();
         assert_eq!(raw.into_config(&[]).unwrap().ui.notifications, expected);
+    }
+
+    #[test_case("", CursorShape::Block, CursorShape::Terminal ; "defaults")]
+    #[test_case("cursor_shape_insert = \"bar\"", CursorShape::Block, CursorShape::Bar ; "insert_bar")]
+    #[test_case("cursor_shape_normal = \"blinking_underline\"", CursorShape::BlinkingUnderline, CursorShape::Terminal ; "normal_blinking_underline")]
+    fn cursor_shapes_deserialize(line: &str, normal: CursorShape, insert: CursorShape) {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\n{line}\n")).unwrap();
+        let ui = raw.into_config(&[]).unwrap().ui;
+        assert_eq!(
+            (ui.cursor_shape_normal, ui.cursor_shape_insert),
+            (normal, insert)
+        );
     }
 
     #[test]

@@ -82,6 +82,8 @@ All fields are optional. Typos in field names cause an error right away.
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `thinking_lines` | integer | `3` | - | Collapse model reasoning to its header and last N lines. Click to toggle. 0 shows only the header, -1 never collapses |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
+| `cursor_shape_normal` | string | `block` | - | Cursor shape while a plugin keeps the chat input in normal mode: terminal (as your terminal draws it), block, bar, underline, blinking_block, blinking_bar, or blinking_underline |
+| `cursor_shape_insert` | string | `terminal` | - | Cursor shape in insert mode, where typed keys go into the chat input. Takes the same values as cursor_shape_normal |
 
 ### `ui.theme`
 
@@ -93,7 +95,7 @@ You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside
 
 Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
 
-The input caret uses `cursor` when the terminal has focus and `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults to `cursor`, so themes only need it when the two should differ. Terminals that do not report focus events keep the focused caret.
+The chat input caret is your terminal's own cursor, in your terminal's colors. Set its shape with `ui.cursor_shape_normal` and `ui.cursor_shape_insert`. Themes still define `cursor` and `cursor_unfocused` for plugins that draw their own caret. `cursor_unfocused` defaults to `cursor`.
 
 Themes use 24-bit colors by default, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
 

@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
-    AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    AgentConfig, ConfigField, NetConfig, ProviderConfig, StorageConfig, TelemetryConfig,
+    ToolOutputLines, UiConfig, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
+    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, TOP_LEVEL_FIELDS,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
@@ -137,10 +137,11 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "The input caret uses `cursor` when the terminal has focus and \
-         `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults \
-         to `cursor`, so themes only need it when the two should differ. \
-         Terminals that do not report focus events keep the focused caret.\n"
+        "The chat input caret is your terminal's own cursor, in your \
+         terminal's colors. Set its shape with `ui.cursor_shape_normal` and \
+         `ui.cursor_shape_insert`. Themes still define `cursor` and \
+         `cursor_unfocused` for plugins that draw their own caret. \
+         `cursor_unfocused` defaults to `cursor`.\n"
     )
     .unwrap();
     writeln!(

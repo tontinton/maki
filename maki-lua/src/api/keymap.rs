@@ -75,10 +75,18 @@ impl ModeState {
     }
 
     pub(crate) fn get(&self) -> InputMode {
-        if self.input_focused.load(Ordering::Acquire) && !self.normal.load(Ordering::Acquire) {
-            InputMode::Insert
+        if self.input_focused.load(Ordering::Acquire) {
+            self.input_mode()
         } else {
             InputMode::Normal
+        }
+    }
+
+    fn input_mode(&self) -> InputMode {
+        if self.normal.load(Ordering::Acquire) {
+            InputMode::Normal
+        } else {
+            InputMode::Insert
         }
     }
 }
@@ -271,6 +279,11 @@ impl KeymapReader {
             .input_focused
             .store(input_focused, Ordering::Release);
         self.mode.get()
+    }
+
+    /// The mode a plugin left the chat input in, whoever has the keyboard now.
+    pub fn input_mode(&self) -> InputMode {
+        self.mode.input_mode()
     }
 
     /// Hands {key} to the binding on it in {mode} and reports whether it was
