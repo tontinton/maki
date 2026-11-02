@@ -196,6 +196,25 @@ fn a_slug_providers_toml_defines_is_still_refused() {
     assert!(matches!(error, RegisterError::ConfiguredSlug(_)), "{error}");
 }
 
+/// A third-party plugin that lists the entry's protocol among its `codecs`
+/// keeps its slug and gets switched: refusing it would hand the user a bare
+/// custom client in place of the plugin and its hooks.
+#[test]
+fn a_slug_the_codecs_list_gets_switched_not_replaced() {
+    let _home = isolated(&format!("[{OWN_SLUG}]\nprotocol = \"openai-responses\"\n"));
+    let mut reg = declaration(OWN_SLUG, OWN_DISPLAY_NAME, OWN_HOST);
+    reg.decl.codecs = Some(vec![Protocol::Openai, Protocol::OpenaiResponses]);
+    plugin::begin_load();
+    plugin::register(reg, DeclAuthority::ThirdParty, &[OWN_SLUG.to_owned()]).expect(PROVIDER_LOST);
+    plugin::commit_load();
+
+    assert!(
+        matches!(Owner::of(OWN_SLUG), Owner::Plugin),
+        "{PROVIDER_LOST}"
+    );
+    assert_eq!(plugin::codec(OWN_SLUG), Some(Protocol::OpenaiResponses));
+}
+
 const CATALOG_SLUG: &str = "takeover-catalog";
 const CATALOG_FILE: &str = "models-dev-catalog.json";
 const SAVED_KEY: &str = "sk-takeover";

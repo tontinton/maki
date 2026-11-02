@@ -628,13 +628,22 @@ fn register_owned(
     // A `providers.toml` entry only defines a provider when it sets a
     // `protocol`, and only a third party loses the slug to it. Without one the
     // entry just tweaks the declaration, like `[deepseek] base_url` pointing at
-    // a gateway. A bundled plugin keeps its slug either way and only gets a
+    // a gateway. A third party that lists the entry's protocol among its
+    // `codecs` keeps the slug and gets switched instead: refusing it would
+    // leave the user a bare custom client in place of the plugin and its
+    // hooks. A bundled plugin keeps its slug either way and only gets a
     // warning, because failing here would abort the whole bundled load and
     // maki would not start.
     if matches!(authority, DeclAuthority::ThirdParty | DeclAuthority::Config)
         && ProvidersConfig::load_or_default()
             .get(&slug)
-            .is_some_and(|def| def.protocol.is_some())
+            .is_some_and(|def| {
+                def.protocol.is_some()
+                    && !decl
+                        .codecs
+                        .as_ref()
+                        .is_some_and(|codecs| codecs.contains(&def.protocol.unwrap()))
+            })
     {
         return Err(RegisterError::ConfiguredSlug(slug));
     }
@@ -770,12 +779,11 @@ pub fn codec(slug: &str) -> Option<Protocol> {
     entry(slug).and_then(|e| e.decl.codec)
 }
 
-/// Applies a `[slug] protocol` override to a bundled declaration. Only a
-/// bundled plugin gets here with one: a third party loses the slug to the
-/// entry outright (`RegisterError::ConfiguredSlug`), so the user's protocol
-/// serves through the custom provider instead. An unsupported ask is a
-/// warning and keeps the declared codec — an error would abort the whole
-/// bundled load and stop maki from starting.
+/// Applies a `[slug] protocol` override to a declaration, bundled or third
+/// party: a third party that lists the entry's protocol among its `codecs`
+/// keeps the slug and gets switched here (see the `ConfiguredSlug` check).
+/// An unsupported ask is a warning and keeps the declared codec: an error
+/// would abort the whole bundled load and stop maki from starting.
 fn apply_protocol_override(decl: &mut ProviderDecl) {
     let slug = decl.slug.clone();
     let Some(user) = ProvidersConfig::load_or_default()
@@ -3210,14 +3218,15 @@ mod tests {
         reg.decl.codecs = Some(vec![Protocol::Openai]);
     }
 
-    /// Every listed codec has to honour the declaration's options, not just
-    /// the default one: a chat-only field on the responses wire would
-    /// silently vanish for a user who switched.
+    /// A listed codec that cannot honour the declaration's options is refused
+    /// at registration, before a user could switch onto it and lose a field.
+    /// The responses wire honours the whole `openai` table but a custom
+    /// thinking `field`, so a declared one fails here.
     fn listed_codec_that_drops_an_option(reg: &mut Registration) {
         reg.decl.codecs = Some(vec![Protocol::OpenaiResponses]);
         reg.decl.openai = Some(
             serde_json::from_value(serde_json::json!({
-                "max_tokens_field": "max_tokens",
+                "thinking": { "dialect": "high-only", "field": "custom_effort" },
             }))
             .unwrap(),
         );
@@ -3279,7 +3288,7 @@ mod tests {
     /// `ConfiguredSlug` and `Credentials` have no row: both need a
     /// `providers.toml` entry for the slug, and the process-wide config is not
     /// a test fixture. They are covered out of line, in
-    /// `tests/configured_overlay.rs` — and so is the `[slug] protocol`
+    /// `tests/configured_overlay.rs`, and so is the `[slug] protocol`
     /// override a `codecs` list accepts.
     #[test_case(bad_slug, |e| matches!(e, RegisterError::InvalidSlug(_)) ; "invalid_slug")]
     #[test_case(already_registered, |e| matches!(e, RegisterError::DuplicateSlug(_)) ; "duplicate")]
