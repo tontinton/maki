@@ -80,11 +80,9 @@
       groupName: 'tree-sitter grammars',
     },
     {
-      description: 'Digest-pinned and held by minimumReleaseAge, so green CI is enough',
       matchManagers: ['github-actions'],
       groupName: 'GitHub Actions',
       schedule: ['* * 1 * *'],
-      automerge: true,
     },
     {
       description: 'Only tags bare majors (v35), which the semver extractVersion of the pin preset drops',

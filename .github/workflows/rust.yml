@@ -23,17 +23,18 @@ jobs:
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
+          # Lists what skips CI rather than what runs it, so a new file runs it by default.
+          predicate-quantifier: some-with-excludes
           filters: |
             code:
-              - "Cargo.toml"
-              - "Cargo.lock"
-              - "src/**"
-              - "maki-*/**"
-              - "plugins/**"
-              - "justfile"
-              - "clippy.toml"
-              - ".cargo/**"
-              - ".github/workflows/rust.yml"
+              - "**"
+              - "!*.md"
+              - "!site/*"
+              - "!site/docs/*"
+              - "!site/docs/{extra,static,templates}/**"
+              - "!scripts/**"
+              - "!flake.*"
+              - "!.github/workflows/{claude-review,claude-triage,nix,python,release}.yml"
             deps:
               - "Cargo.toml"
               - "maki-*/Cargo.toml"
