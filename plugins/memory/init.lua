@@ -63,7 +63,7 @@ maki.api.register_prompt_hint({
     if not tag_line then
       return nil
     end
-    return "\n\nMemory tags (memory tool, `read tags=[...]`): " .. tag_line .. "\n"
+    return "\n\nMemory tags (memory `read` by `tags`): " .. tag_line .. "\n"
   end,
 })
 
@@ -177,10 +177,10 @@ maki.api.register_tool({
       command = {
         type = "string",
         enum = { "list", "read", "write", "delete" },
-        description = "- `list [tags]`: tag-grouped index, no bodies.\n"
-          .. "- `read path|tags`: one body (path) or collated bodies (tags).\n"
-          .. "- `write path tags content`: create or overwrite a note.\n"
-          .. "- `delete path`",
+        description = "- `list`: tag-grouped index, no bodies; optional `tags`.\n"
+          .. "- `read`: one body by `path`, or collated bodies by `tags`.\n"
+          .. "- `write`: create/overwrite `path` with `content`; optional `tags`.\n"
+          .. "- `delete`: `path`.",
         required = true,
       },
       path = {
