@@ -4,13 +4,16 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS,
+    TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
 use crate::gen_folder_trust::POLICY_EXAMPLE;
 use crate::lua_util::in_registration_window;
+
+/// Fixed so the generated docs don't depend on the build machine's OS.
+const EXAMPLE_MOUSE_SCROLL_LINES: u32 = 5;
 
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
@@ -377,7 +380,7 @@ All fields are optional. Typos in field names cause an error right away.
 
 ## Full Reference
 ",
-        mouse_scroll = DEFAULT_MOUSE_SCROLL_LINES + 2,
+        mouse_scroll = EXAMPLE_MOUSE_SCROLL_LINES,
         tol_bash = ToolOutputLines::DEFAULT.bash + 3,
         tol_read = ToolOutputLines::DEFAULT.read + 2,
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
