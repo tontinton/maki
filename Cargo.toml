@@ -128,7 +128,7 @@ unicode-width = "0.2"
 unicode-segmentation = "1"
 similar = { version = "3", features = ["inline", "unicode"] }
 jsonrepair = { version = "0.1", default-features = false, features = ["serde"] }
-jsonschema = { version = "0.59", default-features = false }
+jsonschema = { version = "0.60", default-features = false }
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
 keyring = "4"
 arboard = { version = "3", default-features = false, features = ["image-data"] }
