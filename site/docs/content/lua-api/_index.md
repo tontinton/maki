@@ -5459,7 +5459,7 @@ been sent so far, tool calls and results included. Read only.
 Each message has the same shape as in the session file:
 
 ```text
-{ role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, content = { blocks } }
+{ role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, created_at?, content = { blocks } }
 ```
 
 `kind` is `"turn"` for something the user or the model said,
@@ -5473,7 +5473,10 @@ message moved to the background, and `settles` = `{ task, end }` marks the
 notice that answered one, with `end` one of `"finished"`, `"failed"`,
 `"cancelled"` or `"lost"`. `partial` has the same shape and marks a notice
 that answered one piece early, like one call of a moved batch, and left
-the receipt open. `content` lists blocks:
+the receipt open. `created_at` is the wall clock, in epoch
+milliseconds, when the message was appended, or nil for a message older than
+the field, so a reader can tell a real zero gap from an unknown one.
+`content` lists blocks:
 
 ```text
 { type = "text", text }
