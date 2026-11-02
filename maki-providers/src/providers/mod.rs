@@ -34,6 +34,7 @@ pub mod custom;
 pub(crate) mod google;
 pub(crate) mod llama_cpp;
 pub(crate) mod local;
+pub(crate) mod managed_auth;
 pub(crate) mod oauth_loopback;
 pub(crate) mod ollama;
 pub(crate) mod openai;
