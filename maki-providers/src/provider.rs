@@ -1,23 +1,30 @@
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use flume::Sender;
 use serde_json::Value;
 use tokio::task::spawn_blocking;
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use maki_config::ModelPolicy;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo};
-use crate::model_registry::set_known_models;
+use crate::model_registry::{discovery_complete, set_known_models};
 use crate::providers::catalog::{
     available_if_warm, catalog_providers, catalog_providers_if_available, try_create,
 };
 use crate::providers::{KeyRotation, Timeouts, custom, plugin};
 use crate::spec::{Owner, ProviderRegistry};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
+
+/// A headless run waits for its listing, so a hung endpoint must not hold up
+/// the first turn for as long as a stalled stream may take.
+const DISCOVERY_WAIT: Duration = Duration::from_secs(10);
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -325,9 +332,166 @@ pub async fn fetch_all_models(
     }
 }
 
+/// One provider's share of [`fetch_all_models`], for a provider whose rows can't
+/// describe everything it serves. The UI re-resolves its models whenever a batch
+/// lands, a headless session resolves before a turn and has to wait for the
+/// answer, unless the provider already gave one. A failed listing leaves `model`
+/// on what is already known, which another discovery can have added in the
+/// meantime.
+pub async fn rediscover_model(
+    model: &mut Model,
+    provider: &dyn Provider,
+) -> Result<(), AgentError> {
+    let Some(spec) =
+        ProviderRegistry::get(&model.provider).filter(|spec| spec.accepts_arbitrary_models)
+    else {
+        return Ok(());
+    };
+    let listed = if discovery_complete(spec.slug) {
+        Ok(())
+    } else {
+        remember_models(spec.slug, provider, DISCOVERY_WAIT).await
+    };
+    if let Ok(resolved) = Model::from_spec(&model.spec()) {
+        *model = resolved;
+        provider.adjust_model(model);
+    }
+    listed
+}
+
+async fn remember_models(
+    slug: &str,
+    provider: &dyn Provider,
+    wait: Duration,
+) -> Result<(), AgentError> {
+    let models = timeout(wait, provider.list_models())
+        .await
+        .map_err(io::Error::from)??;
+    set_known_models(slug, models);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::future::{pending, ready};
+
     use super::*;
+
+    const SPEC_WITHOUT_THINKING: &str = "copilot";
+    const LANDED_SLUG: &str = "ollama";
+    const CURATED_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+    const LISTED_MODEL: &str = "listed-with-thinking";
+    const LISTED_WINDOW: u32 = 123_456;
+    const ADJUSTED_MAX_OUTPUT: u32 = 654;
+    const LISTING_FAILED: &str = "no listing";
+    const ONLY_LISTS_MODELS: &str = "only asked for its models";
+    const NO_ANSWER_KEEPS_LISTING: &str = "no answer keeps the last listing";
+    const WAIT: Duration = Duration::from_millis(10);
+
+    type Listed = Result<Vec<ModelInfo>, AgentError>;
+
+    struct Listing(fn() -> BoxFuture<'static, Listed>);
+
+    impl Provider for Listing {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _event_tx: &'a Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            unreachable!("{ONLY_LISTS_MODELS}")
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Listed> {
+            (self.0)()
+        }
+
+        fn adjust_model(&self, model: &mut Model) {
+            model.max_output_tokens = Some(ADJUSTED_MAX_OUTPUT);
+        }
+    }
+
+    fn lists_thinking() -> BoxFuture<'static, Listed> {
+        Box::pin(ready(Ok(vec![ModelInfo {
+            supports_thinking: Some(true),
+            context_window: Some(LISTED_WINDOW),
+            ..ModelInfo::id_only(LISTED_MODEL.into())
+        }])))
+    }
+
+    fn fails() -> BoxFuture<'static, Listed> {
+        Box::pin(ready(Err(AgentError::Config {
+            message: LISTING_FAILED.into(),
+        })))
+    }
+
+    fn hangs() -> BoxFuture<'static, Listed> {
+        Box::pin(pending())
+    }
+
+    fn lands_then_fails() -> BoxFuture<'static, Listed> {
+        set_known_models(
+            LANDED_SLUG,
+            vec![ModelInfo {
+                context_window: Some(LISTED_WINDOW),
+                ..ModelInfo::id_only(LISTED_MODEL.into())
+            }],
+        );
+        fails()
+    }
+
+    #[tokio::test]
+    async fn listing_decides_over_the_spec() {
+        let resolve =
+            || Model::from_spec(&format!("{SPEC_WITHOUT_THINKING}/{LISTED_MODEL}")).unwrap();
+        let mut model = resolve();
+        let mut resolved_before_listing = resolve();
+        assert!(!model.supports_thinking());
+
+        rediscover_model(&mut model, &Listing(fails))
+            .await
+            .unwrap_err();
+        assert!(!model.supports_thinking());
+
+        rediscover_model(&mut model, &Listing(lists_thinking))
+            .await
+            .unwrap();
+        assert!(model.supports_thinking());
+        assert_eq!(model.context_window, LISTED_WINDOW);
+        assert_eq!(model.max_output_tokens, Some(ADJUSTED_MAX_OUTPUT));
+
+        rediscover_model(&mut resolved_before_listing, &Listing(fails))
+            .await
+            .unwrap();
+        assert_eq!(resolved_before_listing.context_window, LISTED_WINDOW);
+
+        for no_answer in [fails, hangs] {
+            remember_models(SPEC_WITHOUT_THINKING, &Listing(no_answer), WAIT)
+                .await
+                .unwrap_err();
+            assert!(resolve().supports_thinking(), "{NO_ANSWER_KEEPS_LISTING}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rows_that_cover_a_provider_need_no_listing() {
+        let mut model = Model::from_spec(CURATED_SPEC).unwrap();
+        rediscover_model(&mut model, &Listing(fails)).await.unwrap();
+        assert_ne!(model.max_output_tokens, Some(ADJUSTED_MAX_OUTPUT));
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_still_takes_what_landed_meanwhile() {
+        let mut model = Model::from_spec(&format!("{LANDED_SLUG}/{LISTED_MODEL}")).unwrap();
+        rediscover_model(&mut model, &Listing(lands_then_fails))
+            .await
+            .unwrap_err();
+        assert_eq!(model.context_window, LISTED_WINDOW);
+    }
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
         ModelPolicy::new(
