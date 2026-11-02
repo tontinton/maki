@@ -1070,6 +1070,29 @@ fn examples_table_flows_to_trait() {
 }
 
 #[test]
+fn memory_command_guidance_rejects_shell_style_input() {
+    let (reg, _host) = builtins_host();
+    let entry = reg.get("memory").expect("memory tool not registered");
+    let schema = entry.tool.schema();
+    let description = schema["properties"]["command"]["description"]
+        .as_str()
+        .expect("command guidance missing");
+    for command in schema["properties"]["command"]["enum"].as_array().unwrap() {
+        let command = command.as_str().unwrap();
+        assert!(description.contains(&format!("- `{command}`:")));
+    }
+
+    let input = json!({"command": "write notes.md tags: [a]"});
+    let Err(err) = entry.tool.parse(&input) else {
+        panic!("shell-style memory command must be rejected");
+    };
+    assert!(
+        err.to_string().contains(r#"Use "write" alone."#),
+        "missing command hint: {err}"
+    );
+}
+
+#[test]
 fn interrupt_kills_infinite_loop_and_vm_recovers() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
