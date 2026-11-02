@@ -30,7 +30,9 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
 pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
-pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
+/// macOS terminals already send more wheel events the faster you scroll, so
+/// one line per event is enough there.
+pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = if cfg!(target_os = "macos") { 1 } else { 3 };
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
 pub const DEFAULT_THINKING_LINES: usize = 3;
 const NEVER_COLLAPSE_THINKING: i64 = -1;
@@ -1254,7 +1256,12 @@ pub struct UiConfig {
     #[config(default = DEFAULT_TYPEWRITER_MS_PER_CHAR, desc = "Typewriter effect speed (ms/char)")]
     pub typewriter_ms_per_char: u64,
 
-    #[config(default = DEFAULT_MOUSE_SCROLL_LINES, min = MIN_MOUSE_SCROLL_LINES, desc = "Lines per mouse wheel scroll")]
+    #[config(
+        default = DEFAULT_MOUSE_SCROLL_LINES,
+        min = MIN_MOUSE_SCROLL_LINES,
+        default_doc = "1 on macOS, 3 elsewhere",
+        desc = "Lines per mouse wheel scroll. Set it to 1 if your terminal runs on a Mac and maki runs remotely (e.g. over SSH)"
+    )]
     pub mouse_scroll_lines: u32,
 
     #[config(default = DEFAULT_MAX_INPUT_LINES, min = MIN_MAX_INPUT_LINES, desc = "Maximum visible input lines")]
