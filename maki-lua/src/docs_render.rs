@@ -170,6 +170,7 @@ with full debug info.
 - Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
+- Describe parameters as separate fields, never as usage lines like `` `write path content` ``: models copy them into the string field.
 - Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
 
 ## A complete real example

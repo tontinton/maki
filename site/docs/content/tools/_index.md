@@ -212,7 +212,7 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `command` | string | yes | - `list [tags]`: tag-grouped index, no bodies.<br>- `read path\|tags`: one body (path) or collated bodies (tags).<br>- `write path tags content`: create or overwrite a note.<br>- `delete path` |
+| `command` | string | yes | - `list`: tag-grouped index, no bodies; optional `tags`.<br>- `read`: one body by `path`, or collated bodies by `tags`.<br>- `write`: create/overwrite `path` with `content`; optional `tags`.<br>- `delete`: `path`. |
 | `content` | string | no | Body for write (frontmatter added automatically). |
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
 | `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
