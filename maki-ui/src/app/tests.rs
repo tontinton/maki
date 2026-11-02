@@ -19,7 +19,6 @@ use crate::highlight::TAB_SPACES;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use crate::text_buffer::{Decoration, EDIT_CONFLICT_ERR, INPUT_REPLACED_ERR, Mark};
-use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::agent::TranscriptError;
@@ -34,7 +33,8 @@ use maki_agent::{
     ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
 };
 use maki_config::{
-    Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
+    CursorShape, Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey,
+    UiConfig,
 };
 use maki_lua::test_support::{
     HintWriterHandle, RequestProbe, TestBinding, hint_writer_pair, keymap_reader_from,
@@ -130,9 +130,7 @@ const PLAN_MENU_GENERATION: u64 = 7;
 /// or plainly in the past, without any test having to wait for a clock.
 const WAIT_AHEAD: Duration = Duration::from_secs(60);
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
-const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
-const CURSOR_ON_SCREEN: &str = "the reported cursor must be on screen";
-const CURSOR_ON_STYLED_CELL: &str = "the focused input box owns a cell painted as the cursor";
+const CURSOR_ON_INPUT: &str = "the focused input box reports its caret for the cursor";
 const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is a cursor";
 /// Stands in for a size the provider measured, baseline included.
 const MEASURED_CONTEXT: u32 = 100_000;
@@ -3410,39 +3408,38 @@ fn rendered(app: &mut App) -> String {
     buffer_text(&rendered_buffer(app))
 }
 
-/// The event loop parks the terminal cursor on whatever `view` reports, so an
-/// IME anchors its preedit text there. The report has to be the very cell the
-/// input box painted for its software cursor, and the hardware cursor has to
-/// stay hidden: shown, it would invert that cell back to plain text.
+/// The event loop shows the terminal cursor on whatever `view` reports, and
+/// an IME anchors its preedit text there.
 #[test]
-fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
+fn view_reports_the_input_caret_until_an_overlay_takes_the_keyboard() {
     let mut app = test_app();
-    let backend = ratatui::backend::TestBackend::new(80, 24);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    let mut draw = |app: &mut App| {
-        let mut cursor = None;
-        terminal.draw(|frame| cursor = app.view(frame)).unwrap();
-        assert!(
-            !terminal.backend().cursor_visible(),
-            "{CURSOR_STAYS_HIDDEN}"
-        );
-        cursor.map(|pos| {
-            let cell = terminal
-                .backend()
-                .buffer()
-                .cell(pos)
-                .expect(CURSOR_ON_SCREEN);
-            (pos, theme::is_caret_cell(cell))
-        })
-    };
-
-    assert!(
-        matches!(draw(&mut app), Some((_, true))),
-        "{CURSOR_ON_STYLED_CELL}"
-    );
+    assert!(draw_to_buffer(&mut app).0.is_some(), "{CURSOR_ON_INPUT}");
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
-    assert_eq!(draw(&mut app), None, "{OVERLAY_TAKES_THE_CURSOR}");
+    assert_eq!(
+        draw_to_buffer(&mut app).0,
+        None,
+        "{OVERLAY_TAKES_THE_CURSOR}"
+    );
+}
+
+/// An overlay makes keys match in normal mode, but the cursor it hides
+/// comes back in the shape of the mode the plugin left the input in.
+#[test_case(InputMode::Insert, false, CursorShape::Bar ; "insert")]
+#[test_case(InputMode::Normal, false, CursorShape::Block ; "normal")]
+#[test_case(InputMode::Insert, true, CursorShape::Bar ; "insert_under_an_overlay")]
+fn cursor_shape_follows_the_mode_the_plugin_set(
+    mode: InputMode,
+    overlay: bool,
+    expected: CursorShape,
+) {
+    let mut app = test_app();
+    app.ui_config.cursor_shape_insert = CursorShape::Bar;
+    set_mode(&app.keymap_reader, mode);
+    if overlay {
+        app.update(Msg::Key(kb::HELP.to_key_event()));
+    }
+    assert_eq!(app.cursor_shape(), expected);
 }
 
 const CARET_FLOAT_MARK: &str = "xqcaret";

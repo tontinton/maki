@@ -18,9 +18,12 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
+use crossterm::cursor::Hide;
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use crossterm::{execute, queue};
 use futures::future::{LocalBoxFuture, select_all};
 use maki_agent::agent::SessionExport;
 use maki_agent::command::CustomCommand;
@@ -50,7 +53,6 @@ use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
 use maki_storage::sessions::normalize_title;
-use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
 use tokio::runtime::Handle;
@@ -75,7 +77,6 @@ use crate::components::{Action, ExitRequest, Status};
 use crate::decor_worker;
 use crate::input::InputReader;
 use crate::repaint::{Dirty, IDLE_POLL};
-use crate::theme;
 use crate::{AppSession, OpenSession};
 
 use crate::storage_writer::StorageWriter;
@@ -798,29 +799,15 @@ impl<'t> EventLoop<'t> {
         &mut self.sessions[self.focused].app
     }
 
-    /// Paints a frame and parks the terminal cursor on the cell the input box
-    /// reversed, without showing it. macOS anchors IME preedit text to the
-    /// cursor, so it has to sit there, but a visible one would invert that
-    /// already reversed cell back to plain text and ride along with every cell
-    /// the next diff writes.
-    ///
-    /// `Frame::set_cursor_position` cannot do this: ratatui shows the cursor
-    /// whenever a frame asks for a position. Hence the move after the draw,
-    /// and the hide that goes with it, so a widget that does ask for one
-    /// cannot bring the block cursor back.
+    /// Paints a frame as one synchronized update, so the terminal shows it
+    /// whole. Terminals without synchronized output ignore it, and the cursor
+    /// is hidden while the diff is written either way, or it would ride along
+    /// with every cell written.
     fn paint(&mut self) -> Result<()> {
-        let app = &mut self.sessions[self.focused].app;
-        let mut cursor = None;
-        self.terminal.draw(|f| {
-            cursor = app.view(f);
-            color_compat::downgrade_if_needed(f.buffer_mut());
-        })?;
-        if let Some(pos) = cursor {
-            self.terminal.hide_cursor()?;
-            self.terminal.set_cursor_position(pos)?;
-            self.terminal.backend_mut().flush()?;
-        }
-        Ok(())
+        queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate, Hide)?;
+        let painted = paint_frame(self.terminal, &mut self.sessions[self.focused].app);
+        execute!(self.terminal.backend_mut(), EndSynchronizedUpdate)?;
+        painted
     }
 
     pub(crate) async fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
@@ -1801,22 +1788,14 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// Only a real focus report may recolor the caret: resume heuristics and
-    /// stray input prove nothing, and no FocusGained follows $EDITOR or fg.
-    fn sync_cursor(&self) {
-        theme::set_cursor_focused(self.focus != Focus::Unfocused);
-    }
-
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
         match raw {
             Event::FocusGained => {
                 self.focus.report(Focus::Focused);
-                self.sync_cursor();
                 (None, None)
             }
             Event::FocusLost => {
                 self.focus.report(Focus::Unfocused);
-                self.sync_cursor();
                 (None, None)
             }
             // The one place the host's view of a keypress is normalized, so
@@ -2269,6 +2248,25 @@ impl<'t> EventLoop<'t> {
             mailboxes,
         }
     }
+}
+
+/// The cursor is placed after the draw rather than through
+/// `Frame::set_cursor_position`, because ratatui shows it before moving it.
+fn paint_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
+    let mut caret = None;
+    terminal.draw(|f| {
+        caret = app.view(f);
+        color_compat::downgrade_if_needed(f.buffer_mut());
+    })?;
+    if let Some(pos) = caret {
+        queue!(
+            terminal.backend_mut(),
+            crate::terminal::cursor_style(app.cursor_shape())
+        )?;
+        terminal.set_cursor_position(pos)?;
+        terminal.show_cursor()?;
+    }
+    Ok(())
 }
 
 fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {

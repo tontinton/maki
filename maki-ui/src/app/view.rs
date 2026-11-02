@@ -8,7 +8,8 @@ use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
-use maki_lua::Split;
+use maki_config::CursorShape;
+use maki_lua::{InputMode, Split};
 use maki_providers::RequestOptions;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -67,9 +68,8 @@ impl App {
             && self.compute_layout(area).input_area.height > BORDER_ROWS
     }
 
-    /// Returns the cell the terminal cursor belongs on, the cell the input box
-    /// reversed. An overlay owning the keyboard leaves none, so there is
-    /// nothing to park an IME on.
+    /// Returns the cell the terminal cursor belongs on, the input box caret.
+    /// An overlay owning the keyboard leaves none, so the cursor stays hidden.
     ///
     /// Where the caret was drawn is a separate question, and a caret-anchored
     /// float is placed from that: the caret outlives an overlay taking focus,
@@ -89,6 +89,15 @@ impl App {
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
         caret.filter(|_| self.input_has_keyboard())
+    }
+
+    /// Follows the mode a plugin left the chat input in, not the one keys
+    /// match in, which is normal whenever anything else has the keyboard.
+    pub(crate) fn cursor_shape(&self) -> CursorShape {
+        match self.keymap_reader.input_mode() {
+            InputMode::Normal => self.ui_config.cursor_shape_normal,
+            InputMode::Insert => self.ui_config.cursor_shape_insert,
+        }
     }
 
     fn compute_layout(&self, area: Rect) -> ViewLayout {
@@ -247,7 +256,6 @@ impl App {
                 layout.input_area,
                 placeholder,
                 self.separator_style(),
-                self.input_has_keyboard(),
                 panel_hint,
             );
             self.command_palette

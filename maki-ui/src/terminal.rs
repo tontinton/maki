@@ -8,6 +8,7 @@ use color_eyre::Result;
 use crossterm::Command;
 use crossterm::ExecutableCommand;
 use crossterm::clipboard::CopyToClipboard;
+use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -15,7 +16,7 @@ use crossterm::event::{
 #[cfg(not(windows))]
 use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use maki_config::NotificationMethod;
+use maki_config::{CursorShape, NotificationMethod};
 
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Maki needs attention";
 const NOTIFICATION_TITLE: &str = "Maki";
@@ -334,9 +335,22 @@ fn teardown() {
     stdout().flush().ok();
 }
 
+pub(crate) fn cursor_style(shape: CursorShape) -> SetCursorStyle {
+    match shape {
+        CursorShape::Terminal => SetCursorStyle::DefaultUserShape,
+        CursorShape::Block => SetCursorStyle::SteadyBlock,
+        CursorShape::Bar => SetCursorStyle::SteadyBar,
+        CursorShape::Underline => SetCursorStyle::SteadyUnderScore,
+        CursorShape::BlinkingBlock => SetCursorStyle::BlinkingBlock,
+        CursorShape::BlinkingBar => SetCursorStyle::BlinkingBar,
+        CursorShape::BlinkingUnderline => SetCursorStyle::BlinkingUnderScore,
+    }
+}
+
 fn pop_terminal_modes() {
     write_mux_sequence(POP_WINDOW_TITLE_SEQUENCE);
-    stdout().execute(crossterm::cursor::Show).ok();
+    stdout().execute(SetCursorStyle::DefaultUserShape).ok();
+    stdout().execute(Show).ok();
     stdout().execute(PopKeyboardEnhancementFlags).ok();
     disable_focus_change();
     stdout().execute(DisableMouseCapture).ok();
