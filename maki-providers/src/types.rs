@@ -254,6 +254,7 @@ pub async fn adapt_images_for_model<'a>(
             kind: message.kind.clone(),
             receipts: message.receipts.clone(),
             settles: message.settles.clone(),
+            created_at: message.created_at,
         });
     }
     Cow::Owned(adapted)
@@ -488,10 +489,15 @@ pub struct TaskSettled {
 
 /// Part of the frozen session surface (disk, exports, Lua), written flat:
 /// `{"role", "content", "display_text"?, "kind"?, "facts"?, "receipts"?,
-/// "settles"?}`, with `kind` as a bare tag and `facts` beside a
+/// "settles"?, "created_at"?}`, with `kind` as a bare tag and `facts` beside a
 /// `context_update`. Older logs nest it as
 /// `{"kind": {"context_update": facts}}`. Those still load, and are not
 /// rewritten just for that.
+///
+/// `created_at` is the wall clock when the message was appended, in epoch
+/// milliseconds. It is storage-only: providers build their wire body by hand and
+/// never read it. Absent on messages written before the field existed, so it is
+/// skipped when unset and a reader must treat a gap as unknown, not as idle.
 ///
 /// It only grows, by the same rules as [`ContentBlock`].
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
@@ -506,6 +512,11 @@ pub struct Message {
     pub receipts: Vec<String>,
     /// Set on the notice that answers a receipt.
     pub settles: Option<TaskSettled>,
+    /// Wall clock (epoch ms) when this message was appended to the transcript.
+    /// `None` for messages from before this field existed, and for ones built in
+    /// a test or replay that never reached the live append path.
+    #[serde(default)]
+    pub created_at: Option<u64>,
 }
 
 /// [`Message`] as stored, before `kind` and `facts` are paired up.
@@ -523,6 +534,8 @@ struct RawMessage {
     receipts: Vec<String>,
     #[serde(default, deserialize_with = "settles_or_none")]
     settles: Option<TaskSettled>,
+    #[serde(default)]
+    created_at: Option<u64>,
 }
 
 /// A newer build may write a [`TaskEnd`] this one does not know. Only the
@@ -574,6 +587,7 @@ impl TryFrom<RawMessage> for Message {
             kind,
             receipts: raw.receipts,
             settles: raw.settles,
+            created_at: raw.created_at,
         })
     }
 }
@@ -588,7 +602,8 @@ impl Serialize for Message {
             + usize::from(!self.kind.is_turn())
             + usize::from(facts.is_some())
             + usize::from(!self.receipts.is_empty())
-            + usize::from(self.settles.is_some());
+            + usize::from(self.settles.is_some())
+            + usize::from(self.created_at.is_some());
         let mut state = serializer.serialize_struct("Message", len)?;
         state.serialize_field("role", &self.role)?;
         state.serialize_field("content", &self.content)?;
@@ -606,6 +621,9 @@ impl Serialize for Message {
         }
         if let Some(settles) = &self.settles {
             state.serialize_field("settles", settles)?;
+        }
+        if let Some(created_at) = self.created_at {
+            state.serialize_field("created_at", &created_at)?;
         }
         state.end()
     }
@@ -1845,6 +1863,32 @@ mod tests {
         };
         assert_eq!(serde_json::to_value(&message).unwrap(), stored);
         assert_eq!(serde_json::from_value::<Message>(stored).unwrap(), message);
+    }
+
+    /// `created_at` is a frozen session-format field: written only when set, read
+    /// back whole, and absent entirely from messages older than it, so a reader
+    /// tells an unknown gap from a real zero one.
+    #[test]
+    fn created_at_writes_only_when_set_and_round_trips() {
+        let stamp = 1_793_600_000_123_u64;
+        let with = Message {
+            created_at: Some(stamp),
+            ..Message::user(PROMPT.into())
+        };
+        let stored = json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": PROMPT }],
+            "created_at": stamp,
+        });
+        assert_eq!(serde_json::to_value(&with).unwrap(), stored);
+        assert_eq!(serde_json::from_value::<Message>(stored).unwrap(), with);
+
+        let bare = Message::user(PROMPT.into());
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({ "role": "user", "content": [{ "type": "text", "text": PROMPT }] })
+        );
+        assert_eq!(bare.created_at, None);
     }
 
     #[test]
