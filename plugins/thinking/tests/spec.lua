@@ -13,7 +13,7 @@ local ADAPTIVE = "adaptive"
 local HIGH = "high"
 local RAW_BUDGET = "8192"
 local TOKENS_LABEL = " tokens"
-local REJECTED = "Usage: /thinking [off|adaptive|minimal|low|medium|high|xhigh|max|<budget>]"
+local REJECTED = "Usage: /thinking [off|adaptive|minimal|low|medium|high|xhigh|max|<budget>|+|-]"
 local UNSUPPORTED = "Thinking requires a model that supports it"
 local CUSTOM_ROW_NAME = "custom…"
 local BOOM = "the event loop blew up"
@@ -436,10 +436,10 @@ case("the_direct_form_skips_the_picker", function()
   eq(result.closed, false, "nothing was opened")
 end)
 
-case("the_flash_names_the_level_a_hidden_adaptive_is_sent_as", function()
+case("the_flash_keeps_the_intent_visible_when_the_model_sends_another_level", function()
   local result = run({}, { direct = ADAPTIVE, shown = HIGH })
   eq(result.sets, ADAPTIVE)
-  eq(result.flashes, "Thinking: " .. HIGH)
+  eq(result.flashes, "Thinking: adaptive (sends high)")
 end)
 
 case("a_model_without_thinking_gets_the_flash_instead_of_a_picker", function()

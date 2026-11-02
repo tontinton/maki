@@ -187,6 +187,10 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 ///   `spec` (string) `"provider/id"`, as listed by `available()`;
 ///   `thinking` (string|number) `"off"`, `"adaptive"`, an effort level
 ///   (`"minimal"` to `"max"`), a token budget, or `""` to toggle it on and off;
+///   `"+"` or `"-"` steps the session's ceiling up or down within the current
+///   model's choices. Concrete budget steps keep token counts. `off` and
+///   unbounded `adaptive` are the endpoints when offered by the model.
+///   At a boundary the setting stays unchanged;
 ///   `fast` (boolean) Anthropic fast mode.
 /// @return (table|nil, string|nil) The new state, or nil and an error.
 /// @example

@@ -815,7 +815,7 @@ impl StopReason {
 }
 
 pub const THINKING_USAGE: &str =
-    "Usage: /thinking [off|adaptive|minimal|low|medium|high|xhigh|max|<budget>]";
+    "Usage: /thinking [off|adaptive|minimal|low|medium|high|xhigh|max|<budget>|+|-]";
 
 /// Effort levels are percentages, so they need a ceiling even when the model
 /// never told us its output window. 32k matches common frontier thinking
@@ -1230,12 +1230,12 @@ pub enum ThinkingConfig {
     Budget(u32),
 }
 
-/// Resolved thinking value for token-budget APIs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Resolved thinking value, ordered by ceiling. Adaptive has no upper bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Budgeted {
     Off,
-    Adaptive,
     Tokens(u32),
+    Adaptive,
 }
 
 impl ThinkingConfig {
@@ -1438,6 +1438,34 @@ impl ThinkingConfig {
         StoredThinking::parse_setting(input)
             .map(Into::into)
             .map_err(|_| THINKING_USAGE)
+    }
+
+    /// Steps the session's delegation ceiling through this model's choices.
+    /// Adaptive is unbounded, above every explicit ceiling. Concrete budget
+    /// steps keep token counts. Replacing them with model-relative efforts
+    /// would change the ceiling subagents inherit when their output windows differ.
+    pub fn stepped(self, model: &Model, increase: bool) -> Self {
+        let current = self.budget(None);
+        let choices = model.thinking_options().into_iter().filter_map(|option| {
+            let choice = Self::parse(option.name, self).ok()?;
+            let choice = match (self, choice) {
+                (Self::Budget(_), Self::Effort(_)) => {
+                    match choice.budget(model.max_thinking_budget()) {
+                        Budgeted::Tokens(tokens) => Self::Budget(tokens),
+                        _ => return None,
+                    }
+                }
+                _ => choice,
+            };
+            let ceiling = choice.budget(None);
+            ((increase && ceiling > current) || (!increase && ceiling < current)).then_some(choice)
+        });
+        if increase {
+            choices.min_by_key(|choice| choice.budget(None))
+        } else {
+            choices.max_by_key(|choice| choice.budget(None))
+        }
+        .unwrap_or(self)
     }
 
     /// Caps this config at `parent`. A subagent's thinking request is written
@@ -1698,6 +1726,8 @@ mod tests {
     const SMALL_BUDGET: u32 = 2048;
     /// Between `Medium` and `High` against [`FALLBACK_MAX_THINKING_BUDGET`].
     const LARGE_BUDGET: u32 = 16_384;
+    const NATIVE_MEDIUM_BUDGET: u32 = 1638;
+    const NATIVE_XHIGH_BUDGET: u32 = 3276;
 
     const PROMPT: &str = "fix the flaky login test";
     const TASK_ID: &str = "toolu_moved";
@@ -2478,6 +2508,50 @@ mod tests {
         expected: ThinkingConfig,
     ) {
         assert_eq!(child.clamp_to(parent), expected);
+    }
+
+    #[test_case(ThinkingConfig::Off, false, ThinkingConfig::Off ; "off_is_the_floor")]
+    #[test_case(ThinkingConfig::Off, true, ThinkingConfig::Effort(Low) ; "skip_undeclared_minimal")]
+    #[test_case(ThinkingConfig::Effort(High), true, ThinkingConfig::Effort(XHigh) ; "step_from_intent_not_snapped_medium")]
+    #[test_case(ThinkingConfig::Effort(High), false, ThinkingConfig::Effort(Medium) ; "lower_an_undeclared_intent")]
+    #[test_case(ThinkingConfig::Effort(XHigh), true, ThinkingConfig::Adaptive ; "adaptive_removes_the_ceiling")]
+    #[test_case(ThinkingConfig::Adaptive, false, ThinkingConfig::Effort(XHigh) ; "adaptive_lowers_to_the_largest_offered_effort")]
+    #[test_case(ThinkingConfig::Adaptive, true, ThinkingConfig::Adaptive ; "adaptive_is_the_upper_boundary")]
+    #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), false, ThinkingConfig::Budget(NATIVE_MEDIUM_BUDGET) ; "budget_lowers_in_tokens")]
+    #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), true, ThinkingConfig::Budget(NATIVE_XHIGH_BUDGET) ; "budget_raises_in_tokens")]
+    fn thinking_steps_preserve_the_ceiling_units(
+        current: ThinkingConfig,
+        increase: bool,
+        expected: ThinkingConfig,
+    ) {
+        let model = native_effort_model();
+        let next = current.stepped(&model, increase);
+        assert_eq!(next, expected);
+        if increase {
+            assert_eq!(current.clamp_to(next), current);
+        } else {
+            assert_eq!(next.clamp_to(current), next);
+        }
+    }
+
+    #[test]
+    fn thinking_steps_keep_aliases_that_change_the_delegation_ceiling() {
+        let mut model = thinking_model("local-step-model");
+        model.provider = Arc::from("openai");
+        model.thinking_override = Some(Support::Yes);
+        let current = ThinkingConfig::Effort(Max);
+        let next = current.stepped(&model, false);
+        assert_eq!(next, ThinkingConfig::Effort(XHigh));
+        assert_eq!(next.shown(&model), current.shown(&model));
+        assert_eq!(current.clamp_to(next), next);
+    }
+
+    #[test]
+    fn thinking_steps_cannot_offer_off_on_a_required_model() {
+        let mut model = native_effort_model();
+        model.thinking_override = Some(Support::Required);
+        let floor = ThinkingConfig::Effort(Low);
+        assert_eq!(floor.stepped(&model, false), floor);
     }
 
     /// Google's own documented ceiling on thinking, which is a capability and
