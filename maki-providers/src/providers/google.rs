@@ -15,6 +15,7 @@ use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
+use crate::providers::openai_compat::assistant_response;
 use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
     sends_as_chosen,
@@ -688,16 +689,7 @@ async fn parse_sse(
         }
     }
 
-    Ok(StreamResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: content_blocks,
-            ..Default::default()
-        },
-        usage,
-        stop_reason,
-        ..Default::default()
-    })
+    Ok(assistant_response(content_blocks, usage, stop_reason))
 }
 
 #[cfg(test)]

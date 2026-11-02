@@ -11,7 +11,9 @@ use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::providers::copilot::copilot_usd;
-use crate::providers::openai_compat::tool_parameters;
+use crate::providers::openai_compat::{
+    assistant_response, parse_tool_input, reasoning_and_text_blocks, tool_parameters,
+};
 use crate::providers::{ResolvedAuth, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
@@ -558,43 +560,14 @@ pub(crate) async fn parse_sse(
         }
     }
 
-    let mut content_blocks: Vec<ContentBlock> = Vec::new();
-
-    if !reasoning_text.is_empty() {
-        content_blocks.push(ContentBlock::Thinking {
-            thinking: reasoning_text,
-            signature: None,
-        });
-    }
-
-    if !text.is_empty() {
-        content_blocks.push(ContentBlock::Text { text });
-    }
+    let mut content_blocks = reasoning_and_text_blocks(reasoning_text, text);
 
     for acc in tool_accumulators {
-        let input: Value = match serde_json::from_str(&acc.arguments) {
-            Ok(v) => {
-                debug!(tool = %acc.name, json = %acc.arguments, "tool input JSON");
-                v
-            }
-            Err(e) => {
-                warn!(error = %e, tool = %acc.name, json = %acc.arguments, "malformed tool JSON, falling back to {{}}");
-                Value::Object(Default::default())
-            }
-        };
+        let input = parse_tool_input(&acc.name, &acc.arguments);
         content_blocks.push(ContentBlock::tool_use(acc.call_id, acc.name, input));
     }
 
-    Ok(StreamResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: content_blocks,
-            ..Default::default()
-        },
-        usage,
-        stop_reason,
-        ..Default::default()
-    })
+    Ok(assistant_response(content_blocks, usage, stop_reason))
 }
 
 fn parse_usage(u: &Value) -> TokenUsage {
