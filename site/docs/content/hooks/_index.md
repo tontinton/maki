@@ -19,6 +19,11 @@ particular order, and what they return is ignored. Slots are a chain: each layer
 gets the value, decides, and passes it down by calling `prev`. The last layer
 registered runs first.
 
+A few slots are neither: observe-only monitors. They fire like a slot, but the
+return value is ignored and the value is a read-only view. The three
+`agent.message.*` slots below work this way. Use a monitor to watch a request,
+a reply, or a token stream without changing it.
+
 Both come from Neovim. An autocmd matches `nvim_create_autocmd`, and a slot
 plays the role `vim.ui.select` plays there, with the wrapping made explicit so
 two plugins can layer the same point without capturing each other's function.
@@ -258,7 +263,7 @@ capability.
 
 ## Agent slots
 
-The agent loop fires four slots of its own:
+The agent loop fires seven slots of its own:
 
 | Slot | Fires | Gets |
 | --- | --- | --- |
@@ -266,13 +271,22 @@ The agent loop fires four slots of its own:
 | `agent.stop` | when the model ends its turn without calling a tool | `{ reason, last_message, num_turns }` |
 | `agent.compact.before` | before a compaction starts | `{ reason, context_size, usable, request_instructions }` |
 | `agent.compact.prepare` | before the transcript goes to the summarizer | `{ results, budget, collapse }` |
+| `agent.message.send` | once per request, before it reaches the provider | `{ messages, system, tools, session_id, task_id }` |
+| `agent.message.receive` | when the assistant message is assembled | `{ message, stop_reason }` |
+| `agent.message.delta` | per text or thinking token as it streams | `{ kind, text, session_id, task_id }` |
 
 They follow the tool slot contract. `ctx` carries `session_id`, `task_id` (set
 inside a subagent), `model`, `context_size`, `context_window`, and
 `deadline_ms`.
 
-A layer on any of them needs every permission, because it steers what the agent
-does next. The chain gets 30 seconds, then the loop carries on without it.
+A layer on `agent.user_message`, `agent.stop`, or either `agent.compact` slot
+needs every permission, because it steers what the agent does next. The chain
+gets 30 seconds, then the loop carries on without it.
+
+The three `agent.message.*` slots are monitors instead. They need every
+permission too, because they read the conversation, but they steer nothing: the
+return value is ignored and the value they receive is read-only. A monitor
+watches a request, a reply, or a token stream without any way to change it.
 
 ### agent.user_message
 
@@ -410,6 +424,60 @@ needs `run` as well.
 
 The popup does not open on a `!` line. Completion holds no `run`, so Enter
 would refuse a shell line it completed.
+
+### agent.message.send
+
+Fires once per request, before the retry loop, so a retry does not fire it
+again. `messages` is the transcript as the model reads it now, `system` and
+`tools` are what this request carries, and `session_id` is `nil` for a
+standalone call.
+
+This slot is observe-only. It watches the request and its return value is
+ignored, with a warning. Nothing a monitor does here reaches the provider, so
+there is no way to void the prompt cache or orphan a thinking block from this
+slot.
+
+`req` is a read-only view. Writing to it raises an error, so a monitor holds
+one reference and mutates nothing. Each registered monitor sees the same `req`,
+so nothing one monitor writes can reach another.
+
+```lua
+maki.api.set_slot("agent.message.send", function(_prev, req, ctx)
+  for _, msg in ipairs(req.messages) do
+    if msg.role == "user" and has_aws_key(msg) then
+      maki.log.warn("outgoing request carries an AWS key")
+    end
+  end
+end)
+```
+
+### agent.message.receive
+
+Fires once per turn when the assistant message is assembled, after any tool
+calls are canonicalized. `message` is the assembled assistant message and
+`stop_reason` is the provider's reason. Observe-only: a returned value is
+ignored, with a warning. `message` is a read-only view, and every monitor on
+one turn sees the same one.
+
+### agent.message.delta
+
+Fires once per text or thinking token as it streams, with `kind` set to
+`"text"` or `"thinking"`. Observe-only: a returned value is ignored, and `ev`
+is a read-only view. It runs on its own task so a slow layer never stalls the
+stream, only runs when a layer is registered, and a layer that falls behind
+drops deltas rather than blocking the model.
+
+```lua
+local runs = {}
+maki.api.set_slot("agent.message.delta", function(_prev, ev, ctx)
+  if ev.kind ~= "thinking" then return end
+  local n = (runs[ev.text] or 0) + 1
+  runs[ev.text] = n
+  if n == 3 then
+    maki.log.warn(("agent %s is repeating itself"):format(ctx.task_id or "main"))
+  end
+end)
+```
 
 ## Permission prompt
 

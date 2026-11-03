@@ -20,9 +20,9 @@ use super::frame::{
     FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
 };
 use super::history::{History, sanitize_cancelled_history};
-use super::hook::{AgentHooks, AgentSlot};
+use super::hook::{AgentHooks, AgentSlot, AgentSlotRole, MonitorFirer};
 use super::instructions::{CallInstructions, LoadedInstructions};
-use super::streaming::{StreamError, StreamRequest, stream_with_retry};
+use super::streaming::{DeltaChunk, DeltaSink, StreamError, StreamRequest, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::{McpSession, ToolDeferral};
@@ -79,6 +79,21 @@ fn served_window_notice(model: &str, served: u32, planned: u32) -> String {
     format!(
         "The server runs {model} with a {served}-token context, below the {planned} tokens maki planned for. Compacting to fit from now on. Raise the server's context length for more room."
     )
+}
+
+/// Drains deltas into the `MessageDelta` monitors on their own task, so the
+/// stream never waits on one. Ends when the sink drops, which is when the
+/// request that owned it returns.
+fn spawn_delta_consumer(
+    firer: MonitorFirer,
+    recv: flume::Receiver<DeltaChunk>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok(chunk) = recv.recv_async().await {
+            let (kind, text) = chunk.parts();
+            firer.fire_delta(kind, text).await;
+        }
+    })
 }
 
 pub async fn resolve_compaction_model(
@@ -621,24 +636,42 @@ impl<'h> Agent<'h> {
         let Some((system, tools)) = self.history.request_prefix() else {
             return Err(no_frame());
         };
-        let response = match stream_with_retry(
-            StreamRequest {
-                provider: &*self.provider,
-                model: &self.model,
-                messages: self.history.as_slice(),
-                system,
-                tools,
-                opts: self.opts,
-                output_budget: self.config.max_turn_output,
-                session_id: self.session_id.as_ref(),
-                retry: self.timeouts.retry,
-            },
-            Some(self.gauge),
-            &self.event_tx,
-            &self.cancel,
-        )
-        .await
-        {
+        self.notify_message_send(system, tools);
+        // Deltas fire off the stream's thread so a slow monitor never stalls a
+        // token. The sink is absent unless a monitor registered, so an unwatched
+        // stream spawns nothing and the forwarder stays as cheap as before.
+        let (delta, delta_consumer) = match self.hooks().monitor_firer(AgentSlot::MessageDelta) {
+            Some(firer) => {
+                let (sink, recv) = DeltaSink::channel();
+                (Some(sink), Some(spawn_delta_consumer(firer, recv)))
+            }
+            None => (None, None),
+        };
+        let response = {
+            let stream_result = stream_with_retry(
+                StreamRequest {
+                    provider: &*self.provider,
+                    model: &self.model,
+                    messages: self.history.as_slice(),
+                    system,
+                    tools,
+                    opts: self.opts,
+                    output_budget: self.config.max_turn_output,
+                    session_id: self.session_id.as_ref(),
+                    retry: self.timeouts.retry,
+                },
+                Some(self.gauge),
+                &self.event_tx,
+                &self.cancel,
+                delta,
+            )
+            .await;
+            if let Some(consumer) = delta_consumer {
+                let _ = consumer.await;
+            }
+            stream_result
+        };
+        let response = match response {
             Ok(r) => {
                 self.reauth_attempts = 0;
                 self.overflow_recoveries = 0;
@@ -690,6 +723,7 @@ impl<'h> Agent<'h> {
 
         // The gauge already took the provider's own count inside the stream.
         self.emit_turn_complete(&response)?;
+        self.notify_message_receive(&response.message, stop_reason);
 
         if has_tools {
             let history_len_before = self.history.len();
@@ -733,6 +767,34 @@ impl<'h> Agent<'h> {
             return Ok(TurnOutcome::Continue);
         }
         Ok(TurnOutcome::Done(reason))
+    }
+
+    /// Tell the send monitors what is about to reach the provider. Observe
+    /// only: fired detached so the turn does not wait on a slow monitor, and a
+    /// monitor that returns a value is logged where the chain runs.
+    fn notify_message_send(&self, system: &str, tools: &Value) {
+        let Some(firer) = self.hooks().monitor_firer(AgentSlot::MessageSend) else {
+            return;
+        };
+        firer.spawn(json!({
+            "messages": self.history.as_slice(),
+            "system": system,
+            "tools": tools,
+            "session_id": self.session_id.as_ref().map(SessionRef::as_str),
+            "task_id": self.task_id.as_deref(),
+        }));
+    }
+
+    /// Tell the receive monitors what the model said. Observe only, same as
+    /// [`Self::notify_message_send`].
+    fn notify_message_receive(&self, message: &Message, stop_reason: Option<StopReason>) {
+        let Some(firer) = self.hooks().monitor_firer(AgentSlot::MessageReceive) else {
+            return;
+        };
+        firer.spawn(json!({
+            "message": message,
+            "stop_reason": stop_reason.map(Into::<&'static str>::into),
+        }));
     }
 
     /// A thinking block the model can no longer see, or one that failed the
@@ -1250,7 +1312,7 @@ mod tests {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, VecDeque};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use maki_config::ProjectConfig;
@@ -1266,6 +1328,7 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::compaction::FIELD_CONTINUE;
+    use super::streaming::{DELTA_TEXT, DELTA_THINKING};
     use super::*;
     use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
@@ -4470,5 +4533,274 @@ mod tests {
 
         assert_eq!(reason, DoneReason::EndTurn);
         assert_continued(&drain_events(&event_rx), &history, allowed);
+    }
+
+    const DELTA_THINK_TEXT: &str = "let me think";
+    const DELTA_TEXT_TEXT: &str = "about it";
+    const SEND_SEEN_TEXT: &str = "observed by the send monitor";
+
+    /// Streams each delta through the provider channel, then answers, so the
+    /// delta consumer drains and the turn ends the way a real stream does.
+    struct DeltaProvider {
+        deltas: Vec<(&'static str, &'static str)>,
+    }
+
+    impl Provider for DeltaProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            ptx: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                for (kind, text) in &self.deltas {
+                    let event = if *kind == DELTA_THINKING {
+                        ProviderEvent::ThinkingDelta {
+                            text: (*text).into(),
+                        }
+                    } else {
+                        ProviderEvent::TextDelta {
+                            text: (*text).into(),
+                        }
+                    };
+                    ptx.send(event).unwrap();
+                }
+                Ok(text_response(StopReason::EndTurn))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    /// Fails the first attempt with a retryable status, then answers, so a test
+    /// can fire the send monitor across a real retry.
+    #[derive(Default)]
+    struct FailOnceProvider {
+        calls: AtomicU32,
+    }
+
+    impl Provider for FailOnceProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(AgentError::api(529, "overloaded"));
+                }
+                Ok(text_response(StopReason::EndTurn))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    /// The send monitor sees the request, and a value it returns changes
+    /// nothing: the provider still reads the untouched transcript.
+    #[tokio::test]
+    async fn message_send_observes_the_request_and_its_return_is_ignored() {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+        let requests = Arc::clone(&provider.requests);
+        let (mut agent, _event_rx) = make_agent(provider, &mut history);
+        let seen = script(
+            &agent.registry,
+            answer_only(AgentSlot::MessageSend, json!({ "messages": "hijacked" })),
+        );
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+        seen.settle(AgentSlot::MessageSend, 1).await;
+
+        let seen = seen.lock().unwrap();
+        let (_, sent) = seen
+            .iter()
+            .find(|(slot, _)| *slot == AgentSlot::MessageSend)
+            .expect("send fired");
+        assert_eq!(sent["messages"][0]["content"][0]["text"], "go");
+        assert!(sent["system"].is_string(), "the send value carries system");
+        assert!(sent["tools"].is_array(), "the send value carries tools");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0].messages[0]["content"][0]["text"], "go",
+            "a returned value must not reach the provider"
+        );
+    }
+
+    /// No monitor, no send value: the slot is gated on registration.
+    #[tokio::test]
+    async fn message_send_is_gated_on_a_registered_monitor() {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+        let (mut agent, _event_rx) = make_agent(provider, &mut history);
+
+        assert!(!agent.hooks().wraps(AgentSlot::MessageSend));
+        let seen = script(&agent.registry, |_, _| Verdict::Unchanged);
+        assert!(agent.hooks().wraps(AgentSlot::MessageSend));
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+        seen.settle(AgentSlot::MessageSend, 1).await;
+
+        let sends = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(slot, _)| *slot == AgentSlot::MessageSend)
+            .count();
+        assert_eq!(sends, 1, "one logical request, one send fire");
+    }
+
+    /// One logical request fires send once, even when the provider retries.
+    #[tokio::test]
+    async fn message_send_fires_once_across_a_retry() {
+        let mut history = History::new(vec![Message::user(SEND_SEEN_TEXT.into())]);
+        let (mut agent, _event_rx) = make_agent(FailOnceProvider::default(), &mut history);
+        agent.timeouts.retry.base_delay = std::time::Duration::ZERO;
+        let seen = script(&agent.registry, |_, _| Verdict::Unchanged);
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+        seen.settle(AgentSlot::MessageSend, 1).await;
+
+        let sends = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(slot, _)| *slot == AgentSlot::MessageSend)
+            .count();
+        assert_eq!(sends, 1, "one logical request, one send monitor call");
+    }
+
+    /// Every token reaches the delta monitor with its kind, in order.
+    #[tokio::test]
+    async fn message_delta_sees_each_token() {
+        let mut history = History::new(Vec::new());
+        let provider = DeltaProvider {
+            deltas: vec![
+                (DELTA_THINKING, DELTA_THINK_TEXT),
+                (DELTA_TEXT, DELTA_TEXT_TEXT),
+            ],
+        };
+        let (mut agent, _event_rx) = make_agent(provider, &mut history);
+        let seen = script(&agent.registry, |_, _| Verdict::Unchanged);
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        let seen = seen.lock().unwrap();
+        let deltas: Vec<_> = seen
+            .iter()
+            .filter(|(slot, _)| *slot == AgentSlot::MessageDelta)
+            .map(|(_, value)| (value["kind"].clone(), value["text"].clone()))
+            .collect();
+        assert_eq!(
+            deltas,
+            [
+                (json!(DELTA_THINKING), json!(DELTA_THINK_TEXT)),
+                (json!(DELTA_TEXT), json!(DELTA_TEXT_TEXT)),
+            ]
+        );
+    }
+
+    /// A run nobody watches spawns no delta consumer and builds no sink.
+    #[tokio::test]
+    async fn message_delta_is_gated_on_a_registered_monitor() {
+        let mut history = History::new(Vec::new());
+        let (agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+
+        assert!(
+            agent
+                .hooks()
+                .monitor_firer(AgentSlot::MessageDelta)
+                .is_none()
+        );
+        script(&agent.registry, |_, _| Verdict::Unchanged);
+        assert!(
+            agent
+                .hooks()
+                .monitor_firer(AgentSlot::MessageDelta)
+                .is_some()
+        );
+    }
+
+    /// Receive sees the assembled answer, and a value it returns changes
+    /// nothing: the slot is observe-only.
+    #[tokio::test]
+    async fn message_receive_observes_and_its_return_is_ignored() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        let seen = script(
+            &agent.registry,
+            answer_only(AgentSlot::MessageReceive, json!({ "message": "hijacked" })),
+        );
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+        seen.settle(AgentSlot::MessageReceive, 1).await;
+
+        let seen = seen.lock().unwrap();
+        let (_, received) = seen
+            .iter()
+            .find(|(slot, _)| *slot == AgentSlot::MessageReceive)
+            .expect("receive fired");
+        assert_eq!(received["message"]["content"][0]["text"], RESPONSE_TEXT);
+        assert_eq!(received["stop_reason"], "end_turn");
+        assert_eq!(
+            history.as_slice().last().unwrap().first_text_content(),
+            Some(RESPONSE_TEXT),
+            "a returned value must not reach history"
+        );
+    }
+
+    /// The three monitors are the only observe-only agent slots.
+    #[test]
+    fn only_the_message_slots_are_monitors() {
+        for slot in [
+            AgentSlot::UserMessage,
+            AgentSlot::Stop,
+            AgentSlot::CompactBefore,
+            AgentSlot::CompactPrepare,
+        ] {
+            assert_eq!(
+                slot.role(),
+                AgentSlotRole::Steering,
+                "{} steers the run",
+                slot.name()
+            );
+        }
+        for slot in [
+            AgentSlot::MessageSend,
+            AgentSlot::MessageReceive,
+            AgentSlot::MessageDelta,
+        ] {
+            assert_eq!(
+                slot.role(),
+                AgentSlotRole::Monitor,
+                "{} only watches",
+                slot.name()
+            );
+        }
     }
 }

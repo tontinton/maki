@@ -25,6 +25,7 @@ use maki_agent::tools::{
     HeaderResult, MovedCall, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry,
     ToolSource,
 };
+use maki_agent::agent::AgentSlotRole;
 use maki_agent::{
     AgentSeed, BufferSnapshot, CallScope, SessionEndReason, SessionMailbox, SharedBuf,
     SnapshotLine, SnapshotSpan, SpanStyle, TaskHome, UiWaker, receipt_tag,
@@ -388,6 +389,31 @@ enum PluginLoad<'a> {
     Function { function: Function, argument: Table },
 }
 
+/// What a firing is for. The kinds differ in what a layer may answer with,
+/// which decides the [`Verdict`] read back and whether the value is frozen
+/// before any layer sees it.
+#[derive(Debug)]
+pub(crate) enum FiringKind {
+    /// A tool stage. An input stage may put the call in front of the user.
+    Tool { may_ask: bool },
+    /// An `agent.*` slot, which steers the run or only watches it.
+    Agent(AgentSlotRole),
+}
+
+impl FiringKind {
+    /// Only a tool input can be put in front of the user, so anywhere else an
+    /// `ask` is dropped and a rewrite next to it still lands.
+    const fn may_ask(&self) -> bool {
+        matches!(self, Self::Tool { may_ask: true })
+    }
+
+    /// Freeze the value before any layer sees it, so a monitor cannot change
+    /// what another monitor reads.
+    const fn frozen(&self) -> bool {
+        matches!(self, Self::Agent(AgentSlotRole::Monitor))
+    }
+}
+
 /// One firing of a host-owned slot, as the call being filtered described it.
 pub(crate) struct HookRun {
     /// Innermost first, run as one chain. See [`run_host_chain`].
@@ -400,9 +426,7 @@ pub(crate) struct HookRun {
     pub deadline: Instant,
     pub value: Value,
     pub call: Value,
-    /// Only a tool input can be put in front of the user, so anywhere else an
-    /// `ask` is dropped and a rewrite next to it still lands.
-    pub may_ask: bool,
+    pub kind: FiringKind,
 }
 
 /// One call that would have prompted, for the `permission.prompt` chain.
@@ -531,6 +555,11 @@ pub enum Request {
         run: HookRun,
         reply: flume::Sender<Verdict>,
     },
+    /// A monitor chain (`agent.message.*`). Carries no reply channel because
+    /// nobody reads a monitor's answer: the caller fires and moves on, so the
+    /// turn never waits for it. The frozen value and the dropped answer are
+    /// the chain's own business, in [`run_hook`].
+    RunMonitor { run: HookRun },
     /// The `permission.prompt` chain, sent only when it has layers.
     RunPrompt {
         run: PromptRun,
@@ -4956,11 +4985,42 @@ async fn open_plan_form(
     Some(plan_form_rows(lua, plugins, gate, deadline, session, args, rows).await)
 }
 
+/// Freezes a Lua value and every table under it, so a monitor cannot change
+/// what a later monitor reads. `Table::set_readonly` is per table, so a shallow
+/// freeze would leave `req.messages[1].content` writable, which is the exact
+/// mutation this blocks. A write raises a Lua error, which the chain already
+/// tolerates by skipping the layer.
+fn freeze_deep(value: &LuaValue) {
+    let LuaValue::Table(table) = value else {
+        return;
+    };
+    for pair in table.clone().pairs::<LuaValue, LuaValue>() {
+        let Ok((_, entry)) = pair else { continue };
+        freeze_deep(&entry);
+    }
+    table.set_readonly(true);
+}
+
+/// The `(value, ctx)` pair a chain is called with. A monitor's pair is frozen
+/// first, so no layer can change what another reads. `None` on a conversion
+/// failure, which is a pass-through: the chain is never run against a value
+/// that did not survive the trip.
+fn hook_args(lua: &Lua, value: &Value, call: &Value, frozen: bool) -> Option<MultiValue> {
+    let (Ok(value), Ok(call)) = (json_to_lua(lua, value), json_to_lua(lua, call)) else {
+        return None;
+    };
+    if frozen {
+        freeze_deep(&value);
+        freeze_deep(&call);
+    }
+    Some(MultiValue::from_vec(vec![value, call]))
+}
+
 /// Fires a host-owned chain and reads back the one contract every host slot
 /// shares: a table replaces the value, `nil` leaves it alone, and
 /// `nil, reason` stops the call with a reason the model reads. A second value
 /// of `{ ask = reason }` instead escalates the call to the user, with or
-/// without a rewrite in front of it, where [`HookRun::may_ask`] allows it.
+/// without a rewrite in front of it, where [`FiringKind::may_ask`] allows it.
 ///
 /// Every failure below is a pass-through, because a layer is an opinion about a
 /// call and never a precondition for making it.
@@ -4981,15 +5041,14 @@ async fn run_hook(
         deadline,
         value,
         call,
-        may_ask,
+        kind,
     } = run;
     let names: Vec<&str> = slots.iter().map(String::as_str).collect();
     let Some(&slot) = names.first() else {
         return Verdict::Unchanged;
     };
-    let args = match (json_to_lua(lua, &value), json_to_lua(lua, &call)) {
-        (Ok(value), Ok(call)) => MultiValue::from_vec(vec![value, call]),
-        _ => return Verdict::Unchanged,
+    let Some(args) = hook_args(lua, &value, &call, kind.frozen()) else {
+        return Verdict::Unchanged;
     };
     let allow_layer = layer_delegation(lua, plugins, cost);
     let chain = run_host_chain(lua, &names, args, &allow_layer);
@@ -5022,7 +5081,7 @@ async fn run_hook(
         _ => None,
     };
     let ask = match ask {
-        Some(reason) if !may_ask => {
+        Some(reason) if !kind.may_ask() => {
             tracing::warn!(
                 slot,
                 reason,
@@ -5059,6 +5118,18 @@ async fn run_hook(
         (Some(reason), input) => Verdict::Ask { reason, input },
         (None, Some(replacement)) => Verdict::Replaced(replacement),
         (None, None) => Verdict::Unchanged,
+    }
+}
+
+/// A monitor is observe-only, so a returned replacement is a bug rather than a
+/// request. Say so once, where the chain's answer is known, since the fire site
+/// dropped it and moved on.
+fn warn_monitor_replaced(slot: &str, verdict: &Verdict) {
+    if matches!(verdict, Verdict::Replaced(_)) {
+        tracing::warn!(
+            slot,
+            "monitor slot is observe-only, the returned value is ignored"
+        );
     }
 }
 
@@ -5840,6 +5911,18 @@ pub fn spawn(
                             spawn_local(async move {
                                 let verdict = run_hook(&lua, &plugins, &gate, run).await;
                                 let _ = reply.send(verdict);
+                            });
+                        }
+                        Request::RunMonitor { run } => {
+                            // Same spawn, no reply: a monitor's answer is
+                            // dropped, so nobody waits on it.
+                            let lua = rt.lua.clone();
+                            let plugins = Rc::clone(&rt.plugins);
+                            let gate = Rc::clone(&gate);
+                            spawn_local(async move {
+                                let slot = run.slots.first().cloned().unwrap_or_default();
+                                let verdict = run_hook(&lua, &plugins, &gate, run).await;
+                                warn_monitor_replaced(&slot, &verdict);
                             });
                         }
                         Request::RunPrompt { run, reply } => {
@@ -7954,5 +8037,58 @@ mod tests {
 
         assert!(suffix.contains(&receipt_tag(MOVED_CALL_ID)), "{suffix}");
         assert_eq!(suffix.contains(STOP_TOOL), offers_stop, "{suffix}");
+    }
+
+    /// A frozen value rejects writes at every level, so a monitor cannot change
+    /// what another monitor reads.
+    #[test]
+    fn freeze_deep_locks_every_table() {
+        let lua = test_lua();
+        let value: LuaValue = lua
+            .load(r#"return { messages = { { content = { { text = "hi" } } } } }"#)
+            .eval()
+            .unwrap();
+        freeze_deep(&value);
+
+        let LuaValue::Table(table) = &value else {
+            panic!("expected a table");
+        };
+        assert!(table.is_readonly());
+        let messages: Table = table.get("messages").unwrap();
+        assert!(messages.is_readonly(), "a nested table is frozen too");
+        let first: Table = messages.get(1).unwrap();
+        let content: Table = first.get("content").unwrap();
+        let block: Table = content.get(1).unwrap();
+        assert!(block.is_readonly(), "a table two levels down is frozen");
+
+        assert!(
+            table.set("x", 1).is_err(),
+            "a write to a frozen table must error"
+        );
+        assert!(
+            block.set("text", "changed").is_err(),
+            "a write to a nested frozen table must error"
+        );
+    }
+
+    /// A scalar is left alone, and freezing it is a no-op rather than a panic.
+    #[test]
+    fn freeze_deep_ignores_a_scalar() {
+        let lua = test_lua();
+        let value: LuaValue = lua.load("return 7").eval().unwrap();
+        freeze_deep(&value);
+        assert_eq!(value, LuaValue::Integer(7));
+    }
+
+    /// The firing kinds and what each may answer with. A tool input may ask, a
+    /// steering agent slot may only rewrite, and a monitor only watches so its
+    /// value is frozen and its answer dropped.
+    #[test_case(FiringKind::Tool { may_ask: true }, true, false ; "a_tool_input_can_ask")]
+    #[test_case(FiringKind::Tool { may_ask: false }, false, false ; "a_tool_output_cannot_ask")]
+    #[test_case(FiringKind::Agent(AgentSlotRole::Steering), false, false ; "an_agent_slot_only_rewrites")]
+    #[test_case(FiringKind::Agent(AgentSlotRole::Monitor), false, true ; "a_monitor_is_frozen")]
+    fn firing_kind_decides_ask_and_freeze(kind: FiringKind, may_ask: bool, frozen: bool) {
+        assert_eq!(kind.may_ask(), may_ask);
+        assert_eq!(kind.frozen(), frozen);
     }
 }

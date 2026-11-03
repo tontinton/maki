@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use maki_agent::agent::{AgentCall, AgentHook, AgentSlot};
+use maki_agent::agent::{AgentCall, AgentHook, AgentSlot, AgentSlotRole};
 use maki_agent::permissions::LayerAnswer;
 use maki_agent::tools::ToolContext;
 use maki_agent::tools::hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
@@ -17,7 +17,9 @@ use serde_json::{Value, json};
 use crate::api::slot::{ANY_TOOL, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, host_slot_name};
 use crate::api::util::ctx::LuaCtx;
 use crate::plugin_permissions::Permission;
-use crate::runtime::{HookRun, KILL_GRACE, PromptRun, Request, SLICE_KILL, WATCHDOG_POLL_INTERVAL};
+use crate::runtime::{
+    FiringKind, HookRun, KILL_GRACE, PromptRun, Request, SLICE_KILL, WATCHDOG_POLL_INTERVAL,
+};
 
 /// Every `agent.*` slot steers what the agent does next: the prompt it
 /// answers, whether it stops, what it remembers after a compaction. No
@@ -115,7 +117,9 @@ impl ToolHook for SlotHook {
                 "receipt": call.receipt,
                 "deadline_ms": deadline_ms(call.deadline),
             }),
-            may_ask: stage == HookStage::Input,
+            kind: FiringKind::Tool {
+                may_ask: stage == HookStage::Input,
+            },
         })
     }
 
@@ -167,7 +171,7 @@ impl AgentHook for SlotHook {
         value: Value,
         call: &'a AgentCall<'a>,
     ) -> BoxFuture<'a, Verdict> {
-        self.send(HookRun {
+        let run = HookRun {
             slots: vec![slot.name().to_owned()],
             cost: AGENT_SLOT_COST,
             cancel: call.cancel.clone(),
@@ -181,7 +185,17 @@ impl AgentHook for SlotHook {
                 "context_window": call.context_window,
                 "deadline_ms": deadline_ms(call.deadline),
             }),
-            may_ask: false,
-        })
+            kind: FiringKind::Agent(slot.role()),
+        };
+        // A monitor's answer is dropped, so it is sent without a reply channel
+        // and this resolves at once: whoever fired it does not wait.
+        if slot.role() == AgentSlotRole::Monitor {
+            let request = Request::RunMonitor { run };
+            return Box::pin(async move {
+                let _ = self.tx.send_async(request).await;
+                Verdict::Unchanged
+            });
+        }
+        self.send(run)
     }
 }

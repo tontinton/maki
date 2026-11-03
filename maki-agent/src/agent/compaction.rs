@@ -231,6 +231,7 @@ pub(super) async fn compact_history(
             None,
             event_tx,
             hooks.cancel,
+            None,
         )
         .await
         {
