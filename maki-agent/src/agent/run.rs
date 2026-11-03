@@ -4035,7 +4035,7 @@ mod tests {
         registry
             .register(
                 Arc::new(MovingTool),
-                ToolSource::Lua {
+                ToolSource {
                     plugin: MOVING_TOOL.into(),
                 },
             )

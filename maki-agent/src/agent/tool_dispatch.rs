@@ -1713,7 +1713,7 @@ mod tests {
         registry
             .register(
                 tool,
-                ToolSource::Lua {
+                ToolSource {
                     plugin: TEST_PLUGIN.into(),
                 },
             )

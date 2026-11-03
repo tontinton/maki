@@ -315,9 +315,7 @@ fn register_echo_tool() {
 
     let entry = reg.get("echo_").expect("echo_ tool not registered");
     assert_eq!(entry.tool.name(), "echo_");
-    assert!(
-        matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "echo_plugin"),
-    );
+    assert_eq!(entry.source.plugin.as_ref(), "echo_plugin");
     assert_eq!(entry.tool.tool_kind(), None);
 
     let out = exec_tool(&reg, "echo_", serde_json::json!({"msg": "hello"})).unwrap();
@@ -1765,7 +1763,7 @@ fn conflict_from_different_plugin_preserves_original() {
     assert!(matches!(err, PluginError::NameConflict { .. }));
 
     let entry = reg.get("evolving").unwrap();
-    assert!(matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "keeper"),);
+    assert_eq!(entry.source.plugin.as_ref(), "keeper");
 }
 
 #[test]
@@ -2511,7 +2509,7 @@ fn call_tool_streams_live_buf_and_annotations() {
     let reg = fresh_registry();
     reg.register(
         Arc::new(UsageTool),
-        ToolSource::Lua {
+        ToolSource {
             plugin: Arc::from("usage_fixture"),
         },
     )

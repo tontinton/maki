@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use include_dir::{Dir, File, include_dir};
 use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
-use maki_agent::tools::{ToolRegistry, ToolSource};
+use maki_agent::tools::ToolRegistry;
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::{DeclAuthority, keep_granted};
 #[cfg(any(test, feature = "test-support"))]
@@ -921,7 +921,7 @@ impl PluginHost {
         let snapshot = self.registry.iter();
         let names: Vec<String> = snapshot
             .iter()
-            .filter(|t| matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin))
+            .filter(|t| t.source.plugin.as_ref() == plugin)
             .filter(|t| carries_builtin_defaults(t.name()))
             .map(|t| format!("`{}`", t.name()))
             .collect();
@@ -3105,7 +3105,7 @@ mod bundled_manifests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use include_dir::{Dir, DirEntry, File};
-    use maki_agent::tools::{ToolRegistry, ToolSource};
+    use maki_agent::tools::ToolRegistry;
     use maki_config::{DEFAULT_BUILTINS, PluginsConfig};
     use strum::VariantArray;
     use test_case::test_case;
@@ -3160,11 +3160,10 @@ mod bundled_manifests {
 
         let mut out: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
         for tool in registry.iter().iter() {
-            let (ToolSource::Lua { plugin }, Some(reach)) = (&tool.source, tool.tool.reach())
-            else {
+            let Some(reach) = tool.tool.reach() else {
                 continue;
             };
-            out.entry(plugin.to_string())
+            out.entry(tool.source.plugin.to_string())
                 .or_default()
                 .insert(reach.permission);
         }

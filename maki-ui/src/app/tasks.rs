@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flume::TryRecvError;
-use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry, ToolSource};
+use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry};
 use maki_agent::{AgentEvent, PartStatus, ToolDoneEvent, ToolPart};
 use maki_lua::MoveOutcome;
 use maki_storage::id::MakiId;
@@ -319,10 +319,9 @@ fn part_task_id(call: &str, part: &str) -> String {
 /// The plugin that registered {tool}, or the tool itself for one no plugin
 /// owns, so the task still has an owner to show.
 fn tool_owner(tool: &Arc<str>) -> Arc<str> {
-    match ToolRegistry::global().get(tool).map(|entry| entry.source) {
-        Some(ToolSource::Lua { plugin }) => plugin,
-        _ => Arc::clone(tool),
-    }
+    ToolRegistry::global()
+        .get(tool)
+        .map_or_else(|| Arc::clone(tool), |entry| entry.source.plugin)
 }
 
 impl App {

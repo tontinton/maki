@@ -2475,7 +2475,7 @@ mod tests {
     ) {
         let lua = Lua::new();
         let registry = ToolRegistry::new();
-        let source = ToolSource::Lua {
+        let source = ToolSource {
             plugin: PLUGIN.into(),
         };
         registry
