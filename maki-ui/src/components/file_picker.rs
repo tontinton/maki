@@ -10,7 +10,6 @@ use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Matcher, Nucleo};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tracing::warn;
@@ -18,10 +17,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::animation::spinner_frame;
-use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::{Overlay, chevron_span, render_field};
 use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -173,6 +172,11 @@ impl FilePickerModal {
         self.session.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_visible(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.visible)
+    }
+
     pub fn contains(&self, pos: Position) -> bool {
         self.session
             .as_ref()
@@ -188,13 +192,12 @@ impl FilePickerModal {
         }
     }
 
-    pub fn handle_paste(&mut self, text: &str) -> bool {
+    pub fn handle_paste(&mut self, text: &str) {
         let Some(s) = &mut self.session else {
-            return false;
+            return;
         };
         s.search.insert_text(text);
         reparse_pattern(s);
-        true
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> FilePickerModalAction {
@@ -300,10 +303,10 @@ impl FilePickerModal {
         (dirty, None)
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> (Rect, Option<Position>) {
         let s = match &mut self.session {
             Some(s) if s.visible => s,
-            _ => return Rect::default(),
+            _ => return (Rect::default(), None),
         };
 
         let match_count = s.matches.len() as u16;
@@ -331,7 +334,7 @@ impl FilePickerModal {
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
         render_list(frame, list_area, s);
-        render_search(frame, search_area, s);
+        let caret = render_search(frame, search_area, s);
 
         if match_count > s.viewport_height as u16 {
             render_vertical_scrollbar(
@@ -342,7 +345,7 @@ impl FilePickerModal {
             );
         }
 
-        popup
+        (popup, caret)
     }
 }
 
@@ -603,29 +606,21 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
+fn render_search(frame: &mut Frame, area: Rect, s: &Session) -> Option<Position> {
     let t = theme::current();
-    let query = s.search.value();
-    let cursor_byte = TextBuffer::char_to_byte(query, s.search.x());
-    let (before, rest) = query.split_at(cursor_byte);
-    let mut chars = rest.chars();
-    let cursor_char = chars.next().unwrap_or(' ');
-    let after = chars.as_str();
-
-    let mut spans = vec![super::chevron_span()];
-
+    let mut prefix = vec![chevron_span()];
     if s.walk == Walk::Running {
         let ch = spinner_frame(s.started_at.elapsed().as_millis());
-        spans.push(Span::styled(format!("{ch} "), t.item_desc));
+        prefix.push(Span::styled(format!("{ch} "), t.item_desc));
     }
-
-    spans.extend([
-        Span::styled(before.to_owned(), Style::default()),
-        Span::styled(cursor_char.to_string(), t.cursor),
-        Span::styled(after.to_owned(), Style::default()),
-    ]);
-
-    frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);
+    render_field(
+        frame,
+        area,
+        prefix,
+        s.search.value(),
+        s.search.cursor_byte(),
+        t.cursor,
+    )
 }
 
 fn build_highlighted_line<'a>(
@@ -997,15 +992,18 @@ mod tests {
     /// The matcher answers on a worker thread, long after the keypress was
     /// handled, so typing is only redrawn because a later `tick` reports the
     /// change. Without that the list freezes on the previous query.
-    #[test]
-    fn query_change_owes_a_frame_from_a_later_tick() {
+    #[test_case(|picker: &mut FilePickerModal| {
+        for c in README_QUERY.chars() {
+            picker.handle_key(key(KeyCode::Char(c)));
+        }
+    } ; "typed")]
+    #[test_case(|picker: &mut FilePickerModal| picker.handle_paste(README_QUERY) ; "pasted")]
+    fn query_change_owes_a_frame_from_a_later_tick(change_query: fn(&mut FilePickerModal)) {
         let (mut picker, index) = pending_picker();
         walked(&index, &[MAIN_PATH, README_PATH]);
         let _ = tick_until(&mut picker, |s| s.matches.len() == 2).expect(NEVER_CONVERGED);
 
-        for c in README_QUERY.chars() {
-            picker.handle_key(key(KeyCode::Char(c)));
-        }
+        change_query(&mut picker);
 
         let dirty = tick_until(&mut picker, |s| s.matches.len() == 1).expect(NEVER_CONVERGED);
         assert_eq!(dirty, Dirty::YES, "{OWED}");
@@ -1477,14 +1475,8 @@ mod tests {
     fn handle_paste_appends_to_search() {
         let (mut picker, _index) = pending_picker();
         picker.handle_key(key(KeyCode::Char('a')));
-        assert!(picker.handle_paste("bc"));
+        picker.handle_paste("bc");
         assert_eq!(picker.session.as_ref().unwrap().search.value(), "abc");
-    }
-
-    #[test]
-    fn handle_paste_returns_false_when_closed() {
-        let mut picker = FilePickerModal::new();
-        assert!(!picker.handle_paste("test"));
     }
 
     #[test]

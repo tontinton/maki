@@ -2,18 +2,19 @@ use std::collections::VecDeque;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
 use maki_config::ToolKey;
 
 use crate::components::Overlay;
-use crate::components::form::render_form;
+use crate::components::form::{FORM_WRAP, render_form};
 use crate::components::hint_line;
 use crate::components::is_ctrl;
+use crate::components::{Caret, field_line, painted_caret};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -139,6 +140,12 @@ pub struct AnsweredRequest {
     pub id: String,
     pub subagent_id: Option<String>,
     pub answer: PermissionAnswer,
+}
+
+/// Where the deny field's caret sits in the prompt's lines, before wrapping.
+struct FieldCaret {
+    row: usize,
+    caret: Caret,
 }
 
 /// Every request parks a tool call until it is answered, so asks that arrive
@@ -324,17 +331,19 @@ impl PermissionPrompt {
         }
     }
 
-    /// True while the prompt is up, since it owns the keyboard then. Only the
-    /// deny editor has a place for {text}, anywhere else it is dropped.
-    pub fn handle_paste(&mut self, text: &str) -> bool {
-        let open = self.is_open();
-        if open && self.state == PromptState::DenyEditing {
+    /// Only the deny editor has a place for {text}, anywhere else it is
+    /// dropped.
+    pub fn handle_paste(&mut self, text: &str) {
+        if self.state == PromptState::DenyEditing {
             self.buffer.insert_text(text);
         }
-        open
     }
 
     fn build_lines(&self) -> Vec<Line<'static>> {
+        self.build_lines_with_caret().0
+    }
+
+    fn build_lines_with_caret(&self) -> (Vec<Line<'static>>, Option<FieldCaret>) {
         let Some(Request {
             tool,
             scopes,
@@ -345,7 +354,7 @@ impl PermissionPrompt {
             ..
         }) = self.queue.front()
         else {
-            return vec![];
+            return (vec![], None);
         };
         let (state, buffer) = (&self.state, &self.buffer);
         let t = theme::current();
@@ -394,30 +403,26 @@ impl PermissionPrompt {
             }
         }
 
+        let mut field = None;
         if *state == PromptState::DenyEditing {
-            let text = buffer.value();
-            let (display_text, cursor_pos) = if text.is_empty() {
-                (DEFAULT_DENY_GUIDANCE, 0)
+            let (text, cursor_byte, tail_style) = if buffer.value().is_empty() {
+                (DEFAULT_DENY_GUIDANCE, 0, t.tool_dim)
             } else {
-                (text, TextBuffer::char_to_byte(text, buffer.x()))
+                (buffer.value(), buffer.cursor_byte(), Style::default())
             };
-            let (before, after) = display_text.split_at(cursor_pos);
-            let mut chars = after.chars();
-            let cursor_ch = chars.next().unwrap_or(' ');
-            let rest: String = chars.collect();
-
-            let mut spans = vec![Span::raw("  "), Span::styled("guide ", label_style)];
-            if text.is_empty() {
-                spans.push(Span::styled(cursor_ch.to_string(), Style::new().reversed()));
-                spans.push(Span::styled(rest, t.tool_dim));
-            } else {
-                spans.push(Span::raw(before.to_string()));
-                spans.push(Span::styled(cursor_ch.to_string(), Style::new().reversed()));
-                if !rest.is_empty() {
-                    spans.push(Span::raw(rest));
-                }
-            }
-            lines.push(Line::from(spans));
+            let prefix = vec![Span::raw("  "), Span::styled("guide ", label_style)];
+            let (line, caret) = field_line(
+                prefix,
+                text,
+                cursor_byte,
+                Style::new().reversed(),
+                tail_style,
+            );
+            field = Some(FieldCaret {
+                row: lines.len(),
+                caret,
+            });
+            lines.push(line);
         }
 
         if !*project_trusted {
@@ -467,22 +472,34 @@ impl PermissionPrompt {
             }
         }
         lines.push(Line::raw(""));
-        lines
+        (lines, field)
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect) {
+    /// Returns the cell the deny field painted its caret in. The row comes
+    /// from how far the lines above it wrap, and the cell is reported only if
+    /// the frame really holds the caret there.
+    pub fn view(&self, frame: &mut Frame, area: Rect) -> Option<Position> {
         if !self.is_open() {
-            return;
+            return None;
         }
-        let lines = self.build_lines();
+        let (lines, field) = self.build_lines_with_caret();
+        let lines_above = field
+            .as_ref()
+            .map(|field| lines[..field.row].to_vec())
+            .unwrap_or_default();
         let t = theme::current();
-        render_form(&t, " Permission Required ", frame, area, lines, (0, 0));
+        let inner = render_form(&t, " Permission Required ", frame, area, lines, (0, 0));
+        let field = field?;
+        let rows_above = Paragraph::new(lines_above)
+            .wrap(FORM_WRAP)
+            .line_count(inner.width);
+        painted_caret(frame.buffer_mut(), inner, &field.caret, rows_above)
     }
 
     pub fn height(&self, width: u16) -> u16 {
         let inner_width = width.saturating_sub(2);
         let lines = self.build_lines();
-        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let para = Paragraph::new(lines).wrap(FORM_WRAP);
         para.line_count(inner_width) as u16 + 2
     }
 }
@@ -605,12 +622,11 @@ mod tests {
 
     #[test]
     fn handle_paste_lands_only_in_the_deny_editor() {
-        assert!(!PermissionPrompt::new().handle_paste("closed"));
         let mut prompt = open_prompt();
-        assert!(prompt.handle_paste("dropped"));
+        prompt.handle_paste("dropped");
         assert_eq!(prompt.buffer.value(), "");
         prompt.handle_key(key(KeyCode::Char('n')));
-        assert!(prompt.handle_paste("accepted"));
+        prompt.handle_paste("accepted");
         assert_eq!(prompt.buffer.value(), "accepted");
     }
 

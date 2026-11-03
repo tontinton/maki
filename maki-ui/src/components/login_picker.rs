@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
@@ -13,14 +13,15 @@ use maki_storage::auth::{
 };
 use maki_storage::model::persist_model;
 
-use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
+use crate::components::{Overlay, chevron_span, field_line, painted_caret};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 const TITLE: &str = " Login ";
 const CATALOG_UNAVAILABLE_SLUG: &str = "catalog-unavailable";
+const WRAP: Wrap = Wrap { trim: true };
 
 const PROTOCOLS: &[(&str, &str)] = &[
     ("openai", "OpenAI-compatible"),
@@ -262,16 +263,18 @@ impl LoginPicker {
         self.step = Step::PickProvider(picker);
     }
 
-    pub fn handle_paste(&mut self, text: &str) -> bool {
+    /// A list step filters on what is pasted, as typing does. A step with no
+    /// field drops it.
+    pub fn handle_paste(&mut self, text: &str) {
         match &mut self.step {
+            Step::PickProvider(picker) => picker.handle_paste(text),
+            Step::PickPlan { picker, .. } => picker.handle_paste(text),
+            Step::CustomProtocol { picker, .. } => picker.handle_paste(text),
             Step::EnterKey { input, .. }
             | Step::CustomName { input }
             | Step::CustomUrl { input, .. }
-            | Step::BuiltinUrl { input, .. } => {
-                input.insert_text(text);
-                true
-            }
-            _ => false,
+            | Step::BuiltinUrl { input, .. } => input.insert_text(text),
+            Step::Closed | Step::Done { .. } => {}
         }
     }
 
@@ -659,9 +662,9 @@ impl LoginPicker {
         }
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> (Rect, Option<Position>) {
         match &mut self.step {
-            Step::Closed => Rect::default(),
+            Step::Closed => (Rect::default(), None),
             Step::PickProvider(picker) => picker.view(frame, area),
             Step::PickPlan { picker, .. } => picker.view(frame, area),
             Step::CustomName { input } => input_step_view(
@@ -720,7 +723,7 @@ impl LoginPicker {
                         .style(Style::new().bg(theme::current().background)),
                     inner,
                 );
-                popup
+                (popup, None)
             }
         }
     }
@@ -755,34 +758,30 @@ fn input_step_view(
     title: &str,
     hint: &'static str,
     input: &TextBuffer,
-) -> Rect {
+) -> (Rect, Option<Position>) {
     let (popup, inner) = step_modal(title).render(frame, area, 2);
     let t = theme::current();
-    let hint = Span::styled(hint, t.input_placeholder);
-    let input_line = input_line_with_cursor(input);
+    let hint_rows = Paragraph::new(hint).wrap(WRAP).line_count(inner.width);
+    let (input_line, caret) = field_line(
+        vec![chevron_span()],
+        input.value(),
+        input.cursor_byte(),
+        t.cursor,
+        Style::default(),
+    );
     frame.render_widget(
-        Paragraph::new(vec![Line::from(hint), input_line])
-            .style(Style::new().bg(t.background))
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(vec![
+            Line::from(Span::styled(hint, t.input_placeholder)),
+            input_line,
+        ])
+        .style(Style::new().bg(t.background))
+        .wrap(WRAP),
         inner,
     );
-    popup
-}
-
-fn input_line_with_cursor(input: &TextBuffer) -> Line<'static> {
-    let t = theme::current();
-    let value = input.value();
-    let cursor_byte = TextBuffer::char_to_byte(value, input.x());
-    let (before, rest) = value.split_at(cursor_byte);
-    let mut chars = rest.chars();
-    let cursor_char = chars.next().unwrap_or(' ');
-    let after = chars.as_str();
-    Line::from(vec![
-        super::chevron_span(),
-        Span::raw(before.to_string()),
-        Span::styled(cursor_char.to_string(), t.cursor),
-        Span::raw(after.to_string()),
-    ])
+    (
+        popup,
+        painted_caret(frame.buffer_mut(), inner, &caret, hint_rows),
+    )
 }
 
 pub enum LoginPickerAction {
@@ -790,4 +789,95 @@ pub enum LoginPickerAction {
     Close,
     Authenticated { model_spec: String },
     Configured { slug: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::*;
+
+    const FIRST_LABEL: &str = "Alpha";
+    const SECOND_LABEL: &str = "Beta";
+    const PASTED_FILTER: &str = "bet";
+    const PLAN_BASE_URL: &str = "https://plan.example.test";
+    const SLUG: &str = "slug";
+    const WRONG_SELECTION: &str = "the paste did not filter the list";
+    const WRONG_STEP: &str = "the step is not the one built";
+
+    fn opened<T: PickerItem>(items: Vec<T>) -> ListPicker<T> {
+        let mut picker = ListPicker::new();
+        picker.open(items, TITLE);
+        picker
+    }
+
+    fn selected_label<T: PickerItem>(picker: &ListPicker<T>) -> Option<String> {
+        picker.selected_item().map(|item| item.label().to_owned())
+    }
+
+    fn provider_item(label: &str) -> ProviderItem {
+        ProviderItem {
+            slug: label.to_lowercase(),
+            display_name: label.to_owned(),
+            has_key: false,
+            has_env: false,
+            configured: false,
+            section: None,
+        }
+    }
+
+    fn plan_item(label: &str) -> PlanItem {
+        PlanItem {
+            key: label.to_lowercase(),
+            display_name: label.to_owned(),
+            base_url: PLAN_BASE_URL.to_owned(),
+        }
+    }
+
+    fn picker_at(step: Step) -> LoginPicker {
+        LoginPicker {
+            step,
+            ..LoginPicker::new()
+        }
+    }
+
+    fn provider_step() -> Step {
+        Step::PickProvider(opened(vec![
+            provider_item(FIRST_LABEL),
+            provider_item(SECOND_LABEL),
+        ]))
+    }
+
+    fn plan_step() -> Step {
+        Step::PickPlan {
+            picker: opened(vec![plan_item(FIRST_LABEL), plan_item(SECOND_LABEL)]),
+            slug: SLUG.to_owned(),
+        }
+    }
+
+    fn protocol_step() -> Step {
+        Step::CustomProtocol {
+            picker: opened(vec![
+                ProtocolItem(SLUG, FIRST_LABEL),
+                ProtocolItem(SLUG, SECOND_LABEL),
+            ]),
+            slug: SLUG.to_owned(),
+        }
+    }
+
+    #[test_case(provider_step ; "provider_list")]
+    #[test_case(plan_step ; "plan_list")]
+    #[test_case(protocol_step ; "protocol_list")]
+    fn paste_filters_a_list_step(step: fn() -> Step) {
+        let mut picker = picker_at(step());
+        picker.handle_paste(PASTED_FILTER);
+
+        let selected = match &picker.step {
+            Step::PickProvider(list) => selected_label(list),
+            Step::PickPlan { picker, .. } => selected_label(picker),
+            Step::CustomProtocol { picker, .. } => selected_label(picker),
+            _ => panic!("{WRONG_STEP}"),
+        };
+        assert_eq!(selected.as_deref(), Some(SECOND_LABEL), "{WRONG_SELECTION}");
+    }
 }
