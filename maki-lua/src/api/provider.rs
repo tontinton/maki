@@ -664,8 +664,9 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///           loopback, and its host must match `net_hosts`. Only with
 ///           `codec`. A `base` moves only to an origin the `auth` hook
 ///           returns, so plans with a `base_url` need a `codec` too.
-///   `api_key_env` (string) Env var holding the API key, re-read each time
-///           the provider is built. Sent as `x-api-key` for anthropic,
+///   `api_key_env` (string or list of strings) Env var holding the API key,
+///           re-read each time the provider is built; with a list, the first
+///           one that is set wins. Sent as `x-api-key` for anthropic,
 ///           `x-goog-api-key` for google, and a bearer token otherwise.
 ///           Also lists the provider in `maki auth login`, which saves the
 ///           key. Needs the `env` permission.

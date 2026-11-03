@@ -78,7 +78,11 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
     ProviderSpec {
         slug: leak_str(&decl.slug),
         display_name: leak_str(&decl.display_name),
-        api_key_env: decl.api_key_env.as_deref().map_or("", leak_str),
+        api_key_env: decl
+            .api_key_env
+            .as_ref()
+            .and_then(|vars| vars.first())
+            .map_or("", |var| leak_str(var)),
         family: decl.family.unwrap_or(native.family),
         supports_thinking: native.supports_thinking,
         supports_deferred_tools: false,
@@ -105,7 +109,10 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
         docs: GeneratedDocs {
             api_urls: leak_slice(decl.base_url.iter().map(|url| leak_str(url)).collect()),
             features: decl.docs.features.as_deref().map(leak_str),
-            auth: AuthDoc::EnvVar,
+            auth: match decl.api_key_env.as_deref().unwrap_or_default() {
+                [] | [_] => AuthDoc::EnvVar,
+                names => AuthDoc::Custom(leak_str(&format!("`{}`", names.join("` or `")))),
+            },
             catalog: if models.is_empty() {
                 CatalogDoc::Discovered(
                     decl.docs

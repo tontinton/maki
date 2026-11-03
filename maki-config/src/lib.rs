@@ -108,6 +108,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "read",
     "regolo",
     "requesty",
+    "scaleway",
     "sessions",
     "skill",
     "synthetic",
@@ -129,6 +130,7 @@ pub const PROVIDER_BUILTINS: &[&str] = &[
     "openrouter",
     "regolo",
     "requesty",
+    "scaleway",
     "synthetic",
     "tensorx",
 ];

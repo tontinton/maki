@@ -155,7 +155,7 @@ fn a_planned_origin_is_vouched_only_for_a_bundled_declaration(
     let _home = isolated(&format!("[{DECLARED_SLUG}]\nplan = \"{PLAN_KEY}\"\n"));
     let plan_url = format!("https://{PLAN_HOST}/v1");
     let mut reg = declaration(DECLARED_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST);
-    reg.decl.api_key_env = Some(PLAN_KEY_ENV.to_owned());
+    reg.decl.api_key_env = Some(vec![PLAN_KEY_ENV.to_owned()]);
     reg.decl.net_hosts.push(PLAN_HOST.to_owned());
     reg.decl.plans = vec![PlanDecl {
         key: PLAN_KEY.to_owned(),
@@ -236,7 +236,7 @@ fn saved_catalog_key() -> TempDir {
 fn a_taken_over_slugs_saved_key_becomes_the_plugins() {
     let _home = saved_catalog_key();
     let mut reg = declaration(CATALOG_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST);
-    reg.decl.api_key_env = Some(KEY_ENV.to_owned());
+    reg.decl.api_key_env = Some(vec![KEY_ENV.to_owned()]);
     plugin::begin_load();
     plugin::register(reg, DeclAuthority::ThirdParty, &[CATALOG_SLUG.to_owned()])
         .expect(CREDENTIALS_LOST);

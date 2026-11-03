@@ -45,7 +45,7 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 
 ## Built-in Providers
 
-`deepseek`, `mistral`, `openrouter`, `regolo`, `requesty`, `synthetic` and `tensorx` ship as bundled [plugins](/docs/plugins/) and are listed last. Turn one off with `plugins = { tensorx = { enabled = false } }` in [`maki.setup`](/docs/configuration/#plugins).
+`deepseek`, `mistral`, `openrouter`, `regolo`, `requesty`, `scaleway`, `synthetic` and `tensorx` ship as bundled [plugins](/docs/plugins/) and are listed last. Turn one off with `plugins = { tensorx = { enabled = false } }` in [`maki.setup`](/docs/configuration/#plugins).
 
 ### Anthropic
 
@@ -333,6 +333,29 @@ Defaults: qwen3.5-122b (strong), qwen3-coder-next (medium), qwen3.5-9b (weak)
 - **Features**: 700+ models behind one key, managed routing policies, EU region
 
 Models are listed live from the API. Managed policies come first, with short ids such as `requesty/claude-sonnet-4-5`, and their `@eu` variants use only EU providers. The full `<vendor>/<model>` catalog follows, e.g. `requesty/openai/gpt-4o-mini`. Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all traffic in the EU.
+
+### Scaleway
+
+- **Env var**: `SCALEWAY_API_KEY` or `SCW_SECRET_KEY`
+- **API**: `https://api.scaleway.ai/v1`
+- **Features**: EU-hosted models, per-model reasoning efforts, vision models
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Weak | mistral-small-3.2-24b-instruct-2506 |  | 128K ctx / 32K out |
+| Weak | gemma-4-26b-a4b-it |  | 256K ctx / 32K out |
+| Weak | **qwen3.6-35b-a3b** (default) | $0.28 / $1.68 | 256K ctx / 32K out |
+| Weak | deepseek-v4-flash-0731 |  | 256K ctx / 32K out |
+| Weak | gpt-oss-120b |  | 128K ctx / 32K out |
+| Medium | **deepseek-v4.1-flash-1017** (default) | $0.67 / $2.02 | 256K ctx / 32K out |
+| Medium | qwen3.8-27b |  | 256K ctx / 32K out |
+| Medium | mistral-medium-3.5-128b |  | 180K ctx / 16K out |
+| Medium | llama-3.3-70b-instruct |  | 100K ctx / 16K out |
+| Medium | qwen3-235b-a22b-instruct-2507 |  | 250K ctx / 16K out |
+| Strong | **glm-5.3** (default) | $2.02 / $6.16 | 256K ctx / 16K out |
+| Strong | qwen3.5-397b-a17b |  | 250K ctx / 16K out |
+
+Defaults: glm-5.3 (strong), deepseek-v4.1-flash-1017 (medium), qwen3.6-35b-a3b (weak)
 
 ### Synthetic
 

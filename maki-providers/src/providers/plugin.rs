@@ -179,8 +179,11 @@ pub struct ProviderDecl {
     /// outranks both, see [`CodecOptions::base_url`].
     pub base_url: Option<String>,
     /// Setting it also lists the provider in `maki auth login`, which then
-    /// asks for the key.
-    pub api_key_env: Option<String>,
+    /// asks for the key. A list names alternatives and the first one that is
+    /// set wins, so a key that goes by two names needs no `providers.toml`
+    /// line.
+    #[serde(default, deserialize_with = "env_var_names::deserialize")]
+    pub api_key_env: Option<Vec<String>>,
     pub system_prefix: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelEntry>,
@@ -253,6 +256,34 @@ mod stated_limit {
             Limit::Published(false) => Ok(Some(None)),
             Limit::Published(true) => Err(D::Error::custom(NOT_A_LIMIT)),
         }
+    }
+}
+
+/// `api_key_env` takes one name or a list of them, and an empty name or list
+/// reads as unset, so it never answers for a variable nothing sets.
+mod env_var_names {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer};
+
+    const NOT_A_NAME: &str = "api_key_env is an env var name, or a list of them";
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Names {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        input: D,
+    ) -> Result<Option<Vec<String>>, D::Error> {
+        let names = Names::deserialize(input).map_err(|_| D::Error::custom(NOT_A_NAME))?;
+        let names = match names {
+            Names::One(name) => vec![name],
+            Names::Many(names) => names,
+        };
+        let kept: Vec<String> = names.into_iter().filter(|name| !name.is_empty()).collect();
+        Ok((!kept.is_empty()).then_some(kept))
     }
 }
 
@@ -526,7 +557,11 @@ pub fn commit_load() {
     };
     for entry in staged.values() {
         let slug = &entry.decl.slug;
-        let api_key_env = entry.decl.api_key_env.clone().filter(|var| !var.is_empty());
+        let api_key_env = entry
+            .decl
+            .api_key_env
+            .clone()
+            .filter(|vars| !vars.is_empty());
         if let Err(error) = entry.auth.redeclare(
             slug,
             api_key_env,
@@ -766,15 +801,15 @@ enum DeclaredKeys {
     /// run on a synchronous path, so nothing is knowable until one does.
     Hooked,
     Resolved {
-        env_var: String,
+        env_vars: Vec<String>,
         pool: KeyPool,
     },
-    /// [`KeyPool::resolve`] failed. The message is kept rather than the error
-    /// because [`AgentError`] is not `Clone`, and `create` has to answer with
-    /// it verbatim every time so the picker hides the provider instead of
+    /// [`KeyPool::resolve_any`] failed. The message is kept rather than the
+    /// error because [`AgentError`] is not `Clone`, and `create` has to answer
+    /// with it verbatim every time so the picker hides the provider instead of
     /// listing one that cannot serve a request.
     Missing {
-        env_var: String,
+        env_vars: Vec<String>,
         message: String,
     },
 }
@@ -782,49 +817,55 @@ enum DeclaredKeys {
 impl DeclaredKeys {
     /// The same call every built-in makes, so env / saved-credential /
     /// `providers.toml` precedence and the "run `maki auth login`" message are
-    /// identical by construction rather than by copying.
-    fn resolve(slug: &str, env_var: Option<String>) -> Self {
-        let Some(env_var) = env_var else {
+    /// identical by construction rather than by copying. Of declared
+    /// alternatives, the first that is set wins.
+    fn resolve(slug: &str, env_vars: Option<Vec<String>>) -> Self {
+        let Some(env_vars) = env_vars else {
             return Self::Hooked;
         };
-        match KeyPool::resolve(slug, &env_var) {
-            Ok(pool) => Self::Resolved { env_var, pool },
+        match KeyPool::resolve_any(slug, &env_vars) {
+            Ok(pool) => Self::Resolved { env_vars, pool },
             Err(e) => Self::Missing {
-                env_var,
+                env_vars,
                 message: e.to_string(),
             },
         }
     }
 
-    fn env_var(&self) -> Option<&str> {
+    /// The declared names as a whole, for a re-read: [`Self::resolve`] needs
+    /// every one of them to tell a renamed declaration from the same names
+    /// re-exported.
+    fn env_vars(&self) -> Option<Vec<String>> {
         match self {
             Self::Hooked => None,
-            Self::Resolved { env_var, .. } | Self::Missing { env_var, .. } => Some(env_var),
+            Self::Resolved { env_vars, .. } | Self::Missing { env_vars, .. } => {
+                Some(env_vars.clone())
+            }
         }
     }
 
-    /// Resolves `env_var` afresh and adopts the answer only if it says
-    /// something new: another variable, other keys, or a key appearing or
+    /// Resolves the declared names afresh and adopts the answer only if it
+    /// says something new: other variables, other keys, or a key appearing or
     /// going. The same keys keep the pool they had, so re-reading never walks a
     /// rotating pool back to its first key. Answers whether anything moved.
-    fn refresh(&mut self, slug: &str, env_var: Option<String>) -> bool {
-        let fresh = Self::resolve(slug, env_var);
+    fn refresh(&mut self, slug: &str, env_vars: Option<Vec<String>>) -> bool {
+        let fresh = Self::resolve(slug, env_vars);
         let unchanged = match (&*self, &fresh) {
             (Self::Hooked, Self::Hooked) => true,
             (
-                Self::Resolved { env_var, pool },
+                Self::Resolved { env_vars, pool },
                 Self::Resolved {
-                    env_var: read,
+                    env_vars: read,
                     pool: read_pool,
                 },
-            ) => env_var == read && pool.same_keys(read_pool),
+            ) => env_vars == read && pool.same_keys(read_pool),
             (
-                Self::Missing { env_var, message },
+                Self::Missing { env_vars, message },
                 Self::Missing {
-                    env_var: read,
+                    env_vars: read,
                     message: read_message,
                 },
-            ) => env_var == read && message == read_message,
+            ) => env_vars == read && message == read_message,
             _ => false,
         };
         if !unchanged {
@@ -893,10 +934,10 @@ impl AuthState {
     /// login` after the old key was revoked, is what the next provider sends.
     fn declared_pool(&self, slug: &str, header: KeyHeader) -> Result<Option<KeyPool>, AgentError> {
         let mut keys = self.keys.lock().unwrap();
-        let env_var = keys.env_var().map(str::to_owned);
+        let env_vars = keys.env_vars();
         // Only over credentials nothing has minted: a token a hook produced is
         // newer than anything an env var can offer.
-        if keys.refresh(slug, env_var)
+        if keys.refresh(slug, env_vars)
             && !self.gate.ran()
             && let Ok(declared) = keys.initial_auth(slug, header)
         {
@@ -905,8 +946,8 @@ impl AuthState {
         match &*keys {
             DeclaredKeys::Hooked => Ok(None),
             DeclaredKeys::Resolved { pool, .. } => Ok(Some(pool.clone())),
-            DeclaredKeys::Missing { env_var, message } => {
-                debug!(slug, env_var, "declared api key did not resolve");
+            DeclaredKeys::Missing { env_vars, message } => {
+                debug!(slug, env_vars = ?env_vars, "declared api key did not resolve");
                 Err(AgentError::Config {
                     message: message.clone(),
                 })
@@ -924,7 +965,7 @@ impl AuthState {
     fn redeclare(
         &self,
         slug: &str,
-        api_key_env: Option<String>,
+        api_key_env: Option<Vec<String>>,
         hosts: &[String],
         header: KeyHeader,
     ) -> Result<(), RegisterError> {
@@ -1404,7 +1445,12 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
 fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
     let decl = &entry.decl;
     CodecOptions {
-        api_key_env: decl.api_key_env.clone().unwrap_or_default().into(),
+        api_key_env: decl
+            .api_key_env
+            .as_ref()
+            .and_then(|vars| vars.first().cloned())
+            .unwrap_or_default()
+            .into(),
         base_url: decl.base_url.clone().unwrap_or_default().into(),
         provider_name: decl.display_name.clone().into(),
         system_prefix: decl.system_prefix.clone(),
@@ -2191,7 +2237,7 @@ mod tests {
         const LISTED_BUT_KEYLESS: &str = "a declared key env with no key must not build";
         const STALE_KEY: &str = "a replaced key must reach the next provider built";
         let mut reg = registration(SLUG);
-        reg.decl.api_key_env = Some(ENV_VAR.to_string());
+        reg.decl.api_key_env = Some(vec![ENV_VAR.to_string()]);
         register_loaded(reg).unwrap();
 
         let error = create(SLUG, Timeouts::default())
@@ -2232,7 +2278,7 @@ mod tests {
             None => registration(SLUG),
         };
         reg.decl.codec = codec;
-        reg.decl.api_key_env = Some(ENV_VAR.to_string());
+        reg.decl.api_key_env = Some(vec![ENV_VAR.to_string()]);
         unsafe { std::env::set_var(ENV_VAR, KEY) };
         register_loaded(reg).unwrap();
 
@@ -2453,7 +2499,7 @@ mod tests {
             reg.hooks.auth = Some(Arc::new(CountingAuth::new(true)));
         } else {
             unsafe { std::env::set_var(KEY_ENV, KEY) };
-            reg.decl.api_key_env = Some(KEY_ENV.to_string());
+            reg.decl.api_key_env = Some(vec![KEY_ENV.to_string()]);
         }
         register_loaded(reg).unwrap();
 
@@ -2503,7 +2549,7 @@ mod tests {
         reg.decl.codec = Some(protocol);
         reg.decl.base_url = Some(base_url);
         reg.decl.net_hosts = vec![host];
-        reg.decl.api_key_env = Some(ENV_VAR.to_string());
+        reg.decl.api_key_env = Some(vec![ENV_VAR.to_string()]);
         register_loaded(reg).unwrap();
 
         let provider = create(slug, Timeouts::default()).unwrap();
@@ -2567,7 +2613,7 @@ mod tests {
         const ENV_VAR: &str = "MAKI_TEST_ROW_PLUGIN_KEY";
         const CONTEXT_WINDOW: u32 = 64_000;
         let mut reg = registration(SLUG);
-        reg.decl.api_key_env = Some(ENV_VAR.to_string());
+        reg.decl.api_key_env = Some(vec![ENV_VAR.to_string()]);
         reg.decl.family = Some(ModelFamily::Synthetic);
         reg.decl.context_window = Some(CONTEXT_WINDOW);
         reg.decl.default_model = Some(MODEL_ID.to_string());

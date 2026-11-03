@@ -574,6 +574,58 @@ impl KeyPool {
         })
     }
 
+    /// [`Self::resolve`] over alternative names, the first one that is set
+    /// winning, so a provider whose key goes by two names reads either without
+    /// a config line. Saved credentials and `providers.toml` answer only when
+    /// no name did.
+    pub fn resolve_any(slug: &str, env_vars: &[String]) -> Result<Self, AgentError> {
+        if let [env_var] = env_vars {
+            return Self::resolve(slug, env_var);
+        }
+        for env_var in env_vars {
+            if let Ok(pool) = Self::from_env(env_var) {
+                debug!(
+                    slug,
+                    keys = pool.len(),
+                    env_var,
+                    "resolved API key from env"
+                );
+                return Ok(pool);
+            }
+        }
+        let missing = Self::missing_message(slug, env_vars);
+        if let Some(key) = Self::key_from_file(slug) {
+            debug!(slug, "resolved API key from saved credentials");
+            return Ok(Self::from_keys(vec![key]));
+        }
+        if let Some(key) = Self::key_from_config(slug) {
+            debug!(slug, "resolved API key from providers.toml");
+            return Ok(Self::from_keys(vec![key]));
+        }
+        Err(AgentError::Config { message: missing })
+    }
+
+    /// `SCALEWAY_API_KEY` (or `SCW_SECRET_KEY`) not set and no saved
+    /// credentials for 'scaleway': run `maki auth login scaleway`.
+    fn missing_message(slug: &str, env_vars: &[String]) -> String {
+        let mut named = String::new();
+        for (i, env_var) in env_vars.iter().enumerate() {
+            if i == 0 {
+                named.push_str(env_var);
+            } else if i + 1 == env_vars.len() {
+                named.push_str(" (or ");
+                named.push_str(env_var);
+                named.push(')');
+            } else {
+                named.push_str(", ");
+                named.push_str(env_var);
+            }
+        }
+        format!(
+            "{named} not set and no saved credentials for '{slug}': run `maki auth login {slug}`"
+        )
+    }
+
     /// Whether both pools hold the same keys, whatever position each is at.
     pub(crate) fn same_keys(&self, other: &Self) -> bool {
         self.keys == other.keys
@@ -1092,6 +1144,40 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{result:?}");
         assert!(msg.contains(&env_var) || msg.contains(&slug));
+    }
+
+    #[test]
+    fn resolve_any_takes_the_first_name_that_is_set() {
+        let unset = format!("MAKI_TEST_ANY_UNSET_{}", fastrand::u32(..));
+        let set = format!("MAKI_TEST_ANY_SET_{}", fastrand::u32(..));
+        unsafe { std::env::set_var(&set, "from-fallback") };
+        let pool = KeyPool::resolve_any("test_slug", &[unset, set.clone()]).unwrap();
+        unsafe { std::env::remove_var(&set) };
+        assert_eq!(pool.current(), "from-fallback");
+    }
+
+    #[test]
+    fn resolve_any_prefers_the_first_name_when_both_are_set() {
+        let primary = format!("MAKI_TEST_ANY_FIRST_{}", fastrand::u32(..));
+        let fallback = format!("MAKI_TEST_ANY_SECOND_{}", fastrand::u32(..));
+        unsafe { std::env::set_var(&primary, "from-primary") };
+        unsafe { std::env::set_var(&fallback, "from-fallback") };
+        let pool = KeyPool::resolve_any("test_slug", &[primary.clone(), fallback.clone()]).unwrap();
+        unsafe { std::env::remove_var(&primary) };
+        unsafe { std::env::remove_var(&fallback) };
+        assert_eq!(pool.current(), "from-primary");
+    }
+
+    #[test]
+    fn resolve_any_names_every_alternative_when_nothing_found() {
+        let slug = format!("test_resolve_any_none_{}", fastrand::u32(..));
+        let first = format!("MAKI_TEST_ANY_NONE_1_{}", fastrand::u32(..));
+        let second = format!("MAKI_TEST_ANY_NONE_2_{}", fastrand::u32(..));
+        let result = KeyPool::resolve_any(&slug, &[first.clone(), second.clone()]);
+        assert!(result.is_err());
+        let msg = format!("{result:?}");
+        assert!(msg.contains(&format!("{first} (or {second}")));
+        assert!(msg.contains(&slug));
     }
 
     const TEST_SLUG: &str = "gateway";
