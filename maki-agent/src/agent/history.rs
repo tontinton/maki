@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
-use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
+use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, Role};
 use maki_storage::frame::{LiveFacts, StoredFrame};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::next_epoch;
+use maki_storage::sessions::{SessionTools, next_epoch};
 use serde_json::Value;
 use tracing::warn;
 
@@ -149,12 +149,24 @@ impl History {
     pub(crate) fn request_prefix(&self) -> Option<(&str, &Value)> {
         Some((
             self.snapshot.frame.as_ref()?.prefix()?,
-            &self.live.as_ref()?.wire,
+            self.live.as_ref()?.wire.as_ref(),
         ))
     }
 
     pub(crate) fn adopt_frame(&mut self, live: LiveFrame) {
         self.live = Some(live);
+        self.publish();
+    }
+
+    /// The fingerprint skips the model, so a kept frame follows a switch here.
+    pub(crate) fn refit_live(&mut self, model: &Model) {
+        let spec = model.spec();
+        if let Some(live) = &mut self.live
+            && live.model != spec
+        {
+            live.model = spec;
+            self.publish();
+        }
     }
 
     pub(crate) fn set_frame(&mut self, stored: StoredFrame, live: LiveFrame) {
@@ -295,7 +307,14 @@ impl History {
     /// here used to make the snapshot as long as the real results that came
     /// next, so the log never saw them. Callers that need an API-valid list
     /// close the dangling calls on their own copy.
-    fn publish(&self) {
+    ///
+    /// Tools come from `live` only here, so a reader always sees the array
+    /// the next request sends.
+    fn publish(&mut self) {
+        self.snapshot.tools = self.live.as_ref().map(|live| SessionTools {
+            model: live.model.clone(),
+            wire: Arc::clone(&live.wire),
+        });
         let Some(mirror) = &self.mirror else { return };
         mirror.store(Arc::new(self.snapshot.clone()));
     }
