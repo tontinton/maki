@@ -6,7 +6,7 @@ use std::fmt::Display;
 use std::future::{Future, pending};
 use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
@@ -2292,34 +2292,50 @@ pub(crate) async fn run_command_scoped<F: Future>(lua: &Lua, depth: u8, fut: F) 
 
 async fn run_scoped<F: Future>(lua: &Lua, scope: TaskScope, fut: F) -> F::Output {
     let handle = Arc::clone(scope.handle());
-    let owner = JobOwner::Task(lock_cell(&handle).id);
+    let (owner, cancel) = {
+        let cell = lock_cell(&handle);
+        (JobOwner::Task(cell.id), cell.cancel.clone())
+    };
     let mut jobs_changed = with_jobs(lua, |store| store.subscribe());
+    let (stop_pump, pump_stopping) = CancelToken::new();
+    let next_event = || with_jobs(lua, |store| store.next_event(&owner));
     let pump = async {
-        while jobs_changed.changed().await.is_ok() {
+        let mut stopping = pin!(pump_stopping.cancelled());
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut stopping => break,
+                Ok(()) = jobs_changed.changed() => {}
+            }
             deliver_pending(lua, usize::MAX, || {
-                with_jobs(lua, |store| store.next_event(&owner))
+                (!pump_stopping.is_cancelled()).then(next_event).flatten()
             })
             .await;
         }
+        deliver_pending(lua, FINAL_DRAIN_BUDGET, next_event).await;
     };
     let out = scope
         .scope_future(async {
-            tokio::select! {
+            let mut pump = pin!(pump);
+            let out = tokio::select! {
                 biased;
                 out = fut => out,
-                () = pump => unreachable!("the job pump never ends"),
+                () = &mut pump => unreachable!("only the body ending stops the job pump"),
+            };
+            // The pump already popped the event in hand, so dropping it here
+            // would kill that callback halfway. Stopped instead, it finishes the
+            // callback and delivers a bounded tail before the scope reaps the
+            // jobs. A cancelled or expired task skips all that, so its {out}
+            // still beats the outer `until_abandoned`.
+            stop_pump.cancel();
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {}
+                () = deadline_lapsed(&handle) => {}
+                () = pump => {}
             }
+            out
         })
-        .await;
-    // `select!` drops the pump the moment {fut} wins, so one last pass under the
-    // same scope delivers whatever arrived in between; the scope teardown
-    // right after reaps any task job. Only a callback caught mid-suspend at
-    // that instant is lost, never a whole event: `deliver_pending` leaves
-    // events in the channel until the delivery that records them starts.
-    scope
-        .scope_future(deliver_pending(lua, FINAL_DRAIN_BUDGET, || {
-            with_jobs(lua, |store| store.next_event(&owner))
-        }))
         .await;
     drop(scope);
     out
@@ -6148,9 +6164,9 @@ mod tests {
     use futures::FutureExt;
     use maki_agent::cancel::CancelTrigger;
     use std::future::poll_fn;
-    use std::pin::pin;
     use std::task::{Context, Poll, Wake, Waker};
     use test_case::test_case;
+    use tokio::sync::Notify;
 
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -7816,6 +7832,131 @@ mod tests {
             .recv_timeout(WATCHDOG_TEST_TIMEOUT)
             .expect("dispatch_async stayed parked");
         assert_eq!(result, expected);
+    }
+
+    const MID_WAIT_DELAY: Duration = Duration::from_millis(10);
+    const ALREADY_LAPSED_BY: Duration = Duration::from_secs(1);
+    const PARKED_DELIVERY_JOB: &str = "echo a; echo b";
+    const CHATTY_JOB: &str = "while :; do echo x; done";
+
+    /// Parks only the first delivery, so the later ones queue up behind it.
+    #[derive(Default)]
+    struct ParkOnce {
+        parked: AtomicBool,
+        entered: Notify,
+        release: Notify,
+        finished: AtomicBool,
+    }
+
+    #[test]
+    fn run_scoped_with_no_callback_in_hand_returns_on_the_first_poll() {
+        HOST_RUNTIME.block_on(async {
+            let lua = Lua::new();
+            let scope = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
+            assert!(run_scoped(&lua, scope, async {}).now_or_never().is_some());
+        });
+    }
+
+    enum BodyEnd {
+        ReleasingCallback,
+        Cancelled,
+        PastDeadline,
+    }
+
+    // The deadline lapses before the wait, never during it: the outer
+    // `until_abandoned` reads the clock right after the inner wait does, so a
+    // lapse between the two reads would turn the result into a timeout.
+    #[test_case(BodyEnd::ReleasingCallback, true ; "callback_finishes")]
+    #[test_case(BodyEnd::Cancelled, false ; "cancel_cuts_the_callback")]
+    #[test_case(BodyEnd::PastDeadline, false ; "deadline_cuts_the_callback")]
+    fn finished_body_keeps_its_result_over_a_callback_in_hand(
+        end: BodyEnd,
+        expected_finished: bool,
+    ) {
+        let (trigger, token) = CancelToken::new();
+        let mut trigger = Some(trigger);
+        let lua = Lua::new();
+        let park = Arc::new(ParkOnce::default());
+        let callback = lua
+            .create_async_function({
+                let park = Arc::clone(&park);
+                move |_, _: MultiValue| {
+                    let park = Arc::clone(&park);
+                    async move {
+                        if !park.parked.swap(true, Ordering::Relaxed) {
+                            park.entered.notify_one();
+                            park.release.notified().await;
+                            park.finished.store(true, Ordering::Relaxed);
+                        }
+                        Ok(())
+                    }
+                }
+            })
+            .unwrap();
+        let body = async {
+            let handle = try_active_task(&lua).unwrap();
+            let owner = JobOwner::Task(lock_cell(&handle).id);
+            let mut spec = JobSpec::new(owner, PARKED_DELIVERY_JOB);
+            spec.on_stdout = Some(lua.create_registry_value(callback.clone()).unwrap());
+            spec.on_exit = Some(lua.create_registry_value(callback).unwrap());
+            with_jobs(&lua, |store| store.start(spec)).unwrap();
+            park.entered.notified().await;
+            match end {
+                BodyEnd::ReleasingCallback => park.release.notify_one(),
+                BodyEnd::Cancelled => {
+                    let (trigger, park) = (trigger.take().unwrap(), Arc::clone(&park));
+                    HOST_RUNTIME.spawn(async move {
+                        sleep(MID_WAIT_DELAY).await;
+                        trigger.cancel();
+                        park.release.notify_one();
+                    });
+                }
+                BodyEnd::PastDeadline => {
+                    let expired = Instant::now() - ALREADY_LAPSED_BY;
+                    lock_cell(&handle).deadline.set(Some(expired));
+                    park.release.notify_one();
+                }
+            }
+        };
+        let result = HOST_RUNTIME
+            .block_on(async {
+                timeout(
+                    WATCHDOG_TEST_TIMEOUT,
+                    run_abandonable(&lua, token, None, body),
+                )
+                .await
+            })
+            .expect("run_scoped never returned");
+        assert_eq!(result, Ok(()));
+        assert_eq!(park.finished.load(Ordering::Relaxed), expected_finished);
+    }
+
+    #[test]
+    fn chatty_job_does_not_hold_back_a_finished_body() {
+        let lua = Lua::new();
+        let entered = Arc::new(Notify::new());
+        let callback = lua
+            .create_async_function({
+                let entered = Arc::clone(&entered);
+                move |_, _: MultiValue| {
+                    let entered = Arc::clone(&entered);
+                    async move {
+                        entered.notify_one();
+                        Ok(())
+                    }
+                }
+            })
+            .unwrap();
+        let body = async {
+            let handle = try_active_task(&lua).unwrap();
+            let mut spec = JobSpec::new(JobOwner::Task(lock_cell(&handle).id), CHATTY_JOB);
+            spec.on_stdout = Some(lua.create_registry_value(callback).unwrap());
+            with_jobs(&lua, |store| store.start(spec)).unwrap();
+            entered.notified().await;
+        };
+        HOST_RUNTIME
+            .block_on(async { timeout(WATCHDOG_TEST_TIMEOUT, run_detached(&lua, body)).await })
+            .expect("run_scoped never returned");
     }
 
     const PARTIAL_REPLY_OUTPUT: &str = "partial output";
