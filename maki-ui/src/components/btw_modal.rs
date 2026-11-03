@@ -26,6 +26,7 @@ const MAX_HEIGHT_PERCENT: u16 = 80;
 const CLICK_EXPANDED: bool = false;
 const CLICKABLE: bool = false;
 
+#[derive(Debug, PartialEq)]
 pub enum BtwEvent {
     TextDelta(String),
     ThinkingDelta(String),
