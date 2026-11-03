@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
-use maki_config::providers::{ProviderDef, ProvidersConfig};
+use maki_config::providers::{ProviderDef, ProvidersConfig, Protocol};
 use maki_lua::{PluginHost, PluginPermissions};
 use maki_providers::model::{Model, ModelTier};
 use maki_providers::provider::{Provider, provider_for_slug};
@@ -574,6 +574,109 @@ fn the_responses_codec_applies_the_body_hook_too() {
     let sent = server.lock().unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].json()["acme_marker"], json!(RESPONSES_MARKER));
+}
+
+/// A user-set `protocol` in providers.toml overrides the declared codec,
+/// and the resolved protocol reaches `build_body` as `body.protocol`.
+#[test]
+fn configured_protocol_overrides_declared_codec_and_reaches_build_body() {
+    let _state = isolated_state();
+    let (base_url, server) = serve(CHAT_SCRIPT);
+
+    // Register first while the slug is unconfigured, then add `protocol`
+    // to providers.toml so create() resolves it at build time.
+    let config = ProvidersConfig::default();
+    config.save().unwrap();
+
+    let host = plugin_host();
+    let source = format!(
+        r#"
+maki.provider.register({{
+  slug = "{SLUG}", display_name = "{DISPLAY_NAME}", codec = "openai",
+  base_url = "{base_url}",
+  models = {{ {{ prefixes = {{ "{MODEL}" }} }} }},
+  build_body = function(_, body, _model, opts)
+    body.acme_protocol_seen = opts.protocol
+    return body
+  end,
+}})
+"#
+    );
+    load_inline(&host, &source, LOOPBACK_HOST);
+    plugin::commit_load();
+
+    // Now set the configured protocol; create() reads it and overrides the
+    // declared codec.
+    let mut config = ProvidersConfig::load_or_default();
+    config.providers.insert(
+        SLUG.into(),
+        ProviderDef {
+            protocol: Some(Protocol::OpenaiResponses),
+            ..ProviderDef::default()
+        },
+    );
+    config.save().unwrap();
+
+    let provider = plugin::create(SLUG, Timeouts::default()).expect(CREATE_FAILED);
+    let model = Model::from_spec(&format!("{SLUG}/{MODEL}")).expect(UNKNOWN_MODEL);
+
+    let (_, result) = stream(provider.as_ref(), &model, ThinkingConfig::Off);
+    result.expect(STREAM_FAILED);
+
+    let sent = server.lock().unwrap();
+    assert_eq!(
+        sent[0].json()["acme_protocol_seen"],
+        json!("openai-responses")
+    );
+}
+
+/// `maki.provider.protocol(slug)` returns the wire configured in
+/// providers.toml, or nil when nothing is configured.
+#[test]
+fn maki_provider_protocol_returns_configured_wire() {
+    let state = isolated_state();
+
+    let mut config = ProvidersConfig::default();
+    config.providers.insert(
+        SLUG.into(),
+        ProviderDef {
+            protocol: Some(Protocol::OpenaiResponses),
+            ..ProviderDef::default()
+        },
+    );
+    config.save().unwrap();
+
+    let protocol_path = state.path().join("protocol.txt");
+    let other_path = state.path().join("other.txt");
+    let none_path = state.path().join("none.txt");
+
+    let host = plugin_host();
+    let source = format!(
+        r#"
+local proto = maki.provider.protocol({SLUG:?})
+maki.fs.write("{protocol_path}", proto or "nil")
+
+local other = maki.provider.protocol("not-configured")
+maki.fs.write("{other_path}", other or "nil")
+
+local none = maki.provider.protocol("does-not-exist")
+maki.fs.write("{none_path}", none or "nil")
+"#,
+        protocol_path = protocol_path.display(),
+        other_path = other_path.display(),
+        none_path = none_path.display(),
+    );
+    load_inline(&host, &source, LOOPBACK_HOST);
+    plugin::commit_load();
+
+    let protocol = std::fs::read_to_string(&protocol_path).expect("protocol file");
+    assert_eq!(protocol, "openai-responses");
+
+    let other = std::fs::read_to_string(&other_path).expect("other file");
+    assert_eq!(other, "nil");
+
+    let none = std::fs::read_to_string(&none_path).expect("none file");
+    assert_eq!(none, "nil");
 }
 
 /// One provider whose `login` runs `body`. The registration is the same every

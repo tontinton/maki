@@ -77,6 +77,9 @@ pub enum AuthPurpose {
 pub struct BodyInput {
     pub body: Value,
     pub model: String,
+    /// The wire the request will use, resolved from config or the declared
+    /// codec. Lets build_body hooks branch on the active protocol.
+    pub protocol: Protocol,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
     /// The [`ModelInfo::extra`] this slug's `list_models` attached to the
@@ -1120,6 +1123,7 @@ impl BodyHook for BodyAdapter {
         self.0.call(BodyInput {
             body,
             model: ctx.model.id.clone(),
+            protocol: ctx.protocol,
             thinking: ctx
                 .opts
                 .thinking

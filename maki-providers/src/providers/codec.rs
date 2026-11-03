@@ -126,6 +126,9 @@ pub struct RequestCtx<'a> {
     pub model: &'a Model,
     pub opts: RequestOptions,
     pub session: Option<&'a SessionRef>,
+    /// The wire the request will use, resolved from config or the declared
+    /// codec. Lets build_body hooks branch on the active protocol.
+    pub protocol: Protocol,
     /// What discovery reported for this model under this slug, looked up once
     /// here rather than by each pass that needs it.
     pub discovered: Option<ModelInfo>,
@@ -495,6 +498,7 @@ impl Provider for CompatProvider {
                 model,
                 opts,
                 session: session_id,
+                protocol: self.protocol,
                 discovered: model_registry::discovered(&self.compat.config().slug, &model.id),
             };
 
@@ -658,7 +662,7 @@ mod tests {
         Model::from_spec(MODEL_SPEC).unwrap()
     }
 
-    fn ctx(model: &Model, thinking: ThinkingConfig) -> RequestCtx<'_> {
+    fn ctx(model: &Model, thinking: ThinkingConfig, protocol: Protocol) -> RequestCtx<'_> {
         RequestCtx {
             model,
             opts: RequestOptions {
@@ -666,6 +670,7 @@ mod tests {
                 ..RequestOptions::default()
             },
             session: None,
+            protocol,
             discovered: None,
         }
     }
@@ -736,7 +741,7 @@ mod tests {
         let session = SessionRef::generate();
         let ctx = RequestCtx {
             session: Some(&session),
-            ..ctx(&model, ThinkingConfig::Effort(Effort::High))
+            ..ctx(&model, ThinkingConfig::Effort(Effort::High), Protocol::Openai)
         };
         let mut body = json!({ "model": model.id });
 
@@ -766,7 +771,7 @@ mod tests {
 
         wire.apply_body(
             &mut body,
-            &ctx(&model, ThinkingConfig::Effort(Effort::High)),
+            &ctx(&model, ThinkingConfig::Effort(Effort::High), Protocol::Openai),
         );
 
         assert_eq!(body.get(DEFAULT_EFFORT_FIELD).is_some(), sent, "{body}");
@@ -790,7 +795,7 @@ mod tests {
                 }),
                 ..ModelInfo::id_only(model.id.clone())
             }),
-            ..ctx(&model, ThinkingConfig::Effort(Effort::Max))
+            ..ctx(&model, ThinkingConfig::Effort(Effort::Max), Protocol::Openai)
         };
         let mut body = json!({});
 

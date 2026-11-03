@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use maki_agent::cancel::CancelToken;
-use maki_config::providers::ProvidersConfig;
+use maki_config::providers::{Protocol, ProvidersConfig};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::AgentError;
 use maki_providers::plugin::{
@@ -621,6 +621,26 @@ fn is_selected(_lua: &Lua, #[ctx] plugin: Arc<str>, slug: String) -> LuaResult<b
         .is_some_and(|def| def.plugin.as_deref() == Some(plugin.as_ref())))
 }
 
+/// The wire a provider speaks, resolved from providers.toml or its declared
+/// codec. A plugin can use this to branch its hooks on the active protocol.
+///
+/// Returns `"openai"`, `"openai-responses"`, `"anthropic"` or `"google"`,
+/// or nil when the provider is unknown.
+///
+/// @param slug string Provider name.
+/// @return string?
+#[lua_fn]
+fn protocol(_lua: &Lua, slug: String) -> LuaResult<Option<String>> {
+    Ok(ProvidersConfig::load_or_default()
+        .get(&slug)
+        .and_then(|def| def.protocol.map(|p| match p {
+            Protocol::Openai => "openai".to_string(),
+            Protocol::OpenaiResponses => "openai-responses".to_string(),
+            Protocol::Anthropic => "anthropic".to_string(),
+            Protocol::Google => "google".to_string(),
+        })))
+}
+
 /// Register a provider this plugin implements. Its models are addressed as
 /// `<slug>/<model>` and appear in the model picker and in `/model`.
 ///
@@ -1046,6 +1066,7 @@ lua_table! {
     "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, plugin: Arc<str>, egress: NetEgress, authority: DeclAuthority, reads_env: bool), DOCS [
         register(perms, plugin, egress, authority, reads_env),
         is_selected(plugin),
+        protocol,
         http_error,
     ]
 }
