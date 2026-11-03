@@ -103,8 +103,10 @@ fn marker(lines: usize, bytes: usize) -> String {
 fn large_output_command(single_line: bool) -> String {
     let newline = if single_line { "" } else { "\\n" };
     let chunk_bytes = CHUNK_BYTES - usize::from(!single_line);
+    // A huge sprintf width like `%065536d` segfaults mawk, so grow the chunk
+    // by doubling and trim it to size. Same bytes, any awk.
     format!(
-        "awk 'BEGIN {{ chunk = sprintf(\"%0{chunk_bytes}d\", 0); for (i = 0; i < {CHUNK_COUNT}; i++) printf \"%s{newline}\", chunk; printf \"%s\", \"{FINAL_MARKER}\" }}'"
+        "awk 'BEGIN {{ chunk = \"0\"; while (length(chunk) < {chunk_bytes}) chunk = chunk chunk; chunk = substr(chunk, 1, {chunk_bytes}); for (i = 0; i < {CHUNK_COUNT}; i++) printf \"%s{newline}\", chunk; printf \"%s\", \"{FINAL_MARKER}\" }}'"
     )
 }
 

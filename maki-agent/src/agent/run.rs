@@ -354,9 +354,10 @@ impl<'h> Agent<'h> {
                 Err(AgentError::Cancelled) => return self.finish(Err(AgentError::Cancelled)),
                 kept => kept?,
             };
-            // A burst dropped whole sends nothing, so it must not rebuild the
-            // frame either. The next run sees the same change.
-            if kept.is_some() && prompt.is_none() {
+            // A burst dropped whole or a run already cancelled sends nothing,
+            // so it must not rebuild the frame either. The next run sees the
+            // same change.
+            if kept.is_some() && prompt.is_none() && !self.cancel.is_cancelled() {
                 self.refresh_frame()?;
             }
             let kept = kept.map(|text| {
@@ -1114,7 +1115,9 @@ impl<'h> Agent<'h> {
 
     async fn try_auto_compact(&mut self) -> Result<(), AgentError> {
         let context_size = self.gauge.size();
-        if !self.auto_compact || !compaction::is_overflow(context_size, &self.model, &self.config) {
+        if !self.auto_compact
+            || !compaction::is_overflow(u64::from(context_size), &self.model, &self.config)
+        {
             return Ok(());
         }
         info!(context_size, "auto-compacting");
@@ -2490,7 +2493,7 @@ mod tests {
     async fn same_model_refresh_updates_auto_compaction(
         initial_window: u32,
         discovered_window: u32,
-        context_size: u32,
+        context_size: u64,
         expected_compaction: bool,
     ) {
         let mut h = Harness::new(Vec::new());
@@ -2803,6 +2806,34 @@ mod tests {
             &e.event,
             AgentEvent::Notice { text } if text == FRAME_REBUILT
         )));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_leaves_the_frame_to_the_next_one() {
+        let rebuilt = |events: &[Envelope]| {
+            events.iter().any(|e| {
+                matches!(
+                    &e.event,
+                    AgentEvent::Notice { text } if text == FRAME_REBUILT
+                )
+            })
+        };
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build).await;
+        let first_frame = h.history.frame().cloned();
+        *h.world.tool.lock().unwrap() = "reloaded";
+
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+        let (reason, events) = h
+            .run(default_input(), Vec::new(), |agent| agent.cancel = cancel)
+            .await;
+        assert_eq!(reason, DoneReason::Cancelled);
+        assert!(!rebuilt(&events));
+        assert_eq!(h.history.frame().cloned(), first_frame);
+
+        assert!(rebuilt(&h.run_in(AgentMode::Build).await));
+        assert_ne!(h.history.frame().cloned(), first_frame);
     }
 
     /// Swapping maki's prompt for one the host wrote, or back, rebuilds the
@@ -3263,7 +3294,7 @@ mod tests {
         };
         let big_turn = StreamResponse {
             usage: TokenUsage {
-                input: TINY_CONTEXT_WINDOW * 10,
+                input: u64::from(TINY_CONTEXT_WINDOW) * 10,
                 ..Default::default()
             },
             ..tool_call_response("glob", "t1")
@@ -3417,7 +3448,7 @@ mod tests {
             cache_creation: 50,
             ..Default::default()
         };
-        let expected = response.usage.total_input();
+        let expected = response.usage.total_input() as u32;
         let mut history = History::new(vec![Message::user("go".into())]);
         let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
         agent.run(default_input()).await.unwrap();
@@ -3715,7 +3746,7 @@ mod tests {
         let mut history = History::new(Vec::new());
         let filling = StreamResponse {
             usage: TokenUsage {
-                input: TINY_CONTEXT_WINDOW,
+                input: u64::from(TINY_CONTEXT_WINDOW),
                 ..Default::default()
             },
             ..text_response(StopReason::EndTurn)

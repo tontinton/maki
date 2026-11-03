@@ -11,6 +11,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
+use crate::providers::managed_auth::OAuthFlow;
 use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
 use crate::providers::{ResolvedAuth, client_builder, status_and_text, urlenc};
 
@@ -241,6 +242,14 @@ fn into_oauth_tokens(resp: TokenResponse) -> OAuthTokens {
     }
 }
 
+pub(crate) static OAUTH_FLOW: OAuthFlow = OAuthFlow {
+    provider: PROVIDER,
+    refresh_tokens: |tokens| Box::pin(refresh_tokens(tokens)),
+    build_resolved: build_oauth_resolved,
+    resolve,
+    on_dead_tokens: || {},
+};
+
 pub(crate) async fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
     let expired = tokens.is_expired();
     debug!(expired, "refreshing OpenAI OAuth tokens");
@@ -284,10 +293,6 @@ pub(crate) fn build_coding_plan_resolved(tokens: &OAuthTokens) -> Result<Resolve
         headers.push(("chatgpt-account-id".into(), account_id.clone()));
     }
     Ok(ResolvedAuth::new(PROVIDER, headers)?.with_base_url(Some(CODING_PLAN_BASE_URL.into())))
-}
-
-pub(crate) fn is_oauth(dir: &StateDir) -> bool {
-    load_tokens(dir, PROVIDER).is_some()
 }
 
 pub fn resolve(dir: &StateDir) -> Result<(ResolvedAuth, Option<OAuthTokens>), AgentError> {

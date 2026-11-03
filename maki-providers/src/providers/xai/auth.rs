@@ -12,6 +12,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
+use crate::providers::managed_auth::OAuthFlow;
 use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
 use crate::providers::{
     KeyPool, ResolvedAuth, UNAUTHORIZED_STATUS, client_builder, status_and_text, urlenc,
@@ -145,6 +146,14 @@ fn into_oauth_tokens(
     })
 }
 
+pub(crate) static OAUTH_FLOW: OAuthFlow = OAuthFlow {
+    provider: PROVIDER,
+    refresh_tokens: |tokens| Box::pin(refresh_tokens(tokens)),
+    build_resolved: build_oauth_resolved,
+    resolve,
+    on_dead_tokens: catalog::invalidate,
+};
+
 pub(crate) async fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
     if tokens.refresh.is_empty() {
         return Err(AgentError::api(
@@ -195,10 +204,6 @@ fn client_mode() -> &'static str {
 pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> Result<ResolvedAuth, AgentError> {
     Ok(ResolvedAuth::new(PROVIDER, oauth_headers(&tokens.access))?
         .with_base_url(Some(CLI_BASE_URL.into())))
-}
-
-pub(crate) fn is_oauth(dir: &StateDir) -> bool {
-    load_tokens(dir, PROVIDER).is_some()
 }
 
 pub fn resolve(dir: &StateDir) -> Result<(ResolvedAuth, Option<OAuthTokens>), AgentError> {

@@ -232,7 +232,7 @@ mod tests {
     const CURRENT: &str = "current";
     const INPUT_RATE: f64 = 3.0;
     const UNPRICED: f64 = 0.0;
-    const ONE_MILLION: u32 = 1_000_000;
+    const ONE_MILLION: u64 = 1_000_000;
     /// [`ONE_MILLION`] input tokens at [`INPUT_RATE`].
     const LIST_PRICE: f64 = 3.0;
     const RECORDED: f64 = 0.5;
@@ -391,7 +391,7 @@ mod tests {
     ) {
         let current = model(CURRENT, input_rate);
         let mut by_model = breakdown(entries);
-        let counted = entries.len().max(1) as u32 * ONE_MILLION;
+        let counted = entries.len().max(1) as u64 * ONE_MILLION;
 
         // With a breakdown the stored running total says nothing about the
         // bill, so the two drifting apart (compaction, a resume) must not

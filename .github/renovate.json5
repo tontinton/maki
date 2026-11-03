@@ -34,6 +34,8 @@
       branchTopic: 'nix-lock-file-maintenance',
       commitMessageAction: 'update',
       commitMessageTopic: 'flake.lock',
+      // Only nix builds use it, and the Nix workflow builds it.
+      automerge: true,
     },
   },
   customManagers: [
@@ -101,11 +103,6 @@
       matchManagers: ['custom.regex'],
       matchDepNames: ['ruff', 'ty'],
       groupName: 'ruff and ty',
-    },
-    {
-      description: 'Pinned to a nightly until a stable release has luau-lang/lute#1234',
-      matchDepNames: ['luau-lang/lute'],
-      allowedVersions: '!/-nightly\\./',
     },
     {
       description: 'release.yml only runs on tags and no PR workflow covers it, so these wait until someone can cut a test release',

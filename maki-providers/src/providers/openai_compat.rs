@@ -533,19 +533,19 @@ struct ChunkChoice {
 #[derive(Deserialize)]
 struct PromptTokensDetails {
     #[serde(default)]
-    cached_tokens: u32,
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize)]
 struct ChunkUsage {
     #[serde(default)]
-    prompt_tokens: u32,
+    prompt_tokens: u64,
     #[serde(default)]
-    completion_tokens: u32,
+    completion_tokens: u64,
     prompt_tokens_details: Option<PromptTokensDetails>,
     /// DeepSeek reports cache hits here instead of `prompt_tokens_details`.
     #[serde(default)]
-    prompt_cache_hit_tokens: u32,
+    prompt_cache_hit_tokens: u64,
     /// What the request billed, which routers like OpenRouter attach to usage.
     #[serde(default, deserialize_with = "lenient_cost")]
     cost: Option<f64>,
@@ -596,6 +596,50 @@ impl ToolAccumulator {
             name: String::new(),
             arguments: String::new(),
         }
+    }
+}
+
+pub(crate) fn reasoning_and_text_blocks(reasoning: String, text: String) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    if !reasoning.is_empty() {
+        blocks.push(ContentBlock::Thinking {
+            thinking: reasoning,
+            signature: None,
+        });
+    }
+    if !text.is_empty() {
+        blocks.push(ContentBlock::Text { text });
+    }
+    blocks
+}
+
+pub(crate) fn parse_tool_input(tool: &str, arguments: &str) -> Value {
+    match serde_json::from_str(arguments) {
+        Ok(input) => {
+            debug!(tool = %tool, json = %arguments, "tool input JSON");
+            input
+        }
+        Err(e) => {
+            warn!(error = %e, tool = %tool, json = %arguments, "malformed tool JSON, falling back to {{}}");
+            Value::Object(Default::default())
+        }
+    }
+}
+
+pub(crate) fn assistant_response(
+    content: Vec<ContentBlock>,
+    usage: TokenUsage,
+    stop_reason: Option<StopReason>,
+) -> StreamResponse {
+    StreamResponse {
+        message: Message {
+            role: Role::Assistant,
+            content,
+            ..Default::default()
+        },
+        usage,
+        stop_reason,
+        ..Default::default()
     }
 }
 
@@ -775,30 +819,10 @@ pub async fn parse_sse(
         }
     }
 
-    let mut content_blocks: Vec<ContentBlock> = Vec::new();
-
-    if !reasoning_text.is_empty() {
-        content_blocks.push(ContentBlock::Thinking {
-            thinking: reasoning_text,
-            signature: None,
-        });
-    }
-
-    if !text.is_empty() {
-        content_blocks.push(ContentBlock::Text { text });
-    }
+    let mut content_blocks = reasoning_and_text_blocks(reasoning_text, text);
 
     for acc in tool_accumulators {
-        let input: Value = match serde_json::from_str(&acc.arguments) {
-            Ok(v) => {
-                debug!(tool = %acc.name, json = %acc.arguments, "tool input JSON");
-                v
-            }
-            Err(e) => {
-                warn!(error = %e, tool = %acc.name, json = %acc.arguments, "malformed tool JSON, falling back to {{}}");
-                Value::Object(Default::default())
-            }
-        };
+        let input = parse_tool_input(&acc.name, &acc.arguments);
         let name = if acc.name.is_empty() {
             warn!(id = %acc.id, raw_args = %acc.arguments, "provider sent empty tool_use name; substituting placeholder");
             "maki_unknown_tool".to_owned()
@@ -808,16 +832,7 @@ pub async fn parse_sse(
         content_blocks.push(ContentBlock::tool_use(acc.id, name, input));
     }
 
-    Ok(StreamResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: content_blocks,
-            ..Default::default()
-        },
-        usage,
-        stop_reason,
-        ..Default::default()
-    })
+    Ok(assistant_response(content_blocks, usage, stop_reason))
 }
 
 #[cfg(test)]

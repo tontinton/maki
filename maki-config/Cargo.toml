@@ -2,6 +2,7 @@
 name = "maki-config"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [features]
 # Keeps `ProjectConfig::for_project` out of the production API. Only

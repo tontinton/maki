@@ -2556,8 +2556,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
     with the current call. `"plugin"` keeps it alive until the plugin
     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
     session ends, and survives plugin reload.
-  - `tail` (`integer?`) trailing lines per stream kept for `jobinfo`
-    (default 20, 0 disables, max 1024).
+  - `tail` (`integer?`) trailing lines per stream kept for `jobinfo` and
+    `jobwait` (default 20, 0 disables, max 1024).
   - `max_line_bytes` (`integer?`) longest line delivered, in bytes. A longer
     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
     skipped without being read into memory (default and `0`: 64 MiB, the
@@ -2636,12 +2636,12 @@ maki.fn.jobwait({job_id}, {timeout_ms?})
 ```
 
 Wait for a job to finish and collect its output. Returns a result
-table with `stdout`, `stderr`, `exit_code`, and `truncated`. A job that
-already exited answers from its captured tail, so `truncated` says
-whether that tail ever lost a line (`tail` too small or 0, or the stream
-redirected away). Waiting on a live job collects every line and is never
-truncated. Neither counts lines cut by `max_line_bytes`: those still
-arrive, ending in `...`.
+table with `stdout`, `stderr`, `exit_code`, and `truncated`. The output
+starts from the job's captured tail, which holds what was delivered before
+the wait, and a live job adds every line from then on. `truncated` says
+whether that tail had already lost a line by then (`tail` too small or 0,
+or the stream redirected away). It doesn't count lines cut by
+`max_line_bytes`: those still arrive, ending in `...`.
 
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream

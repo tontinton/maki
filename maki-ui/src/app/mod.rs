@@ -2501,8 +2501,9 @@ impl App {
         self.state.session_mut().add_model_usage(model, usage);
     }
 
-    /// Run-scoped delivery for the tab's own agent: restore snapshots fan out
-    /// to every chat, stale runs are dropped, the rest goes to [`Self::deliver`].
+    /// Run-scoped delivery for the tab's own agent: restore snapshots go to
+    /// the chats that have the tool, stale runs are dropped, the rest goes to
+    /// [`Self::deliver`].
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
@@ -2518,12 +2519,17 @@ impl App {
                 } => (id, snapshot, theme_gen, true),
                 _ => return vec![],
             };
-            for chat in &mut self.chats {
+            let mut delivered = false;
+            for chat in self.chats.iter_mut().filter(|chat| chat.has_tool(&id)) {
+                delivered = true;
                 if is_header {
                     chat.tool_header_snapshot(&id, snapshot.clone(), theme_gen);
                 } else {
                     chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
                 }
+            }
+            if !delivered {
+                tracing::debug!(tool_id = %id, "restore snapshot dropped: no chat has this tool");
             }
             return vec![];
         }
@@ -2718,7 +2724,9 @@ impl App {
                 tc.usage
                     .billed_with_subsidised_list_cost(tc.cost, tc.subsidised_list_cost),
             );
-            let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
+            let ctx_size = tc
+                .context_size
+                .unwrap_or_else(|| tc.usage.context_tokens().min(u32::MAX as u64) as u32);
             self.set_context_size(chat_idx, ctx_size);
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {
