@@ -5,6 +5,8 @@ use mlua::Lua;
 
 use crate::plugin_permissions::PluginPermissions;
 
+pub(crate) struct TrustedProjectDirs(pub Vec<PathBuf>);
+
 fn utf8(p: PathBuf) -> Option<String> {
     p.into_os_string().into_string().ok()
 }
@@ -51,6 +53,24 @@ fn legacy_dir(_lua: &Lua) -> mlua::Result<Option<String>> {
     Ok(maki_storage::paths::legacy_home_dir().and_then(utf8))
 }
 
+/// Return canonical directories from the working directory to the project root,
+/// nearest first. Empty when project content is disabled, including an
+/// unconfigured host. Session-only trust grants are included.
+///
+/// @return (string[]) Trusted project directories.
+#[lua_fn(guard = FsRead)]
+fn project_dirs(lua: &Lua) -> mlua::Result<Vec<String>> {
+    Ok(lua
+        .app_data_ref::<TrustedProjectDirs>()
+        .map(|dirs| {
+            dirs.0
+                .iter()
+                .filter_map(|path| path.to_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 lua_table! {
     /// Paths to maki's own directories (config, state, logs, legacy).
     ///
@@ -65,6 +85,6 @@ lua_table! {
     /// local cfg = maki.env.config_dir()
     /// ```
     "maki.env" => pub(crate) fn create_env_table(perms: &PluginPermissions), DOCS [
-        state_dir(perms), config_dir(perms), logs_dir(perms), legacy_dir(perms),
+        state_dir(perms), config_dir(perms), logs_dir(perms), legacy_dir(perms), project_dirs(perms),
     ]
 }

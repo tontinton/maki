@@ -16,6 +16,7 @@ anything. Maki loads none of it until you trust the folder.
 | `.maki/permissions.toml` | decides which tools run without asking |
 | `.maki/init.lua` | runs Lua inside Maki's own process at startup |
 | `.maki/mcp.toml` | starts MCP servers as child processes |
+| `project skills` | adds agent instructions from project skill directories |
 
 The first interactive start in an untrusted project draws a card before the
 main UI opens, listing the gated files it found. It takes three answers:
@@ -37,13 +38,14 @@ your global configuration.
 
 ## What Trust Does Not Cover
 
-Trust gates code. Text that a project puts into the prompt loads at any trust
-level:
+Project skills under `.maki/skills`, `.claude/skills`, `.opencode/skills`,
+and `.agents/skills` require folder trust. All these locations share the same
+gate. Personal and builtin skills remain available without project trust.
+
+These project instructions load at any trust level:
 
 - `AGENTS.md` and the other instruction files
 - Commands under `.maki/commands` and `.claude/commands`
-- Skills under `.maki/skills`, `.claude/skills`, `.opencode/skills` and
-  `.agents/skills`
 
 A repository can still steer the agent through what the model reads, so trust
 is not a sandbox. What limits the agent on each tool call is

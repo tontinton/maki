@@ -56,6 +56,7 @@ declare maki: {
     config_dir: @checked () -> (string?),
     logs_dir: @checked () -> (string?),
     legacy_dir: @checked () -> (string?),
+    project_dirs: @checked () -> (any),
   },
   fn: {
     jobstart: @checked (cmd: any, opts: any) -> (number?, string?),

@@ -36,6 +36,7 @@ Type `/` in the input box to open the command palette.
 | `/memory` | View, edit, and delete memory files |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
+| `/skill` | Load a skill: /skill name [request] |
 | `/tasks` | Browse and search tasks |
 | `/thinking` | Extended thinking: pick an effort level, or set one directly |
 
@@ -121,6 +122,7 @@ Aliasing adds a name, so both stay in the palette. Any command works as a target
 
 - Needs `fs_read`, `fs_write`: `/memory`.
 - Needs `fs_read`, `fs_write`, `net`, `run`, `env`, `agent`, `session_read`, `session_write`, `session_settings`: `/tasks`.
+- Needs `fs_read`, `fs_write`, `net`, `run`, `env`, `agent`, `session_read`, `session_write`, `session_settings`, `input`: `/skill`.
 - Needs `agent`: `/btw`.
 - Needs `agent`, `session_write`: `/compact`, custom commands, MCP prompts.
 - Needs `session_write`: `/new`, `/fork`.

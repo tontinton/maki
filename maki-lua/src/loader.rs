@@ -514,6 +514,16 @@ impl PluginHost {
         Ok(())
     }
 
+    /// Share the existing folder-trust decision with plugins before loading them.
+    pub fn set_project_config(&self, project: &ProjectConfig) -> Result<(), PluginError> {
+        self.inner
+            .tx
+            .send(Request::SetProjectDirs {
+                dirs: project.project_dirs().to_vec(),
+            })
+            .map_err(|_| PluginError::HostDead)
+    }
+
     pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
         let result = self.send_builtin_loads(config);
         // Armed even when a load failed, so a caller that only warns about the
@@ -3119,6 +3129,8 @@ mod bundled_manifests {
     const TEST_DIR: &str = "tests";
     const LUA_EXT: &str = "lua";
     const REQUIRE_CALL: &str = "require(";
+    const SET_SLOT_CALL: &str = "maki.api.set_slot(";
+    const AGENT_SLOT_PREFIX: &str = "agent.";
     const PROVIDER_REGISTER: &str = "maki.provider.register";
     const API_KEY_ENV_FIELD: &str = "api_key_env";
     const AGENT_SESSION: &str = "maki.agent.session";
@@ -3190,9 +3202,9 @@ mod bundled_manifests {
         }
     }
 
-    fn required_module_names(source: &'static str) -> impl Iterator<Item = &'static str> {
-        source.match_indices(REQUIRE_CALL).filter_map(|(start, _)| {
-            let rest = &source[start + REQUIRE_CALL.len()..];
+    fn literal_call_arguments<'a>(source: &'a str, call: &'a str) -> impl Iterator<Item = &'a str> {
+        source.match_indices(call).filter_map(move |(start, _)| {
+            let rest = source[start + call.len()..].trim_start();
             let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
             let name = &rest[quote.len_utf8()..];
             name.find(quote).map(|end| &name[..end])
@@ -3213,7 +3225,7 @@ mod bundled_manifests {
         let mut next = 0;
         while let Some(source) = sources.get(next).copied() {
             next += 1;
-            let reached: Vec<&'static str> = required_module_names(source)
+            let reached: Vec<&'static str> = literal_call_arguments(source, REQUIRE_CALL)
                 .filter(|modname| seen.insert(*modname))
                 .filter_map(|modname| {
                     lib_dir().get_file(format!("{}.{LUA_EXT}", modname.replace('.', "/")))
@@ -3256,6 +3268,17 @@ mod bundled_manifests {
     #[test_case(r#"maki.ui.action("completion.accept")"#, false ; "a_plugin_action")]
     fn an_input_action_is_spotted(source: &str, spotted: bool) {
         assert_eq!(runs_an_input_action(source), spotted);
+    }
+
+    #[test_case(r#"maki.api.set_slot("agent.compact.before", handler)"#, true ; "compaction")]
+    #[test_case("maki.api.set_slot( 'agent.stop', handler)", true ; "single_quote_and_whitespace")]
+    #[test_case(r#"maki.api.set_slot("tool.bash.input", handler)"#, false ; "tool_slot_has_its_own_authority")]
+    fn agent_hook_usage_requires_full_authority(source: &str, needed: bool) {
+        assert_eq!(
+            literal_call_arguments(source, SET_SLOT_CALL)
+                .any(|slot| slot.starts_with(AGENT_SLOT_PREFIX)),
+            needed
+        );
     }
 
     fn wakes_session(source: &str) -> bool {
@@ -3324,6 +3347,15 @@ mod bundled_manifests {
                     needed
                         .entry(Permission::Env)
                         .or_insert_with(|| format!("{PROVIDER_REGISTER} with {API_KEY_ENV_FIELD}"));
+                }
+                if literal_call_arguments(source, SET_SLOT_CALL)
+                    .any(|slot| slot.starts_with(AGENT_SLOT_PREFIX))
+                {
+                    for &permission in Permission::ALL {
+                        needed
+                            .entry(permission)
+                            .or_insert_with(|| "an agent hook".to_owned());
+                    }
                 }
                 // Waking a chat is guarded only when the option is set, so
                 // it has no unconditional guard in the API metadata.
