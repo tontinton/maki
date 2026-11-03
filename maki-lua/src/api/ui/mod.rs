@@ -1733,8 +1733,8 @@ mod tests {
         assert_eq!(duration, Duration::from_millis(DURATION_MS));
     }
 
-    #[test]
-    fn transcript_positions_returns_renderer_snapshot() {
+    #[tokio::test]
+    async fn transcript_positions_returns_renderer_snapshot() {
         let lua = Lua::new();
         let (tx, rx) = flume::unbounded();
         let snapshot = serde_json::json!([{ "role": "user", "line": 1 }]);
@@ -1745,7 +1745,7 @@ mod tests {
             };
             reply_tx.send(Ok(snapshot)).unwrap();
         });
-        let (value, err) = smol::block_on(transcript_positions(lua.clone(), Some(tx))).unwrap();
+        let (value, err) = transcript_positions(lua.clone(), Some(tx)).await.unwrap();
         assert!(err.is_none());
         assert_eq!(lua_to_json(&lua, &value.unwrap()).unwrap(), expected);
         worker.join().unwrap();
