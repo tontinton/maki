@@ -5,7 +5,7 @@ use crate::theme;
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 const TITLE: &str = " Themes ";
 const MAX_VISIBLE: u16 = 15;
@@ -69,16 +69,13 @@ impl ThemePicker {
         }
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> (Rect, Option<Position>) {
         self.picker.view(frame, area)
     }
 
-    pub fn handle_paste(&mut self, text: &str) -> bool {
-        let consumed = self.picker.handle_paste(text);
-        if consumed {
-            self.apply_preview();
-        }
-        consumed
+    pub fn handle_paste(&mut self, text: &str) {
+        self.picker.handle_paste(text);
+        self.apply_preview();
     }
 
     fn apply_preview(&self) {
@@ -123,6 +120,25 @@ mod tests {
     use crate::components::keybindings::key as kb;
     use crossterm::event::KeyCode;
     use test_case::test_case;
+
+    const THEME_FILTER: &str = "ayu_light";
+    const NOT_PREVIEWED: &str = "narrowing the list has to preview a theme";
+
+    #[test_case(|p: &mut ThemePicker| {
+        for c in THEME_FILTER.chars() {
+            p.handle_key(key(KeyCode::Char(c)));
+        }
+    } ; "typed")]
+    #[test_case(|p: &mut ThemePicker| p.handle_paste(THEME_FILTER) ; "pasted")]
+    fn narrowing_the_list_previews_a_theme(filter: fn(&mut ThemePicker)) {
+        let mut p = ThemePicker::new();
+        p.open();
+        let generation_before = theme::generation();
+
+        filter(&mut p);
+
+        assert!(theme::generation() > generation_before, "{NOT_PREVIEWED}");
+    }
 
     #[test]
     fn enter_closes() {

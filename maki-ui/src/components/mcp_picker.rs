@@ -1,6 +1,6 @@
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use maki_agent::{McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader};
 
@@ -120,8 +120,8 @@ impl McpPicker {
         self.picker.is_open()
     }
 
-    pub fn handle_paste(&mut self, text: &str) -> bool {
-        self.picker.handle_paste(text)
+    pub fn handle_paste(&mut self, text: &str) {
+        self.picker.handle_paste(text);
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> McpPickerAction {
@@ -143,7 +143,7 @@ impl McpPicker {
         }
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> (Rect, Option<Position>) {
         self.picker.view(frame, area)
     }
 }

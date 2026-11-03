@@ -89,6 +89,7 @@ use maki_storage::sessions::StoredTokenUsage;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
+use strum::{EnumIter, IntoEnumIterator};
 
 pub(crate) use crate::agent::QueuedMessage;
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
@@ -195,6 +196,45 @@ pub(crate) const WRITTEN_MESSAGE: &str = "message";
 pub(crate) const TYPE_IT_YOURSELF: &str = "retype it yourself in a fresh input";
 /// A writer whose name was lost, like that of a draft read back from disk.
 pub(crate) const UNKNOWN_WRITER: &str = "a plugin";
+
+/// Who the keyboard belongs to. The first variant, in declaration order, whose
+/// state holds it answers the key, takes the paste and gets the IME caret, see
+/// [`App::keyboard_owner`]. Those used to be three hand-kept lists, and they
+/// drifted apart. So a new overlay goes in here, where it answers keys, and the
+/// compiler points at every `match` that has to place it.
+///
+/// This is not the paint order: the permission prompt is drawn under every
+/// picker and float, yet answers first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
+enum KeyboardOwner {
+    /// Drawn above everything else, so it answers keys before anything else.
+    Alert,
+    /// A tool is blocked on it and it owns the bottom panel, so with the pack
+    /// review also up it goes first. The pack review waits on nothing.
+    Permission,
+    PackReview,
+    /// Hands `<Tab>` on to the owner under it, see [`PlanFormAction::Passthrough`].
+    PlanForm,
+    Help,
+    Usage,
+    Btw,
+    /// The focused Lua window takes every key. An unfocused popup never holds
+    /// the keyboard.
+    FocusedWindow,
+    Search,
+    FilePicker,
+    Queue,
+    RewindPicker,
+    ThemePicker,
+    ModelPicker,
+    LoginPicker,
+    McpPicker,
+    /// Nothing above holds the keyboard: the chat input, or the transcript of
+    /// a tab with no input. It comes last because the command palette it
+    /// answers is drawn under every modal above. Window bindings, global
+    /// bindings and maki's built-in keys run from here.
+    Chat,
+}
 
 /// For a typed key `Swallowed` and `Handled` mean the same thing, the key is
 /// used up. A plugin's submit has to tell them apart, because a swallowed
@@ -835,11 +875,25 @@ impl App {
         self.keymap_reader.sync_mode(self.input_focused())
     }
 
+    /// Whether typed keys reach the chat input. The terminal cursor does not
+    /// follow this, it parks wherever [`Self::view`] says.
     fn input_focused(&self) -> bool {
-        self.chat_accepts_input()
-            && !self.any_overlay_open()
-            && !self.plan_form_active()
-            && !self.queue_focused()
+        self.chat_accepts_input() && self.keyboard_owner() == KeyboardOwner::Chat
+    }
+
+    fn holds_keyboard(&self, owner: KeyboardOwner) -> bool {
+        match owner {
+            KeyboardOwner::PlanForm => self.plan_form_active(),
+            KeyboardOwner::Queue => self.queue_focused(),
+            KeyboardOwner::Chat => true,
+            _ => self.overlay(owner).is_some_and(Overlay::is_open),
+        }
+    }
+
+    fn keyboard_owner(&self) -> KeyboardOwner {
+        KeyboardOwner::iter()
+            .find(|&owner| self.holds_keyboard(owner))
+            .unwrap_or(KeyboardOwner::Chat)
     }
 
     /// The panel in a subagent chat shows that subagent's inbox, which
@@ -1473,102 +1527,106 @@ impl App {
         None
     }
 
-    /// [`Self::route_text_paste`] walks the same order, so a new overlay goes
-    /// in both.
+    /// The first holder of the keyboard, in [`KeyboardOwner`] order, answers
+    /// the key. The plan form passes `<Tab>` on to the next holder. The chat
+    /// answers `<C-t>` on a ready plan, and the keys its command palette takes
+    /// when no other owner holds the keyboard. For every other key this
+    /// returns `None`, leaving it to the rest of [`Self::handle_key`].
     fn dispatch_overlay(
         &mut self,
         key: KeyEvent,
         sight: Sight,
         turn: &Turn,
     ) -> Option<Vec<Action>> {
-        // Drawn above everything else, so it answers keys before anything else.
-        if self.alert_modal.is_open() {
-            self.alert_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        // With both up the permission prompt goes first: a tool is blocked on
-        // it and it owns the bottom panel. The pack review waits on nothing.
-        // Ctrl+B passes it by, so the user hears why the parked call stays.
-        if self.permission_prompt.is_open() {
-            if key::BACKGROUND.matches(key) {
-                return Some(self.run_builtin(BuiltinAction::Background));
+        KeyboardOwner::iter().find_map(|owner| {
+            if !self.holds_keyboard(owner) {
+                return None;
             }
-            if let Some(answered) = self.permission_prompt.handle_key(key) {
-                let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
-                self.send_to_agent(answered.subagent_id.as_deref(), encoded);
-            }
-            return Some(vec![]);
-        }
+            self.dispatch_to_owner(owner, key, sight, turn)
+        })
+    }
 
-        if self.pack_review.is_open() {
-            return Some(match self.pack_review.handle_key(key) {
+    fn dispatch_to_owner(
+        &mut self,
+        owner: KeyboardOwner,
+        key: KeyEvent,
+        sight: Sight,
+        turn: &Turn,
+    ) -> Option<Vec<Action>> {
+        match owner {
+            KeyboardOwner::Alert => {
+                self.alert_modal.handle_key(key);
+                Some(vec![])
+            }
+            // Ctrl+B passes it by, so the user hears why the parked call stays.
+            KeyboardOwner::Permission => {
+                if key::BACKGROUND.matches(key) {
+                    return Some(self.run_builtin(BuiltinAction::Background));
+                }
+                if let Some(answered) = self.permission_prompt.handle_key(key) {
+                    let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
+                    self.send_to_agent(answered.subagent_id.as_deref(), encoded);
+                }
+                Some(vec![])
+            }
+            KeyboardOwner::PackReview => Some(match self.pack_review.handle_key(key) {
                 Some(PackReviewAction::Accept(plan)) => self.quit_with(ExitRequest::Pack(plan)),
                 Some(PackReviewAction::Decline) => {
                     self.flash(PACK_CHANGES_DECLINED.to_owned());
                     Vec::new()
                 }
                 None => Vec::new(),
-            });
-        }
-
-        // plan_form is non-modal: Passthrough falls through to the rest of dispatch
-        if self.plan_form_active() {
-            let action = self.plan_form.handle_key(key);
-            if action != PlanFormAction::Passthrough {
-                return Some(self.handle_plan_form_action(action));
+            }),
+            KeyboardOwner::PlanForm => match self.plan_form.handle_key(key) {
+                PlanFormAction::Passthrough => None,
+                action => Some(self.handle_plan_form_action(action)),
+            },
+            KeyboardOwner::Help => {
+                self.help_modal.handle_key(key);
+                Some(vec![])
             }
-        }
-
-        if self.help_modal.is_open() {
-            self.help_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        if self.usage_modal.is_open() {
-            if key::REFRESH.matches(key) {
-                return Some(vec![Action::RefreshUsage]);
+            KeyboardOwner::Usage => {
+                if key::REFRESH.matches(key) {
+                    return Some(vec![Action::RefreshUsage]);
+                }
+                self.usage_modal.handle_key(key);
+                Some(vec![])
             }
-            self.usage_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        if self.btw_modal.is_open() {
-            self.btw_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        // Step 2 of `handle_key`, among the overlays, see there for why.
-        if self.dispatch_focused_window(&Pressed::Key(key, sight), turn) {
-            return Some(vec![]);
-        }
-
-        if self.search_modal.is_open() {
-            match self.search_modal.handle_key(key) {
-                SearchAction::Consumed => self.refresh_search_matches(),
-                SearchAction::Navigate => {
-                    sync_search_highlight(&self.search_modal, &mut self.chats[self.active_chat]);
-                }
-                SearchAction::Select(idx) => {
-                    let chat = &mut self.chats[self.active_chat];
-                    chat.scroll_to_segment(idx);
-                    chat.set_highlight_segment(None);
-                    self.search_modal.close();
-                }
-                SearchAction::Close(saved) => {
-                    let chat = &mut self.chats[self.active_chat];
-                    chat.set_highlight_segment(None);
-                    if let Some((pos, auto)) = saved {
-                        chat.restore_scroll(pos, auto);
+            KeyboardOwner::Btw => {
+                self.btw_modal.handle_key(key);
+                Some(vec![])
+            }
+            KeyboardOwner::FocusedWindow => {
+                self.dispatch_focused_window(&Pressed::Key(key, sight), turn);
+                Some(vec![])
+            }
+            KeyboardOwner::Search => {
+                match self.search_modal.handle_key(key) {
+                    SearchAction::Consumed => self.refresh_search_matches(),
+                    SearchAction::Navigate => {
+                        sync_search_highlight(
+                            &self.search_modal,
+                            &mut self.chats[self.active_chat],
+                        );
                     }
-                    self.search_modal.close();
+                    SearchAction::Select(idx) => {
+                        let chat = &mut self.chats[self.active_chat];
+                        chat.scroll_to_segment(idx);
+                        chat.set_highlight_segment(None);
+                        self.search_modal.close();
+                    }
+                    SearchAction::Close(saved) => {
+                        let chat = &mut self.chats[self.active_chat];
+                        chat.set_highlight_segment(None);
+                        if let Some((pos, auto)) = saved {
+                            chat.restore_scroll(pos, auto);
+                        }
+                        self.search_modal.close();
+                    }
                 }
+                Some(vec![])
             }
-            return Some(vec![]);
-        }
-
-        if self.file_picker.is_open() {
-            return Some(match self.file_picker.handle_key(key) {
+            KeyboardOwner::FilePicker => Some(match self.file_picker.handle_key(key) {
                 FilePickerModalAction::Consumed => vec![],
                 FilePickerModalAction::Select(path) => {
                     self.file_picker.close();
@@ -1581,44 +1639,34 @@ impl App {
                     self.file_picker.close();
                     vec![]
                 }
-            });
-        }
-
-        if self.queue_focused() {
-            match key.code {
-                KeyCode::Up => self.queue.move_focus_up(),
-                KeyCode::Down => self.queue.move_focus_down(),
-                KeyCode::Enter => {
-                    self.queue.remove_focused();
+            }),
+            KeyboardOwner::Queue => {
+                match key.code {
+                    KeyCode::Up => self.queue.move_focus_up(),
+                    KeyCode::Down => self.queue.move_focus_down(),
+                    KeyCode::Enter => {
+                        self.queue.remove_focused();
+                    }
+                    KeyCode::Esc => self.queue.unfocus(),
+                    _ if key::QUIT.matches(key) => self.queue.unfocus(),
+                    _ if key::POP_QUEUE.matches(key) => {
+                        self.queue.remove(0);
+                    }
+                    _ => {}
                 }
-                KeyCode::Esc => self.queue.unfocus(),
-                _ if key::QUIT.matches(key) => self.queue.unfocus(),
-                _ if key::POP_QUEUE.matches(key) => {
-                    self.queue.remove(0);
-                }
-                _ => {}
+                Some(vec![])
             }
-            return Some(vec![]);
-        }
-
-        if self.rewind_picker.is_open() {
-            return Some(match self.rewind_picker.handle_key(key) {
+            KeyboardOwner::RewindPicker => Some(match self.rewind_picker.handle_key(key) {
                 RewindPickerAction::Consumed => vec![],
                 RewindPickerAction::Select(entry) => self.rewind_to(entry),
                 RewindPickerAction::Fork(entry) => self.fork_to(entry),
                 RewindPickerAction::Close => vec![],
-            });
-        }
-
-        if self.theme_picker.is_open() {
-            return Some(match self.theme_picker.handle_key(key) {
+            }),
+            KeyboardOwner::ThemePicker => Some(match self.theme_picker.handle_key(key) {
                 ThemePickerAction::Consumed => vec![],
                 ThemePickerAction::Closed => vec![],
-            });
-        }
-
-        if self.model_picker.is_open() {
-            return Some(match self.model_picker.handle_key(key) {
+            }),
+            KeyboardOwner::ModelPicker => Some(match self.model_picker.handle_key(key) {
                 ModelPickerAction::Consumed => vec![],
                 ModelPickerAction::Select(spec) => {
                     vec![Action::ChangeModel(spec)]
@@ -1645,11 +1693,8 @@ impl App {
                     vec![]
                 }
                 ModelPickerAction::Close => vec![],
-            });
-        }
-
-        if self.login_picker.is_open() {
-            return Some(match self.login_picker.handle_key(key) {
+            }),
+            KeyboardOwner::LoginPicker => Some(match self.login_picker.handle_key(key) {
                 LoginPickerAction::Consumed => vec![],
                 LoginPickerAction::Close => vec![],
                 LoginPickerAction::Authenticated { model_spec } => {
@@ -1658,11 +1703,8 @@ impl App {
                 LoginPickerAction::Configured { slug } => {
                     vec![Action::RefreshProvider { slug }, Action::RefreshModels]
                 }
-            });
-        }
-
-        if self.mcp_picker.is_open() {
-            return Some(match self.mcp_picker.handle_key(key) {
+            }),
+            KeyboardOwner::McpPicker => Some(match self.mcp_picker.handle_key(key) {
                 McpPickerAction::Consumed => vec![],
                 McpPickerAction::Toggle {
                     server_name,
@@ -1671,31 +1713,33 @@ impl App {
                     vec![Action::ToggleMcp(server_name, enabled)]
                 }
                 McpPickerAction::Close => vec![],
-            });
-        }
+            }),
+            KeyboardOwner::Chat => {
+                if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
+                    return Some(self.run_builtin(BuiltinAction::PlanToggle));
+                }
 
-        if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
-            return Some(self.run_builtin(BuiltinAction::PlanToggle));
-        }
-
-        // The command palette is the host's overlay over the chat input, so it
-        // is answered here with the rest of them rather than below the claims:
-        // a plugin holding `<Tab>` or `<CR>` must not take them from the `/`
-        // command the user is typing into. Last in the pass, because every
-        // modal above is drawn over it.
-        match self.dispatch_command_palette(key, sight, None) {
-            PaletteKey::Passthrough => None,
-            PaletteKey::Swallowed => Some(vec![]),
-            PaletteKey::Handled(actions) => Some(actions),
-            PaletteKey::Refused(refusal) => {
-                self.flash(refusal);
-                Some(vec![])
+                // The command palette is the host's overlay over the chat input, so it
+                // is answered here with the rest of them rather than below the claims:
+                // a plugin holding `<Tab>` or `<CR>` must not take them from the `/`
+                // command the user is typing into.
+                match self.dispatch_command_palette(key, sight, None) {
+                    PaletteKey::Passthrough => None,
+                    PaletteKey::Swallowed => Some(vec![]),
+                    PaletteKey::Handled(actions) => Some(actions),
+                    PaletteKey::Refused(refusal) => {
+                        self.flash(refusal);
+                        Some(vec![])
+                    }
+                }
             }
         }
     }
 
     /// Ctrl keys pass the palette by, as they always did: `Ctrl+C` closes it
-    /// and the rest belong to the input box and the built-in bindings.
+    /// and the rest belong to the input box and the built-in bindings. So does
+    /// every key while the chat input is not what the keys reach: the `<Tab>` a
+    /// plan form hands on must not complete a `/` command hidden behind it.
     ///
     /// The command an Enter would run is checked first, the way
     /// `maki.api.run_command` checks it, see [`send_refusal`], also for the
@@ -1706,7 +1750,7 @@ impl App {
         sight: Sight,
         caller: Option<&PluginReach>,
     ) -> PaletteKey {
-        if !self.chat_accepts_input() || is_ctrl(&key) {
+        if !self.input_focused() || is_ctrl(&key) {
             return PaletteKey::Passthrough;
         }
         if key.code == KeyCode::Enter
@@ -1872,10 +1916,10 @@ impl App {
     ///    answered here: no binding can take it and [`Self::reserved_by_host`]
     ///    skips the global bindings for it, but the modals and a focused
     ///    window still see it.
-    /// 2. [`Self::dispatch_overlay`]: maki's modals and prompts, then the
-    ///    focused window, [`Self::dispatch_focused_window`], then maki's
-    ///    pickers, the search, the focused queue, the `/` command list and
-    ///    `<C-t>` on a ready plan.
+    /// 2. [`Self::dispatch_overlay`]: the holder of the keyboard, in
+    ///    [`KeyboardOwner`] order, which includes the focused window,
+    ///    [`Self::dispatch_focused_window`], and for the chat the `/` command
+    ///    list and `<C-t>` on a ready plan.
     /// 3. Windows on screen, front first, [`Self::dispatch_on_screen_windows`].
     /// 4. `<Esc>` while the agent runs, which [`Self::reserved_by_host`] keeps
     ///    from the global bindings, so it reaches the cancel in step 6.
@@ -1945,13 +1989,14 @@ impl App {
         self.handle_chat_key(key, sight, mode)
     }
 
-    /// Step 2: the focused window's buffer bindings, then its `recv`. False
-    /// only when no window has focus, since a focused window takes everything.
-    fn dispatch_focused_window(&mut self, pressed: &Pressed, turn: &Turn) -> bool {
-        let Some(buf) = self.float_mgr.focused_buf() else {
-            return false;
-        };
-        self.dispatch_binding(Some(&buf), pressed, turn) || self.send_to_focused_window(pressed)
+    /// Step 2: the focused window's buffer bindings, then its `recv`. A
+    /// focused window takes everything, so nothing is handed on.
+    fn dispatch_focused_window(&mut self, pressed: &Pressed, turn: &Turn) {
+        if let Some(buf) = self.float_mgr.focused_buf()
+            && !self.dispatch_binding(Some(&buf), pressed, turn)
+        {
+            self.send_to_focused_window(pressed);
+        }
     }
 
     /// A press no notation names is still spent on the window, see
@@ -3226,46 +3271,54 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
-        [
-            &self.alert_modal,
-            &self.help_modal,
-            &self.usage_modal,
-            &self.btw_modal,
-            &self.float_mgr,
-            &self.search_modal,
-            &self.file_picker,
-            &self.rewind_picker,
-            &self.theme_picker,
-            &self.model_picker,
-            &self.login_picker,
-            &self.mcp_picker,
-            &self.pack_review,
-            &self.permission_prompt,
-        ]
+    /// `None` means the owner has no [`Overlay`] of its own, as for the plan
+    /// form, the queue focus and the chat.
+    fn overlay(&self, owner: KeyboardOwner) -> Option<&dyn Overlay> {
+        Some(match owner {
+            KeyboardOwner::Alert => &self.alert_modal,
+            KeyboardOwner::Permission => &self.permission_prompt,
+            KeyboardOwner::PackReview => &self.pack_review,
+            KeyboardOwner::Help => &self.help_modal,
+            KeyboardOwner::Usage => &self.usage_modal,
+            KeyboardOwner::Btw => &self.btw_modal,
+            KeyboardOwner::FocusedWindow => &self.float_mgr,
+            KeyboardOwner::Search => &self.search_modal,
+            KeyboardOwner::FilePicker => &self.file_picker,
+            KeyboardOwner::RewindPicker => &self.rewind_picker,
+            KeyboardOwner::ThemePicker => &self.theme_picker,
+            KeyboardOwner::ModelPicker => &self.model_picker,
+            KeyboardOwner::LoginPicker => &self.login_picker,
+            KeyboardOwner::McpPicker => &self.mcp_picker,
+            KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat => return None,
+        })
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
-        [
-            &mut self.alert_modal,
-            &mut self.help_modal,
-            &mut self.usage_modal,
-            &mut self.btw_modal,
-            &mut self.float_mgr,
-            &mut self.search_modal,
-            &mut self.file_picker,
-            &mut self.rewind_picker,
-            &mut self.theme_picker,
-            &mut self.model_picker,
-            &mut self.login_picker,
-            &mut self.mcp_picker,
-            &mut self.pack_review,
-            &mut self.permission_prompt,
-        ]
+    fn overlay_mut(&mut self, owner: KeyboardOwner) -> Option<&mut dyn Overlay> {
+        Some(match owner {
+            KeyboardOwner::Alert => &mut self.alert_modal,
+            KeyboardOwner::Permission => &mut self.permission_prompt,
+            KeyboardOwner::PackReview => &mut self.pack_review,
+            KeyboardOwner::Help => &mut self.help_modal,
+            KeyboardOwner::Usage => &mut self.usage_modal,
+            KeyboardOwner::Btw => &mut self.btw_modal,
+            KeyboardOwner::FocusedWindow => &mut self.float_mgr,
+            KeyboardOwner::Search => &mut self.search_modal,
+            KeyboardOwner::FilePicker => &mut self.file_picker,
+            KeyboardOwner::RewindPicker => &mut self.rewind_picker,
+            KeyboardOwner::ThemePicker => &mut self.theme_picker,
+            KeyboardOwner::ModelPicker => &mut self.model_picker,
+            KeyboardOwner::LoginPicker => &mut self.login_picker,
+            KeyboardOwner::McpPicker => &mut self.mcp_picker,
+            KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat => return None,
+        })
+    }
+
+    fn overlays(&self) -> impl Iterator<Item = &dyn Overlay> {
+        KeyboardOwner::iter().filter_map(|owner| self.overlay(owner))
     }
 
     pub fn any_overlay_open(&self) -> bool {
-        self.overlays().iter().any(|o| o.is_open())
+        self.overlays().any(Overlay::is_open)
     }
 
     /// True when the agent is parked on user input. Drives the `needs_input`
@@ -3299,7 +3352,8 @@ impl App {
     }
 
     pub fn has_modal_overlay(&self) -> bool {
-        self.overlays().iter().any(|o| o.is_open() && o.is_modal())
+        self.overlays()
+            .any(|overlay| overlay.is_open() && overlay.is_modal())
     }
 
     /// Derived fresh every time rather than snapshotted on open: output can
@@ -3314,7 +3368,11 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
-        self.overlays_mut().iter_mut().for_each(|o| o.close());
+        for owner in KeyboardOwner::iter() {
+            if let Some(overlay) = self.overlay_mut(owner) {
+                overlay.close();
+            }
+        }
     }
 
     /// Every poller that feeds the screen, in one place and never in `view`;
@@ -3533,10 +3591,10 @@ impl App {
 
     /// What moves with the clock alone; changes that come from arriving data
     /// are reported by [`Self::tick`] instead. Overlays answer as a group, so
-    /// adding one to [`Self::overlays`] is enough.
+    /// giving one a [`KeyboardOwner`] is enough.
     pub fn cadence(&self) -> Cadence {
         Cadence::any([
-            Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
+            Cadence::any(self.overlays().map(Overlay::cadence)),
             self.status_bar.cadence(&self.status_motion()),
             self.selection_state
                 .as_ref()
@@ -3591,53 +3649,43 @@ impl App {
     /// handler counting offsets over it counts what inserting it adds, while
     /// a prompt, a picker or a plugin window's `recv` keeps its tabs.
     ///
-    /// The first step that owns the keyboard owns the paste as well, and one
-    /// with no field for it drops it. The chat input and the bindings under a
-    /// modal get none of its keys, so they get none of its pastes either.
+    /// The owner of the keyboard, [`KeyboardOwner`], takes the paste as well,
+    /// and one with no field for it drops it. The chat input and the bindings
+    /// under a modal get none of its keys, so they get none of its pastes
+    /// either.
     fn route_text_paste(&mut self, text: &str, turn: &Turn) {
         let text = &normalize_line_endings(text);
-        if self.alert_modal.is_open() || self.permission_prompt.handle_paste(text) {
-            return;
-        }
-        if self.pack_review.is_open()
-            || self.plan_form_active()
-            || self.help_modal.is_open()
-            || self.usage_modal.is_open()
-            || self.btw_modal.is_open()
-        {
-            return;
-        }
-        let pressed = Pressed::Paste(text.to_owned());
-        if self.dispatch_focused_window(&pressed, turn) {
-            return;
-        }
-        if self.search_modal.is_open() {
-            self.search_modal.handle_paste(text);
-            self.refresh_search_matches();
-            return;
-        }
-        macro_rules! try_picker {
-            ($picker:expr) => {
-                if $picker.handle_paste(text) {
-                    return;
+        match self.keyboard_owner() {
+            KeyboardOwner::Alert
+            | KeyboardOwner::PackReview
+            | KeyboardOwner::PlanForm
+            | KeyboardOwner::Help
+            | KeyboardOwner::Usage
+            | KeyboardOwner::Btw
+            | KeyboardOwner::Queue => {}
+            KeyboardOwner::Permission => self.permission_prompt.handle_paste(text),
+            KeyboardOwner::FocusedWindow => {
+                self.dispatch_focused_window(&Pressed::Paste(text.to_owned()), turn);
+            }
+            KeyboardOwner::Search => {
+                self.search_modal.handle_paste(text);
+                self.refresh_search_matches();
+            }
+            KeyboardOwner::FilePicker => self.file_picker.handle_paste(text),
+            KeyboardOwner::RewindPicker => self.rewind_picker.handle_paste(text),
+            KeyboardOwner::ThemePicker => self.theme_picker.handle_paste(text),
+            KeyboardOwner::ModelPicker => self.model_picker.handle_paste(text),
+            KeyboardOwner::LoginPicker => self.login_picker.handle_paste(text),
+            KeyboardOwner::McpPicker => self.mcp_picker.handle_paste(text),
+            KeyboardOwner::Chat => {
+                let pressed = Pressed::Paste(text.to_owned());
+                if !self.dispatch_on_screen_windows(&pressed, turn)
+                    && !self.dispatch_binding(None, &pressed, turn)
+                {
+                    self.builtin_paste(text);
                 }
-            };
+            }
         }
-        try_picker!(self.file_picker);
-        if self.queue_focused() {
-            return;
-        }
-        try_picker!(self.rewind_picker);
-        try_picker!(self.theme_picker);
-        try_picker!(self.model_picker);
-        try_picker!(self.login_picker);
-        try_picker!(self.mcp_picker);
-        if self.dispatch_on_screen_windows(&pressed, turn)
-            || self.dispatch_binding(None, &pressed, turn)
-        {
-            return;
-        }
-        self.builtin_paste(text);
     }
 
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {

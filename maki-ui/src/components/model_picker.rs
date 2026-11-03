@@ -310,8 +310,8 @@ impl ModelPicker {
         result
     }
 
-    pub fn handle_paste(&mut self, text: &str) -> bool {
-        self.track_anchor(|p| p.picker.handle_paste(text))
+    pub fn handle_paste(&mut self, text: &str) {
+        self.track_anchor(|p| p.picker.handle_paste(text));
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ModelPickerAction {
@@ -366,7 +366,7 @@ impl ModelPicker {
         }
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> (Rect, Option<Position>) {
         self.picker.view(frame, area)
     }
 }
@@ -471,6 +471,7 @@ mod tests {
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
     const SWAPPED_SPEC: &str = "zai/glm-5";
     const RETIRED_SPEC: &str = "anthropic/claude-retired";
+    const GLM_FILTER: &str = "glm";
 
     /// A provider that republishes the same number of specs has still changed
     /// the list. Comparing lengths calls that no change, and the picker goes on
@@ -991,8 +992,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refresh_preserves_selection_with_active_search() {
+    #[test_case(
+        |p: &mut ModelPicker| {
+            for c in GLM_FILTER.chars() {
+                p.handle_key(key(KeyCode::Char(c)));
+            }
+        }
+        ; "typed"
+    )]
+    #[test_case(|p: &mut ModelPicker| p.handle_paste(GLM_FILTER) ; "pasted")]
+    fn refresh_preserves_selection_with_active_search(filter: fn(&mut ModelPicker)) {
         let models = test_models();
         let mut p = ModelPicker::new(models.clone());
         p.set_recents(vec![
@@ -1000,9 +1009,7 @@ mod tests {
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
-        p.handle_key(key(KeyCode::Char('g')));
-        p.handle_key(key(KeyCode::Char('l')));
-        p.handle_key(key(KeyCode::Char('m')));
+        filter(&mut p);
 
         models.store(None);
         let _ = p.refresh();

@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::split_layout::SplitReq;
 use crate::components::{
-    Overlay, hint_footer,
+    Caret, Overlay, hint_footer, painted_caret, painted_width,
     scrollbar::render_vertical_scrollbar,
     tool_display::{SPINNER_STYLE_NAME, SPINNER_STYLE_PREFIX, resolve_span_style},
 };
@@ -23,6 +23,8 @@ use crate::theme;
 const STACK_GAP: u16 = 1;
 /// Cells a border takes from a row, one at each end.
 const BORDER_CELLS: u16 = 2;
+/// Plugins paint their caret with this span style.
+pub(crate) const CURSOR_STYLE_NAME: &str = "cursor";
 
 /// A top band, a bottom band, and the scrollable middle. When the window is too
 /// short for both bands the bottom wins, so footers like keybind hints survive
@@ -155,6 +157,11 @@ pub(crate) struct FloatManager {
     windows: Vec<FloatWindow>,
     focused_id: Option<u32>,
     focused_rect: Option<Rect>,
+    /// Where the focused window painted its caret on the last frame.
+    focused_caret: Option<Position>,
+    /// This frame's, swapped in by [`Self::view`] the way `painting` becomes
+    /// `on_screen`, so a window that stops painting a caret leaves none behind.
+    painting_caret: Option<Position>,
     next_id: u32,
     /// How many times a window started waiting on the user, by opening,
     /// showing or being reconfigured to need input.
@@ -167,6 +174,8 @@ impl FloatManager {
             windows: Vec::new(),
             focused_id: None,
             focused_rect: None,
+            focused_caret: None,
+            painting_caret: None,
             next_id: 0,
             prompts_opened: 0,
         }
@@ -178,6 +187,10 @@ impl FloatManager {
 
     pub fn focused_id(&self) -> Option<u32> {
         self.focused_id
+    }
+
+    pub fn focused_caret(&self) -> Option<Position> {
+        self.focused_caret
     }
 
     /// The windows this frame lays out. A hidden one takes no cells and is
@@ -498,6 +511,7 @@ impl FloatManager {
         for win in &mut self.windows {
             win.on_screen = std::mem::take(&mut win.painting);
         }
+        self.focused_caret = std::mem::take(&mut self.painting_caret);
 
         union
     }
@@ -653,21 +667,26 @@ impl FloatManager {
             })
             .collect();
 
+        let focused = Some(win.id) == self.focused_id;
+        let spot_of = |snapshot: &[SnapshotLine], lines: &[Line<'_>], area| {
+            focused.then(|| caret_spot(snapshot, lines, area)).flatten()
+        };
+        let scroll_spot = spot_of(visible, &lines, scroll_area);
         frame.render_widget(Paragraph::new(lines), scroll_area);
 
+        let mut top_spot = None;
         if let Some(pa) = pinned_top_area {
-            let pinned: Vec<Line<'_>> = win.cached_lines[..top]
-                .iter()
-                .map(snapshot_to_line)
-                .collect();
+            let snapshot = &win.cached_lines[..top];
+            let pinned: Vec<Line<'_>> = snapshot.iter().map(snapshot_to_line).collect();
+            top_spot = spot_of(snapshot, &pinned, pa);
             frame.render_widget(Paragraph::new(pinned), pa);
         }
 
+        let mut bottom_spot = None;
         if let Some(pa) = pinned_bot_area {
-            let pinned: Vec<Line<'_>> = win.cached_lines[top + scrollable..]
-                .iter()
-                .map(snapshot_to_line)
-                .collect();
+            let snapshot = &win.cached_lines[top + scrollable..];
+            let pinned: Vec<Line<'_>> = snapshot.iter().map(snapshot_to_line).collect();
+            bottom_spot = spot_of(snapshot, &pinned, pa);
             frame.render_widget(Paragraph::new(pinned), pa);
         }
 
@@ -680,8 +699,11 @@ impl FloatManager {
             );
         }
 
-        if Some(win.id) == self.focused_id {
+        if focused {
             self.focused_rect = Some(popup);
+            self.painting_caret = top_spot.or(scroll_spot).or(bottom_spot).and_then(|spot| {
+                painted_caret(frame.buffer_mut(), spot.area, &spot.caret, spot.row)
+            });
         }
     }
 
@@ -910,6 +932,32 @@ fn snapshot_to_line(sline: &SnapshotLine) -> Line<'_> {
     )
 }
 
+/// Where a caret span should land: its {caret} on {row} of {area}.
+struct CaretSpot {
+    area: Rect,
+    row: usize,
+    caret: Caret,
+}
+
+/// Finds the first caret span among {snapshot}'s rows, painted as {lines}
+/// into {area}. The column comes from the baked line, where a spinner is
+/// already the glyph it paints.
+fn caret_spot(snapshot: &[SnapshotLine], lines: &[Line<'_>], area: Rect) -> Option<CaretSpot> {
+    let (row, idx) = snapshot.iter().enumerate().find_map(|(row, sline)| {
+        let idx = sline.spans.iter().position(
+            |span| matches!(&span.style, SpanStyle::Named(n) if n == CURSOR_STYLE_NAME),
+        )?;
+        Some((row, idx))
+    })?;
+    let spans = &lines.get(row)?.spans;
+    let span = &spans[idx];
+    let caret = Caret {
+        col: painted_width(&spans[..idx]),
+        span: Span::styled(span.content.to_string(), span.style),
+    };
+    Some(CaretSpot { area, row, caret })
+}
+
 fn union_rect(a: Rect, b: Rect) -> Rect {
     if a.width == 0 || a.height == 0 {
         return b;
@@ -935,6 +983,8 @@ impl Overlay for FloatManager {
         self.needs_input()
     }
 
+    // Unlike the inherent `is_open`, which counts any window, this asks for focus:
+    // an unfocused popup never holds the keys.
     fn is_open(&self) -> bool {
         self.focused_id.is_some()
     }
@@ -981,6 +1031,19 @@ mod tests {
     const EXPECT_NAMEABLE: &str = "the test named a key no notation spells";
     const EXPECT_FOCUS_OWNS_KEY: &str = "a focused window spends every key it is handed";
     const EXPECT_NOTHING_SENT: &str = "a key no notation names has no event to send";
+
+    type CaretRow<'a> = &'a [(&'a str, bool)];
+
+    const CARET_WINDOW: Rect = Rect::new(4, 6, 12, 5);
+    const CARET_SCREEN: Rect = Rect::new(0, 0, 40, 20);
+    const SCROLL_ROWS: usize = 8;
+    const LAST_COLUMN_PADDING: &str = "ppppppppppp";
+    const SPINNER_PLACEHOLDER: &str = "xxxxx";
+    const CARET_PREFIX: &str = "> ";
+    const EXPECT_CARET: &str = "a focused window reports the cell of its cursor span";
+    const EXPECT_NO_CARET: &str = "no cursor span on a focused, visible cell reports no caret";
+
+    const PROMPT_ROW: &[CaretRow] = &[&[(CARET_PREFIX, false), ("c", true)]];
 
     fn make_line(text: &str) -> SnapshotLine {
         SnapshotLine {
@@ -3161,5 +3224,203 @@ mod tests {
             "focus must not fall back to a panel window"
         );
         assert_eq!(mgr.windows.len(), 1, "panel window must survive");
+    }
+
+    fn caret_row(parts: CaretRow) -> SnapshotLine {
+        SnapshotLine {
+            spans: parts
+                .iter()
+                .map(|&(text, is_caret)| SnapshotSpan {
+                    text: text.to_string(),
+                    style: if is_caret {
+                        SpanStyle::Named(CURSOR_STYLE_NAME.into())
+                    } else {
+                        SpanStyle::Default
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    fn open_lines_in_caret_window(
+        mgr: &mut FloatManager,
+        lines: Vec<SnapshotLine>,
+        config: FloatConfig,
+        focus: bool,
+    ) -> Arc<SharedBuf> {
+        let buf = Arc::new(SharedBuf::new());
+        buf.set_lines(lines);
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        mgr.open(Arc::clone(&buf), config, focus, event_tx, cmd_rx);
+        buf
+    }
+
+    fn caret_window_config(reserved_top: usize, reserved_bottom: usize) -> FloatConfig {
+        FloatConfig {
+            reserved_top,
+            reserved_bottom,
+            ..split_config(Split::Below, Dimension::Abs(CARET_WINDOW.height))
+        }
+    }
+
+    fn open_caret_window(
+        mgr: &mut FloatManager,
+        rows: &[CaretRow],
+        reserved_top: usize,
+        reserved_bottom: usize,
+        focus: bool,
+    ) -> Arc<SharedBuf> {
+        open_lines_in_caret_window(
+            mgr,
+            rows.iter().map(|row| caret_row(row)).collect(),
+            caret_window_config(reserved_top, reserved_bottom),
+            focus,
+        )
+    }
+
+    fn paint_caret_window(mgr: &mut FloatManager) -> Option<Position> {
+        render_into(mgr, CARET_SCREEN, |m, f| {
+            m.view_split(f, Split::Below, CARET_WINDOW);
+            m.view(f, CARET_SCREEN, NO_CARET);
+        });
+        mgr.focused_caret()
+    }
+
+    fn cell_at(col: u16, row: u16) -> Option<Position> {
+        Some(Position::new(CARET_WINDOW.x + col, CARET_WINDOW.y + row))
+    }
+
+    #[test_case(PROMPT_ROW, 0, 0 => cell_at(2, 0) ; "ascii_prefix")]
+    #[test_case(&[&[("a漢", false), ("b", true)]], 0, 0 => cell_at(3, 0) ; "cjk_before_the_caret")]
+    #[test_case(&[&[("body", false)], &[(CARET_PREFIX, false), ("x", true)]], 0, 1 => cell_at(2, 4) ; "pinned_bottom_row")]
+    #[test_case(&[&[(CARET_PREFIX, false), ("q", true)], &[("body", false)]], 1, 0 => cell_at(2, 0) ; "pinned_top_row")]
+    #[test_case(&[&[("first", true)], &[("second", true)]], 0, 0 => cell_at(0, 0) ; "first_cursor_span_wins")]
+    #[test_case(&[&[(CARET_PREFIX, false), ("q", true)], &[("body ", false), ("z", true)]], 1, 0 => cell_at(2, 0) ; "top_band_beats_body")]
+    #[test_case(&[&[("body ", false), ("z", true)], &[(CARET_PREFIX, false), ("q", true)]], 0, 1 => cell_at(5, 0) ; "body_beats_bottom_band")]
+    #[test_case(&[&[("a\nb", false), ("c", true)]], 0, 0 => cell_at(2, 0) ; "newline_before_the_caret_paints_nothing")]
+    #[test_case(&[&[("abcdefghijklmn", false), ("x", true)]], 0, 0 => None ; "clipped_past_the_right_edge")]
+    #[test_case(&[&[("abcdefghijk", false), ("漢", true)]], 0, 0 => None ; "wide_caret_cut_by_the_edge")]
+    #[test_case(&[&[("no caret here", false)]], 0, 0 => None ; "no_cursor_span")]
+    fn focused_window_reports_its_cursor_span(
+        rows: &[CaretRow],
+        reserved_top: usize,
+        reserved_bottom: usize,
+    ) -> Option<Position> {
+        let mut mgr = FloatManager::new();
+        open_caret_window(&mut mgr, rows, reserved_top, reserved_bottom, true);
+        paint_caret_window(&mut mgr)
+    }
+
+    #[test_case(3, 6 => cell_at(2, 3) ; "caret_row_counts_from_the_scrolled_viewport")]
+    #[test_case(0, 6 => None ; "caret_scrolled_below_the_viewport")]
+    #[test_case(SCROLL_ROWS, 2 => None ; "caret_scrolled_above_the_viewport")]
+    fn scrolled_window_reports_caret_relative_to_the_viewport(
+        scroll_offset: usize,
+        caret_row_idx: usize,
+    ) -> Option<Position> {
+        let mut mgr = FloatManager::new();
+        let lines = (0..SCROLL_ROWS)
+            .map(|i| {
+                if i == caret_row_idx {
+                    caret_row(&[(CARET_PREFIX, false), ("c", true)])
+                } else {
+                    make_line("row")
+                }
+            })
+            .collect();
+        open_lines_in_caret_window(&mut mgr, lines, caret_window_config(0, 0), true);
+        mgr.windows[0].scroll_offset = scroll_offset;
+        paint_caret_window(&mut mgr)
+    }
+
+    #[test]
+    fn caret_under_the_scrollbar_is_not_reported() {
+        let mut mgr = FloatManager::new();
+        let lines = (0..SCROLL_ROWS)
+            .map(|i| {
+                if i == 0 {
+                    caret_row(&[(LAST_COLUMN_PADDING, false), ("c", true)])
+                } else {
+                    make_line("row")
+                }
+            })
+            .collect();
+        open_lines_in_caret_window(&mut mgr, lines, caret_window_config(0, 0), true);
+        assert_eq!(paint_caret_window(&mut mgr), None, "{EXPECT_NO_CARET}");
+    }
+
+    #[test]
+    fn caret_sits_inside_the_border() {
+        let mut mgr = FloatManager::new();
+        let config = FloatConfig {
+            border: Border::Rounded,
+            ..caret_window_config(0, 0)
+        };
+        let lines = PROMPT_ROW.iter().map(|row| caret_row(row)).collect();
+        open_lines_in_caret_window(&mut mgr, lines, config, true);
+        assert_eq!(paint_caret_window(&mut mgr), cell_at(3, 1));
+    }
+
+    #[test]
+    fn caret_is_measured_after_a_spinner_bakes_to_its_glyph() {
+        let mut mgr = FloatManager::new();
+        let spans = [
+            (
+                SPINNER_PLACEHOLDER,
+                SpanStyle::Named(SPINNER_STYLE_NAME.into()),
+            ),
+            ("c", SpanStyle::Named(CURSOR_STYLE_NAME.into())),
+        ]
+        .map(|(text, style)| SnapshotSpan {
+            text: text.into(),
+            style,
+        });
+        let line = SnapshotLine {
+            spans: spans.to_vec(),
+        };
+        open_lines_in_caret_window(&mut mgr, vec![line], caret_window_config(0, 0), true);
+
+        let glyph_cols = spinner_str(animation_elapsed_ms()).width();
+        assert_ne!(glyph_cols, SPINNER_PLACEHOLDER.width());
+        assert_eq!(
+            paint_caret_window(&mut mgr),
+            cell_at(u16::try_from(glyph_cols).unwrap(), 0)
+        );
+    }
+
+    #[test]
+    fn unfocused_window_reports_no_caret() {
+        let mut mgr = FloatManager::new();
+        open_caret_window(&mut mgr, PROMPT_ROW, 0, 0, false);
+        assert_eq!(paint_caret_window(&mut mgr), None, "{EXPECT_NO_CARET}");
+    }
+
+    #[test]
+    fn caret_goes_when_the_span_does() {
+        let mut mgr = FloatManager::new();
+        let buf = open_caret_window(&mut mgr, PROMPT_ROW, 0, 0, true);
+        assert_eq!(
+            paint_caret_window(&mut mgr),
+            cell_at(2, 0),
+            "{EXPECT_CARET}"
+        );
+
+        buf.set_lines(vec![caret_row(&[(CARET_PREFIX, false), ("cd", false)])]);
+        let _ = mgr.tick();
+        assert_eq!(paint_caret_window(&mut mgr), None, "{EXPECT_NO_CARET}");
+    }
+
+    #[test]
+    fn hidden_window_leaves_no_caret_behind() {
+        let mut mgr = FloatManager::new();
+        open_caret_window(&mut mgr, PROMPT_ROW, 0, 0, true);
+        assert_eq!(
+            paint_caret_window(&mut mgr),
+            cell_at(2, 0),
+            "{EXPECT_CARET}"
+        );
+
+        mgr.windows[0].visible = false;
+        assert_eq!(paint_caret_window(&mut mgr), None, "{EXPECT_NO_CARET}");
     }
 }

@@ -7239,7 +7239,8 @@ Looks up a named style from the current theme. The names are the ones a span
 already takes as a string ("dim", "item_selected", "keybind_section",
 "diff_old", ...), so `{ text, "dim" }` and `theme_style("dim")` paint the
 same. Reach for the table when you need the parts, say to keep a style's
-foreground over a background of your own.
+foreground over a background of your own. A span styled "cursor" also marks
+the caret of a focused window, see the `focus` option of `maki.ui.open_win`.
 
 **Parameters:**
 
@@ -7607,7 +7608,7 @@ session, closing the tab), or right away if the session is not in any tab.
   - `reserved_bottom` (`integer`) rows reserved at the bottom of the content area. Default 0.
   - `split` (`string`) dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
   - `order` (`integer`) paint order among split windows at the same edge. Default 50.
-  - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
+  - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true. A focused window parks the terminal cursor on its first span styled `cursor`, which is where an input method (IME) shows the text being composed. With no such span on screen, the cursor is not parked.
   - `keys` (`table`) keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. `maki.keymap.set` with `{ buffer = buf }` is the newer way to give a popup keys, with a handler per key, a mode, and `ev.fallback()`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or global `maki.keymap.set` bindings. The window's buffer bindings are asked first. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
   - `visible` (`boolean`) whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.

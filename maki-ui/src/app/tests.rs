@@ -9,7 +9,8 @@ use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX, L
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::{PROMPT_NEEDS, ParsedCommand, USER_ONLY_SUFFIX};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
-use crate::components::keybindings::{KeybindContext, key as kb};
+use crate::components::keybindings::key as kb;
+use crate::components::lua_float::CURSOR_STYLE_NAME;
 use crate::components::messages::{ClickOutcome, ScrollPos};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
@@ -24,7 +25,7 @@ use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::agent::TranscriptError;
 use maki_agent::command::{CommandScope, CustomCommand};
-use maki_agent::permissions::{PermissionAnswer, PermissionManager};
+use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{
@@ -33,6 +34,7 @@ use maki_agent::{
     McpSnapshot, McpSnapshotReader, RunTotals, SharedBuf, SteerKind, SubagentInbox, TaskLabel,
     ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
 };
+use maki_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
 use maki_config::{
     Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
 };
@@ -41,10 +43,10 @@ use maki_lua::test_support::{
     probed_event_handle, set_mode,
 };
 use maki_lua::{
-    BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest, InputRulesReader,
-    InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader, Missing, PASTE,
-    PackCommand, PackPlan, PackPreparation, PackReport, Permission, PluginHost, PluginPermissions,
-    SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
+    Border, BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest,
+    InputRulesReader, InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader,
+    Missing, PASTE, PackCommand, PackPlan, PackPreparation, PackReport, Permission, PluginHost,
+    PluginPermissions, SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TaskSettled,
@@ -59,7 +61,7 @@ use maki_storage::sessions::{
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use std::env;
@@ -3515,26 +3517,30 @@ const CARET_FLOAT_WIDTH: u16 = 12;
 const CARET_FLOAT_DRAWN: &str = "the caret anchored float has to be on screen";
 const CARET_EXPECTED: &str = "the input box draws a caret with nothing in its way";
 
+fn open_float(app: &mut App, line: SnapshotLine, config: FloatConfig, focus: bool) {
+    let buf = Arc::new(SharedBuf::new());
+    buf.append(line);
+    let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    app.float_mgr.open(buf, config, focus, event_tx, cmd_rx);
+}
+
 /// A borderless float for the input caret, holding one line nothing else on
 /// screen says, so a test can find the row it was placed on.
 fn open_caret_float(app: &mut App) {
-    let buf = Arc::new(SharedBuf::new());
-    buf.append(maki_agent::SnapshotLine {
-        spans: vec![maki_agent::SnapshotSpan {
-            text: CARET_FLOAT_MARK.into(),
-            style: maki_agent::SpanStyle::Default,
-        }],
-    });
     let config = FloatConfig {
         width: Dimension::Abs(CARET_FLOAT_WIDTH),
         height: Dimension::Abs(CARET_FLOAT_HEIGHT),
         anchor: maki_lua::Anchor::InputCaret,
-        border: maki_lua::Border::None,
+        border: Border::None,
         ..FloatConfig::default()
     };
-    let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
-    app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
+    open_float(
+        app,
+        SnapshotLine::plain(CARET_FLOAT_MARK.into()),
+        config,
+        true,
+    );
 }
 
 fn draw_sized(app: &mut App, width: u16, height: u16) -> (Option<Position>, Buffer) {
@@ -3601,6 +3607,470 @@ fn a_caret_anchored_float_falls_back_when_the_input_box_is_off_screen() {
     let (cursor, row) = draw_caret_float(&mut app);
     assert_eq!(cursor, None, "{OVERLAY_TAKES_THE_CURSOR}");
     assert_eq!(row, (TEST_AREA.height - CARET_FLOAT_HEIGHT) / 2);
+}
+
+const IME_TEXT: &str = "a漢b";
+/// Matches no theme, so no key previews one: a preview calls `theme::set`, which is
+/// process-global.
+const IME_UNMATCHED_THEME_TEXT: &str = "漢b";
+const IME_FLOAT_PREFIX: &str = "a漢";
+const IME_CARET_STYLE_REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
+const IME_PICKER_SYMBOL: &str = "b";
+const IME_PROMPT_TEXT: &str = "xyz";
+const IME_PROMPT_SYMBOL: &str = "z";
+const IME_FLOAT_SYMBOL: &str = "f";
+const IME_POPUP_TEXT: &str = "popup";
+const IME_LOGIN_QUERY: &str = "custom";
+const IME_PROMPT_ID: &str = "perm-ime";
+const IME_TOOL: &str = "bash";
+const IME_MODAL_TEXT: &str = "q";
+const IME_NARROW_WIDTH: u16 = 40;
+const IME_NARROW_PROMPT_WIDTH: u16 = 60;
+const IME_SPACED_WORD: &str = "word ";
+const IME_WIDE_CHAR: &str = "漢";
+const IME_REASON_WORDS: usize = 40;
+const IME_SPACE: &str = " ";
+const IME_DENY_KEY: char = 'n';
+const IME_WRAP_BOUNDARY_WIDTH: u16 = 60;
+const IME_BOUNDARY_HEAD: &str = "xxxxx";
+const IME_BOUNDARY_TAIL: char = 'y';
+const IME_BOUNDARY_TAIL_LEN: usize = 30;
+const IME_PICKER_NEVER_SHOWED: &str = "the file picker never became visible";
+const IME_SCOPE: &str = "execute";
+const IME_SCOPE_WORD: &str = "wrapping ";
+const IME_WRAPPED_SCOPE_WORDS: usize = 30;
+const IME_FIELD_DRAWN: &str = "an open text field has to report where it painted its caret";
+const IME_CELL_IS_CARET: &str = "the reported cell has to hold the caret the field painted";
+const IME_FIELD_OVERFLOWS: &str = "a field wider than its row reports no caret";
+const IME_KEYS_OWNER: &str = "the cursor parks on the field the keys reach";
+const IME_FLOAT_WIDTH: u16 = 20;
+const IME_FLOAT_HEIGHT: u16 = 3;
+
+fn type_text(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+}
+
+fn press(app: &mut App, code: KeyCode) {
+    app.update(Msg::Key(key(code)));
+}
+
+fn type_ime_text(app: &mut App) {
+    type_text(app, IME_TEXT);
+    press(app, KeyCode::Left);
+}
+
+fn picker_cursor() -> Style {
+    crate::theme::current().cursor
+}
+
+fn open_search_field(app: &mut App) -> Style {
+    open_search(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_painted_file_picker(app: &mut App) {
+    open_file_picker(app);
+    let deadline = Instant::now() + WALK_TIMEOUT;
+    while !app.file_picker.is_visible() {
+        assert!(Instant::now() < deadline, "{IME_PICKER_NEVER_SHOWED}");
+        let _ = app.tick();
+        std::thread::yield_now();
+    }
+}
+
+fn open_file_picker_field(app: &mut App) -> Style {
+    open_painted_file_picker(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_model_picker(app: &mut App) {
+    app.run_builtin(BuiltinAction::ModelPicker);
+}
+
+fn open_list_picker_field(app: &mut App) -> Style {
+    open_model_picker(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_rewind_field(app: &mut App) -> Style {
+    open_rewind(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+/// Types [`IME_UNMATCHED_THEME_TEXT`], so no key previews a theme.
+fn open_theme_field(app: &mut App) -> Style {
+    open_theme(app);
+    type_text(app, IME_UNMATCHED_THEME_TEXT);
+    press(app, KeyCode::Left);
+    picker_cursor()
+}
+
+fn open_mcp_field(app: &mut App) -> Style {
+    open_mcp(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_login_list_field(app: &mut App) -> Style {
+    open_login_provider_list(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_login_name_step(app: &mut App) {
+    open_login_provider_list(app);
+    type_text(app, IME_LOGIN_QUERY);
+    press(app, KeyCode::Enter);
+}
+
+fn open_login_text_field(app: &mut App) -> Style {
+    open_login_name_step(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_deny_prompt(app: &mut App, scope: &str) {
+    app.permission_prompt.push(
+        IME_PROMPT_ID.into(),
+        ToolKey::native(IME_TOOL),
+        vec![scope.into()],
+        None,
+        true,
+        None,
+    );
+    press(app, KeyCode::Char(IME_DENY_KEY));
+}
+
+fn open_deny_field_with(app: &mut App, scope: &str, text: &str) -> Style {
+    open_deny_prompt(app, scope);
+    type_text(app, text);
+    press(app, KeyCode::Left);
+    IME_CARET_STYLE_REVERSED
+}
+
+fn open_deny_field(app: &mut App) -> Style {
+    open_deny_field_with(app, IME_SCOPE, IME_TEXT)
+}
+
+fn open_deny_field_under_a_wrapped_scope(app: &mut App) -> Style {
+    let scope = IME_SCOPE_WORD.repeat(IME_WRAPPED_SCOPE_WORDS);
+    open_deny_field_with(app, &scope, IME_TEXT)
+}
+
+fn paints_style(cell: &Cell, style: Style) -> bool {
+    style.fg.is_none_or(|fg| cell.fg == fg)
+        && style.bg.is_none_or(|bg| cell.bg == bg)
+        && cell.modifier.contains(style.add_modifier)
+}
+
+/// The preedit lands on the terminal cursor, so the reported cell has to be the
+/// one the field painted its caret in, past a wide char, and not a guess at it.
+#[test_case(open_search_field as fn(&mut App) -> Style ; "search")]
+#[test_case(open_file_picker_field as fn(&mut App) -> Style ; "file_picker")]
+#[test_case(open_list_picker_field as fn(&mut App) -> Style ; "list_picker")]
+#[test_case(open_rewind_field as fn(&mut App) -> Style ; "rewind_picker")]
+#[test_case(open_theme_field as fn(&mut App) -> Style ; "theme_picker")]
+#[test_case(open_mcp_field as fn(&mut App) -> Style ; "mcp_picker")]
+#[test_case(open_login_list_field as fn(&mut App) -> Style ; "login_list_step")]
+#[test_case(open_login_text_field as fn(&mut App) -> Style ; "login_text_step")]
+#[test_case(open_deny_field as fn(&mut App) -> Style ; "permission_deny_field")]
+#[test_case(open_deny_field_under_a_wrapped_scope as fn(&mut App) -> Style ; "permission_deny_field_under_a_wrapped_line")]
+fn an_overlay_text_field_parks_the_cursor_on_its_caret(open: fn(&mut App) -> Style) {
+    let mut app = test_app();
+    let caret_style = open(&mut app);
+
+    let (cursor, buffer) = draw_to_buffer(&mut app);
+    let cell = buffer
+        .cell(cursor.expect(IME_FIELD_DRAWN))
+        .expect(IME_FIELD_DRAWN);
+    assert_eq!(cell.symbol(), IME_PICKER_SYMBOL, "{IME_CELL_IS_CARET}");
+    assert!(paints_style(cell, caret_style), "{IME_CELL_IS_CARET}");
+}
+
+const ZONE_FIELD_UNSELECTABLE: &str = "a picker's field has to sit in a selectable overlay zone";
+
+/// The mouse selects a picker's text through the overlay zone, which is the
+/// rect the picker hands back from its `view`.
+#[test_case(open_search_field as fn(&mut App) -> Style ; "search")]
+#[test_case(open_file_picker_field as fn(&mut App) -> Style ; "file_picker")]
+#[test_case(open_list_picker_field as fn(&mut App) -> Style ; "list_picker")]
+#[test_case(open_rewind_field as fn(&mut App) -> Style ; "rewind_picker")]
+#[test_case(open_theme_field as fn(&mut App) -> Style ; "theme_picker")]
+#[test_case(open_mcp_field as fn(&mut App) -> Style ; "mcp_picker")]
+#[test_case(open_login_list_field as fn(&mut App) -> Style ; "login_list_step")]
+fn an_open_pickers_field_sits_in_its_overlay_zone(open: fn(&mut App) -> Style) {
+    let mut app = test_app();
+    open(&mut app);
+
+    let caret = draw_to_buffer(&mut app).0.expect(IME_FIELD_DRAWN);
+
+    let zone = app.zone_at(caret.y, caret.x).map(|zone| zone.zone);
+    assert_eq!(
+        zone,
+        Some(SelectionZone::Overlay),
+        "{ZONE_FIELD_UNSELECTABLE}"
+    );
+}
+
+const ZONE_FOLLOWS_THE_TOP_PICKER: &str =
+    "the overlay zone follows the picker painted on top, not the one holding the keys";
+
+/// The search holds the keys over the model picker, which is painted over it.
+#[test]
+fn the_overlay_zone_follows_the_picker_painted_on_top() {
+    let zone_at_the_model_field = |with_search: bool| {
+        let mut app = test_app();
+        open_list_picker_field(&mut app);
+        let field = draw_to_buffer(&mut app).0.expect(IME_FIELD_DRAWN);
+        if with_search {
+            open_search(&mut app);
+            draw_to_buffer(&mut app);
+        }
+        app.zone_at(field.y, field.x)
+            .map(|zone| (zone.zone, zone.area))
+    };
+
+    let alone = zone_at_the_model_field(false);
+    assert_eq!(
+        alone.map(|(zone, _)| zone),
+        Some(SelectionZone::Overlay),
+        "{ZONE_FIELD_UNSELECTABLE}"
+    );
+    assert_eq!(
+        zone_at_the_model_field(true),
+        alone,
+        "{ZONE_FOLLOWS_THE_TOP_PICKER}"
+    );
+}
+
+#[test]
+fn a_login_field_pushed_out_of_its_modal_reports_no_caret() {
+    let mut app = test_app();
+    open_login_text_field(&mut app);
+
+    assert_eq!(
+        draw_sized(&mut app, IME_NARROW_WIDTH, TEST_AREA.height).0,
+        None,
+        "{IME_FIELD_OVERFLOWS}"
+    );
+}
+
+#[test]
+fn an_empty_deny_field_parks_the_cursor_on_the_head_of_its_guidance_in_a_narrow_terminal() {
+    let mut app = test_app();
+    open_deny_field_with(&mut app, IME_SCOPE, "");
+
+    let (cursor, buffer) = draw_sized(&mut app, IME_NARROW_PROMPT_WIDTH, TEST_AREA.height);
+    let cell = buffer
+        .cell(cursor.expect(IME_FIELD_DRAWN))
+        .expect(IME_FIELD_DRAWN);
+    assert_eq!(
+        cell.symbol(),
+        &DEFAULT_DENY_GUIDANCE[..1],
+        "{IME_CELL_IS_CARET}"
+    );
+    assert!(
+        paints_style(cell, IME_CARET_STYLE_REVERSED),
+        "{IME_CELL_IS_CARET}"
+    );
+}
+
+/// The caret is placeable while it is on the field's first row, wherever the
+/// rest of the reason wraps to.
+#[test_case(IME_SPACED_WORD, true => Some("w".to_string()) ; "spaced_reason_with_the_caret_on_the_first_row")]
+#[test_case(IME_SPACED_WORD, false => None ; "spaced_reason_with_the_caret_at_the_wrapped_end")]
+#[test_case(IME_WIDE_CHAR, true => None ; "space_free_reason_wider_than_the_row")]
+fn a_long_deny_reason_parks_the_cursor_only_on_its_first_row(
+    word: &str,
+    home: bool,
+) -> Option<String> {
+    let mut app = test_app();
+    open_deny_prompt(&mut app, IME_SCOPE);
+    type_text(&mut app, &word.repeat(IME_REASON_WORDS));
+    if home {
+        press(&mut app, KeyCode::Home);
+    }
+
+    let (cursor, buffer) = draw_to_buffer(&mut app);
+    cursor.map(|pos| {
+        buffer
+            .cell(pos)
+            .expect(IME_FIELD_DRAWN)
+            .symbol()
+            .to_string()
+    })
+}
+
+/// ratatui drops a space that falls on a soft wrap, so there is no cell to
+/// park on.
+#[test]
+fn a_caret_on_a_space_dropped_at_the_soft_wrap_reports_no_caret() {
+    let mut app = test_app();
+    open_login_name_step(&mut app);
+    type_text(&mut app, IME_BOUNDARY_HEAD);
+    type_text(&mut app, IME_SPACE);
+    type_text(
+        &mut app,
+        &IME_BOUNDARY_TAIL.to_string().repeat(IME_BOUNDARY_TAIL_LEN),
+    );
+    press(&mut app, KeyCode::Home);
+    for _ in IME_BOUNDARY_HEAD.chars() {
+        press(&mut app, KeyCode::Right);
+    }
+
+    assert_eq!(
+        draw_sized(&mut app, IME_WRAP_BOUNDARY_WIDTH, TEST_AREA.height).0,
+        None,
+        "{IME_FIELD_OVERFLOWS}"
+    );
+}
+
+fn open_cursor_float(app: &mut App) {
+    let line = SnapshotLine {
+        spans: [
+            (IME_FLOAT_PREFIX, SpanStyle::Default),
+            (IME_FLOAT_SYMBOL, SpanStyle::Named(CURSOR_STYLE_NAME.into())),
+        ]
+        .map(|(text, style)| SnapshotSpan {
+            text: text.into(),
+            style,
+        })
+        .into(),
+    };
+    let config = FloatConfig {
+        width: Dimension::Abs(IME_FLOAT_WIDTH),
+        height: Dimension::Abs(IME_FLOAT_HEIGHT),
+        border: Border::None,
+        ..FloatConfig::default()
+    };
+    open_float(app, line, config, true);
+}
+
+/// Keys go to the first open picker in `KeyboardOwner` order, whichever one is
+/// painted on top.
+#[test]
+fn with_two_pickers_open_the_cursor_parks_on_the_first_ones_field() {
+    let caret_with = |open: fn(&mut App)| {
+        let mut app = test_app();
+        open(&mut app);
+        draw_to_buffer(&mut app).0.expect(IME_FIELD_DRAWN)
+    };
+    let search_alone = caret_with(|app| _ = open_search_field(app));
+    let model_alone = caret_with(|app| _ = open_list_picker_field(app));
+    let both = caret_with(|app| {
+        open_list_picker_field(app);
+        open_search_field(app);
+    });
+
+    assert_ne!(search_alone, model_alone, "{IME_KEYS_OWNER}");
+    assert_eq!(both, search_alone, "{IME_KEYS_OWNER}");
+}
+
+fn open_typed_deny_prompt(app: &mut App) {
+    open_deny_field_with(app, IME_SCOPE, IME_PROMPT_TEXT);
+}
+
+fn open_unfocused_popup(app: &mut App) {
+    let config = FloatConfig {
+        width: Dimension::Abs(IME_FLOAT_WIDTH),
+        height: Dimension::Abs(IME_FLOAT_HEIGHT),
+        border: Border::None,
+        ..FloatConfig::default()
+    };
+    open_float(
+        app,
+        SnapshotLine::plain(IME_POPUP_TEXT.into()),
+        config,
+        false,
+    );
+}
+
+fn open_usage(app: &mut App) {
+    app.usage_modal.toggle();
+}
+
+fn open_btw(app: &mut App) {
+    let (_tx, rx) = flume::bounded::<BtwEvent>(1);
+    app.btw_modal.open(IME_MODAL_TEXT, rx);
+}
+
+fn open_pack_review(app: &mut App) {
+    app.pack_review
+        .open(IME_MODAL_TEXT.into(), PackPlan::default());
+}
+
+/// The first holder of the keyboard, in `KeyboardOwner` order, has the cursor,
+/// whatever the paint order is. The symbol under the cursor names whose caret
+/// it is.
+#[test_case(open_cursor_float as fn(&mut App), IME_FLOAT_SYMBOL ; "focused_float")]
+#[test_case(|app: &mut App| { open_list_picker_field(app); open_unfocused_popup(app); }, IME_PICKER_SYMBOL ; "unfocused_popup_leaves_the_picker")]
+#[test_case(|app: &mut App| { open_list_picker_field(app); open_cursor_float(app); }, IME_FLOAT_SYMBOL ; "focused_float_beats_a_picker")]
+#[test_case(|app: &mut App| { open_list_picker_field(app); open_typed_deny_prompt(app); }, IME_PROMPT_SYMBOL ; "deny_field_beats_a_picker")]
+#[test_case(|app: &mut App| { open_search_field(app); focus_queue(app); }, IME_PICKER_SYMBOL ; "search_beats_the_queue")]
+fn the_cursor_parks_on_the_field_the_keys_reach(setup: fn(&mut App), expected: &str) {
+    let mut app = test_app();
+    setup(&mut app);
+
+    let (cursor, buffer) = draw_to_buffer(&mut app);
+    let cell = buffer
+        .cell(cursor.expect(IME_FIELD_DRAWN))
+        .expect(IME_FIELD_DRAWN);
+    assert_eq!(cell.symbol(), expected, "{IME_KEYS_OWNER}");
+}
+
+/// An owner with no field of its own leaves no caret, not even the one of the
+/// picker it keeps the keys from. The file picker counts here until its first
+/// walk shows it.
+#[test_case(KeyboardOwner::Alert ; "alert")]
+#[test_case(KeyboardOwner::Permission ; "permission_without_the_deny_field")]
+#[test_case(KeyboardOwner::PackReview ; "pack_review")]
+#[test_case(KeyboardOwner::PlanForm ; "plan_form")]
+#[test_case(KeyboardOwner::Help ; "help")]
+#[test_case(KeyboardOwner::Usage ; "usage")]
+#[test_case(KeyboardOwner::Btw ; "btw")]
+#[test_case(KeyboardOwner::FilePicker ; "unpainted_file_picker")]
+#[test_case(KeyboardOwner::Queue ; "queue")]
+fn an_owner_without_a_field_over_a_picker_reports_no_caret(owner: KeyboardOwner) {
+    let mut app = test_app();
+    open_list_picker_field(&mut app);
+    open_owner(&mut app, owner);
+
+    assert_eq!(
+        draw_to_buffer(&mut app).0,
+        None,
+        "{IME_KEYS_OWNER}: {owner:?}"
+    );
+}
+
+fn caret_cells(buffer: &Buffer) -> usize {
+    buffer
+        .content()
+        .iter()
+        .filter(|cell| theme::is_caret_cell(cell))
+        .count()
+}
+
+/// The focused queue answers the keys, so the input box under it is not
+/// where anyone types: no caret is painted in it and none is reported.
+#[test]
+fn a_focused_queue_takes_the_caret_from_the_input_box() {
+    let mut app = test_app();
+    focus_queue(&mut app);
+
+    let (cursor, buffer) = draw_to_buffer(&mut app);
+    assert_eq!(cursor, None, "{IME_KEYS_OWNER}");
+    assert_eq!(caret_cells(&buffer), 0, "{IME_KEYS_OWNER}");
+
+    app.queue.unfocus();
+    let (cursor, buffer) = draw_to_buffer(&mut app);
+    assert!(cursor.is_some(), "{CARET_EXPECTED}");
+    assert_eq!(caret_cells(&buffer), 1, "{CARET_EXPECTED}");
 }
 
 /// A plugin slices `text` with the Lua string library, which counts bytes, so
@@ -4376,51 +4846,6 @@ fn help_modal_consumes_keys_and_esc_closes() {
 
     app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(!app.help_modal.is_open());
-}
-
-#[test_case(
-    |_: &mut App| {},
-    &[KeybindContext::General, KeybindContext::Editing],
-    &[KeybindContext::Streaming]
-    ; "idle"
-)]
-#[test_case(
-    |app: &mut App| { app.status = Status::Streaming; },
-    &[KeybindContext::General, KeybindContext::Streaming, KeybindContext::Editing],
-    &[]
-    ; "streaming"
-)]
-#[test_case(
-    |app: &mut App| { app.state.mode = Mode::Plan; app.plan_form.on_plan_ready(); },
-    &[KeybindContext::FormInput],
-    &[KeybindContext::Editing]
-    ; "plan_form"
-)]
-#[test_case(
-    |app: &mut App| { app.status = Status::Streaming; app.run_id = 1; app.queue_and_notify(queued_msg("q")); app.queue.set_focus_at(0); },
-    &[KeybindContext::QueueFocus],
-    &[KeybindContext::Editing]
-    ; "queue_focus"
-)]
-#[test_case(
-    |app: &mut App| {
-        app.state.session_mut().push_message(Message::user("test".into()));
-        app.open_rewind_picker();
-    },
-    &[KeybindContext::RewindPicker],
-    &[KeybindContext::Editing]
-    ; "rewind_picker"
-)]
-fn active_contexts(setup: fn(&mut App), expected: &[KeybindContext], absent: &[KeybindContext]) {
-    let mut app = test_app();
-    setup(&mut app);
-    let contexts = app.active_keybind_contexts();
-    for ctx in expected {
-        assert!(contexts.contains(ctx), "{ctx:?} should be present");
-    }
-    for ctx in absent {
-        assert!(!contexts.contains(ctx), "{ctx:?} should be absent");
-    }
 }
 
 #[test]
@@ -5470,6 +5895,32 @@ fn search_reaches_output_that_lands_while_the_modal_is_open(status: Status) {
     );
 }
 
+const SEARCH_PASTE_TEXT: &str = "zzarrived";
+const PASTE_REFRESHES_THE_MATCHES: &str = "a pasted query has to find its match like a typed one";
+
+#[test]
+fn a_pasted_search_query_finds_its_match() {
+    let mut app = test_app();
+    app.active_chat().push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        SEARCH_PASTE_TEXT.into(),
+    ));
+    rendered(&mut app);
+    open_search(&mut app);
+
+    app.update(Msg::Paste(SEARCH_PASTE_TEXT.into()));
+
+    assert!(
+        app.search_modal.current_segment_index().is_some(),
+        "{PASTE_REFRESHES_THE_MATCHES}"
+    );
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "",
+        "{PASTE_BELONGS_TO_THE_OVERLAY}"
+    );
+}
+
 #[test_case(ScrollPos { seg: 4, row: 2 }, false ; "restores_scroll_position")]
 #[test_case(ScrollPos::default(),          true  ; "restores_auto_scroll")]
 fn search_escape_restores_scroll(scroll: ScrollPos, auto_scroll: bool) {
@@ -5528,10 +5979,7 @@ fn mcp_toggle_dispatches_action() {
     ; "consumed_by_plan_form"
 )]
 #[test_case(
-    |app: &mut App| {
-        app.state.session_mut().push_message(Message::user("test".into()));
-        app.open_rewind_picker();
-    },
+    open_rewind,
     ""
     ; "routed_to_open_picker"
 )]
@@ -6150,6 +6598,69 @@ fn ctrl_t_noop_when_plan_not_ready() {
 
     app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
     assert!(!app.plan_form.is_visible());
+}
+
+const TAB_TOOK_THE_OWNER_BELOW: &str =
+    "Tab passes through the plan form to whatever answers it below the form";
+const TAB_LEFT_THE_MODE_ALONE: &str = "a Tab the focused window took does not toggle the plan mode";
+const PALETTE_QUERY: &str = "/n";
+const TAB_REACHED_THE_PALETTE: &str =
+    "Tab belongs to the owner below the plan form, not to the command palette under it";
+
+/// The plan form is non-modal and lets only Tab through, to the owner under
+/// it. When that is the chat, its palette for a `/` command hidden behind the
+/// form stays out of it.
+#[test]
+fn tab_passes_through_the_plan_form_to_the_chat() {
+    let mut app = test_app();
+    type_text(&mut app, PALETTE_QUERY);
+    assert!(palette_open(&mut app));
+    open_plan_form(&mut app);
+
+    press(&mut app, KeyCode::Tab);
+
+    assert_eq!(app.state.mode, Mode::Build, "{TAB_TOOK_THE_OWNER_BELOW}");
+    assert_eq!(
+        app.input_box.buffer.value(),
+        PALETTE_QUERY,
+        "{TAB_REACHED_THE_PALETTE}"
+    );
+}
+
+/// A Tab that skipped to the chat would complete `/n` in the input. The mode
+/// stays Plan either way, so the test asserts the input.
+#[test_case(open_help as fn(&mut App) ; "help_modal")]
+#[test_case(open_usage                ; "usage_modal")]
+#[test_case(open_btw                  ; "btw_modal")]
+#[test_case(open_search               ; "search_modal")]
+#[test_case(focus_queue               ; "queue_focus")]
+#[test_case(open_model_picker         ; "model_picker")]
+fn tab_through_the_plan_form_never_reaches_the_palette_behind_an_owner(below: fn(&mut App)) {
+    let mut app = test_app();
+    type_text(&mut app, PALETTE_QUERY);
+    assert!(palette_open(&mut app));
+    below(&mut app);
+    open_plan_form(&mut app);
+
+    press(&mut app, KeyCode::Tab);
+
+    assert_eq!(
+        app.input_box.buffer.value(),
+        PALETTE_QUERY,
+        "{TAB_REACHED_THE_PALETTE}"
+    );
+}
+
+#[test]
+fn tab_passes_through_the_plan_form_to_a_focused_window() {
+    let mut app = test_app();
+    let (events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+    open_plan_form(&mut app);
+
+    press(&mut app, KeyCode::Tab);
+
+    assert!(took_a_key(&events), "{TAB_TOOK_THE_OWNER_BELOW}");
+    assert_eq!(app.state.mode, Mode::Plan, "{TAB_LEFT_THE_MODE_ALONE}");
 }
 
 fn probe_events(app: &mut App) -> RequestProbe {
@@ -7091,21 +7602,94 @@ fn open_alert(app: &mut App) {
     app.open_alert("alert".into());
 }
 
-/// A modal owns the keyboard, so a paste it has no field for goes nowhere:
-/// not into the chat input under it, nor to a global `<Paste>` binding.
-#[test_case(open_permission_prompt as fn(&mut App) ; "permission_prompt")]
+const FIELD_PASTE: &str = "zzfield";
+const PASTE_BELONGS_TO_THE_OVERLAY: &str =
+    "an overlay that owns the keyboard keeps its pastes out of the chat input";
+const PASTE_SHOWN_IN_THE_FIELD: &str = "the pasted text has to show in the field the keys reach";
+
+/// A `<Paste>` binding of every mode, which any paste that falls through an
+/// overlay would reach.
+fn app_with_a_paste_binding() -> (App, RequestProbe) {
+    let mut app = test_app();
+    let probe = install_binding(&mut app, EVERY_MODE, PASTE);
+    (app, probe)
+}
+
+/// The holder of the keyboard drops a paste it has no field for: it goes
+/// neither into the chat input under it nor to a global `<Paste>` binding.
+#[test_case(open_permission_prompt as fn(&mut App) ; "permission_prompt_without_the_deny_field")]
 #[test_case(open_alert                             ; "alert_modal")]
 #[test_case(open_help                              ; "help_modal")]
 #[test_case(focus_queue                            ; "queue_focus")]
-fn a_modal_drops_a_paste_it_has_no_field_for(open: fn(&mut App)) {
-    let mut app = test_app();
-    let probe = install_binding(&mut app, INSERT, PASTE);
+#[test_case(open_pack_review                       ; "pack_review")]
+#[test_case(open_plan_form                         ; "plan_form")]
+#[test_case(open_usage                             ; "usage_modal")]
+#[test_case(open_btw                               ; "btw_modal")]
+fn an_owner_without_a_field_drops_a_paste(open: fn(&mut App)) {
+    let (mut app, probe) = app_with_a_paste_binding();
     open(&mut app);
 
     app.update(Msg::Paste(PASTED.into()));
 
-    assert!(probe.try_recv_ticket().is_none());
-    assert_eq!(app.input_box.buffer.value(), "");
+    assert!(
+        probe.try_recv_ticket().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "",
+        "{PASTE_BELONGS_TO_THE_OVERLAY}"
+    );
+}
+
+fn open_rewind(app: &mut App) {
+    app.state
+        .session_mut()
+        .push_message(Message::user("test".into()));
+    app.open_rewind_picker();
+}
+
+fn open_theme(app: &mut App) {
+    app.execute_command(cmd("/theme"), 0);
+}
+
+fn open_mcp(app: &mut App) {
+    app.execute_command(cmd("/mcp"), 0);
+}
+
+/// A paste lands in the field the keys reach, and in nothing under it.
+#[test_case(open_search as fn(&mut App)         ; "search")]
+#[test_case(open_painted_file_picker            ; "file_picker")]
+#[test_case(open_rewind                         ; "rewind_picker")]
+#[test_case(open_theme                          ; "theme_picker")]
+#[test_case(open_model_picker                   ; "model_picker")]
+#[test_case(open_mcp                            ; "mcp_picker")]
+#[test_case(open_login_provider_list            ; "login_list_step")]
+#[test_case(open_login_name_step                ; "login_text_step")]
+#[test_case(|app: &mut App| open_deny_prompt(app, IME_SCOPE) ; "permission_deny_field")]
+fn a_paste_lands_in_the_field_the_keys_reach(open: fn(&mut App)) {
+    let (mut app, probe) = app_with_a_paste_binding();
+    open(&mut app);
+
+    app.update(Msg::Paste(FIELD_PASTE.into()));
+
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "",
+        "{PASTE_BELONGS_TO_THE_OVERLAY}"
+    );
+    assert!(
+        probe.try_recv_ticket().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+    assert!(
+        rendered(&mut app).contains(FIELD_PASTE),
+        "{PASTE_SHOWN_IN_THE_FIELD}"
+    );
+}
+
+fn open_login_provider_list(app: &mut App) {
+    app.login_picker.open(app.storage.clone());
 }
 
 const TABBED_PASTE: &str = "a\tb\r\nc";
@@ -11530,6 +12114,7 @@ fn a_moved_calls_tab_is_a_transcript_while_it_runs() {
     app.status = Status::Idle;
     app.focus_task(MOVED_ID).unwrap();
     assert!(!app.chat_accepts_input());
+    assert!(!app.input_focused());
     assert!(app.active_chat_working());
     assert!(rendered(&mut app).contains(NO_INPUT_TAB_HINT.trim()));
 
@@ -12626,4 +13211,173 @@ fn a_session_opened_under_a_moved_call_works_once_it_runs() {
     );
 
     assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
+}
+
+const OWNER_MISMATCH: &str = "the wrong state holds the keyboard";
+const OWNER_NOT_OPENED: &str = "the later owner has to be open for the earlier one to beat it";
+const OWNER_INPUT_MISMATCH: &str = "the chat input is focused only when the chat owns the keyboard";
+const OWNER_OVERLAY_MISMATCH: &str =
+    "an overlay is open exactly when a state with its own Overlay holds the keyboard";
+const OWNER_SUBAGENT_QUEUE: &str = "the session queue has no focus left to hold on a subagent tab";
+const OWNER_NOT_CLOSED: &str = "closing every overlay leaves the owner's overlay open";
+
+fn open_file_picker(app: &mut App) {
+    app.file_picker.open(env!("CARGO_MANIFEST_DIR"));
+}
+
+/// Exhaustive on purpose: a new owner does not build until it can be opened.
+fn open_owner(app: &mut App, owner: KeyboardOwner) {
+    match owner {
+        KeyboardOwner::Alert => open_alert(app),
+        KeyboardOwner::Permission => open_permission_prompt(app),
+        KeyboardOwner::PackReview => open_pack_review(app),
+        KeyboardOwner::PlanForm => open_plan_form(app),
+        KeyboardOwner::Help => open_help(app),
+        KeyboardOwner::Usage => open_usage(app),
+        KeyboardOwner::Btw => open_btw(app),
+        KeyboardOwner::FocusedWindow => open_cursor_float(app),
+        KeyboardOwner::Search => open_search(app),
+        KeyboardOwner::FilePicker => open_file_picker(app),
+        KeyboardOwner::Queue => focus_queue(app),
+        KeyboardOwner::RewindPicker => open_rewind(app),
+        KeyboardOwner::ThemePicker => open_theme(app),
+        KeyboardOwner::ModelPicker => open_model_picker(app),
+        KeyboardOwner::LoginPicker => open_login_provider_list(app),
+        KeyboardOwner::McpPicker => open_mcp(app),
+        KeyboardOwner::Chat => {}
+    }
+}
+
+#[test_case(KeyboardOwner::Alert ; "alert")]
+#[test_case(KeyboardOwner::Permission ; "permission")]
+#[test_case(KeyboardOwner::PackReview ; "pack_review")]
+#[test_case(KeyboardOwner::PlanForm ; "plan_form")]
+#[test_case(KeyboardOwner::Help ; "help")]
+#[test_case(KeyboardOwner::Usage ; "usage")]
+#[test_case(KeyboardOwner::Btw ; "btw")]
+#[test_case(KeyboardOwner::FocusedWindow ; "focused_window")]
+#[test_case(KeyboardOwner::Search ; "search")]
+#[test_case(KeyboardOwner::FilePicker ; "file_picker")]
+#[test_case(KeyboardOwner::Queue ; "queue")]
+#[test_case(KeyboardOwner::RewindPicker ; "rewind_picker")]
+#[test_case(KeyboardOwner::ThemePicker ; "theme_picker")]
+#[test_case(KeyboardOwner::ModelPicker ; "model_picker")]
+#[test_case(KeyboardOwner::LoginPicker ; "login_picker")]
+#[test_case(KeyboardOwner::McpPicker ; "mcp_picker")]
+#[test_case(KeyboardOwner::Chat ; "chat")]
+fn each_owner_alone_holds_the_keyboard(owner: KeyboardOwner) {
+    let mut app = test_app();
+    open_owner(&mut app, owner);
+
+    assert_eq!(app.keyboard_owner(), owner, "{OWNER_MISMATCH}: {owner:?}");
+    assert_eq!(
+        app.input_focused(),
+        owner == KeyboardOwner::Chat,
+        "{OWNER_INPUT_MISMATCH}: {owner:?}"
+    );
+    assert_eq!(
+        app.any_overlay_open(),
+        !matches!(
+            owner,
+            KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat
+        ),
+        "{OWNER_OVERLAY_MISMATCH}: {owner:?}"
+    );
+
+    app.close_all_overlays();
+
+    assert!(!app.any_overlay_open(), "{OWNER_NOT_CLOSED}: {owner:?}");
+}
+
+#[test_case(KeyboardOwner::Alert, KeyboardOwner::Permission ; "alert_over_permission")]
+#[test_case(KeyboardOwner::Permission, KeyboardOwner::PackReview ; "permission_over_pack_review")]
+#[test_case(KeyboardOwner::PackReview, KeyboardOwner::PlanForm ; "pack_review_over_plan_form")]
+#[test_case(KeyboardOwner::PlanForm, KeyboardOwner::Help ; "plan_form_over_help")]
+#[test_case(KeyboardOwner::Help, KeyboardOwner::Usage ; "help_over_usage")]
+#[test_case(KeyboardOwner::Usage, KeyboardOwner::Btw ; "usage_over_btw")]
+#[test_case(KeyboardOwner::Btw, KeyboardOwner::FocusedWindow ; "btw_over_focused_window")]
+#[test_case(KeyboardOwner::FocusedWindow, KeyboardOwner::Search ; "focused_window_over_search")]
+#[test_case(KeyboardOwner::Search, KeyboardOwner::FilePicker ; "search_over_file_picker")]
+#[test_case(KeyboardOwner::FilePicker, KeyboardOwner::Queue ; "file_picker_over_queue")]
+#[test_case(KeyboardOwner::Queue, KeyboardOwner::RewindPicker ; "queue_over_rewind_picker")]
+#[test_case(KeyboardOwner::RewindPicker, KeyboardOwner::ThemePicker ; "rewind_picker_over_theme_picker")]
+#[test_case(KeyboardOwner::ThemePicker, KeyboardOwner::ModelPicker ; "theme_picker_over_model_picker")]
+#[test_case(KeyboardOwner::ModelPicker, KeyboardOwner::LoginPicker ; "model_picker_over_login_picker")]
+#[test_case(KeyboardOwner::LoginPicker, KeyboardOwner::McpPicker ; "login_picker_over_mcp_picker")]
+fn the_earlier_owner_holds_the_keyboard_over_the_next(
+    earlier: KeyboardOwner,
+    later: KeyboardOwner,
+) {
+    let mut app = test_app();
+    open_owner(&mut app, earlier);
+    open_owner(&mut app, later);
+
+    assert!(app.holds_keyboard(later), "{OWNER_NOT_OPENED}: {later:?}");
+    assert_eq!(
+        app.keyboard_owner(),
+        earlier,
+        "{OWNER_MISMATCH}: {earlier:?} over {later:?}"
+    );
+}
+
+#[test]
+fn a_focused_queue_on_a_subagent_tab_does_not_hold_the_keyboard() {
+    let mut app = app_with_subagent();
+    focus_queue(&mut app);
+    assert_eq!(
+        app.keyboard_owner(),
+        KeyboardOwner::Queue,
+        "{OWNER_MISMATCH}"
+    );
+
+    app.run_builtin(BuiltinAction::NextChat);
+
+    assert_eq!(
+        app.keyboard_owner(),
+        KeyboardOwner::Chat,
+        "{OWNER_SUBAGENT_QUEUE}"
+    );
+}
+
+const OWNER_LEAKED_A_KEY: &str = "a key the holder of the keyboard answers must not reach the chat";
+
+/// `<C-h>` opens the help from the chat, so a holder that does not answer it
+/// lets the help open. Left out is the help itself, which closes on `<C-h>`,
+/// so a leak would look the same.
+#[test_case(KeyboardOwner::Alert ; "alert")]
+#[test_case(KeyboardOwner::Permission ; "permission")]
+#[test_case(KeyboardOwner::PackReview ; "pack_review")]
+#[test_case(KeyboardOwner::PlanForm ; "plan_form")]
+#[test_case(KeyboardOwner::Usage ; "usage")]
+#[test_case(KeyboardOwner::Btw ; "btw")]
+#[test_case(KeyboardOwner::FocusedWindow ; "focused_window")]
+#[test_case(KeyboardOwner::Search ; "search")]
+#[test_case(KeyboardOwner::FilePicker ; "file_picker")]
+#[test_case(KeyboardOwner::Queue ; "queue")]
+#[test_case(KeyboardOwner::RewindPicker ; "rewind_picker")]
+#[test_case(KeyboardOwner::ThemePicker ; "theme_picker")]
+#[test_case(KeyboardOwner::ModelPicker ; "model_picker")]
+#[test_case(KeyboardOwner::LoginPicker ; "login_picker")]
+#[test_case(KeyboardOwner::McpPicker ; "mcp_picker")]
+fn the_holder_of_the_keyboard_keeps_a_shortcut_from_the_chat(owner: KeyboardOwner) {
+    let mut app = test_app();
+    open_owner(&mut app, owner);
+
+    app.update(Msg::Key(kb::HELP.to_key_event()));
+
+    assert!(!app.help_modal.is_open(), "{OWNER_LEAKED_A_KEY}: {owner:?}");
+}
+
+const PALETTE_ESC_LEAKED: &str = "the Esc that closes the palette is the palette's, not the chat's";
+
+#[test]
+fn the_escape_that_closes_the_palette_stays_out_of_the_chat() {
+    let mut app = test_app();
+    type_slash(&mut app);
+    assert!(palette_open(&mut app));
+
+    press(&mut app, KeyCode::Esc);
+
+    assert!(!palette_open(&mut app));
+    assert_eq!(app.status_bar.flash_text(), None, "{PALETTE_ESC_LEAKED}");
 }
