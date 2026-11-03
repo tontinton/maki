@@ -129,6 +129,8 @@ declare maki: {
   net: {
     request: @checked (url: string, opts: any) -> (any, string?),
     connect: @checked (host: string, port: number, opts: any) -> (any, string?),
+    connect_unix: @checked (path: string, opts: any) -> (any, string?),
+    listen_unix: @checked (path: string) -> (any, string?),
   },
   pack: {
     add: @checked (specs: any, opts: any) -> (),
