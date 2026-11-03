@@ -1350,7 +1350,16 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
             })?;
             (native.with_auth)(shared, timeouts, prefix)
         }
-        Target::Codec(protocol) => codec::build(codec_options(&entry, protocol), shared, timeouts),
+        Target::Codec(declared_protocol) => {
+            // A user-set `protocol` in providers.toml overrides the declared codec,
+            // matching how built-in providers resolve their wire per build.
+            let slug = entry.decl.slug.as_str();
+            let protocol = ProvidersConfig::load_or_default()
+                .get(slug)
+                .and_then(|def| def.protocol)
+                .unwrap_or(declared_protocol);
+            codec::build(codec_options(&entry, protocol), shared, timeouts)
+        }
     };
 
     debug!(
@@ -1492,9 +1501,15 @@ pub fn build_with_auth(
     system_prefix: Option<String>,
 ) -> Option<Box<dyn Provider>> {
     let entry = entry(slug)?;
-    let Target::Codec(protocol) = entry.target else {
+    let Target::Codec(declared_protocol) = entry.target else {
         return None;
     };
+    // A user-set `protocol` in providers.toml overrides the declared codec,
+    // matching how built-in providers resolve their wire per build.
+    let protocol = ProvidersConfig::load_or_default()
+        .get(slug)
+        .and_then(|def| def.protocol)
+        .unwrap_or(declared_protocol);
     let mut options = codec_options(&entry, protocol);
     options.system_prefix = system_prefix.or(options.system_prefix);
     Some(codec::build(options, auth, timeouts))
