@@ -1961,6 +1961,7 @@ fn input_layer_may_ask_the_user(answer: &str, rewritten: Option<&str>) {
 const AGENT_MODEL: &str = "anthropic/claude-sonnet-4";
 const KEEP_GOING: &str = "keep going";
 const CONTINUE_FIELD: &str = "continue";
+const SEND_MONITOR_TEXT: &str = "the monitor saw the request";
 
 fn stop_layer() -> String {
     format!(
@@ -2002,6 +2003,48 @@ fn agent_slot_layers_need_full_trust(granted: fn() -> PluginPermissions, runs: b
         matches!(verdict, Verdict::Replaced(value) if value == kept_going),
         runs
     );
+}
+
+/// A monitor sees the request before it reaches the provider, and its answer
+/// is dropped rather than asked for: a returned rewrite is not a steering.
+#[test]
+fn a_message_monitor_observes_and_cannot_rewrite() {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    assert!(!hook.wraps(AgentSlot::MessageSend));
+    let layer = format!(
+        r#"maki.api.set_slot("agent.message.send", function(prev, value, ctx)
+    maki.ui.flash(value.messages[1].content[1].text)
+    maki.ui.flash("{SENTINEL_FLASH}")
+    return {{ messages = {{ "hijacked" }} }}
+end)"#
+    );
+    load_granted(&host, LAYER_PLUGIN, &layer, PluginPermissions::trusted());
+    assert!(hook.wraps(AgentSlot::MessageSend));
+
+    let cancel = CancelToken::none();
+    let call = AgentCall {
+        session_id: None,
+        task_id: None,
+        model: AGENT_MODEL,
+        context_size: 0,
+        context_window: 0,
+        cancel: &cancel,
+        deadline: Instant::now() + DISPATCH_TIMEOUT,
+    };
+    let payload = serde_json::json!({
+        "messages": [{ "content": [{ "text": SEND_MONITOR_TEXT }] }],
+        "system": "",
+        "tools": [],
+    });
+    assert!(
+        matches!(within(hook.run(AgentSlot::MessageSend, payload, &call)), Verdict::Unchanged),
+        "the monitor's rewrite is dropped, not answered"
+    );
+    let seen = flashes_until_sentinel(&host.ui_action_rx());
+    assert_eq!(seen, vec![SEND_MONITOR_TEXT.to_string()]);
 }
 
 /// Entitlement is per layer, not per slot. The plugin holding the tool's

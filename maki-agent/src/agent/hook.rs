@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use maki_providers::Model;
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
+use strum::EnumIter;
 
 use crate::cancel::CancelToken;
 use crate::tools::ToolRegistry;
@@ -23,7 +24,7 @@ use crate::tools::registry::{BoxFuture, InstalledAgentHook};
 /// one of these. Past this the loop moves on without it.
 const AGENT_CHAIN_MAX: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, EnumIter)]
 pub enum AgentSlot {
     UserMessage,
     /// The model ended its turn without calling a tool.

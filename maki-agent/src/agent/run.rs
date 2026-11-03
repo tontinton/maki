@@ -20,7 +20,7 @@ use super::frame::{
     FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
 };
 use super::history::{History, sanitize_cancelled_history};
-use super::hook::{AgentHooks, AgentSlot, AgentSlotRole, MonitorFirer};
+use super::hook::{AgentHooks, AgentSlot, MonitorFirer};
 use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{DeltaChunk, DeltaSink, StreamError, StreamRequest, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
@@ -1327,15 +1327,17 @@ mod tests {
     use maki_storage::frame::{FactsUpdate, PlanChange};
     use maki_storage::id::MakiId;
     use serde_json::Value;
+    use strum::IntoEnumIterator;
     use test_case::test_case;
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::compaction::FIELD_CONTINUE;
-    use super::streaming::{DELTA_TEXT, DELTA_THINKING};
     use super::*;
     use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
+    use crate::agent::hook::AgentSlotRole;
     use crate::agent::hook::testing::{Seen, script};
+    use crate::agent::streaming::{DELTA_TEXT, DELTA_THINKING};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
@@ -4749,30 +4751,6 @@ mod tests {
         );
     }
 
-    /// A run nobody watches spawns no delta consumer and builds no sink.
-    #[tokio::test]
-    async fn message_delta_is_gated_on_a_registered_monitor() {
-        let mut history = History::new(Vec::new());
-        let (agent, _event_rx) = make_agent(
-            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
-            &mut history,
-        );
-
-        assert!(
-            agent
-                .hooks()
-                .monitor_firer(AgentSlot::MessageDelta)
-                .is_none()
-        );
-        script(&agent.registry, |_, _| Verdict::Unchanged);
-        assert!(
-            agent
-                .hooks()
-                .monitor_firer(AgentSlot::MessageDelta)
-                .is_some()
-        );
-    }
-
     /// Receive sees the assembled answer, and a value it returns changes
     /// nothing: the slot is observe-only.
     #[tokio::test]
@@ -4805,33 +4783,23 @@ mod tests {
         );
     }
 
-    /// The three monitors are the only observe-only agent slots.
+    /// The three monitors are the only observe-only agent slots. The test
+    /// iterates every variant, so a new slot must be classified here or it
+    /// fails.
     #[test]
     fn only_the_message_slots_are_monitors() {
-        for slot in [
-            AgentSlot::UserMessage,
-            AgentSlot::Stop,
-            AgentSlot::CompactBefore,
-            AgentSlot::CompactPrepare,
-        ] {
-            assert_eq!(
-                slot.role(),
-                AgentSlotRole::Steering,
-                "{} steers the run",
-                slot.name()
-            );
-        }
-        for slot in [
+        let monitors = [
             AgentSlot::MessageSend,
             AgentSlot::MessageReceive,
             AgentSlot::MessageDelta,
-        ] {
-            assert_eq!(
-                slot.role(),
-                AgentSlotRole::Monitor,
-                "{} only watches",
-                slot.name()
-            );
+        ];
+        for slot in AgentSlot::iter() {
+            let expected = if monitors.contains(&slot) {
+                AgentSlotRole::Monitor
+            } else {
+                AgentSlotRole::Steering
+            };
+            assert_eq!(slot.role(), expected, "{}", slot.name());
         }
     }
 }
