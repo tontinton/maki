@@ -181,7 +181,7 @@ Return a compact overview of a source file: imports, type definitions, function 
     return { body = buf, header = header }
   end,
   handler = function(input, ctx)
-    local path = input.path
+    local path: string? = input.path
     if not path then
       return { llm_output = "error: path is required", is_error = true }
     end

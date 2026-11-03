@@ -77,7 +77,7 @@ jobs:
     env:
       # Definition files in `lute check` (luau-lang/lute#1234) are not in a release yet.
       # renovate: datasource=github-releases depName=luau-lang/lute versioning=semver
-      LUTE_VERSION: v1.0.1-nightly.20261007
+      LUTE_VERSION: v1.0.1-nightly.20261103
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install lute
