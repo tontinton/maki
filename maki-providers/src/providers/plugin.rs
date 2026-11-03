@@ -77,8 +77,9 @@ pub enum AuthPurpose {
 pub struct BodyInput {
     pub body: Value,
     pub model: String,
-    /// The wire the request will use, resolved from config or the declared
-    /// codec. Lets build_body hooks branch on the active protocol.
+    /// The wire protocol the request will be sent over.
+    /// Resolved from user config in `providers.toml` or the declared codec.
+    /// Exposed so `build_body` hooks can adapt to the active wire.
     pub protocol: Protocol,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,

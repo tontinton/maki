@@ -184,18 +184,24 @@ fn login_row(decl: &ProviderDecl, target: Target, spec: &'static ProviderSpec) -
             (leak_str(&plan.key), row)
         })
         .collect();
-    // A user-set `protocol` in providers.toml overrides the declared codec,
-    // keeping the login row consistent with the wire that create() will use.
-    let protocol = ProvidersConfig::load_or_default()
-        .get(slug)
-        .and_then(|def| def.protocol)
-        .unwrap_or_else(|| match target {
+    /// Resolve the protocol for the login row.
+    /// Precedence: user config in providers.toml > declared codec/base > built-in default.
+    fn resolve_login_protocol(slug: &str, target: Target, _spec: &ProviderSpec) -> Protocol {
+        if let Some(def) = ProvidersConfig::load_or_default().get(slug)
+            && let Some(protocol) = def.protocol
+        {
+            return protocol;
+        }
+        match target {
             Target::Codec(protocol) => protocol,
             Target::Base(spec) => spec
                 .login
                 .as_ref()
                 .map_or(Protocol::Openai, |login| login.protocol),
-        });
+        }
+    }
+
+    let protocol = resolve_login_protocol(slug, target, spec);
     BuiltInProvider {
         slug,
         display_name: spec.display_name,

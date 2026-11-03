@@ -621,12 +621,8 @@ fn is_selected(_lua: &Lua, #[ctx] plugin: Arc<str>, slug: String) -> LuaResult<b
         .is_some_and(|def| def.plugin.as_deref() == Some(plugin.as_ref())))
 }
 
-/// The wire a provider speaks, resolved from providers.toml or its declared
-/// codec. A plugin can use this to branch its hooks on the active protocol.
-///
-/// Returns `"openai"`, `"openai-responses"`, `"anthropic"` or `"google"`,
-/// or nil when the provider is unknown.
-///
+/// The wire protocol a provider speaks, for hooks that branch on the active wire.
+/// Returns the configured protocol name, or nil if unknown.
 /// @param slug string Provider name.
 /// @return string?
 #[lua_fn]

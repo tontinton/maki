@@ -576,8 +576,8 @@ fn the_responses_codec_applies_the_body_hook_too() {
     assert_eq!(sent[0].json()["acme_marker"], json!(RESPONSES_MARKER));
 }
 
-/// A user-set `protocol` in providers.toml overrides the declared codec,
-/// and the resolved protocol reaches `build_body` as `body.protocol`.
+/// Configuring protocol in providers.toml overrides the declared codec,
+/// and the resolved protocol reaches build_body hooks.
 #[test]
 fn configured_protocol_overrides_declared_codec_and_reaches_build_body() {
     let _state = isolated_state();
@@ -630,8 +630,7 @@ maki.provider.register({{
     );
 }
 
-/// `maki.provider.protocol(slug)` returns the wire configured in
-/// providers.toml, or nil when nothing is configured.
+/// The Lua `protocol` function returns the configured wire or nil.
 #[test]
 fn maki_provider_protocol_returns_configured_wire() {
     let state = isolated_state();
