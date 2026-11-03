@@ -198,7 +198,16 @@ impl ModelRegistry {
         let candidate = if tiers_from_discovery(provider) {
             self.discovered_static_candidate(provider, tier)
                 .or_else(|| self.metadata_candidate(provider, tier))
-                .or_else(|| static_candidate(provider, tier))
+                .or_else(|| {
+                    let listed_all = self.known_models.contains_key(provider)
+                        && ProviderRegistry::get(provider)
+                            .is_some_and(|spec| spec.catalog_is_authoritative);
+                    if listed_all {
+                        None
+                    } else {
+                        static_candidate(provider, tier)
+                    }
+                })
                 .or_else(|| self.positional_candidate(provider, tier))
         } else {
             static_candidate(provider, tier)
@@ -441,6 +450,15 @@ mod tests {
         assert_eq!(
             reg.spec_for_tier("copilot", ModelTier::Strong),
             Some(expected.into())
+        );
+    }
+
+    #[test]
+    fn tier_default_stays_in_an_answered_authoritative_catalog() {
+        let reg = make_tiered(&[("alpha", ModelTier::Strong)]);
+        assert_eq!(
+            reg.spec_for_tier("copilot", ModelTier::Weak),
+            Some("copilot/alpha".into())
         );
     }
 

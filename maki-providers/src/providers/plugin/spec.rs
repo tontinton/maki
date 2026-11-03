@@ -63,18 +63,21 @@ pub(super) fn build(decl: &ProviderDecl, target: Target) -> Result<Built, String
 /// undescribed model gets safe limits.
 fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) -> ProviderSpec {
     let native = target.spec();
-    let (accepts_arbitrary_models, max_output, context_window) = match target {
-        Target::Base(spec) => (
-            spec.accepts_arbitrary_models,
-            spec.fallback_max_output,
-            spec.fallback_context_window,
-        ),
-        Target::Codec(_) => (
-            true,
-            Some(UNKNOWN_MODEL_MAX_OUTPUT),
-            UNKNOWN_MODEL_CONTEXT_WINDOW,
-        ),
-    };
+    let (accepts_arbitrary_models, catalog_is_authoritative, max_output, context_window) =
+        match target {
+            Target::Base(spec) => (
+                spec.accepts_arbitrary_models,
+                spec.catalog_is_authoritative,
+                spec.fallback_max_output,
+                spec.fallback_context_window,
+            ),
+            Target::Codec(_) => (
+                true,
+                false,
+                Some(UNKNOWN_MODEL_MAX_OUTPUT),
+                UNKNOWN_MODEL_CONTEXT_WINDOW,
+            ),
+        };
     ProviderSpec {
         slug: leak_str(&decl.slug),
         display_name: leak_str(&decl.display_name),
@@ -93,6 +96,7 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
         accepts_arbitrary_models: decl
             .accepts_arbitrary_models
             .unwrap_or(accepts_arbitrary_models),
+        catalog_is_authoritative,
         fallback_max_output: decl.max_output_tokens.unwrap_or(max_output),
         fallback_context_window: decl.context_window.unwrap_or(context_window),
         models_toml: NO_CURATED_MODELS,

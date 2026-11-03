@@ -25,7 +25,7 @@ use maki_config::providers::Protocol;
 
 pub mod auth;
 
-const SLUG: &str = "copilot";
+pub(crate) const SLUG: &str = "copilot";
 const DISPLAY_NAME: &str = "Copilot";
 const ENV_VAR: &str = "GH_COPILOT_TOKEN";
 const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
@@ -49,6 +49,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: true,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/copilot.toml"),

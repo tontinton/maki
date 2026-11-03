@@ -68,6 +68,12 @@ pub struct ProviderSpec {
     /// whether a toggle fragment can carry an explicit token budget.
     pub thinking_fields_fallback: fn(&Model) -> Option<ThinkingFallback>,
     pub accepts_arbitrary_models: bool,
+    /// The live listing is the account's entitlement: an answered listing is
+    /// the whole list, with no curated rows from [`ProviderSpec::models`]
+    /// appended, and tier defaults stay inside it. A 401/403 lists nothing,
+    /// the offline list leaves the provider to discovery, and any other
+    /// failure falls back to the curated rows.
+    pub catalog_is_authoritative: bool,
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,
     /// This provider's curated table, embedded from `models/<slug>.toml`. Read
