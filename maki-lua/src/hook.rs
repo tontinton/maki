@@ -187,12 +187,20 @@ impl AgentHook for SlotHook {
             }),
             kind: FiringKind::Agent(slot.role()),
         };
-        // A monitor's answer is dropped, so it is sent without a reply channel
-        // and this resolves at once: whoever fired it does not wait.
+        // A monitor's answer is dropped, but `done` still lets the caller wait
+        // for the fan-out to finish. Send and receive fire it detached and
+        // never wait, so a slow monitor cannot stall the turn; the delta
+        // consumer does wait, so a slow monitor backpressures the bounded delta
+        // channel instead of piling unbounded work on the Lua thread.
         if slot.role() == AgentSlotRole::Monitor {
-            let request = Request::RunMonitor { run };
+            let (done_tx, done_rx) = flume::bounded(1);
+            let request = Request::RunMonitor {
+                run,
+                done: done_tx,
+            };
             return Box::pin(async move {
                 let _ = self.tx.send_async(request).await;
+                let _ = done_rx.recv_async().await;
                 Verdict::Unchanged
             });
         }

@@ -60,6 +60,7 @@ use crate::api::plan::{
 use crate::api::slot::{
     ChainObserver, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, PLAN_FORM_ACTIONS_SLOT,
     PLAN_FORM_SLOT, SlotLayer, SlotStore, layer_plugins, run_host_chain, run_host_chain_with,
+    run_monitor_fanout,
 };
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
@@ -556,11 +557,16 @@ pub enum Request {
         run: HookRun,
         reply: flume::Sender<Verdict>,
     },
-    /// A monitor chain (`agent.message.*`). Carries no reply channel because
-    /// nobody reads a monitor's answer: the caller fires and moves on, so the
-    /// turn never waits for it. The frozen value and the dropped answer are
-    /// the chain's own business, in [`run_hook`].
-    RunMonitor { run: HookRun },
+    /// A monitor chain (`agent.message.*`). The answer is dropped, so the
+    /// `done` channel carries nothing: it exists so the delta consumer can wait
+    /// for the fan-out to finish, which is what makes the bounded delta channel
+    /// drop instead of piling unbounded work on the Lua thread. Send and
+    /// receive drop the receiver and move on, so a slow monitor never stalls
+    /// the turn.
+    RunMonitor {
+        run: HookRun,
+        done: flume::Sender<()>,
+    },
     /// The `permission.prompt` chain, sent only when it has layers.
     RunPrompt {
         run: PromptRun,
@@ -5072,7 +5078,18 @@ async fn run_hook(
         return Verdict::Unchanged;
     };
     let allow_layer = layer_delegation(lua, plugins, cost);
-    let chain = run_host_chain(lua, &names, args, &allow_layer);
+    // A monitor is a fan-out, not a chain: every layer runs, none can stop the
+    // next, and nothing it answers is read. `run_awaited` still bounds the lot,
+    // so one parked monitor costs the others nothing past the window.
+    if kind.frozen() {
+        let fanout = async {
+            run_monitor_fanout(lua, &names, args, &allow_layer).await;
+        };
+        if let Err(msg) = run_awaited(lua, gate, cancel, deadline, fanout).await {
+            tracing::warn!(slot, reason = msg, "monitor dispatch abandoned");
+        }
+        return Verdict::Unchanged;
+    }    let chain = run_host_chain(lua, &names, args, &allow_layer);
     let returned = match run_awaited(lua, gate, cancel, deadline, chain).await {
         Ok(Ok(Some(values))) => values,
         Ok(Ok(None)) => return Verdict::Unchanged,
@@ -5139,18 +5156,6 @@ async fn run_hook(
         (Some(reason), input) => Verdict::Ask { reason, input },
         (None, Some(replacement)) => Verdict::Replaced(replacement),
         (None, None) => Verdict::Unchanged,
-    }
-}
-
-/// A monitor is observe-only, so a returned replacement is a bug rather than a
-/// request. Say so once, where the chain's answer is known, since the fire site
-/// dropped it and moved on.
-fn warn_monitor_replaced(slot: &str, verdict: &Verdict) {
-    if matches!(verdict, Verdict::Replaced(_)) {
-        tracing::warn!(
-            slot,
-            "monitor slot is observe-only, the returned value is ignored"
-        );
     }
 }
 
@@ -5935,16 +5940,15 @@ pub fn spawn(
                                 let _ = reply.send(verdict);
                             });
                         }
-                        Request::RunMonitor { run } => {
-                            // Same spawn, no reply: a monitor's answer is
-                            // dropped, so nobody waits on it.
+                        Request::RunMonitor { run, done } => {
+                            // The answer is dropped; `done` only lets a caller
+                            // that opted in wait for the fan-out to finish.
                             let lua = rt.lua.clone();
                             let plugins = Rc::clone(&rt.plugins);
                             let gate = Rc::clone(&gate);
                             spawn_local(async move {
-                                let slot = run.slots.first().cloned().unwrap_or_default();
-                                let verdict = run_hook(&lua, &plugins, &gate, run).await;
-                                warn_monitor_replaced(&slot, &verdict);
+                                let _ = run_hook(&lua, &plugins, &gate, run).await;
+                                let _ = done.send(());
                             });
                         }
                         Request::RunPrompt { run, reply } => {

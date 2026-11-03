@@ -523,6 +523,53 @@ pub(crate) async fn run_host_chain_with(
         .map(Some)
 }
 
+/// Runs every entitled layer on `{names}` once, as independent subscribers,
+/// and drops what each returns. The monitor counterpart of [`run_host_chain`]:
+/// a chain stops at the first layer that does not call `prev`, so routing
+/// observe-only slots through it would let the outermost monitor silently
+/// swallow every monitor behind it. Each layer gets the same `(value, ctx)`
+/// and no `prev` at all, because a monitor has nothing to pass down.
+///
+/// A layer that fails is logged and the rest still run, the way one autocmd
+/// callback never costs the others theirs.
+pub(crate) async fn run_monitor_fanout(
+    lua: &Lua,
+    names: &[&str],
+    args: MultiValue,
+    allow_layer: &dyn Fn(&SlotLayer, &str) -> bool,
+) {
+    let Some(&name) = names.first() else {
+        return;
+    };
+    let Ok(_guard) = DepthGuard::enter(lua, SEAM, name, Reentry::Task) else {
+        tracing::warn!(slot = name, "monitor dispatch exceeded max depth, skipping");
+        return;
+    };
+    let mut layers = Vec::new();
+    for name in names {
+        if let Some((_, _, _, found)) = snapshot(lua, name) {
+            layers.extend(
+                found
+                    .iter()
+                    .filter(|layer| allow_layer(layer, name))
+                    .cloned(),
+            );
+        }
+    }
+    for layer in layers {
+        let returned = call_swallowing::<MultiValue>(&layer.func, args.clone(), name, &layer.plugin)
+            .await
+            .unwrap_or_default();
+        if matches!(returned.iter().next(), Some(Value::Table(_))) {
+            tracing::warn!(
+                slot = name,
+                plugin = &*layer.plugin,
+                "monitor slot is observe-only, the returned value is ignored"
+            );
+        }
+    }
+}
+
 /// The plugins layering {name}, for a log line about a chain that failed as a
 /// whole and cannot name the layer that did it.
 pub(crate) fn layer_plugins(lua: &Lua, name: &str) -> String {
@@ -716,7 +763,14 @@ pub(crate) fn parse_capability(
 /// returned value is ignored. All three receive a read-only view: writing to
 /// it raises an error, and every monitor on one firing sees the same table.
 /// `agent.message.delta` fires once per token, so it only runs when a layer is
-/// registered, and a slow layer drops deltas rather than stalling the stream.
+/// registered. Deltas are best-effort: monitors run one after another on the
+/// shared plugin thread, so a slow layer costs every other monitor deltas
+/// rather than stalling the stream.
+///
+/// A monitor is a fan-out, not a chain, so its layer takes
+/// `function(value, ctx)` with no `prev`: every layer runs, in no guaranteed
+/// order, and none can end the chain for the rest. A steering slot's layer
+/// takes `function(prev, value, ctx)` instead.
 ///
 /// `permission.prompt` fires where the permission prompt would show, with
 /// the prompt as its default. A layer takes `function(prev, req, ctx)` and

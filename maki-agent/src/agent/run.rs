@@ -634,10 +634,10 @@ impl<'h> Agent<'h> {
             return Err(AgentError::Cancelled);
         }
         self.prepare_request()?;
+        self.notify_message_send();
         let Some((system, tools)) = self.history.request_prefix() else {
             return Err(no_frame());
         };
-        self.notify_message_send(system, tools);
         // Deltas fire off the stream's thread so a slow monitor never stalls a
         // token. The sink is absent unless a monitor registered, so an unwatched
         // stream spawns nothing and the forwarder stays as cheap as before.
@@ -773,17 +773,29 @@ impl<'h> Agent<'h> {
     /// Tell the send monitors what is about to reach the provider. Observe
     /// only: fired detached so the turn does not wait on a slow monitor, and a
     /// monitor that returns a value is logged where the chain runs.
-    fn notify_message_send(&self, system: &str, tools: &Value) {
+    ///
+    /// Sends only the messages the monitor has not been handed, plus the total,
+    /// so a long session does not re-serialize the whole transcript on every
+    /// round trip. A rewrite (compaction) mints a new epoch, so the monitor
+    /// then sees the whole new transcript rather than an offset into a list
+    /// that moved.
+    fn notify_message_send(&mut self) {
         let Some(firer) = self.hooks().monitor_firer(AgentSlot::MessageSend) else {
             return;
         };
+        let Some((system, tools)) = self.history.request_prefix() else {
+            return;
+        };
+        let (new_messages, total) = self.history.unsent_messages();
         firer.spawn(json!({
-            "messages": self.history.as_slice(),
+            "messages": new_messages,
+            "total": total,
             "system": system,
             "tools": tools,
             "session_id": self.session_id.as_ref().map(SessionRef::as_str),
             "task_id": self.task_id.as_deref(),
         }));
+        self.history.mark_sent();
     }
 
     /// Tell the receive monitors what the model said. Observe only, same as

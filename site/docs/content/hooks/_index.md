@@ -20,7 +20,9 @@ gets the value, decides, and passes it down by calling `prev`. The last layer
 registered runs first.
 
 A few slots are neither: observe-only monitors. They fire like a slot, but the
-return value is ignored and the value is a read-only view. The three
+return value is ignored and the value is a read-only view. They are a fan-out,
+not a chain: every layer runs, in no guaranteed order, none ends the chain for
+the others, and a layer takes `function(value, ctx)` with no `prev`. The three
 `agent.message.*` slots below work this way. Use a monitor to watch a request,
 a reply, or a token stream without changing it.
 
@@ -437,12 +439,17 @@ ignored, with a warning. Nothing a monitor does here reaches the provider, so
 there is no way to void the prompt cache or orphan a thinking block from this
 slot.
 
-`req` is a read-only view. Writing to it raises an error, so a monitor holds
-one reference and mutates nothing. Each registered monitor sees the same `req`,
-so nothing one monitor writes can reach another.
+A monitor is a fan-out, not a chain: every layer on it runs, in no guaranteed
+order, and one layer never ends the chain for the rest. A layer takes
+`function(value, ctx)`, with no `prev`, because a monitor has nothing to pass
+down. Every layer sees the same read-only `value`.
+
+`value` is a read-only view. Writing to it raises an error, so a monitor holds
+one reference and mutates nothing. Each registered monitor sees the same
+`value`, so nothing one monitor writes can reach another.
 
 ```lua
-maki.api.set_slot("agent.message.send", function(_prev, req, ctx)
+maki.api.set_slot("agent.message.send", function(req, ctx)
   for _, msg in ipairs(req.messages) do
     if msg.role == "user" and has_aws_key(msg) then
       maki.log.warn("outgoing request carries an AWS key")
@@ -464,12 +471,17 @@ one turn sees the same one.
 Fires once per text or thinking token as it streams, with `kind` set to
 `"text"` or `"thinking"`. Observe-only: a returned value is ignored, and `ev`
 is a read-only view. It runs on its own task so a slow layer never stalls the
-stream, only runs when a layer is registered, and a layer that falls behind
-drops deltas rather than blocking the model.
+stream, and it only runs when a layer is registered.
+
+Deltas are best-effort. Monitors on this slot run one after another on the
+shared plugin thread, so a slow layer delays the rest, and a layer slow enough
+to fall behind costs every other monitor deltas too. Treat a delta monitor as a
+sample rather than a complete transcript, and use `agent.message.receive` when
+you need the whole message.
 
 ```lua
 local runs = {}
-maki.api.set_slot("agent.message.delta", function(_prev, ev, ctx)
+maki.api.set_slot("agent.message.delta", function(ev, ctx)
   if ev.kind ~= "thinking" then return end
   local n = (runs[ev.text] or 0) + 1
   runs[ev.text] = n

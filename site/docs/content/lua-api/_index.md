@@ -1242,6 +1242,24 @@ The agent loop fires `agent.user_message`, `agent.stop`,
 contract. Wrapping one costs every permission. See
 [Hooks](/docs/hooks/).
 
+The message slots are the exception. `agent.message.send` is an
+observe-only monitor: it runs once per request, before the retry loop, and
+sees `messages`, `system` and `tools` as the request carries them. A
+returned value is ignored, so a monitor cannot change the request.
+`agent.message.receive` and `agent.message.delta` are observe-only too:
+they see the assistant message and each text or thinking delta, and a
+returned value is ignored. All three receive a read-only view: writing to
+it raises an error, and every monitor on one firing sees the same table.
+`agent.message.delta` fires once per token, so it only runs when a layer is
+registered. Deltas are best-effort: monitors run one after another on the
+shared plugin thread, so a slow layer costs every other monitor deltas
+rather than stalling the stream.
+
+A monitor is a fan-out, not a chain, so its layer takes
+`function(value, ctx)` with no `prev`: every layer runs, in no guaranteed
+order, and none can end the chain for the rest. A steering slot's layer
+takes `function(prev, value, ctx)` instead.
+
 `permission.prompt` fires where the permission prompt would show, with
 the prompt as its default. A layer takes `function(prev, req, ctx)` and
 answers `{ decision = "allow" }` or `{ decision = "deny", guidance = … }`,

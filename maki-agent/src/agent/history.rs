@@ -93,6 +93,20 @@ pub struct History {
     /// because messages only make sense under the prefix they were sent with,
     /// and every frontend already keeps a `History` for the whole session.
     live: Option<LiveFrame>,
+    /// How much of the transcript a send monitor has been handed, and the
+    /// epoch it was handed under. A rewrite mints a new epoch, so a monitor
+    /// reads the whole new transcript instead of an offset into a list that
+    /// moved. Only touched when a send monitor is registered.
+    sent: Sent,
+}
+
+/// What a send monitor has seen: a length within one epoch. An epoch bump
+/// (any rewrite) resets it, because the old offset no longer names the same
+/// messages.
+#[derive(Default, Clone, Copy)]
+struct Sent {
+    epoch: Option<u64>,
+    len: usize,
 }
 
 impl History {
@@ -102,6 +116,7 @@ impl History {
             mirror: None,
             unsaved: false,
             live: None,
+            sent: Sent::default(),
         }
     }
 
@@ -226,6 +241,30 @@ impl History {
 
     pub fn len(&self) -> usize {
         self.snapshot.messages.len()
+    }
+
+    /// The messages a send monitor has not been handed yet, and how many the
+    /// transcript holds in total. A rewrite (`replace`, `truncate`, a
+    /// compaction restart) mints a new epoch, so the whole new transcript is
+    /// unsent and a monitor sees the rewrite instead of an offset into a list
+    /// that moved under it.
+    pub fn unsent_messages(&self) -> (&[Message], usize) {
+        let epoch = self.snapshot.epoch;
+        let from = if self.sent.epoch == Some(epoch) {
+            self.sent.len.min(self.snapshot.messages.len())
+        } else {
+            0
+        };
+        (&self.snapshot.messages[from..], self.snapshot.messages.len())
+    }
+
+    /// Record that a send monitor has been handed everything up to now, so the
+    /// next request sends only what is new.
+    pub fn mark_sent(&mut self) {
+        self.sent = Sent {
+            epoch: Some(self.snapshot.epoch),
+            len: self.snapshot.messages.len(),
+        };
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1003,5 +1042,45 @@ mod tests {
         assert_ne!(snap.epoch, epoch);
         assert_eq!(snap.messages.len(), 1);
         assert_eq!(snap.messages[0].user_text(), Some(SECOND));
+    }
+
+    #[test]
+    fn unsent_messages_starts_at_the_whole_transcript() {
+        let history = History::new(vec![Message::user(FIRST.into())]);
+
+        let (unsent, total) = history.unsent_messages();
+
+        assert_eq!(total, 1);
+        assert_eq!(unsent.len(), 1);
+        assert_eq!(unsent[0].user_text(), Some(FIRST));
+    }
+
+    #[test]
+    fn mark_sent_then_a_push_only_offers_the_new_message() {
+        let mut history = History::new(vec![Message::user(FIRST.into())]);
+        history.mark_sent();
+        history.push(Message::user(SECOND.into()));
+
+        let (unsent, total) = history.unsent_messages();
+
+        assert_eq!(total, 2);
+        assert_eq!(unsent.len(), 1);
+        assert_eq!(unsent[0].user_text(), Some(SECOND));
+    }
+
+    /// A compaction restart replaces the transcript, so the old offset no
+    /// longer names the same messages and a monitor must see the whole new
+    /// list.
+    #[test]
+    fn a_rewrite_offers_the_whole_transcript_again() {
+        let mut history = History::new(vec![Message::user(FIRST.into())]);
+        history.mark_sent();
+        history.restart(vec![Message::user(SECOND.into())]);
+
+        let (unsent, total) = history.unsent_messages();
+
+        assert_eq!(total, 1);
+        assert_eq!(unsent.len(), 1);
+        assert_eq!(unsent[0].user_text(), Some(SECOND));
     }
 }

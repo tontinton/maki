@@ -631,6 +631,45 @@ mod tests {
         assert_eq!(reported, "API error (400)");
     }
 
+    /// A monitor that cannot keep up costs bounded memory, never a stalled
+    /// stream. With nobody draining, a sink takes its channel's worth and then
+    /// drops, so the producer is free to keep streaming.
+    #[test]
+    fn a_full_delta_sink_drops_instead_of_blocking() {
+        let (sink, recv) = DeltaSink::channel();
+        for i in 0..DELTA_CHANNEL_CAPACITY * 2 {
+            sink.notify(DELTA_TEXT, &i.to_string());
+        }
+        assert_eq!(
+            recv.len(),
+            DELTA_CHANNEL_CAPACITY,
+            "a full channel holds capacity and drops the rest"
+        );
+    }
+
+    /// Every delta under capacity still arrives, in order, with its kind: the
+    /// stream only loses deltas once a monitor falls behind.
+    #[test]
+    fn a_delta_sink_keeps_every_chunk_under_capacity() {
+        let (sink, recv) = DeltaSink::channel();
+        sink.notify(DELTA_THINKING, "a");
+        sink.notify(DELTA_TEXT, "b");
+        let parts: Vec<_> = recv
+            .drain()
+            .map(|chunk| {
+                let (kind, text) = chunk.parts();
+                (kind, text.to_owned())
+            })
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                (DELTA_THINKING, "a".to_owned()),
+                (DELTA_TEXT, "b".to_owned())
+            ]
+        );
+    }
+
     /// The kind of server this module exists for: it enforces
     /// `prompt + max_tokens <= window` and counts the prompt with its own
     /// tokenizer, which reads higher than maki's byte estimate. Any budget
