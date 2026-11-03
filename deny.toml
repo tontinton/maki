@@ -5,6 +5,9 @@ all-features = true
 yanked = "deny"
 # Only direct dependencies: a transitive crate going unmaintained shouldn't block a bump.
 unmaintained = "workspace"
+ignore = [
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 comes through aws-config, whose releases still pin p256 0.13" },
+]
 
 [licenses]
 allow = [
