@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
-use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
+use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan, ProvidersConfig};
 
 use crate::manifest::check_rows;
 use crate::model::ModelEntry;
@@ -184,16 +184,22 @@ fn login_row(decl: &ProviderDecl, target: Target, spec: &'static ProviderSpec) -
             (leak_str(&plan.key), row)
         })
         .collect();
-    BuiltInProvider {
-        slug,
-        display_name: spec.display_name,
-        protocol: match target {
+    // A user-set `protocol` in providers.toml overrides the declared codec,
+    // keeping the login row consistent with the wire that create() will use.
+    let protocol = ProvidersConfig::load_or_default()
+        .get(slug)
+        .and_then(|def| def.protocol)
+        .unwrap_or_else(|| match target {
             Target::Codec(protocol) => protocol,
             Target::Base(spec) => spec
                 .login
                 .as_ref()
                 .map_or(Protocol::Openai, |login| login.protocol),
-        },
+        });
+    BuiltInProvider {
+        slug,
+        display_name: spec.display_name,
+        protocol,
         default_base_url,
         default_api_key_env: spec.api_key_env,
         default_model: model_spec(&decl.default_model),
