@@ -33,6 +33,26 @@ function M.set(value)
   maki.ui.flash(err or (FLASH_PREFIX .. model.thinking_shown))
 end
 
+-- At either end, or on a mode, nothing is sent: the flash says where the
+-- session already is.
+function M.step(delta)
+  local model, err = maki.model.get()
+  if err then
+    maki.ui.flash(err)
+    return
+  end
+  if #model.thinking_options == 0 then
+    maki.ui.flash(UNSUPPORTED)
+    return
+  end
+  local value = Picker.step(model, delta)
+  if value then
+    M.set(value)
+  else
+    maki.ui.flash(FLASH_PREFIX .. model.thinking_shown)
+  end
+end
+
 function M.open()
   if open_win then
     return
