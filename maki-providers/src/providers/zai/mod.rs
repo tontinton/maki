@@ -76,6 +76,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: |_, choice| dialect::GLM.sends(choice),
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,
     models_toml: include_str!("../../../models/zai.toml"),

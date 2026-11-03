@@ -39,6 +39,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: platform::sends_thinking,
     thinking_fields_fallback: platform::thinking_fields_fallback,
     accepts_arbitrary_models: false,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/openai.toml"),

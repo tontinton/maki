@@ -40,6 +40,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: |_, choice| dialect::GROK.sends(choice),
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(GROK_MAX_OUTPUT_TOKENS),
     fallback_context_window: 500_000,
     models_toml: include_str!("../../../models/xai.toml"),

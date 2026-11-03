@@ -30,6 +30,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: |model, choice| LLAMACPP.sends_thinking(model, choice),
     thinking_fields_fallback: |_| LLAMACPP.fields_fallback(),
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: None,
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
