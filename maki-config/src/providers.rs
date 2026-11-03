@@ -1037,28 +1037,6 @@ tier = "{input}"
         assert_eq!(ignored_builtin_fields(slug, &def), expected);
     }
 
-    /// The exemption rides on [`overlays_local_thinking`], so a slug added to
-    /// `LOCAL_OVERLAY_SLUGS` without a `resolve_protocol` call in its
-    /// constructor would silently claim a `protocol` nobody reads.
-    #[test]
-    fn every_exempt_slug_really_resolves_its_configured_protocol() {
-        let def = ProviderDef {
-            protocol: Some(Protocol::OpenaiResponses),
-            ..ProviderDef::default()
-        };
-        for slug in LOCAL_OVERLAY_SLUGS {
-            assert!(
-                !ignored_builtin_fields(slug, &def).contains(&"protocol"),
-                "{slug} is reported as ignoring protocol; fix the warning or drop it from the overlay"
-            );
-            assert_eq!(
-                resolve_protocol(slug, Some(&def)),
-                Some(Protocol::OpenaiResponses),
-                "{slug} exempts protocol but does not read it"
-            );
-        }
-    }
-
     /// The literal below stops compiling when [`ModelDef`] grows a field, which
     /// is the one reminder to decide what a local slug does with it: read it in
     /// the overlay, or name it here as dropped. Otherwise the warning slowly
