@@ -105,11 +105,6 @@
       groupName: 'ruff and ty',
     },
     {
-      description: 'Pinned to a nightly until a stable release has luau-lang/lute#1234',
-      matchDepNames: ['luau-lang/lute'],
-      allowedVersions: '!/-nightly\\./',
-    },
-    {
       description: 'release.yml only runs on tags and no PR workflow covers it, so these wait until someone can cut a test release',
       matchManagers: ['custom.regex'],
       matchFileNames: ['.github/workflows/release.yml'],
