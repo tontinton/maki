@@ -144,7 +144,7 @@ return function(U)
   end
 
   local function unwrap_class_member(member)
-    if member:type() ~= "class_member" then
+    if member:type() ~= "member_declaration" then
       return member
     end
     for _, child in ipairs(member:children()) do
@@ -219,8 +219,8 @@ return function(U)
 
   return {
     import_separator = ".",
-    is_doc_comment = function(node, source)
-      return node:type() == "comment" and get_text(node, source):sub(1, 3) == "///"
+    is_doc_comment = function(node, _source)
+      return node:type() == "documentation_comment"
     end,
 
     extract_nodes = function(node, source, _attrs)
