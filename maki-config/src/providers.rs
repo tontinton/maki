@@ -585,12 +585,16 @@ fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
 ///
 /// [`overlays_local_thinking`] slugs are the exception on both counts: they read
 /// their `models` table (so only the keys nobody reads are named) and they take
-/// `protocol` from the config, because `LocalEndpoint` branches on it to pick
-/// the Responses wire.
+/// `protocol` from the config — but only `openai` and `openai-responses`, the
+/// two wires `LocalEndpoint` actually branches on. Anything else is still
+/// dropped and still warned about.
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
     let local = overlays_local_thinking(slug);
     let mut ignored = Vec::new();
-    if def.protocol.is_some() && !local {
+    if def
+        .protocol
+        .is_some_and(|p| !local || !matches!(p, Protocol::Openai | Protocol::OpenaiResponses))
+    {
         ignored.push("protocol");
     }
     if def.api_key_env.is_some() {
@@ -1015,16 +1019,19 @@ tier = "{input}"
     }
 
     /// `LocalEndpoint` reads `protocol` to choose the Responses wire, so a
-    /// local slug that sets it is honored. Warning about it would tell the
-    /// user to undo a change that took effect.
-    #[test_case("ollama", Vec::new() ; "ollama")]
-    #[test_case("llama-cpp", Vec::new() ; "llama_cpp")]
-    #[test_case("anthropic", vec!["protocol"] ; "anthropic")]
-    #[test_case("openai", vec!["protocol"] ; "openai")]
-    #[test_case("zai", vec!["protocol"] ; "zai")]
-    fn protocol_is_ignored_only_where_it_really_is(slug: &str, expected: Vec<&str>) {
+    /// local slug that sets it to `openai` or `openai-responses` is honored.
+    /// Warning about it would tell the user to undo a change that took effect.
+    /// Any other protocol value is still dropped and still warned about.
+    #[test_case("ollama", Protocol::OpenaiResponses, Vec::new() ; "ollama_openai_responses")]
+    #[test_case("llama-cpp", Protocol::Openai, Vec::new() ; "llama_cpp_openai")]
+    #[test_case("ollama", Protocol::Anthropic, vec!["protocol"] ; "ollama_anthropic_warns")]
+    #[test_case("llama-cpp", Protocol::Google, vec!["protocol"] ; "llama_cpp_google_warns")]
+    #[test_case("anthropic", Protocol::OpenaiResponses, vec!["protocol"] ; "anthropic")]
+    #[test_case("openai", Protocol::OpenaiResponses, vec!["protocol"] ; "openai")]
+    #[test_case("zai", Protocol::OpenaiResponses, vec!["protocol"] ; "zai")]
+    fn protocol_is_ignored_only_where_it_really_is(slug: &str, protocol: Protocol, expected: Vec<&str>) {
         let def = ProviderDef {
-            protocol: Some(Protocol::OpenaiResponses),
+            protocol: Some(protocol),
             ..ProviderDef::default()
         };
         assert_eq!(ignored_builtin_fields(slug, &def), expected);
