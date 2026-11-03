@@ -374,7 +374,7 @@ mod tests {
     fn hints_follow_their_plugins_tools(filter: ToolFilter, hinted: bool) {
         let registry = ToolRegistry::new();
         for name in [TOOL_A, TOOL_B] {
-            let source = ToolSource::Lua {
+            let source = ToolSource {
                 plugin: HINTED_PLUGIN.into(),
             };
             registry
