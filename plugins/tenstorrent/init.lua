@@ -2,10 +2,12 @@
 --
 -- Two gateways share the served catalogue. Qwen and MiniMax take the thinking
 -- toggle as `chat_template_kwargs.enable_thinking`. GLM-5.3 ignores that and
--- keeps thinking on until `reasoning_effort` is `"low"`; `"medium"` turns it
--- back on. The VL instruct model does not think, and `reasoning_effort =
--- "none"` is a 400 there, so it gets no fragment. The other ids are on the
--- rate card and were not probed, so thinking stays off.
+-- reads `reasoning_effort`: "minimal", "medium", "xhigh" and "max" think
+-- (medium < xhigh < max on a fixed question), while "low" and "high" both
+-- switch thinking off, and "none" is ignored. So off is spelled "low", and
+-- there is no "low" level to offer. The VL instruct model does not think, and
+-- `reasoning_effort = "none"` is a 400 there, so it gets no fragment. The
+-- other ids are on the rate card and were not probed, so thinking stays off.
 --
 -- Prices are USD per 1M tokens from the console pricing table. Cached input
 -- is `cache_read`. The card has no cache-write column, and created cache
@@ -15,7 +17,10 @@
 
 local TOGGLE_ON = { chat_template_kwargs = { enable_thinking = true } }
 local TOGGLE_OFF = { chat_template_kwargs = { enable_thinking = false } }
-local GLM_ON = { reasoning_effort = "medium" }
+local GLM_MINIMAL = { reasoning_effort = "minimal" }
+local GLM_MEDIUM = { reasoning_effort = "medium" }
+local GLM_XHIGH = { reasoning_effort = "xhigh" }
+local GLM_MAX = { reasoning_effort = "max" }
 local GLM_OFF = { reasoning_effort = "low" }
 
 local function rate(input, cached, output)
@@ -102,7 +107,14 @@ maki.provider.register({
       supports_vision = false,
       context_window = 1048576,
       pricing = rate(0.6, 0.1, 2.5),
-      thinking_fields = { off = GLM_OFF, adaptive = GLM_ON },
+      thinking_fields = {
+        off = GLM_OFF,
+        adaptive = GLM_MEDIUM,
+        minimal = GLM_MINIMAL,
+        medium = GLM_MEDIUM,
+        xhigh = GLM_XHIGH,
+        max = GLM_MAX,
+      },
     },
   },
 })
