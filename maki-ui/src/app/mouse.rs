@@ -32,7 +32,7 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(zone) = self.zone_at(event.row, event.column) {
-                    if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
+                    if self.is_behind_modal(zone.zone) {
                         return;
                     }
                     // Move the cursor to the click position in the input area.
@@ -295,6 +295,12 @@ impl App {
 
     pub(super) fn zone_at(&self, row: u16, col: u16) -> Option<selection::SelectableZone> {
         self.zones.zone_at(row, col)
+    }
+
+    /// Everything outside the Overlay zone sits behind a modal. That zone also
+    /// holds the status bar, queue, panels and splits, which stay live.
+    pub(super) fn is_behind_modal(&self, zone: SelectionZone) -> bool {
+        self.has_modal_overlay() && zone != SelectionZone::Overlay
     }
 
     /// The one place a screen position becomes a document position. The

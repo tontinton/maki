@@ -3066,6 +3066,96 @@ fn scroll_outside_msg_area_ignored() {
     assert!(app.chats[0].auto_scroll());
 }
 
+const MODAL_KEEPS_THE_WHEEL_OFF_THE_CHAT: &str =
+    "a modal owns the wheel, so the chat under it stays put";
+const NON_MODAL_LETS_THE_WHEEL_SCROLL_THE_CHAT: &str =
+    "a holder that is not a modal lets the wheel scroll the chat";
+
+#[test_case(open_alert as fn(&mut App), false ; "alert_modal")]
+#[test_case(open_search, false ; "search_modal")]
+#[test_case(|app: &mut App| app.theme_picker.open(), false ; "theme_picker")]
+#[test_case(|app: &mut App| app.login_picker.open(app.storage.clone()), false ; "login_picker")]
+#[test_case(|app: &mut App| app.mcp_picker.open(), false ; "mcp_picker")]
+#[test_case(open_permission_prompt, true ; "permission_prompt")]
+#[test_case(
+    |app: &mut App| app.pack_review.open(PACK_REVIEW_PROMPT.into(), PackPlan::default()),
+    true
+    ; "pack_review"
+)]
+#[test_case(open_plan_form, true ; "plan_form")]
+#[test_case(focus_queue, true ; "focused_queue")]
+#[test_case(open_caret_float, false ; "focused_modal_float")]
+#[test_case(
+    |app: &mut App| open_split_window(app, maki_lua::Split::Below),
+    true
+    ; "focused_split_window"
+)]
+fn the_wheel_scrolls_the_chat_unless_a_modal_covers_it(open: fn(&mut App), chat_scrolls: bool) {
+    let mut app = app_with_transcript(Rect::new(0, 0, 80, 20));
+    let chat_state = |app: &mut App| {
+        (
+            app.active_chat().scroll_pos(),
+            app.active_chat().auto_scroll(),
+        )
+    };
+    open(&mut app);
+    let before = chat_state(&mut app);
+
+    app.update(Msg::Scroll {
+        column: DRAG_COL,
+        row: DRAG_ROW,
+        delta: SCROLL_LINES,
+    });
+
+    let message = if chat_scrolls {
+        NON_MODAL_LETS_THE_WHEEL_SCROLL_THE_CHAT
+    } else {
+        MODAL_KEEPS_THE_WHEEL_OFF_THE_CHAT
+    };
+    let moved = before != chat_state(&mut app);
+    assert_eq!(moved, chat_scrolls, "{message}");
+}
+
+const HELP_VIEW_AREA: Rect = Rect::new(0, 0, 80, 12);
+const HELP_DID_NOT_SCROLL: &str = "the open help modal takes the wheel wherever the pointer is";
+const CHAT_SCROLLED_UNDER_HELP: &str = "the chat under the help modal stays put";
+
+#[test]
+fn the_wheel_scrolls_an_open_help_modal_and_leaves_the_chat_under_it() {
+    let mut app = app_with_transcript(Rect::new(0, 0, 80, 20));
+    app.active_chat().scroll(SCROLL_LINES);
+    app.help_modal.toggle();
+    let draw_help = |app: &mut App| {
+        let mut terminal = Terminal::new(TestBackend::new(
+            HELP_VIEW_AREA.width,
+            HELP_VIEW_AREA.height,
+        ))
+        .unwrap();
+        terminal
+            .draw(|frame| {
+                app.help_modal
+                    .view(frame, HELP_VIEW_AREA, &app.keymap_reader);
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    };
+    let help_before = draw_help(&mut app);
+    let chat_before = app.active_chat().scroll_pos();
+
+    app.update(Msg::Scroll {
+        column: DRAG_COL,
+        row: DRAG_ROW,
+        delta: -SCROLL_LINES,
+    });
+
+    assert_ne!(help_before, draw_help(&mut app), "{HELP_DID_NOT_SCROLL}");
+    assert_eq!(
+        app.active_chat().scroll_pos(),
+        chat_before,
+        "{CHAT_SCROLLED_UNDER_HELP}"
+    );
+}
+
 #[test]
 fn scroll_shortcuts_toggle_auto_scroll() {
     let mut app = test_app();
@@ -5651,6 +5741,43 @@ fn overlay_zone_click_gating() {
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 20, 5));
     let state = app.selection_state.as_ref().unwrap();
     assert_eq!(state.sel().zone, SelectionZone::Overlay);
+}
+
+const CLICKED_INPUT_TEXT: &str = "hello";
+const CLICKED_INPUT_ZONE: Rect = Rect::new(0, 15, 80, 5);
+const CLICKED_INPUT_COL: u16 = 3;
+const MODAL_LEFT_THE_INPUT_CURSOR: &str =
+    "a modal owns the pointer, so the input box beside it ignores a click";
+const CLICK_MISSED_THE_INPUT: &str = "with no modal open a click in the input moves its cursor";
+
+#[test_case(open_alert as fn(&mut App), false ; "alert_modal")]
+#[test_case(|_: &mut App| {}, true ; "nothing_open")]
+fn a_click_in_the_input_moves_its_cursor_unless_a_modal_is_open(
+    open: fn(&mut App),
+    cursor_moves: bool,
+) {
+    let mut app = test_app();
+    set_zone(&mut app, SelectionZone::Input, CLICKED_INPUT_ZONE);
+    app.input_box.buffer.set_value(CLICKED_INPUT_TEXT);
+    open(&mut app);
+    let before = app.input_box.buffer.x();
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        CLICKED_INPUT_COL,
+        CLICKED_INPUT_ZONE.y,
+    ));
+
+    let message = if cursor_moves {
+        CLICK_MISSED_THE_INPUT
+    } else {
+        MODAL_LEFT_THE_INPUT_CURSOR
+    };
+    assert_eq!(
+        app.input_box.buffer.x() != before,
+        cursor_moves,
+        "{message}"
+    );
 }
 
 fn streaming_app_with_history() -> App {

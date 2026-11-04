@@ -1418,6 +1418,9 @@ impl App {
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
         let zone = self.zone_at(row, column)?.zone;
+        if self.is_behind_modal(zone) {
+            return None;
+        }
         self.scroll_zone(zone, delta);
         Some(zone)
     }
