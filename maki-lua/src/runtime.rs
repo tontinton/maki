@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use event_listener::Event;
 
 use include_dir::Dir;
+use maki_agent::agent::AgentSlotRole;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
 use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
@@ -25,7 +26,6 @@ use maki_agent::tools::{
     HeaderResult, MovedCall, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry,
     ToolSource,
 };
-use maki_agent::agent::AgentSlotRole;
 use maki_agent::{
     AgentSeed, BufferSnapshot, CallScope, SessionEndReason, SessionMailbox, SharedBuf,
     SnapshotLine, SnapshotSpan, SpanStyle, TaskHome, UiWaker, receipt_tag,
@@ -5089,7 +5089,9 @@ async fn run_hook(
             tracing::warn!(slot, reason = msg, "monitor dispatch abandoned");
         }
         return Verdict::Unchanged;
-    }    let chain = run_host_chain(lua, &names, args, &allow_layer);
+    }
+
+    let chain = run_host_chain(lua, &names, args, &allow_layer);
     let returned = match run_awaited(lua, gate, cancel, deadline, chain).await {
         Ok(Ok(Some(values))) => values,
         Ok(Ok(None)) => return Verdict::Unchanged,

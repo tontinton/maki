@@ -194,10 +194,7 @@ impl AgentHook for SlotHook {
         // channel instead of piling unbounded work on the Lua thread.
         if slot.role() == AgentSlotRole::Monitor {
             let (done_tx, done_rx) = flume::bounded(1);
-            let request = Request::RunMonitor {
-                run,
-                done: done_tx,
-            };
+            let request = Request::RunMonitor { run, done: done_tx };
             return Box::pin(async move {
                 let _ = self.tx.send_async(request).await;
                 let _ = done_rx.recv_async().await;

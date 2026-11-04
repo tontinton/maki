@@ -255,7 +255,10 @@ impl History {
         } else {
             0
         };
-        (&self.snapshot.messages[from..], self.snapshot.messages.len())
+        (
+            &self.snapshot.messages[from..],
+            self.snapshot.messages.len(),
+        )
     }
 
     /// Record that a send monitor has been handed everything up to now, so the

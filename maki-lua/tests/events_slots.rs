@@ -2059,7 +2059,10 @@ end)"#
         "tools": [],
     });
     assert!(
-        matches!(within(hook.run(AgentSlot::MessageSend, payload, &call)), Verdict::Unchanged),
+        matches!(
+            within(hook.run(AgentSlot::MessageSend, payload, &call)),
+            Verdict::Unchanged
+        ),
         "the monitor's rewrite is dropped, not answered"
     );
     let seen = flashes_until_sentinel(&host.ui_action_rx());
@@ -2146,12 +2149,7 @@ end)"#;
 end)"#
     );
     load_granted(&host, INNER_LAYER, failing, PluginPermissions::trusted());
-    load_granted(
-        &host,
-        OUTER_LAYER,
-        &observing,
-        PluginPermissions::trusted(),
-    );
+    load_granted(&host, OUTER_LAYER, &observing, PluginPermissions::trusted());
 
     let cancel = CancelToken::none();
     let call = AgentCall {
@@ -2310,7 +2308,10 @@ maki.api.register_tool({{
     assert_eq!(exec_tool(&reg, RELEASE_TOOL), "ok");
 
     assert!(
-        matches!(done_rx.recv_timeout(DISPATCH_TIMEOUT), Ok(Verdict::Unchanged)),
+        matches!(
+            done_rx.recv_timeout(DISPATCH_TIMEOUT),
+            Ok(Verdict::Unchanged)
+        ),
         "releasing the monitor lets the hook answer"
     );
     assert_eq!(

@@ -430,9 +430,16 @@ would refuse a shell line it completed.
 ### agent.message.send
 
 Fires once per request, before the retry loop, so a retry does not fire it
-again. `messages` is the transcript as the model reads it now, `system` and
-`tools` are what this request carries, and `session_id` is `nil` for a
-standalone call.
+again. `messages` is what is new since the last firing and `total` is the whole
+transcript's length, so a monitor that keeps its own copy appends the tail and
+never re-reads what it has. A rewrite, a compaction for one, mints a new
+transcript, and the next firing then sends the whole list again with `total`
+equal to its length. `system` and `tools` are what this request carries, and
+`session_id` is `nil` for a standalone call.
+
+A monitor that needs the whole conversation, or that missed a firing, pulls it
+with [`maki.session.messages`](/docs/lua-api/) rather than rebuilding it from
+the tails.
 
 This slot is observe-only. It watches the request and its return value is
 ignored, with a warning. Nothing a monitor does here reaches the provider, so
@@ -447,6 +454,12 @@ down. Every layer sees the same read-only `value`.
 `value` is a read-only view. Writing to it raises an error, so a monitor holds
 one reference and mutates nothing. Each registered monitor sees the same
 `value`, so nothing one monitor writes can reach another.
+
+A monitor that takes too long is interrupted and warned, at most five times
+per slot per session. The send and receive monitors have a 500 ms deadline,
+and the delta monitor has a 50 ms deadline. Deltas are best-effort: a monitor
+that cannot keep up with the stream will miss tokens rather than stall the
+reply.
 
 ```lua
 maki.api.set_slot("agent.message.send", function(req, ctx)
@@ -475,9 +488,11 @@ stream, and it only runs when a layer is registered.
 
 Deltas are best-effort. Monitors on this slot run one after another on the
 shared plugin thread, so a slow layer delays the rest, and a layer slow enough
-to fall behind costs every other monitor deltas too. Treat a delta monitor as a
-sample rather than a complete transcript, and use `agent.message.receive` when
-you need the whole message.
+to fall behind costs every other monitor deltas too. Each delta firing has a
+50 ms deadline; a monitor that exceeds it is interrupted and warned (at most five
+times per slot per session). Treat a delta monitor as a sample rather than a
+complete transcript, and use `agent.message.receive` when you need the whole
+message.
 
 ```lua
 local runs = {}

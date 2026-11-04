@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, OnceLock, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use serde_json::{Value, json};
@@ -84,14 +85,69 @@ fn served_window_notice(model: &str, served: u32, planned: u32) -> String {
 /// Drains deltas into the `MessageDelta` monitors on their own task, so the
 /// stream never waits on one. Ends when the sink drops, which is when the
 /// request that owned it returns.
+///
+/// Deadlines for monitor firings so a hung monitor cannot tie up the Lua
+/// thread for long. Deltas are best-effort observations; send/receive are
+/// per-request but still observe-only, so a missed firing is acceptable.
+// Monitor timeouts: deltas are per-token (fast), send/receive are per-request.
+const DELTA_DEADLINE_MS: u64 = 50;    // 50 ms per token delta
+const MONITOR_DEADLINE_MS: u64 = 500;  // 500 ms for send/receive monitors
+
+/// Maximum number of timeout warnings to emit per monitor slot per plugin.
+const MAX_MONITOR_WARNINGS_PER_SLOT: usize = 5;
+
+/// Key for rate-limiting: combines slot and plugin hook pointer (as usize for Send+Sync).
+type MonitorWarningKey = (AgentSlot, usize);
+
+/// Static storage for rate-limiting monitor timeout warnings.
+static MONITOR_TIMEOUT_WARNINGS: OnceLock<StdMutex<HashMap<MonitorWarningKey, usize>>> =
+    OnceLock::new();
+
+/// Log a monitor timeout warning at most `MAX_MONITOR_WARNINGS_PER_SLOT` times
+/// per slot per plugin to avoid flooding the logs.
+fn warn_monitor_timeout_once(slot: AgentSlot, hook_id: usize, deadline_ms: u64) {
+    let counts = MONITOR_TIMEOUT_WARNINGS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut counts = counts.lock().unwrap();
+    let key = (slot, hook_id);
+    let entry = counts.entry(key).or_insert(0);
+    if *entry < MAX_MONITOR_WARNINGS_PER_SLOT {
+        warn!(
+            "a {:?} monitor timed out after {}ms; consider optimizing the plugin",
+            slot, deadline_ms
+        );
+        *entry += 1;
+    }
+}
+
+/// Reset the warning counter for a given slot and plugin hook.
+/// Called when a monitor succeeds to allow warnings again after recovery.
+fn reset_monitor_warnings(slot: AgentSlot, hook_id: usize) {
+    let counts = MONITOR_TIMEOUT_WARNINGS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut counts = counts.lock().unwrap();
+    let key = (slot, hook_id);
+    counts.remove(&key);
+}
+
 fn spawn_delta_consumer(
     firer: MonitorFirer,
     recv: flume::Receiver<DeltaChunk>,
 ) -> tokio::task::JoinHandle<()> {
+    let hook_id = firer.hook_id();
+    let slot = firer.slot();
     tokio::spawn(async move {
         while let Ok(chunk) = recv.recv_async().await {
             let (kind, text) = chunk.parts();
-            firer.fire_delta(kind, text).await;
+            if tokio::time::timeout(
+                Duration::from_millis(DELTA_DEADLINE_MS),
+                firer.fire_delta(kind, text),
+            )
+            .await
+            .is_err()
+            {
+                warn_monitor_timeout_once(slot, hook_id, DELTA_DEADLINE_MS);
+            } else {
+                reset_monitor_warnings(slot, hook_id);
+            }
         }
     })
 }
@@ -667,8 +723,12 @@ impl<'h> Agent<'h> {
                 delta,
             )
             .await;
+            // The reply is in hand, so the consumer is aborted rather than
+            // awaited: a hung plugin would otherwise tie up the sole Lua thread
+            // indefinitely. Observations are best-effort, so losing a few
+            // in-flight deltas is preferable to freezing the UI and tool hooks.
             if let Some(consumer) = delta_consumer {
-                let _ = consumer.await;
+                consumer.abort();
             }
             stream_result
         };
@@ -787,14 +847,30 @@ impl<'h> Agent<'h> {
             return;
         };
         let (new_messages, total) = self.history.unsent_messages();
-        firer.spawn(json!({
+        let value = json!({
             "messages": new_messages,
             "total": total,
             "system": system,
             "tools": tools,
             "session_id": self.session_id.as_ref().map(SessionRef::as_str),
             "task_id": self.task_id.as_deref(),
-        }));
+        });
+        let slot = firer.slot();
+        let hook_id = firer.hook_id();
+        let firer_clone = firer.clone();
+        tokio::spawn(async move {
+            if tokio::time::timeout(
+                Duration::from_millis(MONITOR_DEADLINE_MS),
+                firer_clone.fire(value),
+            )
+            .await
+            .is_err()
+            {
+                warn_monitor_timeout_once(slot, hook_id, MONITOR_DEADLINE_MS);
+            } else {
+                reset_monitor_warnings(slot, hook_id);
+            }
+        });
         self.history.mark_sent();
     }
 
@@ -804,10 +880,26 @@ impl<'h> Agent<'h> {
         let Some(firer) = self.hooks().monitor_firer(AgentSlot::MessageReceive) else {
             return;
         };
-        firer.spawn(json!({
+        let value = json!({
             "message": message,
             "stop_reason": stop_reason.map(Into::<&'static str>::into),
-        }));
+        });
+        let slot = firer.slot();
+        let hook_id = firer.hook_id();
+        let firer_clone = firer.clone();
+        tokio::spawn(async move {
+            if tokio::time::timeout(
+                Duration::from_millis(MONITOR_DEADLINE_MS),
+                firer_clone.fire(value),
+            )
+            .await
+            .is_err()
+            {
+                warn_monitor_timeout_once(slot, hook_id, MONITOR_DEADLINE_MS);
+            } else {
+                reset_monitor_warnings(slot, hook_id);
+            }
+        });
     }
 
     /// A thinking block the model can no longer see, or one that failed the
@@ -4746,6 +4838,7 @@ mod tests {
         let seen = script(&agent.registry, |_, _| Verdict::Unchanged);
 
         agent.run(default_input()).await.unwrap();
+        seen.settle(AgentSlot::MessageDelta, 2).await;
         drop(agent);
 
         let seen = seen.lock().unwrap();

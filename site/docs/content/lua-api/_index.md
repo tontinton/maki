@@ -1244,8 +1244,12 @@ contract. Wrapping one costs every permission. See
 
 The message slots are the exception. `agent.message.send` is an
 observe-only monitor: it runs once per request, before the retry loop, and
-sees `messages`, `system` and `tools` as the request carries them. A
-returned value is ignored, so a monitor cannot change the request.
+sees `messages`, `total`, `system` and `tools` as the request carries them.
+`messages` is only what is new since the last firing and `total` is the
+whole transcript's length, so a monitor keeping its own copy appends the
+tail, and a rewrite (a compaction for one) sends the whole list again. Pull
+the full conversation with `maki.session.messages` when a monitor needs it.
+A returned value is ignored, so a monitor cannot change the request.
 `agent.message.receive` and `agent.message.delta` are observe-only too:
 they see the assistant message and each text or thinking delta, and a
 returned value is ignored. All three receive a read-only view: writing to
