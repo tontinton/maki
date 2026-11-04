@@ -1,28 +1,3 @@
-local parse = require("maki.provider_parse")
-
-local MODELS_PATH = "/models"
-
--- Synthetic validates `reasoning_effort` against one ladder for every model it
--- serves: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (and
--- `ultra`, which maki has no level for). Its docs still say low/medium/high,
--- and the `/models` listing says nothing about effort, so the knowledge rides
--- on the row and narrows `openai.thinking` for that model at request time;
--- adaptive keeps the dialect's medium.
-local LADDER = {
-  supported = { "minimal", "low", "medium", "high", "xhigh", "max" },
-}
-
-local function parse_model(m)
-  if type(m) ~= "table" or type(m.id) ~= "string" then
-    return nil
-  end
-  return {
-    id = m.id,
-    context_window = parse.as_u32(m.context_length),
-    effort = LADDER,
-  }
-end
-
 maki.provider.register({
   slug = "synthetic",
   display_name = "Synthetic",
@@ -69,14 +44,6 @@ maki.provider.register({
   openai = {
     max_tokens_field = "max_completion_tokens",
     include_stream_usage = false,
-    thinking = { dialect = "standard" },
+    thinking = { dialect = "synthetic" },
   },
-
-  list_models = function(ctx)
-    local body, err = ctx.get_json(MODELS_PATH)
-    if err then
-      return nil, err
-    end
-    return parse.models(body, parse_model)
-  end,
 })

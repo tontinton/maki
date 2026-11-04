@@ -1115,9 +1115,17 @@ pub mod dialect {
     pub const OFF: &str = "none";
 
     dialects! {
-        /// OpenAI platform, synthetic.
+        /// OpenAI platform.
         STANDARD "standard" {
             supported: [Minimal, Low, Medium, High],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// Synthetic takes the whole ladder for every model it serves. Its
+        /// docs still say low/medium/high and `/models` lists no levels, so
+        /// the declaration is the only place this is known.
+        SYNTHETIC "synthetic" {
+            supported: [Minimal, Low, Medium, High, XHigh, Max],
             adaptive: Some(Medium),
             off: None
         },
@@ -2317,6 +2325,10 @@ mod tests {
     #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Minimal), Some("minimal") ; "standard_minimal_passthrough")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Max),     Some("high")    ; "standard_max_snaps_down")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Budget(1024),    Some("medium")  ; "standard_quarter_budget")]
+    #[test_case(&dialect::SYNTHETIC, ThinkingConfig::Adaptive,      Some("medium") ; "synthetic_adaptive")]
+    #[test_case(&dialect::SYNTHETIC, ThinkingConfig::Effort(Minimal), Some("minimal") ; "synthetic_minimal_passthrough")]
+    #[test_case(&dialect::SYNTHETIC, ThinkingConfig::Effort(XHigh), Some("xhigh") ; "synthetic_xhigh_passthrough")]
+    #[test_case(&dialect::SYNTHETIC, ThinkingConfig::Effort(Max),   Some("max")   ; "synthetic_max_passthrough")]
     #[test_case(&dialect::CODEX, ThinkingConfig::Adaptive,        Some("medium") ; "codex_adaptive")]
     #[test_case(&dialect::CODEX, ThinkingConfig::Effort(Minimal), Some("low")    ; "codex_minimal_snaps_up")]
     #[test_case(&dialect::CODEX, ThinkingConfig::Effort(Max),     Some("xhigh")  ; "codex_max_snaps_down")]
