@@ -21,7 +21,7 @@ registered runs first.
 
 A few slots are neither: observe-only monitors. They fire like a slot, but the
 return value is ignored and the value is a read-only view. They are a fan-out,
-not a chain: every layer runs, in no guaranteed order, none ends the chain for
+not a chain: every layer runs, in the order it registered, none ends the chain for
 the others, and a layer takes `function(value, ctx)` with no `prev`. The three
 `agent.message.*` slots below work this way. Use a monitor to watch a request,
 a reply, or a token stream without changing it.
