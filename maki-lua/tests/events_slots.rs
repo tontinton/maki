@@ -119,8 +119,8 @@ fn flashes_until_sentinel(ui: &flume::Receiver<UiAction>) -> Vec<String> {
     }
 }
 
-/// Exactly `n` flashes. For a fan-out, whose layer order is not guaranteed,
-/// the caller sorts before asserting.
+/// Exactly `n` flashes. A fan-out runs layers in registration order, but callers
+/// that turn the two plugin names into one set sort before asserting.
 fn collect_flashes(ui: &flume::Receiver<UiAction>, n: usize) -> Vec<String> {
     let mut out = Vec::new();
     while out.len() < n {
@@ -2439,11 +2439,16 @@ end)"#
         Verdict::Unchanged
     ));
 
-    let seen = collect_flashes(&host.ui_action_rx(), 1);
+    let ui = host.ui_action_rx();
+    let seen = collect_flashes(&ui, 1);
     assert_eq!(
         seen,
         vec![SLOW_MARK.to_string()],
         "the slow layer ran, the one behind it never did"
+    );
+    assert!(
+        ui.try_recv().is_err(),
+        "the layer behind the parked one must not flash"
     );
 }
 
