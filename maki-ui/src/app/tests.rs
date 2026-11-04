@@ -8737,6 +8737,23 @@ fn plan_toggle_beats_override_when_open_and_after_dismiss() {
     );
 }
 
+#[test_case(Mode::Build, PlanState::None ; "no_plan_in_build_mode")]
+#[test_case(Mode::Plan, PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH)) ; "plan_still_drafting")]
+#[test_case(Mode::Build, PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH)) ; "ready_plan_in_build_mode")]
+fn plan_toggle_yields_to_an_override_until_a_ready_plan_is_up_in_plan_mode(
+    mode: Mode,
+    plan: PlanState,
+) {
+    let mut app = test_app();
+    app.state.mode = mode;
+    app.state.plan = plan;
+    let probe = install_override(&mut app, kb::PLAN_TOGGLE.code, kb::PLAN_TOGGLE.modifiers);
+
+    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+
+    assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
+}
+
 #[test]
 fn streaming_cancel_wins_over_quit_override() {
     let mut app = test_app();
@@ -9170,6 +9187,24 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
 
     assert!(!app.pack_review.is_open());
     assert!(matches!(app.exit_request, ExitRequest::Pack(_)));
+}
+
+#[test_case(key(KeyCode::Char('n')) ; "n")]
+#[test_case(key(KeyCode::Esc) ; "esc")]
+#[test_case(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL) ; "ctrl_c")]
+fn declining_the_package_review_closes_it_and_says_so(decline: KeyEvent) {
+    let mut app = test_app();
+    app.handle_pack_preparation(PackPreparation::Review {
+        prompt: PACK_REVIEW_PROMPT.into(),
+        plan: PackPlan::default(),
+    });
+
+    let actions = app.update(Msg::Key(decline));
+
+    assert!(actions.is_empty());
+    assert!(!app.pack_review.is_open());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(app.status_bar.flash_text(), Some(PACK_CHANGES_DECLINED));
 }
 
 #[test]
