@@ -145,6 +145,16 @@ pub mod key {
     };
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
+    pub const SCROLL_UP: Bind = Bind {
+        code: KeyCode::Up,
+        modifiers: KeyModifiers::SHIFT,
+        label: "Shift+Up",
+    };
+    pub const SCROLL_DOWN: Bind = Bind {
+        code: KeyCode::Down,
+        modifiers: KeyModifiers::SHIFT,
+        label: "Shift+Down",
+    };
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
     pub const SCROLL_BOTTOM: Bind = Bind {
         code: KeyCode::Char('g'),
@@ -446,6 +456,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Alt(key::SCROLL_PAGE_UP.label, key::SCROLL_PAGE_DOWN.label),
         description: "Scroll page up / down",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::SCROLL_UP.label, key::SCROLL_DOWN.label),
+        description: "Scroll line up / down",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },

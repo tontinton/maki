@@ -1937,6 +1937,14 @@ impl App {
             self.active_chat().scroll(-page);
             return vec![];
         }
+        if key::SCROLL_UP.matches(key) {
+            self.active_chat().scroll(1);
+            return vec![];
+        }
+        if key::SCROLL_DOWN.matches(key) {
+            self.active_chat().scroll(-1);
+            return vec![];
+        }
         if key::SCROLL_BOTTOM.matches(key) {
             self.active_chat().enable_auto_scroll();
             return vec![];
