@@ -563,6 +563,10 @@ const INNER_LAYER: &str = "inner_layer";
 const OUTER_LAYER: &str = "outer_layer";
 const INNER_MARK: &str = ":inner";
 const OUTER_MARK: &str = ":outer";
+const SLOW_LAYER: &str = "slow_layer";
+const BEHIND_LAYER: &str = "behind_layer";
+const SLOW_MARK: &str = ":slow";
+const BEHIND_MARK: &str = ":behind";
 const PARKED_MARK: &str = "parked";
 const RELEASED_MARK: &str = "released";
 const RELEASE_TOOL: &str = "release_monitor";
@@ -2381,6 +2385,65 @@ end)"#
     assert!(
         seen.iter().any(|m| m.contains(INNER_LAYER)),
         "the skip names the unentitled layer: {seen:?}"
+    );
+}
+
+/// The fan-out runs under ONE deadline for the whole firing. A slow layer that
+/// burns it makes `until_abandoned` drop the fan-out future, so any layer
+/// registered after the slow one is skipped for that firing. This pins the
+/// current semantics: it should fail the day we move to per-layer scoping.
+#[test]
+fn a_slow_monitor_layer_drops_the_layers_behind_it() {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    // A fan-out runs layers in registration order, so SLOW_LAYER fires first
+    // and parks past the budget; BEHIND_LAYER, registered after it, is skipped.
+    load_granted(
+        &host,
+        SLOW_LAYER,
+        &format!(
+            r#"maki.api.set_slot("agent.message.send", function(value, ctx)
+    maki.ui.flash("{SLOW_MARK}")
+    maki.async.await(1, function(cb) end)
+end)"#
+        ),
+        PluginPermissions::trusted(),
+    );
+    load_granted(
+        &host,
+        BEHIND_LAYER,
+        &format!(
+            r#"maki.api.set_slot("agent.message.send", function(value, ctx)
+    maki.ui.flash("{BEHIND_MARK}")
+end)"#
+        ),
+        PluginPermissions::trusted(),
+    );
+    assert!(hook.wraps(AgentSlot::MessageSend));
+
+    let cancel = CancelToken::none();
+    let call = AgentCall {
+        session_id: None,
+        task_id: None,
+        model: AGENT_MODEL,
+        context_size: 0,
+        context_window: 0,
+        cancel: &cancel,
+        // Short enough that the parked first layer cannot finish in time.
+        deadline: Instant::now() + Duration::from_millis(50),
+    };
+    assert!(matches!(
+        within(hook.run(AgentSlot::MessageSend, serde_json::json!({}), &call)),
+        Verdict::Unchanged
+    ));
+
+    let seen = collect_flashes(&host.ui_action_rx(), 1);
+    assert_eq!(
+        seen,
+        vec![SLOW_MARK.to_string()],
+        "the slow layer ran, the one behind it never did"
     );
 }
 

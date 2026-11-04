@@ -1260,9 +1260,11 @@ shared plugin thread, so a slow layer costs every other monitor deltas
 rather than stalling the stream.
 
 A monitor is a fan-out, not a chain, so its layer takes
-`function(value, ctx)` with no `prev`: every layer runs, in no guaranteed
-order, and none can end the chain for the rest. A steering slot's layer
-takes `function(prev, value, ctx)` instead.
+`function(value, ctx)` with no `prev`: the layers run in registration order
+and none can end the chain for the rest. One deadline covers the whole
+firing, so a layer that burns it stops the layers behind it from running
+that time. A steering slot's layer takes `function(prev, value, ctx)`
+instead.
 
 `permission.prompt` fires where the permission prompt would show, with
 the prompt as its default. A layer takes `function(prev, req, ctx)` and

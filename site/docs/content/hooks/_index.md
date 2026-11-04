@@ -273,7 +273,7 @@ The agent loop fires seven slots of its own:
 | `agent.stop` | when the model ends its turn without calling a tool | `{ reason, last_message, num_turns }` |
 | `agent.compact.before` | before a compaction starts | `{ reason, context_size, usable, request_instructions }` |
 | `agent.compact.prepare` | before the transcript goes to the summarizer | `{ results, budget, collapse }` |
-| `agent.message.send` | once per request, before it reaches the provider | `{ messages, system, tools, session_id, task_id }` |
+| `agent.message.send` | once per request, before it reaches the provider | `{ messages, total, system, tools, session_id, task_id }` |
 | `agent.message.receive` | when the assistant message is assembled | `{ message, stop_reason }` |
 | `agent.message.delta` | per text or thinking token as it streams | `{ kind, text, session_id, task_id }` |
 
@@ -446,8 +446,8 @@ ignored, with a warning. Nothing a monitor does here reaches the provider, so
 there is no way to void the prompt cache or orphan a thinking block from this
 slot.
 
-A monitor is a fan-out, not a chain: every layer on it runs, in no guaranteed
-order, and one layer never ends the chain for the rest. A layer takes
+A monitor is a fan-out, not a chain: the layers run in registration order and
+one layer never ends the chain for the rest. A layer takes
 `function(value, ctx)`, with no `prev`, because a monitor has nothing to pass
 down. Every layer sees the same read-only `value`.
 
@@ -455,11 +455,11 @@ down. Every layer sees the same read-only `value`.
 one reference and mutates nothing. Each registered monitor sees the same
 `value`, so nothing one monitor writes can reach another.
 
-A monitor that takes too long is interrupted and warned, at most five times
-per slot per session. The send and receive monitors have a 500 ms deadline,
-and the delta monitor has a 50 ms deadline. Deltas are best-effort: a monitor
-that cannot keep up with the stream will miss tokens rather than stall the
-reply.
+A monitor that takes too long is interrupted. The send and receive monitors
+have a 500 ms deadline, and the delta monitor has a 50 ms deadline. One
+deadline covers the whole firing, so a monitor that burns it stops the layers
+behind it from running that time. Deltas are best-effort: a monitor that
+cannot keep up with the stream will miss tokens rather than stall the reply.
 
 ```lua
 maki.api.set_slot("agent.message.send", function(req, ctx)
@@ -489,8 +489,8 @@ stream, and it only runs when a layer is registered.
 Deltas are best-effort. Monitors on this slot run one after another on the
 shared plugin thread, so a slow layer delays the rest, and a layer slow enough
 to fall behind costs every other monitor deltas too. Each delta firing has a
-50 ms deadline; a monitor that exceeds it is interrupted and warned (at most five
-times per slot per session). Treat a delta monitor as a sample rather than a
+50 ms deadline. A monitor that exceeds it is interrupted, and the layers after
+it are skipped that firing. Treat a delta monitor as a sample rather than a
 complete transcript, and use `agent.message.receive` when you need the whole
 message.
 

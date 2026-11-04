@@ -8,7 +8,6 @@
 //! nothing back, and hands over a frozen value, so a monitor watches a request
 //! or a reply without any way to change it.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_providers::Model;
@@ -184,20 +183,10 @@ pub struct MonitorFirer {
 }
 
 impl MonitorFirer {
-    /// The slot this firer targets.
-    pub fn slot(&self) -> AgentSlot {
-        self.slot
-    }
-
-    /// Unique identifier for this plugin's hook (used for rate limiting warnings).
-    pub fn hook_id(&self) -> usize {
-        Arc::as_ptr(&self.hook) as usize
-    }
-
     /// Fire and wait. The delta consumer awaits this so one stream's deltas
     /// stay in order; that task is already detached, so nothing user-facing
     /// waits here.
-    pub async fn fire(&self, value: Value) {
+    pub async fn fire(&self, value: Value, deadline: Instant) {
         let call = AgentCall {
             session_id: self.session_id.as_deref(),
             task_id: self.task_id.as_deref(),
@@ -205,7 +194,7 @@ impl MonitorFirer {
             context_size: self.context_size,
             context_window: self.context_window,
             cancel: &self.cancel,
-            deadline: Instant::now() + AGENT_CHAIN_MAX,
+            deadline,
         };
         let chain = self.hook.run(self.slot, value, &call);
         // Observe only: whatever a monitor answers, the run keeps going.
@@ -213,22 +202,25 @@ impl MonitorFirer {
     }
 
     /// One streamed delta, in the shape a delta monitor reads.
-    pub async fn fire_delta(&self, kind: &'static str, text: &str) {
-        self.fire(json!({
-            "kind": kind,
-            "text": text,
-            "session_id": self.session_id.as_deref(),
-            "task_id": self.task_id.as_deref(),
-        }))
+    pub async fn fire_delta(&self, kind: &'static str, text: &str, deadline: Instant) {
+        self.fire(
+            json!({
+                "kind": kind,
+                "text": text,
+                "session_id": self.session_id.as_deref(),
+                "task_id": self.task_id.as_deref(),
+            }),
+            deadline,
+        )
         .await;
     }
 
     /// Fire and return at once, so a slow monitor never stalls the turn. The
     /// value is already frozen on the Lua side, and the answer is dropped
     /// there, so nothing here has to wait for it.
-    pub fn spawn(&self, value: Value) {
+    pub fn spawn(&self, value: Value, deadline: Instant) {
         let firer = self.clone();
-        tokio::spawn(async move { firer.fire(value).await });
+        tokio::spawn(async move { firer.fire(value, deadline).await });
     }
 }
 
