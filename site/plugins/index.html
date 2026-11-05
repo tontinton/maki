@@ -410,8 +410,8 @@
       <li class="card skeleton" aria-hidden="true"><div class="card-head"><span class="avatar"></span><span class="bar"></span></div><p class="desc"><span class="bar"></span><span class="bar"></span><span class="bar short"></span></p><div class="tags"><span class="tag">&nbsp;</span><span class="tag">&nbsp;</span></div><div class="meta"><span class="bar short"></span></div></li>
       <li class="card ghost" id="ghost">
         <h2 class="ghost-title">+ yours</h2>
-        <p>Add the <code>maki</code> and <code>plugin</code> topics to your repo and it shows up here automatically.</p>
-        <div class="meta"><a class="link" href="/docs/plugins/">write a plugin</a><a class="link" href="https://github.com/search?q=topic%3Amaki+topic%3Aplugin&amp;type=repositories" target="_blank" rel="noopener">topic on GitHub</a></div>
+        <p>Lay out your repo as a <a href="/docs/packages/">package</a>, add the <code>maki</code> and <code>plugin</code> topics, and it shows up here automatically.</p>
+        <div class="meta"><a class="link" href="/docs/packages/">write a plugin</a><a class="link" href="https://github.com/search?q=topic%3Amaki+topic%3Aplugin&amp;type=repositories" target="_blank" rel="noopener">topic on GitHub</a></div>
       </li>
     </ul>
   </section>
@@ -419,7 +419,7 @@
 
 <footer>
   <div>Fetched from <a href="https://github.com/search?q=topic%3Amaki+topic%3Aplugin&amp;type=repositories" target="_blank" rel="noopener">GitHub</a>, every repo tagged maki and plugin.</div>
-  <div><a href="/">maki</a> · <a href="/docs/">docs</a> · <a href="/docs/plugins/">write a plugin</a></div>
+  <div><a href="/">maki</a> · <a href="/docs/">docs</a> · <a href="/docs/packages/">write a plugin</a></div>
 </footer>
 
 <template id="star-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg></template>
@@ -427,6 +427,8 @@
 <script>
   const API_URL = 'https://api.github.com/search/repositories?per_page=100&q=topic:maki+topic:plugin+archived:false';
   const SNAPSHOT_URL = 'plugins.json';
+  // lowercase owner/name of tagged repos that must not be listed (spam, malicious, not a maki plugin)
+  const BLOCKLIST = new Set([]);
   const TOPIC_SEARCH = 'https://github.com/search?q=topic%3Amaki+topic%3Aplugin&type=repositories';
   const REPO_BASE = 'https://github.com/';
   const AVATAR_BASE = 'https://avatars.githubusercontent.com/';
@@ -650,7 +652,7 @@
   async function load() {
     const live = await fetchJSON(API_URL).catch(() => null);
     const items = live?.items ?? await fetchJSON(SNAPSHOT_URL).catch(() => null);
-    plugins = (items ?? []).map(p => ({
+    plugins = (items ?? []).filter(p => !BLOCKLIST.has(p.full_name.toLowerCase())).map(p => ({
       p,
       card: buildCard(p),
       haystack: [p.full_name, p.description ?? '', ...p.topics].join(' ').toLowerCase(),
