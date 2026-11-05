@@ -5260,7 +5260,7 @@ been sent so far, tool calls and results included. Read only.
 Each message has the same shape as in the session file:
 
 ```text
-{ role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, content = { blocks } }
+{ role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, content = { blocks } }
 ```
 
 `kind` is `"turn"` for something the user or the model said,
@@ -5272,7 +5272,9 @@ content: nil shows the content, `""` hides the message (a nudge, a
 compaction note). `receipts` lists the calls whose results in this
 message moved to the background, and `settles` = `{ task, end }` marks the
 notice that answered one, with `end` one of `"finished"`, `"failed"`,
-`"cancelled"` or `"lost"`. `content` lists blocks:
+`"cancelled"` or `"lost"`. `partial` has the same shape and marks a notice
+that answered one piece early, like one call of a moved batch, and left
+the receipt open. `content` lists blocks:
 
 ```text
 { type = "text", text }
@@ -5603,20 +5605,19 @@ tool spawned has its tool call's id, one a plugin opened with
 `plugin` field.
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, focused, status?, plugin?,
-  tool?, parent?, part?, started_at?, ended_at?, cost?}` where `status` is `"working"`,
-  `"idle"` (a plugin task between prompts), `"done"`, `"error"`, or
-  `"cancelled"` (stopped by the user or the model), and `session` is the
-  chat session that `stop()` asks for. `tool` is the tool whose call the
-  task runs, `"task"` for a subagent or `"bash"` for a moved command,
-  absent on a session a plugin opened on its own. `parent` is the id of
-  the call the task runs under, like a `batch` that started it. That
-  call is listed only once it moved. `part` is true for a piece listed
-  with `ctx:set_parts()`. Stopping a part stops its whole call, while a
-  subagent the call started stops alone. `started_at` and `ended_at` are
-  Unix seconds: when the task started, or moved to the background, and
-  when it finished. A task saved before they were recorded has neither.
-  `cost` is what a subagent billed so far, in dollars. The main chat has
-  none of the three. Or nil and an error.
+  tool?, parent?, part?, wrapper?, started_at?, ended_at?, cost?}`, or nil and an error.
+  `status` is `"working"`, `"idle"` (a plugin task between prompts), `"done"`,
+  `"error"` or `"cancelled"`. `session` is the chat session that `stop()` asks for.
+  `tool` is the tool whose call the task runs, like `"task"` or `"bash"`, and is
+  absent on a session a plugin opened on its own. `parent` is the id of the call
+  the task runs under, like a `batch`, which is listed only once it moved. `part`
+  is true for a piece listed with `ctx:set_parts()`: stopping it stops its whole
+  call, while a subagent the call started stops alone. `wrapper` is true for a
+  call that `/tasks` replaces with the tasks under it, so it gets no row and does
+  not count as running. `started_at` and `ended_at` are Unix seconds: when the
+  task started or moved, and when it finished. Tasks saved before they were
+  recorded lack them. `cost` is what a subagent billed so far, in dollars. The
+  main chat has none of the three.
 
 **Example:**
 

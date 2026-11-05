@@ -443,6 +443,39 @@ impl BackgroundTasks {
         }
     }
 
+    /// Sends the model the result of {part} of moved call `id` now, while the
+    /// rest keeps running. It is worded like the final reply of a call that
+    /// moved alone, so the transcript reads the same either way. Says `false`
+    /// once the call stopped or has its final reply, because that reply will
+    /// carry the part and explain the stop. Also `false` when nothing waits
+    /// on `id` any more.
+    pub(crate) fn report_part(
+        &self,
+        id: &str,
+        part: &TaskLabel,
+        failed: bool,
+        output: &str,
+    ) -> bool {
+        let Some(mailbox) = self
+            .locked()
+            .iter()
+            .find(|e| e.info.id == id && is_running_call(e) && e.info.running)
+            .and_then(|e| e.mailbox.clone())
+        else {
+            return false;
+        };
+        let (text, display, end) = result_notice(part, id, failed, false, output);
+        mailbox.report_part(
+            id,
+            BackgroundNotice {
+                text,
+                display: Some(&display),
+                wake: true,
+                end,
+            },
+        )
+    }
+
     /// Marks the final reply of moved call `id` as existing, so a host dying
     /// from here on leaves the call to [`Self::deliver`].
     pub(crate) fn final_ready(&self, id: &str) {
@@ -847,8 +880,8 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(
-            notices[0].settles,
-            Some(TaskSettled {
+            notices[0].settles(),
+            Some(&TaskSettled {
                 task: CALL_ID.into(),
                 end
             })

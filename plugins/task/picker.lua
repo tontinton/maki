@@ -28,8 +28,6 @@ local STOP_PARENT_HINT_FMT = "  Ctrl+S again to stop all of %s"
 local MAIN_TASK_ID = "main"
 local FOOTER_KEYS = { { "Enter", "open" }, { "Ctrl+S", "stop" }, { "Ctrl+D", "delete" }, { "Esc", "cancel" } }
 local HINT_KEY = "Ctrl+X"
--- One level in, for a subagent listed under the task that started it.
-local NESTED_INDENT = "  "
 -- The main chat has no status, so it falls through to MAIN.
 local ICONS = {
   working = { RUNNING_ICON, "accent", true },
@@ -124,13 +122,12 @@ local function render()
     if spinning then
       icon_style = "spinner:" .. icon_style
     end
-    local indent = row.depth and NESTED_INDENT or ""
-    local line = { { "  " .. indent, base }, { icon, icon_style } }
+    local line = { { "  ", base }, { icon, icon_style } }
     local hint = selected and board.confirm and board.confirm.id == task.id and board.confirm.hint or ""
     -- A bash task is named after its command, which can run for hundreds of
     -- columns. The name gives way first, so the owner on the right stays in
     -- view.
-    local fixed = 2 + dispw(indent) + dispw(icon) + dispw(hint)
+    local fixed = 2 + dispw(icon) + dispw(hint)
     local owner = Rows.trailer(task, board.drawn_at, 0, maki.ui.humantime, columns)
     local match_style = selected and "match_selected" or "match"
     local spans = ListPicker.highlight_spans(task.name, words, base, match_style)

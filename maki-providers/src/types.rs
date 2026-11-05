@@ -247,14 +247,7 @@ pub async fn adapt_images_for_model<'a>(
                 None => content.push(block.clone()),
             }
         }
-        adapted.push(Message {
-            role: message.role.clone(),
-            content,
-            display_text: message.display_text.clone(),
-            kind: message.kind.clone(),
-            receipts: message.receipts.clone(),
-            settles: message.settles.clone(),
-        });
+        adapted.push(message.with_content(content));
     }
     Cow::Owned(adapted)
 }
@@ -486,9 +479,24 @@ pub struct TaskSettled {
     pub end: TaskEnd,
 }
 
+/// What a background notice answers. One enum rather than a field per kind,
+/// so a notice can never close a receipt and leave it open at once.
+///
+/// Stored under its own key per variant (`settles` or `partial`), so a build
+/// that predates [`Self::Part`] loads one as a plain notice instead of
+/// closing the receipt early.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskAnswer {
+    /// The work behind the receipt is done, and the receipt closes.
+    Settles(TaskSettled),
+    /// One piece of the work ended early, like one call of a moved batch.
+    /// The receipt stays open for the rest.
+    Part(TaskSettled),
+}
+
 /// Part of the frozen session surface (disk, exports, Lua), written flat:
 /// `{"role", "content", "display_text"?, "kind"?, "facts"?, "receipts"?,
-/// "settles"?}`, with `kind` as a bare tag and `facts` beside a
+/// "settles"?, "partial"?}`, with `kind` as a bare tag and `facts` beside a
 /// `context_update`. Older logs nest it as
 /// `{"kind": {"context_update": facts}}`. Those still load, and are not
 /// rewritten just for that.
@@ -504,8 +512,8 @@ pub struct Message {
     /// Calls whose results here are background receipts: each moved, and a
     /// later notice [`settles`](Self::settles) it.
     pub receipts: Vec<String>,
-    /// Set on the notice that answers a receipt.
-    pub settles: Option<TaskSettled>,
+    /// Set on a notice that answers a receipt.
+    pub answers: Option<TaskAnswer>,
 }
 
 /// [`Message`] as stored, before `kind` and `facts` are paired up.
@@ -523,6 +531,8 @@ struct RawMessage {
     receipts: Vec<String>,
     #[serde(default, deserialize_with = "settles_or_none")]
     settles: Option<TaskSettled>,
+    #[serde(default, deserialize_with = "settles_or_none")]
+    partial: Option<TaskSettled>,
 }
 
 /// A newer build may write a [`TaskEnd`] this one does not know. Only the
@@ -573,7 +583,10 @@ impl TryFrom<RawMessage> for Message {
             display_text: raw.display_text,
             kind,
             receipts: raw.receipts,
-            settles: raw.settles,
+            answers: raw
+                .settles
+                .map(TaskAnswer::Settles)
+                .or(raw.partial.map(TaskAnswer::Part)),
         })
     }
 }
@@ -588,7 +601,7 @@ impl Serialize for Message {
             + usize::from(!self.kind.is_turn())
             + usize::from(facts.is_some())
             + usize::from(!self.receipts.is_empty())
-            + usize::from(self.settles.is_some());
+            + usize::from(self.answers.is_some());
         let mut state = serializer.serialize_struct("Message", len)?;
         state.serialize_field("role", &self.role)?;
         state.serialize_field("content", &self.content)?;
@@ -604,8 +617,10 @@ impl Serialize for Message {
         if !self.receipts.is_empty() {
             state.serialize_field("receipts", &self.receipts)?;
         }
-        if let Some(settles) = &self.settles {
-            state.serialize_field("settles", settles)?;
+        match &self.answers {
+            Some(TaskAnswer::Settles(settled)) => state.serialize_field("settles", settled)?,
+            Some(TaskAnswer::Part(settled)) => state.serialize_field("partial", settled)?,
+            None => {}
         }
         state.end()
     }
@@ -633,6 +648,42 @@ impl Message {
             content: vec![ContentBlock::Text { text }],
             kind: MessageKind::Observation,
             ..Default::default()
+        }
+    }
+
+    /// This message with {content} in place of its own, which is never
+    /// cloned. Takes every field apart, so a new one cannot be left behind.
+    pub fn with_content(&self, content: Vec<ContentBlock>) -> Self {
+        let Self {
+            role,
+            content: _,
+            display_text,
+            kind,
+            receipts,
+            answers,
+        } = self;
+        Self {
+            role: role.clone(),
+            content,
+            display_text: display_text.clone(),
+            kind: kind.clone(),
+            receipts: receipts.clone(),
+            answers: answers.clone(),
+        }
+    }
+
+    /// The receipt this notice closes.
+    pub fn settles(&self) -> Option<&TaskSettled> {
+        match &self.answers {
+            Some(TaskAnswer::Settles(settled)) => Some(settled),
+            _ => None,
+        }
+    }
+
+    /// The receipt this notice answers, in full or in part.
+    pub fn answered(&self) -> Option<&TaskSettled> {
+        match self.answers.as_ref()? {
+            TaskAnswer::Settles(settled) | TaskAnswer::Part(settled) => Some(settled),
         }
     }
 
@@ -1826,21 +1877,24 @@ mod tests {
         assert!(err.to_string().contains(expected), "{err}");
     }
 
-    /// A resume reads how each background task ended off these marks.
-    #[test]
-    fn task_marks_write_the_flat_shape() {
-        let stored = json!({
+    /// A resume reads how each background task ended off these marks. Each
+    /// answer has a key of its own, so an older build reads a part as a
+    /// plain notice rather than as the end of its receipt.
+    #[test_case(TaskAnswer::Settles, "settles" ; "settles")]
+    #[test_case(TaskAnswer::Part, "partial" ; "part")]
+    fn task_marks_write_the_flat_shape(answer: fn(TaskSettled) -> TaskAnswer, key: &str) {
+        let mut stored = json!({
             "role": "user",
             "content": [],
             "receipts": [TASK_ID],
-            "settles": { "task": TASK_ID, "end": "cancelled" }
         });
+        stored[key] = json!({ "task": TASK_ID, "end": "cancelled" });
         let message = Message {
             receipts: vec![TASK_ID.into()],
-            settles: Some(TaskSettled {
+            answers: Some(answer(TaskSettled {
                 task: TASK_ID.into(),
                 end: TaskEnd::Cancelled,
-            }),
+            })),
             ..Default::default()
         };
         assert_eq!(serde_json::to_value(&message).unwrap(), stored);

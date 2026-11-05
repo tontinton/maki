@@ -31,7 +31,7 @@ pub fn observation_line(message: &Message) -> Option<&str> {
 /// for the user, so only the output is left to show.
 pub fn observation_detail(message: &Message) -> Option<&str> {
     let text = message.first_text_content()?;
-    let detail = if message.settles.is_some() {
+    let detail = if message.answers.is_some() {
         notice_body(text)
     } else {
         text

@@ -36,20 +36,19 @@ async fn roundtrip(
 /// `plugin` field.
 ///
 /// @return (table|nil, string|nil) Array of `{id, session, name, focused, status?, plugin?,
-///   tool?, parent?, part?, started_at?, ended_at?, cost?}` where `status` is `"working"`,
-///   `"idle"` (a plugin task between prompts), `"done"`, `"error"`, or
-///   `"cancelled"` (stopped by the user or the model), and `session` is the
-///   chat session that `stop()` asks for. `tool` is the tool whose call the
-///   task runs, `"task"` for a subagent or `"bash"` for a moved command,
-///   absent on a session a plugin opened on its own. `parent` is the id of
-///   the call the task runs under, like a `batch` that started it. That
-///   call is listed only once it moved. `part` is true for a piece listed
-///   with `ctx:set_parts()`. Stopping a part stops its whole call, while a
-///   subagent the call started stops alone. `started_at` and `ended_at` are
-///   Unix seconds: when the task started, or moved to the background, and
-///   when it finished. A task saved before they were recorded has neither.
-///   `cost` is what a subagent billed so far, in dollars. The main chat has
-///   none of the three. Or nil and an error.
+///   tool?, parent?, part?, wrapper?, started_at?, ended_at?, cost?}`, or nil and an error.
+///   `status` is `"working"`, `"idle"` (a plugin task between prompts), `"done"`,
+///   `"error"` or `"cancelled"`. `session` is the chat session that `stop()` asks for.
+///   `tool` is the tool whose call the task runs, like `"task"` or `"bash"`, and is
+///   absent on a session a plugin opened on its own. `parent` is the id of the call
+///   the task runs under, like a `batch`, which is listed only once it moved. `part`
+///   is true for a piece listed with `ctx:set_parts()`: stopping it stops its whole
+///   call, while a subagent the call started stops alone. `wrapper` is true for a
+///   call that `/tasks` replaces with the tasks under it, so it gets no row and does
+///   not count as running. `started_at` and `ended_at` are Unix seconds: when the
+///   task started or moved, and when it finished. Tasks saved before they were
+///   recorded lack them. `cost` is what a subagent billed so far, in dollars. The
+///   main chat has none of the three.
 /// @example
 /// for _, t in ipairs(maki.task.list() or {}) do
 ///   print(t.name, t.status or "main")

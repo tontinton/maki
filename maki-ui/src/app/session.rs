@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, tab_ending};
+use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, TaskParent, tab_ending};
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::command::PROMPT_NEEDS;
 use crate::components::input::{COMMAND_PREFIX, sent_text};
@@ -118,7 +118,7 @@ fn moved_outcomes(
 ) -> Vec<(String, BackgroundOutcome)> {
     let mut outcomes = HashMap::new();
     for message in messages {
-        if let Some(settled) = &message.settles {
+        if let Some(settled) = message.settles() {
             outcomes.insert(settled.task.as_str(), settled.end.into());
         }
         for id in &message.receipts {
@@ -659,9 +659,18 @@ impl App {
         vec![Action::OpenFork(Box::new(OpenSession { session, claim }))]
     }
 
+    /// Each running task, keyed by the call whose receipt a rewind would drop.
+    /// A batch child goes by its batch, since only the batch has a receipt.
     fn background_task_names(&self) -> Vec<(Arc<str>, String)> {
         self.running_background_tasks()
-            .filter_map(|chat| Some((Arc::clone(chat.task_id()?), chat.name.clone())))
+            .filter_map(|chat| {
+                let call = chat
+                    .parent
+                    .as_ref()
+                    .map(TaskParent::call)
+                    .or(chat.task_id())?;
+                Some((Arc::clone(call), chat.name.clone()))
+            })
             .collect()
     }
 

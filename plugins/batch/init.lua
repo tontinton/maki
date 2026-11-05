@@ -25,7 +25,7 @@ local CANCELLED_ERROR = "cancelled"
 local DISCARDED_ERROR = string.format("maximum of %d tools per batch", MAX_BATCH_SIZE)
 local WAITING_FMT = "batch is waiting on %s"
 local NOTHING_RUNNING = "batch has no running tool left to move"
-local MOVED_HEADER = "Still running in the background:"
+local MOVED_HEADER = "Still running in the background, each reports back as it finishes:"
 local BACKGROUND_PARAM = "background"
 local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground.\n\n"
 local MOVED_ITEM_FMT = "- %s"
@@ -492,6 +492,7 @@ function Batch:settle(c, status, output)
   c.output = output
   c.stopped = status == STATUS.ERROR and self.ctx:cancelled()
   self:attach_body(c)
+  self:report_finished()
   self:rerender()
   self:publish_parts()
   self:sync_movable()
@@ -561,19 +562,24 @@ function Batch:unreported()
   return out
 end
 
+function Batch:any_running()
+  for _, c in ipairs(self.children) do
+    if not TERMINAL[c.status] then
+      return true
+    end
+  end
+  return false
+end
+
 -- What the hook would answer now, so the row's hint shows only when a
 -- press would move the batch.
 function Batch:movable_now()
-  local running = false
   for _, c in ipairs(self.children) do
-    if not TERMINAL[c.status] then
-      if not c.movable then
-        return false
-      end
-      running = true
+    if not TERMINAL[c.status] and not c.movable then
+      return false
     end
   end
-  return running
+  return self:any_running()
 end
 
 function Batch:sync_movable()
@@ -672,12 +678,35 @@ function Batch:sweep_cancelled(reason)
   end
 end
 
+-- Once the batch moved, a quick child should not wait for a slow one, so
+-- each finished child goes to the model on its own. We send every finished
+-- child not sent yet, not just the one that landed, because a child can
+-- finish while the move is still committing and nobody else would send it.
+-- The last child stays for the final reply, and so does everything after a
+-- stop, since that reply explains the stop. If the runtime refuses a child,
+-- it stays unsent and the final reply carries it.
+function Batch:report_finished()
+  if not self.ctx:backgrounded() or self.ctx:cancelled() or not self:any_running() then
+    return
+  end
+  for _, c in ipairs(self.children) do
+    if TERMINAL[c.status] and not c.reported then
+      c.reported = self.ctx:report_part({
+        tool = c.tool,
+        name = header_text(c),
+        output = c.output,
+        is_error = c.status == STATUS.ERROR,
+      }) == true
+    end
+  end
+end
+
 -- The `ctx:on_background` hook: the whole batch task moves as one, so every
 -- child still running must be able to outlive the turn. Never yields, so the
 -- snapshot it reports is exact: a child that settles after it is listed as
--- running and arrives with the final reply, whether it lands before the
--- move commits or after. Finished children are marked `reported` only once
--- the receipt is built, so a decline leaves the batch untouched.
+-- running and arrives on its own or with the final reply, see
+-- `report_finished`. Finished children are marked `reported` only once the
+-- receipt is built, so a decline leaves the batch untouched.
 function Batch:hand_over()
   local finished, running = {}, {}
   for _, c in ipairs(self.children) do

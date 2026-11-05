@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use arc_swap::ArcSwap;
 use event_listener::Event;
 use maki_config::ModelPolicy;
-use maki_providers::{Message, RequestOptions, TaskEnd, TaskSettled, Timeouts};
+use maki_providers::{Message, RequestOptions, TaskAnswer, TaskEnd, TaskSettled, Timeouts};
 use maki_storage::id::{MakiId, SessionRef};
 use thiserror::Error;
 
@@ -105,15 +105,16 @@ pub struct BackgroundNotice<'a> {
 }
 
 impl Mailbox {
-    /// A full mailbox drops its oldest notice that settles nothing. One that
-    /// settles a receipt is never dropped: the model waits for it, and nothing
-    /// would report it lost. Receipts bound those anyway.
+    /// A full mailbox drops its oldest notice that answers no receipt. One
+    /// that answers a receipt, even in part, is never dropped: the model waits
+    /// for it, and nothing would tell it the result was lost. Each one comes
+    /// from a moved call, so there are never many.
     fn push(&mut self, notice: Message, wake: bool) {
         if self.pending.len() >= MAILBOX_CAPACITY
             && let Some(evicted) = self
                 .pending
                 .iter()
-                .position(|queued| queued.settles.is_none())
+                .position(|queued| queued.answers.is_none())
         {
             self.pending.remove(evicted);
         }
@@ -127,10 +128,7 @@ impl Mailbox {
     }
 
     fn unsettled(&self) -> impl Iterator<Item = &String> {
-        let queued = self
-            .pending
-            .iter()
-            .filter_map(|notice| notice.settles.as_ref());
+        let queued = self.pending.iter().filter_map(Message::settles);
         self.outstanding
             .iter()
             .chain(queued.map(|settled| &settled.task))
@@ -146,13 +144,16 @@ impl Mailbox {
     fn relabel_lost(&mut self, id: &str, label: &TaskLabel) {
         let queued = self.pending.iter_mut().find(|notice| {
             notice
-                .settles
-                .as_ref()
+                .settles()
                 .is_some_and(|settled| settled.task == id && settled.end == TaskEnd::Lost)
         });
         if let Some(notice) = queued {
             *notice = lost_notice(id, label);
         }
+    }
+
+    fn tracks(&self, id: &str) -> bool {
+        self.outstanding.iter().any(|tracked| tracked == id)
     }
 
     /// Stops tracking `id` as running work. False when nothing tracked it.
@@ -167,7 +168,11 @@ impl Mailbox {
 
 fn lost_notice(id: &str, label: &TaskLabel) -> Message {
     let (text, display) = notice(label, id, TaskEnd::Lost, TaskEnd::Lost, LOST_NOTICE_BODY);
-    settling(id, TaskEnd::Lost, text, Some(&display))
+    answering(
+        TaskAnswer::Settles(settled(id, TaskEnd::Lost)),
+        text,
+        Some(&display),
+    )
 }
 
 fn end_word(end: TaskEnd) -> &'static str {
@@ -246,12 +251,16 @@ fn observation(text: String, display: Option<&str>) -> Message {
     message
 }
 
-fn settling(task: &str, end: TaskEnd, text: String, display: Option<&str>) -> Message {
+fn settled(task: &str, end: TaskEnd) -> TaskSettled {
+    TaskSettled {
+        task: task.to_owned(),
+        end,
+    }
+}
+
+fn answering(answer: TaskAnswer, text: String, display: Option<&str>) -> Message {
     Message {
-        settles: Some(TaskSettled {
-            task: task.to_owned(),
-            end,
-        }),
+        answers: Some(answer),
         ..observation(text, display)
     }
 }
@@ -360,7 +369,7 @@ impl SessionMailbox {
     /// once [`Self::close`]d: nobody would read the result.
     pub fn track(&self, id: &str) -> bool {
         self.change(|state| {
-            if !state.closed && !state.outstanding.iter().any(|known| known == id) {
+            if !state.closed && !state.tracks(id) {
                 state.outstanding.push(id.to_owned());
             }
             !state.closed
@@ -382,22 +391,34 @@ impl SessionMailbox {
                 return;
             }
             if let Some(notice) = notice {
-                let message = settling(id, notice.end, notice.text, notice.display);
-                state.push(message, notice.wake);
+                let answer = TaskAnswer::Settles(settled(id, notice.end));
+                state.push(answering(answer, notice.text, notice.display), notice.wake);
             }
         });
+    }
+
+    /// Answers part of `id`'s work early, while the rest still runs. Like
+    /// [`Self::settle`], it drops the answer when nobody tracks `id`, and then
+    /// says `false`.
+    pub fn report_part(&self, id: &str, notice: BackgroundNotice<'_>) -> bool {
+        self.change(|state| {
+            if !state.tracks(id) {
+                tracing::debug!(id, "part of a background task nobody waits for");
+                return false;
+            }
+            let answer = TaskAnswer::Part(settled(id, notice.end));
+            state.push(answering(answer, notice.text, notice.display), notice.wake);
+            true
+        })
     }
 
     /// The receipt for `id` left the history (a rewind): nothing may answer it.
     pub fn forget(&self, id: &str) {
         self.change(|state| {
             state.untrack(id);
-            state.pending.retain(|notice| {
-                notice
-                    .settles
-                    .as_ref()
-                    .is_none_or(|settled| settled.task != id)
-            });
+            state
+                .pending
+                .retain(|notice| notice.answered().is_none_or(|settled| settled.task != id));
             state.wake &= !state.pending.is_empty();
         });
     }
@@ -413,7 +434,7 @@ impl SessionMailbox {
         lock(&self.live.mailbox)
             .pending
             .iter()
-            .filter_map(|notice| notice.settles.as_ref())
+            .filter_map(Message::settles)
             .find(|settled| settled.task == id)
             .map(|settled| settled.end)
     }
@@ -860,6 +881,30 @@ mod tests {
         assert!(mailbox.drain().is_empty());
     }
 
+    #[test]
+    fn a_part_answers_early_and_keeps_its_receipt_open() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+
+        assert!(mailbox.report_part(TASK_ID, result(true).unwrap()));
+
+        let part = mailbox.claim_wake().remove(0);
+        assert_eq!(
+            part.answers,
+            Some(TaskAnswer::Part(settled(TASK_ID, TaskEnd::Finished)))
+        );
+        assert_eq!(mailbox.outstanding(), 1);
+    }
+
+    #[test]
+    fn a_part_of_an_untracked_receipt_is_dropped() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+
+        assert!(!mailbox.report_part(TASK_ID, result(true).unwrap()));
+
+        assert!(mailbox.drain().is_empty());
+    }
+
     #[tokio::test]
     async fn forgetting_the_only_waking_result_leaves_nothing_to_wake_for() {
         let mailbox = SessionMailbox::register(MakiId::generate());
@@ -900,10 +945,11 @@ mod tests {
     }
 
     #[test]
-    fn forget_drops_a_queued_result() {
+    fn forget_drops_every_queued_answer() {
         let mailbox = SessionMailbox::register(MakiId::generate());
         mailbox.track(TASK_ID);
         mailbox.track(OTHER_TASK_ID);
+        mailbox.report_part(TASK_ID, result(false).unwrap());
         mailbox.settle(TASK_ID, result(false));
         mailbox.settle(OTHER_TASK_ID, result(false));
 
@@ -947,7 +993,7 @@ mod tests {
         let lost = mailbox.drain();
         assert_eq!(lost.len(), 1);
         assert!(text(&lost[0]).ends_with(LOST_NOTICE_BODY));
-        assert_eq!(lost[0].settles, settled(TaskEnd::Lost));
+        assert_eq!(lost[0].settles().cloned(), settles(TaskEnd::Lost));
     }
 
     fn label(summary: Option<&str>) -> TaskLabel {
@@ -995,11 +1041,8 @@ mod tests {
         );
     }
 
-    fn settled(end: TaskEnd) -> Option<TaskSettled> {
-        Some(TaskSettled {
-            task: TASK_ID.into(),
-            end,
-        })
+    fn settles(end: TaskEnd) -> Option<TaskSettled> {
+        Some(settled(TASK_ID, end))
     }
 
     #[test_case(false, false, TaskEnd::Finished ; "finished")]
@@ -1021,7 +1064,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(mailbox.drain()[0].settles, settled(end));
+        assert_eq!(mailbox.drain()[0].settles().cloned(), settles(end));
     }
 
     #[test]
@@ -1032,7 +1075,7 @@ mod tests {
 
         SessionMailbox::notify(mailbox.session_id(), text, Some(&display), false).unwrap();
 
-        assert_eq!(mailbox.drain()[0].settles, None);
+        assert_eq!(mailbox.drain()[0].settles(), None);
     }
 
     #[test_case(Some(SUMMARY), NOTICE_BODY ; "plain")]
