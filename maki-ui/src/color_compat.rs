@@ -14,6 +14,9 @@ use std::sync::OnceLock;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 
+#[cfg(any(unix, test))]
+use crate::tty_probe::find;
+
 const CUBE_STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 const TRUECOLOR_TERM_PROGRAMS: [&str; 7] = [
     "iTerm.app",
@@ -119,76 +122,16 @@ fn decrqss_reply_supports_rgb(buf: &[u8]) -> bool {
     find(payload, b"48:2").is_some() || find(payload, b"48;2").is_some()
 }
 
-/// The DA1 reply (`ESC [ ? ... c`) ends the probe: we request it last, and
-/// every terminal answers it, even ones that ignore DECRQSS. Without it we
-/// would sit out the full timeout on every non-RGB terminal.
-#[cfg(any(unix, test))]
-fn da1_answered(buf: &[u8]) -> bool {
-    find(buf, b"\x1b[?").is_some_and(|start| buf[start + 3..].contains(&b'c'))
-}
-
-#[cfg(any(unix, test))]
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
 #[cfg(unix)]
 mod probe {
-    use std::fs::File;
-    use std::io::{IsTerminal, Write, stdin, stdout};
-    use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-    use std::time::{Duration, Instant};
+    use super::decrqss_reply_supports_rgb;
+    use crate::tty_probe;
 
-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
-    use rustix::io::read;
-
-    use super::{da1_answered, decrqss_reply_supports_rgb};
-
-    /// Set an RGB background, query it back with DECRQSS, reset, then DA1.
-    const QUERY: &[u8] = b"\x1b[48;2;1;2;3m\x1bP$qm\x1b\\\x1b[0m\x1b[c";
-    const TIMEOUT: Duration = Duration::from_millis(500);
+    /// Set an RGB background, read it back with DECRQSS, then reset.
+    const QUERY: &[u8] = b"\x1b[48;2;1;2;3m\x1bP$qm\x1b\\\x1b[0m";
 
     pub(super) fn terminal_supports_rgb() -> bool {
-        try_probe().unwrap_or(false)
-    }
-
-    fn try_probe() -> Option<bool> {
-        let tty = open_tty()?;
-        let fd = tty.as_fd();
-        let mut out = stdout().lock();
-        out.write_all(QUERY).ok()?;
-        out.flush().ok()?;
-        let deadline = Instant::now() + TIMEOUT;
-        let mut buf = Vec::with_capacity(64);
-        while !da1_answered(&buf) {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                break;
-            };
-            if !wait_readable(fd, remaining) {
-                break;
-            }
-            let mut chunk = [0u8; 256];
-            let n = match read(fd, &mut chunk) {
-                Ok(n) if n > 0 => n,
-                _ => break,
-            };
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        Some(decrqss_reply_supports_rgb(&buf))
-    }
-
-    fn open_tty() -> Option<OwnedFd> {
-        if stdin().is_terminal() {
-            return stdin().as_fd().try_clone_to_owned().ok();
-        }
-        File::open("/dev/tty").ok().map(OwnedFd::from)
-    }
-
-    fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> bool {
-        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-        let timeout = Timespec::try_from(timeout).ok();
-        poll(&mut fds, timeout.as_ref()).is_ok_and(|ready| ready > 0)
-            && fds[0].revents().contains(PollFlags::IN)
+        tty_probe::query(QUERY).is_some_and(|buf| decrqss_reply_supports_rgb(&buf))
     }
 }
 
@@ -278,12 +221,5 @@ mod tests {
     #[test_case(b"\x1bP1$r0m\x1b\\48;2\x1b[?1;2c", false; "bytes_after_st_ignored")]
     fn decrqss_reply(buf: &[u8], expected: bool) {
         assert_eq!(decrqss_reply_supports_rgb(buf), expected);
-    }
-
-    #[test_case(b"\x1b[?65;1;9c", true; "da1_reply")]
-    #[test_case(b"\x1bP1$r0;48:2:1:2:3m\x1b\\", false; "decrqss_only")]
-    #[test_case(b"\x1b[?65;1;9", false; "partial_da1")]
-    fn da1(buf: &[u8], expected: bool) {
-        assert_eq!(da1_answered(buf), expected);
     }
 }
