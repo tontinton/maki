@@ -189,7 +189,7 @@
     .intro { padding-top: calc(var(--nav-h) + clamp(2.5rem, 6vw, 4.5rem)); padding-bottom: 1.25rem; }
     h1 { font-weight: 800; font-size: clamp(2.5rem, 5vw, 3.5rem); letter-spacing: -0.03em; line-height: 1.05; }
     .lede { max-width: 58ch; margin-top: 0.85rem; font-size: 1.1rem; color: var(--ink-2); text-wrap: pretty; }
-    .lede code { padding-block: 0; line-height: 1; }
+    .lede code, .desc code { padding-block: 0; line-height: 1; }
     .trust { max-width: 58ch; margin-top: 0.5rem; font-size: 0.9rem; color: var(--ink-3); text-wrap: pretty; }
 
     /* ── toolbar ── */
@@ -443,6 +443,8 @@
   const CLEAR_TOPIC = 'Clear topic filter';
   const GENERIC_TOPICS = new Set(['maki', 'plugin', 'plugins', 'maki-plugin', 'maki-plugins', 'lua', 'luau',
     'ai', 'ai-agent', 'ai-agents', 'agent', 'agents', 'coding-agent', 'llm']);
+  const INLINE_MD = /`([^`]+)`|\*\*(.+?)\*\*|__(.+?)__|(?<![\w*])\*(?![\s*])(.+?)(?<!\s)\*(?![\w*])|(?<!\w)_(?![\s_])(.+?)(?<!\s)_(?!\w)|~~(.+?)~~/g;
+  const INLINE_TAGS = ['code', 'strong', 'strong', 'em', 'em', 's'];
   const AGE_STEPS = [[365 * DAY_MS, 'y'], [30 * DAY_MS, 'mo'], [DAY_MS, 'd'], [36e5, 'h'], [6e4, 'm']];
   const desc = key => (a, b) => (b[key] > a[key]) - (b[key] < a[key]);
   const SORTS = {
@@ -503,6 +505,21 @@
     return node;
   }
 
+  function inlineMarkdown(text) {
+    const nodes = [];
+    let last = 0;
+    for (const match of text.matchAll(INLINE_MD)) {
+      const group = match.findIndex((g, i) => i > 0 && g !== undefined);
+      const node = el(INLINE_TAGS[group - 1]);
+      if (group === 1) node.textContent = match[group];
+      else node.append(...inlineMarkdown(match[group]));
+      nodes.push(text.slice(last, match.index), node);
+      last = match.index + match[0].length;
+    }
+    nodes.push(text.slice(last));
+    return nodes;
+  }
+
   function ago(iso) {
     const ms = Date.now() - Date.parse(iso);
     for (const [unit, suffix] of AGE_STEPS) if (ms >= unit) return `${Math.floor(ms / unit)}${suffix} ago`;
@@ -550,7 +567,8 @@
     head.append(avatarFor(owner), title);
     if (Date.now() - Date.parse(p.created_at) < NEW_FOR_MS) head.append(el('span', 'new', 'new'));
 
-    const description = el('p', p.description ? 'desc' : 'desc none', p.description || 'No description.');
+    const description = el('p', p.description ? 'desc' : 'desc none');
+    description.append(...(p.description ? inlineMarkdown(p.description) : ['No description.']));
 
     const tags = el('div', 'tags');
     for (const topic of ownTopics(p).slice(0, MAX_TAGS)) {
