@@ -67,6 +67,7 @@ use crate::app::mode::Mode;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::TaskWatch;
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
+use crate::appearance::{self, Background};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::keybindings::key;
@@ -91,6 +92,9 @@ const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 const FORKED_MSG: &str = "Forked, {key} to switch back";
+/// A `/reload` cannot ask the terminal: its input reader owns the tty.
+const RESTART_FOR_BACKGROUND: &str =
+    "ui.theme: restart Maki to detect the terminal background, using dark until then";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -676,7 +680,12 @@ impl<'t> EventLoop<'t> {
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme. Only the
         // in-memory name is set, so the user's saved pick survives.
-        if let Some(ref name) = ui_config.theme {
+        if let Some(ref pair) = ui_config.theme {
+            let background = appearance::background();
+            if pair.follows_background() && background.is_none() {
+                startup_warnings.push(RESTART_FOR_BACKGROUND.to_owned());
+            }
+            let name = pair.name(background == Some(Background::Light));
             match crate::theme::load_by_name(name) {
                 Ok(theme) => {
                     crate::theme::set_current_name(name);
