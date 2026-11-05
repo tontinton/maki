@@ -26,7 +26,7 @@ use maki_agent::tools::{
     ToolSource,
 };
 use maki_agent::{
-    AgentSeed, BufferSnapshot, CallScope, SessionEndReason, SessionMailbox, SharedBuf,
+    AgentSeed, BufferSnapshot, CallScope, Cutter, SessionEndReason, SessionMailbox, SharedBuf,
     SnapshotLine, SnapshotSpan, SpanStyle, TaskHome, UiWaker, receipt_tag,
 };
 use mlua::chunk::{Chunk, ChunkMode, Compiler};
@@ -77,7 +77,7 @@ use crate::api::util::pair::{Pair, err_pair};
 use crate::api::util::setup::ConfigStore;
 use crate::api::{Owner, create_maki_global};
 use crate::background::{
-    BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime, MovedEnd, Stop, StopMark,
+    BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime, MovedEnd,
 };
 use crate::docs_render;
 use crate::error::PluginError;
@@ -1238,10 +1238,7 @@ impl LiveTask {
         };
         // An Esc that fired the run while the call was moving reaches it
         // through the claim. The user stopped it, so its end is quiet.
-        let stop = StopMark::default();
-        if call.cancel().is_cancelled() {
-            stop.mark(Stop::User);
-        }
+        let stopped = call.cancel().is_cancelled().then_some(Cutter::User);
         let entry = BackgroundTask {
             info: BackgroundInfo {
                 id: self.id.clone(),
@@ -1250,14 +1247,15 @@ impl LiveTask {
                 kind: Kind::Call {
                     tool: Arc::clone(&self.tool),
                 },
-                running: true,
                 started_at: now_epoch(),
                 cost: None,
             },
             session: chat,
             task: None,
             lifetime: Lifetime::Call,
-            stop,
+            stopped,
+            control: None,
+            replied: false,
             cancel: Fire::Owned(cancel),
             mailbox: Some(mailbox.clone()),
         };
@@ -1470,7 +1468,7 @@ fn cut_reason(lua: &Lua, handle: &TaskHandle, reason: KillReason) -> &'static st
     let call = lock_cell(handle).call.clone();
     let by_model = call.is_some_and(|call| {
         lua.app_data_ref::<BackgroundTasks>()
-            .is_some_and(|registry| registry.stopped_by(call.id()) == Stop::Model)
+            .is_some_and(|registry| registry.stopped_by(call.id()) == Some(Cutter::Parent))
     });
     if by_model { STOPPED_MSG } else { CANCELLED_MSG }
 }

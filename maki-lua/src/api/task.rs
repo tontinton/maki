@@ -1,11 +1,18 @@
 //! `maki.task`. The host keeps the subagent transcripts, so a plugin only needs
 //! to list the tasks and show one.
 
-use maki_agent::SessionMailbox;
-use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Either as LuaEither, Lua, LuaSerdeExt, Result as LuaResult, UserDataRef, Value};
+use std::sync::Arc;
 
+use maki_agent::{SessionControl, SessionMailbox};
+use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::RequestOptions;
+use maki_storage::id::MakiId;
+use mlua::{Either as LuaEither, Lua, LuaSerdeExt, Result as LuaResult, Table, UserDataRef, Value};
+
+use crate::api::agent::{delivery, plugin_input};
+use crate::api::session::newest_messages_table;
 use crate::api::util::command::{TaskRequest, UiAction, ui_json_roundtrip};
+use crate::api::util::convert::TableExt;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::background::BackgroundTasks;
@@ -15,6 +22,9 @@ use crate::runtime::{CANCEL_ABANDON_AFTER, is_user_action};
 const USER_ACTION_ERR: &str = "stopping a task requires a user command or keybind";
 const TASK_ID_ERR: &str = "stop(ctx, id): id must be a string";
 const STOP_OPTS_ERR: &str = "stop(id, opts): opts must be a table";
+pub(crate) const NO_RUNNING_SUBAGENT: &str = "no running background subagent with id";
+const LAST_KEY: &str = "last";
+const NAME_KEY: &str = "name";
 
 async fn roundtrip(
     lua: Lua,
@@ -102,11 +112,12 @@ async fn remove(
 /// From a tool handler, `stop(ctx, id)` is the model's stop. It stops a
 /// background task (a command or subagent) that the calling agent moved,
 /// which is allowed because the tool call belongs to a turn the user started.
-/// It waits up to 5 seconds for the final reply and returns it, and the agent
-/// gets no notice of the end. A late reply returns no `output`, and the
-/// result reaches the agent later as a quiet notice. A task another agent
-/// moved, a finished task or an unknown id returns an error that names the
-/// agent's running task ids.
+/// A subagent stopped this way ends its pending `:prompt()` with
+/// `"stopped by parent agent"`. It waits up to 5 seconds for the final reply
+/// and returns it, and the agent gets no notice of the end. A late reply
+/// returns no `output`, and the result reaches the agent later as a quiet
+/// notice. A task another agent moved, a finished task or an unknown id
+/// returns an error that names the agent's running task ids.
 ///
 /// @param id string|LuaCtx Task id, as returned by `list()`. Or the handler's
 ///   ctx, for the model's stop.
@@ -135,10 +146,7 @@ async fn stop(
                 return Err(mlua::Error::runtime(TASK_ID_ERR));
             };
             let task_id = String::from(&*task_id.to_str()?);
-            let Some(agent) = ctx.agent() else {
-                return Ok(ctx.cap_err_pair("maki.task.stop"));
-            };
-            let asker = agent.mailbox.as_ref().map(SessionMailbox::session_id);
+            let asker = try_pair!(asker(&ctx, "maki.task.stop"));
             drop(ctx);
             let stopped = try_pair!(
                 BackgroundTasks::of(&lua)
@@ -159,16 +167,123 @@ async fn stop(
     roundtrip(lua, tx, TaskRequest::Stop { id, session }).await
 }
 
+/// Whose tasks `stop`, `send` and `messages` may touch from a tool handler:
+/// the mailbox its agent reads. `None` outside a run.
+fn asker(ctx: &LuaCtx, method: &str) -> Result<Option<MakiId>, String> {
+    let agent = ctx.agent().ok_or_else(|| ctx.cap_err(method))?;
+    Ok(agent.mailbox.as_ref().map(SessionMailbox::session_id))
+}
+
+/// The live subagent `id` that the agent behind `ctx` reaches, and its name.
+fn reached_subagent(
+    lua: &Lua,
+    ctx: &LuaCtx,
+    method: &str,
+    id: &str,
+) -> Result<(Arc<SessionControl>, String), String> {
+    let asker = asker(ctx, method)?;
+    BackgroundTasks::of(lua)
+        .subagent(asker, id)
+        .ok_or_else(|| not_running(id))
+}
+
+fn not_running(id: &str) -> String {
+    format!("{NO_RUNNING_SUBAGENT} {id}")
+}
+
+/// Messages a background subagent that the calling agent moved, the way the
+/// `task_message` tool does. The subagent reads it as an interrupt from its
+/// parent once its current turn ends, and one still waiting for a slot reads
+/// it with its first prompt.
+///
+/// With `interrupt` it does not wait for the turn to end, nor for the calls
+/// the subagent moved. The reply stops and running tools are cancelled (bash
+/// returns what it printed so far), then the subagent reads the message and
+/// carries on with its history intact. With no turn running the message
+/// waits like any other.
+///
+/// An agent reaches the subagents it moved, and those nested in a call it
+/// moved, until they end. Like `stop(ctx, id)`, it never reaches what
+/// another agent moved.
+///
+/// @param ctx LuaCtx The tool handler's ctx.
+/// @param id string Task id, from its receipt.
+/// @param text string The message.
+/// @param opts table? Optional fields:
+///   `interrupt` (boolean?) - cut its current turn short. Default: `false`.
+/// @return (table|nil, string|nil) `{name}`, the task's name in `/tasks`, or
+///   nil and `"no running background subagent with id <id>"`.
+/// @example
+/// local sent, err = maki.task.send(ctx, input.id, input.message)
+/// if not sent then return { llm_output = err, is_error = true } end
+/// return "Message queued for " .. sent.name .. "."
+#[lua_fn]
+async fn send(
+    lua: Lua,
+    ctx: UserDataRef<LuaCtx>,
+    id: String,
+    text: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Table>> {
+    let delivery = delivery(opts.as_ref());
+    let (control, name) = try_pair!(reached_subagent(&lua, &ctx, "maki.task.send", &id));
+    // A sent message never picks the run's settings, so these are inert.
+    let input = plugin_input(text, RequestOptions::default());
+    if control.send(input, delivery).is_err() {
+        return Ok(err_pair(not_running(&id)));
+    }
+    let sent = lua.create_table()?;
+    sent.set(NAME_KEY, name)?;
+    Ok((Some(sent), None))
+}
+
+/// Reads the transcript of a background subagent that the calling agent
+/// moved, oldest first, while it works. The messages have the shape
+/// `maki.session.messages` returns. It reaches what `send(ctx, id)` does.
+/// Works without an interactive UI.
+///
+/// @param ctx LuaCtx The tool handler's ctx.
+/// @param id string Task id, from its receipt.
+/// @param opts table? `last` (integer?) only the newest `last` messages.
+/// @return (table|nil, string|nil) Array of messages, or nil and
+///   `"no running background subagent with id <id>"`.
+/// @example
+/// local msgs = maki.task.messages(ctx, input.id, { last = 1 })
+/// local last = msgs and msgs[1]
+/// if last and last.content[1].type == "text" then
+///   print(last.content[1].text)
+/// end
+#[lua_fn(guard = SessionRead)]
+async fn messages(
+    lua: Lua,
+    ctx: UserDataRef<LuaCtx>,
+    id: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Table>> {
+    let last = opts
+        .map(|opts| opts.opt::<usize>(LAST_KEY))
+        .transpose()?
+        .flatten();
+    let (control, _) = try_pair!(reached_subagent(&lua, &ctx, "maki.task.messages", &id));
+    drop(ctx);
+    let history = Arc::clone(&control.transcript().load().messages);
+    Ok((
+        Some(newest_messages_table(&lua, &history, last).await?),
+        None,
+    ))
+}
+
 lua_table! {
     /// The subagents of the focused session and their transcripts. Tasks are
     /// spawned by the `task` tool and addressed by an id that survives a reload.
     /// Without an interactive UI every function returns
-    /// `nil, "no interactive UI attached"`.
+    /// `nil, "no interactive UI attached"`, except the ones that take a tool
+    /// handler's ctx: they reach the background tasks its agent moved.
     "maki.task" => pub(crate) fn create_task_table(
         tx: Option<flume::Sender<UiAction>>,
         perms: &PluginPermissions,
     ),
-    DOCS [list(tx), focus(tx), remove(perms, tx), stop(tx)]
+    DOCS [list(tx), focus(tx), remove(perms, tx), stop(tx), send, messages(perms)]
 }
 
 #[cfg(test)]

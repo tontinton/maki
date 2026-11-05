@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource, SessionMailbox};
+use maki_agent::{AgentInput, AgentMode, Delivery, ImageSource, InputSource, SessionMailbox};
 use maki_lua::agent_autocmd::HostEvent;
 
 use super::{Action, App, Status};
@@ -16,6 +16,7 @@ pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
 pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
+pub(crate) const SUBAGENT_REFUSED_PREFIX: &str = "Message not delivered, subagent ";
 
 pub(crate) enum SubmitOutcome {
     Started(Vec<Action>),
@@ -157,9 +158,11 @@ impl App {
     /// `QueueItemConsumed` relayed from there draws it in this chat. The
     /// subagent runs its own settings, so the input carries them. A chat
     /// without an inbox shows no input box, see `App::chat_accepts_input`.
+    /// A session can end before its chat hears about it, so a refused message
+    /// flashes the reason instead of vanishing.
     pub(super) fn queue_for_subagent(&mut self, msg: QueuedMessage) -> Vec<Action> {
         let chat = &self.chats[self.active_chat];
-        let Some(inbox) = chat.inbox.as_ref() else {
+        let Some(control) = chat.control.as_ref() else {
             return vec![];
         };
         let (thinking, fast) = chat
@@ -167,18 +170,24 @@ impl App {
             .map_or((self.state.thinking, self.state.fast), |o| {
                 (o.thinking, o.fast)
             });
-        inbox.push(AgentInput {
-            message: msg.text,
-            mode: AgentMode::Build,
-            images: msg.images,
-            preamble: Vec::new(),
-            earlier: Vec::new(),
-            thinking,
-            fast,
-            workflow: false,
-            prompt: None,
-            source: InputSource::Tui,
-        });
+        let sent = control.send(
+            AgentInput {
+                message: msg.text,
+                mode: AgentMode::Build,
+                images: msg.images,
+                preamble: Vec::new(),
+                earlier: Vec::new(),
+                thinking,
+                fast,
+                workflow: false,
+                prompt: None,
+                source: InputSource::Tui,
+            },
+            Delivery::NextTurn,
+        );
+        if let Err(reason) = sent {
+            self.flash(format!("{SUBAGENT_REFUSED_PREFIX}{reason}"));
+        }
         vec![]
     }
 
@@ -189,9 +198,9 @@ impl App {
             return self.queue.panel_len();
         }
         self.chats[self.active_chat]
-            .inbox
+            .control
             .as_ref()
-            .map_or(0, |inbox| inbox.len())
+            .map_or(0, |control| control.len())
     }
 
     pub(super) fn active_queue_entries(&self) -> Vec<QueueEntry<'static>> {
@@ -200,9 +209,9 @@ impl App {
         }
         let color = theme::current().foreground;
         self.chats[self.active_chat]
-            .inbox
+            .control
             .as_ref()
-            .map_or_else(Vec::new, |inbox| inbox.texts())
+            .map_or_else(Vec::new, |control| control.texts())
             .into_iter()
             .map(|text| QueueEntry {
                 text: Cow::Owned(text),
@@ -215,8 +224,8 @@ impl App {
         if self.is_main_chat() {
             return self.queue.remove(0);
         }
-        if let Some(ref inbox) = self.chats[self.active_chat].inbox {
-            inbox.remove(0);
+        if let Some(ref control) = self.chats[self.active_chat].control {
+            control.remove(0);
         }
     }
 

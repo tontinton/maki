@@ -19,7 +19,7 @@ use super::display_order::{observation_detail, observation_line};
 use super::frame::{
     FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
 };
-use super::history::{History, sanitize_cancelled_history};
+use super::history::{Cutter, History, sanitize_cancelled_history};
 use super::hook::{AgentHooks, AgentSlot};
 use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, stream_with_retry};
@@ -51,10 +51,6 @@ const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty r
 const MAX_NUDGES: u32 = 20;
 /// Counted over non-padding messages.
 const RECENT_TOOL_WINDOW: usize = 5;
-/// Without this note a cancelled reply replays in history as a finished
-/// turn, and a model resuming its own cut-off text can wedge the session
-/// (seen with llama.cpp stuck on an unterminated tool call).
-const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
 const USER_INTERRUPT_TAG: &str = "user-interrupt";
 const USER_INTERRUPT_NOTE: &str =
     "The user sent a new message while you were working. Address it and continue.";
@@ -318,13 +314,9 @@ impl<'h> Agent<'h> {
             prompt: _,
             source,
         } = input;
-        self.rollback_len = self.history.len();
-        self.carry_from = self.history.len();
-        self.stop_continuations = 0;
-        self.moved_last_round = false;
+        self.begin(RequestOptions { thinking, fast });
         self.mode = mode;
         self.workflow = workflow;
-        self.opts = RequestOptions { thinking, fast };
         // Each message of a burst is judged on its own, and one kept message is
         // enough for the run to go on.
         let burst = earlier
@@ -363,10 +355,7 @@ impl<'h> Agent<'h> {
             message_len = message.len(),
             "agent run started"
         );
-        // Subagents are prompted by the machine inside the parent's window;
-        // counting them would inflate prompts and busy time.
-        let top_level = self.audience.contains(ToolAudience::MAIN);
-        if top_level {
+        if self.top_level() {
             // Tabs and frontends share one process, so attribution follows
             // whichever session actually runs a turn, not whoever last
             // called `set_session_id`.
@@ -375,7 +364,52 @@ impl<'h> Agent<'h> {
             }
             maki_otel::emit::user_prompt(&message);
         }
+        self.drive().await
+    }
 
+    /// Goes on with the same history: lands {notices}, then whatever the
+    /// interrupt source holds, the way it lands between turns, so the model
+    /// reads it as an interrupt from whoever sent it. The history alone says
+    /// whether there is anything to answer. After a cut turn its marker is
+    /// enough, so a dropped message lets the cut work go on. After a finished
+    /// answer with nothing new it sends nothing and ends `Dropped`, since a
+    /// request must never end on the model's own reply.
+    pub async fn resume(
+        &mut self,
+        notices: Vec<Message>,
+        opts: RequestOptions,
+    ) -> Result<DoneReason, AgentError> {
+        self.begin(opts);
+        let landed = async {
+            self.land_input(notices, None, false)?;
+            self.handle_queued_command().await
+        }
+        .await;
+        if let Err(e) = landed {
+            return self.finish(Err(e));
+        }
+        if !self.awaits_reply() {
+            return self.finish(Ok(DoneReason::Dropped));
+        }
+        self.drive().await
+    }
+
+    fn awaits_reply(&self) -> bool {
+        self.history
+            .as_slice()
+            .last()
+            .is_some_and(|message| matches!(message.role, Role::User))
+    }
+
+    fn begin(&mut self, opts: RequestOptions) {
+        self.rollback_len = self.history.len();
+        self.carry_from = self.history.len();
+        self.stop_continuations = 0;
+        self.moved_last_round = false;
+        self.opts = opts;
+    }
+
+    async fn drive(&mut self) -> Result<DoneReason, AgentError> {
         if let Some((system, tools)) = self.history.request_prefix() {
             self.gauge
                 .seed_if_empty(self.history.as_slice(), system, tools);
@@ -385,17 +419,32 @@ impl<'h> Agent<'h> {
         // that failed was still busy.
         let busy_since = Instant::now();
         let result = self.run_loop().await;
-        if top_level {
+        if self.top_level() {
             maki_otel::emit::active_time(busy_since.elapsed());
         }
         self.finish(result)
+    }
+
+    /// Subagents are prompted by the machine inside the parent's window, so
+    /// counting them would inflate prompts and busy time.
+    fn top_level(&self) -> bool {
+        self.audience.contains(ToolAudience::MAIN)
+    }
+
+    /// Only asked after the run's token fired. Before that nobody cut it.
+    fn cutter(&self) -> Cutter {
+        self.interrupt_source
+            .as_ref()
+            .map(|source| source.cut_by())
+            .unwrap_or_default()
     }
 
     fn finish(&mut self, result: Result<DoneReason, AgentError>) -> Result<DoneReason, AgentError> {
         let reason = match result {
             Ok(reason) => reason,
             Err(AgentError::Cancelled) => {
-                sanitize_cancelled_history(self.history, self.rollback_len);
+                let cutter = self.cutter();
+                sanitize_cancelled_history(self.history, self.rollback_len, cutter);
                 DoneReason::Cancelled
             }
             Err(e) => return Err(e),
@@ -649,10 +698,11 @@ impl<'h> Agent<'h> {
             Err(StreamError::Cancelled { streamed }) => {
                 let streamed = streamed.trim_end();
                 if !streamed.is_empty() {
+                    let note = self.cutter().cut_reply_note();
                     self.history.push(Message {
                         role: Role::Assistant,
                         content: vec![ContentBlock::Text {
-                            text: format!("{streamed}\n\n{CANCELLED_TEXT_NOTE}"),
+                            text: format!("{streamed}\n\n{note}"),
                         }],
                         ..Default::default()
                     });
@@ -1218,11 +1268,9 @@ fn no_frame() -> AgentError {
 }
 
 fn interrupt_message(message: String, images: Vec<ImageSource>, source: InputSource) -> Message {
-    let (tag, note) = match source {
-        InputSource::Plugin => (PARENT_INTERRUPT_TAG, PARENT_INTERRUPT_NOTE),
-        InputSource::Tui | InputSource::Acp | InputSource::Headless => {
-            (USER_INTERRUPT_TAG, USER_INTERRUPT_NOTE)
-        }
+    let (tag, note) = match Cutter::of(source) {
+        Cutter::Parent => (PARENT_INTERRUPT_TAG, PARENT_INTERRUPT_NOTE),
+        Cutter::User => (USER_INTERRUPT_TAG, USER_INTERRUPT_NOTE),
     };
     let wrapped = format!("<{tag}>\n{note}\n\n{message}\n</{tag}>");
     Message {
@@ -1236,6 +1284,62 @@ fn interrupt_message(message: String, images: Vec<ImageSource>, source: InputSou
 }
 
 #[cfg(test)]
+pub(crate) mod testing {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use maki_config::{DefaultEffect, ModelPolicy, PermissionsConfig, ProjectConfig};
+    use maki_providers::Model;
+    use maki_providers::provider::Provider;
+
+    use super::AgentParams;
+    use crate::agent::frame::RunContext;
+    use crate::cancel::CancelMap;
+    use crate::permissions::PermissionManager;
+    use crate::prompt::ResolvedPrompts;
+    use crate::tools::{BackgroundFor, FileAccess, RequestTools, ToolAudience, ToolRegistry};
+    use crate::{AgentConfig, RunLedger, ToolOutputLines};
+
+    const TEST_DIR: &str = "/tmp";
+    const SYSTEM: &str = "system";
+
+    pub(crate) fn agent_params(provider: Arc<dyn Provider>, model: Model) -> AgentParams {
+        AgentParams {
+            provider,
+            model,
+            config: AgentConfig::default(),
+            tool_output_lines: ToolOutputLines::default(),
+            permissions: Arc::new(PermissionManager::new(
+                PermissionsConfig {
+                    default: DefaultEffect::Allow,
+                    rules: vec![],
+                    ..Default::default()
+                },
+                PathBuf::from(TEST_DIR),
+                ProjectConfig::for_project(Path::new(TEST_DIR)),
+                Arc::default(),
+            )),
+            session_id: None,
+            background_for: BackgroundFor::None,
+            task_id: None,
+            mailbox: None,
+            timeouts: maki_providers::Timeouts::default(),
+            file_access: FileAccess::fresh(),
+            prompt_slots: Arc::new(ResolvedPrompts::default()),
+            subagent_cancels: Arc::new(CancelMap::new()),
+            ledger: Arc::new(RunLedger::default()),
+            registry: Arc::new(ToolRegistry::new()),
+            audience: ToolAudience::MAIN,
+            model_policy: Arc::new(ModelPolicy::default()),
+        }
+    }
+
+    pub(crate) fn fixed_context() -> RunContext {
+        RunContext::fixed(SYSTEM.into(), RequestTools::default())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, VecDeque};
@@ -1243,7 +1347,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use maki_config::ProjectConfig;
     use maki_providers::model::FastSupport;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -1257,13 +1360,14 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::compaction::FIELD_CONTINUE;
+    use super::testing::{agent_params, fixed_context};
     use super::*;
     use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
+    use crate::agent::history::USER_CANCEL_MARKER;
     use crate::agent::hook::testing::{Seen, script};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
-    use crate::permissions::PermissionManager;
     use crate::prompt::{PromptId, Slot, SlotEntry};
     use crate::session::StoredSession;
     use crate::template::Vars;
@@ -1278,7 +1382,6 @@ mod tests {
     const MOVING_RECEIPT: &str = "Moved to the background. End your turn.";
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
     const RESPONSE_TEXT: &str = "response";
-    const FIXED_SYSTEM: &str = "system";
     const THOUGHT: &str = "pondered";
     const THOUGHT_SIGNATURE: &str = "sig";
     const STALE_THINKING_MSG: &str = "thinking from before a new frame must not stay signed";
@@ -1531,34 +1634,7 @@ mod tests {
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
         let agent = Agent::new(
-            AgentParams {
-                provider,
-                model,
-                config: AgentConfig::default(),
-                tool_output_lines: ToolOutputLines::default(),
-                permissions: Arc::new(PermissionManager::new(
-                    maki_config::PermissionsConfig {
-                        default: maki_config::DefaultEffect::Allow,
-                        rules: vec![],
-                        ..Default::default()
-                    },
-                    std::path::PathBuf::from("/tmp"),
-                    ProjectConfig::for_project(Path::new("/tmp")),
-                    Arc::default(),
-                )),
-                session_id: None,
-                background_for: BackgroundFor::None,
-                task_id: None,
-                mailbox: None,
-                timeouts: maki_providers::Timeouts::default(),
-                file_access: FileAccess::fresh(),
-                prompt_slots: Arc::new(ResolvedPrompts::default()),
-                subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
-                ledger: Arc::new(RunLedger::default()),
-                registry: Arc::new(crate::tools::ToolRegistry::new()),
-                audience: ToolAudience::MAIN,
-                model_policy: Arc::new(ModelPolicy::default()),
-            },
+            agent_params(provider, model),
             AgentRunParams {
                 history,
                 gauge: Box::leak(Box::default()),
@@ -1567,10 +1643,6 @@ mod tests {
             },
         );
         (agent, event_rx)
-    }
-
-    fn fixed_context() -> RunContext {
-        RunContext::fixed(FIXED_SYSTEM.into(), RequestTools::default())
     }
 
     fn default_input() -> AgentInput {
@@ -2355,7 +2427,7 @@ mod tests {
         let last = history.as_slice().last().unwrap();
         assert!(matches!(last.role, Role::User));
         assert!(
-            matches!(&last.content[0], ContentBlock::Text { text } if text == "[Cancelled by user]")
+            matches!(&last.content[0], ContentBlock::Text { text } if text == USER_CANCEL_MARKER)
         );
     }
 
@@ -3853,7 +3925,7 @@ mod tests {
         let messages = history.as_slice();
         let partial = &messages[messages.len() - 2];
         assert!(matches!(partial.role, Role::Assistant));
-        let expected = format!("{PARTIAL}\n\n{CANCELLED_TEXT_NOTE}");
+        let expected = format!("{PARTIAL}\n\n{}", Cutter::User.cut_reply_note());
         assert!(
             matches!(&partial.content[0], ContentBlock::Text { text } if *text == expected),
             "kept text must carry the truncation note so the model never resumes it"
@@ -4191,6 +4263,41 @@ mod tests {
             steers(&drain_events(&event_rx)),
             [(SteerKind::MessageRewritten, REWRITTEN.to_owned())]
         );
+    }
+
+    /// A cut turn ends on its marker, so a dropped interrupt still leaves
+    /// work to go on with. After a finished answer it leaves nothing, and a
+    /// request then would end on the model's own reply. The mock panics on a
+    /// request it has no reply for, so the second case proves none went out.
+    #[test_case(Message::synthetic(USER_CANCEL_MARKER.into()), vec![text_response(StopReason::EndTurn)], DoneReason::EndTurn ; "after_a_cut_turn_the_work_goes_on")]
+    #[test_case(text_response(StopReason::EndTurn).message, Vec::new(), DoneReason::Dropped ; "after_a_finished_answer_nothing_is_sent")]
+    #[tokio::test]
+    async fn resume_with_a_dropped_interrupt(
+        last: Message,
+        replies: Vec<StreamResponse>,
+        expected: DoneReason,
+    ) {
+        let mut history = History::new(vec![Message::user("go".into()), last]);
+        let (agent, _event_rx) = make_agent(MockProvider::new(replies), &mut history);
+        let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![
+            ExtractedCommand::Interrupt(vec![AgentInput {
+                message: BLOCKED.into(),
+                ..default_input()
+            }]),
+        ]));
+        script(&agent.registry, drop_blocked);
+
+        let reason = agent
+            .resume(Vec::new(), RequestOptions::default())
+            .await
+            .unwrap();
+        drop(agent);
+
+        assert_eq!(reason, expected);
+        assert!(matches!(
+            history.as_slice().last().unwrap().role,
+            Role::Assistant
+        ));
     }
 
     /// The mock has no responses and panics on any request, so passing proves

@@ -225,6 +225,7 @@ mod tests {
     use super::*;
     use crate::components::buffer_text;
     use crossterm::event::KeyModifiers;
+    use maki_agent::USER_CANCEL_MARKER;
     use maki_providers::ContentBlock;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -313,7 +314,7 @@ mod tests {
             Message::observation("build failed".into()),
             user_msg("real prompt"),
             assistant_msg(),
-            Message::synthetic("[Cancelled by user]".into()),
+            Message::synthetic(USER_CANCEL_MARKER.into()),
         ];
         picker.open(&msgs, &[]).unwrap();
         let item = picker.picker.selected_item().unwrap();

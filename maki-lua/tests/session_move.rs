@@ -23,7 +23,7 @@ const OUTER: &str = "outer";
 const OPENED: &str = "opened";
 const RESULT: &str = "subagent answer";
 const ANSWER: &str = "answer: subagent answer";
-const PROMPT_CANCELLED: &str = "prompt failed: cancelled";
+const PROMPT_STOPPED: &str = "prompt failed: stopped by user";
 
 const SRC: &str = r#"
 local opened = {}
@@ -237,9 +237,10 @@ fn a_move_opens_the_tab_of_a_nested_subagent_mid_turn() {
 
 /// Esc in the adopted tab stops the subagent by its own id while its turn
 /// is parked, so only the stop can end the call. A subagent nested in a
-/// moved call stops alone, and the call finishes with what it got.
+/// moved call stops alone, and the call finishes with what it got: a prompt
+/// that knows the user stopped it.
 #[test_case(SUB, None ; "a_top_level_task")]
-#[test_case(OUTER, Some(PROMPT_CANCELLED) ; "a_subagent_nested_in_a_moved_call")]
+#[test_case(OUTER, Some(PROMPT_STOPPED) ; "a_subagent_nested_in_a_moved_call")]
 fn stopping_an_adopted_subagent_by_its_id_stops_it(tool: &str, reply: Option<&str>) {
     let host = Host::new();
     let chat = Chat::live();

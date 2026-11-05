@@ -1575,7 +1575,7 @@ mod tests {
             model: None,
             opts: None,
             answer_tx,
-            inbox: Arc::default(),
+            control: Arc::default(),
             parent_call: None,
         }
     }

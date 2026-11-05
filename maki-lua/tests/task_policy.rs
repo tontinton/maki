@@ -728,6 +728,19 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
     assert_eq!(out, PLAIN_TEXT);
 }
 
+/// The session opens before the wait for a slot, so a refused open takes no
+/// slot and leaves nothing to close.
+#[test]
+fn a_session_that_fails_to_open_takes_no_slot() {
+    let (reg, _host) = load_task_host();
+    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_SESSION_ERROR, None)).unwrap_err();
+    assert!(err.contains(SESSION_OPEN_ERR), "got: {err}");
+
+    let snap = probe(&reg);
+    assert_eq!(snap["acquired"], json!(0));
+    assert_eq!(snap["closed"], json!(0));
+}
+
 #[test]
 fn background_input_is_on_by_default_and_can_be_turned_off() {
     let advertised = |reg: &ToolRegistry| {

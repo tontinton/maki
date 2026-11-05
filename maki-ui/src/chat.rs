@@ -18,7 +18,7 @@ use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
-    AgentEvent, BufferSnapshot, DisplayItem, SharedBuf, SteerKind, SubagentInbox, ToolDoneEvent,
+    AgentEvent, BufferSnapshot, DisplayItem, SessionControl, SharedBuf, SteerKind, ToolDoneEvent,
     ToolOutput, ToolStartEvent, display_order, observation_detail,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
@@ -94,9 +94,10 @@ pub struct Chat {
     /// A subagent's own settings; `None` on the main chat, which reads the
     /// session's.
     pub opts: Option<RequestOptions>,
-    /// A running subagent's inbox for messages typed in its chat. Taken when
-    /// the chat finishes, since nothing would drain it after that.
-    pub(crate) inbox: Option<Arc<SubagentInbox>>,
+    /// A running subagent's control, whose inbox takes messages typed in its
+    /// chat. Taken when the chat finishes, since nothing would drain it after
+    /// that.
+    pub(crate) control: Option<Arc<SessionControl>>,
     /// Where a subagent's permission answers go. It lives until the chat
     /// finishes, not the turn, so a subagent moved off its turn can still be
     /// answered.
@@ -139,7 +140,7 @@ impl Chat {
             context_size: 0,
             model_id: None,
             opts: None,
-            inbox: None,
+            control: None,
             answer_tx: None,
             draft: Draft::default(),
             pending_turn_usage: None,
@@ -576,7 +577,7 @@ impl Chat {
         if let Some(clock) = &mut self.clock {
             clock.stop();
         }
-        let undelivered = self.inbox.take().map_or(0, |inbox| inbox.len());
+        let undelivered = self.control.take().map_or(0, |control| control.len());
         if undelivered > 0 {
             self.messages_panel.push(DisplayMessage::new(
                 DisplayRole::Error,
@@ -605,7 +606,7 @@ impl Chat {
 
     /// A moved call's task has no inbox, a finished one nothing to read it.
     pub(crate) fn takes_messages(&self) -> bool {
-        self.inbox.is_some() && !self.is_finished()
+        self.control.is_some() && !self.is_finished()
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {

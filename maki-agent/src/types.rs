@@ -16,6 +16,7 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
+use crate::SessionControl;
 pub const NO_FILES_FOUND: &str = "No files found";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -606,8 +607,8 @@ pub enum DoneReason {
     /// A manual `/compact` ended the run, but no user turn ended with it, so
     /// a goal loop should not treat this as a turn boundary.
     Compact,
-    /// An `agent.user_message` layer dropped the message before the model saw
-    /// it.
+    /// Nothing new reached the model: an `agent.user_message` layer dropped
+    /// the message, or [`crate::Agent::resume`] found nothing to answer.
     Dropped,
 }
 
@@ -1330,12 +1331,11 @@ pub struct SubagentInfo {
     pub opts: Option<RequestOptions>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
-    /// Where a host queues messages for this subagent. Its loop drains the
-    /// queue between turns, so a message lands as an interrupt. Every
+    /// How a host reaches this subagent: its inbox, status and stop. Every
     /// subagent has one, so a chat without one has not heard from its
     /// subagent yet.
     #[serde(skip)]
-    pub inbox: Arc<crate::SubagentInbox>,
+    pub control: Arc<SessionControl>,
     /// The model's call this session runs under when that is not its own
     /// `task` call, like the `batch` it is a child of. Once that call moves,
     /// `/tasks` lists the session under it.

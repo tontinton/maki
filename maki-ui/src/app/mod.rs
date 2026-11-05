@@ -511,11 +511,11 @@ fn fill_missing_subagent_info(chat: &mut Chat, info: &SubagentInfo) {
     if chat.answer_tx.is_none() {
         chat.answer_tx.clone_from(&info.answer_tx);
     }
-    // Every subagent has an inbox, so none yet means this is its first word,
-    // unless an ending took the inbox and `Chat::reopen` brought the tab
-    // back: that transcript already opens with the prompt.
-    if chat.inbox.is_none() {
-        chat.inbox = Some(Arc::clone(&info.inbox));
+    // Every subagent has a control, so none yet means this is its first word,
+    // unless an ending took it and `Chat::reopen` brought the tab back: that
+    // transcript already opens with the prompt.
+    if chat.control.is_none() {
+        chat.control = Some(Arc::clone(&info.control));
         if let Some(prompt) = &info.prompt
             && !chat.has_user_message()
         {
