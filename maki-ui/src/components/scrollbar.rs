@@ -2,8 +2,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+
+use crate::theme;
 
 pub const SCROLLBAR_THUMB: &str = "\u{2590}";
 
@@ -30,9 +32,10 @@ pub fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_len: u32
 
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .thumb_symbol(SCROLLBAR_THUMB)
-        // ListPicker renders highlighted rows over the scrollbar track; resetting
-        // the thumb style keeps its color stable instead of inheriting row bg.
-        .thumb_style(Style::new().fg(Color::Reset).bg(Color::Reset))
+        // ListPicker renders highlighted rows over the scrollbar track, so the
+        // thumb keeps its own bg instead of inheriting row bg. The window's
+        // colors keep the thumb on the theme bg; Reset showed the terminal's.
+        .thumb_style(Style::new().fg(theme::current().foreground).bg(theme::current().background))
         .track_symbol(None)
         .begin_symbol(None)
         .end_symbol(None);
