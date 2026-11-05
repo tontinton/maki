@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0">
+  <title>Plugins | maki</title>
+  <meta name="description" content="Lua plugins for maki, the efficient AI coding agent. Made by the community, listed straight from GitHub, installed with one line in init.lua.">
+  <meta name="theme-color" content="#faf3e3" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#161220" media="(prefers-color-scheme: dark)">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://maki.sh/plugins/">
+  <meta property="og:title" content="maki plugins">
+  <meta property="og:description" content="Lua plugins for maki, made by the community. One line in init.lua installs any of them.">
+  <meta property="og:image" content="https://maki.sh/android-chrome-512x512.png">
+  <meta property="og:site_name" content="maki">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="maki plugins">
+  <meta name="twitter:description" content="Lua plugins for maki, made by the community. One line in init.lua installs any of them.">
+  <meta name="twitter:image" content="https://maki.sh/android-chrome-512x512.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
+  <script>
+    (function() {
+      var root = document.documentElement;
+      // a stored choice wins, otherwise follow the system; runs before first paint so nothing flips
+      var theme = localStorage.getItem('theme');
+      root.setAttribute('data-theme', theme === 'light' || theme === 'dark' ? theme
+        : matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    })();
+  </script>
+  <link rel="preconnect" href="https://api.github.com" crossorigin>
+  <link rel="dns-prefetch" href="https://avatars.githubusercontent.com">
+  <link rel="preload" href="/docs/fonts/nunito-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/docs/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <style>
+    @font-face {
+      font-family: 'Nunito';
+      font-style: normal;
+      font-weight: 400 800;
+      font-display: swap;
+      src: url('/docs/fonts/nunito-latin.woff2') format('woff2');
+      unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+    }
+    @font-face {
+      font-family: 'JetBrains Mono';
+      font-style: normal;
+      font-weight: 100 800;
+      font-display: swap;
+      src: url('/docs/fonts/jetbrains-mono-latin.woff2') format('woff2');
+      unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+    }
+
+    *,*::before,*::after { box-sizing: border-box; margin: 0; padding: 0; }
+    button, input { font: inherit; color: inherit; background: none; border: 0; }
+    button { cursor: pointer; }
+
+    :root {
+      color-scheme: dark;
+      --font-body: 'Nunito', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace;
+      --paper: oklch(19.5% 0.028 295);
+      --soft: oklch(100% 0 0 / 0.06);
+      --ink: oklch(89% 0.02 80);
+      --ink-2: oklch(74% 0.025 75);
+      --ink-3: oklch(60% 0.03 70);
+      --rule: oklch(30% 0.03 295);
+      --accent: oklch(75% 0.12 45);
+      --accent-hover: oklch(82% 0.12 50);
+      --link-underline: oklch(75% 0.12 45 / 0.35);
+      --chip-bg: oklch(27% 0.035 295);
+      --chip-fg: oklch(86% 0.025 80);
+      --chip-border: oklch(35% 0.035 295);
+      --nav-sep: oklch(42% 0.03 295);
+      --scroll-thumb: oklch(89% 0.02 80 / 0.2);
+      --card-shadow: 0 12px 26px -16px oklch(0% 0 0 / 0.7);
+      --nav-h: 44px;
+    }
+    [data-theme="light"] {
+      color-scheme: light;
+      --paper: oklch(96.5% 0.022 88);
+      --soft: oklch(100% 0 0 / 0.5);
+      --ink: oklch(27% 0.042 318);
+      --ink-2: oklch(40% 0.036 315);
+      --ink-3: oklch(53% 0.03 318);
+      --rule: oklch(87% 0.03 72);
+      --accent: oklch(50% 0.13 42);
+      --accent-hover: oklch(43% 0.145 40);
+      --link-underline: oklch(50% 0.13 42 / 0.32);
+      --chip-bg: oklch(93.5% 0.03 82);
+      --chip-fg: oklch(32% 0.045 318);
+      --chip-border: oklch(88.5% 0.03 78);
+      --nav-sep: oklch(76% 0.03 72);
+      --scroll-thumb: oklch(27% 0.042 318 / 0.22);
+      --card-shadow: 0 1px 3px oklch(27% 0.042 318 / 0.08), 0 14px 28px -16px oklch(27% 0.042 318 / 0.4);
+    }
+
+    html {
+      overscroll-behavior: none;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+      min-height: 100svh;
+      font-family: var(--font-body);
+      font-size: 16px;
+      line-height: 1.6;
+      color: var(--ink);
+      background: var(--paper);
+    }
+    main { flex: 1; }
+    :not(html) { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent; }
+    a { color: var(--accent); text-decoration: none; }
+    p a, .link {
+      color: var(--accent);
+      text-decoration: underline;
+      text-decoration-color: var(--link-underline);
+      text-underline-offset: 2px;
+    }
+    p a:hover, .link:hover { color: var(--accent-hover); text-decoration-color: currentColor; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.85em;
+      background: var(--chip-bg);
+      color: var(--chip-fg);
+      border: 1px solid var(--chip-border);
+      border-radius: 4px;
+      padding: 0.06rem 0.3rem;
+    }
+    kbd {
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      line-height: 1.4;
+      padding: 0 0.4rem;
+      border: 1px solid var(--nav-sep);
+      border-radius: 4px;
+      box-shadow: 0 2px 0 var(--rule);
+      background: var(--soft);
+      color: var(--ink-3);
+    }
+
+    /* ── nav ── */
+    nav {
+      position: fixed;
+      inset: 0 0 auto 0;
+      z-index: 100;
+      height: var(--nav-h);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 clamp(1rem, 3vw, 1.75rem);
+      background: var(--paper);
+      border-bottom: 1px solid transparent;
+      transition: border-color 0.18s ease;
+    }
+    nav.scrolled { border-bottom-color: var(--rule); }
+    .stuck nav.scrolled { border-bottom-color: transparent; }
+    #top-sentinel { position: absolute; top: 24px; width: 1px; height: 1px; pointer-events: none; }
+    .nav-left { display: flex; align-items: baseline; gap: 0.5rem; }
+    .nav-logo { font-weight: 800; font-size: 1.15rem; letter-spacing: -0.03em; color: var(--ink); }
+    .nav-logo:hover { color: var(--accent); }
+    .nav-crumb { font-family: var(--font-mono); font-size: 0.82rem; color: var(--ink-3); }
+    .nav-right { display: flex; align-items: center; gap: 1rem; }
+    .nav-right a {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      color: var(--ink-2);
+      transition: color 0.1s;
+    }
+    .nav-right a:hover, .nav-right a[aria-current] { color: var(--ink); }
+    .nav-sep { height: 14px; border-left: 1px solid var(--nav-sep); }
+    .theme-toggle { display: flex; margin-left: 0.65rem; padding: 0.15rem; color: var(--ink-2); transition: color 0.1s; }
+    .theme-toggle:hover { color: var(--ink); }
+    .theme-toggle svg { width: 16px; height: 16px; }
+    .theme-toggle .icon-sun { display: none; }
+    [data-theme="light"] .theme-toggle .icon-sun { display: block; }
+    [data-theme="light"] .theme-toggle .icon-moon { display: none; }
+
+    /* ── intro ── */
+    .content { max-width: 1332px; margin: 0 auto; padding: 0 clamp(1.25rem, 7vw, 6rem); }
+    .intro { padding-top: calc(var(--nav-h) + clamp(2.5rem, 6vw, 4.5rem)); padding-bottom: 1.25rem; }
+    h1 { font-weight: 800; font-size: clamp(2.5rem, 5vw, 3.5rem); letter-spacing: -0.03em; line-height: 1.05; }
+    .lede { max-width: 58ch; margin-top: 0.85rem; font-size: 1.1rem; color: var(--ink-2); text-wrap: pretty; }
+    .lede code { padding-block: 0; line-height: 1; }
+    .trust { max-width: 58ch; margin-top: 0.5rem; font-size: 0.9rem; color: var(--ink-3); text-wrap: pretty; }
+
+    /* ── toolbar ── */
+    .toolbar {
+      position: sticky;
+      top: var(--nav-h);
+      z-index: 50;
+      background: var(--paper);
+      border-bottom: 1px solid transparent;
+      transition: border-color 0.18s ease;
+    }
+    .stuck .toolbar { border-bottom-color: var(--rule); }
+    .toolbar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem; padding-block: 0.7rem; }
+    .search { position: relative; flex: 1 1 18rem; max-width: 26rem; }
+    .search input {
+      width: 100%;
+      padding: 0.45rem 2.4rem 0.45rem 0.8rem;
+      border: 1px solid var(--chip-border);
+      border-radius: 8px;
+      background: var(--soft);
+      font-size: 0.95rem;
+      transition: border-color 0.1s;
+    }
+    .search input::placeholder { color: var(--ink-3); }
+    .search input::-webkit-search-cancel-button { display: none; }
+    .search input:focus { outline: none; border-color: var(--accent); }
+    .search kbd { position: absolute; right: 0.6rem; top: 50%; transform: translateY(-50%); pointer-events: none; }
+    .search input:focus + kbd, .search input:not(:placeholder-shown) + kbd { display: none; }
+    .sort { display: inline-flex; padding: 3px; border: 1px solid var(--chip-border); border-radius: 8px; background: var(--chip-bg); }
+    .sort button {
+      padding: 0.2rem 0.7rem;
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      color: var(--ink-3);
+      transition: color 0.1s, background 0.1s;
+    }
+    .sort button:hover { color: var(--ink); }
+    .sort button[aria-pressed="true"] { background: var(--paper); color: var(--ink); }
+    .count { margin-left: auto; font-family: var(--font-mono); font-size: 0.8rem; color: var(--ink-3); }
+    .topics { display: flex; gap: 0.4rem; overflow-x: auto; padding-bottom: 0.7rem; scrollbar-width: none; }
+    .topics[hidden] { display: none; }
+    .tag, .chip {
+      flex: none;
+      position: relative;
+      z-index: 1;
+      padding: 0.08rem 0.5rem;
+      border: 1px solid var(--chip-border);
+      border-radius: 6px;
+      background: var(--chip-bg);
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      color: var(--ink-2);
+      transition: color 0.1s, border-color 0.1s;
+    }
+    .chip { padding: 0.2rem 0.65rem; font-size: 0.78rem; }
+    .chip span { margin-left: 0.4em; color: var(--ink-3); }
+    .chip[aria-pressed="true"]::after { content: '×'; margin-left: 0.4em; }
+    .tag:hover, .chip:hover, .tag[aria-pressed="true"], .chip[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+
+    /* ── results ── */
+    .results { container-type: inline-size; padding-top: 1.25rem; padding-bottom: 1rem; }
+    .notice { margin-bottom: 1.25rem; color: var(--ink-2); }
+    .notice button { font-size: inherit; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); gap: 1rem; list-style: none; }
+    .card {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      padding: 1rem 1.15rem 0.85rem;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      background: var(--soft);
+      transition: border-color 0.1s, box-shadow 0.1s, transform 0.1s;
+    }
+    .card:not(.ghost, .skeleton):hover { border-color: var(--chip-border); box-shadow: var(--card-shadow); transform: translateY(-1px); }
+    .card-head { display: flex; align-items: center; gap: 0.55rem; min-width: 0; }
+    .avatar {
+      position: relative;
+      flex: none;
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      overflow: hidden;
+      border-radius: 50%;
+      background: var(--chip-bg);
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--ink-3);
+      text-transform: uppercase;
+    }
+    .avatar img { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .card h2 { min-width: 0; font-size: 1.05rem; font-weight: 700; line-height: 1.3; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+    .card-link { color: var(--ink); transition: color 0.1s; }
+    .card-link::after { content: ''; position: absolute; inset: 0; border-radius: inherit; }
+    .card-link:focus-visible { outline: none; }
+    .card-link:focus-visible::after { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .card:hover .repo { color: var(--accent); }
+    .owner { font-weight: 400; color: var(--ink-3); }
+    .new { margin-left: auto; padding: 0 0.35rem; border: 1px solid currentColor; border-radius: 4px; font-family: var(--font-mono); font-size: 0.7rem; color: var(--accent); }
+    .desc {
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      font-size: 0.96rem;
+      line-height: 1.5;
+      color: var(--ink-2);
+    }
+    .desc.none { color: var(--ink-3); }
+    /* 2 x 320px columns + 1rem gap: reserve 3 lines only when a row has neighbours to align with */
+    @container (min-width: 656px) { .desc { min-height: 4.5em; } }
+    .tags { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+    .meta { display: flex; align-items: center; flex-wrap: wrap; gap: 0.3rem 0.9rem; margin-top: auto; font-family: var(--font-mono); font-size: 0.76rem; color: var(--ink-3); }
+    .stars { display: inline-flex; align-items: center; gap: 0.25rem; }
+    .stars svg { width: 11px; height: 11px; fill: currentColor; }
+    .copy { position: relative; z-index: 1; margin-left: auto; color: var(--ink-2); opacity: 0; transition: opacity 0.1s, color 0.1s; }
+    .copy:hover, .copy.done { color: var(--accent); }
+    .card:hover .copy, .card:focus-within .copy, .copy.done { opacity: 1; }
+    @media (hover: none) { .copy { opacity: 1; } .search kbd { display: none; } }
+    .ghost { background: none; border: 1px dashed var(--nav-sep); color: var(--ink-3); transition: border-color 0.1s; }
+    .ghost:hover { border-color: var(--accent); }
+    .card .ghost-title { font-family: var(--font-mono); font-size: 1rem; font-weight: 500; color: var(--ink-2); }
+    .ghost p { font-size: 0.94rem; line-height: 1.5; }
+    .ghost .meta { gap: 0.9rem; }
+    .bar { display: block; height: 0.8em; margin: calc((1lh - 0.8em) / 2) 0; border-radius: 4px; background: var(--chip-bg); }
+    .bar.short { width: 55%; }
+    .card-head .bar { flex: 1; max-width: 55%; margin: 0; }
+    .skeleton { pointer-events: none; animation: pulse 1.4s ease-in-out infinite alternate; }
+    .skeleton .tag { width: 4.5rem; }
+    @keyframes pulse { to { opacity: 0.5; } }
+
+    footer {
+      padding: clamp(3rem, 7vw, 5rem) 1.5rem clamp(1.5rem, 3vw, 2rem);
+      text-align: center;
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      color: var(--ink-3);
+    }
+    footer div + div { margin-top: 0.3rem; }
+    footer a { color: var(--ink-2); }
+    footer a:hover { color: var(--accent); }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition-duration: 0.01ms !important; }
+      .card:not(.ghost, .skeleton):hover { transform: none; }
+    }
+    @media (max-width: 768px) {
+      .nav-label, .nav-crumb { display: none; }
+      .nav-right { gap: 0.85rem; }
+      .search { flex-basis: 100%; max-width: none; }
+      .search kbd { display: none; }
+      .toolbar-row { column-gap: 0.6rem; }
+      .sort button { padding-inline: 0.55rem; }
+      .card { padding-inline: 1rem; }
+      .meta { column-gap: 0.75rem; }
+    }
+  </style>
+</head>
+<body>
+
+<div id="top-sentinel" aria-hidden="true"></div>
+
+<nav id="nav">
+  <div class="nav-left">
+    <a href="/" class="nav-logo">maki</a>
+    <span class="nav-crumb" aria-hidden="true">/ plugins</span>
+  </div>
+  <div class="nav-right">
+    <a href="/docs/">Docs</a>
+    <span class="nav-sep"></span>
+    <a href="/plugins/" aria-current="page">Plugins</a>
+    <span class="nav-sep"></span>
+    <a href="https://discord.gg/8VKuA4naC3" target="_blank" rel="noopener" aria-label="Discord"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.369a19.79 19.79 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.249a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.036A19.736 19.736 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 00-.041-.106 13.107 13.107 0 01-1.872-.892.077.077 0 01-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.009c.12.099.246.198.373.292a.077.077 0 01-.006.127c-.598.35-1.22.644-1.873.891a.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.839 19.839 0 006.002-3.03.077.077 0 00.032-.056c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.028zM8.02 15.331c-1.182 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+    <span class="nav-sep"></span>
+    <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener" aria-label="GitHub"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg><span class="nav-label">GitHub</span></a>
+    <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode" aria-keyshortcuts="t">
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
+  </div>
+</nav>
+
+<main>
+  <header class="content intro">
+    <h1>Plugins</h1>
+    <p class="lede">Lua plugins made by the community. Copy the install line from any card into your <code>init.lua</code> and maki asks to install it on next start. <a href="/docs/packages/">How packages work</a>.</p>
+    <p class="trust">They are pulled from GitHub automatically and nobody reviewed them. Read the code before you install one.</p>
+  </header>
+
+  <div id="toolbar-sentinel" aria-hidden="true"></div>
+  <div class="toolbar">
+    <div class="content toolbar-row">
+      <label class="search">
+        <input type="search" id="search" placeholder="Search plugins" aria-label="Search plugins" aria-keyshortcuts="/" autocomplete="off" spellcheck="false">
+        <kbd aria-hidden="true">/</kbd>
+      </label>
+      <div class="sort" id="sort" role="group" aria-label="Sort">
+        <button data-sort="popular">Popular</button>
+        <button data-sort="new">New</button>
+        <button data-sort="updated">Updated</button>
+      </div>
+      <span class="count" id="count" aria-live="polite"></span>
+    </div>
+    <div class="content topics" id="topics" role="group" aria-label="Topics" hidden></div>
+  </div>
+
+  <section class="content results" aria-label="Plugins">
+    <noscript>
+      <style>.skeleton { display: none; }</style>
+      <p class="notice">This list needs JavaScript. <a href="https://github.com/search?q=topic%3Amaki+topic%3Aplugin&amp;type=repositories">Browse the topic on GitHub</a> instead.</p>
+    </noscript>
+    <p class="notice" id="notice" hidden></p>
+    <ul class="grid" id="grid" aria-busy="true">
+      <li class="card skeleton" aria-hidden="true"><div class="card-head"><span class="avatar"></span><span class="bar"></span></div><p class="desc"><span class="bar"></span><span class="bar"></span><span class="bar short"></span></p><div class="tags"><span class="tag">&nbsp;</span><span class="tag">&nbsp;</span></div><div class="meta"><span class="bar short"></span></div></li>
+      <li class="card skeleton" aria-hidden="true"><div class="card-head"><span class="avatar"></span><span class="bar"></span></div><p class="desc"><span class="bar"></span><span class="bar"></span><span class="bar short"></span></p><div class="tags"><span class="tag">&nbsp;</span><span class="tag">&nbsp;</span></div><div class="meta"><span class="bar short"></span></div></li>
+      <li class="card ghost" id="ghost">
+        <h2 class="ghost-title">+ yours</h2>
+        <p>Add the <code>maki</code> and <code>plugin</code> topics to your repo and it shows up here automatically.</p>
+        <div class="meta"><a class="link" href="/docs/plugins/">write a plugin</a><a class="link" href="https://github.com/search?q=topic%3Amaki+topic%3Aplugin&amp;type=repositories" target="_blank" rel="noopener">topic on GitHub</a></div>
+      </li>
+    </ul>
+  </section>
+</main>
+
+<footer>
+  <div>Fetched from <a href="https://github.com/search?q=topic%3Amaki+topic%3Aplugin&amp;type=repositories" target="_blank" rel="noopener">GitHub</a>, every repo tagged maki and plugin.</div>
+  <div><a href="/">maki</a> · <a href="/docs/">docs</a> · <a href="/docs/plugins/">write a plugin</a></div>
+</footer>
+
+<template id="star-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg></template>
+
+<script>
+  const API_URL = 'https://api.github.com/search/repositories?per_page=100&q=topic:maki+topic:plugin+archived:false';
+  const SNAPSHOT_URL = 'plugins.json';
+  const TOPIC_SEARCH = 'https://github.com/search?q=topic%3Amaki+topic%3Aplugin&type=repositories';
+  const REPO_BASE = 'https://github.com/';
+  const AVATAR_BASE = 'https://avatars.githubusercontent.com/';
+  const DAY_MS = 864e5;
+  const NEW_FOR_MS = 30 * DAY_MS;
+  const COPY_HINT_MS = 1500;
+  const AVATAR_PX = 22;
+  const MAX_TAGS = 3;
+  const MAX_CHIPS = 10;
+  const MIN_CHIP_USES = 2;
+  const DEFAULT_SORT = 'popular';
+  const CLEAR_TOPIC = 'Clear topic filter';
+  const GENERIC_TOPICS = new Set(['maki', 'plugin', 'plugins', 'maki-plugin', 'maki-plugins', 'lua', 'luau',
+    'ai', 'ai-agent', 'ai-agents', 'agent', 'agents', 'coding-agent', 'llm']);
+  const AGE_STEPS = [[365 * DAY_MS, 'y'], [30 * DAY_MS, 'mo'], [DAY_MS, 'd'], [36e5, 'h'], [6e4, 'm']];
+  const desc = key => (a, b) => (b[key] > a[key]) - (b[key] < a[key]);
+  const SORTS = {
+    popular: (a, b) => b.stargazers_count - a.stargazers_count || desc('pushed_at')(a, b),
+    new: desc('created_at'),
+    updated: desc('pushed_at'),
+  };
+  const compact = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
+  const fullDate = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' });
+
+  const root = document.documentElement;
+  const search = document.getElementById('search');
+  const sortGroup = document.getElementById('sort');
+  const toolbar = document.querySelector('.toolbar');
+  const topicsEl = document.getElementById('topics');
+  const countEl = document.getElementById('count');
+  const notice = document.getElementById('notice');
+  const grid = document.getElementById('grid');
+  const ghost = document.getElementById('ghost');
+  const toolbarSentinel = document.getElementById('toolbar-sentinel');
+  const starIcon = document.getElementById('star-icon').content.firstElementChild;
+
+  const params = new URLSearchParams(location.search);
+  const state = {
+    q: params.get('q') ?? '',
+    sort: Object.hasOwn(SORTS, params.get('sort')) ? params.get('sort') : DEFAULT_SORT,
+    topic: params.get('topic') ?? '',
+  };
+  search.value = state.q;
+  let plugins = null;
+  // chips are rebuilt only when their set changes, so a clicked chip keeps keyboard focus
+  let chipSig = '';
+
+  function toggleTheme() {
+    const next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    root.setAttribute('data-theme', next);
+    localStorage.setItem('theme', next);
+  }
+  document.getElementById('theme-toggle').addEventListener('click', toggleTheme);
+  matchMedia('(prefers-color-scheme: light)').addEventListener('change', e => {
+    if (localStorage.getItem('theme')) return;
+    root.setAttribute('data-theme', e.matches ? 'light' : 'dark');
+  });
+
+  const nav = document.getElementById('nav');
+  new IntersectionObserver(([entry]) => nav.classList.toggle('scrolled', !entry.isIntersecting))
+    .observe(document.getElementById('top-sentinel'));
+  // the toolbar is stuck once the line above it slides under the nav
+  const navH = nav.offsetHeight;
+  new IntersectionObserver(([entry]) => {
+    root.classList.toggle('stuck', !entry.isIntersecting && entry.boundingClientRect.top < navH);
+  }, { rootMargin: `-${navH}px 0px 0px 0px` }).observe(toolbarSentinel);
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text != null) node.textContent = text;
+    return node;
+  }
+
+  function ago(iso) {
+    const ms = Date.now() - Date.parse(iso);
+    for (const [unit, suffix] of AGE_STEPS) if (ms >= unit) return `${Math.floor(ms / unit)}${suffix} ago`;
+    return 'just now';
+  }
+
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const ownTopics = p => p.topics.filter(t => !GENERIC_TOPICS.has(t));
+
+  function avatarFor(owner) {
+    const avatar = el('span', 'avatar', owner[0]);
+    const img = el('img');
+    Object.assign(img, {
+      src: `${AVATAR_BASE}${owner}?s=${AVATAR_PX * 2}`,
+      alt: '', width: AVATAR_PX, height: AVATAR_PX, loading: 'lazy', decoding: 'async',
+    });
+    img.addEventListener('error', () => img.remove());
+    avatar.append(img);
+    return avatar;
+  }
+
+  function copyInstall(button, line) {
+    navigator.clipboard?.writeText(line).then(() => {
+      button.textContent = 'copied';
+      button.classList.add('done');
+      clearTimeout(button.hintTimer);
+      button.hintTimer = setTimeout(() => {
+        button.textContent = 'copy install';
+        button.classList.remove('done');
+      }, COPY_HINT_MS);
+    }, () => {});
+  }
+
+  function buildCard(p) {
+    const [owner, name] = p.full_name.split('/');
+    const url = REPO_BASE + p.full_name;
+    const card = el('li', 'card');
+
+    const head = el('div', 'card-head');
+    const link = el('a', 'card-link');
+    Object.assign(link, { href: url, target: '_blank', rel: 'noopener' });
+    link.append(el('span', 'owner', owner + '/'), el('span', 'repo', name));
+    const title = el('h2');
+    title.append(link);
+    head.append(avatarFor(owner), title);
+    if (Date.now() - Date.parse(p.created_at) < NEW_FOR_MS) head.append(el('span', 'new', 'new'));
+
+    const description = el('p', p.description ? 'desc' : 'desc none', p.description || 'No description.');
+
+    const tags = el('div', 'tags');
+    for (const topic of ownTopics(p).slice(0, MAX_TAGS)) {
+      const tag = el('button', 'tag', topic);
+      tag.dataset.topic = topic;
+      tags.append(tag);
+    }
+
+    const meta = el('div', 'meta');
+    const stars = el('span', 'stars');
+    stars.title = plural(p.stargazers_count, 'star');
+    stars.append(starIcon.cloneNode(true), compact.format(p.stargazers_count).toLowerCase());
+    meta.append(stars);
+    if (p.pushed_at) {
+      const updated = el('time', null, 'updated ' + ago(p.pushed_at));
+      updated.dateTime = p.pushed_at;
+      updated.title = fullDate.format(new Date(p.pushed_at));
+      meta.append(updated);
+    }
+    const spdx = p.license?.spdx_id;
+    if (spdx && spdx !== 'NOASSERTION') meta.append(el('span', null, spdx));
+    const line = `maki.pack.add({ "${url}" })`;
+    const copy = el('button', 'copy', 'copy install');
+    copy.title = line;
+    copy.addEventListener('click', () => copyInstall(copy, line));
+    meta.append(copy);
+
+    card.append(head, description);
+    if (tags.childElementCount) card.append(tags);
+    card.append(meta);
+    return card;
+  }
+
+  function renderTopics() {
+    const uses = new Map();
+    for (const { p } of plugins) for (const t of ownTopics(p)) uses.set(t, (uses.get(t) ?? 0) + 1);
+    const top = [...uses].filter(([, n]) => n >= MIN_CHIP_USES)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, MAX_CHIPS);
+    // a topic picked from a card stays reachable here, so it can always be cleared
+    if (state.topic && !top.some(([t]) => t === state.topic)) top.push([state.topic, uses.get(state.topic) ?? 0]);
+    const sig = top.join('|');
+    if (sig === chipSig) return;
+    chipSig = sig;
+    topicsEl.replaceChildren(...top.map(([topic, n]) => {
+      const chip = el('button', 'chip', topic);
+      chip.dataset.topic = topic;
+      chip.append(el('span', null, n));
+      return chip;
+    }));
+    topicsEl.hidden = !top.length;
+  }
+
+  function render() {
+    for (const b of sortGroup.children) b.setAttribute('aria-pressed', b.dataset.sort === state.sort);
+    const query = new URLSearchParams();
+    if (state.q) query.set('q', state.q);
+    if (state.sort !== DEFAULT_SORT) query.set('sort', state.sort);
+    if (state.topic) query.set('topic', state.topic);
+    history.replaceState(null, '', query.toString() ? `?${query}` : location.pathname);
+    if (!plugins) return;
+
+    const terms = state.q.toLowerCase().split(/\s+/).filter(Boolean);
+    const shown = plugins
+      .filter(x => (!state.topic || x.p.topics.includes(state.topic)) && terms.every(t => x.haystack.includes(t)))
+      .sort((a, b) => SORTS[state.sort](a.p, b.p));
+    grid.replaceChildren(...shown.map(x => x.card), ghost);
+    renderTopics();
+    for (const b of document.querySelectorAll('[data-topic]')) b.setAttribute('aria-pressed', b.dataset.topic === state.topic);
+    for (const chip of topicsEl.children) chip.ariaLabel = chip.dataset.topic === state.topic ? CLEAR_TOPIC : null;
+
+    toolbar.hidden = !plugins.length;
+    countEl.textContent = shown.length === plugins.length ? plural(plugins.length, 'plugin')
+      : `${shown.length} of ${plural(plugins.length, 'plugin')}`;
+    notice.hidden = shown.length > 0 || !plugins.length;
+    if (!notice.hidden) {
+      const filters = [state.q.trim() && `"${state.q.trim()}"`, state.topic && `in ${state.topic}`].filter(Boolean);
+      const clear = el('button', 'link', 'clear filters');
+      clear.addEventListener('click', () => update({ q: '', topic: '' }));
+      notice.replaceChildren(`No plugins match ${filters.join(' ')}. `, clear);
+    }
+  }
+
+  function update(change) {
+    Object.assign(state, change);
+    if (change.q != null) search.value = state.q;
+    render();
+    // deep in a long list, a new filter should start from its first result rather than wherever the page clamps
+    const resultsTop = toolbarSentinel.getBoundingClientRect().top + scrollY - navH;
+    if (scrollY > resultsTop) scrollTo(0, resultsTop);
+  }
+
+  async function fetchJSON(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${url}: ${res.status}`);
+    return res.json();
+  }
+
+  // live first so new plugins show up between deploys; the build's snapshot covers GitHub's 10 searches/minute limit
+  async function load() {
+    const live = await fetchJSON(API_URL).catch(() => null);
+    const items = live?.items ?? await fetchJSON(SNAPSHOT_URL).catch(() => null);
+    plugins = (items ?? []).map(p => ({
+      p,
+      card: buildCard(p),
+      haystack: [p.full_name, p.description ?? '', ...p.topics].join(' ').toLowerCase(),
+    }));
+    grid.removeAttribute('aria-busy');
+    render();
+    if (items) return;
+    const link = el('a', null, 'Browse the topic on GitHub');
+    Object.assign(link, { href: TOPIC_SEARCH, target: '_blank', rel: 'noopener' });
+    notice.replaceChildren('Could not load the list from GitHub. ', link, ' instead.');
+    notice.hidden = false;
+  }
+
+  search.addEventListener('input', () => update({ q: search.value }));
+  search.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    if (search.value) update({ q: '' });
+    else search.blur();
+  });
+  sortGroup.addEventListener('click', e => {
+    const sort = e.target.closest('[data-sort]')?.dataset.sort;
+    if (sort) update({ sort });
+  });
+  document.addEventListener('click', e => {
+    const topic = e.target.closest('[data-topic]')?.dataset.topic;
+    if (topic) update({ topic: state.topic === topic ? '' : topic });
+  });
+  document.addEventListener('keydown', e => {
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === '/') { e.preventDefault(); search.focus(); search.select(); }
+    else if (e.key === 't') { e.preventDefault(); toggleTheme(); }
+  });
+
+  render();
+  load();
+</script>
+</body>
+</html>
