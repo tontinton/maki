@@ -29,6 +29,7 @@ mod storage_writer;
 mod text_buffer;
 mod theme;
 mod trust_card;
+mod tty_probe;
 pub use theme::BUNDLED_THEMES;
 pub use trust_card::ask_trust;
 pub mod update;
