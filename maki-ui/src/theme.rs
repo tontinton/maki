@@ -532,6 +532,7 @@ pub struct Theme {
     pub index_keyword: Style,
     pub shell_prefix: Style,
     pub progress_bar: Style,
+    pub scrollbar_thumb: Style,
 
     pub syntax: syntect::highlighting::Theme,
 }
@@ -999,6 +1000,15 @@ impl Theme {
                     s
                 }
             },
+            scrollbar_thumb: {
+                // ListPicker paints highlighted rows over the scrollbar track,
+                // so the thumb carries its own bg instead of inheriting row
+                // backgrounds. Defaults to the window's own fg/bg colors.
+                let s = style("scrollbar_thumb");
+                Style::new()
+                    .fg(s.fg.unwrap_or(color("foreground")))
+                    .bg(s.bg.unwrap_or(color("background")))
+            },
             syntax,
         })
     }
@@ -1193,6 +1203,39 @@ mod tests {
                 "scope {scope} should resolve correctly"
             );
         }
+    }
+
+    #[test]
+    fn a_theme_without_colors_keeps_the_terminal_default_thumb() {
+        let theme = Theme::from_toml("[palette]\n[ui]\n").unwrap();
+        assert_eq!(
+            theme.scrollbar_thumb,
+            Style::new().fg(Color::Reset).bg(Color::Reset)
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_defaults_to_the_theme_window_colors() {
+        let t = dracula();
+        assert_eq!(
+            t.scrollbar_thumb,
+            Style::new()
+                .fg(Color::Rgb(0xf8, 0xf8, 0xf2))
+                .bg(Color::Rgb(0x28, 0x2a, 0x36))
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_keeps_its_own_explicit_colors() {
+        let toml = r##"
+[palette]
+magenta = "#ff00ff"
+[ui]
+scrollbar_thumb = { fg = "magenta", bg = "default" }
+"##;
+        let t = Theme::from_toml(toml).unwrap();
+        assert_eq!(t.scrollbar_thumb.fg, Some(Color::Rgb(0xff, 0x00, 0xff)));
+        assert_eq!(t.scrollbar_thumb.bg, Some(Color::Reset));
     }
 
     #[test]

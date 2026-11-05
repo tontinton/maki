@@ -3314,9 +3314,7 @@ fn scrollbar_sits_on_the_theme_window_background() {
     crate::theme::set(crate::theme::Theme::from_toml(dracula).unwrap());
 
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel
-        .streaming_text
-        .set_buffer(&"line\n".repeat(40));
+    panel.streaming_text.set_buffer(&"line\n".repeat(40));
     let backend = TestBackend::new(80, 10);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
@@ -3336,8 +3334,7 @@ fn scrollbar_sits_on_the_theme_window_background() {
     for y in 0..buf.area.height {
         let c = buf.cell((buf.area.width - 1, y)).unwrap();
         assert_eq!(
-            c.bg,
-            theme.background,
+            c.bg, theme.background,
             "the scrollbar column must sit on the theme bg, not the terminal's"
         );
     }
