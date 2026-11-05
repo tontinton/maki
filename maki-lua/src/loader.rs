@@ -7,9 +7,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use include_dir::{Dir, File, include_dir};
-use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::ToolRegistry;
+use maki_agent::{Cutter, SessionEndReason};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::{DeclAuthority, keep_granted};
 #[cfg(any(test, feature = "test-support"))]
@@ -24,7 +24,7 @@ use crate::api::ui::marks::InputRulesReader;
 use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
-use crate::background::{BackgroundTasks, Stop};
+use crate::background::BackgroundTasks;
 use crate::error::PluginError;
 use crate::pack::{DiscoveredPackage, Interaction};
 use crate::plugin_permissions::{
@@ -1134,12 +1134,12 @@ impl EventHandle {
         }
     }
 
-    /// Esc in a plugin task's tab. Drops the session's registry entry, which
-    /// fires its cancel, and the plugin's pending `:prompt()` returns
-    /// "stopped by user". Synchronous on purpose: the registry is a mutex the
-    /// Lua thread shares, so a busy Lua thread cannot delay the stop.
+    /// Esc in a plugin task's tab. Ends the session as stopped by the user,
+    /// so the plugin's pending `:prompt()` returns "stopped by user".
+    /// Synchronous on purpose: the registry is a mutex the Lua thread shares,
+    /// so a busy Lua thread cannot delay the stop.
     pub fn cancel_plugin_session(&self, id: &str) {
-        self.background.stop(id, Stop::User);
+        self.background.stop(id, Cutter::User);
     }
 
     #[doc(hidden)]

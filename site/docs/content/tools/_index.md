@@ -190,10 +190,12 @@ Stop a background task by id.
 ### `task_message` {#task_message}
 
 Message a running background subagent by id, e.g. a new fact, a changed scope or "wrap up now". It reads it after its current step.
+Set interrupt only when it must act now: it cuts the current step, running tools included.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | yes | Task id from its receipt |
+| `interrupt` | boolean | no | Cut the current step short |
 | `message` | string | yes | What the subagent should know or do |
 
 ### `todo_write` {#todo_write}

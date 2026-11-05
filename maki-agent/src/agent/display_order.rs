@@ -65,6 +65,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::agent::history::USER_CANCEL_MARKER;
 
     const BODY: &str = "Background task find auth finished:\n\nok";
     const LINE: &str = "Background agent finished: find auth";
@@ -72,7 +73,6 @@ mod tests {
     const PROMPT: &str = "what changed";
     const NEXT_PROMPT: &str = "and then";
     const REPLY: &str = "the build is green";
-    const CANCELLED: &str = "[Cancelled by user]";
 
     /// What a test history holds.
     #[derive(Clone, Copy)]
@@ -98,7 +98,7 @@ mod tests {
                 content: vec![ContentBlock::Text { text: REPLY.into() }],
                 ..Default::default()
             },
-            Step::Cancelled => Message::synthetic(CANCELLED.into()),
+            Step::Cancelled => Message::synthetic(USER_CANCEL_MARKER.into()),
         }
     }
 
@@ -115,7 +115,7 @@ mod tests {
             Step::Notice(line) => (Row::Notice, line),
             Step::Prompt(text) => (Row::Prompt, text),
             Step::Reply => (Row::Reply, REPLY),
-            Step::Cancelled => (Row::Hidden, CANCELLED),
+            Step::Cancelled => (Row::Hidden, USER_CANCEL_MARKER),
             Step::Hidden => unreachable!("an unlabelled observation shows nothing"),
         }
     }

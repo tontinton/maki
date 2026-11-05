@@ -1811,7 +1811,8 @@ Each entry has these fields:
 - `session` (`string`) Chat session it belongs to.
 - `plugin` (`string`) Plugin that opened it.
 - `name` (`string`) Name given at open.
-- `status` (`string`) `"working"` during a `:prompt()`, otherwise `"idle"`.
+- `status` (`string`) `"working"` while a `:prompt()` runs a turn or waits
+  on calls moved to the background, otherwise `"idle"`.
 - `started_at` (`integer`) Unix seconds.
 - `cost` (`number?`) Dollars billed so far, updated after each turn. nil until
   a priced turn ends.
@@ -1874,9 +1875,10 @@ session, or the end of the task that opened it, stops such calls.
 **Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
 failure. A run cut short after streaming some text hands you both: the
 error and a `{ text = <what it streamed> }` table. `"cancelled"` means the
-task that opened or prompted the session ended. `"stopped by user"` means
-Esc in its tab closed a session opened by chat session id, and every
-later prompt answers the same.
+task that opened or prompted the session ended. `"session closed"` means
+`:close()` ended it. `"stopped by user"` means Esc in its tab stopped it,
+and `"stopped by parent agent"` that the model stopped the background task
+it runs in. Every later prompt answers the same.
 
 **Example:**
 
@@ -1892,22 +1894,32 @@ print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 ### `Session:send()` {#Session-send}
 
 ```lua
-Session:send({message})
+Session:send({message}, {opts?})
 ```
 
 Hand the subagent a message without waiting, delivered the same way as a
-message typed in its tab. A running `:prompt()` picks it up at its next turn boundary, once
-the current reply and its tool calls finish, and the model reads it as an
-interrupt from its parent, not the user. The tab draws it when it lands.
-Messages sent in a burst land together.
+message typed in its tab. A running `:prompt()` picks it up at its next
+turn boundary, once the current reply and its tool calls finish, and the
+model reads it as an interrupt from its parent, not the user. The tab
+draws it when it lands. Messages sent in a burst land together.
 
 With no prompt running, or one already past its last turn, the message
 waits. The next `:prompt()` sends it in the same request as its own
 message, just before it, so the first reply already reads it.
 
+With `interrupt`, a running `:prompt()` does not wait for the turn to end,
+nor for moved calls. The reply stops and running tools are cancelled (bash
+returns what it printed so far). The subagent then reads the message and
+carries on with its history intact, and `:prompt()` returns its answer as
+usual. If an `agent.user_message` layer drops the message, the subagent
+picks up the cut work instead. With no prompt running, the message waits
+like any other.
+
 **Parameters:**
 
 - `{message}` (`string`) Message to deliver.
+- `{opts?}` (`table?`) Optional fields:
+  - `interrupt` (`boolean?`) cut the running turn short. Default: `false`.
 
 **Returns:** (`boolean?`, `string?`) `true`, or `(nil, err)` when the session takes
 no more messages. The errors are the ones `:prompt()` refuses with. `true`
@@ -1920,6 +1932,8 @@ closes is dropped.
 -- From another task, while `sess:prompt()` is still running.
 local ok, err = sess:send("New finding: the bug is in parser.rs, focus there.")
 if not ok then maki.log.warn(err) end
+-- Stop a subagent heading the wrong way, mid tool call.
+sess:send("Stop, the bug is in lexer.rs, not parser.rs.", { interrupt = true })
 ```
 
 ---
@@ -1938,7 +1952,7 @@ leaves the work to the Lua garbage collector, which may never run while
 the VM sits idle, and the subagent's event relay stays alive until it does.
 
 Close cancels a running prompt before waiting to flush its history. That
-prompt returns a cancelled error and any partial text.
+prompt returns `"session closed"` and any partial text.
 
 ---
 
@@ -5595,7 +5609,8 @@ h:stop()
 The subagents of the focused session and their transcripts. Tasks are
 spawned by the `task` tool and addressed by an id that survives a reload.
 Without an interactive UI every function returns
-`nil, "no interactive UI attached"`.
+`nil, "no interactive UI attached"`, except the ones that take a tool
+handler's ctx: they reach the background tasks its agent moved.
 
 ---
 
@@ -5703,11 +5718,12 @@ plugin could stop work that is not its own.
 From a tool handler, `stop(ctx, id)` is the model's stop. It stops a
 background task (a command or subagent) that the calling agent moved,
 which is allowed because the tool call belongs to a turn the user started.
-It waits up to 5 seconds for the final reply and returns it, and the agent
-gets no notice of the end. A late reply returns no `output`, and the
-result reaches the agent later as a quiet notice. A task another agent
-moved, a finished task or an unknown id returns an error that names the
-agent's running task ids.
+A subagent stopped this way ends its pending `:prompt()` with
+`"stopped by parent agent"`. It waits up to 5 seconds for the final reply
+and returns it, and the agent gets no notice of the end. A late reply
+returns no `output`, and the result reaches the agent later as a quiet
+notice. A task another agent moved, a finished task or an unknown id
+returns an error that names the agent's running task ids.
 
 **Parameters:**
 
@@ -5729,6 +5745,82 @@ agent's running task ids.
 local _, err = maki.task.stop(task.id, { session = task.session })
 -- in a tool handler
 local stopped, err = maki.task.stop(ctx, input.id)
+```
+
+---
+
+### `maki.task.send()` {#maki-task-send}
+
+```lua
+maki.task.send({ctx}, {id}, {text}, {opts?})
+```
+
+Messages a background subagent that the calling agent moved, the way the
+`task_message` tool does. The subagent reads it as an interrupt from its
+parent once its current turn ends, and one still waiting for a slot reads
+it with its first prompt.
+
+With `interrupt` it does not wait for the turn to end, nor for the calls
+the subagent moved. The reply stops and running tools are cancelled (bash
+returns what it printed so far), then the subagent reads the message and
+carries on with its history intact. With no turn running the message
+waits like any other.
+
+An agent reaches the subagents it moved, and those nested in a call it
+moved, until they end. Like `stop(ctx, id)`, it never reaches what
+another agent moved.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) The tool handler's ctx.
+- `{id}` (`string`) Task id, from its receipt.
+- `{text}` (`string`) The message.
+- `{opts?}` (`table?`) Optional fields:
+  - `interrupt` (`boolean?`) cut its current turn short. Default: `false`.
+
+**Returns:** (`table|nil`, `string|nil`) `{name}`, the task's name in `/tasks`, or
+  nil and `"no running background subagent with id <id>"`.
+
+**Example:**
+
+```lua
+local sent, err = maki.task.send(ctx, input.id, input.message)
+if not sent then return { llm_output = err, is_error = true } end
+return "Message queued for " .. sent.name .. "."
+```
+
+---
+
+### `maki.task.messages()` {#maki-task-messages}
+
+```lua
+maki.task.messages({ctx}, {id}, {opts?})
+```
+
+Reads the transcript of a background subagent that the calling agent
+moved, oldest first, while it works. The messages have the shape
+`maki.session.messages` returns. It reaches what `send(ctx, id)` does.
+Works without an interactive UI.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) The tool handler's ctx.
+- `{id}` (`string`) Task id, from its receipt.
+- `{opts?}` (`table?`) `last` (integer?) only the newest `last` messages.
+
+**Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and
+  `"no running background subagent with id <id>"`.
+
+**Example:**
+
+```lua
+local msgs = maki.task.messages(ctx, input.id, { last = 1 })
+local last = msgs and msgs[1]
+if last and last.content[1].type == "text" then
+  print(last.content[1].text)
+end
 ```
 
 

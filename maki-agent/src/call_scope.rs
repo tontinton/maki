@@ -8,7 +8,8 @@ use event_listener::{Event, EventListener};
 use maki_storage::id::MakiId;
 use thiserror::Error;
 
-use crate::cancel::{CancelHandle, CancelToken, CancelTrigger};
+use crate::cancel::{CancelToken, CancelTrigger};
+use crate::session_control::SessionControl;
 use crate::types::SubagentInfo;
 
 /// Where a moved call lives once its turn no longer owns it.
@@ -30,7 +31,7 @@ pub struct SessionStub {
     pub ui_id: String,
     pub plugin: Arc<str>,
     pub name: String,
-    pub handle: CancelHandle,
+    pub control: Arc<SessionControl>,
     /// Set at the session's first prompt, when the UI first hears of it.
     pub info: Arc<OnceLock<SubagentInfo>>,
 }

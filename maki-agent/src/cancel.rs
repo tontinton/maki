@@ -148,6 +148,10 @@ impl CancelTrigger {
     pub fn handle(&self) -> CancelHandle {
         CancelHandle(Arc::downgrade(&self.0))
     }
+
+    pub fn token(&self) -> CancelToken {
+        CancelToken(Arc::clone(&self.0))
+    }
 }
 
 impl CancelHandle {

@@ -29,11 +29,11 @@ use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, Permissio
 use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{
-    AgentMode, BackgroundNotice, BufferSnapshot, CallRecord, DoneReason, HistorySnapshot,
-    ImageMediaType, ImageSource, McpConfigErrors, McpPromptArg, McpPromptInfo, McpServerInfo,
-    McpServerStatus, McpSnapshot, McpSnapshotReader, RunTotals, SharedBuf, SnapshotLine,
-    SnapshotSpan, SpanStyle, SteerKind, SubagentInbox, TaskLabel, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
+    AgentMode, BackgroundNotice, BufferSnapshot, CallRecord, Cutter, DoneReason, EndReason,
+    HistorySnapshot, ImageMediaType, ImageSource, McpConfigErrors, McpPromptArg, McpPromptInfo,
+    McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, RunTotals, SessionControl,
+    SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SteerKind, TaskLabel, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
 };
 use maki_config::{
     Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
@@ -378,7 +378,7 @@ fn subagent_info_with_tx(
         model: None,
         opts: None,
         answer_tx,
-        inbox: Arc::default(),
+        control: Arc::default(),
         parent_call: None,
     }
 }
@@ -10864,12 +10864,12 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert!(!app.chats[0].is_finished());
 }
 
-/// A subagent whose session handed the UI its inbox, the way `sess:prompt`
+/// A subagent whose session handed the UI its control, the way `sess:prompt`
 /// does through `SubagentInfo`, with that chat in front.
-fn app_with_subagent_inbox() -> (App, Arc<SubagentInbox>) {
+fn app_with_subagent_inbox() -> (App, Arc<SessionControl>) {
     let app = app_with_active_subagent();
-    let inbox = Arc::clone(app.chats[1].inbox.as_ref().expect("a subagent's inbox"));
-    (app, inbox)
+    let control = Arc::clone(app.chats[1].control.as_ref().expect("a subagent's control"));
+    (app, control)
 }
 
 /// A message typed in a running subagent's chat is for that subagent: it
@@ -10966,13 +10966,30 @@ fn finished_subagent_reports_undelivered_messages() {
     let (mut app, inbox) = app_with_subagent_inbox();
     type_and_submit(&mut app, "a");
     finish_subagent_task(&mut app, false);
-    assert!(app.chats[1].inbox.is_none());
+    assert!(app.chats[1].control.is_none());
     assert_eq!(inbox.len(), 1);
     let notice = app.chats[1]
         .message_at(app.chats[1].message_count() - 2)
         .unwrap();
     assert_eq!(notice.text, format!("1{INBOX_DROPPED_SUFFIX}"));
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+}
+
+/// A session that ended before its chat heard refuses what is typed there,
+/// and the reason flashes instead of the message vanishing.
+#[test]
+fn ended_subagent_refuses_typed_message_with_its_reason() {
+    let reason = EndReason::Stopped(Cutter::Parent);
+    let (mut app, control) = app_with_subagent_inbox();
+    control.end(reason);
+
+    type_and_submit(&mut app, "q");
+
+    assert!(control.is_empty());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(format!("{}{reason}", queue::SUBAGENT_REFUSED_PREFIX).as_str())
+    );
 }
 
 /// A finished subagent's chat is a transcript: no box to type into, and
@@ -12733,12 +12750,12 @@ fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
     let mut app = streaming_app();
     app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
     app.update(agent_msg(moved_done(MOVED_ID)));
-    let inbox = Arc::new(SubagentInbox::default());
+    let control = Arc::new(SessionControl::default());
     let (answer_tx, _answer_rx) = flume::unbounded();
     let mut info = subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx));
     info.model = Some(MOVED_MODEL.into());
     info.opts = Some(MOVED_OPTS);
-    info.inbox = Arc::clone(&inbox);
+    info.control = Arc::clone(&control);
     info.prompt = Some(SUBAGENT_PROMPT.into());
 
     name_session(&mut app, info.clone());
@@ -12747,9 +12764,9 @@ fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
     assert_eq!(app.chats.len(), 2);
     let tab = &app.chats[1];
     assert!(
-        tab.inbox
+        tab.control
             .as_ref()
-            .is_some_and(|tab_inbox| Arc::ptr_eq(tab_inbox, &inbox))
+            .is_some_and(|tab_control| Arc::ptr_eq(tab_control, &control))
     );
     assert!(tab.answer_tx.is_some());
     assert_eq!(tab.model_id.as_deref(), Some(MOVED_MODEL));
@@ -12853,7 +12870,7 @@ fn a_reopened_tab_does_not_show_its_prompt_again() {
     speak_after_the_move(&mut app, info);
 
     let tab = &app.chats[app.chat_of_task(MOVED_ID).unwrap()];
-    assert!(tab.inbox.is_some());
+    assert!(tab.control.is_some());
     let prompts = (0..tab.message_count())
         .filter_map(|i| tab.message_at(i))
         .filter(|m| m.role == DisplayRole::User)

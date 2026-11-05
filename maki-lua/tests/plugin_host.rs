@@ -8233,9 +8233,9 @@ fn a_retired_background_session_refuses_later_prompts() {
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
-/// The provider parks the second turn forever, so only a cancel can end this
-/// prompt. If `close` waited for it instead, a `SessionEnd` callback that
-/// closes its own session would hang.
+/// The provider parks the second turn forever, so only the close can end
+/// this prompt, which then says the session closed. If `close` waited for it
+/// instead, a `SessionEnd` callback that closes its own session would hang.
 #[test]
 fn closing_a_background_session_cancels_its_running_prompt() {
     let reg = fresh_registry();
@@ -8261,7 +8261,7 @@ fn closing_a_background_session_cancels_its_running_prompt() {
     let closed = call_on_thread(&reg, "close_background", CancelToken::none())
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("close must not wait for the parked prompt");
-    assert_eq!(closed, Ok(CANCELLED_MSG.to_owned()));
+    assert_eq!(closed, Ok(SESSION_CLOSED_ERR.to_owned()));
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
