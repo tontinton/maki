@@ -13,7 +13,9 @@ use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 #[cfg(not(windows))]
-use crossterm::event::{DisableFocusChange, EnableFocusChange};
+use crossterm::event::{
+    DisableColorSchemeDetection, DisableFocusChange, EnableColorSchemeDetection, EnableFocusChange,
+};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use maki_config::NotificationMethod;
 
@@ -358,13 +360,27 @@ fn resume(terminal: &mut ratatui::DefaultTerminal) {
 #[cfg(not(windows))]
 fn enable_focus_change() {
     stdout().execute(EnableFocusChange).ok();
+    enable_color_scheme_reports();
 }
+
+/// Only a terminal we asked at startup reports light/dark changes, so this
+/// is a no-op until `appearance::init` asked; startup calls it again after.
+#[cfg(not(windows))]
+pub(crate) fn enable_color_scheme_reports() {
+    if crate::appearance::background().is_some() {
+        stdout().execute(EnableColorSchemeDetection).ok();
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn enable_color_scheme_reports() {}
 
 #[cfg(windows)]
 fn enable_focus_change() {}
 
 #[cfg(not(windows))]
 fn disable_focus_change() {
+    stdout().execute(DisableColorSchemeDetection).ok();
     stdout().execute(DisableFocusChange).ok();
 }
 

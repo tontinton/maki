@@ -124,6 +124,7 @@ pub async fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Res
         let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
         color_compat::init();
         appearance::init(params.ui_config.theme.as_ref());
+        terminal::enable_color_scheme_reports();
         let el = event_loop::EventLoop::new(&mut terminal, params).await?;
         el.run(initial_prompt).await?
     };
