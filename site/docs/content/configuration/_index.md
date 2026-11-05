@@ -87,6 +87,14 @@ All fields are optional. Typos in field names cause an error right away.
 
 Name of the color theme to load at startup, overriding the theme you last picked interactively. If unset, Maki keeps your last selection (the built-in default on first run). An unknown name is ignored with a warning.
 
+To match a light or dark terminal, give a theme for each:
+
+```lua
+theme = { light = "catppuccin_latte", dark = "catppuccin_macchiato" }
+```
+
+Maki asks the terminal for its background color once at startup, and uses `dark` if it gets no answer. Restart Maki after your terminal switches between light and dark.
+
 Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dark_daltonized`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `kanagawa_ink`, `kanagawa_plum`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_midnight`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `system`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
 
 You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
