@@ -104,7 +104,6 @@ fn oauth_form_headers() -> Vec<(&'static str, String)> {
     vec![
         ("content-type", "application/x-www-form-urlencoded".into()),
         ("accept", "application/json".into()),
-        ("user-agent", crate::providers::user_agent().into()),
         ("x-grok-client-version", GROK_CLI_VERSION.into()),
         ("x-grok-client-surface", "cli".into()),
     ]

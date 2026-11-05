@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use crate::AgentError;
 use crate::model::{ModelInfo, ModelPricing};
-use crate::providers::{status_and_text, user_agent};
+use crate::providers::status_and_text;
 
 use super::auth;
 
@@ -181,7 +181,6 @@ async fn fetch_catalog(access: &str) -> FetchOutcome {
         .get(CLI_MODELS_URL)
         .header("accept", "application/json")
         .header("authorization", format!("Bearer {access}"))
-        .header("user-agent", user_agent())
         .header("x-xai-token-auth", auth::TOKEN_AUTH)
         .header("x-authenticateresponse", auth::AUTHENTICATE_RESPONSE)
         .header("x-grok-client-identifier", auth::CLIENT_IDENTIFIER)

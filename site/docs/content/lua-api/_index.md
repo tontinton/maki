@@ -4990,7 +4990,8 @@ Every hook is optional and gets a `ctx` table as its first argument:
   then the declared `base_url`, nil when none is set. Build URLs
   from it so side calls follow a user who points the slug at a
   gateway.
-- `ctx.headers` (`table`) The headers every request to the slug carries.
+- `ctx.headers` (`table`) The headers every request to the slug carries,
+  under lowercase names.
 - `ctx.get_json(target)` (`function`) A GET with `ctx.headers`. A `target`
   starting with `/` is appended to `ctx.base_url`, an absolute URL
   is used as is. Never retried. Returns the decoded body, or nil
@@ -5069,9 +5070,10 @@ it does for a built-in provider.
       `"reasoning.effort"`. Defaults to `reasoning_effort`.
     - `requires_support` (`boolean`) Send effort only to models that
       support thinking. Defaults to `false`.
-  - `headers` (`table`) Sent with every request. A header the credentials
-    set wins. `host`, `content-length`, `transfer-encoding` and
-    `connection` are refused.
+  - `headers` (`table`) Sent with every request, replacing a header maki
+    sets itself. A header the credentials set wins. `host`,
+    `content-length`, `transfer-encoding` and `connection` are
+    refused.
   - `extra_body` (`table`) Merged into every request body.
   - `thinking_overrides` (`table`) Model id prefix to `"no"`, `"yes"` or
     `"required"`, overriding the model table. Longest prefix wins.
@@ -5089,7 +5091,8 @@ it does for a built-in provider.
   on the newest credentials, or `"reload"` to re-read stored
   credentials after a login or another maki process changed them.
   Spend a refresh token only on `"refresh"`.
-  Omitting `base_url` keeps the current one.
+  Omitting `base_url` keeps the current one. A returned header
+  replaces one maki or `openai.headers` sets.
 - `list_models` (`function`) `function(ctx)` returning model rows for a
   catalogue only known at runtime. Without it, the provider
   lists what its codec or base lists. Rows carry `id`,

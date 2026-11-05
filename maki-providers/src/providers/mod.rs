@@ -3,6 +3,7 @@ use std::future::Future;
 use std::io;
 use std::iter;
 use std::pin::Pin;
+use std::str::from_utf8;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,6 +11,7 @@ use std::time::Duration;
 use bytes::Buf;
 use futures::stream::try_unfold;
 use futures::{Stream, TryStreamExt};
+use reqwest::header::{HeaderMap, HeaderName};
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
 use serde::Deserialize;
@@ -23,6 +25,9 @@ use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, lock_tokens, save_tokens};
 
 use crate::AgentError;
+use crate::headers::{
+    HeaderError, header_name, header_pairs, header_value, overlay, parse_headers,
+};
 use crate::http::{error_chain, proxy_env};
 use crate::retry::RetryPolicy;
 
@@ -51,6 +56,8 @@ pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
 const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+#[cfg(test)]
+const TEST_HEADERS_INVALID: &str = "a test's auth headers must parse";
 
 /// Boxed so [`ok_sse`] can name the events its parse closure takes.
 pub(crate) type SseBody = Pin<Box<dyn Stream<Item = Result<Sse, AgentError>> + Send>>;
@@ -176,14 +183,18 @@ pub(crate) fn needs_refresh(dir: &StateDir, provider: &str, held: Option<&OAuthT
     }
 }
 
+/// The credentials and the headers that ride with them: what a plugin's
+/// `auth` hook or a provider's own login produced, with `[<slug>.headers]`
+/// over the top. Kept by name in a [`HeaderMap`], so nothing can append a
+/// second copy of a header (see [`crate::headers`]).
 #[derive(Clone)]
 pub struct ResolvedAuth {
     pub base_url: Option<String>,
-    pub headers: Vec<(String, String)>,
+    headers: HeaderMap,
     /// Header names that came from `[<slug>.headers]`. They win over anything
     /// the provider sets afterwards, so a key rotation cannot drop a gateway
     /// credential that replaced the built-in auth header.
-    config_headers: Vec<String>,
+    config_headers: Vec<HeaderName>,
     /// `[<slug>] top_p`, carried with the auth so whoever the slug's
     /// credentials reach (aperture routes, catalog sub-providers) sends it.
     pub top_p: Option<f64>,
@@ -197,7 +208,7 @@ impl ResolvedAuth {
     pub fn new(slug: &str, headers: Vec<(String, String)>) -> Result<Self, AgentError> {
         let mut auth = Self {
             base_url: None,
-            headers,
+            headers: parse_headers(headers).map_err(|e| header_error(slug, &e))?,
             config_headers: Vec::new(),
             top_p: None,
         };
@@ -216,27 +227,36 @@ impl ResolvedAuth {
         slug: &str,
         headers: &BTreeMap<String, String>,
     ) -> Result<(), AgentError> {
+        let mut expanded = Vec::with_capacity(headers.len());
         for (name, value) in headers {
-            let expanded = maki_config::expand_env(value).map_err(|var| {
+            let value = maki_config::expand_env(value).map_err(|var| {
                 AgentError::Config {
                     message: format!(
                         "provider '{slug}' header '{name}': environment variable '{var}' is unset or empty"
                     ),
                 }
             })?;
-            self.set_header(name, expanded);
-            self.config_headers.push(name.clone());
+            expanded.push((name, value));
         }
+        let configured = parse_headers(expanded).map_err(|e| header_error(slug, &e))?;
+        overlay(&mut self.headers, &configured);
+        self.config_headers.extend(configured.keys().cloned());
         Ok(())
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        from_utf8(self.headers.get(name)?.as_bytes()).ok()
+    }
+
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        header_pairs(&self.headers)
     }
 
     /// The access token behind the bearer header, so a 401 retry can say which
     /// token it was using.
     pub(crate) fn access_token(&self) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(AUTHORIZATION_HEADER))
-            .and_then(|(_, value)| value.strip_prefix(BEARER_PREFIX))
+        self.header(AUTHORIZATION_HEADER)?
+            .strip_prefix(BEARER_PREFIX)
     }
 
     /// No credentials, not even `[<slug>.headers]`: what an auth cell holds
@@ -245,7 +265,7 @@ impl ResolvedAuth {
     pub(crate) fn withheld() -> Self {
         Self {
             base_url: None,
-            headers: Vec::new(),
+            headers: HeaderMap::new(),
             config_headers: Vec::new(),
             top_p: None,
         }
@@ -265,46 +285,53 @@ impl ResolvedAuth {
 
     /// Set the header carrying the API key, unless `[<slug>.headers]` already
     /// owns that name: the config value is the one the gateway expects.
-    fn set_key_header(&mut self, name: &str, value: String) {
-        if self
-            .config_headers
-            .iter()
-            .any(|configured| configured.eq_ignore_ascii_case(name))
-        {
-            return;
+    fn set_key_header(&mut self, name: &str, value: &str) -> Result<(), HeaderError> {
+        let name = header_name(name)?;
+        if self.config_headers.contains(&name) {
+            return Ok(());
         }
-        self.set_header(name, value);
+        let value = header_value(name.as_str(), value)?;
+        self.headers.insert(name, value);
+        Ok(())
     }
 
-    /// Replace a same-name header (case-insensitive) instead of appending a
-    /// second one: `RequestBuilder::header` appends, so a configured
-    /// `Authorization` next to the built-in bearer would send two credentials.
-    pub(crate) fn set_header(&mut self, name: &str, value: String) {
-        match self
-            .headers
-            .iter_mut()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        {
-            Some(slot) => slot.1 = value,
-            None => self.headers.push((name.to_string(), value)),
-        }
+    /// Replace a same-name header (case-insensitive), never add a second one.
+    pub(crate) fn set_header(&mut self, name: &str, value: &str) -> Result<(), HeaderError> {
+        let value = header_value(name, value)?;
+        self.headers.insert(header_name(name)?, value);
+        Ok(())
     }
 
-    /// Apply all auth headers to a request builder.
-    pub fn configure_request(&self, builder: RequestBuilder) -> RequestBuilder {
-        self.headers.iter().fold(builder, |b, (key, value)| {
-            b.header(key.as_str(), value.as_str())
-        })
+    /// The request with these headers laid over everything the provider put
+    /// on it. Last, and it hands back a built [`Request`], so nothing the
+    /// provider adds can land on top of the user's value or beside it.
+    pub fn finish(&self, builder: RequestBuilder) -> Result<Request, AgentError> {
+        let mut request = builder.build()?;
+        overlay(request.headers_mut(), &self.headers);
+        Ok(request)
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(base_url: Option<String>, headers: Vec<(String, String)>) -> Self {
         Self {
             base_url,
-            headers,
+            headers: parse_headers(headers).expect(TEST_HEADERS_INVALID),
             config_headers: Vec::new(),
             top_p: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn header_list(&self) -> Vec<(String, String)> {
+        self.headers()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect()
+    }
+}
+
+fn header_error(slug: &str, error: &HeaderError) -> AgentError {
+    AgentError::Config {
+        message: format!("provider '{slug}': {error}"),
     }
 }
 
@@ -431,7 +458,9 @@ impl Timeouts {
 /// catalogs) shares the providers' redirect, proxy and trust rules. Redirects
 /// stay off: a 3xx reaches [`AgentError::from_response`] and a key header is
 /// never replayed cross-origin. HTTP/1.1 stays pinned in case a dependency
-/// turns on reqwest's http2 feature.
+/// turns on reqwest's http2 feature. The user agent is the client's default,
+/// which reqwest only adds to a request that names none, so a user agent anyone
+/// else sets replaces maki's instead of going out beside it.
 pub fn client_builder() -> ClientBuilder {
     Client::builder()
         .redirect(Policy::none())
@@ -716,10 +745,16 @@ impl<'a> KeyRotation<'a> {
         if !self.pool.rotate() {
             return false;
         }
-        self.auth
+        let name = self.header.name();
+        if let Err(error) = self
+            .auth
             .lock()
             .unwrap()
-            .set_key_header(self.header.name(), self.header.value(self.pool.current()));
+            .set_key_header(name, &self.header.value(self.pool.current()))
+        {
+            warn!(header = name, %error, "the next key cannot be sent, keeping the current one");
+            return false;
+        }
         true
     }
 }
@@ -1147,10 +1182,7 @@ mod tests {
     }
 
     fn header_value(auth: &ResolvedAuth, name: &str) -> Option<String> {
-        auth.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.clone())
+        auth.header(name).map(str::to_owned)
     }
 
     fn test_bearer(key: &str) -> ResolvedAuth {
@@ -1170,7 +1202,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        assert_eq!(auth.headers.len(), 2);
+        assert_eq!(auth.header_list().len(), 2);
         assert_eq!(
             header_value(&auth, AUTHORIZATION_HEADER).as_deref(),
             Some("Basic other")
@@ -1247,7 +1279,7 @@ mod tests {
         // The gateway credential replaced the built-in bearer, so rotating the
         // key must not put `Bearer sk-2` back and lock the user out.
         let auth = auth.lock().unwrap();
-        assert_eq!(auth.headers.len(), 1);
+        assert_eq!(auth.header_list().len(), 1);
         assert_eq!(
             header_value(&auth, AUTHORIZATION_HEADER).as_deref(),
             Some(GATEWAY_CRED)

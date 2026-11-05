@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use maki_config::providers::{OverrideFields, Protocol, ProviderOverride, ProvidersConfig};
+use reqwest::header::HeaderMap;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
@@ -454,7 +455,7 @@ impl Provider for Aperture {
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                 .await
         })
     }

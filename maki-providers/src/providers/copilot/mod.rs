@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use maki_storage::id::SessionRef;
-use reqwest::{Client, RequestBuilder};
+use reqwest::header::HeaderMap;
+use reqwest::{Client, Request};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
@@ -101,6 +102,7 @@ const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const RESPONSES_PATH: &str = "/responses";
 const MESSAGES_PATH: &str = "/v1/messages";
 const MODELS_PATH: &str = "/models";
+const CONVERSATION_AGENT: &str = "conversation-agent";
 
 /// Scales `/models` AI-credit prices (1 credit = $0.01) to USD per 1M tokens.
 const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
@@ -204,12 +206,8 @@ impl Copilot {
 
     async fn fetch_models(&self) -> Result<Vec<CopilotModel>, AgentError> {
         let auth = self.auth().await?;
-        let request = copilot_request(
-            self.client.get(format!("{}{MODELS_PATH}", auth.endpoint)),
-            &auth,
-            None,
-        )
-        .build()?;
+        let request = copilot_auth(&auth, None)?
+            .finish(self.client.get(format!("{}{MODELS_PATH}", auth.endpoint)))?;
         let body_text = super::send_request(&self.client, request, |response| async move {
             if !response.status().is_success() {
                 return Err(AgentError::from_response(response).await);
@@ -263,15 +261,7 @@ impl Copilot {
             body["tools"] = wire_tools;
         }
 
-        let request = self
-            .build_post(
-                &auth,
-                CHAT_COMPLETIONS_PATH,
-                Some("conversation-agent"),
-                &body,
-            )?
-            .body(serde_json::to_vec(&body)?)
-            .build()?;
+        let request = self.build_post(&auth, CHAT_COMPLETIONS_PATH, &body, &[])?;
         super::ok_sse(&self.client, request, self.stream_timeout, |body| {
             openai_compat::parse_sse(body, event_tx, false)
         })
@@ -306,12 +296,11 @@ impl Copilot {
                 &effort_dialect(&info),
             );
         }
-        let resolved =
-            super::ResolvedAuth::new(SLUG, copilot_headers(&auth, Some("conversation-agent")))?
-                .with_base_url(Some(auth.endpoint.clone()));
+        let resolved = copilot_auth(&auth, Some(CONVERSATION_AGENT))?;
         responses::do_stream(
             &self.client,
             model,
+            &HeaderMap::new(),
             &body,
             event_tx,
             &resolved,
@@ -331,34 +320,36 @@ impl Copilot {
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
         let body = messages_body(model, messages, system, tools, thinking);
-        let request = self
-            .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?
-            .header("anthropic-version", "2023-06-01")
-            .body(serde_json::to_vec(&body)?)
-            .build()?;
+        let request = self.build_post(
+            &auth,
+            MESSAGES_PATH,
+            &body,
+            &[("anthropic-version", super::anthropic::API_VERSION)],
+        )?;
         super::ok_sse(&self.client, request, self.stream_timeout, |body| {
             super::anthropic::parse_sse(body, event_tx)
         })
         .await
     }
 
+    /// A conversation turn: the JSON body under maki's headers and
+    /// `headers`, with the credentials and `[copilot.headers]` over them.
     fn build_post(
         &self,
         auth: &CopilotAuth,
         path: &str,
-        interaction_type: Option<&str>,
         body: &Value,
-    ) -> Result<RequestBuilder, AgentError> {
-        debug!(
-            path,
-            body_bytes = serde_json::to_vec(body)?.len(),
-            "sending Copilot API request"
+        headers: &[(&str, &str)],
+    ) -> Result<Request, AgentError> {
+        let body = serde_json::to_vec(body)?;
+        debug!(path, body_bytes = body.len(), "sending Copilot API request");
+        let builder = headers.iter().fold(
+            self.client
+                .post(format!("{}{path}", auth.endpoint))
+                .header("content-type", "application/json"),
+            |builder, &(name, value)| builder.header(name, value),
         );
-        Ok(copilot_request(
-            self.client.post(format!("{}{path}", auth.endpoint)),
-            auth,
-            interaction_type,
-        ))
+        copilot_auth(auth, Some(CONVERSATION_AGENT))?.finish(builder.body(body))
     }
 }
 
@@ -669,7 +660,6 @@ async fn try_discover_api_endpoint(
         .post(graphql_url)
         .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
-        .header("user-agent", super::user_agent())
         .body(serde_json::to_vec(&body)?)
         .build()?;
     let body_text = super::send_request(client, request, |response| async move {
@@ -689,33 +679,21 @@ async fn try_discover_api_endpoint(
         })
 }
 
-fn copilot_request(
-    builder: RequestBuilder,
+/// Every Copilot request's credentials and identity, with `[copilot.headers]`
+/// over them.
+fn copilot_auth(
     auth: &CopilotAuth,
     interaction_type: Option<&str>,
-) -> RequestBuilder {
-    let builder = builder
-        .header("authorization", format!("Bearer {}", auth.token))
-        .header("content-type", "application/json")
-        .header("editor-version", EDITOR_VERSION_HEADER)
-        .header("copilot-integration-id", INTEGRATION_ID_HEADER)
-        .header("x-github-api-version", API_VERSION_HEADER)
-        .header("user-agent", super::user_agent());
-
-    if let Some(interaction_type) = interaction_type {
-        builder
-            .header("x-initiator", "agent")
-            .header("x-interaction-type", interaction_type)
-            .header("openai-intent", interaction_type)
-    } else {
-        builder
-    }
+) -> Result<ResolvedAuth, AgentError> {
+    Ok(
+        ResolvedAuth::new(SLUG, copilot_headers(auth, interaction_type))?
+            .with_base_url(Some(auth.endpoint.clone())),
+    )
 }
 
 fn copilot_headers(auth: &CopilotAuth, interaction_type: Option<&str>) -> Vec<(String, String)> {
     let mut headers = vec![
         ("authorization".into(), format!("Bearer {}", auth.token)),
-        ("content-type".into(), "application/json".into()),
         ("editor-version".into(), EDITOR_VERSION_HEADER.into()),
         (
             "copilot-integration-id".into(),
@@ -735,10 +713,7 @@ fn copilot_headers(auth: &CopilotAuth, interaction_type: Option<&str>) -> Vec<(S
 
 fn copilot_auth_from_resolved(auth: &super::ResolvedAuth) -> Result<CopilotAuth, AgentError> {
     let token = auth
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-        .and_then(|(_, value)| value.strip_prefix("Bearer "))
+        .access_token()
         .map(str::to_owned)
         .ok_or_else(|| AgentError::Config {
             message: "dynamic Copilot provider missing Bearer authorization header".into(),
@@ -862,6 +837,7 @@ mod tests {
     use crate::test_support::{Canned, serve};
     use crate::{ContentBlock, Role, TokenUsage};
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const OPUS_CACHE_WRITE: f64 = 6.25;
     const HIDDEN_ONLY_CATALOG: &[Canned] = &[Canned::json(
@@ -871,6 +847,9 @@ mod tests {
     const CLAUDE_SPEC: &str = "copilot/claude-opus-5";
     const REPLY: &str = "reply";
     const SOL: &str = "gpt-6.1-sol";
+    const GPT_SPEC: &str = "copilot/gpt-5.4";
+    const JSON_CONTENT_TYPE: &str = "application/json";
+    const REJECTED: &[Canned] = &[Canned::json(400, r#"{"error":{"message":"rejected"}}"#)];
 
     #[test]
     fn endpoint_prefers_messages_then_responses_then_chat() {
@@ -913,19 +892,44 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn responses_request_sends_each_header_once() {
+        let (base_url, requests) = serve(REJECTED);
+        let auth = CopilotAuth {
+            token: "token".into(),
+            endpoint: base_url.clone(),
+        };
+        let resolved = ResolvedAuth::for_test(
+            Some(base_url),
+            copilot_headers(&auth, Some(CONVERSATION_AGENT)),
+        );
+        let model = Model::from_spec(GPT_SPEC).unwrap();
+        let (tx, _rx) = unbounded_channel();
+
+        let _ = responses::do_stream(
+            &Client::new(),
+            &model,
+            &HeaderMap::new(),
+            &json!({}),
+            &tx,
+            &resolved,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0].headers.values("content-type"),
+            [JSON_CONTENT_TYPE]
+        );
+    }
+
     #[test]
     fn requests_identify_integrator() {
         let auth = CopilotAuth {
             token: "token".into(),
             endpoint: DEFAULT_API_ENDPOINT.into(),
         };
-        let request = copilot_request(Client::new().get(DEFAULT_API_ENDPOINT), &auth, None)
-            .build()
-            .unwrap();
-        assert_eq!(
-            request.headers()["copilot-integration-id"],
-            INTEGRATION_ID_HEADER
-        );
         assert!(copilot_headers(&auth, None).contains(&(
             "copilot-integration-id".into(),
             INTEGRATION_ID_HEADER.into()

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use futures::TryStreamExt;
 use maki_storage::id::{MakiId, SessionRef};
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::{Client, Request, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
@@ -172,22 +172,13 @@ impl Google {
             .to_string()
     }
 
-    fn build_request(&self, method: Method, url: &str) -> RequestBuilder {
-        let auth = self.auth.lock().unwrap();
-        auth.configure_request(
-            self.client
-                .request(method, url)
-                .header("user-agent", super::user_agent()),
-        )
+    fn finish(&self, builder: RequestBuilder) -> Result<Request, AgentError> {
+        self.auth.lock().unwrap().finish(builder)
     }
 
     fn api_key(&self) -> String {
         let auth = self.auth.lock().unwrap();
-        auth.headers
-            .iter()
-            .find(|(k, _)| k == API_KEY_HEADER)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default()
+        auth.header(API_KEY_HEADER).unwrap_or_default().to_owned()
     }
 
     fn stream_url(&self, model_id: &str) -> String {
@@ -253,11 +244,12 @@ impl Google {
         let url = self.stream_url(&model.id);
         let json_body = serde_json::to_vec(&body)?;
 
-        let request = self
-            .build_request(Method::POST, &url)
-            .header("content-type", "application/json")
-            .body(json_body)
-            .build()?;
+        let request = self.finish(
+            self.client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(json_body),
+        )?;
 
         ok_sse(&self.client, request, self.stream_timeout, |body| {
             parse_sse(body, event_tx)
@@ -282,7 +274,7 @@ impl Provider for Google {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
-        let request = self.build_request(Method::GET, &url).build();
+        let request = self.finish(self.client.get(&url));
         let client = self.client.clone();
         Box::pin(async move {
             let body_text = ok_text(&client, request?).await?;

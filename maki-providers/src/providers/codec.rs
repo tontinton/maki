@@ -2,9 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use reqwest::header::{
-    CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, TRANSFER_ENCODING,
-};
+use reqwest::header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, TRANSFER_ENCODING};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
@@ -18,6 +16,7 @@ use super::custom::{self, THINKING_FIELD};
 use super::openai::responses;
 use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyRotation, ResolvedAuth, Timeouts};
+use crate::headers::{HeaderError, header_name, parse_headers};
 use crate::model::{Model, ModelEffort, ModelInfo, ThinkingSupport};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
@@ -47,14 +46,10 @@ static THINKING_REJECTED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSe
 /// than a request.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
-    #[error("'{0}' is not a valid header name")]
-    HeaderName(String),
+    #[error(transparent)]
+    Header(#[from] HeaderError),
     #[error("header '{0}' is framing the HTTP client sets, and cannot be declared")]
     TransportHeader(String),
-    #[error("header '{0}' must have a value of visible ASCII")]
-    HeaderValue(String),
-    #[error("header '{0}' is declared twice")]
-    DuplicateHeader(String),
     #[error("effort field '{0}' must be a dotted path of non-empty keys, e.g. `reasoning.effort`")]
     EffortField(String),
     #[error("unknown thinking dialect '{name}' (expected one of {expected})")]
@@ -138,19 +133,28 @@ pub struct SessionCarrier {
 impl SessionCarrier {
     /// Body last of the provider's own passes, so a thinking pass or an
     /// extra body naming the same key loses to the session.
-    pub(crate) fn apply(&self, session: &SessionRef, body: &mut Value, auth: &mut ResolvedAuth) {
+    pub(crate) fn apply(
+        &self,
+        session: &SessionRef,
+        body: &mut Value,
+        auth: &mut ResolvedAuth,
+    ) -> Result<(), HeaderError> {
         if let (Some(field), Some(object)) = (&self.body_field, body.as_object_mut()) {
             object.insert(field.to_string(), json!(session.as_str()));
         }
-        self.apply_headers(session, auth);
+        self.apply_headers(session, auth)
     }
 
     /// Set rather than appended, so a request carries each header once even
     /// when the auth layer already named it.
-    pub(crate) fn apply_headers(&self, session: &SessionRef, auth: &mut ResolvedAuth) {
-        for name in self.headers.iter() {
-            auth.set_header(name, session.as_str().to_owned());
-        }
+    pub(crate) fn apply_headers(
+        &self,
+        session: &SessionRef,
+        auth: &mut ResolvedAuth,
+    ) -> Result<(), HeaderError> {
+        self.headers
+            .iter()
+            .try_for_each(|name| auth.set_header(name, session.as_str()))
     }
 }
 
@@ -194,21 +198,10 @@ impl OpenAiWire {
         }
     }
 
-    /// The static headers this declaration sends, under their canonical names.
-    pub(crate) fn request_headers(&self) -> Vec<(&str, &str)> {
-        let Self {
-            max_tokens_field: _,
-            include_stream_usage: _,
-            usage_cost: _,
-            thinking: _,
-            headers,
-            extra_body: _,
-            thinking_overrides: _,
-        } = self;
-        headers
-            .iter()
-            .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)))
-            .collect()
+    /// The static headers this declaration sends, over maki's own and under
+    /// the credentials.
+    pub(crate) fn request_headers(&self) -> &HeaderMap {
+        &self.headers
     }
 
     /// Applied after everything else that shapes the model, so the provider's
@@ -330,29 +323,18 @@ fn deserialize_dialect<'de, D: Deserializer<'de>>(
 }
 
 fn declared_header_name(name: &str) -> Result<HeaderName, WireError> {
-    let parsed = HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| WireError::HeaderName(name.to_owned()))?;
+    let parsed = header_name(name)?;
     if TRANSPORT_HEADERS.contains(&parsed) {
         return Err(WireError::TransportHeader(name.to_owned()));
     }
     Ok(parsed)
 }
 
-/// Visible ASCII only, so every value [`OpenAiWire::request_headers`] hands on
-/// renders as text.
 fn declared_headers(declared: BTreeMap<String, String>) -> Result<HeaderMap, WireError> {
-    let mut headers = HeaderMap::with_capacity(declared.len());
-    for (name, value) in declared {
-        let parsed = declared_header_name(&name)?;
-        let value = HeaderValue::from_str(&value)
-            .ok()
-            .filter(|value| value.to_str().is_ok())
-            .ok_or_else(|| WireError::HeaderValue(name.clone()))?;
-        if headers.insert(parsed, value).is_some() {
-            return Err(WireError::DuplicateHeader(name));
-        }
+    for name in declared.keys() {
+        declared_header_name(name)?;
     }
-    Ok(headers)
+    Ok(parse_headers(declared)?)
 }
 
 fn serialize_headers<S: Serializer>(headers: &HeaderMap, serializer: S) -> Result<S::Ok, S::Error> {
@@ -530,7 +512,7 @@ impl CompatProvider {
     async fn stream_chat(
         &self,
         model: &Model,
-        headers: &[(&str, &str)],
+        headers: &HeaderMap,
         mut body: Value,
         event_tx: &UnboundedSender<ProviderEvent>,
         auth: &ResolvedAuth,
@@ -613,7 +595,7 @@ impl Provider for CompatProvider {
                 let mut body = responses::build_body(model, messages, system, tools);
                 // TODO: wire thinking budget into responses API when llama.cpp supports it
                 if let Some(session) = session_id {
-                    self.session_id.apply(session, &mut body, &mut auth);
+                    self.session_id.apply(session, &mut body, &mut auth)?;
                 }
                 if let Some(hook) = &self.build_body {
                     body = hook.call(body, &ctx).await?;
@@ -621,6 +603,7 @@ impl Provider for CompatProvider {
                 return responses::do_stream(
                     self.compat.client(),
                     model,
+                    &HeaderMap::new(),
                     &body,
                     event_tx,
                     &auth,
@@ -634,13 +617,12 @@ impl Provider for CompatProvider {
                     .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             self.openai.apply_body(&mut body, &ctx);
             if let Some(session) = session_id {
-                self.session_id.apply(session, &mut body, &mut auth);
+                self.session_id.apply(session, &mut body, &mut auth)?;
             }
             if let Some(hook) = &self.build_body {
                 body = hook.call(body, &ctx).await?;
             }
-            let headers = self.openai.request_headers();
-            self.stream_chat(model, &headers, body, event_tx, &auth)
+            self.stream_chat(model, self.openai.request_headers(), body, event_tx, &auth)
                 .await
         })
     }
@@ -689,6 +671,7 @@ mod tests {
 
     use super::super::plugin::PluginAuth;
     use super::*;
+    use crate::headers::header_pairs;
     use crate::model::ModelEffort;
     use crate::{Effort, ThinkingConfig};
 
@@ -789,8 +772,7 @@ mod tests {
     #[test_case("content-length", SAFE_VALUE, WireError::TransportHeader("content-length".into()) ; "content_length")]
     #[test_case("Transfer-Encoding", SAFE_VALUE, WireError::TransportHeader("Transfer-Encoding".into()) ; "transfer_encoding")]
     #[test_case("connection", SAFE_VALUE, WireError::TransportHeader("connection".into()) ; "connection")]
-    #[test_case("bad header", SAFE_VALUE, WireError::HeaderName("bad header".into()) ; "space_in_the_name")]
-    #[test_case(TITLE_HEADER, "caf\u{e9}", WireError::HeaderValue(TITLE_HEADER.into()) ; "non_ascii_value")]
+    #[test_case("bad header", SAFE_VALUE, WireError::Header(HeaderError::Name("bad header".into())) ; "space_in_the_name")]
     fn a_header_the_wire_cannot_carry_is_refused(name: &str, value: &str, expected: WireError) {
         let error = wire(json!({ "headers": { name: value } }))
             .err()
@@ -814,8 +796,9 @@ mod tests {
     fn declared_headers_are_sent_under_canonical_names() {
         let wire = wire(json!({ "headers": { TITLE_HEADER: SAFE_VALUE } })).unwrap();
 
+        let sent: Vec<_> = header_pairs(wire.request_headers()).collect();
         assert_eq!(
-            wire.request_headers(),
+            sent,
             [(TITLE_HEADER.to_ascii_lowercase().as_str(), SAFE_VALUE)]
         );
     }
@@ -872,20 +855,24 @@ mod tests {
         .unwrap();
         let mut body = json!({});
 
-        carrier.apply(&session, &mut body, &mut auth);
+        carrier.apply(&session, &mut body, &mut auth).unwrap();
 
         assert_eq!(body, json!({ CACHE_KEY_FIELD: session.as_str() }));
+        let sent: Vec<_> = auth.headers().collect();
         assert_eq!(
-            auth.headers,
+            sent,
             [
-                (AFFINITY_HEADER.to_owned(), session.to_string()),
-                (SECOND_HEADER.to_ascii_lowercase(), session.to_string()),
+                (AFFINITY_HEADER, session.as_str()),
+                (
+                    SECOND_HEADER.to_ascii_lowercase().as_str(),
+                    session.as_str()
+                ),
             ]
         );
     }
 
     #[test_case("Host", WireError::TransportHeader("Host".into()) ; "transport_header")]
-    #[test_case("bad header", WireError::HeaderName("bad header".into()) ; "invalid_name")]
+    #[test_case("bad header", WireError::Header(HeaderError::Name("bad header".into())) ; "invalid_name")]
     fn a_session_header_the_wire_cannot_carry_is_refused(name: &str, expected: WireError) {
         let error = carrier(json!({ "headers": [name] }))
             .err()

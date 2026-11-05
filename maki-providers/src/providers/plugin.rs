@@ -1927,7 +1927,9 @@ mod tests {
     }
 
     fn token(entry: &PluginEntry) -> String {
-        entry.auth.current.lock().unwrap().headers[0].1.clone()
+        entry.auth.current.lock().unwrap().header_list()[0]
+            .1
+            .clone()
     }
 
     fn base_url(slug: &str) -> Option<String> {
@@ -2247,7 +2249,7 @@ mod tests {
         };
         let entry = entry(SLUG).unwrap();
         let auth = entry.auth.current.lock().unwrap();
-        assert_eq!(auth.headers, [(header.to_string(), value)]);
+        assert_eq!(auth.header_list(), [(header.to_string(), value)]);
     }
 
     /// Tier defaults are looked up through `default`, like in a curated table.

@@ -1,12 +1,11 @@
 use std::borrow::Cow;
-use std::fmt::Display;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::TryStreamExt;
 use maki_storage::id::MakiId;
-use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::header::HeaderMap;
 use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -120,13 +119,7 @@ impl OpenAiCompatProvider {
         auth: &ResolvedAuth,
         url: &str,
     ) -> Result<String, AgentError> {
-        let request = auth
-            .configure_request(
-                self.client
-                    .get(url)
-                    .header("user-agent", super::user_agent()),
-            )
-            .build()?;
+        let request = auth.finish(self.client.get(url))?;
         super::ok_text(&self.client, request).await
     }
 
@@ -137,17 +130,12 @@ impl OpenAiCompatProvider {
         content_type: &str,
         body: &[u8],
     ) -> Result<String, AgentError> {
-        let mut builder = self
-            .client
-            .post(url)
-            .header("user-agent", super::user_agent());
-        for (key, value) in &auth.headers {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-        let request = builder
-            .header("content-type", content_type)
-            .body(body.to_vec())
-            .build()?;
+        let request = auth.finish(
+            self.client
+                .post(url)
+                .header("content-type", content_type)
+                .body(body.to_vec()),
+        )?;
         super::ok_text(&self.client, request).await
     }
 
@@ -204,39 +192,29 @@ impl OpenAiCompatProvider {
 
     fn build_request(&self, method: Method, path: &str, auth: &ResolvedAuth) -> RequestBuilder {
         let base = self.base_url(auth);
-        auth.configure_request(
-            self.client
-                .request(method, format!("{base}{path}"))
-                .header("user-agent", super::user_agent()),
-        )
+        self.client.request(method, format!("{base}{path}"))
     }
 
-    /// Where a provider's own headers meet the credentials. A header already on
-    /// the request wins: no denylist could say which headers carry a
-    /// credential (`x-api-key`, `api-key`, `x-goog-api-key`, ...), so whatever
-    /// the auth layer wrote stays, key rotation included.
+    /// Where a declaration's static headers meet maki's and the credentials.
+    /// They go over maki's own and under the credentials: no denylist could
+    /// say which headers carry a credential (`x-api-key`, `api-key`,
+    /// `x-goog-api-key`, ...), so whatever the auth layer wrote stays, key
+    /// rotation included.
     pub async fn do_stream(
         &self,
         model: &crate::model::Model,
-        extra_headers: &[(&str, &str)],
+        declared_headers: &HeaderMap,
         body: &Value,
         event_tx: &UnboundedSender<ProviderEvent>,
         auth: &ResolvedAuth,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
-        let mut request = self
-            .build_request(Method::POST, "/chat/completions", auth)
-            .header("content-type", "application/json")
-            .body(json_body)
-            .build()?;
-        for &(key, value) in extra_headers {
-            if request.headers().contains_key(key) {
-                debug!(header = key, "kept the header already on the request");
-                continue;
-            }
-            let (name, value) = extra_header(key, value)?;
-            request.headers_mut().append(name, value);
-        }
+        let request = auth.finish(
+            self.build_request(Method::POST, "/chat/completions", auth)
+                .header("content-type", "application/json")
+                .headers(declared_headers.clone())
+                .body(json_body),
+        )?;
 
         debug!(
             model = %model.id,
@@ -322,18 +300,6 @@ impl OpenAiCompatProvider {
         self.fetch_and_parse_models(auth, MODELS_PATH, Self::default_model_parser)
             .await
     }
-}
-
-/// The codec validated declared headers when it built the provider, so this
-/// cannot fail in practice; it keeps a stray one a config error, not a panic.
-fn extra_header(key: &str, value: &str) -> Result<(HeaderName, HeaderValue), AgentError> {
-    let invalid = |e: &dyn Display| AgentError::Config {
-        message: format!("request error: invalid header {key}: {e}"),
-    };
-    Ok((
-        HeaderName::from_bytes(key.as_bytes()).map_err(|e| invalid(&e))?,
-        HeaderValue::from_str(value).map_err(|e| invalid(&e))?,
-    ))
 }
 
 pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
@@ -840,6 +806,7 @@ mod tests {
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
 
+    use crate::headers::parse_headers;
     use crate::model::{Model, ModelPricing, ModelTier};
     use crate::test_support::{Canned, serve, sse_body};
 
@@ -862,6 +829,9 @@ mod tests {
         MODELS_URL_PATH,
         Canned::json(200, r#"{"data":[{"id":"test-model"}]}"#),
     )];
+    const REJECTED_SCRIPT: &[Canned] = &[Canned::json(400, r#"{"error":{"message":"rejected"}}"#)];
+    const DECLARED_AGENT: &str = "declared-agent";
+    const CREDENTIAL_AGENT: &str = "credential-agent";
     const COUNTS_SURVIVE_A_BAD_COST: &str =
         "a price we cannot read must not take the token counts down with it";
     const TOOL_NAME: &str = "word_count";
@@ -1643,6 +1613,35 @@ data: [DONE]\n\n";
             "{ENCODINGS_ARE_RECORDED}: {encodings}"
         );
         assert_eq!(headers[USER_AGENT_HEADER], super::super::user_agent());
+    }
+
+    /// maki's own user agent, then the declaration's, then the credentials':
+    /// each replaces the one below it, and only one ever goes out.
+    #[test_case(None, DECLARED_AGENT ; "declared_over_makis")]
+    #[test_case(Some(CREDENTIAL_AGENT), CREDENTIAL_AGENT ; "credentials_over_declared")]
+    #[tokio::test]
+    async fn each_header_layer_replaces_the_one_below(credential: Option<&str>, expected: &str) {
+        let (base_url, requests) = serve(REJECTED_SCRIPT);
+        let credentials = credential
+            .map(|agent| (USER_AGENT_HEADER.to_owned(), agent.to_owned()))
+            .into_iter()
+            .collect();
+        let auth = ResolvedAuth::for_test(Some(base_url), credentials);
+        let declared = parse_headers([(USER_AGENT_HEADER, DECLARED_AGENT)]).unwrap();
+        let (tx, _rx) = unbounded_channel();
+
+        let _ = test_provider()
+            .do_stream(
+                &test_model(ModelFamily::Generic),
+                &declared,
+                &json!({}),
+                &tx,
+                &auth,
+            )
+            .await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].headers.values(USER_AGENT_HEADER), [expected]);
     }
 
     #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]
