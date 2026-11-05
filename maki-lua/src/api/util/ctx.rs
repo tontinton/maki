@@ -8,7 +8,7 @@ use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{
     Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive, ToolOutputMode,
 };
-use maki_agent::{AgentEvent, AgentSeed, ToolPart};
+use maki_agent::{AgentEvent, AgentSeed, TaskLabel, ToolPart};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::{MakiId, SessionRef};
 use mlua::{
@@ -21,6 +21,7 @@ use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, err_pair, pair};
+use crate::background::BackgroundTasks;
 use crate::runtime::{
     MoveOutcome, RestoreReason, SUBAGENT_SELF_MOVE_MSG, TaskHandle, active_task, lock_cell,
     move_self,
@@ -41,6 +42,9 @@ const NESTED_PARTS_MSG: &str =
     "set_parts: only a model's own call is a task, a call nested in another has no parts";
 const PART_STATUS_ERR: &str =
     "set_parts: status must be \"working\", \"done\", \"error\" or \"cancelled\"";
+const NOT_MOVED_PART_MSG: &str = "report_part: the call has not moved to the background";
+const NO_PART_NOW_MSG: &str =
+    "report_part: the call stopped or replied, or nothing waits on it any more";
 const EXPIRE_BACKGROUND: &str = "background";
 const EXPIRE_TIMEOUT: &str = "timeout";
 
@@ -513,6 +517,26 @@ impl UserData for LuaCtx {
                 MoveOutcome::NoHook => err_pair(NO_BACKGROUND_HOOK_FOR_MOVE_MSG),
                 MoveOutcome::NotMovable(reason) => (None, Some(reason)),
             })
+        });
+
+        // In a moved call that runs other tools, a slow one should not hold
+        // back a quick one, so each result can go to the model as it lands.
+        methods.add_method("report_part", |lua, this, part: Table| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("report_part"));
+            };
+            let Some(home) = agent.call.as_ref().and_then(|call| call.home()) else {
+                return Ok(err_pair(NOT_MOVED_PART_MSG));
+            };
+            let tool: String = part.get("tool")?;
+            let name: Option<String> = part.opt("name")?;
+            let output: String = part.opt("output")?.unwrap_or_default();
+            let failed = part.opt_bool("is_error").unwrap_or(false);
+            let label = TaskLabel::new(&tool, name.as_deref());
+            if !BackgroundTasks::of(lua).report_part(&home.id, &label, failed, &output) {
+                return Ok(err_pair(NO_PART_NOW_MSG));
+            }
+            Ok((Some(true), None))
         });
 
         methods.add_method("backgrounded", |_, this, ()| {

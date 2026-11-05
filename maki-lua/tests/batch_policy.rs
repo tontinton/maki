@@ -13,11 +13,12 @@ use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
 use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
 use maki_agent::{
     AgentEvent, AgentMode, AgentSeed, BufferSnapshot, Envelope, EventSender, PartStatus,
-    SessionMailbox, SharedBuf, SpanStyle, ToolDoneEvent, ToolOutput,
+    SessionMailbox, SharedBuf, SpanStyle, TaskLabel, ToolDoneEvent, ToolOutput, result_notice,
 };
 use maki_config::ToolOutputLines;
 use maki_lua::test_support::runtime;
 use maki_lua::{KILL_GRACE, MoveOutcome, PluginHost, PluginPermissions, UiAction};
+use maki_providers::{TaskAnswer, TaskSettled};
 use serde_json::{Value, json};
 
 const BATCH_PLUGIN_SRC: &str = include_str!("../../plugins/batch/init.lua");
@@ -76,7 +77,7 @@ const HOOKED_TOOL: &str = "hooked";
 const RELEASE_CHILD_TOOL: &str = "release_child";
 const IS_PARKED_TOOL: &str = "is_parked";
 const IS_PARKED_TEXT: &str = "true";
-const MOVED_HEADER: &str = "Still running in the background:";
+const MOVED_HEADER: &str = "Still running in the background, each reports back as it finishes:";
 const MOVED_BY_USER: &str = "Moved to the background by the user";
 const MOVED_AS_ASKED: &str = "Started in the background as asked";
 const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
@@ -1627,6 +1628,55 @@ fn batch_moves_with_finished_results_inline_and_replies_with_the_late_children()
         )
     );
     assert_eq!(batch.mailbox.drain().len(), 1);
+}
+
+/// An early child reads just like a call that moved alone, so the model and
+/// the transcript need nothing new to make sense of it.
+#[test]
+fn a_moved_batch_reports_each_child_as_it_lands() {
+    let (batch, call) = MovableBatch::start(json!([
+        { "tool": HOOKED_TOOL, "parameters": { "tag": "a" } },
+        { "tool": HOOKED_TOOL, "parameters": { "tag": "b" } },
+    ]));
+    batch.wait_parked("a");
+    batch.wait_parked("b");
+    assert_eq!(batch.press(), MoveOutcome::Moved);
+    assert!(call.join().expect("batch thread").backgrounded);
+
+    batch.release("a");
+    let notices = poll_until("the first child never woke the model", || {
+        Some(batch.mailbox.claim_wake()).filter(|notices| !notices.is_empty())
+    });
+    let (text, display, end) = result_notice(
+        &TaskLabel::new(HOOKED_TOOL, Some("a")),
+        BATCH_ID,
+        false,
+        false,
+        "hooked:a",
+    );
+    let [notice] = notices.as_slice() else {
+        panic!("one notice per child: {notices:?}");
+    };
+    assert_eq!(notice.first_text_content(), Some(text.as_str()));
+    assert_eq!(notice.display_text.as_deref(), Some(display.as_str()));
+    assert_eq!(
+        notice.answers,
+        Some(TaskAnswer::Part(TaskSettled {
+            task: BATCH_ID.into(),
+            end
+        }))
+    );
+
+    batch.release("b");
+    assert_eq!(
+        batch.task_done().output.as_text(),
+        format!("{}{}", section(HOOKED_TOOL, "hooked:b"), summary_all_ok(1))
+    );
+    let rest = batch.mailbox.drain();
+    assert!(
+        matches!(rest.as_slice(), [last] if last.settles().is_some()),
+        "{rest:?}"
+    );
 }
 
 /// A decline names the child that cannot move and leaves the batch untouched:
