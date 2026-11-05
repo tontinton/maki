@@ -91,7 +91,7 @@ maki auth logout <provider>
 maki auth status
 ```
 
-`login` stores credentials under the state directory and can write plan / base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). OpenAI and Copilot have dedicated flows; other providers prompt for a key (and a plan when the provider has more than one). Custom providers can be created from the interactive picker.
+`login` stores credentials under the state directory and can write plan / base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). OpenAI and Copilot have dedicated flows; other providers prompt for a key (and a plan when the provider has more than one). Custom providers can be created from the interactive picker. When Codex's `config.toml` defines providers maki does not have, the picker also offers to [import them](/docs/providers/#import-from-codex).
 
 `status` shows each provider as configured (key on disk), env-only, or missing.
 
