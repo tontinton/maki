@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource};
+use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource, SessionMailbox};
 use maki_lua::agent_autocmd::HostEvent;
 
 use super::{Action, App, Status};
@@ -34,7 +34,6 @@ impl MessageQueue {
         self.shared = Some(shared);
     }
 
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.shared.as_ref().is_none_or(|s| s.is_empty())
     }
@@ -282,7 +281,21 @@ impl App {
         self.start_run(input, msg.text.clone())
     }
 
-    pub(crate) fn start_mailbox_run(
+    pub(crate) fn start_woken_run(&mut self) -> Vec<Action> {
+        if !self.takes_wake() {
+            return Vec::new();
+        }
+        let preamble = self
+            .live_mailbox()
+            .map(SessionMailbox::claim_wake)
+            .unwrap_or_default();
+        if preamble.is_empty() {
+            return Vec::new();
+        }
+        self.start_mailbox_run(preamble)
+    }
+
+    pub(super) fn start_mailbox_run(
         &mut self,
         preamble: Vec<maki_providers::Message>,
     ) -> Vec<Action> {

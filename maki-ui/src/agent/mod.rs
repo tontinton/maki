@@ -146,10 +146,6 @@ impl AgentHandles {
         }
     }
 
-    pub(crate) fn claim_mailbox_wake(&self) -> Vec<Message> {
-        self.mailbox.claim_wake()
-    }
-
     pub(crate) fn mailbox(&self) -> &SessionMailbox {
         &self.mailbox
     }

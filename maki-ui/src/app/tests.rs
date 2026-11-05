@@ -4572,6 +4572,29 @@ fn checkpoint_keeps_pending_background(held: bool, expected: &[&str]) {
     );
 }
 
+/// Between a result settling and its run starting, the session must still look
+/// busy, or the turn would notify just before the agent works again. Whatever
+/// holds the wake back leaves Maki waiting on the user, except queued input,
+/// which runs on its own and takes the notices with it.
+#[test_case(|_| {}, true, true ; "wake_starts_a_run")]
+#[test_case(|app| app.queue_compact(None), true, false ; "queued_input_runs_first")]
+#[test_case(|app| app.recoverable_queue = vec![RECOVERED_PROMPT.into()], false, false ; "recovery_text_holds_the_wake")]
+#[test_case(|app| app.exit_request = ExitRequest::Error, false, false ; "failed_exit_holds_the_wake")]
+#[test_case(|app| app.chats[MAIN_CHAT].auth_parked = true, false, false ; "prompt_holds_the_wake")]
+fn a_pending_wake_is_work_only_while_it_may_run(
+    hold: fn(&mut App),
+    working: bool,
+    starts_run: bool,
+) {
+    let mut app = test_app();
+    hold_mailbox(&mut app);
+    SessionMailbox::notify(app.state.session.id, NOTICE_LINE.into(), None, true).unwrap();
+    hold(&mut app);
+
+    assert_eq!(app.is_working(), working);
+    assert_eq!(!app.start_woken_run().is_empty(), starts_run);
+}
+
 /// Receipts the stored session left unanswered come back as lost notices,
 /// once however often it is installed, and the meta keeps them until a run
 /// takes them.
@@ -12351,8 +12374,8 @@ fn exit_on_done_app(background_wait: Option<Duration>) -> (App, SessionMailbox) 
     (app, mailbox)
 }
 
-/// A failed turn exits with its error: neither the wait nor a woken run may
-/// turn it into a success.
+/// A failed turn exits with its error. The background wait must not hold it
+/// until a woken run turns it into a success.
 #[test]
 fn exit_on_done_exits_a_failed_turn_without_waiting() {
     let (mut app, _mailbox) = exit_on_done_app(Some(BACKGROUND_WAIT));
@@ -12364,7 +12387,6 @@ fn exit_on_done_exits_a_failed_turn_without_waiting() {
 
     assert_eq!(app.exit_request, ExitRequest::Error);
     assert!(!app.awaits_background(Instant::now()));
-    assert!(!app.takes_mailbox_runs());
 }
 
 /// One deadline from the first held exit covers the whole wait, so a woken

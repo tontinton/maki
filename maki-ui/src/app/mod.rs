@@ -2300,16 +2300,44 @@ impl App {
         vec![]
     }
 
-    /// The turn, or background work that outlives it. Never a bar on input:
-    /// the bar spins and the session reads "working", but a prompt still
-    /// starts right away. Receipts count too, so a task whose tab closed
-    /// before its result woke the agent leaves no idle gap in between.
+    /// True while something goes on without the user. Once it turns false
+    /// Maki waits on them, and that is when a finished turn notifies. It never
+    /// blocks input: the bar spins and the session reads "working", but a new
+    /// prompt still starts right away.
+    ///
+    /// Receipts count, so a task whose tab already closed leaves no idle gap
+    /// before its result wakes the agent. A wake that
+    /// [`Self::start_woken_run`] is about to claim counts for the same reason.
     pub(crate) fn is_working(&self) -> bool {
-        self.status == Status::Streaming
+        self.runs_turn()
             || self.running_background_tasks().next().is_some()
-            || self
-                .live_mailbox()
-                .is_some_and(|mailbox| mailbox.outstanding() > 0)
+            || self.live_mailbox().is_some_and(|mailbox| {
+                let backlog = mailbox.backlog();
+                backlog.running || (backlog.wake && self.takes_wake())
+            })
+    }
+
+    /// Queued input counts as a turn. The agent loop starts its run by itself,
+    /// and restored queue items never pass through `start_run`, so the status
+    /// alone would miss them.
+    fn runs_turn(&self) -> bool {
+        self.status == Status::Streaming || !self.queue.is_empty()
+    }
+
+    /// Whether a pending wake may start its run now. [`Self::is_working`] and
+    /// [`Self::start_woken_run`] both ask here, so the session never looks
+    /// busy for a wake that will not run, or idle for one that will.
+    ///
+    /// A turn that runs or is queued picks up the notices by itself, and a
+    /// prompt means the user goes first. A woken run would also wipe two
+    /// things the user still needs: the text kept for recovery after an agent
+    /// error (`start_run` clears it), and the error a failed `--exit-on-done`
+    /// turn exits with.
+    fn takes_wake(&self) -> bool {
+        !self.runs_turn()
+            && !self.awaiting_input()
+            && self.recoverable_queue.is_empty()
+            && self.exit_request != ExitRequest::Error
     }
 
     fn status_motion(&self) -> Motion<'_> {
@@ -2409,12 +2437,6 @@ impl App {
             && self
                 .live_mailbox()
                 .is_some_and(|mailbox| mailbox.outstanding() > 0)
-    }
-
-    /// A woken run would clear the error a failed `--exit-on-done` turn
-    /// exits with, so such a session takes none.
-    pub(crate) fn takes_mailbox_runs(&self) -> bool {
-        self.exit_request != ExitRequest::Error
     }
 
     pub(crate) fn clear_exit_request(&mut self) {
@@ -3272,12 +3294,6 @@ impl App {
     /// session status.
     pub(crate) fn awaiting_input(&self) -> bool {
         self.permission_prompt.is_open() || self.turn_awaits_auth() || self.float_mgr.needs_input()
-    }
-
-    /// True while `recoverable_queue` holds user text captured at an agent
-    /// error; a background run would wipe it (`start_run` clears the queue).
-    pub(crate) fn holds_recovery_text(&self) -> bool {
-        !self.recoverable_queue.is_empty()
     }
 
     pub(crate) fn attention(&self) -> Option<Notification> {

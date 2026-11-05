@@ -96,6 +96,18 @@ impl TaskLabel {
     }
 }
 
+/// Work that goes on without the user. Both flags come from one lock on
+/// purpose. Settling trades a receipt for its wake in a single step, and two
+/// separate reads could land on either side of it, see neither, and make the
+/// session look idle for a moment.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Backlog {
+    /// Some receipt's work still runs.
+    pub running: bool,
+    /// A notice waits to start a run, see [`SessionMailbox::claim_wake`].
+    pub wake: bool,
+}
+
 /// The result of a background task, for the run that holds its receipt.
 pub struct BackgroundNotice<'a> {
     pub text: String,
@@ -442,6 +454,14 @@ impl SessionMailbox {
     /// Background work still running for this mailbox's receipts.
     pub fn outstanding(&self) -> usize {
         lock(&self.live.mailbox).outstanding.len()
+    }
+
+    pub fn backlog(&self) -> Backlog {
+        let mailbox = lock(&self.live.mailbox);
+        Backlog {
+            running: !mailbox.outstanding.is_empty(),
+            wake: mailbox.wake,
+        }
     }
 
     /// The receipts a stored session left unsettled, each answered with a
@@ -845,10 +865,22 @@ mod tests {
         let mailbox = SessionMailbox::register(MakiId::generate());
         mailbox.track(TASK_ID);
         assert_eq!(mailbox.unsettled(), [TASK_ID]);
-        assert_eq!(mailbox.outstanding(), 1);
+        assert_eq!(
+            mailbox.backlog(),
+            Backlog {
+                running: true,
+                wake: false
+            }
+        );
 
         mailbox.settle(TASK_ID, result(true));
-        assert_eq!(mailbox.outstanding(), 0);
+        assert_eq!(
+            mailbox.backlog(),
+            Backlog {
+                running: false,
+                wake: true
+            }
+        );
         assert_eq!(mailbox.unsettled(), [TASK_ID]);
 
         assert_eq!(text(&mailbox.claim_wake()[0]), NOTICE_BODY);
