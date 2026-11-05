@@ -379,7 +379,7 @@ impl World {
     /// What the event loop does for an idle chat whose mailbox holds a wake:
     /// claim it and start a run with the notices as its preamble.
     fn claim_wake(&self) -> Vec<Message> {
-        self.handles.claim_mailbox_wake()
+        self.handles.mailbox().claim_wake()
     }
 
     fn start_wake_run(&self, run_id: u64, preamble: Vec<Message>) {

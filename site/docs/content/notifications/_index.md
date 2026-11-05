@@ -12,8 +12,10 @@ when you move to another terminal while Maki works.
 
 Notifications are enabled by default. A prompt that waits on you always
 notifies, because the agent stays parked until you answer. `Agent turn
-complete` is skipped only when Maki can tell you are watching: the terminal
-reported focus, or you typed in the last 30 seconds.
+complete` comes once Maki has nothing left to do. If background tasks still
+run when a turn ends, it waits for them and for any turn their results start.
+It is skipped when Maki can tell you are watching:
+the terminal reported focus, or you typed in the last 30 seconds.
 
 Maki uses these messages:
 
