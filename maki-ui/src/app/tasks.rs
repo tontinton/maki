@@ -381,9 +381,9 @@ impl App {
 
     /// A moved call keeps streaming into the buf its row was drawing. So its
     /// task tab starts as a copy of that row, holding the same buf: nothing
-    /// is replayed and nothing is lost. This runs before the row in {origin}
-    /// takes the receipt, because the receipt retires the buf there. A `task`
-    /// call already has a tab, its subagent's, and that tab is adopted.
+    /// is replayed and nothing is lost. The row in {origin} keeps drawing the
+    /// buf's head until its badge gets an outcome. A `task` call already has
+    /// a tab, its subagent's, and that tab is adopted.
     pub(super) fn open_background_call(&mut self, origin: usize, done: &ToolDoneEvent) {
         let mut outcome = None;
         if let Ok(idx) = self.chat_of_task(&done.id) {

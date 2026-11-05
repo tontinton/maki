@@ -422,7 +422,8 @@ end
 function Batch:rerender()
   local lines, ranges = render_children(self.children)
   self.ranges = ranges
-  self.buf:set_lines(lines)
+  -- All head: a moved batch keeps drawing its children in its row.
+  self.buf:set_lines(lines, { head = #lines })
 end
 
 -- A child's buf keeps changing after we get it (async highlights land

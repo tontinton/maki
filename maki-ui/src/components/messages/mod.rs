@@ -104,6 +104,8 @@ pub struct MessagesPanel {
     expanded_tools: HashMap<String, SectionFlags>,
     /// Per-tool log of post-completion click rows, replayed on restore.
     lua_clicks: HashMap<String, Vec<usize>>,
+    /// Bufs of rows that stream, kept apart from `watched_bufs` by
+    /// [`Self::sync_buf`] alone.
     live_bufs: HashMap<String, BufWatch>,
     /// Bufs of finished tools we keep polling so runtime-side warm
     /// clicks stay visible. Purely local: every finished-tool click
@@ -319,25 +321,24 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        let had_live_buf = self.retire_live_buf(&event.id);
-        let Some(msg) = self
-            .messages
-            .iter_mut()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == event.id))
-        else {
+        if let Some(msg) = self.find_tool_msg_mut(&event.id) {
+            if let DisplayRole::Tool(t) = &mut msg.role {
+                t.status = if event.is_error {
+                    ToolStatus::Error
+                } else {
+                    ToolStatus::Success
+                };
+            }
+            msg.movable = false;
+            if event.backgrounded && msg.background.is_none() {
+                msg.background = Some(BackgroundBadge::moved(&event));
+            }
+        }
+        let had_buf = self.sync_buf(&event.id);
+        let max_output_lines = self.tool_output_lines.get(&event.tool);
+        let Some(msg) = self.find_tool_msg_mut(&event.id) else {
             return;
         };
-        if let DisplayRole::Tool(t) = &mut msg.role {
-            t.status = if event.is_error {
-                ToolStatus::Error
-            } else {
-                ToolStatus::Success
-            };
-        }
-        msg.movable = false;
-        if event.backgrounded && msg.background.is_none() {
-            msg.background = Some(BackgroundBadge::moved(&event));
-        }
         truncate_to_header(&mut msg.text);
         let done_annotation = event
             .annotation
@@ -352,7 +353,7 @@ impl MessagesPanel {
             ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
                 if msg.render_snapshot.is_none() =>
             {
-                if had_live_buf && !event.backgrounded {
+                if had_buf && !event.backgrounded {
                     // The plugin streamed a body buf but no snapshot ever
                     // landed: this is the raw llm_output glitch users report.
                     warn!(
@@ -362,7 +363,7 @@ impl MessagesPanel {
                         "live buf had no snapshot at tool_done; falling back to llm_output"
                     );
                 }
-                let tr = truncate_output(&text.text, self.tool_output_lines.get(&event.tool));
+                let tr = truncate_output(&text.text, max_output_lines);
                 msg.truncated_lines = tr.skipped;
                 if !tr.kept.is_empty() {
                     msg.text = format!("{}\n{}", msg.text, tr.kept);
@@ -380,12 +381,12 @@ impl MessagesPanel {
 
     /// Ends a row that no `ToolDone` will reach.
     pub fn settle_tool(&mut self, tool_id: &str, status: ToolStatus) {
-        self.retire_live_buf(tool_id);
         self.update_tool(tool_id, |msg| {
             if let DisplayRole::Tool(tool) = &mut msg.role {
                 tool.status = status;
             }
         });
+        self.sync_buf(tool_id);
     }
 
     pub fn set_tool_movable(&mut self, tool_id: &str, movable: bool) {
@@ -394,6 +395,7 @@ impl MessagesPanel {
 
     pub fn set_tool_background(&mut self, tool_id: &str, badge: BackgroundBadge) {
         self.update_tool(tool_id, |msg| msg.background = Some(badge));
+        self.sync_buf(tool_id);
     }
 
     pub fn set_background_outcome(&mut self, tool_id: &str, outcome: BackgroundOutcome) {
@@ -402,6 +404,7 @@ impl MessagesPanel {
                 badge.outcome = Some(outcome);
             }
         });
+        self.sync_buf(tool_id);
     }
 
     pub fn has_background_badge(&self, tool_id: &str) -> bool {
@@ -580,9 +583,8 @@ impl MessagesPanel {
 
         for id in &affected_ids {
             // The stale-run_id filter drops these tools' ToolDone events,
-            // so retire their live bufs here: keeps them clickable via
-            // the warm path and stops them being polled forever.
-            self.retire_live_buf(id);
+            // so their bufs settle here.
+            self.sync_buf(id);
             self.rebuild_tool_segment(id);
         }
     }
@@ -829,7 +831,7 @@ impl MessagesPanel {
             return self.try_toggle_cached_thinking(pos.seg, width)
                 || self.try_toggle_cached_notice(pos.seg, width);
         };
-        // A moved row draws only its header, so there is nothing to unfold.
+        // A moved row unfolds in its task's tab, not here.
         if self
             .find_tool_msg(tool_id)
             .is_some_and(|msg| msg.background.is_some())
@@ -1248,23 +1250,33 @@ impl MessagesPanel {
         self.watched_bufs.retain(|(id, _)| id != tool_id);
     }
 
-    /// Moves a finished tool's live buf to the watched set, flushing any
-    /// last dirty lines. Called on completion and on cancellation, so
-    /// `live_bufs` never leaks entries that outlive their tool, and the capped
-    /// watched set keeps what `tick` polls bounded.
-    /// Returns whether a live buf existed for this id.
-    fn retire_live_buf(&mut self, id: &str) -> bool {
-        let Some(mut watch) = self.live_bufs.remove(id) else {
+    /// Files {id}'s buf by what its row is now, after flushing its last
+    /// lines: in `live_bufs` while the row [streams](DisplayMessage::streams),
+    /// else last in the capped watched set. Whatever changes whether a row
+    /// streams calls this, so a buf is live exactly while its call writes
+    /// to it: none outlives its call, and no cap evicts one still in use.
+    /// Returns whether {id} had a buf.
+    fn sync_buf(&mut self, id: &str) -> bool {
+        let watch = self.live_bufs.remove(id).or_else(|| {
+            let pos = self
+                .watched_bufs
+                .iter()
+                .position(|(watched, _)| watched == id)?;
+            self.watched_bufs.remove(pos).map(|(_, watch)| watch)
+        });
+        let Some(mut watch) = watch else {
             return false;
         };
         if let Some(snapshot) = watch.changed() {
             self.store_snapshot(id, snapshot, false, None);
         }
-        // A part's tab registers the same buf again on every report.
-        self.watched_bufs.retain(|(watched, _)| watched != id);
-        self.watched_bufs.push_back((id.to_owned(), watch));
-        if self.watched_bufs.len() > WARM_TOOL_CAP {
-            self.watched_bufs.pop_front();
+        if self.find_tool_msg(id).is_some_and(DisplayMessage::streams) {
+            self.live_bufs.insert(id.to_owned(), watch);
+        } else {
+            self.watched_bufs.push_back((id.to_owned(), watch));
+            if self.watched_bufs.len() > WARM_TOOL_CAP {
+                self.watched_bufs.pop_front();
+            }
         }
         true
     }
@@ -1404,14 +1416,15 @@ impl MessagesPanel {
         }
     }
 
+    /// A buf that comes before its row stays live until the row settles it,
+    /// see [`Self::sync_buf`]. A part's tab registers the same buf again on
+    /// every report.
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
-        let mut watch = BufWatch::new(body);
-        if self.find_tool_msg(&id).is_some()
-            && let Some(snapshot) = watch.changed()
-        {
-            self.store_snapshot(&id, snapshot, false, None);
+        self.stop_watching(&id);
+        self.live_bufs.insert(id.clone(), BufWatch::new(body));
+        if self.find_tool_msg(&id).is_some() {
+            self.sync_buf(&id);
         }
-        self.live_bufs.insert(id, watch);
     }
 
     /// Snapshots are baked at the last width `view` saw, and a resize

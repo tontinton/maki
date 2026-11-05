@@ -455,6 +455,16 @@ impl DisplayMessage {
         (self.render_snapshot.is_some() || self.render_header.is_some())
             && self.snapshot_theme_gen != current_gen
     }
+
+    /// Whether its call still writes to the buf the row draws: a moved call
+    /// until its badge has an outcome, any other one while it runs.
+    pub fn streams(&self) -> bool {
+        match (&self.background, &self.role) {
+            (Some(badge), _) => badge.outcome.is_none(),
+            (None, DisplayRole::Tool(tool)) => tool.status == ToolStatus::InProgress,
+            (None, _) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

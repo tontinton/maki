@@ -3182,6 +3182,41 @@ fn a_moved_row_keeps_its_head_and_follows_it() {
     assert!(view_text(&mut panel).contains(NEW_COMMAND));
 }
 
+/// A long moved call outlives many quick calls after it, and those must not
+/// evict it from what the panel polls before its outcome lands. A move that
+/// races Esc lands on a row Esc already ended, and streams again all the same.
+#[test_case(false ; "moved_while_running")]
+#[test_case(true ; "moved_after_esc")]
+fn a_moved_row_follows_its_buf_until_its_outcome(esc_first: bool) {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.set_lines_with_head(vec![snap_line(COMMAND)], 1);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(MOVABLE_ID, BASH_TOOL_NAME));
+    panel.register_live_buf(MOVABLE_ID.into(), Arc::clone(&buf));
+    if esc_first {
+        panel.cancel_in_progress();
+    }
+    panel.tool_done(backgrounded_done(RECEIPT));
+    for i in 0..=WARM_TOOL_CAP {
+        finish_with_live_buf(&mut panel, &format!("quick{i}"), STREAMED, false);
+    }
+
+    buf.set_lines_with_head(vec![snap_line(NEW_COMMAND)], 1);
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES);
+    let snapshot = panel
+        .find_tool_msg(MOVABLE_ID)
+        .unwrap()
+        .render_snapshot
+        .as_ref();
+    assert_eq!(
+        snapshot.map(BufferSnapshot::text).as_deref(),
+        Some(NEW_COMMAND)
+    );
+
+    panel.set_background_outcome(MOVABLE_ID, BackgroundOutcome::Done);
+    assert!(!panel.live_bufs.contains_key(MOVABLE_ID));
+}
+
 fn unstruck_cancelled(theme: &Theme) -> Style {
     theme.todo_cancelled.remove_modifier(Modifier::CROSSED_OUT)
 }

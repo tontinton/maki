@@ -54,7 +54,7 @@ The status bar confirms the key press:
 |------|----------|-------|
 | `bash` | Yes | Once the process has started. See [Bash logs](#bash-logs). |
 | `task` | Yes | The subagent moves with its transcript and still counts toward `max_concurrent`. One that waits for a free slot cannot move yet. |
-| `batch` | When every running child can move | The receipt holds the children that already finished. The rest arrive with the final result. |
+| `batch` | When every running child can move | The receipt holds the children that already finished. The rest arrive with the final result. Its row keeps showing every child and its status live. |
 | `code_execution` | No | A budgeted script that calls other tools. |
 | MCP tools | No | |
 | `edit`, `write` and other fast tools | No | They finish before a move would matter. |
