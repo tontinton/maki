@@ -119,6 +119,20 @@ fn flashes_until_sentinel(ui: &flume::Receiver<UiAction>) -> Vec<String> {
     }
 }
 
+/// Exactly `n` flashes. A fan-out runs layers in registration order, but callers
+/// that turn the two plugin names into one set sort before asserting.
+fn collect_flashes(ui: &flume::Receiver<UiAction>, n: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        match ui.recv_timeout(DISPATCH_TIMEOUT) {
+            Ok(UiAction::Flash(msg)) => out.push(msg),
+            Ok(_) => {}
+            Err(e) => panic!("expected {n} flashes, got {}: {e}", out.len()),
+        }
+    }
+    out
+}
+
 /// A plugin without `session_read` still hears the event, minus the content,
 /// and is told so once rather than on every event.
 #[test_case("TurnStart" ; "turn_start")]
@@ -549,6 +563,13 @@ const INNER_LAYER: &str = "inner_layer";
 const OUTER_LAYER: &str = "outer_layer";
 const INNER_MARK: &str = ":inner";
 const OUTER_MARK: &str = ":outer";
+const SLOW_LAYER: &str = "slow_layer";
+const BEHIND_LAYER: &str = "behind_layer";
+const SLOW_MARK: &str = ":slow";
+const BEHIND_MARK: &str = ":behind";
+const PARKED_MARK: &str = "parked";
+const RELEASED_MARK: &str = "released";
+const RELEASE_TOOL: &str = "release_monitor";
 /// Far longer than [`HOOK_WINDOW`], so a layer parked on it can only answer
 /// because the window let it, never because the job came back in time.
 const PARKED_FOR: Duration = Duration::from_secs(5);
@@ -1961,6 +1982,7 @@ fn input_layer_may_ask_the_user(answer: &str, rewritten: Option<&str>) {
 const AGENT_MODEL: &str = "anthropic/claude-sonnet-4";
 const KEEP_GOING: &str = "keep going";
 const CONTINUE_FIELD: &str = "continue";
+const SEND_MONITOR_TEXT: &str = "the monitor saw the request";
 
 fn stop_layer() -> String {
     format!(
@@ -2001,6 +2023,432 @@ fn agent_slot_layers_need_full_trust(granted: fn() -> PluginPermissions, runs: b
     assert_eq!(
         matches!(verdict, Verdict::Replaced(value) if value == kept_going),
         runs
+    );
+}
+
+/// A monitor sees the request before it reaches the provider, and its answer
+/// is dropped rather than asked for: a returned rewrite is not a steering.
+/// A monitor's layer takes `(value, ctx)`, with no `prev`: it has nothing to
+/// pass down.
+#[test]
+fn a_message_monitor_observes_and_cannot_rewrite() {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    assert!(!hook.wraps(AgentSlot::MessageSend));
+    let layer = format!(
+        r#"maki.api.set_slot("agent.message.send", function(value, ctx)
+    maki.ui.flash(value.messages[1].content[1].text)
+    maki.ui.flash("{SENTINEL_FLASH}")
+    return {{ messages = {{ "hijacked" }} }}
+end)"#
+    );
+    load_granted(&host, LAYER_PLUGIN, &layer, PluginPermissions::trusted());
+    assert!(hook.wraps(AgentSlot::MessageSend));
+
+    let cancel = CancelToken::none();
+    let call = AgentCall {
+        session_id: None,
+        task_id: None,
+        model: AGENT_MODEL,
+        context_size: 0,
+        context_window: 0,
+        cancel: &cancel,
+        deadline: Instant::now() + DISPATCH_TIMEOUT,
+    };
+    let payload = serde_json::json!({
+        "messages": [{ "content": [{ "text": SEND_MONITOR_TEXT }] }],
+        "system": "",
+        "tools": [],
+    });
+    assert!(
+        matches!(
+            within(hook.run(AgentSlot::MessageSend, payload, &call)),
+            Verdict::Unchanged
+        ),
+        "the monitor's rewrite is dropped, not answered"
+    );
+    let seen = flashes_until_sentinel(&host.ui_action_rx());
+    assert_eq!(seen, vec![SEND_MONITOR_TEXT.to_string()]);
+}
+
+/// Two plugins layering one monitor both fire on the same request. A monitor
+/// is a fan-out, not a chain: one layer never ends it, so the outermost
+/// listener cannot silently swallow every other one.
+#[test]
+fn two_message_monitors_both_see_the_request() {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    let layer = |mark: &str| {
+        format!(
+            r#"maki.api.set_slot("agent.message.send", function(value, ctx)
+    maki.ui.flash("{mark}:" .. value.messages[1].content[1].text)
+end)"#
+        )
+    };
+    load_granted(
+        &host,
+        INNER_LAYER,
+        &layer(INNER_MARK),
+        PluginPermissions::trusted(),
+    );
+    load_granted(
+        &host,
+        OUTER_LAYER,
+        &layer(OUTER_MARK),
+        PluginPermissions::trusted(),
+    );
+    assert!(hook.wraps(AgentSlot::MessageSend));
+
+    let cancel = CancelToken::none();
+    let call = AgentCall {
+        session_id: None,
+        task_id: None,
+        model: AGENT_MODEL,
+        context_size: 0,
+        context_window: 0,
+        cancel: &cancel,
+        deadline: Instant::now() + DISPATCH_TIMEOUT,
+    };
+    let payload = serde_json::json!({
+        "messages": [{ "content": [{ "text": SEND_MONITOR_TEXT }] }],
+        "system": "",
+        "tools": [],
+    });
+    assert!(matches!(
+        within(hook.run(AgentSlot::MessageSend, payload, &call)),
+        Verdict::Unchanged
+    ));
+
+    let mut seen = collect_flashes(&host.ui_action_rx(), 2);
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            format!("{INNER_MARK}:{SEND_MONITOR_TEXT}"),
+            format!("{OUTER_MARK}:{SEND_MONITOR_TEXT}"),
+        ],
+        "every registered monitor fires, each with the request the loop built"
+    );
+}
+
+/// A monitor that raises must not take its neighbours down with it. The
+/// fan-out calls every layer and swallows each error, so the one after a
+/// failing one still sees the request.
+#[test]
+fn a_monitor_error_does_not_silence_the_other_monitors() {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    let failing = r#"maki.api.set_slot("agent.message.send", function(value, ctx)
+    error("boom")
+end)"#;
+    let observing = format!(
+        r#"maki.api.set_slot("agent.message.send", function(value, ctx)
+    maki.ui.flash("{OUTER_MARK}:" .. value.messages[1].content[1].text)
+end)"#
+    );
+    load_granted(&host, INNER_LAYER, failing, PluginPermissions::trusted());
+    load_granted(&host, OUTER_LAYER, &observing, PluginPermissions::trusted());
+
+    let cancel = CancelToken::none();
+    let call = AgentCall {
+        session_id: None,
+        task_id: None,
+        model: AGENT_MODEL,
+        context_size: 0,
+        context_window: 0,
+        cancel: &cancel,
+        deadline: Instant::now() + DISPATCH_TIMEOUT,
+    };
+    let payload = serde_json::json!({
+        "messages": [{ "content": [{ "text": SEND_MONITOR_TEXT }] }],
+        "system": "",
+        "tools": [],
+    });
+    assert!(matches!(
+        within(hook.run(AgentSlot::MessageSend, payload, &call)),
+        Verdict::Unchanged
+    ));
+
+    assert_eq!(
+        collect_flashes(&host.ui_action_rx(), 1),
+        vec![format!("{OUTER_MARK}:{SEND_MONITOR_TEXT}")],
+        "the surviving monitor still fires after its neighbour errored"
+    );
+}
+
+/// Fan-out is per monitor slot, not just the send one (which
+/// `two_message_monitors_both_see_the_request` covers with content). Two layers
+/// on the same name both fire for receive and delta too.
+#[test_case(AgentSlot::MessageReceive ; "receive")]
+#[test_case(AgentSlot::MessageDelta ; "delta")]
+fn two_monitors_of_every_other_slot_both_fire(slot: AgentSlot) {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    let layer = |mark: &str| {
+        format!(
+            r#"maki.api.set_slot("{name}", function(value, ctx)
+    maki.ui.flash("{mark}")
+end)"#,
+            name = slot.name()
+        )
+    };
+    load_granted(
+        &host,
+        INNER_LAYER,
+        &layer(INNER_MARK),
+        PluginPermissions::trusted(),
+    );
+    load_granted(
+        &host,
+        OUTER_LAYER,
+        &layer(OUTER_MARK),
+        PluginPermissions::trusted(),
+    );
+    assert!(hook.wraps(slot));
+
+    let cancel = CancelToken::none();
+    let call = AgentCall {
+        session_id: None,
+        task_id: None,
+        model: AGENT_MODEL,
+        context_size: 0,
+        context_window: 0,
+        cancel: &cancel,
+        deadline: Instant::now() + DISPATCH_TIMEOUT,
+    };
+    assert!(matches!(
+        within(hook.run(slot, serde_json::json!({}), &call)),
+        Verdict::Unchanged
+    ));
+
+    let mut seen = collect_flashes(&host.ui_action_rx(), 2);
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![INNER_MARK.to_string(), OUTER_MARK.to_string()],
+        "every registered layer of {slot:?} fires"
+    );
+}
+
+/// A delta monitor that parks costs the producer its turn: the hook does not
+/// answer until the fan-out is done, so a monitor that never returns cannot
+/// leave unbounded work behind on the Lua thread.
+#[test]
+fn a_delta_monitor_that_parks_holds_the_hook() {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    load_granted(
+        &host,
+        LAYER_PLUGIN,
+        &format!(
+            r#"
+local parked = nil
+maki.api.set_slot("agent.message.delta", function(value, ctx)
+    maki.ui.flash("{PARKED_MARK}")
+    maki.async.await(1, function(cb) parked = cb end)
+    maki.ui.flash("{RELEASED_MARK}")
+end)
+maki.api.register_tool({{
+    name = "{RELEASE_TOOL}",
+    description = "release",
+    schema = {PROBE_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        if parked then
+            local cb = parked
+            parked = nil
+            cb()
+        end
+        return "ok"
+    end,
+}})"#
+        ),
+        PluginPermissions::trusted(),
+    );
+    assert!(hook.wraps(AgentSlot::MessageDelta));
+
+    let (done_tx, done_rx) = flume::bounded(1);
+    let worker = {
+        let reg = Arc::clone(&reg);
+        std::thread::spawn(move || {
+            let verdict = within(hook.run(
+                AgentSlot::MessageDelta,
+                serde_json::json!({ "kind": "text", "text": "x" }),
+                &AgentCall {
+                    session_id: None,
+                    task_id: None,
+                    model: AGENT_MODEL,
+                    context_size: 0,
+                    context_window: 0,
+                    cancel: &CancelToken::none(),
+                    deadline: Instant::now() + DISPATCH_TIMEOUT,
+                },
+            ));
+            done_tx.send(verdict).ok();
+            drop(reg);
+        })
+    };
+
+    // The fan-out reached the park, which is the only way the first mark lands.
+    assert_eq!(
+        collect_flashes(&host.ui_action_rx(), 1),
+        vec![PARKED_MARK.to_string()]
+    );
+    assert!(
+        done_rx.try_recv().is_err(),
+        "the hook must not answer while the monitor is still parked"
+    );
+
+    assert_eq!(exec_tool(&reg, RELEASE_TOOL), "ok");
+
+    assert!(
+        matches!(
+            done_rx.recv_timeout(DISPATCH_TIMEOUT),
+            Ok(Verdict::Unchanged)
+        ),
+        "releasing the monitor lets the hook answer"
+    );
+    assert_eq!(
+        collect_flashes(&host.ui_action_rx(), 1),
+        vec![RELEASED_MARK.to_string()]
+    );
+    worker.join().expect("worker thread");
+}
+
+/// The entitlement filter applies inside the fan-out too: a plugin without the
+/// agent capability has its monitor layer dropped, so the entitled neighbour is
+/// the only one that fires.
+#[test]
+fn a_monitor_layer_without_the_capability_is_dropped_from_the_fanout() {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    let layer = |body: &str| {
+        format!(
+            r#"maki.api.set_slot("agent.message.send", function(value, ctx)
+    {body}
+end)"#
+        )
+    };
+    load_granted(
+        &host,
+        INNER_LAYER,
+        &layer(&format!(r#"maki.ui.flash("{INNER_MARK}")"#)),
+        PluginPermissions::denied(),
+    );
+    load_granted(
+        &host,
+        OUTER_LAYER,
+        &layer(&format!(
+            r#"maki.ui.flash("{OUTER_MARK}")
+    maki.ui.flash("{SENTINEL_FLASH}")"#
+        )),
+        PluginPermissions::trusted(),
+    );
+    assert!(hook.wraps(AgentSlot::MessageSend));
+
+    let cancel = CancelToken::none();
+    let call = AgentCall {
+        session_id: None,
+        task_id: None,
+        model: AGENT_MODEL,
+        context_size: 0,
+        context_window: 0,
+        cancel: &cancel,
+        deadline: Instant::now() + DISPATCH_TIMEOUT,
+    };
+    assert!(matches!(
+        within(hook.run(AgentSlot::MessageSend, serde_json::json!({}), &call)),
+        Verdict::Unchanged
+    ));
+
+    let seen = flashes_until_sentinel(&host.ui_action_rx());
+    assert!(
+        seen.iter().any(|m| m == OUTER_MARK),
+        "the entitled monitor fires: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|m| m.contains(INNER_MARK)),
+        "the unentitled monitor never runs: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|m| m.contains(INNER_LAYER)),
+        "the skip names the unentitled layer: {seen:?}"
+    );
+}
+
+/// The fan-out runs under ONE deadline for the whole firing. A slow layer that
+/// burns it makes `until_abandoned` drop the fan-out future, so any layer
+/// registered after the slow one is skipped for that firing. This pins the
+/// current semantics: it should fail the day we move to per-layer scoping.
+#[test]
+fn a_slow_monitor_layer_drops_the_layers_behind_it() {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    // A fan-out runs layers in registration order, so SLOW_LAYER fires first
+    // and parks past the budget; BEHIND_LAYER, registered after it, is skipped.
+    load_granted(
+        &host,
+        SLOW_LAYER,
+        &format!(
+            r#"maki.api.set_slot("agent.message.send", function(value, ctx)
+    maki.ui.flash("{SLOW_MARK}")
+    maki.async.await(1, function(cb) end)
+end)"#
+        ),
+        PluginPermissions::trusted(),
+    );
+    load_granted(
+        &host,
+        BEHIND_LAYER,
+        &format!(
+            r#"maki.api.set_slot("agent.message.send", function(value, ctx)
+    maki.ui.flash("{BEHIND_MARK}")
+end)"#
+        ),
+        PluginPermissions::trusted(),
+    );
+    assert!(hook.wraps(AgentSlot::MessageSend));
+
+    let cancel = CancelToken::none();
+    let call = AgentCall {
+        session_id: None,
+        task_id: None,
+        model: AGENT_MODEL,
+        context_size: 0,
+        context_window: 0,
+        cancel: &cancel,
+        // Short enough that the parked first layer cannot finish in time.
+        deadline: Instant::now() + Duration::from_millis(50),
+    };
+    assert!(matches!(
+        within(hook.run(AgentSlot::MessageSend, serde_json::json!({}), &call)),
+        Verdict::Unchanged
+    ));
+
+    let ui = host.ui_action_rx();
+    let seen = collect_flashes(&ui, 1);
+    assert_eq!(
+        seen,
+        vec![SLOW_MARK.to_string()],
+        "the slow layer ran, the one behind it never did"
+    );
+    assert!(
+        ui.try_recv().is_err(),
+        "the layer behind the parked one must not flash"
     );
 }
 

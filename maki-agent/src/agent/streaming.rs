@@ -46,15 +46,24 @@ fn canonicalize_tool_names(message: &mut Message) {
 async fn forward_provider_events(
     prx: flume::Receiver<ProviderEvent>,
     event_tx: &EventSender,
+    delta: Option<DeltaSink>,
 ) -> String {
     let mut streamed = String::new();
     while let Ok(pe) = prx.recv_async().await {
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
                 streamed.push_str(&text);
+                if let Some(sink) = delta.as_ref() {
+                    sink.notify(DELTA_TEXT, &text);
+                }
                 AgentEvent::TextDelta { text }
             }
-            ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
+            ProviderEvent::ThinkingDelta { text } => {
+                if let Some(sink) = delta.as_ref() {
+                    sink.notify(DELTA_THINKING, &text);
+                }
+                AgentEvent::ThinkingDelta { text }
+            }
             ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending {
                 id,
                 name: canonical_tool_name(&name).to_owned(),
@@ -74,6 +83,49 @@ async fn forward_provider_events(
         }
     }
     streamed
+}
+
+pub(crate) const DELTA_TEXT: &str = "text";
+pub(crate) const DELTA_THINKING: &str = "thinking";
+/// Deep enough to absorb a burst between consumer polls, small enough that a
+/// stalled layer costs bounded memory. Past it deltas drop, by design.
+const DELTA_CHANNEL_CAPACITY: usize = 64;
+
+/// Pushes each delta to the stream task's firer. Present only when a delta
+/// monitor is registered, so a stream nobody watches builds none and the
+/// forwarder above stays as cheap as it was.
+#[derive(Clone)]
+pub(crate) struct DeltaSink {
+    send: flume::Sender<DeltaChunk>,
+}
+
+pub(crate) struct DeltaChunk {
+    kind: &'static str,
+    text: String,
+}
+
+impl DeltaSink {
+    /// Splits a sink from the channel its consumer drains. The consumer fires
+    /// the hook off the stream's thread, so a slow monitor never stalls a token.
+    pub(crate) fn channel() -> (Self, flume::Receiver<DeltaChunk>) {
+        let (send, recv) = flume::bounded(DELTA_CHANNEL_CAPACITY);
+        (Self { send }, recv)
+    }
+
+    fn notify(&self, kind: &'static str, text: &str) {
+        // A full or closed channel drops the chunk rather than stalling the
+        // stream. A delta is an observation, never a precondition for the reply.
+        let _ = self.send.try_send(DeltaChunk {
+            kind,
+            text: text.to_owned(),
+        });
+    }
+}
+
+impl DeltaChunk {
+    pub(crate) fn parts(&self) -> (&'static str, &str) {
+        (self.kind, &self.text)
+    }
 }
 
 /// Cancelling mid-stream carries the text the user still sees on screen,
@@ -189,6 +241,7 @@ pub(crate) async fn stream_with_retry(
     mut gauge: Option<&mut ContextGauge>,
     event_tx: &EventSender,
     cancel: &CancelToken,
+    delta: Option<DeltaSink>,
 ) -> Result<StreamResponse, StreamError> {
     let StreamRequest {
         provider,
@@ -235,7 +288,8 @@ pub(crate) async fn stream_with_retry(
         let (ptx, prx) = flume::unbounded();
         let forwarder = tokio::spawn({
             let event_tx = event_tx.clone();
-            async move { forward_provider_events(prx, &event_tx).await }
+            let delta = delta.clone();
+            async move { forward_provider_events(prx, &event_tx, delta).await }
         });
         // `race` checks the token before it polls, so a run cancelled while a
         // retry slept on a server `Retry-After` never pays for the attempt it
@@ -577,6 +631,45 @@ mod tests {
         assert_eq!(reported, "API error (400)");
     }
 
+    /// A monitor that cannot keep up costs bounded memory, never a stalled
+    /// stream. With nobody draining, a sink takes its channel's worth and then
+    /// drops, so the producer is free to keep streaming.
+    #[test]
+    fn a_full_delta_sink_drops_instead_of_blocking() {
+        let (sink, recv) = DeltaSink::channel();
+        for i in 0..DELTA_CHANNEL_CAPACITY * 2 {
+            sink.notify(DELTA_TEXT, &i.to_string());
+        }
+        assert_eq!(
+            recv.len(),
+            DELTA_CHANNEL_CAPACITY,
+            "a full channel holds capacity and drops the rest"
+        );
+    }
+
+    /// Every delta under capacity still arrives, in order, with its kind: the
+    /// stream only loses deltas once a monitor falls behind.
+    #[test]
+    fn a_delta_sink_keeps_every_chunk_under_capacity() {
+        let (sink, recv) = DeltaSink::channel();
+        sink.notify(DELTA_THINKING, "a");
+        sink.notify(DELTA_TEXT, "b");
+        let parts: Vec<_> = recv
+            .drain()
+            .map(|chunk| {
+                let (kind, text) = chunk.parts();
+                (kind, text.to_owned())
+            })
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                (DELTA_THINKING, "a".to_owned()),
+                (DELTA_TEXT, "b".to_owned())
+            ]
+        );
+    }
+
     /// The kind of server this module exists for: it enforces
     /// `prompt + max_tokens <= window` and counts the prompt with its own
     /// tokenizer, which reads higher than maki's byte estimate. Any budget
@@ -673,6 +766,7 @@ mod tests {
             gauge,
             &EventSender::new(tx, 0),
             &CancelToken::none(),
+            None,
         )
         .await;
         (
@@ -726,6 +820,7 @@ mod tests {
             None,
             &EventSender::new(tx, 0),
             &cancel,
+            None,
         )
         .await;
 

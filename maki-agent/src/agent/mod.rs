@@ -17,7 +17,7 @@ pub use history::{
     close_dangling_tool_calls, live_header, live_history, live_snapshot, publish_live_history,
     publish_live_session,
 };
-pub use hook::{AgentCall, AgentHook, AgentHooks, AgentSlot};
+pub use hook::{AgentCall, AgentHook, AgentHooks, AgentSlot, AgentSlotRole};
 pub use instructions::{
     CallInstructions, Instructions, LoadedInstructions, build_system_prompt,
     default_instruction_files, find_subdirectory_instructions, is_instruction_file,
