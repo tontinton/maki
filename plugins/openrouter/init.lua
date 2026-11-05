@@ -116,8 +116,8 @@ maki.provider.register({
     -- Marks the whole prompt as cacheable, for the upstreams that only cache
     -- when asked to.
     extra_body = { cache_control = { type = "ephemeral" } },
-    session_id = { body_field = "session_id" },
   },
+  session_id = { body_field = "session_id" },
 
   list_models = function(ctx)
     local body, err = ctx.get_json(MODELS_PATH)
