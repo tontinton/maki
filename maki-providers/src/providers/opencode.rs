@@ -255,7 +255,7 @@ impl Opencode {
                 .unlocked(sub_provider)?
                 .clone(),
         };
-        let auth = provider_data.request_auth(auth, session_id);
+        let auth = provider_data.request_auth(auth, session_id)?;
         Ok((meta.clone(), provider_data.api_format, auth))
     }
 }

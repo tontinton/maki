@@ -232,12 +232,7 @@ fn a_taken_over_slugs_saved_key_becomes_the_plugins() {
     plugin::commit_load();
 
     let auth = plugin::resolved_auth(CATALOG_SLUG).expect(CREDENTIALS_LOST);
-    assert!(
-        auth.headers.iter().any(|(name, value)| (name, value)
-            == (&"authorization".to_owned(), &SAVED_BEARER.to_owned())),
-        "{:?}",
-        auth.headers
-    );
+    assert_eq!(auth.header("authorization"), Some(SAVED_BEARER));
 }
 
 /// A v0.6.4 `plugin =` selection in `providers.toml` keeps the slug owned by

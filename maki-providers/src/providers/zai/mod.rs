@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use maki_config::providers::{Protocol, ProviderPlan};
 use maki_storage::id::SessionRef;
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -242,7 +243,7 @@ impl Provider for Zai {
             }
             match self
                 .compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                 .await
             {
                 Err(AgentError::Api {

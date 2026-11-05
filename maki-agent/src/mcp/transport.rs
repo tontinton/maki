@@ -10,6 +10,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use maki_providers::headers::parse_headers;
 use maki_providers::http::error_chain;
 use maki_providers::strip_provider_keys;
 use maki_storage::StateDir;
@@ -447,14 +448,11 @@ fn header_map(
     headers: &HashMap<String, String>,
 ) -> Result<HashMap<HeaderName, HeaderValue>, String> {
     let mut map = HashMap::with_capacity(headers.len());
-    for (name, value) in headers {
-        let invalid = |e: &dyn Error| format!("header '{name}': {e}");
-        let header = HeaderName::try_from(name.as_str()).map_err(|e| invalid(&e))?;
-        let value = HeaderValue::try_from(value.as_str()).map_err(|e| invalid(&e))?;
-        if is_reserved(&header) {
-            warn!(server, header = name, "ignoring a header MCP sets itself");
+    for (name, value) in &parse_headers(headers).map_err(|e| e.to_string())? {
+        if is_reserved(name) {
+            warn!(server, header = %name, "ignoring a header MCP sets itself");
         } else {
-            map.insert(header, value);
+            map.insert(name.clone(), value.clone());
         }
     }
     Ok(map)

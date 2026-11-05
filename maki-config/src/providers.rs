@@ -336,8 +336,10 @@ pub struct ProviderDef {
     /// CF-Access-Client-Secret = "${CF_ACCESS_CLIENT_SECRET}"
     /// ```
     ///
-    /// A same-name header (case-insensitive) replaces the built-in auth
-    /// header instead of appending, and keeps winning across key rotations.
+    /// A same-name header (case-insensitive) replaces whatever maki, the
+    /// plugin or the built-in auth would send under that name, and keeps
+    /// winning across key rotations. `anthropic-beta` values are added to the
+    /// betas maki sends rather than replacing them.
     /// An unset or empty variable fails the whole provider so callers see the
     /// missing name instead of a silent 401.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

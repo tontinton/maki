@@ -3,11 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::Effort;
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::ThinkingConfig;
+use crate::headers::HeaderError;
 use crate::model::{FastSupport, Model, ModelInfo};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
@@ -217,10 +219,7 @@ fn parse_plan_models(
 }
 
 fn plan_account_id(auth: &ResolvedAuth) -> Option<&str> {
-    auth.headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(ACCOUNT_ID_HEADER))
-        .map(|(_, value)| value.as_str())
+    auth.header(ACCOUNT_ID_HEADER)
         .filter(|value| !value.is_empty())
 }
 
@@ -270,10 +269,15 @@ fn apply_plan_fast(
     }
 }
 
-fn apply_session_affinity(body: &mut Value, auth: &mut ResolvedAuth, session: &SessionRef) {
+fn apply_session_affinity(
+    body: &mut Value,
+    auth: &mut ResolvedAuth,
+    session: &SessionRef,
+) -> Result<(), HeaderError> {
     if is_coding_plan(auth) {
-        SESSION_AFFINITY.apply(session, body, auth);
+        SESSION_AFFINITY.apply(session, body, auth)?;
     }
+    Ok(())
 }
 
 #[derive(Deserialize, Default)]
@@ -505,7 +509,7 @@ impl Provider for OpenAi {
                         let mut codex_auth = self.codex_auth()?;
                         let mut body = super::responses::build_body(model, messages, system, tools);
                         if let Some(session) = session_id {
-                            apply_session_affinity(&mut body, &mut codex_auth, session);
+                            apply_session_affinity(&mut body, &mut codex_auth, session)?;
                         }
                         super::responses::apply_responses_reasoning(
                             &mut body,
@@ -517,6 +521,7 @@ impl Provider for OpenAi {
                         super::responses::do_stream(
                             self.compat.client(),
                             model,
+                            &HeaderMap::new(),
                             &body,
                             event_tx,
                             &codex_auth,
@@ -537,7 +542,7 @@ impl Provider for OpenAi {
                 .with_retry(|| async {
                     let auth = self.auth.current();
                     self.compat
-                        .do_stream(model, &[], &body, event_tx, &auth)
+                        .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                         .await
                 })
                 .await
@@ -976,16 +981,10 @@ mod tests {
         let expected = oauth.then_some(session.as_str());
         let mut auth = plan_auth(oauth, Some(ACCOUNT_ID));
         let mut body = json!({});
-        apply_session_affinity(&mut body, &mut auth, &session);
+        apply_session_affinity(&mut body, &mut auth, &session).unwrap();
         assert_eq!(body[PROMPT_CACHE_KEY_FIELD].as_str(), expected);
         for header in SESSION_AFFINITY_HEADERS {
-            let values: Vec<&str> = auth
-                .headers
-                .iter()
-                .filter(|(name, _)| name == header)
-                .map(|(_, value)| value.as_str())
-                .collect();
-            assert_eq!(values, Vec::from_iter(expected), "{header}");
+            assert_eq!(auth.header(header), expected, "{header}");
         }
     }
 

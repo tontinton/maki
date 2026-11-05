@@ -26,6 +26,7 @@ use tokio::sync::{Mutex, OnceCell};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+use crate::headers::header_pairs;
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
@@ -200,11 +201,7 @@ async fn lookup_credentials(region: Region) -> Result<Credentials, CredentialsEr
 }
 
 fn invoke_request(client: &Client, url: &str) -> Result<Request, AgentError> {
-    let request = client
-        .post(url)
-        .header("user-agent", super::super::user_agent())
-        .header(CONTENT_TYPE, JSON)
-        .build()?;
+    let request = client.post(url).header(CONTENT_TYPE, JSON).build()?;
     Ok(request)
 }
 
@@ -235,14 +232,10 @@ fn sign_request(
         .build()
         .map_err(signing_error)?
         .into();
-    let headers = request
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)));
     let signable = SignableRequest::new(
         request.method().as_str(),
         request.url().as_str(),
-        headers,
+        header_pairs(request.headers()),
         SignableBody::Bytes(body),
     )
     .map_err(signing_error)?;

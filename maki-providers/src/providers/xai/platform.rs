@@ -2,9 +2,11 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use maki_storage::id::SessionRef;
+use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::headers::parse_headers;
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::ResolvedAuth;
@@ -127,12 +129,11 @@ impl Provider for Xai {
                 return self
                     .auth
                     .with_retry(|| async {
-                        let mut auth = self.auth.current();
-                        auth.headers
-                            .extend(proxy_request_headers(model, session_id));
+                        let auth = self.auth.current();
                         responses::do_stream(
                             self.compat.client(),
                             model,
+                            &parse_headers(proxy_request_headers(model, session_id))?,
                             &body,
                             event_tx,
                             &auth,
@@ -153,7 +154,7 @@ impl Provider for Xai {
                 .with_retry(|| async {
                     let auth = self.auth.current();
                     self.compat
-                        .do_stream(model, &[], &body, event_tx, &auth)
+                        .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                         .await
                 })
                 .await
@@ -218,15 +219,11 @@ impl Provider for Xai {
 }
 
 fn bearer_token(auth: &ResolvedAuth) -> Option<String> {
-    auth.headers.iter().find_map(|(key, value)| {
-        if !key.eq_ignore_ascii_case("authorization") {
-            return None;
-        }
-        value
-            .strip_prefix("Bearer ")
-            .or_else(|| value.strip_prefix("bearer "))
-            .map(ToOwned::to_owned)
-    })
+    let value = auth.header("authorization")?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
