@@ -15,8 +15,7 @@ pub const SCROLLBAR_THUMB: &str = "\u{2590}";
 /// keeps its own bg instead of picking up the row background. The window's
 /// colors keep the thumb on the theme bg; Reset showed the terminal's.
 fn thumb_style() -> Style {
-    let theme = theme::current();
-    Style::new().fg(theme.foreground).bg(theme.background)
+    theme::current().scrollbar_thumb
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
