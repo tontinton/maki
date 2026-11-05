@@ -248,5 +248,8 @@ lto = true
 # the pop its loop guard watches, so one such line pins a core at 100% for good.
 # Pinned to a v5.3.0 backport of trishume/syntect#706, remove once that ships.
 [patch.crates-io]
-crossterm = { git = "https://github.com/crossterm-rs/crossterm", rev = "94ed7154e35d24a2f643c61760e1eb05b8ca9e63" }
+# PROTOTYPE: head of crossterm-rs/crossterm#1052 (color scheme events) plus a fix for
+# an EventStream panic on the first report, until the PR picks it up. Drops the #1030
+# Windows fix, so this pin must not land.
+crossterm = { git = "https://github.com/disrupted/crossterm", rev = "1ee2a70ee11ea62c197bbbeffe246010f4ff1ce6" }
 syntect = { git = "https://github.com/tontinton/syntect", rev = "01df275f6f25da670e5ba5b7128cb89d03795119" }

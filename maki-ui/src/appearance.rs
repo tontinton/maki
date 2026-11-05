@@ -5,11 +5,14 @@
 //! luminance, so the answer follows what is really on screen. A terminal
 //! that stays quiet counts as dark, which is what Maki assumed before.
 //!
-//! We skip the `CSI ? 996 n` color scheme query on purpose. Our crossterm
-//! cannot parse its `CSI ? 997 n` reply, and a reply that shows up late
-//! would stall all input after it.
+//! We skip the `CSI ? 996 n` color scheme query on purpose: a reply that
+//! shows up late would land in the input reader.
+//!
+//! When startup asked, the terminal then reports changes itself (DEC mode
+//! `?2031`, `Event::ColorSchemeChanged`), and [`report`] records them.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use maki_config::ThemePair;
 
@@ -34,9 +37,43 @@ pub(crate) fn init(theme: Option<&ThemePair>) {
     });
 }
 
+/// The latest change the terminal reported, `NONE` before the first.
+static REPORTED: AtomicU8 = AtomicU8::new(NONE);
+const NONE: u8 = 0;
+const LIGHT: u8 = 1;
+const DARK: u8 = 2;
+
 /// `None` when startup did not ask.
 pub(crate) fn background() -> Option<Background> {
+    current(startup(), REPORTED.load(Ordering::Acquire))
+}
+
+/// Records a change the terminal reported; true when it is a real change.
+/// Ignored when startup did not ask, since then nothing follows it.
+pub(crate) fn report(background: Background) -> bool {
+    let before = REPORTED.swap(encode(background), Ordering::AcqRel);
+    current(startup(), before).is_some_and(|before| before != background)
+}
+
+fn startup() -> Option<Background> {
     BACKGROUND.get().copied().flatten()
+}
+
+/// Kept apart from the statics so tests need no shared state.
+fn current(startup: Option<Background>, reported: u8) -> Option<Background> {
+    let startup = startup?;
+    Some(match reported {
+        LIGHT => Background::Light,
+        DARK => Background::Dark,
+        _ => startup,
+    })
+}
+
+fn encode(background: Background) -> u8 {
+    match background {
+        Background::Light => LIGHT,
+        Background::Dark => DARK,
+    }
 }
 
 fn detect() -> Background {
@@ -83,6 +120,17 @@ fn parse_osc11(buf: &[u8]) -> Option<(f64, f64, f64)> {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    const L: Option<Background> = Some(Background::Light);
+    const D: Option<Background> = Some(Background::Dark);
+
+    #[test_case(None, LIGHT, None; "unasked_ignores_reports")]
+    #[test_case(D, NONE, D; "startup_until_a_report")]
+    #[test_case(D, LIGHT, L; "report_wins")]
+    #[test_case(L, DARK, D; "report_wins_back")]
+    fn background_now(startup: Option<Background>, reported: u8, expected: Option<Background>) {
+        assert_eq!(current(startup, reported), expected);
+    }
 
     #[test_case(b"\x1b]11;rgb:2828/2a2a/3636\x1b\\\x1b[?62c", Some(Background::Dark); "dracula_st")]
     #[test_case(b"\x1b]11;rgb:efef/f1f1/f5f5\x07\x1b[?62c", Some(Background::Light); "latte_bel")]

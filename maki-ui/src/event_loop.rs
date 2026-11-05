@@ -18,6 +18,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
+use crossterm::colors::ColorScheme;
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
@@ -31,7 +32,7 @@ use maki_agent::{
     SessionMailbox, Transcript, mcp,
 };
 use maki_config::project::TrustQuestion;
-use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
+use maki_config::{ModelPolicy, ProjectConfig, ThemePair, UiConfig};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
@@ -263,6 +264,16 @@ impl SessionStatus {
             Self::Idle => STATUS_IDLE,
         }
     }
+}
+
+/// Loads the theme {pair} names for the current terminal background. Only
+/// the in-memory name is set, so the user's saved pick survives.
+fn apply_config_theme(pair: &ThemePair) -> Result<(), String> {
+    let name = pair.name(appearance::background() == Some(Background::Light));
+    let theme = theme::load_by_name(name)?;
+    theme::set_current_name(name);
+    theme::set(theme);
+    Ok(())
 }
 
 fn prepend_preamble(preamble: &mut Vec<Message>, mut leading: Vec<Message>) {
@@ -685,13 +696,8 @@ impl<'t> EventLoop<'t> {
             if pair.follows_background() && background.is_none() {
                 startup_warnings.push(RESTART_FOR_BACKGROUND.to_owned());
             }
-            let name = pair.name(background == Some(Background::Light));
-            match crate::theme::load_by_name(name) {
-                Ok(theme) => {
-                    crate::theme::set_current_name(name);
-                    crate::theme::set(theme);
-                }
-                Err(e) => startup_warnings.push(format!("config ui.theme: {e}")),
+            if let Err(e) = apply_config_theme(pair) {
+                startup_warnings.push(format!("config ui.theme: {e}"));
             }
         }
 
@@ -1816,6 +1822,25 @@ impl<'t> EventLoop<'t> {
         theme::set_cursor_focused(self.focus != Focus::Unfocused);
     }
 
+    /// A light/dark `ui.theme` follows the terminal. Only a real change
+    /// swaps it, so the burst of reports a terminal may send repaints once.
+    fn follow_color_scheme(&mut self, scheme: ColorScheme) {
+        let background = match scheme {
+            ColorScheme::Light => Background::Light,
+            ColorScheme::Dark => Background::Dark,
+        };
+        tracing::info!(?background, "terminal color scheme changed");
+        if !appearance::report(background) {
+            return;
+        }
+        if let Some(pair) = &self.ctx.ui_config.theme
+            && pair.follows_background()
+            && let Err(e) = apply_config_theme(pair)
+        {
+            self.focused_app().flash(format!("config ui.theme: {e}"));
+        }
+    }
+
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
         match raw {
             Event::FocusGained => {
@@ -1826,6 +1851,10 @@ impl<'t> EventLoop<'t> {
             Event::FocusLost => {
                 self.focus.report(Focus::Unfocused);
                 self.sync_cursor();
+                (None, None)
+            }
+            Event::ColorSchemeChanged(scheme) => {
+                self.follow_color_scheme(scheme);
                 (None, None)
             }
             // The one place the host's view of a keypress is normalized, so

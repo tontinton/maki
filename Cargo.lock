@@ -1600,9 +1600,9 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 [[package]]
 name = "crossterm"
 version = "0.29.0"
-source = "git+https://github.com/crossterm-rs/crossterm?rev=94ed7154e35d24a2f643c61760e1eb05b8ca9e63#94ed7154e35d24a2f643c61760e1eb05b8ca9e63"
+source = "git+https://github.com/disrupted/crossterm?rev=1ee2a70ee11ea62c197bbbeffe246010f4ff1ce6#1ee2a70ee11ea62c197bbbeffe246010f4ff1ce6"
 dependencies = [
- "base64 0.23.1",
+ "base64 0.22.1",
  "bitflags 2.13.2",
  "crossterm_winapi",
  "derive_more",
