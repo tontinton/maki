@@ -11,6 +11,9 @@ A Lua package lets you add tools, commands, keybindings, and event handlers
 without copying its code into `init.lua`. Maki can load a package that you put
 on disk, or it can install one from a Git repository and lock it to one commit.
 
+Community packages are listed at [maki.sh/plugins](https://maki.sh/plugins/).
+A repository appears there when it has both the `maki` and `plugin` topics.
+
 A package directory holds sorted `plugin/*.lua` entry files, modules at
 `lua/<module>.lua` or `lua/<module>/init.lua`, and a `plugin.toml` manifest.
 The entry files share one environment and use the API the
