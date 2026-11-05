@@ -3,6 +3,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, Role};
+use maki_storage::auth::now_millis;
 use maki_storage::frame::{LiveFacts, StoredFrame};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionTools, next_epoch};
@@ -212,7 +213,7 @@ impl History {
     }
 
     pub fn push(&mut self, msg: Message) {
-        self.edit(|msgs| msgs.push(msg));
+        self.edit(|msgs| msgs.push(stamp_new(msg)));
     }
 
     /// A run future that gets dropped never reaches its cancel path, so the tool
@@ -435,6 +436,15 @@ pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
     }
 }
 
+/// Fill a message's `created_at` on append. An existing stamp is kept, so a
+/// restored or replayed message holds the time it was first recorded, not now.
+pub(crate) fn stamp_new(mut msg: Message) -> Message {
+    if msg.created_at.is_none() {
+        msg.created_at = Some(now_millis());
+    }
+    msg
+}
+
 fn dangling_results(messages: &[Message], note: &str) -> Option<Message> {
     let last = messages.last()?;
     if !matches!(last.role, Role::Assistant) || !last.has_tool_calls() {
@@ -456,9 +466,15 @@ pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: us
     if history.len() <= rollback_len {
         return;
     }
+    // Close dangling tool calls and add the cancel marker, stamping both. The
+    // free `close_dangling_tool_calls` is left for the restore path, which must
+    // not re-time messages it is only repairing.
+    let closing = dangling_results(history.as_slice(), CANCEL_MARKER).map(stamp_new);
     history.edit(|msgs| {
-        close_dangling_tool_calls(msgs, CANCEL_MARKER);
-        msgs.push(Message::synthetic(CANCEL_MARKER.into()));
+        if let Some(closing) = closing {
+            msgs.push(closing);
+        }
+        msgs.push(stamp_new(Message::synthetic(CANCEL_MARKER.into())));
     });
 }
 
@@ -659,6 +675,41 @@ mod tests {
             &snap.messages[3].content[0],
             ContentBlock::Text { text } if text == CANCEL_MARKER
         ));
+    }
+
+    #[test]
+    fn push_stamps_created_at_and_keeps_an_existing_one() {
+        let mut history = History::new(vec![]);
+        history.push(Message::user(GO.into()));
+        assert!(
+            history.as_slice()[0].created_at.is_some(),
+            "push fills created_at on append"
+        );
+
+        history.push(Message {
+            role: Role::Assistant,
+            content: vec![],
+            created_at: Some(7),
+            ..Default::default()
+        });
+        assert_eq!(
+            history.as_slice()[1].created_at,
+            Some(7),
+            "an existing stamp survives a push"
+        );
+    }
+
+    #[test]
+    fn sanitize_cancelled_history_stamps_its_appends() {
+        let mut history = History::new(vec![Message::user(GO.into()), make_tool_use_msg(&["t1"])]);
+        sanitize_cancelled_history(&mut history, 0);
+        let [closing, marker] = &history.as_slice()[2..] else {
+            panic!("expected a closing result and the cancel marker");
+        };
+        assert!(
+            closing.created_at.is_some() && marker.created_at.is_some(),
+            "a cancelled turn's appended messages are timed, so a plugin can measure it"
+        );
     }
 
     fn text_msg(role: Role, text: &str) -> Message {

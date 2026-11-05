@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use super::frame::{RunContext, fit_frame};
-use super::history::{History, remove_orphaned_tool_results, strip_thinking};
+use super::history::{History, remove_orphaned_tool_results, stamp_new, strip_thinking};
 use super::hook::{AgentHooks, AgentSlot};
 use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
 use crate::mcp::McpSession;
@@ -264,6 +264,36 @@ pub(super) async fn compact_history(
     Err(last_error.unwrap())
 }
 
+/// Rebuild the transcript after a compaction: a summary pair, then the tail that
+/// was not summarized. Returns the new list and the length of the summary pair,
+/// so the caller can report how many messages carried over.
+///
+/// The summary pair carries the first kept message's stamp, not "now". The pair
+/// is followed by the carried tail, whose stamps predate the summary call that
+/// just returned; stamping the pair now would run the transcript's clock backwards
+/// at the join, and a timing reader would see a negative gap. The compaction
+/// call's own wall time then falls to the first carried message instead.
+fn rebuild_history(
+    summary: Message,
+    history: &[Message],
+    summarized: usize,
+) -> (Vec<Message>, usize) {
+    let carried_at = history.get(summarized).and_then(|m| m.created_at);
+    let stamp = |msg: Message| {
+        stamp_new(Message {
+            created_at: carried_at,
+            ..msg
+        })
+    };
+    let mut new_history = vec![
+        stamp(Message::user("What did we do so far?".into())),
+        stamp(summary),
+    ];
+    let summary_len = new_history.len();
+    new_history.extend_from_slice(&history[summarized..]);
+    (new_history, summary_len)
+}
+
 fn finish_compact(
     response: StreamResponse,
     history: &mut History,
@@ -288,12 +318,8 @@ fn finish_compact(
         return Err(AgentError::EmptySummary);
     };
 
-    let mut new_history = vec![
-        Message::user("What did we do so far?".into()),
-        response.message,
-    ];
-    let summary_len = new_history.len();
-    new_history.extend_from_slice(&history.as_slice()[summarized..]);
+    let (new_history, summary_len) =
+        rebuild_history(response.message, history.as_slice(), summarized);
     history.restart(new_history);
     info!(
         model = %model.id,
@@ -627,6 +653,61 @@ mod tests {
     use crate::cancel::CancelToken;
     use crate::tools::{RequestTools, ToolRegistry};
     use maki_config::CompactionBuffer;
+
+    #[test]
+    fn rebuild_history_keeps_timestamps_monotonic_at_the_join() {
+        let history = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "summarized".into(),
+                }],
+                created_at: Some(100),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "first kept".into(),
+                }],
+                created_at: Some(1_000),
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "kept".into(),
+                }],
+                created_at: Some(2_000),
+                ..Default::default()
+            },
+        ];
+        let summary = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "the summary".into(),
+            }],
+            ..Default::default()
+        };
+
+        let (rebuilt, summary_len) = rebuild_history(summary, &history, 1);
+        assert_eq!(
+            summary_len, 2,
+            "a prompt and its summary head the transcript"
+        );
+        assert_eq!(rebuilt.len(), 2 + 2, "pair + the carried tail");
+        // The pair takes the first kept message's stamp (1_000), never "now": the
+        // summary call started after the tail was written, so "now" would postdate
+        // it and run the transcript clock backwards at the join.
+        assert_eq!(rebuilt[0].created_at, Some(1_000));
+        assert_eq!(rebuilt[1].created_at, Some(1_000));
+        let mut prev = 0;
+        for msg in &rebuilt {
+            let at = msg.created_at.expect("every rebuilt message is stamped");
+            assert!(at >= prev, "timestamps must not go backwards: {rebuilt:?}");
+            prev = at;
+        }
+    }
 
     const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
     const REQUEST_EXTRA: &str = "Keep the failing test names";
