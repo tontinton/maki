@@ -5,13 +5,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ratatui::Frame;
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget};
 
+use crate::theme;
+
 pub const SCROLLBAR_THUMB: &str = "\u{2590}";
-/// ListPicker paints highlighted rows across the scrollbar column. Resetting the
-/// style keeps the thumb color steady instead of picking up the row background.
-const THUMB_STYLE: Style = Style::new().fg(Color::Reset).bg(Color::Reset);
+/// ListPicker paints highlighted rows across the scrollbar column, so the thumb
+/// keeps its own bg instead of picking up the row background. The window's
+/// colors keep the thumb on the theme bg; Reset showed the terminal's.
+fn thumb_style() -> Style {
+    let theme = theme::current();
+    Style::new().fg(theme.foreground).bg(theme.background)
+}
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -110,7 +116,7 @@ pub fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_len: u32
             if let Some(thumbs) = recording {
                 thumbs.cover(cell, pos);
             }
-            cell.set_symbol(SCROLLBAR_THUMB).set_style(THUMB_STYLE);
+            cell.set_symbol(SCROLLBAR_THUMB).set_style(thumb_style());
         }
     });
 }
