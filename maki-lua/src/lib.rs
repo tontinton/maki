@@ -68,16 +68,15 @@ pub mod test_support {
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
     use crate::key::Key;
+    use crate::runtime::Request;
     pub use crate::runtime::layer_skipped_message;
-    use crate::{KeybindTicket, KeymapReader, PluginPermissions, SessionEndReason};
+    use crate::{EventHandle, KeybindTicket, KeymapReader, PluginPermissions, SessionEndReason};
     use maki_agent::SharedBuf;
     use maki_storage::id::MakiId;
-    #[cfg(any(test, feature = "test-support"))]
     use tokio::runtime::Runtime;
 
     /// The runtime [`crate::PluginHost::start`] puts a host on, for the sync
     /// side of a test to drive futures with.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn runtime() -> &'static Runtime {
         &crate::loader::HOST_RUNTIME
     }
@@ -109,15 +108,14 @@ pub mod test_support {
         (HintWriterHandle(writer), reader)
     }
 
-    /// Observes which requests an [`crate::EventHandle`] sends, without a
+    /// Observes which requests an [`EventHandle`] sends, without a
     /// running plugin host.
-    pub struct RequestProbe(flume::Receiver<crate::runtime::Request>);
+    pub struct RequestProbe(flume::Receiver<Request>);
 
     impl RequestProbe {
         /// Next request as `(kind, clicks)`: `"click"` carries no clicks,
         /// `"click_fallback"` and `"restore"` carry their restore item's.
         pub fn try_recv(&self) -> Option<(&'static str, Vec<usize>)> {
-            use crate::runtime::Request;
             Some(match self.0.try_recv().ok()? {
                 Request::ClickTool { fallback: None, .. } => ("click", Vec::new()),
                 Request::ClickTool {
@@ -131,7 +129,6 @@ pub mod test_support {
         /// Next dispatched slash command as `(command, args, depth)`, skipping
         /// other requests.
         pub fn try_recv_command(&self) -> Option<(String, String, u8)> {
-            use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
                 if let Request::RunCommand {
                     command,
@@ -157,7 +154,6 @@ pub mod test_support {
         /// [`Self::try_recv_keybind`] with the whole ticket, for a test that
         /// plays the Lua thread and reports the handler done.
         pub fn try_recv_ticket(&self) -> Option<KeybindTicket> {
-            use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
                 if let Request::RunKeybindCallback { ticket } = req {
                     return Some(ticket);
@@ -168,7 +164,6 @@ pub mod test_support {
 
         /// Next queued restore item, skipping other requests.
         pub fn try_recv_restore_item(&self) -> Option<crate::RestoreItem> {
-            use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
                 if let Request::RestoreToolAsync { item, .. } = req {
                     return Some(item);
@@ -179,7 +174,6 @@ pub mod test_support {
 
         /// Next fired autocmd as `(event, data)`, skipping other requests.
         pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
-            use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
                 if let Request::FireAutocmd { event, data } = req {
                     return Some((event, data));
@@ -190,7 +184,6 @@ pub mod test_support {
 
         /// Next `SessionEnd` request as the session being left behind and why.
         pub fn try_recv_end_session(&self) -> Option<(MakiId, SessionEndReason)> {
-            use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
                 if let Request::EndSession(end) = req {
                     return Some((end.session, end.reason));
@@ -200,14 +193,25 @@ pub mod test_support {
         }
     }
 
-    pub fn probed_event_handle() -> (crate::EventHandle, RequestProbe) {
+    /// Fires {event} with {data} as given, for a payload no
+    /// [`crate::agent_autocmd::HostEvent`] carries. Kept off [`EventHandle`]
+    /// on purpose: host code would have to import it from `test_support`,
+    /// which makes an unclassified event easy to catch in review.
+    pub fn fire_autocmd(handle: &EventHandle, event: &str, data: serde_json::Value) {
+        let _ = handle.tx.try_send(Request::FireAutocmd {
+            event: event.to_owned(),
+            data,
+        });
+    }
+
+    pub fn probed_event_handle() -> (EventHandle, RequestProbe) {
         let (tx, rx) = flume::unbounded();
-        (crate::EventHandle::probed_for_test(tx), RequestProbe(rx))
+        (EventHandle::probed_for_test(tx), RequestProbe(rx))
     }
 
     /// [`probed_event_handle`] for a host with a plugin layering the plan
     /// form, the one case the UI has to ask a chain before it draws.
-    pub fn probed_event_handle_layering_plan_form() -> (crate::EventHandle, RequestProbe) {
+    pub fn probed_event_handle_layering_plan_form() -> (EventHandle, RequestProbe) {
         let (handle, probe) = probed_event_handle();
         (handle.layering(&[crate::api::slot::PLAN_FORM_SLOT]), probe)
     }

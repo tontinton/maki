@@ -10,7 +10,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_agent::{AgentEvent, EventSender, SpanStyle};
 use maki_config::ToolOutputLines;
 use maki_highlight::highlight_code;
-use maki_lua::test_support::runtime;
+use maki_lua::test_support::{fire_autocmd, runtime};
 use maki_lua::{PluginHost, RestoreReason, Split, UiAction};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
@@ -527,7 +527,8 @@ fn todo_load_restore_leaves_the_panel_closed() {
     // Focus what a restore-time store would have written: the calling chat's
     // own ids.
     let sid = session_ref().id().to_string();
-    host.event_handle().fire_autocmd(
+    fire_autocmd(
+        &host.event_handle(),
         "TaskFocusChanged",
         json!({ "session_id": sid, "id": SUBAGENT_TASK_ID }),
     );
