@@ -19,7 +19,8 @@ pub mod session_snapshot;
 pub use api::action::ActionInfo;
 pub use api::agent::{MCP_HINT, UNDECLARED_REACH, UNPAID_REACH_ERR};
 pub use api::keymap::{
-    InputMode, InputSnapshot, KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot,
+    CursorShape, CursorStyle, InputMode, InputSnapshot, KeybindTicket, KeymapEntry, KeymapReader,
+    KeymapSnapshot,
 };
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};

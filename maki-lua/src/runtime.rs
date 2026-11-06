@@ -55,7 +55,7 @@ use crate::api::agent::adopt_session;
 use crate::api::autocmd::AutocmdStore;
 use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
-use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter, release_mode};
+use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter, release_cursor, release_mode};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
 use crate::api::plan::{
     PlanRowHandlers, RowOwners, clear_menu_generation, clear_plugin_rows, clear_session_rows,
@@ -3776,6 +3776,7 @@ impl LuaRuntime {
         clear_plugin_rows(&self.lua, name);
         clear_plugin_actions(&self.lua, name);
         release_mode(&self.lua, name);
+        release_cursor(&self.lua, name);
         let mut revision_guard = None;
         if let Some(owner) = self.plugins.borrow_mut().remove(name) {
             unload_ui(&self.lua, name);

@@ -12,7 +12,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::api::action::run_plugin_action;
-use crate::api::keymap::{InputMode, accept_key, switch_mode};
+use crate::api::keymap::{
+    CursorShape, CursorStyle, InputMode, accept_key, switch_cursor, switch_mode,
+};
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintEntry, HintWriter,
     InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit, Split, TextEdit, TitlePos,
@@ -494,6 +496,48 @@ fn set_window_title(
 #[lua_fn]
 fn set_mode(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String) -> LuaResult<()> {
     switch_mode(lua, InputMode::parse(&mode)?, &plugin);
+    Ok(())
+}
+
+const SET_CURSOR_SHAPE: &str = "set_cursor_shape";
+const CURSOR_SHAPE_OPTIONS: &[&str] = &["blink"];
+
+/// Sets the shape of the chat input's cursor, like Neovim's `guicursor`.
+///
+/// The chat input uses your terminal's own cursor. Until a plugin calls this,
+/// maki never changes its shape or blink, so it looks the way you set up your
+/// terminal. `"default"` gives that look back. If your plugin unloads after
+/// setting a shape, maki switches back to `"default"` too.
+///
+/// A shape always sets blinking on or off, because terminals take both in
+/// one setting. Leave out `blink` for a steady cursor.
+///
+/// Throws on any shape not listed below, and on an unknown option.
+///
+/// @param shape string `"block"`, `"bar"`, `"underline"` or `"default"`.
+/// @param opts table? Optional. `blink` (boolean) blinks the cursor, default false.
+/// @return
+/// @example
+/// maki.api.create_autocmd("ModeChanged", {
+///   callback = function(ev)
+///     maki.ui.set_cursor_shape(ev.data.new_mode == "n" and "block" or "bar")
+///   end,
+/// })
+#[lua_fn]
+fn set_cursor_shape(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    shape: String,
+    opts: Option<Table>,
+) -> LuaResult<()> {
+    if let Some(opts) = &opts {
+        reject_unknown_fields(opts, CURSOR_SHAPE_OPTIONS, SET_CURSOR_SHAPE)?;
+    }
+    let style = CursorStyle::new(
+        CursorShape::parse(&shape)?,
+        opts.and_then(|t| t.opt_bool("blink")).unwrap_or(false),
+    );
+    switch_cursor(lua, style, &plugin);
     Ok(())
 }
 
@@ -1227,7 +1271,7 @@ lua_table! {
     ///   Plugin actions still run.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
-    /// - `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
+    /// - `open_win`, `set_status_hint`, `set_window_title`, `set_mode`, `set_cursor_shape` and `input_rules` have no effect.
     ///   `input_rules` still throws on a bad rule, so a plugin's tests catch it.
     ///
     /// ### Chat input
@@ -1243,6 +1287,7 @@ lua_table! {
     /// | Send the input, as Enter does | [`input_submit`](#maki-ui-input_submit) |
     /// | React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
     /// | Switch to normal mode for a vim mode | [`set_mode`](#maki-ui-set_mode), see [Modes](/docs/lua-api/#modes) |
+    /// | Change the cursor shape, like a block in normal mode | [`set_cursor_shape`](#maki-ui-set_cursor_shape) |
     ///
     /// A key that types `TODO: ` at the cursor:
     ///
@@ -1387,7 +1432,7 @@ lua_table! {
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual set_mode, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
+        manual set_mode, manual set_cursor_shape, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
         manual set_window_title, manual input, manual input_rules, manual input_decorate,
         manual input_edit, manual input_submit,
     ]
@@ -1405,6 +1450,7 @@ pub(crate) fn create_ui_table(
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
     set_mode__register(&t, lua, Arc::clone(&plugin))?;
+    set_cursor_shape__register(&t, lua, Arc::clone(&plugin))?;
     action__register(
         &t,
         lua,

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
@@ -275,8 +275,6 @@ static THEME: LazyLock<ArcSwap<Theme>> =
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-static CURSOR_FOCUSED: AtomicBool = AtomicBool::new(true);
-
 static CURRENT_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn current() -> Guard<Arc<Theme>> {
@@ -289,32 +287,6 @@ pub fn set(theme: Theme) {
     THEME.store(Arc::new(theme));
     crate::highlight::refresh_syntax_theme();
     GENERATION.fetch_add(1, Ordering::Release);
-}
-
-/// Tracks terminal focus so the input caret can recolor itself when the user
-/// switches away. Terminals that never report focus keep the focused look.
-pub fn set_cursor_focused(focused: bool) {
-    CURSOR_FOCUSED.store(focused, Ordering::Relaxed);
-}
-
-/// The `[ui] cursor` style while focused, `[ui] cursor_unfocused` otherwise.
-pub fn cursor_style() -> Style {
-    let t = current();
-    if CURSOR_FOCUSED.load(Ordering::Relaxed) {
-        t.cursor
-    } else {
-        t.cursor_unfocused
-    }
-}
-
-/// True for a buffer cell that carries the `cursor_style()` paint, so tests
-/// assert against the theme instead of one theme's hardcoded colors.
-#[cfg(test)]
-pub(crate) fn is_caret_cell(cell: &ratatui::buffer::Cell) -> bool {
-    let cursor = cursor_style();
-    cursor.fg.is_none_or(|fg| cell.fg == fg)
-        && cursor.bg.is_none_or(|bg| cell.bg == bg)
-        && cell.modifier.contains(cursor.add_modifier)
 }
 
 pub fn generation() -> u64 {
@@ -443,7 +415,6 @@ named_styles!(t => {
     "item_match" | "match" => t.item_match,
     "item_match_selected" | "match_selected" => t.item_match_selected,
     "cursor" => t.cursor,
-    "cursor_unfocused" => t.cursor_unfocused,
     "background" => Style::new().bg(t.background),
     "foreground" => Style::new().fg(t.foreground),
     "accent" => t.accent,
@@ -512,7 +483,6 @@ pub struct Theme {
     pub panel_border: Style,
     pub panel_title: Style,
     pub cursor: Style,
-    pub cursor_unfocused: Style,
     pub input_border: Style,
     pub accent: Style,
     pub active: Style,
@@ -855,14 +825,10 @@ impl Theme {
             Modifier::BOLD,
         );
 
-        // Themes that leave `cursor` unset get a visible caret everywhere,
-        // including pickers that paint `t.cursor` directly.
+        // The pickers and plugins paint their own carets with `cursor`, so a
+        // theme that leaves it unset still gets a visible one.
         let cursor = match style("cursor") {
             s if s == Style::default() => Style::new().reversed(),
-            s => s,
-        };
-        let cursor_unfocused = match style("cursor_unfocused") {
-            s if s == Style::default() => cursor,
             s => s,
         };
 
@@ -964,7 +930,6 @@ impl Theme {
             panel_border: style("panel_border"),
             panel_title: style("panel_title"),
             cursor,
-            cursor_unfocused,
             input_border: style("input_border"),
             accent: style("accent"),
             active: {
@@ -1484,7 +1449,6 @@ diff_new_line_nr = { fg = "red" }
         assert_eq!(style_by_name("item"), t.item);
         assert_eq!(style_by_name("item_desc"), t.item_desc);
         assert_eq!(style_by_name("cursor"), t.cursor);
-        assert_eq!(style_by_name("cursor_unfocused"), t.cursor_unfocused);
         assert_eq!(style_by_name("accent"), t.accent);
         assert_eq!(style_by_name("active"), t.active);
         assert_eq!(style_by_name("foreground"), Style::new().fg(t.foreground));
@@ -1666,28 +1630,6 @@ magenta    = "magenta"
 
         let ty = scope("type");
         assert_eq!((ty.r, ty.g, ty.b, ty.a), (0xfd, 0xa3, 0x31, 0xFF));
-    }
-
-    #[test]
-    fn cursor_unfocused_falls_back_to_cursor() {
-        let t = Theme::from_toml(
-            r##"
-[ui]
-"cursor" = { fg = "#ff0000" }
-"##,
-        )
-        .unwrap();
-        assert_eq!(t.cursor_unfocused, t.cursor);
-
-        let t = Theme::from_toml(
-            r##"
-[ui]
-"cursor"          = { fg = "#ff0000" }
-"cursor_unfocused" = { fg = "#00ff00" }
-"##,
-        )
-        .unwrap();
-        assert_eq!(t.cursor_unfocused.fg, Some(Color::Rgb(0, 255, 0)));
     }
 
     #[test]

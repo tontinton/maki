@@ -7,27 +7,53 @@
 //! synchronized update, and on terminals that honor it the IME only sees the
 //! final position. If a frame dies midway, teardown closes the update.
 //!
+//! The cursor is hidden right after the update begins. The previous frame may
+//! have left it shown, and ratatui writes the diff before it hides it, so on
+//! terminals that ignore the update a visible cursor would run over every
+//! cell.
+//!
 //! `Frame::set_cursor_position` cannot do the park, since ratatui shows the
-//! cursor whenever a frame sets one. So we move it after the draw, which
-//! already hid it.
+//! cursor whenever a frame sets one. So we move it after the draw.
+//!
+//! Where nothing paints a caret, the chat input, the parked cursor is shown
+//! instead, in the shape a plugin asked for if one did.
 
 use std::io::{self, Write};
 
+use crossterm::cursor::{Hide, SetCursorStyle, Show};
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Position;
 use ratatui::{Frame, Terminal};
 
+use crate::terminal::mark_cursor_styled;
+
+/// Where the cursor goes after a frame. Not `shown` where the caret is
+/// painted, so the cursor stays parked out of sight. `style` is None until a
+/// plugin sets a shape, so the terminal keeps its own.
+pub(crate) struct Caret {
+    pub position: Position,
+    pub shown: bool,
+    pub style: Option<SetCursorStyle>,
+}
+
 pub(crate) fn present<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
-    render: impl FnOnce(&mut Frame) -> Option<Position>,
+    render: impl FnOnce(&mut Frame) -> Option<Caret>,
 ) -> io::Result<()> {
-    queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    queue!(terminal.backend_mut(), BeginSynchronizedUpdate, Hide)?;
     let mut caret = None;
     terminal.draw(|frame| caret = render(frame))?;
-    if let Some(pos) = caret {
-        terminal.set_cursor_position(pos)?;
+    if let Some(caret) = caret {
+        terminal.set_cursor_position(caret.position)?;
+        if caret.shown {
+            if let Some(style) = caret.style {
+                queue!(terminal.backend_mut(), style)?;
+                mark_cursor_styled();
+            }
+            queue!(terminal.backend_mut(), Show)?;
+        }
     }
     execute!(terminal.backend_mut(), EndSynchronizedUpdate)
 }
@@ -38,8 +64,8 @@ mod tests {
     use std::io::{self, Write};
     use std::rc::Rc;
 
-    use super::present;
-    use crossterm::cursor::MoveTo;
+    use super::{Caret, present};
+    use crossterm::cursor::{Hide, MoveTo, SetCursorStyle, Show};
     use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
     use crossterm::{Command, queue};
     use ratatui::backend::CrosstermBackend;
@@ -87,9 +113,15 @@ mod tests {
             .count()
     }
 
-    #[test_case(Some(CARET) ; "the_caret_is_parked_last_inside_the_update")]
-    #[test_case(None ; "no_caret_adds_nothing_but_the_update")]
-    fn frame_is_the_diff_and_the_park_in_one_update(caret: Option<Position>) {
+    #[test_case(Some(CARET), false, None ; "the_caret_is_parked_last_inside_the_update")]
+    #[test_case(Some(CARET), true, None ; "a_shown_caret_keeps_the_terminal_shape")]
+    #[test_case(Some(CARET), true, Some(SetCursorStyle::SteadyBar) ; "a_shown_caret_gets_its_shape_after_the_park")]
+    #[test_case(None, false, None ; "no_caret_adds_nothing_but_the_update")]
+    fn frame_is_the_diff_and_the_park_in_one_update(
+        caret: Option<Position>,
+        shown: bool,
+        style: Option<SetCursorStyle>,
+    ) {
         let delivered = Bytes::default();
         let sink = Sink {
             pending: Vec::new(),
@@ -105,13 +137,22 @@ mod tests {
 
         present(&mut terminal, |frame| {
             frame.render_widget(TEXT, AREA);
-            caret
+            caret.map(|position| Caret {
+                position,
+                shown,
+                style,
+            })
         })
         .expect("the frame presents");
 
-        let begin = encode(BeginSynchronizedUpdate);
+        let mut begin = encode(BeginSynchronizedUpdate);
+        begin.extend(encode(Hide));
         let end = encode(EndSynchronizedUpdate);
         let mut tail = caret.map_or_else(Vec::new, |pos| encode(MoveTo(pos.x, pos.y)));
+        if shown {
+            tail.extend(style.map_or_else(Vec::new, encode));
+            tail.extend(encode(Show));
+        }
         tail.extend_from_slice(&end);
         let delivered = delivered.borrow();
         assert!(delivered.starts_with(&begin));
