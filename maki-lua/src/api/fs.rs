@@ -1487,6 +1487,7 @@ mod tests {
     #[cfg(unix)]
     use std::io::Write;
     use std::io::repeat;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant, SystemTime};
 
     use super::*;
@@ -1495,6 +1496,7 @@ mod tests {
     use mlua::Lua;
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::runtime::Builder;
 
     const FIRST_CONTENT: &str = "first";
     const BINARY_CONTENT: &[u8] = b"\0\xff\x80\r\n";
@@ -3264,8 +3266,8 @@ mod tests {
     /// The flag can land while the blocking task is already on its way back,
     /// so an answer that was built before the cancel still must not be
     /// published, and nothing it learned on the way may be kept either.
-    #[tokio::test]
-    async fn a_query_superseded_mid_flight_publishes_nothing() {
+    #[test]
+    fn a_query_superseded_mid_flight_publishes_nothing() {
         let base = cwd_root().unwrap();
         let tmp = file_tree(&base);
         walked(tmp.path());
@@ -3277,23 +3279,34 @@ mod tests {
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
         let f: mlua::Function = tbl.get("fuzzy_files").unwrap();
 
-        let (found, err): (Option<Table>, Option<String>) = async {
-            let mut call = Box::pin(f.call_async::<(Option<Table>, Option<String>)>(opts));
-            // One poll runs the call up to its first await, which is where it
-            // has taken its flag and handed the ranking to a blocking task.
-            // Superseding it now is the flag landing while the answer it is
-            // about to return is already built.
-            assert!(
-                (&mut call).now_or_never().is_none(),
-                "the call is supposed to be waiting on its ranking here"
-            );
-            let overtaking = supersede(&plugin);
-            let out = call.await;
-            retire(&plugin, &overtaking);
-            out
-        }
-        .await
-        .unwrap();
+        // On a busy machine the ranking can finish before the call is first
+        // polled, and then the call is over before the test gets to
+        // supersede it. One blocking thread works through its queue in
+        // order, so a task waiting on a gate holds the ranking back.
+        let runtime = Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (found, err): (Option<Table>, Option<String>) = runtime
+            .block_on(async {
+                let (open_gate, gate) = mpsc::channel::<()>();
+                spawn_blocking(move || gate.recv());
+                let mut call = Box::pin(f.call_async::<(Option<Table>, Option<String>)>(opts));
+                // One poll takes the call's flag and queues its ranking.
+                assert!(
+                    (&mut call).now_or_never().is_none(),
+                    "the call is supposed to be waiting on its ranking here"
+                );
+                drop(open_gate);
+                // Queued after the ranking, so once this is back the answer is
+                // built and only the check after the await can stop it.
+                spawn_blocking(|| ()).await.unwrap();
+                let overtaking = supersede(&plugin);
+                let out = call.await;
+                retire(&plugin, &overtaking);
+                out
+            })
+            .unwrap();
         assert!(found.is_none());
         assert_eq!(err.as_deref(), Some(SUPERSEDED_ERR));
         // The roots are a least-recently-asked-for list, so an overtaken
