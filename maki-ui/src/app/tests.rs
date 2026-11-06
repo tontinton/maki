@@ -12,11 +12,13 @@ use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::key as kb;
 use crate::components::lua_float::CURSOR_STYLE_NAME;
 use crate::components::messages::{ClickOutcome, ScrollPos};
+use crate::components::plan_form::builtin_menu;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
-use crate::components::{ExitRequest, buffer_text, key, test_model};
+use crate::components::{BackgroundOutcome, ExitRequest, buffer_text, key, test_model};
 use crate::decor_worker;
 use crate::highlight::TAB_SPACES;
+use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use crate::text_buffer::{Decoration, EDIT_CONFLICT_ERR, INPUT_REPLACED_ERR, Mark};
@@ -32,8 +34,8 @@ use maki_agent::{
     AgentMode, BackgroundNotice, BufferSnapshot, CallRecord, Cutter, DoneReason, EndReason,
     HistorySnapshot, ImageMediaType, ImageSource, McpConfigErrors, McpPromptArg, McpPromptInfo,
     McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, RunTotals, SessionControl,
-    SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SteerKind, TaskLabel, ToolDoneEvent,
-    ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
+    SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SteerKind, SubagentInfo, TaskLabel,
+    ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
 };
 use maki_config::project::{self, TrustMode};
 use maki_config::{Effect, PermissionRule, PermissionsConfig, PluginsConfig, ToolKey, UiConfig};
@@ -44,8 +46,9 @@ use maki_lua::test_support::{
 use maki_lua::{
     Border, BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest,
     InputRulesReader, InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader,
-    Missing, PASTE, PackCommand, PackPlan, PackPreparation, PackReport, Permission, PluginHost,
-    PluginPermissions, SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
+    Missing, PASTE, PackCommand, PackPlan, PackPreparation, PackReport, Permission,
+    PlanActionOutcome, PluginHost, PluginPermissions, SessionEndReason, Split, TextEdit, UiAction,
+    WinCommand, WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TaskAnswer,
@@ -731,7 +734,7 @@ fn ctrl_c_after_a_copy(between: &[KeyCode]) -> CtrlC {
 #[test_case(AgentEvent::Error { message: "boom".into(), auth: false, totals: RunTotals::default() }, ExitRequest::Error ; "error_exits_error")]
 fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     let mut app = test_app();
-    app.exit_on_done = true;
+    app.exit_when_done(None);
     app.status = Status::Streaming;
     app.run_id = 1;
     let actions = app.update(agent_msg(event));
@@ -742,7 +745,7 @@ fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
 #[test]
 fn reset_session_clears_exit_request_source() {
     let mut app = test_app();
-    app.exit_on_done = true;
+    app.exit_when_done(None);
     app.status = Status::Streaming;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::Done {
@@ -5073,12 +5076,10 @@ fn yolo_toggle() {
     assert!(!app.permissions.is_yolo());
     app.execute_command(cmd("/yolo"), 0);
     assert!(app.permissions.is_yolo());
-    let flash = app.status_bar.flash_text().unwrap();
-    assert!(flash.contains("enabled"), "flash={flash:?}");
+    assert_eq!(app.status_bar.flash_text().unwrap(), YOLO_ON_MSG);
     app.execute_command(cmd("/yolo"), 0);
     assert!(!app.permissions.is_yolo());
-    let flash = app.status_bar.flash_text().unwrap();
-    assert!(flash.contains("disabled"), "flash={flash:?}");
+    assert_eq!(app.status_bar.flash_text().unwrap(), YOLO_OFF_MSG);
 }
 
 /// The toggle is session state like mode and thinking, so a checkpoint has to
@@ -6076,10 +6077,7 @@ fn btw_empty_flashes_error() {
         0,
     );
     assert!(actions.is_empty());
-    assert_eq!(
-        app.status_bar.flash_text().unwrap(),
-        "Usage: /btw <question>"
-    );
+    assert_eq!(app.status_bar.flash_text().unwrap(), BTW_USAGE_MSG);
 }
 
 #[test]
@@ -6951,6 +6949,23 @@ fn ask_permission(app: &mut App) {
         scopes: vec!["ls".into()],
         reason: None,
     }));
+}
+
+const ASK_REASON: &str = "plugin wants a human to look";
+
+#[test]
+fn permission_request_reason_reaches_the_prompt() {
+    let mut app = test_app();
+    let _answers = answer_channel(&mut app);
+    app.update(agent_msg(AgentEvent::PermissionRequest {
+        id: FIRST_ASK.into(),
+        tool: ToolKey::native("bash"),
+        scopes: vec!["ls".into()],
+        reason: Some(ASK_REASON.into()),
+    }));
+
+    assert!(app.permission_prompt.is_asking(FIRST_ASK));
+    assert!(rendered(&mut app).contains(ASK_REASON));
 }
 
 fn open_plan_form(app: &mut App) {
@@ -12984,8 +12999,7 @@ const BACKGROUND_WAIT: Duration = Duration::from_secs(600);
 fn exit_on_done_app(background_wait: Option<Duration>) -> (App, SessionMailbox) {
     let mut app = streaming_app();
     let mailbox = hold_mailbox(&mut app);
-    app.exit_on_done = true;
-    app.background_wait = background_wait;
+    app.exit_when_done(background_wait);
     mailbox.track(MOVED_ID);
     (app, mailbox)
 }
