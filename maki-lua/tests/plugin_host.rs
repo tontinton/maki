@@ -7964,13 +7964,8 @@ impl Provider for TurnThenPark {
     }
 }
 
-/// What this chat session's task tabs were sent since the last drain. The
-/// notice that opens a tab carries no event, so it is skipped.
-fn task_events(
-    ui: &flume::Receiver<maki_lua::UiAction>,
-    session: MakiId,
-) -> impl Iterator<Item = AgentEvent> {
-    ui.drain().filter_map(move |action| match action {
+fn task_event(action: maki_lua::UiAction, session: MakiId) -> Option<AgentEvent> {
+    match action {
         maki_lua::UiAction::PluginTaskEvent {
             session: owner,
             envelope,
@@ -7978,7 +7973,24 @@ fn task_events(
         } if owner == session => Some(envelope.event),
         maki_lua::UiAction::PluginTaskOpened { session: owner, .. } if owner == session => None,
         _ => panic!("only this chat session's task events go to the UI here"),
-    })
+    }
+}
+
+/// What this chat session's task tabs were sent since the last drain. The
+/// notice that opens a tab carries no event, so it is skipped.
+fn task_events(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+) -> impl Iterator<Item = AgentEvent> {
+    ui.drain()
+        .filter_map(move |action| task_event(action, session))
+}
+
+fn into_billed_turn(event: AgentEvent) -> Option<TurnCompleteEvent> {
+    match event {
+        AgentEvent::TurnComplete(turn) => Some(*turn),
+        _ => None,
+    }
 }
 
 /// The paid turns the tab was told about, in order.
@@ -7987,11 +7999,25 @@ fn billed_turns(
     session: MakiId,
 ) -> Vec<TurnCompleteEvent> {
     task_events(ui, session)
-        .filter_map(|event| match event {
-            AgentEvent::TurnComplete(turn) => Some(*turn),
-            _ => None,
-        })
+        .filter_map(into_billed_turn)
         .collect()
+}
+
+/// Like `billed_turns`, but waits for the first one if none has arrived yet.
+fn wait_for_billed_turns(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+) -> Vec<TurnCompleteEvent> {
+    let deadline = std::time::Instant::now() + CANCEL_TEST_TIMEOUT;
+    let mut turns = billed_turns(ui, session);
+    while turns.is_empty() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let Ok(action) = ui.recv_timeout(left) else {
+            break;
+        };
+        turns.extend(task_event(action, session).and_then(into_billed_turn));
+    }
+    turns
 }
 
 /// The transcript the tab was last handed for task `id`.
@@ -8040,7 +8066,7 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     parked
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("the prompt must reach its second turn");
-    let turns = billed_turns(&ui, session);
+    let turns = wait_for_billed_turns(&ui, session);
     let [turn] = turns.as_slice() else {
         panic!("the paid turn must reach the tab while the prompt still runs");
     };
