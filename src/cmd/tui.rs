@@ -727,7 +727,7 @@ mod tests {
             &plugin_host,
             &cli,
             InitFiles::Disabled,
-            &ProjectConfig::for_project(dir.path()),
+            &project::resolve_noninteractive(dir.path(), TrustMode::Session).project_config,
             &no_names,
             &mut Vec::new(),
         )
@@ -768,7 +768,7 @@ mod tests {
             &plugin_host,
             &cli,
             InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
-            &ProjectConfig::for_project(dir.path()),
+            &project::resolve_noninteractive(dir.path(), TrustMode::Session).project_config,
             &no_names,
             &mut Vec::new(),
         ) {

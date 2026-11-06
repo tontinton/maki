@@ -313,7 +313,8 @@ mod tests {
 
     use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
     use maki_agent::{AgentEvent, AgentInput, AgentMode, AgentSeed, InputSource};
-    use maki_config::{PermissionsConfig, ProjectConfig};
+    use maki_config::PermissionsConfig;
+    use maki_config::project::{self, TrustMode};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, TaskEnd,
@@ -394,7 +395,7 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
+            project::resolve_noninteractive(Path::new("/tmp"), TrustMode::Session).project_config,
             Arc::default(),
         ));
         let handles = AgentHandles::spawn(

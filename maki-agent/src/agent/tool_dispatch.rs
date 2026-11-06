@@ -1545,9 +1545,8 @@ mod tests {
 
     use flume::Receiver;
     use futures::FutureExt;
-    use maki_config::{
-        Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
-    };
+    use maki_config::project::{self, TrustMode};
+    use maki_config::{Effect, Permission, PermissionRule, PermissionsConfig, ToolKey};
     use maki_providers::{ContentBlock, Message, Role, StreamResponse};
     use maki_storage::id::MakiId;
     use test_case::test_case;
@@ -1747,7 +1746,8 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             config,
             PathBuf::from(TEST_ROOT),
-            ProjectConfig::for_project(Path::new(TEST_ROOT)),
+            project::resolve_noninteractive(Path::new(TEST_ROOT), TrustMode::Session)
+                .project_config,
             Arc::default(),
         ));
         stub_ctx_with_permissions(mode, permissions)

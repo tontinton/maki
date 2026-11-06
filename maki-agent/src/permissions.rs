@@ -1166,6 +1166,7 @@ fn write_rule_dir(scope: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_config::project::{self, TrustMode};
     use test_case::test_case;
 
     const PLAN_FILE: &str = "/home/user/.local/state/maki/plans/test.md";
@@ -1237,8 +1238,13 @@ mod tests {
         }
     }
 
+    /// `--trust`, the grant that reads and writes no state directory.
+    fn session_trusted(cwd: &Path) -> ProjectConfig {
+        project::resolve_noninteractive(cwd, TrustMode::Session).project_config
+    }
+
     fn mgr_with(config: PermissionsConfig, cwd: PathBuf) -> PermissionManager {
-        let project_config = ProjectConfig::for_project(&cwd);
+        let project_config = session_trusted(&cwd);
         PermissionManager::new(config, cwd, project_config, Arc::default())
     }
 
@@ -1749,7 +1755,7 @@ mod tests {
             PermissionsConfig::default(),
             project.path().to_path_buf(),
             if trusted {
-                ProjectConfig::for_project(project.path())
+                session_trusted(project.path())
             } else {
                 ProjectConfig::discover(project.path())
             },
@@ -2481,7 +2487,7 @@ mod tests {
         let mgr = PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
+            session_trusted(Path::new("/tmp")),
             Arc::clone(&store),
         );
         let fork = mgr.fork();
@@ -2501,7 +2507,7 @@ mod tests {
         let mgr = PermissionManager::new(
             make_config(vec![plugin_edit_rule("/x/**", Effect::Deny)]),
             PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
+            session_trusted(Path::new("/tmp")),
             store,
         );
         assert!(matches!(
@@ -2617,7 +2623,7 @@ mod tests {
         let mgr = PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
+            session_trusted(Path::new("/tmp")),
             store,
         );
         let reason = denied_reason(&mgr, &ToolKey::native("edit"), "/x/f");

@@ -767,6 +767,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures::FutureExt;
+    use maki_config::project::{self, TrustMode};
     use maki_config::providers::Protocol;
     use maki_providers::model::ModelTier;
     use maki_providers::plugin::{
@@ -995,7 +996,8 @@ mod tests {
             defaults: SessionDefaults::default(),
             model_policy: Arc::default(),
             plugin_rules: Arc::default(),
-            project_config: ProjectConfig::for_project(tmp.path()),
+            project_config: project::resolve_noninteractive(tmp.path(), TrustMode::Session)
+                .project_config,
             local_tools: LocalTools::default(),
             background: BackgroundMode::Blocking,
             stop: CancelToken::none(),

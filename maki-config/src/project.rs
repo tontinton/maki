@@ -116,14 +116,6 @@ impl ProjectConfig {
         }
     }
 
-    /// Trust without consulting the store, for tests that need a trusted config
-    /// without a state directory. `project::resolve` is the only production
-    /// route to a trusted config.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn for_project(root: &Path) -> Self {
-        Self::discover(root).with_trust(true)
-    }
-
     pub fn config_root(&self) -> &Path {
         &self.config_root
     }
@@ -675,7 +667,7 @@ mod tests {
     #[test]
     fn gated_paths_exist_only_for_a_trusted_folder() {
         let dir = tempfile::tempdir().unwrap();
-        let trusted = ProjectConfig::for_project(dir.path());
+        let trusted = resolve_noninteractive(dir.path(), TrustMode::Session).project_config;
         let untrusted = ProjectConfig::discover(dir.path());
 
         for file in GatedFile::ALL.iter().copied() {

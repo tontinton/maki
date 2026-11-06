@@ -518,6 +518,7 @@ fn read_config(path: &Path) -> Result<Option<McpConfig>, McpConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_config::project::{self, TrustMode};
     use maki_storage::paths::home;
     use test_case::test_case;
 
@@ -847,7 +848,7 @@ command = ["project"]
         let (merged, errors) = load_config_inner(
             &project_dir,
             Some(&global_dir.join(MCP_CONFIG_FILE)),
-            ProjectConfig::for_project(&project_dir),
+            project::resolve_noninteractive(&project_dir, TrustMode::Session).project_config,
         );
         assert!(errors.is_empty());
         let all: Vec<_> = merged

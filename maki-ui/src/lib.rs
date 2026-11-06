@@ -6,7 +6,6 @@
 pub mod animation;
 pub mod app;
 mod appearance;
-#[cfg(feature = "bench")]
 #[doc(hidden)]
 pub mod bench_support;
 pub mod chat;
