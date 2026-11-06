@@ -23,7 +23,9 @@ use maki_lua::{DiscoveredPackage, Origin, PluginHost, PluginPermissions, Request
 use maki_providers::model::{Model, ModelTier};
 use maki_providers::provider::Provider;
 use maki_providers::retry::RetryKind;
-use maki_providers::test_support::{Canned, JSON_HEADERS, Recorded, Requests, serve};
+use maki_providers::test_support::{
+    Canned, JSON_HEADERS, Recorded, Requests, isolated_home, serve,
+};
 use maki_providers::{
     AgentError, Effort, Message, ProviderEvent, RequestOptions, StopReason, StreamResponse,
     ThinkingConfig, Timeouts, plugin,
@@ -89,6 +91,7 @@ const TAKEOVER_REFUSED: &str = "was not granted it";
 const WRITE_FAILED: &str = "the fixture package could not be written";
 const PARSE_FAILED: &str = "the fixture manifest did not parse";
 const CACHE_DIR_FAILED: &str = "no isolated cache directory";
+const TEMPDIR_FAILED: &str = "no temporary state directory";
 
 const PROMPT: &str = "read a.txt";
 const SYSTEM: &str = "You are a test.";
@@ -110,7 +113,6 @@ const HOOK_FAILED: &str = "a provider hook did not answer";
 const NO_USAGE: &str = "fetch_usage answered with nothing";
 const NO_STATE_DIR: &str = "the isolated state directory did not resolve";
 const NO_CREDENTIALS: &str = "the refresh hook stored no credentials";
-const TEMPDIR_FAILED: &str = "no temporary state directory";
 const IO_FAILED: &str = "the recorded connection broke";
 const NO_TOKEN_LOCK: &str = "the credential lock could not be taken";
 const HOST_THREAD_PARKED: &str =
@@ -181,22 +183,6 @@ const OVERLOADED_SCRIPT: &[Canned] = &[Canned {
     path: None,
 }];
 
-/// Points every base directory at a throwaway tree, so the credentials the
-/// fixture's `login` and `auth` store never touch the real state dir.
-fn isolated_state() -> TempDir {
-    let dir = TempDir::new().expect(TEMPDIR_FAILED);
-    for var in [
-        "HOME",
-        "XDG_STATE_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_CACHE_HOME",
-    ] {
-        unsafe { std::env::set_var(var, dir.path()) };
-    }
-    dir
-}
-
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider_plugin/init.lua")
 }
@@ -243,7 +229,7 @@ impl Fixture {
     }
 
     fn at(base_url: &str, server: Requests) -> Self {
-        let state = isolated_state();
+        let state = isolated_home();
         unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
 
         let host = plugin_host();
@@ -535,7 +521,7 @@ maki.provider.register({{
 /// branch builds its body somewhere else entirely, so it gets its own case.
 #[test]
 fn the_responses_codec_applies_the_body_hook_too() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     let (base_url, server) = serve(RESPONSES_SCRIPT);
     let host = plugin_host();
     load_inline(
@@ -637,7 +623,7 @@ fn wait_for(path: &Path) {
 /// A parked host would otherwise hang the test for good instead of failing it.
 #[test]
 fn a_credential_write_does_not_park_the_plugin_host() {
-    let state = isolated_state();
+    let state = isolated_home();
     let entered = state.path().join("entered");
     let done = state.path().join("done");
 
@@ -672,7 +658,7 @@ fn a_credential_write_does_not_park_the_plugin_host() {
 /// on belong to the handle and go only once nobody holds it.
 #[test]
 fn an_in_flight_hook_call_survives_a_plugin_reload() {
-    let state = isolated_state();
+    let state = isolated_home();
     let started = state.path().join("started");
     let release = state.path().join("release");
 
@@ -695,7 +681,7 @@ fn an_in_flight_hook_call_survives_a_plugin_reload() {
 /// maki ships stays reserved, even when its bundled plugin is turned off.
 #[test]
 fn a_third_party_plugin_cannot_take_a_builtin_slug() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     let host = plugin_host();
     plugin::begin_load();
 
@@ -737,7 +723,7 @@ fn takeover_catalog_cached() {
 /// holds no grant at all.
 #[test]
 fn every_registered_slug_needs_the_grant_a_package_load_carries() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     takeover_catalog_cached();
 
     let site = TempDir::new().expect(TEMPDIR_FAILED);
@@ -799,7 +785,7 @@ fn every_registered_slug_needs_the_grant_a_package_load_carries() {
 /// does.
 #[test]
 fn a_failed_package_load_keeps_its_granted_slug_owned() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     takeover_catalog_cached();
 
     let site = TempDir::new().expect(TEMPDIR_FAILED);

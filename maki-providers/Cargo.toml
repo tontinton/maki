@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# The recorded loopback server in `test_support`, for suites in other crates.
-test-support = []
+# The recorded loopback server and the provider setup isolation in
+# `test_support`, for suites in other crates.
+test-support = ["dep:tempfile"]
 
 [dependencies]
 serde = { workspace = true }
@@ -37,8 +38,10 @@ open = { workspace = true }
 keyring = { workspace = true }
 url = { workspace = true }
 toml = { workspace = true }
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+maki-providers = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
