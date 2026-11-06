@@ -3085,6 +3085,7 @@ mod bundled_manifests {
     const LUA_EXT: &str = "lua";
     const REQUIRE_CALL: &str = "require(";
     const PROVIDER_REGISTER: &str = "maki.provider.register";
+    const TOOL_REGISTER: &str = "maki.api.register_tool";
     const API_KEY_ENV_FIELD: &str = "api_key_env";
     const AGENT_SESSION: &str = "maki.agent.session";
     const SESSION_NOTIFY: &str = "maki.session.notify";
@@ -3255,6 +3256,26 @@ mod bundled_manifests {
         registering.sort_unstable();
         expected.sort_unstable();
         assert_eq!(registering, expected);
+    }
+
+    /// `NON_TOOL_BUILTINS` keeps a UI-only plugin's name from reading as a
+    /// tool, so it must list exactly the defaults that register neither.
+    #[test]
+    fn non_tool_builtins_are_the_defaults_that_register_no_tool_or_provider() {
+        let mut silent: Vec<&str> = BUNDLED_PLUGINS
+            .iter()
+            .filter(|p| DEFAULT_BUILTINS.contains(&p.name))
+            .filter(|p| {
+                !runtime_sources(&p.dir)
+                    .iter()
+                    .any(|s| calls(s, TOOL_REGISTER) || calls(s, PROVIDER_REGISTER))
+            })
+            .map(|p| p.name)
+            .collect();
+        let mut expected = maki_config::NON_TOOL_BUILTINS.to_vec();
+        silent.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(silent, expected);
     }
 
     #[test]
