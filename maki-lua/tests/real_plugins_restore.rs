@@ -524,18 +524,32 @@ fn failed_call_restores_without_a_body(tool: &str) {
     assert!(r.header.starts_with(MISSING_PATH), "header: {}", r.header);
 }
 
-/// Nothing else runs the real plugin's restore. It draws the call's list into
-/// the chat from its input alone, so a failed call renders the same.
-#[test]
-fn todo_write_restore_renders_the_list() {
+/// The panel shows the live list, so a call's list stays folded under its
+/// header in the chat. Each recorded click on the row flips it, and restore
+/// replays them, so it builds the list from the input alone and a failed call
+/// renders the same.
+#[test_case(Vec::new() => false ; "folded_by_default")]
+#[test_case(vec![0] => true ; "click_unfolds")]
+#[test_case(vec![0, 1] => false ; "second_click_folds")]
+fn todo_write_restore_shows_the_list_once_clicked(clicks: Vec<usize>) -> bool {
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     host.load_source(TODO_TOOL, TODO_SRC).unwrap();
     let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
-    let item = in_subagent_load(restore_item(TODO_TOOL, input, "", None, Vec::new()));
+    let item = in_subagent_load(restore_item(TODO_TOOL, input, "", None, clicks));
 
-    let r = run_restore(&host, item);
+    run_restore(&host, item).body.contains(TODO_ITEM)
+}
 
-    assert!(r.body.contains(TODO_ITEM), "list missing: {}", r.body);
+#[test]
+fn todo_write_live_call_starts_folded() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+    let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
+
+    let live = exec_live(&host, &reg, TODO_TOOL, input);
+
+    assert!(!live.body.contains(TODO_ITEM), "list shown: {}", live.body);
 }
 
 /// A session load replays a transcript, so its restores run with the panel
