@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::clipboard::{self, CopyResult};
 use crate::components::messages::ClickOutcome;
+use crate::components::scrollbar::Thumbs;
 use crate::selection::{
     self, ContentRegion, DocPos, EdgeScroll, RowPos, ScreenSelection, Selection, SelectionState,
     SelectionZone,
@@ -259,6 +260,7 @@ impl App {
         buf: &mut ratatui::buffer::Buffer,
         sel: &Selection,
         render_chat: usize,
+        thumbs: &Thumbs,
     ) {
         let text = match sel.zone {
             SelectionZone::Messages => {
@@ -281,7 +283,7 @@ impl App {
                     area: sel.area,
                     ..Default::default()
                 }];
-                selection::extract_selected_text(buf, &screen_sel, &regions)
+                selection::extract_selected_text(&thumbs.uncovered(buf), &screen_sel, &regions)
             }
         };
 

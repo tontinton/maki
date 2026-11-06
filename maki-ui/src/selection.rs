@@ -32,12 +32,13 @@ use std::ops::Range;
 use std::time::Instant;
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::components::scrollbar::Thumbs;
 use crate::repaint::Cadence;
 use crate::theme;
 use crate::wrap::{self, Break};
@@ -442,8 +443,9 @@ fn clip(buf: &Buffer, area: Rect) -> Rect {
     area.intersection(*buf.area())
 }
 
-/// Last column is the scrollbar, so we skip it.
-pub fn apply_highlight(buf: &mut Buffer, area: Rect, ss: &ScreenSelection) {
+/// Thumbs are not highlighted, since the copy takes the text hidden under
+/// them and not the thumb itself.
+pub fn apply_highlight(buf: &mut Buffer, area: Rect, ss: &ScreenSelection, thumbs: &Thumbs) {
     let area = clip(buf, area);
     if area.is_empty() {
         return;
@@ -454,7 +456,11 @@ pub fn apply_highlight(buf: &mut Buffer, area: Rect, ss: &ScreenSelection) {
     for row in row_start..=row_end {
         let (col_start, col_end) = col_range(ss, area.x, right, row);
         for col in col_start..=col_end {
-            let cell = &mut buf[(col, row)];
+            let pos = Position::new(col, row);
+            if thumbs.covers(buf, pos) {
+                continue;
+            }
+            let cell = &mut buf[pos];
             cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
         }
     }
@@ -610,9 +616,20 @@ pub fn extract_selected_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::scrollbar::test_support::{draw_recorded, thumb_cells};
     use ratatui::style::Style;
     use ratatui::text::Span;
     use test_case::test_case;
+
+    /// The last letter of each row sits in the scrollbar column, so the thumb
+    /// hides some of them.
+    const UNDER_SCROLLBAR: [&str; 4] = ["row0x", "row1x", "row2x", "row3x"];
+    const UNDER_SCROLLBAR_COPY: &str = "row0x\nrow1x\nrow2x\nrow3x";
+
+    fn select_all(buf: &Buffer) -> ScreenSelection {
+        let area = buf.area();
+        ss(0, 0, area.bottom() - 1, area.right() - 1)
+    }
 
     fn doc(row: u16, col: u16) -> DocPos {
         DocPos::flat(row, col)
@@ -1209,5 +1226,29 @@ mod tests {
             &mut RowCarry::default(),
         );
         assert_eq!(out, "好");
+    }
+
+    #[test]
+    fn copy_reads_the_text_beneath_the_thumb() {
+        let (buf, thumbs) = draw_recorded(Buffer::with_lines(UNDER_SCROLLBAR), 1);
+        let region = ContentRegion {
+            area: buf.area,
+            ..Default::default()
+        };
+        let text = extract_selected_text(&thumbs.uncovered(&buf), &select_all(&buf), &[region]);
+        assert_eq!(text, UNDER_SCROLLBAR_COPY);
+    }
+
+    #[test]
+    fn highlight_reverses_all_but_the_thumb() {
+        let (mut buf, thumbs) = draw_recorded(Buffer::with_lines(UNDER_SCROLLBAR), 1);
+        let covered = thumb_cells(&buf, &thumbs);
+        let area = buf.area;
+        let sel = select_all(&buf);
+        apply_highlight(&mut buf, area, &sel, &thumbs);
+        for pos in area.positions() {
+            let reversed = buf[pos].modifier.contains(Modifier::REVERSED);
+            assert_eq!(reversed, !covered.contains(&pos), "{pos:?}");
+        }
     }
 }
