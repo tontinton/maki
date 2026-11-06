@@ -475,17 +475,19 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
 
-`~/.maki/` (or `%USERPROFILE%\\.maki\\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
+`~/.maki/` (or `%USERPROFILE%\\.maki\\`) is the layout older versions used. Maki does not read it anymore.
 
-### Migrating from ~/.maki/
+### Moving from ~/.maki/
+
+Maki moves `~/.maki/` into the locations above on the first start that finds it, before it reads or writes anything else, and shows where the files went. Files maki writes go to state. Your own files (`init.lua`, `lua/`, `permissions.toml`, `mcp.toml`, `providers.toml`, `.env`, `AGENTS.md`, `pack-lock.json`, `commands/`, `skills/`, `themes/` and `providers/`) go to config. Logs go to logs. Caches are rebuilt.
+
+When both places hold the same file, folder trust and recent models are merged. For any other file maki keeps the copy written last and moves the other one to `~/.maki.bak/`. The exception is `permissions.toml`: older versions applied the one in `~/.config/maki/`, so that one stays.
+
+Maki does not move a `~/.maki/` that is a symlink, because it most likely points into a dotfiles repository. Run the move yourself, or retry one that failed, with:
 
 ```
 maki migrate xdg
 ```
-
-This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
-
-Safe to run more than once.
 
 ## Personal Instructions
 

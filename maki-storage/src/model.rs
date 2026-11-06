@@ -63,6 +63,20 @@ pub fn push_recent(dir: &StateDir, spec: &str) -> Vec<String> {
     recents
 }
 
+/// Newest first, so a list written by a launch that predates the migration
+/// does not bury the history it replaced. Identical to `push_recent` for one
+/// spec, applied to a whole list.
+pub fn merge_recents(new: &[String], old: &[String]) -> Vec<String> {
+    let mut merged = new.to_vec();
+    for spec in old {
+        if !merged.contains(spec) {
+            merged.push(spec.clone());
+        }
+    }
+    merged.truncate(MAX_RECENTS);
+    merged
+}
+
 pub fn read_recents(dir: &StateDir) -> Vec<String> {
     let Ok(raw) = fs::read_to_string(dir.path().join(RECENT_FILE)) else {
         return Vec::new();
@@ -163,6 +177,22 @@ mod tests {
             read_recents(&dir),
             ["anthropic/claude-sonnet-4", "openai/gpt-5.4-nano"]
         );
+    }
+
+    #[test]
+    fn merge_recents_keeps_both_sides_newest_first() {
+        let merged = merge_recents(
+            &["new/one".to_owned()],
+            &["old/one".to_owned(), "new/one".to_owned()],
+        );
+        assert_eq!(merged, ["new/one", "old/one"]);
+    }
+
+    #[test]
+    fn merge_recents_caps_at_max() {
+        let new: Vec<String> = (0..MAX_RECENTS).map(|i| format!("new/{i}")).collect();
+        let old: Vec<String> = (0..MAX_RECENTS).map(|i| format!("old/{i}")).collect();
+        assert_eq!(merge_recents(&new, &old).len(), MAX_RECENTS);
     }
 
     #[test]
