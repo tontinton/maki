@@ -4,7 +4,7 @@ local QuestionForm = {}
 
 local MAX_HEIGHT_RATIO = 0.75
 local CUSTOM_OPTION = "Type your own answer"
-local CHROME = 3
+local BORDER_CHROME = 2
 local DESC_SEP = " - "
 local DESC_SEP_WIDTH = 3
 local ARROW_PREFIX = "    → "
@@ -615,7 +615,7 @@ function QuestionForm.open(questions)
   while true do
     local result = render(state, width)
     win:set_config({
-      height = math.min(#result.lines + CHROME, max_h),
+      height = math.min(#result.lines + BORDER_CHROME, max_h),
       reserved_top = result.reserved_top,
       footer = result.footer,
     })
