@@ -60,7 +60,7 @@ The whole conversation is re-sent to the model on every turn, so anything that l
 
 ### Lua plugins
 
-* Extend with neovim like Lua plugins - [Builtin plugins](https://github.com/tontinton/maki/tree/main/plugins), [Community plugins](https://maki.sh/plugins/), [Lua API reference](https://maki.sh/docs/lua-api/).
+* Extend with neovim like Lua plugins - [Builtin plugins](https://github.com/tontinton/maki/tree/main/plugins), [Community plugins](https://maki.sh/plugins/), [User made plugins showcase](https://github.com/tontinton/maki/discussions/452), [Lua API reference](https://maki.sh/docs/lua-api/).
 * Every builtin tool (`read`, `bash`, `edit`, even `batch`) is itself a Lua plugin, so anything maki does out of the box your plugin can do too. Tools, slash commands, keymaps, UI, providers.
 * Install packages from git with `maki.pack.add`. They get locked to a commit in `pack-lock.json`, so you can commit it with your dotfiles. See [Lua Packages](https://maki.sh/docs/packages/).
 * [Hooks](https://maki.sh/docs/hooks/) to rewrite a tool call before it runs, or filter its output before the model sees it (e.g. redacting secrets).
