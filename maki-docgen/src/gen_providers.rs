@@ -453,7 +453,7 @@ local function credentials()
   if stored then
     return stored
   end
-  local text = maki.fs.read(maki.fs.normalize("~/.maki/auth/acme.json"))
+  local text = maki.fs.read(maki.fs.normalize("~/.local/state/maki/auth/acme.json"))
   if not text then
     return nil
   end

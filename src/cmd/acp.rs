@@ -21,6 +21,7 @@ pub async fn run(
     no_jit: bool,
     trust_mode: TrustMode,
     background: bool,
+    legacy_notice: Option<String>,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
@@ -58,6 +59,7 @@ pub async fn run(
     )
     .await?;
     warnings.extend(provider_scripts::startup_warning());
+    warnings.extend(legacy_notice);
     super::report_warnings(warnings);
 
     let timeouts = maki_providers::Timeouts::from(&config.provider);

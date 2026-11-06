@@ -103,18 +103,12 @@ pub struct DiscoveredPackage {
 
 /// `pack-lock.json`, beside the user's configuration so it can be committed.
 ///
-/// `config_search_dirs` returns candidates in the order `init.lua` is searched
-/// for, so the first that exists is the one whose `maki.pack.add` declared
-/// these packages, and a custom config directory keeps its lockfile rather than
-/// leaving it behind in XDG. With none of them created yet there is nothing to
-/// sit beside, and the last candidate is the one `append_permission_rule`
-/// already treats as writable.
+/// The config dir is where `init.lua` ran, so it is the directory whose
+/// `maki.pack.add` declared these packages, and it keeps its lockfile rather
+/// than leaving it behind.
 pub fn lockfile_path() -> Option<PathBuf> {
-    let dirs = maki_storage::paths::config_search_dirs();
-    dirs.iter()
-        .find(|dir| dir.is_dir())
-        .cloned()
-        .or_else(|| dirs.into_iter().next_back())
+    maki_storage::paths::config_dir()
+        .ok()
         .map(|dir| dir.join("pack-lock.json"))
 }
 

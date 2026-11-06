@@ -291,7 +291,7 @@ async fn rebuild(
     Ok((stack, warnings, pack_report))
 }
 
-pub async fn run(mut cli: Cli) -> Result<()> {
+pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
@@ -493,9 +493,14 @@ pub async fn run(mut cli: Cli) -> Result<()> {
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
                 startup_notice: notice.take(),
-                // Read per run: plugins have just (re)loaded, and a script one
-                // of them now replaces is no longer worth a word.
-                startup_alert: provider_scripts::startup_warning(),
+                // The scripts are read per run: plugins have just (re)loaded,
+                // and a script one of them now replaces is no longer worth a
+                // word. An alert, not a status-bar flash: both say where the
+                // user's files are, and a 1.5s flash is too short to read.
+                startup_alert: [legacy_notice.take(), provider_scripts::startup_warning()]
+                    .into_iter()
+                    .flatten()
+                    .reduce(|shown, next| format!("{shown}\n\n{next}")),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),

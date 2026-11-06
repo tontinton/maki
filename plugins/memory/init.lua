@@ -20,49 +20,30 @@ local function memories_path_suffix()
   return "projects/" .. helpers.project_id(root) .. "/memories"
 end
 
-local function legacy_dir_if_exists(suffix): string?
-  local legacy = maki.env.legacy_dir()
-  if not legacy then
-    return nil
-  end
-  local dir = maki.fs.joinpath(legacy, suffix)
-  local meta = maki.fs.metadata(dir)
-  if meta and meta.is_dir then
-    return dir
-  end
-end
-
 -- Notes live outside cwd, where file-write tools normally prompt; pre-allow
--- them here so the agent can edit notes directly. Reads may come from the
--- legacy dir while writes go to the state dir, so cover both.
+-- them here so the agent can edit notes directly.
 local function register_write_rules()
-  local suffix = memories_path_suffix()
-  local dirs = { legacy_dir_if_exists(suffix) }
   local state = maki.env.state_dir()
-  if state then
-    dirs[#dirs + 1] = maki.fs.joinpath(state, suffix)
+  if not state then
+    return
   end
-  for _, dir in ipairs(dirs) do
-    for _, tool in ipairs(WRITE_TOOLS) do
-      -- The edit sub-tools are opt-in, and a rule naming an unregistered tool
-      -- is dropped with a warning. Ask first, or a default config logs that
-      -- warning at every startup.
-      if maki.api.get_tool(tool) then
-        maki.api.register_permission_rule({ tool = tool, scope = dir .. "/**" })
-      end
+  local dir = maki.fs.joinpath(state, memories_path_suffix())
+  for _, tool in ipairs(WRITE_TOOLS) do
+    -- The edit sub-tools are opt-in, and a rule naming an unregistered tool
+    -- is dropped with a warning. Ask first, or a default config logs that
+    -- warning at every startup.
+    if maki.api.get_tool(tool) then
+      maki.api.register_permission_rule({ tool = tool, scope = dir .. "/**" })
     end
   end
 end
 register_write_rules()
 
-local function resolve_dir(check_legacy)
+-- Reads and writes share one directory: the state dir. `~/.maki` is read only
+-- by `maki migrate xdg`, so preferring it here would return a directory this
+-- version never writes to.
+local function resolve_dir(): string?
   local suffix = memories_path_suffix()
-  if check_legacy then
-    local dir = legacy_dir_if_exists(suffix)
-    if dir then
-      return dir
-    end
-  end
   local state = maki.env.state_dir()
   if not state then
     return nil, "cannot resolve state dir"
@@ -74,7 +55,7 @@ maki.api.register_prompt_hint({
   prompt = "system",
   slot = "after_instructions",
   content = function()
-    local dir = resolve_dir(true)
+    local dir = resolve_dir()
     if not dir then
       return nil
     end
@@ -235,7 +216,7 @@ maki.api.register_tool({
       input.tags = { input.tags }
     end
     local cmd = input.command
-    local dir, dir_err = resolve_dir(cmd ~= "write" and cmd ~= "delete")
+    local dir, dir_err = resolve_dir()
     local verr = helpers.validate_input(input, dir)
     if verr then
       return { llm_output = "error: " .. verr, is_error = true }
@@ -335,7 +316,7 @@ maki.api.register_command({
   name = "/memory",
   description = "View, edit, and delete memory files",
   handler = function()
-    local dir = resolve_dir(true)
+    local dir = resolve_dir()
     if not dir then
       maki.ui.flash("Cannot resolve memory directory")
       return

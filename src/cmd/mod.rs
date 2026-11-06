@@ -201,6 +201,25 @@ async fn cli_stack(
 }
 
 pub async fn dispatch(cli: Cli) -> Result<()> {
+    // First, so anything moved out of `~/.maki` lands before this start writes
+    // a file of its own. `migrate xdg` is the same move asked for by hand.
+    let legacy_notice = match cli.command {
+        Some(Command::Migrate { .. }) => None,
+        _ => migrate::startup_notice(),
+    };
+    // The TUI and ACP show it on their own channel, which stderr from here
+    // would sit under. Everything else, `-p` and the SDK included, prints it.
+    let owns_channel = match cli.command {
+        Some(Command::Acp { .. }) => true,
+        None => !cli.print,
+        Some(_) => false,
+    };
+    let legacy_notice = if owns_channel {
+        legacy_notice
+    } else {
+        report_warnings(Vec::from_iter(legacy_notice));
+        None
+    };
     // `--trust` is a grant for this process, so every entry point under it
     // reads the same shared project config the TUI would.
     let trust_mode = if cli.trust {
@@ -267,6 +286,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 cli.no_jit,
                 trust_mode,
                 background,
+                legacy_notice,
             )
             .await?;
         }
@@ -310,7 +330,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             .await?;
         }
         None => {
-            tui::run(cli).await?;
+            tui::run(cli, legacy_notice).await?;
         }
     }
     Ok(())
