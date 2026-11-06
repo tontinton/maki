@@ -1,0 +1,72 @@
+{
+  "call": {
+    "endpoint": "stream",
+    "model": "tenstorrent/Qwen/Qwen3.8-27B",
+    "thinking": {
+      "kind": "effort",
+      "level": "high"
+    }
+  },
+  "script": [
+    {
+      "body": "data: {\"choices\":[{\"delta\":{\"reasoning\":\"checking\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"pong\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\ndata: [DONE]\n\n",
+      "headers": {
+        "content-type": "text/event-stream"
+      },
+      "status": 200
+    }
+  ],
+  "expected": {
+    "events": [
+      {
+        "ThinkingDelta": {
+          "text": "checking"
+        }
+      },
+      {
+        "TextDelta": {
+          "text": "pong"
+        }
+      }
+    ],
+    "outcome": {
+      "context_size": 19,
+      "message": {
+        "content": [
+          {
+            "thinking": "checking",
+            "type": "thinking"
+          },
+          {
+            "text": "pong",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      "stop_reason": "end_turn",
+      "usage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 19,
+        "output_tokens": 2
+      }
+    },
+    "requests": [
+      {
+        "body": "{\"chat_template_kwargs\":{\"enable_thinking\":true},\"max_tokens\":16384,\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"}],\"model\":\"Qwen/Qwen3.8-27B\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "content-length": "433",
+          "content-type": "application/json",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "POST",
+        "path": "/v1/chat/completions"
+      }
+    ]
+  }
+}

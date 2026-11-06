@@ -113,6 +113,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "synthetic",
     "task",
     "tensorx",
+    "tenstorrent",
     "thinking",
     "todo_write",
     "view_image",
@@ -131,6 +132,7 @@ pub const PROVIDER_BUILTINS: &[&str] = &[
     "requesty",
     "synthetic",
     "tensorx",
+    "tenstorrent",
 ];
 
 /// The [`DEFAULT_BUILTINS`] that only add UI or commands and register no tool,

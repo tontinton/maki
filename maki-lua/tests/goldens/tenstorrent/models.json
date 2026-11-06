@@ -1,0 +1,79 @@
+{
+  "call": {
+    "endpoint": "models"
+  },
+  "script": [
+    {
+      "body": "{\"object\":\"list\",\"data\":[{\"id\":\"MiniMaxAI/MiniMax-M3.1-Flash\",\"object\":\"model\",\"owned_by\":\"tenstorrent\"},{\"id\":\"Qwen/Qwen3-32B\",\"object\":\"model\",\"owned_by\":\"tenstorrent\"},{\"id\":\"Qwen/Qwen3.8-27B\",\"object\":\"model\",\"owned_by\":\"tenstorrent\"},{\"id\":\"Qwen/Qwen3-VL-32B-Instruct\",\"object\":\"model\",\"owned_by\":\"tenstorrent\"},{\"id\":\"zai-org/GLM-5.3\",\"object\":\"model\",\"owned_by\":\"tenstorrent\"}]}",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "status": 200
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "models": [
+        {
+          "context_window": null,
+          "id": "MiniMaxAI/MiniMax-M3.1-Flash",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "Qwen/Qwen3-32B",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "Qwen/Qwen3-VL-32B-Instruct",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "Qwen/Qwen3.8-27B",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "zai-org/GLM-5.3",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        }
+      ]
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/models"
+      }
+    ]
+  }
+}
