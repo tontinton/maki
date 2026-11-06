@@ -10,7 +10,7 @@ use include_dir::{Dir, File, include_dir};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{Cutter, SessionEndReason};
-use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
+use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::{DeclAuthority, keep_granted};
 use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
 use tokio::task::spawn_blocking;
@@ -397,25 +397,12 @@ impl PluginHost {
         self.inner.prio_tx = flume::unbounded().0;
     }
 
-    /// Boots the runtime and loads every bundled plugin into `registry`, the
-    /// ones that ship switched off included. For callers like tests and
-    /// docgen that want the full builtin set without building a config, and
-    /// which have to document an opt-in plugin's options too.
+    /// Boots the runtime and loads every default bundled plugin into
+    /// `registry`. For callers like tests and docgen that want the full
+    /// builtin set without building a config.
     pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
-        let opt_in: HashMap<String, PluginFileConfig> = maki_config::OPTIONAL_BUILTINS
-            .iter()
-            .map(|name| {
-                (
-                    (*name).to_owned(),
-                    PluginFileConfig {
-                        enabled: Some(true),
-                        ..PluginFileConfig::default()
-                    },
-                )
-            })
-            .collect();
         let mut host = Self::new(registry)?;
-        host.load_builtins(&PluginsConfig::from_plugins(opt_in))?;
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))?;
         Ok(host)
     }
 
@@ -3277,9 +3264,10 @@ mod bundled_manifests {
         let mut drift = Vec::new();
         // `lib` is the one bundled directory that never loads on its own, so it
         // ships no manifest and its modules answer to whoever requires them.
-        for plugin in BUNDLED_PLUGINS.iter().filter(|p| {
-            DEFAULT_BUILTINS.contains(&p.name) || maki_config::OPTIONAL_BUILTINS.contains(&p.name)
-        }) {
+        for plugin in BUNDLED_PLUGINS
+            .iter()
+            .filter(|p| DEFAULT_BUILTINS.contains(&p.name))
+        {
             let declared = bundled_permissions(plugin).expect("every builtin ships a plugin.toml");
             // Each permission paired with the usage demanding it, so a failure
             // points at something to go look at.
