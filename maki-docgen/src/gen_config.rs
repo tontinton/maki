@@ -10,7 +10,11 @@ use maki_config::{
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
 use crate::gen_folder_trust::POLICY_EXAMPLE;
+use crate::gen_tools::SECTIONS as TOOL_SECTIONS;
 use crate::lua_util::in_registration_window;
+
+const OTHER_FIELD: &str = "other";
+const OTHER_TOOLS: &str = "Every other tool, MCP tools included";
 
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
@@ -309,19 +313,33 @@ fn write_tool_output_section(out: &mut String) {
     writeln!(out, "### `ui.tool_output_lines`\n").unwrap();
     writeln!(
         out,
-        "How many lines of output to show per tool in the UI. \
-         All values are `usize`. The `read` value also applies to the list tool.\n\n\
-         A value of 0 shows only the tool header until you click it. This is the \
-         default for read, index and list, since their header already gives the \
-         line or entry count. Errors and tools without a view of their own, such \
-         as MCP tools, have no count in their header, so they still show their \
-         first line.\n"
+        "Lines of output a tool call shows before it collapses. Click the call \
+         to see all of it.\n\n\
+         With 0 you see only the header. The read, index and list tools default \
+         to 0, because their header already says how many lines or entries came \
+         back. Errors and MCP tools still show their first line.\n"
     )
     .unwrap();
-    writeln!(out, "| Field | Default |").unwrap();
-    writeln!(out, "|-------|---------|").unwrap();
-    for (name, default) in ToolOutputLines::FIELD_DEFAULTS {
-        writeln!(out, "| `{name}` | {default} |",).unwrap();
+    let mut tools: Vec<&str> = TOOL_SECTIONS
+        .iter()
+        .flat_map(|(_, names)| *names)
+        .copied()
+        .collect();
+    tools.sort_unstable();
+    writeln!(out, "| Field | Default | Tools |").unwrap();
+    writeln!(out, "|-------|---------|-------|").unwrap();
+    for (field, default) in ToolOutputLines::FIELD_DEFAULTS {
+        let covered = if *field == OTHER_FIELD {
+            OTHER_TOOLS.to_owned()
+        } else {
+            tools
+                .iter()
+                .filter(|t| ToolOutputLines::field_for(t) == *field)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        writeln!(out, "| `{field}` | {default} | {covered} |").unwrap();
     }
     writeln!(out).unwrap();
 }

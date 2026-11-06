@@ -107,7 +107,8 @@ end
 -- max_line_bytes (optional) per-line byte cap. Lines are stored already cut,
 -- so a run of huge lines costs no more than short ones while kept for expansion.
 -- With max_lines 0 only the set_header lines show until a click expands the
--- view, so the tool header should give the count.
+-- view. The UI puts the line count in the tool header, so the row still says
+-- how much is hidden.
 function ToolView.new(buf, opts)
   local self = setmetatable({}, ToolView)
   self.buf = buf
