@@ -186,12 +186,12 @@ The popup takes these keys only while it is open. Otherwise `↑` and `↓` stil
 
 The inserted path is plain text in your message. Nothing is attached or read until the agent calls `read`.
 
-The plugin is off by default while its file index is tested on large repositories. Turn it on in `init.lua`:
+The popup is on by default. To turn it off, set this in `init.lua`:
 
 ```lua
 maki.setup({
   plugins = {
-    completion = { enabled = true },
+    completion = { enabled = false },
   },
 })
 ```
