@@ -7,7 +7,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::poll_until;
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
@@ -8043,6 +8043,34 @@ fn billed_turns(
         .collect()
 }
 
+/// Waits for the relay to hand the tab a paid turn. The relay is its own task,
+/// so the provider being asked for the next turn says nothing about whether
+/// the tab heard of the last one yet.
+fn await_billed_turn(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+) -> TurnCompleteEvent {
+    let deadline = Instant::now() + CANCEL_TEST_TIMEOUT;
+    loop {
+        let action = ui
+            .recv_deadline(deadline)
+            .expect("the paid turn must reach the tab while the prompt still runs");
+        match action {
+            maki_lua::UiAction::PluginTaskEvent {
+                session: owner,
+                envelope,
+                ..
+            } if owner == session => {
+                if let AgentEvent::TurnComplete(turn) = envelope.event {
+                    return *turn;
+                }
+            }
+            maki_lua::UiAction::PluginTaskOpened { session: owner, .. } if owner == session => {}
+            _ => panic!("only this chat session's task events go to the UI here"),
+        }
+    }
+}
+
 /// The transcript the tab was last handed for task `id`.
 fn handed_over_history(
     ui: &flume::Receiver<maki_lua::UiAction>,
@@ -8089,10 +8117,11 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     parked
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("the prompt must reach its second turn");
-    let turns = billed_turns(&ui, session);
-    let [turn] = turns.as_slice() else {
-        panic!("the paid turn must reach the tab while the prompt still runs");
-    };
+    let turn = await_billed_turn(&ui, session);
+    assert!(
+        billed_turns(&ui, session).is_empty(),
+        "one paid turn must reach the tab once"
+    );
     assert_eq!(turn.usage.input, PAID_TURN_INPUT);
     let billed_cost = turn.cost.expect("the paid turn must have a price");
     let listed_cost = format!("{billed_cost:.COST_DECIMALS$}");
