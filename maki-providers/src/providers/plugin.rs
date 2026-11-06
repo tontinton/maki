@@ -38,6 +38,7 @@ mod spec;
 const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const OPENAI_OPTION: &str = "openai";
+const SESSION_ID_OPTION: &str = "session_id";
 const BASE_URL_OPTION: &str = "base_url";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
@@ -187,6 +188,8 @@ pub struct ProviderDecl {
     /// Only for `codec = "openai"`: grouped under the codec that honours them,
     /// so one rule refuses every option a different target would ignore.
     pub openai: Option<OpenAiWire>,
+    /// Above the codec tables, because every codec but google carries it.
+    pub session_id: Option<SessionCarrier>,
     /// This and the next three describe a model no row or listing covers.
     /// Each falls back to the native provider behind the codec or base. The
     /// two limits also fill in any row that leaves its own out.
@@ -415,6 +418,16 @@ fn honours_openai_wire(target: Target) -> bool {
 /// reach the same constructor and must answer alike.
 fn honours_system_prefix(target: Target) -> bool {
     target.spec().slug != super::google::SLUG
+}
+
+/// The anthropic and both openai codecs stamp the session id. A base is the
+/// native provider whole, which carries its own or none, and google has no
+/// use for one.
+fn honours_session_id(target: Target) -> bool {
+    match target {
+        Target::Codec(Protocol::Anthropic | Protocol::Openai | Protocol::OpenaiResponses) => true,
+        Target::Codec(Protocol::Google) | Target::Base(_) => false,
+    }
 }
 
 /// A base is the native provider whole, and the native only moves for an
@@ -717,6 +730,9 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     }
     if decl.openai.is_some() && !honours_openai_wire(target) {
         return Err(unsupported(OPENAI_OPTION));
+    }
+    if decl.session_id.is_some() && !honours_session_id(target) {
+        return Err(unsupported(SESSION_ID_OPTION));
     }
     let states_origin =
         decl.base_url.is_some() || decl.plans.iter().any(|plan| plan.base_url.is_some());
@@ -1409,6 +1425,7 @@ fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
         provider_name: decl.display_name.clone().into(),
         system_prefix: decl.system_prefix.clone(),
         openai: decl.openai.clone().unwrap_or_default(),
+        session_id: decl.session_id.clone().unwrap_or_default(),
         build_body: entry
             .hooks
             .build_body
@@ -1639,6 +1656,7 @@ pub async fn logout(slug: &str) -> Result<bool, AgentError> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -2525,6 +2543,73 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1, "{MISSED_ORIGIN}");
     }
 
+    /// One declaration spelling, the same id in every header and the body
+    /// field, whichever codec builds the request.
+    #[test_case(Protocol::Anthropic, "anthropic-session-plugin" ; "anthropic")]
+    #[test_case(Protocol::Openai, "openai-session-plugin" ; "openai")]
+    #[test_case(Protocol::OpenaiResponses, "responses-session-plugin" ; "openai_responses")]
+    #[tokio::test]
+    async fn every_session_codec_carries_the_declared_session_id(protocol: Protocol, slug: &str) {
+        const ENV_VAR: &str = "MAKI_TEST_SESSION_CARRIER_KEY";
+        const KEY: &str = "sk-session";
+        const PROMPT: &str = "hi";
+        const SCRIPT: &[Canned] = &[Canned::json(401, r#"{"error":{"message":"no"}}"#)];
+        const SESSION_HEADERS: [&str; 2] = ["x-affinity", "x-request-group"];
+        const SESSION_FIELD: &str = "prompt_cache_key";
+        const MISSING_SESSION: &str = "the session id did not reach the wire";
+
+        let (base_url, requests) = serve(SCRIPT);
+        let host = Url::parse(&base_url)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_owned();
+        unsafe { std::env::set_var(ENV_VAR, KEY) };
+        let mut reg = registration(slug);
+        reg.decl.codec = Some(protocol);
+        reg.decl.base_url = Some(base_url);
+        reg.decl.net_hosts = vec![host];
+        reg.decl.api_key_env = Some(ENV_VAR.to_string());
+        reg.decl.session_id = Some(SessionCarrier {
+            headers: SESSION_HEADERS.map(Cow::Borrowed).to_vec().into(),
+            body_field: Some(Cow::Borrowed(SESSION_FIELD)),
+        });
+        register_loaded(reg).unwrap();
+
+        let provider = create(slug, Timeouts::default()).unwrap();
+        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
+        let session = SessionRef::generate();
+        let (tx, _rx) = flume::unbounded();
+        let _ = provider
+            .stream_message(
+                &model,
+                &[Message::user(PROMPT.to_owned())],
+                "",
+                &serde_json::json!([]),
+                &tx,
+                RequestOptions::default(),
+                Some(&session),
+            )
+            .await;
+
+        let recorded = requests.lock().unwrap();
+        let [request] = recorded.as_slice() else {
+            panic!("{MISSING_SESSION}");
+        };
+        for header in SESSION_HEADERS {
+            assert_eq!(
+                request.headers.get(header).map(String::as_str),
+                Some(session.as_str()),
+                "{MISSING_SESSION}"
+            );
+        }
+        assert_eq!(
+            request.json()[SESSION_FIELD],
+            session.as_str(),
+            "{MISSING_SESSION}"
+        );
+    }
+
     /// Only an origin the user or maki chose skips the side-call guard, never
     /// the one a third-party decl wrote.
     #[test_case(DeclAuthority::ThirdParty, None, None ; "third_party_declared_origin")]
@@ -2695,7 +2780,6 @@ mod tests {
                 fast: false,
             }
             .clamped(&model),
-            session: None,
             discovered: None,
         };
         let mut body = serde_json::json!({});
@@ -2740,7 +2824,6 @@ mod tests {
                 thinking,
                 fast: false,
             },
-            session: None,
             discovered: None,
         };
         let mut body = serde_json::json!({});
@@ -3098,6 +3181,11 @@ mod tests {
         reg.decl.openai = Some(OpenAiWire::default());
     }
 
+    fn session_id_on_google(reg: &mut Registration) {
+        reg.decl.codec = Some(Protocol::Google);
+        reg.decl.session_id = Some(SessionCarrier::default());
+    }
+
     fn system_prefix_on_google(reg: &mut Registration) {
         reg.decl.codec = Some(Protocol::Google);
         reg.decl.system_prefix = Some(SOME_SYSTEM_PREFIX.to_string());
@@ -3139,6 +3227,7 @@ mod tests {
     #[test_case(outside_a_load, |e| matches!(e, RegisterError::Closed(_)) ; "registration_outside_a_load")]
     #[test_case(body_hook_on_anthropic, |e| matches!(e, RegisterError::Unsupported { .. }) ; "build_body_needs_an_openai_codec")]
     #[test_case(openai_wire_on_anthropic, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "openai_table_needs_the_openai_codec")]
+    #[test_case(session_id_on_google, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == SESSION_ID_OPTION) ; "google_carries_no_session_id")]
     #[test_case(system_prefix_on_google, |e| matches!(e, RegisterError::Unsupported { .. }) ; "google_drops_the_system_prefix")]
     #[test_case(system_prefix_on_the_google_base, |e| matches!(e, RegisterError::Unsupported { .. }) ; "so_does_the_google_base")]
     #[test_case(base_url_on_a_base, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == BASE_URL_OPTION) ; "base_url_needs_a_codec")]

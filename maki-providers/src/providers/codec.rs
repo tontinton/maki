@@ -87,7 +87,6 @@ pub struct OpenAiWire {
     pub headers: HeaderMap,
     /// Merged into every request body before the thinking pass.
     pub extra_body: Option<Map<String, Value>>,
-    pub session_id: Option<SessionCarrier>,
     /// Model id prefix to what the model can do about thinking, for a
     /// provider whose API knows better than the model table.
     pub thinking_overrides: BTreeMap<String, ThinkingSupport>,
@@ -117,19 +116,38 @@ pub struct ThinkingWire {
 pub struct EffortField(Box<[String]>);
 
 /// Where the session id rides, for a provider that routes a session to the
-/// same backend by it: a header, a body field, or both. Absent, the id is
-/// not sent at all.
-#[derive(Clone, Default, PartialEq, Deserialize, Serialize)]
+/// same backend or keys its cache by it: headers, a body field, or both.
+/// Shared by declarations and native providers, so every provider stamps the
+/// id the same way. `Cow` so a native one is a `const`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionCarrier {
     #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_session_header",
-        deserialize_with = "deserialize_session_header"
+        skip_serializing_if = "<[_]>::is_empty",
+        deserialize_with = "deserialize_session_headers"
     )]
-    pub header: Option<HeaderName>,
+    pub headers: Cow<'static, [Cow<'static, str>]>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub body_field: Option<String>,
+    pub body_field: Option<Cow<'static, str>>,
+}
+
+impl SessionCarrier {
+    /// Body last of the provider's own passes, so a thinking pass or an
+    /// extra body naming the same key loses to the session.
+    pub(crate) fn apply(&self, session: &SessionRef, body: &mut Value, auth: &mut ResolvedAuth) {
+        if let (Some(field), Some(object)) = (&self.body_field, body.as_object_mut()) {
+            object.insert(field.to_string(), json!(session.as_str()));
+        }
+        self.apply_headers(session, auth);
+    }
+
+    /// Set rather than appended, so a request carries each header once even
+    /// when the auth layer already named it.
+    pub(crate) fn apply_headers(&self, session: &SessionRef, auth: &mut ResolvedAuth) {
+        for name in self.headers.iter() {
+            auth.set_header(name, session.as_str().to_owned());
+        }
+    }
 }
 
 /// One request, as every pass after the codec's own body sees it. Built once
@@ -138,7 +156,6 @@ pub struct SessionCarrier {
 pub struct RequestCtx<'a> {
     pub model: &'a Model,
     pub opts: RequestOptions,
-    pub session: Option<&'a SessionRef>,
     /// What discovery reported for this model under this slug, looked up once
     /// here rather than by each pass that needs it.
     pub discovered: Option<ModelInfo>,
@@ -147,7 +164,7 @@ pub struct RequestCtx<'a> {
 impl OpenAiWire {
     /// Everything this declaration adds to a body the codec built. The static
     /// fragment goes in first, so a thinking pass that writes the same key
-    /// has the last word, and the session id last of all.
+    /// has the last word.
     pub(crate) fn apply_body(&self, body: &mut Value, ctx: &RequestCtx) {
         let Self {
             max_tokens_field: _,
@@ -155,7 +172,6 @@ impl OpenAiWire {
             thinking,
             headers: _,
             extra_body,
-            session_id,
             thinking_overrides: _,
         } = self;
         if let (Some(extra), Some(object)) = (extra_body, body.as_object_mut()) {
@@ -171,41 +187,21 @@ impl OpenAiWire {
                 .thinking
                 .apply_thinking(body, ctx.model, ThinkingFallback::None),
         }
-        if let Some(carrier) = session_id
-            && let Some(field) = &carrier.body_field
-            && let Some(session) = ctx.session
-            && let Some(object) = body.as_object_mut()
-        {
-            object.insert(field.clone(), json!(session.as_str()));
-        }
     }
 
-    /// The headers this declaration sends: the static ones, then the session
-    /// header when there is a session to carry.
-    pub(crate) fn request_headers<'a>(
-        &'a self,
-        session: Option<&'a SessionRef>,
-    ) -> Vec<(&'a str, &'a str)> {
+    /// The static headers this declaration sends, under their canonical names.
+    pub(crate) fn request_headers(&self) -> Vec<(&str, &str)> {
         let Self {
             max_tokens_field: _,
             include_stream_usage: _,
             thinking: _,
             headers,
             extra_body: _,
-            session_id,
             thinking_overrides: _,
         } = self;
-        let session = match (session_id, session) {
-            (Some(carrier), Some(session)) => carrier
-                .header
-                .as_ref()
-                .map(|name| (name.as_str(), session.as_str())),
-            _ => None,
-        };
         headers
             .iter()
             .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)))
-            .chain(session)
             .collect()
     }
 
@@ -361,22 +357,19 @@ fn deserialize_headers<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Hea
     declared_headers(BTreeMap::deserialize(deserializer)?).map_err(D::Error::custom)
 }
 
-fn serialize_session_header<S: Serializer>(
-    name: &Option<HeaderName>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match name {
-        Some(name) => serializer.serialize_str(name.as_str()),
-        None => serializer.serialize_none(),
-    }
-}
-
-fn deserialize_session_header<'de, D: Deserializer<'de>>(
+/// Validated like a declared header and kept in canonical lowercase, so
+/// [`SessionCarrier::apply_headers`] matches the auth layer's own names.
+fn deserialize_session_headers<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<Option<HeaderName>, D::Error> {
-    Option::<String>::deserialize(deserializer)?
-        .map(|name| declared_header_name(&name).map_err(D::Error::custom))
-        .transpose()
+) -> Result<Cow<'static, [Cow<'static, str>]>, D::Error> {
+    Vec::<String>::deserialize(deserializer)?
+        .iter()
+        .map(|name| {
+            declared_header_name(name)
+                .map(|parsed| Cow::Owned(parsed.as_str().to_owned()))
+                .map_err(D::Error::custom)
+        })
+        .collect()
 }
 
 /// Everything a provider declaration tells the codec about its wire: what an
@@ -403,6 +396,8 @@ pub struct CodecOptions {
     /// Only the `openai` codec reads it, and registration refuses one stated
     /// for any other.
     pub openai: OpenAiWire,
+    /// Read by every codec but google, which registration refuses it for.
+    pub session_id: SessionCarrier,
     pub build_body: Option<Arc<dyn BodyHook>>,
 }
 
@@ -419,6 +414,7 @@ impl CodecOptions {
             slug,
             system_prefix: None,
             openai: OpenAiWire::default(),
+            session_id: SessionCarrier::default(),
             build_body: None,
         }
     }
@@ -474,7 +470,8 @@ pub fn build(
         Protocol::Anthropic => Box::new(
             super::anthropic::Anthropic::with_auth(auth, timeouts)
                 .with_fallback_base_url(fallback_base_url(&options))
-                .with_system_prefix(options.system_prefix),
+                .with_system_prefix(options.system_prefix)
+                .with_session_id(options.session_id),
         ),
         Protocol::Openai | Protocol::OpenaiResponses => Box::new(CompatProvider {
             compat: OpenAiCompatProvider::new(compat_config(&options), timeouts),
@@ -482,6 +479,7 @@ pub fn build(
             protocol: options.protocol,
             system_prefix: options.system_prefix,
             openai: options.openai,
+            session_id: options.session_id,
             build_body: options.build_body,
         }),
         Protocol::Google => Box::new(
@@ -505,6 +503,7 @@ pub(crate) struct CompatProvider {
     protocol: Protocol,
     system_prefix: Option<String>,
     openai: OpenAiWire,
+    session_id: SessionCarrier,
     build_body: Option<Arc<dyn BodyHook>>,
 }
 
@@ -588,7 +587,6 @@ impl Provider for CompatProvider {
             let ctx = RequestCtx {
                 model,
                 opts,
-                session: session_id,
                 discovered: model_registry::discovered(&self.compat.config().slug, &model.id),
             };
 
@@ -603,6 +601,9 @@ impl Provider for CompatProvider {
                 }
                 let mut body = responses::build_body(model, messages, system, tools);
                 // TODO: wire thinking budget into responses API when llama.cpp supports it
+                if let Some(session) = session_id {
+                    self.session_id.apply(session, &mut body, &mut auth);
+                }
                 if let Some(hook) = &self.build_body {
                     body = hook.call(body, &ctx).await?;
                 }
@@ -621,10 +622,13 @@ impl Provider for CompatProvider {
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             self.openai.apply_body(&mut body, &ctx);
+            if let Some(session) = session_id {
+                self.session_id.apply(session, &mut body, &mut auth);
+            }
             if let Some(hook) = &self.build_body {
                 body = hook.call(body, &ctx).await?;
             }
-            let headers = self.openai.request_headers(session_id);
+            let headers = self.openai.request_headers();
             self.stream_chat(model, &headers, body, event_tx, &auth)
                 .await
         })
@@ -680,7 +684,6 @@ mod tests {
     const TITLE_HEADER: &str = "X-Title";
     const AFFINITY_HEADER: &str = "x-affinity";
     const SAFE_VALUE: &str = "maki";
-    const SESSION_FIELD: &str = "session_id";
     const MODEL_SPEC: &str = "xai/grok-4.6";
 
     /// One slug per case: `<SLUG>_BASE_URL` is process-wide, and these run in
@@ -762,7 +765,6 @@ mod tests {
                 thinking,
                 ..RequestOptions::default()
             },
-            session: None,
             discovered: None,
         }
     }
@@ -795,49 +797,32 @@ mod tests {
         );
     }
 
-    /// The static headers go out under their canonical names, and the session
-    /// header after them, only when there is a session to carry.
     #[test]
-    fn declared_headers_and_the_session_header_are_sent() {
-        let wire = wire(json!({
-            "headers": { TITLE_HEADER: SAFE_VALUE },
-            "session_id": { "header": AFFINITY_HEADER },
-        }))
-        .unwrap();
-        let session = SessionRef::generate();
+    fn declared_headers_are_sent_under_canonical_names() {
+        let wire = wire(json!({ "headers": { TITLE_HEADER: SAFE_VALUE } })).unwrap();
 
         assert_eq!(
-            wire.request_headers(None),
+            wire.request_headers(),
             [(TITLE_HEADER.to_ascii_lowercase().as_str(), SAFE_VALUE)]
-        );
-        assert_eq!(
-            wire.request_headers(Some(&session)),
-            [
-                (TITLE_HEADER.to_ascii_lowercase().as_str(), SAFE_VALUE),
-                (AFFINITY_HEADER, session.as_str()),
-            ]
         );
     }
 
-    /// The static fragment, the effort under a nested path that keeps its
-    /// siblings, and the session id in the body.
+    /// The static fragment, and the effort under a nested path that keeps its
+    /// siblings.
     #[test]
     fn the_declared_body_options_reach_the_body() {
         let wire = wire(json!({
             "thinking": { "dialect": "standard", "field": "reasoning.effort" },
             "extra_body": { "reasoning": { "exclude": true }, "cache_control": { "type": "ephemeral" } },
-            "session_id": { "body_field": SESSION_FIELD },
         }))
         .unwrap();
         let model = curated_model();
-        let session = SessionRef::generate();
-        let ctx = RequestCtx {
-            session: Some(&session),
-            ..ctx(&model, ThinkingConfig::Effort(Effort::High))
-        };
         let mut body = json!({ "model": model.id });
 
-        wire.apply_body(&mut body, &ctx);
+        wire.apply_body(
+            &mut body,
+            &ctx(&model, ThinkingConfig::Effort(Effort::High)),
+        );
 
         assert_eq!(
             body,
@@ -845,36 +830,54 @@ mod tests {
                 "model": model.id,
                 "reasoning": { "exclude": true, "effort": "high" },
                 "cache_control": { "type": "ephemeral" },
-                SESSION_FIELD: session.as_str(),
             })
         );
     }
 
-    /// A provider whose cache keys off a body field while it routes by a
-    /// header (Mistral speaks both) declares the two together, and both
-    /// leave with the turn.
+    fn carrier(authored: Value) -> Result<SessionCarrier, String> {
+        serde_json::from_value(authored).map_err(|e| e.to_string())
+    }
+
+    /// A provider whose cache keys off a body field while it routes by
+    /// headers declares them together. Each header is set once, over one
+    /// the auth layer already named.
     #[test]
-    fn the_session_id_can_ride_a_header_and_a_body_field() {
+    fn the_session_id_rides_every_header_and_the_body_field() {
         const CACHE_KEY_FIELD: &str = "prompt_cache_key";
-        let wire = wire(json!({
-            "session_id": { "header": AFFINITY_HEADER, "body_field": CACHE_KEY_FIELD },
+        const SECOND_HEADER: &str = "X-Request-Group";
+        const STALE_VALUE: &str = "stale";
+        let carrier = carrier(json!({
+            "headers": [AFFINITY_HEADER, SECOND_HEADER],
+            "body_field": CACHE_KEY_FIELD,
         }))
         .unwrap();
-        let model = curated_model();
         let session = SessionRef::generate();
-        let ctx = RequestCtx {
-            session: Some(&session),
-            ..ctx(&model, ThinkingConfig::default())
-        };
+        let mut auth = ResolvedAuth::new(
+            DECLARED_SLUG,
+            vec![(AFFINITY_HEADER.to_owned(), STALE_VALUE.to_owned())],
+        )
+        .unwrap();
         let mut body = json!({});
 
-        wire.apply_body(&mut body, &ctx);
+        carrier.apply(&session, &mut body, &mut auth);
 
-        assert_eq!(body[CACHE_KEY_FIELD], session.as_str());
+        assert_eq!(body, json!({ CACHE_KEY_FIELD: session.as_str() }));
         assert_eq!(
-            wire.request_headers(Some(&session)),
-            [(AFFINITY_HEADER, session.as_str())]
+            auth.headers,
+            [
+                (AFFINITY_HEADER.to_owned(), session.to_string()),
+                (SECOND_HEADER.to_ascii_lowercase(), session.to_string()),
+            ]
         );
+    }
+
+    #[test_case("Host", WireError::TransportHeader("Host".into()) ; "transport_header")]
+    #[test_case("bad header", WireError::HeaderName("bad header".into()) ; "invalid_name")]
+    fn a_session_header_the_wire_cannot_carry_is_refused(name: &str, expected: WireError) {
+        let error = carrier(json!({ "headers": [name] }))
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains(&expected.to_string()), "{error}");
     }
 
     #[test_case(false, true ; "sent_to_any_model_by_default")]

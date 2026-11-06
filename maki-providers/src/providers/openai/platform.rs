@@ -19,6 +19,7 @@ use crate::{
 
 use super::auth;
 use crate::providers::ResolvedAuth;
+use crate::providers::codec::SessionCarrier;
 use crate::providers::managed_auth::ManagedAuth;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 
@@ -63,7 +64,16 @@ const LISTED_VISIBILITY: &str = "list";
 const ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 const FAST_SERVICE_TIER: &str = "priority";
 const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
-const SESSION_AFFINITY_HEADERS: [&str; 2] = ["session-id", "x-client-request-id"];
+const SESSION_AFFINITY_HEADERS: &[Cow<'static, str>] = &[
+    Cow::Borrowed("session-id"),
+    Cow::Borrowed("x-client-request-id"),
+];
+/// Without a stable key the backend spreads a session's requests over cache
+/// shards, so an unchanged prefix still misses most of the time.
+const SESSION_AFFINITY: SessionCarrier = SessionCarrier {
+    headers: Cow::Borrowed(SESSION_AFFINITY_HEADERS),
+    body_field: Some(Cow::Borrowed(PROMPT_CACHE_KEY_FIELD)),
+};
 const IMAGE_MODALITY: &str = "image";
 const EMPTY_USAGE_ERROR: &str =
     "OpenAI usage response contained no plan or rate limits; the endpoint schema likely changed";
@@ -258,15 +268,9 @@ fn apply_plan_fast(
     }
 }
 
-/// Without a stable key the backend spreads a session's requests over cache
-/// shards, so an unchanged prefix still misses most of the time.
 fn apply_session_affinity(body: &mut Value, auth: &mut ResolvedAuth, session: &SessionRef) {
-    if !is_coding_plan(auth) {
-        return;
-    }
-    body[PROMPT_CACHE_KEY_FIELD] = session.as_str().into();
-    for header in SESSION_AFFINITY_HEADERS {
-        auth.set_header(header, session.to_string());
+    if is_coding_plan(auth) {
+        SESSION_AFFINITY.apply(session, body, auth);
     }
 }
 

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -22,6 +23,7 @@ use crate::{
     ThinkingConfig, UsageLimit,
 };
 
+use super::codec::SessionCarrier;
 use super::{ResolvedAuth, Timeouts, with_prefix};
 
 /// Zen lives under the bare `opencode` models.dev entry; Go has its own.
@@ -132,7 +134,7 @@ fn create_with_auth(
 /// OpenCode asked clients to send one stable ID per conversation and warned
 /// that requests without it may start failing:
 /// https://github.com/tontinton/maki/issues/935
-const SESSION_HEADER: &str = "x-opencode-session";
+const SESSION_HEADERS: &[Cow<'static, str>] = &[Cow::Borrowed("x-opencode-session")];
 const PUBLIC_KEY: &str = "public";
 
 const FREE_TIER: Option<FreeTier> = Some(FreeTier {
@@ -140,17 +142,24 @@ const FREE_TIER: Option<FreeTier> = Some(FreeTier {
     config_slug: ZEN_SLUG,
 });
 
+/// Headers only: the OpenCode wires are OpenAI-compatible and carry no body
+/// field for a session.
+const SESSION_CARRIER: SessionCarrier = SessionCarrier {
+    headers: Cow::Borrowed(SESSION_HEADERS),
+    body_field: None,
+};
+
 /// Only Go has a quota endpoint; OpenCode themselves expose subscription
 /// usage on `/zen/go/v1/usage` and nothing on the Zen base.
 pub(crate) const ZEN_QUIRKS: ProviderQuirks = ProviderQuirks {
     free_tier: FREE_TIER,
-    session_header: Some(SESSION_HEADER),
+    session_id: SESSION_CARRIER,
     usage: None,
 };
 
 pub(crate) const GO_QUIRKS: ProviderQuirks = ProviderQuirks {
     free_tier: FREE_TIER,
-    session_header: Some(SESSION_HEADER),
+    session_id: SESSION_CARRIER,
     usage: Some(GO_USAGE),
 };
 
