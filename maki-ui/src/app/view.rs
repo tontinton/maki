@@ -1,6 +1,7 @@
 use crate::components::Overlay;
 use crate::components::input::BORDER_ROWS;
 use crate::components::queue_panel;
+use crate::components::scrollbar::Thumbs;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
 use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
@@ -101,15 +102,18 @@ impl App {
         let render_chat = self.active_chat;
         let owner = self.keyboard_owner();
 
-        self.render_background(frame);
-        self.render_messages(frame, &layout, render_chat);
-        let (caret, prompt_caret) = self.render_bottom_panel(frame, &layout);
-        self.render_splits(frame, &layout);
-        let (mut overlay_rect, picker_caret) = self.render_picker_overlays(frame, &layout, owner);
-        self.render_status_bar(frame, layout.status_area, render_chat);
-        overlay_rect = self.render_top_modals(frame, overlay_rect, caret);
+        let ((overlay_rect, caret, prompt_caret, picker_caret), thumbs) = Thumbs::record(|| {
+            self.render_background(frame);
+            self.render_messages(frame, &layout, render_chat);
+            let (caret, prompt_caret) = self.render_bottom_panel(frame, &layout);
+            self.render_splits(frame, &layout);
+            let (overlay_rect, picker_caret) = self.render_picker_overlays(frame, &layout, owner);
+            self.render_status_bar(frame, layout.status_area, render_chat);
+            let overlay_rect = self.render_top_modals(frame, overlay_rect, caret);
+            (overlay_rect, caret, prompt_caret, picker_caret)
+        });
         self.register_zones(&layout, overlay_rect);
-        self.apply_selection(frame, render_chat);
+        self.apply_selection(frame, render_chat, &thumbs);
         self.keyboard_caret(owner, caret, prompt_caret, picker_caret)
     }
 
@@ -493,18 +497,23 @@ impl App {
         }
     }
 
-    fn apply_selection(&mut self, frame: &mut Frame, render_chat: usize) {
+    fn apply_selection(&mut self, frame: &mut Frame, render_chat: usize, thumbs: &Thumbs) {
         let Some(ref state) = self.selection_state else {
             return;
         };
 
         let sel = state.sel();
         if let Some(screen_sel) = self.screen_selection(sel, render_chat) {
-            selection::apply_highlight(frame.buffer_mut(), sel.highlight_area(), &screen_sel);
+            selection::apply_highlight(
+                frame.buffer_mut(),
+                sel.highlight_area(),
+                &screen_sel,
+                thumbs,
+            );
         }
         if state.is_pending_copy() {
             let sel = *sel;
-            self.copy_selection(frame.buffer_mut(), &sel, render_chat);
+            self.copy_selection(frame.buffer_mut(), &sel, render_chat, thumbs);
         }
     }
 
