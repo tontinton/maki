@@ -1720,7 +1720,7 @@ pub(crate) fn rfc3339_millis(at: &str) -> Option<u64> {
 /// plugin needs no date parser that could drift from this one. A string that
 /// is no timestamp reads as no reset, the way maki's own providers read one,
 /// rather than failing the whole report over one field.
-fn deserialize_reset_at<'de, D: Deserializer<'de>>(
+pub(crate) fn deserialize_reset_at<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<u64>, D::Error> {
     #[derive(Deserialize)]

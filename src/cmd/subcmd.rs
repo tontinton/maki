@@ -190,7 +190,7 @@ struct LoginRow {
 enum LoginTarget {
     Provider(String),
     /// A models.dev provider, which logs in through its catalog entry.
-    Catalog(ProviderData),
+    Catalog(Box<ProviderData>),
     Custom,
 }
 
@@ -249,7 +249,7 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
             mark(saved(&slug)),
             &slug,
             &display,
-            LoginTarget::Catalog(provider),
+            LoginTarget::Catalog(Box::new(provider)),
         ));
     }
     rows.push(LoginRow {
