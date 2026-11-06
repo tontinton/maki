@@ -220,11 +220,7 @@ impl Provider for LocalEndpoint {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 }
 

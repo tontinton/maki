@@ -1337,11 +1337,11 @@ impl Provider for PluginProvider {
     /// spending its budget, so a provider that hides its pool turns every
     /// rotation into a retry.
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.pool.as_ref()?,
+        KeyRotation::over(
+            &self.pool,
             &self.entry.auth.current,
             self.entry.target.key_header(),
-        ))
+        )
     }
 
     /// Whatever the target knows about its models, a `base`'s own rules

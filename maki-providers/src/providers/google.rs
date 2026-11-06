@@ -26,8 +26,7 @@ use crate::{
 };
 
 use super::{
-    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, body_reader, http_client, next_sse_line,
-    ok_text, send_request,
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line, ok_sse, ok_text,
 };
 
 pub(crate) const SLUG: &str = "google";
@@ -262,12 +261,8 @@ impl Google {
             .body(json_body)
             .build()?;
 
-        send_request(&self.client, request, |response| async move {
-            if response.status().as_u16() == 200 {
-                parse_sse(body_reader(response), event_tx, self.stream_timeout).await
-            } else {
-                Err(AgentError::from_response(response).await)
-            }
+        ok_sse(&self.client, request, |body| {
+            parse_sse(body, event_tx, self.stream_timeout)
         })
         .await
     }
@@ -331,11 +326,7 @@ impl Provider for Google {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Raw(API_KEY_HEADER),
-        ))
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Raw(API_KEY_HEADER))
     }
 }
 

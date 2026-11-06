@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::iter;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,6 +50,9 @@ pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
 const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+
+/// Boxed so [`ok_sse`] can name the reader its parse closure takes.
+pub(crate) type SseBody = Pin<Box<dyn AsyncBufRead + Send>>;
 
 fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")
@@ -513,6 +517,25 @@ pub(crate) async fn ok_text(client: &Client, request: Request) -> Result<String,
     .await
 }
 
+/// A 200 handed to the SSE parser, anything else read as an API error.
+pub(crate) async fn ok_sse<T, F, Fut>(
+    client: &Client,
+    request: Request,
+    parse: F,
+) -> Result<T, AgentError>
+where
+    F: FnOnce(SseBody) -> Fut,
+    Fut: Future<Output = Result<T, AgentError>>,
+{
+    send_request(client, request, |response| async move {
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+        parse(Box::pin(body_reader(response))).await
+    })
+    .await
+}
+
 /// The body as the line reader the SSE parsers take. A stall is an io timeout,
 /// so it retries as transient and never as the stream deadline, and the URL is
 /// left out before the error is worded.
@@ -658,6 +681,16 @@ pub struct KeyRotation<'a> {
 impl<'a> KeyRotation<'a> {
     pub fn new(pool: &'a KeyPool, auth: &'a Mutex<ResolvedAuth>, header: KeyHeader) -> Self {
         Self { pool, auth, header }
+    }
+
+    /// The rotation for a provider whose pool is only there when it resolved
+    /// its own keys.
+    pub(crate) fn over(
+        pool: &'a Option<KeyPool>,
+        auth: &'a Mutex<ResolvedAuth>,
+        header: KeyHeader,
+    ) -> Option<Self> {
+        Some(Self::new(pool.as_ref()?, auth, header))
     }
 
     /// How many keys a walk can try before it is back where it started.
