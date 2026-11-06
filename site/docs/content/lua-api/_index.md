@@ -7416,7 +7416,7 @@ every case.
 - `{lang}` (`string`) Language identifier, e.g. "rust", "python".
 - `{opts?}` (`table?`) Options. Fields:
   - `independent` (`boolean`) highlight each line without cross-line context. Default false.
-  - `prefix` (`string`) preceding source used as token context. Only the nearest lines fitting within 16 KiB are parsed, so earlier comments or strings may affect coloring. Default "".
+  - `prefix` (`string`) the lines before `code`, used as token context. A trailing newline is optional. Only the nearest lines fitting within 16 KiB are parsed, so a comment or string opened before them is missed. Default "".
 
 **Returns:** (`table`) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
 
