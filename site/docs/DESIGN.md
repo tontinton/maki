@@ -26,7 +26,7 @@ Theme: identical head script and `localStorage.theme` rule as the other pages. `
 
 ## Code blocks
 
-The landing's dark pane: `--pane-bg`, 1px `--pane-line` border, 10px radius, in both themes. Custom `maki` syntax theme (`extra/maki.json`), all roman:
+The plugin reader's README pane, value for value (8px radius, 0.84rem, line-height 1.6), in both themes. Giallo wraps each line in `.giallo-l`: never make it `inline-block`, or every line grows by its descender gap and the panes stop matching. Custom `maki` syntax theme (`extra/maki.json`), all roman:
 
 | ink | comment | keyword | operator | function/command | type | string | const |
 |---|---|---|---|---|---|---|---|
@@ -36,7 +36,7 @@ Hover `copy` text button, the same one the plugin reader uses. No title bar, lan
 
 ## Components
 
-- Radii follow the site: 4px chips and keycaps, 6px sidebar items and buttons, 8px inputs, tables and callouts, 10px panes and cards, 12px the search modal.
+- Radii follow the site: 4px chips and keycaps, 6px sidebar items and buttons, 8px inputs, tables and callouts, 8px code panes, 10px cards, 12px the search modal.
 - Nav: the shared 44px bar, `maki / docs` crumb, `Docs` marked `aria-current`. Its border appears only once scrolled.
 - Sidebar: on `--paper`, no border. Link text lines up with the nav logo. Active item: accent text on `--chip-bg`.
 - Toc: a 1px rail with a 2px accent marker on the active entry.

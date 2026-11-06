@@ -362,22 +362,24 @@
     }
     a code { padding: 0; border: 0; background: none; color: inherit; }
 
-    /* ── code blocks: the landing page's dark pane ── */
+    /* ── code blocks: the plugin reader's pane, value for value ── */
+    .code { position: relative; margin-bottom: 1.1rem; }
     pre {
-      position: relative;
-      margin-bottom: 1.5rem;
-      padding: 1rem 1.15rem;
+      --scroll-thumb: oklch(100% 0 0 / 0.14);
+      padding: 0.9rem 1rem;
       overflow-x: auto;
       border: 1px solid var(--pane-line);
-      border-radius: 10px;
+      border-radius: 8px;
       background: var(--pane-bg) !important;
       color: var(--pane-ink) !important;
       color-scheme: dark;
-      --scroll-thumb: oklch(100% 0 0 / 0.14);
+      font-family: var(--font-mono);
+      font-size: 0.84rem;
+      line-height: 1.6;
+      tab-size: 4;
     }
-    pre code { padding: 0; border: 0; background: none; color: inherit; font-size: 0.87rem; line-height: 1.62; }
-    .giallo-l { display: inline-block; min-height: 1lh; width: 100%; }
-    .copy-btn {
+    pre code { padding: 0; border: 0; background: none; color: inherit; font-size: inherit; }
+    .code-copy {
       position: absolute;
       top: 0.45rem;
       right: 0.45rem;
@@ -391,9 +393,9 @@
       opacity: 0;
       transition: opacity 0.1s, color 0.1s;
     }
-    pre:hover .copy-btn, .copy-btn:focus-visible, .copy-btn.done { opacity: 1; }
-    .copy-btn:hover, .copy-btn.done { color: var(--pane-ink); }
-    @media (hover: none) { .copy-btn { opacity: 1; } }
+    .code:hover .code-copy, .code-copy:focus-visible, .code-copy.done { opacity: 1; }
+    .code-copy:hover, .code-copy.done { color: var(--pane-ink); }
+    @media (hover: none) { .code-copy { opacity: 1; } }
 
     /* ── tables ── */
     .table-wrap { margin-bottom: 1.5rem; overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; }
@@ -727,11 +729,13 @@
     overlay.classList.remove('open');
   });
 
-  // copy buttons, same as the plugin reader
+  // copy buttons, same frame as the plugin reader so the button stays put when the code scrolls
   document.querySelectorAll('main pre').forEach(pre => {
     const code = pre.querySelector('code') || pre;
+    const frame = document.createElement('div');
+    frame.className = 'code';
     const btn = document.createElement('button');
-    btn.className = 'copy-btn';
+    btn.className = 'code-copy';
     btn.type = 'button';
     btn.textContent = 'copy';
     let timer;
@@ -742,7 +746,8 @@
       clearTimeout(timer);
       timer = setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('done'); }, 1500);
     });
-    pre.appendChild(btn);
+    pre.replaceWith(frame);
+    frame.append(pre, btn);
   });
 
   // active sidebar link
