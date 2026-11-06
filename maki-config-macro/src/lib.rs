@@ -3,7 +3,9 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{DeriveInput, Expr, Fields, Ident, LitStr, Token, Type, parse_macro_input, parse_str};
+use syn::{
+    DeriveInput, Expr, Field, Fields, Ident, LitStr, Token, Type, parse_macro_input, parse_str,
+};
 
 struct ConfigAttr {
     key: Ident,
@@ -96,7 +98,7 @@ fn parse_struct_attrs(input: &DeriveInput) -> syn::Result<StructAttrs> {
     })
 }
 
-fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
+fn parse_field_attrs(field: &Field) -> syn::Result<FieldAttrs> {
     let mut attrs = FieldAttrs {
         skip: false,
         default: None,
@@ -174,6 +176,93 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
     Ok(attrs)
 }
 
+enum MergeStrategy {
+    Override,
+    Nested,
+    NestedOption,
+    With(Box<Expr>),
+}
+
+fn parse_merge_strategy(field: &Field) -> syn::Result<MergeStrategy> {
+    let mut strategy = MergeStrategy::Override;
+    for attr in field
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("merge"))
+    {
+        let item: ConfigAttr = attr.parse_args()?;
+        strategy = match (item.key.to_string().as_str(), item.value) {
+            ("nested", ConfigAttrValue::Flag) => MergeStrategy::Nested,
+            ("nested_option", ConfigAttrValue::Flag) => MergeStrategy::NestedOption,
+            ("with", ConfigAttrValue::Expr(path)) => MergeStrategy::With(path),
+            _ => {
+                return Err(syn::Error::new(
+                    item.key.span(),
+                    "expected `nested`, `nested_option` or `with = path`",
+                ));
+            }
+        };
+    }
+    Ok(strategy)
+}
+
+fn named_fields(input: &DeriveInput) -> syn::Result<&Punctuated<Field, Token![,]>> {
+    let name = &input.ident;
+    match &input.data {
+        syn::Data::Struct(data) => match &data.fields {
+            Fields::Named(named) => Ok(&named.named),
+            _ => Err(syn::Error::new(name.span(), "only named fields supported")),
+        },
+        _ => Err(syn::Error::new(name.span(), "only structs supported")),
+    }
+}
+
+/// Generates `merge(&mut self, overlay: Self)`. By default a field must be an
+/// `Option` and the overlay wins when it is `Some`, so a new field can never
+/// be silently left out of the merge. `#[merge(nested)]` merges the field
+/// recursively, `#[merge(nested_option)]` does so inside an `Option`, and
+/// `#[merge(with = path)]` calls `path(&mut self.field, overlay.field)`.
+#[proc_macro_derive(Merge, attributes(merge))]
+pub fn derive_merge(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match merge_impl(&input) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+fn merge_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
+    let name = &input.ident;
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let mut steps = Vec::new();
+    for field in named_fields(input)? {
+        let ident = field.ident.as_ref().unwrap();
+        steps.push(match parse_merge_strategy(field)? {
+            MergeStrategy::Override => quote! {
+                if overlay.#ident.is_some() {
+                    self.#ident = overlay.#ident;
+                }
+            },
+            MergeStrategy::Nested => quote! { self.#ident.merge(overlay.#ident); },
+            MergeStrategy::NestedOption => quote! {
+                match (self.#ident.as_mut(), overlay.#ident) {
+                    (Some(base), Some(over)) => base.merge(over),
+                    (None, Some(over)) => self.#ident = Some(over),
+                    _ => {}
+                }
+            },
+            MergeStrategy::With(path) => quote! { #path(&mut self.#ident, overlay.#ident); },
+        });
+    }
+    Ok(quote! {
+        impl #impl_generics #name #ty_generics #where_clause {
+            pub fn merge(&mut self, overlay: Self) {
+                #(#steps)*
+            }
+        }
+    })
+}
+
 fn config_value_expr(ty_name: &str, default: &Option<Expr>) -> TokenStream2 {
     match ty_name {
         "bool" => {
@@ -206,16 +295,8 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let struct_attrs = parse_struct_attrs(input)?;
     let name = &input.ident;
 
-    let fields = match &input.data {
-        syn::Data::Struct(data) => match &data.fields {
-            Fields::Named(named) => &named.named,
-            _ => return Err(syn::Error::new(name.span(), "only named fields supported")),
-        },
-        _ => return Err(syn::Error::new(name.span(), "only structs supported")),
-    };
-
     let mut field_data = Vec::new();
-    for field in fields {
+    for field in named_fields(input)? {
         let ident = field.ident.as_ref().unwrap();
         let attrs = parse_field_attrs(field)?;
         let ty = &field.ty;
