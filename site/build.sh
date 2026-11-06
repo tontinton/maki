@@ -140,23 +140,7 @@ EOF
 
 cp "$OUT/llms.txt" "$OUT/llms-full.txt" "$OUT/docs/"
 
-# 5. Community plugin snapshot, the page's fallback when GitHub rate limits the visitor (best effort)
-python3 - "$OUT/plugins/plugins.json" <<'EOF' || echo "warning: plugin snapshot failed, the page will only fetch live" >&2
-import json, os, sys, urllib.request
-
-URL = "https://api.github.com/search/repositories?per_page=100&q=topic:maki+topic:plugin+archived:false"
-KEYS = ("full_name", "description", "stargazers_count", "topics", "created_at", "pushed_at")
-TIMEOUT_SECS = 20
-
-headers = {"Accept": "application/vnd.github+json", "User-Agent": "maki-sh-build"}
-if token := os.environ.get("GITHUB_TOKEN"):
-    headers["Authorization"] = f"Bearer {token}"
-
-with urllib.request.urlopen(urllib.request.Request(URL, headers=headers), timeout=TIMEOUT_SECS) as resp:
-    repos = json.load(resp)["items"]
-
-# same shape as the live API response, minus the fields the page never reads
-items = [{**{k: r[k] for k in KEYS}, "license": r["license"] and {"spdx_id": r["license"]["spdx_id"]}} for r in repos]
-with open(sys.argv[1], "w", encoding="utf-8") as f:
-    json.dump(items, f, ensure_ascii=False, separators=(",", ":"))
-EOF
+# 5. Community plugin snapshot inlined into the page, so it paints without waiting on GitHub
+#    and still lists everything when GitHub rate limits the visitor (best effort)
+node plugins-snapshot.mjs "$OUT/plugins/index.html" \
+  || echo "warning: plugin snapshot failed, the page will only fetch live" >&2

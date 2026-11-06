@@ -29,8 +29,8 @@
 /docs/fonts/*
   Cache-Control: public, max-age=31536000, immutable
 
-/plugins/plugins.json
-  Cache-Control: public, max-age=300, stale-while-revalidate=3600
+/plugins/marked.esm.js
+  Cache-Control: public, max-age=604800, stale-while-revalidate=2592000
 
 /*.png
   Cache-Control: public, max-age=2592000
