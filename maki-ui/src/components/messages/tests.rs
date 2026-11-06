@@ -3477,8 +3477,8 @@ fn a_task_notice_opens_with_its_ending_dot(
 }
 
 /// Shell output is not markdown: a diff's `-` lines would turn into bullets.
-#[test_case(false, "- removed line", &format!("{NOTICE_DETAIL_INDENT}- removed line") ; "plain_output_stays_as_written")]
-#[test_case(true, "```\nlet answer = 42;\n```", &format!("{NOTICE_DETAIL_INDENT}{CODE_BAR}let answer = 42;") ; "markdown_reply_renders_its_code_block")]
+#[test_case(false, "- removed line", "- removed line" ; "plain_output_stays_as_written")]
+#[test_case(true, "```\nlet answer = 42;\n```", &format!("{CODE_BAR}let answer = 42;") ; "markdown_reply_renders_its_code_block")]
 fn notice_detail_follows_its_format(markdown: bool, text: &str, expected_row: &str) {
     let detail = NoticeDetail {
         text: text.into(),

@@ -64,7 +64,6 @@ const IMAGE_KEEP_MARGIN_SEGMENTS: usize = 8;
 const CLICKABLE: bool = true;
 const NOTICE_COLLAPSED_MARK: &str = " ▸";
 const NOTICE_EXPANDED_MARK: &str = " ▾";
-const NOTICE_DETAIL_INDENT: &str = "  ";
 const NOTICE_DETAIL_DIM: f32 = 0.3;
 
 /// What a click in the transcript asks of the app.
@@ -1873,8 +1872,7 @@ fn push_notice_detail(
 fn notice_detail_lines(detail: &NoticeDetail, width: u16) -> impl Iterator<Item = Line<'static>> {
     let text_style = theme::current().assistant;
     let lines = if detail.markdown {
-        let body_width = width.saturating_sub(NOTICE_DETAIL_INDENT.len() as u16);
-        text_to_lines(&detail.text, "", text_style, text_style, body_width, None)
+        text_to_lines(&detail.text, "", text_style, text_style, width, None)
     } else {
         plain_lines(
             detail.text.trim_end_matches('\n'),
@@ -1887,7 +1885,6 @@ fn notice_detail_lines(detail: &NoticeDetail, width: u16) -> impl Iterator<Item 
         for span in &mut line.spans {
             span.style = theme::dim_style(span.style, NOTICE_DETAIL_DIM);
         }
-        line.spans.insert(0, Span::raw(NOTICE_DETAIL_INDENT));
         line
     })
 }
