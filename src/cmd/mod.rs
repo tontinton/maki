@@ -189,6 +189,7 @@ async fn cli_stack(
                 .into_config(&names(host)?)
                 .context("invalid config")?;
             config.permissions = load_permissions(&trust.project_config);
+            config.validate()?;
             Ok(config)
         },
     )
@@ -200,7 +201,7 @@ async fn cli_stack(
     Ok((host, config))
 }
 
-pub async fn dispatch(cli: Cli) -> Result<()> {
+pub async fn dispatch(mut cli: Cli) -> Result<()> {
     // First, so anything moved out of `~/.maki` lands before this start writes
     // a file of its own. `migrate xdg` is the same move asked for by hand.
     let legacy_notice = match cli.command {
@@ -227,8 +228,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
     } else {
         TrustMode::Consult
     };
-    let background = cli.background_wait().is_some();
-    match cli.command {
+    match cli.command.take() {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             // Providers registered by a Lua plugin only reach the registry once
@@ -279,16 +279,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Acp { model, yolo }) => {
-            acp::run(
-                model,
-                yolo,
-                cli.no_plugins,
-                cli.no_jit,
-                trust_mode,
-                background,
-                legacy_notice,
-            )
-            .await?;
+            acp::run(&cli, model, yolo, trust_mode, legacy_notice).await?;
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,

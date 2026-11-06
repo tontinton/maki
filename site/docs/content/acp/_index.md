@@ -48,8 +48,8 @@ Authentication, providers, and permissions come from your normal Maki config. Se
 
 The editor picks each session's working directory, and that folder's own
 [trust](/docs/folder-trust/) decides whether its `.maki` config loads. ACP never
-asks, so trust a project with `maki trust add` in it, or start the server with
-`maki --trust acp`.
+asks, so trust a project with `maki trust add` in it, match it with a
+`trust.paths` pattern, or start the server with `maki --trust acp`.
 
 ```bash
 maki acp
@@ -58,7 +58,7 @@ maki acp --yolo
 maki --no-jit acp
 ```
 
-`maki acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`maki --no-jit acp`, not `maki acp --no-jit`).
+`maki acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`maki --no-jit acp`, not `maki acp --no-jit`). `--allowed-tools` and `--disallowed-tools` apply to every ACP session: `maki --allowed-tools read,grep acp`.
 
 Plan mode in ACP uses the same state-directory plan files as the TUI (`…/plans/<slug>.md`), not the SDK's `./plan.md`.
 

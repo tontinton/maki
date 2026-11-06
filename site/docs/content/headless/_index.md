@@ -161,7 +161,7 @@ your orchestrator                     maki --print --input-format stream-json
 
 Inbound messages (`user`, `control_request`, `control_response`, `control_cancel_request`) drive the agent; outbound messages match the Claude Code SDK shape. Under the hood it reuses the same driver as the TUI and ACP server, so sessions, tools, and permissions all work the same way.
 
-SDK-only flags (`--system-prompt`, `--max-turns`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path).
+SDK-only flags (`--system-prompt`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path).
 
 Two caveats:
 

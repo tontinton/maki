@@ -551,7 +551,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         claim,
         storage,
         model,
-        mut config,
+        config,
         permissions_config,
         timeouts,
         prompt_slots,
@@ -562,9 +562,6 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         project_config,
     } = params;
     cli.warn_ignored_flags();
-    if let Some(max) = cli.max_turns {
-        config.max_turns = Some(max);
-    }
     let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
     let interrupt = Interrupt::install();
     let stop = interrupt.stop();

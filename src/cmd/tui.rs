@@ -17,7 +17,7 @@ use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_ui::{OpenSession, RunOutcome};
 
-use crate::cli::{Cli, normalize_tool_name};
+use crate::cli::Cli;
 use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
@@ -100,19 +100,10 @@ fn load_config(
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
     }
-    if !cli.allowed_tools.is_empty() {
-        config.agent.allowed_tools = cli
-            .allowed_tools
-            .iter()
-            .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
-    }
-    if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
+    cli.apply_tool_flags(&mut config.agent)?;
+    // `-p` and SDK mode only: a turn cap would cut an interactive session short.
+    if cli.print {
+        config.agent.max_turns = cli.max_turns;
     }
     config.validate()?;
     Ok(config)
