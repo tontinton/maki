@@ -1518,8 +1518,8 @@ mod tests {
 
     use super::*;
     use crate::agent::history::History;
-    use crate::call_scope::TaskHome;
-    use crate::cancel::{CancelToken, CancelTrigger};
+    use crate::call_scope::{MovedTrigger, TaskHome};
+    use crate::cancel::CancelToken;
     use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::{ToolDeferral, tool_names};
@@ -2761,7 +2761,7 @@ mod tests {
         assert!(prompts(&events).is_empty());
     }
 
-    fn moved_away(scope: &CallScope) -> CancelTrigger {
+    fn moved_away(scope: &CallScope) -> MovedTrigger {
         scope
             .move_to(TaskHome {
                 chat: MakiId::generate(),

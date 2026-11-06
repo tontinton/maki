@@ -30,7 +30,7 @@ pub use agent::{
     Transcript, UNAVAILABLE_RESULT, USER_CANCEL_MARKER, close_dangling_tool_calls, display_order,
     find_subdirectory_instructions, is_instruction_file, observation_detail, observation_line,
 };
-pub use call_scope::{AlreadyMoved, CallGuard, CallScope, SessionStub, TaskHome};
+pub use call_scope::{AlreadyMoved, CallGuard, CallScope, MovedTrigger, SessionStub, TaskHome};
 pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};
 pub use live_session::{
     AgentSeed, BackgroundNotice, MailboxError, SessionMailbox, TaskLabel, receipt_tag,

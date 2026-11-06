@@ -109,8 +109,9 @@ lua_class! {
 /// Start {fn} as a background task without waiting for it. Pass
 /// {on_finish} to get the result. The task is cancelled with its caller
 /// and stopped after 60 seconds. Started from a tool handler, it may outlive
-/// the reply: it ends with the turn, or with the background task once the
-/// call moved. For work that outlives the caller, use `maki.async.spawn`.
+/// the reply and ends with the turn. If the call was moved to the background,
+/// only stopping that call ends it. For work that outlives the caller, use
+/// `maki.async.spawn`.
 ///
 /// @param fn function Zero-argument function to execute.
 /// @param on_finish function? Optional callback `function(err, result)`. Called once {fn} completes.

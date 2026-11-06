@@ -2119,12 +2119,12 @@ fn call_local_tool(
 mod tests {
     use flume::Sender;
     use futures::FutureExt;
-    use maki_agent::cancel::CancelTrigger;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
     use maki_agent::tools::test_support::{mock_tool, stub_ctx_with, stub_seed};
     use maki_agent::tools::{ToolAudience, ToolSource};
     use maki_agent::{
-        BackgroundNotice, Cutter, DoneReason, SessionMailbox, TaskEnd, TurnCompleteEvent,
+        BackgroundNotice, Cutter, DoneReason, MovedTrigger, SessionMailbox, TaskEnd,
+        TurnCompleteEvent,
     };
     use maki_config::ToolKey;
     use maki_providers::model::ThinkingSupport;
@@ -3267,7 +3267,7 @@ mod tests {
         call: &CallScope,
         chat: MakiId,
         ui: Option<&Sender<UiAction>>,
-    ) -> CancelTrigger {
+    ) -> MovedTrigger {
         let home = home(chat, CALL_ID);
         let trigger = call.move_to(home.clone()).unwrap();
         let registry = BackgroundTasks::of(lua);
@@ -3308,7 +3308,7 @@ mod tests {
         call: &CallScope,
         chat: MakiId,
         opened: Opened,
-    ) -> (AnyUserData, CancelTrigger) {
+    ) -> (AnyUserData, MovedTrigger) {
         match opened {
             Opened::BeforeTheMove => {
                 let sess = native_session(lua, ctx).await;
