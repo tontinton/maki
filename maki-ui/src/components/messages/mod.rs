@@ -64,7 +64,7 @@ const CLICKABLE: bool = true;
 const NOTICE_COLLAPSED_MARK: &str = " ▸";
 const NOTICE_EXPANDED_MARK: &str = " ▾";
 const NOTICE_DETAIL_INDENT: &str = "  ";
-const NOTICE_DETAIL_DIM: f32 = 0.3;
+const NOTICE_DETAIL_DIM: f32 = 0.7;
 
 /// What a click in the transcript asks of the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
