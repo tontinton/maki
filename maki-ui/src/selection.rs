@@ -38,6 +38,7 @@ use ratatui::text::Line;
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::components::scrollbar;
 use crate::repaint::Cadence;
 use crate::theme;
 use crate::wrap::{self, Break};
@@ -407,9 +408,6 @@ pub struct ContentRegion<'a> {
     pub area: Rect,
     pub raw_text: &'a str,
     pub line_breaks: LineBreaks,
-    /// Cells chrome still covers this frame (live scrollbar thumbs). Cells
-    /// inside are skipped no matter what the selection covers.
-    pub exclude: Vec<Rect>,
 }
 
 pub fn inset_border(area: Rect) -> Rect {
@@ -623,7 +621,7 @@ pub fn extract_selected_text(
                 row..chunk_end,
                 &mut out,
                 &region.line_breaks,
-                &region.exclude,
+                &scrollbar::live_rails(buf, region.area),
                 &mut RowCarry::default(),
             );
         }

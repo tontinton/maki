@@ -4549,7 +4549,6 @@ fn overlay_copy_skips_painted_rail_cells() {
     };
     let regions = [ContentRegion {
         area: zone.area,
-        exclude: rails,
         ..Default::default()
     }];
     let text = selection::extract_selected_text(&buffer, &sel, &regions);
@@ -4614,7 +4613,6 @@ fn overlay_copy_reads_rails_from_the_live_buffer() {
     };
     let regions = [ContentRegion {
         area,
-        exclude: scrollbar::live_rails(&buffer, area),
         ..Default::default()
     }];
     let text = selection::extract_selected_text(&buffer, &sel, &regions);
