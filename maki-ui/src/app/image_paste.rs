@@ -13,7 +13,7 @@ const IMAGE_NOT_SUPPORTED_MSG: &str = "Model does not support image input";
 
 /// Runs a blocking read on its own thread: a clipboard owner may be slow or
 /// hung, and the UI thread must not wait on it.
-pub(super) fn spawn_read<T: Send + 'static>(
+pub(crate) fn spawn_read<T: Send + 'static>(
     read: impl FnOnce() -> T + Send + 'static,
 ) -> Receiver<T> {
     let (tx, rx) = flume::bounded(1);
