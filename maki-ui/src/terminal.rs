@@ -2,12 +2,14 @@ use shell_words::split;
 use std::io::{Write, stdout};
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
 use crossterm::Command;
 use crossterm::ExecutableCommand;
 use crossterm::clipboard::CopyToClipboard;
+use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -18,6 +20,7 @@ use crossterm::terminal::{
     self, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use maki_config::NotificationMethod;
+use maki_lua::{CursorShape, CursorStyle};
 
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Maki needs attention";
 const NOTIFICATION_TITLE: &str = "Maki";
@@ -336,12 +339,32 @@ fn teardown() {
     stdout().flush().ok();
 }
 
+/// Set once a shape was sent. xterm takes the reset for a blinking block, so
+/// a terminal nobody changed the shape of must not be sent one on exit.
+static CURSOR_STYLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn cursor_style(style: CursorStyle) -> SetCursorStyle {
+    CURSOR_STYLED.store(true, Ordering::Relaxed);
+    match (style.shape, style.blink) {
+        (CursorShape::Default, _) => SetCursorStyle::DefaultUserShape,
+        (CursorShape::Block, false) => SetCursorStyle::SteadyBlock,
+        (CursorShape::Block, true) => SetCursorStyle::BlinkingBlock,
+        (CursorShape::Bar, false) => SetCursorStyle::SteadyBar,
+        (CursorShape::Bar, true) => SetCursorStyle::BlinkingBar,
+        (CursorShape::Underline, false) => SetCursorStyle::SteadyUnderScore,
+        (CursorShape::Underline, true) => SetCursorStyle::BlinkingUnderScore,
+    }
+}
+
 fn pop_terminal_modes() {
     write_mux_sequence(POP_WINDOW_TITLE_SEQUENCE);
     // An error or panic mid-frame leaves the synchronized update open, and the
     // terminal would hold its output until its own timeout.
     stdout().execute(EndSynchronizedUpdate).ok();
-    stdout().execute(crossterm::cursor::Show).ok();
+    if CURSOR_STYLED.load(Ordering::Relaxed) {
+        stdout().execute(SetCursorStyle::DefaultUserShape).ok();
+    }
+    stdout().execute(Show).ok();
     stdout().execute(PopKeyboardEnhancementFlags).ok();
     disable_focus_change();
     stdout().execute(DisableMouseCapture).ok();

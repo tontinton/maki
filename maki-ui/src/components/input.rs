@@ -586,19 +586,14 @@ impl InputBox {
         }
     }
 
-    /// Returns the screen cell the caret was drawn in, reversed or not.
-    ///
-    /// {show_cursor} only decides whether that cell is painted as a block
-    /// cursor, which an overlay owning the keyboard turns off. The cell is
-    /// reported either way, so a caret-anchored window stays on it while a
-    /// float holds focus to read keys.
+    /// Returns the screen cell the caret is on. The terminal draws the cursor
+    /// there, so nothing is painted for it here.
     pub fn view(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         placeholder: Placeholder,
         border_style: Style,
-        show_cursor: bool,
         top_right_hint: Option<Line<'_>>,
     ) -> Option<Position> {
         let content_height = area.height.saturating_sub(BORDER_ROWS);
@@ -640,10 +635,8 @@ impl InputBox {
                 Placeholder::Background(count) => (background_wait(count).into(), Vec::new()),
             };
             let mut spans = vec![super::chevron_span()];
-            let head = Span::styled(head, base);
-            let (with_cursor, col) = overlay_cursor(vec![head], 0, show_cursor);
-            cursor_cell = Some(Position::new(display_width(&spans) + col, 0));
-            spans.extend(with_cursor);
+            cursor_cell = Some(Position::new(display_width(&spans), 0));
+            spans.push(Span::styled(head, base));
             spans.extend(tail);
             vec![Line::from(spans)]
         } else {
@@ -677,7 +670,7 @@ impl InputBox {
                     let screen_row = lines.len() as u16;
                     let owns_caret = u32::from(self.scroll_y) + u32::from(screen_row) == cursor_row;
                     let caret = owns_caret.then(|| caret - text.start);
-                    let (drawn, col) = draw_row(line, row, &decor, caret, show_cursor);
+                    let (drawn, col) = draw_row(line, row, &decor, caret);
                     if let Some(col) = col {
                         cursor_cell = Some(Position::new(col, screen_row));
                     }
@@ -866,14 +859,12 @@ const fn effective_width(content_width: usize) -> usize {
 /// Draws one row of {line}. When the row owns the caret, {caret} is its byte in
 /// the line and the column it lands in comes back too. Only this function
 /// knows where the caret was drawn, so a terminal cursor placed from that
-/// column can never drift off the cell. {reversed} paints it as a block
-/// cursor, and the column is reported either way.
+/// column can never drift off the cell.
 fn draw_row(
     line: &str,
     row: &Row,
     decor: &LineDecor,
     caret: Option<usize>,
-    reversed: bool,
 ) -> (Line<'static>, Option<u16>) {
     let mut spans = match row.index {
         0 if row.line == 0 => vec![super::chevron_span()],
@@ -886,8 +877,8 @@ fn draw_row(
         spans.extend(content);
         return (Line::from(spans), None);
     };
-    let (with_cursor, col) = overlay_cursor(content, caret_chars, reversed);
-    spans.extend(with_cursor);
+    let col = caret_column(&content, caret_chars);
+    spans.extend(content);
     (Line::from(spans), Some(prefix_width + col))
 }
 
@@ -895,58 +886,21 @@ fn display_width(spans: &[Span<'_>]) -> u16 {
     spans.iter().map(Span::width).sum::<usize>() as u16
 }
 
-/// Reports the display column of the cell under the cursor, measured from the
-/// spans actually emitted before it so wide chars cannot throw it off, and
-/// reverses that cell when {reversed}. The spans are split around it either
-/// way, so the geometry is the same whoever owns the keyboard.
-fn overlay_cursor(
-    spans: Vec<Span<'static>>,
-    cursor_char_pos: usize,
-    reversed: bool,
-) -> (Vec<Span<'static>>, u16) {
-    let cursor_style = |style: Style| {
-        if reversed {
-            style.patch(theme::cursor_style())
-        } else {
-            style
-        }
-    };
-    let mut result = Vec::new();
-    let mut pos = 0;
-    let mut cursor_col = None;
+/// The display column of the {caret_chars}th char of {spans}, measured from
+/// the spans actually emitted so wide chars cannot throw it off.
+fn caret_column(spans: &[Span<'_>], caret_chars: usize) -> u16 {
+    let mut left = caret_chars;
+    let mut col = 0;
     for span in spans {
-        let span_len = span.content.chars().count();
-        if cursor_col.is_none() && cursor_char_pos >= pos && cursor_char_pos < pos + span_len {
-            let local = cursor_char_pos - pos;
-            let byte_pos = TextBuffer::char_to_byte(&span.content, local);
-            let (before, after) = span.content.split_at(byte_pos);
-            if !before.is_empty() {
-                result.push(Span::styled(before.to_string(), span.style));
-            }
-            let mut cs = after.chars();
-            let Some(cursor_char) = cs.next() else {
-                break;
-            };
-            cursor_col = Some(display_width(&result));
-            result.push(Span::styled(
-                cursor_char.to_string(),
-                cursor_style(span.style),
-            ));
-            let rest: String = cs.collect();
-            if !rest.is_empty() {
-                result.push(Span::styled(rest.to_string(), span.style));
-            }
-        } else {
-            result.push(span);
+        let len = span.content.chars().count();
+        if left < len {
+            let byte = TextBuffer::char_to_byte(&span.content, left);
+            return col + Span::raw(&span.content[..byte]).width() as u16;
         }
-        pos += span_len;
+        col += span.width() as u16;
+        left -= len;
     }
-    if let Some(col) = cursor_col {
-        return (result, col);
-    }
-    let col = display_width(&result);
-    result.push(Span::styled(" ", cursor_style(Style::new())));
-    (result, col)
+    col
 }
 
 #[cfg(test)]
@@ -963,7 +917,6 @@ mod tests {
     use maki_lua::{InputRule, PatternRule, SyntaxRule};
     use maki_providers::ImageMediaType;
     use ratatui::layout::{Position, Rect};
-    use ratatui::style::Color;
     use std::ops::Range;
     use std::sync::Arc;
     use test_case::test_case;
@@ -1179,7 +1132,6 @@ mod tests {
         width: u16,
         height: u16,
         placeholder: Placeholder,
-        show_cursor: bool,
     ) -> Rendered {
         let border_style = Style::new().fg(theme::current().mode_build);
         let backend = ratatui::backend::TestBackend::new(width, height);
@@ -1188,7 +1140,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, width, height);
-                cursor = input.view(frame, area, placeholder, border_style, show_cursor, None);
+                cursor = input.view(frame, area, placeholder, border_style, None);
             })
             .unwrap();
         Rendered { terminal, cursor }
@@ -1200,7 +1152,7 @@ mod tests {
         height: u16,
         placeholder: Placeholder,
     ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
-        draw_input(input, width, height, placeholder, true).terminal
+        draw_input(input, width, height, placeholder).terminal
     }
 
     fn render_input(
@@ -1574,44 +1526,20 @@ mod tests {
     const CURSOR_WIDTH: u16 = 12;
     const CURSOR_HEIGHT: u16 = 6;
     const CURSOR_EW: usize = effective_width(CURSOR_WIDTH as usize);
-    const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
-    const NO_BLOCK_CURSOR_UNFOCUSED: &str =
-        "an overlay owns the keyboard, so nothing may be reversed";
-    const CARET_FG: Color = Color::Rgb(0x12, 0x34, 0x56);
-    const CARET_BG: Color = Color::Rgb(0x65, 0x43, 0x21);
-    const CARET_UNFOCUSED_FG: Color = Color::Rgb(0x0f, 0x0f, 0x0f);
-    const CARET_THEME_WITH_CURSOR: &str = r##"
-[ui]
-"cursor" = { fg = "#123456", bg = "#654321" }
-"cursor_unfocused" = { fg = "#0f0f0f" }
-"##;
-    const CARET_THEME_WITHOUT_CURSOR: &str = "";
-
-    /// Finds the cells painted as the caret, whatever the loaded theme is.
-    fn caret_cells(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<Position> {
-        let buf = terminal.backend().buffer();
-        buf.area
-            .positions()
-            .filter(|&p| buf.cell(p).is_some_and(theme::is_caret_cell))
-            .collect()
-    }
 
     struct Rendered {
         terminal: ratatui::Terminal<ratatui::backend::TestBackend>,
         cursor: Option<Position>,
     }
 
-    /// An IME anchors its preedit text to the terminal cursor, so the box has to
-    /// report the very cell it reversed, and no other. The hardware cursor stays
-    /// hidden: shown, it would invert that cell back to plain text.
+    /// The terminal draws the cursor, and an IME anchors its preedit text to
+    /// it, on the very cell reported here.
     fn assert_cursor_at(rendered: &Rendered, expected: Option<Position>) {
-        assert!(!rendered.terminal.backend().cursor_visible());
         assert_eq!(rendered.cursor, expected);
-        assert_eq!(caret_cells(&rendered.terminal), Vec::from_iter(expected));
     }
 
     fn render_cursor(input: &mut InputBox, width: u16, height: u16) -> Rendered {
-        draw_input(input, width, height, Placeholder::Suggestion, true)
+        draw_input(input, width, height, Placeholder::Suggestion)
     }
 
     fn render_with_cursor_left(text: &str, left: usize) -> Rendered {
@@ -1620,37 +1548,6 @@ mod tests {
             input.buffer.move_left();
         }
         render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT)
-    }
-
-    /// The caret carries whatever paint the theme gives it: the explicit
-    /// `[ui] cursor` colors when set, the reversed fallback when not.
-    fn painted_caret() -> ratatui::buffer::Cell {
-        render_with_cursor_left("abc", 1)
-            .terminal
-            .backend()
-            .buffer()
-            .cell(Position::new(4, 1))
-            .expect("caret cell must be on screen")
-            .clone()
-    }
-
-    /// The caret carries whatever paint the theme gives it: the explicit
-    /// `[ui] cursor` colors when set, the reversed fallback when not, and
-    /// `[ui] cursor_unfocused` once the terminal reports lost focus.
-    #[test]
-    fn caret_honors_the_theme_cursor_styles() {
-        theme::set(theme::Theme::from_toml(CARET_THEME_WITHOUT_CURSOR).unwrap());
-        assert!(painted_caret().modifier.contains(Modifier::REVERSED));
-
-        theme::set(theme::Theme::from_toml(CARET_THEME_WITH_CURSOR).unwrap());
-        let cell = painted_caret();
-        assert_eq!(cell.fg, CARET_FG);
-        assert_eq!(cell.bg, CARET_BG);
-
-        theme::set_cursor_focused(false);
-        assert_eq!(painted_caret().fg, CARET_UNFOCUSED_FG);
-        theme::set_cursor_focused(true);
-        theme::set(theme::load_by_name("dracula").unwrap());
     }
 
     #[test_case("hello", 0, Position::new(7, 1) ; "ascii_at_end_of_line")]
@@ -1734,35 +1631,6 @@ mod tests {
             "{SHOULD_FOLLOW_WIDE_WRAP}"
         );
         assert_cursor_at(&rendered, Some(expected));
-    }
-
-    /// An overlay owning the keyboard takes the block cursor away, but not the
-    /// caret: a caret-anchored window is placed from the cell reported here,
-    /// and reporting None teleports it to the middle of the screen.
-    #[test]
-    fn an_unfocused_input_reports_its_caret_without_reversing_it() {
-        let mut input = single_line("hello");
-        let focused = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        let unfocused = draw_input(
-            &mut input,
-            CURSOR_WIDTH,
-            CURSOR_HEIGHT,
-            Placeholder::Suggestion,
-            false,
-        );
-        assert_eq!(
-            unfocused.cursor, focused.cursor,
-            "the caret cell does not move when the keyboard goes elsewhere"
-        );
-        assert!(
-            !unfocused.terminal.backend().cursor_visible(),
-            "{CURSOR_STAYS_HIDDEN}"
-        );
-        assert_eq!(
-            caret_cells(&unfocused.terminal),
-            Vec::new(),
-            "{NO_BLOCK_CURSOR_UNFOCUSED}"
-        );
     }
 
     fn plugin_write(input: &mut InputBox, range: Range<usize>, text: &str) {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
@@ -275,8 +275,6 @@ static THEME: LazyLock<ArcSwap<Theme>> =
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-static CURSOR_FOCUSED: AtomicBool = AtomicBool::new(true);
-
 static CURRENT_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn current() -> Guard<Arc<Theme>> {
@@ -289,32 +287,6 @@ pub fn set(theme: Theme) {
     THEME.store(Arc::new(theme));
     crate::highlight::refresh_syntax_theme();
     GENERATION.fetch_add(1, Ordering::Release);
-}
-
-/// Tracks terminal focus so the input caret can recolor itself when the user
-/// switches away. Terminals that never report focus keep the focused look.
-pub fn set_cursor_focused(focused: bool) {
-    CURSOR_FOCUSED.store(focused, Ordering::Relaxed);
-}
-
-/// The `[ui] cursor` style while focused, `[ui] cursor_unfocused` otherwise.
-pub fn cursor_style() -> Style {
-    let t = current();
-    if CURSOR_FOCUSED.load(Ordering::Relaxed) {
-        t.cursor
-    } else {
-        t.cursor_unfocused
-    }
-}
-
-/// True for a buffer cell that carries the `cursor_style()` paint, so tests
-/// assert against the theme instead of one theme's hardcoded colors.
-#[cfg(test)]
-pub(crate) fn is_caret_cell(cell: &ratatui::buffer::Cell) -> bool {
-    let cursor = cursor_style();
-    cursor.fg.is_none_or(|fg| cell.fg == fg)
-        && cursor.bg.is_none_or(|bg| cell.bg == bg)
-        && cell.modifier.contains(cursor.add_modifier)
 }
 
 pub fn generation() -> u64 {
@@ -850,8 +822,8 @@ impl Theme {
             Modifier::BOLD,
         );
 
-        // Themes that leave `cursor` unset get a visible caret everywhere,
-        // including pickers that paint `t.cursor` directly.
+        // Plugins paint their own carets with `cursor`, so a theme that leaves
+        // it unset still gets a visible one.
         let cursor = match style("cursor") {
             s if s == Style::default() => Style::new().reversed(),
             s => s,

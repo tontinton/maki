@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
@@ -57,6 +57,66 @@ impl InputMode {
     }
 }
 
+const UNKNOWN_CURSOR_SHAPE_ERR: &str = "unsupported cursor shape";
+
+/// A cursor shape a plugin asks for with `maki.ui.set_cursor_shape`.
+/// `Default` is whatever the user configured their terminal to draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorShape {
+    Default,
+    Block,
+    Bar,
+    Underline,
+}
+
+impl CursorShape {
+    const ALL: [Self; 4] = [Self::Default, Self::Block, Self::Bar, Self::Underline];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Block => "block",
+            Self::Bar => "bar",
+            Self::Underline => "underline",
+        }
+    }
+
+    pub(crate) fn parse(name: &str) -> LuaResult<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|shape| shape.name() == name)
+            .ok_or_else(|| mlua::Error::runtime(format!("{UNKNOWN_CURSOR_SHAPE_ERR}: {name}")))
+    }
+}
+
+/// `blink` means nothing for `Default`, which keeps the terminal's own blink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorStyle {
+    pub shape: CursorShape,
+    pub blink: bool,
+}
+
+impl CursorStyle {
+    pub const DEFAULT: Self = Self {
+        shape: CursorShape::Default,
+        blink: false,
+    };
+
+    /// Never 0, which [`ModeState`] keeps for "no plugin asked".
+    fn encode(self) -> u8 {
+        let blink = self.blink && self.shape != CursorShape::Default;
+        1 + 2 * self.shape as u8 + u8::from(blink)
+    }
+
+    fn decode(code: u8) -> Option<Self> {
+        let index = usize::from(code.checked_sub(1)? / 2);
+        Some(Self {
+            shape: *CursorShape::ALL.get(index)?,
+            blink: (code - 1) % 2 == 1,
+        })
+    }
+}
+
 /// The mode lives on two threads. A plugin picks it with `set_mode` on the
 /// Lua thread, but only the UI knows if the chat input has the keyboard.
 /// Each half is stored the moment it changes, so `maki.fn.mode()` right after
@@ -66,12 +126,20 @@ impl InputMode {
 pub(crate) struct ModeState {
     normal: AtomicBool,
     input_focused: AtomicBool,
+    /// 0 until a plugin sets a cursor shape, then a [`CursorStyle`] code. It
+    /// never goes back to 0: once a shape was sent, the terminal has to be
+    /// told to restore its own.
+    cursor: AtomicU8,
 }
 
 impl ModeState {
     pub(crate) fn set(&self, mode: InputMode) {
         self.normal
             .store(mode == InputMode::Normal, Ordering::Release);
+    }
+
+    fn set_cursor(&self, style: CursorStyle) {
+        self.cursor.store(style.encode(), Ordering::Release);
     }
 
     pub(crate) fn get(&self) -> InputMode {
@@ -273,6 +341,12 @@ impl KeymapReader {
         self.mode.get()
     }
 
+    /// The cursor shape a plugin asked for, or None if none ever did, so the
+    /// terminal is never sent a shape the user did not opt into.
+    pub fn cursor_style(&self) -> Option<CursorStyle> {
+        CursorStyle::decode(self.mode.cursor.load(Ordering::Acquire))
+    }
+
     /// Hands {key} to the binding on it in {mode} and reports whether it was
     /// taken. With {buffer}, only the bindings set for that buffer are asked,
     /// which the host does for each window showing one before it asks the
@@ -372,6 +446,8 @@ pub(crate) struct KeymapStore {
     plugins: HashMap<Arc<str>, Arc<AtomicBool>>,
     /// The plugin that last switched the input to normal mode.
     normal_owner: Option<Arc<str>>,
+    /// The plugin that last set a cursor shape other than the default.
+    cursor_owner: Option<Arc<str>>,
 }
 
 impl KeymapStore {
@@ -380,6 +456,7 @@ impl KeymapStore {
             bindings: Vec::new(),
             plugins: HashMap::new(),
             normal_owner: None,
+            cursor_owner: None,
         }
     }
 
@@ -602,6 +679,42 @@ pub(crate) fn release_mode(lua: &Lua, plugin: &str) {
     });
     if owned {
         apply_mode(lua, InputMode::Insert);
+    }
+}
+
+fn apply_cursor(lua: &Lua, style: CursorStyle) {
+    if let Some(writer) = lua.app_data_ref::<KeymapWriter>() {
+        writer.mode.set_cursor(style);
+    }
+    if let Some(waker) = lua.app_data_ref::<UiWaker>() {
+        waker.wake();
+    }
+}
+
+/// What `maki.ui.set_cursor_shape` does for {plugin}, which then owns the
+/// shape until anyone sets it again. Dropped for an unloaded plugin, for the
+/// same reason as [`switch_mode`].
+pub(crate) fn switch_cursor(lua: &Lua, style: CursorStyle, plugin: &Arc<str>) {
+    if !plugin_loaded(lua, plugin) {
+        tracing::debug!(shape = style.shape.name(), plugin = %plugin, "cursor shape dropped: plugin unloaded");
+        return;
+    }
+    if let Some(mut store) = lua.app_data_mut::<KeymapStore>() {
+        store.cursor_owner = (style != CursorStyle::DEFAULT).then(|| Arc::clone(plugin));
+    }
+    apply_cursor(lua, style);
+}
+
+/// Gives the terminal its own cursor back if {plugin} set the shape.
+pub(crate) fn release_cursor(lua: &Lua, plugin: &str) {
+    let owned = lua.app_data_mut::<KeymapStore>().is_some_and(|mut store| {
+        store
+            .cursor_owner
+            .take_if(|owner| owner.as_ref() == plugin)
+            .is_some()
+    });
+    if owned {
+        apply_cursor(lua, CursorStyle::DEFAULT);
     }
 }
 
