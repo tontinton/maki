@@ -530,7 +530,7 @@ async fn resolve_model(
 
     let (model, assigned_tier) = match spec_str {
         Some(ref spec) => (
-            try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
+            try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy).await),
             None,
         ),
         None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref()).await),
@@ -671,9 +671,12 @@ async fn tools(
     let spec_str: Option<String> = opts.opt("spec")?;
     let mcp_enabled: bool = opts.opt::<bool>("mcp")?.unwrap_or(false);
 
-    let parsed = spec_str
-        .as_deref()
-        .and_then(|spec| Model::from_spec_with_policy(spec, &agent.model_policy).ok());
+    let parsed = match spec_str {
+        Some(spec) => Model::from_spec_with_policy(&spec, &agent.model_policy)
+            .await
+            .ok(),
+        None => None,
+    };
     let model = parsed.as_ref().unwrap_or(&agent.model);
 
     let base = match (only, except) {
@@ -995,7 +998,7 @@ async fn session(
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
     {
-        let mut m = try_pair!(Model::from_spec_with_policy(spec, &agent_ctx.model_policy));
+        let mut m = try_pair!(Model::from_spec_with_policy(spec, &agent_ctx.model_policy).await);
         let p = try_pair!(provider::from_model_async(&mut m, agent_ctx.timeouts).await);
         (m, Arc::from(p))
     } else {

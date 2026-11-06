@@ -278,7 +278,7 @@ async fn handle_request(
             Err(e) => Err(e),
         },
         "session/set_mode" => handle_set_mode(srv, raw),
-        "session/set_config_option" => handle_set_config(srv, raw),
+        "session/set_config_option" => handle_set_config(srv, raw).await,
         _ => Err(AcpError::method_not_found()),
     };
     srv.respond(id, result);
@@ -364,8 +364,9 @@ async fn load_session(
     }
     // Priced against the model the session recorded, not the one selected now
     // (which may cost 10x more or less). Later turns add their own exact cost.
-    let recorded_model =
-        Model::from_spec(&restored.session.model).unwrap_or_else(|_| params.model.clone());
+    let recorded_model = Model::from_spec_or_warm_catalog(&restored.session.model)
+        .await
+        .unwrap_or_else(|_| params.model.clone());
     // Settling writes today's estimate into entries that never recorded a cost.
     // The run saves this session back, so we settle a copy and keep that
     // estimate off disk.
@@ -807,7 +808,7 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
     ))
 }
 
-fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
     let req: SetSessionConfigOptionRequest = parse_params(raw)?;
     if req.config_id.0.as_ref() != methods::MODEL_CONFIG_ID {
         let detail = format!("unknown config option: {}", req.config_id);
@@ -818,11 +819,9 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
         return Err(AcpError::invalid_params().data(json_str(&"model must be a value id")));
     };
     let spec = value.0.to_string();
-    if !srv.model_policy.allows(&spec) {
-        return Err(AcpError::invalid_params().data(json_str(&"model is not allowed by policy")));
-    }
-    let model =
-        Model::from_spec(&spec).map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
+    let model = Model::from_spec_with_policy(&spec, &srv.model_policy)
+        .await
+        .map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
 
     let session = srv.session.as_mut().ok_or_else(no_session)?;
     session

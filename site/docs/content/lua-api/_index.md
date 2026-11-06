@@ -4500,6 +4500,9 @@ provider it names), else the curated default within `provider`, else any
 provider. `assigned` tells a pick apart from a default. Pass `provider` to
 prefer its models, the way subagents prefer the session's provider.
 
+Resolving a models.dev model can wait for that catalog to download, so
+like `get`, this can't run in a callback that must not yield.
+
 **Parameters:**
 
 - `{name}` (`string`) `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.

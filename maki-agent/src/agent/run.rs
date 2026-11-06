@@ -86,8 +86,7 @@ pub async fn resolve_compaction_model(
 ) -> (Arc<dyn Provider>, Model) {
     if let Some(spec) =
         maki_providers::model_registry::resolve_tier(None, maki_providers::ModelTier::Compaction)
-        && model_policy.allows(&spec)
-        && let Ok(mut m) = Model::from_spec(&spec)
+        && let Ok(mut m) = Model::from_spec_with_policy(&spec, model_policy).await
         && let Ok(p) = maki_providers::provider::from_model_async(&mut m, timeouts)
             .await
             .inspect_err(|err| warn!(provider = %m.provider, model = %m.id, error = %err, "compaction model unavailable, falling back to the session model"))

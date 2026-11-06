@@ -810,7 +810,9 @@ pub async fn prompt(
                 .default_model
                 .as_deref()
                 .unwrap_or("anthropic/claude-sonnet-4-20250514");
-            let model = Model::from_spec(model_spec).context("invalid default model")?;
+            let model = Model::from_spec_or_warm_catalog(model_spec)
+                .await
+                .context("invalid default model")?;
             let prompt = build_system_prompt(&vars, &instructions, &slots, &model);
             // Plan mode reaches the model as a context update after the
             // prompt, so this shows that message too.
