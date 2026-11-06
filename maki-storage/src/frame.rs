@@ -15,6 +15,10 @@ use serde_json::Value;
 pub struct PromptFacts {
     pub date: String,
     pub cwd: String,
+    /// Empty when the prompt does not state the model, so no switch is ever
+    /// announced. Always serialized: older builds require the field as a
+    /// plain string, so it must not drop from the session.
+    #[serde(default)]
     pub model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instructions: String,
@@ -112,7 +116,8 @@ impl LiveFacts {
         };
         let changed = |told: &String, now: &String| (told != now).then(|| now.clone());
         update.date = changed(&told.date, &now.date);
-        update.model = changed(&told.model, &now.model);
+        update.model =
+            (!now.model.is_empty() && told.model != now.model).then(|| now.model.clone());
         update.cwd = changed(&told.cwd, &now.cwd);
         update.instructions = changed(&told.instructions, &now.instructions);
         for (key, content) in &now.hints {
@@ -294,5 +299,28 @@ mod tests {
                 ..FactsUpdate::default()
             }
         );
+    }
+
+    #[test_case(false ; "empty_model")]
+    #[test_case(true ; "missing_legacy_model")]
+    fn empty_model_round_trips_with_upstream_field(missing: bool) {
+        let mut value = serde_json::to_value(prompt()).unwrap();
+        if missing {
+            value.as_object_mut().unwrap().remove("model");
+        } else {
+            value["model"] = serde_json::json!("");
+        }
+        let facts: PromptFacts = serde_json::from_value(value).unwrap();
+        assert!(facts.model.is_empty());
+        let serialized = serde_json::to_value(facts).unwrap();
+        assert_eq!(serialized["model"], "");
+    }
+
+    #[test]
+    fn empty_now_model_tells_nothing() {
+        let told = rendered();
+        let mut now = rendered();
+        now.prompt.as_mut().unwrap().model.clear();
+        assert!(told.changes_to(&now).is_empty());
     }
 }
