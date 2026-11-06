@@ -1994,11 +1994,10 @@ maki.async.run({fn}, {on_finish?})
 ```
 
 Start {fn} as a background task without waiting for it. Pass
-{on_finish} to get the result. The task is cancelled with its caller
-and stopped after 60 seconds. Started from a tool handler, it may outlive
-the reply: it ends with the turn, or once the call moved to the
-background, with a stop of that call. For work that outlives the caller,
-use `maki.async.spawn`.
+{on_finish} to get the result. The task stops when its caller ends, or
+after 60 seconds. A tool handler's task can outlive the reply: it runs
+until the turn ends, or until the call is stopped if it was moved to the
+background. For work that outlives the caller, use `maki.async.spawn`.
 
 **Parameters:**
 
