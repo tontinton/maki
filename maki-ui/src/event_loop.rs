@@ -59,7 +59,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, warn};
 
 use crate::agent::{
-    AgentHandles, ModelSlot, ModelSlots, Respawn,
+    AgentDeps, AgentHandles, ModelSlot, ModelSlots, Respawn,
     shared_queue::{Compaction, QueueItem, QueuedInput},
 };
 use crate::app::mode::Mode;
@@ -450,11 +450,13 @@ impl SpawnCtx {
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
-            self.timeouts,
             self.lua_event_handle.clone(),
-            self.mcp_handle.clone(),
-            self.mcp_config_errors.clone(),
-            Arc::clone(&self.model_policy),
+            AgentDeps {
+                mcp_handle: self.mcp_handle.clone(),
+                mcp_config_errors: self.mcp_config_errors.clone(),
+                timeouts: self.timeouts,
+                model_policy: Arc::clone(&self.model_policy),
+            },
         );
         let mut app = App::new(
             &slot.model,
@@ -462,7 +464,7 @@ impl SpawnCtx {
             self.storage.clone(),
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
-            handles.mcp_config_errors.clone(),
+            handles.deps.mcp_config_errors.clone(),
             self.lua_command_reader.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
@@ -745,8 +747,9 @@ impl<'t> EventLoop<'t> {
         }
         let focused = focused.min(runtimes.len() - 1);
         let app = &mut runtimes[focused].app;
-        app.exit_on_done = exit_on_done;
-        app.background_wait = background_wait;
+        if exit_on_done {
+            app.exit_when_done(background_wait);
+        }
         if needs_login {
             app.login_picker.open(app.storage.clone());
         }
@@ -840,7 +843,7 @@ impl<'t> EventLoop<'t> {
                 // A result settling since the drain above both clears its
                 // receipt and wakes the session, so the wake is claimed after
                 // the read: its run goes first, and that run's drain exits.
-                if self.sessions[i].app.exit_on_done {
+                if self.sessions[i].app.exits_on_done() {
                     dirty |= self.start_woken_runs();
                 }
                 if self.sessions[i].app.exit_request != ExitRequest::None {
@@ -980,7 +983,7 @@ impl<'t> EventLoop<'t> {
             }
             AgentEvent::QueueItemConsumed { .. } if current => {
                 rt.notifications.on_queue_item_consumed();
-                if rt.app.exit_on_done {
+                if rt.app.exits_on_done() {
                     rt.app.clear_exit_request();
                 }
             }
@@ -990,8 +993,7 @@ impl<'t> EventLoop<'t> {
             event if current => rt.notifications.on_done(event),
             _ => {}
         }
-        let actions = self.sessions[idx].app.update(Msg::Agent(envelope));
-        self.dispatch(idx, actions);
+        self.sessions[idx].app.update(Msg::Agent(envelope));
     }
 
     async fn drain_channels(&mut self) -> Result<Dirty> {
@@ -1159,8 +1161,7 @@ impl<'t> EventLoop<'t> {
             } => {
                 // A straggler after `/new` finds no tab and is dropped.
                 if let Some(idx) = self.sessions.iter().position(|rt| rt.id() == session) {
-                    let actions = self.sessions[idx].app.deliver(*envelope, Some(plugin));
-                    self.dispatch(idx, actions);
+                    self.sessions[idx].app.deliver(*envelope, Some(plugin));
                 }
             }
             UiAction::PluginTaskOpened {
@@ -1922,17 +1923,12 @@ impl<'t> EventLoop<'t> {
     fn respawn_agent(&mut self, idx: usize, history: Vec<Message>, reason: Respawn) {
         let rt = &mut self.sessions[idx];
         rt.reset_run_notifications();
-        let lua_handle = rt.app.lua_event_handle.clone();
-        let permissions = Arc::clone(&rt.app.permissions);
-        let slot = Arc::clone(&rt.slot);
         rt.handles.respawn(
             history,
-            &slot,
+            &rt.slot,
             self.ctx.config.clone(),
             self.ctx.ui_config.tool_output_lines,
-            &permissions,
             &mut rt.app,
-            lua_handle,
             reason,
         );
     }

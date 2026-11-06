@@ -21,7 +21,7 @@ use maki_agent::{
     AgentEvent, BufferSnapshot, DisplayItem, SessionControl, SharedBuf, SteerKind, ToolDoneEvent,
     ToolOutput, ToolStartEvent, display_order, observation_detail,
 };
-use maki_config::{ToolKey, ToolOutputLines, UiConfig};
+use maki_config::{ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
 use maki_storage::id::MakiId;
@@ -47,18 +47,7 @@ pub(crate) const INBOX_DROPPED_SUFFIX: &str =
 pub enum ChatEventResult {
     Continue,
     Done,
-    QueueItemConsumed {
-        text: String,
-        images: Vec<ImageSource>,
-    },
     Error(String),
-    PermissionRequest {
-        id: String,
-        tool: ToolKey,
-        scopes: Vec<String>,
-        reason: Option<String>,
-    },
-    AuthRequired,
 }
 
 /// A call this chat's agent started that has not reported done.
@@ -274,16 +263,17 @@ impl Chat {
             AgentEvent::CompactionDone { .. } => {
                 self.messages_panel.flush();
             }
-            AgentEvent::QueueItemConsumed { text, images } => {
-                return ChatEventResult::QueueItemConsumed { text, images };
-            }
+            // The App takes these before they reach a chat.
+            AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::PermissionRequest { .. }
+            | AgentEvent::AuthRequired
+            | AgentEvent::Retry { .. } => {}
             AgentEvent::QueueDrained => {}
             AgentEvent::ToolMovable { id, movable } => {
                 self.messages_panel.set_tool_movable(&id, movable);
             }
             // Parts belong to `/tasks`, which the App keeps, never to a transcript.
             AgentEvent::ToolParts { .. } => {}
-            AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::Done { .. } => {
                 self.messages_panel.flush();
                 return ChatEventResult::Done;
@@ -291,19 +281,6 @@ impl Chat {
             AgentEvent::Error { message, .. } => {
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
-            }
-            AgentEvent::PermissionRequest {
-                id,
-                tool,
-                scopes,
-                reason,
-            } => {
-                return ChatEventResult::PermissionRequest {
-                    id,
-                    tool,
-                    scopes,
-                    reason,
-                };
             }
             AgentEvent::Steered { kind, text } => {
                 let prefix = match kind {
@@ -320,9 +297,6 @@ impl Chat {
             AgentEvent::AllowedByPlugin { id, plugin } => self
                 .messages_panel
                 .annotate_tool(&id, &format!("{ALLOWED_BY} {plugin}")),
-            AgentEvent::AuthRequired => {
-                return ChatEventResult::AuthRequired;
-            }
             AgentEvent::ToolSnapshot {
                 id,
                 snapshot,
@@ -1046,7 +1020,6 @@ mod tests {
     use test_case::test_case;
 
     const IMAGE_DATA: &str = "dGVzdA==";
-    const EXPECTED_QUEUE_DELIVERY: &str = "a consumed queue item must carry its images";
 
     fn image() -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))
@@ -1099,17 +1072,7 @@ mod tests {
     #[test]
     fn queued_user_images_reach_display() {
         let mut chat = chat();
-        let result = chat.handle_event(
-            AgentEvent::QueueItemConsumed {
-                text: String::new(),
-                images: vec![image()],
-            },
-            None,
-        );
-        let ChatEventResult::QueueItemConsumed { text, images } = result else {
-            panic!("{EXPECTED_QUEUE_DELIVERY}");
-        };
-        chat.show_user_message(text, images);
+        chat.show_user_message(String::new(), vec![image()]);
         let message = chat.message_at(0).unwrap();
         assert_eq!(message.role, DisplayRole::User);
         assert_eq!(message.text, IMAGE_PLACEHOLDER);
@@ -1862,8 +1825,6 @@ mod tests {
     }
 
     const STEER_TEXT: &str = "keep going";
-    const ASK_REASON: &str = "plugin wants a human to look";
-    const EXPECTED_PERMISSION_REQUEST: &str = "a permission request must reach the caller";
 
     #[test_case(SteerKind::MessageRewritten, REWRITTEN_PREFIX ; "message_rewritten")]
     #[test_case(SteerKind::MessageDropped, DROPPED_PREFIX ; "message_dropped")]
@@ -1884,24 +1845,5 @@ mod tests {
             "{text}"
         );
         assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
-    }
-
-    #[test]
-    fn permission_request_carries_reason() {
-        let mut chat = chat();
-        let result = chat.handle_event(
-            AgentEvent::PermissionRequest {
-                id: TASK_ID.into(),
-                tool: ToolKey::native("bash"),
-                scopes: Vec::new(),
-                reason: Some(ASK_REASON.into()),
-            },
-            None,
-        );
-        let ChatEventResult::PermissionRequest { id, reason, .. } = result else {
-            panic!("{EXPECTED_PERMISSION_REQUEST}");
-        };
-        assert_eq!(id, TASK_ID);
-        assert_eq!(reason.as_deref(), Some(ASK_REASON));
     }
 }
