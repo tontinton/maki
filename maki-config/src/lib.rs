@@ -134,14 +134,6 @@ pub const PROVIDER_BUILTINS: &[&str] = &[
     "tensorx",
 ];
 
-/// Bundled plugins that ship switched off. They load only when a config says
-/// `plugins.<name> = { enabled = true }`, and the config layer accepts their
-/// tables either way so that line is not itself an error.
-///
-/// A plugin belongs here while what it does is worth shipping but what it
-/// costs at scale is not yet known.
-pub const OPTIONAL_BUILTINS: &[&str] = &[];
-
 /// Tools the edit plugin provides alongside `edit`, toggled through its options.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
@@ -627,16 +619,11 @@ impl RawConfig {
         let mut unknown: Vec<&String> = self
             .plugins
             .keys()
-            .filter(|name| {
-                !DEFAULT_BUILTINS.contains(&name.as_str())
-                    && !OPTIONAL_BUILTINS.contains(&name.as_str())
-                    && !packages.contains(name)
-            })
+            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()) && !packages.contains(name))
             .collect();
         unknown.sort();
         if let Some(&plugin) = unknown.first() {
             let mut valid: Vec<&str> = DEFAULT_BUILTINS.to_vec();
-            valid.extend(OPTIONAL_BUILTINS);
             valid.extend(packages.iter().map(String::as_str));
             valid.sort_unstable();
             return Err(ConfigError::UnknownPlugin {
@@ -4636,34 +4623,6 @@ mod tests {
                 pair[0],
                 pair[1]
             );
-        }
-    }
-
-    /// A name in both lists would be on by default and documented as opt-in,
-    /// and the two answers are given by different code paths.
-    #[test]
-    fn optional_builtins_are_not_also_defaults() {
-        for name in OPTIONAL_BUILTINS {
-            assert!(
-                !DEFAULT_BUILTINS.contains(name),
-                "{name} is both a default and an opt-in builtin"
-            );
-        }
-    }
-
-    /// The point of shipping one off by default: naming it in a config is
-    /// accepted, and it stays off until that config says `enabled = true`.
-    #[test]
-    fn an_optional_builtin_loads_only_when_a_config_asks_for_it() {
-        for name in OPTIONAL_BUILTINS {
-            let off: RawConfig = toml::from_str(&format!("[plugins.{name}]\n")).unwrap();
-            let off = off.into_config(&[]).expect("naming it is not an error");
-            assert!(!off.plugins.names.iter().any(|n| n == name));
-
-            let on: RawConfig =
-                toml::from_str(&format!("[plugins.{name}]\nenabled = true\n")).unwrap();
-            let on = on.into_config(&[]).unwrap();
-            assert!(on.plugins.names.iter().any(|n| n == name));
         }
     }
 
