@@ -68,12 +68,22 @@ local function park(name)
     released[name] = nil
     return
   end
-  maki.async.await(1, function(cb) parked[name] = cb end)
+  -- Every waiter stays referenced: a callback the GC collects ends its
+  -- await with an error, so a call parked under a shared name would finish
+  -- whenever the collector happens to run.
+  maki.async.await(1, function(cb)
+    parked[name] = parked[name] or {}
+    table.insert(parked[name], cb)
+  end)
 end
 local function release(name)
-  local cb = parked[name]
+  local waiters = parked[name]
   parked[name] = nil
-  if cb then cb() else released[name] = true end
+  if not waiters then
+    released[name] = true
+    return
+  end
+  for _, cb in ipairs(waiters) do cb() end
 end
 local schema = {
   type = "object",
