@@ -31,11 +31,10 @@ use maki_agent::tools::ToolRegistry;
 use maki_agent::{
     AgentMode, BackgroundNotice, BufferSnapshot, CallRecord, DoneReason, HistorySnapshot,
     ImageMediaType, ImageSource, McpConfigErrors, McpPromptArg, McpPromptInfo, McpServerInfo,
-    McpServerStatus, McpSnapshot, McpSnapshotReader, RunTotals, SharedBuf, SteerKind,
-    SubagentInbox, TaskLabel, ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript,
-    TurnCompleteEvent, result_notice,
+    McpServerStatus, McpSnapshot, McpSnapshotReader, RunTotals, SharedBuf, SnapshotLine,
+    SnapshotSpan, SpanStyle, SteerKind, SubagentInbox, TaskLabel, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
 };
-use maki_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
 use maki_config::{
     Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
 };
