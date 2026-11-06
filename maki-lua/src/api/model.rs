@@ -108,6 +108,9 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
 /// provider. `assigned` tells a pick apart from a default. Pass `provider` to
 /// prefer its models, the way subagents prefer the session's provider.
 ///
+/// Resolving a models.dev model can wait for that catalog to download, so
+/// like `get`, this can't run in a callback that must not yield.
+///
 /// @param name string `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
 /// @param provider string|nil Provider slug to resolve within first.
 /// @return (table|nil, string|nil) The model in the shape `info` returns, plus
@@ -118,7 +121,7 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
 /// local m = maki.model.tier("weak", maki.model.get().provider)
 /// if m then maki.model.set(m.spec) end
 #[lua_fn]
-fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Table>> {
+async fn tier(lua: Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Table>> {
     let tier: ModelTier = match name.parse() {
         Ok(tier) => tier,
         Err(e) => return Ok(err_pair(e)),
@@ -127,11 +130,11 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
         Some(spec) => spec,
         None => return Ok((None, None)),
     };
-    let model = match Model::from_spec(&spec) {
+    let model = match Model::from_spec_or_warm_catalog(&spec).await {
         Ok(model) => model,
         Err(e) => return Ok(err_pair(stale_tier_err(tier, &spec, e))),
     };
-    let tbl = model_info_table(lua, &model)?;
+    let tbl = model_info_table(&lua, &model)?;
     tbl.set(
         "assigned",
         model_registry::override_tiers(&spec).contains(&tier),
@@ -425,9 +428,11 @@ mod tests {
 
     /// An assignment left over from a provider that is gone is an error, not a
     /// silent `nil`: the user did pick something, it just no longer resolves.
+    /// The spec has no provider slug, so it fails before the catalog is
+    /// fetched and the test stays off the network.
     #[tokio::test]
     async fn tier_with_a_stale_assignment_returns_an_error_pair() {
-        let (lua, tier, spec) = assign_tier("no-such-provider/nope", ModelTier::Weak);
+        let (lua, tier, spec) = assign_tier("removed-model", ModelTier::Weak);
         let (val, err) = eval(&lua, "return model.tier('weak')").await;
         clear_tier(tier, spec);
         assert_eq!(val, Json::Null);

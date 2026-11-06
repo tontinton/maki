@@ -1005,11 +1005,14 @@ impl Model {
         Err(ModelError::UnsupportedProvider(slug.to_string()))
     }
 
-    pub fn from_spec_with_policy(spec: &str, policy: &ModelPolicy) -> Result<Self, ModelError> {
+    pub async fn from_spec_with_policy(
+        spec: &str,
+        policy: &ModelPolicy,
+    ) -> Result<Self, ModelError> {
         if !policy.allows(spec) {
             return Err(ModelError::NotAllowed(spec.to_string()));
         }
-        Self::from_spec(spec)
+        Self::from_spec_or_warm_catalog(spec).await
     }
 
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
@@ -1404,12 +1407,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn from_spec_with_policy_rejects_disallowed_exact_spec() {
+    #[tokio::test]
+    async fn from_spec_with_policy_rejects_disallowed_exact_spec() {
         let policy = policy(&["anthropic/*"], &[]);
         let spec = "openai/gpt-5.6-sol";
 
-        let error = Model::from_spec_with_policy(spec, &policy).unwrap_err();
+        let error = Model::from_spec_with_policy(spec, &policy)
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, ModelError::NotAllowed(disallowed) if disallowed == spec));
     }
@@ -1439,11 +1444,13 @@ mod tests {
         assert_eq!(model.output_tokens(), expected);
     }
 
-    #[test]
-    fn from_spec_with_policy_resolves_allowed_exact_spec() {
+    #[tokio::test]
+    async fn from_spec_with_policy_resolves_allowed_exact_spec() {
         let policy = policy(&["openai/gpt-5.6-sol"], &[]);
 
-        let model = Model::from_spec_with_policy("openai/gpt-5.6-sol", &policy).unwrap();
+        let model = Model::from_spec_with_policy("openai/gpt-5.6-sol", &policy)
+            .await
+            .unwrap();
 
         assert_eq!(model.spec(), "openai/gpt-5.6-sol");
     }
