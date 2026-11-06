@@ -131,7 +131,6 @@ fn move_file(src: &Path, dst: &Path, legacy: &Path) -> Result<()> {
 }
 
 /// Both sides are resolved, since `~/.maki` itself can sit behind a symlink.
-#[cfg(unix)]
 fn resolves_into(link: &Path, dir: &Path) -> bool {
     let (Ok(target), Ok(dir)) = (fs::canonicalize(link), fs::canonicalize(dir)) else {
         return false;
@@ -158,6 +157,16 @@ fn stash(path: &Path, relative: &Path, legacy: &Path) -> Result<PathBuf> {
     let dst = free_path(&backup_path(legacy).join(relative));
     move_file(path, &dst, legacy)?;
     Ok(dst)
+}
+
+/// A link from the new layout into `~/.maki` reaches the very file about to
+/// move there, so it looks like a clash and the only copy would go to the
+/// backup. It points at nothing once `~/.maki` is gone anyway.
+fn unlink_into_legacy(path: &Path, legacy: &Path) -> Result<()> {
+    if is_symlink(path) && resolves_into(path, legacy) {
+        fs::remove_file(path).with_context(|| format!("remove link {}", tilde(path)))?;
+    }
+    Ok(())
 }
 
 /// One rule for every file both layouts hold and nothing can merge: the copy
@@ -189,6 +198,7 @@ fn merge_tree(src: &Path, dst: &Path, legacy: &Path) -> Result<usize> {
     for entry in fs::read_dir(src).with_context(|| format!("read {}", tilde(src)))? {
         let entry = entry?;
         let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        unlink_into_legacy(&to, legacy)?;
         if entry.file_type()?.is_dir() {
             files += merge_tree(&from, &to, legacy)?;
         } else {
@@ -603,6 +613,13 @@ fn move_legacy_layout(
 ) -> Result<()> {
     eprintln!("Moving files from {} ...\n", tilde(legacy));
 
+    // `merge_tree` clears the levels below. The top level goes first, since
+    // `reconcile` and `keep_rules_in_force` look at both sides too.
+    for target in [config, data, state, logs] {
+        for name in entry_names(target) {
+            unlink_into_legacy(&target.join(name), legacy)?;
+        }
+    }
     for name in REBUILT_ENTRIES {
         remove_entry(&legacy.join(name));
     }
@@ -1027,6 +1044,34 @@ mod tests {
             fs::read_to_string(xdg[0].join(INIT_LUA)).unwrap(),
             NEW_CONTENT
         );
+    }
+
+    #[cfg(unix)]
+    #[test_case(0, INIT_LUA, INIT_LUA ; "a_link_to_a_file")]
+    #[test_case(2, SESSIONS, "sessions/abc.json" ; "a_link_to_a_directory")]
+    #[test_case(2, "sessions/abc.json", "sessions/abc.json" ; "a_link_inside_a_merged_directory")]
+    #[test_case(0, PERMISSIONS_FILE, PERMISSIONS_FILE ; "a_link_to_the_permissions")]
+    #[test_case(2, TRUST_FILE, TRUST_FILE ; "a_link_to_a_merged_file")]
+    fn a_link_into_the_old_dir_is_replaced_by_the_real_file(
+        target: usize,
+        linked: &str,
+        file: &str,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(".maki");
+        let xdg = xdg_layout(root.path());
+        write(legacy.join(file), NEW_CONTENT);
+        let link = xdg[target].join(linked);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(legacy.join(linked), link).unwrap();
+
+        migrate(&legacy, &xdg).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(xdg[target].join(file)).unwrap(),
+            NEW_CONTENT
+        );
+        assert!(!root.path().join(BACKUP_DIR).exists());
     }
 
     #[cfg(unix)]
