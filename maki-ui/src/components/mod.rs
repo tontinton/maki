@@ -38,7 +38,12 @@ use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput};
 use maki_lua::{PackCommand, PackPlan};
 use maki_providers::{ImageSource, Message, ModelTier};
+use ratatui::Frame;
+use ratatui::buffer::{Buffer, CellWidth};
+use ratatui::layout::{Position, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 
 use crate::OpenSession;
 
@@ -50,6 +55,79 @@ pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
     ratatui::text::Span::styled(CHEVRON, crate::theme::current().tool_dim)
 }
 
+/// A field's caret: the span it paints and the display column it should land
+/// on, measured from the start of its line.
+pub(crate) struct Caret {
+    pub col: usize,
+    pub span: Span<'static>,
+}
+
+/// Cells {spans} take once painted, the way ratatui counts them: it drops
+/// every grapheme holding a control char, such as a pasted newline.
+pub(crate) fn painted_width(spans: &[Span]) -> usize {
+    spans
+        .iter()
+        .flat_map(|span| span.styled_graphemes(Style::default()))
+        .map(|grapheme| usize::from(grapheme.symbol.cell_width()))
+        .sum()
+}
+
+/// Lays {text} out as a field line after {prefix}, the char at {cursor_byte}
+/// in {caret_style} and what follows it in {tail_style}. A caret on a control
+/// char or at the end is painted as a space, the only thing that shows.
+pub(crate) fn field_line(
+    prefix: Vec<Span<'static>>,
+    text: &str,
+    cursor_byte: usize,
+    caret_style: Style,
+    tail_style: Style,
+) -> (Line<'static>, Caret) {
+    let (before, rest) = text.split_at(cursor_byte);
+    let mut chars = rest.chars();
+    let caret_char = chars.next().filter(|c| !c.is_control()).unwrap_or(' ');
+    let mut spans = prefix;
+    spans.push(Span::raw(before.to_owned()));
+    let col = painted_width(&spans);
+    let span = Span::styled(caret_char.to_string(), caret_style);
+    spans.push(span.clone());
+    spans.push(Span::styled(chars.as_str().to_owned(), tail_style));
+    (Line::from(spans), Caret { col, span })
+}
+
+/// The cell of {caret} on {row} of {area}, but only if {buf} really holds the
+/// caret there. ratatui decides whether text clips, wraps or merges into its
+/// neighbour, and a copy of those rules would drift. So the cell is read back,
+/// and a mismatch reports nothing rather than a guess. An overlay painted over
+/// the field later is not seen.
+pub(crate) fn painted_caret(
+    buf: &Buffer,
+    area: Rect,
+    caret: &Caret,
+    row: usize,
+) -> Option<Position> {
+    let x = u16::try_from(usize::from(area.x) + caret.col).ok()?;
+    let y = u16::try_from(usize::from(area.y) + row).ok()?;
+    let pos = Position::new(x, y);
+    let cell = buf.cell(pos).filter(|_| area.contains(pos))?;
+    let style = cell.style();
+    let painted = caret.span.styled_graphemes(Style::default()).next()?;
+    (cell.symbol() == painted.symbol && style.patch(caret.span.style) == style).then_some(pos)
+}
+
+/// Paints a one row text field into {area} and returns the cell of its caret.
+pub(crate) fn render_field(
+    frame: &mut Frame,
+    area: Rect,
+    prefix: Vec<Span<'static>>,
+    text: &str,
+    cursor_byte: usize,
+    caret_style: Style,
+) -> Option<Position> {
+    let (line, caret) = field_line(prefix, text, cursor_byte, caret_style, Style::default());
+    frame.render_widget(Paragraph::new(line), area);
+    painted_caret(frame.buffer_mut(), area, &caret, 0)
+}
+
 pub(crate) trait Overlay {
     fn is_open(&self) -> bool;
     fn close(&mut self);
@@ -57,7 +135,8 @@ pub(crate) trait Overlay {
     /// permission prompt. Keys typed before one opened must never answer it,
     /// so each overlay has to say.
     fn is_prompting(&self) -> bool;
-    /// Modal overlays block mouse interaction behind them.
+    /// Modal overlays block clicks behind them. The wheel ignores this flag:
+    /// `App::scroll_at` decides per overlay where it goes.
     fn is_modal(&self) -> bool {
         true
     }
@@ -336,12 +415,18 @@ pub struct DisplayMessage {
     /// Set once the call moved: the row keeps its receipt and follows the task.
     pub background: Option<BackgroundBadge>,
     /// The full body behind a one-line notice, shown when the row expands.
-    pub detail: Option<String>,
+    pub detail: Option<NoticeDetail>,
     /// Whether [`Self::detail`] is shown. Only a click sets it, so a notice
     /// starts collapsed however it got here.
     pub detail_expanded: bool,
     /// On a notice that answers a background task: how the task ended.
     pub task_end: Option<BackgroundOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoticeDetail {
+    pub text: String,
+    pub markdown: bool,
 }
 
 /// How a moved call's row tracks its background task.
@@ -455,6 +540,16 @@ impl DisplayMessage {
         (self.render_snapshot.is_some() || self.render_header.is_some())
             && self.snapshot_theme_gen != current_gen
     }
+
+    /// Whether its call still writes to the buf the row draws: a moved call
+    /// until its badge has an outcome, any other one while it runs.
+    pub fn streams(&self) -> bool {
+        match (&self.background, &self.role) {
+            (Some(badge), _) => badge.outcome.is_none(),
+            (None, DisplayRole::Tool(tool)) => tool.status == ToolStatus::InProgress,
+            (None, _) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -540,9 +635,17 @@ pub(crate) fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent
 mod tests {
     use super::*;
     use maki_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
+    use ratatui::widgets::Widget;
     use test_case::test_case;
 
     const SNAPSHOT_GEN: u64 = 7;
+    const FIELD_PREFIX: &str = "❯ ";
+    const FIELD_AREA: Rect = Rect::new(5, 7, 10, 3);
+    const FIELD_SCREEN: Rect = Rect::new(0, 0, 40, 20);
+
+    fn field_cell(col: u16, row: u16) -> Option<Position> {
+        Some(Position::new(FIELD_AREA.x + col, FIELD_AREA.y + row))
+    }
 
     fn snapshot() -> BufferSnapshot {
         BufferSnapshot::from_arc(Arc::new(vec![SnapshotLine {
@@ -578,5 +681,63 @@ mod tests {
     #[test_case(0, 5, 0    ; "clamp_underflow")]
     fn apply_scroll_delta_cases(offset: u16, delta: i32, expected: u16) {
         assert_eq!(apply_scroll_delta(offset, delta), expected);
+    }
+
+    #[test_case("abc", 1 => ("❯ abc".to_string(), 3, "b".to_string()) ; "ascii_mid_text")]
+    #[test_case("abc", 3 => ("❯ abc ".to_string(), 5, " ".to_string()) ; "ascii_at_the_end")]
+    #[test_case("", 0 => ("❯  ".to_string(), 2, " ".to_string()) ; "empty_text")]
+    #[test_case("a漢b", 4 => ("❯ a漢b".to_string(), 5, "b".to_string()) ; "after_a_wide_char")]
+    #[test_case("a漢b", 1 => ("❯ a漢b".to_string(), 3, "漢".to_string()) ; "on_a_wide_char")]
+    #[test_case("ab\ncd", 5 => ("❯ abcd ".to_string(), 6, " ".to_string()) ; "after_a_newline")]
+    #[test_case("ab\n", 3 => ("❯ ab ".to_string(), 4, " ".to_string()) ; "after_a_trailing_newline")]
+    #[test_case("ab\ncd", 2 => ("❯ ab cd".to_string(), 4, " ".to_string()) ; "on_a_newline")]
+    #[test_case("ｶﾞx", 6 => ("❯ ｶﾞx".to_string(), 5, "x".to_string()) ; "after_a_halfwidth_voiced_mark")]
+    fn field_line_places_the_caret(text: &str, cursor_byte: usize) -> (String, usize, String) {
+        let (line, caret) = field_line(
+            vec![Span::raw(FIELD_PREFIX)],
+            text,
+            cursor_byte,
+            Style::new().reversed(),
+            Style::default(),
+        );
+        let painted: String = line
+            .spans
+            .iter()
+            .flat_map(|span| span.styled_graphemes(Style::default()))
+            .map(|grapheme| grapheme.symbol)
+            .collect();
+        (painted, caret.col, caret.span.content.to_string())
+    }
+
+    fn painted_caret_in(text: &str, cursor_byte: usize, width: u16) -> Option<Position> {
+        let area = Rect {
+            width,
+            ..FIELD_AREA
+        };
+        let mut buf = Buffer::empty(FIELD_SCREEN);
+        let (line, caret) = field_line(
+            vec![Span::raw(FIELD_PREFIX)],
+            text,
+            cursor_byte,
+            Style::new().reversed(),
+            Style::default(),
+        );
+        Paragraph::new(line).render(area, &mut buf);
+        painted_caret(&buf, area, &caret, 0)
+    }
+
+    #[test_case("abc", 1, 10 => field_cell(3, 0) ; "mid_text")]
+    #[test_case("abc", 3, 10 => field_cell(5, 0) ; "end_of_text_space")]
+    #[test_case("a漢b", 4, 10 => field_cell(5, 0) ; "after_a_wide_char")]
+    #[test_case("ｶﾞx", 6, 10 => field_cell(5, 0) ; "after_a_halfwidth_voiced_mark")]
+    #[test_case("abcdefghij", 8, 10 => None ; "clipped_past_the_right_edge")]
+    #[test_case("xxxxxx漢", 6, 9 => None ; "wide_caret_cut_by_the_edge")]
+    #[test_case("a\u{301}b", 1, 10 => None ; "zero_width_caret_merges_into_its_neighbour")]
+    fn painted_caret_reports_only_what_ratatui_painted(
+        text: &str,
+        cursor_byte: usize,
+        width: u16,
+    ) -> Option<Position> {
+        painted_caret_in(text, cursor_byte, width)
     }
 }

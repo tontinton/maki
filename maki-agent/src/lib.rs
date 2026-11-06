@@ -20,22 +20,25 @@ pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
     ToolDeferral,
 };
-pub mod inbox;
 pub mod session;
+mod session_control;
+pub use session_control::{Activity, Delivery, EndReason, SessionControl};
+mod session_loop;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, DisplayItem, History, HistorySnapshot, Instructions,
-    LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages, Transcript,
-    UNAVAILABLE_RESULT, close_dangling_tool_calls, display_order, find_subdirectory_instructions,
-    is_instruction_file, observation_detail, observation_line,
+    Agent, AgentParams, AgentRunParams, Cutter, DisplayItem, History, HistorySnapshot,
+    Instructions, LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages,
+    Transcript, UNAVAILABLE_RESULT, USER_CANCEL_MARKER, close_dangling_tool_calls, display_order,
+    find_subdirectory_instructions, is_instruction_file, observation_detail, observation_line,
+    unbind_thinking,
 };
-pub use call_scope::{AlreadyMoved, CallGuard, CallScope, SessionStub, TaskHome};
+pub use call_scope::{AlreadyMoved, CallGuard, CallScope, MovedTrigger, SessionStub, TaskHome};
 pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};
-pub use inbox::SubagentInbox;
 pub use live_session::{
     AgentSeed, BackgroundNotice, MailboxError, SessionMailbox, TaskLabel, receipt_tag,
     result_notice,
 };
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
+pub use session_loop::{CutShort, TurnHost, run_turns};
 pub mod command;
 pub mod diff;
 pub mod permissions;
@@ -90,6 +93,11 @@ pub enum ExtractedCommand {
 
 pub trait InterruptSource: Send + Sync {
     fn poll(&self) -> Option<ExtractedCommand>;
+
+    /// Who cut the run, asked only after its token fired.
+    fn cut_by(&self) -> Cutter {
+        Cutter::User
+    }
 }
 
 #[derive(Clone)]

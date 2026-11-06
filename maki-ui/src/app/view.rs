@@ -1,10 +1,7 @@
-use std::sync::atomic::Ordering;
-
 use crate::components::Overlay;
 use crate::components::input::BORDER_ROWS;
-#[cfg(test)]
-use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
+use crate::components::scrollbar::Thumbs;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
 use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
@@ -17,13 +14,11 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
-#[cfg(test)]
-use super::Status;
-use super::{App, Mode};
+use super::{App, KeyboardOwner, Mode};
 
-/// A finished task's tab has no input box, so only this hint says how to
-/// get out.
-pub(super) const FINISHED_TAB_HINT: &str = " esc back · ctrl+x tasks ";
+/// A tab without an input box, a finished task's or a moved call's, has
+/// only this hint to say how to get out and where to stop it.
+pub(super) const NO_INPUT_TAB_HINT: &str = " esc back · ctrl+x tasks ";
 
 struct ViewLayout {
     msg_area: Rect,
@@ -45,11 +40,35 @@ impl App {
         self.prompt_open() || self.plan_form_active()
     }
 
-    /// Whether the chat input is the widget the user's keys reach. It decides
-    /// the block cursor and the terminal cursor, never where the caret was
-    /// drawn.
-    fn input_has_keyboard(&self) -> bool {
-        !self.any_overlay_open()
+    /// The caret of {owner}, the holder of the keyboard: the input box's
+    /// {input}, the permission prompt's {prompt}, the focused window's own, or
+    /// the {picker} one for a picker. None for an owner with no text field.
+    fn keyboard_caret(
+        &self,
+        owner: KeyboardOwner,
+        input: Option<Position>,
+        prompt: Option<Position>,
+        picker: Option<Position>,
+    ) -> Option<Position> {
+        match owner {
+            KeyboardOwner::Chat => input,
+            KeyboardOwner::Permission => prompt,
+            KeyboardOwner::FocusedWindow => self.float_mgr.focused_caret(),
+            KeyboardOwner::Search
+            | KeyboardOwner::FilePicker
+            | KeyboardOwner::RewindPicker
+            | KeyboardOwner::ThemePicker
+            | KeyboardOwner::ModelPicker
+            | KeyboardOwner::LoginPicker
+            | KeyboardOwner::McpPicker => picker,
+            KeyboardOwner::Alert
+            | KeyboardOwner::PackReview
+            | KeyboardOwner::PlanForm
+            | KeyboardOwner::Help
+            | KeyboardOwner::Usage
+            | KeyboardOwner::Btw
+            | KeyboardOwner::Queue => None,
+        }
     }
 
     /// Whether a plugin writing to the chat input would land in a box the
@@ -69,9 +88,10 @@ impl App {
             && self.compute_layout(area).input_area.height > BORDER_ROWS
     }
 
-    /// Returns the cell the terminal cursor belongs on, the cell the input box
-    /// reversed. An overlay owning the keyboard leaves none, so there is
-    /// nothing to park an IME on.
+    /// Returns the cell the terminal cursor belongs on, so an IME draws its
+    /// preedit there: the input box's caret, or while an overlay owns the
+    /// keyboard, the caret of the field its keys reach. None when that field
+    /// wraps, is clipped, or the overlay has no field.
     ///
     /// Where the caret was drawn is a separate question, and a caret-anchored
     /// float is placed from that: the caret outlives an overlay taking focus,
@@ -80,17 +100,21 @@ impl App {
     pub fn view(&mut self, frame: &mut Frame) -> Option<Position> {
         let layout = self.compute_layout(frame.area());
         let render_chat = self.active_chat;
+        let owner = self.keyboard_owner();
 
-        self.render_background(frame);
-        self.render_messages(frame, &layout, render_chat);
-        let caret = self.render_bottom_panel(frame, &layout);
-        self.render_splits(frame, &layout);
-        let mut overlay_rect = self.render_picker_overlays(frame, &layout);
-        self.render_status_bar(frame, layout.status_area, render_chat);
-        overlay_rect = self.render_top_modals(frame, overlay_rect, caret);
+        let ((overlay_rect, caret, prompt_caret, picker_caret), thumbs) = Thumbs::record(|| {
+            self.render_background(frame);
+            self.render_messages(frame, &layout, render_chat);
+            let (caret, prompt_caret) = self.render_bottom_panel(frame, &layout);
+            self.render_splits(frame, &layout);
+            let (overlay_rect, picker_caret) = self.render_picker_overlays(frame, &layout, owner);
+            self.render_status_bar(frame, layout.status_area, render_chat);
+            let overlay_rect = self.render_top_modals(frame, overlay_rect, caret);
+            (overlay_rect, caret, prompt_caret, picker_caret)
+        });
         self.register_zones(&layout, overlay_rect);
-        self.apply_selection(frame, render_chat);
-        caret.filter(|_| self.input_has_keyboard())
+        self.apply_selection(frame, render_chat, &thumbs);
+        self.keyboard_caret(owner, caret, prompt_caret, picker_caret)
     }
 
     fn compute_layout(&self, area: Rect) -> ViewLayout {
@@ -196,14 +220,20 @@ impl App {
         );
     }
 
-    /// Returns the cell the input box drew its caret in, when it drew one at
-    /// all: a prompt, a form, a `below` split or a finished subagent's chat
-    /// all take the box off screen, and a box scrolled off its own viewport
-    /// draws without a caret. A running subagent's chat keeps the box, so a
-    /// message can be queued for that subagent while watching it.
-    fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Option<Position> {
+    /// Returns the cell the input box drew its caret in and the cell the
+    /// permission prompt drew its deny field's in, when they drew one at all.
+    /// A prompt, a form, a `below` split or a chat that takes no messages all
+    /// take the box off screen, and a box scrolled off its own viewport draws
+    /// without a caret. A running subagent's chat keeps the box, so a message
+    /// can be queued for that subagent while watching it.
+    fn render_bottom_panel(
+        &mut self,
+        frame: &mut Frame,
+        layout: &ViewLayout,
+    ) -> (Option<Position>, Option<Position>) {
         if self.permission_prompt.is_open() {
-            self.permission_prompt.view(frame, layout.bottom_area);
+            let prompt_caret = self.permission_prompt.view(frame, layout.bottom_area);
+            return (None, prompt_caret);
         } else if self.pack_review.is_open() {
             self.pack_review.view(frame, layout.bottom_area);
         } else if !self.chat_accepts_input() {
@@ -224,7 +254,7 @@ impl App {
             } else {
                 layout.bottom_area
             };
-            let hint = Line::from(Span::styled(FINISHED_TAB_HINT, theme::current().tool_dim));
+            let hint = Line::from(Span::styled(NO_INPUT_TAB_HINT, theme::current().tool_dim));
             let sep = Block::default()
                 .borders(Borders::TOP)
                 .border_style(self.separator_style())
@@ -249,14 +279,14 @@ impl App {
                 layout.input_area,
                 placeholder,
                 self.separator_style(),
-                self.input_has_keyboard(),
+                self.input_focused(),
                 panel_hint,
             );
             self.command_palette
                 .view(frame, layout.input_area, &self.input_box.buffer);
-            return caret;
+            return (caret, None);
         }
-        None
+        (None, None)
     }
 
     fn render_splits(&mut self, frame: &mut Frame, layout: &ViewLayout) {
@@ -267,33 +297,66 @@ impl App {
         }
     }
 
-    fn render_picker_overlays(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Rect {
+    /// A later picker is drawn over an earlier one. {overlay_rect} is the
+    /// topmost picker's, and the caret is the one of the picker that is
+    /// {owner}, None when {owner} is not a picker.
+    fn render_picker_overlays(
+        &mut self,
+        frame: &mut Frame,
+        layout: &ViewLayout,
+        owner: KeyboardOwner,
+    ) -> (Rect, Option<Position>) {
         let mut overlay_rect = Rect::default();
+        let mut picker_caret = None;
         let full = frame.area();
+        let mut record = |picker: KeyboardOwner, (rect, caret): (Rect, Option<Position>)| {
+            overlay_rect = rect;
+            if picker == owner {
+                picker_caret = caret;
+            }
+        };
 
         if self.search_modal.is_open() {
-            overlay_rect = self.search_modal.view(frame, layout.msg_area);
+            record(
+                KeyboardOwner::Search,
+                self.search_modal.view(frame, layout.msg_area),
+            );
         }
-
         if self.file_picker.is_open() {
-            overlay_rect = self.file_picker.view(frame, full);
+            record(
+                KeyboardOwner::FilePicker,
+                self.file_picker.view(frame, full),
+            );
+        }
+        if self.rewind_picker.is_open() {
+            record(
+                KeyboardOwner::RewindPicker,
+                self.rewind_picker.view(frame, full),
+            );
+        }
+        if self.theme_picker.is_open() {
+            record(
+                KeyboardOwner::ThemePicker,
+                self.theme_picker.view(frame, full),
+            );
+        }
+        if self.model_picker.is_open() {
+            record(
+                KeyboardOwner::ModelPicker,
+                self.model_picker.view(frame, full),
+            );
+        }
+        if self.login_picker.is_open() {
+            record(
+                KeyboardOwner::LoginPicker,
+                self.login_picker.view(frame, full),
+            );
+        }
+        if self.mcp_picker.is_open() {
+            record(KeyboardOwner::McpPicker, self.mcp_picker.view(frame, full));
         }
 
-        macro_rules! render_if_open {
-            ($overlay:expr) => {
-                if $overlay.is_open() {
-                    overlay_rect = $overlay.view(frame, full);
-                }
-            };
-        }
-
-        render_if_open!(self.rewind_picker);
-        render_if_open!(self.theme_picker);
-        render_if_open!(self.model_picker);
-        render_if_open!(self.login_picker);
-        render_if_open!(self.mcp_picker);
-
-        overlay_rect
+        (overlay_rect, picker_caret)
     }
 
     /// {caret} is the cell `render_bottom_panel` just drew the input caret in,
@@ -351,6 +414,7 @@ impl App {
         let (mode_label, mode_style) = self.mode_label();
         let ctx = StatusBarContext {
             status: &self.status,
+            motion: self.status_motion(),
             mode_label,
             mode_style,
             model_id: chat
@@ -368,13 +432,11 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
-            retry_info: self.retry_info.as_ref(),
             thinking_label: opts.thinking.status_label(),
             fast: opts.fast,
             workflow: self.state.workflow,
             restricted: self.trust_question.is_some(),
             yolo: self.permissions.is_yolo(),
-            restoring: self.restoring.load(Ordering::Relaxed),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }
@@ -435,18 +497,23 @@ impl App {
         }
     }
 
-    fn apply_selection(&mut self, frame: &mut Frame, render_chat: usize) {
+    fn apply_selection(&mut self, frame: &mut Frame, render_chat: usize, thumbs: &Thumbs) {
         let Some(ref state) = self.selection_state else {
             return;
         };
 
         let sel = state.sel();
         if let Some(screen_sel) = self.screen_selection(sel, render_chat) {
-            selection::apply_highlight(frame.buffer_mut(), sel.highlight_area(), &screen_sel);
+            selection::apply_highlight(
+                frame.buffer_mut(),
+                sel.highlight_area(),
+                &screen_sel,
+                thumbs,
+            );
         }
         if state.is_pending_copy() {
             let sel = *sel;
-            self.copy_selection(frame.buffer_mut(), &sel, render_chat);
+            self.copy_selection(frame.buffer_mut(), &sel, render_chat, thumbs);
         }
     }
 
@@ -473,33 +540,5 @@ impl App {
             .map(|(text, style_name)| Span::styled(text.clone(), theme::style_by_name(style_name)))
             .collect();
         (!spans.is_empty()).then(|| Line::from(spans))
-    }
-
-    #[cfg(test)]
-    pub(super) fn active_keybind_contexts(&mut self) -> Vec<KeybindContext> {
-        let mut contexts = vec![KeybindContext::General];
-        if self.pack_review.is_open() || self.plan_form_active() {
-            contexts.push(KeybindContext::FormInput);
-        } else if self.queue.focus().is_some() {
-            contexts.push(KeybindContext::QueueFocus);
-        } else if self.rewind_picker.is_open() {
-            contexts.push(KeybindContext::RewindPicker);
-        } else if self.theme_picker.is_open() {
-            contexts.push(KeybindContext::ThemePicker);
-        } else if self.model_picker.is_open() {
-            contexts.push(KeybindContext::ModelPicker);
-        } else if self.command_palette.is_active(&self.input_box.buffer) {
-            contexts.push(KeybindContext::CommandPalette);
-        } else if self.search_modal.is_open() {
-            contexts.push(KeybindContext::Search);
-        } else if self.file_picker.is_open() {
-            contexts.push(KeybindContext::FilePicker);
-        } else {
-            if self.status == Status::Streaming {
-                contexts.push(KeybindContext::Streaming);
-            }
-            contexts.push(KeybindContext::Editing);
-        }
-        contexts
     }
 }

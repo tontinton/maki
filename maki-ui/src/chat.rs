@@ -10,7 +10,8 @@ use crate::components::input::Draft;
 use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
 use crate::components::{
-    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, ToolRole, ToolStatus,
+    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, NoticeDetail, ToolRole,
+    ToolStatus,
 };
 use crate::markdown::truncate_output;
 
@@ -18,10 +19,10 @@ use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
-    AgentEvent, BufferSnapshot, DisplayItem, SharedBuf, SteerKind, SubagentInbox, ToolDoneEvent,
+    AgentEvent, BufferSnapshot, DisplayItem, SessionControl, SharedBuf, SteerKind, ToolDoneEvent,
     ToolOutput, ToolStartEvent, display_order, observation_detail,
 };
-use maki_config::{ToolKey, ToolOutputLines, UiConfig};
+use maki_config::{ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
 use maki_storage::id::MakiId;
@@ -47,18 +48,7 @@ pub(crate) const INBOX_DROPPED_SUFFIX: &str =
 pub enum ChatEventResult {
     Continue,
     Done,
-    QueueItemConsumed {
-        text: String,
-        images: Vec<ImageSource>,
-    },
     Error(String),
-    PermissionRequest {
-        id: String,
-        tool: ToolKey,
-        scopes: Vec<String>,
-        reason: Option<String>,
-    },
-    AuthRequired,
 }
 
 /// A call this chat's agent started that has not reported done.
@@ -94,9 +84,10 @@ pub struct Chat {
     /// A subagent's own settings; `None` on the main chat, which reads the
     /// session's.
     pub opts: Option<RequestOptions>,
-    /// A running subagent's inbox for messages typed in its chat. Taken when
-    /// the chat finishes, since nothing would drain it after that.
-    pub(crate) inbox: Option<Arc<SubagentInbox>>,
+    /// A running subagent's control, whose inbox takes messages typed in its
+    /// chat. Taken when the chat finishes, since nothing would drain it after
+    /// that.
+    pub(crate) control: Option<Arc<SessionControl>>,
     /// Where a subagent's permission answers go. It lives until the chat
     /// finishes, not the turn, so a subagent moved off its turn can still be
     /// answered.
@@ -139,7 +130,7 @@ impl Chat {
             context_size: 0,
             model_id: None,
             opts: None,
-            inbox: None,
+            control: None,
             answer_tx: None,
             draft: Draft::default(),
             pending_turn_usage: None,
@@ -273,16 +264,17 @@ impl Chat {
             AgentEvent::CompactionDone { .. } => {
                 self.messages_panel.flush();
             }
-            AgentEvent::QueueItemConsumed { text, images } => {
-                return ChatEventResult::QueueItemConsumed { text, images };
-            }
+            // The App takes these before they reach a chat.
+            AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::PermissionRequest { .. }
+            | AgentEvent::AuthRequired
+            | AgentEvent::Retry { .. } => {}
             AgentEvent::QueueDrained => {}
             AgentEvent::ToolMovable { id, movable } => {
                 self.messages_panel.set_tool_movable(&id, movable);
             }
             // Parts belong to `/tasks`, which the App keeps, never to a transcript.
             AgentEvent::ToolParts { .. } => {}
-            AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::Done { .. } => {
                 self.messages_panel.flush();
                 return ChatEventResult::Done;
@@ -290,19 +282,6 @@ impl Chat {
             AgentEvent::Error { message, .. } => {
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
-            }
-            AgentEvent::PermissionRequest {
-                id,
-                tool,
-                scopes,
-                reason,
-            } => {
-                return ChatEventResult::PermissionRequest {
-                    id,
-                    tool,
-                    scopes,
-                    reason,
-                };
             }
             AgentEvent::Steered { kind, text } => {
                 let prefix = match kind {
@@ -319,9 +298,6 @@ impl Chat {
             AgentEvent::AllowedByPlugin { id, plugin } => self
                 .messages_panel
                 .annotate_tool(&id, &format!("{ALLOWED_BY} {plugin}")),
-            AgentEvent::AuthRequired => {
-                return ChatEventResult::AuthRequired;
-            }
             AgentEvent::ToolSnapshot {
                 id,
                 snapshot,
@@ -348,13 +324,19 @@ impl Chat {
             }
             AgentEvent::Notice { text } => {
                 self.messages_panel.flush();
-                self.messages_panel.push(notice(text, None));
+                self.messages_panel
+                    .push(DisplayMessage::new(DisplayRole::Notice, text));
             }
-            AgentEvent::ObservationLine { text, detail, end } => {
+            AgentEvent::ObservationLine {
+                text,
+                detail,
+                markdown,
+                end,
+            } => {
                 self.messages_panel.flush();
                 self.messages_panel.push(task_notice(
                     text,
-                    detail,
+                    detail.map(|text| NoticeDetail { text, markdown }),
                     end.map(BackgroundOutcome::from),
                 ));
             }
@@ -474,6 +456,10 @@ impl Chat {
         self.messages_panel.toggle_click(row, area)
     }
 
+    pub fn has_tool(&self, tool_id: &str) -> bool {
+        self.messages_panel.has_tool(tool_id)
+    }
+
     pub fn tool_snapshot(
         &mut self,
         tool_id: &str,
@@ -572,7 +558,7 @@ impl Chat {
         if let Some(clock) = &mut self.clock {
             clock.stop();
         }
-        let undelivered = self.inbox.take().map_or(0, |inbox| inbox.len());
+        let undelivered = self.control.take().map_or(0, |control| control.len());
         if undelivered > 0 {
             self.messages_panel.push(DisplayMessage::new(
                 DisplayRole::Error,
@@ -597,6 +583,11 @@ impl Chat {
 
     pub fn is_finished(&self) -> bool {
         self.finish.is_some()
+    }
+
+    /// A moved call's task has no inbox, a finished one nothing to read it.
+    pub(crate) fn takes_messages(&self) -> bool {
+        self.control.is_some() && !self.is_finished()
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
@@ -630,6 +621,10 @@ impl Chat {
         self.messages_panel.live_buf(tool_id)
     }
 
+    pub(crate) fn tool_name(&self, tool_id: &str) -> Option<Arc<str>> {
+        self.messages_panel.tool_name(tool_id)
+    }
+
     pub(crate) fn register_live_buf(&mut self, tool_id: String, buf: Arc<SharedBuf>) {
         self.messages_panel.register_live_buf(tool_id, buf);
     }
@@ -657,6 +652,11 @@ impl Chat {
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.running_calls.clear();
         self.messages_panel.load_messages(msgs);
+    }
+
+    /// Whether the transcript already shows what the subagent was asked.
+    pub(crate) fn has_user_message(&self) -> bool {
+        self.messages_panel.has_user_message()
     }
 
     pub fn push_user_message(&mut self, text: impl Into<String>) {
@@ -749,8 +749,11 @@ pub fn history_to_display(
                 let message = &messages[index];
                 display.push(task_notice(
                     text.to_owned(),
-                    observation_detail(message).map(str::to_owned),
-                    message.settles.as_ref().map(|settled| settled.end.into()),
+                    observation_detail(message).map(|text| NoticeDetail {
+                        text: text.to_owned(),
+                        markdown: message.markdown,
+                    }),
+                    message.answered().map(|settled| settled.end.into()),
                 ));
                 continue;
             }
@@ -889,13 +892,9 @@ pub fn history_to_display(
     (display, restore_items)
 }
 
-fn notice(text: String, detail: Option<String>) -> DisplayMessage {
-    task_notice(text, detail, None)
-}
-
 fn task_notice(
     text: String,
-    detail: Option<String>,
+    detail: Option<NoticeDetail>,
     task_end: Option<BackgroundOutcome>,
 ) -> DisplayMessage {
     DisplayMessage {
@@ -1023,11 +1022,10 @@ mod tests {
         AgentEvent, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
     };
     use maki_config::UiConfig;
-    use maki_providers::{ImageMediaType, TaskEnd, TaskSettled};
+    use maki_providers::{ImageMediaType, TaskAnswer, TaskEnd, TaskSettled};
     use test_case::test_case;
 
     const IMAGE_DATA: &str = "dGVzdA==";
-    const EXPECTED_QUEUE_DELIVERY: &str = "a consumed queue item must carry its images";
 
     fn image() -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))
@@ -1080,17 +1078,7 @@ mod tests {
     #[test]
     fn queued_user_images_reach_display() {
         let mut chat = chat();
-        let result = chat.handle_event(
-            AgentEvent::QueueItemConsumed {
-                text: String::new(),
-                images: vec![image()],
-            },
-            None,
-        );
-        let ChatEventResult::QueueItemConsumed { text, images } = result else {
-            panic!("{EXPECTED_QUEUE_DELIVERY}");
-        };
-        chat.show_user_message(text, images);
+        chat.show_user_message(String::new(), vec![image()]);
         let message = chat.message_at(0).unwrap();
         assert_eq!(message.role, DisplayRole::User);
         assert_eq!(message.text, IMAGE_PLACEHOLDER);
@@ -1381,9 +1369,11 @@ mod tests {
     ) {
         let mut observation = Message::observation(NOTICE_BODY.into());
         observation.display_text = Some(NOTICE_LINE.into());
-        observation.settles = end.map(|end| TaskSettled {
-            task: TASK_ID.into(),
-            end,
+        observation.answers = end.map(|end| {
+            TaskAnswer::Settles(TaskSettled {
+                task: TASK_ID.into(),
+                end,
+            })
         });
 
         let display = history_to_display(
@@ -1393,7 +1383,13 @@ mod tests {
         )
         .0;
 
-        assert_eq!(display[0].detail.as_deref(), Some(detail));
+        assert_eq!(
+            display[0]
+                .detail
+                .as_ref()
+                .map(|detail| detail.text.as_str()),
+            Some(detail)
+        );
         assert_eq!(display[0].task_end, task_end);
     }
 
@@ -1822,7 +1818,7 @@ mod tests {
     /// Once its run ends, only another run brings a task back. A woken run
     /// opens with no prompt, and what trails a run says nothing of the next.
     #[test_case(AgentEvent::TextDelta { text: USER_TEXT.into() }, TaskStatus::Working ; "a_run_streams")]
-    #[test_case(AgentEvent::ObservationLine { text: USER_TEXT.into(), detail: None, end: None }, TaskStatus::Working ; "a_woken_run_lands_its_notice")]
+    #[test_case(AgentEvent::ObservationLine { text: USER_TEXT.into(), detail: None, markdown: false, end: None }, TaskStatus::Working ; "a_woken_run_lands_its_notice")]
     #[test_case(AgentEvent::SubagentHistory { tool_use_id: TASK_ID.into(), messages: Vec::new() }, TaskStatus::Idle ; "transcript_trails_the_run")]
     #[test_case(AgentEvent::StreamClosed, TaskStatus::Idle ; "close_trails_the_run")]
     fn only_a_run_event_brings_an_idle_task_back(event: AgentEvent, status: TaskStatus) {
@@ -1841,8 +1837,6 @@ mod tests {
     }
 
     const STEER_TEXT: &str = "keep going";
-    const ASK_REASON: &str = "plugin wants a human to look";
-    const EXPECTED_PERMISSION_REQUEST: &str = "a permission request must reach the caller";
 
     #[test_case(SteerKind::MessageRewritten, REWRITTEN_PREFIX ; "message_rewritten")]
     #[test_case(SteerKind::MessageDropped, DROPPED_PREFIX ; "message_dropped")]
@@ -1863,24 +1857,5 @@ mod tests {
             "{text}"
         );
         assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
-    }
-
-    #[test]
-    fn permission_request_carries_reason() {
-        let mut chat = chat();
-        let result = chat.handle_event(
-            AgentEvent::PermissionRequest {
-                id: TASK_ID.into(),
-                tool: ToolKey::native("bash"),
-                scopes: Vec::new(),
-                reason: Some(ASK_REASON.into()),
-            },
-            None,
-        );
-        let ChatEventResult::PermissionRequest { id, reason, .. } = result else {
-            panic!("{EXPECTED_PERMISSION_REQUEST}");
-        };
-        assert_eq!(id, TASK_ID);
-        assert_eq!(reason.as_deref(), Some(ASK_REASON));
     }
 }

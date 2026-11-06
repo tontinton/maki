@@ -968,8 +968,17 @@ fn plain_output_text(output: &ToolOutput) -> Option<&str> {
 }
 
 pub fn truncate_to_header(text: &mut String) {
-    let end = text.find('\n').unwrap_or(text.len());
-    text.truncate(end);
+    text.truncate(header_end(text));
+}
+
+/// A restored row with no body view holds its only copy of the output below
+/// the header.
+pub fn replace_header(text: &mut String, header: &str) {
+    text.replace_range(..header_end(text), header);
+}
+
+fn header_end(text: &str) -> usize {
+    text.find('\n').unwrap_or(text.len())
 }
 
 /// A moved call has no deadline left, so its timeout note would mislead.
@@ -1839,7 +1848,7 @@ mod tests {
 
     #[test_case(20, false, true,  true  ; "read_collapsed_truncates")]
     #[test_case(20, true,  false, false ; "read_expanded_shows_all")]
-    #[test_case(3,  false, false, false ; "read_short_no_truncation")]
+    #[test_case(TOL.read, false, false, false ; "read_short_no_truncation")]
     fn read_output_truncation(
         line_count: usize,
         expanded: bool,

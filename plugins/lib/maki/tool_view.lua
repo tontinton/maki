@@ -106,6 +106,9 @@ end
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,
 -- max_line_bytes (optional) per-line byte cap. Lines are stored already cut,
 -- so a run of huge lines costs no more than short ones while kept for expansion.
+-- With max_lines 0 only the set_header lines show until a click expands the
+-- view. The UI puts the line count in the tool header, so the row still says
+-- how much is hidden.
 function ToolView.new(buf, opts)
   local self = setmetatable({}, ToolView)
   self.buf = buf
@@ -151,34 +154,26 @@ function ToolView:append(line)
     self.all_skipped = self.all_skipped + 1
   end
 
-  if self.keep == "head" then
-    if self.ring_count < self.max then
-      self.ring_count = self.ring_count + 1
-      self.ring[self.ring_count] = line
-      if all_idx then
-        self.ring_map[self.ring_count] = all_idx
-      end
-      self:flush()
-    else
-      self.skipped = self.skipped + 1
+  if self.ring_count < self.max then
+    self.ring_count = self.ring_count + 1
+    self.ring[self.ring_count] = line
+    if all_idx then
+      self.ring_map[self.ring_count] = all_idx
+    end
+  elseif self.keep == "head" or self.max == 0 then
+    self.skipped = self.skipped + 1
+    if not self.expanded then
+      return
     end
   else
-    if self.ring_count < self.max then
-      self.ring_count = self.ring_count + 1
-      self.ring[self.ring_count] = line
-      if all_idx then
-        self.ring_map[self.ring_count] = all_idx
-      end
-    else
-      self.ring[self.ring_start] = line
-      if all_idx then
-        self.ring_map[self.ring_start] = all_idx
-      end
-      self.ring_start = (self.ring_start % self.max) + 1
-      self.skipped = self.skipped + 1
+    self.ring[self.ring_start] = line
+    if all_idx then
+      self.ring_map[self.ring_start] = all_idx
     end
-    self:flush()
+    self.ring_start = (self.ring_start % self.max) + 1
+    self.skipped = self.skipped + 1
   end
+  self:flush()
 end
 
 function ToolView:append_text(text)
@@ -233,7 +228,7 @@ function ToolView:visible_count()
   if self.expanded then
     return #self.all_lines
   end
-  return self.ring_count + (self.skipped == 1 and 1 or 0)
+  return self.ring_count + (self.max > 0 and self.skipped == 1 and 1 or 0)
 end
 
 function ToolView:toggle()
@@ -247,7 +242,7 @@ function ToolView:flush()
   for _, h in ipairs(self.header) do
     lines[#lines + 1] = truncate_line(h, self.max_line_bytes)
   end
-  if #self.header > 0 then
+  if #self.header > 0 and (self.expanded or self.max > 0) then
     lines[#lines + 1] = SEPARATOR
   end
 
@@ -258,7 +253,7 @@ function ToolView:flush()
     if self.all_skipped > 0 then
       lines[#lines + 1] = { { self.all_skipped .. " lines omitted", "dim" } }
     end
-  else
+  elseif self.max > 0 then
     local hidden = self.skipped
     local notice = hidden >= 2 and { { "... (" .. hidden .. " lines) (click to expand)", "dim" } }
       or hidden == 1 and self.all_lines[self.keep == "tail" and 1 or self.ring_count + 1]
@@ -298,7 +293,7 @@ end
 
 -- Call once after the last append so the collapsed notice renders.
 function ToolView:finish()
-  if self.keep == "head" and self.skipped > 0 then
+  if (self.keep == "head" or self.max == 0) and self.skipped > 0 then
     self:flush()
   end
 end

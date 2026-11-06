@@ -12,13 +12,14 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use flume::Sender;
 use maki_config::providers::ProvidersConfig;
 use reqwest::Client;
 use serde_json::Value;
+use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
@@ -27,18 +28,18 @@ use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
-use crate::providers::anthropic::shared;
+use crate::providers::anthropic::{self, shared};
 use crate::providers::openai_compat::{
     DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
 };
 use crate::providers::{
-    ResolvedAuth, Timeouts, body_reader, http_client, opencode, plugin, send_request,
-    status_and_text, user_agent, wait,
+    ResolvedAuth, Timeouts, http_client, ok_sse, ok_text, opencode, plugin, status_and_text,
+    user_agent,
 };
 use crate::spec::ProviderRegistry;
 use crate::{
-    AgentError, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    ThinkingConfig, dialect,
+    AgentError, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse, ThinkingConfig, dialect,
 };
 
 const MESSAGES_PATH: &str = "/messages";
@@ -61,7 +62,10 @@ pub(crate) const CATALOG_BACKED_BUILTINS: &[&str] = opencode::SLUGS;
 const CHAT_DIALECT: EffortDialect<'static> = dialect::PREFER_HIGH;
 
 /// Provider modules own their entry here; the catalog only reads it.
-const QUIRKS: &[(&[&str], ProviderQuirks)] = &[(opencode::SLUGS, opencode::QUIRKS)];
+const QUIRKS: &[(&[&str], ProviderQuirks)] = &[
+    (&[opencode::ZEN_SLUG], opencode::ZEN_QUIRKS),
+    (&[opencode::GO_SLUG], opencode::GO_QUIRKS),
+];
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
@@ -83,10 +87,22 @@ pub enum EndpointType {
 }
 
 /// Behaviour a provider needs beyond what models.dev publishes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ProviderQuirks {
     pub free_tier: Option<FreeTier>,
     pub session_header: Option<&'static str>,
+    /// Quota endpoint a [`CatalogProvider::fetch_usage`] reads, with the
+    /// parser that understands the wire it answers.
+    pub usage: Option<UsageEndpoint>,
+}
+
+/// One provider's quota endpoint. `parse` sits beside `url` so the generic
+/// fetch never has to know a wire shape that belongs to the provider module.
+/// No `PartialEq`: comparing fn pointers is not meaningful equality.
+#[derive(Debug, Clone, Copy)]
+pub struct UsageEndpoint {
+    pub url: &'static str,
+    pub parse: fn(&str) -> Result<ProviderUsage, AgentError>,
 }
 
 /// A no-key tier that unlocks only zero-priced models, and only after the
@@ -460,37 +476,41 @@ static CATALOG_PROVIDER_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: Cow::Borrowed("catalog"),
 };
 
-static SHARED_CATALOG: OnceLock<Mutex<CatalogData>> = OnceLock::new();
+static SHARED_CATALOG: OnceCell<Mutex<CatalogData>> = OnceCell::const_new();
 
-pub(crate) fn init_shared_catalog_if_needed() -> &'static Mutex<CatalogData> {
-    SHARED_CATALOG.get_or_init(|| Mutex::new(init_catalog_blocking()))
+/// The catalog, loaded from the on-disk cache and fetched once if the cache
+/// is cold or stale. Concurrent first callers share the one fetch.
+pub(crate) async fn shared_catalog() -> &'static Mutex<CatalogData> {
+    SHARED_CATALOG
+        .get_or_init(|| async { Mutex::new(init_catalog().await) })
+        .await
 }
 
-/// Loads the models.dev catalog from the on-disk cache, fetching once if the
-/// cache is cold or stale. Blocks on the fetch, so only startup paths call
-/// it; every other lookup stays on the `*_if_available` variants.
-pub fn warm_catalog() {
-    init_shared_catalog_if_needed();
+/// Loads the models.dev catalog, fetching once if the cache is cold or stale.
+/// Waits for the fetch, so only startup paths call it; every other lookup
+/// stays on the `*_if_available` variants.
+pub async fn warm_catalog() {
+    shared_catalog().await;
 }
 
 /// Force-refetches the models.dev catalog; failures keep the stale catalog and cache.
-/// Blocks on the fetch, so only `maki models --refresh` calls it.
-pub fn refresh_catalog() -> Result<(), AgentError> {
+/// Waits for the fetch, so only `maki models --refresh` calls it.
+pub async fn refresh_catalog() -> Result<(), AgentError> {
     let state_dir = StateDir::resolve()
         .map_err(|e| config_error(format!("failed to resolve state dir: {e}")))?;
-    let data = fetch_catalog_blocking(&state_dir)?;
+    let data = fetch_catalog(&state_dir).await?;
     match SHARED_CATALOG.get() {
         Some(catalog) => *catalog.lock().unwrap() = data,
         // Set instead of `get_or_init` so a cold catalog takes the fetch we just
-        // did rather than kicking off `init_catalog_blocking` and fetching twice.
+        // did rather than kicking off `init_catalog` and fetching twice.
         None => drop(SHARED_CATALOG.set(Mutex::new(data))),
     }
     Ok(())
 }
 
 /// Returns the list of all providers in alphabetical order.
-pub fn catalog_providers() -> Vec<ProviderData> {
-    let guard = init_shared_catalog_if_needed().lock().unwrap();
+pub async fn catalog_providers() -> Vec<ProviderData> {
+    let guard = shared_catalog().await.lock().unwrap();
     guard.all_providers()
 }
 
@@ -503,8 +523,8 @@ pub fn catalog_providers_if_available() -> Option<Vec<ProviderData>> {
 }
 
 /// Returns the ProviderData for a specific catalog provider, if found.
-pub fn catalog_provider(provider_id: &str) -> Option<ProviderData> {
-    let guard = init_shared_catalog_if_needed().lock().ok()?;
+pub async fn catalog_provider(provider_id: &str) -> Option<ProviderData> {
+    let guard = shared_catalog().await.lock().ok()?;
     guard.providers.get(provider_id).cloned()
 }
 
@@ -580,9 +600,9 @@ fn catalog_cache_path() -> Option<PathBuf> {
     Some(dir.join(CATALOG_CACHE_FILE))
 }
 
-fn load_cached_catalog() -> Option<schema::CatalogIndex> {
+async fn load_cached_catalog() -> Option<schema::CatalogIndex> {
     let path = catalog_cache_path()?;
-    let meta = fs::metadata(&path).ok()?;
+    let meta = tokio::fs::metadata(&path).await.ok()?;
 
     let modified = meta.modified().ok()?;
     let age = SystemTime::now().duration_since(modified).ok()?;
@@ -591,19 +611,19 @@ fn load_cached_catalog() -> Option<schema::CatalogIndex> {
         return None;
     }
 
-    let text = fs::read_to_string(&path).ok()?;
+    let text = tokio::fs::read_to_string(&path).await.ok()?;
     let index: schema::CatalogIndex = serde_json::from_str(&text).ok()?;
     debug!("loaded catalog from cache");
     Some(index)
 }
 
-fn save_cached_catalog(index: &schema::CatalogIndex) {
+async fn save_cached_catalog(index: &schema::CatalogIndex) {
     let path = match catalog_cache_path() {
         Some(p) => p,
         None => return,
     };
     if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
+        let _ = tokio::fs::create_dir_all(dir).await;
     }
     let text = match serde_json::to_string_pretty(index) {
         Ok(t) => t,
@@ -612,7 +632,7 @@ fn save_cached_catalog(index: &schema::CatalogIndex) {
             return;
         }
     };
-    if let Err(e) = fs::write(&path, &text) {
+    if let Err(e) = tokio::fs::write(&path, &text).await {
         warn!(error = %e, path = %path.display(), "failed to write catalog cache");
     } else {
         debug!(path = %path.display(), "cached catalog");
@@ -715,17 +735,14 @@ fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
     }
 }
 
-/// Blocks on the fetch through [`wait`], so it runs anywhere [`wait`] does.
-fn fetch_catalog_blocking(state_dir: &StateDir) -> Result<CatalogData, AgentError> {
-    let index = wait(fetch_remote_catalog_async(
-        &http_client(Timeouts::default()),
-    ))?;
-    save_cached_catalog(&index);
+async fn fetch_catalog(state_dir: &StateDir) -> Result<CatalogData, AgentError> {
+    let index = fetch_remote_catalog_async(&http_client(Timeouts::default())).await?;
+    save_cached_catalog(&index).await;
     Ok(CatalogData::from_index(index, state_dir))
 }
 
 // Try cache first, then fetch from remote.
-fn init_catalog_blocking() -> CatalogData {
+async fn init_catalog() -> CatalogData {
     let state_dir = match StateDir::resolve() {
         Ok(s) => s,
         Err(e) => {
@@ -734,11 +751,11 @@ fn init_catalog_blocking() -> CatalogData {
         }
     };
 
-    if let Some(index) = load_cached_catalog() {
+    if let Some(index) = load_cached_catalog().await {
         return CatalogData::from_index(index, &state_dir);
     }
 
-    match fetch_catalog_blocking(&state_dir) {
+    match fetch_catalog(&state_dir).await {
         Ok(data) => data,
         Err(e) => {
             warn!(error = %e, "catalog fetch failed, using empty catalog");
@@ -823,17 +840,8 @@ impl CatalogTransport {
                     .body(serde_json::to_vec(&body)?)
                     .build()?;
                 debug!(model = %model.id, "sending Anthropic-format request via catalog");
-                send_request(&self.client, request, |response| async move {
-                    if response.status().as_u16() == 200 {
-                        crate::providers::anthropic::parse_sse(
-                            body_reader(response),
-                            event_tx,
-                            self.stream_timeout,
-                        )
-                        .await
-                    } else {
-                        Err(AgentError::from_response(response).await)
-                    }
+                ok_sse(&self.client, request, |body| {
+                    anthropic::parse_sse(body, event_tx, self.stream_timeout)
                 })
                 .await
             }
@@ -951,6 +959,28 @@ impl Provider for CatalogProvider {
                 .collect())
         })
     }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move {
+            let Some(endpoint) = self.data.quirks.usage else {
+                return Ok(None);
+            };
+            if matches!(self.auth, CatalogAuth::FreeOnly(_)) {
+                return Ok(None);
+            }
+            let auth = self.auth.unlocked(&self.data.slug)?.clone();
+            let request = auth
+                .configure_request(
+                    self.transport
+                        .client
+                        .get(endpoint.url)
+                        .header("user-agent", super::user_agent()),
+                )
+                .build()?;
+            let body = ok_text(&self.transport.client, request).await?;
+            (endpoint.parse)(&body).map(Some)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -970,19 +1000,20 @@ pub(crate) fn warm_empty_catalog_for_tests(state_dir: StateDir) {
 struct LazyCatalogProvider {
     slug: String,
     timeouts: Timeouts,
-    inner: OnceLock<Result<CatalogProvider, String>>,
+    inner: OnceCell<Result<CatalogProvider, String>>,
 }
 
 impl LazyCatalogProvider {
     async fn resolve(&self) -> Result<&CatalogProvider, AgentError> {
-        if self.inner.get().is_none() {
-            let slug = self.slug.clone();
-            let timeouts = self.timeouts;
-            let created =
-                tokio::task::spawn_blocking(move || create_resolved(&slug, timeouts)).await?;
-            let _ = self.inner.set(created.map_err(|e| e.to_string()));
-        }
-        match self.inner.get().expect("set above") {
+        let created = self
+            .inner
+            .get_or_init(|| async {
+                create_resolved(&self.slug, self.timeouts)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+        match created {
             Ok(provider) => Ok(provider),
             Err(message) => Err(AgentError::Config {
                 message: message.clone(),
@@ -990,7 +1021,6 @@ impl LazyCatalogProvider {
         }
     }
 }
-
 impl Provider for LazyCatalogProvider {
     fn stream_message<'a>(
         &'a self,
@@ -1013,12 +1043,18 @@ impl Provider for LazyCatalogProvider {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move { self.resolve().await?.list_models().await })
     }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move { self.resolve().await?.fetch_usage().await })
+    }
 }
 
-fn create_resolved(slug: &str, timeouts: Timeouts) -> Result<CatalogProvider, AgentError> {
-    let data = catalog_provider(slug).ok_or_else(|| AgentError::Config {
-        message: format!("unknown provider '{slug}'"),
-    })?;
+async fn create_resolved(slug: &str, timeouts: Timeouts) -> Result<CatalogProvider, AgentError> {
+    let data = catalog_provider(slug)
+        .await
+        .ok_or_else(|| AgentError::Config {
+            message: format!("unknown provider '{slug}'"),
+        })?;
     let state_dir = StateDir::resolve().map_err(|e| AgentError::Config {
         message: format!("failed to resolve state dir: {e}"),
     })?;
@@ -1043,7 +1079,7 @@ pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provi
     Some(Ok(Box::new(LazyCatalogProvider {
         slug: slug.to_string(),
         timeouts,
-        inner: OnceLock::new(),
+        inner: OnceCell::new(),
     })))
 }
 
@@ -1069,6 +1105,8 @@ pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use tokio::sync::OnceCell;
 
     use super::schema::{CatalogCost, CatalogIndex, CatalogLimits, CatalogModel, CatalogProvider};
     use std::sync::Arc;
@@ -1176,7 +1214,7 @@ mod tests {
 
     fn opencode_go_provider_data(env_key: &str) -> ProviderData {
         ProviderData {
-            quirks: opencode::QUIRKS,
+            quirks: opencode::GO_QUIRKS,
             slug: "opencode-go".into(),
             display_name: "Opencode Go".into(),
             env_keys: vec![env_key.into()],
@@ -1188,6 +1226,38 @@ mod tests {
                 ("free-model".into(), priced(0.0)),
             ]),
         }
+    }
+
+    /// The free tier authenticates with the public key, which the quota
+    /// endpoint answers with a 401. There is no quota to show, so it is
+    /// `Ok(None)`, while a missing key stays an error.
+    #[tokio::test]
+    async fn free_only_auth_has_no_usage() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_30518");
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
+        assert!(matches!(provider.auth, super::CatalogAuth::FreeOnly(_)));
+        assert!(provider.fetch_usage().await.unwrap().is_none());
+    }
+
+    /// The wrapper receives `/usage` calls before the catalog has warmed, and
+    /// the trait default would answer `Ok(None)` for a provider that does have
+    /// an endpoint. Gated auth fails inside `fetch_usage`, so the error, not
+    /// `Ok(None)`, is the proof the call was forwarded.
+    #[tokio::test]
+    async fn lazy_provider_forwards_fetch_usage_to_resolution() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_87016");
+        let resolved =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        let lazy = super::LazyCatalogProvider {
+            slug: "opencode-go".into(),
+            timeouts: Timeouts::default(),
+            inner: OnceCell::from(Ok(resolved)),
+        };
+        let error = lazy.fetch_usage().await.unwrap_err();
+        assert!(error.to_string().contains("no API key"), "{error}");
     }
 
     #[tokio::test]

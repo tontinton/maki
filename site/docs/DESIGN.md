@@ -1,71 +1,70 @@
 # Docs design system
 
-**Terminal-editorial.** The one personality channel is maki's TUI heritage. If you cannot name a reason for a new element, do not add it.
+**Part of the site.** The docs use the landing and `/plugins/` system (`../DESIGN.md`): same tokens, nav, faces and theme rule. Moving between them should not feel like a different site. What the docs add is reading furniture (sidebar, toc, tables, callouts), drawn with the same vocabulary. If you cannot name a reason for a new element, do not add it.
 
 ## Principles
 
 1. Text is the interface: fix measure, leading, hierarchy first.
 2. Accent means something: links, active state, hover. Never decoration.
-3. Density over marketing whitespace.
-4. Earn your ornaments; what we omit is the credibility signal.
-5. Perf is sacred: zero external requests, static everything.
+3. Density over marketing whitespace. No sky, no covers, no demos here.
+4. Perf is sacred: zero external requests, static everything.
 
 ## Type
 
-- Body: system sans stack (`--font-body`), 16px, line-height 1.6, `--content-max: 680px`. Zero downloads.
-- Headings, nav chrome, labels, `th`, code: JetBrains Mono (`--font-mono`), self-hosted variable woff2 latin subset in `static/fonts/` (31KB + 22KB lazy italic). The only loaded font.
-- h1 1.5-1.8rem clamp, h2 1.25rem + hairline rule, h3 1rem. Max 3 levels; hierarchy by weight + space, not size.
-- `text-wrap: balance` on headings, `pretty` on paragraphs. Space-after only.
-- Labels (eyebrow, sidebar groups, toc, th, pn-dir): mono uppercase, 0.64-0.7rem, letter-spacing 0.12-0.14em, muted ink.
+- Body and h1/h2: Nunito (`--font-body`), 16px, line-height 1.65, `--content-max: 720px`.
+- Mono (`--font-mono`, JetBrains Mono) is the machine voice: nav, h3 (mostly API names), labels, `th`, code.
+- h1 Nunito 800 `clamp(2.1rem, 4vw, 2.75rem)`, `-0.03em`, like the plugins title. The paragraph right after it is the lede: 1.1rem, `--ink-2`.
+- h2 Nunito 800 1.55rem with a hairline rule above, like the landing's sections. h3 mono 700 ~1rem, like the landing's item labels. Max 3 levels.
+- Labels (sidebar groups, toc, eyebrow, pn-dir, th): mono, lowercase, `--ink-3`, no letter-spacing. Uppercase tracked eyebrows are gone with the old system.
+- Both faces are self-hosted in `static/fonts/` and preloaded, so the landing, plugins and docs share one cached copy.
 
 ## Color
 
-"Warm surfaces, cool ink." Two neutrals + one accent, oklch, defined once in `base.html` `:root` / `[data-theme="dark"]`; components only use vars. A stored choice wins, otherwise `prefers-color-scheme` decides; the head script resolves both before the first paint. The landing page runs the identical rule on the same `localStorage.theme` key, so the two never disagree.
+Tokens are copied from `plugins/index.html` (`--paper`, `--ink`, `--ink-2`, `--ink-3`, `--rule`, `--accent`, `--chip-*`, `--soft`, `--nav-sep`, `--pane-*`). `:root` is dark, `[data-theme="light"]` overrides. Keep them in sync with the plugins page when either changes. Docs-only additions: `--tip` (hue 155), `--warn` (hue 65-75), `--selection`, `--backdrop`, `--modal-shadow`.
 
-| | Light | Dark |
-|---|---|---|
-| Surface | warm paper `95.5% .018 95` | deep navy `19% .03 277` |
-| Ink | navy `30-32% .04 277` | `85% .015 277` |
-| Accent | sienna `48% .115 45` | salmon `73% .105 45` |
-
-- Accent only on: links, active items, hover, focus ring, search marks, note-callout strong.
-- Neutral tints: hue 85-95 light, hue 277 low-chroma dark. Hue 275+ with chroma > .06 is banned (reads purple).
-- Callouts: tip green (hue 155), warn amber (hue 70-80). Never pure #000/#fff.
+Theme: identical head script and `localStorage.theme` rule as the other pages. `html` gets no background, `body` paints `--paper`. Never set the background from script.
 
 ## Code blocks
 
-Dark panes (#1E1E2E) in both themes. Custom `maki` syntax theme (`extra/maki.json`, VSCode format, `extra_themes`, zola >= 0.22); single `theme` key so giallo emits plain hex. Tokens, all roman, no italics:
+The plugin reader's README pane, value for value (8px radius, 0.84rem, line-height 1.6), in both themes.
 
-| ink | comment | keyword | operator | function/command | type | string | const |
-|---|---|---|---|---|---|---|---|
-| `#DDE0EA` | `#878DA9` | `#A2B5FA` | `#A6ADC8` | `#F7A87D` | `#A9D5E3` | `#ABD695` | `#EDA8C2` |
+Highlighting is the reader's own: Zola's highlighter is off, and `docs-highlight.mjs` (run by `build.sh`) passes each block through `highlight()` from `plugins/readme.js`. One grammar set colours both pages, so a snippet looks the same in the docs and in a plugin README. It covers lua, sh/bash, toml, json, yaml and diff, and anything else stays plain ink. A TextMate theme was tried first and never matched: it colours shell flags, operators and members that the reader leaves alone. `zola serve` shows plain code, the same as the token counts. Tokens are the `--t-*` vars, copied from the plugins page:
 
-Salmon is the only saturated token (echoes the accent). Shell unquoted args map to ink.
+| ink | comment | keyword | function/command | type | string | const |
+|---|---|---|---|---|---|---|
+| `#DDE0EA` | `#878DA9` | `#A2B5FA` | `#F7A87D` | `#A9D5E3` | `#ABD695` | `#EDA8C2` |
 
-## Banned (AI-slop tells)
+To colour a new language, add a grammar to `GRAMMARS` in `readme.js`, so READMEs get it too.
 
-Rotation display serifs (Fraunces, Instrument Serif, Space Grotesk...), rounded sans (Nunito), purple/indigo accents, gradients, glassmorphism, border-radius above 2px, hover lifts, card grids with icons, decorative starfields/washes, accent underline bars, colored eyebrows, mac-dots terminal mockups, pill badges, emoji, box-shadows on nav (border shift only; modal shadow excepted).
+Hover `copy` text button, the same one the plugin reader uses. No title bar, lang label, or dots.
 
 ## Components
 
-- Vocabulary: flat surfaces, 1px hairline borders, 2px accent left-edge for active. Nothing else.
-- Radius rule: small typographic chips (inline code, keycaps) get 2px to avoid corner glints at text scale; everything architectural (panes, tables, cards, nav, buttons) stays square.
-- Inline code chips: tight padding (0.06rem 0.28rem).
-- Docs index: dense list rows (10.5rem title column + muted desc), no cards.
-- Tables: mono uppercase `th`. Keycaps: chip + 2px bottom shadow.
-- `a code`: chip stripped, accent + underline only.
-- Code blocks: hover copy button; no title bar, lang label, or dots.
-- Idiosyncratic details, exactly two: hover `#` anchors; `~N tokens` per page (injected by `build.sh`, hidden in local `zola serve`).
+- Radii follow the site: 4px chips and keycaps, 6px sidebar items and buttons, 8px inputs, tables and callouts, 8px code panes, 10px cards, 12px the search modal.
+- Nav: the shared 44px bar, `maki / docs` crumb, `Docs` marked `aria-current`. Its border appears only once scrolled.
+- Sidebar: on `--paper`, no border. Link text lines up with the nav logo. Active item: accent text on `--chip-bg`.
+- Toc: a 1px rail with a 2px accent marker on the active entry.
+- Inline code: plugins chip. `a code`: chip stripped, accent + underline.
+- Tables: 8px wrapped, mono `th` on `--soft`, row rules only.
+- Callouts: `--soft` box, 3px colored left edge, the label `strong` in the same color.
+- Docs index: dense list rows (10.5rem title column + desc) in one 10px box, no cards.
+- Idiosyncratic details, exactly two: hover `#` anchors, `~N tokens` per page (injected by `build.sh`, hidden in `zola serve`).
+
+## Banned
+
+Gradients, glassmorphism, hover lifts, card grids with icons, starfields and covers (the landing and plugins own those), purple/indigo accents, colored eyebrows, mac-dots terminal mockups, emoji, shadows on the nav (border shift only, the modal and mobile drawer are excepted).
+
+## Keys
+
+`/` or `Ctrl+K` search, `t` theme, like the other pages.
 
 ## Perf
 
-- No external requests; preload the normal mono face only.
+- No external requests. Two preloaded fonts (Nunito 39KB, mono 31KB), shared with the landing and plugins pages. The mono italic loads lazily.
 - Animations: transform/opacity only, one rAF scroll handler, reduced-motion guard.
 - Lazy `search.json`, hover prefetch, MPA view transitions 140ms.
-- All CSS/JS inline in `base.html` (~64KB/page, one request).
+- All CSS/JS inline in `base.html`, one request per page.
 
 ## Verifying
 
-`cd site && ./build.sh` (full: search.json + token spans) or `zola build` here (fast). Check both themes, 390px and 1600px. Screenshot previews can lie about color; pixel-sample PNGs.
-
-The landing page has its own system: see `../DESIGN.md`. The banned list above is docs-scoped and does not apply to it.
+`cd site && ./build.sh` (full: search.json + token spans), then serve `_build/`. `zola build` alone wipes `_build/docs`, including `search.json`. Check both themes, 390px and 1600px, and compare against `/plugins/` side by side. Screenshot previews can lie about color; pixel-sample PNGs.

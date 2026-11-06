@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::agent::QueuedMessage;
-use crate::components::Status;
 use crate::theme;
 use maki_agent::{AgentInput, AgentMode, InputSource};
 use maki_lua::agent_autocmd::HostEvent;
@@ -190,8 +189,10 @@ impl App {
         }
     }
 
+    /// Dim while the agent in front works, so a running task's tab reads
+    /// busy like a streaming main chat.
     pub(super) fn separator_style(&self) -> Style {
-        if self.status == Status::Streaming {
+        if self.active_chat_working() {
             theme::current().input_border
         } else {
             Style::new().fg(self.effective_mode_color())

@@ -7,7 +7,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::poll_until;
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
@@ -26,7 +26,7 @@ use maki_config::{
     AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
     ThinkingLines, ToolKey, ToolOutputLines,
 };
-use maki_lua::test_support::runtime;
+use maki_lua::test_support::{fire_autocmd, runtime};
 use maki_lua::{
     InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, NO_UI_ERR, PERMISSION_NAME_WARNING,
     PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
@@ -315,9 +315,7 @@ fn register_echo_tool() {
 
     let entry = reg.get("echo_").expect("echo_ tool not registered");
     assert_eq!(entry.tool.name(), "echo_");
-    assert!(
-        matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "echo_plugin"),
-    );
+    assert_eq!(entry.source.plugin.as_ref(), "echo_plugin");
     assert_eq!(entry.tool.tool_kind(), None);
 
     let out = exec_tool(&reg, "echo_", serde_json::json!({"msg": "hello"})).unwrap();
@@ -1765,7 +1763,7 @@ fn conflict_from_different_plugin_preserves_original() {
     assert!(matches!(err, PluginError::NameConflict { .. }));
 
     let entry = reg.get("evolving").unwrap();
-    assert!(matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "keeper"),);
+    assert_eq!(entry.source.plugin.as_ref(), "keeper");
 }
 
 #[test]
@@ -2504,14 +2502,14 @@ fn warm_click_survives_post_completion_cancel() {
     assert_eq!(body.read()[0].spans[0].text, WARM_CLICK_LINE);
 }
 
-/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs,
+/// `maki.agent.call_tool` returns `(text, err, format)` and delivers live bufs,
 /// annotations (live and completion alike) and usage through the callbacks.
 #[test]
 fn call_tool_streams_live_buf_and_annotations() {
     let reg = fresh_registry();
     reg.register(
         Arc::new(UsageTool),
-        ToolSource::Lua {
+        ToolSource {
             plugin: Arc::from("usage_fixture"),
         },
     )
@@ -2525,7 +2523,7 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function(input, ctx)
-        return {{ llm_output = "child_done", annotation = "5 items" }}
+        return {{ llm_output = "child_done", annotation = "5 items", format = "markdown" }}
     end
 }})
 maki.api.register_tool({{
@@ -2556,12 +2554,12 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function(input, ctx)
         local ann = "nil"
-        local text, err = maki.agent.call_tool(ctx, "annotated_child", {{}}, {{
+        local text, err, format = maki.agent.call_tool(ctx, "annotated_child", {{}}, {{
             on_annotation = function(a) ann = a end,
         }})
         local live_text = "none"
         local ann2 = "nil"
-        local text2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
+        local text2, _, format2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
             on_live_buf = function(b)
                 local lines = b:get_lines()
                 live_text = lines[1] and lines[1][1] and lines[1][1][1] or "empty"
@@ -2573,13 +2571,13 @@ maki.api.register_tool({{
             on_usage = function(value) usage = value end,
         }})
         local ann3 = "nil"
-        local _, err3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
+        local _, err3, format3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
             on_annotation = function(a) ann3 = a end,
         }})
-        return tostring(text) .. "/" .. ann
-            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2
+        return tostring(text) .. "/" .. ann .. "/" .. format
+            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2 .. "/" .. format2
             .. " " .. tostring(text3) .. "/" .. usage
-            .. " " .. tostring(err3) .. "/" .. ann3
+            .. " " .. tostring(err3) .. "/" .. ann3 .. "/" .. tostring(format3)
     end
 }})
 "#,
@@ -2595,8 +2593,8 @@ maki.api.register_tool({{
     assert_eq!(
         out,
         format!(
-            "child_done/5 items stream_done/streamed line/1 line \
-             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
+            "child_done/5 items/markdown stream_done/streamed line/1 line/plain \
+             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil/nil"
         )
     );
 }
@@ -3214,6 +3212,55 @@ maki.api.register_tool({{
         .end_sessions_blocking([session], SessionEndReason::Shutdown);
 }
 
+/// The gate holds `three` back until the second wait owns the receiver, and
+/// the first wait only ends once the pump delivered `two`.
+#[cfg(unix)]
+#[test_case::test_case(8, "one\ntwo\nthree:false" ; "tail_held_everything")]
+#[test_case::test_case(1, "two\nthree:true" ; "tail_lost_a_line")]
+#[test_case::test_case(0, "three:true" ; "no_tail")]
+fn jobwait_starts_from_the_lines_a_pump_already_delivered(tail: usize, expected: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("gate");
+    let gate = gate.display();
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "wait_in_turn",
+    description = "waits on two jobs one after the other",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local first = maki.fn.jobstart("sleep 600", {{ scope = "plugin" }})
+        local second = maki.fn.jobstart(
+            "mkfifo '{gate}'; echo one; echo two; read _ < '{gate}'; echo three",
+            {{
+                scope = "plugin",
+                tail = {tail},
+                on_stdout = function(_, line)
+                    if line == "two" then
+                        maki.fn.jobstop(first)
+                    end
+                end,
+            }}
+        )
+        maki.fn.jobwait(first)
+        maki.fn.jobstart("echo > '{gate}'")
+        local got = maki.fn.jobwait(second)
+        return got.stdout .. ":" .. tostring(got.truncated)
+    end,
+}})
+"#
+    );
+    host.load_source("wait_in_turn", &src).unwrap();
+
+    assert_eq!(
+        exec_tool(&reg, "wait_in_turn", json!({})).unwrap(),
+        expected
+    );
+}
+
 /// `run` on its own is enough to start a job, but pointing a stream at a path
 /// is a write, so it costs `fs_write` too.
 #[test]
@@ -3411,8 +3458,7 @@ maki.api.register_tool({{
     );
     host.load_source("isolation_probe", &src).unwrap();
 
-    host.event_handle()
-        .fire_autocmd("ProbeIsolation", json!({}));
+    fire_autocmd(&host.event_handle(), "ProbeIsolation", json!({}));
 
     // FireAutocmd and CallTool queue on the same channel and dispatch is
     // awaited in order, so the second handler has already run here. A shared
@@ -3453,8 +3499,11 @@ maki.api.register_tool({{
     );
     host.load_source("sessionend_suspend", &src).unwrap();
 
-    host.event_handle()
-        .fire_autocmd("SessionEnd", json!({ "dir": dir.display().to_string() }));
+    fire_autocmd(
+        &host.event_handle(),
+        "SessionEnd",
+        json!({ "dir": dir.display().to_string() }),
+    );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let seen = loop {
@@ -7759,7 +7808,7 @@ const CANCELLED_MSG: &str = "cancelled";
 const STOPPED_BY_USER_ERR: &str = "stopped by user";
 const PAID_TOOL_USE_ID: &str = "toolu_paid";
 const PAID_TOOL_NAME: &str = "not_a_tool";
-const PAID_TURN_INPUT: u32 = 1234;
+const PAID_TURN_INPUT: u64 = 1234;
 const COST_DECIMALS: usize = 12;
 
 /// The spawned task outlives the tool call that started it, so only the chat
@@ -7994,6 +8043,34 @@ fn billed_turns(
         .collect()
 }
 
+/// Waits for the relay to hand the tab a paid turn. The relay is its own task,
+/// so the provider being asked for the next turn says nothing about whether
+/// the tab heard of the last one yet.
+fn await_billed_turn(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+) -> TurnCompleteEvent {
+    let deadline = Instant::now() + CANCEL_TEST_TIMEOUT;
+    loop {
+        let action = ui
+            .recv_deadline(deadline)
+            .expect("the paid turn must reach the tab while the prompt still runs");
+        match action {
+            maki_lua::UiAction::PluginTaskEvent {
+                session: owner,
+                envelope,
+                ..
+            } if owner == session => {
+                if let AgentEvent::TurnComplete(turn) = envelope.event {
+                    return *turn;
+                }
+            }
+            maki_lua::UiAction::PluginTaskOpened { session: owner, .. } if owner == session => {}
+            _ => panic!("only this chat session's task events go to the UI here"),
+        }
+    }
+}
+
 /// The transcript the tab was last handed for task `id`.
 fn handed_over_history(
     ui: &flume::Receiver<maki_lua::UiAction>,
@@ -8040,10 +8117,11 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     parked
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("the prompt must reach its second turn");
-    let turns = billed_turns(&ui, session);
-    let [turn] = turns.as_slice() else {
-        panic!("the paid turn must reach the tab while the prompt still runs");
-    };
+    let turn = await_billed_turn(&ui, session);
+    assert!(
+        billed_turns(&ui, session).is_empty(),
+        "one paid turn must reach the tab once"
+    );
     assert_eq!(turn.usage.input, PAID_TURN_INPUT);
     let billed_cost = turn.cost.expect("the paid turn must have a price");
     let listed_cost = format!("{billed_cost:.COST_DECIMALS$}");
@@ -8186,9 +8264,9 @@ fn a_retired_background_session_refuses_later_prompts() {
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
-/// The provider parks the second turn forever, so only a cancel can end this
-/// prompt. If `close` waited for it instead, a `SessionEnd` callback that
-/// closes its own session would hang.
+/// The provider parks the second turn forever, so only the close can end
+/// this prompt, which then says the session closed. If `close` waited for it
+/// instead, a `SessionEnd` callback that closes its own session would hang.
 #[test]
 fn closing_a_background_session_cancels_its_running_prompt() {
     let reg = fresh_registry();
@@ -8214,7 +8292,7 @@ fn closing_a_background_session_cancels_its_running_prompt() {
     let closed = call_on_thread(&reg, "close_background", CancelToken::none())
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("close must not wait for the parked prompt");
-    assert_eq!(closed, Ok(CANCELLED_MSG.to_owned()));
+    assert_eq!(closed, Ok(SESSION_CLOSED_ERR.to_owned()));
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 

@@ -39,16 +39,8 @@
         );
 
       mkCraneLib =
-        pkgs:
-        let
-          rustToolchain = pkgs.rust-bin.stable."1.99.0".default.override {
-            extensions = [
-              "rust-src"
-              "rust-analyzer"
-            ];
-          };
-        in
-        (crane.mkLib pkgs).overrideToolchain rustToolchain;
+        pkgs: pickToolchain:
+        (crane.mkLib pkgs).overrideToolchain (pickToolchain pkgs.rust-bin.stable."1.99.0");
 
       mkWorkspaceSrc =
         craneLib:
@@ -63,6 +55,42 @@
             || (lib.hasSuffix ".lua" path);
           src = lib.cleanSource ./.;
         };
+
+      # The minimal toolchain skips rust-docs, clippy and rustfmt, which no build
+      # needs. Dependencies are built without the `cargo check` and `cargo test
+      # --no-run` passes crane runs by default: no build here runs tests.
+      mkMaki =
+        pkgs: profile:
+        let
+          craneLib = mkCraneLib pkgs (toolchains: toolchains.minimal);
+          src = mkWorkspaceSrc craneLib;
+          commonArgs = {
+            pname = packageName;
+            inherit src version;
+            CARGO_PROFILE = profile;
+            doCheck = false;
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              python3
+            ];
+            buildInputs = with pkgs; [
+              stdenv.cc.cc.lib
+            ];
+            cargoVendorDir = craneLib.vendorCargoDeps {
+              inherit src;
+              outputHashes = gitDepHashes;
+            };
+          };
+        in
+        craneLib.buildPackage (
+          commonArgs
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly (
+              commonArgs // { buildPhaseCargoCommand = "cargoWithProfile build --locked"; }
+            );
+            cargoExtraArgs = "--package ${packageName}";
+          }
+        );
 
       cargoLockParsed = builtins.fromTOML (builtins.readFile ./Cargo.lock);
 
@@ -110,54 +138,13 @@
         '';
     in
     {
-      packages = forEachSystem (
-        system: pkgs:
-        let
-          craneLib = mkCraneLib pkgs;
-          workspaceSrc = mkWorkspaceSrc craneLib;
-
-          cargoVendorDir = craneLib.vendorCargoDeps {
-            src = workspaceSrc;
-            outputHashes = gitDepHashes;
-          };
-
-          commonArgs = {
-            nativeBuildInputs = with pkgs; [
-              pkg-config
-              python3
-            ];
-            buildInputs = with pkgs; [
-              stdenv.cc.cc.lib
-            ];
-            inherit cargoVendorDir;
-          };
-
-          cargoArtifacts = craneLib.buildDepsOnly (
-            commonArgs
-            // {
-              pname = "${packageName}-deps";
-              inherit version;
-              src = workspaceSrc;
-            }
-          );
-        in
-        {
-          default = craneLib.buildPackage (
-            commonArgs
-            // {
-              pname = packageName;
-              inherit version;
-              src = workspaceSrc;
-              cargoArtifacts = cargoArtifacts;
-              cargoExtraArgs = "--package ${packageName}";
-              doCheck = false;
-            }
-          );
-        }
-      );
+      packages = forEachSystem (_: pkgs: { default = mkMaki pkgs "release"; });
 
       checks = forEachSystem (
-        system: pkgs: {
+        _: pkgs: {
+          # Catches what only breaks under Nix (source filter, vendoring, native
+          # inputs) in a fraction of the time of the fat LTO release build.
+          build = mkMaki pkgs "dev";
           git-dep-hashes =
             if missingGitDepHashes == [ ] && staleGitDepHashes == [ ] then
               pkgs.runCommandLocal "git-dep-hashes" { } "touch $out"
@@ -181,7 +168,15 @@
       devShells = forEachSystem (
         _: pkgs:
         let
-          craneLib = mkCraneLib pkgs;
+          craneLib = mkCraneLib pkgs (
+            toolchains:
+            toolchains.default.override {
+              extensions = [
+                "rust-src"
+                "rust-analyzer"
+              ];
+            }
+          );
           certs = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         in
         {

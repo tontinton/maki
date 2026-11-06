@@ -54,6 +54,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: |model, choice| OLLAMA.sends_thinking(model, choice),
     thinking_fields_fallback: |_| OLLAMA.fields_fallback(),
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,

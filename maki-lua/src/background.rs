@@ -9,14 +9,13 @@
 
 use std::collections::HashMap;
 use std::mem;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use maki_agent::cancel::{CancelHandle, CancelToken, CancelTrigger};
 use maki_agent::{
-    AgentEvent, AgentSeed, BackgroundNotice, Envelope, SessionMailbox, TaskEnd, TaskLabel,
-    ToolDoneEvent, result_notice,
+    Activity, AgentEvent, AgentSeed, BackgroundNotice, Cutter, EndReason, Envelope, MovedTrigger,
+    SessionControl, SessionMailbox, TaskEnd, TaskLabel, ToolDoneEvent, result_notice,
 };
 use maki_storage::id::MakiId;
 use mlua::Lua;
@@ -47,37 +46,12 @@ pub(crate) enum Lifetime {
     Call,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum Stop {
-    None,
-    User,
-    Model,
-}
-
-/// Who stopped the task. Shared with whoever must tell a stop from a normal
-/// end once the cancel cut its work short.
-#[derive(Clone, Default)]
-pub(crate) struct StopMark(Arc<AtomicU8>);
-
-impl StopMark {
-    pub(crate) fn mark(&self, stop: Stop) {
-        self.0.store(stop as u8, Ordering::Relaxed);
-    }
-
-    pub(crate) fn get(&self) -> Stop {
-        match self.0.load(Ordering::Relaxed) {
-            stop if stop == Stop::User as u8 => Stop::User,
-            stop if stop == Stop::Model as u8 => Stop::Model,
-            _ => Stop::None,
-        }
-    }
-}
-
 /// How retiring an entry reaches its work.
 pub(crate) enum Fire {
     /// The registry owns the work's trigger: dropping it fires.
     Owned(#[expect(dead_code, reason = "held: dropping it fires the work")] CancelTrigger),
+    /// A moved call: dropping it is a stop, unless [`Self::finish`] ran first.
+    Call(MovedTrigger),
     /// Somebody else owns the trigger (a session stub under a moved call).
     Handle(CancelHandle),
 }
@@ -88,6 +62,12 @@ impl Fire {
     /// for its final reply.
     fn disarm(&mut self) -> Self {
         mem::replace(self, Self::Owned(CancelToken::new().0))
+    }
+
+    fn finish(&self) {
+        if let Self::Call(trigger) = self {
+            trigger.finish();
+        }
     }
 }
 
@@ -105,7 +85,17 @@ pub(crate) struct BackgroundTask {
     /// `None` under session scope: nothing but the chat and the plugin ends it.
     pub(crate) task: Option<u64>,
     pub(crate) lifetime: Lifetime,
-    pub(crate) stop: StopMark,
+    /// Who stopped it. Only [`Self::stop`] writes it, the first stop sticks,
+    /// and it is written before the cancel fires, so the work cut short can
+    /// tell who did it.
+    pub(crate) stopped: Option<Cutter>,
+    /// The subagent session it runs. A session's own entry has it from the
+    /// start. A moved `task` call gets it when the session it runs under the
+    /// call's id attaches.
+    pub(crate) control: Option<Arc<SessionControl>>,
+    /// A moved call whose final reply exists: only dispatch's output layers
+    /// stand between it and [`BackgroundTasks::deliver`].
+    pub(crate) replied: bool,
     pub(crate) cancel: Fire,
     /// Where a moved call reports: the mailbox of the run that made it, kept
     /// open while the work is out, so the run's receipt survives an agent
@@ -118,10 +108,24 @@ impl BackgroundTask {
         matches!(self.info.kind, Kind::Call { .. })
     }
 
-    /// A moved call whose final reply exists: only dispatch's output layers
-    /// stand between it and [`BackgroundTasks::deliver`].
     fn has_final(&self) -> bool {
-        self.is_call() && !self.info.running
+        self.is_call() && self.replied
+    }
+
+    fn stop(&mut self, by: Cutter) {
+        let by = *self.stopped.get_or_insert(by);
+        if let Some(control) = &self.control {
+            control.end(EndReason::Stopped(by));
+        }
+    }
+
+    /// The session a moved call runs under its own id, opened before or after
+    /// the move. A stop that came first ends it too.
+    pub(crate) fn attach(&mut self, control: Arc<SessionControl>) {
+        if let Some(by) = self.stopped {
+            control.end(EndReason::Stopped(by));
+        }
+        self.control = Some(control);
     }
 
     fn label(&self, tool: &str) -> TaskLabel {
@@ -142,6 +146,13 @@ impl BackgroundTask {
             .is_some_and(|own| own.session_id() == mailbox)
     }
 
+    /// The one rule for what the model may reach: only tasks that report to
+    /// the mailbox of its run (`asker`). Outside a run (`None`) it reaches
+    /// nothing.
+    fn answers(&self, asker: Option<MakiId>) -> bool {
+        asker.is_some_and(|asker| self.reports_to(asker))
+    }
+
     /// The notice text the model reads, the line the transcript shows, and
     /// how the task ended.
     fn notice(&self, done: &ToolDoneEvent, output: &str) -> (String, String, TaskEnd) {
@@ -153,7 +164,7 @@ impl BackgroundTask {
             &self.label(tool),
             &self.info.id,
             done.is_error,
-            self.stop.get() != Stop::None,
+            self.stopped.is_some(),
             output,
         )
     }
@@ -177,8 +188,6 @@ pub(crate) struct BackgroundInfo {
     /// A moved call's start summary.
     pub(crate) name: String,
     pub(crate) kind: Kind,
-    /// A moved call stops running once its final reply exists.
-    pub(crate) running: bool,
     pub(crate) started_at: u64,
     pub(crate) cost: Option<f64>,
 }
@@ -253,7 +262,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn is_running_call(entry: &BackgroundTask) -> bool {
-    entry.is_call() && entry.stop.get() == Stop::None
+    entry.is_call() && entry.stopped.is_none()
 }
 
 fn no_running_task_err(id: &str, running: &[String]) -> String {
@@ -287,7 +296,8 @@ impl BackgroundTasks {
         if AgentSeed::live(entry.session).is_none() {
             return Err(not_live(entry.session));
         }
-        if let Some(mailbox) = &entry.mailbox
+        if entry.is_call()
+            && let Some(mailbox) = &entry.mailbox
             && !mailbox.track(&entry.info.id)
         {
             return Err(RUN_ENDED.to_owned());
@@ -296,6 +306,7 @@ impl BackgroundTasks {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn contains(&self, id: &str) -> bool {
         self.locked().iter().any(|entry| entry.info.id == id)
     }
@@ -306,28 +317,53 @@ impl BackgroundTasks {
         }
     }
 
-    pub(crate) fn stopped_by(&self, id: &str) -> Stop {
+    pub(crate) fn stopped_by(&self, id: &str) -> Option<Cutter> {
+        self.locked().iter().find(|e| e.info.id == id)?.stopped
+    }
+
+    /// Where moved call `id` reports, which the sessions it runs report to as
+    /// well, so its caller reaches them too.
+    pub(crate) fn mailbox(&self, id: &str) -> Option<SessionMailbox> {
         self.locked()
             .iter()
-            .find(|e| e.info.id == id)
-            .map_or(Stop::None, |e| e.stop.get())
+            .find(|e| e.info.id == id)?
+            .mailbox
+            .clone()
+    }
+
+    /// The live session of subagent `id`, and its name, if the run reading
+    /// mailbox `asker` reaches it by [`BackgroundTask::answers`].
+    pub(crate) fn subagent(
+        &self,
+        asker: Option<MakiId>,
+        id: &str,
+    ) -> Option<(Arc<SessionControl>, String)> {
+        let entries = self.locked();
+        let entry = entries
+            .iter()
+            .find(|e| e.info.id == id && e.answers(asker))?;
+        let control = entry.control.as_ref()?;
+        control
+            .ended()
+            .is_none()
+            .then(|| (Arc::clone(control), entry.info.name.clone()))
     }
 
     pub(crate) fn remove(&self, id: &str) {
         self.extract(|e| e.info.id == id);
     }
 
-    /// The mark is set before the work is cut short, so the work sees who
-    /// stopped it. A moved call stays listed until [`Self::deliver`], which
-    /// needs its session, plugin and mark. Its work is fired right away,
+    /// The stop is recorded before the work is cut short, so the work sees
+    /// who stopped it. A moved call stays listed until [`Self::deliver`],
+    /// which needs its session, plugin and stop. Its work is fired right away,
     /// outside the lock.
-    pub(crate) fn stop(&self, id: &str, by: Stop) {
+    pub(crate) fn stop(&self, id: &str, by: Cutter) {
         let fired = {
             let mut entries = self.locked();
             let Some(entry) = entries.iter_mut().find(|e| e.info.id == id) else {
                 return;
             };
-            entry.stop.mark(by);
+            entry.stop(by);
             entry.is_call().then(|| entry.cancel.disarm())
         };
         if fired.is_none() {
@@ -370,7 +406,7 @@ impl BackgroundTasks {
         let running: Vec<_> = self
             .locked()
             .iter()
-            .filter(|e| is_running_call(e) && mailbox.is_some_and(|mailbox| e.reports_to(mailbox)))
+            .filter(|e| is_running_call(e) && e.answers(mailbox))
             .map(|e| e.info.clone())
             .collect();
         let Some(target) = running.iter().find(|info| info.id == id) else {
@@ -380,12 +416,13 @@ impl BackgroundTasks {
         let name = target.name.clone();
         let (waiter, reply) = flume::bounded(1);
         lock(&self.waiters).insert(id.to_owned(), waiter);
-        self.stop(id, Stop::Model);
+        self.stop(id, Cutter::Parent);
         Ok((reply, name))
     }
 
     /// The final reply of a moved call: settles its receipt in the run it
-    /// reports to, closes its task tab and retires the entry. A model's
+    /// reports to, closes its task tab and retires the entry, which ends the
+    /// call but not what it left running past its reply. A model's
     /// `task_stop` that is waiting takes the output instead of the run
     /// getting a notice. Needs no Lua host, so it can land after the host
     /// died.
@@ -399,6 +436,7 @@ impl BackgroundTasks {
             tracing::debug!(id, "final reply of a background task that already settled");
             return;
         };
+        task.cancel.finish();
         if let Some(mailbox) = &task.mailbox {
             let output = done.output.as_text();
             if self.hand_to_waiter(id, &output) {
@@ -410,8 +448,9 @@ impl BackgroundTasks {
                     Some(BackgroundNotice {
                         text,
                         display: Some(&display),
-                        wake: task.stop.get() == Stop::None,
+                        wake: task.stopped.is_none(),
                         end,
+                        markdown: done.output.is_markdown(),
                     }),
                 );
             }
@@ -419,7 +458,7 @@ impl BackgroundTasks {
         if let Some(ui) = ui {
             // A killed process usually exits with an error, so the tab hears
             // of the stop first and ends cancelled, not failed.
-            if task.stop.get() != Stop::None {
+            if task.stopped.is_some() {
                 let _ = ui.try_send(UiAction::PluginTaskEnded {
                     session: task.session,
                     id: id.to_owned(),
@@ -443,14 +482,45 @@ impl BackgroundTasks {
         }
     }
 
+    /// Sends the model the result of {part} of moved call `id` now, while the
+    /// rest keeps running. It is worded like the final reply of a call that
+    /// moved alone, so the transcript reads the same either way. Says `false`
+    /// once the call stopped or has its final reply, because that reply will
+    /// carry the part and explain the stop. Also `false` when nothing waits
+    /// on `id` any more.
+    pub(crate) fn report_part(
+        &self,
+        id: &str,
+        part: &TaskLabel,
+        failed: bool,
+        output: &str,
+        markdown: bool,
+    ) -> bool {
+        let Some(mailbox) = self
+            .locked()
+            .iter()
+            .find(|e| e.info.id == id && is_running_call(e) && !e.has_final())
+            .and_then(|e| e.mailbox.clone())
+        else {
+            return false;
+        };
+        let (text, display, end) = result_notice(part, id, failed, false, output);
+        mailbox.report_part(
+            id,
+            BackgroundNotice {
+                text,
+                display: Some(&display),
+                wake: true,
+                end,
+                markdown,
+            },
+        )
+    }
+
     /// Marks the final reply of moved call `id` as existing, so a host dying
     /// from here on leaves the call to [`Self::deliver`].
     pub(crate) fn final_ready(&self, id: &str) {
-        self.update(id, |e| {
-            if e.is_call() {
-                e.info.running = false;
-            }
-        });
+        self.update(id, |e| e.replied = true);
     }
 
     /// Takes the entry out whole, so whoever gets it is the one that settles
@@ -547,13 +617,13 @@ impl BackgroundTasks {
     }
 
     /// What `maki.agent.list()` shows: the sessions plugins opened by chat id.
-    pub(crate) fn list_agents(&self, session: MakiId) -> Vec<BackgroundInfo> {
+    pub(crate) fn list_agents(&self, session: MakiId) -> Vec<(BackgroundInfo, Activity)> {
         self.locked()
             .iter()
             .filter(|e| {
                 e.session == session && e.info.kind == Kind::Agent && e.lifetime == Lifetime::Plugin
             })
-            .map(|e| e.info.clone())
+            .filter_map(|e| Some((e.info.clone(), e.control.as_ref()?.activity())))
             .collect()
     }
 
@@ -568,7 +638,7 @@ impl BackgroundTasks {
                 .iter_mut()
                 .filter(|e| doomed(e) && is_running_call(e))
                 .map(|e| {
-                    e.stop.mark(Stop::User);
+                    e.stop(Cutter::User);
                     e.cancel.disarm()
                 })
                 .collect();
@@ -607,6 +677,7 @@ pub(crate) mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::runtime::test_support::call_scope;
     use crate::runtime::{TaskCell, TaskScope, lock_cell};
 
     const PLUGIN: &str = "monitor";
@@ -644,14 +715,15 @@ pub(crate) mod tests {
                 plugin: Arc::from(PLUGIN),
                 name: String::new(),
                 kind: Kind::Agent,
-                running: false,
                 started_at: 0,
                 cost: None,
             },
             session,
             task,
             lifetime: Lifetime::Plugin,
-            stop: StopMark::default(),
+            stopped: None,
+            control: Some(Arc::default()),
+            replied: false,
             cancel: Fire::Owned(cancel),
             mailbox: None,
         };
@@ -732,7 +804,7 @@ pub(crate) mod tests {
         entry.info.kind = Kind::Call {
             tool: Arc::from(TOOL),
         };
-        entry.info.running = true;
+        entry.control = None;
         entry.lifetime = Lifetime::Call;
         entry.mailbox = mailbox;
         (entry, token)
@@ -751,12 +823,11 @@ pub(crate) mod tests {
         }
     }
 
-    fn registry_with_call(session: MakiId) -> (BackgroundTasks, CancelToken, StopMark) {
+    fn registry_with_call(session: MakiId) -> (BackgroundTasks, CancelToken) {
         let registry = BackgroundTasks::default();
         let (call, token) = call_entry(session, CALL_ID);
-        let mark = call.stop.clone();
         registry.register(call).unwrap();
-        (registry, token, mark)
+        (registry, token)
     }
 
     #[test]
@@ -785,10 +856,31 @@ pub(crate) mod tests {
         let id = opened.info.id.clone();
         registry.register(opened).unwrap();
 
-        registry.stop(&id, Stop::User);
+        registry.stop(&id, Cutter::User);
 
         assert!(token.is_cancelled());
         assert!(!registry.contains(&id));
+    }
+
+    /// The owner token carries what the call left running, like a highlight.
+    #[test_case(false ; "a_delivered_call_leaves_it_running")]
+    #[test_case(true ; "a_stopped_call_takes_it_along")]
+    fn a_moved_calls_late_work(stopped: bool) {
+        let session = MakiId::generate();
+        let _live = live(session);
+        let (call, _run, trigger) = call_scope(true);
+        let (mut entry, _) = call_entry(session, CALL_ID);
+        entry.cancel = Fire::Call(trigger.expect("moved"));
+        let registry = BackgroundTasks::default();
+        registry.register(entry).unwrap();
+
+        if stopped {
+            registry.stop(CALL_ID, Cutter::User);
+        }
+        registry.deliver(CALL_ID, done(OUTPUT, false), None);
+
+        assert!(call.cancel().is_cancelled());
+        assert_eq!(call.owner().is_cancelled(), stopped);
     }
 
     #[test]
@@ -803,18 +895,18 @@ pub(crate) mod tests {
         let ids: Vec<_> = registry
             .list_agents(session)
             .into_iter()
-            .map(|info| info.id)
+            .map(|(info, _)| info.id)
             .collect();
 
         assert_eq!(ids, [opened_id]);
         assert_eq!(registry.list(session).len(), 2);
     }
 
-    #[test_case(Stop::None, false, FINISHED, TaskEnd::Finished, true ; "finished_wakes_the_chat")]
-    #[test_case(Stop::None, true, FAILED, TaskEnd::Failed, true ; "failed_wakes_the_chat")]
-    #[test_case(Stop::User, true, FAILED, TaskEnd::Cancelled, false ; "stopped_by_the_user_is_quiet")]
+    #[test_case(None, false, FINISHED, TaskEnd::Finished, true ; "finished_wakes_the_chat")]
+    #[test_case(None, true, FAILED, TaskEnd::Failed, true ; "failed_wakes_the_chat")]
+    #[test_case(Some(Cutter::User), true, FAILED, TaskEnd::Cancelled, false ; "stopped_by_the_user_is_quiet")]
     fn deliver_tells_the_chat(
-        stop: Stop,
+        stop: Option<Cutter>,
         is_error: bool,
         text_outcome: &str,
         end: TaskEnd,
@@ -822,8 +914,8 @@ pub(crate) mod tests {
     ) {
         let session = MakiId::generate();
         let (mailbox, _seed) = live(session);
-        let (registry, token, _) = registry_with_call(session);
-        if stop != Stop::None {
+        let (registry, token) = registry_with_call(session);
+        if let Some(stop) = stop {
             registry.stop(CALL_ID, stop);
             assert!(token.is_cancelled());
             assert!(registry.contains(CALL_ID), "{KEPT_UNTIL_DELIVER}");
@@ -847,13 +939,29 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(
-            notices[0].settles,
-            Some(TaskSettled {
+            notices[0].settles(),
+            Some(&TaskSettled {
                 task: CALL_ID.into(),
                 end
             })
         );
         assert!(!registry.contains(CALL_ID));
+    }
+
+    #[test_case(ToolOutput::Markdown(OUTPUT.into()), true ; "markdown_reply")]
+    #[test_case(ToolOutput::Plain(OUTPUT.into()), false ; "plain_output")]
+    fn a_delivered_notice_keeps_the_output_format(output: ToolOutput, markdown: bool) {
+        let session = MakiId::generate();
+        let (mailbox, _seed) = live(session);
+        let (registry, _token) = registry_with_call(session);
+
+        let done = ToolDoneEvent {
+            output: Arc::new(output),
+            ..done(OUTPUT, false)
+        };
+        registry.deliver(CALL_ID, done, None);
+
+        assert_eq!(mailbox.claim_wake()[0].markdown, markdown);
     }
 
     #[test]
@@ -885,9 +993,9 @@ pub(crate) mod tests {
         assert!(matches!(events[1], AgentEvent::StreamClosed));
     }
 
-    #[test_case(Stop::User ; "by_the_user")]
-    #[test_case(Stop::Model ; "by_the_model")]
-    fn a_stopped_calls_tab_hears_of_the_stop_before_its_reply(stop: Stop) {
+    #[test_case(Cutter::User ; "by_the_user")]
+    #[test_case(Cutter::Parent ; "by_the_model")]
+    fn a_stopped_calls_tab_hears_of_the_stop_before_its_reply(stop: Cutter) {
         let session = MakiId::generate();
         let _live = live(session);
         let (registry, ..) = registry_with_call(session);
@@ -911,15 +1019,17 @@ pub(crate) mod tests {
     async fn model_stop_that_gets_the_output_leaves_the_chat_no_notice() {
         let session = MakiId::generate();
         let (mailbox, _seed) = live(session);
-        let (registry, token, mark) = registry_with_call(session);
+        let (registry, token) = registry_with_call(session);
 
         let (stopped, ()) = tokio::join!(
             registry.stop_by_model(Some(session), CALL_ID, FOREVER),
-            async { registry.deliver(CALL_ID, done(OUTPUT, true), None) },
+            async {
+                assert_eq!(registry.stopped_by(CALL_ID), Some(Cutter::Parent));
+                registry.deliver(CALL_ID, done(OUTPUT, true), None)
+            },
         );
 
         assert_eq!(stopped.map(|stop| stop.output), Ok(Some(OUTPUT.to_owned())));
-        assert_eq!(mark.get(), Stop::Model);
         assert!(token.is_cancelled());
         assert!(mailbox.unsettled().is_empty());
         assert!(mailbox.drain().is_empty());
@@ -1005,6 +1115,80 @@ pub(crate) mod tests {
         assert!(tokens.iter().all(|token| !token.is_cancelled()));
     }
 
+    enum Target {
+        Live,
+        Ended,
+        NoSession,
+    }
+
+    /// `task_message` and `maki.task.messages` reach a subagent by the rule
+    /// `task_stop` follows, and only while its session lives.
+    #[test_case(Asker::Owner, Target::Live, true ; "the_owner_reaches_a_live_session")]
+    #[test_case(Asker::Subagent, Target::Live, false ; "another_run_does_not")]
+    #[test_case(Asker::NoRun, Target::Live, false ; "outside_a_run_nothing_does")]
+    #[test_case(Asker::Owner, Target::Ended, false ; "an_ended_session_is_gone")]
+    #[test_case(Asker::Owner, Target::NoSession, false ; "a_call_without_a_session")]
+    fn subagent_follows_the_model_stop_rule(asker: Asker, target: Target, reached: bool) {
+        let chat = MakiId::generate();
+        let _live = live(chat);
+        let subagent = SessionMailbox::register(MakiId::generate());
+        let registry = BackgroundTasks::default();
+        let (mut call, _token) = call_entry(chat, CALL_ID);
+        let control = Arc::new(SessionControl::default());
+        if !matches!(target, Target::NoSession) {
+            call.attach(Arc::clone(&control));
+        }
+        if matches!(target, Target::Ended) {
+            control.end(EndReason::Closed);
+        }
+        registry.register(call).unwrap();
+        let asker = match asker {
+            Asker::Owner => Some(chat),
+            Asker::Subagent => Some(subagent.session_id()),
+            Asker::NoRun => None,
+        };
+
+        let found = registry.subagent(asker, CALL_ID);
+
+        assert_eq!(found.is_some(), reached);
+        if let Some((found, name)) = found {
+            assert!(Arc::ptr_eq(&found, &control));
+            assert_eq!(name, SUMMARY);
+        }
+    }
+
+    /// The session a moved call runs hears of the call's stop whichever came
+    /// first, and the stop still counts when that session was already over.
+    #[test_case(true, false ; "session_attached_before_the_stop")]
+    #[test_case(false, false ; "session_attached_after_the_stop")]
+    #[test_case(true, true ; "session_closed_before_the_stop")]
+    fn a_moved_calls_stop_reaches_its_session_in_either_order(attached_first: bool, closed: bool) {
+        let session = MakiId::generate();
+        let _live = live(session);
+        let (registry, _token) = registry_with_call(session);
+        let control = Arc::new(SessionControl::default());
+        let attach = || registry.update(CALL_ID, |e| e.attach(Arc::clone(&control)));
+        if attached_first {
+            attach();
+        }
+        if closed {
+            control.end(EndReason::Closed);
+        }
+
+        registry.stop(CALL_ID, Cutter::Parent);
+        if !attached_first {
+            attach();
+        }
+
+        assert_eq!(registry.stopped_by(CALL_ID), Some(Cutter::Parent));
+        let ended = if closed {
+            EndReason::Closed
+        } else {
+            EndReason::Stopped(Cutter::Parent)
+        };
+        assert_eq!(control.ended(), Some(ended));
+    }
+
     #[test]
     fn end_mailbox_stops_the_calls_reporting_there_and_leaves_the_rest() {
         let chat = MakiId::generate();
@@ -1033,7 +1217,7 @@ pub(crate) mod tests {
     fn a_retired_moved_call_reports_its_end_quietly(retire: Retire) {
         let session = MakiId::generate();
         let (mailbox, _seed) = live(session);
-        let (registry, token, mark) = registry_with_call(session);
+        let (registry, token) = registry_with_call(session);
         let (tx, rx) = flume::unbounded();
 
         match retire {
@@ -1042,7 +1226,7 @@ pub(crate) mod tests {
         }
 
         assert!(token.is_cancelled());
-        assert_eq!(mark.get(), Stop::User);
+        assert_eq!(registry.stopped_by(CALL_ID), Some(Cutter::User));
         assert!(registry.contains(CALL_ID), "{KEPT_UNTIL_DELIVER}");
 
         registry.deliver(CALL_ID, done(OUTPUT, true), Some(tx));
@@ -1123,7 +1307,7 @@ pub(crate) mod tests {
     ) {
         let session = MakiId::generate();
         let (mailbox, _seed) = live(session);
-        let (registry, token, _) = registry_with_call(session);
+        let (registry, token) = registry_with_call(session);
         let end = MovedEnd::new(registry.clone(), CALL_ID.to_owned(), None);
         let finish = move || match ending {
             Ending::Delivered => end.land(Some(done(OUTPUT, false))),

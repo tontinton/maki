@@ -171,7 +171,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `background` | boolean | no | Run in the background. The result arrives as a message when it ends. End your turn to wait for it. |
+| `background` | boolean | no | Run in the background and continue other work: the call returns immediately and the result arrives later as a message. Launch every background task in one parallel batch, never as sequential calls, and don't sleep or poll for it; end your turn once nothing else is left. |
 | `description` | string | yes | Short (3-5 words) description of the task |
 | `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
 | `output_schema` | object | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
@@ -190,10 +190,12 @@ Stop a background task by id.
 ### `task_message` {#task_message}
 
 Message a running background subagent by id, e.g. a new fact, a changed scope or "wrap up now". It reads it after its current step.
+Set interrupt only when it must act now: it cuts the current step, running tools included.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | yes | Task id from its receipt |
+| `interrupt` | boolean | no | Cut the current step short |
 | `message` | string | yes | What the subagent should know or do |
 
 ### `todo_write` {#todo_write}

@@ -145,7 +145,7 @@ The rules:
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.Timer`](#maki-Timer) | Handle returned by `maki.defer_fn`. |
 | [`maki.task`](#maki-task) | The subagents of the focused session and their transcripts. |
-| [`maki.text`](#maki-text) | Text utilities: format conversion and the fuzzy matcher the built-in |
+| [`maki.text`](#maki-text) | Text utilities: format conversion, UTF-8 decoding and the fuzzy matcher |
 | [`maki.treesitter`](#maki-treesitter) | Tree-sitter parsing and query API. |
 | [`maki.treesitter.language`](#maki-treesitter-language) | Language registry for tree-sitter grammars. |
 | [`maki.treesitter.query`](#maki-treesitter-query) | Query compilation and lookup. |
@@ -470,6 +470,7 @@ Your {spec} table must include a name, a description (the model reads it
 to decide when to use the tool), a JSON Schema for the input, and a handler
 function. The handler receives `(input, ctx)` and returns either a plain
 string or a table with richer output fields.
+Invalid UTF-8 in the returned text becomes U+FFFD.
 
 `ctx:output_mode()` returns "compact" when the result goes to the model and
 "full" when code such as `code_execution` made the call. Apply output limits
@@ -918,7 +919,8 @@ name the session now running or focused. What each event adds:
 - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
-  or `"idle"`), `data.title`, and `data.focused` (boolean).
+  or `"idle"`), `data.title`, and `data.focused` (boolean). A session
+  stays `"working"` while a background task it waits on still runs.
 - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
   when the title changes (rename or auto-generation).
 - `"SessionCwdChanged"`: `data.cwd`, the session's new working
@@ -1470,7 +1472,11 @@ You might want a cheaper model for simple subtasks (summaries, classification)
 without hard-coding a model name.
 
 The returned table has fields: `id` (string), `tier` (string),
-`provider` (string), `spec` (string).
+`provider` (string), `spec` (string), `assigned_tier` (string?).
+`assigned_tier` is set when the user assigned this model to that tier, and
+nil for an explicit `spec`, the inherited model or a curated default. Mention
+it in your errors, since the user may have forgotten the assignment. If an
+assigned model no longer resolves, you get an error instead of another model.
 
 **Parameters:**
 
@@ -1663,8 +1669,9 @@ through optional callbacks while the tool runs.
     a subagent, which `/tasks` then lists as a task of its own. Must not
     yield.
 
-**Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
-  Instruction files the child picks up (a subdirectory `AGENTS.md`) are
+**Returns:** (`string?`, `string?`, `string?`) Tool output text and its format
+  (`"markdown"` or `"plain"`, as a tool handler sets it), or `(nil, err)`
+  on failure. Instruction files the child picks up (a subdirectory `AGENTS.md`) are
   not in the text: they land on the calling tool's own result.
 
 **Example:**
@@ -1805,7 +1812,8 @@ Each entry has these fields:
 - `session` (`string`) Chat session it belongs to.
 - `plugin` (`string`) Plugin that opened it.
 - `name` (`string`) Name given at open.
-- `status` (`string`) `"working"` during a `:prompt()`, otherwise `"idle"`.
+- `status` (`string`) `"working"` while a `:prompt()` runs a turn or waits
+  on calls moved to the background, otherwise `"idle"`.
 - `started_at` (`integer`) Unix seconds.
 - `cost` (`number?`) Dollars billed so far, updated after each turn. nil until
   a priced turn ends.
@@ -1868,9 +1876,10 @@ session, or the end of the task that opened it, stops such calls.
 **Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
 failure. A run cut short after streaming some text hands you both: the
 error and a `{ text = <what it streamed> }` table. `"cancelled"` means the
-task that opened or prompted the session ended. `"stopped by user"` means
-Esc in its tab closed a session opened by chat session id, and every
-later prompt answers the same.
+task that opened or prompted the session ended. `"session closed"` means
+`:close()` ended it. `"stopped by user"` means Esc in its tab stopped it,
+and `"stopped by parent agent"` that the model stopped the background task
+it runs in. Every later prompt answers the same.
 
 **Example:**
 
@@ -1886,22 +1895,32 @@ print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 ### `Session:send()` {#Session-send}
 
 ```lua
-Session:send({message})
+Session:send({message}, {opts?})
 ```
 
 Hand the subagent a message without waiting, delivered the same way as a
-message typed in its tab. A running `:prompt()` picks it up at its next turn boundary, once
-the current reply and its tool calls finish, and the model reads it as an
-interrupt from its parent, not the user. The tab draws it when it lands.
-Messages sent in a burst land together.
+message typed in its tab. A running `:prompt()` picks it up at its next
+turn boundary, once the current reply and its tool calls finish, and the
+model reads it as an interrupt from its parent, not the user. The tab
+draws it when it lands. Messages sent in a burst land together.
 
 With no prompt running, or one already past its last turn, the message
 waits. The next `:prompt()` sends it in the same request as its own
 message, just before it, so the first reply already reads it.
 
+With `interrupt`, a running `:prompt()` does not wait for the turn to end,
+nor for moved calls. The reply stops and running tools are cancelled (bash
+returns what it printed so far). The subagent then reads the message and
+carries on with its history intact, and `:prompt()` returns its answer as
+usual. If an `agent.user_message` layer drops the message, the subagent
+picks up the cut work instead. With no prompt running, the message waits
+like any other.
+
 **Parameters:**
 
 - `{message}` (`string`) Message to deliver.
+- `{opts?}` (`table?`) Optional fields:
+  - `interrupt` (`boolean?`) cut the running turn short. Default: `false`.
 
 **Returns:** (`boolean?`, `string?`) `true`, or `(nil, err)` when the session takes
 no more messages. The errors are the ones `:prompt()` refuses with. `true`
@@ -1914,6 +1933,8 @@ closes is dropped.
 -- From another task, while `sess:prompt()` is still running.
 local ok, err = sess:send("New finding: the bug is in parser.rs, focus there.")
 if not ok then maki.log.warn(err) end
+-- Stop a subagent heading the wrong way, mid tool call.
+sess:send("Stop, the bug is in lexer.rs, not parser.rs.", { interrupt = true })
 ```
 
 ---
@@ -1932,7 +1953,7 @@ leaves the work to the Lua garbage collector, which may never run while
 the VM sits idle, and the subagent's event relay stays alive until it does.
 
 Close cancels a running prompt before waiting to flush its history. That
-prompt returns a cancelled error and any partial text.
+prompt returns `"session closed"` and any partial text.
 
 ---
 
@@ -1974,10 +1995,10 @@ maki.async.run({fn}, {on_finish?})
 ```
 
 Start {fn} as a background task without waiting for it. Pass
-{on_finish} to get the result. The task is cancelled with its caller
-and stopped after 60 seconds. Started from a tool handler, it may outlive
-the reply: it ends with the turn, or with the background task once the
-call moved. For work that outlives the caller, use `maki.async.spawn`.
+{on_finish} to get the result. The task stops when its caller ends, or
+after 60 seconds. A tool handler's task can outlive the reply: it runs
+until the turn ends, or until the call is stopped if it was moved to the
+background. For work that outlives the caller, use `maki.async.spawn`.
 
 **Parameters:**
 
@@ -2555,8 +2576,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
     with the current call. `"plugin"` keeps it alive until the plugin
     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
     session ends, and survives plugin reload.
-  - `tail` (`integer?`) trailing lines per stream kept for `jobinfo`
-    (default 20, 0 disables, max 1024).
+  - `tail` (`integer?`) trailing lines per stream kept for `jobinfo` and
+    `jobwait` (default 20, 0 disables, max 1024).
   - `max_line_bytes` (`integer?`) longest line delivered, in bytes. A longer
     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
     skipped without being read into memory (default and `0`: 64 MiB, the
@@ -2635,12 +2656,12 @@ maki.fn.jobwait({job_id}, {timeout_ms?})
 ```
 
 Wait for a job to finish and collect its output. Returns a result
-table with `stdout`, `stderr`, `exit_code`, and `truncated`. A job that
-already exited answers from its captured tail, so `truncated` says
-whether that tail ever lost a line (`tail` too small or 0, or the stream
-redirected away). Waiting on a live job collects every line and is never
-truncated. Neither counts lines cut by `max_line_bytes`: those still
-arrive, ending in `...`.
+table with `stdout`, `stderr`, `exit_code`, and `truncated`. The output
+starts from the job's captured tail, which holds what was delivered before
+the wait, and a live job adds every line from then on. `truncated` says
+whether that tail had already lost a line by then (`tail` too small or 0,
+or the stream redirected away). It doesn't count lines cut by
+`max_line_bytes`: those still arrive, ending in `...`.
 
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream
@@ -3299,7 +3320,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to write.
+- `{content}` (`string|buffer`) Bytes to write.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -3326,7 +3347,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to append.
+- `{content}` (`string|buffer`) Bytes to append.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -3354,7 +3375,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to write.
+- `{content}` (`string|buffer`) Bytes to write.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -4480,6 +4501,9 @@ provider it names), else the curated default within `provider`, else any
 provider. `assigned` tells a pick apart from a default. Pass `provider` to
 prefer its models, the way subagents prefer the session's provider.
 
+Resolving a models.dev model can wait for that catalog to download, so
+like `get`, this can't run in a callback that must not yield.
+
 **Parameters:**
 
 - `{name}` (`string`) `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
@@ -4583,7 +4607,7 @@ one. This holds only for an origin the user set (`<SLUG>_BASE_URL`,
 {opts} fields:
 - `method` (`string`) HTTP verb, in any case (default `"GET"`).
 - `headers` (`table`) Header name/value pairs.
-- `body` (`string`) Request body.
+- `body` (`string|buffer`) Request body, sent as is.
 - `timeout` (`integer`) Total timeout in seconds, max 120 (default 30,
   none on a provider's origin). 0 means the default.
 - `max_bytes` (`integer`) Max response size in bytes (default 5 MB).
@@ -4599,6 +4623,9 @@ response's headers under lowercase names, as in
 which breaks `set-cookie`. A compressed response arrives decoded, without
 its `content-encoding` and `content-length`. A failed response can go
 straight to `maki.provider.http_error`.
+`body` holds the raw bytes, so a binary download can go straight to
+`maki.fs.write`. Tool results and `maki.text.html_to_markdown` turn
+invalid UTF-8 into U+FFFD.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -5120,8 +5147,8 @@ maki.session.live()
 ```
 
 Lists the sessions currently running in this UI. Status is "working",
-"needs_input", or "idle". A mailbox follow-up stays "working" without an
-intermediate "idle" status.
+"needs_input", or "idle". Background work a turn moved out keeps the
+session "working" until its result is in, with no "idle" in between.
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
 
@@ -5259,7 +5286,7 @@ been sent so far, tool calls and results included. Read only.
 Each message has the same shape as in the session file:
 
 ```text
-{ role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, content = { blocks } }
+{ role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, content = { blocks } }
 ```
 
 `kind` is `"turn"` for something the user or the model said,
@@ -5271,7 +5298,9 @@ content: nil shows the content, `""` hides the message (a nudge, a
 compaction note). `receipts` lists the calls whose results in this
 message moved to the background, and `settles` = `{ task, end }` marks the
 notice that answered one, with `end` one of `"finished"`, `"failed"`,
-`"cancelled"` or `"lost"`. `content` lists blocks:
+`"cancelled"` or `"lost"`. `partial` has the same shape and marks a notice
+that answered one piece early, like one call of a moved batch, and left
+the receipt open. `content` lists blocks:
 
 ```text
 { type = "text", text }
@@ -5584,7 +5613,8 @@ h:stop()
 The subagents of the focused session and their transcripts. Tasks are
 spawned by the `task` tool and addressed by an id that survives a reload.
 Without an interactive UI every function returns
-`nil, "no interactive UI attached"`.
+`nil, "no interactive UI attached"`, except the ones that take a tool
+handler's ctx: they reach the background tasks its agent moved.
 
 ---
 
@@ -5602,18 +5632,19 @@ tool spawned has its tool call's id, one a plugin opened with
 `plugin` field.
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, focused, status?, plugin?,
-  parent?, part?, started_at?, ended_at?, cost?}` where `status` is `"working"`,
-  `"idle"` (a plugin task between prompts), `"done"`, `"error"`, or
-  `"cancelled"` (stopped by the user or the model), and `session` is the
-  chat session that `stop()` asks for. `parent` is the id of the call the
-  task runs under, like a `batch` that started it. That call is listed
-  only once it moved. `part` is true for a piece listed with
-  `ctx:set_parts()`. Stopping a part stops its whole call, while a
-  subagent the call started stops alone. `started_at` and `ended_at` are
-  Unix seconds: when the task started, or moved to the background, and
-  when it finished. A task loaded from disk has neither. `cost` is what a
-  subagent billed so far, in dollars. The main chat has none of the
-  three. Or nil and an error.
+  tool?, parent?, part?, wrapper?, started_at?, ended_at?, cost?}`, or nil and an error.
+  `status` is `"working"`, `"idle"` (a plugin task between prompts), `"done"`,
+  `"error"` or `"cancelled"`. `session` is the chat session that `stop()` asks for.
+  `tool` is the tool whose call the task runs, like `"task"` or `"bash"`, and is
+  absent on a session a plugin opened on its own. `parent` is the id of the call
+  the task runs under, like a `batch`, which is listed only once it moved. `part`
+  is true for a piece listed with `ctx:set_parts()`: stopping it stops its whole
+  call, while a subagent the call started stops alone. `wrapper` is true for a
+  call that `/tasks` replaces with the tasks under it, so it gets no row and does
+  not count as running. `started_at` and `ended_at` are Unix seconds: when the
+  task started or moved, and when it finished. Tasks saved before they were
+  recorded lack them. `cost` is what a subagent billed so far, in dollars. The
+  main chat has none of the three.
 
 **Example:**
 
@@ -5691,11 +5722,12 @@ plugin could stop work that is not its own.
 From a tool handler, `stop(ctx, id)` is the model's stop. It stops a
 background task (a command or subagent) that the calling agent moved,
 which is allowed because the tool call belongs to a turn the user started.
-It waits up to 5 seconds for the final reply and returns it, and the agent
-gets no notice of the end. A late reply returns no `output`, and the
-result reaches the agent later as a quiet notice. A task another agent
-moved, a finished task or an unknown id returns an error that names the
-agent's running task ids.
+A subagent stopped this way ends its pending `:prompt()` with
+`"stopped by parent agent"`. It waits up to 5 seconds for the final reply
+and returns it, and the agent gets no notice of the end. A late reply
+returns no `output`, and the result reaches the agent later as a quiet
+notice. A task another agent moved, a finished task or an unknown id
+returns an error that names the agent's running task ids.
 
 **Parameters:**
 
@@ -5719,14 +5751,91 @@ local _, err = maki.task.stop(task.id, { session = task.session })
 local stopped, err = maki.task.stop(ctx, input.id)
 ```
 
+---
+
+### `maki.task.send()` {#maki-task-send}
+
+```lua
+maki.task.send({ctx}, {id}, {text}, {opts?})
+```
+
+Messages a background subagent that the calling agent moved, the way the
+`task_message` tool does. The subagent reads it as an interrupt from its
+parent once its current turn ends, and one still waiting for a slot reads
+it with its first prompt.
+
+With `interrupt` it does not wait for the turn to end, nor for the calls
+the subagent moved. The reply stops and running tools are cancelled (bash
+returns what it printed so far), then the subagent reads the message and
+carries on with its history intact. With no turn running the message
+waits like any other.
+
+An agent reaches the subagents it moved, and those nested in a call it
+moved, until they end. Like `stop(ctx, id)`, it never reaches what
+another agent moved.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) The tool handler's ctx.
+- `{id}` (`string`) Task id, from its receipt.
+- `{text}` (`string`) The message.
+- `{opts?}` (`table?`) Optional fields:
+  - `interrupt` (`boolean?`) cut its current turn short. Default: `false`.
+
+**Returns:** (`table|nil`, `string|nil`) `{name}`, the task's name in `/tasks`, or
+  nil and `"no running background subagent with id <id>"`.
+
+**Example:**
+
+```lua
+local sent, err = maki.task.send(ctx, input.id, input.message)
+if not sent then return { llm_output = err, is_error = true } end
+return "Message queued for " .. sent.name .. "."
+```
+
+---
+
+### `maki.task.messages()` {#maki-task-messages}
+
+```lua
+maki.task.messages({ctx}, {id}, {opts?})
+```
+
+Reads the transcript of a background subagent that the calling agent
+moved, oldest first, while it works. The messages have the shape
+`maki.session.messages` returns. It reaches what `send(ctx, id)` does.
+Works without an interactive UI.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) The tool handler's ctx.
+- `{id}` (`string`) Task id, from its receipt.
+- `{opts?}` (`table?`) `last` (integer?) only the newest `last` messages.
+
+**Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and
+  `"no running background subagent with id <id>"`.
+
+**Example:**
+
+```lua
+local msgs = maki.task.messages(ctx, input.id, { last = 1 })
+local last = msgs and msgs[1]
+if last and last.content[1].type == "text" then
+  print(last.content[1].text)
+end
+```
+
 
 ## maki.text {#maki-text}
 
-Text utilities: format conversion and the fuzzy matcher the built-in
-pickers use.
+Text utilities: format conversion, UTF-8 decoding and the fuzzy matcher
+the built-in pickers use.
 
 ```lua
 local md = maki.text.html_to_markdown(html)
+local text = maki.text.to_utf8(bytes)
 local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
 ```
 
@@ -5740,6 +5849,7 @@ maki.text.html_to_markdown({html})
 
 Convert an HTML string to Markdown.
 Useful for cleaning up web content fetched with `maki.webfetch`.
+Invalid UTF-8 becomes U+FFFD.
 
 **Parameters:**
 
@@ -5753,6 +5863,34 @@ Useful for cleaning up web content fetched with `maki.webfetch`.
 local md, err = maki.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
 if err then return end
 print(md) -- "# Hello\n\nworld"
+```
+
+---
+
+### `maki.text.to_utf8()` {#maki-text-to_utf8}
+
+```lua
+maki.text.to_utf8({s})
+```
+
+Return {s} as valid UTF-8, with every invalid byte sequence replaced by
+U+FFFD. Lua strings are bytes, and `maki.net` and `maki.fs` hand them over
+as-is, so decode before measuring or cutting a body as text. An invalid
+byte can grow to 3 bytes, so a cut made before decoding can triple in size.
+
+Needs no plugin permission.
+
+**Parameters:**
+
+- `{s}` (`string`) Bytes to decode.
+
+**Returns:** (`string`) Valid UTF-8 text, `s` itself when it already is.
+
+**Example:**
+
+```lua
+local resp = maki.net.request(url)
+local text = maki.text.to_utf8(resp.body)
 ```
 
 ---
@@ -7236,7 +7374,8 @@ Looks up a named style from the current theme. The names are the ones a span
 already takes as a string ("dim", "item_selected", "keybind_section",
 "diff_old", ...), so `{ text, "dim" }` and `theme_style("dim")` paint the
 same. Reach for the table when you need the parts, say to keep a style's
-foreground over a background of your own.
+foreground over a background of your own. A span styled "cursor" also marks
+the caret of a focused window, see the `focus` option of `maki.ui.open_win`.
 
 **Parameters:**
 
@@ -7278,7 +7417,7 @@ every case.
 - `{lang}` (`string`) Language identifier, e.g. "rust", "python".
 - `{opts?}` (`table?`) Options. Fields:
   - `independent` (`boolean`) highlight each line without cross-line context. Default false.
-  - `prefix` (`string`) preceding source used as token context. Only the nearest lines fitting within 16 KiB are parsed, so earlier comments or strings may affect coloring. Default "".
+  - `prefix` (`string`) the lines before `code`, used as token context. A trailing newline is optional. Only the nearest lines fitting within 16 KiB are parsed, so a comment or string opened before them is missed. Default "".
 
 **Returns:** (`table`) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
 
@@ -7604,7 +7743,7 @@ session, closing the tab), or right away if the session is not in any tab.
   - `reserved_bottom` (`integer`) rows reserved at the bottom of the content area. Default 0.
   - `split` (`string`) dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
   - `order` (`integer`) paint order among split windows at the same edge. Default 50.
-  - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
+  - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true. A focused window parks the terminal cursor on its first span styled `cursor`, which is where an input method (IME) shows the text being composed. With no such span on screen, the cursor is not parked.
   - `keys` (`table`) keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. `maki.keymap.set` with `{ buffer = buf }` is the newer way to give a popup keys, with a handler per key, a mode, and `ev.fallback()`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or global `maki.keymap.set` bindings. The window's buffer bindings are asked first. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
   - `visible` (`boolean`) whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
@@ -8239,6 +8378,8 @@ or a palette index as a string like "4". Names must be spelled exactly,
 hyphens included. Named and indexed colors are left for the terminal to
 resolve, so they follow the user's palette. To mix a named style with colors
 of your own, `maki.ui.theme_style` hands back its parts.
+
+Invalid UTF-8 shows as U+FFFD.
 
 **Parameters:**
 
@@ -8951,6 +9092,9 @@ function ToolView.line_nr_fmt(max_line_nr)
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,
 -- max_line_bytes (optional) per-line byte cap. Lines are stored already cut,
 -- so a run of huge lines costs no more than short ones while kept for expansion.
+-- With max_lines 0 only the set_header lines show until a click expands the
+-- view. The UI puts the line count in the tool header, so the row still says
+-- how much is hidden.
 function ToolView.new(buf, opts)
 function ToolView:set_header(lines)
 function ToolView:clear()

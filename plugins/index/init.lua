@@ -108,21 +108,11 @@ local function apply_highlights(view, hl_entries, ext)
   view:flush()
 end
 
-local function render_header(path, line_count)
-  local buf = maki.ui.buf()
-  local spans = { { shorten_path(path), "path" } }
-  if line_count then
-    spans[#spans + 1] = { " (" .. line_count .. " lines)", "dim" }
-  end
-  buf:line(spans)
-  return buf
-end
-
-local function render_index(skeleton, path, ctx, ext, line_meta)
+local function render_index(skeleton, ctx, ext, line_meta)
   local tol = ctx:tool_output_lines()
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, {
-    max_lines = (tol and tol.index) or 5,
+    max_lines = (tol and tol.index) or 0,
     keep = "head",
   })
   buf:on("click", function()
@@ -136,9 +126,7 @@ local function render_index(skeleton, path, ctx, ext, line_meta)
       apply_highlights(view, hl_entries, ext)
     end)
   end
-
-  local line_count = select(2, skeleton:gsub("\n", "\n")) + 1
-  return buf, render_header(path, line_count)
+  return buf
 end
 
 maki.api.register_prompt_hint({
@@ -169,19 +157,23 @@ Return a compact overview of a source file: imports, type definitions, function 
     },
   },
   header = function(input)
-    return render_header(input.path)
+    local buf = maki.ui.buf()
+    buf:line({ { shorten_path(input.path or ""), "path" } })
+    return buf
   end,
-  restore = function(input, output, _is_error, ctx)
+  restore = function(input, output, is_error, ctx)
+    if is_error then
+      return nil
+    end
     local meta = input.path and maki.fs.metadata(input.path :: string)
     if meta and meta.is_dir then
-      return { body = dir_listing.view(output, ctx) }
+      return dir_listing.view(output, ctx)
     end
     local ext = input.path:match("%.([^%.]+)$") or ""
-    local buf, header = render_index(output, input.path, ctx, ext)
-    return { body = buf, header = header }
+    return render_index(output, ctx, ext)
   end,
   handler = function(input, ctx)
-    local path = input.path
+    local path: string? = input.path
     if not path then
       return { llm_output = "error: path is required", is_error = true }
     end
@@ -240,11 +232,9 @@ Return a compact overview of a source file: imports, type definitions, function 
     end
 
     local ext = path:match("%.([^%.]+)$") or indexer.LANG_TO_EXT[lang] or ""
-    local buf, header = render_index(skeleton, path, ctx, ext, line_meta)
     return {
       llm_output = skeleton:gsub("\n+$", ""),
-      body = buf,
-      header = header,
+      body = render_index(skeleton, ctx, ext, line_meta),
     }
   end,
 })

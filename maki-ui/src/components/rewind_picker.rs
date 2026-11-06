@@ -156,10 +156,9 @@ impl RewindPicker {
         self.disarm_if_moved();
     }
 
-    pub fn handle_paste(&mut self, text: &str) -> bool {
-        let handled = self.picker.handle_paste(text);
+    pub fn handle_paste(&mut self, text: &str) {
+        self.picker.handle_paste(text);
         self.disarm_if_moved();
-        handled
     }
 
     /// The confirmation is for the entry it was shown on. Coming back to
@@ -198,7 +197,7 @@ impl RewindPicker {
         }
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> (Rect, Option<Position>) {
         self.picker.view(frame, area)
     }
 }
@@ -226,6 +225,7 @@ mod tests {
     use super::*;
     use crate::components::buffer_text;
     use crossterm::event::KeyModifiers;
+    use maki_agent::USER_CANCEL_MARKER;
     use maki_providers::ContentBlock;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -234,6 +234,7 @@ mod tests {
     const RECEIPT_ID: &str = "toolu_moved";
     const OTHER_RECEIPT_ID: &str = "toolu_moved_too";
     const TASK_NAME: &str = "cargo test";
+    const LATER_TURN_FILTER: &str = "second";
 
     fn user_msg(text: &str) -> Message {
         Message::user(text.into())
@@ -313,7 +314,7 @@ mod tests {
             Message::observation("build failed".into()),
             user_msg("real prompt"),
             assistant_msg(),
-            Message::synthetic("[Cancelled by user]".into()),
+            Message::synthetic(USER_CANCEL_MARKER.into()),
         ];
         picker.open(&msgs, &[]).unwrap();
         let item = picker.picker.selected_item().unwrap();
@@ -451,18 +452,29 @@ mod tests {
         assert!(screen.contains(CONFIRM_PREFIX.trim_end()), "{screen}");
     }
 
-    #[test]
-    fn moving_off_the_armed_entry_asks_again_on_return() {
+    #[test_case(|picker: &mut RewindPicker| { press(picker, KeyCode::Up); } ; "a_key")]
+    #[test_case(|picker: &mut RewindPicker| picker.handle_paste(LATER_TURN_FILTER) ; "a_paste")]
+    fn moving_off_the_armed_entry_disarms_it(move_off: fn(&mut RewindPicker)) {
         let mut picker = picker_with_receipt_in_first_turn();
         press(&mut picker, KeyCode::Down);
         press(&mut picker, KeyCode::Enter);
         assert_eq!(picker.armed, Some(0));
 
-        press(&mut picker, KeyCode::Up);
+        move_off(&mut picker);
+
         assert_eq!(picker.armed, None);
         assert_eq!(picker.picker.alert_text(), None);
+    }
 
+    #[test]
+    fn coming_back_to_the_armed_entry_asks_again() {
+        let mut picker = picker_with_receipt_in_first_turn();
         press(&mut picker, KeyCode::Down);
+        press(&mut picker, KeyCode::Enter);
+
+        press(&mut picker, KeyCode::Up);
+        press(&mut picker, KeyCode::Down);
+
         assert!(matches!(
             press(&mut picker, KeyCode::Enter),
             RewindPickerAction::Consumed

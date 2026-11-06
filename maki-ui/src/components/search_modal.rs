@@ -1,18 +1,18 @@
 use std::cmp::Reverse;
 
-use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::messages::ScrollPos;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::{Overlay, render_field};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -194,9 +194,9 @@ impl SearchModal {
         self.matches.get(self.selected).map(|m| m.segment_index)
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> (Rect, Option<Position>) {
         if !self.open {
-            return Rect::default();
+            return (Rect::default(), None);
         }
 
         let content_rows = if self.matches.is_empty() && !self.search.value().is_empty() {
@@ -219,14 +219,14 @@ impl SearchModal {
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
         self.render_list(frame, list_area, viewport_h);
-        self.render_search(frame, search_area);
+        let caret = self.render_search(frame, search_area);
 
         let total = self.matches.len() as u32;
         if total > viewport_h as u32 {
             render_vertical_scrollbar(frame, list_area, total, self.scroll_offset as u32);
         }
 
-        popup
+        (popup, caret)
     }
 
     fn render_list(&self, frame: &mut Frame, area: Rect, viewport_height: usize) {
@@ -260,22 +260,16 @@ impl SearchModal {
         frame.render_widget(Paragraph::new(lines), area);
     }
 
-    fn render_search(&self, frame: &mut Frame, area: Rect) {
+    fn render_search(&self, frame: &mut Frame, area: Rect) -> Option<Position> {
         let t = theme::current();
-        let query = self.search.value();
-        let cursor_byte = TextBuffer::char_to_byte(query, self.search.x());
-        let (before, rest) = query.split_at(cursor_byte);
-        let mut chars = rest.chars();
-        let cursor_char = chars.next().unwrap_or(' ');
-        let after = chars.as_str();
-
-        let line = Line::from(vec![
-            Span::styled(SEARCH_PREFIX, t.tool_dim),
-            Span::styled(before.to_owned(), Style::default()),
-            Span::styled(cursor_char.to_string(), t.cursor),
-            Span::styled(after.to_owned(), Style::default()),
-        ]);
-        frame.render_widget(Paragraph::new(vec![line]), area);
+        render_field(
+            frame,
+            area,
+            vec![Span::styled(SEARCH_PREFIX, t.tool_dim)],
+            self.search.value(),
+            self.search.cursor_byte(),
+            t.cursor,
+        )
     }
 }
 

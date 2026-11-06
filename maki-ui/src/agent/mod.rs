@@ -8,24 +8,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use maki_agent::mcp::McpSession;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
-    AgentConfig, CancelMap, Envelope, HistorySnapshot, McpCommand, McpConfigErrors, McpHandle,
-    McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
+    AgentConfig, AgentSeed, CancelMap, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
+    McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
 
 use self::run_cancels::RunCancels;
-use maki_providers::Message;
+use maki_providers::{Message, Timeouts};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{info, warn};
 
 use crate::app::App;
 
-use self::agent_loop::AgentLoop;
+use self::agent_loop::{AgentLoop, LoopEnds};
 pub(crate) use self::model_slots::ModelSlots;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 pub(crate) use maki_agent::ModelSlot;
@@ -41,6 +42,42 @@ pub(crate) enum Respawn {
     Load,
 }
 
+/// What every loop a tab spawns shares: MCP is started once by the event
+/// loop and shut down at exit, so a respawn hands these on as they are.
+#[derive(Clone)]
+pub(crate) struct AgentDeps {
+    pub(crate) mcp_handle: Option<McpHandle>,
+    pub(crate) mcp_config_errors: McpConfigErrors,
+    pub(crate) timeouts: Timeouts,
+    pub(crate) model_policy: Arc<ModelPolicy>,
+}
+
+impl AgentDeps {
+    fn seed(
+        &self,
+        resumed: &Resumed,
+        model_slot: &Arc<ArcSwap<ModelSlot>>,
+        config: AgentConfig,
+        tool_output_lines: ToolOutputLines,
+        permissions: &Arc<PermissionManager>,
+    ) -> AgentSeed {
+        let mcp = self
+            .mcp_handle
+            .clone()
+            .map(|handle| McpSession::new(handle, &resumed.history));
+        AgentSeed::new(
+            resumed.id.clone(),
+            Arc::clone(model_slot),
+            config,
+            tool_output_lines,
+            Arc::clone(permissions),
+            mcp,
+            self.timeouts,
+            Arc::clone(&self.model_policy),
+        )
+    }
+}
+
 /// Input channels (`answer_tx`, `queue`) are per-agent, so an old loop can
 /// never steal new input. The output channel (`agent_tx`/`agent_rx`) is
 /// per-tab: `respawn` reuses it, so anyone still holding a sender (a Lua
@@ -51,51 +88,32 @@ pub(crate) struct AgentHandles {
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedMessages,
-    pub(crate) mcp_handle: Option<McpHandle>,
-    pub(crate) mcp_config_errors: McpConfigErrors,
+    pub(crate) deps: AgentDeps,
     pub(crate) queue: QueueSender,
-    pub(crate) timeouts: maki_providers::Timeouts,
     cancels: Arc<RunCancels>,
     subagent_cancels: Arc<CancelMap<String>>,
-    model_policy: Arc<ModelPolicy>,
     mailbox: SessionMailbox,
     task: AbortOnDropHandle<()>,
 }
 
 impl AgentHandles {
-    /// MCP is shared across sessions and agent respawns; the event loop starts it
-    /// once and shuts it down at exit. Only the agent loop task lives here.
-    #[allow(clippy::too_many_arguments)]
+    /// Only the agent loop task lives here, see [`AgentDeps`].
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         resumed: Resumed,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
-        timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
-        mcp_handle: Option<McpHandle>,
-        mcp_config_errors: McpConfigErrors,
-        model_policy: Arc<ModelPolicy>,
+        deps: AgentDeps,
     ) -> Self {
-        spawn_agent_internal(
-            flume::unbounded(),
-            model_slot,
-            resumed,
-            config,
-            tool_output_lines,
-            permissions,
-            mcp_handle,
-            mcp_config_errors,
-            timeouts,
-            lua_handle,
-            model_policy,
-            false,
-        )
+        let seed = deps.seed(&resumed, model_slot, config, tool_output_lines, permissions);
+        spawn_agent_internal(flume::unbounded(), seed, resumed, lua_handle, deps, false)
     }
 
     pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
-        self.mcp_handle
+        self.deps
+            .mcp_handle
             .as_ref()
             .map(McpHandle::reader)
             .unwrap_or_else(McpSnapshotReader::empty)
@@ -141,55 +159,51 @@ impl AgentHandles {
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {
-        if let Some(ref h) = self.mcp_handle {
+        if let Some(ref h) = self.deps.mcp_handle {
             h.send(cmd);
         }
-    }
-
-    pub(crate) fn claim_mailbox_wake(&self) -> Vec<Message> {
-        self.mailbox.claim_wake()
     }
 
     pub(crate) fn mailbox(&self) -> &SessionMailbox {
         &self.mailbox
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// The new loop runs under the app's permissions and Lua handle.
     pub(crate) fn respawn(
         &mut self,
         history: Vec<Message>,
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
-        permissions: &Arc<PermissionManager>,
         app: &mut App,
-        lua_handle: EventHandle,
         reason: Respawn,
     ) {
         // The output channel survives the respawn, so this bump is the only
         // thing that makes the old loop's in-flight envelopes stale. It lives
         // here so no caller can respawn without it.
         app.run_id += 1;
-        let new = spawn_agent_internal(
-            (self.agent_tx.clone(), self.agent_rx.clone()),
+        let resumed = Resumed {
+            id: SessionRef::from(app.state.session.id),
+            history,
+            // A respawn carries the app's last reported count across, so
+            // the next request is not left guessing at its own prompt.
+            context_size: app.state.context_size,
+            frame: app.state.session.frame().cloned(),
+            session: None,
+        };
+        let seed = self.deps.seed(
+            &resumed,
             model_slot,
-            Resumed {
-                id: SessionRef::from(app.state.session.id),
-                history,
-                // A respawn carries the app's last reported count across, so
-                // the next request is not left guessing at its own prompt.
-                context_size: app.state.context_size,
-                frame: app.state.session.frame().cloned(),
-                session: None,
-            },
             config,
             tool_output_lines,
-            permissions,
-            self.mcp_handle.clone(),
-            self.mcp_config_errors.clone(),
-            self.timeouts,
-            lua_handle,
-            Arc::clone(&self.model_policy),
+            &app.permissions,
+        );
+        let new = spawn_agent_internal(
+            (self.agent_tx.clone(), self.agent_rx.clone()),
+            seed,
+            resumed,
+            app.lua_event_handle.clone(),
+            self.deps.clone(),
             true,
         );
         let old = mem::replace(self, new);
@@ -235,24 +249,16 @@ pub(crate) async fn join_all(tasks: Vec<AbortOnDropHandle<()>>, timeout: Duratio
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
-    model_slot: &Arc<ArcSwap<ModelSlot>>,
+    seed: AgentSeed,
     resumed: Resumed,
-    config: AgentConfig,
-    tool_output_lines: ToolOutputLines,
-    permissions: &Arc<PermissionManager>,
-    mcp_handle: Option<McpHandle>,
-    mcp_config_errors: McpConfigErrors,
-    timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
-    model_policy: Arc<ModelPolicy>,
+    deps: AgentDeps,
     reload_auth: bool,
 ) -> AgentHandles {
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
-    let queue_rx = Arc::new(queue_rx);
     // Seeded empty because `AgentLoop::new` below publishes the real snapshot
     // synchronously, before any handle escapes.
     let shared_history: SharedMessages =
@@ -262,26 +268,22 @@ fn spawn_agent_internal(
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let mailbox = SessionMailbox::register(resumed.id.id());
 
-    let agent_loop = AgentLoop::new(
-        Arc::clone(model_slot),
-        config,
-        tool_output_lines,
-        resumed,
-        Arc::clone(&shared_history),
-        mcp_handle.clone(),
-        Arc::clone(permissions),
-        agent_tx.clone(),
-        answer_rx,
-        queue_rx,
-        Arc::clone(&cancels),
-        mailbox.clone(),
-        timeouts,
-        lua_handle,
-        Arc::clone(&subagent_cancels),
-        Arc::clone(&model_policy),
-    );
+    let provider = Arc::clone(&seed.model_slot.load().provider);
 
-    let provider = Arc::clone(&model_slot.load().provider);
+    let agent_loop = AgentLoop::new(
+        seed,
+        resumed,
+        LoopEnds {
+            shared_history: Arc::clone(&shared_history),
+            agent_tx: agent_tx.clone(),
+            answer_rx,
+            queue: Arc::new(queue_rx),
+            cancels: Arc::clone(&cancels),
+            mailbox: mailbox.clone(),
+            subagent_cancels: Arc::clone(&subagent_cancels),
+        },
+        lua_handle,
+    );
     let task = AbortOnDropHandle::new(tokio::spawn(async move {
         // A loop respawned after a login runs on the new credentials from
         // its first request on.
@@ -296,13 +298,10 @@ fn spawn_agent_internal(
         agent_tx,
         answer_tx,
         history: shared_history,
-        mcp_handle,
-        mcp_config_errors,
+        deps,
         queue: queue_tx,
-        timeouts,
         cancels,
         subagent_cancels,
-        model_policy,
         mailbox,
         task,
     }
@@ -317,7 +316,8 @@ mod tests {
 
     use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
     use maki_agent::{AgentEvent, AgentInput, AgentMode, AgentSeed, InputSource};
-    use maki_config::{PermissionsConfig, ProjectConfig};
+    use maki_config::PermissionsConfig;
+    use maki_config::project::{self, TrustMode};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, TaskEnd,
@@ -368,40 +368,39 @@ mod tests {
         }
     }
 
-    fn stub_spawn() -> (
-        AgentHandles,
-        Arc<ArcSwap<ModelSlot>>,
-        Arc<PermissionManager>,
-    ) {
+    fn stub_spawn() -> (AgentHandles, Arc<ArcSwap<ModelSlot>>) {
         stub_spawn_with(Vec::new())
     }
 
-    fn stub_spawn_with(
-        initial_history: Vec<Message>,
-    ) -> (
-        AgentHandles,
-        Arc<ArcSwap<ModelSlot>>,
-        Arc<PermissionManager>,
-    ) {
+    fn stub_spawn_with(initial_history: Vec<Message>) -> (AgentHandles, Arc<ArcSwap<ModelSlot>>) {
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: crate::components::test_model(),
             provider: Arc::new(StubProvider),
         }));
-        let (handles, permissions) = spawn_on(&model_slot, initial_history);
-        (handles, model_slot, permissions)
+        let handles = spawn_on(&model_slot, initial_history);
+        (handles, model_slot)
+    }
+
+    fn test_deps() -> AgentDeps {
+        AgentDeps {
+            mcp_handle: None,
+            mcp_config_errors: McpConfigErrors::new(PathBuf::new()),
+            timeouts: Timeouts::default(),
+            model_policy: Arc::new(ModelPolicy::default()),
+        }
     }
 
     fn spawn_on(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         initial_history: Vec<Message>,
-    ) -> (AgentHandles, Arc<PermissionManager>) {
+    ) -> AgentHandles {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
+            project::resolve_noninteractive(Path::new("/tmp"), TrustMode::Session).project_config,
             Arc::default(),
         ));
-        let handles = AgentHandles::spawn(
+        AgentHandles::spawn(
             model_slot,
             Resumed {
                 history: initial_history,
@@ -410,31 +409,30 @@ mod tests {
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
-            maki_providers::Timeouts::default(),
             EventHandle::disconnected_for_test(),
-            None,
-            McpConfigErrors::new(PathBuf::new()),
-            Arc::new(ModelPolicy::default()),
-        );
-        (handles, permissions)
+            test_deps(),
+        )
     }
 
-    fn respawn(
+    fn respawn_with(
         handles: &mut AgentHandles,
+        history: Vec<Message>,
         model_slot: &Arc<ArcSwap<ModelSlot>>,
-        permissions: &Arc<PermissionManager>,
         app: &mut App,
+        reason: Respawn,
     ) {
         handles.respawn(
-            Vec::new(),
+            history,
             model_slot,
             AgentConfig::default(),
             ToolOutputLines::default(),
-            permissions,
             app,
-            EventHandle::disconnected_for_test(),
-            Respawn::Restart,
+            reason,
         );
+    }
+
+    fn respawn(handles: &mut AgentHandles, model_slot: &Arc<ArcSwap<ModelSlot>>, app: &mut App) {
+        respawn_with(handles, Vec::new(), model_slot, app, Respawn::Restart);
     }
 
     /// Reports which model the agent handed it, then ends the turn with a
@@ -562,8 +560,8 @@ mod tests {
         let (provider_two, reported_two) = recorder();
         let cell_one = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_one)));
         let cell_two = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_two)));
-        let (handles_one, _permissions_one) = spawn_on(&cell_one, Vec::new());
-        let (handles_two, _permissions_two) = spawn_on(&cell_two, Vec::new());
+        let handles_one = spawn_on(&cell_one, Vec::new());
+        let handles_two = spawn_on(&cell_two, Vec::new());
 
         cell_one.store(slot(MODEL_B, &provider_one));
 
@@ -586,9 +584,9 @@ mod tests {
         let _runtime = enter_runtime();
         let (provider, reported) = recorder();
         let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
-        let (mut handles, permissions) = spawn_on(&cell, Vec::new());
+        let mut handles = spawn_on(&cell, Vec::new());
         let mut app = crate::app::tests::test_app();
-        respawn(&mut handles, &cell, &permissions, &mut app);
+        respawn(&mut handles, &cell, &mut app);
 
         cell.store(slot(MODEL_B, &provider));
         assert_eq!(
@@ -605,7 +603,7 @@ mod tests {
         let _runtime = enter_runtime();
         let (provider, reported, release) = gated_recorder();
         let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
-        let (handles, _permissions) = spawn_on(&cell, Vec::new());
+        let handles = spawn_on(&cell, Vec::new());
 
         push_prompt(&handles, 1, FIRST_PROMPT);
         let in_flight = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
@@ -630,17 +628,17 @@ mod tests {
     #[test]
     fn respawn_twice_keeps_channel_and_delivers_restored_queue() {
         let _runtime = enter_runtime();
-        let (mut handles, model_slot, permissions) = stub_spawn();
+        let (mut handles, model_slot) = stub_spawn();
         let pre_gen1_sender =
             maki_agent::EventSender::new(handles.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
 
         let mut app = crate::app::tests::test_app();
         let run_id_before = app.run_id;
-        respawn(&mut handles, &model_slot, &permissions, &mut app);
+        respawn(&mut handles, &model_slot, &mut app);
         assert_eq!(app.run_id, run_id_before + 1);
 
         app.state.session_mut().meta.queued_messages = vec![RESTORED_TEXT.into()];
-        respawn(&mut handles, &model_slot, &permissions, &mut app);
+        respawn(&mut handles, &model_slot, &mut app);
         assert_eq!(
             app.run_id,
             run_id_before + 2,
@@ -682,7 +680,7 @@ mod tests {
     #[test]
     fn spawn_publishes_the_resumed_history_before_the_handles_escape() {
         let _runtime = enter_runtime();
-        let (handles, _model_slot, _permissions) =
+        let (handles, _model_slot) =
             stub_spawn_with(vec![Message::user(RESUMED_HISTORY_TEXT.into())]);
         let snapshot = handles.history.load();
         assert_eq!(
@@ -696,16 +694,13 @@ mod tests {
     #[test]
     fn respawn_publishes_the_new_history_into_the_app_mirror() {
         let _runtime = enter_runtime();
-        let (mut handles, model_slot, permissions) = stub_spawn();
+        let (mut handles, model_slot) = stub_spawn();
         let mut app = crate::app::tests::test_app();
-        handles.respawn(
+        respawn_with(
+            &mut handles,
             vec![Message::user(RESUMED_HISTORY_TEXT.into())],
             &model_slot,
-            AgentConfig::default(),
-            ToolOutputLines::default(),
-            &permissions,
             &mut app,
-            EventHandle::disconnected_for_test(),
             Respawn::Restart,
         );
 
@@ -731,22 +726,13 @@ mod tests {
         let _runtime = enter_runtime();
         let (provider, _reported) = recorder();
         let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
-        let (mut handles, permissions) = spawn_on(&cell, Vec::new());
+        let mut handles = spawn_on(&cell, Vec::new());
         let mut app = crate::app::tests::test_app();
         let meta = &mut app.state.session_mut().meta;
         meta.pending_background = vec![LOST_ID.into()];
         meta.queued_messages = vec![RESTORED_TEXT.into()];
 
-        handles.respawn(
-            Vec::new(),
-            &cell,
-            AgentConfig::default(),
-            ToolOutputLines::default(),
-            &permissions,
-            &mut app,
-            EventHandle::disconnected_for_test(),
-            reason,
-        );
+        respawn_with(&mut handles, Vec::new(), &cell, &mut app, reason);
 
         let mut observed = false;
         loop {
@@ -770,12 +756,12 @@ mod tests {
     #[test]
     fn a_respawned_seed_starts_with_the_chat_settings() {
         let _runtime = enter_runtime();
-        let (mut handles, model_slot, permissions) = stub_spawn();
+        let (mut handles, model_slot) = stub_spawn();
         let mut app = crate::app::tests::test_app();
         app.set_mode(Mode::Plan);
         app.state.thinking = ThinkingConfig::Adaptive;
 
-        respawn(&mut handles, &model_slot, &permissions, &mut app);
+        respawn(&mut handles, &model_slot, &mut app);
         let id = app.state.session.id;
         let seed = AgentSeed::live(id).expect(SEED_NOT_LIVE);
         assert_eq!(seed.chat_opts(), app.request_options());

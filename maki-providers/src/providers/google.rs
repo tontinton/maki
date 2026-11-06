@@ -15,6 +15,7 @@ use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
+use crate::providers::openai_compat::assistant_response;
 use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
     sends_as_chosen,
@@ -25,8 +26,7 @@ use crate::{
 };
 
 use super::{
-    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, body_reader, http_client, next_sse_line,
-    ok_text, send_request,
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line, ok_sse, ok_text,
 };
 
 pub(crate) const SLUG: &str = "google";
@@ -61,6 +61,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: sends_as_chosen,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/google.toml"),
@@ -260,12 +261,8 @@ impl Google {
             .body(json_body)
             .build()?;
 
-        send_request(&self.client, request, |response| async move {
-            if response.status().as_u16() == 200 {
-                parse_sse(body_reader(response), event_tx, self.stream_timeout).await
-            } else {
-                Err(AgentError::from_response(response).await)
-            }
+        ok_sse(&self.client, request, |body| {
+            parse_sse(body, event_tx, self.stream_timeout)
         })
         .await
     }
@@ -329,11 +326,7 @@ impl Provider for Google {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Raw(API_KEY_HEADER),
-        ))
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Raw(API_KEY_HEADER))
     }
 }
 
@@ -465,38 +458,28 @@ fn convert_tools(tools: &Value) -> Vec<Value> {
                 "description": description,
             });
             if let Some(parameters) = tool_parameters(t) {
-                decl["parameters"] = parameters;
+                decl["parametersJsonSchema"] = parameters;
             }
             Some(decl)
         })
         .collect()
 }
 
+/// The schema goes out as `parametersJsonSchema`, which takes JSON Schema as
+/// is. The older `parameters` field knows only Gemini's OpenAPI subset and 400s
+/// on every other key (`additionalProperties`, `$schema`, MCP's `x-mcp-header`),
+/// so MCP servers kept tripping it one key at a time.
+///
 /// Gemini turns down an object schema that lists no properties, while MiniMax
 /// turns down a bare `{}`, so no single payload pleases both. A tool that takes
-/// no arguments simply travels here without `parameters`.
+/// no arguments simply travels here without a schema.
 fn tool_parameters(tool: &Value) -> Option<Value> {
     let schema = tool.get("input_schema")?;
     let has_properties = schema
         .get("properties")
         .and_then(Value::as_object)
         .is_some_and(|props| !props.is_empty());
-    has_properties.then(|| strip_additional_properties(schema.clone()))
-}
-
-fn strip_additional_properties(value: Value) -> Value {
-    match value {
-        Value::Object(mut map) => {
-            map.remove("additionalProperties");
-            map.values_mut()
-                .for_each(|v| *v = strip_additional_properties(std::mem::take(v)));
-            Value::Object(map)
-        }
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(strip_additional_properties).collect())
-        }
-        other => other,
-    }
+    has_properties.then(|| schema.clone())
 }
 
 fn tool_defs_empty(tool_decls: &[Value]) -> bool {
@@ -540,13 +523,13 @@ struct SseFunctionCall {
 #[serde(rename_all = "camelCase")]
 struct SseUsageMetadata {
     #[serde(default)]
-    prompt_token_count: u32,
+    prompt_token_count: u64,
     #[serde(default)]
-    candidates_token_count: u32,
+    candidates_token_count: u64,
     #[serde(default)]
-    thoughts_token_count: u32,
+    thoughts_token_count: u64,
     #[serde(default)]
-    cached_content_token_count: Option<u32>,
+    cached_content_token_count: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -698,16 +681,7 @@ async fn parse_sse(
         }
     }
 
-    Ok(StreamResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: content_blocks,
-            ..Default::default()
-        },
-        usage,
-        stop_reason,
-        ..Default::default()
-    })
+    Ok(assistant_response(content_blocks, usage, stop_reason))
 }
 
 #[cfg(test)]
@@ -781,27 +755,40 @@ mod tests {
         let decls = convert_tools(&tools);
         assert_eq!(decls[0]["name"], json!(TOOL_NAME));
         assert_eq!(
-            decls[0].get("parameters"),
+            decls[0].get("parametersJsonSchema"),
             None,
             "{EMPTY_PROPERTIES_REJECTED}"
         );
     }
 
     #[test]
-    fn convert_tools_keeps_populated_parameters() {
+    fn convert_tools_sends_input_schema_as_json_schema() {
+        let input_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                PATH_PROP: {"type": "string", "x-mcp-header": "Path"},
+                "opts": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"verbose": {"type": "boolean"}}
+                }
+            },
+            "additionalProperties": false,
+        });
         let tools = json!([{
             "name": TOOL_NAME,
             "description": TOOL_DESCRIPTION,
-            "input_schema": {
-                "type": "object",
-                "properties": { PATH_PROP: {"type": "string"} },
-                "additionalProperties": false,
-            },
+            "input_schema": input_schema,
         }]);
         let decls = convert_tools(&tools);
         assert_eq!(
-            decls[0]["parameters"],
-            json!({"type": "object", "properties": { PATH_PROP: {"type": "string"} }})
+            decls[0],
+            json!({
+                "name": TOOL_NAME,
+                "description": TOOL_DESCRIPTION,
+                "parametersJsonSchema": input_schema,
+            })
         );
     }
 
@@ -1069,82 +1056,6 @@ mod tests {
         assert_eq!(parts[1]["inlineData"]["mimeType"], "image/webp");
     }
 
-    #[test]
-    fn convert_tools_basic() {
-        let tools = json!([{
-            "name": "bash",
-            "description": "run a command",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "cmd": {"type": "string", "additionalProperties": false},
-                    "opts": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {"verbose": {"type": "boolean"}}
-                    }
-                },
-                "additionalProperties": false
-            }
-        }]);
-        let result = convert_tools(&tools);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["name"], "bash");
-        assert_eq!(result[0]["description"], "run a command");
-        assert!(result[0]["parameters"]["properties"]["cmd"].is_object());
-        assert!(
-            result[0]["parameters"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            result[0]["parameters"]["properties"]["cmd"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            result[0]["parameters"]["properties"]["opts"]
-                .get("additionalProperties")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn strip_additional_properties_recursive() {
-        let schema = json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "inner": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {"x": {"type": "number", "additionalProperties": false}}
-                },
-                "list": {
-                    "type": "array",
-                    "items": {"type": "string", "additionalProperties": false}
-                }
-            }
-        });
-        let cleaned = strip_additional_properties(schema);
-        assert!(cleaned.get("additionalProperties").is_none());
-        assert!(
-            cleaned["properties"]["inner"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            cleaned["properties"]["inner"]["properties"]["x"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            cleaned["properties"]["list"]["items"]
-                .get("additionalProperties")
-                .is_none()
-        );
-    }
-
     #[tokio::test]
     async fn parse_sse_plain_text() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":10}}\n\n";
@@ -1292,7 +1203,7 @@ mod tests {
     #[test_case(Some(100), 0 ; "fully_cached")]
     #[test_case(Some(150), 0 ; "cache_exceeds_prompt")]
     #[tokio::test]
-    async fn parse_sse_cached_tokens(cached: Option<u32>, expected_input: u32) {
+    async fn parse_sse_cached_tokens(cached: Option<u64>, expected_input: u64) {
         let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
         if let Some(cached) = cached {
             metadata["cachedContentTokenCount"] = json!(cached);
@@ -1311,9 +1222,9 @@ mod tests {
     #[test_case(Some(25), 75, 25 ; "present_cache_replaces_previous")]
     #[tokio::test]
     async fn parse_sse_cached_tokens_across_chunks(
-        cached: Option<u32>,
-        expected_input: u32,
-        expected_cache_read: u32,
+        cached: Option<u64>,
+        expected_input: u64,
+        expected_cache_read: u64,
     ) {
         let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
         if let Some(cached) = cached {

@@ -17,7 +17,7 @@ use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_ui::{OpenSession, RunOutcome};
 
-use crate::cli::{Cli, normalize_tool_name};
+use crate::cli::Cli;
 use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
@@ -100,19 +100,10 @@ fn load_config(
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
     }
-    if !cli.allowed_tools.is_empty() {
-        config.agent.allowed_tools = cli
-            .allowed_tools
-            .iter()
-            .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
-    }
-    if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
+    cli.apply_tool_flags(&mut config.agent)?;
+    // `-p` and SDK mode only: a turn cap would cut an interactive session short.
+    if cli.print {
+        config.agent.max_turns = cli.max_turns;
     }
     config.validate()?;
     Ok(config)
@@ -184,7 +175,8 @@ async fn build_stack(
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
     setup::remember_thinking(&mut config.session_defaults, launch.storage);
-    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
+    let model_result =
+        setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage).await;
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok((m, warning)), _) => {
             warnings.extend(warning);
@@ -290,7 +282,7 @@ async fn rebuild(
     Ok((stack, warnings, pack_report))
 }
 
-pub async fn run(mut cli: Cli) -> Result<()> {
+pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
@@ -492,9 +484,14 @@ pub async fn run(mut cli: Cli) -> Result<()> {
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
                 startup_notice: notice.take(),
-                // Read per run: plugins have just (re)loaded, and a script one
-                // of them now replaces is no longer worth a word.
-                startup_alert: provider_scripts::startup_warning(),
+                // The scripts are read per run: plugins have just (re)loaded,
+                // and a script one of them now replaces is no longer worth a
+                // word. An alert, not a status-bar flash: both say where the
+                // user's files are, and a 1.5s flash is too short to read.
+                startup_alert: [legacy_notice.take(), provider_scripts::startup_warning()]
+                    .into_iter()
+                    .flatten()
+                    .reduce(|shown, next| format!("{shown}\n\n{next}")),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
@@ -726,7 +723,7 @@ mod tests {
             &plugin_host,
             &cli,
             InitFiles::Disabled,
-            &ProjectConfig::for_project(dir.path()),
+            &project::resolve_noninteractive(dir.path(), TrustMode::Session).project_config,
             &no_names,
             &mut Vec::new(),
         )
@@ -767,7 +764,7 @@ mod tests {
             &plugin_host,
             &cli,
             InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
-            &ProjectConfig::for_project(dir.path()),
+            &project::resolve_noninteractive(dir.path(), TrustMode::Session).project_config,
             &no_names,
             &mut Vec::new(),
         ) {

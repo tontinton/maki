@@ -8,7 +8,8 @@ use event_listener::{Event, EventListener};
 use maki_storage::id::MakiId;
 use thiserror::Error;
 
-use crate::cancel::{CancelHandle, CancelToken, CancelTrigger};
+use crate::cancel::{CancelToken, CancelTrigger};
+use crate::session_control::SessionControl;
 use crate::types::SubagentInfo;
 
 /// Where a moved call lives once its turn no longer owns it.
@@ -30,7 +31,7 @@ pub struct SessionStub {
     pub ui_id: String,
     pub plugin: Arc<str>,
     pub name: String,
-    pub handle: CancelHandle,
+    pub control: Arc<SessionControl>,
     /// Set at the session's first prompt, when the UI first hears of it.
     pub info: Arc<OnceLock<SubagentInfo>>,
 }
@@ -38,10 +39,11 @@ pub struct SessionStub {
 pub struct CallScope {
     id: String,
     run: CancelToken,
-    /// Fires with the run. After a move it fires with the call's own token
-    /// instead, which only a stop or the end of the moved work fires. It does
-    /// not fire when the call returns, because what the call leaves running
-    /// past its reply, like a highlight, lives on this token.
+    /// What the call leaves running past its reply, like a highlight, lives
+    /// here, so the call returning never fires it. The run ending does. After
+    /// a move there is no run to follow, so it follows the call token: a stop
+    /// still takes it along, but a final reply lets it go
+    /// ([`MovedTrigger::finish`]).
     owner: CancelToken,
     cancel: CancelToken,
     trigger: Mutex<Option<CancelTrigger>>,
@@ -96,25 +98,26 @@ impl CallScope {
     }
 
     /// Takes the gate of a move, detaches the subtree from the run token and
-    /// hands the call's trigger to the caller, who now decides when the work
-    /// ends. Detached here rather than at the landing, so the run ending as
-    /// the receipt reaches it finds nothing left to cancel.
+    /// hands the call's [`MovedTrigger`] to the caller, who now decides when
+    /// the work ends. Detached here rather than at the landing, so the run
+    /// ending as the receipt reaches it finds nothing left to cancel.
     ///
     /// Taking the trigger is the one gate: a second move, or a move after the
     /// call ended and its guard fired, finds it gone. A run token that already
     /// fired has cancelled the call token by the time this returns.
-    pub fn claim_move(&self) -> Result<(MoveClaim<'_>, CancelTrigger), AlreadyMoved> {
-        let trigger = self.take_trigger().ok_or(AlreadyMoved)?;
+    pub fn claim_move(&self) -> Result<(MoveClaim<'_>, MovedTrigger), AlreadyMoved> {
+        let call = self.take_trigger().ok_or(AlreadyMoved)?;
         // In this order a run firing midway reaches the owner either way:
         // directly, or through the call token it now follows.
         self.cancel.adopt(&self.owner);
         self.owner.unlink(&self.run);
         self.cancel.unlink(&self.run);
-        Ok((MoveClaim(self), trigger))
+        let owner = self.owner.clone();
+        Ok((MoveClaim(self), MovedTrigger { call, owner }))
     }
 
     /// A move with nothing to do between the claim and the landing.
-    pub fn move_to(&self, home: TaskHome) -> Result<CancelTrigger, AlreadyMoved> {
+    pub fn move_to(&self, home: TaskHome) -> Result<MovedTrigger, AlreadyMoved> {
         let (claim, trigger) = self.claim_move()?;
         claim.land(home);
         Ok(trigger)
@@ -177,6 +180,23 @@ impl MoveClaim<'_> {
     }
 }
 
+/// The end of a moved call, held by whoever runs it now. Dropping it is a
+/// stop: it ends the call and everything the call left running.
+pub struct MovedTrigger {
+    call: CancelTrigger,
+    owner: CancelToken,
+}
+
+impl MovedTrigger {
+    /// The work ended with its final reply, not a stop. A batch whose last
+    /// child settles queues that child's highlight right as it returns, so
+    /// the highlight must outlive the call, just like for a call that never
+    /// moved.
+    pub fn finish(&self) {
+        self.owner.unlink(&self.call.token());
+    }
+}
+
 /// Fires the call's trigger when the call ends, unless a move took it first.
 pub struct CallGuard(Arc<CallScope>);
 
@@ -219,8 +239,9 @@ mod tests {
         (scope, guard)
     }
 
-    #[test]
-    fn a_moved_call_ends_with_its_trigger_alone() {
+    #[test_case(false ; "a_stop_takes_the_owner_along")]
+    #[test_case(true ; "a_final_reply_leaves_the_owner_running")]
+    fn a_moved_call_ends_with_its_trigger_alone(finished: bool) {
         let (run_trigger, run) = CancelToken::new();
         let (scope, guard) = scope_under(&run);
         let (_nested_trigger, nested) = scope.cancel().child();
@@ -235,10 +256,13 @@ mod tests {
             );
         }
 
-        drop(trigger);
-        for token in [scope.cancel(), &nested, scope.owner()] {
-            assert!(token.is_cancelled());
+        if finished {
+            trigger.finish();
         }
+        drop(trigger);
+        assert!(scope.cancel().is_cancelled());
+        assert!(nested.is_cancelled());
+        assert_eq!(scope.owner().is_cancelled(), !finished);
     }
 
     #[test]

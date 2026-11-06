@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use common::{
-    Chat, WAIT, call_ctx, done_text, exec, next_task_done, request_move, wait_live_buf,
+    Chat, WAIT, call_ctx, done_text, exec, next_task_done, poll_until, request_move, wait_live_buf,
     wait_movable,
 };
 use maki_agent::cancel::{CancelToken, CancelTrigger};
@@ -29,6 +29,8 @@ const OUTER: &str = "outer";
 const NESTING: &str = "nesting";
 const CHILD: &str = "child";
 const CHILD_REPLY: &str = "child done";
+const LATE: &str = "late";
+const LATE_LINE: &str = "late_line";
 /// Never loaded: unloading it only runs the reload drain.
 const BYSTANDER_PLUGIN: &str = "bystander";
 const RECEIPT: &str = "Running in the background";
@@ -68,12 +70,22 @@ local function park(name)
     released[name] = nil
     return
   end
-  maki.async.await(1, function(cb) parked[name] = cb end)
+  -- Every waiter stays referenced: a callback the GC collects ends its
+  -- await with an error, so a call parked under a shared name would finish
+  -- whenever the collector happens to run.
+  maki.async.await(1, function(cb)
+    parked[name] = parked[name] or {}
+    table.insert(parked[name], cb)
+  end)
 end
 local function release(name)
-  local cb = parked[name]
+  local waiters = parked[name]
   parked[name] = nil
-  if cb then cb() else released[name] = true end
+  if not waiters then
+    released[name] = true
+    return
+  end
+  for _, cb in ipairs(waiters) do cb() end
 end
 local schema = {
   type = "object",
@@ -123,6 +135,21 @@ tool("movable", function(input, ctx)
   end
   park("movable")
   return input.final .. ":" .. tostring(ctx:cancelled())
+end)
+
+-- Leaves a line to land after its final reply, like a highlight.
+tool("late", function(_, ctx)
+  local buf = maki.ui.buf()
+  ctx:live_buf(buf)
+  ctx:on_background(function() return "late moved" end)
+  park("late")
+  maki.async.run(function()
+    park("late_line")
+    maki.async.run(function()
+      buf:line("late_line")
+    end)
+  end)
+  return "late done"
 end)
 
 tool("plain", function(_, ctx)
@@ -355,6 +382,27 @@ fn clicks_still_reach_a_moved_call() {
         done_text(&host.task_done()),
         (FINAL_REPLY.to_owned(), false)
     );
+}
+
+/// The line is queued only after the final reply landed, the way the last
+/// batch child to settle queues its highlight as the batch returns.
+#[test]
+fn async_run_from_a_moved_call_outlives_its_final_reply() {
+    let host = Host::new();
+    let chat = Chat::live();
+    let running = Running::start(&host, chat.id, LATE, json!({}));
+    let body = wait_live_buf(&running.events, &running.id);
+    running.wait_movable();
+    assert_eq!(host.request(), MoveOutcome::Moved);
+    assert!(running.result().backgrounded);
+
+    host.release(LATE);
+    host.task_done();
+    host.release(LATE_LINE);
+
+    poll_until("the late line never landed", || {
+        body.take().text().contains(LATE_LINE).then_some(())
+    });
 }
 
 #[test_case(Some(DECLINE_REASON), DECLINE_REASON ; "with_a_reason")]

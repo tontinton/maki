@@ -18,6 +18,10 @@ local SEPARATOR = "──────────────────"
 local BODY_INDENT = "  "
 local ANNOTATION_SEP = " · "
 local MARKDOWN_FORMAT = "markdown"
+-- Same floor as the host's plain text path. Errors and tools without a view
+-- end up in this fallback with no line count in their header, so a limit of
+-- 0 still shows their first line.
+local MIN_PLAIN_LINES = 1
 local ERROR_PREFIX = "[ERROR] "
 local EMPTY_ERROR = "provide at least one tool call"
 local NESTED_ERROR = "cannot nest batch inside batch"
@@ -25,7 +29,7 @@ local CANCELLED_ERROR = "cancelled"
 local DISCARDED_ERROR = string.format("maximum of %d tools per batch", MAX_BATCH_SIZE)
 local WAITING_FMT = "batch is waiting on %s"
 local NOTHING_RUNNING = "batch has no running tool left to move"
-local MOVED_HEADER = "Still running in the background:"
+local MOVED_HEADER = "Still running in the background, each reports back as it finishes:"
 local BACKGROUND_PARAM = "background"
 local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground.\n\n"
 local MOVED_ITEM_FMT = "- %s"
@@ -199,7 +203,7 @@ local function child_body_buf(c, cctx)
     end
   end
   local tol = cctx.tool_output_lines
-  local opts = { max_lines = tol[c.tool] or tol.other, keep = "head" }
+  local opts = { max_lines = math.max(tol[c.tool] or tol.other, MIN_PLAIN_LINES), keep = "head" }
   if t and t.format == MARKDOWN_FORMAT then
     return ToolView.restore_markdown(output, is_error, opts)
   end
@@ -422,7 +426,8 @@ end
 function Batch:rerender()
   local lines, ranges = render_children(self.children)
   self.ranges = ranges
-  self.buf:set_lines(lines)
+  -- All head: a moved batch keeps drawing its children in its row.
+  self.buf:set_lines(lines, { head = #lines })
 end
 
 -- A child's buf keeps changing after we get it (async highlights land
@@ -491,6 +496,7 @@ function Batch:settle(c, status, output)
   c.output = output
   c.stopped = status == STATUS.ERROR and self.ctx:cancelled()
   self:attach_body(c)
+  self:report_finished()
   self:rerender()
   self:publish_parts()
   self:sync_movable()
@@ -504,7 +510,7 @@ function Batch:run_child(c, ctx)
   end
   c.status = STATUS.RUNNING
   self:rerender()
-  local text, err = maki.agent.call_tool(ctx, c.tool, c.params, {
+  local text, err, format = maki.agent.call_tool(ctx, c.tool, c.params, {
     output_mode = ctx:output_mode(),
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
@@ -542,6 +548,7 @@ function Batch:run_child(c, ctx)
   if err then
     self:settle(c, STATUS.ERROR, err)
   else
+    c.format = format
     self:settle(c, STATUS.SUCCESS, text)
   end
 end
@@ -560,19 +567,24 @@ function Batch:unreported()
   return out
 end
 
+function Batch:any_running()
+  for _, c in ipairs(self.children) do
+    if not TERMINAL[c.status] then
+      return true
+    end
+  end
+  return false
+end
+
 -- What the hook would answer now, so the row's hint shows only when a
 -- press would move the batch.
 function Batch:movable_now()
-  local running = false
   for _, c in ipairs(self.children) do
-    if not TERMINAL[c.status] then
-      if not c.movable then
-        return false
-      end
-      running = true
+    if not TERMINAL[c.status] and not c.movable then
+      return false
     end
   end
-  return running
+  return self:any_running()
 end
 
 function Batch:sync_movable()
@@ -618,10 +630,23 @@ function Batch:background_if_due()
   end)
 end
 
+-- A moved batch's reply becomes a notice, and the transcript can only draw
+-- it as markdown when every child in it replied in markdown.
+local function all_markdown(children)
+  for _, c in ipairs(children) do
+    if c.format ~= MARKDOWN_FORMAT then
+      return false
+    end
+  end
+  return #children > 0
+end
+
 function Batch:reply()
   local note = self.foreground_reason and string.format(FOREGROUND_NOTE, tostring(self.foreground_reason)) or ""
+  local children = self:unreported()
   return {
-    llm_output = note .. render_llm(self:unreported()),
+    llm_output = note .. render_llm(children),
+    format = all_markdown(children) and MARKDOWN_FORMAT or nil,
     is_error = self.cancelled,
     body = self.buf,
     state = to_state(self.children),
@@ -671,12 +696,36 @@ function Batch:sweep_cancelled(reason)
   end
 end
 
+-- Once the batch moved, a quick child should not wait for a slow one, so
+-- each finished child goes to the model on its own. We send every finished
+-- child not sent yet, not just the one that landed, because a child can
+-- finish while the move is still committing and nobody else would send it.
+-- The last child stays for the final reply, and so does everything after a
+-- stop, since that reply explains the stop. If the runtime refuses a child,
+-- it stays unsent and the final reply carries it.
+function Batch:report_finished()
+  if not self.ctx:backgrounded() or self.ctx:cancelled() or not self:any_running() then
+    return
+  end
+  for _, c in ipairs(self.children) do
+    if TERMINAL[c.status] and not c.reported then
+      c.reported = self.ctx:report_part({
+        tool = c.tool,
+        name = header_text(c),
+        output = c.output,
+        is_error = c.status == STATUS.ERROR,
+        format = c.format,
+      }) == true
+    end
+  end
+end
+
 -- The `ctx:on_background` hook: the whole batch task moves as one, so every
 -- child still running must be able to outlive the turn. Never yields, so the
 -- snapshot it reports is exact: a child that settles after it is listed as
--- running and arrives with the final reply, whether it lands before the
--- move commits or after. Finished children are marked `reported` only once
--- the receipt is built, so a decline leaves the batch untouched.
+-- running and arrives on its own or with the final reply, see
+-- `report_finished`. Finished children are marked `reported` only once the
+-- receipt is built, so a decline leaves the batch untouched.
 function Batch:hand_over()
   local finished, running = {}, {}
   for _, c in ipairs(self.children) do

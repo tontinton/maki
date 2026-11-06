@@ -11,9 +11,8 @@ pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
 pub mod spec;
-/// One recorded server for two audiences: other crates get it behind the
-/// feature, this crate's own tests get it without.
-#[cfg(any(test, feature = "test-support"))]
+/// Tests only, here and in other crates. Always built because a cargo feature
+/// gating it would pass in the workspace build and fail a lone crate.
 pub mod test_support;
 pub mod tokens;
 pub(crate) mod types;
@@ -45,7 +44,7 @@ pub use types::{
     EffortDialect, FACTS_WITHOUT_CONTEXT_UPDATE, IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE,
     IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource, InputTransformation,
     Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, TaskEnd, TaskSettled, ThinkingConfig,
+    StopReason, StreamResponse, THINKING_USAGE, TaskAnswer, TaskEnd, TaskSettled, ThinkingConfig,
     ThinkingFallback, UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model,
     dialect, is_deferred_tool,
 };

@@ -16,6 +16,7 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
+use crate::SessionControl;
 pub const NO_FILES_FOUND: &str = "No files found";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,18 +526,27 @@ pub struct CallRecord {
 const UNKNOWN_TOOL: &str = "unknown";
 
 impl ToolDoneEvent {
-    pub fn error(id: String, message: impl Into<String>) -> Self {
-        let message: String = message.into();
+    pub fn new(id: String, tool: Arc<str>, output: ToolOutput, is_error: bool) -> Self {
         Self {
             id,
-            tool: Arc::from(UNKNOWN_TOOL),
-            output: Arc::new(ToolOutput::Plain(message.into())),
-            is_error: true,
+            tool,
+            output: Arc::new(output),
+            is_error,
             annotation: None,
             written_path: None,
             call: None,
             backgrounded: false,
         }
+    }
+
+    pub fn error(id: String, message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        Self::new(
+            id,
+            Arc::from(UNKNOWN_TOOL),
+            ToolOutput::Plain(message.into()),
+            true,
+        )
     }
 
     /// How long the call ran before this result, a receipt's until the move.
@@ -606,8 +616,8 @@ pub enum DoneReason {
     /// A manual `/compact` ended the run, but no user turn ended with it, so
     /// a goal loop should not treat this as a turn boundary.
     Compact,
-    /// An `agent.user_message` layer dropped the message before the model saw
-    /// it.
+    /// Nothing new reached the model: an `agent.user_message` layer dropped
+    /// the message, or [`crate::Agent::resume`] found nothing to answer.
     Dropped,
 }
 
@@ -793,6 +803,9 @@ pub enum AgentEvent {
         text: String,
         /// What the line unfolds to, see `observation_detail`.
         detail: Option<String>,
+        /// `detail` is markdown, see [`Message::markdown`].
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        markdown: bool,
         /// Set when the line answers a background task, for its colored dot.
         #[serde(skip_serializing_if = "Option::is_none")]
         end: Option<TaskEnd>,
@@ -1330,10 +1343,11 @@ pub struct SubagentInfo {
     pub opts: Option<RequestOptions>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
-    /// Where a host queues messages for this subagent. Its loop drains the
-    /// queue between turns, so a message lands as an interrupt.
+    /// How a host reaches this subagent: its inbox, status and stop. Every
+    /// subagent has one, so a chat without one has not heard from its
+    /// subagent yet.
     #[serde(skip)]
-    pub inbox: Option<Arc<crate::SubagentInbox>>,
+    pub control: Arc<SessionControl>,
     /// The model's call this session runs under when that is not its own
     /// `task` call, like the `batch` it is a child of. Once that call moves,
     /// `/tasks` lists the session under it.
@@ -2029,15 +2043,15 @@ mod tests {
 
     const FIRST_COST: f64 = 0.5;
     const SECOND_COST: f64 = 0.25;
-    const FIRST_INPUT: u32 = 10;
-    const SECOND_INPUT: u32 = 5;
+    const FIRST_INPUT: u64 = 10;
+    const SECOND_INPUT: u64 = 5;
     const OWN_SUBTREE_MSG: &str = "a child ledger reports only what it spent itself";
     const ROLLUP_MSG: &str = "a child's spend has to land in the parent's totals";
     const CARRIED_ONCE_MSG: &str =
         "a carried balance shows on the child and stays counted once on the parent";
     const FLOAT_RESIDUE: f64 = 1e-12;
 
-    fn usage(input: u32) -> TokenUsage {
+    fn usage(input: u64) -> TokenUsage {
         TokenUsage {
             input,
             ..Default::default()
@@ -2120,7 +2134,7 @@ mod tests {
 
     #[test_case(SECOND_INPUT, Some(SECOND_COST) ; "spent_rounds_are_the_difference")]
     #[test_case(0, None ; "no_tokens_means_no_spend_despite_cost_residue")]
-    fn totals_since_an_earlier_reading(input: u32, expected_cost: Option<f64>) {
+    fn totals_since_an_earlier_reading(input: u64, expected_cost: Option<f64>) {
         let earlier = RunTotals {
             usage: usage(FIRST_INPUT),
             cost: Some(FIRST_COST),

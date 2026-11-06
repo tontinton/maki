@@ -19,7 +19,7 @@ const PROVIDERS_FILE: &str = "providers.toml";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
-const LOCAL_OVERLAY_SLUGS: [&str; 2] = ["ollama", "llama-cpp"];
+const LOCAL_ENDPOINT_SLUGS: [&str; 2] = ["ollama", "llama-cpp"];
 
 /// Where the last parse came from and what the file looked like then. The
 /// config path follows the project directory, so one process can read more
@@ -448,14 +448,12 @@ impl ProvidersConfig {
     }
 }
 
-/// The `providers.toml` we already read, or where a fresh one goes. Both share
-/// this path so `save` cannot leave a second copy behind in the other dir.
+/// The `providers.toml` we already read, or where a fresh one goes; one file
+/// under the config dir is both.
 fn providers_file_path() -> PathBuf {
-    paths::find_config_path(PROVIDERS_FILE).unwrap_or_else(|| {
-        paths::config_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(PROVIDERS_FILE)
-    })
+    paths::config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(PROVIDERS_FILE)
 }
 
 pub fn set_registered_providers(rows: Vec<&'static BuiltInProvider>) {
@@ -527,18 +525,13 @@ pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String>
         .or_else(|| builtin_provider(slug).map(|b| b.default_base_url.to_string()))
 }
 
-/// Whether a built-in slug reads the thinking keys (`supports_thinking`,
-/// `requires_thinking`, `thinking_fields`) of its `providers.toml` models.
-/// Only the local endpoints do, and only those keys: everything else about
-/// them stays compiled in, so an `OLLAMA_HOST` setup can describe how its
-/// models think without a second slug and without touching auth wiring.
-///
-/// The list is the slugs whose request path merges those keys into the body,
-/// not every slug that serves models we cannot know (`google`, `copilot` and
-/// `mistral` also accept arbitrary models, but their paths would drop the
-/// keys on the floor). It grows when a path learns to read them.
-pub fn overlays_local_thinking(slug: &str) -> bool {
-    LOCAL_OVERLAY_SLUGS.contains(&slug)
+/// Whether a built-in slug runs on `LocalEndpoint`. Unlike the other built-ins
+/// it reads `protocol` and the model thinking keys (`supports_thinking`,
+/// `requires_thinking`, `thinking_fields`) from its `providers.toml` entry, so
+/// an `OLLAMA_HOST` setup can describe its models without a second slug. Auth
+/// and the rest of the model catalog stay compiled in.
+pub fn is_local_endpoint(slug: &str) -> bool {
+    LOCAL_ENDPOINT_SLUGS.contains(&slug)
 }
 
 /// The rest of a local `[[slug.models]]` entry, which still loses to the
@@ -575,11 +568,19 @@ fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
 /// Callers decide what counts as built-in (the inventory misses the `opencode`
 /// slugs) and when to report it.
 ///
-/// [`overlays_local_thinking`] slugs are the exception: their `models` table is
-/// half read, so only the keys nobody reads are named.
+/// [`is_local_endpoint`] slugs read part of their `models` table, so only the
+/// keys nobody reads are named. They also read `protocol`, but `LocalEndpoint`
+/// only branches on `openai-responses` and sends every other value over chat
+/// completions, so only `openai` and `openai-responses` are honored.
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
+    let local = is_local_endpoint(slug);
+    let honored_protocol = local
+        && matches!(
+            def.protocol,
+            Some(Protocol::Openai | Protocol::OpenaiResponses)
+        );
     let mut ignored = Vec::new();
-    if def.protocol.is_some() {
+    if def.protocol.is_some() && !honored_protocol {
         ignored.push("protocol");
     }
     if def.api_key_env.is_some() {
@@ -589,7 +590,7 @@ pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str
         ignored.push("discover_models");
     }
     if !def.models.is_empty() {
-        if overlays_local_thinking(slug) {
+        if local {
             ignored.extend(ignored_local_model_fields(&def.models));
         } else {
             ignored.push("models");
@@ -1000,6 +1001,21 @@ tier = "{input}"
     #[test_case("ollama", RICH_MODEL, vec!["models.tier", "models.context_window", "models.supports_vision", "models.pricing_*"] ; "local_slug_names_what_it_dropped")]
     fn ignored_builtin_fields_on_declared_models(slug: &str, entry: &str, expected: Vec<&str>) {
         let def: ProviderDef = toml::from_str(entry).unwrap();
+        assert_eq!(ignored_builtin_fields(slug, &def), expected);
+    }
+
+    #[test_case("ollama", Protocol::OpenaiResponses, Vec::new() ; "local_honors_responses")]
+    #[test_case("llama-cpp", Protocol::Openai, Vec::new() ; "local_honors_completions")]
+    #[test_case("ollama", Protocol::Anthropic, vec!["protocol"] ; "local_warns_on_other_wires")]
+    fn ignored_builtin_fields_on_local_protocol(
+        slug: &str,
+        protocol: Protocol,
+        expected: Vec<&str>,
+    ) {
+        let def = ProviderDef {
+            protocol: Some(protocol),
+            ..ProviderDef::default()
+        };
         assert_eq!(ignored_builtin_fields(slug, &def), expected);
     }
 

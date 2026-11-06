@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::clipboard::{self, CopyResult};
 use crate::components::messages::ClickOutcome;
+use crate::components::scrollbar::Thumbs;
 use crate::selection::{
     self, ContentRegion, DocPos, EdgeScroll, RowPos, ScreenSelection, Selection, SelectionState,
     SelectionZone,
@@ -27,8 +28,13 @@ impl App {
             // plain button event, so the selection is read back and routed
             // like a bracketed paste.
             MouseEventKind::Down(MouseButton::Middle) => {
-                self.primary_paste_rx
+                self.mouse_paste_rx
                     .push(spawn_read(clipboard::read_primary_selection));
+            }
+            // Windows consoles paste on right-click, but mouse capture eats
+            // that click, so we read the clipboard ourselves.
+            MouseEventKind::Down(MouseButton::Right) if cfg!(windows) => {
+                self.mouse_paste_rx.push(spawn_read(clipboard::read_text));
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(zone) = self.zone_at(event.row, event.column) {
@@ -118,12 +124,11 @@ impl App {
         }
     }
 
-    /// The selection is read in the background, so it comes back as a paste
-    /// typed now and waits behind any keys still held, like one from the
-    /// terminal.
-    pub fn poll_primary_paste(&mut self) -> Dirty {
+    /// The text is read in the background, so it comes back as a paste typed
+    /// now and waits behind any keys still held, like one from the terminal.
+    pub fn poll_mouse_paste(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
-        while let Some(selection) = take_ready(&mut self.primary_paste_rx) {
+        while let Some(selection) = take_ready(&mut self.mouse_paste_rx) {
             dirty = Dirty::YES;
             if let Some(text) = selection.filter(|text| !text.is_empty()) {
                 let actions = self.update(Msg::Paste(text));
@@ -255,6 +260,7 @@ impl App {
         buf: &mut ratatui::buffer::Buffer,
         sel: &Selection,
         render_chat: usize,
+        thumbs: &Thumbs,
     ) {
         let text = match sel.zone {
             SelectionZone::Messages => {
@@ -277,7 +283,7 @@ impl App {
                     area: sel.area,
                     ..Default::default()
                 }];
-                selection::extract_selected_text(buf, &screen_sel, &regions)
+                selection::extract_selected_text(&thumbs.uncovered(buf), &screen_sel, &regions)
             }
         };
 

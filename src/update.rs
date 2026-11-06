@@ -116,9 +116,16 @@ fn execute_script(script: &str, install_dir: &Path) -> Result<(), UpdateError> {
         .map_err(UpdateError::WriteScript)?;
     tmp.flush().map_err(UpdateError::WriteScript)?;
 
+    // Close our handle before spawning: on Windows, powershell -File refuses to
+    // open the script while we still hold it open for write ("The process
+    // cannot access the file ... it is being used by another process"), so
+    // every `maki update` on Windows fails. TempPath still deletes the file
+    // when dropped.
+    let tmp_path = tmp.into_temp_path();
+
     let status = std::process::Command::new(INSTALLER.program)
         .args(INSTALLER.args)
-        .arg(tmp.path())
+        .arg(tmp_path.as_os_str())
         .env(INSTALL_DIR_ENV, install_dir)
         .status()
         .map_err(UpdateError::ExecScript)?;

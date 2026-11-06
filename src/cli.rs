@@ -6,6 +6,7 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use maki_config::AgentConfig;
 
 use crate::print::OutputFormat;
 
@@ -222,6 +223,24 @@ impl Cli {
         }
     }
 
+    /// `--allowed-tools` replaces the allowlist and rejects an unknown name;
+    /// `--disallowed-tools` adds to the denylist and skips one.
+    pub fn apply_tool_flags(&self, agent: &mut AgentConfig) -> Result<()> {
+        if !self.allowed_tools.is_empty() {
+            agent.allowed_tools = self
+                .allowed_tools
+                .iter()
+                .map(|t| normalize_tool_name(t))
+                .collect::<Result<Vec<_>>>()?;
+        }
+        agent.disabled_tools.extend(
+            self.disallowed_tools
+                .iter()
+                .filter_map(|t| normalize_tool_name(t).ok()),
+        );
+        Ok(())
+    }
+
     pub fn is_sdk_mode(&self) -> bool {
         self.print && matches!(self.input_format, InputFormat::StreamJson)
     }
@@ -367,7 +386,7 @@ pub enum SessionAction {
 
 #[derive(Subcommand)]
 pub enum MigrateAction {
-    /// Migrate files from ~/.maki/ to XDG directories
+    /// Move ~/.maki/ to the XDG directories (maki also does this on startup)
     Xdg,
     /// Print a prompt that ports your old provider scripts to Lua plugins
     Providers,
@@ -403,7 +422,7 @@ pub enum AuthAction {
     Status,
 }
 
-pub fn normalize_tool_name(name: &str) -> Result<String> {
+fn normalize_tool_name(name: &str) -> Result<String> {
     let mut result = String::with_capacity(name.len() + 4);
     for (i, c) in name.chars().enumerate() {
         if c.is_ascii_uppercase() {

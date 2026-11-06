@@ -28,8 +28,6 @@ local STOP_PARENT_HINT_FMT = "  Ctrl+S again to stop all of %s"
 local MAIN_TASK_ID = "main"
 local FOOTER_KEYS = { { "Enter", "open" }, { "Ctrl+S", "stop" }, { "Ctrl+D", "delete" }, { "Esc", "cancel" } }
 local HINT_KEY = "Ctrl+X"
--- One level in, for a subagent listed under the task that started it.
-local NESTED_INDENT = "  "
 -- The main chat has no status, so it falls through to MAIN.
 local ICONS = {
   working = { RUNNING_ICON, "accent", true },
@@ -105,6 +103,9 @@ local function render()
   local lines = table.move(board.header, 1, #board.header, 1, {})
   local cursor_line = #lines
   local words = ListPicker.split_words(board.input:value())
+  -- Over every task, not the filtered rows, so columns hold still while a
+  -- query is typed.
+  local columns = Rows.columns(board.tasks, board.drawn_at, maki.ui.humantime)
   for _, row in ipairs(board.rows) do
     if row.section then
       lines[#lines + 1] = { { "  " .. row.section, "keybind_section" } }
@@ -121,14 +122,13 @@ local function render()
     if spinning then
       icon_style = "spinner:" .. icon_style
     end
-    local indent = row.depth and NESTED_INDENT or ""
-    local line = { { "  " .. indent, base }, { icon, icon_style } }
+    local line = { { "  ", base }, { icon, icon_style } }
     local hint = selected and board.confirm and board.confirm.id == task.id and board.confirm.hint or ""
     -- A bash task is named after its command, which can run for hundreds of
     -- columns. The name gives way first, so the owner on the right stays in
     -- view.
-    local fixed = 2 + dispw(indent) + dispw(icon) + dispw(hint)
-    local owner = Rows.trailer(task, board.drawn_at, 0, maki.ui.humantime)
+    local fixed = 2 + dispw(icon) + dispw(hint)
+    local owner = Rows.trailer(task, board.drawn_at, 0, maki.ui.humantime, columns)
     local match_style = selected and "match_selected" or "match"
     local spans = ListPicker.highlight_spans(task.name, words, base, match_style)
     local name_width = 0
@@ -142,7 +142,7 @@ local function render()
     -- Rows with nothing on the right would otherwise end short of the border
     -- and read as padding on one side only, so the bar runs the full width.
     local room = board.width - fixed - name_width
-    local trailer = Rows.trailer(task, board.drawn_at, room, maki.ui.humantime)
+    local trailer = Rows.trailer(task, board.drawn_at, room, maki.ui.humantime, columns)
     local trail = room - dispw(trailer)
     if trail > 0 then
       line[#line + 1] = { string.rep(" ", trail), base }

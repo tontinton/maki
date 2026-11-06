@@ -151,7 +151,10 @@ pub(crate) struct LiveFrame {
     pub(crate) tools: RequestTools,
     /// What requests carry: the base tools, then the MCP part. It only grows.
     /// A tool whose server went away stays listed and fails at dispatch.
-    pub(crate) wire: Value,
+    /// Shared with the published snapshot, so a side request sends the same.
+    pub(crate) wire: Arc<Value>,
+    /// The model the wire was fitted for, as a spec.
+    pub(crate) model: String,
 }
 
 impl LiveFrame {
@@ -160,18 +163,26 @@ impl LiveFrame {
         if let Some(mcp) = mcp {
             mcp.extend_tools(&mut wire, ToolDeferral::for_model(model));
         }
-        Self { tools, wire }
+        Self {
+            tools,
+            wire: Arc::new(wire),
+            model: model.spec(),
+        }
     }
 
     /// Takes the MCP part from the stored frame, not the live servers. Which
     /// servers are up by now is just timing, and the model already saw the old
     /// list.
-    pub(crate) fn restore(tools: RequestTools, stored: &StoredFrame) -> Self {
+    pub(crate) fn restore(tools: RequestTools, stored: &StoredFrame, model: &Model) -> Self {
         let mut wire = tools.definitions().clone();
         if let Some(entries) = wire.as_array_mut() {
             entries.extend(stored.mcp_tools.iter().cloned());
         }
-        Self { tools, wire }
+        Self {
+            tools,
+            wire: Arc::new(wire),
+            model: model.spec(),
+        }
     }
 
     pub(crate) fn mcp_tools(&self) -> &[Value] {
@@ -188,7 +199,7 @@ impl LiveFrame {
         deferral: ToolDeferral,
     ) -> &[Value] {
         let before = self.wire.as_array().map_or(0, Vec::len);
-        mcp.append_late_tools(&mut self.wire, deferral);
+        mcp.append_late_tools(Arc::make_mut(&mut self.wire), deferral);
         self.wire.as_array().map_or(&[], |wire| &wire[before..])
     }
 }
@@ -215,6 +226,13 @@ pub(crate) enum FrameFit {
 /// [`History::told`] replays every update in the transcript on top anyway,
 /// so this tells the same thing today. A later rewind can cut those updates,
 /// and then the frame must not claim the model still heard them.
+///
+/// Thinking is signed against the prefix it was written under, so a new frame
+/// makes every signature in history invalid. An enforcing account answers
+/// with a 400, and a lenient one flags each block again on every request. The
+/// cache is gone anyway, so the signatures go here and the text stays for the
+/// transcript. Only lenient accounts lose anything: the old reasoning they
+/// still showed the model.
 pub(crate) fn fit_frame(
     history: &mut History,
     context: RunContext,
@@ -229,7 +247,9 @@ pub(crate) fn fit_frame(
     {
         Some(stored) if stored.fingerprint == fingerprint => {
             if history.live_frame().is_none() {
-                history.adopt_frame(LiveFrame::restore(context.tools, &stored));
+                history.adopt_frame(LiveFrame::restore(context.tools, &stored, model));
+            } else {
+                history.refit_live(model);
             }
             FrameFit::Kept
         }
@@ -246,6 +266,7 @@ pub(crate) fn fit_frame(
                 live.mcp_tools().to_vec(),
             );
             frame.inherited = inherited;
+            history.unbind_thinking();
             history.set_frame(frame, live);
             if stored.is_some() {
                 FrameFit::Rebuilt
@@ -333,9 +354,11 @@ pub(crate) fn context_update(
 mod tests {
     use std::path::PathBuf;
 
+    use super::super::history::{HistorySnapshot, SharedMessages};
     use super::*;
     use crate::AgentConfig;
     use crate::mcp::test_support::stub_session;
+    use arc_swap::ArcSwap;
     use serde_json::json;
     use test_case::test_case;
 
@@ -343,6 +366,7 @@ mod tests {
     const NEXT_DATE: &str = "2026-10-03";
     const HINT_KEY: &str = "memory/after_instructions";
     const NATIVE_MODEL: &str = "anthropic/claude-opus-5";
+    const OTHER_NATIVE_MODEL: &str = "anthropic/claude-sonnet-5";
     const CLIENT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
 
     fn facts() -> LiveFacts {
@@ -397,6 +421,47 @@ mod tests {
                 &model(NATIVE_MODEL),
             ),
         )
+    }
+
+    /// A side request sends the published array to share the session's cache,
+    /// so it must match the next request's wire after every frame change.
+    #[test]
+    fn published_tools_are_the_live_wire() {
+        let native = model(NATIVE_MODEL);
+        let mirror: SharedMessages =
+            Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(Vec::new())));
+        let mut history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+        assert!(mirror.load().tools.is_none());
+        let in_sync = |history: &History, spec: &str| {
+            let (_, wire) = history.request_prefix().unwrap();
+            let published = mirror.load();
+            let published = published.tools.as_ref().unwrap();
+            assert_eq!((published.model.as_str(), &*published.wire), (spec, wire));
+        };
+
+        fit_frame(
+            &mut history,
+            context("a", ""),
+            Some(&stub_session(&[])),
+            &native,
+        );
+        in_sync(&history, NATIVE_MODEL);
+
+        let late = stub_session(&[("stub.alpha", "late tool")]);
+        let before = mirror.load().tools.clone().unwrap().wire;
+        history.append_late_tools(&late, ToolDeferral::for_model(&native));
+        assert_ne!(*before, *history.request_prefix().unwrap().1);
+        in_sync(&history, NATIVE_MODEL);
+
+        let switched = model(OTHER_NATIVE_MODEL);
+        assert_eq!(
+            fit_frame(&mut history, context("a", ""), Some(&late), &switched),
+            FrameFit::Kept
+        );
+        in_sync(&history, OTHER_NATIVE_MODEL);
+
+        history.restart(Vec::new());
+        assert!(mirror.load().tools.is_none());
     }
 
     #[test]

@@ -31,9 +31,9 @@ Trust, `n` answers Not now, and "Never" needs the arrow keys and Enter. Ctrl-C
 exits Maki. A project that ships no gated file is never asked about.
 
 One answer covers one project root: the active Git checkout, or the working
-directory outside Git. Linked worktrees answer for themselves. Starting Maki in
-your home directory loads no project configuration, because `~/.maki` there is
-your global configuration.
+directory outside Git. Linked worktrees answer for themselves. Your home
+directory is never a project root, so starting Maki there loads no project
+configuration.
 
 ## What Trust Does Not Cover
 

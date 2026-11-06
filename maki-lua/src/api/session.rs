@@ -148,8 +148,8 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 }
 
 /// Lists the sessions currently running in this UI. Status is "working",
-/// "needs_input", or "idle". A mailbox follow-up stays "working" without an
-/// intermediate "idle" status.
+/// "needs_input", or "idle". Background work a turn moved out keeps the
+/// session "working" until its result is in, with no "idle" in between.
 ///
 /// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
 /// @example
@@ -313,14 +313,7 @@ async fn transcript(
 /// The serde shape, nulls as `maki.NIL`. An image block is built around a
 /// handle on its payload, which is never copied, not even into JSON.
 fn message_table(lua: &Lua, message: &Message) -> LuaResult<Value> {
-    let envelope = Message {
-        role: message.role.clone(),
-        content: Vec::new(),
-        display_text: message.display_text.clone(),
-        kind: message.kind.clone(),
-        receipts: message.receipts.clone(),
-        settles: message.settles.clone(),
-    };
+    let envelope = message.with_content(Vec::new());
     let json = serde_json::to_value(&envelope).map_err(mlua::Error::external)?;
     let table = lua.unpack::<Table>(json_to_lua_exact(lua, &json)?)?;
     let content = lua.create_table_with_capacity(message.content.len(), 0)?;
@@ -357,6 +350,16 @@ async fn messages_table(lua: &Lua, messages: &[Message]) -> LuaResult<Table> {
     }
     out.set_metatable(Some(lua.array_metatable()))?;
     Ok(out)
+}
+
+/// The newest `last` of {messages}, or all of them.
+pub(crate) async fn newest_messages_table(
+    lua: &Lua,
+    messages: &[Message],
+    last: Option<usize>,
+) -> LuaResult<Table> {
+    let skip = last.map_or(0, |n| messages.len().saturating_sub(n));
+    messages_table(lua, &messages[skip..]).await
 }
 
 async fn transcript_table(lua: &Lua, export: SessionExport) -> LuaResult<Table> {
@@ -409,7 +412,7 @@ async fn export(
 /// Each message has the same shape as in the session file:
 ///
 /// ```text
-/// { role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, content = { blocks } }
+/// { role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, content = { blocks } }
 /// ```
 ///
 /// `kind` is `"turn"` for something the user or the model said,
@@ -421,7 +424,9 @@ async fn export(
 /// compaction note). `receipts` lists the calls whose results in this
 /// message moved to the background, and `settles` = `{ task, end }` marks the
 /// notice that answered one, with `end` one of `"finished"`, `"failed"`,
-/// `"cancelled"` or `"lost"`. `content` lists blocks:
+/// `"cancelled"` or `"lost"`. `partial` has the same shape and marks a notice
+/// that answered one piece early, like one call of a moved batch, and left
+/// the receipt open. `content` lists blocks:
 ///
 /// ```text
 /// { type = "text", text }
@@ -466,8 +471,10 @@ async fn messages(
         Some(history) => history,
         None => try_pair!(transcript(&lua, tx.as_ref(), session).await).messages,
     };
-    let skip = last.map_or(0, |n| history.len().saturating_sub(n));
-    Ok((Some(messages_table(&lua, &history[skip..]).await?), None))
+    Ok((
+        Some(newest_messages_table(&lua, &history, last).await?),
+        None,
+    ))
 }
 
 /// Returns the id of the focused session. Under `maki -p` and the sdk,

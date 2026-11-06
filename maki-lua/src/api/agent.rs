@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
-use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken, CancelTrigger};
+use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
@@ -19,11 +19,11 @@ use maki_agent::tools::{
 };
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, CallScope,
-    DoneReason, EMPTY_RESPONSE_MARKER, EarlierInput, Envelope, EventSender, EventStreamGuard,
-    History, ImageSource, InputSource, McpSession, RunContext, RunContextBuilder, RunLedger,
-    RunTotals, SessionEvents, SessionMailbox, SessionStub, SubagentInbox, SubagentInfo, TaskHome,
-    ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
+    Activity, Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed,
+    CallScope, Delivery, DoneReason, EMPTY_RESPONSE_MARKER, EndReason, Envelope, EventSender,
+    EventStreamGuard, History, InputSource, McpSession, RunContext, RunContextBuilder, RunLedger,
+    RunTotals, SessionControl, SessionEvents, SessionMailbox, SessionStub, SubagentInfo, TaskHome,
+    ToolDoneEvent, TurnHost, UNAVAILABLE_RESULT, event_stream, run_turns,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -45,24 +45,19 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::spawn_blocking;
 use tracing::info;
 
+use crate::api::model::stale_tier_err;
 use crate::api::session::{not_live, required_session};
-use crate::api::tool::{audiences_to_lua, parse_audience};
+use crate::api::tool::{audiences_to_lua, format_name, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::command::UiAction;
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
-use crate::background::{
-    BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime, Stop, StopMark,
-};
+use crate::background::{BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime};
 use crate::plugin_permissions::{Permission, PluginPermissions, require};
 use crate::runtime::{CANCELLED_MSG, active_task_cancel, host_ui};
 
-const SESSION_CLOSED_ERR: &str = "session closed";
-/// Esc in the task's tab. Distinct from [`CANCELLED_MSG`], so a loop can tell
-/// user intent from the end of its own task and not reopen.
-pub(crate) const STOPPED_BY_USER_ERR: &str = "stopped by user";
-const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prompt";
+const INTERRUPT_OPT: &str = "interrupt";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 const OUTPUT_MODE_ERR: &str = "output_mode must be 'full' or 'compact'";
 const OPTS_REQUIRED_ERR: &str = "opts table is required";
@@ -77,24 +72,37 @@ const MCP_REACH_ERR: &str =
 const TASK_REQUIRED_ERR: &str = "maki.agent.session({ session = id }) and its prompts must run \
      in a task: maki.async.spawn, an autocmd callback or a tool handler";
 
-fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
+/// Also returns the tier when the user's assignment picked the model. A curated
+/// default that does not resolve falls back quietly. An assigned model is an
+/// error instead, because running some other model would hide the stale
+/// assignment from the user. Headless loads the models.dev catalog only for
+/// the main model, so a catalog provider's spec has to warm it here first.
+async fn resolve_model_from_ctx(
+    ctx: &AgentContext,
+    tier: Option<&str>,
+) -> Result<(Model, Option<ModelTier>), String> {
     let Some(tier_str) = tier else {
-        return Ok(Model::clone(&ctx.model));
+        return Ok((Model::clone(&ctx.model), None));
     };
     let requested = tier_str.parse::<ModelTier>().map_err(|e| e.to_string())?;
     let effective = requested.capped_at(ctx.model.tier);
     if effective == ctx.model.tier {
-        return Ok(Model::clone(&ctx.model));
+        return Ok((Model::clone(&ctx.model), None));
     }
     let slug = &ctx.model.provider;
-    model_registry::resolve_tier(Some(slug), effective)
+    if let Some(spec) = model_registry::resolve_tier(Some(slug), effective)
         .filter(|spec| ctx.model_policy.allows(spec))
-        .and_then(|s| Model::from_spec(&s).ok())
-        .map(Ok)
-        .unwrap_or_else(|| {
-            Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
-                .map_err(|e| e.to_string())
-        })
+    {
+        let assigned = model_registry::override_tiers(&spec).contains(&effective);
+        match Model::from_spec_or_warm_catalog(&spec).await {
+            Ok(model) => return Ok((model, assigned.then_some(effective))),
+            Err(e) if assigned => return Err(stale_tier_err(effective, &spec, e)),
+            Err(_) => {}
+        }
+    }
+    Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
+        .map(|model| (model, None))
+        .map_err(|e| e.to_string())
 }
 
 fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
@@ -256,8 +264,9 @@ impl Adoption {
 }
 
 /// Gives a session opened under a moved call an entry of its own, so its
-/// adopted tab can be stopped by its id. A top-level `task` shares the call's
-/// id, and the call's entry already covers it. An entry its chat refuses
+/// adopted tab can be stopped by its id. It reports where the call does, so
+/// the call's caller reaches it. A top-level `task` shares the call's id, so
+/// the call's entry takes its control instead. An entry its chat refuses
 /// fires the session as it drops, and its chat ending ends the session anyway.
 ///
 /// A session that already ran has a chat in the UI, under the call's row.
@@ -270,6 +279,7 @@ pub(crate) fn adopt_session(
     stub: SessionStub,
 ) {
     if stub.ui_id == home.id {
+        registry.update(&home.id, |entry| entry.attach(stub.control));
         return;
     }
     let entry = BackgroundTask {
@@ -278,16 +288,17 @@ pub(crate) fn adopt_session(
             plugin: Arc::clone(&stub.plugin),
             name: stub.name,
             kind: Kind::Agent,
-            running: true,
             started_at: now_epoch(),
             cost: None,
         },
         session: home.chat,
         task: None,
         lifetime: Lifetime::Call,
-        stop: StopMark::default(),
-        cancel: Fire::Handle(stub.handle),
-        mailbox: None,
+        cancel: Fire::Handle(stub.control.handle()),
+        stopped: None,
+        control: Some(stub.control),
+        replied: false,
+        mailbox: registry.mailbox(&home.id),
     };
     if let Err(error) = registry.register(entry) {
         tracing::debug!(call = %home.id, %error, "session under a moved call outlived its chat");
@@ -484,7 +495,11 @@ fn unattended_answer(event: &AgentEvent) -> Option<String> {
 /// without hard-coding a model name.
 ///
 /// The returned table has fields: `id` (string), `tier` (string),
-/// `provider` (string), `spec` (string).
+/// `provider` (string), `spec` (string), `assigned_tier` (string?).
+/// `assigned_tier` is set when the user assigned this model to that tier, and
+/// nil for an explicit `spec`, the inherited model or a curated default. Mention
+/// it in your errors, since the user may have forgotten the assignment. If an
+/// assigned model no longer resolves, you get an error instead of another model.
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table? Optional fields:
@@ -513,11 +528,16 @@ async fn resolve_model(
         .as_ref()
         .and_then(|t| t.opt::<String>("spec").ok().flatten());
 
-    let model = match spec_str {
-        Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
-        None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref())),
+    let (model, assigned_tier) = match spec_str {
+        Some(ref spec) => (
+            try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy).await),
+            None,
+        ),
+        None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref()).await),
     };
-    Ok((Some(model_to_lua_table(&lua, &model)?), None))
+    let tbl = model_to_lua_table(&lua, &model)?;
+    tbl.set("assigned_tier", assigned_tier.map(|tier| tier.to_string()))?;
+    Ok((Some(tbl), None))
 }
 
 /// Build a system prompt from the parent's resolved prompt catalogue.
@@ -651,9 +671,12 @@ async fn tools(
     let spec_str: Option<String> = opts.opt("spec")?;
     let mcp_enabled: bool = opts.opt::<bool>("mcp")?.unwrap_or(false);
 
-    let parsed = spec_str
-        .as_deref()
-        .and_then(|spec| Model::from_spec_with_policy(spec, &agent.model_policy).ok());
+    let parsed = match spec_str {
+        Some(spec) => Model::from_spec_with_policy(&spec, &agent.model_policy)
+            .await
+            .ok(),
+        None => None,
+    };
     let model = parsed.as_ref().unwrap_or(&agent.model);
 
     let base = match (only, except) {
@@ -762,8 +785,9 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 ///   `on_task` (function?) - called with the task id when the child runs as
 ///     a subagent, which `/tasks` then lists as a task of its own. Must not
 ///     yield.
-/// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
-///   Instruction files the child picks up (a subdirectory `AGENTS.md`) are
+/// @return (string?, string?, string?) Tool output text and its format
+///   (`"markdown"` or `"plain"`, as a tool handler sets it), or `(nil, err)`
+///   on failure. Instruction files the child picks up (a subdirectory `AGENTS.md`) are
 ///   not in the text: they land on the calling tool's own result.
 /// @example
 /// local out, err = maki.agent.call_tool(ctx, "bash", {
@@ -779,9 +803,33 @@ async fn call_tool(
     name: String,
     input: LuaValue,
     opts: Option<Table>,
-) -> LuaResult<Pair<String>> {
-    let input_json = lua_to_json(&lua, &input)?;
-    let agent = try_pair!(dispatch_ctx(&ctx, "call_tool"));
+) -> LuaResult<(Option<String>, Option<String>, Option<&'static str>)> {
+    let done = match dispatch_child(&lua, ctx, &name, &input, opts).await? {
+        Ok(done) => done,
+        Err(e) => return Ok((None, Some(e), None)),
+    };
+    Ok(match interpreter_bridge::flatten(&done) {
+        Ok(text) => (
+            Some(text),
+            None,
+            Some(format_name(done.output.is_markdown())),
+        ),
+        Err(e) => (None, Some(e), None),
+    })
+}
+
+async fn dispatch_child(
+    lua: &Lua,
+    ctx: mlua::UserDataRef<LuaCtx>,
+    name: &str,
+    input: &LuaValue,
+    opts: Option<Table>,
+) -> LuaResult<Result<ToolDoneEvent, String>> {
+    let input_json = lua_to_json(lua, input)?;
+    let agent = match dispatch_ctx(&ctx, "call_tool") {
+        Ok(agent) => agent,
+        Err(e) => return Ok(Err(e.to_string())),
+    };
     let mut tctx = agent.to_tool_context();
     tctx.output_mode = ToolOutputMode::Full;
     // Open even without callbacks: when a plugin answers the child's
@@ -793,7 +841,7 @@ async fn call_tool(
     if let Some(o) = opts {
         if let Some(mode) = o.opt::<String>("output_mode")? {
             let Some(mode) = ToolOutputMode::parse(&mode) else {
-                return Ok(err_pair(OUTPUT_MODE_ERR));
+                return Ok(Err(OUTPUT_MODE_ERR.into()));
             };
             tctx.output_mode = mode;
         }
@@ -807,7 +855,7 @@ async fn call_tool(
         on_task = o.opt::<Function>("on_task")?;
     }
     let cbs = LiveCallbacks {
-        tool: &name,
+        tool: name,
         caller: ToolContext::clone(agent),
         on_buf,
         on_ann,
@@ -817,9 +865,9 @@ async fn call_tool(
     };
     drop(ctx);
     if let Err(e) = tctx.deadline.check() {
-        return Ok(err_pair(e));
+        return Ok(Err(e.to_string()));
     }
-    let done = dispatch_racing_live(&tctx, &name, &input_json, live_rx, &cbs).await;
+    let done = dispatch_racing_live(&tctx, name, &input_json, live_rx, &cbs).await;
     // Same fallback the UI applies on tool completion, so a batch child's
     // header carries the annotation its standalone run would get.
     let annotation = done
@@ -829,7 +877,7 @@ async fn call_tool(
     if let Some(a) = annotation {
         cbs.deliver(ToolLive::Annotation(a)).await;
     }
-    Ok(pair(interpreter_bridge::flatten(&done)))
+    Ok(Ok(done))
 }
 
 /// Create a new subagent session. The session inherits the parent model and
@@ -975,7 +1023,7 @@ async fn session(
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
     {
-        let mut m = try_pair!(Model::from_spec_with_policy(spec, &agent_ctx.model_policy));
+        let mut m = try_pair!(Model::from_spec_with_policy(spec, &agent_ctx.model_policy).await);
         let p = try_pair!(provider::from_model_async(&mut m, agent_ctx.timeouts).await);
         (m, Arc::from(p))
     } else {
@@ -1124,22 +1172,22 @@ async fn session(
         agent_ctx.live_sink.clone(),
     ));
 
-    // The session owns its trigger and the map only a handle: the run reaches
-    // an unmoved session through the call's token anyway, and draining the
-    // map at run end must leave a moved one running. A handle under an id
-    // that is already cancelled fires at once.
-    let (child_trigger, child_cancel) = agent_ctx.cancel.child();
+    // The control owns the session's token and the map only a handle: the run
+    // reaches an unmoved session through the call's token anyway, and
+    // draining the map at run end must leave a moved one running. A handle
+    // under an id that is already cancelled fires at once.
+    let control = Arc::new(SessionControl::new(&agent_ctx.cancel));
     // Several sessions can share one `ui_id`, so keep the slot and retire
     // only ours on close instead of clearing the whole key.
     let cancel_slot = agent_ctx
         .subagent_cancels
-        .insert_handle(ui_id.clone(), child_trigger.handle());
+        .insert_handle(ui_id.clone(), control.handle());
     if let Some(adoption) = &adoption {
         let stub = SessionStub {
             ui_id: ui_id.clone(),
             plugin: Arc::clone(&plugin),
             name: name.clone(),
-            handle: child_trigger.handle(),
+            control: Arc::clone(&control),
             info: Arc::clone(&subagent_info),
         };
         if let Some(stub) = adoption.call.add_session(stub)
@@ -1153,14 +1201,13 @@ async fn session(
         parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
         ui_id,
         slot: cancel_slot,
-        trigger: child_trigger,
+        control,
         registry: registry.clone(),
         background: owner.is_some(),
         mailbox: SessionMailbox::register(MakiId::generate()),
         adoption,
-        stop: StopMark::default(),
     });
-    cancellation.end_mailbox_on_cancel(child_cancel.clone());
+    cancellation.end_mailbox_on_cancel();
     let background = match owner {
         Some((session, task, cancel)) => {
             try_pair!(registry.register(BackgroundTask {
@@ -1169,19 +1216,19 @@ async fn session(
                     plugin,
                     name: name.clone(),
                     kind: Kind::Agent,
-                    running: false,
                     started_at: now_epoch(),
                     cost: None,
                 },
                 session,
                 task,
                 lifetime: Lifetime::Plugin,
-                stop: cancellation.stop.clone(),
+                stopped: None,
+                control: Some(Arc::clone(&cancellation.control)),
+                replied: false,
                 cancel: Fire::Owned(cancel),
                 mailbox: None,
             }));
             Some(Background {
-                registry,
                 session,
                 thinking: requested_thinking,
                 fast,
@@ -1204,7 +1251,6 @@ async fn session(
     let context: RunContextBuilder =
         Arc::new(move |_, _| RunContext::fixed(system.clone(), tools.clone()));
 
-    let inbox = Arc::new(SubagentInbox::default());
     let state = SessionState {
         params: AgentParams {
             provider,
@@ -1230,7 +1276,6 @@ async fn session(
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
             subagent_cancels: Arc::new(CancelMap::new()),
             ledger: RunLedger::child(&agent_ctx.ledger),
-            registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
         },
@@ -1241,13 +1286,13 @@ async fn session(
             .as_ref()
             .filter(|_| mcp_enabled)
             .map(McpSession::fresh),
-        history: History::new(Vec::new()),
+        history: History::new(Vec::new())
+            .with_mirror(Arc::clone(cancellation.control.transcript())),
         gauge: ContextGauge::default(),
         loaded_instructions: LoadedInstructions::new(),
         instruction_files: Arc::clone(&agent_ctx.instruction_files),
         sub_event_tx,
         stream_guard: Some(stream_guard),
-        child_cancel,
         answer_rx,
         answer_tx,
         reauth: agent_ctx.reauth,
@@ -1258,7 +1303,6 @@ async fn session(
         name,
         dones: RunDones::new(done_rx),
         start: Instant::now(),
-        closed: false,
         background,
     };
 
@@ -1270,7 +1314,7 @@ async fn session(
             model: Some(state.params.model.spec()),
             opts: Some(state.opts),
             answer_tx: None,
-            inbox: Some(Arc::clone(&inbox)),
+            control: Arc::clone(&state.cancellation.control),
             parent_call: None,
         };
         state.upstream.open_task(info.clone());
@@ -1280,7 +1324,6 @@ async fn session(
     let sess = lua.create_userdata(LuaSession {
         inner: Arc::new(AsyncMutex::new(state)),
         cancellation,
-        inbox,
     })?;
     Ok((Some(sess), None))
 }
@@ -1293,7 +1336,8 @@ async fn session(
 ///   `session` (string) Chat session it belongs to.
 ///   `plugin` (string) Plugin that opened it.
 ///   `name` (string) Name given at open.
-///   `status` (string) `"working"` during a `:prompt()`, otherwise `"idle"`.
+///   `status` (string) `"working"` while a `:prompt()` runs a turn or waits
+///     on calls moved to the background, otherwise `"idle"`.
 ///   `started_at` (integer) Unix seconds.
 ///   `cost` (number?) Dollars billed so far, updated after each turn. nil until
 ///     a priced turn ends.
@@ -1309,11 +1353,10 @@ async fn session(
 fn list(lua: &Lua, opts: Table) -> LuaResult<Pair<Table>> {
     let session = try_pair!(required_session(Some(&opts))?);
     let out = lua.create_table()?;
-    for entry in BackgroundTasks::of(lua).list_agents(session) {
-        let status = if entry.running {
-            WORKING_STATUS
-        } else {
-            IDLE_STATUS
+    for (entry, activity) in BackgroundTasks::of(lua).list_agents(session) {
+        let status = match activity {
+            Activity::Running | Activity::Waiting => WORKING_STATUS,
+            Activity::Idle => IDLE_STATUS,
         };
         let t = lua.create_table()?;
         t.set("status", status)?;
@@ -1500,9 +1543,8 @@ struct SessionState {
     sub_event_tx: EventSender,
     /// Dropped on close, which ends the relay task. Tool contexts keep
     /// [`EventSender`] clones alive past the run, so the relay cannot key off
-    /// sender disconnect.
+    /// sender disconnect. `None` once closed.
     stream_guard: Option<EventStreamGuard>,
-    child_cancel: maki_agent::cancel::CancelToken,
     answer_rx: Option<Arc<AsyncMutex<flume::Receiver<String>>>>,
     answer_tx: Option<flume::Sender<String>>,
     reauth: bool,
@@ -1513,7 +1555,6 @@ struct SessionState {
     name: String,
     dones: RunDones,
     start: Instant,
-    closed: bool,
     background: Option<Background>,
 }
 
@@ -1548,7 +1589,6 @@ impl RunDones {
 }
 
 struct Background {
-    registry: BackgroundTasks,
     session: MakiId,
     /// What the plugin asked for at open. We keep it because every prompt caps
     /// it again against the chat as it is at that moment.
@@ -1556,17 +1596,28 @@ struct Background {
     fast: Option<bool>,
 }
 
-impl Background {
-    fn start_prompt(
-        &self,
-        id: &str,
-        event_tx: EventSender,
-        ledger: Arc<RunLedger>,
-    ) -> PromptSettle {
-        self.registry.update(id, |e| e.info.running = true);
-        PromptSettle {
-            registry: self.registry.clone(),
-            id: id.to_owned(),
+/// Tells the tab of a background prompt how its last run ended, once the
+/// prompt drops. A cancelled task drops the prompt future in the middle of the
+/// run, so the code after its `await` never runs. It can drop while Lua is
+/// tearing down the cancelled coroutine, so it only touches Rust state and
+/// never calls into Lua.
+///
+/// The run only sends `Done` when it comes back `Ok`. A run that failed or got
+/// dropped sends nothing, and its tab would keep its tools spinning until the
+/// session closes. So we tell the tab `outcome` ourselves. It goes through the
+/// relay, so it lands after the run's own events. It is never a `Done`, because
+/// the relay counts every `Done` against the ones `prompt` waits for. It bills
+/// what `ledger` holds when it drops, as a `Done` would, so a run cancelled
+/// mid-turn still reports its spend.
+struct PromptSettle {
+    event_tx: EventSender,
+    ledger: Arc<RunLedger>,
+    outcome: Option<AgentEvent>,
+}
+
+impl PromptSettle {
+    fn new(event_tx: EventSender, ledger: Arc<RunLedger>) -> Self {
+        Self {
             event_tx,
             ledger,
             outcome: Some(cancelled_run()),
@@ -1583,30 +1634,8 @@ fn cancelled_run() -> AgentEvent {
     }
 }
 
-/// Wraps up a background prompt when it drops. A cancelled task drops the
-/// prompt future in the middle of the run, so the code after its `await` never
-/// runs. Without this the entry would say "running" forever. It can drop while
-/// Lua is tearing down the cancelled coroutine, so it only touches Rust state
-/// and never calls into Lua.
-///
-/// The run only sends `Done` when it comes back `Ok`. A run that failed or got
-/// dropped sends nothing, and its tab would keep its tools spinning until the
-/// session closes. So we tell the tab `outcome` ourselves. It goes through the
-/// relay, so it lands after the run's own events. It is never a `Done`, because
-/// the relay counts every `Done` against the ones `prompt` waits for. It bills
-/// what `ledger` holds when it drops, as a `Done` would, so a run cancelled
-/// mid-turn still reports its spend.
-struct PromptSettle {
-    registry: BackgroundTasks,
-    id: String,
-    event_tx: EventSender,
-    ledger: Arc<RunLedger>,
-    outcome: Option<AgentEvent>,
-}
-
 impl Drop for PromptSettle {
     fn drop(&mut self) {
-        self.registry.update(&self.id, |e| e.info.running = false);
         if let Some(mut outcome) = self.outcome.take() {
             if let AgentEvent::Error { totals, .. } = &mut outcome {
                 *totals = self.ledger.totals();
@@ -1617,27 +1646,19 @@ impl Drop for PromptSettle {
 }
 
 impl SessionState {
-    /// Why this session takes no more messages, if it does not.
-    fn refusal(&self) -> Option<&'static str> {
-        if self.closed {
-            return Some(SESSION_CLOSED_ERR);
-        }
-        self.cancellation.refusal()
-    }
-
-    fn stopped_by_user(&self) -> bool {
-        self.cancellation.stopped_by_user()
-    }
-
+    /// Only the first close sends the history upstream.
     fn close(&mut self) {
-        if self.closed {
+        if self.stream_guard.take().is_none() {
             return;
         }
-        self.closed = true;
-        self.stream_guard.take();
-        self.cancellation.cancel();
+        self.cancellation.close();
         let usage = self.params.ledger.totals().usage;
-        let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
+        let history = std::mem::replace(&mut self.history, History::new(Vec::new()));
+        // Every handle and tab holding the control would keep the whole
+        // transcript alive, and nothing reads an ended session's. Cleared
+        // first, so `into_vec` owns the messages instead of copying them.
+        self.cancellation.control.transcript().store(Arc::default());
+        let messages = history.into_vec();
         let adopted = self.upstream.adopted();
         adopted
             .as_ref()
@@ -1652,7 +1673,7 @@ impl SessionState {
         );
     }
 
-    fn agent(&mut self, inbox: &Arc<SubagentInbox>) -> Agent<'_> {
+    fn agent(&mut self) -> Agent<'_> {
         let agent = Agent::new(
             self.params.clone(),
             AgentRunParams {
@@ -1663,12 +1684,10 @@ impl SessionState {
             },
         )
         .with_reauth(self.reauth)
-        .with_interrupt_source(Arc::clone(inbox) as Arc<dyn maki_agent::InterruptSource>)
         .with_loaded_instructions(
             self.loaded_instructions.clone(),
             Arc::clone(&self.instruction_files),
         )
-        .with_cancel(self.child_cancel.clone())
         .with_mcp(self.mcp.clone())
         .with_local_tools(Arc::clone(&self.local_tools));
         match &self.answer_rx {
@@ -1684,69 +1703,59 @@ fn messages_since(history: &History, start: usize) -> &[Message] {
     &history.as_slice()[start.min(history.len())..]
 }
 
-/// Why a run left its caller without an answer, or `None` if it answered. A
-/// subagent can be cancelled on its own, and its caller should hear about that
-/// instead of taking a half-finished answer for a real one, so cancel reads
-/// like an error here even though the run ended normally. A dropped prompt
-/// never reached the model, so an empty answer would be a lie.
-fn cut_short_err(result: &Result<DoneReason, AgentError>, stopped_by_user: bool) -> Option<String> {
-    match result {
-        Err(e) => Some(e.to_string()),
-        Ok(DoneReason::Cancelled) if stopped_by_user => Some(STOPPED_BY_USER_ERR.to_owned()),
-        Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
-        Ok(DoneReason::Dropped) => Some(PROMPT_DROPPED_ERR.to_owned()),
-        Ok(
-            DoneReason::EndTurn
-            | DoneReason::MaxTokens
-            | DoneReason::MaxTurns
-            | DoneReason::Compact,
-        ) => None,
-    }
+/// Hooks one `:prompt()` into [`run_turns`]. For a background session it also
+/// keeps the tab told how each run went.
+struct PromptHost<'a> {
+    state: &'a mut SessionState,
+    settle: Option<PromptSettle>,
 }
 
-/// The notices that wake the session's next turn, or `None` once none of its
-/// moved calls is still out and nothing they reported is left unread. A sent
-/// message wakes it with no notices while a moved call is still out. `Err`
-/// when the session or the caller is cancelled first.
-async fn next_wake(
-    mailbox: &SessionMailbox,
-    inbox: &SubagentInbox,
-    session: &CancelToken,
-    caller: Option<&CancelToken>,
-) -> Result<Option<Vec<Message>>, String> {
-    let sent = async {
-        inbox.wait_nonempty().await;
-        Some(Vec::new())
-    };
-    let wake = session.race(async {
-        tokio::select! {
-            biased;
-            wake = mailbox.next_wake_before_answer() => wake,
-            wake = sent => wake,
+impl TurnHost for PromptHost<'_> {
+    fn agent(&mut self) -> Agent<'_> {
+        if let Some(settle) = &mut self.settle {
+            settle.outcome = Some(cancelled_run());
         }
-    });
-    match caller {
-        Some(caller) => caller.race(wake).await?,
-        None => wake.await,
+        self.state.agent()
+    }
+
+    /// Before the run is judged, so a prompt Esc or an error cut short still
+    /// leaves what it streamed in the tab's transcript. A monitor nobody
+    /// closes would otherwise keep it in memory until the plugin unloads.
+    fn run_ended(&mut self, finished: Option<&Result<DoneReason, AgentError>>) {
+        // A run that lost the race keeps the `cancelled` it started with.
+        if let (Some(settle), Some(result)) = (&mut self.settle, finished) {
+            settle.outcome = result
+                .as_ref()
+                .err()
+                .map(|e| AgentEvent::error(e, RunTotals::default()));
+        }
+        let state = &mut *self.state;
+        if let Some(Ok(_)) = finished {
+            state.dones.expect_one();
+        }
+        if state.background.is_some() {
+            state
+                .upstream
+                .send_history(&state.cancellation.ui_id, state.history.as_slice().to_vec());
+        }
     }
 }
 
 struct LuaSession {
     inner: Arc<AsyncMutex<SessionState>>,
+    /// Kept outside the lock, which a running prompt holds for the whole run,
+    /// so `send` and `close` still reach the session.
     cancellation: Arc<SessionCancellation>,
-    /// Shared with the host through [`SubagentInfo`], so a user watching this
-    /// session can queue messages that its next turn boundary picks up. Kept
-    /// outside the lock, which a running prompt holds for the whole run, so
-    /// `send` can still reach it.
-    inbox: Arc<SubagentInbox>,
 }
 
 struct SessionCancellation {
     parent_cancels: Arc<CancelMap<String>>,
     ui_id: String,
     slot: CancelSlot,
-    /// Fires the session's token. `parent_cancels` holds only its handle.
-    trigger: CancelTrigger,
+    /// How everyone reaches the session: its inbox, its status and the one
+    /// record of how it ended. The host gets it through [`SubagentInfo`], the
+    /// model through the registry.
+    control: Arc<SessionControl>,
     registry: BackgroundTasks,
     /// Opened by chat session id, so `registry` holds an entry under `ui_id`.
     background: bool,
@@ -1754,8 +1763,6 @@ struct SessionCancellation {
     /// whole life, so a later prompt still hears of a call an earlier one moved.
     mailbox: SessionMailbox,
     adoption: Option<Adoption>,
-    /// Esc in the task's tab, see [`BackgroundTasks::stop`].
-    stop: StopMark,
 }
 
 impl SessionCancellation {
@@ -1765,27 +1772,10 @@ impl SessionCancellation {
         (call != self.ui_id).then(|| call.to_owned())
     }
 
-    /// Why this session takes no more messages, closing aside. It needs no
-    /// session lock, so `send` gets the same answer mid-prompt as between.
-    fn refusal(&self) -> Option<&'static str> {
-        if self.stopped_by_user() {
-            return Some(STOPPED_BY_USER_ERR);
-        }
-        // Stopping the call that opened the session fires this token right
-        // away, but the prompt it cut short takes a while to unwind. Its chat
-        // session or its plugin may also have ended while the plugin kept the
-        // handle.
-        (self.trigger.is_cancelled() || (self.background && !self.registry.contains(&self.ui_id)))
-            .then_some(CANCELLED_MSG)
-    }
-
-    fn stopped_by_user(&self) -> bool {
-        self.stop.get() != Stop::None
-    }
-
-    fn cancel(&self) {
+    /// Ends the session as closed, unless something ended it first.
+    fn close(&self) {
+        self.control.end(EndReason::Closed);
         self.parent_cancels.retire(&self.ui_id, self.slot);
-        self.trigger.handle().fire();
         if self.background {
             self.registry.remove(&self.ui_id);
         }
@@ -1803,8 +1793,9 @@ impl SessionCancellation {
 
     /// The session's token can fire with no prompt left to notice: the task
     /// that opened it ends between prompts, or the prompt waiting on it was
-    /// dropped. Dropping the session fires it too, so this never outlives it.
-    fn end_mailbox_on_cancel(&self, token: CancelToken) {
+    /// dropped. Closing the session fires it too, so this never outlives it.
+    fn end_mailbox_on_cancel(&self) {
+        let token = self.control.token();
         let registry = self.registry.clone();
         let mailbox = self.mailbox.clone();
         tokio::spawn(async move {
@@ -1816,13 +1807,13 @@ impl SessionCancellation {
 
 impl Drop for SessionCancellation {
     fn drop(&mut self) {
-        self.cancel();
+        self.close();
     }
 }
 
 impl Drop for LuaSession {
     fn drop(&mut self) {
-        self.cancellation.cancel();
+        self.cancellation.close();
         match self.inner.try_lock() {
             Ok(mut s) => s.close(),
             // Prompt still in flight: close asynchronously so history
@@ -1835,27 +1826,7 @@ impl Drop for LuaSession {
     }
 }
 
-/// What was sent while no run read the inbox, shown as consumed and handed
-/// to the next run ahead of its own message, so its first reply reads it.
-fn take_waiting(inbox: &SubagentInbox, event_tx: &EventSender) -> Vec<EarlierInput> {
-    inbox
-        .drain()
-        .into_iter()
-        .map(|input| {
-            announce_consumed(event_tx, &input.message, &input.images);
-            EarlierInput::from(input)
-        })
-        .collect()
-}
-
-fn announce_consumed(event_tx: &EventSender, text: &str, images: &[ImageSource]) {
-    let _ = event_tx.send(AgentEvent::QueueItemConsumed {
-        text: text.to_owned(),
-        images: images.to_vec(),
-    });
-}
-
-fn plugin_input(message: String, opts: RequestOptions) -> AgentInput {
+pub(crate) fn plugin_input(message: String, opts: RequestOptions) -> AgentInput {
     AgentInput {
         message,
         mode: AgentMode::Build,
@@ -1867,6 +1838,15 @@ fn plugin_input(message: String, opts: RequestOptions) -> AgentInput {
         workflow: false,
         prompt: None,
         source: InputSource::Plugin,
+    }
+}
+
+/// How a sent message reaches the subagent, from `{ interrupt = bool }`.
+pub(crate) fn delivery(opts: Option<&Table>) -> Delivery {
+    if opts.and_then(|opts| opts.opt_bool(INTERRUPT_OPT)) == Some(true) {
+        Delivery::Interrupt
+    } else {
+        Delivery::NextTurn
     }
 }
 
@@ -1888,9 +1868,10 @@ fn plugin_input(message: String, opts: RequestOptions) -> AgentInput {
 /// @return (table?, string?) Result table on success, or `(nil, err)` on
 /// failure. A run cut short after streaming some text hands you both: the
 /// error and a `{ text = <what it streamed> }` table. `"cancelled"` means the
-/// task that opened or prompted the session ended. `"stopped by user"` means
-/// Esc in its tab closed a session opened by chat session id, and every
-/// later prompt answers the same.
+/// task that opened or prompted the session ended. `"session closed"` means
+/// `:close()` ended it. `"stopped by user"` means Esc in its tab stopped it,
+/// and `"stopped by parent agent"` that the model stopped the background task
+/// it runs in. Every later prompt answers the same.
 /// @example
 /// local r, err = sess:prompt("What files are in this project?")
 /// if err then error(err) end
@@ -1914,7 +1895,7 @@ async fn prompt(
         (true, None) => return Ok(err_pair(TASK_REQUIRED_ERR)),
     };
     let inner = Arc::clone(&this.inner);
-    let inbox = Arc::clone(&this.inbox);
+    let cancellation = Arc::clone(&this.cancellation);
     drop(this);
     let mut guard = match &caller_cancel {
         Some(cancel) => match cancel.race(inner.lock()).await {
@@ -1924,14 +1905,15 @@ async fn prompt(
         None => inner.lock().await,
     };
     let s = &mut *guard;
-    if let Some(refusal) = s.refusal() {
-        return Ok(err_pair(refusal));
+    let control = &cancellation.control;
+    if let Some(reason) = control.ended() {
+        return Ok(err_pair(reason));
     }
     // The user can lower the effort while a monitor sits idle, so we ask the
     // seed again on every prompt. Plan mode is left out on purpose. Each write
     // checks it instead, see `AgentSeed::background_write_block`.
-    let mut watch = match (&s.background, caller_cancel) {
-        (Some(background), Some(caller_cancel)) => {
+    let settle = match &s.background {
+        Some(background) => {
             let Some(seed) = AgentSeed::live(background.session) else {
                 return Ok(err_pair(not_live(background.session)));
             };
@@ -1941,37 +1923,36 @@ async fn prompt(
                 seed.chat_opts(),
                 &s.params.model,
             );
-            Some((
-                caller_cancel,
-                background.start_prompt(
-                    &s.cancellation.ui_id,
-                    s.sub_event_tx.clone(),
-                    Arc::clone(&s.params.ledger),
-                ),
+            Some(PromptSettle::new(
+                s.sub_event_tx.clone(),
+                Arc::clone(&s.params.ledger),
             ))
         }
-        _ => None,
+        None => None,
     };
     if s.background.is_none() && s.subagent_info.get().is_none() {
         let _ = s.subagent_info.set(SubagentInfo {
-            parent_tool_use_id: s.cancellation.ui_id.clone(),
+            parent_tool_use_id: cancellation.ui_id.clone(),
             name: s.name.clone(),
             prompt: Some(message.clone()),
             model: Some(s.params.model.spec()),
             opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
-            inbox: Some(Arc::clone(&inbox)),
-            parent_call: s.cancellation.parent_call(),
+            control: Arc::clone(control),
+            parent_call: cancellation.parent_call(),
         });
     }
     // The run only reads the inbox after a turn, so a message sent while we
     // sat idle would cost a reply that ignores it plus one more turn. It rides
     // in front of the prompt instead.
-    let earlier = take_waiting(&inbox, &s.sub_event_tx);
+    let earlier = control.take_waiting(&s.sub_event_tx);
     // The tab opened with the session, so every prompt shows up the way a
     // queued message does.
     if s.background.is_some() {
-        announce_consumed(&s.sub_event_tx, &message, &[]);
+        let _ = s.sub_event_tx.send(AgentEvent::QueueItemConsumed {
+            text: message.clone(),
+            images: Vec::new(),
+        });
     }
 
     // A cancel drops the run future, here in the race or with the whole task,
@@ -1980,80 +1961,37 @@ async fn prompt(
     // on, so we close them before going again.
     s.history.close_dangling_tool_calls(UNAVAILABLE_RESULT);
     let history_len = s.history.len();
-    let mut input = AgentInput {
+    let input = AgentInput {
         earlier,
         ..plugin_input(message, s.opts)
     };
-    // A call moved off a run reports to the session's mailbox, and the caller
-    // is owed the answer that comes after it. So the prompt waits for every
-    // moved call, and each wake runs one more turn on the same history.
-    let mut last_run_start;
-    let cut_short = loop {
-        last_run_start = s.history.len();
-        let mut agent = s.agent(&inbox);
-        let run = agent.run(input);
-        let finished = match &watch {
-            Some((caller_cancel, _)) => caller_cancel.race(run).await.ok(),
-            None => Some(run.await),
-        };
-        drop(agent);
-        // A run that lost the race keeps the `cancelled` it started with.
-        if let (Some((_, settle)), Some(result)) = (&mut watch, &finished) {
-            settle.outcome = result
-                .as_ref()
-                .err()
-                .map(|e| AgentEvent::error(e, RunTotals::default()));
-        }
-        if let Some(Ok(_)) = finished {
-            s.dones.expect_one();
-        }
-        // Before the run is judged, so a prompt Esc or an error cut short still
-        // leaves what it streamed in the tab's transcript. A monitor nobody
-        // closes would otherwise keep it in memory until the plugin unloads.
-        if s.background.is_some() {
-            s.upstream
-                .send_history(&s.cancellation.ui_id, s.history.as_slice().to_vec());
-        }
-        let result = finished.unwrap_or(Ok(DoneReason::Cancelled));
-        if let Some(err) = cut_short_err(&result, s.stopped_by_user()) {
-            break Some(err);
-        }
-        let caller_cancel = watch.as_ref().map(|(caller_cancel, _)| caller_cancel);
-        match next_wake(
-            &s.cancellation.mailbox,
-            &inbox,
-            &s.child_cancel,
-            caller_cancel,
-        )
-        .await
-        {
-            Ok(Some(notices)) => {
-                if let Some((_, settle)) = &mut watch {
-                    settle.outcome = Some(cancelled_run());
-                }
-                input = AgentInput {
-                    preamble: notices,
-                    earlier: take_waiting(&inbox, &s.sub_event_tx),
-                    ..plugin_input(String::new(), s.opts)
-                };
-            }
-            Ok(None) => break None,
-            Err(_) => break cut_short_err(&Ok(DoneReason::Cancelled), s.stopped_by_user()),
-        }
+    let mut host = PromptHost {
+        state: &mut *s,
+        settle,
     };
-    drop(watch);
+    let turns = run_turns(
+        control,
+        &cancellation.mailbox,
+        caller_cancel.as_ref(),
+        &mut host,
+        input,
+    )
+    .await;
+    drop(host);
     // Its own token fired, so no run of this session will read what its moved
     // calls report. A caller's cancel alone leaves them for the next prompt.
-    if s.child_cancel.is_cancelled() {
-        s.cancellation.end_mailbox();
+    if control.ended().is_some() {
+        cancellation.end_mailbox();
     }
-    if let Some(err) = cut_short {
-        // Only this call's messages count: older turns may hold stale preamble
-        // text, and the agent loop's empty-response retry leaves a synthetic
-        // "(empty)" assistant marker that must not pass for a real response.
-        let partial = messages_since(&s.history, history_len)
-            .iter()
-            .filter(|m| matches!(m.role, Role::Assistant))
+    // Only this call's messages count: older turns may hold stale preamble
+    // text.
+    let mut replies = messages_since(&s.history, history_len)
+        .iter()
+        .filter(|m| matches!(m.role, Role::Assistant));
+    if let Err(cut_short) = turns {
+        // The agent loop's empty-response retry leaves a synthetic "(empty)"
+        // assistant marker that must not pass for a real response.
+        let partial = replies
             .flat_map(|m| m.content.iter())
             .filter_map(|b| match b {
                 ContentBlock::Text { text } if text != EMPTY_RESPONSE_MARKER => Some(text.as_str()),
@@ -2068,7 +2006,7 @@ async fn prompt(
             tbl.set("text", partial)?;
             Some(tbl)
         };
-        return Ok((tbl, Some(err)));
+        return Ok((tbl, Some(cut_short.to_string())));
     }
     // The relay reaches `Done` only after every `TurnComplete`, so once it has,
     // all our `ToolLive::Usage` messages sit in the live channel before
@@ -2078,15 +2016,14 @@ async fn prompt(
     }
     let usage = s.params.ledger.totals().usage;
 
-    let text = messages_since(&s.history, last_run_start)
-        .iter()
-        .rfind(|m| matches!(m.role, Role::Assistant))
-        .and_then(|m| {
-            m.content.iter().find_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-        });
+    // The last reply is the answer: a resume with nothing new to answer
+    // leaves the one before it standing.
+    let text = replies.next_back().and_then(|m| {
+        m.content.iter().find_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+    });
     let text = text.map_or_else(String::new, str::to_owned);
 
     let tbl = lua.create_table()?;
@@ -2098,16 +2035,26 @@ async fn prompt(
 }
 
 /// Hand the subagent a message without waiting, delivered the same way as a
-/// message typed in its tab. A running `:prompt()` picks it up at its next turn boundary, once
-/// the current reply and its tool calls finish, and the model reads it as an
-/// interrupt from its parent, not the user. The tab draws it when it lands.
-/// Messages sent in a burst land together.
+/// message typed in its tab. A running `:prompt()` picks it up at its next
+/// turn boundary, once the current reply and its tool calls finish, and the
+/// model reads it as an interrupt from its parent, not the user. The tab
+/// draws it when it lands. Messages sent in a burst land together.
 ///
 /// With no prompt running, or one already past its last turn, the message
 /// waits. The next `:prompt()` sends it in the same request as its own
 /// message, just before it, so the first reply already reads it.
 ///
+/// With `interrupt`, a running `:prompt()` does not wait for the turn to end,
+/// nor for moved calls. The reply stops and running tools are cancelled (bash
+/// returns what it printed so far). The subagent then reads the message and
+/// carries on with its history intact, and `:prompt()` returns its answer as
+/// usual. If an `agent.user_message` layer drops the message, the subagent
+/// picks up the cut work instead. With no prompt running, the message waits
+/// like any other.
+///
 /// @param message string Message to deliver.
+/// @param opts table? Optional fields:
+///   `interrupt` (boolean?) - cut the running turn short. Default: `false`.
 /// @return (boolean?, string?) `true`, or `(nil, err)` when the session takes
 /// no more messages. The errors are the ones `:prompt()` refuses with. `true`
 /// means queued, not delivered: a message still waiting when the session
@@ -2116,22 +2063,24 @@ async fn prompt(
 /// -- From another task, while `sess:prompt()` is still running.
 /// local ok, err = sess:send("New finding: the bug is in parser.rs, focus there.")
 /// if not ok then maki.log.warn(err) end
+/// -- Stop a subagent heading the wrong way, mid tool call.
+/// sess:send("Stop, the bug is in lexer.rs, not parser.rs.", { interrupt = true })
 #[lua_fn]
-fn send(_lua: &Lua, this: &LuaSession, message: String) -> LuaResult<Pair<bool>> {
-    // A held lock means a prompt is running, and a task stopped mid-prompt
-    // holds it until the prompt unwinds. Without the fallback its message
-    // would queue for a run that never reads it.
-    let refusal = match this.inner.try_lock() {
-        Ok(s) => s.refusal(),
-        Err(_) => this.cancellation.refusal(),
-    };
-    if let Some(refusal) = refusal {
-        return Ok(err_pair(refusal));
-    }
+fn send(
+    _lua: &Lua,
+    this: &LuaSession,
+    message: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<bool>> {
+    let delivery = delivery(opts.as_ref());
     // A sent message never picks the run's settings, so these are inert.
-    this.inbox
-        .push(plugin_input(message, RequestOptions::default()));
-    Ok((Some(true), None))
+    let input = plugin_input(message, RequestOptions::default());
+    Ok(pair(
+        this.cancellation
+            .control
+            .send(input, delivery)
+            .map(|()| true),
+    ))
 }
 
 /// Close the session and flush its history back to the parent agent. Calling
@@ -2142,12 +2091,12 @@ fn send(_lua: &Lua, this: &LuaSession, message: String) -> LuaResult<Pair<bool>>
 /// the VM sits idle, and the subagent's event relay stays alive until it does.
 ///
 /// Close cancels a running prompt before waiting to flush its history. That
-/// prompt returns a cancelled error and any partial text.
+/// prompt returns `"session closed"` and any partial text.
 ///
 /// @return
 #[lua_fn]
 async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
-    this.cancellation.cancel();
+    this.cancellation.close();
     let inner = Arc::clone(&this.inner);
     drop(this);
     let mut s = inner.lock().await;
@@ -2198,7 +2147,10 @@ mod tests {
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
     use maki_agent::tools::test_support::{mock_tool, stub_ctx_with, stub_seed};
     use maki_agent::tools::{ToolAudience, ToolSource};
-    use maki_agent::{BackgroundNotice, DoneReason, SessionMailbox, TaskEnd, TurnCompleteEvent};
+    use maki_agent::{
+        BackgroundNotice, Cutter, DoneReason, MovedTrigger, SessionMailbox, TaskEnd,
+        TurnCompleteEvent,
+    };
     use maki_config::ToolKey;
     use maki_providers::model::ThinkingSupport;
     use maki_providers::provider::{BoxFuture, Provider};
@@ -2214,6 +2166,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::api::task::{NO_RUNNING_SUBAGENT, create_task_table};
     use crate::runtime::{TaskCell, TaskScope};
 
     const PLUGIN: &str = "monitor";
@@ -2232,9 +2185,25 @@ mod tests {
     const MOVED_CALL_ID: &str = "toolu_moved";
     const NOTICE_TEXT: &str = "Background bash toolu_moved (cargo build) finished:\n\nok";
     const SENT_MESSAGE: &str = "Wrap up now.";
+    const UNKNOWN_TASK_ID: &str = "toolu_unknown";
+    const PEEK_CALL_ID: &str = "toolu_peek";
+    const PEEK_TEXTS: &str = "
+        local messages, err = task.messages(ctx, id, { last = last })
+        if not messages then return nil, err end
+        local texts = {}
+        for i, message in ipairs(messages) do
+            texts[i] = message.content[1].text
+        end
+        return texts
+    ";
     const HINTED_TOOL: &str = "hinted_tool";
     const OTHER_TOOL: &str = "other_tool";
     const TOOL_HINT: &str = "Call hinted_tool first.";
+    const SESSION_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+    const ASSIGNED_SPEC: &str = "zai/glm-5";
+    // Malformed on purpose: an unknown slug would warm the catalog, which
+    // fetches models.dev.
+    const STALE_SPEC: &str = "removed-model";
 
     #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
     #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
@@ -2335,16 +2304,7 @@ mod tests {
             close(lua.clone(), first.borrow().unwrap()).await.unwrap();
         }
         for session in [sibling, replacement] {
-            assert!(
-                !session
-                    .borrow::<LuaSession>()
-                    .unwrap()
-                    .inner
-                    .lock()
-                    .await
-                    .child_cancel
-                    .is_cancelled()
-            );
+            assert!(!session_cancelled(&session));
             close(lua.clone(), session.borrow().unwrap()).await.unwrap();
         }
     }
@@ -2375,8 +2335,9 @@ mod tests {
                     },
                 )
                 .await;
+                let closed = EndReason::Closed.to_string();
                 let (partial, error) = result.unwrap();
-                assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
+                assert_eq!(error.as_ref(), Some(&closed));
                 assert!(
                     partial
                         .unwrap()
@@ -2389,10 +2350,10 @@ mod tests {
                         prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into())
                             .await
                             .unwrap();
-                    assert_eq!(error.as_deref(), Some(SESSION_CLOSED_ERR));
+                    assert_eq!(error.as_ref(), Some(&closed));
                     let (_, error) =
-                        send(&lua, &sess.borrow().unwrap(), SESSION_PROMPT.into()).unwrap();
-                    assert_eq!(error.as_deref(), Some(SESSION_CLOSED_ERR));
+                        send(&lua, &sess.borrow().unwrap(), SESSION_PROMPT.into(), None).unwrap();
+                    assert_eq!(error.as_ref(), Some(&closed));
                     assert!(started_rx.is_empty());
                 }
                 loop {
@@ -2475,7 +2436,7 @@ mod tests {
     ) {
         let lua = Lua::new();
         let registry = ToolRegistry::new();
-        let source = ToolSource::Lua {
+        let source = ToolSource {
             plugin: PLUGIN.into(),
         };
         registry
@@ -2555,6 +2516,9 @@ mod tests {
 
     const NUDGE: &str = "new finding, hurry up";
     const INTERRUPT_OPEN: &str = "<parent-interrupt>";
+    const HANG_TOOL: &str = "hang";
+    const HANG_CALL_ID: &str = "toolu_hang";
+    const TOOL_CUT: &str = "cut short";
 
     /// Hands the texts of each request's closing user messages to the test,
     /// then holds the reply until the test lets it go.
@@ -2622,7 +2586,7 @@ mod tests {
             release: release_rx,
         });
         let nudge = |sess: &AnyUserData| {
-            let sent = send(&lua, &sess.borrow().unwrap(), NUDGE.into()).unwrap();
+            let sent = send(&lua, &sess.borrow().unwrap(), NUDGE.into(), None).unwrap();
             assert_eq!(sent, (Some(true), None));
         };
         let run = async {
@@ -2666,6 +2630,114 @@ mod tests {
                     .subagent
                     .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
         }));
+    }
+
+    /// The first request calls {HANG_TOOL}, every later one answers.
+    struct HangingToolProvider {
+        requests: Sender<Vec<Message>>,
+    }
+
+    impl Provider for HangingToolProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a JsonValue,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.requests.send(messages.to_vec()).unwrap();
+                let first = !messages.iter().any(|m| matches!(m.role, Role::Assistant));
+                let content = if first {
+                    vec![ContentBlock::tool_use(HANG_CALL_ID, HANG_TOOL, json!({}))]
+                } else {
+                    vec![ContentBlock::Text {
+                        text: CHILD_RESPONSE.into(),
+                    }]
+                };
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content,
+                        ..Default::default()
+                    },
+                    stop_reason: Some(StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn hang_tool(started: Sender<()>) -> LocalTool {
+        maki_agent::tools::local_tool(ToolAudience::all(), move |_, ctx| {
+            let started = started.clone();
+            Box::pin(async move {
+                started.send(()).unwrap();
+                ctx.cancel.cancelled().await;
+                Err(TOOL_CUT.into())
+            })
+        })
+    }
+
+    /// The model must never see a tool call without its result, so the call
+    /// the interrupt cancelled still gets one before the marker and the
+    /// message. Then the same prompt answers.
+    #[tokio::test]
+    async fn an_interrupting_send_cuts_a_running_tool_and_the_prompt_goes_on() {
+        let lua = Lua::new();
+        let (started_tx, started) = flume::unbounded();
+        let (requests_tx, requests) = flume::unbounded();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.provider = Arc::new(HangingToolProvider {
+            requests: requests_tx,
+        });
+        let sess = native_session(&lua, &ctx).await;
+        sess.borrow::<LuaSession>()
+            .unwrap()
+            .inner
+            .lock()
+            .await
+            .local_tools = Arc::new(HashMap::from([(
+            HANG_TOOL.to_owned(),
+            hang_tool(started_tx),
+        )]));
+
+        let (result, ()) = futures::future::join(prompt_text(&lua, &sess), async {
+            started.recv_async().await.unwrap();
+            let opts = lua.create_table_from([(INTERRUPT_OPT, true)]).unwrap();
+            let sent = send(&lua, &sess.borrow().unwrap(), NUDGE.into(), Some(opts)).unwrap();
+            assert_eq!(sent, (Some(true), None));
+        })
+        .await;
+        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+
+        assert_eq!(result, (Some(CHILD_RESPONSE.to_owned()), None));
+        let [first, second] = &requests.drain().collect::<Vec<_>>()[..] else {
+            panic!("expected the cut request and the one after it");
+        };
+        assert!(second.starts_with(first), "earlier messages were edited");
+        let answered: Vec<_> = second
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answered, [HANG_CALL_ID]);
+        let appended = texts(&second[first.len()..]);
+        let [marker, interrupt] = appended[..] else {
+            panic!("expected the marker and the interrupt, got {appended:?}");
+        };
+        assert_eq!(marker, Cutter::Parent.cancel_marker());
+        assert!(interrupt.starts_with(INTERRUPT_OPEN) && interrupt.contains(NUDGE));
     }
 
     fn call(src: &str, input: JsonValue) -> Result<String, String> {
@@ -2740,7 +2812,7 @@ mod tests {
     const SESSION_MODEL: &str = "test-model";
     const NESTED_MODEL: &str = "nested-model";
 
-    const fn tokens(input: u32, output: u32) -> TokenUsage {
+    const fn tokens(input: u64, output: u64) -> TokenUsage {
         TokenUsage {
             input,
             output,
@@ -2771,7 +2843,7 @@ mod tests {
             model: None,
             opts: None,
             answer_tx: None,
-            inbox: None,
+            control: Arc::default(),
             parent_call: None,
         })
         .unwrap();
@@ -3025,60 +3097,6 @@ mod tests {
         );
     }
 
-    fn cancellation(
-        ui_id: &str,
-        trigger: CancelTrigger,
-        registry: BackgroundTasks,
-        background: bool,
-    ) -> SessionCancellation {
-        let parent_cancels = Arc::new(CancelMap::new());
-        let (slot_trigger, _cancel) = CancelToken::new();
-        SessionCancellation {
-            slot: parent_cancels.insert(ui_id.to_owned(), slot_trigger),
-            parent_cancels,
-            ui_id: ui_id.to_owned(),
-            trigger,
-            registry,
-            background,
-            mailbox: SessionMailbox::register(MakiId::generate()),
-            adoption: None,
-            stop: StopMark::default(),
-        }
-    }
-
-    /// A running prompt holds the session lock until it unwinds, so `send`
-    /// can only ask the cancellation whether Esc stopped the task.
-    #[test]
-    fn user_stop_refuses_without_the_session_lock() {
-        let session = MakiId::generate();
-        let _live = crate::background::tests::live(session);
-        let registry = BackgroundTasks::default();
-        let (mut entry, _token) = crate::background::tests::entry(session, None);
-        let (trigger, _session_cancel) = CancelToken::new();
-        let cancellation = cancellation(&entry.info.id, trigger, registry.clone(), true);
-        entry.stop = cancellation.stop.clone();
-        registry.register(entry).unwrap();
-        assert_eq!(cancellation.refusal(), None);
-
-        registry.stop(&cancellation.ui_id, Stop::User);
-
-        assert_eq!(cancellation.refusal(), Some(STOPPED_BY_USER_ERR));
-    }
-
-    /// The parent message of a stopped call would otherwise queue for the
-    /// prompt that is still unwinding and never reads it.
-    #[test]
-    fn a_stopped_call_refuses_while_its_prompt_unwinds() {
-        let (call_trigger, call) = CancelToken::new();
-        let (trigger, _session_cancel) = call.child();
-        let cancellation = cancellation(PARENT_ID, trigger, BackgroundTasks::default(), false);
-        assert_eq!(cancellation.refusal(), None);
-
-        call_trigger.cancel();
-
-        assert_eq!(cancellation.refusal(), Some(CANCELLED_MSG));
-    }
-
     /// The first turn reaches the parent while the call is in the
     /// foreground. Everything after the move goes to the chat, in order, and
     /// the run's bill so far lands on the moved call's entry, whose id a
@@ -3148,14 +3166,8 @@ mod tests {
     #[tokio::test]
     async fn dropped_background_prompt_still_ends_the_run_in_its_tab() {
         let (guard, sub_events) = event_stream();
-        let background = Background {
-            registry: BackgroundTasks::default(),
-            session: MakiId::generate(),
-            thinking: None,
-            fast: None,
-        };
         let ledger = Arc::new(RunLedger::default());
-        let settle = background.start_prompt(PARENT_ID, guard.sender(RUN_ID), Arc::clone(&ledger));
+        let settle = PromptSettle::new(guard.sender(RUN_ID), Arc::clone(&ledger));
         ledger.add(DONE_USAGE, None, None);
         drop(settle);
         drop(guard);
@@ -3190,25 +3202,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_model_selection_tier_override_beats_the_session_provider() {
+    #[test_case(None ; "unassigned_default_has_no_provenance")]
+    #[test_case(Some(ASSIGNED_SPEC) ; "assignment_beats_the_session_provider")]
+    #[test_case(Some(STALE_SPEC) ; "stale_assignment_fails_instead_of_falling_back")]
+    #[tokio::test]
+    async fn task_model_selection_follows_the_tier_assignment(assigned: Option<&str>) {
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
-        ctx.model = Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap());
+        ctx.model = Arc::new(Model::from_spec(SESSION_SPEC).unwrap());
         let ctx = AgentContext::from(&ctx);
-
-        let same_provider_weak = resolve_model_from_ctx(&ctx, Some("weak")).unwrap().spec();
-        assert!(same_provider_weak.starts_with("anthropic/"));
-
         let dir = tempfile::TempDir::new().unwrap();
-        maki_providers::model_registry::set_and_persist(
-            "zai/glm-5".into(),
-            ModelTier::Weak,
-            &maki_storage::StateDir::from_path(dir.path().to_path_buf()),
-        );
+        if let Some(spec) = assigned {
+            model_registry::set_and_persist(
+                spec.into(),
+                ModelTier::Weak,
+                &maki_storage::StateDir::from_path(dir.path().to_path_buf()),
+            );
+        }
 
-        let model = resolve_model_from_ctx(&ctx, Some("weak")).unwrap();
-        assert_eq!(model.spec(), "zai/glm-5");
-        assert_ne!(model.spec(), same_provider_weak);
+        let resolved = resolve_model_from_ctx(&ctx, Some(ModelTier::Weak.to_string().as_str()))
+            .await
+            .map(|(model, tier)| (model.spec(), tier));
+        match assigned.map(|spec| (spec, Model::from_spec(spec))) {
+            None => {
+                let (spec, tier) = resolved.unwrap();
+                assert_eq!(spec.split_once('/').unwrap().0, &*ctx.model.provider);
+                assert_eq!(tier, None);
+            }
+            Some((spec, Ok(_))) => {
+                assert_eq!(resolved, Ok((spec.to_owned(), Some(ModelTier::Weak))));
+            }
+            Some((spec, Err(cause))) => {
+                assert_eq!(resolved, Err(stale_tier_err(ModelTier::Weak, spec, cause)));
+            }
+        }
     }
 
     fn live_chat() -> (MakiId, SessionMailbox, Arc<AgentSeed>) {
@@ -3237,14 +3263,15 @@ mod tests {
                 kind: Kind::Call {
                     tool: Arc::from(CALL_TOOL),
                 },
-                running: true,
                 started_at: 0,
                 cost: None,
             },
             session: chat,
             task: None,
             lifetime: Lifetime::Call,
-            stop: StopMark::default(),
+            stopped: None,
+            control: None,
+            replied: false,
             cancel: Fire::Owned(CancelToken::new().0),
             mailbox: None,
         }
@@ -3265,7 +3292,7 @@ mod tests {
         call: &CallScope,
         chat: MakiId,
         ui: Option<&Sender<UiAction>>,
-    ) -> CancelTrigger {
+    ) -> MovedTrigger {
         let home = home(chat, CALL_ID);
         let trigger = call.move_to(home.clone()).unwrap();
         let registry = BackgroundTasks::of(lua);
@@ -3282,7 +3309,8 @@ mod tests {
     }
 
     fn session_cancelled(sess: &AnyUserData) -> bool {
-        session_state(sess, |state| state.child_cancel.is_cancelled())
+        let sess = sess.borrow::<LuaSession>().unwrap();
+        sess.cancellation.control.token().is_cancelled()
     }
 
     fn session_ui_id(sess: &AnyUserData) -> String {
@@ -3305,7 +3333,7 @@ mod tests {
         call: &CallScope,
         chat: MakiId,
         opened: Opened,
-    ) -> (AnyUserData, CancelTrigger) {
+    ) -> (AnyUserData, MovedTrigger) {
         match opened {
             Opened::BeforeTheMove => {
                 let sess = native_session(lua, ctx).await;
@@ -3373,7 +3401,8 @@ mod tests {
         assert_eq!(blocked_by(), Some(if inherited { owner } else { chat }));
     }
 
-    /// Esc in the adopted tab of a subagent a moved `batch` runs.
+    /// Esc in the adopted tab of a subagent a moved `batch` runs. Its prompt
+    /// and every send after it learn the user stopped it.
     #[test_case(Opened::BeforeTheMove ; "opened_before_the_move")]
     #[test_case(Opened::AfterTheMove ; "opened_after_the_move")]
     #[tokio::test]
@@ -3392,10 +3421,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(kinds, [(id.clone(), Kind::Agent)]);
 
-        registry.stop(&id, Stop::User);
+        registry.stop(&id, Cutter::User);
         assert!(session_cancelled(&sess));
         assert!(!call.cancel().is_cancelled());
         assert!(registry.list(chat).is_empty());
+        let (_, error) = send(&lua, &sess.borrow().unwrap(), NUDGE.into(), None).unwrap();
+        assert_eq!(error, Some(EndReason::Stopped(Cutter::User).to_string()));
     }
 
     /// A top-level `task` shares its id with the call, so the call's entry
@@ -3475,6 +3506,8 @@ mod tests {
     }
 
     /// Answers each request with the next reply and hands over what it carried.
+    /// A request waits for its reply while the sender lives, and fails once
+    /// it is gone.
     struct ScriptedProvider {
         requests: Sender<ScriptedRequest>,
         replies: flume::Receiver<&'static str>,
@@ -3503,7 +3536,7 @@ mod tests {
                     message: Message {
                         role: Role::Assistant,
                         content: vec![ContentBlock::Text {
-                            text: self.replies.try_recv().unwrap().into(),
+                            text: self.replies.recv_async().await.unwrap().into(),
                         }],
                         ..Default::default()
                     },
@@ -3518,17 +3551,24 @@ mod tests {
         }
     }
 
-    fn scripted_ctx() -> (ToolContext, flume::Receiver<ScriptedRequest>) {
+    fn scripted_provider(
+        ctx: &mut ToolContext,
+    ) -> (flume::Receiver<ScriptedRequest>, Sender<&'static str>) {
         let (requests_tx, requests) = flume::unbounded();
         let (replies_tx, replies) = flume::unbounded();
-        for reply in [FIRST_REPLY, WOKEN_REPLY] {
-            replies_tx.send(reply).unwrap();
-        }
-        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         ctx.provider = Arc::new(ScriptedProvider {
             requests: requests_tx,
             replies,
         });
+        (requests, replies_tx)
+    }
+
+    fn scripted_ctx() -> (ToolContext, flume::Receiver<ScriptedRequest>) {
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        let (requests, replies) = scripted_provider(&mut ctx);
+        for reply in [FIRST_REPLY, WOKEN_REPLY] {
+            replies.send(reply).unwrap();
+        }
         (ctx, requests)
     }
 
@@ -3549,6 +3589,7 @@ mod tests {
 
     fn moved_call_notice(wake: bool) -> BackgroundNotice<'static> {
         BackgroundNotice {
+            markdown: false,
             text: NOTICE_TEXT.into(),
             display: None,
             wake,
@@ -3635,7 +3676,7 @@ mod tests {
         let ((text, error), woken) = futures::future::join(prompt_text(&lua, &sess), async {
             requests.recv_async().await.unwrap();
             let session = sess.borrow::<LuaSession>().unwrap();
-            let (sent, _) = send(&lua, &session, SENT_MESSAGE.into()).unwrap();
+            let (sent, _) = send(&lua, &session, SENT_MESSAGE.into(), None).unwrap();
             assert_eq!(sent, Some(true));
             let woken = requests.recv_async().await.unwrap();
             mailbox.settle(MOVED_CALL_ID, None);
@@ -3698,16 +3739,68 @@ mod tests {
         close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
     }
 
+    /// A coordinator reads a moved subagent while its run holds the session
+    /// lock. A top-level `task` shares the call's entry and a nested one gets
+    /// its own, so both must report where the call does.
+    #[test_case(Some(CALL_ID) ; "top_level")]
+    #[test_case(None ; "nested")]
     #[tokio::test]
-    async fn a_caller_cancel_ends_the_wait_for_moved_calls() {
-        let mailbox = SessionMailbox::register(MakiId::generate());
-        mailbox.track(MOVED_CALL_ID);
-        let session = CancelToken::none();
-        let (caller_trigger, caller) = CancelToken::new();
-        let inbox = SubagentInbox::default();
-        let mut wake = pin!(next_wake(&mailbox, &inbox, &session, Some(&caller)));
-        assert!((&mut wake).now_or_never().is_none());
-        caller_trigger.cancel();
-        assert!(wake.await.is_err());
+    async fn task_messages_reads_a_moved_session_mid_run(tool_use_id: Option<&str>) {
+        let lua = Lua::new();
+        let (chat, chat_mailbox, _seed) = live_chat();
+        install_task_table(&lua, &chat_mailbox);
+        let (_run_trigger, run) = CancelToken::new();
+        let (mut ctx, call) = call_ctx(&run, tool_use_id);
+        let (requests, replies) = scripted_provider(&mut ctx);
+        BackgroundTasks::of(&lua)
+            .register(BackgroundTask {
+                mailbox: Some(chat_mailbox.clone()),
+                ..call_entry(chat, CALL_ID)
+            })
+            .unwrap();
+        let (sess, _call_trigger) =
+            open_under_moved_call(&lua, &ctx, &call, chat, Opened::BeforeTheMove).await;
+        let id = session_ui_id(&sess);
+        replies.send(FIRST_REPLY).unwrap();
+        prompt_text(&lua, &sess).await;
+        requests.drain();
+        let (_, peeked) = futures::future::join(prompt_text(&lua, &sess), async {
+            requests.recv_async().await.unwrap();
+            let peeked = [peek(&lua, &id, None).await, peek(&lua, &id, Some(2)).await];
+            replies.send(WOKEN_REPLY).unwrap();
+            peeked
+        })
+        .await;
+        let all = [SESSION_PROMPT, FIRST_REPLY, SESSION_PROMPT].map(String::from);
+        assert_eq!(
+            peeked.map(Result::unwrap),
+            [(Some(all.to_vec()), None), (Some(all[1..].to_vec()), None)]
+        );
+
+        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        for gone in [id.as_str(), UNKNOWN_TASK_ID] {
+            let (_, error) = peek(&lua, gone, None).await.unwrap();
+            assert_eq!(error, Some(format!("{NO_RUNNING_SUBAGENT} {gone}")));
+        }
+    }
+
+    /// The task table, called as a model call of the chat reading `mailbox`.
+    fn install_task_table(lua: &Lua, mailbox: &SessionMailbox) {
+        let task = create_task_table(lua, None, &PluginPermissions::trusted()).unwrap();
+        lua.globals().set("task", task).unwrap();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PEEK_CALL_ID));
+        ctx.mailbox = Some(mailbox.clone());
+        let ctx = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+        lua.globals().set("ctx", ctx).unwrap();
+    }
+
+    async fn peek(
+        lua: &Lua,
+        id: &str,
+        last: Option<usize>,
+    ) -> mlua::Result<(Option<Vec<String>>, Option<String>)> {
+        lua.globals().set("id", id)?;
+        lua.globals().set("last", last)?;
+        lua.load(PEEK_TEXTS).eval_async().await
     }
 }

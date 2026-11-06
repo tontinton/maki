@@ -181,23 +181,30 @@ impl BackgroundOnly {
     }
 }
 
-pub(crate) struct PendingTool {
+/// What `register_tool` declared, carried unchanged from the pending entry
+/// into the registered tool.
+#[derive(Clone)]
+pub(crate) struct ToolMeta {
     pub(crate) name: Arc<str>,
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
     pub(crate) kind: Option<Arc<str>>,
+    pub(crate) mutable_path_field: Option<Arc<str>>,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) start_annotation: Option<StartAnnotation>,
+    pub(crate) examples: Option<Value>,
+    pub(crate) background_only: BackgroundOnly,
+}
+
+pub(crate) struct PendingTool {
+    pub(crate) meta: ToolMeta,
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
     pub(crate) restore_key: Option<RegistryKey>,
     pub(crate) start_key: Option<RegistryKey>,
     pub(crate) permission: Option<ToolPermission<PermissionScopeSpec>>,
-    pub(crate) mutable_path_field: Option<Arc<str>>,
-    pub(crate) timeout: Option<Duration>,
-    pub(crate) start_annotation: Option<StartAnnotation>,
-    pub(crate) examples: Option<Value>,
     pub(crate) describe_key: Option<RegistryKey>,
-    pub(crate) background_only: BackgroundOnly,
 }
 
 impl PendingTool {
@@ -236,38 +243,29 @@ pub(crate) struct PendingRule {
 pub(crate) type PendingRules = Arc<Mutex<Vec<PendingRule>>>;
 
 pub(crate) struct LuaTool {
-    pub(crate) name: Arc<str>,
-    pub(crate) description: String,
-    pub(crate) schema: &'static ParamSchema,
-    pub(crate) audience: ToolAudience,
-    pub(crate) kind: Option<Arc<str>>,
+    pub(crate) meta: ToolMeta,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
     pub(crate) permission: Option<ToolPermission<PermissionScopeKind>>,
-    pub(crate) mutable_path_field: Option<Arc<str>>,
-    pub(crate) timeout: Option<Duration>,
-    pub(crate) start_annotation: Option<StartAnnotation>,
-    pub(crate) examples: Option<Value>,
     pub(crate) has_describe_fn: bool,
-    pub(crate) background_only: BackgroundOnly,
 }
 
 impl Tool for LuaTool {
     fn name(&self) -> &str {
-        &self.name
+        &self.meta.name
     }
 
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
         if !self.has_describe_fn {
-            return Cow::Borrowed(&self.description);
+            return Cow::Borrowed(&self.meta.description);
         }
         let dctx = dctx_json(ctx);
-        if let Some(result) = local_describe(&self.plugin, &self.name, &dctx) {
+        if let Some(result) = local_describe(&self.plugin, &self.meta.name, &dctx) {
             return match result {
                 Some(s) => Cow::Owned(s),
-                None => Cow::Borrowed(&self.description),
+                None => Cow::Borrowed(&self.meta.description),
             };
         }
         let (reply_tx, reply_rx) = flume::bounded(1);
@@ -275,7 +273,7 @@ impl Tool for LuaTool {
             .tx
             .send(Request::Describe {
                 plugin: Arc::clone(&self.plugin),
-                tool: Arc::clone(&self.name),
+                tool: Arc::clone(&self.meta.name),
                 dctx,
                 reply: reply_tx,
             })
@@ -285,29 +283,29 @@ impl Tool for LuaTool {
                 Ok(Some(s)) => return Cow::Owned(s),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(
-                    tool = %self.name,
+                    tool = %self.meta.name,
                     error = %e,
                     "describe round trip failed; falling back to static description"
                 ),
             }
         }
-        Cow::Borrowed(&self.description)
+        Cow::Borrowed(&self.meta.description)
     }
 
     fn schema(&self) -> Value {
-        to_json_schema(self.schema)
+        to_json_schema(self.meta.schema)
     }
 
     fn offered_schema(&self, background: bool) -> Option<Value> {
         if background {
             return Some(self.schema());
         }
-        if self.background_only.tool {
+        if self.meta.background_only.tool {
             return None;
         }
         let mut schema = self.schema();
         if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-            for param in &self.background_only.params {
+            for param in &self.meta.background_only.params {
                 properties.remove(param);
             }
         }
@@ -315,15 +313,15 @@ impl Tool for LuaTool {
     }
 
     fn audience(&self) -> ToolAudience {
-        self.audience
+        self.meta.audience
     }
 
     fn tool_kind(&self) -> Option<&str> {
-        self.kind.as_deref()
+        self.meta.kind.as_deref()
     }
 
     fn examples(&self) -> Option<Value> {
-        self.examples.clone()
+        self.meta.examples.clone()
     }
 
     fn reach(&self) -> Option<ToolReach> {
@@ -334,7 +332,7 @@ impl Tool for LuaTool {
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-        let validated = validate(self.schema, input.clone())?;
+        let validated = validate(self.meta.schema, input.clone())?;
         let permission_state = match self.permission.as_ref().and_then(|p| p.scopes.as_ref()) {
             Some(PermissionScopeKind::Field(field)) => {
                 let scope = validated.get(field.as_ref()).and_then(|v| v.as_str());
@@ -347,16 +345,16 @@ impl Tool for LuaTool {
             None => PermissionState::Ready(None),
         };
         Ok(Box::new(LuaToolInvocation {
-            tool: Arc::clone(&self.name),
+            tool: Arc::clone(&self.meta.name),
             plugin: Arc::clone(&self.plugin),
             has_header_fn: self.has_header_fn,
             has_start_fn: self.has_start_fn,
             input: validated,
             tx: self.tx.clone(),
             permission_state,
-            mutable_path_field: self.mutable_path_field.clone(),
-            timeout: self.timeout,
-            start_annotation: self.start_annotation.clone(),
+            mutable_path_field: self.meta.mutable_path_field.clone(),
+            timeout: self.meta.timeout,
+            start_annotation: self.meta.start_annotation.clone(),
         }))
     }
 }
@@ -752,6 +750,7 @@ fn register_prompt(
 /// to decide when to use the tool), a JSON Schema for the input, and a handler
 /// function. The handler receives `(input, ctx)` and returns either a plain
 /// string or a table with richer output fields.
+/// Invalid UTF-8 in the returned text becomes U+FFFD.
 ///
 /// `ctx:output_mode()` returns "compact" when the result goes to the model and
 /// "full" when code such as `code_execution` made the call. Apply output limits
@@ -1311,14 +1310,7 @@ fn routed_tool_entry(lua: &Lua, name: String) -> LuaResult<LuaValue> {
     };
     let t = lua.create_table()?;
     t.set("name", name.as_str())?;
-    t.set(
-        "format",
-        if view.markdown {
-            LUA_FORMAT_MARKDOWN
-        } else {
-            LUA_FORMAT_PLAIN
-        },
-    )?;
+    t.set("format", format_name(view.markdown))?;
     let summary = {
         let name = name.clone();
         lua.create_function(move |lua, input: LuaValue| {
@@ -1732,22 +1724,24 @@ fn register_tool_from_lua(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(PendingTool {
-            name,
-            description,
-            schema: param_schema,
-            audience,
-            kind,
+            meta: ToolMeta {
+                name,
+                description,
+                schema: param_schema,
+                audience,
+                kind,
+                mutable_path_field,
+                timeout,
+                start_annotation,
+                examples,
+                background_only,
+            },
             handler_key,
             header_key,
             restore_key,
             start_key,
             permission,
-            mutable_path_field,
-            timeout,
-            start_annotation,
-            examples,
             describe_key,
-            background_only,
         });
 
     Ok(())
@@ -1986,7 +1980,15 @@ impl ToolCallReply {
     }
 }
 
-fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
+pub(crate) fn format_name(markdown: bool) -> &'static str {
+    if markdown {
+        LUA_FORMAT_MARKDOWN
+    } else {
+        LUA_FORMAT_PLAIN
+    }
+}
+
+pub(crate) fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
     let Ok(LuaValue::String(s)) = t.get::<LuaValue>("format") else {
         return LuaOutputFormat::default();
     };
@@ -2042,11 +2044,11 @@ fn extract_image(t: &mlua::Table) -> Result<Option<ImageSource>, String> {
 
 pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
     match result {
-        LuaValue::String(s) => s.to_str().map(|s| s.to_owned()).map_err(|e| e.to_string()),
+        LuaValue::String(s) => Ok(s.to_string_lossy()),
         LuaValue::Table(t) => {
             let output = t.get::<LuaValue>("llm_output").ok().and_then(|v| {
                 if let LuaValue::String(s) = v {
-                    s.to_str().ok().map(|s| s.to_owned())
+                    Some(s.to_string_lossy())
                 } else {
                     None
                 }
@@ -2083,6 +2085,9 @@ mod tests {
 
         assert_eq!(background_params(&schema, offered), expected);
     }
+
+    const LEGACY_TEXT: &[u8] = b"caf\xe9";
+    const DISPLAY_TEXT: &str = "caf\u{fffd}";
 
     #[test_case::test_case("echo", true ; "simple_name")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]
@@ -2213,11 +2218,18 @@ mod tests {
         .unwrap();
         let (tx, _rx) = flume::unbounded();
         LuaTool {
-            name: Arc::from("test_tool"),
-            description: "test".into(),
-            schema,
-            audience: ToolAudience::default(),
-            kind: None,
+            meta: ToolMeta {
+                name: Arc::from("test_tool"),
+                description: "test".into(),
+                schema,
+                audience: ToolAudience::default(),
+                kind: None,
+                mutable_path_field: None,
+                timeout: Some(Duration::from_secs(60)),
+                start_annotation: None,
+                examples: None,
+                background_only: BackgroundOnly::default(),
+            },
             tx,
             plugin: Arc::from("test"),
             has_header_fn: false,
@@ -2225,13 +2237,8 @@ mod tests {
                 permission: Permission::FsWrite,
                 scopes: Some(scopes),
             }),
-            mutable_path_field: None,
-            timeout: Some(Duration::from_secs(60)),
-            start_annotation: None,
             has_start_fn: false,
-            examples: None,
             has_describe_fn: false,
-            background_only: BackgroundOnly::default(),
         }
     }
 
@@ -2269,11 +2276,25 @@ mod tests {
         assert!(unconfigured.permission_scopes().await.is_none());
     }
 
-    #[test]
-    fn coerce_string_returns_ok() {
+    #[test_case::test_case(b"hello", "hello" ; "utf8")]
+    #[test_case::test_case(LEGACY_TEXT, DISPLAY_TEXT ; "non_utf8")]
+    fn coerce_string_returns_ok(input: &[u8], expected: &str) {
         let lua = Lua::new();
-        let val = LuaValue::String(lua.create_string("hello").unwrap());
-        assert_eq!(coerce_tool_result(&val), Ok("hello".to_string()));
+        let val = LuaValue::String(lua.create_string(input).unwrap());
+        assert_eq!(coerce_tool_result(&val).as_deref(), Ok(expected));
+    }
+
+    #[test]
+    fn coerce_table_decodes_invalid_utf8() {
+        let lua = Lua::new();
+        let result = lua.create_table().unwrap();
+        result
+            .set("llm_output", lua.create_string(LEGACY_TEXT).unwrap())
+            .unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(result)).as_deref(),
+            Ok(DISPLAY_TEXT)
+        );
     }
 
     #[test]

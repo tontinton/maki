@@ -1,0 +1,1460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0">
+  <title>Plugins | maki</title>
+  <meta name="description" content="Lua plugins for maki, the efficient AI coding agent. Made by the community, listed straight from GitHub, installed with one line in init.lua.">
+  <meta name="theme-color" content="#faf3e3" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#161220" media="(prefers-color-scheme: dark)">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://maki.sh/plugins/">
+  <meta property="og:title" content="maki plugins">
+  <meta property="og:description" content="Lua plugins for maki, made by the community. One line in init.lua installs any of them.">
+  <meta property="og:image" content="https://maki.sh/android-chrome-512x512.png">
+  <meta property="og:site_name" content="maki">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="maki plugins">
+  <meta name="twitter:description" content="Lua plugins for maki, made by the community. One line in init.lua installs any of them.">
+  <meta name="twitter:image" content="https://maki.sh/android-chrome-512x512.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
+  <script>
+    (function() {
+      var root = document.documentElement;
+      // a stored choice wins, otherwise follow the system; runs before first paint so nothing flips
+      var theme = localStorage.getItem('theme');
+      root.setAttribute('data-theme', theme === 'light' || theme === 'dark' ? theme
+        : matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    })();
+  </script>
+  <link rel="preconnect" href="https://api.github.com" crossorigin>
+  <link rel="preconnect" href="https://raw.githubusercontent.com">
+  <link rel="preconnect" href="https://raw.githubusercontent.com" crossorigin>
+  <link rel="dns-prefetch" href="https://avatars.githubusercontent.com">
+  <link rel="preload" href="/docs/fonts/nunito-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/docs/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <style>
+    @font-face {
+      font-family: 'Nunito';
+      font-style: normal;
+      font-weight: 400 800;
+      font-display: swap;
+      src: url('/docs/fonts/nunito-latin.woff2') format('woff2');
+      unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+    }
+    @font-face {
+      font-family: 'JetBrains Mono';
+      font-style: normal;
+      font-weight: 100 800;
+      font-display: swap;
+      src: url('/docs/fonts/jetbrains-mono-latin.woff2') format('woff2');
+      unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+    }
+
+    *,*::before,*::after { box-sizing: border-box; margin: 0; padding: 0; }
+    button, input { font: inherit; color: inherit; background: none; border: 0; }
+    button { cursor: pointer; }
+
+    :root {
+      color-scheme: dark;
+      --font-body: 'Nunito', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace;
+      --paper: oklch(19.5% 0.028 295);
+      --soft: oklch(100% 0 0 / 0.06);
+      --ink: oklch(89% 0.02 80);
+      --ink-2: oklch(74% 0.025 75);
+      --ink-3: oklch(60% 0.03 70);
+      --rule: oklch(30% 0.03 295);
+      --accent: oklch(75% 0.12 45);
+      --accent-hover: oklch(82% 0.12 50);
+      --link-underline: oklch(75% 0.12 45 / 0.35);
+      --chip-bg: oklch(27% 0.035 295);
+      --chip-fg: oklch(86% 0.025 80);
+      --chip-border: oklch(35% 0.035 295);
+      --nav-sep: oklch(42% 0.03 295);
+      --scroll-thumb: oklch(89% 0.02 80 / 0.2);
+      --card-shadow: 0 12px 26px -16px oklch(0% 0 0 / 0.7);
+      --soft-hover: oklch(100% 0 0 / 0.09);
+      --cover-bg: oklch(15.5% 0.022 295);
+      --art-l1: 31%;
+      --art-l2: 21%;
+      --art-c: 0.07;
+      --art-ink: oklch(93% 0.035 85);
+      --art-moon: oklch(94% 0.06 88);
+      --art-glow: oklch(85% 0.09 85 / 0.14);
+      --art-stars:
+        radial-gradient(circle at 16% 24%, oklch(96% 0.035 92 / 0.85) 0.09rem, transparent 0.1rem),
+        radial-gradient(circle at 28% 78%, oklch(96% 0.035 92 / 0.5) 0.06rem, transparent 0.07rem),
+        radial-gradient(circle at 63% 14%, oklch(96% 0.035 92 / 0.6) 0.07rem, transparent 0.08rem),
+        radial-gradient(circle at 88% 70%, oklch(96% 0.035 92 / 0.45) 0.06rem, transparent 0.07rem);
+      --alert-l: 75%;
+      --backdrop: oklch(10% 0.02 295 / 0.5);
+      --sheet-shadow: -24px 0 60px -30px oklch(0% 0 0 / 0.8);
+      --pane-bg: #1E1E2E;
+      --pane-head: #191B28;
+      --pane-line: #2C2F42;
+      --pane-label: #878DA9;
+      --t-ink: #DDE0EA;
+      --t-com: #878DA9;
+      --t-kw: #A2B5FA;
+      --t-fn: #F7A87D;
+      --t-ty: #A9D5E3;
+      --t-str: #ABD695;
+      --t-con: #EDA8C2;
+      --nav-h: 44px;
+      --ease: cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    [data-theme="light"] {
+      color-scheme: light;
+      --paper: oklch(96.5% 0.022 88);
+      --soft: oklch(100% 0 0 / 0.5);
+      --ink: oklch(27% 0.042 318);
+      --ink-2: oklch(40% 0.036 315);
+      --ink-3: oklch(53% 0.03 318);
+      --rule: oklch(87% 0.03 72);
+      --accent: oklch(50% 0.13 42);
+      --accent-hover: oklch(43% 0.145 40);
+      --link-underline: oklch(50% 0.13 42 / 0.32);
+      --chip-bg: oklch(93.5% 0.03 82);
+      --chip-fg: oklch(32% 0.045 318);
+      --chip-border: oklch(88.5% 0.03 78);
+      --nav-sep: oklch(76% 0.03 72);
+      --scroll-thumb: oklch(27% 0.042 318 / 0.22);
+      --card-shadow: 0 1px 3px oklch(27% 0.042 318 / 0.08), 0 14px 28px -16px oklch(27% 0.042 318 / 0.4);
+      --soft-hover: oklch(100% 0 0 / 0.85);
+      --cover-bg: oklch(92% 0.025 82);
+      --art-l1: 91%;
+      --art-l2: 85%;
+      --art-c: 0.05;
+      --art-ink: oklch(33% 0.06 318);
+      --art-moon: oklch(72% 0.12 70);
+      --art-glow: oklch(100% 0 0 / 0.55);
+      --art-stars: linear-gradient(transparent, transparent);
+      --alert-l: 52%;
+      --backdrop: oklch(27% 0.042 318 / 0.3);
+      --sheet-shadow: -16px 0 48px -24px oklch(27% 0.042 318 / 0.45);
+    }
+
+    html {
+      overscroll-behavior: none;
+      /* the reader hides the page scrollbar; a reserved gutter keeps the grid from jumping sideways */
+      scrollbar-gutter: stable;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+      min-height: 100svh;
+      font-family: var(--font-body);
+      font-size: 16px;
+      line-height: 1.6;
+      color: var(--ink);
+      background: var(--paper);
+    }
+    main { flex: 1; }
+    :not(html) { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent; }
+    a { color: var(--accent); text-decoration: none; }
+    p a, .link {
+      color: var(--accent);
+      text-decoration: underline;
+      text-decoration-color: var(--link-underline);
+      text-underline-offset: 2px;
+    }
+    p a:hover, .link:hover { color: var(--accent-hover); text-decoration-color: currentColor; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.85em;
+      background: var(--chip-bg);
+      color: var(--chip-fg);
+      border: 1px solid var(--chip-border);
+      border-radius: 4px;
+      padding: 0.06rem 0.3rem;
+    }
+    kbd {
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      line-height: 1.4;
+      padding: 0 0.4rem;
+      border: 1px solid var(--nav-sep);
+      border-radius: 4px;
+      box-shadow: 0 2px 0 var(--rule);
+      background: var(--soft);
+      color: var(--ink-3);
+    }
+
+    /* ── nav ── */
+    nav {
+      position: fixed;
+      inset: 0 0 auto 0;
+      z-index: 100;
+      height: var(--nav-h);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 clamp(1rem, 3vw, 1.75rem);
+      background: var(--paper);
+      border-bottom: 1px solid transparent;
+      transition: border-color 0.18s ease;
+    }
+    nav.scrolled { border-bottom-color: var(--rule); }
+    .stuck nav.scrolled { border-bottom-color: transparent; }
+    #top-sentinel { position: absolute; top: 24px; width: 1px; height: 1px; pointer-events: none; }
+    .nav-left { display: flex; align-items: baseline; gap: 0.5rem; }
+    .nav-logo { font-weight: 800; font-size: 1.15rem; letter-spacing: -0.03em; color: var(--ink); }
+    .nav-logo:hover { color: var(--accent); }
+    .nav-crumb { font-family: var(--font-mono); font-size: 0.82rem; color: var(--ink-3); }
+    .nav-right { display: flex; align-items: center; gap: 1rem; }
+    .nav-right a {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      color: var(--ink-2);
+      transition: color 0.1s;
+    }
+    .nav-right a:hover, .nav-right a[aria-current] { color: var(--ink); }
+    .nav-sep { height: 14px; border-left: 1px solid var(--nav-sep); }
+    .theme-toggle { display: flex; margin-left: 0.65rem; padding: 0.15rem; color: var(--ink-2); transition: color 0.1s; }
+    .theme-toggle:hover { color: var(--ink); }
+    .theme-toggle svg { width: 16px; height: 16px; }
+    .theme-toggle .icon-sun { display: none; }
+    [data-theme="light"] .theme-toggle .icon-sun { display: block; }
+    [data-theme="light"] .theme-toggle .icon-moon { display: none; }
+
+    /* ── intro ── */
+    .content { max-width: 1332px; margin: 0 auto; padding: 0 clamp(1.25rem, 7vw, 6rem); }
+    /* the author panel sits beside the title rather than after the grid, where a long list buries it */
+    .intro {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 25rem);
+      gap: 1.75rem clamp(2rem, 5vw, 4.5rem);
+      padding-top: calc(var(--nav-h) + clamp(2.5rem, 6vw, 4.5rem));
+      padding-bottom: 1.5rem;
+    }
+    h1 { font-weight: 800; font-size: clamp(2.5rem, 5vw, 3.5rem); letter-spacing: -0.03em; line-height: 1.05; }
+    .lede { max-width: 58ch; margin-top: 0.85rem; font-size: 1.1rem; color: var(--ink-2); text-wrap: pretty; }
+    .lede code, .desc code, .publish code, .reader-desc code { padding-block: 0; line-height: 1; }
+    .trust { max-width: 58ch; margin-top: 0.5rem; font-size: 0.9rem; color: var(--ink-3); text-wrap: pretty; }
+    /* stretched to the title block, links pinned to its bottom, so both columns share a top and a bottom edge */
+    .publish {
+      display: flex;
+      flex-direction: column;
+      padding: 0.9rem 1.15rem 1rem;
+      border: 1px dashed var(--nav-sep);
+      border-radius: 10px;
+      font-size: 0.92rem;
+      line-height: 1.5;
+      color: var(--ink-2);
+      text-wrap: pretty;
+    }
+    .publish h2 { margin-bottom: 0.35rem; font-family: var(--font-mono); font-size: 0.95rem; font-weight: 500; color: var(--ink); }
+    .publish p + p { margin-top: 0.5rem; }
+    .publish .cover-tip { display: flex; gap: 0.6rem; }
+    /* centred on the first 0.92rem x 1.5 line */
+    .ratio {
+      flex: none;
+      display: grid;
+      place-items: center;
+      width: 2.3rem;
+      height: 1.15rem;
+      margin-top: 0.115rem;
+      border: 1px solid var(--chip-border);
+      border-radius: 3px;
+      background: var(--chip-bg);
+      font-family: var(--font-mono);
+      font-size: 0.64rem;
+      color: var(--ink-3);
+    }
+    .publish-links { display: flex; flex-wrap: wrap; gap: 0.3rem 1rem; margin-top: auto; padding-top: 0.75rem; font-family: var(--font-mono); font-size: 0.8rem; }
+
+    /* ── toolbar ── */
+    .toolbar {
+      position: sticky;
+      top: var(--nav-h);
+      z-index: 50;
+      background: var(--paper);
+      border-bottom: 1px solid transparent;
+      transition: border-color 0.18s ease;
+    }
+    .stuck .toolbar { border-bottom-color: var(--rule); }
+    .toolbar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem; padding-block: 0.7rem; }
+    .search { position: relative; flex: 1 1 18rem; max-width: 26rem; }
+    .search input {
+      width: 100%;
+      padding: 0.45rem 2.4rem 0.45rem 0.8rem;
+      border: 1px solid var(--chip-border);
+      border-radius: 8px;
+      background: var(--soft);
+      font-size: 0.95rem;
+      transition: border-color 0.1s;
+    }
+    .search input::placeholder { color: var(--ink-3); }
+    .search input::-webkit-search-cancel-button { display: none; }
+    .search input:focus { outline: none; border-color: var(--accent); }
+    .search kbd { position: absolute; right: 0.6rem; top: 50%; transform: translateY(-50%); pointer-events: none; }
+    .search input:focus + kbd, .search input:not(:placeholder-shown) + kbd { display: none; }
+    .sort { display: inline-flex; padding: 3px; border: 1px solid var(--chip-border); border-radius: 8px; background: var(--chip-bg); }
+    .sort button {
+      padding: 0.2rem 0.7rem;
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      color: var(--ink-3);
+      transition: color 0.1s, background 0.1s;
+    }
+    .sort button:hover { color: var(--ink); }
+    .sort button[aria-pressed="true"] { background: var(--paper); color: var(--ink); }
+    .count { margin-left: auto; font-family: var(--font-mono); font-size: 0.8rem; color: var(--ink-3); }
+    .topics { display: flex; gap: 0.4rem; overflow-x: auto; padding-bottom: 0.7rem; scrollbar-width: none; }
+    .topics[hidden] { display: none; }
+    .tag, .chip {
+      flex: none;
+      position: relative;
+      z-index: 1;
+      padding: 0.08rem 0.5rem;
+      border: 1px solid var(--chip-border);
+      border-radius: 6px;
+      background: var(--chip-bg);
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      color: var(--ink-2);
+      transition: color 0.1s, border-color 0.1s;
+    }
+    .chip { padding: 0.2rem 0.65rem; font-size: 0.78rem; }
+    .chip span { margin-left: 0.4em; color: var(--ink-3); }
+    .chip[aria-pressed="true"]::after { content: '×'; margin-left: 0.4em; }
+    .tag:hover, .chip:hover, .tag[aria-pressed="true"], .chip[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+
+    /* ── results ── */
+    .results { container-type: inline-size; padding-top: 1.25rem; padding-bottom: 1rem; }
+    .notice { margin-bottom: 1.25rem; color: var(--ink-2); }
+    .notice button { font-size: inherit; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(310px, 100%), 1fr)); gap: 1.1rem; list-style: none; }
+    .card {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      padding: 6px 6px 0.85rem;
+      border: 1px solid transparent;
+      border-radius: 12px;
+      background: var(--soft);
+      /* clears the nav and the sticky toolbar when j/k moves focus */
+      scroll-margin: calc(var(--nav-h) + 7rem) 0 1rem;
+      transition: border-color 0.1s, box-shadow 0.1s, transform 0.1s;
+    }
+    .card > :not(.cover) { margin-inline: 0.7rem; }
+    .card:not(.skeleton):hover { border-color: var(--chip-border); box-shadow: var(--card-shadow); transform: translateY(-1px); }
+
+    /* every card has one, media or not, so a cover arriving late fills a box instead of growing one */
+    .cover {
+      position: relative;
+      container-type: inline-size;
+      aspect-ratio: 2;
+      margin-bottom: 0.2rem;
+      overflow: hidden;
+      border-radius: 7px;
+      background: var(--cover-bg);
+    }
+    .cover > img, .cover > video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: 50% 0;
+      opacity: 0;
+      transition: opacity 0.25s ease;
+    }
+    .cover > .contain { object-fit: contain; object-position: 50% 50%; padding: 6%; }
+    .cover > .ready { opacity: 1; }
+    .cover.pending { animation: pulse 1.4s ease-in-out infinite alternate; }
+    [data-theme="light"] .only-dark, [data-theme="dark"] .only-light { display: none; }
+    .art {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 1rem 12%;
+      background:
+        var(--art-stars),
+        radial-gradient(circle at 84% 22%, var(--art-glow), transparent 30%),
+        linear-gradient(155deg, oklch(var(--art-l1) var(--art-c) var(--hue)), oklch(var(--art-l2) var(--art-c) calc(var(--hue) + 40)));
+    }
+    .art::before {
+      content: '';
+      position: absolute;
+      top: 15%;
+      right: 12%;
+      width: 1.05rem;
+      height: 1.05rem;
+      border-radius: 50%;
+      box-shadow: inset 0.3rem -0.2rem 0 0 var(--art-moon);
+    }
+    .art span {
+      font-weight: 800;
+      font-size: clamp(1.1rem, 7.5cqi, 1.9rem);
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      text-align: center;
+      text-wrap: balance;
+      overflow-wrap: anywhere;
+      color: var(--art-ink);
+    }
+
+    .card-head { display: flex; align-items: center; gap: 0.55rem; min-width: 0; }
+    .avatar {
+      position: relative;
+      flex: none;
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      overflow: hidden;
+      border-radius: 50%;
+      background: var(--chip-bg);
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--ink-3);
+      text-transform: uppercase;
+    }
+    .avatar img { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .card h2 { min-width: 0; font-size: 1.05rem; font-weight: 700; line-height: 1.3; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+    .card-link { color: var(--ink); transition: color 0.1s; }
+    .card-link::after { content: ''; position: absolute; inset: 0; border-radius: inherit; }
+    .card-link:focus-visible { outline: none; }
+    .card-link:focus-visible::after { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .card:hover .repo { color: var(--accent); }
+    .owner { font-weight: 400; color: var(--ink-3); }
+    .new { margin-left: auto; padding: 0 0.35rem; border: 1px solid currentColor; border-radius: 4px; font-family: var(--font-mono); font-size: 0.7rem; color: var(--accent); }
+    .gh { position: relative; z-index: 1; display: flex; flex: none; margin-left: auto; padding: 0.15rem; color: var(--ink-3); opacity: 0; transition: opacity 0.1s, color 0.1s; }
+    .new + .gh { margin-left: 0; }
+    .gh svg { width: 15px; height: 15px; }
+    .gh:hover { color: var(--ink); }
+    .desc {
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      font-size: 0.96rem;
+      line-height: 1.5;
+      color: var(--ink-2);
+    }
+    .desc.none { color: var(--ink-3); }
+    /* 2 x 310px columns + gap: reserve 3 lines only when a row has neighbours to align with */
+    @container (min-width: 638px) { .desc { min-height: 4.5em; } }
+    .tags { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+    .meta { display: flex; align-items: center; flex-wrap: wrap; gap: 0.3rem 0.9rem; margin-top: auto; font-family: var(--font-mono); font-size: 0.76rem; color: var(--ink-3); }
+    .stars { display: inline-flex; align-items: center; gap: 0.25rem; }
+    .stars svg { width: 11px; height: 11px; fill: currentColor; }
+    .copy { position: relative; z-index: 1; margin-left: auto; color: var(--ink-2); opacity: 0; transition: opacity 0.1s, color 0.1s; }
+    .copy:hover, .copy.done { color: var(--accent); }
+    .card:hover :is(.copy, .gh), .card:focus-within :is(.copy, .gh), .copy.done { opacity: 1; }
+    @media (hover: none) { .copy, .gh, .code-copy { opacity: 1; } .search kbd { display: none; } }
+    .bar { display: block; height: 0.8em; margin: calc((1lh - 0.8em) / 2) 0; border-radius: 4px; background: var(--chip-bg); }
+    .bar.short { width: 55%; }
+    .card-head .bar { flex: 1; max-width: 55%; margin: 0; }
+    .skeleton { pointer-events: none; animation: pulse 1.4s ease-in-out infinite alternate; }
+    .skeleton .tag { width: 4.5rem; }
+    @keyframes pulse { to { opacity: 0.5; } }
+
+    /* ── reader ── */
+    html:has(.reader[open]) { overflow: hidden; }
+    .reader {
+      position: fixed;
+      inset: 0 0 0 auto;
+      width: min(56rem, 100%);
+      height: 100%;
+      max-width: none;
+      max-height: none;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      border-left: 1px solid var(--rule);
+      background: var(--paper);
+      color: var(--ink);
+      box-shadow: var(--sheet-shadow);
+      overflow: hidden;
+    }
+    .reader[open] { animation: sheet-in 0.28s var(--ease); }
+    .reader::backdrop { background: var(--backdrop); animation: fade-in 0.2s ease; }
+    @keyframes sheet-in { from { transform: translateX(3rem); opacity: 0; } }
+    @keyframes fade-in { from { opacity: 0; } }
+    .reader-sheet { display: flex; flex-direction: column; height: 100%; }
+    .reader-bar {
+      flex: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      height: 3.4rem;
+      padding: 0 0.75rem 0 clamp(1.25rem, 4vw, 2.75rem);
+      border-bottom: 1px solid var(--rule);
+    }
+    .reader-id { display: flex; align-items: center; gap: 0.6rem; min-width: 0; }
+    .reader-id .avatar { width: 26px; height: 26px; }
+    .reader-id h2 { min-width: 0; overflow: hidden; font-size: 1.1rem; font-weight: 700; letter-spacing: -0.01em; text-overflow: ellipsis; white-space: nowrap; }
+    .reader-actions { flex: none; display: flex; align-items: center; gap: 0.15rem; }
+    .icon-btn { display: grid; place-items: center; width: 2rem; height: 2rem; border-radius: 7px; color: var(--ink-2); transition: background 0.1s, color 0.1s; }
+    .icon-btn:hover:not(:disabled) { background: var(--chip-bg); color: var(--ink); }
+    .icon-btn:disabled { opacity: 0.35; cursor: default; }
+    .reader-actions svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    .gh-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      height: 2rem;
+      margin: 0 0.35rem;
+      padding: 0 0.6rem 0 0.7rem;
+      border: 1px solid var(--chip-border);
+      border-radius: 7px;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      color: var(--ink-2);
+      transition: color 0.1s, border-color 0.1s;
+    }
+    .reader-actions .gh-btn svg { width: 13px; height: 13px; }
+    .gh-btn:hover { color: var(--accent); border-color: var(--accent); }
+    .reader-scroll { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 1.5rem clamp(1.25rem, 4vw, 2.75rem) 4rem; }
+    .reader-scroll:focus { outline: none; }
+    .reader-info { margin-bottom: 2rem; padding-bottom: 1.5rem; border-bottom: 1px solid var(--rule); }
+    .reader-desc { margin-bottom: 0.75rem; font-size: 1.08rem; color: var(--ink-2); text-wrap: pretty; }
+    .reader-desc:empty { display: none; }
+    .install {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 1rem;
+      width: 100%;
+      margin-top: 1.1rem;
+      padding: 0.7rem 0.9rem;
+      border-radius: 8px;
+      background: var(--soft);
+      text-align: left;
+      transition: background 0.1s;
+    }
+    .install code { padding: 0; border: 0; background: none; font-size: 0.9rem; color: var(--ink); overflow-wrap: anywhere; }
+    .install-url { color: var(--accent); }
+    .install-hint { flex: none; font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink-3); transition: color 0.1s; }
+    .install:hover { background: var(--soft-hover); }
+    .install:hover .install-hint, .install-hint.done { color: var(--accent); }
+    .install-note { margin-top: 0.45rem; font-size: 0.86rem; color: var(--ink-3); }
+    .install-note code { padding-block: 0; }
+    .readme-loading { display: grid; gap: 0.75rem; }
+    .readme-loading .bar { height: 0.9rem; margin: 0; animation: pulse 1.4s ease-in-out infinite alternate; }
+    .readme-loading .wide { width: 45%; height: 1.6rem; margin-bottom: 0.4rem; }
+    .readme-loading .block { height: 7rem; margin: 0.5rem 0; }
+    .readme-failed { color: var(--ink-2); }
+
+    /* ── README ── */
+    .md { line-height: 1.7; overflow-wrap: break-word; }
+    .md > :first-child { margin-top: 0; }
+    .md :is(p, ul, ol, dl, blockquote, details, .code, .table-wrap, video) { margin: 0 0 1rem; }
+    .md :is(h1, h2, h3, h4, h5, h6) { margin: 2rem 0 0.8rem; font-weight: 700; line-height: 1.25; letter-spacing: -0.015em; scroll-margin-top: 1.5rem; }
+    .md :is(h1, h2) { padding-bottom: 0.35rem; border-bottom: 1px solid var(--rule); font-weight: 800; letter-spacing: -0.02em; }
+    .md h1 { font-size: 1.85rem; }
+    .md h2 { font-size: 1.4rem; }
+    .md h3 { font-size: 1.15rem; }
+    .md h4 { font-size: 1rem; }
+    .md :is(h5, h6) { font-size: 0.9rem; color: var(--ink-2); }
+    .md a { color: var(--accent); text-decoration: underline; text-decoration-color: var(--link-underline); text-underline-offset: 2px; }
+    .md a:hover { color: var(--accent-hover); text-decoration-color: currentColor; }
+    .md :is(ul, ol) { padding-left: 1.6rem; }
+    .md li + li { margin-top: 0.3rem; }
+    .md li > :is(p, ul, ol) { margin: 0.3rem 0 0; }
+    .md li:has(> input[type="checkbox"]) { list-style: none; }
+    .md li > input[type="checkbox"] { margin: 0 0.5rem 0 -1.35rem; vertical-align: -0.1em; accent-color: var(--accent); }
+    .md :is(img, video) { max-width: 100%; height: auto; }
+    .md video { display: block; border-radius: 8px; background: var(--pane-bg); }
+    .md hr { height: 0; margin: 2rem 0; border: 0; border-top: 1px solid var(--rule); }
+    .md blockquote { padding: 0.1rem 0 0.1rem 1rem; border-left: 3px solid var(--chip-border); color: var(--ink-2); }
+    .md blockquote > :last-child, .md details > :last-child { margin-bottom: 0; }
+    .md .alert { border-left-color: oklch(var(--alert-l) 0.13 var(--alert-hue)); color: var(--ink); }
+    .md .alert-title { margin-bottom: 0.25rem; font-family: var(--font-mono); font-size: 0.85rem; font-weight: 600; color: oklch(var(--alert-l) 0.13 var(--alert-hue)); }
+    .md .alert-note { --alert-hue: 255; }
+    .md .alert-tip { --alert-hue: 150; }
+    .md .alert-important { --alert-hue: 305; }
+    .md .alert-warning { --alert-hue: 75; }
+    .md .alert-caution { --alert-hue: 25; }
+    .md .code { position: relative; }
+    .md pre {
+      --scroll-thumb: oklch(100% 0 0 / 0.14);
+      padding: 0.9rem 1rem;
+      overflow-x: auto;
+      border: 1px solid var(--pane-line);
+      border-radius: 8px;
+      background: var(--pane-bg);
+      color: var(--t-ink);
+      font-family: var(--font-mono);
+      font-size: 0.84rem;
+      line-height: 1.6;
+      tab-size: 4;
+    }
+    .md pre code { padding: 0; border: 0; background: none; color: inherit; font-size: inherit; }
+    .md .kw { color: var(--t-kw); }
+    .md .ty { color: var(--t-ty); }
+    .md .fn { color: var(--t-fn); }
+    .md .con { color: var(--t-con); }
+    .md .cm { color: var(--t-com); }
+    .md .st { color: var(--t-str); }
+    .code-copy {
+      position: absolute;
+      top: 0.45rem;
+      right: 0.45rem;
+      padding: 0.05rem 0.5rem;
+      border: 1px solid var(--pane-line);
+      border-radius: 5px;
+      background: var(--pane-head);
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      color: var(--pane-label);
+      opacity: 0;
+      transition: opacity 0.1s, color 0.1s;
+    }
+    .code:hover .code-copy, .code-copy:focus-visible, .code-copy.done { opacity: 1; }
+    .code-copy:hover, .code-copy.done { color: var(--t-ink); }
+    .md .table-wrap { overflow-x: auto; }
+    .md table { border-collapse: collapse; font-size: 0.94rem; }
+    .md :is(th, td) { padding: 0.4rem 0.8rem; border: 1px solid var(--rule); }
+    .md th { background: var(--soft); font-weight: 700; }
+    .md td code { white-space: nowrap; }
+    .md details { padding: 0.5rem 0.9rem; border: 1px solid var(--rule); border-radius: 8px; }
+    .md summary { cursor: pointer; font-weight: 700; }
+    .md details[open] > summary { margin-bottom: 0.6rem; }
+    .md dt { font-weight: 700; }
+    .md dd { margin-left: 1.25rem; }
+    .md mark { background: oklch(85% 0.12 90 / 0.4); color: inherit; }
+
+    footer {
+      padding: clamp(3rem, 7vw, 5rem) 1.5rem clamp(1.5rem, 3vw, 2rem);
+      text-align: center;
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      color: var(--ink-3);
+    }
+    footer div + div { margin-top: 0.3rem; }
+    footer a { color: var(--ink-2); }
+    footer a:hover { color: var(--accent); }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after, .reader::backdrop { animation: none !important; transition-duration: 0.01ms !important; }
+      .card:not(.skeleton):hover { transform: none; }
+    }
+    @media (max-width: 1000px) {
+      .intro { grid-template-columns: minmax(0, 1fr); }
+      .publish { max-width: 40rem; }
+    }
+    @media (max-width: 768px) {
+      .nav-label, .nav-crumb { display: none; }
+      .nav-right { gap: 0.85rem; }
+      .search { flex-basis: 100%; max-width: none; }
+      .search kbd { display: none; }
+      .toolbar-row { column-gap: 0.6rem; }
+      .sort button { padding-inline: 0.55rem; }
+      .card > :not(.cover) { margin-inline: 0.55rem; }
+      .meta { column-gap: 0.75rem; }
+      .reader { border-left: 0; }
+      .reader-bar { gap: 0.5rem; padding-left: 1rem; }
+      .gh-btn { margin-inline: 0.2rem; }
+      .md pre { white-space: pre-wrap; overflow-wrap: break-word; }
+    }
+  </style>
+</head>
+<body>
+
+<div id="top-sentinel" aria-hidden="true"></div>
+
+<nav id="nav">
+  <div class="nav-left">
+    <a href="/" class="nav-logo">maki</a>
+    <span class="nav-crumb" aria-hidden="true">/ plugins</span>
+  </div>
+  <div class="nav-right">
+    <a href="/docs/">Docs</a>
+    <span class="nav-sep"></span>
+    <a href="/plugins/" aria-current="page">Plugins</a>
+    <span class="nav-sep"></span>
+    <a href="https://discord.gg/8VKuA4naC3" target="_blank" rel="noopener" aria-label="Discord"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.369a19.79 19.79 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.249a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.036A19.736 19.736 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 00-.041-.106 13.107 13.107 0 01-1.872-.892.077.077 0 01-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.009c.12.099.246.198.373.292a.077.077 0 01-.006.127c-.598.35-1.22.644-1.873.891a.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.839 19.839 0 006.002-3.03.077.077 0 00.032-.056c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.028zM8.02 15.331c-1.182 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+    <span class="nav-sep"></span>
+    <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener" aria-label="GitHub"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg><span class="nav-label">GitHub</span></a>
+    <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode" aria-keyshortcuts="t">
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
+  </div>
+</nav>
+
+<main>
+  <header class="content intro">
+    <div class="intro-text">
+      <h1>Plugins</h1>
+      <p class="lede">Lua plugins made by the community. Open one to read its README, then paste its install line into your <code>init.lua</code> and maki asks to install it on next start. <a href="/docs/packages/">How packages work</a>.</p>
+      <p class="trust">They are pulled from GitHub automatically and nobody reviewed them. Read the code before you install one.</p>
+    </div>
+    <aside class="publish" aria-labelledby="publish-title">
+      <h2 id="publish-title">+ yours</h2>
+      <p>Add the <code>maki</code> and <code>plugin</code> topics to a <a href="/docs/packages/">package</a> repo and it shows up here on its own.</p>
+      <p class="cover-tip"><span class="ratio" aria-hidden="true">2:1</span><span>The first image, GIF or video in your README is the cover, badges skipped. 2:1 fills it, like VHS's default 1200x600.</span></p>
+      <div class="publish-links"><a class="link" href="/docs/packages/">write a plugin</a><a class="link" href="https://github.com/search?q=topic%3Amaki+topic%3Aplugin&amp;type=repositories" target="_blank" rel="noopener">topic on GitHub</a></div>
+    </aside>
+  </header>
+
+  <div id="toolbar-sentinel" aria-hidden="true"></div>
+  <div class="toolbar">
+    <div class="content toolbar-row">
+      <label class="search">
+        <input type="search" id="search" placeholder="Search plugins" aria-label="Search plugins" aria-keyshortcuts="/" autocomplete="off" spellcheck="false">
+        <kbd aria-hidden="true">/</kbd>
+      </label>
+      <div class="sort" id="sort" role="group" aria-label="Sort">
+        <button data-sort="popular">Popular</button>
+        <button data-sort="new">New</button>
+        <button data-sort="updated">Updated</button>
+      </div>
+      <span class="count" id="count" aria-live="polite"></span>
+    </div>
+    <div class="content topics" id="topics" role="group" aria-label="Topics" hidden></div>
+  </div>
+
+  <section class="content results" aria-label="Plugins">
+    <noscript>
+      <style>.skeleton { display: none; }</style>
+      <p class="notice">This list needs JavaScript. <a href="https://github.com/search?q=topic%3Amaki+topic%3Aplugin&amp;type=repositories">Browse the topic on GitHub</a> instead.</p>
+    </noscript>
+    <p class="notice" id="notice" hidden></p>
+    <ul class="grid" id="grid" aria-busy="true">
+      <li class="card skeleton" aria-hidden="true"><div class="cover"></div><div class="card-head"><span class="avatar"></span><span class="bar"></span></div><p class="desc"><span class="bar"></span><span class="bar"></span><span class="bar short"></span></p><div class="tags"><span class="tag">&nbsp;</span><span class="tag">&nbsp;</span></div><div class="meta"><span class="bar short"></span></div></li>
+      <li class="card skeleton" aria-hidden="true"><div class="cover"></div><div class="card-head"><span class="avatar"></span><span class="bar"></span></div><p class="desc"><span class="bar"></span><span class="bar"></span><span class="bar short"></span></p><div class="tags"><span class="tag">&nbsp;</span><span class="tag">&nbsp;</span></div><div class="meta"><span class="bar short"></span></div></li>
+      <li class="card skeleton" aria-hidden="true"><div class="cover"></div><div class="card-head"><span class="avatar"></span><span class="bar"></span></div><p class="desc"><span class="bar"></span><span class="bar"></span><span class="bar short"></span></p><div class="tags"><span class="tag">&nbsp;</span><span class="tag">&nbsp;</span></div><div class="meta"><span class="bar short"></span></div></li>
+    </ul>
+  </section>
+</main>
+
+<footer>
+  <div>Fetched from <a href="https://github.com/search?q=topic%3Amaki+topic%3Aplugin&amp;type=repositories" target="_blank" rel="noopener">GitHub</a>, every repo tagged maki and plugin.</div>
+  <div><a href="/">maki</a> · <a href="/docs/">docs</a> · <a href="/docs/packages/">write a plugin</a></div>
+</footer>
+
+<dialog class="reader" id="reader" aria-labelledby="reader-title">
+  <div class="reader-sheet">
+    <header class="reader-bar">
+      <div class="reader-id" id="reader-id"></div>
+      <div class="reader-actions">
+        <button class="icon-btn" id="reader-prev" title="Previous plugin (k)" aria-label="Previous plugin" aria-keyshortcuts="k ArrowLeft"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg></button>
+        <button class="icon-btn" id="reader-next" title="Next plugin (j)" aria-label="Next plugin" aria-keyshortcuts="j ArrowRight"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg></button>
+        <a class="gh-btn" id="reader-github" target="_blank" rel="noopener" title="Open on GitHub (o)" aria-keyshortcuts="o"><span>GitHub</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg></a>
+        <button class="icon-btn" id="reader-close" title="Close (esc)" aria-label="Close"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+      </div>
+    </header>
+    <div class="reader-scroll" id="reader-scroll" tabindex="-1" autofocus>
+      <div class="reader-info">
+        <p class="reader-desc" id="reader-desc"></p>
+        <div class="meta" id="reader-meta"></div>
+        <button class="install" id="reader-install" title="Copy (c)" aria-keyshortcuts="c"><code><span class="install-call">maki.pack.add</span>({ <span class="install-url" id="reader-url"></span> })</code><span class="install-hint" id="reader-install-hint">copy</span></button>
+        <p class="install-note">Paste it into <code>init.lua</code> and maki asks to install it on next start.</p>
+      </div>
+      <article class="readme" id="reader-body" aria-label="README"></article>
+    </div>
+  </div>
+</dialog>
+
+<template id="star-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg></template>
+
+<script id="snapshot" type="application/json"></script>
+<script>
+  const API_URL = 'https://api.github.com/search/repositories?per_page=100&q=topic:maki+topic:plugin+archived:false';
+  const REPO_API = 'https://api.github.com/repos/';
+  const RAW_BASE = 'https://raw.githubusercontent.com/';
+  const README_MODULE = '/plugins/readme.js';
+  const DEFAULT_README = 'README.md';
+  // lowercase owner/name of tagged repos that must not be listed (spam, malicious, not a maki plugin)
+  const BLOCKLIST = new Set([]);
+  const TOPIC_SEARCH = 'https://github.com/search?q=topic%3Amaki+topic%3Aplugin&type=repositories';
+  const REPO_BASE = 'https://github.com/';
+  const AVATAR_BASE = 'https://avatars.githubusercontent.com/';
+  const DAY_MS = 864e5;
+  const NEW_FOR_MS = 30 * DAY_MS;
+  const COPY_HINT_MS = 1500;
+  const PREFETCH_DELAY_MS = 70;
+  const IDLE_FALLBACK_MS = 1500;
+  const AVATAR_PX = 22;
+  const READER_AVATAR_PX = 26;
+  const MAX_TAGS = 3;
+  const MAX_CHIPS = 10;
+  const MIN_CHIP_USES = 2;
+  const MAX_COVER_TRIES = 3;
+  // smaller than this once loaded is a badge or an icon, never a cover
+  const MIN_COVER_PX = 40;
+  // covers are 2:1; anything this close is cropped to fill, the rest is letterboxed whole
+  const FILL_RATIO = [1.6, 2.5];
+  const COVER_LOOKAHEAD = '600px';
+  const PLAY_THRESHOLD = 0.4;
+  const ART_HUE_START = 250;
+  const ART_HUE_SPAN = 130;
+  const DEFAULT_SORT = 'popular';
+  const CLEAR_TOPIC = 'Clear topic filter';
+  const COPY_LABEL = 'copy install';
+  const COPIED = 'copied';
+  const GENERIC_TOPICS = new Set(['maki', 'plugin', 'plugins', 'maki-plugin', 'maki-plugins', 'lua', 'luau',
+    'ai', 'ai-agent', 'ai-agents', 'agent', 'agents', 'coding-agent', 'llm']);
+  const INLINE_MD = /`([^`]+)`|\*\*(.+?)\*\*|__(.+?)__|(?<![\w*])\*(?![\s*])(.+?)(?<!\s)\*(?![\w*])|(?<!\w)_(?![\s_])(.+?)(?<!\s)_(?!\w)|~~(.+?)~~/g;
+  const INLINE_TAGS = ['code', 'strong', 'strong', 'em', 'em', 's'];
+  const AGE_STEPS = [[365 * DAY_MS, 'y'], [30 * DAY_MS, 'mo'], [DAY_MS, 'd'], [36e5, 'h'], [6e4, 'm']];
+  const READER_KEYS = { j: 1, ArrowRight: 1, k: -1, ArrowLeft: -1 };
+  const desc = key => (a, b) => (b[key] > a[key]) - (b[key] < a[key]);
+  const SORTS = {
+    popular: (a, b) => b.stargazers_count - a.stargazers_count || desc('pushed_at')(a, b),
+    new: desc('created_at'),
+    updated: desc('pushed_at'),
+  };
+  const compact = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
+  const fullDate = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' });
+  const calm = matchMedia('(prefers-reduced-motion: reduce)');
+
+  const root = document.documentElement;
+  const $ = id => document.getElementById(id);
+  const search = $('search');
+  const sortGroup = $('sort');
+  const toolbar = document.querySelector('.toolbar');
+  const topicsEl = $('topics');
+  const countEl = $('count');
+  const notice = $('notice');
+  const grid = $('grid');
+  const toolbarSentinel = $('toolbar-sentinel');
+  const reader = $('reader');
+  const readerScroll = $('reader-scroll');
+  const readerBody = $('reader-body');
+  const readerInstall = $('reader-install');
+  const readerHint = $('reader-install-hint');
+  const readerGithub = $('reader-github');
+  const starIcon = $('star-icon').content.firstElementChild;
+  const githubIcon = document.querySelector('nav a[aria-label="GitHub"] svg');
+
+  const state = {};
+  function readUrl() {
+    const params = new URLSearchParams(location.search);
+    Object.assign(state, {
+      q: params.get('q') ?? '',
+      sort: Object.hasOwn(SORTS, params.get('sort')) ? params.get('sort') : DEFAULT_SORT,
+      topic: params.get('topic') ?? '',
+      p: params.get('p') ?? '',
+    });
+    search.value = state.q;
+  }
+  readUrl();
+  const snapshot = JSON.parse($('snapshot').textContent || 'null');
+  const byName = new Map();
+  // in-flight and settled loads: the README module and each plugin's README
+  const loads = new Map();
+  let plugins = null;
+  let shown = [];
+  let current = null;
+  // chips are rebuilt only when their set changes, so a clicked chip keeps keyboard focus
+  let chipSig = '';
+
+  function toggleTheme() {
+    const next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    root.setAttribute('data-theme', next);
+    localStorage.setItem('theme', next);
+  }
+  $('theme-toggle').addEventListener('click', toggleTheme);
+  matchMedia('(prefers-color-scheme: light)').addEventListener('change', e => {
+    if (localStorage.getItem('theme')) return;
+    root.setAttribute('data-theme', e.matches ? 'light' : 'dark');
+  });
+
+  const nav = $('nav');
+  new IntersectionObserver(([entry]) => nav.classList.toggle('scrolled', !entry.isIntersecting))
+    .observe($('top-sentinel'));
+  // the toolbar is stuck once the line above it slides under the nav
+  const navH = nav.offsetHeight;
+  new IntersectionObserver(([entry]) => {
+    root.classList.toggle('stuck', !entry.isIntersecting && entry.boundingClientRect.top < navH);
+  }, { rootMargin: `-${navH}px 0px 0px 0px` }).observe(toolbarSentinel);
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text != null) node.textContent = text;
+    return node;
+  }
+
+  function inlineMarkdown(text) {
+    const nodes = [];
+    let last = 0;
+    for (const match of text.matchAll(INLINE_MD)) {
+      const group = match.findIndex((g, i) => i > 0 && g !== undefined);
+      const node = el(INLINE_TAGS[group - 1]);
+      if (group === 1) node.textContent = match[group];
+      else node.append(...inlineMarkdown(match[group]));
+      nodes.push(text.slice(last, match.index), node);
+      last = match.index + match[0].length;
+    }
+    nodes.push(text.slice(last));
+    return nodes;
+  }
+
+  function ago(iso) {
+    const ms = Date.now() - Date.parse(iso);
+    for (const [unit, suffix] of AGE_STEPS) if (ms >= unit) return `${Math.floor(ms / unit)}${suffix} ago`;
+    return 'just now';
+  }
+
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const ownTopics = p => p.topics.filter(t => !GENERIC_TOPICS.has(t));
+  const installLine = p => `maki.pack.add({ "${REPO_BASE}${p.full_name}" })`;
+  const idle = window.requestIdleCallback ?? (callback => setTimeout(callback, IDLE_FALLBACK_MS));
+  const pluginOf = node => byName.get(node?.closest('.card')?.dataset.name);
+
+  function avatarFor(owner, px) {
+    const avatar = el('span', 'avatar', owner[0]);
+    const img = el('img');
+    Object.assign(img, {
+      src: `${AVATAR_BASE}${owner}?s=${px * 2}`,
+      alt: '', width: px, height: px, loading: 'lazy', decoding: 'async',
+    });
+    img.addEventListener('error', () => img.remove());
+    avatar.append(img);
+    return avatar;
+  }
+
+  function copyText(text, hint, label) {
+    navigator.clipboard?.writeText(text).then(() => {
+      hint.textContent = COPIED;
+      hint.classList.add('done');
+      clearTimeout(hint.hintTimer);
+      hint.hintTimer = setTimeout(() => {
+        hint.textContent = label;
+        hint.classList.remove('done');
+      }, COPY_HINT_MS);
+    }, () => {});
+  }
+
+  // a failed load is forgotten, so the next call retries it
+  function cached(key, load) {
+    if (!loads.has(key)) loads.set(key, load().catch(error => {
+      loads.delete(key);
+      throw error;
+    }));
+    return loads.get(key);
+  }
+
+  const loadModule = () => cached(README_MODULE, () => import(README_MODULE));
+  const readmeOf = p => cached(p.full_name, () => fetchReadme(p));
+
+  async function fetchReadme(p) {
+    const path = p.readme ?? DEFAULT_README;
+    const raw = await fetch(`${RAW_BASE}${p.full_name}/HEAD/${encodeURI(path)}`);
+    if (raw.ok) return { path, text: await raw.text() };
+    if (raw.status !== 404) throw new Error(`README of ${p.full_name}: ${raw.status}`);
+    // not at the usual path: the API knows where it is, at the cost of one call from the hourly 60
+    const res = await fetch(`${REPO_API}${p.full_name}/readme`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`README of ${p.full_name}: ${res.status}`);
+    const meta = await res.json();
+    return { path: meta.path, text: await (await fetch(meta.download_url)).text() };
+  }
+
+  function prefetch(x) {
+    if (!x) return;
+    readmeOf(x.p).catch(() => {});
+    loadModule().catch(() => {});
+  }
+
+  // ── covers ──
+  const fills = (w, h) => w / h >= FILL_RATIO[0] && w / h <= FILL_RATIO[1];
+
+  const playObserver = new IntersectionObserver(entries => {
+    for (const { target, isIntersecting } of entries) {
+      if (isIntersecting && !calm.matches && !reader.open) target.play().catch(() => {});
+      else target.pause();
+    }
+  }, { threshold: PLAY_THRESHOLD });
+
+  const coverObserver = new IntersectionObserver(entries => {
+    for (const { target, isIntersecting } of entries) {
+      if (!isIntersecting) continue;
+      coverObserver.unobserve(target);
+      findCover(pluginOf(target));
+    }
+  }, { rootMargin: COVER_LOOKAHEAD });
+
+  function artFor(p) {
+    let hash = 0;
+    for (const c of p.full_name) hash = (hash * 31 + c.codePointAt(0)) >>> 0;
+    const art = el('div', 'art');
+    art.style.setProperty('--hue', ART_HUE_START + hash % ART_HUE_SPAN);
+    art.append(el('span', null, p.full_name.split('/')[1]));
+    return art;
+  }
+
+  function mediaFor(media) {
+    if (media.kind === 'video') {
+      const video = el('video');
+      // a still first frame for reduced motion, otherwise nothing loads until it scrolls into view
+      Object.assign(video, {
+        muted: true, loop: true, playsInline: true, disablePictureInPicture: true,
+        preload: calm.matches ? 'metadata' : 'none',
+        src: calm.matches ? `${media.src}#t=0.1` : media.src,
+      });
+      playObserver.observe(video);
+      return [video];
+    }
+    const variants = media.dark ? [[media.src, 'only-light'], [media.dark, 'only-dark']] : [[media.src]];
+    return variants.map(([src, theme]) => {
+      const img = el('img', theme);
+      Object.assign(img, { src, alt: '', loading: 'lazy', decoding: 'async', referrerPolicy: 'no-referrer' });
+      return img;
+    });
+  }
+
+  // tries each candidate in turn; a broken or badge-sized one falls through to the next, then to art.
+  // Media stays transparent until `ready`, so its fit is settled from the loaded size unseen.
+  function mountCover(cover, p, candidates) {
+    const [media, ...rest] = candidates;
+    cover.classList.remove('pending');
+    if (!media) return cover.replaceChildren(artFor(p));
+    const nodes = mediaFor(media);
+    const next = () => mountCover(cover, p, rest);
+    for (const node of nodes) {
+      const isVideo = node.tagName === 'VIDEO';
+      node.addEventListener('error', next, { once: true });
+      node.addEventListener(isVideo ? 'loadeddata' : 'load', () => {
+        const [w, h] = isVideo ? [node.videoWidth, node.videoHeight] : [node.naturalWidth, node.naturalHeight];
+        if (w && h && (w < MIN_COVER_PX || h < MIN_COVER_PX)) return next();
+        if (w && h) node.classList.toggle('contain', !fills(w, h));
+        node.classList.add('ready');
+      }, { once: true });
+    }
+    cover.replaceChildren(...nodes);
+  }
+
+  async function findCover(x) {
+    let candidates = [];
+    try {
+      const [readme, module] = await Promise.all([readmeOf(x.p), loadModule()]);
+      if (readme) candidates = module.previewCandidates(readme.text, module.bases(x.p.full_name, readme.path));
+    } catch {}
+    mountCover(x.cover, x.p, candidates.slice(0, MAX_COVER_TRIES));
+  }
+
+  // the snapshot settles the cover before first paint; a plugin newer than the build looks for its own
+  function coverFor(p) {
+    const cover = el('div', 'cover');
+    cover.setAttribute('aria-hidden', 'true');
+    if (p.preview) mountCover(cover, p, [p.preview]);
+    else if ('readme' in p) mountCover(cover, p, []);
+    else {
+      cover.classList.add('pending');
+      coverObserver.observe(cover);
+    }
+    return cover;
+  }
+
+  // ── cards ──
+  function metaFor(p) {
+    const nodes = [];
+    const stars = el('span', 'stars');
+    stars.title = plural(p.stargazers_count, 'star');
+    stars.append(starIcon.cloneNode(true), compact.format(p.stargazers_count).toLowerCase());
+    nodes.push(stars);
+    if (p.pushed_at) {
+      const updated = el('time', null, 'updated ' + ago(p.pushed_at));
+      updated.dateTime = p.pushed_at;
+      updated.title = fullDate.format(new Date(p.pushed_at));
+      nodes.push(updated);
+    }
+    const spdx = p.license?.spdx_id;
+    if (spdx && spdx !== 'NOASSERTION') nodes.push(el('span', null, spdx));
+    return nodes;
+  }
+
+  function tagsFor(p) {
+    const tags = el('div', 'tags');
+    for (const topic of ownTopics(p).slice(0, MAX_TAGS)) {
+      const tag = el('button', 'tag', topic);
+      tag.dataset.topic = topic;
+      tags.append(tag);
+    }
+    return tags;
+  }
+
+  function descriptionFor(p) {
+    const description = el('p', p.description ? 'desc' : 'desc none');
+    description.append(...(p.description ? inlineMarkdown(p.description) : ['No description.']));
+    return description;
+  }
+
+  function githubLink(p, cls) {
+    const link = el('a', cls);
+    Object.assign(link, { href: REPO_BASE + p.full_name, target: '_blank', rel: 'noopener', title: 'Open on GitHub' });
+    link.ariaLabel = `${p.full_name} on GitHub`;
+    link.append(githubIcon.cloneNode(true));
+    return link;
+  }
+
+  function buildCard(x) {
+    const { p } = x;
+    const [owner, name] = p.full_name.split('/');
+    const card = el('li', 'card');
+    card.dataset.name = p.full_name;
+
+    const head = el('div', 'card-head');
+    const link = el('a', 'card-link');
+    link.href = `?p=${p.full_name}`;
+    link.setAttribute('aria-haspopup', 'dialog');
+    link.append(el('span', 'owner', owner + '/'), el('span', 'repo', name));
+    const title = el('h2');
+    title.append(link);
+    head.append(avatarFor(owner, AVATAR_PX), title);
+    if (Date.now() - Date.parse(p.created_at) < NEW_FOR_MS) head.append(el('span', 'new', 'new'));
+    head.append(githubLink(p, 'gh'));
+
+    const tags = tagsFor(p);
+    const meta = el('div', 'meta');
+    const copy = el('button', 'copy', COPY_LABEL);
+    copy.title = installLine(p);
+    copy.addEventListener('click', () => copyText(installLine(p), copy, COPY_LABEL));
+    meta.append(...metaFor(p), copy);
+
+    x.cover ??= coverFor(p);
+    card.append(x.cover, head, descriptionFor(p));
+    if (tags.childElementCount) card.append(tags);
+    card.append(meta);
+    return card;
+  }
+
+  // what a card shows; a live result that differs in any of it rebuilds the card
+  const listing = p => JSON.stringify([p.description, p.stargazers_count, p.topics, p.created_at, p.pushed_at, p.license?.spdx_id]);
+
+  // a live result keeps the snapshot's README facts and reuses the cover, so its media never reloads
+  function ingest(items) {
+    plugins = items.filter(p => !BLOCKLIST.has(p.full_name.toLowerCase())).map(item => {
+      const known = byName.get(item.full_name);
+      if (known && listing(known.p) === listing(item)) return known;
+      const x = known ?? { cover: null };
+      x.p = { ...known?.p, ...item };
+      x.haystack = [x.p.full_name, x.p.description ?? '', ...x.p.topics].join(' ').toLowerCase();
+      const card = buildCard(x);
+      x.card?.replaceWith(card);
+      x.card = card;
+      byName.set(x.p.full_name, x);
+      return x;
+    });
+  }
+
+  function renderTopics() {
+    const uses = new Map();
+    for (const { p } of plugins) for (const t of ownTopics(p)) uses.set(t, (uses.get(t) ?? 0) + 1);
+    const top = [...uses].filter(([, n]) => n >= MIN_CHIP_USES)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, MAX_CHIPS);
+    // a topic picked from a card stays reachable here, so it can always be cleared
+    if (state.topic && !top.some(([t]) => t === state.topic)) top.push([state.topic, uses.get(state.topic) ?? 0]);
+    const sig = top.join('|');
+    if (sig === chipSig) return;
+    chipSig = sig;
+    topicsEl.replaceChildren(...top.map(([topic, n]) => {
+      const chip = el('button', 'chip', topic);
+      chip.dataset.topic = topic;
+      chip.append(el('span', null, n));
+      return chip;
+    }));
+    topicsEl.hidden = !top.length;
+  }
+
+  function syncUrl(push) {
+    const query = new URLSearchParams();
+    if (state.q) query.set('q', state.q);
+    if (state.sort !== DEFAULT_SORT) query.set('sort', state.sort);
+    if (state.topic) query.set('topic', state.topic);
+    if (state.p) query.set('p', state.p);
+    const url = query.size ? `?${query}`.replaceAll('%2F', '/') : location.pathname;
+    if (push) history.pushState({ reader: true }, '', url);
+    else history.replaceState(state.p ? history.state : null, '', url);
+  }
+
+  // `settle` is for data arriving on its own: cards already on screen keep their place and new
+  // matches join the end, so nothing moves under the reader until they touch a control
+  function render(settle) {
+    for (const b of sortGroup.children) b.setAttribute('aria-pressed', b.dataset.sort === state.sort);
+    syncUrl(false);
+    if (!plugins) return;
+
+    const terms = state.q.toLowerCase().split(/\s+/).filter(Boolean);
+    const matches = plugins
+      .filter(x => (!state.topic || x.p.topics.includes(state.topic)) && terms.every(t => x.haystack.includes(t)))
+      .sort((a, b) => SORTS[state.sort](a.p, b.p));
+    shown = settle ? [...shown.filter(x => matches.includes(x)), ...matches.filter(x => !shown.includes(x))] : matches;
+    const cards = shown.map(x => x.card);
+    if (cards.length !== grid.children.length || cards.some((card, i) => grid.children[i] !== card)) grid.replaceChildren(...cards);
+    if (!settle) renderTopics();
+    for (const b of document.querySelectorAll('[data-topic]')) b.setAttribute('aria-pressed', b.dataset.topic === state.topic);
+    for (const chip of topicsEl.children) chip.ariaLabel = chip.dataset.topic === state.topic ? CLEAR_TOPIC : null;
+
+    toolbar.hidden = !plugins.length;
+    countEl.textContent = shown.length === plugins.length ? plural(plugins.length, 'plugin')
+      : `${shown.length} of ${plural(plugins.length, 'plugin')}`;
+    notice.hidden = shown.length > 0 || !plugins.length;
+    if (!notice.hidden) {
+      const filters = [state.q.trim() && `"${state.q.trim()}"`, state.topic && `in ${state.topic}`].filter(Boolean);
+      const clear = el('button', 'link', 'clear filters');
+      clear.addEventListener('click', () => update({ q: '', topic: '' }));
+      notice.replaceChildren(`No plugins match ${filters.join(' ')}. `, clear);
+    }
+  }
+
+  function update(change) {
+    Object.assign(state, change);
+    if (change.q != null) search.value = state.q;
+    render();
+    // deep in a long list, a new filter should start from its first result rather than wherever the page clamps
+    const resultsTop = toolbarSentinel.getBoundingClientRect().top + scrollY - navH;
+    if (scrollY > resultsTop) scrollTo(0, resultsTop);
+  }
+
+  // ── reader ──
+  function readerList() {
+    return shown.includes(current) ? shown : plugins;
+  }
+
+  function fillReader(x) {
+    const { p } = x;
+    const [owner, name] = p.full_name.split('/');
+    const title = el('h2');
+    title.id = 'reader-title';
+    title.append(el('span', 'owner', owner + '/'), el('span', 'repo', name));
+    $('reader-id').replaceChildren(avatarFor(owner, READER_AVATAR_PX), title);
+    $('reader-desc').replaceChildren(...(p.description ? inlineMarkdown(p.description) : []));
+    const tags = tagsFor(p);
+    $('reader-meta').replaceChildren(...metaFor(p), ...tags.children);
+    for (const tag of $('reader-meta').querySelectorAll('[data-topic]')) tag.setAttribute('aria-pressed', tag.dataset.topic === state.topic);
+    $('reader-url').textContent = `"${REPO_BASE}${p.full_name}"`;
+    readerGithub.href = REPO_BASE + p.full_name;
+  }
+
+  function readmeSkeleton() {
+    const lines = el('div', 'readme-loading');
+    lines.setAttribute('aria-hidden', 'true');
+    for (const cls of ['bar wide', 'bar', 'bar', 'bar short', 'bar block', 'bar', 'bar short']) lines.append(el('span', cls));
+    return lines;
+  }
+
+  function readmeFailed(p) {
+    const failed = el('p', 'readme-failed', 'Could not load the README. ');
+    const link = el('a', null, 'Read it on GitHub');
+    Object.assign(link, { href: REPO_BASE + p.full_name, target: '_blank', rel: 'noopener' });
+    failed.append(link, '.');
+    return failed;
+  }
+
+  async function showReadme(x) {
+    readerBody.replaceChildren(readmeSkeleton());
+    readerBody.ariaBusy = 'true';
+    let content;
+    try {
+      const [readme, module] = await Promise.all([readmeOf(x.p), loadModule()]);
+      content = el('div', 'md');
+      content.append(readme
+        ? module.renderReadme(readme.text, { full: x.p.full_name, path: readme.path, sizes: x.p.sizes })
+        : el('p', 'readme-failed', 'This plugin has no README yet.'));
+    } catch {
+      content = readmeFailed(x.p);
+    }
+    if (current !== x) return;
+    readerBody.replaceChildren(content);
+    readerBody.ariaBusy = null;
+  }
+
+  function showReader(x) {
+    current = x;
+    fillReader(x);
+    if (!reader.open) {
+      reader.showModal();
+      for (const video of grid.querySelectorAll('video')) video.pause();
+    }
+    readerScroll.scrollTop = 0;
+    showReadme(x);
+    const list = readerList();
+    const at = list.indexOf(x);
+    $('reader-prev').disabled = at <= 0;
+    $('reader-next').disabled = at < 0 || at >= list.length - 1;
+    prefetch(list[at + 1]);
+    prefetch(list[at - 1]);
+  }
+
+  function openReader(x) {
+    const push = !reader.open;
+    state.p = x.p.full_name;
+    syncUrl(push);
+    showReader(x);
+  }
+
+  // every close goes through history, so back closes the reader and forward reopens it
+  function leaveReader() {
+    if (history.state?.reader) return history.back();
+    state.p = '';
+    syncUrl(false);
+    if (reader.open) reader.close();
+  }
+
+  function step(direction) {
+    const list = readerList();
+    const next = list[list.indexOf(current) + direction];
+    if (next) openReader(next);
+  }
+
+  reader.addEventListener('cancel', e => {
+    e.preventDefault();
+    leaveReader();
+  });
+  reader.addEventListener('close', () => {
+    if (state.p) leaveReader();
+    for (const video of grid.querySelectorAll('video')) {
+      playObserver.unobserve(video);
+      playObserver.observe(video);
+    }
+    const link = current?.card.querySelector('.card-link');
+    if (!link?.isConnected) return;
+    link.focus({ preventScroll: true });
+    current.card.scrollIntoView({ block: 'nearest' });
+  });
+  addEventListener('popstate', () => {
+    readUrl();
+    render();
+    const x = byName.get(state.p);
+    if (x) showReader(x);
+    else if (reader.open) reader.close();
+  });
+  // a press that starts and ends on the backdrop closes; a text selection dragged out of the sheet does not
+  let pressedBackdrop = false;
+  reader.addEventListener('pointerdown', e => { pressedBackdrop = e.target === reader; });
+  reader.addEventListener('click', e => {
+    if (e.target === reader && pressedBackdrop) leaveReader();
+  });
+  $('reader-close').addEventListener('click', leaveReader);
+  $('reader-prev').addEventListener('click', () => step(-1));
+  $('reader-next').addEventListener('click', () => step(1));
+  readerInstall.addEventListener('click', () => copyText(installLine(current.p), readerHint, 'copy'));
+  readerBody.addEventListener('click', e => {
+    const copy = e.target.closest('.code-copy');
+    if (copy) return copyText(copy.previousElementSibling.textContent, copy, 'copy');
+    const anchor = e.target.closest('a[href^="#"]');
+    if (!anchor) return;
+    e.preventDefault();
+    const id = decodeURIComponent(anchor.getAttribute('href').slice(1));
+    const target = $(id) ?? readerBody.querySelector(`[name="${CSS.escape(id)}"]`);
+    target?.scrollIntoView({ behavior: calm.matches ? 'auto' : 'smooth' });
+  });
+
+  // ── data ──
+  async function fetchJSON(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${url}: ${res.status}`);
+    return res.json();
+  }
+
+  function openLinked() {
+    const x = byName.get(state.p);
+    if (x && !reader.open) showReader(x);
+    return !!x;
+  }
+
+  // The build inlines a snapshot, so the first paint is already complete. The live search then
+  // adds plugins tagged since the deploy; the snapshot alone covers GitHub's 10 searches/minute limit.
+  async function load() {
+    if (snapshot) {
+      ingest(snapshot);
+      grid.removeAttribute('aria-busy');
+      render();
+      openLinked();
+    }
+    const live = await fetchJSON(API_URL).catch(() => null);
+    if (live) ingest(live.items);
+    else if (!snapshot) ingest([]);
+    grid.removeAttribute('aria-busy');
+    render(!!snapshot);
+    if (state.p && !openLinked()) {
+      state.p = '';
+      syncUrl(false);
+    }
+    idle(() => loadModule().catch(() => {}));
+    if (live || snapshot) return;
+    const link = el('a', null, 'Browse the topic on GitHub');
+    Object.assign(link, { href: TOPIC_SEARCH, target: '_blank', rel: 'noopener' });
+    notice.replaceChildren('Could not load the list from GitHub. ', link, ' instead.');
+    notice.hidden = false;
+  }
+
+  // ── input ──
+  search.addEventListener('input', () => update({ q: search.value }));
+  search.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    if (search.value) update({ q: '' });
+    else search.blur();
+  });
+  sortGroup.addEventListener('click', e => {
+    const sort = e.target.closest('[data-sort]')?.dataset.sort;
+    if (sort) update({ sort });
+  });
+  document.addEventListener('click', e => {
+    const topic = e.target.closest('[data-topic]')?.dataset.topic;
+    if (!topic) return;
+    if (reader.open) {
+      state.p = '';
+      reader.close();
+    }
+    update({ topic: state.topic === topic ? '' : topic });
+  });
+  grid.addEventListener('click', e => {
+    const link = e.target.closest('.card-link');
+    if (!link || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    openReader(pluginOf(link));
+  });
+  // a README starts loading on hover intent, so the reader usually opens on a finished page
+  let hoverTimer;
+  grid.addEventListener('pointerover', e => {
+    const card = e.target.closest('.card');
+    if (!card || card.contains(e.relatedTarget)) return;
+    clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(() => prefetch(pluginOf(card)), PREFETCH_DELAY_MS);
+  });
+  grid.addEventListener('pointerout', e => {
+    if (!e.target.closest('.card')?.contains(e.relatedTarget)) clearTimeout(hoverTimer);
+  });
+  grid.addEventListener('focusin', e => prefetch(pluginOf(e.target)));
+
+  function walkCards(direction) {
+    const cards = shown.map(x => x.card);
+    if (!cards.length) return;
+    const at = cards.findIndex(card => card.contains(document.activeElement));
+    const next = at < 0 ? cards[0] : cards[Math.max(0, Math.min(cards.length - 1, at + direction))];
+    next.querySelector('.card-link').focus();
+  }
+
+  document.addEventListener('keydown', e => {
+    if (/^(INPUT|TEXTAREA|SELECT|VIDEO)$/.test(e.target.tagName) || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 't') { e.preventDefault(); toggleTheme(); return; }
+    if (reader.open) {
+      if (Object.hasOwn(READER_KEYS, e.key)) { e.preventDefault(); step(READER_KEYS[e.key]); }
+      else if (e.key === 'c') { e.preventDefault(); readerInstall.click(); }
+      else if (e.key === 'o') { e.preventDefault(); readerGithub.click(); }
+      return;
+    }
+    if (e.key === '/') { e.preventDefault(); search.focus(); search.select(); }
+    else if (e.key === 'j' || e.key === 'k') { e.preventDefault(); walkCards(e.key === 'j' ? 1 : -1); }
+  });
+
+  render();
+  load();
+</script>
+</body>
+</html>

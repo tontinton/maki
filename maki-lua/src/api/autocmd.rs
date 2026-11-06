@@ -270,7 +270,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
 ///   first focus at startup.
 /// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
-///   or `"idle"`), `data.title`, and `data.focused` (boolean).
+///   or `"idle"`), `data.title`, and `data.focused` (boolean). A session
+///   stays `"working"` while a background task it waits on still runs.
 /// - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
 ///   when the title changes (rename or auto-generation).
 /// - `"SessionCwdChanged"`: `data.cwd`, the session's new working

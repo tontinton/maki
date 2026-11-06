@@ -589,16 +589,20 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
     result
 }
 
+fn registers_a_tool(name: &str) -> bool {
+    maki_config::DEFAULT_BUILTINS.contains(&name)
+        && !maki_config::PROVIDER_BUILTINS.contains(&name)
+        && !maki_config::NON_TOOL_BUILTINS.contains(&name)
+}
+
 pub fn is_builtin_tool(name: &str) -> bool {
-    let bundled_tool = maki_config::DEFAULT_BUILTINS.contains(&name)
-        && !maki_config::PROVIDER_BUILTINS.contains(&name);
-    bundled_tool || maki_config::EDIT_SUB_TOOLS.contains(&name)
+    registers_a_tool(name) || maki_config::EDIT_SUB_TOOLS.contains(&name)
 }
 
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
     maki_config::DEFAULT_BUILTINS
         .iter()
-        .filter(|name| !maki_config::PROVIDER_BUILTINS.contains(name))
+        .filter(|name| registers_a_tool(name))
         .chain(maki_config::EDIT_SUB_TOOLS.iter())
         .copied()
         .collect()
@@ -1320,8 +1324,11 @@ mod tests {
     }
 
     #[test]
-    fn provider_plugins_are_not_tools() {
-        for &name in maki_config::PROVIDER_BUILTINS {
+    fn provider_and_non_tool_plugins_are_not_tools() {
+        for &name in maki_config::PROVIDER_BUILTINS
+            .iter()
+            .chain(maki_config::NON_TOOL_BUILTINS)
+        {
             assert!(maki_config::DEFAULT_BUILTINS.contains(&name), "{name}");
             assert!(!is_builtin_tool(name), "{name}");
             assert!(!all_builtin_tool_names().contains(&name), "{name}");

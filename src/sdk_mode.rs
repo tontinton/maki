@@ -551,7 +551,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         claim,
         storage,
         model,
-        mut config,
+        config,
         permissions_config,
         timeouts,
         prompt_slots,
@@ -562,9 +562,6 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         project_config,
     } = params;
     cli.warn_ignored_flags();
-    if let Some(max) = cli.max_turns {
-        config.max_turns = Some(max);
-    }
     let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
     let interrupt = Interrupt::install();
     let stop = interrupt.stop();
@@ -731,7 +728,8 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
                     &startup_model,
                     &model_policy,
                     &cwd,
-                )?;
+                )
+                .await?;
             }
             "control_response" => {
                 let Some(cr) =
@@ -852,7 +850,7 @@ fn content_images(content: &Value) -> Vec<ImageSource> {
         .collect()
 }
 
-fn handle_control_request(
+async fn handle_control_request(
     cr: &InboundControlRequest,
     writer: &SdkWriter,
     handle: &InteractiveHandle,
@@ -898,7 +896,9 @@ fn handle_control_request(
             }
         }
         "set_model" => {
-            match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
+            match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy)
+                .await
+            {
                 Some(model) => {
                     let _ = handle.model_tx.send(model.clone());
                     shared.lock().unwrap().model = model;
@@ -919,7 +919,7 @@ fn handle_control_request(
     }
 }
 
-fn resolve_set_model(
+async fn resolve_set_model(
     model_val: Option<&Value>,
     startup_model: &Model,
     model_policy: &ModelPolicy,
@@ -928,17 +928,10 @@ fn resolve_set_model(
         Value::Null => Some(startup_model.clone()),
         Value::String(model_str) => {
             let spec = resolve_model_spec(model_str);
-            if !model_policy.allows(&spec) {
-                warn!(model = %spec, "ignoring model disallowed by policy");
-                return None;
-            }
-            match Model::from_spec(&spec) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    warn!(model = %model_str, error = %e, "ignoring invalid model");
-                    None
-                }
-            }
+            Model::from_spec_with_policy(&spec, model_policy)
+                .await
+                .inspect_err(|e| warn!(model = %spec, error = %e, "ignoring requested model"))
+                .ok()
         }
         _ => None,
     }
@@ -1625,20 +1618,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_set_model_null_returns_startup() {
+    #[tokio::test]
+    async fn resolve_set_model_null_returns_startup() {
         let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let result = resolve_set_model(
             Some(&Value::Null),
             &startup,
             &maki_config::ModelPolicy::default(),
         )
+        .await
         .unwrap();
         assert_eq!(result.id, startup.id);
     }
 
-    #[test]
-    fn resolve_set_model_rejects_disallowed_exact_spec() {
+    #[tokio::test]
+    async fn resolve_set_model_rejects_disallowed_exact_spec() {
         let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let raw: maki_config::RawConfig = serde_json::from_value(serde_json::json!({
             "provider": {"allowed_models": [startup.spec()]}
@@ -1652,6 +1646,7 @@ mod tests {
                 &startup,
                 &policy
             )
+            .await
             .is_none()
         );
     }
@@ -1691,9 +1686,9 @@ mod tests {
     const ANSWER_OUTLIVES_TURN: &str =
         "a call moved off its turn can still be parked on its ask after the turn result";
     const OUTSTANDING_REQ: &str = "req_1";
-    const RESULT_INPUT_TOKENS: u32 = 1_000;
+    const RESULT_INPUT_TOKENS: u64 = 1_000;
     const RESULT_COST: f64 = 0.25;
-    const LATE_INPUT_TOKENS: u32 = 300;
+    const LATE_INPUT_TOKENS: u64 = 300;
     const LATE_COST: f64 = 0.5;
     const UNREPORTED_ONLY: &str =
         "only spend that no result carried may be reported after the last one";
@@ -1946,6 +1941,7 @@ mod tests {
         pump.handle(top_level(AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
             detail: None,
+            markdown: false,
             end: None,
         }))
         .unwrap();
@@ -1957,6 +1953,7 @@ mod tests {
             event: AgentEvent::ObservationLine {
                 text: CHILD_NOTICE_LINE.into(),
                 detail: None,
+                markdown: false,
                 end: None,
             },
             subagent: Some(SubagentInfo {
@@ -1966,7 +1963,7 @@ mod tests {
                 model: None,
                 opts: None,
                 answer_tx: None,
-                inbox: None,
+                control: Arc::default(),
                 parent_call: None,
             }),
             run_id: 0,
@@ -2050,7 +2047,7 @@ mod tests {
     #[test_case(LATE_INPUT_TOKENS, LATE_COST, false ; "spend_after_the_last_result")]
     #[test_case(LATE_INPUT_TOKENS, LATE_COST, true ; "spend_after_a_failed_run")]
     fn only_spend_no_result_carried_is_reported_at_the_end(
-        late_input: u32,
+        late_input: u64,
         late_cost: f64,
         failed: bool,
     ) {
@@ -2087,7 +2084,7 @@ mod tests {
         assert_eq!(result["is_error"], failed);
         assert_eq!(
             result["usage"]["input_tokens"].as_u64(),
-            Some(u64::from(RESULT_INPUT_TOKENS)),
+            Some(RESULT_INPUT_TOKENS),
             "{RESULT_BILLED}"
         );
         assert_eq!(
@@ -2109,8 +2106,7 @@ mod tests {
                 )
             })
             .collect();
-        let expected =
-            Vec::from_iter((late_input > 0).then_some((u64::from(late_input), late_cost)));
+        let expected = Vec::from_iter((late_input > 0).then_some((late_input, late_cost)));
         assert_eq!(unreported, expected, "{UNREPORTED_ONLY}");
     }
 }

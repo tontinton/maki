@@ -19,7 +19,7 @@ use super::display_order::{observation_detail, observation_line};
 use super::frame::{
     FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
 };
-use super::history::{History, sanitize_cancelled_history};
+use super::history::{Cutter, History, sanitize_cancelled_history};
 use super::hook::{AgentHooks, AgentSlot};
 use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, stream_with_retry};
@@ -31,7 +31,7 @@ use crate::prompt::ResolvedPrompts;
 use crate::tools::hook::Verdict;
 use crate::tools::{
     BackgroundFor, Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter,
-    ToolOutputMode,
+    ToolOutputMode, ToolRegistry,
 };
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
@@ -51,10 +51,6 @@ const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty r
 const MAX_NUDGES: u32 = 20;
 /// Counted over non-padding messages.
 const RECENT_TOOL_WINDOW: usize = 5;
-/// Without this note a cancelled reply replays in history as a finished
-/// turn, and a model resuming its own cut-off text can wedge the session
-/// (seen with llama.cpp stuck on an unterminated tool call).
-const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
 const USER_INTERRUPT_TAG: &str = "user-interrupt";
 const USER_INTERRUPT_NOTE: &str =
     "The user sent a new message while you were working. Address it and continue.";
@@ -72,6 +68,7 @@ const NO_FRAME: &str = "no prompt frame to send the request under";
 /// The reason the API gives when it drops the old model's thinking after a
 /// switch. That is expected and does not mean the prefix moved.
 const MODEL_BINDING_MISMATCH: &str = "model_binding_mismatch";
+const MAX_LOGGED_PATHS: usize = 5;
 const THINKING_DROPPED: &str =
     "The prompt changed under earlier reasoning, so it was dropped to keep the session going.";
 
@@ -89,8 +86,7 @@ pub async fn resolve_compaction_model(
 ) -> (Arc<dyn Provider>, Model) {
     if let Some(spec) =
         maki_providers::model_registry::resolve_tier(None, maki_providers::ModelTier::Compaction)
-        && model_policy.allows(&spec)
-        && let Ok(mut m) = Model::from_spec(&spec)
+        && let Ok(mut m) = Model::from_spec_with_policy(&spec, model_policy).await
         && let Ok(p) = maki_providers::provider::from_model_async(&mut m, timeouts)
             .await
             .inspect_err(|err| warn!(provider = %m.provider, model = %m.id, error = %err, "compaction model unavailable, falling back to the session model"))
@@ -134,7 +130,6 @@ pub struct AgentParams {
     pub subagent_cancels: Arc<CancelMap<String>>,
     /// Subagents inherit this, so a turn's totals cover everything it spawned.
     pub ledger: Arc<RunLedger>,
-    pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
     pub model_policy: Arc<ModelPolicy>,
 }
@@ -191,7 +186,7 @@ pub struct Agent<'h> {
     file_access: Arc<FileAccess>,
     prompt_slots: Arc<ResolvedPrompts>,
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
-    registry: Arc<crate::tools::ToolRegistry>,
+    registry: Arc<ToolRegistry>,
     audience: ToolAudience,
     workflow: bool,
     local_tools: LocalTools,
@@ -241,7 +236,7 @@ impl<'h> Agent<'h> {
             file_access: params.file_access,
             prompt_slots: params.prompt_slots,
             subagent_cancels: params.subagent_cancels,
-            registry: params.registry,
+            registry: Arc::clone(ToolRegistry::global_arc()),
             audience: params.audience,
             workflow: false,
             local_tools: LocalTools::default(),
@@ -317,13 +312,9 @@ impl<'h> Agent<'h> {
             prompt: _,
             source,
         } = input;
-        self.rollback_len = self.history.len();
-        self.carry_from = self.history.len();
-        self.stop_continuations = 0;
-        self.moved_last_round = false;
+        self.begin(RequestOptions { thinking, fast });
         self.mode = mode;
         self.workflow = workflow;
-        self.opts = RequestOptions { thinking, fast };
         // Each message of a burst is judged on its own, and one kept message is
         // enough for the run to go on.
         let burst = earlier
@@ -339,9 +330,10 @@ impl<'h> Agent<'h> {
                 Err(AgentError::Cancelled) => return self.finish(Err(AgentError::Cancelled)),
                 kept => kept?,
             };
-            // A burst dropped whole sends nothing, so it must not rebuild the
-            // frame either. The next run sees the same change.
-            if kept.is_some() && prompt.is_none() {
+            // A burst dropped whole or a run already cancelled sends nothing,
+            // so it must not rebuild the frame either. The next run sees the
+            // same change.
+            if kept.is_some() && prompt.is_none() && !self.cancel.is_cancelled() {
                 self.refresh_frame()?;
             }
             let kept = kept.map(|text| {
@@ -361,10 +353,7 @@ impl<'h> Agent<'h> {
             message_len = message.len(),
             "agent run started"
         );
-        // Subagents are prompted by the machine inside the parent's window;
-        // counting them would inflate prompts and busy time.
-        let top_level = self.audience.contains(ToolAudience::MAIN);
-        if top_level {
+        if self.top_level() {
             // Tabs and frontends share one process, so attribution follows
             // whichever session actually runs a turn, not whoever last
             // called `set_session_id`.
@@ -373,7 +362,52 @@ impl<'h> Agent<'h> {
             }
             maki_otel::emit::user_prompt(&message);
         }
+        self.drive().await
+    }
 
+    /// Goes on with the same history: lands {notices}, then whatever the
+    /// interrupt source holds, the way it lands between turns, so the model
+    /// reads it as an interrupt from whoever sent it. The history alone says
+    /// whether there is anything to answer. After a cut turn its marker is
+    /// enough, so a dropped message lets the cut work go on. After a finished
+    /// answer with nothing new it sends nothing and ends `Dropped`, since a
+    /// request must never end on the model's own reply.
+    pub async fn resume(
+        &mut self,
+        notices: Vec<Message>,
+        opts: RequestOptions,
+    ) -> Result<DoneReason, AgentError> {
+        self.begin(opts);
+        let landed = async {
+            self.land_input(notices, None, false)?;
+            self.handle_queued_command().await
+        }
+        .await;
+        if let Err(e) = landed {
+            return self.finish(Err(e));
+        }
+        if !self.awaits_reply() {
+            return self.finish(Ok(DoneReason::Dropped));
+        }
+        self.drive().await
+    }
+
+    fn awaits_reply(&self) -> bool {
+        self.history
+            .as_slice()
+            .last()
+            .is_some_and(|message| matches!(message.role, Role::User))
+    }
+
+    fn begin(&mut self, opts: RequestOptions) {
+        self.rollback_len = self.history.len();
+        self.carry_from = self.history.len();
+        self.stop_continuations = 0;
+        self.moved_last_round = false;
+        self.opts = opts;
+    }
+
+    async fn drive(&mut self) -> Result<DoneReason, AgentError> {
         if let Some((system, tools)) = self.history.request_prefix() {
             self.gauge
                 .seed_if_empty(self.history.as_slice(), system, tools);
@@ -383,17 +417,32 @@ impl<'h> Agent<'h> {
         // that failed was still busy.
         let busy_since = Instant::now();
         let result = self.run_loop().await;
-        if top_level {
+        if self.top_level() {
             maki_otel::emit::active_time(busy_since.elapsed());
         }
         self.finish(result)
+    }
+
+    /// Subagents are prompted by the machine inside the parent's window, so
+    /// counting them would inflate prompts and busy time.
+    fn top_level(&self) -> bool {
+        self.audience.contains(ToolAudience::MAIN)
+    }
+
+    /// Only asked after the run's token fired. Before that nobody cut it.
+    fn cutter(&self) -> Cutter {
+        self.interrupt_source
+            .as_ref()
+            .map(|source| source.cut_by())
+            .unwrap_or_default()
     }
 
     fn finish(&mut self, result: Result<DoneReason, AgentError>) -> Result<DoneReason, AgentError> {
         let reason = match result {
             Ok(reason) => reason,
             Err(AgentError::Cancelled) => {
-                sanitize_cancelled_history(self.history, self.rollback_len);
+                let cutter = self.cutter();
+                sanitize_cancelled_history(self.history, self.rollback_len, cutter);
                 DoneReason::Cancelled
             }
             Err(e) => return Err(e),
@@ -451,11 +500,16 @@ impl<'h> Agent<'h> {
             .as_ref()
             .and(observation_detail(&message))
             .map(str::to_owned);
-        let end = message.settles.as_ref().map(|settled| settled.end);
+        let end = message.answered().map(|settled| settled.end);
+        let markdown = message.markdown;
         self.history.push(message);
         if let Some(text) = line {
-            self.event_tx
-                .send(AgentEvent::ObservationLine { text, detail, end })?;
+            self.event_tx.send(AgentEvent::ObservationLine {
+                text,
+                detail,
+                markdown,
+                end,
+            })?;
         }
         Ok(())
     }
@@ -647,10 +701,11 @@ impl<'h> Agent<'h> {
             Err(StreamError::Cancelled { streamed }) => {
                 let streamed = streamed.trim_end();
                 if !streamed.is_empty() {
+                    let note = self.cutter().cut_reply_note();
                     self.history.push(Message {
                         role: Role::Assistant,
                         content: vec![ContentBlock::Text {
-                            text: format!("{streamed}\n\n{CANCELLED_TEXT_NOTE}"),
+                            text: format!("{streamed}\n\n{note}"),
                         }],
                         ..Default::default()
                     });
@@ -735,17 +790,26 @@ impl<'h> Agent<'h> {
         Ok(TurnOutcome::Done(reason))
     }
 
-    /// A thinking block the model can no longer see, or one that failed the
-    /// prefix check and was let through on an account that does not enforce
-    /// it. After a model switch that is normal. Anything else means the
-    /// prefix moved, which an enforcing account answers with a 400.
+    /// After a model switch the API flags the old model's thinking again on
+    /// every request, which is normal, so it only gets a debug line. Anything
+    /// else means the prefix moved, and an enforcing account would answer
+    /// that with a 400. We log one line per request, not one per block, so a
+    /// long session cannot flood the log and hide the warning.
     fn note_input_transformations(&self, transformations: &[InputTransformation]) {
-        for t in transformations {
-            if t.reason == MODEL_BINDING_MISMATCH {
-                info!(session = ?self.session_id, model = %self.model.id, kind = %t.kind, path = %t.path, reason = %t.reason, "thinking from another model not carried over");
-            } else {
-                warn!(session = ?self.session_id, model = %self.model.id, kind = %t.kind, path = %t.path, reason = %t.reason, flagged = transformations.len(), "thinking block failed the prefix check");
-            }
+        let (model_switch, moved): (Vec<_>, Vec<_>) = transformations
+            .iter()
+            .partition(|t| t.reason == MODEL_BINDING_MISMATCH);
+        if !model_switch.is_empty() {
+            debug!(session = ?self.session_id, model = %self.model.id, count = model_switch.len(), "thinking from another model not carried over");
+        }
+        if let Some(first) = moved.first() {
+            let paths = moved
+                .iter()
+                .take(MAX_LOGGED_PATHS)
+                .map(|t| t.path.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            warn!(session = ?self.session_id, model = %self.model.id, count = moved.len(), kind = %first.kind, reason = %first.reason, paths = %paths, "thinking block failed the prefix check");
         }
     }
 
@@ -884,11 +948,12 @@ impl<'h> Agent<'h> {
     }
 
     /// The account enforces thinking binding and something before a thinking
-    /// block moved: a rebuilt frame, an evicted image, a tool that joined in
-    /// full. The same body fails the same way every time, so every thinking
-    /// block goes, once. That edit is valid on every endpoint and leaves the
-    /// prefix append-only from here on. With none left to drop, the error is
-    /// the honest answer.
+    /// block moved: an evicted image, a tool that joined in full. A new frame
+    /// never gets here, because it clears the signatures when it is built.
+    /// The same body fails the same way every time, so every thinking block
+    /// goes, once. That edit is valid on every endpoint and leaves the prefix
+    /// append-only from here on. With none left to drop, the error is the
+    /// honest answer.
     fn recover_unbound_thinking(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
         let dropped = self.history.strip_thinking();
         if dropped == 0 {
@@ -1052,7 +1117,9 @@ impl<'h> Agent<'h> {
 
     async fn try_auto_compact(&mut self) -> Result<(), AgentError> {
         let context_size = self.gauge.size();
-        if !self.auto_compact || !compaction::is_overflow(context_size, &self.model, &self.config) {
+        if !self.auto_compact
+            || !compaction::is_overflow(u64::from(context_size), &self.model, &self.config)
+        {
             return Ok(());
         }
         info!(context_size, "auto-compacting");
@@ -1080,28 +1147,6 @@ impl<'h> Agent<'h> {
         // images and all. `carry_from` is where that input starts: the run's
         // own prompt, plus anything queued in since the last turn ended.
         let carry_len = self.history.len().saturating_sub(self.carry_from);
-        let carried = self
-            .compact_and_bill(steer.instructions.as_deref(), carry_len)
-            .await?;
-        // An unanswered prompt says what to do next better than the generic
-        // nudge, so it stands in for it. A layer's own words still go in.
-        if carried == 0 {
-            self.history
-                .push(Message::synthetic(compaction::continue_message(
-                    &self.config,
-                    steer.continue_text.as_deref(),
-                )));
-        } else if let Some(text) = steer.continue_text {
-            self.history.push(Message::synthetic(text));
-        }
-        Ok(())
-    }
-
-    async fn compact_and_bill(
-        &mut self,
-        instructions: Option<&str>,
-        carry_len: usize,
-    ) -> Result<usize, AgentError> {
         let context_size_before = self.gauge.size();
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
@@ -1120,36 +1165,35 @@ impl<'h> Agent<'h> {
             cancel: &self.cancel,
             context_size: context_size_before,
         };
-        let Compacted {
-            usage: compaction_usage,
-            summary,
-            carried,
-        } = compaction::compact_history(
+        let Compacted { summary, carried } = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
             &self.event_tx,
             &hooks,
             &self.config,
-            instructions,
+            steer.instructions.as_deref(),
             carry_len,
             self.timeouts.retry,
+            &self.ledger,
         )
         .await?;
-        // The summariser can be a different model, so price this with
-        // `compact_model` and not `self.model`. `list_cost` gates `fast`
-        // against whichever one it gets, and is the un-subsidised price the
-        // ledger wants either way.
-        let compact_cost = compact_model.billed_cost(&compaction_usage, self.opts.fast);
-        let compact_list_cost = compact_model.list_cost(&compaction_usage, self.opts.fast);
-        self.ledger
-            .add(compaction_usage, compact_cost, compact_list_cost);
         let carry_from = self.history.len() - carried;
         self.rollback_len = carry_from;
         self.carry_from = carry_from;
         // The old prefix has nothing worth keeping now, so the new prompt picks
         // up every fact told since.
         self.refresh_frame()?;
+        // An unanswered prompt says what to do next better than the generic
+        // nudge, so it stands in for it. A layer's own words still go in.
+        if carried == 0 {
+            self.history
+                .push(Message::synthetic(compaction::continue_message(
+                    steer.continue_text.as_deref(),
+                )));
+        } else if let Some(text) = steer.continue_text {
+            self.history.push(Message::synthetic(text));
+        }
         // The measurement the gauge holds describes the transcript that was
         // just summarized away, so what is left is all it may count.
         if let Some((system, tools)) = self.history.request_prefix() {
@@ -1161,8 +1205,7 @@ impl<'h> Agent<'h> {
             context_size_after,
             context_window: self.model.context_window,
             summary,
-        })?;
-        Ok(carried)
+        })
     }
 
     async fn handle_queued_command(&mut self) -> Result<bool, AgentError> {
@@ -1228,11 +1271,9 @@ fn no_frame() -> AgentError {
 }
 
 fn interrupt_message(message: String, images: Vec<ImageSource>, source: InputSource) -> Message {
-    let (tag, note) = match source {
-        InputSource::Plugin => (PARENT_INTERRUPT_TAG, PARENT_INTERRUPT_NOTE),
-        InputSource::Tui | InputSource::Acp | InputSource::Headless => {
-            (USER_INTERRUPT_TAG, USER_INTERRUPT_NOTE)
-        }
+    let (tag, note) = match Cutter::of(source) {
+        Cutter::Parent => (PARENT_INTERRUPT_TAG, PARENT_INTERRUPT_NOTE),
+        Cutter::User => (USER_INTERRUPT_TAG, USER_INTERRUPT_NOTE),
     };
     let wrapped = format!("<{tag}>\n{note}\n\n{message}\n</{tag}>");
     Message {
@@ -1246,6 +1287,63 @@ fn interrupt_message(message: String, images: Vec<ImageSource>, source: InputSou
 }
 
 #[cfg(test)]
+pub(crate) mod testing {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use maki_config::project::{self, TrustMode};
+    use maki_config::{DefaultEffect, ModelPolicy, PermissionsConfig};
+    use maki_providers::Model;
+    use maki_providers::provider::Provider;
+
+    use super::AgentParams;
+    use crate::agent::frame::RunContext;
+    use crate::cancel::CancelMap;
+    use crate::permissions::PermissionManager;
+    use crate::prompt::ResolvedPrompts;
+    use crate::tools::{BackgroundFor, FileAccess, RequestTools, ToolAudience};
+    use crate::{AgentConfig, RunLedger, ToolOutputLines};
+
+    const TEST_DIR: &str = "/tmp";
+    const SYSTEM: &str = "system";
+
+    pub(crate) fn agent_params(provider: Arc<dyn Provider>, model: Model) -> AgentParams {
+        AgentParams {
+            provider,
+            model,
+            config: AgentConfig::default(),
+            tool_output_lines: ToolOutputLines::default(),
+            permissions: Arc::new(PermissionManager::new(
+                PermissionsConfig {
+                    default: DefaultEffect::Allow,
+                    rules: vec![],
+                    ..Default::default()
+                },
+                PathBuf::from(TEST_DIR),
+                project::resolve_noninteractive(Path::new(TEST_DIR), TrustMode::Session)
+                    .project_config,
+                Arc::default(),
+            )),
+            session_id: None,
+            background_for: BackgroundFor::None,
+            task_id: None,
+            mailbox: None,
+            timeouts: maki_providers::Timeouts::default(),
+            file_access: FileAccess::fresh(),
+            prompt_slots: Arc::new(ResolvedPrompts::default()),
+            subagent_cancels: Arc::new(CancelMap::new()),
+            ledger: Arc::new(RunLedger::default()),
+            audience: ToolAudience::MAIN,
+            model_policy: Arc::new(ModelPolicy::default()),
+        }
+    }
+
+    pub(crate) fn fixed_context() -> RunContext {
+        RunContext::fixed(SYSTEM.into(), RequestTools::default())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, VecDeque};
@@ -1253,11 +1351,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use maki_config::ProjectConfig;
+    use maki_providers::model::FastSupport;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, ThinkingSupport, TokenUsage,
+        ContentBlock, FastPricing, Message, Model, ModelPricing, ProviderEvent, RequestOptions,
+        Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
     };
     use maki_storage::frame::{FactsUpdate, PlanChange};
     use maki_storage::id::MakiId;
@@ -1266,13 +1364,14 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::compaction::FIELD_CONTINUE;
+    use super::testing::{agent_params, fixed_context};
     use super::*;
     use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
+    use crate::agent::history::USER_CANCEL_MARKER;
     use crate::agent::hook::testing::{Seen, script};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
-    use crate::permissions::PermissionManager;
     use crate::prompt::{PromptId, Slot, SlotEntry};
     use crate::session::StoredSession;
     use crate::template::Vars;
@@ -1287,6 +1386,10 @@ mod tests {
     const MOVING_RECEIPT: &str = "Moved to the background. End your turn.";
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
     const RESPONSE_TEXT: &str = "response";
+    const THOUGHT: &str = "pondered";
+    const THOUGHT_SIGNATURE: &str = "sig";
+    const STALE_THINKING_MSG: &str = "thinking from before a new frame must not stay signed";
+    const KEPT_THINKING_MSG: &str = "a new frame must keep the reasoning text";
     const PLAN_ENDED: &str = "Plan mode ended. You may edit files again.";
     const CUSTOM_SYSTEM: &str = "You analyse information.";
     const CUSTOM_CONVENTIONS: &str = "State the evidence and uncertainty.";
@@ -1324,6 +1427,21 @@ mod tests {
         system: String,
         tools: Value,
         messages: Vec<Value>,
+        opts: RequestOptions,
+    }
+
+    impl CapturedRequest {
+        fn thinking(&self) -> Vec<ContentBlock> {
+            self.messages
+                .iter()
+                .flat_map(|m| {
+                    serde_json::from_value::<Message>(m.clone())
+                        .unwrap()
+                        .content
+                })
+                .filter(ContentBlock::is_thinking)
+                .collect()
+        }
     }
 
     /// The contract that keeps the cache and every thinking block valid:
@@ -1366,10 +1484,10 @@ mod tests {
             system: &'a str,
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
-            _: RequestOptions,
+            opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async {
+            Box::pin(async move {
                 self.requests.lock().unwrap().push(CapturedRequest {
                     model: model.id.clone(),
                     system: system.to_owned(),
@@ -1378,6 +1496,7 @@ mod tests {
                         .iter()
                         .map(|m| serde_json::to_value(m).unwrap())
                         .collect(),
+                    opts,
                 });
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
@@ -1468,6 +1587,28 @@ mod tests {
         }])
     }
 
+    fn thought_response() -> StreamResponse {
+        let mut response = text_response(StopReason::EndTurn);
+        response.message.content.insert(
+            0,
+            ContentBlock::Thinking {
+                thinking: THOUGHT.into(),
+                signature: Some(THOUGHT_SIGNATURE.into()),
+            },
+        );
+        response
+    }
+
+    fn is_signed(block: &ContentBlock) -> bool {
+        matches!(
+            block,
+            ContentBlock::Thinking {
+                signature: Some(_),
+                ..
+            } | ContentBlock::RedactedThinking { .. }
+        )
+    }
+
     fn assistant_response(content: Vec<ContentBlock>) -> StreamResponse {
         StreamResponse {
             message: Message {
@@ -1496,44 +1637,16 @@ mod tests {
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
-        let agent = Agent::new(
-            AgentParams {
-                provider,
-                model,
-                config: AgentConfig::default(),
-                tool_output_lines: ToolOutputLines::default(),
-                permissions: Arc::new(PermissionManager::new(
-                    maki_config::PermissionsConfig {
-                        default: maki_config::DefaultEffect::Allow,
-                        rules: vec![],
-                        ..Default::default()
-                    },
-                    std::path::PathBuf::from("/tmp"),
-                    ProjectConfig::for_project(Path::new("/tmp")),
-                    Arc::default(),
-                )),
-                session_id: None,
-                background_for: BackgroundFor::None,
-                task_id: None,
-                mailbox: None,
-                timeouts: maki_providers::Timeouts::default(),
-                file_access: FileAccess::fresh(),
-                prompt_slots: Arc::new(ResolvedPrompts::default()),
-                subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
-                ledger: Arc::new(RunLedger::default()),
-                registry: Arc::new(crate::tools::ToolRegistry::new()),
-                audience: ToolAudience::MAIN,
-                model_policy: Arc::new(ModelPolicy::default()),
-            },
+        let mut agent = Agent::new(
+            agent_params(provider, model),
             AgentRunParams {
                 history,
                 gauge: Box::leak(Box::default()),
                 event_tx: EventSender::new(raw_tx, 0),
-                context: Arc::new(|_, _| {
-                    RunContext::fixed("system".into(), RequestTools::default())
-                }),
+                context: Arc::new(|_, _| fixed_context()),
             },
         );
+        agent.registry = Arc::new(ToolRegistry::new());
         (agent, event_rx)
     }
 
@@ -2319,7 +2432,7 @@ mod tests {
         let last = history.as_slice().last().unwrap();
         assert!(matches!(last.role, Role::User));
         assert!(
-            matches!(&last.content[0], ContentBlock::Text { text } if text == "[Cancelled by user]")
+            matches!(&last.content[0], ContentBlock::Text { text } if text == USER_CANCEL_MARKER)
         );
     }
 
@@ -2427,7 +2540,7 @@ mod tests {
     async fn same_model_refresh_updates_auto_compaction(
         initial_window: u32,
         discovered_window: u32,
-        context_size: u32,
+        context_size: u64,
         expected_compaction: bool,
     ) {
         let mut h = Harness::new(Vec::new());
@@ -2730,7 +2843,8 @@ mod tests {
     #[tokio::test]
     async fn fingerprint_change_starts_a_new_frame_with_a_notice(change: fn(&World)) {
         let mut h = Harness::new(Vec::new());
-        h.run_in(AgentMode::Build).await;
+        h.run(default_input(), vec![thought_response()], |_| {})
+            .await;
         let first_frame = h.history.frame().cloned();
         change(&h.world);
         let events = h.run_in(AgentMode::Build).await;
@@ -2740,6 +2854,38 @@ mod tests {
             &e.event,
             AgentEvent::Notice { text } if text == FRAME_REBUILT
         )));
+        let requests = h.requests.lock().unwrap();
+        let thinking = requests.last().unwrap().thinking();
+        assert!(!thinking.is_empty(), "{KEPT_THINKING_MSG}");
+        assert!(!thinking.iter().any(is_signed), "{STALE_THINKING_MSG}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_leaves_the_frame_to_the_next_one() {
+        let rebuilt = |events: &[Envelope]| {
+            events.iter().any(|e| {
+                matches!(
+                    &e.event,
+                    AgentEvent::Notice { text } if text == FRAME_REBUILT
+                )
+            })
+        };
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build).await;
+        let first_frame = h.history.frame().cloned();
+        *h.world.tool.lock().unwrap() = "reloaded";
+
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+        let (reason, events) = h
+            .run(default_input(), Vec::new(), |agent| agent.cancel = cancel)
+            .await;
+        assert_eq!(reason, DoneReason::Cancelled);
+        assert!(!rebuilt(&events));
+        assert_eq!(h.history.frame().cloned(), first_frame);
+
+        assert!(rebuilt(&h.run_in(AgentMode::Build).await));
+        assert_ne!(h.history.frame().cloned(), first_frame);
     }
 
     /// Swapping maki's prompt for one the host wrote, or back, rebuilds the
@@ -3049,12 +3195,17 @@ mod tests {
         let mut h = Harness::new(Vec::new());
         h.run_in(AgentMode::Build).await;
         h.world.change(|f| f.date = NEXT_DATE.into());
-        let replies = (0..3).map(|_| text_response(StopReason::EndTurn)).collect();
+        let replies = (0..3).map(|_| thought_response()).collect();
         h.run(default_input(), replies, with_compact).await;
 
         let requests = h.requests.lock().unwrap();
         assert_append_only(&requests[0], &requests[1]);
-        assert!(requests.last().unwrap().system.contains(NEXT_DATE));
+        let after = requests.last().unwrap();
+        assert!(after.system.contains(NEXT_DATE));
+        assert!(
+            !after.thinking().iter().any(is_signed),
+            "{STALE_THINKING_MSG}"
+        );
         assert!(updates(&h.history).is_empty());
     }
 
@@ -3200,7 +3351,7 @@ mod tests {
         };
         let big_turn = StreamResponse {
             usage: TokenUsage {
-                input: TINY_CONTEXT_WINDOW * 10,
+                input: u64::from(TINY_CONTEXT_WINDOW) * 10,
                 ..Default::default()
             },
             ..tool_call_response("glob", "t1")
@@ -3227,7 +3378,7 @@ mod tests {
         })
         .await;
 
-        let continue_text = compaction::continue_message(&AgentConfig::default(), None);
+        let continue_text = compaction::continue_message(None);
         let messages = h.history.as_slice();
         assert!(
             messages
@@ -3354,7 +3505,7 @@ mod tests {
             cache_creation: 50,
             ..Default::default()
         };
-        let expected = response.usage.total_input();
+        let expected = response.usage.total_input() as u32;
         let mut history = History::new(vec![Message::user("go".into())]);
         let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
         agent.run(default_input()).await.unwrap();
@@ -3409,6 +3560,47 @@ mod tests {
         });
         assert_eq!(turn_subsidised_list_cost, Some(None));
         assert_eq!(done_list_cost, Some(Some(expected)));
+    }
+
+    /// The summary request never asks for fast mode, so a fast session must
+    /// not price it at fast rates, even when the summary turns out unusable.
+    #[test_case(text_response(StopReason::EndTurn) ; "usable_summary")]
+    #[test_case(thinking_response() ; "unusable_summary")]
+    #[tokio::test]
+    async fn fast_session_bills_compaction_at_standard_rates(mut response: StreamResponse) {
+        const INPUT_TOKENS: u64 = 1_000;
+        const OUTPUT_TOKENS: u64 = 100;
+        let usage = TokenUsage {
+            input: INPUT_TOKENS,
+            output: OUTPUT_TOKENS,
+            ..Default::default()
+        };
+        response.usage = usage;
+        let provider = MockProvider::new(vec![response]);
+        let requests = Arc::clone(&provider.requests);
+        let mut model = default_model();
+        model.supports_fast_override = Some(FastSupport::Supported);
+        model.pricing = ModelPricing {
+            input: 1.0,
+            output: 2.0,
+            fast: Some(FastPricing {
+                input: 3.0,
+                output: 6.0,
+            }),
+            ..Default::default()
+        };
+        let mut history = History::new(vec![Message::user(CARRIED.into())]);
+        let (mut agent, _event_rx) = make_agent_with(Arc::new(provider), model, &mut history);
+        agent.opts.fast = true;
+        agent.carry_from = agent.history.len();
+
+        let _ = agent.do_compact(CompactSteer::default()).await;
+
+        assert!(!requests.lock().unwrap()[0].opts.fast);
+        let totals = agent.ledger.totals();
+        assert_eq!(totals.usage, usage);
+        assert_eq!(totals.cost, agent.model.billed_cost(&usage, false));
+        assert_eq!(totals.list_cost, agent.model.list_cost(&usage, false));
     }
 
     #[test_case(true,  170_000, true  ; "enabled_and_over_threshold")]
@@ -3602,22 +3794,21 @@ mod tests {
     #[test_case(true, false, UNBOUND_GIVE_UP_MSG ; "nothing_left_to_drop_surfaces_the_error")]
     #[tokio::test]
     async fn unbound_thinking_recovery(always: bool, expected: bool, message: &str) {
-        let mut history = History::new(vec![
-            Message::user("go".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![
-                    ContentBlock::Thinking {
-                        thinking: "hmm".into(),
-                        signature: Some("sig".into()),
-                    },
-                    ContentBlock::Text {
-                        text: "done".into(),
-                    },
-                ],
-                ..Default::default()
-            },
-        ]);
+        let mut history = History::new(vec![Message::user("go".into())]);
+        fit_frame(&mut history, fixed_context(), None, &default_model());
+        history.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "hmm".into(),
+                    signature: Some("sig".into()),
+                },
+                ContentBlock::Text {
+                    text: "done".into(),
+                },
+            ],
+            ..Default::default()
+        });
         let (mut agent, event_rx) = make_agent(UnboundThinkingProvider { always }, &mut history);
 
         let recovered = agent.run(default_input()).await.is_ok();
@@ -3652,7 +3843,7 @@ mod tests {
         let mut history = History::new(Vec::new());
         let filling = StreamResponse {
             usage: TokenUsage {
-                input: TINY_CONTEXT_WINDOW,
+                input: u64::from(TINY_CONTEXT_WINDOW),
                 ..Default::default()
             },
             ..text_response(StopReason::EndTurn)
@@ -3691,26 +3882,6 @@ mod tests {
                 .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(QUEUED_INPUT))),
             "{QUEUED_KEPT_MSG}"
         );
-    }
-
-    #[tokio::test]
-    async fn do_compact_appends_post_instructions_to_continue_message() {
-        const POST: &str = "Re-read plan.md";
-        let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, _event_rx) = make_agent(
-            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
-            &mut history,
-        );
-        agent.config.post_compaction_instructions = Some(POST.into());
-        agent.carry_from = agent.history.len();
-        agent.do_compact(CompactSteer::default()).await.unwrap();
-        drop(agent);
-
-        let last = history.as_slice().last().unwrap();
-        assert!(matches!(
-            &last.content[0],
-            ContentBlock::Text { text } if text.ends_with(POST) && text != POST
-        ));
     }
 
     #[tokio::test]
@@ -3759,7 +3930,7 @@ mod tests {
         let messages = history.as_slice();
         let partial = &messages[messages.len() - 2];
         assert!(matches!(partial.role, Role::Assistant));
-        let expected = format!("{PARTIAL}\n\n{CANCELLED_TEXT_NOTE}");
+        let expected = format!("{PARTIAL}\n\n{}", Cutter::User.cut_reply_note());
         assert!(
             matches!(&partial.content[0], ContentBlock::Text { text } if *text == expected),
             "kept text must carry the truncation note so the model never resumes it"
@@ -4004,7 +4175,7 @@ mod tests {
         registry
             .register(
                 Arc::new(MovingTool),
-                ToolSource::Lua {
+                ToolSource {
                     plugin: MOVING_TOOL.into(),
                 },
             )
@@ -4097,6 +4268,41 @@ mod tests {
             steers(&drain_events(&event_rx)),
             [(SteerKind::MessageRewritten, REWRITTEN.to_owned())]
         );
+    }
+
+    /// A cut turn ends on its marker, so a dropped interrupt still leaves
+    /// work to go on with. After a finished answer it leaves nothing, and a
+    /// request then would end on the model's own reply. The mock panics on a
+    /// request it has no reply for, so the second case proves none went out.
+    #[test_case(Message::synthetic(USER_CANCEL_MARKER.into()), vec![text_response(StopReason::EndTurn)], DoneReason::EndTurn ; "after_a_cut_turn_the_work_goes_on")]
+    #[test_case(text_response(StopReason::EndTurn).message, Vec::new(), DoneReason::Dropped ; "after_a_finished_answer_nothing_is_sent")]
+    #[tokio::test]
+    async fn resume_with_a_dropped_interrupt(
+        last: Message,
+        replies: Vec<StreamResponse>,
+        expected: DoneReason,
+    ) {
+        let mut history = History::new(vec![Message::user("go".into()), last]);
+        let (agent, _event_rx) = make_agent(MockProvider::new(replies), &mut history);
+        let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![
+            ExtractedCommand::Interrupt(vec![AgentInput {
+                message: BLOCKED.into(),
+                ..default_input()
+            }]),
+        ]));
+        script(&agent.registry, drop_blocked);
+
+        let reason = agent
+            .resume(Vec::new(), RequestOptions::default())
+            .await
+            .unwrap();
+        drop(agent);
+
+        assert_eq!(reason, expected);
+        assert!(matches!(
+            history.as_slice().last().unwrap().role,
+            Role::Assistant
+        ));
     }
 
     /// The mock has no responses and panics on any request, so passing proves
@@ -4328,15 +4534,16 @@ mod tests {
         );
     }
 
+    const POST_COMPACTION: &str = "Re-read plan.md";
+
     #[tokio::test]
-    async fn compact_before_continue_joins_the_configured_one() {
-        const POST: &str = "Re-read plan.md";
+    async fn compact_before_continue_follows_the_configured_instructions() {
         let mut history = History::new(vec![Message::user("go".into())]);
         let (mut agent, _event_rx) = make_agent(
             MockProvider::new(vec![text_response(StopReason::EndTurn)]),
             &mut history,
         );
-        agent.config.post_compaction_instructions = Some(POST.into());
+        agent.config.post_compaction_instructions = Some(POST_COMPACTION.into());
         agent.carry_from = agent.history.len();
         script(
             &agent.registry,
@@ -4355,7 +4562,11 @@ mod tests {
             .unwrap()
             .first_text_content()
             .unwrap();
-        assert!(last.contains(POST) && last.contains(KEEP_GOING), "{last}");
+        assert_eq!(
+            history.as_slice()[2].first_text_content(),
+            Some(POST_COMPACTION)
+        );
+        assert_eq!(last, compaction::continue_message(Some(KEEP_GOING)));
     }
 
     const CARRIED: &str = "answer this next";
@@ -4392,28 +4603,93 @@ mod tests {
         assert_eq!(tail, [Some(CARRIED), Some(KEEP_GOING)]);
     }
 
+    fn summary_response() -> StreamResponse {
+        assistant_response(vec![ContentBlock::Text {
+            text: SUMMARY.into(),
+        }])
+    }
+
+    /// The continuation lands after the summary, so measuring before it would
+    /// report a context short by that message.
     #[tokio::test]
-    async fn compaction_done_carries_the_summary() {
+    async fn compaction_done_describes_the_final_history() {
         let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, event_rx) = make_agent(
-            MockProvider::new(vec![assistant_response(vec![ContentBlock::Text {
-                text: SUMMARY.into(),
-            }])]),
-            &mut history,
-        );
+        let (mut agent, event_rx) =
+            make_agent(MockProvider::new(vec![summary_response()]), &mut history);
         agent.carry_from = agent.history.len();
 
-        agent.do_compact(CompactSteer::default()).await.unwrap();
-        drop(agent);
+        agent
+            .do_compact(CompactSteer {
+                continue_text: Some(KEEP_GOING.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
-        let summaries: Vec<_> = drain_events(&event_rx)
+        let mut expected_gauge = ContextGauge::default();
+        let (system, tools) = agent.history.request_prefix().unwrap();
+        expected_gauge.reset(agent.history.as_slice(), system, tools);
+        assert_eq!(agent.gauge.size(), expected_gauge.size());
+        let completions: Vec<_> = drain_events(&event_rx)
             .into_iter()
             .filter_map(|e| match e.event {
-                AgentEvent::CompactionDone { summary, .. } => Some(summary),
+                AgentEvent::CompactionDone {
+                    summary,
+                    context_size_after,
+                    ..
+                } => Some((summary, context_size_after)),
                 _ => None,
             })
             .collect();
-        assert_eq!(summaries, [SUMMARY]);
+        assert_eq!(completions, [(SUMMARY.into(), expected_gauge.size())]);
+    }
+
+    /// The configured instructions close the summary block, ahead of the
+    /// carried input. A truncated answer stays last so it can be continued, and
+    /// the next compaction summarizes the old copy instead of carrying it.
+    #[test_case(Vec::new(), 1 ; "not_carried")]
+    #[test_case(vec![Message::user(CARRIED.into())], 1 ; "carried")]
+    #[test_case(vec![Message::user(CARRIED.into())], 2 ; "repeated_compaction")]
+    #[test_case(
+        vec![Message::user(PENDING_PROMPT.into()), text_response(StopReason::MaxTokens).message], 1
+        ; "truncated_answer"
+    )]
+    #[tokio::test]
+    async fn post_compaction_instructions_close_the_summary(
+        carried: Vec<Message>,
+        compactions: usize,
+    ) {
+        let mut history = History::new(
+            [Message::user("go".into())]
+                .into_iter()
+                .chain(carried.iter().cloned())
+                .collect(),
+        );
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new((0..compactions).map(|_| summary_response()).collect()),
+            &mut history,
+        );
+        agent.config.post_compaction_instructions = Some(POST_COMPACTION.into());
+        agent.carry_from = 1;
+
+        for _ in 0..compactions {
+            agent.do_compact(CompactSteer::default()).await.unwrap();
+        }
+
+        let messages = agent.history.as_slice();
+        assert_eq!(
+            messages[1..agent.carry_from],
+            [
+                summary_response().message,
+                Message::synthetic(POST_COMPACTION.into())
+            ]
+        );
+        let expected_tail = if carried.is_empty() {
+            vec![Message::synthetic(compaction::continue_message(None))]
+        } else {
+            carried
+        };
+        assert_eq!(messages[agent.carry_from..], expected_tail);
     }
 
     /// Lands its command once the stop layer has spent the allowance, keyed on

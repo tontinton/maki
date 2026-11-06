@@ -2,23 +2,68 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
-use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
+use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, Role};
 use maki_storage::frame::{LiveFacts, StoredFrame};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::next_epoch;
+use maki_storage::sessions::{SessionTools, next_epoch};
 use serde_json::Value;
+use strum::Display;
 use tracing::warn;
 
 use super::frame::LiveFrame;
+use crate::InputSource;
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::session::SessionHeader;
 
-const CANCEL_MARKER: &str = "[Cancelled by user]";
+/// Older sessions carry this one for every cut, whoever made it.
+pub const USER_CANCEL_MARKER: &str = "[Cancelled by user]";
+const PARENT_CANCEL_MARKER: &str = "[Cancelled by your parent agent or a plugin, not the user]";
+/// Without this note a cancelled reply replays in history as a finished
+/// turn, and a model resuming its own cut-off text can wedge the session
+/// (seen with llama.cpp stuck on an unterminated tool call).
+const USER_CUT_REPLY_NOTE: &str = "[Response cut off by user cancel]";
+const PARENT_CUT_REPLY_NOTE: &str = "[Response cut off by your parent agent or a plugin]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
 pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
 pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
 pub type SharedHeader = Arc<ArcSwap<SessionHeader>>;
+
+/// Who cut a turn short or stopped a task. A subagent stopped by its parent
+/// should not read that the user changed their mind, so the marker names the
+/// right one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Display)]
+pub enum Cutter {
+    #[default]
+    #[strum(serialize = "user")]
+    User,
+    /// The parent agent (`task_stop`) or a plugin.
+    #[strum(serialize = "parent agent")]
+    Parent,
+}
+
+impl Cutter {
+    pub const fn of(source: InputSource) -> Self {
+        match source {
+            InputSource::Plugin => Self::Parent,
+            InputSource::Tui | InputSource::Acp | InputSource::Headless => Self::User,
+        }
+    }
+
+    pub const fn cancel_marker(self) -> &'static str {
+        match self {
+            Self::User => USER_CANCEL_MARKER,
+            Self::Parent => PARENT_CANCEL_MARKER,
+        }
+    }
+
+    pub const fn cut_reply_note(self) -> &'static str {
+        match self {
+            Self::User => USER_CUT_REPLY_NOTE,
+            Self::Parent => PARENT_CUT_REPLY_NOTE,
+        }
+    }
+}
 
 struct LiveEntry {
     history: Weak<ArcSwap<HistorySnapshot>>,
@@ -149,12 +194,24 @@ impl History {
     pub(crate) fn request_prefix(&self) -> Option<(&str, &Value)> {
         Some((
             self.snapshot.frame.as_ref()?.prefix()?,
-            &self.live.as_ref()?.wire,
+            self.live.as_ref()?.wire.as_ref(),
         ))
     }
 
     pub(crate) fn adopt_frame(&mut self, live: LiveFrame) {
         self.live = Some(live);
+        self.publish();
+    }
+
+    /// The fingerprint skips the model, so a kept frame follows a switch here.
+    pub(crate) fn refit_live(&mut self, model: &Model) {
+        let spec = model.spec();
+        if let Some(live) = &mut self.live
+            && live.model != spec
+        {
+            live.model = spec;
+            self.publish();
+        }
     }
 
     pub(crate) fn set_frame(&mut self, stored: StoredFrame, live: LiveFrame) {
@@ -272,6 +329,20 @@ impl History {
         thinking
     }
 
+    /// Every signature is bound to the prefix it was written under, so a new
+    /// frame voids them all. The reasoning text stays for the transcript, and
+    /// a provider that needs a signature leaves unsigned thinking out.
+    pub(crate) fn unbind_thinking(&mut self) {
+        if self
+            .as_slice()
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(is_bound)
+        {
+            self.rewrite(|msgs| unbind_thinking(msgs));
+        }
+    }
+
     pub fn into_vec(self) -> Vec<Message> {
         Arc::unwrap_or_clone(self.snapshot.messages)
     }
@@ -295,7 +366,14 @@ impl History {
     /// here used to make the snapshot as long as the real results that came
     /// next, so the log never saw them. Callers that need an API-valid list
     /// close the dangling calls on their own copy.
-    fn publish(&self) {
+    ///
+    /// Tools come from `live` only here, so a reader always sees the array
+    /// the next request sends.
+    fn publish(&mut self) {
+        self.snapshot.tools = self.live.as_ref().map(|live| SessionTools {
+            model: live.model.clone(),
+            wire: Arc::clone(&live.wire),
+        });
         let Some(mirror) = &self.mirror else { return };
         mirror.store(Arc::new(self.snapshot.clone()));
     }
@@ -374,6 +452,37 @@ pub(super) fn strip_thinking(messages: &mut [Message]) {
     }
 }
 
+fn is_bound(block: &ContentBlock) -> bool {
+    matches!(
+        block,
+        ContentBlock::Thinking {
+            signature: Some(_),
+            ..
+        } | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::ToolUse {
+                thought_signature: Some(_),
+                ..
+            }
+    )
+}
+
+/// A redacted block is nothing but its binding, so it goes whole.
+pub fn unbind_thinking(messages: &mut [Message]) {
+    for msg in messages {
+        msg.content
+            .retain(|block| !matches!(block, ContentBlock::RedactedThinking { .. }));
+        for block in &mut msg.content {
+            match block {
+                ContentBlock::Thinking { signature, .. } => *signature = None,
+                ContentBlock::ToolUse {
+                    thought_signature, ..
+                } => *thought_signature = None,
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Empty markers and synthetic prompts (empty `display_text`) are
 /// bookkeeping, not conversation.
 fn is_system_padding(m: &Message) -> bool {
@@ -433,13 +542,18 @@ fn dangling_results(messages: &[Message], note: &str) -> Option<Message> {
     })
 }
 
-pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize) {
+pub(crate) fn sanitize_cancelled_history(
+    history: &mut History,
+    rollback_len: usize,
+    cutter: Cutter,
+) {
     if history.len() <= rollback_len {
         return;
     }
+    let marker = cutter.cancel_marker();
     history.edit(|msgs| {
-        close_dangling_tool_calls(msgs, CANCEL_MARKER);
-        msgs.push(Message::synthetic(CANCEL_MARKER.into()));
+        close_dangling_tool_calls(msgs, marker);
+        msgs.push(Message::synthetic(marker.into()));
     });
 }
 
@@ -460,7 +574,9 @@ mod tests {
     fn assert_ends_with_cancel_marker(history: &History) {
         let last = history.as_slice().last().unwrap();
         assert!(matches!(last.role, Role::User));
-        assert!(matches!(&last.content[0], ContentBlock::Text { text } if text == CANCEL_MARKER));
+        assert!(
+            matches!(&last.content[0], ContentBlock::Text { text } if text == USER_CANCEL_MARKER)
+        );
     }
 
     fn make_tool_use_msg(ids: &[&str]) -> Message {
@@ -536,7 +652,7 @@ mod tests {
         expect_cancel_marker: bool,
     ) {
         let mut history = History::new(messages);
-        sanitize_cancelled_history(&mut history, rollback_len);
+        sanitize_cancelled_history(&mut history, rollback_len, Cutter::User);
         assert_eq!(history.len(), expected_len);
         if expect_cancel_marker {
             assert_ends_with_cancel_marker(&history);
@@ -549,7 +665,7 @@ mod tests {
             Message::user("hello".into()),
             make_tool_use_msg(&["t1", "t2"]),
         ]);
-        sanitize_cancelled_history(&mut history, 0);
+        sanitize_cancelled_history(&mut history, 0, Cutter::User);
 
         assert_eq!(extract_error_ids(&history.as_slice()[2]), ["t1", "t2"]);
         assert_ends_with_cancel_marker(&history);
@@ -619,14 +735,16 @@ mod tests {
 
     /// Cancelling closes the open tool calls and marks the turn, all onto the
     /// end of the list, so the log can keep appending instead of rewriting.
-    #[test]
-    fn sanitize_cancelled_history_appends_onto_the_mirror() {
+    /// Both carry the marker of whoever cut the turn.
+    #[test_case(Cutter::User, USER_CANCEL_MARKER     ; "cut_by_the_user")]
+    #[test_case(Cutter::Parent, PARENT_CANCEL_MARKER ; "cut_by_the_parent")]
+    fn sanitize_cancelled_history_appends_onto_the_mirror(cutter: Cutter, marker: &str) {
         let mirror = make_mirror();
         let mut history = History::new(vec![Message::user(GO.into()), make_tool_use_msg(&["t1"])])
             .with_mirror(Arc::clone(&mirror));
         let epoch = mirror.load().epoch;
 
-        sanitize_cancelled_history(&mut history, 0);
+        sanitize_cancelled_history(&mut history, 0, cutter);
 
         let snap = mirror.load();
         assert_eq!(snap.epoch, epoch, "cancel cleanup is a pure append");
@@ -634,11 +752,11 @@ mod tests {
         assert_eq!(extract_error_ids(&snap.messages[2]), ["t1"]);
         assert!(snap.messages[2].content.iter().any(|b| matches!(
             b,
-            ContentBlock::ToolResult { content, .. } if content == CANCEL_MARKER
+            ContentBlock::ToolResult { content, .. } if content == marker
         )));
         assert!(matches!(
             &snap.messages[3].content[0],
-            ContentBlock::Text { text } if text == CANCEL_MARKER
+            ContentBlock::Text { text } if text == marker
         ));
     }
 
@@ -779,6 +897,39 @@ mod tests {
             &history.as_slice()[1].content[..],
             [ContentBlock::ToolUse { thought_signature, .. }] if thought_signature.is_some() == signature_kept
         ));
+    }
+
+    #[test]
+    fn unbind_thinking_keeps_the_reasoning_text() {
+        let thinking = |signature: Option<&str>| ContentBlock::Thinking {
+            thinking: GO.into(),
+            signature: signature.map(Into::into),
+        };
+        let tool_use = |thought_signature: Option<&str>| ContentBlock::ToolUse {
+            id: FIRST.into(),
+            name: SECOND.into(),
+            input: serde_json::json!({}),
+            thought_signature: thought_signature.map(Into::into),
+        };
+        let call = Message {
+            role: Role::Assistant,
+            content: vec![
+                thinking(Some(SIGNATURE)),
+                ContentBlock::RedactedThinking {
+                    data: SIGNATURE.into(),
+                },
+                tool_use(Some(SIGNATURE)),
+            ],
+            ..Default::default()
+        };
+        let mut history = History::new(vec![Message::user(GO.into()), call]);
+
+        history.unbind_thinking();
+
+        assert_eq!(
+            history.as_slice()[1].content,
+            [thinking(None), tool_use(None)]
+        );
     }
 
     /// Dropping an orphaned result must not take a newer build's block with it.
@@ -962,7 +1113,7 @@ mod tests {
         let before = mirror.load_full();
         let rollback_len = history.len();
 
-        sanitize_cancelled_history(&mut history, rollback_len);
+        sanitize_cancelled_history(&mut history, rollback_len, Cutter::User);
 
         let after = mirror.load_full();
         assert_eq!(before.epoch, after.epoch);

@@ -2,99 +2,20 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
+use self::KeybindContext as Ctx;
+
 macro_rules! mod_key {
     ($suffix:expr) => {
         concat!("Ctrl+", $suffix)
     };
 }
 
-macro_rules! upper {
-    ('a') => {
-        "A"
-    };
-    ('b') => {
-        "B"
-    };
-    ('c') => {
-        "C"
-    };
-    ('d') => {
-        "D"
-    };
-    ('e') => {
-        "E"
-    };
-    ('f') => {
-        "F"
-    };
-    ('g') => {
-        "G"
-    };
-    ('h') => {
-        "H"
-    };
-    ('i') => {
-        "I"
-    };
-    ('j') => {
-        "J"
-    };
-    ('k') => {
-        "K"
-    };
-    ('l') => {
-        "L"
-    };
-    ('m') => {
-        "M"
-    };
-    ('n') => {
-        "N"
-    };
-    ('o') => {
-        "O"
-    };
-    ('p') => {
-        "P"
-    };
-    ('q') => {
-        "Q"
-    };
-    ('r') => {
-        "R"
-    };
-    ('s') => {
-        "S"
-    };
-    ('t') => {
-        "T"
-    };
-    ('u') => {
-        "U"
-    };
-    ('v') => {
-        "V"
-    };
-    ('w') => {
-        "W"
-    };
-    ('x') => {
-        "X"
-    };
-    ('y') => {
-        "Y"
-    };
-    ('z') => {
-        "Z"
-    };
-}
-
 macro_rules! ctrl_bind {
-    ($char:tt) => {
+    ($upper:literal) => {
         Bind {
-            code: KeyCode::Char($char),
+            code: KeyCode::Char($upper.as_bytes()[0].to_ascii_lowercase() as char),
             modifiers: KeyModifiers::CONTROL,
-            label: mod_key!(upper!($char)),
+            label: mod_key!($upper),
         }
     };
 }
@@ -126,13 +47,14 @@ pub mod key {
     use super::Bind;
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    pub const QUIT: Bind = ctrl_bind!('c');
-    pub const HELP: Bind = ctrl_bind!('h');
-    pub const SESSIONS: Bind = ctrl_bind!('p');
-    pub const TASKS: Bind = ctrl_bind!('x');
-    pub const BACKGROUND: Bind = ctrl_bind!('b');
-    pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
-    pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!('d');
+    pub const QUIT: Bind = ctrl_bind!("C");
+    pub const HELP: Bind = ctrl_bind!("H");
+    pub const PASTE: Bind = ctrl_bind!("V");
+    pub const SESSIONS: Bind = ctrl_bind!("P");
+    pub const TASKS: Bind = ctrl_bind!("X");
+    pub const BACKGROUND: Bind = ctrl_bind!("B");
+    pub const SCROLL_HALF_UP: Bind = ctrl_bind!("U");
+    pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!("D");
     pub const SCROLL_PAGE_UP: Bind = Bind {
         code: KeyCode::PageUp,
         modifiers: KeyModifiers::NONE,
@@ -143,28 +65,28 @@ pub mod key {
         modifiers: KeyModifiers::NONE,
         label: "PageDown",
     };
-    pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
-    pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
-    pub const SCROLL_TOP: Bind = ctrl_bind!('g');
+    pub const SCROLL_LINE_UP: Bind = ctrl_bind!("Y");
+    pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!("E");
+    pub const SCROLL_TOP: Bind = ctrl_bind!("G");
     pub const SCROLL_BOTTOM: Bind = Bind {
         code: KeyCode::Char('g'),
         modifiers: KeyModifiers::CONTROL.union(KeyModifiers::ALT),
         label: mod_key!("Alt+G"),
     };
-    pub const POP_QUEUE: Bind = ctrl_bind!('q');
-    pub const DELETE_WORD: Bind = ctrl_bind!('w');
-    pub const SEARCH: Bind = ctrl_bind!('f');
-    pub const FORK: Bind = ctrl_bind!('f');
-    pub const FILE_PICKER: Bind = ctrl_bind!('s');
-    pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
-    pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
-    pub const MODEL_PICKER: Bind = ctrl_bind!('l');
-    pub const REFRESH: Bind = ctrl_bind!('r');
-    pub const SUSPEND: Bind = ctrl_bind!('z');
-    pub const DELETE: Bind = ctrl_bind!('d');
-    pub const KILL_LINE: Bind = ctrl_bind!('k');
-    pub const LINE_START: Bind = ctrl_bind!('a');
-    pub const LINE_END: Bind = ctrl_bind!('e');
+    pub const POP_QUEUE: Bind = ctrl_bind!("Q");
+    pub const DELETE_WORD: Bind = ctrl_bind!("W");
+    pub const SEARCH: Bind = ctrl_bind!("F");
+    pub const FORK: Bind = ctrl_bind!("F");
+    pub const FILE_PICKER: Bind = ctrl_bind!("S");
+    pub const OPEN_EDITOR: Bind = ctrl_bind!("O");
+    pub const PLAN_TOGGLE: Bind = ctrl_bind!("T");
+    pub const MODEL_PICKER: Bind = ctrl_bind!("L");
+    pub const REFRESH: Bind = ctrl_bind!("R");
+    pub const SUSPEND: Bind = ctrl_bind!("Z");
+    pub const DELETE: Bind = ctrl_bind!("D");
+    pub const KILL_LINE: Bind = ctrl_bind!("K");
+    pub const LINE_START: Bind = ctrl_bind!("A");
+    pub const LINE_END: Bind = ctrl_bind!("E");
     pub const EDIT_INPUT: Bind = Bind {
         code: KeyCode::Char('o'),
         modifiers: KeyModifiers::ALT,
@@ -319,280 +241,140 @@ pub struct Keybind {
     pub platform: Platform,
 }
 
+impl Keybind {
+    const fn on(self, platform: Platform) -> Self {
+        Self { platform, ..self }
+    }
+}
+
+const fn kb(label: KeyLabel, description: &'static str, context: Ctx) -> Keybind {
+    Keybind {
+        label,
+        description,
+        context,
+        platform: Platform::All,
+    }
+}
+
+const fn single(label: &'static str, description: &'static str, context: Ctx) -> Keybind {
+    kb(KeyLabel::Single(label), description, context)
+}
+
 pub const KEYBINDS: &[Keybind] = &[
-    Keybind {
-        label: KeyLabel::Single(key::QUIT.label),
-        description: "Quit / clear input / copy selection",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::HELP.label),
-        description: "Show keybindings",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::SEARCH.label),
-        description: "Search messages",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::FILE_PICKER.label),
-        description: "File picker",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::OPEN_EDITOR.label),
-        description: "Open plan in editor",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::PLAN_TOGGLE.label),
-        description: "Toggle plan panel",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::MODEL_PICKER.label),
-        description: "Model picker",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::SUSPEND.label),
-        description: "Suspend process",
-        context: KeybindContext::General,
-        platform: Platform::UnixOnly,
-    },
-    Keybind {
-        label: KeyLabel::Single("Enter"),
-        description: "Submit prompt",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::MacMulti(
+    single(
+        key::QUIT.label,
+        "Quit / clear input / copy selection",
+        Ctx::General,
+    ),
+    single(key::HELP.label, "Show keybindings", Ctx::General),
+    single(key::SEARCH.label, "Search messages", Ctx::General),
+    single(key::FILE_PICKER.label, "File picker", Ctx::General),
+    single(key::OPEN_EDITOR.label, "Open plan in editor", Ctx::General),
+    single(key::PLAN_TOGGLE.label, "Toggle plan panel", Ctx::General),
+    single(key::MODEL_PICKER.label, "Model picker", Ctx::General),
+    single(key::SUSPEND.label, "Suspend process", Ctx::General).on(Platform::UnixOnly),
+    single("Enter", "Submit prompt", Ctx::Editing),
+    kb(
+        KeyLabel::MacMulti(
             &["Shift+Enter", "Ctrl+Enter", "Ctrl+J", "Alt+Enter"],
             &["⇧↵", "⌃↵", "⌃J", "⌥↵"],
         ),
-        description: "Newline",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Tab"),
-        description: "Switch between plan and build",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("/command"),
-        description: "Open command palette",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::MacAlt(key::DELETE_WORD.label, "⌥⌫"),
-        description: "Delete word backward",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::MacMulti(&["Alt+←", "Alt+→"], &["⌥←", "⌥→"]),
-        description: "Move word left / right",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Shift+motion"),
-        description: "Select text",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(mod_key!("Del"), "⌥Del"),
-        description: "Delete word forward",
-        context: KeybindContext::Editing,
-        platform: Platform::MacOnly,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::KILL_LINE.label),
-        description: "Delete to end of line",
-        context: KeybindContext::Editing,
-        platform: Platform::MacOnly,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::LINE_START.label),
-        description: "Jump to start of line",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt("Home", "End"),
-        description: "Jump to start/end of line",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
-        description: "Scroll half page up / down",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(key::SCROLL_PAGE_UP.label, key::SCROLL_PAGE_DOWN.label),
-        description: "Scroll page up / down",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::LINE_END.label),
-        description: "Jump to end of line",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::SCROLL_TOP.label),
-        description: "Scroll to top",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::SCROLL_BOTTOM.label),
-        description: "Scroll to bottom",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::POP_QUEUE.label),
-        description: "Pop queue",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Esc Esc"),
-        description: "Rewind",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::EDIT_INPUT.label),
-        description: "Edit input in external editor",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::UNDO.label),
-        description: "Undo typing / paste",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt("↑", "↓"),
-        description: "Navigate input history",
-        context: KeybindContext::Streaming,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Esc Esc"),
-        description: "Cancel agent",
-        context: KeybindContext::Streaming,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::BACKGROUND.label),
-        description: "Move running calls to the background (tmux: press twice)",
-        context: KeybindContext::Streaming,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt("↑", "↓"),
-        description: "Navigate options",
-        context: KeybindContext::FormInput,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Enter"),
-        description: "Select option",
-        context: KeybindContext::FormInput,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Esc"),
-        description: "Close",
-        context: KeybindContext::FormInput,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt("↑", "↓"),
-        description: "Navigate",
-        context: KeybindContext::Picker,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Enter"),
-        description: "Select",
-        context: KeybindContext::Picker,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Esc"),
-        description: "Close",
-        context: KeybindContext::Picker,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Type"),
-        description: "Filter",
-        context: KeybindContext::Picker,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt("PageUp", "PageDown"),
-        description: "Scroll page up / down",
-        context: KeybindContext::Picker,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
-        description: "Scroll half page up / down",
-        context: KeybindContext::Picker,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::FORK.label),
-        description: "Fork up to the selected prompt and switch to it",
-        context: KeybindContext::RewindPicker,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Enter"),
-        description: "Remove item",
-        context: KeybindContext::QueueFocus,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Tab"),
-        description: "Complete command",
-        context: KeybindContext::CommandPalette,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("!/@/#/$"),
-        description: "Set tier (strong/medium/weak/compaction)",
-        context: KeybindContext::ModelPicker,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("%"),
-        description: "Fold or unfold provider",
-        context: KeybindContext::ModelPicker,
-        platform: Platform::All,
-    },
+        "Newline",
+        Ctx::Editing,
+    ),
+    single("Tab", "Switch between plan and build", Ctx::Editing),
+    single("/command", "Open command palette", Ctx::Editing),
+    kb(
+        KeyLabel::MacAlt(key::DELETE_WORD.label, "⌥⌫"),
+        "Delete word backward",
+        Ctx::Editing,
+    ),
+    kb(
+        KeyLabel::MacMulti(&["Alt+←", "Alt+→"], &["⌥←", "⌥→"]),
+        "Move word left / right",
+        Ctx::Editing,
+    ),
+    single("Shift+motion", "Select text", Ctx::Editing),
+    kb(
+        KeyLabel::Alt(mod_key!("Del"), "⌥Del"),
+        "Delete word forward",
+        Ctx::Editing,
+    )
+    .on(Platform::MacOnly),
+    single(key::KILL_LINE.label, "Delete to end of line", Ctx::Editing).on(Platform::MacOnly),
+    single(key::LINE_START.label, "Jump to start of line", Ctx::Editing),
+    kb(
+        KeyLabel::Alt("Home", "End"),
+        "Jump to start/end of line",
+        Ctx::Editing,
+    ),
+    kb(
+        KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
+        "Scroll half page up / down",
+        Ctx::Editing,
+    ),
+    kb(
+        KeyLabel::Alt(key::SCROLL_PAGE_UP.label, key::SCROLL_PAGE_DOWN.label),
+        "Scroll page up / down",
+        Ctx::Editing,
+    ),
+    single(key::LINE_END.label, "Jump to end of line", Ctx::Editing),
+    single(key::SCROLL_TOP.label, "Scroll to top", Ctx::Editing),
+    single(key::SCROLL_BOTTOM.label, "Scroll to bottom", Ctx::Editing),
+    single(key::POP_QUEUE.label, "Pop queue", Ctx::Editing),
+    single("Esc Esc", "Rewind", Ctx::Editing),
+    single(
+        key::EDIT_INPUT.label,
+        "Edit input in external editor",
+        Ctx::Editing,
+    ),
+    single(
+        key::PASTE.label,
+        "Paste clipboard image or text",
+        Ctx::Editing,
+    ),
+    single(key::UNDO.label, "Undo typing / paste", Ctx::Editing),
+    kb(
+        KeyLabel::Alt("↑", "↓"),
+        "Navigate input history",
+        Ctx::Streaming,
+    ),
+    single("Esc Esc", "Cancel agent", Ctx::Streaming),
+    single(
+        key::BACKGROUND.label,
+        "Move running calls to the background (tmux: press twice)",
+        Ctx::Streaming,
+    ),
+    kb(KeyLabel::Alt("↑", "↓"), "Navigate options", Ctx::FormInput),
+    single("Enter", "Select option", Ctx::FormInput),
+    single("Esc", "Close", Ctx::FormInput),
+    kb(KeyLabel::Alt("↑", "↓"), "Navigate", Ctx::Picker),
+    single("Enter", "Select", Ctx::Picker),
+    single("Esc", "Close", Ctx::Picker),
+    single("Type", "Filter", Ctx::Picker),
+    kb(
+        KeyLabel::Alt("PageUp", "PageDown"),
+        "Scroll page up / down",
+        Ctx::Picker,
+    ),
+    kb(
+        KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
+        "Scroll half page up / down",
+        Ctx::Picker,
+    ),
+    single(
+        key::FORK.label,
+        "Fork up to the selected prompt and switch to it",
+        Ctx::RewindPicker,
+    ),
+    single("Enter", "Remove item", Ctx::QueueFocus),
+    single("Tab", "Complete command", Ctx::CommandPalette),
+    single(
+        "!/@/#/$",
+        "Set tier (strong/medium/weak/compaction)",
+        Ctx::ModelPicker,
+    ),
+    single("%", "Fold or unfold provider", Ctx::ModelPicker),
 ];
 
 pub fn all_contexts() -> impl Iterator<Item = KeybindContext> {

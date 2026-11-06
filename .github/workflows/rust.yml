@@ -11,26 +11,39 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      deps: ${{ steps.filter.outputs.deps }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
+          # Lists what skips CI rather than what runs it, so a new file runs it by default.
+          predicate-quantifier: some-with-excludes
           filters: |
             code:
+              - "**"
+              - "!*.md"
+              - "!site/*"
+              - "!site/docs/*"
+              - "!site/docs/{extra,static,templates}/**"
+              - "!scripts/**"
+              - "!flake.*"
+              - "!.github/workflows/{claude-review,claude-triage,nix,python,release}.yml"
+            deps:
               - "Cargo.toml"
+              - "maki-*/Cargo.toml"
               - "Cargo.lock"
-              - "src/**"
-              - "maki-*/src/**"
-              - "maki-*/models/**"
-              - "plugins/**"
-              - "justfile"
+              - "deny.toml"
               - ".github/workflows/rust.yml"
 
   fmt:
@@ -68,7 +81,7 @@ jobs:
     env:
       # Definition files in `lute check` (luau-lang/lute#1234) are not in a release yet.
       # renovate: datasource=github-releases depName=luau-lang/lute versioning=semver
-      LUTE_VERSION: v1.0.1-nightly.20261007
+      LUTE_VERSION: v1.0.1-nightly.20261103
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install lute
@@ -91,7 +104,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: just
       - run: just lint
@@ -109,13 +122,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: just,cargo-nextest
       - run: sudo apt-get -o Acquire::Retries=5 install -y ripgrep
       - run: just test
-      # Lives here to reuse the warm target dir instead of building the graph twice.
-      - run: just gen-docs-check
 
   machete:
     name: Unused deps
@@ -124,10 +135,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-machete
       - run: cargo machete
+
+  # Gated on dependency changes so a newly published advisory doesn't fail unrelated PRs.
+  deny:
+    name: Dependency policy
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny
+      - run: cargo deny --locked check advisories licenses sources
 
   build:
     name: Build
@@ -140,32 +164,40 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: just
       - run: just build
+      # Lives here, off the Test critical path, to reuse the warm dev target dir.
+      - run: just gen-docs-check
 
+  # Lint and build share little beyond build scripts, so they run as separate jobs.
   windows:
-    name: Lint + Build (Windows)
+    name: ${{ matrix.recipe == 'lint' && 'Lint' || 'Build' }} (Windows)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        recipe: [lint, build]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          key: ${{ matrix.recipe }}
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: just
-      - run: just lint
-      - run: just build
+      - run: just ${{ matrix.recipe }}
 
   ci-pass:
     name: CI
     if: always()
-    needs: [fmt, fmt-lua, check-lua, lint, test, machete, build, windows]
+    needs: [fmt, fmt-lua, check-lua, lint, test, machete, deny, build, windows]
     runs-on: ubuntu-latest
     steps:
       - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')

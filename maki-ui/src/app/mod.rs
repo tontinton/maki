@@ -4,10 +4,13 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
+mod agent_events;
 mod btw;
+mod commands;
 mod image_paste;
 pub(crate) mod mode;
 mod mouse;
+mod plan_form;
 mod queue;
 mod session;
 pub(crate) mod session_state;
@@ -27,15 +30,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::OpenSession;
-use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, TaskParent, count_phrase};
+use crate::app::tasks::{BackgroundMoves, TaskOutcome, TaskStatus, count_phrase};
 use crate::chat::Chat;
-use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
+use crate::chat::{CANCELLED_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
-use crate::components::command::{
-    CommandAction, CommandPalette, ParsedCommand, PluginAccess, SUBMITS_PROMPT,
-};
+use crate::components::command::{CommandAction, CommandPalette, PluginAccess, SUBMITS_PROMPT};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Placeholder, Submission, sent_text};
@@ -46,18 +47,16 @@ use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
-use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_menu, builtin_rows};
+use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
-use crate::components::status_bar::StatusBar;
+use crate::components::status_bar::{Motion, StatusBar};
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
-    Action, BackgroundOutcome, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo,
-    Status, is_ctrl,
+    Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
-use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::text_buffer::{RuleSet, TextBuffer, Writers, normalize_line_endings, sanitize};
@@ -65,8 +64,8 @@ use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SessionMailbox, SharedBuf, SharedMessages, SubagentInfo, ToolPart,
+    AgentEvent, Envelope, McpConfigErrors, McpSnapshotReader, SessionMailbox, SharedBuf,
+    SharedMessages, ToolPart,
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
@@ -74,24 +73,29 @@ use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks,
     InputMode, InputRule, InputRulesReader, InputSnapshot, InputSubmit, Key, KeymapReader,
-    LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
-    PackPreparation, Permission, PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView,
-    is_reserved,
+    LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, Permission, PluginReach,
+    WinView, is_reserved,
 };
 use maki_providers::models_cache::ModelList;
-use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
+use maki_providers::{ContentBlock, Message, Model, ThinkingConfig};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_thinking;
-use maki_storage::sessions::StoredTokenUsage;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
+use strum::{EnumIter, IntoEnumIterator};
 
 pub(crate) use crate::agent::QueuedMessage;
+use image_paste::PastedContent;
+#[cfg(test)]
+use image_paste::READING_CLIPBOARD_MSG;
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
+#[cfg(test)]
+use plan_form::PlanAction;
+use plan_form::PlanAnswers;
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
 use session::Sent;
 pub(crate) use session::session_has_content;
@@ -150,6 +154,12 @@ const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
+const YOLO_ON_MSG: &str = "YOLO mode enabled";
+const YOLO_OFF_MSG: &str = "YOLO mode disabled";
+const BTW_USAGE_MSG: &str = "Usage: /btw <question>";
+const AGENT_BUSY_MSG: &str = "Agent is busy, try again later";
+const SHELL_CD_REFUSED_MSG: &str = "Only /cd can change the working directory";
+const UNKNOWN_COMMAND_PREFIX: &str = "Unknown command:";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
@@ -193,6 +203,45 @@ pub(crate) const WRITTEN_MESSAGE: &str = "message";
 pub(crate) const TYPE_IT_YOURSELF: &str = "retype it yourself in a fresh input";
 /// A writer whose name was lost, like that of a draft read back from disk.
 pub(crate) const UNKNOWN_WRITER: &str = "a plugin";
+
+/// Who the keyboard belongs to. The first variant, in declaration order, whose
+/// state holds it answers the key, takes the paste and gets the IME caret, see
+/// [`App::keyboard_owner`]. Those used to be three hand-kept lists, and they
+/// drifted apart. So a new overlay goes in here, where it answers keys, and the
+/// compiler points at every `match` that has to place it.
+///
+/// This is not the paint order: the permission prompt is drawn under every
+/// picker and float, yet answers first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
+enum KeyboardOwner {
+    /// Drawn above everything else, so it answers keys before anything else.
+    Alert,
+    /// A tool is blocked on it and it owns the bottom panel, so with the pack
+    /// review also up it goes first. The pack review waits on nothing.
+    Permission,
+    PackReview,
+    /// Hands `<Tab>` on to the owner under it, see [`PlanFormAction::Passthrough`].
+    PlanForm,
+    Help,
+    Usage,
+    Btw,
+    /// The focused Lua window takes every key. An unfocused popup never holds
+    /// the keyboard.
+    FocusedWindow,
+    Search,
+    FilePicker,
+    Queue,
+    RewindPicker,
+    ThemePicker,
+    ModelPicker,
+    LoginPicker,
+    McpPicker,
+    /// Nothing above holds the keyboard: the chat input, or the transcript of
+    /// a tab with no input. It comes last because the command palette it
+    /// answers is drawn under every modal above. Window bindings, global
+    /// bindings and maki's built-in keys run from here.
+    Chat,
+}
 
 /// For a typed key `Swallowed` and `Handled` mean the same thing, the key is
 /// used up. A plugin's submit has to tell them apart, because a swallowed
@@ -427,54 +476,6 @@ fn normalize_preview(text: &str) -> Option<String> {
     notification_preview(std::iter::once(text))
 }
 
-fn cap_error_text(message: &str) -> String {
-    match message.char_indices().nth(ERROR_BUBBLE_MAX_CHARS) {
-        Some((end, _)) => format!("{}{TRUNCATION_PREFIX}", &message[..end]),
-        None => message.to_owned(),
-    }
-}
-
-/// The task an event belongs to: a transcript names it itself, every other
-/// event through its subagent stamp.
-fn task_id_of(envelope: &Envelope) -> Option<&str> {
-    match &envelope.event {
-        AgentEvent::SubagentHistory { tool_use_id, .. } => Some(tool_use_id.as_str()),
-        _ => envelope
-            .subagent
-            .as_ref()
-            .map(|s| s.parent_tool_use_id.as_str()),
-    }
-}
-
-fn started_by(info: &SubagentInfo) -> Option<TaskParent> {
-    info.parent_call
-        .as_deref()
-        .map(|call| TaskParent::Started(Arc::from(call)))
-}
-
-/// A chat can open before its session speaks: a moved call's tab, or a
-/// subagent a plugin adopted. The first info naming it fills in what it
-/// lacks: the sender its permission answers go to, the inbox its input
-/// feeds, and the model and options its header shows.
-fn fill_missing_subagent_info(chat: &mut Chat, info: &SubagentInfo) {
-    if chat.parent.is_none() {
-        chat.parent = started_by(info);
-    }
-    if chat.is_finished() {
-        return;
-    }
-    if chat.answer_tx.is_none() {
-        chat.answer_tx.clone_from(&info.answer_tx);
-    }
-    if chat.inbox.is_none() {
-        chat.inbox.clone_from(&info.inbox);
-    }
-    if chat.model_id.is_none() {
-        chat.model_id.clone_from(&info.model);
-    }
-    chat.opts = chat.opts.or(info.opts);
-}
-
 pub(crate) fn turn_response(message: &Message) -> Option<String> {
     if message.has_tool_calls() {
         return None;
@@ -486,58 +487,20 @@ pub(crate) fn turn_response(message: &Message) -> Option<String> {
     }))
 }
 
-/// A plan form row picked by the user, waiting on the plugin handler behind
-/// it. `pick` is the form's pick counter at the moment of the press, and an
-/// answer that comes back under a different one belongs to a form the user
-/// has already left.
-pub(super) struct PlanAction {
-    pick: u64,
-    /// The built-in outcome the row kept, which runs after the handler.
-    then: Option<PlanRowAction>,
-    deadline: Instant,
-    answer: flume::Receiver<PlanActionOutcome>,
-}
-
-/// Everything the plan form has in flight, under one owner so that no reset
-/// path can retire half of it. A menu chain and a picked row's handler both
-/// answer on the Lua thread long after the key press that started them, and
-/// the session they were asked about may be gone by then.
-#[derive(Default)]
-pub(super) struct PlanAnswers {
-    /// In flight answer from the `ui.plan_form*` chains: whether the form
-    /// opens for the draft that landed, and with which rows. Given up on
-    /// after [`PLAN_FORM_ANSWER_WAIT`].
-    pub(super) form: Option<(Instant, flume::Receiver<Option<PlanMenu>>)>,
-    /// In flight answer from a picked plugin row.
-    pub(super) action: Option<PlanAction>,
-    /// Bumped by every pick the plan form makes, and by every path that walks
-    /// away from a draft. Without it an outcome from a pick nobody waits on
-    /// any more fires a second implement prompt on top of the one already
-    /// running, or one against a session the user never picked in.
-    pick: u64,
-}
-
-impl PlanAnswers {
-    /// Retires the answers in flight and the pick they belong to, returning
-    /// the pick a new one starts at. The counter only ever moves forward, so
-    /// anything stamped with an earlier pick can only miss from here on.
-    ///
-    /// Every reset path funnels through [`App::reset_ui_chrome`], which calls
-    /// this: a new one gets the invariant for free.
-    fn abandon(&mut self) -> u64 {
-        self.form = None;
-        self.action = None;
-        self.pick += 1;
-        self.pick
-    }
-}
-
 pub enum Msg {
     Key(KeyEvent),
     Paste(String),
     Mouse(MouseEvent),
     Scroll { column: u16, row: u16, delta: i32 },
     Agent(Box<Envelope>),
+}
+
+/// `--exit-on-done`: the end of a turn exits the app.
+struct ExitOnDone {
+    /// How long a successful exit waits for background work, `None` for not
+    /// at all. One deadline, from the first held exit on, covers the whole
+    /// wait, so a chain of woken runs cannot keep the process up.
+    background_wait: Option<Duration>,
 }
 
 pub struct App {
@@ -569,11 +532,9 @@ pub struct App {
     pub status: Status,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
-    pub(crate) exit_on_done: bool,
-    /// How long an `exit_on_done` exit waits for background work, `None` for
-    /// not at all. One deadline, from the first held exit on, covers the
-    /// whole wait, so a chain of woken runs cannot keep the process up.
-    pub(crate) background_wait: Option<Duration>,
+    exit_on_done: Option<ExitOnDone>,
+    /// The overall budget of the background wait, armed by the first held
+    /// exit and never reset, not even by [`Self::clear_exit_request`].
     background_deadline: Option<Instant>,
     pub(crate) queue: MessageQueue,
     recoverable_queue: Vec<String>,
@@ -611,8 +572,8 @@ pub struct App {
     pub(crate) trust_question: Option<TrustQuestion>,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
-    pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
-    pub(crate) primary_paste_rx: Vec<flume::Receiver<Option<String>>>,
+    pub(crate) paste_rx: Vec<flume::Receiver<Result<PastedContent, String>>>,
+    pub(crate) mouse_paste_rx: Vec<flume::Receiver<Option<String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
@@ -726,8 +687,7 @@ impl App {
             status: Status::Idle,
             state,
             exit_request: ExitRequest::None,
-            exit_on_done: false,
-            background_wait: None,
+            exit_on_done: None,
             background_deadline: None,
             queue: MessageQueue::default(),
             recoverable_queue: Vec::new(),
@@ -749,8 +709,8 @@ impl App {
             trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
-            image_paste_rx: vec![],
-            primary_paste_rx: vec![],
+            paste_rx: vec![],
+            mouse_paste_rx: vec![],
             storage_writer,
             last_sent: None,
             shell: shell::ShellState::default(),
@@ -799,9 +759,21 @@ impl App {
 
     /// Whether the chat in front shows the input box. A running subagent's
     /// chat does, so a message can be queued for that subagent while it is
-    /// watched. A finished one is a transcript, so it does not.
+    /// watched. A finished one, or a task with no inbox like a moved `bash`,
+    /// is a transcript, so it does not: Esc leaves it and `/tasks` stops it.
     pub(super) fn chat_accepts_input(&self) -> bool {
-        self.is_main_chat() || !self.chats[self.active_chat].is_finished()
+        self.is_main_chat() || self.chats[self.active_chat].takes_messages()
+    }
+
+    /// Whether the agent behind the chat in front is at work: the main
+    /// chat's turn, or a task still working. The main chat waiting on a
+    /// background task is not, since a prompt starts right away.
+    pub(super) fn active_chat_working(&self) -> bool {
+        if self.is_main_chat() {
+            self.status == Status::Streaming
+        } else {
+            self.chats[self.active_chat].task_status() == TaskStatus::Working
+        }
     }
 
     /// Stores this tab's focus into the mode every tab shares, so only the
@@ -813,11 +785,25 @@ impl App {
         self.keymap_reader.sync_mode(self.input_focused())
     }
 
+    /// Whether typed keys reach the chat input. The terminal cursor does not
+    /// follow this, it parks wherever [`Self::view`] says.
     fn input_focused(&self) -> bool {
-        self.chat_accepts_input()
-            && !self.any_overlay_open()
-            && !self.plan_form_active()
-            && !self.queue_focused()
+        self.chat_accepts_input() && self.keyboard_owner() == KeyboardOwner::Chat
+    }
+
+    fn holds_keyboard(&self, owner: KeyboardOwner) -> bool {
+        match owner {
+            KeyboardOwner::PlanForm => self.plan_form_active(),
+            KeyboardOwner::Queue => self.queue_focused(),
+            KeyboardOwner::Chat => true,
+            _ => self.overlay(owner).is_some_and(Overlay::is_open),
+        }
+    }
+
+    fn keyboard_owner(&self) -> KeyboardOwner {
+        KeyboardOwner::iter()
+            .find(|&owner| self.holds_keyboard(owner))
+            .unwrap_or(KeyboardOwner::Chat)
     }
 
     /// The panel in a subagent chat shows that subagent's inbox, which
@@ -865,18 +851,12 @@ impl App {
         }
     }
 
-    /// A running task with no inbox takes no messages, so its input says how
-    /// to stop it instead. The background count is the receipts the model
-    /// holds, so it leaves out a plugin's own sessions, which wake nobody.
+    /// The background count is the receipts the model holds, so it leaves
+    /// out a plugin's own sessions, which wake nobody.
     pub(super) fn input_placeholder(&self) -> Placeholder {
-        let chat = &self.chats[self.active_chat];
         let waiting_on = self.live_mailbox().map_or(0, SessionMailbox::outstanding);
         if !self.is_main_chat() {
-            if chat.inbox.is_none() && !chat.is_finished() {
-                Placeholder::TaskStop
-            } else {
-                Placeholder::SubagentQueue
-            }
+            Placeholder::SubagentQueue
         } else if self.status == Status::Streaming {
             Placeholder::Queue
         } else if waiting_on > 0 {
@@ -1304,8 +1284,8 @@ impl App {
             Msg::Key(key) => self.handle_key(key, sight, turn),
             Msg::Paste(text) => {
                 if text.is_empty() {
-                    if self.input_focused() && self.image_paste_rx.is_empty() {
-                        self.start_image_paste();
+                    if self.input_focused() && self.paste_rx.is_empty() {
+                        self.start_clipboard_paste();
                     }
                 } else {
                     self.route_text_paste(&text, turn);
@@ -1320,7 +1300,10 @@ impl App {
                 self.handle_scroll(column, row, delta);
                 vec![]
             }
-            Msg::Agent(envelope) => self.handle_agent_event(*envelope),
+            Msg::Agent(envelope) => {
+                self.handle_agent_event(*envelope);
+                vec![]
+            }
         }
     }
 
@@ -1457,102 +1440,106 @@ impl App {
         None
     }
 
-    /// [`Self::route_text_paste`] walks the same order, so a new overlay goes
-    /// in both.
+    /// The first holder of the keyboard, in [`KeyboardOwner`] order, answers
+    /// the key. The plan form passes `<Tab>` on to the next holder. The chat
+    /// answers `<C-t>` on a ready plan, and the keys its command palette takes
+    /// when no other owner holds the keyboard. For every other key this
+    /// returns `None`, leaving it to the rest of [`Self::handle_key`].
     fn dispatch_overlay(
         &mut self,
         key: KeyEvent,
         sight: Sight,
         turn: &Turn,
     ) -> Option<Vec<Action>> {
-        // Drawn above everything else, so it answers keys before anything else.
-        if self.alert_modal.is_open() {
-            self.alert_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        // With both up the permission prompt goes first: a tool is blocked on
-        // it and it owns the bottom panel. The pack review waits on nothing.
-        // Ctrl+B passes it by, so the user hears why the parked call stays.
-        if self.permission_prompt.is_open() {
-            if key::BACKGROUND.matches(key) {
-                return Some(self.run_builtin(BuiltinAction::Background));
+        KeyboardOwner::iter().find_map(|owner| {
+            if !self.holds_keyboard(owner) {
+                return None;
             }
-            if let Some(answered) = self.permission_prompt.handle_key(key) {
-                let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
-                self.send_to_agent(answered.subagent_id.as_deref(), encoded);
-            }
-            return Some(vec![]);
-        }
+            self.dispatch_to_owner(owner, key, sight, turn)
+        })
+    }
 
-        if self.pack_review.is_open() {
-            return Some(match self.pack_review.handle_key(key) {
+    fn dispatch_to_owner(
+        &mut self,
+        owner: KeyboardOwner,
+        key: KeyEvent,
+        sight: Sight,
+        turn: &Turn,
+    ) -> Option<Vec<Action>> {
+        match owner {
+            KeyboardOwner::Alert => {
+                self.alert_modal.handle_key(key);
+                Some(vec![])
+            }
+            // Ctrl+B passes it by, so the user hears why the parked call stays.
+            KeyboardOwner::Permission => {
+                if key::BACKGROUND.matches(key) {
+                    return Some(self.run_builtin(BuiltinAction::Background));
+                }
+                if let Some(answered) = self.permission_prompt.handle_key(key) {
+                    let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
+                    self.send_to_agent(answered.subagent_id.as_deref(), encoded);
+                }
+                Some(vec![])
+            }
+            KeyboardOwner::PackReview => Some(match self.pack_review.handle_key(key) {
                 Some(PackReviewAction::Accept(plan)) => self.quit_with(ExitRequest::Pack(plan)),
                 Some(PackReviewAction::Decline) => {
                     self.flash(PACK_CHANGES_DECLINED.to_owned());
                     Vec::new()
                 }
                 None => Vec::new(),
-            });
-        }
-
-        // plan_form is non-modal: Passthrough falls through to the rest of dispatch
-        if self.plan_form_active() {
-            let action = self.plan_form.handle_key(key);
-            if action != PlanFormAction::Passthrough {
-                return Some(self.handle_plan_form_action(action));
+            }),
+            KeyboardOwner::PlanForm => match self.plan_form.handle_key(key) {
+                PlanFormAction::Passthrough => None,
+                action => Some(self.handle_plan_form_action(action)),
+            },
+            KeyboardOwner::Help => {
+                self.help_modal.handle_key(key);
+                Some(vec![])
             }
-        }
-
-        if self.help_modal.is_open() {
-            self.help_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        if self.usage_modal.is_open() {
-            if key::REFRESH.matches(key) {
-                return Some(vec![Action::RefreshUsage]);
+            KeyboardOwner::Usage => {
+                if key::REFRESH.matches(key) {
+                    return Some(vec![Action::RefreshUsage]);
+                }
+                self.usage_modal.handle_key(key);
+                Some(vec![])
             }
-            self.usage_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        if self.btw_modal.is_open() {
-            self.btw_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        // Step 2 of `handle_key`, among the overlays, see there for why.
-        if self.dispatch_focused_window(&Pressed::Key(key, sight), turn) {
-            return Some(vec![]);
-        }
-
-        if self.search_modal.is_open() {
-            match self.search_modal.handle_key(key) {
-                SearchAction::Consumed => self.refresh_search_matches(),
-                SearchAction::Navigate => {
-                    sync_search_highlight(&self.search_modal, &mut self.chats[self.active_chat]);
-                }
-                SearchAction::Select(idx) => {
-                    let chat = &mut self.chats[self.active_chat];
-                    chat.scroll_to_segment(idx);
-                    chat.set_highlight_segment(None);
-                    self.search_modal.close();
-                }
-                SearchAction::Close(saved) => {
-                    let chat = &mut self.chats[self.active_chat];
-                    chat.set_highlight_segment(None);
-                    if let Some((pos, auto)) = saved {
-                        chat.restore_scroll(pos, auto);
+            KeyboardOwner::Btw => {
+                self.btw_modal.handle_key(key);
+                Some(vec![])
+            }
+            KeyboardOwner::FocusedWindow => {
+                self.dispatch_focused_window(&Pressed::Key(key, sight), turn);
+                Some(vec![])
+            }
+            KeyboardOwner::Search => {
+                match self.search_modal.handle_key(key) {
+                    SearchAction::Consumed => self.refresh_search_matches(),
+                    SearchAction::Navigate => {
+                        sync_search_highlight(
+                            &self.search_modal,
+                            &mut self.chats[self.active_chat],
+                        );
                     }
-                    self.search_modal.close();
+                    SearchAction::Select(idx) => {
+                        let chat = &mut self.chats[self.active_chat];
+                        chat.scroll_to_segment(idx);
+                        chat.set_highlight_segment(None);
+                        self.search_modal.close();
+                    }
+                    SearchAction::Close(saved) => {
+                        let chat = &mut self.chats[self.active_chat];
+                        chat.set_highlight_segment(None);
+                        if let Some((pos, auto)) = saved {
+                            chat.restore_scroll(pos, auto);
+                        }
+                        self.search_modal.close();
+                    }
                 }
+                Some(vec![])
             }
-            return Some(vec![]);
-        }
-
-        if self.file_picker.is_open() {
-            return Some(match self.file_picker.handle_key(key) {
+            KeyboardOwner::FilePicker => Some(match self.file_picker.handle_key(key) {
                 FilePickerModalAction::Consumed => vec![],
                 FilePickerModalAction::Select(path) => {
                     self.file_picker.close();
@@ -1565,44 +1552,34 @@ impl App {
                     self.file_picker.close();
                     vec![]
                 }
-            });
-        }
-
-        if self.queue_focused() {
-            match key.code {
-                KeyCode::Up => self.queue.move_focus_up(),
-                KeyCode::Down => self.queue.move_focus_down(),
-                KeyCode::Enter => {
-                    self.queue.remove_focused();
+            }),
+            KeyboardOwner::Queue => {
+                match key.code {
+                    KeyCode::Up => self.queue.move_focus_up(),
+                    KeyCode::Down => self.queue.move_focus_down(),
+                    KeyCode::Enter => {
+                        self.queue.remove_focused();
+                    }
+                    KeyCode::Esc => self.queue.unfocus(),
+                    _ if key::QUIT.matches(key) => self.queue.unfocus(),
+                    _ if key::POP_QUEUE.matches(key) => {
+                        self.queue.remove(0);
+                    }
+                    _ => {}
                 }
-                KeyCode::Esc => self.queue.unfocus(),
-                _ if key::QUIT.matches(key) => self.queue.unfocus(),
-                _ if key::POP_QUEUE.matches(key) => {
-                    self.queue.remove(0);
-                }
-                _ => {}
+                Some(vec![])
             }
-            return Some(vec![]);
-        }
-
-        if self.rewind_picker.is_open() {
-            return Some(match self.rewind_picker.handle_key(key) {
+            KeyboardOwner::RewindPicker => Some(match self.rewind_picker.handle_key(key) {
                 RewindPickerAction::Consumed => vec![],
                 RewindPickerAction::Select(entry) => self.rewind_to(entry),
                 RewindPickerAction::Fork(entry) => self.fork_to(entry),
                 RewindPickerAction::Close => vec![],
-            });
-        }
-
-        if self.theme_picker.is_open() {
-            return Some(match self.theme_picker.handle_key(key) {
+            }),
+            KeyboardOwner::ThemePicker => Some(match self.theme_picker.handle_key(key) {
                 ThemePickerAction::Consumed => vec![],
                 ThemePickerAction::Closed => vec![],
-            });
-        }
-
-        if self.model_picker.is_open() {
-            return Some(match self.model_picker.handle_key(key) {
+            }),
+            KeyboardOwner::ModelPicker => Some(match self.model_picker.handle_key(key) {
                 ModelPickerAction::Consumed => vec![],
                 ModelPickerAction::Select(spec) => {
                     vec![Action::ChangeModel(spec)]
@@ -1629,11 +1606,8 @@ impl App {
                     vec![]
                 }
                 ModelPickerAction::Close => vec![],
-            });
-        }
-
-        if self.login_picker.is_open() {
-            return Some(match self.login_picker.handle_key(key) {
+            }),
+            KeyboardOwner::LoginPicker => Some(match self.login_picker.handle_key(key) {
                 LoginPickerAction::Consumed => vec![],
                 LoginPickerAction::Close => vec![],
                 LoginPickerAction::Authenticated { model_spec } => {
@@ -1642,11 +1616,8 @@ impl App {
                 LoginPickerAction::Configured { slug } => {
                     vec![Action::RefreshProvider { slug }, Action::RefreshModels]
                 }
-            });
-        }
-
-        if self.mcp_picker.is_open() {
-            return Some(match self.mcp_picker.handle_key(key) {
+            }),
+            KeyboardOwner::McpPicker => Some(match self.mcp_picker.handle_key(key) {
                 McpPickerAction::Consumed => vec![],
                 McpPickerAction::Toggle {
                     server_name,
@@ -1655,31 +1626,33 @@ impl App {
                     vec![Action::ToggleMcp(server_name, enabled)]
                 }
                 McpPickerAction::Close => vec![],
-            });
-        }
+            }),
+            KeyboardOwner::Chat => {
+                if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
+                    return Some(self.run_builtin(BuiltinAction::PlanToggle));
+                }
 
-        if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
-            return Some(self.run_builtin(BuiltinAction::PlanToggle));
-        }
-
-        // The command palette is the host's overlay over the chat input, so it
-        // is answered here with the rest of them rather than below the claims:
-        // a plugin holding `<Tab>` or `<CR>` must not take them from the `/`
-        // command the user is typing into. Last in the pass, because every
-        // modal above is drawn over it.
-        match self.dispatch_command_palette(key, sight, None) {
-            PaletteKey::Passthrough => None,
-            PaletteKey::Swallowed => Some(vec![]),
-            PaletteKey::Handled(actions) => Some(actions),
-            PaletteKey::Refused(refusal) => {
-                self.flash(refusal);
-                Some(vec![])
+                // The command palette is the host's overlay over the chat input, so it
+                // is answered here with the rest of them rather than below the claims:
+                // a plugin holding `<Tab>` or `<CR>` must not take them from the `/`
+                // command the user is typing into.
+                match self.dispatch_command_palette(key, sight, None) {
+                    PaletteKey::Passthrough => None,
+                    PaletteKey::Swallowed => Some(vec![]),
+                    PaletteKey::Handled(actions) => Some(actions),
+                    PaletteKey::Refused(refusal) => {
+                        self.flash(refusal);
+                        Some(vec![])
+                    }
+                }
             }
         }
     }
 
     /// Ctrl keys pass the palette by, as they always did: `Ctrl+C` closes it
-    /// and the rest belong to the input box and the built-in bindings.
+    /// and the rest belong to the input box and the built-in bindings. So does
+    /// every key while the chat input is not what the keys reach: the `<Tab>` a
+    /// plan form hands on must not complete a `/` command hidden behind it.
     ///
     /// The command an Enter would run is checked first, the way
     /// `maki.api.run_command` checks it, see [`send_refusal`], also for the
@@ -1690,7 +1663,7 @@ impl App {
         sight: Sight,
         caller: Option<&PluginReach>,
     ) -> PaletteKey {
-        if !self.chat_accepts_input() || is_ctrl(&key) {
+        if !self.input_focused() || is_ctrl(&key) {
             return PaletteKey::Passthrough;
         }
         if key.code == KeyCode::Enter
@@ -1856,10 +1829,10 @@ impl App {
     ///    answered here: no binding can take it and [`Self::reserved_by_host`]
     ///    skips the global bindings for it, but the modals and a focused
     ///    window still see it.
-    /// 2. [`Self::dispatch_overlay`]: maki's modals and prompts, then the
-    ///    focused window, [`Self::dispatch_focused_window`], then maki's
-    ///    pickers, the search, the focused queue, the `/` command list and
-    ///    `<C-t>` on a ready plan.
+    /// 2. [`Self::dispatch_overlay`]: the holder of the keyboard, in
+    ///    [`KeyboardOwner`] order, which includes the focused window,
+    ///    [`Self::dispatch_focused_window`], and for the chat the `/` command
+    ///    list and `<C-t>` on a ready plan.
     /// 3. Windows on screen, front first, [`Self::dispatch_on_screen_windows`].
     /// 4. `<Esc>` while the agent runs, which [`Self::reserved_by_host`] keeps
     ///    from the global bindings, so it reaches the cancel in step 6.
@@ -1929,13 +1902,14 @@ impl App {
         self.handle_chat_key(key, sight, mode)
     }
 
-    /// Step 2: the focused window's buffer bindings, then its `recv`. False
-    /// only when no window has focus, since a focused window takes everything.
-    fn dispatch_focused_window(&mut self, pressed: &Pressed, turn: &Turn) -> bool {
-        let Some(buf) = self.float_mgr.focused_buf() else {
-            return false;
-        };
-        self.dispatch_binding(Some(&buf), pressed, turn) || self.send_to_focused_window(pressed)
+    /// Step 2: the focused window's buffer bindings, then its `recv`. A
+    /// focused window takes everything, so nothing is handed on.
+    fn dispatch_focused_window(&mut self, pressed: &Pressed, turn: &Turn) {
+        if let Some(buf) = self.float_mgr.focused_buf()
+            && !self.dispatch_binding(Some(&buf), pressed, turn)
+        {
+            self.send_to_focused_window(pressed);
+        }
     }
 
     /// A press no notation names is still spent on the window, see
@@ -2146,14 +2120,14 @@ impl App {
     /// A message typed while watching a running subagent is for that
     /// subagent, see [`Self::queue_for_subagent`]. `Esc` follows the chat in front
     /// too: armed twice in a running subagent's chat it cancels that subagent
-    /// alone. A finished subagent's chat has no input, so only the mode
-    /// toggle answers there.
+    /// alone. A chat without an input box, see [`Self::chat_accepts_input`],
+    /// answers only the mode toggle, and Esc goes back to the main chat.
     ///
-    /// While a turn runs, `Esc` drops a selection and arms the cancel in the
-    /// same press, for the reason [`Self::reserved_by_host`] gives: a plugin
-    /// that keeps setting a selection must not be able to keep the user from
-    /// stopping. Idle, it only drops the selection, so it never arms the
-    /// rewind.
+    /// While the agent in front works, `Esc` drops a selection and arms the
+    /// cancel in the same press, for the reason [`Self::reserved_by_host`]
+    /// gives: a plugin that keeps setting a selection must not be able to
+    /// keep the user from stopping. Idle, it only drops the selection, so it
+    /// never arms the rewind.
     ///
     /// {mode} is the one the key was pressed in. A fallback must not type in
     /// insert mode a key a plugin matched in normal mode.
@@ -2166,8 +2140,8 @@ impl App {
                     self.set_active_chat(MAIN_CHAT);
                     vec![]
                 }
-                // A finished tab has no input box. Typing there used to do
-                // nothing at all, so the keys go to the main chat instead.
+                // A tab without an input box used to swallow typing, so the
+                // keys go to the main chat instead.
                 // Without an input box the mode always reads normal, so the
                 // real one is read again once the main chat has focus.
                 KeyCode::Char(_)
@@ -2204,18 +2178,18 @@ impl App {
                 return self.run_builtin(BuiltinAction::Search);
             } else if key::FILE_PICKER.matches(key) {
                 return self.run_builtin(BuiltinAction::FilePicker);
-            } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
-                self.start_image_paste();
+            } else if key::PASTE.matches(key) && self.paste_rx.is_empty() {
+                self.start_clipboard_paste();
             } else if let InputAction::Changed = self.input_box.handle_key(key, mode) {
                 self.input_changed(InputWriter::Anyone);
             }
             return vec![];
         }
 
-        let streaming = self.status == Status::Streaming;
-        if streaming && key.code == KeyCode::Esc {
+        let working = self.active_chat_working();
+        if working && key.code == KeyCode::Esc {
             self.input_box.buffer.deselect();
-            return self.handle_esc(streaming);
+            return self.handle_esc(working);
         }
         match self.input_box.handle_key(key, mode) {
             InputAction::Submit => self
@@ -2233,16 +2207,16 @@ impl App {
                     self.last_esc = None;
                 }
                 match key.code {
-                    KeyCode::Up if streaming => {
+                    KeyCode::Up if working => {
                         self.active_chat().scroll(1);
                         vec![]
                     }
-                    KeyCode::Down if streaming => {
+                    KeyCode::Down if working => {
                         self.active_chat().scroll(-1);
                         vec![]
                     }
                     KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                    KeyCode::Esc => self.handle_esc(streaming),
+                    KeyCode::Esc => self.handle_esc(working),
                     _ => vec![],
                 }
             }
@@ -2250,7 +2224,7 @@ impl App {
         }
     }
 
-    fn handle_esc(&mut self, streaming: bool) -> Vec<Action> {
+    fn handle_esc(&mut self, working: bool) -> Vec<Action> {
         let in_subagent = !self.is_main_chat();
         let armed = self
             .last_esc
@@ -2259,14 +2233,14 @@ impl App {
         if armed {
             return if in_subagent {
                 self.handle_subagent_cancel()
-            } else if streaming {
+            } else if working {
                 self.handle_cancel()
             } else {
                 self.open_rewind_picker()
             };
         }
         self.last_esc = Some(Instant::now());
-        let hint = if in_subagent || streaming {
+        let hint = if in_subagent || working {
             FLASH_CANCEL
         } else {
             FLASH_REWIND
@@ -2282,6 +2256,54 @@ impl App {
         };
         self.status_bar.flash(flash);
         vec![]
+    }
+
+    /// True while something goes on without the user. Once it turns false
+    /// Maki waits on them, and that is when a finished turn notifies. It never
+    /// blocks input: the bar spins and the session reads "working", but a new
+    /// prompt still starts right away.
+    ///
+    /// Receipts count, so a task whose tab already closed leaves no idle gap
+    /// before its result wakes the agent. A wake that
+    /// [`Self::start_woken_run`] is about to claim counts for the same reason.
+    pub(crate) fn is_working(&self) -> bool {
+        self.runs_turn()
+            || self.running_background_tasks().next().is_some()
+            || self.live_mailbox().is_some_and(|mailbox| {
+                let backlog = mailbox.backlog();
+                backlog.running || (backlog.wake && self.takes_wake())
+            })
+    }
+
+    /// Queued input counts as a turn. The agent loop starts its run by itself,
+    /// and restored queue items never pass through `start_run`, so the status
+    /// alone would miss them.
+    fn runs_turn(&self) -> bool {
+        self.status == Status::Streaming || !self.queue.is_empty()
+    }
+
+    /// Whether a pending wake may start its run now. [`Self::is_working`] and
+    /// [`Self::start_woken_run`] both ask here, so the session never looks
+    /// busy for a wake that will not run, or idle for one that will.
+    ///
+    /// A turn that runs or is queued picks up the notices by itself, and a
+    /// prompt means the user goes first. A woken run would also wipe two
+    /// things the user still needs: the text kept for recovery after an agent
+    /// error (`start_run` clears it), and the error a failed `--exit-on-done`
+    /// turn exits with.
+    fn takes_wake(&self) -> bool {
+        !self.runs_turn()
+            && !self.awaiting_input()
+            && self.recoverable_queue.is_empty()
+            && self.exit_request != ExitRequest::Error
+    }
+
+    fn status_motion(&self) -> Motion<'_> {
+        Motion {
+            working: self.is_working(),
+            restoring: self.restoring.load(Ordering::Relaxed),
+            retry: self.retry_info.as_ref(),
+        }
     }
 
     /// Background tasks of every open session. They all run in the one Lua
@@ -2356,7 +2378,7 @@ impl App {
     fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
         self.save_input_history();
         self.exit_request = req;
-        self.exit_on_done = false;
+        self.exit_on_done = None;
         vec![Action::ManualExit]
     }
 
@@ -2365,7 +2387,7 @@ impl App {
     /// A failed turn exits with its error. Once the deadline lapses the exit
     /// goes, the work stops with the process and the meta keeps its receipts.
     pub(crate) fn awaits_background(&self, now: Instant) -> bool {
-        self.exit_on_done
+        self.exits_on_done()
             && self.exit_request == ExitRequest::Success
             && self
                 .background_deadline
@@ -2375,10 +2397,12 @@ impl App {
                 .is_some_and(|mailbox| mailbox.outstanding() > 0)
     }
 
-    /// A woken run would clear the error a failed `--exit-on-done` turn
-    /// exits with, so such a session takes none.
-    pub(crate) fn takes_mailbox_runs(&self) -> bool {
-        self.exit_request != ExitRequest::Error
+    pub(crate) fn exit_when_done(&mut self, background_wait: Option<Duration>) {
+        self.exit_on_done = Some(ExitOnDone { background_wait });
+    }
+
+    pub(crate) fn exits_on_done(&self) -> bool {
+        self.exit_on_done.is_some()
     }
 
     pub(crate) fn clear_exit_request(&mut self) {
@@ -2410,7 +2434,7 @@ impl App {
         self.set_active_chat(MAIN_CHAT);
         let cmd = prefix.command.trim();
         if cmd == "cd" || cmd.starts_with("cd ") {
-            self.flash("Only /cd can change the working directory".into());
+            self.flash(SHELL_CD_REFUSED_MSG.into());
         }
         let id = self.shell.reserve_id();
         let sigil = if prefix.visible { "!" } else { "!!" };
@@ -2450,803 +2474,60 @@ impl App {
         self.stop_task(&id).into_iter().collect()
     }
 
-    fn bill(&mut self, chat_idx: usize, model: &str, usage: StoredTokenUsage) {
-        self.state.token_usage += TokenUsage::from(usage);
-        add_cost(&mut self.state.cost, usage.cost);
-        add_cost(&mut self.chats[chat_idx].cost, usage.cost);
-        add_cost(
-            &mut self.state.subsidised_list_cost,
-            usage.subsidised_list_cost,
-        );
-        add_cost(
-            &mut self.chats[chat_idx].list_cost,
-            usage.subsidised_list_cost,
-        );
-        self.state.session_mut().add_model_usage(model, usage);
-        // A task's cost outlives it on disk, and nothing else writes the meta
-        // between a plugin task's turns.
-        if chat_idx != MAIN_CHAT {
-            self.sync_subagents();
-        }
-    }
-
-    /// Run-scoped delivery for the tab's own agent: restore snapshots fan out
-    /// to every chat, stale runs are dropped, the rest goes to [`Self::deliver`].
-    fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
-        if envelope.run_id == RESTORE_RUN_ID {
-            let (id, snapshot, theme_gen, is_header) = match envelope.event {
-                AgentEvent::ToolSnapshot {
-                    id,
-                    snapshot,
-                    theme_gen,
-                } => (id, snapshot, theme_gen, false),
-                AgentEvent::ToolHeaderSnapshot {
-                    id,
-                    snapshot,
-                    theme_gen,
-                } => (id, snapshot, theme_gen, true),
-                _ => return vec![],
-            };
-            for chat in &mut self.chats {
-                if is_header {
-                    chat.tool_header_snapshot(&id, snapshot.clone(), theme_gen);
-                } else {
-                    chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
-                }
-            }
-            return vec![];
-        }
-        // Taken before the run check, since a moved call keeps reporting
-        // after its turn ended.
-        if let AgentEvent::ToolParts { id, parts } = envelope.event {
-            self.set_parts(id, parts);
-            return vec![];
-        }
-        // What an adopted subagent sent before its call moved belongs to its
-        // task, not to the run, and may land after the next run started.
-        if let Some(plugin) = task_id_of(&envelope).and_then(|id| self.task_plugin(id)) {
-            return self.deliver(envelope, Some(plugin));
-        }
-        if envelope.run_id != self.run_id && !self.is_racing_receipt(&envelope) {
-            // A snapshot dropped here degrades the tool body to llm_output.
-            if let AgentEvent::ToolSnapshot { id, .. }
-            | AgentEvent::ToolHeaderSnapshot { id, .. }
-            | AgentEvent::LiveToolBuf { id, .. } = &envelope.event
-            {
-                tracing::debug!(
-                    tool_id = %id,
-                    event_run_id = envelope.run_id,
-                    current_run_id = self.run_id,
-                    "tool render event dropped: stale run_id"
-                );
-            }
-            return vec![];
-        }
-        self.deliver(envelope, None)
-    }
-
-    /// A move racing Esc lands after the run it moved out of. Its task lives
-    /// on, so the row it moved, while still on screen, needs its tab. Only a
-    /// main chat call: Esc ends the subagents with the run, and a call moved
-    /// out of one has no agent left to report to.
-    fn is_racing_receipt(&self, envelope: &Envelope) -> bool {
-        envelope.subagent.is_none()
-            && matches!(&envelope.event, AgentEvent::ToolDone(done)
-                if done.backgrounded && self.chats[MAIN_CHAT].tool_message(&done.id).is_some())
-    }
-
-    /// `plugin` names the plugin whose session sent the event, which the chat
-    /// shows as a task of that plugin. Those events skip the run gate above:
-    /// the session outlives turns, Esc and rewinds, so the only gate is the
-    /// chat session, which the event loop already matched.
-    pub(crate) fn deliver(&mut self, envelope: Envelope, plugin: Option<Arc<str>>) -> Vec<Action> {
-        if task_id_of(&envelope).is_some_and(|id| self.deleted_tasks.contains(id)) {
-            return vec![];
-        }
-
-        if let AgentEvent::SubagentHistory {
-            tool_use_id,
-            messages,
-        } = envelope.event
-        {
-            // Workflow sessions use synthetic ids that no ToolDone will match,
-            // so we finish them here on SubagentHistory. This event only knows
-            // that the transcript closed, so say Unknown and leave the verdict
-            // to the ToolDone that follows elsewhere. A plugin task is never in
-            // `chat_index`, and rightly stays open here: it writes its
-            // transcript after every prompt, and its close is `StreamClosed`.
-            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
-                self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
-            }
-            self.state
-                .session_mut()
-                .set_subagent_messages(tool_use_id, messages);
-            return vec![];
-        }
-
-        // A moved call's final result names the call, and the envelope names
-        // no task or that same one. It ends the task and never reaches
-        // history: the receipt is what the model got for that call. A
-        // `ToolDone` inside another task's session is that session's own row.
-        if plugin.is_some()
-            && let AgentEvent::ToolDone(done) = &envelope.event
-            && envelope
-                .subagent
-                .as_ref()
-                .is_none_or(|s| s.parent_tool_use_id == done.id)
-        {
-            match self.chat_of_task(&done.id) {
-                Ok(idx) if idx != MAIN_CHAT && self.chats[idx].plugin.is_some() => {
-                    self.finish_background_call(idx, envelope.event);
-                    return vec![];
-                }
-                // A subagent's tab is the turn's until the receipt adopts it,
-                // and the turn may have ended it by then. The result waits so
-                // the adoption can tell, see `App::adopt_subagent`.
-                Ok(idx) if idx != MAIN_CHAT => {
-                    self.early_finals.insert(done.id.clone(), envelope.event);
-                    return vec![];
-                }
-                // A deleted tab's receipt never comes back to claim it.
-                Err(_) if envelope.subagent.is_none() => {
-                    if !self.deleted_tasks.contains(&done.id) {
-                        self.early_finals.insert(done.id.clone(), envelope.event);
-                    }
-                    return vec![];
-                }
-                _ => {}
-            }
-        }
-
-        maki_lua::agent_autocmd::dispatch(
-            &self.lua_event_handle,
-            &self.state.session.id,
-            &envelope,
-            envelope.subagent.is_some(),
-        );
-
-        let subagent_id = envelope
-            .subagent
-            .as_ref()
-            .map(|s| s.parent_tool_use_id.clone());
-
-        let is_plugin_task = plugin.is_some();
-        let chat_idx = match envelope.subagent {
-            Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin),
-            // A plugin event without its task must never land in the main chat.
-            None if is_plugin_task => return vec![],
-            None => MAIN_CHAT,
-        };
-        if is_plugin_task && matches!(envelope.event, AgentEvent::StreamClosed) {
-            // The session is gone. If Esc already ended the task, its `Error`
-            // stays. A close mid-prompt leaves tools without a result, and
-            // nothing after this would settle them. The close knows no
-            // verdict, so the final result of an adopted subagent's call can
-            // still refine it, and its badge.
-            let chat = &mut self.chats[chat_idx];
-            chat.cancel_in_progress();
-            if !chat.is_finished() {
-                chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
-                if let Some(id) = &subagent_id {
-                    self.set_badge_outcome(id, BackgroundOutcome::Done);
-                }
-            }
-            return vec![];
-        }
-        self.chats[chat_idx].track_run(&envelope.event);
-
-        if let AgentEvent::ToolDone(ref e) = envelope.event {
-            if self.state.mode == Mode::Plan
-                && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
-            {
-                self.transition_plan(PlanTrigger::WriteDone);
-            }
-            self.state
-                .session_mut()
-                .insert_tool_output(e.id.clone(), e.output.clone());
-            // A receipt does not end the subagent behind it: the call goes
-            // on, and adopting its chat takes it off the turn first.
-            if e.backgrounded {
-                self.open_background_call(chat_idx, e);
-            } else if let Some(&sub_idx) = self.chat_index.get(&e.id) {
-                let (outcome, text) = if e.is_error {
-                    (TaskOutcome::Error, ERROR_TEXT)
-                } else {
-                    (TaskOutcome::Done, DONE_TEXT)
-                };
-                self.chats[sub_idx].mark_finished(outcome, text);
-            }
-        }
-
-        if let AgentEvent::Retry {
-            attempt,
-            message,
-            delay_ms,
-        } = envelope.event
-        {
-            self.chats[chat_idx].stream_reset();
-            if chat_idx == 0 {
-                self.retry_info = Some(RetryInfo {
-                    attempt,
-                    message,
-                    deadline: Instant::now() + Duration::from_millis(delay_ms),
-                });
-            }
-            return vec![];
-        }
-
-        // A plugin task streams while the main chat may be mid-retry.
-        if chat_idx == MAIN_CHAT {
-            self.retry_info = None;
-        }
-
-        if let AgentEvent::TurnComplete(ref tc) = envelope.event {
-            self.bill(
-                chat_idx,
-                &tc.model,
-                tc.usage
-                    .billed_with_subsidised_list_cost(tc.cost, tc.subsidised_list_cost),
-            );
-            let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
-            self.set_context_size(chat_idx, ctx_size);
-            self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
-            if let Some(tool_id) = &subagent_id {
-                let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
-                self.chats[MAIN_CHAT].set_tool_turn_usage(tool_id, formatted);
-            }
-        }
-
-        // Compaction is the one thing that lowers the context size with no turn
-        // behind it. The number is stored in the session meta and seeds the
-        // next run's gauge, so left stale a session compacted just before exit
-        // gets compacted again on resume.
-        if let AgentEvent::CompactionDone {
-            context_size_after, ..
-        } = envelope.event
-        {
-            self.set_context_size(chat_idx, context_size_after);
-        }
-
-        let plan_path = if self.state.mode == Mode::Plan {
-            self.state.plan.path()
-        } else {
-            None
-        };
-        let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);
-
-        if let ChatEventResult::QueueItemConsumed { text, images } = result {
-            if chat_idx == 0 {
-                self.on_queue_item_consumed(text, images);
-            } else {
-                self.chats[chat_idx].show_user_message(text, images);
-            }
-            return vec![];
-        }
-
-        if let ChatEventResult::PermissionRequest {
-            id,
-            tool,
-            scopes,
-            reason,
-        } = result
-        {
-            let project_trusted = self.permissions.project_is_trusted();
-            self.open_prompt(|app| {
-                app.permission_prompt.push(
-                    id,
-                    tool,
-                    scopes,
-                    subagent_id.clone(),
-                    project_trusted,
-                    reason,
-                );
-            });
-            return vec![];
-        }
-
-        if let ChatEventResult::AuthRequired = result {
-            self.chats[chat_idx].push(DisplayMessage::new(
-                DisplayRole::Error,
-                AUTH_EXPIRED_MSG.into(),
-            ));
-            if self.answer_channel(chat_idx).is_none() {
-                return vec![];
-            }
-            if chat_idx != MAIN_CHAT {
-                self.main_chat().push(DisplayMessage::new(
-                    DisplayRole::Error,
-                    AUTH_EXPIRED_MSG.into(),
-                ));
-            }
-            let park = |app: &mut Self| app.chats[chat_idx].auth_parked = true;
-            if self.chats[chat_idx].plugin.is_none() {
-                self.open_prompt(park);
-            } else {
-                park(self);
-            }
-            return vec![];
-        }
-
-        if is_plugin_task {
-            // Either way the prompt has returned, and the session waits for
-            // the next one. A run its Lua task's end cut short mid-tool has no
-            // `handle_cancel` to settle the tool, so it is settled here.
-            match result {
-                ChatEventResult::Done => self.chats[chat_idx].cancel_in_progress(),
-                ChatEventResult::Error(message) => {
-                    self.chats[chat_idx].cancel_in_progress();
-                    // Esc in the tab already wrote the task's ending, and the
-                    // error its cut short run sends after that would say it twice.
-                    if !self.chats[chat_idx].is_finished() {
-                        self.chats[chat_idx].push(DisplayMessage::new(
-                            DisplayRole::Error,
-                            cap_error_text(&message),
-                        ));
-                    }
-                }
-                _ => {}
-            }
-            return vec![];
-        }
-
-        if chat_idx == 0 {
-            match result {
-                ChatEventResult::Done => {
-                    self.status_bar.clear_flash();
-                    self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.chat_index.clear();
-                    self.status = Status::Idle;
-                    if self.exit_on_done {
-                        self.exit_request = ExitRequest::Success;
-                        self.background_deadline = self
-                            .background_deadline
-                            .or_else(|| self.background_wait.map(|wait| Instant::now() + wait));
-                    }
-                }
-                ChatEventResult::Error(message) => {
-                    self.status = Status::error(message.clone());
-                    self.status_bar.clear_flash();
-                    self.main_chat().push(DisplayMessage::new(
-                        DisplayRole::Error,
-                        cap_error_text(&message),
-                    ));
-                    self.terminalize_turn(&message);
-                    self.recoverable_queue = self.queue.text_messages();
-                    self.queue.clear();
-                    self.chat_index.clear();
-                    if self.exit_on_done {
-                        self.exit_request = ExitRequest::Error;
-                    }
-                }
-                ChatEventResult::AuthRequired
-                | ChatEventResult::PermissionRequest { .. }
-                | ChatEventResult::QueueItemConsumed { .. } => unreachable!(),
-                ChatEventResult::Continue => {}
-            }
-        }
-        vec![]
-    }
-
-    /// Chat 0 is the session itself, and its size is the one stored in the
-    /// session meta.
-    fn set_context_size(&mut self, chat_idx: usize, size: u32) {
-        self.chats[chat_idx].context_size = size;
-        if chat_idx == 0 {
-            self.state.context_size = size;
-        }
-    }
-
-    /// A tool task is found through `chat_index`, a plugin task by id: the
-    /// index is wiped every turn, and a plugin task would come back as a
-    /// second chat at the main chat's next turn end. A plugin event naming a
-    /// subagent's chat adopts it, see [`Self::adopt_subagent`].
-    fn resolve_or_create_chat(
-        &mut self,
-        subagent: &SubagentInfo,
-        plugin: &Option<Arc<str>>,
-    ) -> usize {
-        let id = &subagent.parent_tool_use_id;
-        let known = match plugin {
-            None => self.chat_index.get(id.as_str()).copied(),
-            Some(_) => self.chat_of_task(id).ok(),
-        };
-        if let Some(idx) = known {
-            if let Some(plugin) = plugin {
-                self.adopt_subagent(idx, plugin);
-            }
-            fill_missing_subagent_info(&mut self.chats[idx], subagent);
-            return idx;
-        }
-        let idx = self.chats.len();
-        if plugin.is_none() {
-            self.chat_index.insert(id.clone(), idx);
-            self.chats[MAIN_CHAT].update_tool_summary(id, &subagent.name);
-            if let Some(ref model) = subagent.model {
-                self.chats[MAIN_CHAT].update_tool_model(id, model);
-            }
-        }
-        let mut chat = Chat::new(
-            self.state.session.id,
-            Some(id),
-            subagent.name.clone(),
-            self.ui_config.clone(),
-            self.lua_event_handle.clone(),
-        );
-        chat.set_restore_channel(self.restore_event_tx.clone());
-        chat.plugin = plugin.clone();
-        chat.clock = Some(TaskClock::start());
-        chat.model_id = subagent.model.clone();
-        chat.opts = subagent.opts;
-        chat.inbox = subagent.inbox.clone();
-        chat.answer_tx = subagent.answer_tx.clone();
-        chat.parent = started_by(subagent);
-        if let Some(ref prompt) = subagent.prompt {
-            chat.push_user_message(prompt);
-        }
-        self.chats.push(chat);
-        self.sync_subagents();
-        idx
-    }
-
-    /// A chat this task already has, maybe one the user just stopped, stays as
-    /// it is rather than turning idle again. A subagent's chat is adopted,
-    /// which is how a session nested under a moved call leaves the turn.
-    pub(crate) fn open_plugin_task(&mut self, info: &SubagentInfo, plugin: Arc<str>) {
-        let id = &info.parent_tool_use_id;
-        if self.deleted_tasks.contains(id) {
-            return;
-        }
-        let known = self.chat_of_task(id).is_ok();
-        let idx = self.resolve_or_create_chat(info, &Some(plugin));
-        if !known {
-            self.chats[idx].idle = true;
-        }
-    }
-
-    /// Entry point for `maki.api.run_command`: splits a command line into the
-    /// name and args the input bar would hand over, leading slash optional.
-    /// `Err` means nothing ran at all, so the Lua caller can say why.
-    pub(crate) fn run_cmdline(
-        &mut self,
-        cmdline: &str,
-        depth: u8,
-        caller: &PluginReach,
-    ) -> Result<Vec<Action>, String> {
-        if depth > MAX_COMMAND_DEPTH {
-            return Err(COMMAND_DEPTH_MSG.to_string());
-        }
-        let trimmed = cmdline.trim();
-        let (name, args) = trimmed
-            .split_once(char::is_whitespace)
-            .unwrap_or((trimmed, ""));
-        let resolved = self
-            .command_palette
-            .resolve_for_plugin(&format!("/{}", name.trim_start_matches('/')), caller)?;
-        Ok(self.execute_command(
-            ParsedCommand {
-                name: resolved,
-                args: args.trim().to_string(),
-                bang: false,
-            },
-            depth,
-        ))
-    }
-
-    /// {depth} is the `maki.api.run_command` hop count, forwarded to a Lua
-    /// handler so an alias cycle keeps counting. 0 when the user typed it.
-    fn execute_command(&mut self, cmd: ParsedCommand, depth: u8) -> Vec<Action> {
-        match cmd.name.as_str() {
-            "/compact" => {
-                let instructions = (!cmd.args.is_empty()).then(|| cmd.args.clone());
-                if self.status == Status::Streaming {
-                    self.queue_compact(instructions);
-                    return vec![];
-                }
-                self.status = Status::Streaming;
-                vec![Action::Compact(instructions)]
-            }
-            "/help" => {
-                self.toggle_prompt(self.help_modal.is_open(), |app| app.help_modal.toggle());
-                vec![]
-            }
-            "/usage" => {
-                self.toggle_prompt(self.usage_modal.is_open(), |app| app.usage_modal.toggle());
-                if self.usage_modal.is_open() {
-                    vec![Action::RefreshUsage]
-                } else {
-                    vec![]
-                }
-            }
-            "/btw" => {
-                let question = cmd.args.trim().to_string();
-                if question.is_empty() {
-                    self.flash("Usage: /btw <question>".into());
-                    vec![]
-                } else {
-                    vec![Action::Btw(question)]
-                }
-            }
-            "/new" => self.start_new_session(cmd.bang),
-            "/fork" => self.fork_session(),
-            "/queue" => {
-                self.queue.set_focus();
-                vec![]
-            }
-            "/model" => {
-                self.model_picker.open(&self.state.model.spec());
-                vec![Action::RefreshModels]
-            }
-            "/theme" => {
-                self.theme_picker.open();
-                vec![]
-            }
-            "/mcp" => {
-                self.mcp_picker.open();
-                vec![]
-            }
-            "/login" => {
-                self.login_picker.open(self.storage.clone());
-                vec![]
-            }
-            "/cd" => self.cmd_cd(&cmd.args),
-            "/yolo" => {
-                let enabled = self.permissions.toggle_yolo();
-                let msg = if enabled {
-                    "YOLO mode enabled"
-                } else {
-                    "YOLO mode disabled"
-                };
-                self.flash(msg.into());
-                vec![]
-            }
-            "/fast" => {
-                match self.set_fast(!self.state.fast_intent()) {
-                    Ok(()) => self.flash(
-                        if self.state.pending_fast {
-                            FAST_PENDING_MSG
-                        } else if self.state.fast {
-                            FAST_ON_MSG
-                        } else {
-                            FAST_OFF_MSG
-                        }
-                        .into(),
-                    ),
-                    Err(msg) => self.flash(msg),
-                }
-                vec![]
-            }
-            "/workflow" => {
-                self.state.workflow = !self.state.workflow;
-                self.flash(
-                    if self.state.workflow {
-                        WORKFLOW_ON_MSG
-                    } else {
-                        WORKFLOW_OFF_MSG
-                    }
-                    .into(),
-                );
-                vec![]
-            }
-            EXIT_COMMAND => self.quit(),
-            "/reload" => self.reload(cmd.bang),
-            // Typing `/trust` is the consent, exactly like `maki trust add
-            // --yes`, so there is no second question to ask here.
-            "/trust" => self.trust_folder(),
-            name @ ("/packupdate" | "/packdel") => {
-                match PackCommand::parse(name, &cmd.args, cmd.bang) {
-                    Ok(command) => vec![Action::PreparePack(command)],
-                    Err(message) => {
-                        self.flash(message);
-                        vec![]
-                    }
-                }
-            }
-            name if name.starts_with("/project:") || name.starts_with("/user:") => {
-                self.execute_custom_command(name, &cmd.args)
-            }
-            name if self.command_palette.find_mcp_prompt(name).is_some() => {
-                self.execute_mcp_prompt(name, &cmd.args)
-            }
-            name if self.command_palette.find_lua_command(name).is_some() => {
-                self.run_lua_command(name, cmd.args, depth);
-                vec![]
-            }
-            _ => vec![],
-        }
-    }
-
-    fn run_lua_command(&self, name: &str, args: String, depth: u8) {
-        let Some(lua_cmd) = self.command_palette.find_lua_command(name) else {
-            return;
-        };
-        self.lua_event_handle.run_command(
-            Arc::clone(&lua_cmd.plugin),
-            Arc::clone(&lua_cmd.name),
-            args,
-            depth,
-        );
-    }
-
-    pub(crate) fn handle_pack_preparation(&mut self, preparation: PackPreparation) -> Vec<Action> {
-        match preparation {
-            PackPreparation::Complete(report) => {
-                self.flash(report.message());
-                Vec::new()
-            }
-            PackPreparation::Ready(plan) => self.quit_with(ExitRequest::Pack(plan)),
-            PackPreparation::Review { prompt, plan } => {
-                self.open_prompt(|app| app.pack_review.open(prompt, plan));
-                Vec::new()
-            }
-        }
-    }
-
-    fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {
-        let prompt = self.command_palette.find_mcp_prompt(name).unwrap().clone();
-
-        let arguments = Self::parse_prompt_args(&prompt, args);
-        let missing: Vec<_> = prompt
-            .arguments
-            .iter()
-            .filter(|a| a.required && !arguments.contains_key(&a.name))
-            .map(|a| format!("<{}>", a.name))
-            .collect();
-        if !missing.is_empty() {
-            self.flash(format!("Usage: {} {}", name, missing.join(" ")));
-            return vec![];
-        }
-
-        let prompt_ref = maki_agent::McpPromptRef {
-            qualified_name: prompt.qualified_name.clone(),
-            arguments,
-        };
-        let display_text = if args.trim().is_empty() {
-            name.to_string()
-        } else {
-            format!("{name} {args}")
-        };
-        let mut input = self.build_agent_input(&QueuedMessage {
-            text: display_text.clone(),
-            images: Vec::new(),
-        });
-        input.prompt = Some(Box::new(prompt_ref));
-
-        if self.status == Status::Streaming {
-            self.flash("Agent is busy, try again later".into());
-            vec![]
-        } else {
-            self.start_run(input, display_text)
-        }
-    }
-
-    fn parse_prompt_args(prompt: &McpPromptInfo, args: &str) -> HashMap<String, String> {
-        let mut result = HashMap::new();
-        let mut remaining = args.trim();
-        if remaining.is_empty() || prompt.arguments.is_empty() {
-            return result;
-        }
-        let last_idx = prompt.arguments.len() - 1;
-        for (i, arg) in prompt.arguments.iter().enumerate() {
-            if remaining.is_empty() {
-                break;
-            }
-            if i == last_idx {
-                result.insert(arg.name.clone(), remaining.to_string());
-            } else if let Some((word, rest)) = remaining.split_once(char::is_whitespace) {
-                result.insert(arg.name.clone(), word.to_string());
-                remaining = rest.trim_start();
-            } else {
-                result.insert(arg.name.clone(), remaining.to_string());
-                break;
-            }
-        }
-        result
-    }
-
-    fn execute_custom_command(&mut self, name: &str, args: &str) -> Vec<Action> {
-        let Some(cmd) = self.command_palette.find_custom_command(name) else {
-            self.flash(format!("Unknown command: {name}"));
-            return vec![];
-        };
-        self.submit_or_queue(QueuedMessage {
-            text: cmd.render(args),
-            images: Vec::new(),
+    /// `None` means the owner has no [`Overlay`] of its own, as for the plan
+    /// form, the queue focus and the chat.
+    fn overlay(&self, owner: KeyboardOwner) -> Option<&dyn Overlay> {
+        Some(match owner {
+            KeyboardOwner::Alert => &self.alert_modal,
+            KeyboardOwner::Permission => &self.permission_prompt,
+            KeyboardOwner::PackReview => &self.pack_review,
+            KeyboardOwner::Help => &self.help_modal,
+            KeyboardOwner::Usage => &self.usage_modal,
+            KeyboardOwner::Btw => &self.btw_modal,
+            KeyboardOwner::FocusedWindow => &self.float_mgr,
+            KeyboardOwner::Search => &self.search_modal,
+            KeyboardOwner::FilePicker => &self.file_picker,
+            KeyboardOwner::RewindPicker => &self.rewind_picker,
+            KeyboardOwner::ThemePicker => &self.theme_picker,
+            KeyboardOwner::ModelPicker => &self.model_picker,
+            KeyboardOwner::LoginPicker => &self.login_picker,
+            KeyboardOwner::McpPicker => &self.mcp_picker,
+            KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat => return None,
         })
     }
 
-    fn cmd_cd(&mut self, args: &str) -> Vec<Action> {
-        let path = if args.is_empty() {
-            maki_storage::paths::home().unwrap_or_default()
-        } else {
-            match args.strip_prefix('~') {
-                Some(rest) => {
-                    let home = maki_storage::paths::home().unwrap_or_default();
-                    if rest.is_empty() {
-                        home
-                    } else {
-                        home.join(rest.trim_start_matches('/'))
-                    }
-                }
-                None => PathBuf::from(args),
-            }
-        };
-        self.save_input_history();
-        match env::set_current_dir(&path) {
-            Ok(()) => {
-                if let Ok(canonical) = env::current_dir() {
-                    let max_entries = self.input_box.history().max_entries();
-                    self.input_box.set_history(InputHistory::load(
-                        &self.storage,
-                        &canonical,
-                        max_entries,
-                    ));
-                    self.state
-                        .session_mut()
-                        .set_cwd(canonical.to_string_lossy().into_owned());
-                    self.fire_session_event(HostEvent::SessionCwdChanged {
-                        cwd: &canonical.to_string_lossy(),
-                    });
-                }
-                self.status_bar.refresh_cwd();
-                self.flash(format!("cd {}", path.display()))
-            }
-            Err(e) => self.flash(format!("cd: {e}")),
-        }
-        vec![]
+    fn overlay_mut(&mut self, owner: KeyboardOwner) -> Option<&mut dyn Overlay> {
+        Some(match owner {
+            KeyboardOwner::Alert => &mut self.alert_modal,
+            KeyboardOwner::Permission => &mut self.permission_prompt,
+            KeyboardOwner::PackReview => &mut self.pack_review,
+            KeyboardOwner::Help => &mut self.help_modal,
+            KeyboardOwner::Usage => &mut self.usage_modal,
+            KeyboardOwner::Btw => &mut self.btw_modal,
+            KeyboardOwner::FocusedWindow => &mut self.float_mgr,
+            KeyboardOwner::Search => &mut self.search_modal,
+            KeyboardOwner::FilePicker => &mut self.file_picker,
+            KeyboardOwner::RewindPicker => &mut self.rewind_picker,
+            KeyboardOwner::ThemePicker => &mut self.theme_picker,
+            KeyboardOwner::ModelPicker => &mut self.model_picker,
+            KeyboardOwner::LoginPicker => &mut self.login_picker,
+            KeyboardOwner::McpPicker => &mut self.mcp_picker,
+            KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat => return None,
+        })
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
-        [
-            &self.alert_modal,
-            &self.help_modal,
-            &self.usage_modal,
-            &self.btw_modal,
-            &self.float_mgr,
-            &self.search_modal,
-            &self.file_picker,
-            &self.rewind_picker,
-            &self.theme_picker,
-            &self.model_picker,
-            &self.login_picker,
-            &self.mcp_picker,
-            &self.pack_review,
-            &self.permission_prompt,
-        ]
-    }
-
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
-        [
-            &mut self.alert_modal,
-            &mut self.help_modal,
-            &mut self.usage_modal,
-            &mut self.btw_modal,
-            &mut self.float_mgr,
-            &mut self.search_modal,
-            &mut self.file_picker,
-            &mut self.rewind_picker,
-            &mut self.theme_picker,
-            &mut self.model_picker,
-            &mut self.login_picker,
-            &mut self.mcp_picker,
-            &mut self.pack_review,
-            &mut self.permission_prompt,
-        ]
+    fn overlays(&self) -> impl Iterator<Item = &dyn Overlay> {
+        KeyboardOwner::iter().filter_map(|owner| self.overlay(owner))
     }
 
     pub fn any_overlay_open(&self) -> bool {
-        self.overlays().iter().any(|o| o.is_open())
+        self.overlays().any(Overlay::is_open)
     }
 
     /// True when the agent is parked on user input. Drives the `needs_input`
     /// session status.
     pub(crate) fn awaiting_input(&self) -> bool {
         self.permission_prompt.is_open() || self.turn_awaits_auth() || self.float_mgr.needs_input()
-    }
-
-    /// True while `recoverable_queue` holds user text captured at an agent
-    /// error; a background run would wipe it (`start_run` clears the queue).
-    pub(crate) fn holds_recovery_text(&self) -> bool {
-        !self.recoverable_queue.is_empty()
     }
 
     pub(crate) fn attention(&self) -> Option<Notification> {
@@ -3268,7 +2549,8 @@ impl App {
     }
 
     pub fn has_modal_overlay(&self) -> bool {
-        self.overlays().iter().any(|o| o.is_open() && o.is_modal())
+        self.overlays()
+            .any(|overlay| overlay.is_open() && overlay.is_modal())
     }
 
     /// Derived fresh every time rather than snapshotted on open: output can
@@ -3283,7 +2565,11 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
-        self.overlays_mut().iter_mut().for_each(|o| o.close());
+        for owner in KeyboardOwner::iter() {
+            if let Some(overlay) = self.overlay_mut(owner) {
+                overlay.close();
+            }
+        }
     }
 
     /// Every poller that feeds the screen, in one place and never in `view`;
@@ -3294,8 +2580,8 @@ impl App {
             | self.tick_typeahead()
             | self.tick_edge_scroll()
             | self.tick_error_expiry()
-            | self.poll_image_paste()
-            | self.poll_primary_paste()
+            | self.poll_paste()
+            | self.poll_mouse_paste()
             | self.btw_modal.poll()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
@@ -3310,135 +2596,6 @@ impl App {
             | self.tick_input_changed()
             | self.tick_background_moves()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
-    }
-
-    /// Both halves of the plan surface the Lua host answers asynchronously:
-    /// the menu a draft opens with, and the built-in outcome a picked plugin
-    /// row still owes. Drained for every session, since a plan that lands in
-    /// a background tab has to reach its form too.
-    pub(crate) fn tick_plan(&mut self) -> Dirty {
-        self.tick_plan_form() | self.tick_plan_action()
-    }
-
-    /// Open the form with the menu the `ui.plan_form*` chains answered with.
-    /// A chain that answers to keep it closed leaves it closed, and the
-    /// plan-toggle key still reopens it. A chain that says nothing at all
-    /// runs out of [`PLAN_FORM_ANSWER_WAIT`] and leaves the built-in form.
-    pub(crate) fn tick_plan_form(&mut self) -> Dirty {
-        let Some((deadline, rx)) = self.plan_answers.form.as_ref() else {
-            return Dirty::NO;
-        };
-        let (answered, expired) = (rx.try_recv(), Instant::now() >= *deadline);
-        let (menu, slow) = match answered {
-            // A layer took the surface over, so the host draws nothing. The
-            // menu goes with it, since its rows answer for the draft they
-            // were built for.
-            Ok(None) => {
-                self.plan_answers.abandon();
-                self.plan_form.forget_menu();
-                return Dirty::from(self.plan_form.is_visible());
-            }
-            Ok(Some(menu)) => (menu, false),
-            // The host went away mid-question, so nobody is drawing the plan.
-            Err(flume::TryRecvError::Disconnected) => (builtin_menu(), false),
-            Err(flume::TryRecvError::Empty) if expired => (builtin_menu(), true),
-            Err(flume::TryRecvError::Empty) => return Dirty::NO,
-        };
-        self.plan_answers.abandon();
-        self.open_plan_form(menu);
-        if slow {
-            self.flash(FLASH_PLAN_FORM_SLOW.into());
-        }
-        Dirty::YES
-    }
-
-    /// The built-in outcome a picked plugin row kept, once its handler has
-    /// answered.
-    ///
-    /// A handler that says `false` is gating the row on a check of its own
-    /// and stays quiet. A handler that failed, or a pick that reached no
-    /// handler, left the user watching the menu vanish for nothing, and says
-    /// so.
-    fn tick_plan_action(&mut self) -> Dirty {
-        let Some(pending) = self.plan_answers.action.as_ref() else {
-            return Dirty::NO;
-        };
-        // "Lost" is the host never having taken the pick, which reads
-        // differently to the user than a handler that ran and failed.
-        let (answered, expired) = (
-            pending.answer.try_recv(),
-            Instant::now() >= pending.deadline,
-        );
-        let (outcome, lost) = match answered {
-            Ok(outcome) => (outcome, false),
-            Err(flume::TryRecvError::Disconnected) => (PlanActionOutcome::Failed, true),
-            Err(flume::TryRecvError::Empty) if expired => (PlanActionOutcome::Failed, true),
-            Err(flume::TryRecvError::Empty) => return Dirty::NO,
-        };
-        let pending = self.plan_answers.action.take().expect("checked above");
-        if pending.pick != self.plan_answers.pick {
-            // Running the outcome of a pick the user has navigated away from
-            // would be a second implement prompt behind the one they asked
-            // for, or one against a session they never picked in.
-            tracing::debug!(outcome = ?outcome, "dropping the answer of a stale plan form pick");
-            return Dirty::NO;
-        }
-        match outcome {
-            PlanActionOutcome::Proceed => {
-                let actions = match pending.then {
-                    Some(PlanRowAction::Implement) => self.implement_plan(false),
-                    Some(PlanRowAction::ClearAndImplement) => self.implement_plan(true),
-                    Some(PlanRowAction::Refine) | None => vec![],
-                };
-                self.pending_actions.extend(actions);
-            }
-            PlanActionOutcome::Vetoed => {}
-            PlanActionOutcome::Failed => self.flash(
-                if lost {
-                    FLASH_PLAN_ACTION_LOST
-                } else {
-                    FLASH_PLAN_ACTION_FAILED
-                }
-                .into(),
-            ),
-        }
-        Dirty::YES
-    }
-
-    /// Ask the `ui.plan_form*` chains what to draw for the draft that just
-    /// landed, starting from the host's own rows.
-    ///
-    /// Only asked when a plugin is layering one of them. With no layer the
-    /// chain answers with the host's own rows by construction, and the
-    /// roundtrip through a request loop that may be busy would cost a stock
-    /// install its form.
-    pub(super) fn offer_plan_form(&mut self, path: Option<&str>) {
-        // A new draft retires the pick the last one was waiting on, handler
-        // and built-in outcome both. The handler may well still be running,
-        // but its answer is stamped with a pick nobody waits on any more, so
-        // the outcome the row promised is gone and the user is told.
-        let lost_pick = self.plan_answers.action.is_some();
-        self.plan_answers.abandon();
-        if lost_pick {
-            self.flash(FLASH_PLAN_ACTION_LOST.into());
-        }
-        let Some(path) = path.filter(|_| self.lua_event_handle.plan_form_layered()) else {
-            self.open_plan_form(builtin_menu());
-            return;
-        };
-        // The last draft's menu is not this draft's, and the chain has not
-        // answered with one yet.
-        self.plan_form.forget_menu();
-        let answer = self.lua_event_handle.open_plan_form(
-            path.to_owned(),
-            self.state.session.id.to_string(),
-            builtin_rows(),
-        );
-        self.plan_answers.form = Some((Instant::now() + PLAN_FORM_ANSWER_WAIT, answer));
-    }
-
-    fn open_plan_form(&mut self, menu: PlanMenu) {
-        self.open_prompt(|app| app.plan_form.open_with(menu));
     }
 
     pub(crate) fn open_alert(&mut self, message: String) {
@@ -3502,15 +2659,11 @@ impl App {
 
     /// What moves with the clock alone; changes that come from arriving data
     /// are reported by [`Self::tick`] instead. Overlays answer as a group, so
-    /// adding one to [`Self::overlays`] is enough.
+    /// giving one a [`KeyboardOwner`] is enough.
     pub fn cadence(&self) -> Cadence {
         Cadence::any([
-            Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
-            self.status_bar.cadence(
-                &self.status,
-                self.restoring.load(Ordering::Relaxed),
-                self.retry_info.is_some(),
-            ),
+            Cadence::any(self.overlays().map(Overlay::cadence)),
+            self.status_bar.cadence(&self.status_motion()),
             self.selection_state
                 .as_ref()
                 .map_or(Cadence::IDLE, SelectionState::cadence),
@@ -3538,7 +2691,7 @@ impl App {
     }
 
     /// Marks unfinished subagent chats as ended and drops them from
-    /// `chat_index`, then mirrors the tabs into the session meta.
+    /// `chat_index`.
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.chat_index.retain(|_, &mut sub_idx| {
             if self.chats[sub_idx].is_finished() {
@@ -3549,13 +2702,6 @@ impl App {
             }
         });
         self.forget_untasked_parts();
-        self.sync_subagents();
-    }
-
-    pub fn flush_all_chats(&mut self) {
-        for chat in &mut self.chats {
-            chat.flush();
-        }
     }
 
     /// A paste walks the steps of [`Self::handle_key`] as the `<Paste>` key.
@@ -3565,178 +2711,43 @@ impl App {
     /// handler counting offsets over it counts what inserting it adds, while
     /// a prompt, a picker or a plugin window's `recv` keeps its tabs.
     ///
-    /// The first step that owns the keyboard owns the paste as well, and one
-    /// with no field for it drops it. The chat input and the bindings under a
-    /// modal get none of its keys, so they get none of its pastes either.
+    /// The owner of the keyboard, [`KeyboardOwner`], takes the paste as well,
+    /// and one with no field for it drops it. The chat input and the bindings
+    /// under a modal get none of its keys, so they get none of its pastes
+    /// either.
     fn route_text_paste(&mut self, text: &str, turn: &Turn) {
         let text = &normalize_line_endings(text);
-        if self.alert_modal.is_open() || self.permission_prompt.handle_paste(text) {
-            return;
-        }
-        if self.pack_review.is_open()
-            || self.plan_form_active()
-            || self.help_modal.is_open()
-            || self.usage_modal.is_open()
-            || self.btw_modal.is_open()
-        {
-            return;
-        }
-        let pressed = Pressed::Paste(text.to_owned());
-        if self.dispatch_focused_window(&pressed, turn) {
-            return;
-        }
-        if self.search_modal.is_open() {
-            self.search_modal.handle_paste(text);
-            self.refresh_search_matches();
-            return;
-        }
-        macro_rules! try_picker {
-            ($picker:expr) => {
-                if $picker.handle_paste(text) {
-                    return;
+        match self.keyboard_owner() {
+            KeyboardOwner::Alert
+            | KeyboardOwner::PackReview
+            | KeyboardOwner::PlanForm
+            | KeyboardOwner::Help
+            | KeyboardOwner::Usage
+            | KeyboardOwner::Btw
+            | KeyboardOwner::Queue => {}
+            KeyboardOwner::Permission => self.permission_prompt.handle_paste(text),
+            KeyboardOwner::FocusedWindow => {
+                self.dispatch_focused_window(&Pressed::Paste(text.to_owned()), turn);
+            }
+            KeyboardOwner::Search => {
+                self.search_modal.handle_paste(text);
+                self.refresh_search_matches();
+            }
+            KeyboardOwner::FilePicker => self.file_picker.handle_paste(text),
+            KeyboardOwner::RewindPicker => self.rewind_picker.handle_paste(text),
+            KeyboardOwner::ThemePicker => self.theme_picker.handle_paste(text),
+            KeyboardOwner::ModelPicker => self.model_picker.handle_paste(text),
+            KeyboardOwner::LoginPicker => self.login_picker.handle_paste(text),
+            KeyboardOwner::McpPicker => self.mcp_picker.handle_paste(text),
+            KeyboardOwner::Chat => {
+                let pressed = Pressed::Paste(text.to_owned());
+                if !self.dispatch_on_screen_windows(&pressed, turn)
+                    && !self.dispatch_binding(None, &pressed, turn)
+                {
+                    self.builtin_paste(text);
                 }
-            };
-        }
-        try_picker!(self.file_picker);
-        if self.queue_focused() {
-            return;
-        }
-        try_picker!(self.rewind_picker);
-        try_picker!(self.theme_picker);
-        try_picker!(self.model_picker);
-        try_picker!(self.login_picker);
-        try_picker!(self.mcp_picker);
-        if self.dispatch_on_screen_windows(&pressed, turn)
-            || self.dispatch_binding(None, &pressed, turn)
-        {
-            return;
-        }
-        self.builtin_paste(text);
-    }
-
-    fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
-        match action {
-            PlanFormAction::Consumed | PlanFormAction::Passthrough => vec![],
-            PlanFormAction::Hide => {
-                self.plan_answers.abandon();
-                self.plan_form.hide();
-                vec![]
-            }
-            PlanFormAction::OpenEditor => match self.state.plan.path() {
-                Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
-                None => {
-                    self.flash(FLASH_NO_PLAN.into());
-                    vec![]
-                }
-            },
-            PlanFormAction::Implement => {
-                self.plan_answers.abandon();
-                self.implement_plan(false)
-            }
-            PlanFormAction::ClearAndImplement => {
-                self.plan_answers.abandon();
-                self.implement_plan(true)
-            }
-            PlanFormAction::Plugin {
-                row,
-                generation,
-                then,
-            } => {
-                // Snapshot the parallel flag before reset() clears it, since
-                // the handler is told what it was.
-                let parallel = self.plan_form.parallel();
-                let path = self
-                    .state
-                    .plan
-                    .path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                // Plan state is per session, so the handler is told which one
-                // fired instead of assuming the focused tab.
-                let session = self.state.session.id.to_string();
-                self.plan_form.reset();
-                // The generation travels with the pick, so a chain that
-                // resumed late and installed its handlers over this menu
-                // cannot answer for the rows the user saw.
-                let answer = self
-                    .lua_event_handle
-                    .run_plan_action(session, generation, row, path, parallel);
-                let pick = self.plan_answers.abandon();
-                self.plan_answers.action = Some(PlanAction {
-                    pick,
-                    then,
-                    deadline: Instant::now() + PLAN_ACTION_ANSWER_WAIT,
-                    answer,
-                });
-                vec![]
             }
         }
-    }
-
-    /// Snapshot of the current plan for `maki.plan.read()`. `content` stays
-    /// `None` when the plan is not ready or the file cannot be read, which an
-    /// empty plan is not.
-    pub(crate) fn plan_snapshot(&self) -> serde_json::Value {
-        let mode = if self.state.mode == Mode::Plan {
-            "plan"
-        } else {
-            "build"
-        };
-        let path = self.state.plan.path().map(|p| p.display().to_string());
-        let ready = self.state.plan.is_ready();
-        let content = if ready {
-            self.state
-                .plan
-                .path()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-        } else {
-            None
-        };
-        serde_json::json!({
-            "mode": mode,
-            "path": path,
-            "ready": ready,
-            "content": content,
-        })
-    }
-
-    fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
-        let parallel = self.plan_form.parallel();
-        self.plan_form.reset();
-        let plan_snapshot = match std::mem::take(&mut self.state.plan) {
-            PlanState::Ready(p) => Some((
-                std::fs::read_to_string(&p).unwrap_or_default(),
-                p.display().to_string(),
-            )),
-            _ => None,
-        };
-
-        self.state.mode = Mode::Build;
-
-        let mut actions = if clear_context {
-            self.reset_session()
-        } else {
-            vec![]
-        };
-
-        let text = if let Some((content, path_str)) = plan_snapshot {
-            let text = if parallel {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`. {IMPLEMENT_PARALLEL_HINT}")
-            } else {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`.")
-            };
-            self.main_chat()
-                .push(DisplayMessage::plan(content, path_str));
-            text
-        } else {
-            format!("{}.", IMPLEMENT_MSG_PREFIX)
-        };
-        let msg = QueuedMessage {
-            text,
-            images: vec![],
-        };
-        actions.extend(self.start_from_queue(&msg));
-        actions
     }
 }
 

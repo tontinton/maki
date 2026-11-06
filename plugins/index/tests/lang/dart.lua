@@ -101,3 +101,23 @@ class A<T> {
     "asyncMethod<T>() Future<T>",
   })
 end)
+
+case("dart_doc_comments_extend_the_range", function()
+  local src = [==[
+/// Line doc
+/// second line
+String foo() => "";
+
+/** Block doc */
+int bar() => 1;
+
+// plain comment
+int plain() => 2;
+]==]
+  local out = idx(src, "dart")
+  has(out, {
+    "foo() String [1-3]",
+    "bar() int [5-6]",
+    "plain() int [9]",
+  })
+end)

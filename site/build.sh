@@ -38,11 +38,13 @@ cp apple-touch-icon.png "$OUT/"
 cp android-chrome-192x192.png "$OUT/"
 cp android-chrome-512x512.png "$OUT/"
 cp site.webmanifest "$OUT/"
+cp -r plugins "$OUT/"
 
 # 2. Build Zola docs
 cd docs
 zola build -o "../_build/docs"
 cd ..
+node docs-highlight.mjs "$OUT/docs"
 
 # 3. Markdown mirrors + llms.txt / llms-full.txt for LLM consumption
 BASE_URL="https://maki.sh"
@@ -138,3 +140,8 @@ with open(out, "w", encoding="utf-8") as f:
 EOF
 
 cp "$OUT/llms.txt" "$OUT/llms-full.txt" "$OUT/docs/"
+
+# 5. Community plugin snapshot inlined into the page, so it paints without waiting on GitHub
+#    and still lists everything when GitHub rate limits the visitor (best effort)
+node plugins-snapshot.mjs "$OUT/plugins/index.html" \
+  || echo "warning: plugin snapshot failed, the page will only fetch live" >&2

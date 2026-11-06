@@ -1,8 +1,8 @@
 # Landing page design (`site/index.html`)
 
-Kin to the docs, not a clone. `docs/DESIGN.md` is the docs system; its banned list is docs-scoped.
+The landing, `/plugins/` and the docs are one site. `docs/DESIGN.md` covers the docs' reading furniture; its banned list is docs-scoped.
 
-- Shared: the mono face (same `/docs/fonts/` URL, so the cache carries over), the sienna/salmon accent, dark code panes and the `maki` syntax theme, the theme toggle and its `localStorage.theme` key.
+- Shared: the colour tokens, the nav bar, both faces (same `/docs/fonts/` URLs, so the cache carries over), dark code panes and their token colours (the docs highlight with `plugins/readme.js`), the theme toggle and its `localStorage.theme` key.
 - This page alone: a dusk sky behind the hero and closing section (moon, stars, clouds), warm paper and plum ink, 8-10px radii, no eyebrow labels.
 
 ## Type

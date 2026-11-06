@@ -41,6 +41,7 @@ const STOP_TOOL: &str = "task_stop";
 const MESSAGE_CALL_ID: &str = "toolu_message";
 const MESSAGE: &str = "the user added an IOC, check it too";
 const QUEUED: &str = "Message queued for find the answer.";
+const INTERRUPTED: &str = "Interrupted find the answer with the message.";
 const NOT_RUNNING: &str = "no running background subagent with id";
 const INTERRUPT_OPEN: &str = "<parent-interrupt>";
 const INIT: &str = include_str!("../../plugins/task/init.lua");
@@ -209,19 +210,19 @@ fn task_input() -> Value {
 }
 
 /// Sends {MESSAGE} to task {id} as a model call of chat {chat}.
-fn message(host: &Host, chat: MakiId, id: &str) -> (String, bool) {
+fn message(host: &Host, chat: MakiId, id: &str, interrupt: bool) -> (String, bool) {
     let (_run, run_token) = CancelToken::new();
     let (ctx, _events) = call_ctx(&host.reg, chat, &run_token, MESSAGE_CALL_ID);
     done_text(&exec(
         &host.reg,
         MESSAGE_TOOL,
-        json!({ "id": id, "message": MESSAGE }),
+        json!({ "id": id, "message": MESSAGE, "interrupt": interrupt }),
         &ctx,
     ))
 }
 
 fn assert_refused(host: &Host, chat: MakiId, id: &str) {
-    let (output, failed) = message(host, chat, id);
+    let (output, failed) = message(host, chat, id, false);
     assert!(failed && output.starts_with(NOT_RUNNING), "{output}");
 }
 
@@ -450,7 +451,10 @@ fn a_message_reaches_a_running_background_task_at_its_next_turn() {
     parked.wait_started();
     assert_eq!(parked.user_turns.recv().unwrap(), [PROMPT]);
 
-    assert_eq!(message(&host, chat.id, CALL_ID), (QUEUED.to_owned(), false));
+    assert_eq!(
+        message(&host, chat.id, CALL_ID, false),
+        (QUEUED.to_owned(), false)
+    );
     parked.release.send(()).unwrap();
     parked.wait_started();
     let [interrupt] = &parked.user_turns.recv().unwrap()[..] else {
@@ -465,8 +469,9 @@ fn a_message_reaches_a_running_background_task_at_its_next_turn() {
     assert_refused(&host, chat.id, CALL_ID);
 }
 
-/// A task still waiting for a slot has no session yet, so the message waits
-/// and the first request carries it just before the prompt.
+/// A task still waiting for a slot has opened its session but not prompted
+/// it, so the message waits and the first request carries it just before the
+/// prompt.
 #[test]
 fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
     let host = Host::task_with_slots(Arc::new(ToolRegistry::new()), 1);
@@ -483,7 +488,7 @@ fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
     assert!(exec(&host.reg, TASK_TOOL, task_input(), &second).backgrounded);
 
     assert_eq!(
-        message(&host, chat.id, SECOND_CALL_ID),
+        message(&host, chat.id, SECOND_CALL_ID, false),
         (QUEUED.to_owned(), false)
     );
     parked.release.send(()).unwrap();
@@ -492,6 +497,36 @@ fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
     let turns: Vec<_> = parked.user_turns.drain().collect();
     assert_eq!(turns, [vec![PROMPT], vec![MESSAGE, PROMPT]]);
     host.task_dones(&[CALL_ID, SECOND_CALL_ID]);
+}
+
+/// An interrupt does not wait for the turn to end: the parked reply is cut,
+/// and the same prompt goes on with the message.
+#[test]
+fn an_interrupt_cuts_a_background_tasks_turn_and_it_goes_on() {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let parked = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    ctx.provider = Arc::clone(&parked.provider);
+
+    assert!(exec(&host.reg, TASK_TOOL, task_input(), &ctx).backgrounded);
+    parked.wait_started();
+    assert_eq!(parked.user_turns.recv().unwrap(), [PROMPT]);
+
+    assert_eq!(
+        message(&host, chat.id, CALL_ID, true),
+        (INTERRUPTED.to_owned(), false)
+    );
+    parked.wait_started();
+    let turn = parked.user_turns.recv().unwrap();
+    let interrupt = turn.last().expect("the request closes on the interrupt");
+    assert!(
+        interrupt.starts_with(INTERRUPT_OPEN) && interrupt.contains(MESSAGE),
+        "{interrupt}"
+    );
+    parked.release.send(()).unwrap();
+    assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
 }
 
 /// A user stop does not wait for the task to end, and the message must not
@@ -536,7 +571,7 @@ fn a_message_is_refused_by_tasks_the_caller_cannot_reach() {
 }
 
 /// Ctrl+B still moves a blocking task with `allow_background` off, where
-/// `task_message` is not offered and nothing tracks the call for it.
+/// `task_message` is not offered.
 #[test]
 fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports() {
     let host = Host::task_with_opts(Arc::new(ToolRegistry::new()), false, DEFAULT_SLOTS);

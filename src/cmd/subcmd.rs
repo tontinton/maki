@@ -31,19 +31,20 @@ const PROVIDERS_TOML_DOCS: &str = "https://maki.sh/docs/providers/";
 const CONFIGURED: &str = "\x1b[32m✓\x1b[0m";
 const FROM_ENV: &str = "\x1b[33m~\x1b[0m";
 const UNCONFIGURED: &str = " ";
+const CUSTOM_PROVIDER_LABEL: &str = "Custom provider...";
 const PLAN_PREVIEW_PATH: &str = "plan.md";
 
 pub async fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
-        Some("openai") => openai_auth::login(storage)?,
-        Some("xai") => xai_auth::login(storage)?,
+        Some("openai") => openai_auth::login(storage).await?,
+        Some("xai") => xai_auth::login(storage).await?,
         Some("copilot") => copilot_auth::login(storage)?,
         Some(slug) => {
             let slug = slugify(slug);
             if builtin_provider(&slug).is_none()
                 && !plugin::is_registered(&slug)
                 && ProvidersConfig::load().get(&slug).is_none()
-                && let Some(provider_data) = maki_providers::catalog_provider(&slug)
+                && let Some(provider_data) = maki_providers::catalog_provider(&slug).await
             {
                 login_catalog_provider(&provider_data, storage)?;
             } else {
@@ -79,7 +80,9 @@ async fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     // Past the check above, an `Unknown` owner is a `providers.toml` entry with
     // no `protocol`. Login would say "Configured" and it would never work,
     // unless the slug is a models.dev provider, which brings its own protocol.
-    if matches!(Owner::of(slug), Owner::Unknown) && known_outside_catalog(slug, &catalog_slugs()) {
+    if matches!(Owner::of(slug), Owner::Unknown)
+        && known_outside_catalog(slug, &catalog_slugs().await)
+    {
         bail!(
             "providers.toml entry [{slug}] has no `protocol` and is not a models.dev provider, so maki cannot talk to it\n\
              add `protocol` ({PROTOCOL_CHOICES}) and `base_url`, or run `maki auth login` and pick \"Custom provider...\"\n\n\
@@ -161,8 +164,9 @@ async fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-fn catalog_slugs() -> Vec<String> {
+async fn catalog_slugs() -> Vec<String> {
     catalog_providers()
+        .await
         .into_iter()
         .map(|provider| provider.slug)
         .collect()
@@ -175,11 +179,43 @@ fn known_outside_catalog(slug: &str, catalog_slugs: &[String]) -> bool {
     !catalog_slugs.is_empty() && !catalog_slugs.iter().any(|known| known == slug)
 }
 
+/// One line of the `maki auth login` picker.
+struct LoginRow {
+    status: &'static str,
+    label: String,
+    target: LoginTarget,
+}
+
+/// What picking a [`LoginRow`] starts.
+enum LoginTarget {
+    Provider(String),
+    /// A models.dev provider, which logs in through its catalog entry.
+    Catalog(Box<ProviderData>),
+    Custom,
+}
+
+impl LoginRow {
+    fn new(status: &'static str, slug: &str, display_name: &str, target: LoginTarget) -> Self {
+        Self {
+            status,
+            label: format!("{slug:<14} {display_name}"),
+            target,
+        }
+    }
+
+    fn provider(status: &'static str, slug: &str, display_name: &str) -> Self {
+        Self::new(
+            status,
+            slug,
+            display_name,
+            LoginTarget::Provider(slug.to_owned()),
+        )
+    }
+}
+
 async fn login_interactive(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
-    // Status, slug, display name, and the models.dev entry a catalog row logs
-    // in through.
-    let mut rows: Vec<(&str, String, String, Option<ProviderData>)> = Vec::new();
+    let mut rows: Vec<LoginRow> = Vec::new();
 
     let saved = |slug: &str| load_provider_credentials(storage, slug).is_some();
     let mark = |configured: bool| if configured { CONFIGURED } else { UNCONFIGURED };
@@ -194,50 +230,55 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         } else {
             UNCONFIGURED
         };
-        rows.push((status, b.slug.to_owned(), b.display_name.to_owned(), None));
+        rows.push(LoginRow::provider(status, b.slug, b.display_name));
     }
     for (slug, display) in hooked_login_providers() {
         let status = mark(load_plugin_auth(storage, &slug).is_some());
-        rows.push((status, slug, display, None));
+        rows.push(LoginRow::provider(status, &slug, &display));
     }
     let custom = config.providers.iter().filter(|(slug, _)| {
         builtin_provider(slug).is_none() && !plugin::is_registered(slug) && *slug != "opencode"
     });
     for (slug, def) in custom {
-        let display = def.display_name.clone().unwrap_or_else(|| slug.clone());
-        rows.push((mark(saved(slug)), slug.clone(), display, None));
+        let display = def.display_name.as_deref().unwrap_or(slug);
+        rows.push(LoginRow::provider(mark(saved(slug)), slug, display));
     }
-    for cat in catalog_providers() {
-        let (slug, display) = (cat.slug.clone(), cat.display_name.clone());
-        rows.push((mark(saved(&slug)), slug, display, Some(cat)));
+    for provider in catalog_providers().await {
+        let (slug, display) = (provider.slug.clone(), provider.display_name.clone());
+        rows.push(LoginRow::new(
+            mark(saved(&slug)),
+            &slug,
+            &display,
+            LoginTarget::Catalog(Box::new(provider)),
+        ));
     }
+    rows.push(LoginRow {
+        status: UNCONFIGURED,
+        label: CUSTOM_PROVIDER_LABEL.to_owned(),
+        target: LoginTarget::Custom,
+    });
 
     println!();
     println!("  Available providers:");
     println!();
-    for (i, (status, slug, display, _)) in rows.iter().enumerate() {
-        println!("  {} {}. {:<14} {}", status, i + 1, slug, display);
+    for (i, row) in rows.iter().enumerate() {
+        println!("  {} {}. {}", row.status, i + 1, row.label);
     }
-    let custom_idx = rows.len() + 1;
-    println!("    {}. Custom provider...", custom_idx);
     println!();
 
-    print!("  Select [1-{}]: ", custom_idx);
+    print!("  Select [1-{}]: ", rows.len());
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let choice: usize = input.trim().parse().context("enter a number")?;
 
-    if choice == custom_idx {
-        return login_custom(storage);
-    }
-    let Some((_, slug, _, catalog)) = choice.checked_sub(1).and_then(|i| rows.into_iter().nth(i))
-    else {
+    let Some(row) = choice.checked_sub(1).and_then(|i| rows.into_iter().nth(i)) else {
         bail!("invalid selection");
     };
-    match catalog {
-        Some(provider) => login_catalog_provider(&provider, storage),
-        None => login_provider(&slug, storage).await,
+    match row.target {
+        LoginTarget::Provider(slug) => login_provider(&slug, storage).await,
+        LoginTarget::Catalog(provider) => login_catalog_provider(&provider, storage),
+        LoginTarget::Custom => login_custom(storage),
     }
 }
 
@@ -482,7 +523,7 @@ pub async fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn auth_status(storage: &StateDir) -> Result<()> {
+pub async fn auth_status(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
     let builtins = all_builtins();
 
@@ -569,7 +610,7 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
         }
     }
     // Catalog providers from models.dev
-    let catalog_entries = catalog_providers();
+    let catalog_entries = catalog_providers().await;
     if !catalog_entries.is_empty() {
         println!("  \x1b[1mCatalog Providers (models.dev):\x1b[0m");
         for entry in &catalog_entries {
@@ -609,7 +650,7 @@ pub async fn models(
 
     let mut refresh_failure = None;
     if refresh {
-        match maki_providers::refresh_catalog() {
+        match maki_providers::refresh_catalog().await {
             Ok(()) => eprintln!("models.dev catalog has been refreshed"),
             Err(e) => refresh_failure = Some(e),
         }
@@ -769,7 +810,9 @@ pub async fn prompt(
                 .default_model
                 .as_deref()
                 .unwrap_or("anthropic/claude-sonnet-4-20250514");
-            let model = Model::from_spec(model_spec).context("invalid default model")?;
+            let model = Model::from_spec_or_warm_catalog(model_spec)
+                .await
+                .context("invalid default model")?;
             let prompt = build_system_prompt(&vars, &instructions, &slots, &model);
             // Plan mode reaches the model as a context update after the
             // prompt, so this shows that message too.

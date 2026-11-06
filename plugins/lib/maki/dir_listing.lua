@@ -4,7 +4,7 @@
 
 local ToolView = require("maki.tool_view")
 
-local DEFAULT_MAX_LINES = 10
+local DEFAULT_MAX_LINES = 0
 
 local M = {}
 

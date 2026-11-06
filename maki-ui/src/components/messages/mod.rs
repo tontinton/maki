@@ -15,11 +15,12 @@ use super::tool_display::{
     MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info,
     assistant_style, build_instructions_lines, build_tool_lines, done_style, error_style,
     format_timestamp_now, gutter_marker, hint_columns, instructions_search_text, notice_style,
-    outcome_glyph, search_text_for, thinking_style, truncate_to_header, user_style,
+    outcome_glyph, replace_header, search_text_for, thinking_style, truncate_to_header,
+    user_style,
 };
 use super::{
-    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole,
-    ToolStatus, code_view::SectionFlags,
+    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER,
+    NoticeDetail, ToolRole, ToolStatus, code_view::SectionFlags,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -64,6 +65,7 @@ const CLICKABLE: bool = true;
 const NOTICE_COLLAPSED_MARK: &str = " ▸";
 const NOTICE_EXPANDED_MARK: &str = " ▾";
 const NOTICE_DETAIL_INDENT: &str = "  ";
+const NOTICE_DETAIL_DIM: f32 = 0.3;
 
 /// What a click in the transcript asks of the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +106,8 @@ pub struct MessagesPanel {
     expanded_tools: HashMap<String, SectionFlags>,
     /// Per-tool log of post-completion click rows, replayed on restore.
     lua_clicks: HashMap<String, Vec<usize>>,
+    /// Bufs of rows that stream, kept apart from `watched_bufs` by
+    /// [`Self::sync_buf`] alone.
     live_bufs: HashMap<String, BufWatch>,
     /// Bufs of finished tools we keep polling so runtime-side warm
     /// clicks stay visible. Purely local: every finished-tool click
@@ -319,25 +323,24 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        let had_live_buf = self.retire_live_buf(&event.id);
-        let Some(msg) = self
-            .messages
-            .iter_mut()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == event.id))
-        else {
+        if let Some(msg) = self.find_tool_msg_mut(&event.id) {
+            if let DisplayRole::Tool(t) = &mut msg.role {
+                t.status = if event.is_error {
+                    ToolStatus::Error
+                } else {
+                    ToolStatus::Success
+                };
+            }
+            msg.movable = false;
+            if event.backgrounded && msg.background.is_none() {
+                msg.background = Some(BackgroundBadge::moved(&event));
+            }
+        }
+        let had_buf = self.sync_buf(&event.id);
+        let max_output_lines = self.tool_output_lines.get(&event.tool);
+        let Some(msg) = self.find_tool_msg_mut(&event.id) else {
             return;
         };
-        if let DisplayRole::Tool(t) = &mut msg.role {
-            t.status = if event.is_error {
-                ToolStatus::Error
-            } else {
-                ToolStatus::Success
-            };
-        }
-        msg.movable = false;
-        if event.backgrounded && msg.background.is_none() {
-            msg.background = Some(BackgroundBadge::moved(&event));
-        }
         truncate_to_header(&mut msg.text);
         let done_annotation = event
             .annotation
@@ -352,7 +355,7 @@ impl MessagesPanel {
             ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
                 if msg.render_snapshot.is_none() =>
             {
-                if had_live_buf && !event.backgrounded {
+                if had_buf && !event.backgrounded {
                     // The plugin streamed a body buf but no snapshot ever
                     // landed: this is the raw llm_output glitch users report.
                     warn!(
@@ -362,7 +365,7 @@ impl MessagesPanel {
                         "live buf had no snapshot at tool_done; falling back to llm_output"
                     );
                 }
-                let tr = truncate_output(&text.text, self.tool_output_lines.get(&event.tool));
+                let tr = truncate_output(&text.text, max_output_lines);
                 msg.truncated_lines = tr.skipped;
                 if !tr.kept.is_empty() {
                     msg.text = format!("{}\n{}", msg.text, tr.kept);
@@ -380,12 +383,12 @@ impl MessagesPanel {
 
     /// Ends a row that no `ToolDone` will reach.
     pub fn settle_tool(&mut self, tool_id: &str, status: ToolStatus) {
-        self.retire_live_buf(tool_id);
         self.update_tool(tool_id, |msg| {
             if let DisplayRole::Tool(tool) = &mut msg.role {
                 tool.status = status;
             }
         });
+        self.sync_buf(tool_id);
     }
 
     pub fn set_tool_movable(&mut self, tool_id: &str, movable: bool) {
@@ -394,6 +397,7 @@ impl MessagesPanel {
 
     pub fn set_tool_background(&mut self, tool_id: &str, badge: BackgroundBadge) {
         self.update_tool(tool_id, |msg| msg.background = Some(badge));
+        self.sync_buf(tool_id);
     }
 
     pub fn set_background_outcome(&mut self, tool_id: &str, outcome: BackgroundOutcome) {
@@ -402,6 +406,7 @@ impl MessagesPanel {
                 badge.outcome = Some(outcome);
             }
         });
+        self.sync_buf(tool_id);
     }
 
     pub fn has_background_badge(&self, tool_id: &str) -> bool {
@@ -419,6 +424,13 @@ impl MessagesPanel {
     /// A copy of the tool's row, for a task tab that shows the same call.
     pub fn tool_message(&self, tool_id: &str) -> Option<DisplayMessage> {
         self.find_tool_msg(tool_id).cloned()
+    }
+
+    pub fn tool_name(&self, tool_id: &str) -> Option<Arc<str>> {
+        match &self.find_tool_msg(tool_id)?.role {
+            DisplayRole::Tool(tool) => Some(Arc::clone(&tool.name)),
+            _ => None,
+        }
     }
 
     /// The buf a running tool streams into, live or still watched.
@@ -439,6 +451,10 @@ impl MessagesPanel {
 
     pub fn annotate_tool(&mut self, tool_id: &str, note: &str) {
         self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, note));
+    }
+
+    pub fn has_tool(&self, tool_id: &str) -> bool {
+        self.find_tool_msg(tool_id).is_some()
     }
 
     pub fn tool_snapshot(
@@ -570,9 +586,8 @@ impl MessagesPanel {
 
         for id in &affected_ids {
             // The stale-run_id filter drops these tools' ToolDone events,
-            // so retire their live bufs here: keeps them clickable via
-            // the warm path and stops them being polled forever.
-            self.retire_live_buf(id);
+            // so their bufs settle here.
+            self.sync_buf(id);
             self.rebuild_tool_segment(id);
         }
     }
@@ -620,6 +635,10 @@ impl MessagesPanel {
     #[cfg(test)]
     pub fn message_at(&self, index: usize) -> Option<&DisplayMessage> {
         self.messages.get(index)
+    }
+
+    pub fn has_user_message(&self) -> bool {
+        self.messages.iter().any(|m| m.role == DisplayRole::User)
     }
 
     pub fn last_message_text(&self) -> &str {
@@ -815,7 +834,7 @@ impl MessagesPanel {
             return self.try_toggle_cached_thinking(pos.seg, width)
                 || self.try_toggle_cached_notice(pos.seg, width);
         };
-        // A moved row draws only its header, so there is nothing to unfold.
+        // A moved row unfolds in its task's tab, not here.
         if self
             .find_tool_msg(tool_id)
             .is_some_and(|msg| msg.background.is_some())
@@ -1246,23 +1265,33 @@ impl MessagesPanel {
         self.watched_bufs.retain(|(id, _)| id != tool_id);
     }
 
-    /// Moves a finished tool's live buf to the watched set, flushing any
-    /// last dirty lines. Called on completion and on cancellation, so
-    /// `live_bufs` never leaks entries that outlive their tool, and the capped
-    /// watched set keeps what `tick` polls bounded.
-    /// Returns whether a live buf existed for this id.
-    fn retire_live_buf(&mut self, id: &str) -> bool {
-        let Some(mut watch) = self.live_bufs.remove(id) else {
+    /// Files {id}'s buf by what its row is now, after flushing its last
+    /// lines: in `live_bufs` while the row [streams](DisplayMessage::streams),
+    /// else last in the capped watched set. Whatever changes whether a row
+    /// streams calls this, so a buf is live exactly while its call writes
+    /// to it: none outlives its call, and no cap evicts one still in use.
+    /// Returns whether {id} had a buf.
+    fn sync_buf(&mut self, id: &str) -> bool {
+        let watch = self.live_bufs.remove(id).or_else(|| {
+            let pos = self
+                .watched_bufs
+                .iter()
+                .position(|(watched, _)| watched == id)?;
+            self.watched_bufs.remove(pos).map(|(_, watch)| watch)
+        });
+        let Some(mut watch) = watch else {
             return false;
         };
         if let Some(snapshot) = watch.changed() {
             self.store_snapshot(id, snapshot, false, None);
         }
-        // A part's tab registers the same buf again on every report.
-        self.watched_bufs.retain(|(watched, _)| watched != id);
-        self.watched_bufs.push_back((id.to_owned(), watch));
-        if self.watched_bufs.len() > WARM_TOOL_CAP {
-            self.watched_bufs.pop_front();
+        if self.find_tool_msg(id).is_some_and(DisplayMessage::streams) {
+            self.live_bufs.insert(id.to_owned(), watch);
+        } else {
+            self.watched_bufs.push_back((id.to_owned(), watch));
+            if self.watched_bufs.len() > WARM_TOOL_CAP {
+                self.watched_bufs.pop_front();
+            }
         }
         true
     }
@@ -1367,9 +1396,10 @@ impl MessagesPanel {
         };
         if let Some(msg) = self.find_tool_msg_mut(tool_id) {
             if is_header {
-                msg.text = snapshot.first_line_text();
+                replace_header(&mut msg.text, &snapshot.first_line_text());
                 msg.render_header = Some(snapshot);
             } else {
+                truncate_to_header(&mut msg.text);
                 msg.render_snapshot = Some(snapshot);
             }
             msg.snapshot_theme_gen = applied_gen;
@@ -1402,14 +1432,15 @@ impl MessagesPanel {
         }
     }
 
+    /// A buf that comes before its row stays live until the row settles it,
+    /// see [`Self::sync_buf`]. A part's tab registers the same buf again on
+    /// every report.
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
-        let mut watch = BufWatch::new(body);
-        if self.find_tool_msg(&id).is_some()
-            && let Some(snapshot) = watch.changed()
-        {
-            self.store_snapshot(&id, snapshot, false, None);
+        self.stop_watching(&id);
+        self.live_bufs.insert(id.clone(), BufWatch::new(body));
+        if self.find_tool_msg(&id).is_some() {
+            self.sync_buf(&id);
         }
-        self.live_bufs.insert(id, watch);
     }
 
     /// Snapshots are baked at the last width `view` saw, and a resize
@@ -1808,7 +1839,7 @@ fn message_view(msg: &DisplayMessage, mode: ThinkingLines, width: u16) -> Messag
     if matches!(msg.role, DisplayRole::Notice)
         && let Some(detail) = &msg.detail
     {
-        push_notice_detail(&mut lines, detail, msg.detail_expanded);
+        push_notice_detail(&mut lines, detail, msg.detail_expanded, body);
     }
     MessageView {
         lines,
@@ -1817,23 +1848,48 @@ fn message_view(msg: &DisplayMessage, mode: ThinkingLines, width: u16) -> Messag
     }
 }
 
-fn push_notice_detail(lines: &mut Vec<Line<'static>>, detail: &str, expanded: bool) {
-    let style = notice_style().text_style;
+fn push_notice_detail(
+    lines: &mut Vec<Line<'static>>,
+    detail: &NoticeDetail,
+    expanded: bool,
+    width: u16,
+) {
     let mark = if expanded {
         NOTICE_EXPANDED_MARK
     } else {
         NOTICE_COLLAPSED_MARK
     };
     if let Some(last) = lines.last_mut() {
-        last.spans.push(Span::styled(mark, style));
+        last.spans
+            .push(Span::styled(mark, notice_style().text_style));
     }
     if expanded {
-        lines.extend(
-            detail.lines().map(|line| {
-                Line::from(Span::styled(format!("{NOTICE_DETAIL_INDENT}{line}"), style))
-            }),
-        );
+        lines.extend(notice_detail_lines(detail, width));
     }
+}
+
+/// Fading every span, highlights too, keeps the output quieter than the
+/// conversation while it stays easy to read.
+fn notice_detail_lines(detail: &NoticeDetail, width: u16) -> impl Iterator<Item = Line<'static>> {
+    let text_style = theme::current().assistant;
+    let lines = if detail.markdown {
+        let body_width = width.saturating_sub(NOTICE_DETAIL_INDENT.len() as u16);
+        text_to_lines(&detail.text, "", text_style, text_style, body_width, None)
+    } else {
+        plain_lines(
+            detail.text.trim_end_matches('\n'),
+            "",
+            text_style,
+            text_style,
+        )
+    };
+    lines.into_iter().map(|mut line| {
+        for span in &mut line.spans {
+            span.style = theme::dim_style(span.style, NOTICE_DETAIL_DIM);
+        }
+        line.spans.insert(0, Span::raw(NOTICE_DETAIL_INDENT));
+        line
+    })
 }
 
 /// Builds ratatui lines for a non-Tool message shown in full at the given

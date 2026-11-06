@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flume::TryRecvError;
-use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry, ToolSource};
+use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry};
 use maki_agent::{AgentEvent, PartStatus, ToolDoneEvent, ToolPart};
 use maki_lua::MoveOutcome;
 use maki_storage::id::MakiId;
@@ -126,8 +126,9 @@ impl From<TaskOutcome> for TaskStatus {
     }
 }
 
-/// When a task started, or moved to the background, and when it ended. A
-/// task loaded from disk has none: the session file keeps neither.
+/// When a task started, or moved to the background, and when it ended. The
+/// session file keeps both as Unix seconds, so a reloaded task still says
+/// how long it ran; one written before that was recorded has no clock.
 pub(crate) struct TaskClock {
     started: SystemTime,
     ended: Option<SystemTime>,
@@ -136,6 +137,22 @@ pub(crate) struct TaskClock {
 impl TaskClock {
     pub(crate) fn start() -> Self {
         Self::started_ago(Duration::ZERO)
+    }
+
+    pub(crate) fn from_unix(started_at: Option<u64>, ended_at: Option<u64>) -> Option<Self> {
+        let at = |secs| UNIX_EPOCH + Duration::from_secs(secs);
+        Some(Self {
+            started: at(started_at?),
+            ended: ended_at.map(at),
+        })
+    }
+
+    pub(crate) fn started_at(&self) -> Option<u64> {
+        unix_secs(self.started)
+    }
+
+    pub(crate) fn ended_at(&self) -> Option<u64> {
+        self.ended.and_then(unix_secs)
     }
 
     /// A moved call's task counts from the call's start, as the call's own
@@ -192,12 +209,20 @@ pub(crate) struct TaskInfo {
     status: Option<TaskStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plugin: Option<Arc<str>>,
+    /// The tool whose call the task runs: `task` for a subagent, moved or
+    /// not, `bash` for a moved command. A session a plugin opened on its own
+    /// has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<Arc<str>>,
     /// See [`Chat::parent`].
     #[serde(skip_serializing_if = "Option::is_none")]
     parent: Option<Arc<str>>,
     /// A [`TaskParent::Part`], whose stop is its parent's.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     part: bool,
+    /// See [`App::is_wrapper`].
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    wrapper: bool,
     focused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at: Option<u64>,
@@ -297,10 +322,9 @@ fn part_task_id(call: &str, part: &str) -> String {
 /// The plugin that registered {tool}, or the tool itself for one no plugin
 /// owns, so the task still has an owner to show.
 fn tool_owner(tool: &Arc<str>) -> Arc<str> {
-    match ToolRegistry::global().get(tool).map(|entry| entry.source) {
-        Some(ToolSource::Lua { plugin }) => plugin,
-        _ => Arc::clone(tool),
-    }
+    ToolRegistry::global()
+        .get(tool)
+        .map_or_else(|| Arc::clone(tool), |entry| entry.source.plugin)
 }
 
 impl App {
@@ -360,9 +384,9 @@ impl App {
 
     /// A moved call keeps streaming into the buf its row was drawing. So its
     /// task tab starts as a copy of that row, holding the same buf: nothing
-    /// is replayed and nothing is lost. This runs before the row in {origin}
-    /// takes the receipt, because the receipt retires the buf there. A `task`
-    /// call already has a tab, its subagent's, and that tab is adopted.
+    /// is replayed and nothing is lost. The row in {origin} keeps drawing the
+    /// buf's head until its badge gets an outcome. A `task` call already has
+    /// a tab, its subagent's, and that tab is adopted.
     pub(super) fn open_background_call(&mut self, origin: usize, done: &ToolDoneEvent) {
         let mut outcome = None;
         if let Ok(idx) = self.chat_of_task(&done.id) {
@@ -600,14 +624,32 @@ impl App {
         self.chats[idx].plugin.clone()
     }
 
-    /// What `/tasks` counts in its hint: the tasks quitting or a rewind would
-    /// end, as opposed to the tool tasks a turn owns.
+    /// The tasks quitting, `/new` or a rewind would end, as opposed to the
+    /// tool tasks a turn owns. Counted the way `/tasks` lists them.
     pub(crate) fn running_background_tasks(&self) -> impl Iterator<Item = &Chat> {
         self.chats.iter().filter(|chat| {
             chat.plugin.is_some()
-                && chat.parent.is_none()
                 && chat.task_status() == TaskStatus::Working
+                && !self.is_wrapper(chat)
         })
+    }
+
+    /// One rule decides what `/tasks` lists and what every count counts, so
+    /// they never disagree. A call that runs other tasks, like a moved batch,
+    /// is shown through them, since each one reports to the model on its own.
+    /// It counts as itself again when it still works but none of them does,
+    /// like right before its final reply, so no count misses running work.
+    fn is_wrapper(&self, chat: &Chat) -> bool {
+        let Some(id) = chat.task_id() else {
+            return false;
+        };
+        let working = |task: &Chat| task.task_status() == TaskStatus::Working;
+        let mut children = self
+            .chats
+            .iter()
+            .filter(|child| child.parent.as_ref().map(TaskParent::call) == Some(id))
+            .peekable();
+        children.peek().is_some() && (!working(chat) || children.any(working))
     }
 
     /// Subagent chats only, in chat order.
@@ -634,18 +676,15 @@ impl App {
                 name: chat.name.clone(),
                 status: chat.task_id().map(|_| chat.task_status()),
                 plugin: chat.plugin.clone(),
+                tool: chat
+                    .task_id()
+                    .and_then(|id| self.chats[MAIN_CHAT].tool_name(id)),
                 parent: chat.parent.as_ref().map(TaskParent::call).cloned(),
                 part: chat.part_of().is_some(),
+                wrapper: self.is_wrapper(chat),
                 focused: idx == self.active_chat,
-                started_at: chat
-                    .clock
-                    .as_ref()
-                    .and_then(|clock| unix_secs(clock.started)),
-                ended_at: chat
-                    .clock
-                    .as_ref()
-                    .and_then(|clock| clock.ended)
-                    .and_then(unix_secs),
+                started_at: chat.clock.as_ref().and_then(TaskClock::started_at),
+                ended_at: chat.clock.as_ref().and_then(TaskClock::ended_at),
                 cost: chat.task_id().and(chat.cost),
             })
             .collect()
@@ -872,7 +911,7 @@ mod tests {
         STARTED_AT_KEY, agent_msg, app_with_moved_call, app_with_plugin_task,
         app_with_subagent_call, app_with_subagent_id, cancel_app, close_subagent_transcript, done,
         end_turn, error_app, finish_subagent, moved_done, moved_subagent_event, plugin_event,
-        start_subagent, streaming_app, subagent_info, test_app, tool_start,
+        reload, start_subagent, streaming_app, subagent_info, test_app, tool_start,
     };
     use crate::chat::{DONE_TEXT, ERROR_TEXT};
     use crate::components::Overlay;
@@ -1044,16 +1083,25 @@ mod tests {
     }
 
     /// A moved call may run for hours, and its tab keeps the spinner of the
-    /// row it copied. Only the tab on screen may claim that motion, or an
-    /// idle session paints at spinner rate for as long as the task lives.
+    /// row it copied. Only the tab on screen may claim that motion.
     #[test]
     fn a_background_task_spins_only_while_its_tab_is_on_screen() {
         let (mut app, _buf) = app_with_moved_call();
         end_turn(&mut app);
-        assert_eq!(app.cadence(), Cadence::IDLE);
+        assert_eq!(app.chats[app.active_chat].cadence(), Cadence::IDLE);
 
         app.focus_task(MOVED_ID).unwrap();
+        assert_eq!(app.chats[app.active_chat].cadence(), Cadence::SPINNER);
+    }
+
+    #[test]
+    fn the_status_bar_spins_while_a_background_task_runs() {
+        let (mut app, _buf) = app_with_moved_call();
+        end_turn(&mut app);
         assert_eq!(app.cadence(), Cadence::SPINNER);
+
+        app.end_task(MOVED_ID, BackgroundOutcome::Done);
+        assert_eq!(app.cadence(), Cadence::IDLE);
     }
 
     /// A reply wakes nothing, so the loop keeps looking without painting
@@ -1062,6 +1110,7 @@ mod tests {
     fn a_pending_move_is_looked_for_until_it_answers() {
         let (mut app, _buf) = app_with_moved_call();
         end_turn(&mut app);
+        app.end_task(MOVED_ID, BackgroundOutcome::Done);
         let (reply, answer) = flume::bounded(1);
         app.background_moves.pending = vec![answer];
         assert_eq!(app.cadence(), Cadence::PENDING);
@@ -1172,6 +1221,38 @@ mod tests {
         }));
     }
 
+    /// The quit flash counts what `/tasks` lists: a moved batch is its
+    /// running children, and itself once none of them runs.
+    #[test_case(&[PartStatus::Working, PartStatus::Working], 2 ; "every_running_part")]
+    #[test_case(&[PartStatus::Working, PartStatus::Done], 1 ; "only_running_parts")]
+    #[test_case(&[PartStatus::Done, PartStatus::Done], 1 ; "the_call_once_no_part_runs")]
+    fn a_moved_call_counts_as_its_running_parts(statuses: &[PartStatus], expected: usize) {
+        let (mut app, _) = app_with_moved_call();
+        let parts = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, &status)| ToolPart {
+                id: i.to_string(),
+                name: PART_NAME.into(),
+                tool: SUB_TOOL.into(),
+                status,
+                body: None,
+            })
+            .collect();
+        app.update(agent_msg(AgentEvent::ToolParts {
+            id: MOVED_ID.into(),
+            parts,
+        }));
+
+        assert_eq!(app.running_background_tasks().count(), expected);
+        let listed = app
+            .tasks()
+            .into_iter()
+            .filter(|task| task.status == Some(TaskStatus::Working) && !task.wrapper)
+            .count();
+        assert_eq!(listed, expected, "/tasks lists what the flash counts");
+    }
+
     fn app_with_working_part() -> (App, Arc<SharedBuf>, String) {
         let (mut app, _) = app_with_moved_call();
         let body = Arc::new(SharedBuf::new());
@@ -1197,11 +1278,6 @@ mod tests {
         assert!(
             tab.live_buf(&part)
                 .is_some_and(|shared| Arc::ptr_eq(&shared, &body))
-        );
-        assert_eq!(
-            app.running_background_tasks().count(),
-            1,
-            "a part is counted with its call"
         );
         let listed = app.tasks().into_iter().find(|task| *task.id == *part);
         assert!(listed.as_ref().is_some_and(|task| task.part));
@@ -1430,8 +1506,7 @@ mod tests {
         // so both have to close before the session is written.
         close_subagent_transcript(&mut app, OTHER_ID);
         close_subagent_transcript(&mut app, TASK_ID);
-        app.reset_ui_chrome();
-        app.restore_display();
+        reload(&mut app);
         app
     }
 
@@ -1522,14 +1597,14 @@ mod tests {
         start_subagent(&mut app, OTHER_ID, BUILD_NAME);
         close_subagent_transcript(&mut app, OTHER_ID);
 
-        app.reset_ui_chrome();
-        app.restore_display();
+        reload(&mut app);
 
         let restored: Vec<_> = app
             .task_states()
             .map(|task| (task.id.to_string(), task.status))
             .collect();
         assert_eq!(restored, vec![(OTHER_ID.to_owned(), TaskStatus::Done)]);
+        app.checkpoint();
         let recorded: Vec<_> = app
             .state
             .session
@@ -1679,6 +1754,7 @@ mod tests {
         assert!(app.state.session.subagent_messages().contains_key(TASK_ID));
 
         app.remove_task(TASK_ID).unwrap();
+        app.checkpoint();
 
         let listed: Vec<_> = app.task_states().map(|task| task.id.to_string()).collect();
         assert_eq!(listed, [OTHER_ID]);

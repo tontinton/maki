@@ -16,7 +16,7 @@ use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 use tokio::task::spawn_blocking;
 
 use crate::agent_autocmd::HostEvent;
-use crate::api::util::convert::TableExt;
+use crate::api::util::convert::{TableExt, bytes_arg};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::loader::EventHandle;
 use crate::plugin_permissions::PluginPermissions;
@@ -790,13 +790,14 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 /// or overwriting it if it does.
 ///
 /// @param path string Destination file path. `~/` is expanded.
-/// @param content string Text to write.
+/// @param content string|buffer Bytes to write.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
 /// local ok, err = maki.fs.write("out.txt", "hello world")
 /// if err then print("write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+    let content = bytes_arg(&content, "fs.write")?;
     let abs = try_pair!(make_absolute(&path));
     let result = tokio::fs::write(&abs, content).await;
     Ok(pair(touched(abs, result).await.map(|()| true)))
@@ -806,13 +807,14 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
 /// directory) if it does not exist.
 ///
 /// @param path string Destination file path. `~/` is expanded.
-/// @param content string Text to append.
+/// @param content string|buffer Bytes to append.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
 /// local ok, err = maki.fs.append("out.log", "line\n")
 /// if err then print("append failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn append(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+    let content = bytes_arg(&content, "fs.append")?;
     let abs = try_pair!(make_absolute(&path));
     let appended = abs.clone();
     let result = spawn_blocking(move || {
@@ -821,7 +823,7 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
             .create(true)
             .append(true)
             .open(&abs)
-            .and_then(|mut f| f.write_all(content.as_bytes()))
+            .and_then(|mut f| f.write_all(&content))
     })
     .await
     .map_err(mlua::Error::external)?;
@@ -833,16 +835,17 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
 /// Existing file permissions are preserved. On Unix, new files use mode 0600.
 ///
 /// @param path string Destination file path. `~/` is expanded.
-/// @param content string Text to write.
+/// @param content string|buffer Bytes to write.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
 /// local ok, err = maki.fs.atomic_write("state.json", encoded)
 /// if err then print("atomic write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn atomic_write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+    let content = bytes_arg(&content, "fs.atomic_write")?;
     let abs = try_pair!(make_absolute(&path));
     let written = abs.clone();
-    let result = spawn_blocking(move || maki_storage::atomic_write(&abs, content.as_bytes()))
+    let result = spawn_blocking(move || maki_storage::atomic_write(&abs, &content))
         .await
         .map_err(mlua::Error::external)?;
     Ok(pair(touched(written, result).await.map(|()| true)))
@@ -1484,6 +1487,7 @@ mod tests {
     #[cfg(unix)]
     use std::io::Write;
     use std::io::repeat;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant, SystemTime};
 
     use super::*;
@@ -1492,8 +1496,10 @@ mod tests {
     use mlua::Lua;
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::runtime::Builder;
 
     const FIRST_CONTENT: &str = "first";
+    const BINARY_CONTENT: &[u8] = b"\0\xff\x80\r\n";
     const REPLACEMENT_CONTENT: &str = "replacement";
     const FS_WRITE_PERMISSION: &str = "fs_write";
     const READ_LIMIT_ERROR: &str = "file exceeds the 67108864-byte read limit";
@@ -2173,6 +2179,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+    }
+
+    #[test_case("write" ; "write")]
+    #[test_case("append" ; "append")]
+    #[test_case("atomic_write" ; "atomic_write")]
+    #[tokio::test]
+    async fn file_writes_preserve_binary_content(method: &str) {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("bytes.bin");
+        std::fs::write(&file, FIRST_CONTENT).unwrap();
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let write: mlua::Function = table.get(method).unwrap();
+        let content = lua.create_buffer(BINARY_CONTENT).unwrap();
+        let (ok, error): (bool, Option<String>) = write
+            .call_async((file.to_str().unwrap(), content))
+            .await
+            .unwrap();
+        assert!(ok);
+        assert_eq!(error, None);
+        let expected = if method == "append" {
+            [FIRST_CONTENT.as_bytes(), BINARY_CONTENT].concat()
+        } else {
+            BINARY_CONTENT.to_vec()
+        };
+        assert_eq!(std::fs::read(&file).unwrap(), expected);
     }
 
     #[tokio::test]
@@ -3233,8 +3266,8 @@ mod tests {
     /// The flag can land while the blocking task is already on its way back,
     /// so an answer that was built before the cancel still must not be
     /// published, and nothing it learned on the way may be kept either.
-    #[tokio::test]
-    async fn a_query_superseded_mid_flight_publishes_nothing() {
+    #[test]
+    fn a_query_superseded_mid_flight_publishes_nothing() {
         let base = cwd_root().unwrap();
         let tmp = file_tree(&base);
         walked(tmp.path());
@@ -3246,23 +3279,34 @@ mod tests {
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
         let f: mlua::Function = tbl.get("fuzzy_files").unwrap();
 
-        let (found, err): (Option<Table>, Option<String>) = async {
-            let mut call = Box::pin(f.call_async::<(Option<Table>, Option<String>)>(opts));
-            // One poll runs the call up to its first await, which is where it
-            // has taken its flag and handed the ranking to a blocking task.
-            // Superseding it now is the flag landing while the answer it is
-            // about to return is already built.
-            assert!(
-                (&mut call).now_or_never().is_none(),
-                "the call is supposed to be waiting on its ranking here"
-            );
-            let overtaking = supersede(&plugin);
-            let out = call.await;
-            retire(&plugin, &overtaking);
-            out
-        }
-        .await
-        .unwrap();
+        // On a busy machine the ranking can finish before the call is first
+        // polled, and then the call is over before the test gets to
+        // supersede it. One blocking thread works through its queue in
+        // order, so a task waiting on a gate holds the ranking back.
+        let runtime = Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (found, err): (Option<Table>, Option<String>) = runtime
+            .block_on(async {
+                let (open_gate, gate) = mpsc::channel::<()>();
+                spawn_blocking(move || gate.recv());
+                let mut call = Box::pin(f.call_async::<(Option<Table>, Option<String>)>(opts));
+                // One poll takes the call's flag and queues its ranking.
+                assert!(
+                    (&mut call).now_or_never().is_none(),
+                    "the call is supposed to be waiting on its ranking here"
+                );
+                drop(open_gate);
+                // Queued after the ranking, so once this is back the answer is
+                // built and only the check after the await can stop it.
+                spawn_blocking(|| ()).await.unwrap();
+                let overtaking = supersede(&plugin);
+                let out = call.await;
+                retire(&plugin, &overtaking);
+                out
+            })
+            .unwrap();
         assert!(found.is_none());
         assert_eq!(err.as_deref(), Some(SUPERSEDED_ERR));
         // The roots are a least-recently-asked-for list, so an overtaken

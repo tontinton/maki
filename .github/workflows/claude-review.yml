@@ -60,9 +60,11 @@ jobs:
         shell: bash
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          FALLBACK_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_FALLBACK }}
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: 1
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           REVIEWER: ${{ steps.app-token.outputs.app-slug || 'github-actions' }}
+          OUT: /tmp/claude-review.jsonl
         run: |
           if [ -z "$REVIEW_PROMPT" ]; then
             echo "::error::Set the REVIEW_PROMPT repository variable"
@@ -88,22 +90,32 @@ jobs:
           prompt="${REVIEW_PROMPT//\$PR/$PR}"
           prompt="${prompt//\$REPO/$GITHUB_REPOSITORY}"
           prompt="${prompt//\$REVIEWER/$REVIEWER}"
-          claude -p "$prompt
-          ${EXTRA#/review}" \
-            --model "$REVIEW_MODEL" \
-            --effort "$REVIEW_EFFORT" \
-            --settings '{"attribution":{"commit":"","pr":""},"includeCoAuthoredBy":false,"sandbox":{"network":{"allowedDomains":["github.com","api.github.com"]}}}' \
-            --setting-sources user \
-            --strict-mcp-config \
-            --add-dir "$SCRATCH_DIR" \
-            --allowedTools "Read(./**),Grep(./**),Glob(./**),Read(/$SCRATCH_DIR/**),Edit(/$SCRATCH_DIR/**),Write(/$SCRATCH_DIR/**),WebSearch,WebFetch,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git blame:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh api:*)" \
-            --output-format stream-json --verbose \
-            | jq -j --unbuffered '
-              if .type == "assistant" then .message.content[]
-                | if .type == "text" then .text + "\n"
-                  elif .type == "tool_use" then "> \(.name) \(.input | tostring | .[0:300])\n"
-                  else empty end
-              elif .type == "result" then
-                "\n== \(.subtype) turns=\(.num_turns) cost=$\(.total_cost_usd)\n",
-                (.permission_denials // [] | .[] | "denied: \(.tool_name) \(.tool_input | tostring | .[0:300])\n")
-              else empty end'
+          review() {
+            claude -p "$@" \
+              --model "$REVIEW_MODEL" \
+              --effort "$REVIEW_EFFORT" \
+              --settings '{"attribution":{"commit":"","pr":""},"includeCoAuthoredBy":false,"sandbox":{"network":{"allowedDomains":["github.com","api.github.com"]}}}' \
+              --setting-sources user \
+              --strict-mcp-config \
+              --add-dir "$SCRATCH_DIR" \
+              --allowedTools "Read(./**),Grep(./**),Glob(./**),Read(/$SCRATCH_DIR/**),Edit(/$SCRATCH_DIR/**),Write(/$SCRATCH_DIR/**),WebSearch,WebFetch,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git blame:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh api:*)" \
+              --output-format stream-json --verbose \
+              | tee -a "$OUT" \
+              | jq -j --unbuffered '
+                if .type == "assistant" then .message.content[]
+                  | if .type == "text" then .text + "\n"
+                    elif .type == "tool_use" then "> \(.name) \(.input | tostring | .[0:300])\n"
+                    else empty end
+                elif .type == "result" then
+                  "\n== \(.subtype) turns=\(.num_turns) cost=$\(.total_cost_usd)\n",
+                  (.permission_denials // [] | .[] | "denied: \(.tool_name) \(.tool_input | tostring | .[0:300])\n")
+                else empty end'
+          }
+          review "$prompt
+          ${EXTRA#/review}" && exit 0
+          [ -n "$FALLBACK_OAUTH_TOKEN" ] || exit 1
+          jq -e 'select(.type == "assistant" and .api_error == "usage_limit_reached")' "$OUT" >/dev/null || exit 1
+          echo "::notice::The subscription hit its usage limit, resuming the review on the fallback subscription"
+          CLAUDE_CODE_OAUTH_TOKEN=$FALLBACK_OAUTH_TOKEN review \
+            --resume "$(jq -r 'select(.type == "system" and .subtype == "init") | .session_id' "$OUT")" \
+            "A usage limit cut your last turn off. Continue the review from where you stopped."

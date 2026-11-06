@@ -158,16 +158,7 @@ pub async fn run(
         }
         Verdict::Denied(reason) => {
             warn!(tool = %name, reason = %reason, "input hook stopped the call");
-            return ToolDoneEvent {
-                call: None,
-                id,
-                tool: Arc::from(name),
-                output: Arc::new(ToolOutput::Plain(reason.into())),
-                is_error: true,
-                annotation: None,
-                written_path: None,
-                backgrounded: false,
-            };
+            return ToolDoneEvent::new(id, Arc::from(name), ToolOutput::Plain(reason.into()), true);
         }
     };
 
@@ -229,14 +220,10 @@ fn ran(id: String, tool: Arc<str>, result: ToolExecResult) -> Ran {
     let backgrounded = moved.is_some();
     let done = match output {
         Ok(output) => ToolDoneEvent {
-            call: None,
-            id,
-            tool,
-            output: Arc::new(output),
-            is_error: false,
             annotation,
             written_path,
             backgrounded,
+            ..ToolDoneEvent::new(id, tool, output, false)
         },
         Err(message) => ToolDoneEvent {
             tool,
@@ -871,16 +858,12 @@ async fn run_inner(
             if ctx.mcp.is_some() && is_wire_name(name) {
                 text = format!("{text}. {MCP_SERVER_GONE}");
             }
-            ToolDoneEvent {
-                call: None,
+            ToolDoneEvent::new(
                 id,
-                tool: Arc::from(UNKNOWN_MCP),
-                output: Arc::new(ToolOutput::Plain(text.into())),
-                is_error: true,
-                annotation: None,
-                written_path: None,
-                backgrounded: false,
-            }
+                Arc::from(UNKNOWN_MCP),
+                ToolOutput::Plain(text.into()),
+                true,
+            )
             .into()
         }
     }
@@ -1101,16 +1084,7 @@ fn run_tool_search(
         Ok(found) => (found, false),
         Err(e) => (e.into(), true),
     };
-    ToolDoneEvent {
-        call: None,
-        id,
-        tool: tool_id,
-        output: Arc::new(view.output(output)),
-        is_error,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
-    }
+    ToolDoneEvent::new(id, tool_id, view.output(output), is_error)
 }
 
 /// Why a file-mutating tool is stopped before its permission check, if it is.
@@ -1190,16 +1164,7 @@ async fn run_local_tool(
             (e, true)
         }
     };
-    ToolDoneEvent {
-        call: None,
-        id,
-        tool: tool_id,
-        output: Arc::new(ToolOutput::Plain(output.into())),
-        is_error,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
-    }
+    ToolDoneEvent::new(id, tool_id, ToolOutput::Plain(output.into()), is_error)
 }
 
 /// Enforce permission for a native tool. MCP tools bypass this — they go
@@ -1340,15 +1305,13 @@ async fn execute_mcp_tool(
 ) -> ToolDoneEvent {
     let view = RoutedView::mcp(&tool);
     emit_raw_start(ctx, origin, id, &tool, view.summary.clone(), input);
-    let done = |output: TextOutput, is_error: bool| ToolDoneEvent {
-        call: None,
-        id: id.to_owned(),
-        tool: Arc::clone(&tool),
-        output: Arc::new(view.output(output)),
-        is_error,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
+    let done = |output: TextOutput, is_error: bool| {
+        ToolDoneEvent::new(
+            id.to_owned(),
+            Arc::clone(&tool),
+            view.output(output),
+            is_error,
+        )
     };
 
     let perm_tool = match ToolKey::parse(&tool) {
@@ -1545,9 +1508,8 @@ mod tests {
 
     use flume::Receiver;
     use futures::FutureExt;
-    use maki_config::{
-        Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
-    };
+    use maki_config::project::{self, TrustMode};
+    use maki_config::{Effect, Permission, PermissionRule, PermissionsConfig, ToolKey};
     use maki_providers::{ContentBlock, Message, Role, StreamResponse};
     use maki_storage::id::MakiId;
     use test_case::test_case;
@@ -1556,8 +1518,8 @@ mod tests {
 
     use super::*;
     use crate::agent::history::History;
-    use crate::call_scope::TaskHome;
-    use crate::cancel::{CancelToken, CancelTrigger};
+    use crate::call_scope::{MovedTrigger, TaskHome};
+    use crate::cancel::CancelToken;
     use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::{ToolDeferral, tool_names};
@@ -1713,7 +1675,7 @@ mod tests {
         registry
             .register(
                 tool,
-                ToolSource::Lua {
+                ToolSource {
                     plugin: TEST_PLUGIN.into(),
                 },
             )
@@ -1747,7 +1709,8 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             config,
             PathBuf::from(TEST_ROOT),
-            ProjectConfig::for_project(Path::new(TEST_ROOT)),
+            project::resolve_noninteractive(Path::new(TEST_ROOT), TrustMode::Session)
+                .project_config,
             Arc::default(),
         ));
         stub_ctx_with_permissions(mode, permissions)
@@ -2798,7 +2761,7 @@ mod tests {
         assert!(prompts(&events).is_empty());
     }
 
-    fn moved_away(scope: &CallScope) -> CancelTrigger {
+    fn moved_away(scope: &CallScope) -> MovedTrigger {
         scope
             .move_to(TaskHome {
                 chat: MakiId::generate(),

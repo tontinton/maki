@@ -13,6 +13,7 @@ use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use maki_config::DEFAULT_THINKING_LINES;
+use maki_markdown::render::CODE_BAR;
 use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
@@ -2124,6 +2125,26 @@ fn header_snapshot_stamps_gen_on_top_level() {
     assert!(msg.render_header.is_some(), "render_header must be set");
 }
 
+/// A headless session stores no tool outputs, so a reopened failed call has
+/// its error only in the row text. The header must keep it, and a body view
+/// must replace it, or a tail view of a long error draws it twice.
+#[test]
+fn restored_row_text_stays_until_a_body_view_lands() {
+    const ERROR_BODY: &str = "error: path not found";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.find_tool_msg_mut("t1").unwrap().text = format!("t1\n{ERROR_BODY}");
+
+    panel.tool_header_snapshot("t1", rendered_snapshot(), Some(1));
+    assert_eq!(
+        panel.find_tool_msg_mut("t1").unwrap().text,
+        format!("rendered\n{ERROR_BODY}")
+    );
+
+    panel.tool_snapshot("t1", rendered_snapshot(), Some(1));
+    assert_eq!(panel.find_tool_msg_mut("t1").unwrap().text, "rendered");
+}
+
 #[test]
 fn live_snapshot_uses_panel_generation() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
@@ -3337,6 +3358,41 @@ fn a_moved_row_keeps_its_head_and_follows_it() {
     assert!(view_text(&mut panel).contains(NEW_COMMAND));
 }
 
+/// A long moved call outlives many quick calls after it, and those must not
+/// evict it from what the panel polls before its outcome lands. A move that
+/// races Esc lands on a row Esc already ended, and streams again all the same.
+#[test_case(false ; "moved_while_running")]
+#[test_case(true ; "moved_after_esc")]
+fn a_moved_row_follows_its_buf_until_its_outcome(esc_first: bool) {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.set_lines_with_head(vec![snap_line(COMMAND)], 1);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(MOVABLE_ID, BASH_TOOL_NAME));
+    panel.register_live_buf(MOVABLE_ID.into(), Arc::clone(&buf));
+    if esc_first {
+        panel.cancel_in_progress();
+    }
+    panel.tool_done(backgrounded_done(RECEIPT));
+    for i in 0..=WARM_TOOL_CAP {
+        finish_with_live_buf(&mut panel, &format!("quick{i}"), STREAMED, false);
+    }
+
+    buf.set_lines_with_head(vec![snap_line(NEW_COMMAND)], 1);
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES);
+    let snapshot = panel
+        .find_tool_msg(MOVABLE_ID)
+        .unwrap()
+        .render_snapshot
+        .as_ref();
+    assert_eq!(
+        snapshot.map(BufferSnapshot::text).as_deref(),
+        Some(NEW_COMMAND)
+    );
+
+    panel.set_background_outcome(MOVABLE_ID, BackgroundOutcome::Done);
+    assert!(!panel.live_bufs.contains_key(MOVABLE_ID));
+}
+
 fn unstruck_cancelled(theme: &Theme) -> Style {
     theme.todo_cancelled.remove_modifier(Modifier::CROSSED_OUT)
 }
@@ -3384,7 +3440,10 @@ fn moved_row_shows_elapsed_since_the_move() {
 fn notice_panel(detail: Option<&str>) -> MessagesPanel {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     let mut notice = DisplayMessage::new(DisplayRole::Notice, NOTICE_TEXT.into());
-    notice.detail = detail.map(str::to_owned);
+    notice.detail = detail.map(|text| NoticeDetail {
+        text: text.into(),
+        markdown: false,
+    });
     panel.push(notice);
     panel
 }
@@ -3415,6 +3474,20 @@ fn a_task_notice_opens_with_its_ending_dot(
     let gutter = panel.cache.get(0).unwrap().gutter.clone().unwrap();
     let dot = (gutter.content == TOOL_INDICATOR).then_some(gutter.style);
     assert_eq!(dot, style.map(|style| style(&theme::current())));
+}
+
+/// Shell output is not markdown: a diff's `-` lines would turn into bullets.
+#[test_case(false, "- removed line", &format!("{NOTICE_DETAIL_INDENT}- removed line") ; "plain_output_stays_as_written")]
+#[test_case(true, "```\nlet answer = 42;\n```", &format!("{NOTICE_DETAIL_INDENT}{CODE_BAR}let answer = 42;") ; "markdown_reply_renders_its_code_block")]
+fn notice_detail_follows_its_format(markdown: bool, text: &str, expected_row: &str) {
+    let detail = NoticeDetail {
+        text: text.into(),
+        markdown,
+    };
+    let rows: Vec<String> = notice_detail_lines(&detail, VIEW_WIDTH)
+        .map(|row| row.to_string())
+        .collect();
+    assert!(rows.iter().any(|row| row == expected_row), "{rows:?}");
 }
 
 #[test]

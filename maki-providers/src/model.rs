@@ -288,6 +288,7 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
+    #[cfg(test)]
     pub(crate) fn canonical_id(&self) -> Option<&str> {
         self.prefixes.first().map(String::as_str)
     }
@@ -457,14 +458,14 @@ fn deferral_endpoint(
 }
 
 /// The thinking keys a `providers.toml` entry may lend a builtin local model
-/// (see [`maki_config::providers::overlays_local_thinking`]). Everything else
-/// about those slugs stays compiled in, so this reads no base URLs and no
-/// keys, and leaves auth wiring alone.
+/// (see [`maki_config::providers::is_local_endpoint`]). Base URL and protocol
+/// are read by `LocalEndpoint` itself, so this reads only the thinking keys
+/// and leaves auth wiring alone.
 fn local_thinking_overlay(
     slug: &str,
     model_id: &str,
 ) -> (Option<ThinkingSupport>, Option<Box<ThinkingFields>>) {
-    if !maki_config::providers::overlays_local_thinking(slug) {
+    if !maki_config::providers::is_local_endpoint(slug) {
         return (None, None);
     }
     let config = maki_config::providers::ProvidersConfig::load();
@@ -1004,11 +1005,14 @@ impl Model {
         Err(ModelError::UnsupportedProvider(slug.to_string()))
     }
 
-    pub fn from_spec_with_policy(spec: &str, policy: &ModelPolicy) -> Result<Self, ModelError> {
+    pub async fn from_spec_with_policy(
+        spec: &str,
+        policy: &ModelPolicy,
+    ) -> Result<Self, ModelError> {
         if !policy.allows(spec) {
             return Err(ModelError::NotAllowed(spec.to_string()));
         }
-        Self::from_spec(spec)
+        Self::from_spec_or_warm_catalog(spec).await
     }
 
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
@@ -1031,6 +1035,19 @@ impl Model {
         }
 
         Err(ModelError::UnsupportedProvider(slug.to_string()))
+    }
+
+    /// An unknown slug may just mean the models.dev catalog has not been loaded
+    /// yet, so retry once with a warm catalog. This waits for the fetch, which
+    /// is why `from_spec` itself stays non-blocking: the UI draws with it.
+    pub async fn from_spec_or_warm_catalog(spec: &str) -> Result<Self, ModelError> {
+        match Self::from_spec(spec) {
+            Err(ModelError::UnsupportedProvider(_)) => {
+                catalog::warm_catalog().await;
+                Self::from_spec(spec)
+            }
+            result => result,
+        }
     }
 
     /// Free public models surfaced through the OpenCode provider (Zen/Go),
@@ -1080,14 +1097,16 @@ impl Model {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Non-cached input tokens. Total input = `input + cache_read + cache_creation`.
+    /// u64 because a session accumulates these for its whole life; a u32
+    /// running total saturates around 4.3 billion tokens.
     #[serde(rename = "input_tokens")]
-    pub input: u32,
+    pub input: u64,
     #[serde(rename = "output_tokens")]
-    pub output: u32,
+    pub output: u64,
     #[serde(rename = "cache_creation_input_tokens")]
-    pub cache_creation: u32,
+    pub cache_creation: u64,
     #[serde(rename = "cache_read_input_tokens")]
-    pub cache_read: u32,
+    pub cache_read: u64,
     /// What this one response cost, straight from the provider, when it bothers
     /// to say (OpenRouter's `usage.cost`). Worth preferring on a router, where
     /// our table prices the model we asked for and the router bills for
@@ -1139,13 +1158,13 @@ impl TokenUsage {
         }
     }
 
-    pub fn total_input(&self) -> u32 {
+    pub fn total_input(&self) -> u64 {
         self.input
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_creation)
     }
 
-    pub fn context_tokens(&self) -> u32 {
+    pub fn context_tokens(&self) -> u64 {
         self.total_input().saturating_add(self.output)
     }
 
@@ -1244,7 +1263,7 @@ mod tests {
     const UNPRICED_SCHEDULED_SPEC: &str = "scheduled-plugin/my-custom-model";
     const SCHEDULED_HOST: &str = "scheduled.example";
     const SURCHARGE: f64 = 2.0;
-    const MILLION: u32 = 1_000_000;
+    const MILLION: u64 = 1_000_000;
     const INPUT_ONLY: TokenUsage = TokenUsage {
         input: MILLION,
         output: 0,
@@ -1354,13 +1373,13 @@ mod tests {
     #[test_case(1_000, "1.0k"      ; "thousand")]
     #[test_case(999_999, "1000.0k" ; "just_under_million")]
     #[test_case(1_000_000, "1.0m"  ; "million")]
-    fn format_tokens_display(tokens: u32, expected: &str) {
+    fn format_tokens_display(tokens: u64, expected: &str) {
         assert_eq!(format_tokens(tokens), expected);
     }
 
     #[test_case(TokenUsage { input: 12_000, output: 456, cache_creation: 200, cache_read: 100, cost: None }, None, "12.3k↑ 456↓" ; "without_cost")]
     #[test_case(TokenUsage { input: 1_000_000, output: 100_000, cache_creation: 200_000, cache_read: 500_000, cost: None }, Some(5.4), "1.7m↑ 100.0k↓ $5.400" ; "with_cost")]
-    #[test_case(TokenUsage { input: u32::MAX, output: 1, cache_creation: 1, cache_read: 1, cost: None }, None, "4295.0m↑ 1↓" ; "input_saturates")]
+    #[test_case(TokenUsage { input: u64::from(u32::MAX) + 1, output: 1, cache_creation: 1, cache_read: 1, cost: None }, None, "4295.0m↑ 1↓" ; "past_u32_max")]
     fn usage_formatting(usage: TokenUsage, cost: Option<f64>, expected: &str) {
         assert_eq!(usage.format(cost), expected);
     }
@@ -1388,12 +1407,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn from_spec_with_policy_rejects_disallowed_exact_spec() {
+    #[tokio::test]
+    async fn from_spec_with_policy_rejects_disallowed_exact_spec() {
         let policy = policy(&["anthropic/*"], &[]);
         let spec = "openai/gpt-5.6-sol";
 
-        let error = Model::from_spec_with_policy(spec, &policy).unwrap_err();
+        let error = Model::from_spec_with_policy(spec, &policy)
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, ModelError::NotAllowed(disallowed) if disallowed == spec));
     }
@@ -1423,11 +1444,13 @@ mod tests {
         assert_eq!(model.output_tokens(), expected);
     }
 
-    #[test]
-    fn from_spec_with_policy_resolves_allowed_exact_spec() {
+    #[tokio::test]
+    async fn from_spec_with_policy_resolves_allowed_exact_spec() {
         let policy = policy(&["openai/gpt-5.6-sol"], &[]);
 
-        let model = Model::from_spec_with_policy("openai/gpt-5.6-sol", &policy).unwrap();
+        let model = Model::from_spec_with_policy("openai/gpt-5.6-sol", &policy)
+            .await
+            .unwrap();
 
         assert_eq!(model.spec(), "openai/gpt-5.6-sol");
     }
@@ -1525,6 +1548,20 @@ mod tests {
         };
         assert_eq!(total.input, COUNTERS.input * 2);
         assert_eq!(total.cost, None);
+    }
+
+    #[test]
+    fn running_total_past_u32_max_keeps_counting() {
+        let mut total = TokenUsage {
+            input: u32::MAX as u64,
+            ..Default::default()
+        };
+        total += TokenUsage {
+            input: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(total.input, u32::MAX as u64 + 1_000);
+        assert_eq!(format_tokens(total.input), "4295.0m");
     }
 
     #[test]
@@ -1944,7 +1981,7 @@ mod tests {
         let model = Model::from_spec(SCHEDULED_SPEC).unwrap();
 
         let list = model.list_cost(&INPUT_ONLY, false).unwrap();
-        let table_price = f64::from(INPUT_ONLY.input) * model.pricing.input / PER_MILLION;
+        let table_price = INPUT_ONLY.input as f64 * model.pricing.input / PER_MILLION;
         assert!(
             (list - table_price).abs() < EPSILON,
             "list_cost {list} must be the table price {table_price}, surcharge free"

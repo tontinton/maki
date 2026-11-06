@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::iter;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,8 +13,7 @@ use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, Lines};
-use tokio::runtime::Handle;
-use tokio::task::block_in_place;
+use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tokio_util::io::StreamReader;
 use tracing::{debug, warn};
@@ -34,6 +34,7 @@ pub mod custom;
 pub(crate) mod google;
 pub(crate) mod llama_cpp;
 pub(crate) mod local;
+pub(crate) mod managed_auth;
 pub(crate) mod oauth_loopback;
 pub(crate) mod ollama;
 pub(crate) mod openai;
@@ -49,6 +50,9 @@ pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
 const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+
+/// Boxed so [`ok_sse`] can name the reader its parse closure takes.
+pub(crate) type SseBody = Pin<Box<dyn AsyncBufRead + Send>>;
 
 fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")
@@ -109,14 +113,20 @@ impl From<&maki_config::ProviderConfig> for Timeouts {
 /// token, deletes the token file. Anything else keeps it (a 429, a 5xx, a
 /// firewall's 403, a proxy's login page, a dropped connection): a token kept
 /// by mistake costs one failed refresh, one deleted by mistake a new login.
-pub(crate) fn refreshed_tokens(
+pub(crate) async fn refreshed_tokens(
     dir: &StateDir,
     provider: &str,
     rejected: Option<&str>,
-    refresh: impl FnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
+    refresh: impl AsyncFnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
 ) -> Result<OAuthTokens, AgentError> {
-    let _lock = lock_tokens(dir, provider);
-    let current = load_tokens(dir, provider).ok_or_else(|| {
+    // The file lock is held across the refresh request, so two processes never
+    // spend the same refresh token; the blocking pool takes the lock and the
+    // file reads and writes, the request itself is awaited.
+    let (lock, current) = {
+        let (dir, provider) = (dir.clone(), provider.to_owned());
+        spawn_blocking(move || (lock_tokens(&dir, &provider), load_tokens(&dir, &provider))).await?
+    };
+    let current = current.ok_or_else(|| {
         AgentError::api(
             UNAUTHORIZED_STATUS,
             format!("{provider} OAuth tokens not found on disk"),
@@ -125,27 +135,33 @@ pub(crate) fn refreshed_tokens(
     if rejected.is_none_or(|stale| current.access != stale) && !current.is_expired() {
         return Ok(current);
     }
-    let fresh = refresh(&current).inspect_err(|e| {
-        let cleared = matches!(
-            e,
-            AgentError::Api {
-                status: BAD_REQUEST_STATUS | UNAUTHORIZED_STATUS,
-                ..
+    let fresh = refresh(&current).await;
+    let (dir, provider) = (dir.clone(), provider.to_owned());
+    spawn_blocking(move || {
+        let _lock = lock;
+        let fresh = fresh.inspect_err(|e| {
+            let cleared = matches!(
+                e,
+                AgentError::Api {
+                    status: BAD_REQUEST_STATUS | UNAUTHORIZED_STATUS,
+                    ..
+                }
+            );
+            warn!(provider, cleared, error = %e, "OAuth refresh failed");
+            if cleared {
+                let _ = delete_tokens(&dir, &provider);
             }
-        );
-        warn!(provider, cleared, error = %e, "OAuth refresh failed");
-        if cleared {
-            let _ = delete_tokens(dir, provider);
+        })?;
+        // Not `?`: every caller reads an error here as "these credentials are
+        // dead" and falls back to other auth, so a full disk would log the user
+        // out over a refresh that actually succeeded. The run keeps the token
+        // it just got and the next start refreshes again.
+        if let Err(e) = save_tokens(&dir, &provider, &fresh) {
+            warn!(provider, error = %e, "could not persist refreshed OAuth tokens");
         }
-    })?;
-    // Not `?`: every caller reads an error here as "these credentials are
-    // dead" and falls back to other auth, so a full disk would log the user out
-    // over a refresh that actually succeeded. The run keeps the token it just
-    // got and the next start refreshes again.
-    if let Err(e) = save_tokens(dir, provider, &fresh) {
-        warn!(provider, error = %e, "could not persist refreshed OAuth tokens");
-    }
-    Ok(fresh)
+        Ok(fresh)
+    })
+    .await?
 }
 
 /// Whether `held` must give way to the stored tokens: it expired, or a peer
@@ -429,7 +445,7 @@ impl Timeouts {
 }
 
 /// Where every client in the crate starts, so a side request (OAuth, the
-/// catalogs, container credentials) shares the providers' redirect, proxy,
+/// catalogs) shares the providers' redirect, proxy,
 /// DNS and trust rules. Redirects stay off: a 3xx reaches
 /// [`AgentError::from_response`] and a key header is never replayed
 /// cross-origin. HTTP/1.1 stays pinned in case a dependency turns on reqwest's
@@ -460,14 +476,6 @@ pub(crate) fn http_client(timeouts: Timeouts) -> Client {
                 .build()
                 .expect("an HTTP client without trust roots always builds")
         })
-}
-
-/// For the credential and catalog flows that are still synchronous and have
-/// to block on one request. Works from a worker, from the main thread's
-/// `block_on` and from the blocking pool alike; panics on a current_thread
-/// runtime (every `#[tokio::test]`) and inside a `LocalSet` (the Lua thread).
-pub(crate) fn wait<T>(future: impl Future<Output = T>) -> T {
-    block_in_place(|| Handle::current().block_on(future))
 }
 
 /// `Client::execute` arms the timeouts as it is called, so the send and the
@@ -505,6 +513,25 @@ pub(crate) async fn ok_text(client: &Client, request: Request) -> Result<String,
             return Err(AgentError::from_response(response).await);
         }
         Ok(response.text().await?)
+    })
+    .await
+}
+
+/// A 200 handed to the SSE parser, anything else read as an API error.
+pub(crate) async fn ok_sse<T, F, Fut>(
+    client: &Client,
+    request: Request,
+    parse: F,
+) -> Result<T, AgentError>
+where
+    F: FnOnce(SseBody) -> Fut,
+    Fut: Future<Output = Result<T, AgentError>>,
+{
+    send_request(client, request, |response| async move {
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+        parse(Box::pin(body_reader(response))).await
     })
     .await
 }
@@ -656,6 +683,16 @@ impl<'a> KeyRotation<'a> {
         Self { pool, auth, header }
     }
 
+    /// The rotation for a provider whose pool is only there when it resolved
+    /// its own keys.
+    pub(crate) fn over(
+        pool: &'a Option<KeyPool>,
+        auth: &'a Mutex<ResolvedAuth>,
+        header: KeyHeader,
+    ) -> Option<Self> {
+        Some(Self::new(pool.as_ref()?, auth, header))
+    }
+
     /// How many keys a walk can try before it is back where it started.
     pub fn key_count(&self) -> usize {
         self.pool.len()
@@ -689,6 +726,7 @@ mod tests {
     use crate::retry::RetryKind;
     use test_case::test_case;
     use tokio::io::{AsyncBufReadExt, AsyncRead, ReadBuf};
+    use tokio::time::sleep;
 
     use crate::test_support::{Canned, serve, transport::LOOPBACK_HOST};
 
@@ -711,6 +749,10 @@ mod tests {
     /// it, since the read timeout covers the head as well as the body.
     const SHORT: Duration = Duration::from_millis(500);
     const LONG: Duration = Duration::from_secs(10);
+    /// Long enough for a caller polling the file lock to get in if the lock
+    /// ever stops covering the request. Correct code never lets it in, so a
+    /// slow machine can't fail the test, only make it miss a regression.
+    const REFRESH_OVERLAP: Duration = Duration::from_millis(200);
     const REDIRECT_STATUS: u16 = 302;
     const REDIRECT_TARGET: &str = "http://127.0.0.1:9/";
     const REDIRECT_SCRIPT: &[Canned] = &[Canned {
@@ -737,7 +779,7 @@ mod tests {
         dir
     }
 
-    fn fresh_tokens(_: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
+    async fn fresh_tokens(_: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
         Ok(OAuthTokens {
             access: FRESH.into(),
             refresh: "refresh".into(),
@@ -749,14 +791,17 @@ mod tests {
     #[test_case(Some(ON_DISK), FRESH,  REFRESHED     ; "the rejected token is the one on disk")]
     #[test_case(Some("older"), ON_DISK, NOT_REFRESHED ; "a peer already rotated it")]
     #[test_case(None,          ON_DISK, NOT_REFRESHED ; "not expired and nothing was rejected")]
-    fn refreshed_tokens_forces_a_refresh_only_for_the_rejected_token(
+    #[tokio::test]
+    async fn refreshed_tokens_forces_a_refresh_only_for_the_rejected_token(
         rejected: Option<&str>,
         expected: &str,
         reason: &str,
     ) {
         let dir = state_with_tokens(ON_DISK);
         let state = StateDir::from_path(dir.path().to_path_buf());
-        let got = refreshed_tokens(&state, TEST_PROVIDER, rejected, fresh_tokens).expect("refresh");
+        let got = refreshed_tokens(&state, TEST_PROVIDER, rejected, fresh_tokens)
+            .await
+            .expect("refresh");
         assert_eq!(got.access, expected, "{reason}");
     }
 
@@ -766,12 +811,33 @@ mod tests {
     #[test_case(AgentError::from(serde_json::from_str::<Value>(PROXY_LOGIN_PAGE).unwrap_err()), true ; "proxy_login_page_keeps_tokens")]
     #[test_case(AgentError::api(400, ERROR_MESSAGE), false ; "invalid_grant_clears_tokens")]
     #[test_case(AgentError::api(401, ERROR_MESSAGE), false ; "unauthorized_clears_tokens")]
-    fn refreshed_tokens_clears_only_a_dead_token(error: AgentError, kept: bool) {
+    #[tokio::test]
+    async fn refreshed_tokens_clears_only_a_dead_token(error: AgentError, kept: bool) {
         let dir = state_with_tokens(ON_DISK);
         let state = StateDir::from_path(dir.path().to_path_buf());
-        refreshed_tokens(&state, TEST_PROVIDER, Some(ON_DISK), |_| Err(error))
+        refreshed_tokens(&state, TEST_PROVIDER, Some(ON_DISK), async |_| Err(error))
+            .await
             .expect_err("refresh should fail");
         assert_eq!(load_tokens(&state, TEST_PROVIDER).is_some(), kept);
+    }
+
+    #[tokio::test]
+    async fn refreshed_tokens_spends_a_token_once_between_concurrent_callers() {
+        let dir = state_with_tokens(ON_DISK);
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        let refreshes = AtomicUsize::new(0);
+        let refresh = async |tokens: &OAuthTokens| {
+            refreshes.fetch_add(1, Ordering::Relaxed);
+            sleep(REFRESH_OVERLAP).await;
+            fresh_tokens(tokens).await
+        };
+        let (first, second) = tokio::join!(
+            refreshed_tokens(&state, TEST_PROVIDER, Some(ON_DISK), refresh),
+            refreshed_tokens(&state, TEST_PROVIDER, Some(ON_DISK), refresh),
+        );
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+        assert_eq!(first.expect("first caller").access, FRESH);
+        assert_eq!(second.expect("second caller").access, FRESH);
     }
 
     #[test_case(Some(EXPIRED), Some(EXPIRED), true  ; "held_expired")]

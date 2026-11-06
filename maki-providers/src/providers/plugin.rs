@@ -1337,11 +1337,11 @@ impl Provider for PluginProvider {
     /// spending its budget, so a provider that hides its pool turns every
     /// rotation into a retry.
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.pool.as_ref()?,
+        KeyRotation::over(
+            &self.pool,
             &self.entry.auth.current,
             self.entry.target.key_header(),
-        ))
+        )
     }
 
     /// Whatever the target knows about its models, a `base`'s own rules
@@ -1694,6 +1694,7 @@ mod tests {
     const UNDECLARED_BASE_URL: &str = "https://evil.test/v1";
     /// A native built-in, which no declaration may take.
     const BUILTIN_SLUG: &str = super::super::anthropic::SLUG;
+    const AUTHORITATIVE_SLUG: &str = super::super::copilot::SLUG;
     /// A slug a bundled plugin ships, which only that plugin may declare.
     const BUNDLED_SLUG: &str = PROVIDER_BUILTINS[0];
     const RELOAD_DROPS_STALE: &str = "a new load must not inherit the last load's entries";
@@ -2589,6 +2590,7 @@ mod tests {
 
     #[test_case(None ; "codec_lends_only_its_wire")]
     #[test_case(Some(BUILTIN_SLUG) ; "base_lends_its_provider")]
+    #[test_case(Some(AUTHORITATIVE_SLUG) ; "base_lends_its_authoritative_catalog")]
     fn undeclared_curation_and_limits(base: Option<&str>) {
         const SLUG: &str = "defaults-plugin";
         let reg = match base {
@@ -2601,11 +2603,13 @@ mod tests {
         let expected = match base.and_then(ProviderRegistry::compiled) {
             Some(base) => (
                 base.accepts_arbitrary_models,
+                base.catalog_is_authoritative,
                 base.fallback_max_output,
                 base.fallback_context_window,
             ),
             None => (
                 true,
+                false,
                 Some(UNKNOWN_MODEL_MAX_OUTPUT),
                 UNKNOWN_MODEL_CONTEXT_WINDOW,
             ),
@@ -2613,6 +2617,7 @@ mod tests {
         assert_eq!(
             (
                 row.accepts_arbitrary_models,
+                row.catalog_is_authoritative,
                 row.fallback_max_output,
                 row.fallback_context_window,
             ),
@@ -3212,7 +3217,8 @@ mod tests {
 
         assert!(is_registered(CATALOG_SLUG), "{TAKEOVER_FAILED}");
         assert!(
-            !catalog::catalog_providers()
+            !catalog::catalog_providers_if_available()
+                .expect("seeded")
                 .iter()
                 .any(|provider| provider.slug == CATALOG_SLUG),
             "{REPLACED}"
@@ -3258,7 +3264,8 @@ mod tests {
         );
         assert!(!is_registered(CATALOG_SLUG), "{NOT_TAKEN}");
         assert!(
-            catalog::catalog_providers()
+            catalog::catalog_providers_if_available()
+                .expect("seeded")
                 .iter()
                 .any(|provider| provider.slug == CATALOG_SLUG),
             "{STILL_LISTED}"

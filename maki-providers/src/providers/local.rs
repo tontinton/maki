@@ -220,11 +220,7 @@ impl Provider for LocalEndpoint {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 }
 
@@ -737,7 +733,7 @@ mod tests {
     #[test]
     fn local_slugs_read_their_declared_thinking_keys() {
         for cfg in [OLLAMA, LLAMACPP] {
-            assert!(maki_config::providers::overlays_local_thinking(cfg.slug));
+            assert!(maki_config::providers::is_local_endpoint(cfg.slug));
         }
     }
 
@@ -854,6 +850,45 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(ep.discovery_mode, DiscoveryMode::LlamaCpp));
+    }
+
+    /// `ignored_builtin_fields` in maki-config stays quiet about these values
+    /// on a local slug, so each one has to pick its wire here.
+    mod protocol_wire {
+        use test_case::test_case;
+
+        use super::super::*;
+        use crate::Timeouts;
+        use crate::test_support::{Canned, serve};
+
+        const PROMPT: &str = "hi";
+        const REJECTED: &[Canned] = &[Canned::json(401, r#"{"error":{"message":"no"}}"#)];
+
+        #[test_case(Some(Protocol::OpenaiResponses), "/v1/responses" ; "responses_api")]
+        #[test_case(Some(Protocol::Openai), "/v1/chat/completions" ; "openai_is_chat")]
+        #[test_case(None, "/v1/chat/completions" ; "default_is_chat")]
+        #[tokio::test]
+        async fn protocol_picks_the_path(protocol: Option<Protocol>, expected: &str) {
+            let (base_url, requests) = serve(REJECTED);
+            let host = base_url.strip_suffix("/v1").map(str::to_owned);
+            let ep =
+                LocalEndpoint::build(&LLAMACPP, Timeouts::default(), None, host, protocol).unwrap();
+            let model = Model::from_spec("llama-cpp/default").unwrap();
+            let (tx, _rx) = flume::unbounded();
+            let _ = ep
+                .stream_message(
+                    &model,
+                    &[Message::user(PROMPT.to_owned())],
+                    "",
+                    &json!([]),
+                    &tx,
+                    RequestOptions::default(),
+                    None,
+                )
+                .await;
+
+            assert_eq!(requests.lock().unwrap()[0].path, expected);
+        }
     }
 
     mod extract_ctx {

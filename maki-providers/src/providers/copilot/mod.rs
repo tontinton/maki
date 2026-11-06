@@ -25,7 +25,7 @@ use maki_config::providers::Protocol;
 
 pub mod auth;
 
-const SLUG: &str = "copilot";
+pub(crate) const SLUG: &str = "copilot";
 const DISPLAY_NAME: &str = "Copilot";
 const ENV_VAR: &str = "GH_COPILOT_TOKEN";
 const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
@@ -49,6 +49,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: true,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/copilot.toml"),
@@ -175,18 +176,25 @@ impl Copilot {
 
         let models = self.fetch_models().await?;
         self.remember(models);
-        Ok(self
-            .models
-            .lock()
-            .unwrap()
+        let known = self.models.lock().unwrap();
+        known
             .get(model_id)
             .map(CopilotModel::endpoint)
-            .unwrap_or_else(|| guess_endpoint(model_id)))
+            .ok_or_else(|| {
+                let mut available = known.keys().map(String::as_str).collect::<Vec<_>>();
+                available.sort_unstable();
+                AgentError::Config {
+                    message: format!(
+                        "'{model_id}' is not enabled for this Copilot account. Available: {}",
+                        available.join(", ")
+                    ),
+                }
+            })
     }
 
-    /// Merges rather than replaces: `/models` sometimes omits a model it
-    /// served a moment ago, and forgetting it would reroute that model to
-    /// a guessed endpoint mid-session.
+    /// Merges instead of replacing. `/models` sometimes leaves out a model
+    /// it listed a moment ago, and forgetting it would make that model fail
+    /// mid-session.
     fn remember(&self, models: Vec<CopilotModel>) {
         self.models
             .lock()
@@ -264,17 +272,8 @@ impl Copilot {
             )?
             .body(serde_json::to_vec(&body)?)
             .build()?;
-        super::send_request(&self.client, request, |response| async move {
-            if response.status().is_success() {
-                openai_compat::parse_sse(
-                    super::body_reader(response),
-                    event_tx,
-                    self.stream_timeout,
-                )
-                .await
-            } else {
-                Err(AgentError::from_response(response).await)
-            }
+        super::ok_sse(&self.client, request, |body| {
+            openai_compat::parse_sse(body, event_tx, self.stream_timeout)
         })
         .await
     }
@@ -337,17 +336,8 @@ impl Copilot {
             .header("anthropic-version", "2023-06-01")
             .body(serde_json::to_vec(&body)?)
             .build()?;
-        super::send_request(&self.client, request, |response| async move {
-            if response.status().is_success() {
-                super::anthropic::parse_sse(
-                    super::body_reader(response),
-                    event_tx,
-                    self.stream_timeout,
-                )
-                .await
-            } else {
-                Err(AgentError::from_response(response).await)
-            }
+        super::ok_sse(&self.client, request, |body| {
+            super::anthropic::parse_sse(body, event_tx, self.stream_timeout)
         })
         .await
     }
@@ -444,9 +434,11 @@ struct CopilotTokenPriceTier {
 }
 
 impl CopilotModel {
+    /// `model_picker_enabled` is left out on purpose. It only hides a model
+    /// from Copilot's own picker, the account can still use it, so routing
+    /// needs it here and only `list_models` filters on it.
     fn is_enabled_chat_model(&self) -> bool {
-        self.model_picker_enabled
-            && self.capabilities.model_type == "chat"
+        self.capabilities.model_type == "chat"
             && self
                 .policy
                 .as_ref()
@@ -809,25 +801,6 @@ fn listed_sends_thinking(info: &CopilotModelInfo, choice: ThinkingConfig) -> Thi
     }
 }
 
-fn guess_endpoint(model_id: &str) -> Endpoint {
-    if model_id.starts_with("claude-") {
-        Endpoint::Messages
-    } else if model_id.contains("codex") || gpt_major(model_id).is_some_and(|major| major >= 5) {
-        Endpoint::Responses
-    } else {
-        Endpoint::ChatCompletions
-    }
-}
-
-fn gpt_major(model_id: &str) -> Option<u32> {
-    model_id
-        .strip_prefix("gpt-")?
-        .split(['.', '-'])
-        .next()?
-        .parse()
-        .ok()
-}
-
 impl Provider for Copilot {
     fn stream_message<'a>(
         &'a self,
@@ -866,6 +839,7 @@ impl Provider for Copilot {
             let models = self.fetch_models().await?;
             let infos = models
                 .iter()
+                .filter(|model| model.model_picker_enabled)
                 .map(CopilotModel::model_info)
                 .collect::<Vec<_>>();
             self.remember(models);
@@ -885,10 +859,15 @@ impl Provider for Copilot {
 mod tests {
     use super::*;
     use crate::spec::ProviderRegistry;
+    use crate::test_support::{Canned, serve};
     use crate::{ContentBlock, Role, TokenUsage};
     use test_case::test_case;
 
     const OPUS_CACHE_WRITE: f64 = 6.25;
+    const HIDDEN_ONLY_CATALOG: &[Canned] = &[Canned::json(
+        200,
+        r#"{"data":[{"id":"gpt-4o-hidden","model_picker_enabled":false,"capabilities":{"type":"chat"},"supported_endpoints":["/responses"]}]}"#,
+    )];
     const CLAUDE_SPEC: &str = "copilot/claude-opus-5";
     const REPLY: &str = "reply";
     const SOL: &str = "gpt-6.1-sol";
@@ -917,16 +896,21 @@ mod tests {
         assert_eq!(model.endpoint(), Endpoint::ChatCompletions);
     }
 
-    #[test_case("gpt-6-luna", Endpoint::Responses ; "gpt_6")]
-    #[test_case("gpt-5.6-terra", Endpoint::Responses ; "gpt_5")]
-    #[test_case("gpt-10-mini", Endpoint::Responses ; "two_digit_major")]
-    #[test_case("gpt-5.3-codex", Endpoint::Responses ; "codex")]
-    #[test_case("gpt-4.1", Endpoint::ChatCompletions ; "gpt_4")]
-    #[test_case("gpt-4o", Endpoint::ChatCompletions ; "gpt_4o")]
-    #[test_case("claude-opus-5", Endpoint::Messages ; "claude")]
-    #[test_case("gemini-3.7-flash", Endpoint::ChatCompletions ; "other")]
-    fn guess_endpoint_for_unlisted_model(model_id: &str, expected: Endpoint) {
-        assert_eq!(guess_endpoint(model_id), expected);
+    #[test_case("gpt-4o-hidden", Some(Endpoint::Responses) ; "hidden_model_takes_its_listed_endpoint")]
+    #[test_case("gpt-4o", None ; "unlisted_model_is_refused")]
+    #[tokio::test]
+    async fn endpoint_comes_from_the_whole_catalog(model_id: &str, expected: Option<Endpoint>) {
+        let (base_url, _) = serve(HIDDEN_ONLY_CATALOG);
+        let auth = ResolvedAuth::for_test(
+            Some(base_url),
+            vec![("Authorization".into(), "Bearer token".into())],
+        );
+        let copilot = Copilot::with_auth(Arc::new(Mutex::new(auth)), Timeouts::default());
+        let result = copilot.model_endpoint(model_id).await;
+        match expected {
+            Some(endpoint) => assert_eq!(result.unwrap(), endpoint),
+            None => assert!(matches!(result, Err(AgentError::Config { .. }))),
+        }
     }
 
     #[test]
@@ -1068,7 +1052,7 @@ mod tests {
     #[test_case("copilot/gpt-5.6-luna", 1_000_000, 1_000_000, 0.20 + 1.20; "luna default rates")]
     #[test_case("copilot/gpt-5.4-mini", 100_000, 100_000, 0.075 + 0.45; "gpt-5.4-mini beats gpt-5.4 prefix")]
     #[test_case("copilot/claude-opus-4.8-fast", 100_000, 100_000, 1.00 + 5.00; "opus 4.8 fast beats opus prefix")]
-    fn manifest_models_report_cost(spec: &str, input: u32, output: u32, expected: f64) {
+    fn manifest_models_report_cost(spec: &str, input: u64, output: u64, expected: f64) {
         let usage = TokenUsage {
             input,
             output,

@@ -36,7 +36,10 @@ maki.api.register_tool({
     return buf
   end,
 
-  restore = function(_input, output, _is_error, ctx)
+  restore = function(_input, output, is_error, ctx)
+    if is_error then
+      return nil
+    end
     return dir_listing.view(output, ctx)
   end,
 

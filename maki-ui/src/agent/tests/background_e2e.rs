@@ -13,15 +13,16 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, InputSource, McpConfigErrors,
-    ModelSlot, ToolDoneEvent, ToolOutputLines,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, InputSource, ModelSlot,
+    ToolDoneEvent, ToolOutputLines,
 };
-use maki_config::{ModelPolicy, PermissionsConfig, PluginsConfig, ProjectConfig};
+use maki_config::project::{self, TrustMode};
+use maki_config::{PermissionsConfig, PluginsConfig};
 use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-    StopReason, StreamResponse, ThinkingConfig, Timeouts, TokenUsage,
+    StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -31,7 +32,7 @@ use crate::agent::AgentHandles;
 use crate::agent::shared_queue::{QueueItem, QueuedInput};
 use crate::app::tests::enter_runtime;
 
-use super::push_prompt;
+use super::{push_prompt, test_deps};
 
 const WAIT: Duration = Duration::from_secs(30);
 const PLUGIN: &str = "background_e2e";
@@ -346,7 +347,7 @@ impl World {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
+            project::resolve_noninteractive(Path::new("/tmp"), TrustMode::Session).project_config,
             Arc::default(),
         ));
         let handles = AgentHandles::spawn(
@@ -355,11 +356,8 @@ impl World {
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
-            Timeouts::default(),
             host.event_handle(),
-            None,
-            McpConfigErrors::new(PathBuf::new()),
-            Arc::new(ModelPolicy::default()),
+            test_deps(),
         );
         Self {
             handles,
@@ -379,7 +377,7 @@ impl World {
     /// What the event loop does for an idle chat whose mailbox holds a wake:
     /// claim it and start a run with the notices as its preamble.
     fn claim_wake(&self) -> Vec<Message> {
-        self.handles.claim_mailbox_wake()
+        self.handles.mailbox().claim_wake()
     }
 
     fn start_wake_run(&self, run_id: u64, preamble: Vec<Message>) {

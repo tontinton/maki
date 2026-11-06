@@ -62,7 +62,7 @@ jobs:
               git config --global --add safe.directory /workspace
               curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
               source "$HOME/.cargo/env"
-              cargo build --release --target ${{ matrix.target }}
+              cargo build --profile release-lto --target ${{ matrix.target }}
             '
           sudo chown -R $(id -u):$(id -g) target/
 
@@ -70,7 +70,7 @@ jobs:
         run: |
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
+          cp "target/${{ matrix.target }}/release-lto/${BINARY_NAME}" "${BINARY_NAME}"
           tar czf "${archive}" "${BINARY_NAME}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
@@ -179,16 +179,16 @@ jobs:
           STD: ${{ matrix.std }}
         run: |
           if [ "$STD" = build-std ]; then
-            cargo build --release --locked --target "$TARGET" -Z build-std=std,panic_abort
+            cargo build --profile release-lto --locked --target "$TARGET" -Z build-std=std,panic_abort
           else
-            cargo build --release --locked --target "$TARGET"
+            cargo build --profile release-lto --locked --target "$TARGET"
           fi
 
       - name: Package
         run: |
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
+          cp "target/${{ matrix.target }}/release-lto/${BINARY_NAME}" "${BINARY_NAME}"
           tar czf "${archive}" "${BINARY_NAME}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
@@ -206,7 +206,7 @@ jobs:
           - target: x86_64-apple-darwin
             runner: macos-15-intel
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
 
@@ -222,14 +222,14 @@ jobs:
           key: ${{ matrix.target }}-${{ github.ref_name }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --profile release-lto --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
+          cp "target/${{ matrix.target }}/release-lto/${BINARY_NAME}" "${BINARY_NAME}"
           tar czf "${archive}" "${BINARY_NAME}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
@@ -239,7 +239,7 @@ jobs:
         run: |
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
+          cp "target/${{ matrix.target }}/release-lto/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
           7z a "${archive}" "${BINARY_NAME}.exe"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 

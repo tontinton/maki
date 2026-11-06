@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
-use maki_config_macro::ConfigSection;
+use maki_config_macro::{ConfigSection, Merge};
 use maki_storage::paths;
 use maki_storage::sessions::{SessionMeta, StoredThinking, ThinkingParseError};
 use serde::de::{Error as DeError, IgnoredAny};
@@ -80,7 +80,6 @@ const MAX_COMPACTION_PERCENT: u8 = 99;
 const COMPACTION_BUFFER_EXPECTED: &str =
     r#"a token count (e.g. 12000) or a percent of the context window (e.g. "20%")"#;
 pub const MIN_MOUSE_SCROLL_LINES: u32 = 1;
-pub const MIN_TOOL_OUTPUT_LINES: usize = 1;
 pub const MIN_MAX_LOG_BYTES_MB: u64 = 1;
 pub const MIN_MAX_LOG_FILES: u32 = 1;
 pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
@@ -95,6 +94,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
     "batch",
     "code_execution",
+    "completion",
     "deepseek",
     "edit",
     "glob",
@@ -133,13 +133,9 @@ pub const PROVIDER_BUILTINS: &[&str] = &[
     "tensorx",
 ];
 
-/// Bundled plugins that ship switched off. They load only when a config says
-/// `plugins.<name> = { enabled = true }`, and the config layer accepts their
-/// tables either way so that line is not itself an error.
-///
-/// A plugin belongs here while what it does is worth shipping but what it
-/// costs at scale is not yet known.
-pub const OPTIONAL_BUILTINS: &[&str] = &["completion"];
+/// The [`DEFAULT_BUILTINS`] that only add UI or commands and register no tool,
+/// so their names stay free for MCP servers and are not valid tool names.
+pub const NON_TOOL_BUILTINS: &[&str] = &["completion", "sessions", "thinking"];
 
 /// Tools the edit plugin provides alongside `edit`, toggled through its options.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
@@ -486,12 +482,6 @@ fn check(
     Ok(())
 }
 
-macro_rules! merge_option {
-    ($self:ident, $overlay:ident, $($field:ident),+) => {
-        $(if $overlay.$field.is_some() { $self.$field = $overlay.$field; })+
-    };
-}
-
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum AlwaysThinking {
@@ -541,7 +531,7 @@ impl SessionDefaults {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawConfig {
     pub always_yolo: Option<bool>,
@@ -549,44 +539,40 @@ pub struct RawConfig {
     pub always_workflow: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
+    #[merge(nested)]
     pub ui: UiFileConfig,
+    #[merge(nested)]
     pub agent: AgentFileConfig,
+    #[merge(nested)]
     pub provider: ProviderFileConfig,
+    #[merge(nested)]
     pub storage: StorageFileConfig,
+    #[merge(nested)]
     pub net: NetFileConfig,
+    #[merge(nested)]
     pub trust: TrustFileConfig,
+    #[merge(nested)]
     pub instructions: InstructionsFileConfig,
+    #[merge(nested)]
     pub telemetry: TelemetryConfig,
+    #[merge(with = merge_plugins)]
     pub plugins: HashMap<String, PluginFileConfig>,
 }
 
-impl RawConfig {
-    pub fn merge(&mut self, overlay: RawConfig) {
-        merge_option!(
-            self,
-            overlay,
-            always_yolo,
-            always_fast,
-            always_workflow,
-            always_thinking
-        );
-        self.ui.merge(overlay.ui);
-        self.agent.merge(overlay.agent);
-        self.provider.merge(overlay.provider);
-        self.storage.merge(overlay.storage);
-        self.net.merge(overlay.net);
-        self.trust.merge(overlay.trust);
-        self.instructions.merge(overlay.instructions);
-        self.telemetry.merge(overlay.telemetry);
-        for (name, plugin) in overlay.plugins {
-            let entry = self.plugins.entry(name).or_default();
-            if plugin.enabled.is_some() {
-                entry.enabled = plugin.enabled;
-            }
-            entry.opts.extend(plugin.opts);
+fn merge_plugins(
+    base: &mut HashMap<String, PluginFileConfig>,
+    overlay: HashMap<String, PluginFileConfig>,
+) {
+    for (name, plugin) in overlay {
+        let entry = base.entry(name).or_default();
+        if plugin.enabled.is_some() {
+            entry.enabled = plugin.enabled;
         }
+        entry.opts.extend(plugin.opts);
     }
+}
 
+impl RawConfig {
     /// `packages` are the external package names discovery found. They are
     /// passed in rather than stored, because an installed package is host
     /// state: it is not written in any config file and must not survive a
@@ -626,16 +612,11 @@ impl RawConfig {
         let mut unknown: Vec<&String> = self
             .plugins
             .keys()
-            .filter(|name| {
-                !DEFAULT_BUILTINS.contains(&name.as_str())
-                    && !OPTIONAL_BUILTINS.contains(&name.as_str())
-                    && !packages.contains(name)
-            })
+            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()) && !packages.contains(name))
             .collect();
         unknown.sort();
         if let Some(&plugin) = unknown.first() {
             let mut valid: Vec<&str> = DEFAULT_BUILTINS.to_vec();
-            valid.extend(OPTIONAL_BUILTINS);
             valid.extend(packages.iter().map(String::as_str));
             valid.sort_unstable();
             return Err(ConfigError::UnknownPlugin {
@@ -657,7 +638,49 @@ pub struct PluginFileConfig {
     pub opts: JsonMap<String, JsonValue>,
 }
 
-#[derive(Deserialize, Default, Debug)]
+/// `ui.theme`: a theme for each terminal background. A single name is
+/// shorthand for the same theme on both.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(from = "ThemeSpec")]
+pub struct ThemePair {
+    pub light: String,
+    pub dark: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum ThemeSpec {
+    Name(String),
+    Pair { light: String, dark: String },
+}
+
+impl From<ThemeSpec> for ThemePair {
+    fn from(spec: ThemeSpec) -> Self {
+        match spec {
+            ThemeSpec::Name(name) => Self {
+                light: name.clone(),
+                dark: name,
+            },
+            ThemeSpec::Pair { light, dark } => Self { light, dark },
+        }
+    }
+}
+
+impl ThemePair {
+    pub fn name(&self, light_background: bool) -> &str {
+        if light_background {
+            &self.light
+        } else {
+            &self.dark
+        }
+    }
+
+    pub fn follows_background(&self) -> bool {
+        self.light != self.dark
+    }
+}
+
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiFileConfig {
     pub splash_animation: Option<bool>,
@@ -671,36 +694,11 @@ pub struct UiFileConfig {
     /// Gone, replaced by `thinking_lines`. We still read it so an old config
     /// gets told about the new key, not a vague unknown-field error.
     show_thinking: Option<IgnoredAny>,
-    pub theme: Option<String>,
+    pub theme: Option<ThemePair>,
     pub clock_format: Option<ClockFormat>,
+    #[merge(nested_option)]
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
-}
-
-impl UiFileConfig {
-    fn merge(&mut self, overlay: UiFileConfig) {
-        merge_option!(
-            self,
-            overlay,
-            splash_animation,
-            scrollbar,
-            inline_images,
-            notifications,
-            flash_duration_ms,
-            typewriter_ms_per_char,
-            mouse_scroll_lines,
-            thinking_lines,
-            show_thinking,
-            theme,
-            clock_format,
-            max_input_lines
-        );
-        match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
-            (Some(base), Some(over)) => base.merge(over),
-            (None, Some(over)) => self.tool_output_lines = Some(over),
-            _ => {}
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -731,38 +729,6 @@ pub enum NotificationMethod {
     Bell,
     Notify,
     Off,
-}
-
-#[derive(Deserialize, Default, Debug)]
-#[serde(default, deny_unknown_fields)]
-pub struct ToolOutputLinesFile {
-    pub bash: Option<usize>,
-    pub code_execution: Option<usize>,
-    pub task: Option<usize>,
-    pub index: Option<usize>,
-    pub grep: Option<usize>,
-    pub read: Option<usize>,
-    pub write: Option<usize>,
-    pub web: Option<usize>,
-    pub other: Option<usize>,
-}
-
-impl ToolOutputLinesFile {
-    fn merge(&mut self, overlay: ToolOutputLinesFile) {
-        merge_option!(
-            self,
-            overlay,
-            bash,
-            code_execution,
-            task,
-            index,
-            grep,
-            read,
-            write,
-            web,
-            other
-        );
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -833,7 +799,7 @@ impl<'de> Deserialize<'de> for CompactionBuffer {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentFileConfig {
     pub max_output_bytes: Option<usize>,
@@ -848,26 +814,7 @@ pub struct AgentFileConfig {
     pub shell: Option<ShellPreference>,
 }
 
-impl AgentFileConfig {
-    fn merge(&mut self, overlay: AgentFileConfig) {
-        merge_option!(
-            self,
-            overlay,
-            max_output_bytes,
-            max_output_lines,
-            max_continuation_turns,
-            max_turn_output,
-            compaction_buffer,
-            compaction_instructions,
-            post_compaction_instructions,
-            stale_read_check,
-            rtk,
-            shell
-        );
-    }
-}
-
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderFileConfig {
     pub default_model: Option<String>,
@@ -882,41 +829,16 @@ pub struct ProviderFileConfig {
     pub max_timeout_retries: Option<u32>,
 }
 
-impl ProviderFileConfig {
-    fn merge(&mut self, overlay: ProviderFileConfig) {
-        merge_option!(
-            self,
-            overlay,
-            default_model,
-            allowed_models,
-            excluded_models,
-            connect_timeout_secs,
-            low_speed_timeout_secs,
-            stream_timeout_secs,
-            retry_base_ms,
-            retry_max_ms,
-            max_retries,
-            max_timeout_retries
-        );
-    }
-}
-
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetFileConfig {
     pub allowed_private_hosts: Option<Vec<String>>,
 }
 
-impl NetFileConfig {
-    fn merge(&mut self, overlay: NetFileConfig) {
-        merge_option!(self, overlay, allowed_private_hosts);
-    }
-}
-
 /// Folder trust answered ahead of time. Only the global `init.lua` may set
 /// this: a folder cannot vouch for itself, and `maki-lua` strips the table
 /// from every other scope before it reaches here.
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct TrustFileConfig {
     pub paths: Option<Vec<String>>,
@@ -924,10 +846,6 @@ pub struct TrustFileConfig {
 }
 
 impl TrustFileConfig {
-    fn merge(&mut self, overlay: TrustFileConfig) {
-        merge_option!(self, overlay, paths, prompt);
-    }
-
     /// Whether the file mentioned trust at all, so the scope that is not
     /// allowed to set it can warn about exactly the configs that tried.
     pub fn is_set(&self) -> bool {
@@ -939,7 +857,7 @@ impl TrustFileConfig {
 /// this: a project file that could pick its own instructions would be
 /// trusting itself, and `maki-lua` strips the table from every other scope
 /// before it reaches here.
-#[derive(Deserialize, Default, Debug, Clone)]
+#[derive(Deserialize, Default, Debug, Clone, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct InstructionsFileConfig {
     /// Replaces the built-in file list. An empty list loads no project
@@ -947,21 +865,21 @@ pub struct InstructionsFileConfig {
     pub files: Option<Vec<String>>,
     /// Per-checkout overrides of `files`, matched by local `path` glob, git
     /// `remote` glob, or both. The first matching entry wins.
+    #[merge(with = replace_if_non_empty)]
     pub overrides: Vec<ProjectOverrideFileConfig>,
 }
 
 impl InstructionsFileConfig {
-    fn merge(&mut self, overlay: InstructionsFileConfig) {
-        merge_option!(self, overlay, files);
-        if !overlay.overrides.is_empty() {
-            self.overrides = overlay.overrides;
-        }
-    }
-
     /// Whether the file mentioned instructions at all, so the scope that is
     /// not allowed to set them can warn about exactly the configs that tried.
     pub fn is_set(&self) -> bool {
         self.files.is_some() || !self.overrides.is_empty()
+    }
+}
+
+fn replace_if_non_empty<T>(base: &mut Vec<T>, overlay: Vec<T>) {
+    if !overlay.is_empty() {
+        *base = overlay;
     }
 }
 
@@ -980,24 +898,12 @@ pub struct ProjectOverrideFileConfig {
     pub files: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageFileConfig {
     pub max_log_bytes_mb: Option<u64>,
     pub max_log_files: Option<u32>,
     pub input_history_size: Option<usize>,
-}
-
-impl StorageFileConfig {
-    fn merge(&mut self, overlay: StorageFileConfig) {
-        merge_option!(
-            self,
-            overlay,
-            max_log_bytes_mb,
-            max_log_files,
-            input_history_size
-        );
-    }
 }
 
 #[derive(Default)]
@@ -1359,7 +1265,7 @@ pub struct UiConfig {
     pub clock_format: ClockFormat,
 
     #[config(skip, default = "None")]
-    pub theme: Option<String>,
+    pub theme: Option<ThemePair>,
 
     #[config(skip, default = "ToolOutputLines::default()")]
     pub tool_output_lines: ToolOutputLines,
@@ -1390,107 +1296,71 @@ impl UiConfig {
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
         }
     }
-
-    pub fn validate_all(&self) -> Result<(), ConfigError> {
-        self.validate()?;
-        self.tool_output_lines.validate()?;
-        Ok(())
-    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ToolOutputLines {
-    pub bash: usize,
-    pub code_execution: usize,
-    pub task: usize,
-    pub index: usize,
-    pub grep: usize,
-    pub read: usize,
-    pub write: usize,
-    pub web: usize,
-    pub other: usize,
+/// Declares every `ui.tool_output_lines` key once: the file struct, the
+/// resolved struct, its defaults and the lookup by field all come from this
+/// list.
+macro_rules! tool_output_lines {
+    ($($field:ident = $default:expr),+ $(,)?) => {
+        #[derive(Deserialize, Default, Debug, Merge)]
+        #[serde(default, deny_unknown_fields)]
+        pub struct ToolOutputLinesFile {
+            $(pub $field: Option<usize>,)+
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(default)]
+        pub struct ToolOutputLines {
+            $(pub $field: usize,)+
+        }
+
+        impl ToolOutputLines {
+            pub const DEFAULT: Self = Self { $($field: $default),+ };
+
+            pub const FIELD_DEFAULTS: &[(&'static str, usize)] =
+                &[$((stringify!($field), Self::DEFAULT.$field)),+];
+
+            fn from_file(f: Option<ToolOutputLinesFile>) -> Self {
+                let f = f.unwrap_or_default();
+                Self { $($field: f.$field.unwrap_or(Self::DEFAULT.$field)),+ }
+            }
+
+            pub fn get(&self, tool: &str) -> usize {
+                match Self::field_for(tool) {
+                    $(stringify!($field) => self.$field,)+
+                    _ => self.other,
+                }
+            }
+        }
+    };
+}
+
+tool_output_lines! {
+    bash = 3,
+    code_execution = 3,
+    task = 3,
+    index = 0,
+    grep = 3,
+    read = 0,
+    write = 5,
+    web = 3,
+    other = 3,
 }
 
 impl ToolOutputLines {
-    pub const DEFAULT: Self = Self {
-        bash: 5,
-        code_execution: 5,
-        task: 5,
-        index: 3,
-        grep: 3,
-        read: 3,
-        write: 7,
-        web: 3,
-        other: 3,
-    };
-
-    pub const FIELD_DEFAULTS: &[(&'static str, usize)] = &[
-        ("bash", Self::DEFAULT.bash),
-        ("code_execution", Self::DEFAULT.code_execution),
-        ("task", Self::DEFAULT.task),
-        ("index", Self::DEFAULT.index),
-        ("grep", Self::DEFAULT.grep),
-        ("read", Self::DEFAULT.read),
-        ("write", Self::DEFAULT.write),
-        ("web", Self::DEFAULT.web),
-        ("other", Self::DEFAULT.other),
-    ];
-
-    fn from_file(f: Option<ToolOutputLinesFile>) -> Self {
-        let d = Self::DEFAULT;
-        let f = f.unwrap_or_default();
-        Self {
-            bash: f.bash.unwrap_or(d.bash),
-            code_execution: f.code_execution.unwrap_or(d.code_execution),
-            task: f.task.unwrap_or(d.task),
-            index: f.index.unwrap_or(d.index),
-            grep: f.grep.unwrap_or(d.grep),
-            read: f.read.unwrap_or(d.read),
-            write: f.write.unwrap_or(d.write),
-            web: f.web.unwrap_or(d.web),
-            other: f.other.unwrap_or(d.other),
-        }
-    }
-
-    fn fields(&self) -> [(&'static str, usize); 9] {
-        [
-            ("bash", self.bash),
-            ("code_execution", self.code_execution),
-            ("task", self.task),
-            ("index", self.index),
-            ("grep", self.grep),
-            ("read", self.read),
-            ("write", self.write),
-            ("web", self.web),
-            ("other", self.other),
-        ]
-    }
-
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        for (name, value) in self.fields() {
-            check(
-                "ui.tool_output_lines",
-                name,
-                value as u64,
-                MIN_TOOL_OUTPUT_LINES as u64,
-            )?;
-        }
-        Ok(())
-    }
-
-    pub fn get(&self, name: &str) -> usize {
-        match name {
-            "bash" => self.bash,
-            "code_execution" => self.code_execution,
-            "task" => self.task,
-            "index" => self.index,
-            "grep" | "glob" => self.grep,
-            "read" => self.read,
-            "memory" => self.write,
-            name if FILE_WRITE_TOOLS.contains(&name) => self.write,
-            "webfetch" | "websearch" => self.web,
-            _ => self.other,
+    pub fn field_for(tool: &str) -> &'static str {
+        match tool {
+            "bash" => "bash",
+            "code_execution" => "code_execution",
+            "task" => "task",
+            "index" => "index",
+            "grep" | "glob" => "grep",
+            "read" | "list" => "read",
+            "memory" => "write",
+            tool if FILE_WRITE_TOOLS.contains(&tool) => "write",
+            "webfetch" | "websearch" => "web",
+            _ => "other",
         }
     }
 }
@@ -2073,7 +1943,7 @@ fn normalize_remote_url(url: &str) -> String {
 ///
 /// Fields stay optional: `maki-otel` owns the defaults, so the meaning of
 /// "unset" is decided in one place.
-#[derive(Deserialize, Debug, Clone, ConfigSection)]
+#[derive(Deserialize, Debug, Clone, ConfigSection, Merge)]
 #[serde(default, deny_unknown_fields)]
 #[config(section = "telemetry")]
 pub struct TelemetryConfig {
@@ -2218,43 +2088,6 @@ pub struct TelemetryConfig {
     pub content_max_length: Option<usize>,
 }
 
-impl TelemetryConfig {
-    fn merge(&mut self, overlay: TelemetryConfig) {
-        merge_option!(
-            self,
-            overlay,
-            enabled,
-            metrics_exporter,
-            logs_exporter,
-            protocol,
-            endpoint,
-            headers,
-            timeout_ms,
-            compression,
-            metrics_protocol,
-            metrics_endpoint,
-            metrics_headers,
-            metrics_timeout_ms,
-            logs_protocol,
-            logs_endpoint,
-            logs_headers,
-            logs_timeout_ms,
-            metrics_interval_ms,
-            logs_interval_ms,
-            logs_max_queue_size,
-            logs_max_export_batch_size,
-            metrics_temporality,
-            service_name,
-            resource_attributes,
-            metrics_include_session_id,
-            metrics_include_version,
-            log_user_prompts,
-            log_tool_details,
-            content_max_length
-        );
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct PluginsConfig {
     pub enabled: bool,
@@ -2325,7 +2158,7 @@ impl PluginsConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.ui.validate_all()?;
+        self.ui.validate()?;
         self.agent.validate()?;
         self.provider.validate()?;
         self.storage.validate()?;
@@ -2661,19 +2494,16 @@ fn collect_env_vars(path: &Path, vars: &mut HashMap<String, String>) {
 }
 
 pub fn load_permissions(project_config: &ProjectConfig) -> PermissionsConfig {
-    load_permissions_inner(&paths::config_search_dirs(), project_config)
+    load_permissions_inner(paths::config_dir().ok().as_deref(), project_config)
 }
 
 fn load_permissions_inner(
-    global_dirs: &[PathBuf],
+    global_dir: Option<&Path>,
     project_config: &ProjectConfig,
 ) -> PermissionsConfig {
-    let mut global_perms = PermissionsFileConfig::default();
-    for dir in global_dirs {
-        if let Some(p) = read_permissions_file(&dir.join(PERMISSIONS_FILE), true) {
-            global_perms = p;
-        }
-    }
+    let global_perms = global_dir
+        .and_then(|dir| read_permissions_file(&dir.join(PERMISSIONS_FILE), true))
+        .unwrap_or_default();
 
     // The one deliberate exception to the gate: read at any trust level so a
     // repository can narrow the agent inside it, then stripped down to its deny
@@ -2870,7 +2700,7 @@ pub fn append_permission_rule(
     effect: Effect,
     target: &PermissionTarget,
 ) -> Result<(), String> {
-    let dir = paths::config_search_dirs().into_iter().last();
+    let dir = paths::config_dir().ok();
     append_permission_rule_with_global(tool, scope, effect, target, dir)
 }
 
@@ -2896,7 +2726,7 @@ fn append_global_permission(
     global: Option<PathBuf>,
 ) -> Result<(), String> {
     let path = global
-        .ok_or_else(|| "cannot determine home directory".to_string())?
+        .ok_or_else(|| "cannot determine config directory".to_string())?
         .join(PERMISSIONS_FILE);
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
@@ -2985,6 +2815,7 @@ fn insert_permission_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::TrustMode;
     use maki_storage::StateDir;
     use maki_storage::sessions::Effort;
     use maki_storage::trusted_folders::{CanonicalFolder, TrustDecision, TrustedFolders};
@@ -3002,6 +2833,11 @@ mod tests {
     const EXAMPLE_HOST: &str = "example.com";
     const PINNED_PORT: u16 = 7777;
     const OTHER_PORT: u16 = 8443;
+
+    /// `--trust`, the grant that reads and writes no state directory.
+    fn session_trusted(root: &Path) -> ProjectConfig {
+        project::resolve_noninteractive(root, TrustMode::Session).project_config
+    }
 
     #[test_case(EXAMPLE_HOST, EXAMPLE_HOST, true ; "exact")]
     #[test_case("api.example.com", EXAMPLE_HOST, false ; "exact_rejects_subdomain")]
@@ -3155,6 +2991,22 @@ mod tests {
     fn notifications_reject_unknown_value() {
         let result: Result<RawConfig, _> = toml::from_str("[ui]\nnotifications = \"desktop\"\n");
         assert!(result.is_err());
+    }
+
+    #[test_case("theme = \"dracula\"", "dracula", "dracula", false ; "name_is_both")]
+    #[test_case("theme = { light = \"catppuccin_latte\", dark = \"catppuccin_macchiato\" }", "catppuccin_latte", "catppuccin_macchiato", true ; "pair")]
+    #[test_case("theme = { light = \"dracula\", dark = \"dracula\" }", "dracula", "dracula", false ; "same_pair")]
+    fn theme_deserialize(line: &str, light: &str, dark: &str, follows: bool) {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\n{line}\n")).unwrap();
+        let theme = raw.into_config(&[]).unwrap().ui.theme.unwrap();
+        assert_eq!((theme.name(true), theme.name(false)), (light, dark));
+        assert_eq!(theme.follows_background(), follows);
+    }
+
+    #[test_case("theme = { light = \"a\" }" ; "missing_dark")]
+    #[test_case("theme = { light = \"a\", dark = \"b\", auto = \"c\" }" ; "unknown_key")]
+    fn theme_rejects_bad_pair(line: &str) {
+        assert!(toml::from_str::<RawConfig>(&format!("[ui]\n{line}\n")).is_err());
     }
 
     #[test]
@@ -3787,10 +3639,7 @@ mod tests {
              [bash]\nallow = [\n    \"cargo *\",\n]\ndeny = [\n    \"rm -rf *\",\n]\n",
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Allow);
         assert_eq!(perms.rules.len(), 2);
         assert_eq!(perms.rules[0].effect, Effect::Deny);
@@ -3815,10 +3664,7 @@ mod tests {
              [write]\ndeny = [\"/etc/*\"]\n",
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(perms.rules.len(), 4);
 
@@ -3854,7 +3700,7 @@ mod tests {
         write_project_permissions(dir.path(), &legacy);
 
         let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
+            Some(&global),
             &ProjectConfig::discover(dir.path()).with_trust(trusted),
         );
 
@@ -3901,7 +3747,7 @@ mod tests {
         );
 
         let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
+            Some(&global),
             &ProjectConfig::discover(dir.path()).with_trust(trusted),
         );
 
@@ -3946,10 +3792,7 @@ mod tests {
             ),
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::discover(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::discover(dir.path()));
 
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert!(perms.tool_defaults.is_empty());
@@ -3967,10 +3810,7 @@ mod tests {
         );
         write_project_permissions(dir.path(), &format!("[bash]\ndeny = [\"{SCOPE}\"]\n"));
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::discover(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &ProjectConfig::discover(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Allow);
         let scoped: Vec<_> = perms
             .rules
@@ -4004,7 +3844,7 @@ mod tests {
         fs::write(linked.join(".git"), GIT_FILE_POINTER).unwrap();
         let global = global_config_dir(container.path());
 
-        let permissions = load_permissions_inner(&[global], &ProjectConfig::for_project(&linked));
+        let permissions = load_permissions_inner(Some(&global), &session_trusted(&linked));
 
         let scopes = permissions
             .rules
@@ -4090,10 +3930,7 @@ mod tests {
         fs::create_dir_all(&maki_dir).unwrap();
         fs::write(maki_dir.join("permissions.toml"), "default = \"allow\"\n").unwrap();
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
     }
 
@@ -4153,10 +3990,7 @@ mod tests {
     fn no_permissions_file_returns_defaults() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert!(perms.rules.is_empty());
     }
@@ -4170,10 +4004,7 @@ mod tests {
             "[bash]\nallow = [\"git *\"]\ndeny = [\"rm *\"]\n",
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.rules[0].effect, Effect::Deny);
         assert_eq!(perms.rules[1].effect, Effect::Allow);
     }
@@ -4184,10 +4015,7 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "default = \"deny\"\n");
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
     }
 
@@ -4200,10 +4028,7 @@ mod tests {
             "default = \"deny\"\n\n[bash]\ndefault = \"allow\"\nallow = [\"cargo *\"]\n",
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
@@ -4224,10 +4049,7 @@ mod tests {
         )
         .unwrap();
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
             Some(DefaultEffect::Deny)
@@ -4243,10 +4065,7 @@ mod tests {
             "allow_all = true\n\n[bash]\nallow = [\"cargo *\"]\n",
         );
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Allow);
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
@@ -4260,10 +4079,7 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "allow_all = false\n");
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
@@ -4279,10 +4095,7 @@ mod tests {
         fs::create_dir_all(&maki_dir).unwrap();
         fs::write(maki_dir.join("permissions.toml"), "default = \"deny\"\n").unwrap();
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
     }
 
@@ -4616,32 +4429,6 @@ mod tests {
         }
     }
 
-    /// A name in both lists would be on by default and documented as opt-in,
-    /// and the two answers are given by different code paths.
-    #[test]
-    fn optional_builtins_are_not_also_defaults() {
-        for name in OPTIONAL_BUILTINS {
-            assert!(
-                !DEFAULT_BUILTINS.contains(name),
-                "{name} is both a default and an opt-in builtin"
-            );
-        }
-    }
-
-    /// The point of shipping one off by default: naming it in a config is
-    /// accepted, and it stays off until that config says `enabled = true`.
-    #[test]
-    fn an_optional_builtin_loads_only_when_a_config_asks_for_it() {
-        let name = OPTIONAL_BUILTINS[0];
-        let off: RawConfig = toml::from_str(&format!("[plugins.{name}]\n")).unwrap();
-        let off = off.into_config(&[]).expect("naming it is not an error");
-        assert!(!off.plugins.names.iter().any(|n| n == name));
-
-        let on: RawConfig = toml::from_str(&format!("[plugins.{name}]\nenabled = true\n")).unwrap();
-        let on = on.into_config(&[]).unwrap();
-        assert!(on.plugins.names.iter().any(|n| n == name));
-    }
-
     #[test_case("enabled = false" ; "enabled_false")]
     #[test_case("search_result_limit = 50" ; "opts_only")]
     fn unknown_plugin_name_errors(body: &str) {
@@ -4751,10 +4538,7 @@ mod tests {
             dir.path(),
             "[mcp.deepwiki]\nallow = [\"search\", \"fetch\"]\n",
         );
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.rules.len(), 2);
         assert!(perms.rules.iter().any(|r| r.tool
             == ToolKey::McpTool {
@@ -4775,10 +4559,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.github]\ndeny = [\"admin_delete\"]\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.rules.len(), 1);
         assert_eq!(
             perms.rules[0].tool,
@@ -4795,10 +4576,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.myserver]\nallow = [\"web.search\"]\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(perms.rules.len(), 0, "dotted tool name should be rejected");
     }
 
@@ -4810,10 +4588,7 @@ mod tests {
             dir.path(),
             "default = \"deny\"\n\n[mcp.exa]\ndefault = \"allow\"\n",
         );
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::McpServer {
                 server: "exa".into()
@@ -4831,10 +4606,7 @@ mod tests {
             dir.path(),
             "[mcp.exa]\ndefault = \"prompt\"\nallow = [\"search\"]\n",
         );
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::McpServer {
                 server: "exa".into()
@@ -4865,10 +4637,7 @@ mod tests {
         )
         .unwrap();
 
-        let _perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let _perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
         assert!(content.contains("[mcp.deepwiki]"), "server table present");
@@ -4897,10 +4666,7 @@ mod tests {
         )
         .unwrap();
 
-        let _perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let _perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
         assert!(content.contains("[mcp.deepwiki]"), "server table present");
@@ -4915,10 +4681,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[\"\"]\ndefault = \"allow\"\nallow = [\"x\"]\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert!(perms.rules.is_empty());
         assert!(perms.tool_defaults.is_empty());
     }
@@ -4940,10 +4703,7 @@ mod tests {
             return; // running as root, cannot simulate a read-only dir
         }
 
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
+        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         fs::set_permissions(&global, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(perms.rules.len(), 1);

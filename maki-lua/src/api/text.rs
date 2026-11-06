@@ -8,7 +8,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use tokio::task::spawn_blocking;
 
 use super::util::convert::TableExt;
-use super::util::pair::{Pair, pair, try_pair};
+use super::util::pair::{Pair, pair};
 
 thread_local! {
     /// `Matcher::new` allocates a score matrix of about 135KB, so building one
@@ -20,6 +20,7 @@ thread_local! {
 
 /// Convert an HTML string to Markdown.
 /// Useful for cleaning up web content fetched with `maki.webfetch`.
+/// Invalid UTF-8 becomes U+FFFD.
 ///
 /// @param html string HTML source text.
 /// @return (string?, string?) Markdown text on success, or nil plus an error message.
@@ -29,13 +30,33 @@ thread_local! {
 /// print(md) -- "# Hello\n\nworld"
 #[lua_fn]
 async fn html_to_markdown(_lua: Lua, html: LuaString) -> LuaResult<Pair<String>> {
-    let html = try_pair!(html.to_str()).to_owned();
+    let html = html.to_string_lossy();
     Ok(pair(
         spawn_blocking(move || htmd::convert(&html))
             .await
             .map_err(mlua::Error::external)?
             .map_err(|e| format!("html_to_markdown: {e}")),
     ))
+}
+
+/// Return {s} as valid UTF-8, with every invalid byte sequence replaced by
+/// U+FFFD. Lua strings are bytes, and `maki.net` and `maki.fs` hand them over
+/// as-is, so decode before measuring or cutting a body as text. An invalid
+/// byte can grow to 3 bytes, so a cut made before decoding can triple in size.
+///
+/// Needs no plugin permission.
+///
+/// @param s string Bytes to decode.
+/// @return (string) Valid UTF-8 text, `s` itself when it already is.
+/// @example
+/// local resp = maki.net.request(url)
+/// local text = maki.text.to_utf8(resp.body)
+#[lua_fn]
+fn to_utf8(lua: &Lua, s: LuaString) -> LuaResult<LuaString> {
+    if s.to_str().is_ok() {
+        return Ok(s);
+    }
+    lua.create_string(s.to_string_lossy())
 }
 
 /// `Config::DEFAULT.match_paths()` is what the file picker ranks with, and
@@ -204,24 +225,30 @@ fn fuzzy_list(
 }
 
 lua_table! {
-    /// Text utilities: format conversion and the fuzzy matcher the built-in
-    /// pickers use.
+    /// Text utilities: format conversion, UTF-8 decoding and the fuzzy matcher
+    /// the built-in pickers use.
     ///
     /// ```lua
     /// local md = maki.text.html_to_markdown(html)
+    /// local text = maki.text.to_utf8(bytes)
     /// local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
     /// ```
     "maki.text" => pub(crate) fn create_text_table(), DOCS [
-        html_to_markdown, fuzzy, fuzzy_list,
+        html_to_markdown, to_utf8, fuzzy, fuzzy_list,
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlua::Function;
     use test_case::test_case;
 
     const PATHS: [&str; 3] = ["maki-ui/src/main.rs", "README.md", "docs/index.html"];
+    const LATIN1_HTML: &[u8] = b"<h1>caf\xe9</h1>";
+    const LOSSY_MARKDOWN: &str = "# caf\u{fffd}";
+    const LATIN1_TEXT: &[u8] = b"caf\xe9 cr\xe8me";
+    const LOSSY_TEXT: &str = "caf\u{fffd} cr\u{fffd}me";
 
     fn best(needle: &str) -> Option<&'static str> {
         let pattern = compile(needle);
@@ -283,6 +310,31 @@ mod tests {
         let text = create_text_table(&lua).unwrap();
         lua.globals().set("text", text).unwrap();
         lua
+    }
+
+    #[test_case(b"<h1>hello</h1>", "# hello" ; "utf8")]
+    #[test_case(LATIN1_HTML, LOSSY_MARKDOWN ; "non_utf8")]
+    #[tokio::test]
+    async fn html_bytes_are_decoded_at_the_text_boundary(input: &[u8], expected: &str) {
+        let lua = lua_with_text();
+        let text: Table = lua.globals().get("text").unwrap();
+        let convert: Function = text.get("html_to_markdown").unwrap();
+        let (markdown, error): (String, Option<String>) = convert
+            .call_async(lua.create_string(input).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(error, None);
+        assert_eq!(markdown.trim(), expected);
+    }
+
+    #[test_case(b"caf\xc3\xa9", "caf\u{e9}" ; "valid_utf8_is_unchanged")]
+    #[test_case(LATIN1_TEXT, LOSSY_TEXT ; "invalid_bytes_become_replacement_chars")]
+    fn to_utf8_decodes_lossily(input: &[u8], expected: &str) {
+        let lua = lua_with_text();
+        let text: Table = lua.globals().get("text").unwrap();
+        let to_utf8: Function = text.get("to_utf8").unwrap();
+        let decoded: String = to_utf8.call(lua.create_string(input).unwrap()).unwrap();
+        assert_eq!(decoded, expected);
     }
 
     #[test]
