@@ -334,6 +334,7 @@ end
 maki.api.register_command({
   name = "/memory",
   description = "View, edit, and delete memory files",
+  interactive = true,
   handler = function()
     local dir = resolve_dir(true)
     if not dir then
