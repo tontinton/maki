@@ -540,12 +540,10 @@ impl PermissionManager {
                 }
             }
 
-            if has_allow {
-                // allow wins for this scope (no deny matched)
-            } else if !force_prompt {
+            // force_prompt: all scopes will be prompted anyway
+            if !has_allow && !force_prompt {
                 unclaimed_scopes.push(scope);
             }
-            // force_prompt: all scopes will be prompted anyway
         }
 
         if self.yolo.load(Ordering::Relaxed) && gate.accepts(Approval::Standing) {
@@ -567,7 +565,7 @@ impl PermissionManager {
         // A single non-plan scope means we must prompt for the rest.
         // Compared the way the write lands: `link/../plan.md` is the plan
         // file lexically but somewhere else once `link` is followed.
-        if !force_prompt && !pending.is_empty() {
+        if !force_prompt {
             let is_plan_write = plan_path.is_some_and(|pp| {
                 matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
                     && {

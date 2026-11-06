@@ -1251,7 +1251,6 @@ async fn session(
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
             subagent_cancels: Arc::new(CancelMap::new()),
             ledger: RunLedger::child(&agent_ctx.ledger),
-            registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
         },

@@ -31,7 +31,7 @@ use crate::prompt::ResolvedPrompts;
 use crate::tools::hook::Verdict;
 use crate::tools::{
     BackgroundFor, Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter,
-    ToolOutputMode,
+    ToolOutputMode, ToolRegistry,
 };
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
@@ -130,7 +130,6 @@ pub struct AgentParams {
     pub subagent_cancels: Arc<CancelMap<String>>,
     /// Subagents inherit this, so a turn's totals cover everything it spawned.
     pub ledger: Arc<RunLedger>,
-    pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
     pub model_policy: Arc<ModelPolicy>,
 }
@@ -187,7 +186,7 @@ pub struct Agent<'h> {
     file_access: Arc<FileAccess>,
     prompt_slots: Arc<ResolvedPrompts>,
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
-    registry: Arc<crate::tools::ToolRegistry>,
+    registry: Arc<ToolRegistry>,
     audience: ToolAudience,
     workflow: bool,
     local_tools: LocalTools,
@@ -237,7 +236,7 @@ impl<'h> Agent<'h> {
             file_access: params.file_access,
             prompt_slots: params.prompt_slots,
             subagent_cancels: params.subagent_cancels,
-            registry: params.registry,
+            registry: Arc::clone(ToolRegistry::global_arc()),
             audience: params.audience,
             workflow: false,
             local_tools: LocalTools::default(),
@@ -1297,7 +1296,7 @@ pub(crate) mod testing {
     use crate::cancel::CancelMap;
     use crate::permissions::PermissionManager;
     use crate::prompt::ResolvedPrompts;
-    use crate::tools::{BackgroundFor, FileAccess, RequestTools, ToolAudience, ToolRegistry};
+    use crate::tools::{BackgroundFor, FileAccess, RequestTools, ToolAudience};
     use crate::{AgentConfig, RunLedger, ToolOutputLines};
 
     const TEST_DIR: &str = "/tmp";
@@ -1329,7 +1328,6 @@ pub(crate) mod testing {
             prompt_slots: Arc::new(ResolvedPrompts::default()),
             subagent_cancels: Arc::new(CancelMap::new()),
             ledger: Arc::new(RunLedger::default()),
-            registry: Arc::new(ToolRegistry::new()),
             audience: ToolAudience::MAIN,
             model_policy: Arc::new(ModelPolicy::default()),
         }
@@ -1634,7 +1632,7 @@ mod tests {
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
-        let agent = Agent::new(
+        let mut agent = Agent::new(
             agent_params(provider, model),
             AgentRunParams {
                 history,
@@ -1643,6 +1641,7 @@ mod tests {
                 context: Arc::new(|_, _| fixed_context()),
             },
         );
+        agent.registry = Arc::new(ToolRegistry::new());
         (agent, event_rx)
     }
 
