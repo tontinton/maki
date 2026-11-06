@@ -338,10 +338,28 @@ impl BackgroundTasks {
         asker: Option<MakiId>,
         id: &str,
     ) -> Option<(Arc<SessionControl>, String)> {
+        self.live_subagent(id, |entry| entry.answers(asker))
+    }
+
+    /// The live session of subagent `id` in the session `mailbox`, and its
+    /// name, whoever moved it. A caller outside a run is bounded by no
+    /// [`BackgroundTask::answers`] rule, so only a permission guard may reach
+    /// this.
+    pub(crate) fn session_subagent(
+        &self,
+        mailbox: MakiId,
+        id: &str,
+    ) -> Option<(Arc<SessionControl>, String)> {
+        self.live_subagent(id, |entry| entry.reports_to(mailbox))
+    }
+
+    fn live_subagent(
+        &self,
+        id: &str,
+        reaches: impl Fn(&BackgroundTask) -> bool,
+    ) -> Option<(Arc<SessionControl>, String)> {
         let entries = self.locked();
-        let entry = entries
-            .iter()
-            .find(|e| e.info.id == id && e.answers(asker))?;
+        let entry = entries.iter().find(|e| e.info.id == id && reaches(e))?;
         let control = entry.control.as_ref()?;
         control
             .ended()

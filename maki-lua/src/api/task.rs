@@ -1,5 +1,5 @@
 //! `maki.task`. The host keeps the subagent transcripts, so a plugin only needs
-//! to list the tasks and show one.
+//! to list the tasks, show one, and send it a message while it runs.
 
 use std::sync::Arc;
 
@@ -10,13 +10,13 @@ use maki_storage::id::MakiId;
 use mlua::{Either as LuaEither, Lua, LuaSerdeExt, Result as LuaResult, Table, UserDataRef, Value};
 
 use crate::api::agent::{delivery, plugin_input};
-use crate::api::session::newest_messages_table;
+use crate::api::session::{newest_messages_table, required_session};
 use crate::api::util::command::{TaskRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::TableExt;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::background::BackgroundTasks;
-use crate::plugin_permissions::PluginPermissions;
+use crate::plugin_permissions::{Permission, PluginPermissions, require};
 use crate::runtime::{CANCEL_ABANDON_AFTER, is_user_action};
 
 const USER_ACTION_ERR: &str = "stopping a task requires a user command or keybind";
@@ -25,6 +25,7 @@ const STOP_OPTS_ERR: &str = "stop(id, opts): opts must be a table";
 pub(crate) const NO_RUNNING_SUBAGENT: &str = "no running background subagent with id";
 const LAST_KEY: &str = "last";
 const NAME_KEY: &str = "name";
+const BLANK_SEND_ERR: &str = "cannot send a blank message";
 
 async fn roundtrip(
     lua: Lua,
@@ -202,31 +203,58 @@ fn not_running(id: &str) -> String {
 /// carries on with its history intact. With no turn running the message
 /// waits like any other.
 ///
-/// An agent reaches the subagents it moved, and those nested in a call it
+/// A tool handler reaches the subagents it moved, and those nested in a call it
 /// moved, until they end. Like `stop(ctx, id)`, it never reaches what
 /// another agent moved.
 ///
-/// @param ctx LuaCtx The tool handler's ctx.
-/// @param id string Task id, from its receipt.
-/// @param text string The message.
+/// Outside a tool call there is no ctx to say who asks, so pass
+/// `{ session = sid }`: the task is reached in that session whoever moved
+/// it, bounded only by the plugin's `session_write`, which this form needs.
+/// Like the ctx form this needs no interactive UI.
+///
+/// @param ctx LuaCtx|table The handler's ctx, or `{ session = sid }` (the
+///   session the task runs in, as `list()` reports it) outside a tool call.
+/// @param id string Task id, from its receipt, or `data.task_id` on a
+///   subagent's `ToolDone`.
+/// @param text string The message. Must not be blank.
 /// @param opts table? Optional fields:
 ///   `interrupt` (boolean?) - cut its current turn short. Default: `false`.
 /// @return (table|nil, string|nil) `{name}`, the task's name in `/tasks`, or
 ///   nil and `"no running background subagent with id <id>"`.
 /// @example
+/// -- in a tool handler
 /// local sent, err = maki.task.send(ctx, input.id, input.message)
 /// if not sent then return { llm_output = err, is_error = true } end
 /// return "Message queued for " .. sent.name .. "."
+/// -- in an autocmd, where there is no ctx
+/// maki.task.send({ session = ev.data.session_id }, ev.data.task_id, "wrap up")
 #[lua_fn]
 async fn send(
     lua: Lua,
-    ctx: UserDataRef<LuaCtx>,
+    #[ctx] grants: PluginPermissions,
+    ctx: LuaEither<UserDataRef<LuaCtx>, Table>,
     id: String,
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
+    if text.trim().is_empty() {
+        return Ok(err_pair(BLANK_SEND_ERR));
+    }
     let delivery = delivery(opts.as_ref());
-    let (control, name) = try_pair!(reached_subagent(&lua, &ctx, "maki.task.send", &id));
+    let (control, name) = match ctx {
+        LuaEither::Left(ctx) => try_pair!(reached_subagent(&lua, &ctx, "maki.task.send", &id)),
+        LuaEither::Right(target) => {
+            // Unlike the ctx form this names any session and is bounded by no
+            // lineage rule, so the permission is what stands in for it.
+            require(&lua, &grants, Permission::SessionWrite)?;
+            let session = try_pair!(required_session(Some(&target))?);
+            try_pair!(
+                BackgroundTasks::of(&lua)
+                    .session_subagent(session, &id)
+                    .ok_or_else(|| not_running(&id))
+            )
+        }
+    };
     // A sent message never picks the run's settings, so these are inert.
     let input = plugin_input(text, RequestOptions::default());
     if control.send(input, delivery).is_err() {
@@ -277,19 +305,23 @@ lua_table! {
     /// The subagents of the focused session and their transcripts. Tasks are
     /// spawned by the `task` tool and addressed by an id that survives a reload.
     /// Without an interactive UI every function returns
-    /// `nil, "no interactive UI attached"`, except the ones that take a tool
-    /// handler's ctx: they reach the background tasks its agent moved.
+    /// `nil, "no interactive UI attached"`, except the ones that name their
+    /// task directly: `send` and `messages` from a tool handler's ctx, and
+    /// `send` from a plugin holding `session_write` that names its session
+    /// in place of a ctx.
     "maki.task" => pub(crate) fn create_task_table(
         tx: Option<flume::Sender<UiAction>>,
         perms: &PluginPermissions,
+        grants: PluginPermissions,
     ),
-    DOCS [list(tx), focus(tx), remove(perms, tx), stop(tx), send, messages(perms)]
+    DOCS [list(tx), focus(tx), remove(perms, tx), stop(tx), send(grants), messages(perms)]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, UiReply};
+    use crate::plugin_permissions::denied_error;
     use mlua::Table;
     use serde_json::json;
     use std::thread::JoinHandle;
@@ -327,9 +359,28 @@ mod tests {
 
     fn lua_with_task(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
-        let t = create_task_table(&lua, tx, &PluginPermissions::trusted()).unwrap();
+        let grants = PluginPermissions::trusted();
+        let t = create_task_table(&lua, tx, &PluginPermissions::trusted(), grants).unwrap();
         lua.globals().set("task", t).unwrap();
         lua
+    }
+
+    /// The table form has no lineage bound, so without `session_write` it is
+    /// denied before the task is even looked up. The ctx form needs no grant.
+    #[tokio::test]
+    async fn session_send_needs_session_write() {
+        let lua = Lua::new();
+        let denied = PluginPermissions::denied();
+        let t = create_task_table(&lua, None, &denied, denied.clone()).unwrap();
+        lua.globals().set("task", t).unwrap();
+        let err = lua
+            .load("return task.send({ session = 's' }, 'toolu_01', 'hi')")
+            .eval_async::<(Value, Option<String>)>()
+            .await
+            .unwrap_err()
+            .to_string();
+        let expected = denied_error(Permission::SessionWrite).to_string();
+        assert!(err.contains(&expected), "{err}");
     }
 
     /// Answers the first request with {reply} and hands it back to assert on.
