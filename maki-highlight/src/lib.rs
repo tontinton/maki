@@ -426,12 +426,19 @@ fn bounded_prefix(prefix: &str) -> &str {
         .map_or("", |newline| &prefix[start + newline + 1..])
 }
 
-/// Prefix context is limited to the nearest lines that fit in 16 KiB.
-/// Parser state opened before that window cannot be reconstructed.
+/// `prefix` is the lines before `code`, with or without a trailing newline.
+/// Only the nearest lines that fit in 16 KiB are parsed, so a comment or
+/// string opened before them is missed.
 pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSegment>> {
     let mut hl = Highlighter::for_token(lang);
     for line in LinesWithEndings::from(bounded_prefix(prefix)) {
-        hl.advance(line);
+        // Syntaxes close a line comment on its `\n`. Without one, a comment
+        // just above `code` would swallow the first line of `code` too.
+        if line.ends_with('\n') {
+            hl.advance(line);
+        } else {
+            hl.advance(&format!("{line}\n"));
+        }
     }
     LinesWithEndings::from(code)
         .map(|raw| hl.highlight_line(raw))
@@ -756,6 +763,17 @@ mod tests {
         assert_ne!(
             highlight_code(RUST, PREFIX_CODE, RECENT_COMMENT),
             highlight_code(RUST, PREFIX_CODE, "")
+        );
+    }
+
+    #[test_case(PYTHON, "# note"; "python")]
+    #[test_case("js", "// note"; "javascript")]
+    fn line_comment_ending_the_prefix_stays_on_its_line(lang: &str, comment: &str) {
+        let _globals = exclusive_globals();
+        let code = "x = 1\n";
+        assert_eq!(
+            highlight_code(lang, code, comment),
+            highlight_code(lang, code, "")
         );
     }
 
