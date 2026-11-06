@@ -23,6 +23,11 @@
       "status": 200
     }
   ],
+  "plugins": {
+    "mistral": {
+      "effort_ladders": true
+    }
+  },
   "expected": {
     "discovery": {
       "models": [

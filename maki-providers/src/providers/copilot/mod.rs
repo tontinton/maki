@@ -313,6 +313,7 @@ impl Copilot {
             &self.client,
             model,
             &body,
+            &[],
             event_tx,
             &resolved,
             self.stream_timeout,
