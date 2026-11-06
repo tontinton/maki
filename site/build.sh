@@ -44,6 +44,7 @@ cp -r plugins "$OUT/"
 cd docs
 zola build -o "../_build/docs"
 cd ..
+node docs-highlight.mjs "$OUT/docs"
 
 # 3. Markdown mirrors + llms.txt / llms-full.txt for LLM consumption
 BASE_URL="https://maki.sh"

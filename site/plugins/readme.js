@@ -153,7 +153,7 @@ export const previewCandidates = (text, b) => findMedia(text, b).filter(media =>
 
 const escapeHtml = text => text.replace(/[&<>"]/g, c => HTML_ESCAPES[c]);
 
-function highlight(code, language) {
+export function highlight(code, language) {
   const grammar = HIGHLIGHTERS[LANGUAGE_ALIASES[language] ?? language];
   if (!grammar) return null;
   let html = '';

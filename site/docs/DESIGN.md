@@ -26,11 +26,15 @@ Theme: identical head script and `localStorage.theme` rule as the other pages. `
 
 ## Code blocks
 
-The plugin reader's README pane, value for value (8px radius, 0.84rem, line-height 1.6), in both themes. Giallo wraps each line in `.giallo-l`: never make it `inline-block`, or every line grows by its descender gap and the panes stop matching. Custom `maki` syntax theme (`extra/maki.json`), all roman:
+The plugin reader's README pane, value for value (8px radius, 0.84rem, line-height 1.6), in both themes.
 
-| ink | comment | keyword | operator | function/command | type | string | const |
-|---|---|---|---|---|---|---|---|
-| `#DDE0EA` | `#878DA9` | `#A2B5FA` | `#A6ADC8` | `#F7A87D` | `#A9D5E3` | `#ABD695` | `#EDA8C2` |
+Highlighting is the reader's own: Zola's highlighter is off, and `docs-highlight.mjs` (run by `build.sh`) passes each block through `highlight()` from `plugins/readme.js`. One grammar set colours both pages, so a snippet looks the same in the docs and in a plugin README. It covers lua, sh/bash, toml, json, yaml and diff, and anything else stays plain ink. A TextMate theme was tried first and never matched: it colours shell flags, operators and members that the reader leaves alone. `zola serve` shows plain code, the same as the token counts. Tokens are the `--t-*` vars, copied from the plugins page:
+
+| ink | comment | keyword | function/command | type | string | const |
+|---|---|---|---|---|---|---|
+| `#DDE0EA` | `#878DA9` | `#A2B5FA` | `#F7A87D` | `#A9D5E3` | `#ABD695` | `#EDA8C2` |
+
+To colour a new language, add a grammar to `GRAMMARS` in `readme.js`, so READMEs get it too.
 
 Hover `copy` text button, the same one the plugin reader uses. No title bar, lang label, or dots.
 

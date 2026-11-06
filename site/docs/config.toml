@@ -2,9 +2,3 @@ base_url = "/docs"
 title = "Maki Docs"
 compile_sass = true
 build_search_index = false
-
-[markdown.highlighting]
-enabled = true
-style = "inline"
-theme = "maki"
-extra_themes = ["extra/maki.json"]

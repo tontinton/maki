@@ -75,7 +75,13 @@
       --pane-head: #191B28;
       --pane-line: #2C2F42;
       --pane-label: #878DA9;
-      --pane-ink: #DDE0EA;
+      --t-ink: #DDE0EA;
+      --t-com: #878DA9;
+      --t-kw: #A2B5FA;
+      --t-fn: #F7A87D;
+      --t-ty: #A9D5E3;
+      --t-str: #ABD695;
+      --t-con: #EDA8C2;
       --sidebar-w: 248px;
       --toc-w: 250px;
       --content-max: 720px;
@@ -370,8 +376,8 @@
       overflow-x: auto;
       border: 1px solid var(--pane-line);
       border-radius: 8px;
-      background: var(--pane-bg) !important;
-      color: var(--pane-ink) !important;
+      background: var(--pane-bg);
+      color: var(--t-ink);
       color-scheme: dark;
       font-family: var(--font-mono);
       font-size: 0.84rem;
@@ -379,6 +385,12 @@
       tab-size: 4;
     }
     pre code { padding: 0; border: 0; background: none; color: inherit; font-size: inherit; }
+    pre .kw { color: var(--t-kw); }
+    pre .ty { color: var(--t-ty); }
+    pre .fn { color: var(--t-fn); }
+    pre .con { color: var(--t-con); }
+    pre .cm { color: var(--t-com); }
+    pre .st { color: var(--t-str); }
     .code-copy {
       position: absolute;
       top: 0.45rem;
@@ -394,7 +406,7 @@
       transition: opacity 0.1s, color 0.1s;
     }
     .code:hover .code-copy, .code-copy:focus-visible, .code-copy.done { opacity: 1; }
-    .code-copy:hover, .code-copy.done { color: var(--pane-ink); }
+    .code-copy:hover, .code-copy.done { color: var(--t-ink); }
     @media (hover: none) { .code-copy { opacity: 1; } }
 
     /* ── tables ── */
