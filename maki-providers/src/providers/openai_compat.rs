@@ -243,12 +243,8 @@ impl OpenAiCompatProvider {
             "sending API request"
         );
 
-        super::send_request(&self.client, request, |response| async move {
-            if response.status().as_u16() == 200 {
-                parse_sse(super::body_reader(response), event_tx, self.stream_timeout).await
-            } else {
-                Err(AgentError::from_response(response).await)
-            }
+        super::ok_sse(&self.client, request, |body| {
+            parse_sse(body, event_tx, self.stream_timeout)
         })
         .await
     }
@@ -599,18 +595,66 @@ impl ToolAccumulator {
     }
 }
 
-pub(crate) fn reasoning_and_text_blocks(reasoning: String, text: String) -> Vec<ContentBlock> {
-    let mut blocks = Vec::new();
-    if !reasoning.is_empty() {
-        blocks.push(ContentBlock::Thinking {
-            thinking: reasoning,
-            signature: None,
-        });
+/// The text and reasoning streamed so far. The leading whitespace some models
+/// open their answer with is trimmed off its first delta.
+#[derive(Default)]
+pub(crate) struct StreamedText {
+    text: String,
+    pub(crate) reasoning: String,
+    text_started: bool,
+}
+
+impl StreamedText {
+    pub(crate) async fn push_text(
+        &mut self,
+        delta: String,
+        event_tx: &Sender<ProviderEvent>,
+    ) -> Result<(), AgentError> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+        let delta = if self.text_started {
+            delta
+        } else {
+            self.text_started = true;
+            delta.trim_start().to_owned()
+        };
+        if !delta.is_empty() {
+            self.text.push_str(&delta);
+            event_tx
+                .send_async(ProviderEvent::TextDelta { text: delta })
+                .await?;
+        }
+        Ok(())
     }
-    if !text.is_empty() {
-        blocks.push(ContentBlock::Text { text });
+
+    pub(crate) async fn push_reasoning(
+        &mut self,
+        delta: String,
+        event_tx: &Sender<ProviderEvent>,
+    ) -> Result<(), AgentError> {
+        if !delta.is_empty() {
+            self.reasoning.push_str(&delta);
+            event_tx
+                .send_async(ProviderEvent::ThinkingDelta { text: delta })
+                .await?;
+        }
+        Ok(())
     }
-    blocks
+
+    pub(crate) fn into_blocks(self) -> Vec<ContentBlock> {
+        let mut blocks = Vec::new();
+        if !self.reasoning.is_empty() {
+            blocks.push(ContentBlock::Thinking {
+                thinking: self.reasoning,
+                signature: None,
+            });
+        }
+        if !self.text.is_empty() {
+            blocks.push(ContentBlock::Text { text: self.text });
+        }
+        blocks
+    }
 }
 
 pub(crate) fn parse_tool_input(tool: &str, arguments: &str) -> Value {
@@ -650,12 +694,10 @@ pub async fn parse_sse(
 ) -> Result<StreamResponse, AgentError> {
     let mut lines = reader.lines();
 
-    let mut text = String::new();
-    let mut reasoning_text = String::new();
+    let mut streamed = StreamedText::default();
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
-    let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
@@ -716,28 +758,11 @@ pub async fn parse_sse(
             .flatten()
             .find(|s| !s.is_empty())
         {
-            reasoning_text.push_str(&reasoning);
-            event_tx
-                .send_async(ProviderEvent::ThinkingDelta { text: reasoning })
-                .await?;
+            streamed.push_reasoning(reasoning, event_tx).await?;
         }
 
         match delta.content {
-            Some(ContentDelta::String(content_str)) if !content_str.is_empty() => {
-                let content = if is_first_content {
-                    is_first_content = false;
-                    content_str.trim_start().to_string()
-                } else {
-                    content_str
-                };
-
-                if !content.is_empty() {
-                    text.push_str(&content);
-                    event_tx
-                        .send_async(ProviderEvent::TextDelta { text: content })
-                        .await?;
-                }
-            }
+            Some(ContentDelta::String(content)) => streamed.push_text(content, event_tx).await?,
             Some(ContentDelta::Array(content_array)) => {
                 for part in content_array {
                     match part {
@@ -749,31 +774,11 @@ pub async fn parse_sse(
                                     }) => content_str,
                                     ThinkingDelta::String(content_str) => content_str,
                                 };
-
-                                if content.is_empty() {
-                                    continue;
-                                }
-
-                                reasoning_text.push_str(&content);
-                                event_tx
-                                    .send_async(ProviderEvent::ThinkingDelta { text: content })
-                                    .await?;
+                                streamed.push_reasoning(content, event_tx).await?;
                             }
                         }
-                        ContentDeltaPart::Text { text: content_str } => {
-                            let content = if is_first_content {
-                                is_first_content = false;
-                                content_str.trim_start().to_string()
-                            } else {
-                                content_str
-                            };
-
-                            if !content.is_empty() {
-                                text.push_str(&content);
-                                event_tx
-                                    .send_async(ProviderEvent::TextDelta { text: content })
-                                    .await?;
-                            }
+                        ContentDeltaPart::Text { text } => {
+                            streamed.push_text(text, event_tx).await?;
                         }
                     }
                 }
@@ -819,7 +824,7 @@ pub async fn parse_sse(
         }
     }
 
-    let mut content_blocks = reasoning_and_text_blocks(reasoning_text, text);
+    let mut content_blocks = streamed.into_blocks();
 
     for acc in tool_accumulators {
         let input = parse_tool_input(&acc.name, &acc.arguments);
@@ -1081,6 +1086,60 @@ data: [DONE]\n";
         assert!(
             matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "think")
         );
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Kind {
+        Text,
+        Reasoning,
+    }
+
+    fn owned(deltas: &[(Kind, &str)]) -> Vec<(Kind, String)> {
+        deltas
+            .iter()
+            .map(|&(kind, text)| (kind, text.into()))
+            .collect()
+    }
+
+    #[test_case(&[(Kind::Text, ""), (Kind::Text, "\n Hi")], &[(Kind::Text, "Hi")], &[(Kind::Text, "Hi")] ; "empty_first_part_keeps_trim")]
+    #[test_case(&[(Kind::Text, "  Hi"), (Kind::Text, " there")], &[(Kind::Text, "Hi"), (Kind::Text, " there")], &[(Kind::Text, "Hi there")] ; "only_first_text_delta_trimmed")]
+    #[test_case(&[(Kind::Reasoning, " think"), (Kind::Text, "\nHi")], &[(Kind::Reasoning, " think"), (Kind::Text, "Hi")], &[(Kind::Reasoning, " think"), (Kind::Text, "Hi")] ; "reasoning_first_keeps_text_trim")]
+    #[tokio::test]
+    async fn streamed_text_trims_leading_whitespace_once(
+        pushed: &[(Kind, &str)],
+        sent: &[(Kind, &str)],
+        blocks: &[(Kind, &str)],
+    ) {
+        let (tx, rx) = flume::unbounded();
+        let mut streamed = StreamedText::default();
+        for &(kind, delta) in pushed {
+            match kind {
+                Kind::Text => streamed.push_text(delta.into(), &tx).await,
+                Kind::Reasoning => streamed.push_reasoning(delta.into(), &tx).await,
+            }
+            .unwrap();
+        }
+
+        let events: Vec<_> = rx
+            .try_iter()
+            .map(|event| match event {
+                ProviderEvent::TextDelta { text } => (Kind::Text, text),
+                ProviderEvent::ThinkingDelta { text } => (Kind::Reasoning, text),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        assert_eq!(events, owned(sent));
+
+        let built: Vec<_> = streamed
+            .into_blocks()
+            .into_iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => (Kind::Text, text),
+                ContentBlock::Thinking { thinking, .. } => (Kind::Reasoning, thinking),
+                other => panic!("unexpected block {other:?}"),
+            })
+            .collect();
+        assert_eq!(built, owned(blocks));
     }
 
     #[test]

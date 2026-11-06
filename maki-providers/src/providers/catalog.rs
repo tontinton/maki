@@ -28,13 +28,12 @@ use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
-use crate::providers::anthropic::shared;
+use crate::providers::anthropic::{self, shared};
 use crate::providers::openai_compat::{
     DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
 };
 use crate::providers::{
-    ResolvedAuth, Timeouts, body_reader, http_client, opencode, plugin, send_request,
-    status_and_text, user_agent,
+    ResolvedAuth, Timeouts, http_client, ok_sse, opencode, plugin, status_and_text, user_agent,
 };
 use crate::spec::ProviderRegistry;
 use crate::{
@@ -825,17 +824,8 @@ impl CatalogTransport {
                     .body(serde_json::to_vec(&body)?)
                     .build()?;
                 debug!(model = %model.id, "sending Anthropic-format request via catalog");
-                send_request(&self.client, request, |response| async move {
-                    if response.status().as_u16() == 200 {
-                        crate::providers::anthropic::parse_sse(
-                            body_reader(response),
-                            event_tx,
-                            self.stream_timeout,
-                        )
-                        .await
-                    } else {
-                        Err(AgentError::from_response(response).await)
-                    }
+                ok_sse(&self.client, request, |body| {
+                    anthropic::parse_sse(body, event_tx, self.stream_timeout)
                 })
                 .await
             }

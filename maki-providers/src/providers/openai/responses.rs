@@ -12,9 +12,9 @@ use tracing::{debug, warn};
 use crate::model::Model;
 use crate::providers::copilot::copilot_usd;
 use crate::providers::openai_compat::{
-    assistant_response, parse_tool_input, reasoning_and_text_blocks, tool_parameters,
+    StreamedText, assistant_response, parse_tool_input, tool_parameters,
 };
-use crate::providers::{ResolvedAuth, sse_error_status};
+use crate::providers::{ResolvedAuth, ok_sse, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -249,17 +249,8 @@ async fn post_responses(
         "sending Responses API request"
     );
 
-    super::super::send_request(client, request, |response| async move {
-        if response.status().as_u16() == 200 {
-            parse_sse(
-                super::super::body_reader(response),
-                event_tx,
-                stream_timeout,
-            )
-            .await
-        } else {
-            Err(AgentError::from_response(response).await)
-        }
+    ok_sse(client, request, |body| {
+        parse_sse(body, event_tx, stream_timeout)
     })
     .await
 }
@@ -278,12 +269,10 @@ pub(crate) async fn parse_sse(
 ) -> Result<StreamResponse, AgentError> {
     let mut lines = reader.lines();
 
-    let mut text = String::new();
-    let mut reasoning_text = String::new();
+    let mut streamed = StreamedText::default();
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
-    let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
     let mut current_event = String::new();
 
@@ -313,44 +302,23 @@ pub(crate) async fn parse_sse(
             return Err(AgentError::api(500, message));
         }
 
-        let parsed_event = if current_event.is_empty() {
-            serde_json::from_str::<Value>(data)
-                .ok()
-                .and_then(|value| value["type"].as_str().map(ToOwned::to_owned))
-                .unwrap_or_default()
+        let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let event = if current_event.is_empty() {
+            parsed["type"].as_str().unwrap_or_default()
         } else {
-            current_event.clone()
+            current_event.as_str()
         };
 
-        match parsed_event.as_str() {
+        match event {
             "response.output_text.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if let Some(delta) = parsed["delta"].as_str()
-                    && !delta.is_empty()
-                {
-                    let delta = if is_first_content {
-                        is_first_content = false;
-                        delta.trim_start().to_string()
-                    } else {
-                        delta.to_string()
-                    };
-                    if !delta.is_empty() {
-                        text.push_str(&delta);
-                        event_tx
-                            .send_async(ProviderEvent::TextDelta { text: delta })
-                            .await?;
-                    }
+                if let Some(delta) = parsed["delta"].as_str() {
+                    streamed.push_text(delta.to_owned(), event_tx).await?;
                 }
             }
 
             "response.output_item.added" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let item = &parsed["item"];
                 let output_index = parsed["output_index"]
                     .as_u64()
@@ -376,10 +344,6 @@ pub(crate) async fn parse_sse(
             }
 
             "response.function_call_arguments.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let delta: Cow<'_, str> = if let Some(s) = parsed["delta"].as_str() {
                     Cow::Borrowed(s)
                 } else if let Some(obj) = parsed["delta"].as_object() {
@@ -400,10 +364,6 @@ pub(crate) async fn parse_sse(
             }
 
             "response.in_progress" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 if let Some(pp) = parsed.get("prompt_progress") {
                     let processed = pp["processed"].as_u64().unwrap_or(0) as u32;
                     let total = pp["total"].as_u64().unwrap_or(0) as u32;
@@ -419,10 +379,6 @@ pub(crate) async fn parse_sse(
             }
 
             "response.output_item.done" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let item = &parsed["item"];
                 if item["type"].as_str() == Some("function_call") {
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
@@ -480,39 +436,20 @@ pub(crate) async fn parse_sse(
             }
 
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if let Some(delta) = parsed["delta"].as_str()
-                    && !delta.is_empty()
-                {
-                    reasoning_text.push_str(delta);
-                    event_tx
-                        .send_async(ProviderEvent::ThinkingDelta {
-                            text: delta.to_string(),
-                        })
-                        .await?;
+                if let Some(delta) = parsed["delta"].as_str() {
+                    streamed.push_reasoning(delta.to_owned(), event_tx).await?;
                 }
             }
 
-            "response.reasoning_summary_part.added" if !reasoning_text.is_empty() => {
-                reasoning_text.push_str("\n\n");
+            "response.reasoning_summary_part.added" if !streamed.reasoning.is_empty() => {
+                streamed.reasoning.push_str("\n\n");
             }
 
             "response.completed" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let resp = &parsed["response"];
-
-                if let Some(u) = resp.get("usage") {
-                    usage = parse_usage(u);
-                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
+                if let Some(parsed_usage) = parse_usage(&parsed) {
+                    usage = parsed_usage;
                 }
-
-                let status = resp["status"].as_str().unwrap_or("completed");
+                let status = parsed["response"]["status"].as_str().unwrap_or("completed");
                 stop_reason = Some(match status {
                     "completed" => {
                         if tool_accumulators.is_empty() {
@@ -527,23 +464,13 @@ pub(crate) async fn parse_sse(
             }
 
             "response.incomplete" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let resp = &parsed["response"];
-                if let Some(u) = resp.get("usage") {
-                    usage = parse_usage(u);
-                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
+                if let Some(parsed_usage) = parse_usage(&parsed) {
+                    usage = parsed_usage;
                 }
                 stop_reason = Some(StopReason::MaxTokens);
             }
 
             "response.failed" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let error = &parsed["response"]["error"];
                 let message = error["message"]
                     .as_str()
@@ -560,7 +487,7 @@ pub(crate) async fn parse_sse(
         }
     }
 
-    let mut content_blocks = reasoning_and_text_blocks(reasoning_text, text);
+    let mut content_blocks = streamed.into_blocks();
 
     for acc in tool_accumulators {
         let input = parse_tool_input(&acc.name, &acc.arguments);
@@ -570,7 +497,9 @@ pub(crate) async fn parse_sse(
     Ok(assistant_response(content_blocks, usage, stop_reason))
 }
 
-fn parse_usage(u: &Value) -> TokenUsage {
+/// The usage a `response.completed` or `response.incomplete` event carries.
+fn parse_usage(event: &Value) -> Option<TokenUsage> {
+    let u = event["response"].get("usage")?;
     let input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
     let output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
 
@@ -578,13 +507,13 @@ fn parse_usage(u: &Value) -> TokenUsage {
         .as_u64()
         .unwrap_or(0);
 
-    TokenUsage {
+    Some(TokenUsage {
         input: input_tokens.saturating_sub(cached),
         output: output_tokens,
         cache_read: cached,
         cache_creation: 0,
-        cost: None,
-    }
+        cost: copilot_usd(&event["copilot_usage"]),
+    })
 }
 
 #[cfg(test)]
