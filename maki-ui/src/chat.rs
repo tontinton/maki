@@ -10,7 +10,8 @@ use crate::components::input::Draft;
 use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
 use crate::components::{
-    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, ToolRole, ToolStatus,
+    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, NoticeDetail, ToolRole,
+    ToolStatus,
 };
 use crate::markdown::truncate_output;
 
@@ -323,13 +324,19 @@ impl Chat {
             }
             AgentEvent::Notice { text } => {
                 self.messages_panel.flush();
-                self.messages_panel.push(notice(text, None));
+                self.messages_panel
+                    .push(DisplayMessage::new(DisplayRole::Notice, text));
             }
-            AgentEvent::ObservationLine { text, detail, end } => {
+            AgentEvent::ObservationLine {
+                text,
+                detail,
+                markdown,
+                end,
+            } => {
                 self.messages_panel.flush();
                 self.messages_panel.push(task_notice(
                     text,
-                    detail,
+                    detail.map(|text| NoticeDetail { text, markdown }),
                     end.map(BackgroundOutcome::from),
                 ));
             }
@@ -742,7 +749,10 @@ pub fn history_to_display(
                 let message = &messages[index];
                 display.push(task_notice(
                     text.to_owned(),
-                    observation_detail(message).map(str::to_owned),
+                    observation_detail(message).map(|text| NoticeDetail {
+                        text: text.to_owned(),
+                        markdown: message.markdown,
+                    }),
                     message.answered().map(|settled| settled.end.into()),
                 ));
                 continue;
@@ -882,13 +892,9 @@ pub fn history_to_display(
     (display, restore_items)
 }
 
-fn notice(text: String, detail: Option<String>) -> DisplayMessage {
-    task_notice(text, detail, None)
-}
-
 fn task_notice(
     text: String,
-    detail: Option<String>,
+    detail: Option<NoticeDetail>,
     task_end: Option<BackgroundOutcome>,
 ) -> DisplayMessage {
     DisplayMessage {
@@ -1377,7 +1383,13 @@ mod tests {
         )
         .0;
 
-        assert_eq!(display[0].detail.as_deref(), Some(detail));
+        assert_eq!(
+            display[0]
+                .detail
+                .as_ref()
+                .map(|detail| detail.text.as_str()),
+            Some(detail)
+        );
         assert_eq!(display[0].task_end, task_end);
     }
 
@@ -1806,7 +1818,7 @@ mod tests {
     /// Once its run ends, only another run brings a task back. A woken run
     /// opens with no prompt, and what trails a run says nothing of the next.
     #[test_case(AgentEvent::TextDelta { text: USER_TEXT.into() }, TaskStatus::Working ; "a_run_streams")]
-    #[test_case(AgentEvent::ObservationLine { text: USER_TEXT.into(), detail: None, end: None }, TaskStatus::Working ; "a_woken_run_lands_its_notice")]
+    #[test_case(AgentEvent::ObservationLine { text: USER_TEXT.into(), detail: None, markdown: false, end: None }, TaskStatus::Working ; "a_woken_run_lands_its_notice")]
     #[test_case(AgentEvent::SubagentHistory { tool_use_id: TASK_ID.into(), messages: Vec::new() }, TaskStatus::Idle ; "transcript_trails_the_run")]
     #[test_case(AgentEvent::StreamClosed, TaskStatus::Idle ; "close_trails_the_run")]
     fn only_a_run_event_brings_an_idle_task_back(event: AgentEvent, status: TaskStatus) {

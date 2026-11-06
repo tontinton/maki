@@ -496,7 +496,7 @@ pub enum TaskAnswer {
 
 /// Part of the frozen session surface (disk, exports, Lua), written flat:
 /// `{"role", "content", "display_text"?, "kind"?, "facts"?, "receipts"?,
-/// "settles"?, "partial"?}`, with `kind` as a bare tag and `facts` beside a
+/// "settles"?, "partial"?, "markdown"?}`, with `kind` as a bare tag and `facts` beside a
 /// `context_update`. Older logs nest it as
 /// `{"kind": {"context_update": facts}}`. Those still load, and are not
 /// rewritten just for that.
@@ -514,6 +514,10 @@ pub struct Message {
     pub receipts: Vec<String>,
     /// Set on a notice that answers a receipt.
     pub answers: Option<TaskAnswer>,
+    /// The text is markdown, like a `task` reply. Shell output is not, and
+    /// a markdown renderer would eat its `#`, `*` and `-`. Only a background
+    /// notice sets it, since a turn already renders by its role.
+    pub markdown: bool,
 }
 
 /// [`Message`] as stored, before `kind` and `facts` are paired up.
@@ -533,6 +537,8 @@ struct RawMessage {
     settles: Option<TaskSettled>,
     #[serde(default, deserialize_with = "settles_or_none")]
     partial: Option<TaskSettled>,
+    #[serde(default)]
+    markdown: bool,
 }
 
 /// A newer build may write a [`TaskEnd`] this one does not know. Only the
@@ -587,6 +593,7 @@ impl TryFrom<RawMessage> for Message {
                 .settles
                 .map(TaskAnswer::Settles)
                 .or(raw.partial.map(TaskAnswer::Part)),
+            markdown: raw.markdown,
         })
     }
 }
@@ -601,7 +608,8 @@ impl Serialize for Message {
             + usize::from(!self.kind.is_turn())
             + usize::from(facts.is_some())
             + usize::from(!self.receipts.is_empty())
-            + usize::from(self.answers.is_some());
+            + usize::from(self.answers.is_some())
+            + usize::from(self.markdown);
         let mut state = serializer.serialize_struct("Message", len)?;
         state.serialize_field("role", &self.role)?;
         state.serialize_field("content", &self.content)?;
@@ -621,6 +629,9 @@ impl Serialize for Message {
             Some(TaskAnswer::Settles(settled)) => state.serialize_field("settles", settled)?,
             Some(TaskAnswer::Part(settled)) => state.serialize_field("partial", settled)?,
             None => {}
+        }
+        if self.markdown {
+            state.serialize_field("markdown", &true)?;
         }
         state.end()
     }
@@ -661,6 +672,7 @@ impl Message {
             kind,
             receipts,
             answers,
+            markdown,
         } = self;
         Self {
             role: role.clone(),
@@ -669,6 +681,7 @@ impl Message {
             kind: kind.clone(),
             receipts: receipts.clone(),
             answers: answers.clone(),
+            markdown: *markdown,
         }
     }
 
@@ -1882,11 +1895,12 @@ mod tests {
     /// plain notice rather than as the end of its receipt.
     #[test_case(TaskAnswer::Settles, "settles" ; "settles")]
     #[test_case(TaskAnswer::Part, "partial" ; "part")]
-    fn task_marks_write_the_flat_shape(answer: fn(TaskSettled) -> TaskAnswer, key: &str) {
+    fn task_notices_write_the_flat_shape(answer: fn(TaskSettled) -> TaskAnswer, key: &str) {
         let mut stored = json!({
             "role": "user",
             "content": [],
             "receipts": [TASK_ID],
+            "markdown": true,
         });
         stored[key] = json!({ "task": TASK_ID, "end": "cancelled" });
         let message = Message {
@@ -1895,6 +1909,7 @@ mod tests {
                 task: TASK_ID.into(),
                 end: TaskEnd::Cancelled,
             })),
+            markdown: true,
             ..Default::default()
         };
         assert_eq!(serde_json::to_value(&message).unwrap(), stored);

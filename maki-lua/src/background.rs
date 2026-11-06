@@ -450,6 +450,7 @@ impl BackgroundTasks {
                         display: Some(&display),
                         wake: task.stopped.is_none(),
                         end,
+                        markdown: done.output.is_markdown(),
                     }),
                 );
             }
@@ -493,6 +494,7 @@ impl BackgroundTasks {
         part: &TaskLabel,
         failed: bool,
         output: &str,
+        markdown: bool,
     ) -> bool {
         let Some(mailbox) = self
             .locked()
@@ -510,6 +512,7 @@ impl BackgroundTasks {
                 display: Some(&display),
                 wake: true,
                 end,
+                markdown,
             },
         )
     }
@@ -943,6 +946,22 @@ pub(crate) mod tests {
             })
         );
         assert!(!registry.contains(CALL_ID));
+    }
+
+    #[test_case(ToolOutput::Markdown(OUTPUT.into()), true ; "markdown_reply")]
+    #[test_case(ToolOutput::Plain(OUTPUT.into()), false ; "plain_output")]
+    fn a_delivered_notice_keeps_the_output_format(output: ToolOutput, markdown: bool) {
+        let session = MakiId::generate();
+        let (mailbox, _seed) = live(session);
+        let (registry, _token) = registry_with_call(session);
+
+        let done = ToolDoneEvent {
+            output: Arc::new(output),
+            ..done(OUTPUT, false)
+        };
+        registry.deliver(CALL_ID, done, None);
+
+        assert_eq!(mailbox.claim_wake()[0].markdown, markdown);
     }
 
     #[test]

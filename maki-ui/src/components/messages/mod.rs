@@ -18,8 +18,8 @@ use super::tool_display::{
     replace_header, search_text_for, thinking_style, truncate_to_header, user_style,
 };
 use super::{
-    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole,
-    ToolStatus, code_view::SectionFlags,
+    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER,
+    NoticeDetail, ToolRole, ToolStatus, code_view::SectionFlags,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -64,6 +64,7 @@ const CLICKABLE: bool = true;
 const NOTICE_COLLAPSED_MARK: &str = " ▸";
 const NOTICE_EXPANDED_MARK: &str = " ▾";
 const NOTICE_DETAIL_INDENT: &str = "  ";
+const NOTICE_DETAIL_DIM: f32 = 0.3;
 
 /// What a click in the transcript asks of the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1803,28 +1804,53 @@ fn message_view(
     if matches!(msg.role, DisplayRole::Notice)
         && let Some(detail) = &msg.detail
     {
-        push_notice_detail(&mut lines, detail, msg.detail_expanded);
+        push_notice_detail(&mut lines, detail, msg.detail_expanded, width);
     }
     (lines, false)
 }
 
-fn push_notice_detail(lines: &mut Vec<Line<'static>>, detail: &str, expanded: bool) {
-    let style = notice_style().text_style;
+fn push_notice_detail(
+    lines: &mut Vec<Line<'static>>,
+    detail: &NoticeDetail,
+    expanded: bool,
+    width: u16,
+) {
     let mark = if expanded {
         NOTICE_EXPANDED_MARK
     } else {
         NOTICE_COLLAPSED_MARK
     };
     if let Some(last) = lines.last_mut() {
-        last.spans.push(Span::styled(mark, style));
+        last.spans
+            .push(Span::styled(mark, notice_style().text_style));
     }
     if expanded {
-        lines.extend(
-            detail.lines().map(|line| {
-                Line::from(Span::styled(format!("{NOTICE_DETAIL_INDENT}{line}"), style))
-            }),
-        );
+        lines.extend(notice_detail_lines(detail, width));
     }
+}
+
+/// Fading every span, highlights too, keeps the output quieter than the
+/// conversation while it stays easy to read.
+fn notice_detail_lines(detail: &NoticeDetail, width: u16) -> impl Iterator<Item = Line<'static>> {
+    let text_style = theme::current().assistant;
+    let lines = if detail.markdown {
+        let body_width = width.saturating_sub(NOTICE_DETAIL_INDENT.len() as u16);
+        text_to_lines(&detail.text, "", text_style, text_style, body_width, None)
+    } else {
+        plain_lines(
+            detail.text.trim_end_matches('\n'),
+            "",
+            text_style,
+            text_style,
+        )
+    };
+    lines.into_iter().map(|mut line| {
+        for span in &mut line.spans {
+            span.style = theme::dim_style(span.style, NOTICE_DETAIL_DIM);
+        }
+        line.spans.insert(0, Span::raw(NOTICE_DETAIL_INDENT));
+        line
+    })
 }
 
 /// Builds ratatui lines for a non-Tool message shown in full at the given

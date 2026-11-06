@@ -811,6 +811,7 @@ mod tests {
         mailbox.settle(
             BACKGROUND_TASK_ID,
             Some(BackgroundNotice {
+                markdown: false,
                 text: BACKGROUND_RESULT.into(),
                 display: None,
                 wake: true,

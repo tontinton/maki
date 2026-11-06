@@ -1310,14 +1310,7 @@ fn routed_tool_entry(lua: &Lua, name: String) -> LuaResult<LuaValue> {
     };
     let t = lua.create_table()?;
     t.set("name", name.as_str())?;
-    t.set(
-        "format",
-        if view.markdown {
-            LUA_FORMAT_MARKDOWN
-        } else {
-            LUA_FORMAT_PLAIN
-        },
-    )?;
+    t.set("format", format_name(view.markdown))?;
     let summary = {
         let name = name.clone();
         lua.create_function(move |lua, input: LuaValue| {
@@ -1987,7 +1980,15 @@ impl ToolCallReply {
     }
 }
 
-fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
+pub(crate) fn format_name(markdown: bool) -> &'static str {
+    if markdown {
+        LUA_FORMAT_MARKDOWN
+    } else {
+        LUA_FORMAT_PLAIN
+    }
+}
+
+pub(crate) fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
     let Ok(LuaValue::String(s)) = t.get::<LuaValue>("format") else {
         return LuaOutputFormat::default();
     };

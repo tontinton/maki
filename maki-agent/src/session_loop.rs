@@ -352,6 +352,7 @@ mod tests {
 
     fn notice() -> BackgroundNotice<'static> {
         BackgroundNotice {
+            markdown: false,
             text: NOTICE.into(),
             display: None,
             wake: true,

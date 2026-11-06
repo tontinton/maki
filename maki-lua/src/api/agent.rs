@@ -47,7 +47,7 @@ use tracing::info;
 
 use crate::api::model::stale_tier_err;
 use crate::api::session::{not_live, required_session};
-use crate::api::tool::{audiences_to_lua, parse_audience};
+use crate::api::tool::{audiences_to_lua, format_name, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::command::UiAction;
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_tool_result};
@@ -785,8 +785,9 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 ///   `on_task` (function?) - called with the task id when the child runs as
 ///     a subagent, which `/tasks` then lists as a task of its own. Must not
 ///     yield.
-/// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
-///   Instruction files the child picks up (a subdirectory `AGENTS.md`) are
+/// @return (string?, string?, string?) Tool output text and its format
+///   (`"markdown"` or `"plain"`, as a tool handler sets it), or `(nil, err)`
+///   on failure. Instruction files the child picks up (a subdirectory `AGENTS.md`) are
 ///   not in the text: they land on the calling tool's own result.
 /// @example
 /// local out, err = maki.agent.call_tool(ctx, "bash", {
@@ -802,9 +803,33 @@ async fn call_tool(
     name: String,
     input: LuaValue,
     opts: Option<Table>,
-) -> LuaResult<Pair<String>> {
-    let input_json = lua_to_json(&lua, &input)?;
-    let agent = try_pair!(dispatch_ctx(&ctx, "call_tool"));
+) -> LuaResult<(Option<String>, Option<String>, Option<&'static str>)> {
+    let done = match dispatch_child(&lua, ctx, &name, &input, opts).await? {
+        Ok(done) => done,
+        Err(e) => return Ok((None, Some(e), None)),
+    };
+    Ok(match interpreter_bridge::flatten(&done) {
+        Ok(text) => (
+            Some(text),
+            None,
+            Some(format_name(done.output.is_markdown())),
+        ),
+        Err(e) => (None, Some(e), None),
+    })
+}
+
+async fn dispatch_child(
+    lua: &Lua,
+    ctx: mlua::UserDataRef<LuaCtx>,
+    name: &str,
+    input: &LuaValue,
+    opts: Option<Table>,
+) -> LuaResult<Result<ToolDoneEvent, String>> {
+    let input_json = lua_to_json(lua, input)?;
+    let agent = match dispatch_ctx(&ctx, "call_tool") {
+        Ok(agent) => agent,
+        Err(e) => return Ok(Err(e.to_string())),
+    };
     let mut tctx = agent.to_tool_context();
     tctx.output_mode = ToolOutputMode::Full;
     // Open even without callbacks: when a plugin answers the child's
@@ -816,7 +841,7 @@ async fn call_tool(
     if let Some(o) = opts {
         if let Some(mode) = o.opt::<String>("output_mode")? {
             let Some(mode) = ToolOutputMode::parse(&mode) else {
-                return Ok(err_pair(OUTPUT_MODE_ERR));
+                return Ok(Err(OUTPUT_MODE_ERR.into()));
             };
             tctx.output_mode = mode;
         }
@@ -830,7 +855,7 @@ async fn call_tool(
         on_task = o.opt::<Function>("on_task")?;
     }
     let cbs = LiveCallbacks {
-        tool: &name,
+        tool: name,
         caller: ToolContext::clone(agent),
         on_buf,
         on_ann,
@@ -840,9 +865,9 @@ async fn call_tool(
     };
     drop(ctx);
     if let Err(e) = tctx.deadline.check() {
-        return Ok(err_pair(e));
+        return Ok(Err(e.to_string()));
     }
-    let done = dispatch_racing_live(&tctx, &name, &input_json, live_rx, &cbs).await;
+    let done = dispatch_racing_live(&tctx, name, &input_json, live_rx, &cbs).await;
     // Same fallback the UI applies on tool completion, so a batch child's
     // header carries the annotation its standalone run would get.
     let annotation = done
@@ -852,7 +877,7 @@ async fn call_tool(
     if let Some(a) = annotation {
         cbs.deliver(ToolLive::Annotation(a)).await;
     }
-    Ok(pair(interpreter_bridge::flatten(&done)))
+    Ok(Ok(done))
 }
 
 /// Create a new subagent session. The session inherits the parent model and
@@ -3564,6 +3589,7 @@ mod tests {
 
     fn moved_call_notice(wake: bool) -> BackgroundNotice<'static> {
         BackgroundNotice {
+            markdown: false,
             text: NOTICE_TEXT.into(),
             display: None,
             wake,

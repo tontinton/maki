@@ -501,10 +501,15 @@ impl<'h> Agent<'h> {
             .and(observation_detail(&message))
             .map(str::to_owned);
         let end = message.answered().map(|settled| settled.end);
+        let markdown = message.markdown;
         self.history.push(message);
         if let Some(text) = line {
-            self.event_tx
-                .send(AgentEvent::ObservationLine { text, detail, end })?;
+            self.event_tx.send(AgentEvent::ObservationLine {
+                text,
+                detail,
+                markdown,
+                end,
+            })?;
         }
         Ok(())
     }
