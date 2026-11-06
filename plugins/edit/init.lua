@@ -6,7 +6,7 @@ local insert_after = require("edit_helpers").insert_after
 local preserve_line_endings = require("edit_helpers").preserve_line_endings
 
 local SNIPPET_MAX_CHARS = 32
-local FALLBACK_VIEW_LINES = 10
+local FALLBACK_VIEW_LINES = 5
 
 local DIFF_OLD = { style = "diff_old", prefix = "- ", sign = "diff_old_sign", nr = "diff_old_line_nr" }
 local DIFF_NEW = { style = "diff_new", prefix = "+ ", sign = "diff_new_sign", nr = "diff_new_line_nr" }
