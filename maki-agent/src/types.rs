@@ -526,18 +526,27 @@ pub struct CallRecord {
 const UNKNOWN_TOOL: &str = "unknown";
 
 impl ToolDoneEvent {
-    pub fn error(id: String, message: impl Into<String>) -> Self {
-        let message: String = message.into();
+    pub fn new(id: String, tool: Arc<str>, output: ToolOutput, is_error: bool) -> Self {
         Self {
             id,
-            tool: Arc::from(UNKNOWN_TOOL),
-            output: Arc::new(ToolOutput::Plain(message.into())),
-            is_error: true,
+            tool,
+            output: Arc::new(output),
+            is_error,
             annotation: None,
             written_path: None,
             call: None,
             backgrounded: false,
         }
+    }
+
+    pub fn error(id: String, message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        Self::new(
+            id,
+            Arc::from(UNKNOWN_TOOL),
+            ToolOutput::Plain(message.into()),
+            true,
+        )
     }
 
     /// How long the call ran before this result, a receipt's until the move.
