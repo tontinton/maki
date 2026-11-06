@@ -234,7 +234,6 @@
     .intro {
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(0, 25rem);
-      align-items: end;
       gap: 1.75rem clamp(2rem, 5vw, 4.5rem);
       padding-top: calc(var(--nav-h) + clamp(2.5rem, 6vw, 4.5rem));
       padding-bottom: 1.5rem;
@@ -243,7 +242,10 @@
     .lede { max-width: 58ch; margin-top: 0.85rem; font-size: 1.1rem; color: var(--ink-2); text-wrap: pretty; }
     .lede code, .desc code, .publish code, .reader-desc code { padding-block: 0; line-height: 1; }
     .trust { max-width: 58ch; margin-top: 0.5rem; font-size: 0.9rem; color: var(--ink-3); text-wrap: pretty; }
+    /* stretched to the title block, links pinned to its bottom, so both columns share a top and a bottom edge */
     .publish {
+      display: flex;
+      flex-direction: column;
       padding: 0.9rem 1.15rem 1rem;
       border: 1px dashed var(--nav-sep);
       border-radius: 10px;
@@ -254,22 +256,23 @@
     }
     .publish h2 { margin-bottom: 0.35rem; font-family: var(--font-mono); font-size: 0.95rem; font-weight: 500; color: var(--ink); }
     .publish p + p { margin-top: 0.5rem; }
+    .publish .cover-tip { display: flex; gap: 0.6rem; }
+    /* centred on the first 0.92rem x 1.5 line */
     .ratio {
-      display: inline-block;
+      flex: none;
+      display: grid;
+      place-items: center;
       width: 2.3rem;
       height: 1.15rem;
-      margin-right: 0.45rem;
+      margin-top: 0.115rem;
       border: 1px solid var(--chip-border);
       border-radius: 3px;
       background: var(--chip-bg);
       font-family: var(--font-mono);
       font-size: 0.64rem;
-      line-height: 1.05rem;
-      text-align: center;
-      vertical-align: -0.2rem;
       color: var(--ink-3);
     }
-    .publish-links { display: flex; flex-wrap: wrap; gap: 0.3rem 1rem; margin-top: 0.75rem; font-family: var(--font-mono); font-size: 0.8rem; }
+    .publish-links { display: flex; flex-wrap: wrap; gap: 0.3rem 1rem; margin-top: auto; padding-top: 0.75rem; font-family: var(--font-mono); font-size: 0.8rem; }
 
     /* ── toolbar ── */
     .toolbar {
@@ -697,9 +700,8 @@
     </div>
     <aside class="publish" aria-labelledby="publish-title">
       <h2 id="publish-title">+ yours</h2>
-      <p>Lay out your repo as a <a href="/docs/packages/">package</a> and add the <code>maki</code> and <code>plugin</code> topics. It shows up here on its own.</p>
-      <p><span class="ratio" aria-hidden="true">2:1</span>The first image, GIF or video in your README becomes the cover, badges skipped. 2:1 fills it edge to edge, like the 1200x600 VHS records by default.</p>
-      <p>The README opens right here, so write it for someone deciding whether to install.</p>
+      <p>Add the <code>maki</code> and <code>plugin</code> topics to a <a href="/docs/packages/">package</a> repo and it shows up here on its own.</p>
+      <p class="cover-tip"><span class="ratio" aria-hidden="true">2:1</span><span>The first image, GIF or video in your README is the cover, badges skipped. 2:1 fills it, like VHS's default 1200x600.</span></p>
       <div class="publish-links"><a class="link" href="/docs/packages/">write a plugin</a><a class="link" href="https://github.com/search?q=topic%3Amaki+topic%3Aplugin&amp;type=repositories" target="_blank" rel="noopener">topic on GitHub</a></div>
     </aside>
   </header>
