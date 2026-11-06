@@ -201,10 +201,14 @@ fn remove_entry(path: &Path) {
     };
 }
 
+/// Files only: plugin tokens live in a subdirectory, and a directory without
+/// its x bit cannot be entered even by its owner.
 #[cfg(unix)]
 fn restrict_auth(dir: &Path) {
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-        fs::set_permissions(entry.path(), fs::Permissions::from_mode(AUTH_FILE_MODE)).ok();
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            fs::set_permissions(entry.path(), fs::Permissions::from_mode(AUTH_FILE_MODE)).ok();
+        }
     }
 }
 
@@ -621,6 +625,12 @@ mod tests {
     const OLD_CONTENT: &str = "old";
     const NEW_CONTENT: &str = "new";
     const LONG_AGO: Duration = Duration::from_secs(86_400);
+    #[cfg(unix)]
+    const PLUGIN_AUTH: &str = "plugins";
+    #[cfg(unix)]
+    const PERMISSION_BITS: u32 = 0o777;
+    #[cfg(unix)]
+    const OWNER_EXEC: u32 = 0o100;
 
     fn xdg_layout(root: &Path) -> [PathBuf; 4] {
         [
@@ -936,5 +946,27 @@ mod tests {
             "migration continued past the bad trust file"
         );
         assert!(root.path().join(BACKUP_DIR).join(TRUST_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_files_are_restricted_and_the_plugin_dir_stays_enterable() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(".maki");
+        let xdg = xdg_layout(root.path());
+        write(legacy.join(AUTH).join("anthropic"), "{}");
+        write(legacy.join(AUTH).join(PLUGIN_AUTH).join("acme.json"), "{}");
+
+        migrate(&legacy, &xdg).unwrap();
+
+        let mode =
+            |path: PathBuf| fs::metadata(path).unwrap().permissions().mode() & PERMISSION_BITS;
+        let auth = xdg[2].join(AUTH);
+        assert_eq!(mode(auth.join("anthropic")), AUTH_FILE_MODE);
+        assert_ne!(
+            mode(auth.join(PLUGIN_AUTH)) & OWNER_EXEC,
+            0,
+            "plugin logins live in there"
+        );
     }
 }
