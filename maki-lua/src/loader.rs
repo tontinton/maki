@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use flume::Sender;
 use include_dir::{Dir, File, include_dir};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::ToolRegistry;
@@ -587,28 +588,18 @@ impl PluginHost {
         chunks: Vec<LoadChunk>,
         context: LoadContext,
     ) -> Result<(), PluginError> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
-            .tx
-            .send(Request::LoadSource {
-                name,
-                chunks,
-                context,
-                reply: reply_tx,
-            })
-            .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)?
+        self.ask(|reply| Request::LoadSource {
+            name,
+            chunks,
+            context,
+            reply,
+        })?
     }
 
     /// Option specs declared by loaded plugins via `maki.api.register_options`,
     /// keyed by plugin name. Used by docgen.
     pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
-            .tx
-            .send(Request::CollectPluginOptions { reply: reply_tx })
-            .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
+        self.ask(|reply| Request::CollectPluginOptions { reply })
     }
 
     /// Runs a source as the global `init.lua`.
@@ -641,30 +632,28 @@ impl PluginHost {
         scope: ConfigScope,
         plugin_dir: Option<PathBuf>,
     ) -> Result<Option<RawConfig>, PluginError> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
-            .tx
-            .send(Request::RunInitLua {
-                source,
-                scope,
-                plugin_dir,
-                reply: reply_tx,
-            })
-            .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)?
+        self.ask(|reply| Request::RunInitLua {
+            source,
+            scope,
+            plugin_dir,
+            reply,
+        })?
     }
 
     pub fn unload(&self, plugin: &str) -> Result<(), PluginError> {
+        self.ask(|reply| Request::ClearPlugin {
+            plugin: Arc::from(plugin),
+            reply,
+        })
+    }
+
+    fn ask<T>(&self, request: impl FnOnce(Sender<T>) -> Request) -> Result<T, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .tx
-            .send(Request::ClearPlugin {
-                plugin: Arc::from(plugin),
-                reply: reply_tx,
-            })
+            .send(request(reply_tx))
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)?;
-        Ok(())
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
     }
 
     /// Runs a source with every permission granted, for tests and embedders.
@@ -745,12 +734,7 @@ impl PluginHost {
     /// Read after the init files have run, which is when the declared set is
     /// complete and before anything is installed.
     pub fn declared_packages(&self) -> Result<Vec<crate::api::pack::Declared>, PluginError> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
-            .tx
-            .send(Request::CollectPackages { reply: reply_tx })
-            .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
+        self.ask(|reply| Request::CollectPackages { reply })
     }
 
     fn run_pack_loader(
@@ -762,24 +746,19 @@ impl PluginHost {
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
         check_plugin_compatibility(&package.name, Some(&package.dir))?;
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
-            .tx
-            .send(Request::RunPackLoader {
-                declared,
-                context: LoadContext {
-                    plugin_dir: Some(package.dir.clone()),
-                    permissions,
-                    granted_providers,
-                    opts,
-                    revision_guard: package.revision_guard.clone(),
-                    package: true,
-                    authority: DeclAuthority::ThirdParty,
-                },
-                reply: reply_tx,
-            })
-            .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)?
+        self.ask(|reply| Request::RunPackLoader {
+            declared,
+            context: LoadContext {
+                plugin_dir: Some(package.dir.clone()),
+                permissions,
+                granted_providers,
+                opts,
+                revision_guard: package.revision_guard.clone(),
+                package: true,
+                authority: DeclAuthority::ThirdParty,
+            },
+            reply,
+        })?
     }
 
     /// Loads one external package directory as a single owner.
@@ -864,12 +843,7 @@ impl PluginHost {
     /// One call and not a read followed by a close, because a Lua task can
     /// record an activation between the two and closing would strand it.
     pub fn seal_pack_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
-            .tx
-            .send(Request::SealPackOps { reply: reply_tx })
-            .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
+        self.ask(|reply| Request::SealPackOps { reply })
     }
 
     /// Takes the package operations Lua recorded, leaving the queue empty.
@@ -877,12 +851,7 @@ impl PluginHost {
     /// Called by the host after the initiating task has exited, which keeps a
     /// load off the thread that requested it.
     fn take_pending_pack_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
-            .tx
-            .send(Request::TakePackOps { reply: reply_tx })
-            .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
+        self.ask(|reply| Request::TakePackOps { reply })
     }
 
     /// Loads every package that should be loaded now: the `start/` ones, and

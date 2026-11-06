@@ -47,7 +47,6 @@ use crate::agent_autocmd::HostEvent;
 use crate::api::action::{ActionStore, clear_plugin_actions};
 use crate::api::agent::adopt_session;
 use crate::api::autocmd::AutocmdStore;
-use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter, release_mode};
@@ -81,6 +80,7 @@ use crate::background::{
 };
 use crate::docs_render;
 use crate::error::PluginError;
+use crate::jobs::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::key_lint::KeyLint;
 use crate::loader::EventHandle;
 use crate::pack::Interaction;
@@ -3532,6 +3532,34 @@ struct ToolKeys {
     describe: Option<RegistryKey>,
 }
 
+impl ToolKeys {
+    fn release(self, lua: &Lua, plugin: &str) {
+        let Self {
+            handler,
+            header,
+            restore,
+            start,
+            permission_scopes,
+            describe,
+        } = self;
+        let keys = [
+            ("handler", Some(handler)),
+            ("header", header),
+            ("restore", restore),
+            ("start", start),
+            ("permission_scopes", permission_scopes),
+            ("describe", describe),
+        ];
+        for (slot, key) in keys {
+            if let Some(key) = key
+                && let Err(e) = lua.remove_registry_value(key)
+            {
+                tracing::warn!(plugin, slot, error = %e, "failed to drop lua tool key");
+            }
+        }
+    }
+}
+
 struct PluginOwner {
     tools: HashMap<Arc<str>, ToolKeys>,
     revision_guard: Option<Arc<maki_pack::lock::Lock>>,
@@ -3726,30 +3754,8 @@ impl LuaRuntime {
         if let Some(owner) = self.plugins.borrow_mut().remove(name) {
             unload_ui(&self.lua, name);
             revision_guard = owner.revision_guard;
-            for (_, tk) in owner.tools {
-                if let Err(e) = self.lua.remove_registry_value(tk.handler) {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop lua handler key");
-                }
-                if let Some(sk) = tk.header
-                    && let Err(e) = self.lua.remove_registry_value(sk)
-                {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop lua header key");
-                }
-                if let Some(sk) = tk.permission_scopes
-                    && let Err(e) = self.lua.remove_registry_value(sk)
-                {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop lua permission_scopes key");
-                }
-                if let Some(sk) = tk.start
-                    && let Err(e) = self.lua.remove_registry_value(sk)
-                {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop lua start key");
-                }
-                if let Some(sk) = tk.describe
-                    && let Err(e) = self.lua.remove_registry_value(sk)
-                {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop lua describe key");
-                }
+            for tk in owner.tools.into_values() {
+                tk.release(&self.lua, name);
             }
         }
         if let Some(mut cmd_map) = self.lua.app_data_mut::<CommandHandlerMap>()
@@ -4101,22 +4107,13 @@ impl LuaRuntime {
             .iter()
             .map(|t| {
                 let tool: Arc<dyn Tool> = Arc::new(LuaTool {
-                    name: Arc::clone(&t.name),
-                    description: t.description.clone(),
-                    schema: t.schema,
-                    audience: t.audience,
-                    kind: t.kind.clone(),
+                    meta: t.meta.clone(),
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     has_header_fn: t.header_key.is_some(),
                     has_start_fn: t.start_key.is_some(),
                     permission: t.permission.as_ref().map(ToolPermission::kind),
-                    mutable_path_field: t.mutable_path_field.clone(),
-                    timeout: t.timeout,
-                    start_annotation: t.start_annotation.clone(),
-                    examples: t.examples.clone(),
                     has_describe_fn: t.describe_key.is_some(),
-                    background_only: t.background_only.clone(),
                 });
                 (
                     tool,
@@ -4147,7 +4144,7 @@ impl LuaRuntime {
             .into_iter()
             .map(|t| {
                 (
-                    t.name,
+                    t.meta.name,
                     ToolKeys {
                         handler: t.handler_key,
                         header: t.header_key,
@@ -4307,6 +4304,166 @@ impl LuaRuntime {
         )
         .await?;
         Ok(config_store.lock().unwrap().take())
+    }
+
+    async fn run_pack_loader(
+        &mut self,
+        declared: crate::api::pack::Declared,
+        context: LoadContext,
+    ) -> LoadResult {
+        let name = declared.spec.name.clone();
+        let (function, argument) = (|| {
+            let crate::api::pack::LoadMode::Custom(loader) = &declared.load else {
+                return Err(mlua::Error::runtime("run_pack_loader: not a custom load"));
+            };
+            let function = self.lua.registry_value::<Function>(loader.as_ref())?;
+            let argument = self.lua.create_table()?;
+            argument.set(
+                "spec",
+                crate::api::pack::spec_to_lua(&self.lua, &declared.spec, declared.data.as_ref())?,
+            )?;
+            // The same directory the chunks would load from, read back rather
+            // than passed twice.
+            argument.set(
+                "path",
+                context
+                    .plugin_dir
+                    .as_ref()
+                    .map(|dir| dir.display().to_string()),
+            )?;
+            Ok::<_, mlua::Error>((function, argument))
+        })()
+        .map_err(|source| PluginError::Lua {
+            plugin: name.clone(),
+            source,
+        })?;
+        self.load_source(
+            Arc::from(name.as_str()),
+            PluginLoad::Function { function, argument },
+            context,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_plan_action(
+        &self,
+        gate: &Rc<InflightGate>,
+        session: String,
+        generation: u64,
+        row: usize,
+        path: String,
+        parallel: bool,
+        reply: flume::Sender<PlanActionOutcome>,
+    ) {
+        let found = self
+            .lua
+            .app_data_ref::<PlanRowHandlers>()
+            .ok_or(PLAN_HANDLERS_MISSING_ERR)
+            .and_then(|handlers| {
+                let handler = handlers.handler(&session, generation, row)?;
+                let func = self
+                    .lua
+                    .registry_value::<Function>(&handler.key)
+                    .map_err(|_| PLAN_HANDLER_GONE_ERR)?;
+                Ok((Arc::clone(&handler.plugin), func))
+            });
+        let (plugin, func) = match found {
+            Ok(found) => found,
+            Err(reason) => {
+                tracing::warn!(
+                    session,
+                    generation,
+                    row,
+                    reason,
+                    "plan form row pick reached no handler"
+                );
+                let _ = reply.send(PlanActionOutcome::Failed);
+                return;
+            }
+        };
+        let lua = self.lua.clone();
+        let gate = Rc::clone(gate);
+        spawn_local(async move {
+            let run = async {
+                let opts = row_handler_opts(&lua, &session, &path, parallel)?;
+                let thread = lua.create_thread(func)?;
+                thread.into_async::<LuaValue>(opts)?.await
+            };
+            // Handler-then-action: the row's built-in outcome follows unless
+            // the handler answered `false` or failed.
+            let deadline = Instant::now() + PLAN_ROW_HANDLER_DEADLINE;
+            let outcome = match run_awaited(&lua, &gate, CancelToken::none(), deadline, run).await {
+                Ok(Ok(LuaValue::Boolean(false))) => PlanActionOutcome::Vetoed,
+                Ok(Ok(_)) => PlanActionOutcome::Proceed,
+                Ok(Err(e)) => {
+                    tracing::warn!(plugin = %plugin, row, error = %strip_traceback(&e), "plan form row handler failed");
+                    PlanActionOutcome::Failed
+                }
+                Err(reason) => {
+                    tracing::warn!(plugin = %plugin, row, reason, "plan form row handler abandoned");
+                    PlanActionOutcome::Failed
+                }
+            };
+            let _ = reply.send(outcome);
+        });
+    }
+
+    fn click_tool(
+        &self,
+        gate: &Rc<InflightGate>,
+        restores: &Rc<RestoreTracker>,
+        tool_use_id: String,
+        row: usize,
+        fallback: Option<Box<ClickFallback>>,
+    ) {
+        let handle = self
+            .live_tasks
+            .borrow()
+            .get(&tool_use_id)
+            .map(|task| Arc::clone(&task.handle))
+            .or_else(|| {
+                self.warm_tools
+                    .borrow()
+                    .iter()
+                    .find(|w| w.id == tool_use_id)
+                    .map(|w| Arc::clone(&w.handle))
+            });
+        let func = handle
+            .as_ref()
+            .and_then(resolve_root_buf)
+            .and_then(|root| crate::api::ui::buf::click_fn(&root));
+        let (Some(handle), Some(func)) = (handle, func) else {
+            // No handle, or a buf without a click handler (some plugins wire
+            // clicks only in restore): either way the fallback restore serves
+            // it.
+            if let Some(fb) = fallback {
+                spawn_restore(gate, restores, self, fb.item, fb.event_tx);
+            } else {
+                tracing::debug!(tool_use_id, "unhandled click ignored");
+            }
+            return;
+        };
+        let lua = self.lua.clone();
+        let gate = Rc::clone(gate);
+        let arg = match self.lua.create_table() {
+            Ok(t) => {
+                let _ = t.set("row", row);
+                LuaValue::Table(t)
+            }
+            Err(_) => LuaValue::Nil,
+        };
+        spawn_local(async move {
+            let slot = Some(gate.acquire().await);
+            let call = covered(
+                slot,
+                ScopedFuture::new(lua.clone(), handle, func.call_async::<()>(arg)),
+            );
+            if let Err(e) = call.await {
+                tracing::warn!(tool_use_id, error = %e, "live click failed");
+            }
+        });
     }
 }
 
@@ -5725,72 +5882,9 @@ pub fn spawn(
                             path,
                             parallel,
                             reply,
-                        } => {
-                            let found = rt
-                                .lua
-                                .app_data_ref::<PlanRowHandlers>()
-                                .ok_or(PLAN_HANDLERS_MISSING_ERR)
-                                .and_then(|handlers| {
-                                    let handler = handlers.handler(&session, generation, row)?;
-                                    let func = rt
-                                        .lua
-                                        .registry_value::<Function>(&handler.key)
-                                        .map_err(|_| PLAN_HANDLER_GONE_ERR)?;
-                                    Ok((Arc::clone(&handler.plugin), func))
-                                });
-                            match found {
-                                Ok((plugin, func)) => {
-                                    let lua = rt.lua.clone();
-                                    let gate = Rc::clone(&gate);
-                                    spawn_local(async move {
-                                        let run = async {
-                                            let opts =
-                                                row_handler_opts(&lua, &session, &path, parallel)?;
-                                            let thread = lua.create_thread(func)?;
-                                            thread.into_async::<LuaValue>(opts)?.await
-                                        };
-                                        // Handler-then-action: the row's
-                                        // built-in outcome follows unless the
-                                        // handler answered `false` or failed.
-                                        let deadline =
-                                            Instant::now() + PLAN_ROW_HANDLER_DEADLINE;
-                                        let outcome = match run_awaited(
-                                            &lua,
-                                            &gate,
-                                            CancelToken::none(),
-                                            deadline,
-                                            run,
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(LuaValue::Boolean(false))) => {
-                                                PlanActionOutcome::Vetoed
-                                            }
-                                            Ok(Ok(_)) => PlanActionOutcome::Proceed,
-                                            Ok(Err(e)) => {
-                                                tracing::warn!(plugin = %plugin, row, error = %strip_traceback(&e), "plan form row handler failed");
-                                                PlanActionOutcome::Failed
-                                            }
-                                            Err(reason) => {
-                                                tracing::warn!(plugin = %plugin, row, reason, "plan form row handler abandoned");
-                                                PlanActionOutcome::Failed
-                                            }
-                                        };
-                                        let _ = reply.send(outcome);
-                                    });
-                                }
-                                Err(reason) => {
-                                    tracing::warn!(
-                                        session,
-                                        generation,
-                                        row,
-                                        reason,
-                                        "plan form row pick reached no handler"
-                                    );
-                                    let _ = reply.send(PlanActionOutcome::Failed);
-                                }
-                            }
-                        }
+                        } => rt.run_plan_action(
+                            &gate, session, generation, row, path, parallel, reply,
+                        ),
                         Request::OpenPlanForm {
                             path,
                             session,
@@ -5920,52 +6014,7 @@ pub fn spawn(
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &gate, &spawn_rx).await;
-                            let name = declared.spec.name.clone();
-                            let input = (|| {
-                                let crate::api::pack::LoadMode::Custom(loader) = &declared.load
-                                else {
-                                    return Err(mlua::Error::runtime(
-                                        "run_pack_loader: not a custom load",
-                                    ));
-                                };
-                                let function =
-                                    rt.lua.registry_value::<Function>(loader.as_ref())?;
-                                let argument = rt.lua.create_table()?;
-                                argument.set(
-                                    "spec",
-                                    crate::api::pack::spec_to_lua(
-                                        &rt.lua,
-                                        &declared.spec,
-                                        declared.data.as_ref(),
-                                    )?,
-                                )?;
-                                // The same directory the chunks would load
-                                // from, read back rather than passed twice.
-                                argument.set(
-                                    "path",
-                                    context
-                                        .plugin_dir
-                                        .as_ref()
-                                        .map(|dir| dir.display().to_string()),
-                                )?;
-                                Ok::<_, mlua::Error>((function, argument))
-                            })()
-                            .map_err(|source| PluginError::Lua {
-                                plugin: name.clone(),
-                                source,
-                            });
-                            let result = match input {
-                                Ok((function, argument)) => {
-                                    rt.load_source(
-                                        Arc::from(name.as_str()),
-                                        PluginLoad::Function { function, argument },
-                                        context,
-                                        None,
-                                    )
-                                    .await
-                                }
-                                Err(error) => Err(error),
-                            };
+                            let result = rt.run_pack_loader(declared, context).await;
                             let _ = reply.send(result);
                         }
                         Request::RestoreToolAsync { item, event_tx } => {
@@ -5978,54 +6027,7 @@ pub fn spawn(
                             tool_use_id,
                             row,
                             fallback,
-                        } => {
-                            let handle = rt
-                                .live_tasks
-                                .borrow()
-                                .get(&tool_use_id)
-                                .map(|task| Arc::clone(&task.handle))
-                                .or_else(|| {
-                                    rt.warm_tools
-                                        .borrow()
-                                        .iter()
-                                        .find(|w| w.id == tool_use_id)
-                                        .map(|w| Arc::clone(&w.handle))
-                                });
-                            let func = handle
-                                .as_ref()
-                                .and_then(resolve_root_buf)
-                                .and_then(|root| crate::api::ui::buf::click_fn(&root));
-                            let (Some(handle), Some(func)) = (handle, func) else {
-                                // No handle, or a buf without a click handler
-                                // (some plugins wire clicks only in restore):
-                                // either way the fallback restore serves it.
-                                if let Some(fb) = fallback {
-                                    spawn_restore(&gate, &restores, &rt, fb.item, fb.event_tx);
-                                } else {
-                                    tracing::debug!(tool_use_id, "unhandled click ignored");
-                                }
-                                continue;
-                            };
-                            let lua = rt.lua.clone();
-                            let g = Rc::clone(&gate);
-                            let arg = match rt.lua.create_table() {
-                                Ok(t) => {
-                                    let _ = t.set("row", row);
-                                    LuaValue::Table(t)
-                                }
-                                Err(_) => LuaValue::Nil,
-                            };
-                            spawn_local(async move {
-                                let slot = Some(g.acquire().await);
-                                let call = covered(
-                                    slot,
-                                    ScopedFuture::new(lua.clone(), handle, func.call_async::<()>(arg)),
-                                );
-                                if let Err(e) = call.await {
-                                    tracing::warn!(tool_use_id, error = %e, "live click failed");
-                                }
-                            });
-                        }
+                        } => rt.click_tool(&gate, &restores, tool_use_id, row, fallback),
                         Request::FireAutocmd { event, data } => {
                             let _ = hook_tx.send(HostHook::Autocmd { event, data });
                         }
@@ -6156,8 +6158,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{MOVED_CALL_ID, call_scope, moved_home};
     use super::*;
-    use crate::api::r#fn::JobSpec;
     use crate::api::tool::ToolCallReply;
+    use crate::jobs::JobSpec;
     use crate::loader::HOST_RUNTIME;
     use futures::FutureExt;
     use maki_agent::cancel::CancelTrigger;
@@ -7442,6 +7444,36 @@ mod tests {
         } else {
             drop(scope);
         }
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
+
+    #[test]
+    fn tool_keys_release_drops_every_key() {
+        let lua = Lua::new();
+        let captured = Arc::new(());
+        let key = || {
+            let held = Arc::clone(&captured);
+            let func = lua
+                .create_function(move |_, ()| {
+                    let _ = &held;
+                    Ok(())
+                })
+                .unwrap();
+            lua.create_registry_value(func).unwrap()
+        };
+        let keys = ToolKeys {
+            handler: key(),
+            header: Some(key()),
+            restore: Some(key()),
+            start: Some(key()),
+            permission_scopes: Some(key()),
+            describe: Some(key()),
+        };
+
+        keys.release(&lua, "plugin");
         lua.gc_collect().unwrap();
         lua.gc_collect().unwrap();
 
