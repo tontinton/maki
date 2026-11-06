@@ -134,6 +134,10 @@ pub const PROVIDER_BUILTINS: &[&str] = &[
     "tensorx",
 ];
 
+/// The [`DEFAULT_BUILTINS`] that only add UI or commands and register no tool,
+/// so their names stay free for MCP servers and are not valid tool names.
+pub const NON_TOOL_BUILTINS: &[&str] = &["completion", "sessions", "thinking"];
+
 /// Tools the edit plugin provides alongside `edit`, toggled through its options.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
