@@ -1,4 +1,9 @@
+local ToolView = require("maki.tool_view")
+
 local MAIN_TASK = "main"
+-- The panel already shows the live list, so the chat keeps each call folded to
+-- its header until clicked.
+local BODY_VIEW = { max_lines = 0, keep = "head" }
 
 -- `sessions[session_id]`, one per session that wrote todos or took focus:
 --   lists[task_id]  the latest list of each task. A subagent shares its
@@ -56,11 +61,10 @@ local function build_lines(items)
   return lines
 end
 
--- Shared by handler and restore, so a call looks the same live and reloaded.
+-- Shared by handler and restore, so a call looks the same live and reloaded,
+-- and the UI's recorded clicks replay onto the same toggle.
 local function list_body(items)
-  local body = maki.ui.buf()
-  body:set_lines(build_lines(items))
-  return body
+  return ToolView.restore_lines(build_lines(items), BODY_VIEW)
 end
 
 -- A plain buf made during a tool call becomes that call's chat body, and it
