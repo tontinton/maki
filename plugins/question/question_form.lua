@@ -595,7 +595,8 @@ QuestionForm._is_selected = is_selected
 QuestionForm._wrap_spans = wrap_spans
 QuestionForm.MODE = MODE
 
-function QuestionForm.open(questions)
+-- `on_open(win)` runs once the form is on screen, before it waits for a key.
+function QuestionForm.open(questions, on_open)
   local state = initial_state(questions)
   local buf = maki.ui.buf()
   local max_h = math.floor(maki.ui.terminal_size().rows * MAX_HEIGHT_RATIO)
@@ -610,6 +611,9 @@ function QuestionForm.open(questions)
     needs_input = true,
     split = "below",
   })
+  if on_open then
+    on_open(win)
+  end
 
   local width = win.width
   while true do

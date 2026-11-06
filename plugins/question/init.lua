@@ -33,6 +33,21 @@ local function dense(questions, answers)
   return out
 end
 
+-- A plugin may answer for a user who is away from the terminal, so the form
+-- sits behind a slot. It names no price: answering stands in for the user,
+-- which costs every permission.
+local open_form = maki.api.declare_slot("question.form", function(questions, _ev, on_open)
+  return QuestionForm.open(questions, on_open)
+end)
+
+local function ask(questions, ctx)
+  local result = open_form(questions, { session = ctx:session_id() })
+  if QuestionHelpers.is_reply(result) then
+    return result
+  end
+  return QuestionForm.open(questions)
+end
+
 maki.api.register_tool({
   name = "question",
   description = DESCRIPTION,
@@ -82,7 +97,7 @@ maki.api.register_tool({
     if #questions == 0 then
       return { llm_output = "error: at least one question is required", is_error = true }
     end
-    local result = QuestionForm.open(questions)
+    local result = ask(questions, ctx)
     local opts = QuestionHelpers.view_opts(ctx)
     if result.type == "dismiss" then
       return {
