@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use std::os::unix::fs::PermissionsExt;
 
 use color_eyre::Result;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, bail};
 use maki_storage::paths::{self, tilde};
 
 use crate::provider_scripts::{self, MIGRATE_COMMAND, Reference, Script};
@@ -536,11 +536,31 @@ fn keep_rules_in_force(legacy: &Path, config: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A target inside `~/.maki`, say `~/.config/maki` symlinked to it, holds the
+/// very same files, so each one would look like a clash and its only copy
+/// would go to the backup before `~/.maki` is removed.
+fn ensure_outside(legacy: &Path, targets: &[&Path]) -> Result<()> {
+    let legacy_real =
+        fs::canonicalize(legacy).with_context(|| format!("resolve {}", tilde(legacy)))?;
+    for target in targets {
+        let real =
+            fs::canonicalize(target).with_context(|| format!("resolve {}", tilde(target)))?;
+        if real.starts_with(&legacy_real) {
+            let (target, legacy) = (tilde(target), tilde(legacy));
+            bail!(
+                "{target} points into {legacy}, so maki cannot move {legacy} into it. Move {target} out of {legacy} first"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn migrate_from(legacy: &Path) -> Result<()> {
     let config = paths::config_dir().context("determine config directory")?;
     let data = paths::data_dir().context("determine data directory")?;
     let state = paths::state_dir().context("determine state directory")?;
     let logs = paths::logs_dir().context("determine log directory")?;
+    ensure_outside(legacy, &[&config, &data, &state, &logs])?;
     move_legacy_layout(legacy, &config, &data, &state, &logs)
 }
 
@@ -946,6 +966,18 @@ mod tests {
             "migration continued past the bad trust file"
         );
         assert!(root.path().join(BACKUP_DIR).join(TRUST_FILE).exists());
+    }
+
+    #[test_case("config", true ; "a_target_outside_is_fine")]
+    #[test_case(".maki/config", false ; "a_target_inside_is_refused")]
+    fn targets_must_be_outside_the_legacy_dir(target: &str, allowed: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(".maki");
+        let target = root.path().join(target);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(&target).unwrap();
+
+        assert_eq!(ensure_outside(&legacy, &[&target]).is_ok(), allowed);
     }
 
     #[cfg(unix)]
