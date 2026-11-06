@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   changes:
     name: Detect changes
@@ -55,9 +59,4 @@ jobs:
           purge-prefixes: nix-${{ runner.os }}-
           purge-created: 0
           purge-primary-key: never
-      - name: Check hash drift
-        run: nix build .#checks.x86_64-linux.git-dep-hashes
-      - name: Check Nix formatting
-        run: nix build .#checks.x86_64-linux.fmt
-      - name: Build
-        run: nix build
+      - run: nix flake check -L

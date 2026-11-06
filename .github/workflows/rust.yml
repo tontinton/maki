@@ -11,6 +11,10 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   changes:
     name: Detect changes
@@ -123,8 +127,6 @@ jobs:
           tool: just,cargo-nextest
       - run: sudo apt-get -o Acquire::Retries=5 install -y ripgrep
       - run: just test
-      # Lives here to reuse the warm target dir instead of building the graph twice.
-      - run: just gen-docs-check
 
   machete:
     name: Unused deps
@@ -166,23 +168,31 @@ jobs:
         with:
           tool: just
       - run: just build
+      # Lives here, off the Test critical path, to reuse the warm dev target dir.
+      - run: just gen-docs-check
 
+  # Lint and build share little beyond build scripts, so they run as separate jobs.
   windows:
-    name: Lint + Build (Windows)
+    name: ${{ matrix.recipe == 'lint' && 'Lint' || 'Build' }} (Windows)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        recipe: [lint, build]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.recipe }}
       - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: just
-      - run: just lint
-      - run: just build
+      - run: just ${{ matrix.recipe }}
 
   ci-pass:
     name: CI
