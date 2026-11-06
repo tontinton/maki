@@ -4,19 +4,23 @@ use flume::Sender;
 use maki_storage::StateDir;
 use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::catalog::{
-    CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks, sends_if_available,
-    shared_catalog,
+    CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks, UsageEndpoint,
+    sends_if_available, shared_catalog,
 };
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, NO_CURATED_MODELS, Native,
     ProviderSpec,
 };
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    ThinkingConfig, UsageLimit,
+};
 
 use super::{ResolvedAuth, Timeouts, with_prefix};
 
@@ -131,12 +135,28 @@ fn create_with_auth(
 const SESSION_HEADER: &str = "x-opencode-session";
 const PUBLIC_KEY: &str = "public";
 
-pub(crate) const QUIRKS: ProviderQuirks = ProviderQuirks {
-    free_tier: Some(FreeTier {
-        public_key: PUBLIC_KEY,
-        config_slug: ZEN_SLUG,
-    }),
+const FREE_TIER: Option<FreeTier> = Some(FreeTier {
+    public_key: PUBLIC_KEY,
+    config_slug: ZEN_SLUG,
+});
+
+/// Only Go has a quota endpoint; OpenCode themselves expose subscription
+/// usage on `/zen/go/v1/usage` and nothing on the Zen base.
+pub(crate) const ZEN_QUIRKS: ProviderQuirks = ProviderQuirks {
+    free_tier: FREE_TIER,
     session_header: Some(SESSION_HEADER),
+    usage: None,
+};
+
+pub(crate) const GO_QUIRKS: ProviderQuirks = ProviderQuirks {
+    free_tier: FREE_TIER,
+    session_header: Some(SESSION_HEADER),
+    usage: Some(GO_USAGE),
+};
+
+const GO_USAGE: UsageEndpoint = UsageEndpoint {
+    url: "https://opencode.ai/zen/go/v1/usage",
+    parse: parse_usage,
 };
 
 /// Plan quotas, served on 401 as well as 429. They clear on a weekly or monthly
@@ -325,4 +345,110 @@ pub(crate) fn non_login_error(status: u16, body: &str) -> Option<NonLoginError> 
             .to_owned(),
         is_quota,
     })
+}
+
+const ROLLING_LABEL: &str = "5-hour";
+const WEEKLY_LABEL: &str = "Weekly";
+const MONTHLY_LABEL: &str = "Monthly";
+const RATE_LIMITED_STATUS: &str = "rate-limited";
+const RATE_LIMITED_DETAIL: &str = "rate limited";
+
+#[derive(Default, Deserialize)]
+struct GoUsageResponse {
+    usage: GoUsage,
+}
+
+#[derive(Default, Deserialize)]
+struct GoUsage {
+    #[serde(default)]
+    rolling: Option<GoWindow>,
+    #[serde(default)]
+    weekly: Option<GoWindow>,
+    #[serde(default)]
+    monthly: Option<GoWindow>,
+}
+
+#[derive(Deserialize)]
+struct GoWindow {
+    percent: Option<f64>,
+    #[serde(
+        default,
+        rename = "resetsAt",
+        deserialize_with = "crate::types::deserialize_reset_at"
+    )]
+    resets_at: Option<u64>,
+    status: Option<String>,
+}
+
+impl GoUsage {
+    fn limits(self) -> Vec<UsageLimit> {
+        [
+            (ROLLING_LABEL, self.rolling),
+            (WEEKLY_LABEL, self.weekly),
+            (MONTHLY_LABEL, self.monthly),
+        ]
+        .into_iter()
+        .filter_map(|(label, window)| window.map(|window| (label, window)))
+        .map(|(label, window)| UsageLimit {
+            label: label.to_owned(),
+            percentage: window
+                .percent
+                .map(|percent| percent.round().clamp(0.0, 100.0) as u32),
+            reset_at: window.resets_at,
+            detail: (window.status.as_deref() == Some(RATE_LIMITED_STATUS))
+                .then(|| RATE_LIMITED_DETAIL.to_owned()),
+        })
+        .collect()
+    }
+}
+
+/// The shape `UsageEndpoint::url` answers, see the wire sample in the tests.
+fn parse_usage(body: &str) -> Result<ProviderUsage, AgentError> {
+    let response: GoUsageResponse = serde_json::from_str(body)?;
+    Ok(ProviderUsage {
+        plan: None,
+        limits: response.usage.limits(),
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_BODY: &str = r#"{"usage":{
+        "rolling": {"status":"active","percent":62,"resetsAt":"2026-11-03T19:30:00Z"},
+        "weekly": {"status":"rate-limited","percent":31.4,"resetsAt":"2026-11-08T00:00:00Z"},
+        "monthly": {"status":"active","percent":0,"resetsAt":"2026-12-01T00:00:00Z"}
+    }}"#;
+
+    fn usage(body: &str) -> Vec<UsageLimit> {
+        parse_usage(body).unwrap().limits
+    }
+
+    #[test]
+    fn parse_usage_windows_keep_order_percent_and_reset() {
+        let limits = usage(SAMPLE_BODY);
+        assert_eq!(limits.len(), 3);
+        assert_eq!(limits[0].label, ROLLING_LABEL);
+        assert_eq!(limits[0].percentage, Some(62));
+        assert_eq!(limits[0].detail, None);
+        assert_eq!(limits[1].percentage, Some(31));
+        assert_eq!(limits[1].detail.as_deref(), Some(RATE_LIMITED_DETAIL));
+        assert_eq!(limits[2].percentage, Some(0));
+        assert!(limits.iter().all(|limit| limit.reset_at.is_some()));
+    }
+
+    #[test]
+    fn parse_usage_missing_windows_are_skipped() {
+        let limited: GoUsageResponse =
+            serde_json::from_str(r#"{"usage":{"weekly":{"percent":5}}}"#).unwrap();
+        assert_eq!(limited.usage.limits()[0].label, WEEKLY_LABEL);
+    }
+
+    #[test]
+    fn parse_usage_unknown_status_is_dropped() {
+        let limits = usage(r#"{"usage":{"rolling":{"status":"what-now","percent":1}}}"#);
+        assert_eq!(limits[0].detail, None);
+    }
 }
