@@ -15,7 +15,7 @@ pub use frame::{RunContext, RunContextBuilder, plan_mode_update};
 pub use history::{
     Cutter, History, HistorySnapshot, SharedHeader, SharedMessages, UNAVAILABLE_RESULT,
     USER_CANCEL_MARKER, close_dangling_tool_calls, live_header, live_history, live_snapshot,
-    publish_live_history, publish_live_session,
+    publish_live_history, publish_live_session, unbind_thinking,
 };
 pub use hook::{AgentCall, AgentHook, AgentHooks, AgentSlot};
 pub use instructions::{

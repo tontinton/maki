@@ -467,7 +467,7 @@ fn is_bound(block: &ContentBlock) -> bool {
 }
 
 /// A redacted block is nothing but its binding, so it goes whole.
-fn unbind_thinking(messages: &mut [Message]) {
+pub fn unbind_thinking(messages: &mut [Message]) {
     for msg in messages {
         msg.content
             .retain(|block| !matches!(block, ContentBlock::RedactedThinking { .. }));

@@ -29,6 +29,7 @@ pub use agent::{
     Instructions, LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages,
     Transcript, UNAVAILABLE_RESULT, USER_CANCEL_MARKER, close_dangling_tool_calls, display_order,
     find_subdirectory_instructions, is_instruction_file, observation_detail, observation_line,
+    unbind_thinking,
 };
 pub use call_scope::{AlreadyMoved, CallGuard, CallScope, MovedTrigger, SessionStub, TaskHome};
 pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};

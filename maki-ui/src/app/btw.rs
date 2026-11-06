@@ -65,16 +65,20 @@ impl App {
         // thinking (`tool_choice: none` would void it). A resumed session has
         // no wire before its first run, and a switched model has no cache to
         // hit and may reject the old wire. Either way the transcript's
-        // thinking blocks are bound to a prefix this request cannot rebuild,
-        // so thinking goes off: the API then ignores them instead of
-        // rejecting the request.
+        // thinking signatures are bound to a prefix this request cannot
+        // rebuild. With thinking off the API would ignore them, but some
+        // models cannot turn it off, so the signatures go and the reasoning
+        // text stays.
         let fitted = snapshot
             .as_ref()
             .and_then(|s| s.tools.as_ref())
             .filter(|tools| tools.model == model.spec());
         let (tools, opts) = match fitted {
             Some(SessionTools { wire, .. }) => (Arc::clone(wire), self.request_options()),
-            None => (Arc::new(NO_TOOLS), RequestOptions::default()),
+            None => {
+                maki_agent::unbind_thinking(&mut messages);
+                (Arc::new(NO_TOOLS), RequestOptions::default())
+            }
         };
 
         let (tx, rx) = flume::bounded(64);
@@ -176,7 +180,8 @@ mod tests {
     use maki_lua::PluginHost;
     use maki_providers::provider::BoxFuture;
     use maki_providers::{
-        AgentError, Effort, ModelInfo, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+        AgentError, ContentBlock, Effort, ModelInfo, Role, StopReason, StreamResponse,
+        ThinkingConfig, TokenUsage,
     };
     use maki_storage::frame::{PromptFacts, StoredFrame};
     use serde_json::json;
@@ -186,8 +191,11 @@ mod tests {
     const FRAME_POLICY: &str = "Use the active conversation policy.";
     const ANSWER: &str = "Let me check.";
     const OTHER_MODEL: &str = "anthropic/other-model";
+    const THOUGHT: &str = "sqlite needs no server";
+    const SIGNATURE: &str = "bound-to-the-old-prefix";
 
     struct Recorded {
+        messages: Vec<Message>,
         system: String,
         tools: Value,
         opts: RequestOptions,
@@ -202,7 +210,7 @@ mod tests {
         fn stream_message<'a>(
             &'a self,
             _: &'a Model,
-            _: &'a [Message],
+            messages: &'a [Message],
             system: &'a str,
             tools: &'a Value,
             events: &'a Sender<ProviderEvent>,
@@ -211,6 +219,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let _ = self.sent.send(Recorded {
+                    messages: messages.to_vec(),
                     system: system.to_owned(),
                     tools: tools.clone(),
                     opts,
@@ -240,8 +249,19 @@ mod tests {
         json!([{ "name": "read" }])
     }
 
+    fn thought(signature: Option<&str>) -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: THOUGHT.into(),
+            signature: signature.map(Into::into),
+        }
+    }
+
     fn share_history(app: &mut App, frame: StoredFrame, fitted_for: Option<String>) {
-        let mut snapshot = HistorySnapshot::new(Vec::new());
+        let mut snapshot = HistorySnapshot::new(vec![Message {
+            role: Role::Assistant,
+            content: vec![thought(Some(SIGNATURE))],
+            ..Default::default()
+        }]);
         snapshot.frame = Some(Arc::new(frame));
         snapshot.tools = fitted_for.map(|model| SessionTools {
             model,
@@ -292,14 +312,17 @@ mod tests {
         );
     }
 
-    #[test_case(Some(test_model().spec()), wire(), ThinkingConfig::Effort(Effort::High) ; "live_wire_shares_the_cache_prefix")]
-    #[test_case(Some(OTHER_MODEL.into()), NO_TOOLS, ThinkingConfig::Off ; "switched_model_takes_the_no_tools_path")]
-    #[test_case(None, NO_TOOLS, ThinkingConfig::Off ; "no_live_wire_leaves_thinking_off")]
+    /// Some models cannot turn thinking off, so without the session's wire the
+    /// old signatures must go or Anthropic rejects the request.
+    #[test_case(Some(test_model().spec()), wire(), ThinkingConfig::Effort(Effort::High), Some(SIGNATURE) ; "live_wire_shares_the_cache_prefix")]
+    #[test_case(Some(OTHER_MODEL.into()), NO_TOOLS, ThinkingConfig::Off, None ; "switched_model_takes_the_no_tools_path")]
+    #[test_case(None, NO_TOOLS, ThinkingConfig::Off, None ; "no_live_wire_unbinds_thinking")]
     #[tokio::test]
     async fn side_question_repeats_the_sessions_tools_and_thinking(
         fitted_for: Option<String>,
         tools: Value,
         thinking: ThinkingConfig,
+        signature: Option<&str>,
     ) {
         let mut app = test_app();
         app.state.thinking = ThinkingConfig::Effort(Effort::High);
@@ -307,6 +330,7 @@ mod tests {
         let sent = ask(&mut app).await;
         assert_eq!(sent.tools, tools);
         assert_eq!(sent.opts.thinking, thinking);
+        assert_eq!(sent.messages[0].content, [thought(signature)]);
     }
 
     /// `Done` once never came: the provider's sender outlived the stream, so
@@ -346,7 +370,7 @@ mod tests {
         msg.content
             .iter()
             .filter_map(|b| match b {
-                maki_providers::ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect()
