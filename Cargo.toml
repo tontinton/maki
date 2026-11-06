@@ -46,7 +46,6 @@ rustix = { workspace = true }
 
 [dev-dependencies]
 maki-config = { workspace = true, features = ["test-util"] }
-maki-lua = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 
 [workspace]

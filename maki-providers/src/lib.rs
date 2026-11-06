@@ -11,9 +11,8 @@ pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
 pub mod spec;
-/// One recorded server for two audiences: other crates get it behind the
-/// feature, this crate's own tests get it without.
-#[cfg(any(test, feature = "test-support"))]
+/// Tests only, here and in other crates. Always built because a cargo feature
+/// gating it would pass in the workspace build and fail a lone crate.
 pub mod test_support;
 pub mod tokens;
 pub(crate) mod types;

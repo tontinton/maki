@@ -12,7 +12,6 @@ use maki_agent::tools::ToolRegistry;
 use maki_agent::{Cutter, SessionEndReason};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::{DeclAuthority, keep_granted};
-#[cfg(any(test, feature = "test-support"))]
 use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
 use tokio::task::spawn_blocking;
 
@@ -40,7 +39,8 @@ use maki_storage::id::MakiId;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// The runtime a host built outside `main`'s gets, which is every test.
-#[cfg(any(test, feature = "test-support"))]
+/// `main` enters its own multi-thread runtime first, so this one is never
+/// built in production.
 pub(crate) static HOST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
     Builder::new_multi_thread()
         .enable_all()
@@ -50,15 +50,11 @@ pub(crate) static HOST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
 /// A `#[tokio::test]` runtime is single-threaded and only advances while the
 /// test awaits, so a host on it could not wake a sleeping Lua task while the
 /// test thread blocks on the host; only a multi-thread runtime is kept.
-#[cfg(any(test, feature = "test-support"))]
 fn enter_test_runtime() -> Option<EnterGuard<'static>> {
     let on_workers = Handle::try_current()
         .is_ok_and(|handle| handle.runtime_flavor() == RuntimeFlavor::MultiThread);
     (!on_workers).then(|| HOST_RUNTIME.enter())
 }
-
-#[cfg(not(any(test, feature = "test-support")))]
-fn enter_test_runtime() {}
 
 const PACK_STATE_UNAVAILABLE: &str = "could not read package state: plugin host stopped";
 const USER_PLUGIN: &str = "user";
@@ -1113,7 +1109,7 @@ impl PluginHost {
 
 #[derive(Clone)]
 pub struct EventHandle {
-    tx: flume::Sender<Request>,
+    pub(crate) tx: flume::Sender<Request>,
     /// User-initiated requests bypass queued bulk work (session restores).
     prio_tx: flume::Sender<Request>,
     moves: flume::Sender<MoveRequest>,
@@ -1334,17 +1330,6 @@ impl EventHandle {
         let _ = self.tx.try_send(Request::FireAutocmd {
             event: event.name().to_owned(),
             data: event.payload(session_id),
-        });
-    }
-
-    /// Fires {event} with {data} as given, for tests that need a payload no
-    /// [`HostEvent`] carries. Test builds only, so host code has no way to
-    /// fire an event whose fields nobody classified.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn fire_autocmd(&self, event: &str, data: serde_json::Value) {
-        let _ = self.tx.try_send(Request::FireAutocmd {
-            event: event.to_owned(),
-            data,
         });
     }
 
