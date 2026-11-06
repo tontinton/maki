@@ -15,6 +15,7 @@ use syntect::highlighting::{
 
 const DEFAULT_THEME: &str = "dracula";
 const THEMES_DIR: &str = "themes";
+const WASH: f32 = 0.06;
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
 
 const HELIX_TO_TEXTMATE: &[(&str, &str)] = &[
@@ -465,6 +466,8 @@ pub struct Theme {
     pub assistant: Style,
     pub assistant_prefix: Style,
     pub thinking: Style,
+    /// Subtle full-row tint behind user messages; missing key = no bg.
+    pub user_message_bg: Style,
     pub tool_bg: Style,
     pub tool: Style,
     pub tool_path: Style,
@@ -861,11 +864,14 @@ impl Theme {
             s => s,
         };
 
+        let user = style("user");
+        let user_message_bg = style("user_message_bg");
+
         Ok(Self {
             background: color("background"),
             foreground: color("foreground"),
 
-            user: style("user"),
+            user,
             assistant: style("assistant"),
             assistant_prefix: style("assistant_prefix"),
             thinking: brighten_toward(
@@ -874,6 +880,13 @@ impl Theme {
                 color("foreground"),
                 0.3,
             ),
+            // An explicit value wins; otherwise a faint wash of the user color
+            // over the background. Non-Rgb terminals get no background at all.
+            user_message_bg: if user_message_bg == Style::default() {
+                user_bg_fallback(color("background"), user.fg.unwrap_or(Color::Reset))
+            } else {
+                user_message_bg
+            },
             tool_bg: style("tool_bg"),
             tool: style("tool"),
             tool_path: style("tool_path"),
@@ -1027,6 +1040,19 @@ pub(crate) fn dim_style(style: Style, factor: f32) -> Style {
             lerp_u8(fb, bb, factor),
         )),
         _ => style.add_modifier(Modifier::DIM),
+    }
+}
+
+/// Faint wash of the user color over the background, for themes that do not
+/// pick a `user_message_bg` themselves.
+fn user_bg_fallback(background: Color, user: Color) -> Style {
+    match (background, user) {
+        (Color::Rgb(br, bgr, bb), Color::Rgb(ur, ug, ub)) => Style::new().bg(Color::Rgb(
+            lerp_u8(br, ur, WASH),
+            lerp_u8(bgr, ug, WASH),
+            lerp_u8(bb, ub, WASH),
+        )),
+        _ => Style::default(),
     }
 }
 
@@ -1203,6 +1229,56 @@ mod tests {
 "#;
         let theme = Theme::from_toml(toml).unwrap();
         assert_eq!(theme.user, Style::default());
+    }
+
+    #[test]
+    fn missing_user_message_bg_still_gets_a_derived_tint() {
+        let toml = r##"
+[palette]
+background = "#202020"
+[ui]
+user = { fg = "#00ff00" }
+"##;
+        let theme = Theme::from_toml(toml).unwrap();
+        let Color::Rgb(r, g, b) = theme
+            .user_message_bg
+            .bg
+            .expect("an Rgb theme derives a tint")
+        else {
+            panic!("Rgb background and user fg must blend");
+        };
+        // WASH wash of the user fg over the background, all but untouched.
+        assert_eq!(r, lerp_u8(0x20, 0x00, WASH));
+        assert_eq!(g, lerp_u8(0x20, 0xff, WASH));
+        assert_eq!(b, lerp_u8(0x20, 0x00, WASH));
+    }
+
+    #[test]
+    fn non_rgb_background_keeps_no_tint() {
+        let toml = r#"
+[palette]
+background = "default"
+[ui]
+user = { fg = "green" }
+"#;
+        let theme = Theme::from_toml(toml).unwrap();
+        assert_eq!(theme.user_message_bg.bg, None, "palette names cannot blend");
+    }
+
+    #[test]
+    fn explicit_user_message_bg_wins_over_the_derived_tint() {
+        let toml = r##"
+[palette]
+background = "#202020"
+[ui]
+user = { fg = "#00ff00" }
+user_message_bg = { bg = "#f00f0f" }
+"##;
+        let theme = Theme::from_toml(toml).unwrap();
+        let Color::Rgb(r, g, b) = theme.user_message_bg.bg.expect("explicit key") else {
+            panic!("the explicit key must land verbatim");
+        };
+        assert_eq!((r, g, b), (0xf0, 0x0f, 0x0f));
     }
 
     #[test]

@@ -114,6 +114,7 @@ user               = { fg = "lavender" }
 assistant          = { fg = "foreground" }
 assistant_prefix   = { fg = "rosewater" }
 thinking           = { fg = "comment", modifiers = ["italic"] }
+user_message_bg    = { bg = "#2e2e40" }
 
 # Tool styles
 tool               = { fg = "foreground" }
