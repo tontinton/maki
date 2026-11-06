@@ -95,6 +95,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
     "batch",
     "code_execution",
+    "completion",
     "deepseek",
     "edit",
     "glob",
@@ -139,7 +140,7 @@ pub const PROVIDER_BUILTINS: &[&str] = &[
 ///
 /// A plugin belongs here while what it does is worth shipping but what it
 /// costs at scale is not yet known.
-pub const OPTIONAL_BUILTINS: &[&str] = &["completion"];
+pub const OPTIONAL_BUILTINS: &[&str] = &[];
 
 /// Tools the edit plugin provides alongside `edit`, toggled through its options.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
@@ -4654,14 +4655,16 @@ mod tests {
     /// accepted, and it stays off until that config says `enabled = true`.
     #[test]
     fn an_optional_builtin_loads_only_when_a_config_asks_for_it() {
-        let name = OPTIONAL_BUILTINS[0];
-        let off: RawConfig = toml::from_str(&format!("[plugins.{name}]\n")).unwrap();
-        let off = off.into_config(&[]).expect("naming it is not an error");
-        assert!(!off.plugins.names.iter().any(|n| n == name));
+        for name in OPTIONAL_BUILTINS {
+            let off: RawConfig = toml::from_str(&format!("[plugins.{name}]\n")).unwrap();
+            let off = off.into_config(&[]).expect("naming it is not an error");
+            assert!(!off.plugins.names.iter().any(|n| n == name));
 
-        let on: RawConfig = toml::from_str(&format!("[plugins.{name}]\nenabled = true\n")).unwrap();
-        let on = on.into_config(&[]).unwrap();
-        assert!(on.plugins.names.iter().any(|n| n == name));
+            let on: RawConfig =
+                toml::from_str(&format!("[plugins.{name}]\nenabled = true\n")).unwrap();
+            let on = on.into_config(&[]).unwrap();
+            assert!(on.plugins.names.iter().any(|n| n == name));
+        }
     }
 
     #[test_case("enabled = false" ; "enabled_false")]
