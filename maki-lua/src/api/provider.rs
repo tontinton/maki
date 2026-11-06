@@ -58,6 +58,7 @@ const SLUG: &str = "slug";
 const BASE_URL: &str = "base_url";
 const HEADERS: &str = "headers";
 const GET_JSON: &str = "get_json";
+const PROTOCOL: &str = "protocol";
 const HTTP_OK: u16 = 200;
 const HTTP_SCHEME: &str = "http://";
 const HTTPS_SCHEME: &str = "https://";
@@ -428,6 +429,13 @@ fn hook_ctx(lua: &Lua, keys: &LuaHookKeys, terminal: bool) -> LuaResult<Table> {
     ctx.set(BASE_URL, base_url.as_deref())?;
     ctx.set(HEADERS, lua.create_table_from(headers.clone())?)?;
     ctx.set(
+        PROTOCOL,
+        plugin::codec(&keys.slug)
+            .map(|p| serde_json::to_value(p).unwrap())
+            .map(|v| json_to_lua(lua, &v))
+            .transpose()?,
+    )?;
+    ctx.set(
         GET_JSON,
         get_json(lua, base_url, headers, keys.egress.clone())?,
     )?;
@@ -647,6 +655,10 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///           from it so side calls follow a user who points the slug at a
 ///           gateway.
 ///   `ctx.headers` (table) The headers every request to the slug carries.
+///   `ctx.protocol` (string?) The wire requests speak right now: the declared
+///           `codec` with a `providers.toml` `[slug] protocol` override
+///           applied, nil for a `base`. A hook that writes wire-specific
+///           fields branches on it.
 ///   `ctx.get_json(target)` (function) A GET with `ctx.headers`. A `target`
 ///           starting with `/` is appended to `ctx.base_url`, an absolute URL
 ///           is used as is. Never retried. Returns the decoded body, or nil
@@ -662,6 +674,10 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///   `display_name` (string) Required. Shown in the UI.
 ///   `codec` (string) Wire format: `"openai"`, `"openai-responses"`,
 ///           `"anthropic"` or `"google"`.
+///   `codecs` (table) Extra wire formats a `[slug] protocol` entry in
+///           `providers.toml` may switch this provider to. The declared
+///           `codec` is always supported and stays the default. Only with
+///           `codec`; every listed codec must honour the other options.
 ///   `base` (string) A native provider to borrow whole, e.g. `"ollama"`.
 ///           Prefer `codec` for a new provider.
 ///   `base_url` (string) Default origin. Must be `https`, or `http` on
@@ -1062,6 +1078,7 @@ lua_table! {
         register(perms, owner, egress, grants),
         is_selected(owner),
         http_error,
+        codec(owner),
     ]
 }
 
@@ -1079,6 +1096,24 @@ pub(crate) fn create_provider_namespace(
     let provider = create_provider_table(lua, permissions, owner, egress, permissions.clone())?;
     provider.set("auth", create_auth_table(lua, owned)?)?;
     Ok(provider)
+}
+
+/// The wire the slug's requests speak right now: the declared `codec` with a
+/// `providers.toml` `[slug] protocol` override applied, nil for a `base`.
+/// Lets a hook that writes wire-specific fields branch on it, the way
+/// `maki.provider.codec("mistral")` answers `"openai"` or `"openai-responses"`.
+///
+/// @param slug string Provider name.
+/// @return (string) The wire name as the codec spells it, e.g. `"openai"`.
+#[lua_fn]
+fn codec(_lua: &Lua, #[ctx] _owner: crate::api::Owner, slug: String) -> LuaResult<String> {
+    let wire = plugin::codec(&slug).map(|p| serde_json::to_value(p).unwrap());
+    match wire {
+        Some(Value::String(s)) => Ok(s.as_str().to_owned()),
+        _ => Err(mlua::Error::runtime(format!(
+            "maki.provider.codec: '{slug}' serves a `base`, so it has no wire"
+        ))),
+    }
 }
 
 #[cfg(test)]

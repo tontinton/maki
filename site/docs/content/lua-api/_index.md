@@ -4819,6 +4819,10 @@ Every hook is optional and gets a `ctx` table as its first argument:
   from it so side calls follow a user who points the slug at a
   gateway.
 - `ctx.headers` (`table`) The headers every request to the slug carries.
+- `ctx.protocol` (`string?`) The wire requests speak right now: the declared
+  `codec` with a `providers.toml` `[slug] protocol` override
+  applied, nil for a `base`. A hook that writes wire-specific
+  fields branches on it.
 - `ctx.get_json(target)` (`function`) A GET with `ctx.headers`. A `target`
   starting with `/` is appended to `ctx.base_url`, an absolute URL
   is used as is. Never retried. Returns the decoded body, or nil
@@ -4834,6 +4838,10 @@ it does for a built-in provider.
 - `display_name` (`string`) Required. Shown in the UI.
 - `codec` (`string`) Wire format: `"openai"`, `"openai-responses"`,
   `"anthropic"` or `"google"`.
+- `codecs` (`table`) Extra wire formats a `[slug] protocol` entry in
+  `providers.toml` may switch this provider to. The declared
+  `codec` is always supported and stays the default. Only with
+  `codec`; every listed codec must honour the other options.
 - `base` (`string`) A native provider to borrow whole, e.g. `"ollama"`.
   Prefer `codec` for a new provider.
 - `base_url` (`string`) Default origin. Must be `https`, or `http` on
@@ -5018,6 +5026,25 @@ fetch_usage = function(ctx)
   return { limits = {} }
 end
 ```
+
+---
+
+### `maki.provider.codec()` {#maki-provider-codec}
+
+```lua
+maki.provider.codec({slug})
+```
+
+The wire the slug's requests speak right now: the declared `codec` with a
+`providers.toml` `[slug] protocol` override applied, nil for a `base`.
+Lets a hook that writes wire-specific fields branch on it, the way
+`maki.provider.codec("mistral")` answers `"openai"` or `"openai-responses"`.
+
+**Parameters:**
+
+- `{slug}` (`string`) Provider name.
+
+**Returns:** (`string`) The wire name as the codec spells it, e.g. `"openai"`.
 
 
 ## maki.provider.auth {#maki-provider-auth}

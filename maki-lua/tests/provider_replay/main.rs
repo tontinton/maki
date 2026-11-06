@@ -8,7 +8,10 @@
 //! replaying each file in a child process, see [`golden`].
 
 use std::collections::HashMap;
+use std::fs;
 use std::sync::{Arc, Mutex};
+
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use maki_agent::tools::ToolRegistry;
 use maki_config::providers::builtin_provider;
@@ -40,6 +43,9 @@ const HOME_VARS: &[&str] = &[
 const HOST_FAILED: &str = "the plugin host did not start";
 const LOAD_FAILED: &str = "the bundled provider plugin did not load";
 const TEMPDIR_FAILED: &str = "no temporary state directory";
+const CONFIG_DIR_FAILED: &str = "the isolated config directory did not resolve";
+const WRITE_FAILED: &str = "providers.toml could not be written";
+const PROVIDERS_FILE: &str = "providers.toml";
 const UNDECLARED_SLUG: &str =
     "a bundled provider plugin did not declare the slug it is named after";
 const NOT_LISTED_FOR_LOGIN: &str = "a bundled provider plugin is missing from maki auth login";
@@ -57,6 +63,14 @@ fn isolated_state() -> TempDir {
     dir
 }
 
+/// Writes a `providers.toml` into the isolated config directory, the way a
+/// user would. Called before the plugin loads, so a `[slug] protocol` entry
+/// reaches registration.
+pub(crate) fn write_providers_toml(_home: &TempDir, contents: &str) {
+    let config = maki_storage::paths::config_dir().expect(CONFIG_DIR_FAILED);
+    fs::write(config.join(PROVIDERS_FILE), contents).expect(WRITE_FAILED);
+}
+
 /// One bundled plugin and no others, so what registers the slug is never
 /// ambiguous, loaded with the permissions its own `plugin.toml` declares, so
 /// what is under test is the plugin exactly as it ships.
@@ -66,13 +80,22 @@ fn isolated_state() -> TempDir {
 /// local gateway. The host comes back instead of being dropped, since a hook
 /// whose host has died answers nothing.
 fn load_bundled(slug: &str) -> PluginHost {
+    load_bundled_with_opts(slug, HashMap::new())
+}
+
+/// `opts` is the `plugins.<name>` table from `maki.setup`, so a golden can
+/// load its plugin the way a user who set that option would.
+fn load_bundled_with_opts(
+    slug: &str,
+    opts: HashMap<String, JsonMap<String, JsonValue>>,
+) -> PluginHost {
     let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).expect(HOST_FAILED);
     plugin::begin_load();
     host.load_builtins(&PluginsConfig {
         enabled: true,
         names: vec![slug.to_owned()],
         packages: Vec::new(),
-        opts: HashMap::new(),
+        opts,
     })
     .expect(LOAD_FAILED);
     plugin::commit_load();

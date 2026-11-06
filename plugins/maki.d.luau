@@ -141,6 +141,7 @@ declare maki: {
     register: @checked (spec: any) -> (),
     is_selected: @checked (slug: string) -> (boolean),
     http_error: @checked (res: any) -> (any),
+    codec: @checked (slug: string) -> (string),
     auth: {
       get: @checked (slug: string) -> (any, string?),
       set: @checked (slug: string, credentials: any) -> (boolean?, string?),
