@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
-use maki_config_macro::ConfigSection;
+use maki_config_macro::{ConfigSection, Merge};
 use maki_storage::paths;
 use maki_storage::sessions::{SessionMeta, StoredThinking, ThinkingParseError};
 use serde::de::{Error as DeError, IgnoredAny};
@@ -483,12 +483,6 @@ fn check(
     Ok(())
 }
 
-macro_rules! merge_option {
-    ($self:ident, $overlay:ident, $($field:ident),+) => {
-        $(if $overlay.$field.is_some() { $self.$field = $overlay.$field; })+
-    };
-}
-
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum AlwaysThinking {
@@ -538,7 +532,7 @@ impl SessionDefaults {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawConfig {
     pub always_yolo: Option<bool>,
@@ -546,44 +540,40 @@ pub struct RawConfig {
     pub always_workflow: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
+    #[merge(nested)]
     pub ui: UiFileConfig,
+    #[merge(nested)]
     pub agent: AgentFileConfig,
+    #[merge(nested)]
     pub provider: ProviderFileConfig,
+    #[merge(nested)]
     pub storage: StorageFileConfig,
+    #[merge(nested)]
     pub net: NetFileConfig,
+    #[merge(nested)]
     pub trust: TrustFileConfig,
+    #[merge(nested)]
     pub instructions: InstructionsFileConfig,
+    #[merge(nested)]
     pub telemetry: TelemetryConfig,
+    #[merge(with = merge_plugins)]
     pub plugins: HashMap<String, PluginFileConfig>,
 }
 
-impl RawConfig {
-    pub fn merge(&mut self, overlay: RawConfig) {
-        merge_option!(
-            self,
-            overlay,
-            always_yolo,
-            always_fast,
-            always_workflow,
-            always_thinking
-        );
-        self.ui.merge(overlay.ui);
-        self.agent.merge(overlay.agent);
-        self.provider.merge(overlay.provider);
-        self.storage.merge(overlay.storage);
-        self.net.merge(overlay.net);
-        self.trust.merge(overlay.trust);
-        self.instructions.merge(overlay.instructions);
-        self.telemetry.merge(overlay.telemetry);
-        for (name, plugin) in overlay.plugins {
-            let entry = self.plugins.entry(name).or_default();
-            if plugin.enabled.is_some() {
-                entry.enabled = plugin.enabled;
-            }
-            entry.opts.extend(plugin.opts);
+fn merge_plugins(
+    base: &mut HashMap<String, PluginFileConfig>,
+    overlay: HashMap<String, PluginFileConfig>,
+) {
+    for (name, plugin) in overlay {
+        let entry = base.entry(name).or_default();
+        if plugin.enabled.is_some() {
+            entry.enabled = plugin.enabled;
         }
+        entry.opts.extend(plugin.opts);
     }
+}
 
+impl RawConfig {
     /// `packages` are the external package names discovery found. They are
     /// passed in rather than stored, because an installed package is host
     /// state: it is not written in any config file and must not survive a
@@ -691,7 +681,7 @@ impl ThemePair {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiFileConfig {
     pub splash_animation: Option<bool>,
@@ -707,34 +697,9 @@ pub struct UiFileConfig {
     show_thinking: Option<IgnoredAny>,
     pub theme: Option<ThemePair>,
     pub clock_format: Option<ClockFormat>,
+    #[merge(nested_option)]
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
-}
-
-impl UiFileConfig {
-    fn merge(&mut self, overlay: UiFileConfig) {
-        merge_option!(
-            self,
-            overlay,
-            splash_animation,
-            scrollbar,
-            inline_images,
-            notifications,
-            flash_duration_ms,
-            typewriter_ms_per_char,
-            mouse_scroll_lines,
-            thinking_lines,
-            show_thinking,
-            theme,
-            clock_format,
-            max_input_lines
-        );
-        match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
-            (Some(base), Some(over)) => base.merge(over),
-            (None, Some(over)) => self.tool_output_lines = Some(over),
-            _ => {}
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -765,38 +730,6 @@ pub enum NotificationMethod {
     Bell,
     Notify,
     Off,
-}
-
-#[derive(Deserialize, Default, Debug)]
-#[serde(default, deny_unknown_fields)]
-pub struct ToolOutputLinesFile {
-    pub bash: Option<usize>,
-    pub code_execution: Option<usize>,
-    pub task: Option<usize>,
-    pub index: Option<usize>,
-    pub grep: Option<usize>,
-    pub read: Option<usize>,
-    pub write: Option<usize>,
-    pub web: Option<usize>,
-    pub other: Option<usize>,
-}
-
-impl ToolOutputLinesFile {
-    fn merge(&mut self, overlay: ToolOutputLinesFile) {
-        merge_option!(
-            self,
-            overlay,
-            bash,
-            code_execution,
-            task,
-            index,
-            grep,
-            read,
-            write,
-            web,
-            other
-        );
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -867,7 +800,7 @@ impl<'de> Deserialize<'de> for CompactionBuffer {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentFileConfig {
     pub max_output_bytes: Option<usize>,
@@ -882,26 +815,7 @@ pub struct AgentFileConfig {
     pub shell: Option<ShellPreference>,
 }
 
-impl AgentFileConfig {
-    fn merge(&mut self, overlay: AgentFileConfig) {
-        merge_option!(
-            self,
-            overlay,
-            max_output_bytes,
-            max_output_lines,
-            max_continuation_turns,
-            max_turn_output,
-            compaction_buffer,
-            compaction_instructions,
-            post_compaction_instructions,
-            stale_read_check,
-            rtk,
-            shell
-        );
-    }
-}
-
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderFileConfig {
     pub default_model: Option<String>,
@@ -916,41 +830,16 @@ pub struct ProviderFileConfig {
     pub max_timeout_retries: Option<u32>,
 }
 
-impl ProviderFileConfig {
-    fn merge(&mut self, overlay: ProviderFileConfig) {
-        merge_option!(
-            self,
-            overlay,
-            default_model,
-            allowed_models,
-            excluded_models,
-            connect_timeout_secs,
-            low_speed_timeout_secs,
-            stream_timeout_secs,
-            retry_base_ms,
-            retry_max_ms,
-            max_retries,
-            max_timeout_retries
-        );
-    }
-}
-
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetFileConfig {
     pub allowed_private_hosts: Option<Vec<String>>,
 }
 
-impl NetFileConfig {
-    fn merge(&mut self, overlay: NetFileConfig) {
-        merge_option!(self, overlay, allowed_private_hosts);
-    }
-}
-
 /// Folder trust answered ahead of time. Only the global `init.lua` may set
 /// this: a folder cannot vouch for itself, and `maki-lua` strips the table
 /// from every other scope before it reaches here.
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct TrustFileConfig {
     pub paths: Option<Vec<String>>,
@@ -958,10 +847,6 @@ pub struct TrustFileConfig {
 }
 
 impl TrustFileConfig {
-    fn merge(&mut self, overlay: TrustFileConfig) {
-        merge_option!(self, overlay, paths, prompt);
-    }
-
     /// Whether the file mentioned trust at all, so the scope that is not
     /// allowed to set it can warn about exactly the configs that tried.
     pub fn is_set(&self) -> bool {
@@ -973,7 +858,7 @@ impl TrustFileConfig {
 /// this: a project file that could pick its own instructions would be
 /// trusting itself, and `maki-lua` strips the table from every other scope
 /// before it reaches here.
-#[derive(Deserialize, Default, Debug, Clone)]
+#[derive(Deserialize, Default, Debug, Clone, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct InstructionsFileConfig {
     /// Replaces the built-in file list. An empty list loads no project
@@ -981,21 +866,21 @@ pub struct InstructionsFileConfig {
     pub files: Option<Vec<String>>,
     /// Per-checkout overrides of `files`, matched by local `path` glob, git
     /// `remote` glob, or both. The first matching entry wins.
+    #[merge(with = replace_if_non_empty)]
     pub overrides: Vec<ProjectOverrideFileConfig>,
 }
 
 impl InstructionsFileConfig {
-    fn merge(&mut self, overlay: InstructionsFileConfig) {
-        merge_option!(self, overlay, files);
-        if !overlay.overrides.is_empty() {
-            self.overrides = overlay.overrides;
-        }
-    }
-
     /// Whether the file mentioned instructions at all, so the scope that is
     /// not allowed to set them can warn about exactly the configs that tried.
     pub fn is_set(&self) -> bool {
         self.files.is_some() || !self.overrides.is_empty()
+    }
+}
+
+fn replace_if_non_empty<T>(base: &mut Vec<T>, overlay: Vec<T>) {
+    if !overlay.is_empty() {
+        *base = overlay;
     }
 }
 
@@ -1014,24 +899,12 @@ pub struct ProjectOverrideFileConfig {
     pub files: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Merge)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageFileConfig {
     pub max_log_bytes_mb: Option<u64>,
     pub max_log_files: Option<u32>,
     pub input_history_size: Option<usize>,
-}
-
-impl StorageFileConfig {
-    fn merge(&mut self, overlay: StorageFileConfig) {
-        merge_option!(
-            self,
-            overlay,
-            max_log_bytes_mb,
-            max_log_files,
-            input_history_size
-        );
-    }
 }
 
 #[derive(Default)]
@@ -1432,87 +1305,59 @@ impl UiConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ToolOutputLines {
-    pub bash: usize,
-    pub code_execution: usize,
-    pub task: usize,
-    pub index: usize,
-    pub grep: usize,
-    pub read: usize,
-    pub write: usize,
-    pub web: usize,
-    pub other: usize,
+/// Declares every `ui.tool_output_lines` key once: the file struct, the
+/// resolved struct, its defaults and its validation all come from this list.
+macro_rules! tool_output_lines {
+    ($($field:ident = $default:expr),+ $(,)?) => {
+        #[derive(Deserialize, Default, Debug, Merge)]
+        #[serde(default, deny_unknown_fields)]
+        pub struct ToolOutputLinesFile {
+            $(pub $field: Option<usize>,)+
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(default)]
+        pub struct ToolOutputLines {
+            $(pub $field: usize,)+
+        }
+
+        impl ToolOutputLines {
+            pub const DEFAULT: Self = Self { $($field: $default),+ };
+
+            pub const FIELD_DEFAULTS: &[(&'static str, usize)] =
+                &[$((stringify!($field), Self::DEFAULT.$field)),+];
+
+            fn from_file(f: Option<ToolOutputLinesFile>) -> Self {
+                let f = f.unwrap_or_default();
+                Self { $($field: f.$field.unwrap_or(Self::DEFAULT.$field)),+ }
+            }
+
+            pub fn validate(&self) -> Result<(), ConfigError> {
+                $(check(
+                    "ui.tool_output_lines",
+                    stringify!($field),
+                    self.$field as u64,
+                    MIN_TOOL_OUTPUT_LINES as u64,
+                )?;)+
+                Ok(())
+            }
+        }
+    };
+}
+
+tool_output_lines! {
+    bash = 3,
+    code_execution = 3,
+    task = 3,
+    index = 1,
+    grep = 3,
+    read = 1,
+    write = 5,
+    web = 3,
+    other = 3,
 }
 
 impl ToolOutputLines {
-    pub const DEFAULT: Self = Self {
-        bash: 3,
-        code_execution: 3,
-        task: 3,
-        index: 1,
-        grep: 3,
-        read: 1,
-        write: 5,
-        web: 3,
-        other: 3,
-    };
-
-    pub const FIELD_DEFAULTS: &[(&'static str, usize)] = &[
-        ("bash", Self::DEFAULT.bash),
-        ("code_execution", Self::DEFAULT.code_execution),
-        ("task", Self::DEFAULT.task),
-        ("index", Self::DEFAULT.index),
-        ("grep", Self::DEFAULT.grep),
-        ("read", Self::DEFAULT.read),
-        ("write", Self::DEFAULT.write),
-        ("web", Self::DEFAULT.web),
-        ("other", Self::DEFAULT.other),
-    ];
-
-    fn from_file(f: Option<ToolOutputLinesFile>) -> Self {
-        let d = Self::DEFAULT;
-        let f = f.unwrap_or_default();
-        Self {
-            bash: f.bash.unwrap_or(d.bash),
-            code_execution: f.code_execution.unwrap_or(d.code_execution),
-            task: f.task.unwrap_or(d.task),
-            index: f.index.unwrap_or(d.index),
-            grep: f.grep.unwrap_or(d.grep),
-            read: f.read.unwrap_or(d.read),
-            write: f.write.unwrap_or(d.write),
-            web: f.web.unwrap_or(d.web),
-            other: f.other.unwrap_or(d.other),
-        }
-    }
-
-    fn fields(&self) -> [(&'static str, usize); 9] {
-        [
-            ("bash", self.bash),
-            ("code_execution", self.code_execution),
-            ("task", self.task),
-            ("index", self.index),
-            ("grep", self.grep),
-            ("read", self.read),
-            ("write", self.write),
-            ("web", self.web),
-            ("other", self.other),
-        ]
-    }
-
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        for (name, value) in self.fields() {
-            check(
-                "ui.tool_output_lines",
-                name,
-                value as u64,
-                MIN_TOOL_OUTPUT_LINES as u64,
-            )?;
-        }
-        Ok(())
-    }
-
     pub fn get(&self, name: &str) -> usize {
         match name {
             "bash" => self.bash,
@@ -2107,7 +1952,7 @@ fn normalize_remote_url(url: &str) -> String {
 ///
 /// Fields stay optional: `maki-otel` owns the defaults, so the meaning of
 /// "unset" is decided in one place.
-#[derive(Deserialize, Debug, Clone, ConfigSection)]
+#[derive(Deserialize, Debug, Clone, ConfigSection, Merge)]
 #[serde(default, deny_unknown_fields)]
 #[config(section = "telemetry")]
 pub struct TelemetryConfig {
@@ -2250,43 +2095,6 @@ pub struct TelemetryConfig {
              env = "MAKI_OTEL_CONTENT_MAX_LENGTH",
              desc = "Character cap on any logged prompt or tool input")]
     pub content_max_length: Option<usize>,
-}
-
-impl TelemetryConfig {
-    fn merge(&mut self, overlay: TelemetryConfig) {
-        merge_option!(
-            self,
-            overlay,
-            enabled,
-            metrics_exporter,
-            logs_exporter,
-            protocol,
-            endpoint,
-            headers,
-            timeout_ms,
-            compression,
-            metrics_protocol,
-            metrics_endpoint,
-            metrics_headers,
-            metrics_timeout_ms,
-            logs_protocol,
-            logs_endpoint,
-            logs_headers,
-            logs_timeout_ms,
-            metrics_interval_ms,
-            logs_interval_ms,
-            logs_max_queue_size,
-            logs_max_export_batch_size,
-            metrics_temporality,
-            service_name,
-            resource_attributes,
-            metrics_include_session_id,
-            metrics_include_version,
-            log_user_prompts,
-            log_tool_details,
-            content_max_length
-        );
-    }
 }
 
 #[derive(Debug, Clone, Default)]
