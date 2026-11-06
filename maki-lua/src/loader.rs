@@ -1362,10 +1362,13 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::keymap::{InputMode, InputSnapshot, TAKEN_ERR};
+    use crate::api::keymap::{
+        CursorShape, CursorStyle, InputMode, InputSnapshot, TAKEN_ERR, UNKNOWN_CURSOR_SHAPE_ERR,
+    };
     use crate::api::util::command::{
         BuiltinAction, InputRequest, LuaCommandInfo, LuaCommandWriter, PLUGIN_LOADING_ERR,
     };
+    use crate::api::util::convert::UNKNOWN_FIELD_ERR;
     use crate::key::{Key, PASTE};
     use crate::key_lint::{MODE_WARNING, UPGRADE_DOCS};
     use crate::plugin_permissions::{Permission, PluginReach, denied_error};
@@ -1752,6 +1755,56 @@ mod tests {
 
         teardown(&host);
         assert_eq!(reader.sync_mode(true), InputMode::Insert);
+    }
+
+    const BLINKING_BAR: CursorStyle = CursorStyle {
+        shape: CursorShape::Bar,
+        blink: true,
+    };
+
+    /// No shape is sent before a plugin asks, so the terminal keeps the one
+    /// the user configured.
+    #[test_case("", None ; "never_set")]
+    #[test_case(r#"maki.ui.set_cursor_shape("bar", { blink = true })"#, Some(BLINKING_BAR) ; "bar_blinking")]
+    #[test_case(r#"maki.ui.set_cursor_shape("block")"#, Some(CursorStyle { shape: CursorShape::Block, blink: false }) ; "block_steady_by_default")]
+    #[test_case(r#"maki.ui.set_cursor_shape("default", { blink = true })"#, Some(CursorStyle::DEFAULT) ; "default_keeps_the_terminal_blink")]
+    fn cursor_shape_is_what_the_plugin_set(source: &str, expected: Option<CursorStyle>) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(VIM_PLUGIN, source).unwrap();
+        assert_eq!(host.keymap_reader().cursor_style(), expected);
+    }
+
+    #[test_case(r#"maki.ui.set_cursor_shape("beam")"#, UNKNOWN_CURSOR_SHAPE_ERR ; "unknown_shape")]
+    #[test_case(r#"maki.ui.set_cursor_shape("bar", { blinks = true })"#, UNKNOWN_FIELD_ERR ; "unknown_option")]
+    fn cursor_shape_throws_on_bad_arguments(source: &str, expected: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let err = host
+            .load_source(VIM_PLUGIN, source)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "{err}");
+        assert_eq!(host.keymap_reader().cursor_style(), None);
+    }
+
+    /// Like normal mode, a shape goes with the plugin that set it, and the
+    /// terminal gets its own cursor back. Another plugin going away leaves it.
+    #[test_case(unload_vim ; "unloaded")]
+    #[test_case(reload_vim ; "reloaded")]
+    fn cursor_shape_goes_with_the_plugin_that_set_it(teardown: fn(&PluginHost)) {
+        const OTHER_PLUGIN: &str = "other";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(OTHER_PLUGIN, "").unwrap();
+        host.load_source(
+            VIM_PLUGIN,
+            r#"maki.ui.set_cursor_shape("bar", { blink = true })"#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        host.unload(OTHER_PLUGIN).unwrap();
+        assert_eq!(reader.cursor_style(), Some(BLINKING_BAR));
+
+        teardown(&host);
+        assert_eq!(reader.cursor_style(), Some(CursorStyle::DEFAULT));
     }
 
     const PARKED_COMMAND: &str = "/park";

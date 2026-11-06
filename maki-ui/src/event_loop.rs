@@ -75,13 +75,12 @@ use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest};
 use crate::decor_worker;
 use crate::input::InputReader;
-use crate::present::present;
+use crate::present::{Caret, present};
 use crate::repaint::{Dirty, IDLE_POLL};
-use crate::theme;
 use crate::{AppSession, OpenSession};
 
 use crate::storage_writer::StorageWriter;
-use crate::terminal::{self, BlockedKind, ProgramState, ProgramStatusReporter};
+use crate::terminal::{self, BlockedKind, ProgramState, ProgramStatusReporter, cursor_style};
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
@@ -860,9 +859,13 @@ impl<'t> EventLoop<'t> {
     fn paint(&mut self) -> Result<()> {
         let app = &mut self.sessions[self.focused].app;
         present(self.terminal, |frame| {
-            let caret = app.view(frame);
+            let position = app.view(frame);
             color_compat::downgrade_if_needed(frame.buffer_mut());
-            caret
+            position.map(|position| Caret {
+                position,
+                shown: app.shows_terminal_cursor(),
+                style: app.cursor_style().map(cursor_style),
+            })
         })?;
         Ok(())
     }
@@ -1860,22 +1863,14 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// Only a real focus report may recolor the caret: resume heuristics and
-    /// stray input prove nothing, and no FocusGained follows $EDITOR or fg.
-    fn sync_cursor(&self) {
-        theme::set_cursor_focused(self.focus != Focus::Unfocused);
-    }
-
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
         match raw {
             Event::FocusGained => {
                 self.focus.report(Focus::Focused);
-                self.sync_cursor();
                 (None, None)
             }
             Event::FocusLost => {
                 self.focus.report(Focus::Unfocused);
-                self.sync_cursor();
                 (None, None)
             }
             // The one place the host's view of a keypress is normalized, so

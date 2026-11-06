@@ -170,10 +170,10 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "The input caret uses `cursor` when the terminal has focus and \
-         `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults \
-         to `cursor`, so themes only need it when the two should differ. \
-         Terminals that do not report focus events keep the focused caret.\n"
+        "The chat input caret is your terminal's own cursor, in your \
+         terminal's shape and colors. Plugins can change its shape with \
+         `maki.ui.set_cursor_shape`. The search, file, list and login \
+         pickers still paint their caret with `cursor`, and so can plugins.\n"
     )
     .unwrap();
     writeln!(

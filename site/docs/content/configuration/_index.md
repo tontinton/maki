@@ -112,7 +112,7 @@ user_bg = { bg = "#1d2021" }
 
 Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
 
-The input caret uses `cursor` when the terminal has focus and `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults to `cursor`, so themes only need it when the two should differ. Terminals that do not report focus events keep the focused caret.
+The chat input caret is your terminal's own cursor, in your terminal's shape and colors. Plugins can change its shape with `maki.ui.set_cursor_shape`. The search, file, list and login pickers still paint their caret with `cursor`, and so can plugins.
 
 Themes use 24-bit colors by default, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
 

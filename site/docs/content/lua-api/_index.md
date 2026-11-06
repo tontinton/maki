@@ -7474,7 +7474,7 @@ still work. The calls that need a screen behave like this:
   Plugin actions still run.
 - `open_editor` returns -1.
 - `flash` writes to the log.
-- `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
+- `open_win`, `set_status_hint`, `set_window_title`, `set_mode`, `set_cursor_shape` and `input_rules` have no effect.
   `input_rules` still throws on a bad rule, so a plugin's tests catch it.
 
 ### Chat input
@@ -7490,6 +7490,7 @@ Plugins can read, style, change and send the chat input:
 | Send the input, as Enter does | [`input_submit`](#maki-ui-input_submit) |
 | React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
 | Switch to normal mode for a vim mode | [`set_mode`](#maki-ui-set_mode), see [Modes](/docs/lua-api/#modes) |
+| Change the cursor shape, like a block in normal mode | [`set_cursor_shape`](#maki-ui-set_cursor_shape) |
 
 A key that types `TODO: ` at the cursor:
 
@@ -7912,6 +7913,41 @@ Throws on any mode but `"n"` and `"i"`.
 
 ```lua
 maki.keymap.set("n", "i", function() maki.ui.set_mode("i") end)
+```
+
+---
+
+### `maki.ui.set_cursor_shape()` {#maki-ui-set_cursor_shape}
+
+```lua
+maki.ui.set_cursor_shape({shape}, {opts?})
+```
+
+Sets the shape of the chat input's cursor, like Neovim's `guicursor`.
+
+The chat input uses your terminal's own cursor. Until a plugin calls this,
+maki never changes its shape or blink, so it looks the way you set up your
+terminal. `"default"` gives that look back. If your plugin unloads after
+setting a shape, maki switches back to `"default"` too.
+
+A shape always sets blinking on or off, because terminals take both in
+one setting. Leave out `blink` for a steady cursor.
+
+Throws on any shape not listed below, and on an unknown option.
+
+**Parameters:**
+
+- `{shape}` (`string`) `"block"`, `"bar"`, `"underline"` or `"default"`.
+- `{opts?}` (`table?`) Optional. `blink` (boolean) blinks the cursor, default false.
+
+**Example:**
+
+```lua
+maki.api.create_autocmd("ModeChanged", {
+  callback = function(ev)
+    maki.ui.set_cursor_shape(ev.data.new_mode == "n" and "block" or "bar")
+  end,
+})
 ```
 
 ---

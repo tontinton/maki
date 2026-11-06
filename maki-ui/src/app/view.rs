@@ -7,7 +7,7 @@ use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
-use maki_lua::Split;
+use maki_lua::{CursorStyle, Split};
 use maki_providers::RequestOptions;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -115,6 +115,18 @@ impl App {
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat, &thumbs);
         self.keyboard_caret(owner, caret, prompt_caret, picker_caret)
+    }
+
+    /// Whether the terminal draws the caret. Only the chat input stopped
+    /// painting its own; every other field still paints one.
+    pub(crate) fn shows_terminal_cursor(&self) -> bool {
+        self.keyboard_owner() == KeyboardOwner::Chat
+    }
+
+    /// The shape a plugin set with `maki.ui.set_cursor_shape`, None if no
+    /// plugin ever did.
+    pub(crate) fn cursor_style(&self) -> Option<CursorStyle> {
+        self.keymap_reader.cursor_style()
     }
 
     fn compute_layout(&self, area: Rect) -> ViewLayout {
@@ -279,7 +291,6 @@ impl App {
                 layout.input_area,
                 placeholder,
                 self.separator_style(),
-                self.input_focused(),
                 panel_hint,
             );
             self.command_palette

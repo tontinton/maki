@@ -214,6 +214,7 @@ declare maki: {
     display_width: @checked (text: string) -> (number),
     truncate_text: @checked (text: string, max_width: number) -> (any),
     set_mode: @checked (mode: string) -> (),
+    set_cursor_shape: @checked (shape: string, opts: any) -> (),
     flash: @checked (msg: string) -> (),
     action: @checked (name: string) -> (boolean?, string?),
     open_editor: @checked (path: string) -> (number),
