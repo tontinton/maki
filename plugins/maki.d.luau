@@ -14,7 +14,7 @@ declare maki: {
     system_prompt: @checked (ctx: any, opts: any) -> (string?, string?),
     tools: @checked (ctx: any, opts: any) -> (any, string?),
     callable_tools: @checked (ctx: any) -> (any, string?),
-    call_tool: @checked (ctx: any, name: string, input: any, opts: any) -> (string?, string?),
+    call_tool: @checked (ctx: any, name: string, input: any, opts: any) -> (string?, string?, string?),
     session: @checked (ctx: any, opts: any) -> (any, string?),
     list: @checked (opts: any) -> (any, string?),
   },

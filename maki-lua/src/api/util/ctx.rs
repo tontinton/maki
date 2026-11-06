@@ -17,7 +17,7 @@ use mlua::{
 };
 use tokio::task::spawn_blocking;
 
-use crate::api::tool::ToolCallReply;
+use crate::api::tool::{LuaOutputFormat, ToolCallReply, extract_format};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, err_pair, pair};
@@ -532,8 +532,9 @@ impl UserData for LuaCtx {
             let name: Option<String> = part.opt("name")?;
             let output: String = part.opt("output")?.unwrap_or_default();
             let failed = part.opt_bool("is_error").unwrap_or(false);
+            let markdown = extract_format(&part) == LuaOutputFormat::Markdown;
             let label = TaskLabel::new(&tool, name.as_deref());
-            if !BackgroundTasks::of(lua).report_part(&home.id, &label, failed, &output) {
+            if !BackgroundTasks::of(lua).report_part(&home.id, &label, failed, &output, markdown) {
                 return Ok(err_pair(NO_PART_NOW_MSG));
             }
             Ok((Some(true), None))

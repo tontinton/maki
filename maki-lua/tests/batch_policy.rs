@@ -20,6 +20,7 @@ use maki_lua::test_support::runtime;
 use maki_lua::{KILL_GRACE, MoveOutcome, PluginHost, PluginPermissions, UiAction};
 use maki_providers::{TaskAnswer, TaskSettled};
 use serde_json::{Value, json};
+use test_case::test_case;
 
 const BATCH_PLUGIN_SRC: &str = include_str!("../../plugins/batch/init.lua");
 
@@ -83,6 +84,7 @@ const MOVED_AS_ASKED: &str = "Started in the background as asked";
 const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
 const FOREGROUND_NOTE_TAIL: &str = "). Ran in the foreground.\n\n";
 const WAITING_ON_EDIT: &str = "batch is waiting on edit";
+const MARKDOWN_FORMAT: &str = "markdown";
 
 const SPINNER_STYLE: &str = "spinner";
 const ERROR_STYLE: &str = "tool_error";
@@ -1451,7 +1453,7 @@ do
       end
       park(input.tag)
       -- A batch hands a background ask over, so it never reaches the child.
-      return name .. ":" .. input.tag .. (input.background and "+background" or "")
+      return name .. ":" .. input.tag .. (input.background and "+background" or ""), nil, input.format
     end
     return stubbed(ctx, name, input, opts)
   end
@@ -1460,6 +1462,7 @@ do
     type = "object",
     properties = {
       tag = { type = "string" },
+      format = { type = "string" },
       background = { type = "boolean", needs_background = true },
     },
   }
@@ -1631,12 +1634,15 @@ fn batch_moves_with_finished_results_inline_and_replies_with_the_late_children()
 }
 
 /// An early child reads just like a call that moved alone, so the model and
-/// the transcript need nothing new to make sense of it.
-#[test]
-fn a_moved_batch_reports_each_child_as_it_lands() {
+/// the transcript need nothing new to make sense of it. A markdown reply,
+/// like a `task` child's, keeps its format for the transcript, and so does
+/// the final reply when all of it is markdown.
+#[test_case(Some(MARKDOWN_FORMAT), true ; "markdown_last_child")]
+#[test_case(None, false ; "plain_last_child")]
+fn a_moved_batch_reports_each_child_as_it_lands(last_format: Option<&str>, markdown_reply: bool) {
     let (batch, call) = MovableBatch::start(json!([
-        { "tool": HOOKED_TOOL, "parameters": { "tag": "a" } },
-        { "tool": HOOKED_TOOL, "parameters": { "tag": "b" } },
+        { "tool": HOOKED_TOOL, "parameters": { "tag": "a", "format": MARKDOWN_FORMAT } },
+        { "tool": HOOKED_TOOL, "parameters": { "tag": "b", "format": last_format } },
     ]));
     batch.wait_parked("a");
     batch.wait_parked("b");
@@ -1659,6 +1665,7 @@ fn a_moved_batch_reports_each_child_as_it_lands() {
     };
     assert_eq!(notice.first_text_content(), Some(text.as_str()));
     assert_eq!(notice.display_text.as_deref(), Some(display.as_str()));
+    assert!(notice.markdown);
     assert_eq!(
         notice.answers,
         Some(TaskAnswer::Part(TaskSettled {
@@ -1674,7 +1681,7 @@ fn a_moved_batch_reports_each_child_as_it_lands() {
     );
     let rest = batch.mailbox.drain();
     assert!(
-        matches!(rest.as_slice(), [last] if last.settles().is_some()),
+        matches!(rest.as_slice(), [last] if last.settles().is_some() && last.markdown == markdown_reply),
         "{rest:?}"
     );
 }

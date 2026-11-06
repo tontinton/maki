@@ -15,7 +15,9 @@ use crate::components::messages::{ClickOutcome, ScrollPos};
 use crate::components::plan_form::builtin_menu;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
-use crate::components::{BackgroundOutcome, ExitRequest, buffer_text, key, test_model};
+use crate::components::{
+    BackgroundOutcome, ExitRequest, NoticeDetail, buffer_text, key, test_model,
+};
 use crate::decor_worker;
 use crate::highlight::TAB_SPACES;
 use crate::markdown::TRUNCATION_PREFIX;
@@ -512,6 +514,7 @@ fn a_notice_line_appears_when_the_loop_accepts_it() {
         AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
             detail: None,
+            markdown: false,
             end: None,
         },
         app.run_id,
@@ -596,6 +599,7 @@ fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedSte
             LiveStep::Accepted(text) => AgentEvent::ObservationLine {
                 text: text.into(),
                 detail: None,
+                markdown: false,
                 end: None,
             },
             LiveStep::Done => done(),
@@ -12207,14 +12211,20 @@ fn the_chat_in_front_decides_whether_the_borders_dim(status: Status, running: bo
     app.active_chat_working()
 }
 
-#[test]
-fn a_notice_keeps_its_detail_live_and_on_restore() {
+#[test_case(false ; "plain")]
+#[test_case(true ; "markdown")]
+fn a_notice_keeps_its_detail_live_and_on_restore(markdown: bool) {
+    let notice = Message {
+        markdown,
+        ..labelled_notice(NOTICE_LINE)
+    };
     let mut app = test_app();
-    app.start_mailbox_run(vec![labelled_notice(NOTICE_LINE)]);
+    app.start_mailbox_run(vec![notice.clone()]);
     app.update(agent_msg_with_run_id(
         AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
             detail: Some(NOTICE_BODY.into()),
+            markdown,
             end: None,
         },
         app.run_id,
@@ -12225,7 +12235,7 @@ fn a_notice_keeps_its_detail_live_and_on_restore() {
         .and_then(|row| row.detail.clone());
 
     let (restored, _) = crate::chat::history_to_display(
-        &[labelled_notice(NOTICE_LINE)],
+        &[notice],
         &HashMap::new(),
         &app.ui_config.tool_output_lines,
     );
@@ -12234,8 +12244,12 @@ fn a_notice_keeps_its_detail_live_and_on_restore() {
         .find(|row| row.role == DisplayRole::Notice)
         .and_then(|row| row.detail);
 
-    assert_eq!(live.as_deref(), Some(NOTICE_BODY));
-    assert_eq!(restored.as_deref(), Some(NOTICE_BODY));
+    let expected = NoticeDetail {
+        text: NOTICE_BODY.into(),
+        markdown,
+    };
+    assert_eq!(live.as_ref(), Some(&expected));
+    assert_eq!(restored, Some(expected));
 }
 
 const RECEIPT_TURN_ID: &str = "tool-1";
@@ -12440,6 +12454,7 @@ fn a_reloaded_moved_row_tells_the_ending_its_queued_result_gives(
             "output",
         );
         let notice = BackgroundNotice {
+            markdown: false,
             text,
             display: Some(&display),
             wake: false,

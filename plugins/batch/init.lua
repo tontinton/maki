@@ -510,7 +510,7 @@ function Batch:run_child(c, ctx)
   end
   c.status = STATUS.RUNNING
   self:rerender()
-  local text, err = maki.agent.call_tool(ctx, c.tool, c.params, {
+  local text, err, format = maki.agent.call_tool(ctx, c.tool, c.params, {
     output_mode = ctx:output_mode(),
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
@@ -548,6 +548,7 @@ function Batch:run_child(c, ctx)
   if err then
     self:settle(c, STATUS.ERROR, err)
   else
+    c.format = format
     self:settle(c, STATUS.SUCCESS, text)
   end
 end
@@ -629,10 +630,23 @@ function Batch:background_if_due()
   end)
 end
 
+-- A moved batch's reply becomes a notice, and the transcript can only draw
+-- it as markdown when every child in it replied in markdown.
+local function all_markdown(children)
+  for _, c in ipairs(children) do
+    if c.format ~= MARKDOWN_FORMAT then
+      return false
+    end
+  end
+  return #children > 0
+end
+
 function Batch:reply()
   local note = self.foreground_reason and string.format(FOREGROUND_NOTE, tostring(self.foreground_reason)) or ""
+  local children = self:unreported()
   return {
-    llm_output = note .. render_llm(self:unreported()),
+    llm_output = note .. render_llm(children),
+    format = all_markdown(children) and MARKDOWN_FORMAT or nil,
     is_error = self.cancelled,
     body = self.buf,
     state = to_state(self.children),
@@ -700,6 +714,7 @@ function Batch:report_finished()
         name = header_text(c),
         output = c.output,
         is_error = c.status == STATUS.ERROR,
+        format = c.format,
       }) == true
     end
   end

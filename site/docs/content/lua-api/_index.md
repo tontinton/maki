@@ -1669,8 +1669,9 @@ through optional callbacks while the tool runs.
     a subagent, which `/tasks` then lists as a task of its own. Must not
     yield.
 
-**Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
-  Instruction files the child picks up (a subdirectory `AGENTS.md`) are
+**Returns:** (`string?`, `string?`, `string?`) Tool output text and its format
+  (`"markdown"` or `"plain"`, as a tool handler sets it), or `(nil, err)`
+  on failure. Instruction files the child picks up (a subdirectory `AGENTS.md`) are
   not in the text: they land on the calling tool's own result.
 
 **Example:**

@@ -191,7 +191,7 @@ end
 | `ctx:backgrounded()` | `true` once the call has moved, for example to switch to a bounded buffer. |
 | `ctx:background()` | Move the call from the handler, as `bash(background = true)` does. Answers `true` or `nil, reason`. |
 | `ctx:set_parts(parts)` | List the pieces of the call in `/tasks`. See [Pieces of a call](#pieces-of-a-call). |
-| `ctx:report_part({ tool, name?, output, is_error? })` | After the move, send one piece's result to the model now, worded as if `tool` had moved alone, with `name` as its summary. The final result is still due, so leave reported pieces out of it. Answers `true`, or `nil, reason` before the move or after the call ended. |
+| `ctx:report_part({ tool, name?, output, is_error?, format? })` | After the move, send one piece's result to the model now, worded as if `tool` had moved alone, with `name` as its summary. `format = "markdown"` makes the transcript render `output` as markdown, plain text otherwise. The final result is still due, so leave reported pieces out of it. Answers `true`, or `nil, reason` before the move or after the call ended. |
 | `ctx:set_deadline(secs, { expire = "background" })` | Move the call at its deadline instead of ending it. |
 
 A move the plugin starts itself, through `ctx:background()` or a deadline, needs the `agent` [plugin permission](/docs/lua-api/#plugin-permissions) and fails inside a subagent.

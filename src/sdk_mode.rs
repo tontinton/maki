@@ -1941,6 +1941,7 @@ mod tests {
         pump.handle(top_level(AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
             detail: None,
+            markdown: false,
             end: None,
         }))
         .unwrap();
@@ -1952,6 +1953,7 @@ mod tests {
             event: AgentEvent::ObservationLine {
                 text: CHILD_NOTICE_LINE.into(),
                 detail: None,
+                markdown: false,
                 end: None,
             },
             subagent: Some(SubagentInfo {

@@ -803,6 +803,9 @@ pub enum AgentEvent {
         text: String,
         /// What the line unfolds to, see `observation_detail`.
         detail: Option<String>,
+        /// `detail` is markdown, see [`Message::markdown`].
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        markdown: bool,
         /// Set when the line answers a background task, for its colored dot.
         #[serde(skip_serializing_if = "Option::is_none")]
         end: Option<TaskEnd>,

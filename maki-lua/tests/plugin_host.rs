@@ -2502,7 +2502,7 @@ fn warm_click_survives_post_completion_cancel() {
     assert_eq!(body.read()[0].spans[0].text, WARM_CLICK_LINE);
 }
 
-/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs,
+/// `maki.agent.call_tool` returns `(text, err, format)` and delivers live bufs,
 /// annotations (live and completion alike) and usage through the callbacks.
 #[test]
 fn call_tool_streams_live_buf_and_annotations() {
@@ -2523,7 +2523,7 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function(input, ctx)
-        return {{ llm_output = "child_done", annotation = "5 items" }}
+        return {{ llm_output = "child_done", annotation = "5 items", format = "markdown" }}
     end
 }})
 maki.api.register_tool({{
@@ -2554,12 +2554,12 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function(input, ctx)
         local ann = "nil"
-        local text, err = maki.agent.call_tool(ctx, "annotated_child", {{}}, {{
+        local text, err, format = maki.agent.call_tool(ctx, "annotated_child", {{}}, {{
             on_annotation = function(a) ann = a end,
         }})
         local live_text = "none"
         local ann2 = "nil"
-        local text2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
+        local text2, _, format2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
             on_live_buf = function(b)
                 local lines = b:get_lines()
                 live_text = lines[1] and lines[1][1] and lines[1][1][1] or "empty"
@@ -2571,13 +2571,13 @@ maki.api.register_tool({{
             on_usage = function(value) usage = value end,
         }})
         local ann3 = "nil"
-        local _, err3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
+        local _, err3, format3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
             on_annotation = function(a) ann3 = a end,
         }})
-        return tostring(text) .. "/" .. ann
-            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2
+        return tostring(text) .. "/" .. ann .. "/" .. format
+            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2 .. "/" .. format2
             .. " " .. tostring(text3) .. "/" .. usage
-            .. " " .. tostring(err3) .. "/" .. ann3
+            .. " " .. tostring(err3) .. "/" .. ann3 .. "/" .. tostring(format3)
     end
 }})
 "#,
@@ -2593,8 +2593,8 @@ maki.api.register_tool({{
     assert_eq!(
         out,
         format!(
-            "child_done/5 items stream_done/streamed line/1 line \
-             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
+            "child_done/5 items/markdown stream_done/streamed line/1 line/plain \
+             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil/nil"
         )
     );
 }

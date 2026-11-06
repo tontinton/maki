@@ -415,12 +415,18 @@ pub struct DisplayMessage {
     /// Set once the call moved: the row keeps its receipt and follows the task.
     pub background: Option<BackgroundBadge>,
     /// The full body behind a one-line notice, shown when the row expands.
-    pub detail: Option<String>,
+    pub detail: Option<NoticeDetail>,
     /// Whether [`Self::detail`] is shown. Only a click sets it, so a notice
     /// starts collapsed however it got here.
     pub detail_expanded: bool,
     /// On a notice that answers a background task: how the task ended.
     pub task_end: Option<BackgroundOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoticeDetail {
+    pub text: String,
+    pub markdown: bool,
 }
 
 /// How a moved call's row tracks its background task.

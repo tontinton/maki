@@ -13,6 +13,7 @@ use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use maki_config::DEFAULT_THINKING_LINES;
+use maki_markdown::render::CODE_BAR;
 use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
@@ -3284,7 +3285,10 @@ fn moved_row_shows_elapsed_since_the_move() {
 fn notice_panel(detail: Option<&str>) -> MessagesPanel {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     let mut notice = DisplayMessage::new(DisplayRole::Notice, NOTICE_TEXT.into());
-    notice.detail = detail.map(str::to_owned);
+    notice.detail = detail.map(|text| NoticeDetail {
+        text: text.into(),
+        markdown: false,
+    });
     panel.push(notice);
     panel
 }
@@ -3315,6 +3319,20 @@ fn a_task_notice_opens_with_its_ending_dot(
     let first = &panel.cache.get(0).unwrap().lines()[0].spans[0];
     let dot = (first.content == TOOL_INDICATOR).then_some(first.style);
     assert_eq!(dot, style.map(|style| style(&theme::current())));
+}
+
+/// Shell output is not markdown: a diff's `-` lines would turn into bullets.
+#[test_case(false, "- removed line", &format!("{NOTICE_DETAIL_INDENT}- removed line") ; "plain_output_stays_as_written")]
+#[test_case(true, "```\nlet answer = 42;\n```", &format!("{NOTICE_DETAIL_INDENT}{CODE_BAR}let answer = 42;") ; "markdown_reply_renders_its_code_block")]
+fn notice_detail_follows_its_format(markdown: bool, text: &str, expected_row: &str) {
+    let detail = NoticeDetail {
+        text: text.into(),
+        markdown,
+    };
+    let rows: Vec<String> = notice_detail_lines(&detail, VIEW_WIDTH)
+        .map(|row| row.to_string())
+        .collect();
+    assert!(rows.iter().any(|row| row == expected_row), "{rows:?}");
 }
 
 #[test]

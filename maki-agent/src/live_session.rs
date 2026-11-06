@@ -114,6 +114,8 @@ pub struct BackgroundNotice<'a> {
     pub display: Option<&'a str>,
     pub wake: bool,
     pub end: TaskEnd,
+    /// `text` is markdown, see [`Message::markdown`].
+    pub markdown: bool,
 }
 
 impl Mailbox {
@@ -184,6 +186,7 @@ fn lost_notice(id: &str, label: &TaskLabel) -> Message {
         TaskAnswer::Settles(settled(id, TaskEnd::Lost)),
         text,
         Some(&display),
+        false,
     )
 }
 
@@ -270,9 +273,10 @@ fn settled(task: &str, end: TaskEnd) -> TaskSettled {
     }
 }
 
-fn answering(answer: TaskAnswer, text: String, display: Option<&str>) -> Message {
+fn answering(answer: TaskAnswer, text: String, display: Option<&str>, markdown: bool) -> Message {
     Message {
         answers: Some(answer),
+        markdown,
         ..observation(text, display)
     }
 }
@@ -404,7 +408,10 @@ impl SessionMailbox {
             }
             if let Some(notice) = notice {
                 let answer = TaskAnswer::Settles(settled(id, notice.end));
-                state.push(answering(answer, notice.text, notice.display), notice.wake);
+                state.push(
+                    answering(answer, notice.text, notice.display, notice.markdown),
+                    notice.wake,
+                );
             }
         });
     }
@@ -419,7 +426,10 @@ impl SessionMailbox {
                 return false;
             }
             let answer = TaskAnswer::Part(settled(id, notice.end));
-            state.push(answering(answer, notice.text, notice.display), notice.wake);
+            state.push(
+                answering(answer, notice.text, notice.display, notice.markdown),
+                notice.wake,
+            );
             true
         })
     }
@@ -853,6 +863,7 @@ mod tests {
 
     fn result(wake: bool) -> Option<BackgroundNotice<'static>> {
         Some(BackgroundNotice {
+            markdown: false,
             text: NOTICE_BODY.into(),
             display: None,
             wake,
@@ -1089,6 +1100,7 @@ mod tests {
         mailbox.settle(
             TASK_ID,
             Some(BackgroundNotice {
+                markdown: false,
                 text,
                 display: Some(&display),
                 wake: false,
