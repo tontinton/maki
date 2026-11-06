@@ -6,6 +6,7 @@ pub mod docs;
 pub mod docs_render;
 mod error;
 mod hook;
+mod jobs;
 pub mod key;
 mod key_lint;
 pub mod language;
@@ -16,7 +17,6 @@ mod runtime;
 pub mod session_snapshot;
 
 pub use api::action::ActionInfo;
-pub use api::r#fn::set_shell_preference;
 pub use api::keymap::{
     InputMode, InputSnapshot, KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot,
 };
@@ -37,6 +37,7 @@ pub use api::util::command::{
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
+pub use jobs::set_shell_preference;
 pub use key::{Key, PASTE, RESERVED_KEYS, is_reserved};
 pub use key_lint::KEY_WARNING;
 pub use loader::{
