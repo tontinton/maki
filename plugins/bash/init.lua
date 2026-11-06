@@ -214,7 +214,7 @@ local function create_bash_view(command, ctx)
   local tol = ctx:tool_output_lines()
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, {
-    max_lines = (tol and tol.bash) or 5,
+    max_lines = (tol and tol.bash) or 3,
     keep = "tail",
     max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
   })

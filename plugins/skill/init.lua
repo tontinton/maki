@@ -133,7 +133,7 @@ end
 
 local function view_opts(ctx)
   local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.other) or 20, keep = "head" }
+  return { max_lines = (tol and tol.other) or 3, keep = "head" }
 end
 
 -- Live call and restore both draw from the llm text, so the two views

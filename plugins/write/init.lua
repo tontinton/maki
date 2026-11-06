@@ -10,7 +10,7 @@ local DESCRIPTION = [[Write content to a file, replacing existing content.
 
 local function write_view_opts(ctx)
   local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.write) or 10, keep = "head" }
+  return { max_lines = (tol and tol.write) or 5, keep = "head" }
 end
 
 local function build_view(content, path, ctx)

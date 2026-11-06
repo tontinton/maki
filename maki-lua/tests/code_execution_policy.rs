@@ -675,9 +675,10 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
         text.contains("1 print(boom_undefined)"),
         "script header must survive the error path: {text}"
     );
+    let exception = err.trim_end().lines().last().unwrap();
     assert!(
-        text.contains(err.trim_end()),
-        "error must render below the script, err: {err:?}, body: {text}"
+        text.contains(exception),
+        "exception line must render below the script, err: {err:?}, body: {text}"
     );
     assert!(
         !text.contains("Waiting for output"),

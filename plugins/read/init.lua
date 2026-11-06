@@ -25,7 +25,7 @@ local opts = maki.api.register_options({
 
 local function read_view_opts(ctx)
   local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.read) or 10, keep = "head" }
+  return { max_lines = (tol and tol.read) or 1, keep = "head" }
 end
 
 local function apply_highlights(view, lines, ext, prefix)

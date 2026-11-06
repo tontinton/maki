@@ -1837,7 +1837,7 @@ mod tests {
 
     #[test_case(20, false, true,  true  ; "read_collapsed_truncates")]
     #[test_case(20, true,  false, false ; "read_expanded_shows_all")]
-    #[test_case(3,  false, false, false ; "read_short_no_truncation")]
+    #[test_case(TOL.read, false, false, false ; "read_short_no_truncation")]
     fn read_output_truncation(
         line_count: usize,
         expanded: bool,

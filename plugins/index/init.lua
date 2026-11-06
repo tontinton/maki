@@ -122,7 +122,7 @@ local function render_index(skeleton, path, ctx, ext, line_meta)
   local tol = ctx:tool_output_lines()
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, {
-    max_lines = (tol and tol.index) or 5,
+    max_lines = (tol and tol.index) or 1,
     keep = "head",
   })
   buf:on("click", function()

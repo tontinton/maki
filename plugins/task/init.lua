@@ -14,7 +14,7 @@ if Runner.allow_background then
   require("message")
 end
 
-local DEFAULT_OUTPUT_LINES = 5
+local DEFAULT_OUTPUT_LINES = 3
 local WAITING_FOR_SLOT = "waiting for a free subagent slot"
 local MOVED_RECEIPT = "Subagent %s"
 local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground."

@@ -77,7 +77,7 @@ local opts = maki.api.register_options(output_limits.extend({
 }))
 
 local function new_view(ctx, buf)
-  return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 30 })
+  return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 3 })
 end
 
 -- One body builder for every path (start preview, handler, restore), so the
