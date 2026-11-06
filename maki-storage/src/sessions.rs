@@ -4,8 +4,6 @@
 //! crash-safe: on load, any trailing run of unparseable lines is discarded (a partial
 //! flush may corrupt multiple trailing records). `SessionLog` tracks cursor state to
 //! enable O(delta) incremental saves.
-//!
-//! Legacy `.json` files are loaded transparently and converted to `.jsonl` on next save.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -44,10 +42,7 @@ const OLDEST_LOG_FORMAT_VERSION: u32 = 2;
 const NEWER_LOG_FORMAT: &str = "written by a newer maki, log format";
 pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
-const CWD_INDEX_STEM: &str = "cwd_latest";
 const SCAN_CACHE_FILE: &str = "scan_cache.json";
-const SCAN_CACHE_STEM: &str = "scan_cache";
-const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
 /// Printed on stderr when a transcript never reached disk. Nobody reads a
 /// `warn!` in a scripted run or a status bar that is about to close, and the
 /// next `-c` would quietly continue a session missing a turn.
@@ -720,15 +715,6 @@ pub struct StoredSubagent {
     pub started_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct LegacyHeader {
-    version: u32,
-    id: MakiId,
-    title: String,
-    cwd: String,
-    updated_at: u64,
 }
 
 pub trait TitleSource {
@@ -1539,25 +1525,21 @@ fn jsonl_path(dir: &Path, id: MakiId) -> PathBuf {
     dir.join(format!("{id}.jsonl"))
 }
 
-fn json_path(dir: &Path, id: MakiId) -> PathBuf {
-    dir.join(format!("{id}.json"))
-}
-
 fn is_jsonl(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "jsonl")
 }
 
 fn remove_legacy_files(dir: &Path, id: MakiId) -> Result<bool, SessionError> {
-    let mut removed = try_remove(&json_path(dir, id))?;
+    let mut removed = false;
     for legacy in find_legacy_files(dir, id) {
         removed |= try_remove(&legacy)?;
     }
     Ok(removed)
 }
 
-/// Rewriting a pre-jsonl file as jsonl is a write like any other, so it needs a
-/// claim. A plain read has none to lend and takes its own. A session another
-/// process owns is left for that process to migrate.
+/// Moving a legacy-named file to its canonical name is a write like any other,
+/// so it needs a claim. A plain read has none to lend and takes its own. A
+/// session another process owns is left for that process to migrate.
 fn migrate_legacy<M, U, T>(dir: &Path, session: &Session<M, U, T>, held: Option<&SessionClaim>)
 where
     M: Serialize,
@@ -1674,15 +1656,10 @@ fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, St
             Some(e) if e.size == size && e.mtime_ms == mtime_ms => e,
             _ => {
                 dirty = true;
-                let header = if is_jsonl(&path) {
-                    scan_jsonl_header(&path)
-                } else {
-                    scan_legacy_header(&path)
-                };
                 ScanCacheEntry {
                     size,
                     mtime_ms,
-                    header,
+                    header: scan_jsonl_header(&path),
                 }
             }
         };
@@ -1755,34 +1732,13 @@ fn read_last_meta(file: &mut File) -> Option<(String, u64)> {
     }
 }
 
-fn scan_legacy_header(path: &Path) -> Option<ScannedHeader> {
-    let data = fs::read(path).ok()?;
-    let h: LegacyHeader = serde_json::from_slice(&data).ok()?;
-    if h.version != SESSION_VERSION {
-        return None;
-    }
-    Some(ScannedHeader {
-        id: h.id,
-        cwd: h.cwd,
-        title: h.title,
-        updated_at: h.updated_at,
-    })
-}
-
 fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
     Ok(fs::read_dir(dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .filter(|p| is_session_file(p))
+        .filter(|p| is_jsonl(p))
         .collect())
-}
-
-fn is_session_file(p: &Path) -> bool {
-    p.file_stem()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| !NON_SESSION_STEMS.contains(&s))
-        && p.extension().is_some_and(|e| e == "json" || e == "jsonl")
 }
 
 fn find_legacy_files(dir: &Path, id: MakiId) -> Vec<PathBuf> {
@@ -1799,18 +1755,11 @@ fn find_legacy_files(dir: &Path, id: MakiId) -> Vec<PathBuf> {
 }
 
 fn locate_session_file(dir: &Path, id: MakiId) -> Option<PathBuf> {
-    for ext in ["jsonl", "json"] {
-        let path = dir.join(format!("{id}.{ext}"));
-        if path.exists() {
-            return Some(path);
-        }
+    let path = jsonl_path(dir, id);
+    if path.exists() {
+        return Some(path);
     }
-    let legacy = find_legacy_files(dir, id);
-    legacy
-        .iter()
-        .find(|p| is_jsonl(p))
-        .or_else(|| legacy.first())
-        .cloned()
+    find_legacy_files(dir, id).into_iter().next()
 }
 
 fn load_session_at<M, U, T>(path: &Path) -> Result<Session<M, U, T>, SessionError>
@@ -1820,22 +1769,8 @@ where
     T: DeserializeOwned,
 {
     let data = fs::read(path).map_err(StorageError::from)?;
-    // Held across both formats: either one decodes the same image payload once
-    // per record that mentions it.
     let _intern = crate::intern::Scope::enter();
-    let mut session: Session<M, U, T> = if path.extension().is_some_and(|e| e == "jsonl") {
-        load_jsonl(&data, &path.display().to_string())?
-    } else {
-        let session: Session<M, U, T> =
-            serde_json::from_slice(&data).map_err(StorageError::from)?;
-        if session.version != SESSION_VERSION {
-            return Err(SessionError::VersionMismatch {
-                found: session.version,
-                expected: SESSION_VERSION,
-            });
-        }
-        session
-    };
+    let mut session: Session<M, U, T> = load_jsonl(&data, &path.display().to_string())?;
     session.title = normalize_title(&session.title);
     Ok(session)
 }
@@ -2387,8 +2322,8 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
-        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, lock_path, locks_dir,
-        next_epoch, update_cwd_index, write_full_session,
+        TAIL_BUF, generate_title, jsonl_path, load_cwd_index, lock_path, locks_dir, next_epoch,
+        update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT, OLDEST_LOG_FORMAT_VERSION,
@@ -3352,30 +3287,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_json_to_jsonl() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.push_message(user_message("legacy"));
-
-        let json_path = json_path(dir, session.id);
-        fs::write(&json_path, serde_json::to_vec(&session).unwrap()).unwrap();
-        update_cwd_index(dir, &session.cwd, session.id).unwrap();
-
-        let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.messages().len(), 1);
-
-        let _log = SessionLog::rewrite(dir, &claim_for(dir, &loaded), &loaded).unwrap();
-
-        assert!(!json_path.exists());
-        assert!(jsonl_path(dir, session.id).exists());
-
-        let reloaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(reloaded.messages().len(), 1);
-        assert_eq!(reloaded.model, "m");
-    }
-
-    #[test]
     fn load_nonexistent_returns_not_found() {
         let tmp = TempDir::new().unwrap();
         let id = MakiId::generate();
@@ -3817,97 +3728,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_coexisting_json_and_jsonl() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.push_message(user_message("hi"));
-
-        let jsonl_file = jsonl_path(dir, session.id);
-        write_legacy_jsonl(&jsonl_file, &session);
-        let json_file = json_path(dir, session.id);
-        fs::write(&json_file, serde_json::to_vec(&session).unwrap()).unwrap();
-
-        TestSession::delete_from(&claim_id(dir, session.id), dir).unwrap();
-        assert!(!jsonl_file.exists());
-        assert!(!json_file.exists());
-    }
-
-    #[test]
-    fn load_picks_jsonl_when_legacy_dual_file_exists() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
-        let mut jsonl_session: TestSession = Session::new("m", "/project");
-        jsonl_session.id = id;
-        jsonl_session.push_message(user_message("newer"));
-
-        let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
-        write_legacy_jsonl(&legacy_jsonl, &jsonl_session);
-
-        let mut json_session: TestSession = Session::new("m", "/project");
-        json_session.id = id;
-        json_session.push_message(user_message("older"));
-        let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
-        fs::write(&legacy_json, serde_json::to_vec(&json_session).unwrap()).unwrap();
-
-        let loaded = TestSession::load_from(id, dir).unwrap();
-        assert_eq!(loaded.messages().len(), 1);
-        assert_eq!(loaded.messages()[0], user_message("newer"));
-    }
-
-    #[test]
-    fn load_dual_legacy_files_does_not_leave_duplicate_in_list() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
-        let mut jsonl_session: TestSession = Session::new("m", "/project");
-        jsonl_session.id = id;
-        jsonl_session.push_message(user_message("newer"));
-        let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
-        write_legacy_jsonl(&legacy_jsonl, &jsonl_session);
-
-        let mut json_session: TestSession = Session::new("m", "/project");
-        json_session.id = id;
-        json_session.push_message(user_message("older"));
-        let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
-        fs::write(&legacy_json, serde_json::to_vec(&json_session).unwrap()).unwrap();
-
-        TestSession::load_from(id, dir).unwrap();
-
-        assert!(!legacy_json.exists(), "legacy .json sibling left behind");
-        let list = TestSession::list_in("/project", dir).unwrap();
-        assert_eq!(
-            list.len(),
-            1,
-            "session shows up more than once in the picker"
-        );
-    }
-
-    #[test]
-    fn delete_drains_coexisting_legacy_json_and_jsonl() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.id = id;
-        session.push_message(user_message("legacy"));
-
-        let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
-        write_legacy_jsonl(&legacy_jsonl, &session);
-
-        let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
-        fs::write(&legacy_json, serde_json::to_vec(&session).unwrap()).unwrap();
-
-        TestSession::delete_from(&claim_id(dir, id), dir).unwrap();
-        assert!(!legacy_jsonl.exists());
-        assert!(!legacy_json.exists());
-    }
-
-    #[test]
     fn rewrite_removes_legacy_named_files() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -3920,13 +3740,9 @@ mod tests {
         let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
         write_legacy_jsonl(&legacy_jsonl, &session);
 
-        let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
-        fs::write(&legacy_json, serde_json::to_vec(&session).unwrap()).unwrap();
-
         let _log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         assert!(!legacy_jsonl.exists());
-        assert!(!legacy_json.exists());
         assert!(jsonl_path(dir, id).exists());
     }
 
@@ -3940,16 +3756,17 @@ mod tests {
         save_with_time(&mut newest, dir, 3000);
 
         let mut older: TestSession = Session::new("m", "/project");
+        older.id = LEGACY_HEX_ID.parse().unwrap();
         older.title = "older".into();
         older.updated_at = 1000;
-        let json_path = json_path(dir, older.id);
-        fs::write(&json_path, serde_json::to_vec(&older).unwrap()).unwrap();
+        let legacy_path = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
+        write_legacy_jsonl(&legacy_path, &older);
 
         // Opening the older session migrates it to canonical jsonl, but must not
         // repoint cwd→latest at it.
         let loaded = TestSession::load_from(older.id, dir).unwrap();
         assert_eq!(loaded.title, "older");
-        assert!(!json_path.exists());
+        assert!(!legacy_path.exists());
 
         let latest = TestSession::claim_latest_in("/project", dir)
             .unwrap()
@@ -4072,40 +3889,6 @@ mod tests {
         let title = generate_title(&[user_message(&input)]);
         assert!(title.len() <= MAX_TITLE_LEN * 4);
         assert!(title.is_char_boundary(title.len()));
-    }
-
-    #[test]
-    fn scan_headers_reads_both_formats() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let mut s1: TestSession = Session::new("m", "/project");
-        s1.title = "jsonl-session".into();
-        s1.save_to(&claim_for(dir, &s1), dir).unwrap();
-
-        let mut s2: TestSession = Session::new("m", "/project");
-        s2.title = "json-session".into();
-        let json_path = json_path(dir, s2.id);
-        fs::write(&json_path, serde_json::to_vec(&s2).unwrap()).unwrap();
-
-        let list = TestSession::list_in("/project", dir).unwrap();
-        assert_eq!(list.len(), 2);
-    }
-
-    #[test]
-    fn load_wrong_version_legacy_returns_error() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("test/model", "/tmp");
-        session.version = 999;
-        let path = json_path(dir, session.id);
-        fs::write(&path, serde_json::to_vec(&session).unwrap()).unwrap();
-
-        let err = TestSession::load_from(session.id, dir).unwrap_err();
-        assert!(matches!(
-            err,
-            SessionError::VersionMismatch { found: 999, .. }
-        ));
     }
 
     /// A torn tail is what a crash mid-append leaves behind, and the file is
