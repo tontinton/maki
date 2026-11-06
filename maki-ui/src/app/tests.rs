@@ -35,9 +35,8 @@ use maki_agent::{
     SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SteerKind, TaskLabel, ToolDoneEvent,
     ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
 };
-use maki_config::{
-    Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
-};
+use maki_config::project::{self, TrustMode};
+use maki_config::{Effect, PermissionRule, PermissionsConfig, PluginsConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{
     HintWriterHandle, RequestProbe, TestBinding, hint_writer_pair, keymap_reader_from,
     probed_event_handle, set_mode,
@@ -192,7 +191,8 @@ fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
             ..Default::default()
         },
         PathBuf::from(PERMISSIONS_CWD),
-        ProjectConfig::for_project(Path::new(PERMISSIONS_CWD)),
+        project::resolve_noninteractive(Path::new(PERMISSIONS_CWD), TrustMode::Session)
+            .project_config,
         Arc::default(),
     ))
 }

@@ -56,14 +56,10 @@ rustix = { workspace = true }
 windows-sys = { workspace = true }
 
 [dev-dependencies]
-maki-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 fastrand = { workspace = true }
-
-[features]
-bench = []
 
 [[bench]]
 name = "splash"
@@ -80,7 +76,6 @@ harness = false
 [[bench]]
 name = "input"
 harness = false
-required-features = ["bench"]
 
 [lints]
 workspace = true

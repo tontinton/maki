@@ -1250,7 +1250,7 @@ mod tests {
         assert!(trusted.is_trusted());
         assert_eq!(
             trusted.config_root(),
-            ProjectConfig::for_project(project.path()).config_root()
+            ProjectConfig::discover(project.path()).config_root()
         );
         let rules = maki_config::load_permissions(&trusted).rules;
         assert!(
@@ -1401,7 +1401,8 @@ mod tests {
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
                 PathBuf::from("/project"),
-                ProjectConfig::for_project(Path::new("/project")),
+                project::resolve_noninteractive(Path::new("/project"), TrustMode::Session)
+                    .project_config,
                 Arc::default(),
             )),
             task: AbortOnDropHandle::new(tokio::spawn(async { SessionEnd::default() })),

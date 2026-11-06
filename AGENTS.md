@@ -35,7 +35,7 @@ Maki is an AI coding agent (like Claude Code and opencode), that is built bottom
 Cheapest first, and scope to the crate you touched while iterating:
 
 - `just check` (or `cargo check -p <crate> --all-targets`)
-- `just lint` - `cargo clippy --all --all-targets --features maki-ui/bench -- -D warnings`
+- `just lint` - `cargo clippy --all --all-targets -- -D warnings`
 - `just test` - `cargo nextest run --workspace`
 
 Read `justfile` for more.

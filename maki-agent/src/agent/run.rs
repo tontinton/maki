@@ -1287,7 +1287,8 @@ pub(crate) mod testing {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use maki_config::{DefaultEffect, ModelPolicy, PermissionsConfig, ProjectConfig};
+    use maki_config::project::{self, TrustMode};
+    use maki_config::{DefaultEffect, ModelPolicy, PermissionsConfig};
     use maki_providers::Model;
     use maki_providers::provider::Provider;
 
@@ -1315,7 +1316,8 @@ pub(crate) mod testing {
                     ..Default::default()
                 },
                 PathBuf::from(TEST_DIR),
-                ProjectConfig::for_project(Path::new(TEST_DIR)),
+                project::resolve_noninteractive(Path::new(TEST_DIR), TrustMode::Session)
+                    .project_config,
                 Arc::default(),
             )),
             session_id: None,

@@ -16,7 +16,8 @@ use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, InputSource, McpConfigErrors,
     ModelSlot, ToolDoneEvent, ToolOutputLines,
 };
-use maki_config::{ModelPolicy, PermissionsConfig, PluginsConfig, ProjectConfig};
+use maki_config::project::{self, TrustMode};
+use maki_config::{ModelPolicy, PermissionsConfig, PluginsConfig};
 use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -346,7 +347,7 @@ impl World {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
+            project::resolve_noninteractive(Path::new("/tmp"), TrustMode::Session).project_config,
             Arc::default(),
         ));
         let handles = AgentHandles::spawn(
