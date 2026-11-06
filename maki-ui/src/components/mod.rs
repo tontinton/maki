@@ -135,7 +135,8 @@ pub(crate) trait Overlay {
     /// permission prompt. Keys typed before one opened must never answer it,
     /// so each overlay has to say.
     fn is_prompting(&self) -> bool;
-    /// Modal overlays block mouse interaction behind them.
+    /// Modal overlays block clicks behind them. The wheel ignores this flag:
+    /// `App::scroll_at` decides per overlay where it goes.
     fn is_modal(&self) -> bool {
         true
     }
