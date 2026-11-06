@@ -1299,7 +1299,8 @@ impl UiConfig {
 }
 
 /// Declares every `ui.tool_output_lines` key once: the file struct, the
-/// resolved struct and its defaults all come from this list.
+/// resolved struct, its defaults and the lookup by field all come from this
+/// list.
 macro_rules! tool_output_lines {
     ($($field:ident = $default:expr),+ $(,)?) => {
         #[derive(Deserialize, Default, Debug, Merge)]
@@ -1324,6 +1325,13 @@ macro_rules! tool_output_lines {
                 let f = f.unwrap_or_default();
                 Self { $($field: f.$field.unwrap_or(Self::DEFAULT.$field)),+ }
             }
+
+            pub fn get(&self, tool: &str) -> usize {
+                match Self::field_for(tool) {
+                    $(stringify!($field) => self.$field,)+
+                    _ => self.other,
+                }
+            }
         }
     };
 }
@@ -1341,18 +1349,18 @@ tool_output_lines! {
 }
 
 impl ToolOutputLines {
-    pub fn get(&self, name: &str) -> usize {
-        match name {
-            "bash" => self.bash,
-            "code_execution" => self.code_execution,
-            "task" => self.task,
-            "index" => self.index,
-            "grep" | "glob" => self.grep,
-            "read" | "list" => self.read,
-            "memory" => self.write,
-            name if FILE_WRITE_TOOLS.contains(&name) => self.write,
-            "webfetch" | "websearch" => self.web,
-            _ => self.other,
+    pub fn field_for(tool: &str) -> &'static str {
+        match tool {
+            "bash" => "bash",
+            "code_execution" => "code_execution",
+            "task" => "task",
+            "index" => "index",
+            "grep" | "glob" => "grep",
+            "read" | "list" => "read",
+            "memory" => "write",
+            tool if FILE_WRITE_TOOLS.contains(&tool) => "write",
+            "webfetch" | "websearch" => "web",
+            _ => "other",
         }
     }
 }

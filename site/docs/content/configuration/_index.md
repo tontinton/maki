@@ -111,21 +111,21 @@ These work everywhere a hex value does, including syntax highlighting scopes, so
 
 ### `ui.tool_output_lines`
 
-How many lines of output to show per tool in the UI. All values are `usize`. The `read` value also applies to the list tool.
+Lines of output a tool call shows before it collapses. Click the call to see all of it.
 
-A value of 0 shows only the tool header until you click it. This is the default for read, index and list, since their header already gives the line or entry count. Errors and tools without a view of their own, such as MCP tools, have no count in their header, so they still show their first line.
+With 0 you see only the header. The read, index and list tools default to 0, because their header already says how many lines or entries came back. Errors and MCP tools still show their first line.
 
-| Field | Default |
-|-------|---------|
-| `bash` | 3 |
-| `code_execution` | 3 |
-| `task` | 3 |
-| `index` | 0 |
-| `grep` | 3 |
-| `read` | 0 |
-| `write` | 5 |
-| `web` | 3 |
-| `other` | 3 |
+| Field | Default | Tools |
+|-------|---------|-------|
+| `bash` | 3 | bash |
+| `code_execution` | 3 | code_execution |
+| `task` | 3 | task |
+| `index` | 0 | index |
+| `grep` | 3 | glob, grep |
+| `read` | 0 | list, read |
+| `write` | 5 | edit, edit_lines, insert_lines, memory, multiedit, write |
+| `web` | 3 | webfetch, websearch |
+| `other` | 3 | Every other tool, MCP tools included |
 
 ### `agent`
 

@@ -16,7 +16,7 @@ const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
 /// (plugin, option, tool).
 const OPTION_GATED_TOOLS: &[(&str, &str, &str)] = &[("task", "allow_background", "task_message")];
 
-const SECTIONS: &[(&str, &[&str])] = &[
+pub(crate) const SECTIONS: &[(&str, &[&str])] = &[
     (
         "File Operations",
         &[
