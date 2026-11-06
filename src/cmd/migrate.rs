@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
@@ -102,9 +102,16 @@ fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-fn move_file(src: &Path, dst: &Path) -> Result<()> {
+#[cfg_attr(not(unix), expect(unused_variables))]
+fn move_file(src: &Path, dst: &Path, legacy: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", tilde(parent)))?;
+    }
+    // A link to a file in `~/.maki` stays as it is, since that file moves out
+    // too and usually lands right next to it.
+    #[cfg(unix)]
+    if is_symlink(src) && !resolves_into(src, legacy) {
+        return relink(src, dst);
     }
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
@@ -123,10 +130,33 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
     }
 }
 
+/// Both sides are resolved, since `~/.maki` itself can sit behind a symlink.
+#[cfg(unix)]
+fn resolves_into(link: &Path, dir: &Path) -> bool {
+    let (Ok(target), Ok(dir)) = (fs::canonicalize(link), fs::canonicalize(dir)) else {
+        return false;
+    };
+    target.starts_with(dir)
+}
+
+/// `rename` keeps a relative link as it is, so a link out of `~/.maki`, like
+/// the ones GNU stow makes, points at nothing from its new home. The new link
+/// points at the fully resolved file instead, because even
+/// `~/.maki/../dotfiles` breaks once `~/.maki` is gone. A link that already
+/// pointed at nothing is copied as is.
+#[cfg(unix)]
+fn relink(src: &Path, dst: &Path) -> Result<()> {
+    let target = fs::canonicalize(src)
+        .or_else(|_| fs::read_link(src))
+        .with_context(|| format!("read link {}", tilde(src)))?;
+    symlink(&target, dst).with_context(|| format!("link {} -> {}", tilde(dst), tilde(&target)))?;
+    fs::remove_file(src).with_context(|| format!("remove source {}", tilde(src)))
+}
+
 /// Moves `path` into the backup, under its place in the old layout.
 fn stash(path: &Path, relative: &Path, legacy: &Path) -> Result<PathBuf> {
     let dst = free_path(&backup_path(legacy).join(relative));
-    move_file(path, &dst)?;
+    move_file(path, &dst, legacy)?;
     Ok(dst)
 }
 
@@ -136,13 +166,13 @@ fn stash(path: &Path, relative: &Path, legacy: &Path) -> Result<PathBuf> {
 /// keeps writing `~/.maki` for as long as that directory exists.
 fn keep_newest(old: &Path, new: &Path, legacy: &Path) -> Result<()> {
     if !present(new) {
-        return move_file(old, new);
+        return move_file(old, new, legacy);
     }
     let relative = old.strip_prefix(legacy).unwrap_or(old);
     let old_wins = modified(old) > modified(new);
     let stashed = stash(if old_wins { new } else { old }, relative, legacy)?;
     if old_wins {
-        move_file(old, new)?;
+        move_file(old, new, legacy)?;
     }
     eprintln!(
         "  kept the newer {}, older copy moved to {}",
@@ -978,6 +1008,25 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
 
         assert_eq!(ensure_outside(&legacy, &[&target]).is_ok(), allowed);
+    }
+
+    #[cfg(unix)]
+    #[test_case("../dotfiles/init.lua" ; "a_link_out_of_the_old_dir")]
+    #[test_case("lua/main.lua" ; "a_link_within_the_old_dir")]
+    fn a_relative_symlink_still_reaches_its_file_after_the_move(target: &str) {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(".maki");
+        let xdg = xdg_layout(root.path());
+        fs::create_dir_all(&legacy).unwrap();
+        write(legacy.join(target), NEW_CONTENT);
+        symlink(target, legacy.join(INIT_LUA)).unwrap();
+
+        migrate(&legacy, &xdg).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(xdg[0].join(INIT_LUA)).unwrap(),
+            NEW_CONTENT
+        );
     }
 
     #[cfg(unix)]
