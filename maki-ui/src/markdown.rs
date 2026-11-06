@@ -10,6 +10,10 @@ use ratatui::text::{Line, Span};
 pub const TRUNCATION_PREFIX: &str = "...";
 pub const EXPAND_HINT: &str = "click to expand";
 pub(crate) const MIN_TRUNCATABLE_LINES: usize = 2;
+/// Errors and MCP output render here as plain text, and their header has no
+/// line count. If a limit of 0 hid every line, the call would show nothing,
+/// so the first line always stays.
+const MIN_PLAIN_LINES: usize = 1;
 
 /// Add `over`'s modifiers on top of `base`, keeping `base`'s colors.
 fn apply_modifiers(base: Style, over: Style) -> Style {
@@ -260,7 +264,7 @@ pub fn truncate_output(text: &str, max: usize) -> TruncatedOutput<'_> {
 /// Keeps the head. Tools that want tail truncation do it in Lua instead
 /// (ToolView `keep = "tail"`).
 pub fn truncate_lines(s: &str, max: usize) -> Truncated<'_> {
-    let Some((i, _)) = s.match_indices('\n').nth(max.saturating_sub(1)) else {
+    let Some((i, _)) = s.match_indices('\n').nth(max.max(MIN_PLAIN_LINES) - 1) else {
         return Truncated {
             kept: s,
             skipped: 0,
@@ -453,6 +457,7 @@ mod tests {
 
     #[test_case("a\nb\nc", 5, "a\nb\nc", 0     ; "under_limit")]
     #[test_case("a\nb\nc\nd", 2, "a\nb", 2     ; "over_limit_keeps_head")]
+    #[test_case("a\nb\nc", 0, "a", 2           ; "zero_keeps_first_line")]
     fn truncate_lines_cases(input: &str, max: usize, expected_kept: &str, expected_skipped: usize) {
         let tr = truncate_lines(input, max);
         assert_eq!(tr.kept, expected_kept);

@@ -80,7 +80,6 @@ const MAX_COMPACTION_PERCENT: u8 = 99;
 const COMPACTION_BUFFER_EXPECTED: &str =
     r#"a token count (e.g. 12000) or a percent of the context window (e.g. "20%")"#;
 pub const MIN_MOUSE_SCROLL_LINES: u32 = 1;
-pub const MIN_TOOL_OUTPUT_LINES: usize = 1;
 pub const MIN_MAX_LOG_BYTES_MB: u64 = 1;
 pub const MIN_MAX_LOG_FILES: u32 = 1;
 pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
@@ -1297,16 +1296,10 @@ impl UiConfig {
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
         }
     }
-
-    pub fn validate_all(&self) -> Result<(), ConfigError> {
-        self.validate()?;
-        self.tool_output_lines.validate()?;
-        Ok(())
-    }
 }
 
 /// Declares every `ui.tool_output_lines` key once: the file struct, the
-/// resolved struct, its defaults and its validation all come from this list.
+/// resolved struct and its defaults all come from this list.
 macro_rules! tool_output_lines {
     ($($field:ident = $default:expr),+ $(,)?) => {
         #[derive(Deserialize, Default, Debug, Merge)]
@@ -1331,16 +1324,6 @@ macro_rules! tool_output_lines {
                 let f = f.unwrap_or_default();
                 Self { $($field: f.$field.unwrap_or(Self::DEFAULT.$field)),+ }
             }
-
-            pub fn validate(&self) -> Result<(), ConfigError> {
-                $(check(
-                    "ui.tool_output_lines",
-                    stringify!($field),
-                    self.$field as u64,
-                    MIN_TOOL_OUTPUT_LINES as u64,
-                )?;)+
-                Ok(())
-            }
         }
     };
 }
@@ -1349,9 +1332,9 @@ tool_output_lines! {
     bash = 3,
     code_execution = 3,
     task = 3,
-    index = 1,
+    index = 0,
     grep = 3,
-    read = 1,
+    read = 0,
     write = 5,
     web = 3,
     other = 3,
@@ -1365,7 +1348,7 @@ impl ToolOutputLines {
             "task" => self.task,
             "index" => self.index,
             "grep" | "glob" => self.grep,
-            "read" => self.read,
+            "read" | "list" => self.read,
             "memory" => self.write,
             name if FILE_WRITE_TOOLS.contains(&name) => self.write,
             "webfetch" | "websearch" => self.web,
@@ -2167,7 +2150,7 @@ impl PluginsConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.ui.validate_all()?;
+        self.ui.validate()?;
         self.agent.validate()?;
         self.provider.validate()?;
         self.storage.validate()?;

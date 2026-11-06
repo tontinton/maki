@@ -4711,6 +4711,10 @@ fn extract_restore_reply(ret: &LuaValue) -> Option<RestoreReply> {
             });
             (body, header)
         }
+        // A nil restore leaves the output to the host, as a live call with no
+        // body does. Returning None here would also lose the header that
+        // restore_item builds from the tool's `header` fn.
+        LuaValue::Nil => (None, None),
         _ => return None,
     };
     Some(RestoreReply { body, header })

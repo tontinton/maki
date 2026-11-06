@@ -18,6 +18,10 @@ local SEPARATOR = "──────────────────"
 local BODY_INDENT = "  "
 local ANNOTATION_SEP = " · "
 local MARKDOWN_FORMAT = "markdown"
+-- Same floor as the host's plain text path. Errors and tools without a view
+-- end up in this fallback with no line count in their header, so a limit of
+-- 0 still shows their first line.
+local MIN_PLAIN_LINES = 1
 local ERROR_PREFIX = "[ERROR] "
 local EMPTY_ERROR = "provide at least one tool call"
 local NESTED_ERROR = "cannot nest batch inside batch"
@@ -199,7 +203,7 @@ local function child_body_buf(c, cctx)
     end
   end
   local tol = cctx.tool_output_lines
-  local opts = { max_lines = tol[c.tool] or tol.other, keep = "head" }
+  local opts = { max_lines = math.max(tol[c.tool] or tol.other, MIN_PLAIN_LINES), keep = "head" }
   if t and t.format == MARKDOWN_FORMAT then
     return ToolView.restore_markdown(output, is_error, opts)
   end

@@ -2124,6 +2124,26 @@ fn header_snapshot_stamps_gen_on_top_level() {
     assert!(msg.render_header.is_some(), "render_header must be set");
 }
 
+/// A headless session stores no tool outputs, so a reopened failed call has
+/// its error only in the row text. The header must keep it, and a body view
+/// must replace it, or a tail view of a long error draws it twice.
+#[test]
+fn restored_row_text_stays_until_a_body_view_lands() {
+    const ERROR_BODY: &str = "error: path not found";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.find_tool_msg_mut("t1").unwrap().text = format!("t1\n{ERROR_BODY}");
+
+    panel.tool_header_snapshot("t1", rendered_snapshot(), Some(1));
+    assert_eq!(
+        panel.find_tool_msg_mut("t1").unwrap().text,
+        format!("rendered\n{ERROR_BODY}")
+    );
+
+    panel.tool_snapshot("t1", rendered_snapshot(), Some(1));
+    assert_eq!(panel.find_tool_msg_mut("t1").unwrap().text, "rendered");
+}
+
 #[test]
 fn live_snapshot_uses_panel_generation() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
