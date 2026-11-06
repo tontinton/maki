@@ -1256,7 +1256,7 @@ impl LiveTask {
             stopped,
             control: None,
             replied: false,
-            cancel: Fire::Owned(cancel),
+            cancel: Fire::Call(cancel),
             mailbox: Some(mailbox.clone()),
         };
         let registry = BackgroundTasks::of(lua);
@@ -6131,6 +6131,7 @@ pub fn spawn(
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use maki_agent::MovedTrigger;
     use maki_agent::cancel::CancelTrigger;
 
     use super::*;
@@ -6148,9 +6149,7 @@ pub(crate) mod test_support {
 
     /// A model call, moved or not. Hold on to the triggers it hands back:
     /// dropping one fires it, and the call would read as cancelled.
-    pub(crate) fn call_scope(
-        moved: bool,
-    ) -> (Arc<CallScope>, CancelTrigger, Option<CancelTrigger>) {
+    pub(crate) fn call_scope(moved: bool) -> (Arc<CallScope>, CancelTrigger, Option<MovedTrigger>) {
         let (run_trigger, run) = CancelToken::new();
         let call = Arc::new(CallScope::new(MOVED_CALL_ID.to_owned(), &run));
         let task_trigger = moved.then(|| call.move_to(moved_home()).expect("first move"));

@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use maki_agent::cancel::{CancelHandle, CancelToken, CancelTrigger};
 use maki_agent::{
-    Activity, AgentEvent, AgentSeed, BackgroundNotice, Cutter, EndReason, Envelope, SessionControl,
-    SessionMailbox, TaskEnd, TaskLabel, ToolDoneEvent, result_notice,
+    Activity, AgentEvent, AgentSeed, BackgroundNotice, Cutter, EndReason, Envelope, MovedTrigger,
+    SessionControl, SessionMailbox, TaskEnd, TaskLabel, ToolDoneEvent, result_notice,
 };
 use maki_storage::id::MakiId;
 use mlua::Lua;
@@ -50,6 +50,8 @@ pub(crate) enum Lifetime {
 pub(crate) enum Fire {
     /// The registry owns the work's trigger: dropping it fires.
     Owned(#[expect(dead_code, reason = "held: dropping it fires the work")] CancelTrigger),
+    /// A moved call: dropping it is a stop, unless [`Self::finish`] ran first.
+    Call(MovedTrigger),
     /// Somebody else owns the trigger (a session stub under a moved call).
     Handle(CancelHandle),
 }
@@ -60,6 +62,12 @@ impl Fire {
     /// for its final reply.
     fn disarm(&mut self) -> Self {
         mem::replace(self, Self::Owned(CancelToken::new().0))
+    }
+
+    fn finish(&self) {
+        if let Self::Call(trigger) = self {
+            trigger.finish();
+        }
     }
 }
 
@@ -413,7 +421,8 @@ impl BackgroundTasks {
     }
 
     /// The final reply of a moved call: settles its receipt in the run it
-    /// reports to, closes its task tab and retires the entry. A model's
+    /// reports to, closes its task tab and retires the entry, which ends the
+    /// call but not what it left running past its reply. A model's
     /// `task_stop` that is waiting takes the output instead of the run
     /// getting a notice. Needs no Lua host, so it can land after the host
     /// died.
@@ -427,6 +436,7 @@ impl BackgroundTasks {
             tracing::debug!(id, "final reply of a background task that already settled");
             return;
         };
+        task.cancel.finish();
         if let Some(mailbox) = &task.mailbox {
             let output = done.output.as_text();
             if self.hand_to_waiter(id, &output) {
@@ -664,6 +674,7 @@ pub(crate) mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::runtime::test_support::call_scope;
     use crate::runtime::{TaskCell, TaskScope, lock_cell};
 
     const PLUGIN: &str = "monitor";
@@ -846,6 +857,27 @@ pub(crate) mod tests {
 
         assert!(token.is_cancelled());
         assert!(!registry.contains(&id));
+    }
+
+    /// The owner token carries what the call left running, like a highlight.
+    #[test_case(false ; "a_delivered_call_leaves_it_running")]
+    #[test_case(true ; "a_stopped_call_takes_it_along")]
+    fn a_moved_calls_late_work(stopped: bool) {
+        let session = MakiId::generate();
+        let _live = live(session);
+        let (call, _run, trigger) = call_scope(true);
+        let (mut entry, _) = call_entry(session, CALL_ID);
+        entry.cancel = Fire::Call(trigger.expect("moved"));
+        let registry = BackgroundTasks::default();
+        registry.register(entry).unwrap();
+
+        if stopped {
+            registry.stop(CALL_ID, Cutter::User);
+        }
+        registry.deliver(CALL_ID, done(OUTPUT, false), None);
+
+        assert!(call.cancel().is_cancelled());
+        assert_eq!(call.owner().is_cancelled(), stopped);
     }
 
     #[test]
