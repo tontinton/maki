@@ -231,10 +231,19 @@ debug = false
 [profile.dev.build-override]
 debug = false
 
-# Fat LTO makes the UI hot paths about 8% faster and the binary 8% smaller. Only
-# release builds pay for it, about 2.5 minutes on an M3 Pro.
+# Fat LTO made the UI hot paths about 8% faster and the binary 8% smaller, but
+# its 2.5 minutes of link time on an M3 Pro were too much for `cargo install`
+# and `cargo build --release`. Thin LTO keeps part of the gain at a fraction of
+# that; the released binaries get the full treatment below.
 [profile.release]
-lto = true
+lto = "thin"
+
+# What the release workflow ships. Only CI pays for it. Packagers that build
+# from source should pass `--profile release-lto` too.
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 # crossterm 0.29.0 has no VT input on Windows, so bracketed paste never decodes and a
 # multiline paste submits at the first newline (#336). Pinned to the head of
