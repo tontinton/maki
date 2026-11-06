@@ -15,7 +15,7 @@ use super::tool_display::{
     MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info,
     assistant_style, build_instructions_lines, build_tool_lines, done_style, error_style,
     format_timestamp_now, hint_columns, instructions_search_text, notice_style, outcome_glyph,
-    search_text_for, thinking_style, truncate_to_header, user_style,
+    replace_header, search_text_for, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole,
@@ -1381,9 +1381,10 @@ impl MessagesPanel {
         };
         if let Some(msg) = self.find_tool_msg_mut(tool_id) {
             if is_header {
-                msg.text = snapshot.first_line_text();
+                replace_header(&mut msg.text, &snapshot.first_line_text());
                 msg.render_header = Some(snapshot);
             } else {
+                truncate_to_header(&mut msg.text);
                 msg.render_snapshot = Some(snapshot);
             }
             msg.snapshot_theme_gen = applied_gen;

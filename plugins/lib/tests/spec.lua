@@ -237,6 +237,40 @@ case("tool_view_ring_wraparound", function()
   eq(buf.lines[4], "line10")
 end)
 
+case("tool_view_zero_lines_shows_only_header_until_expanded", function()
+  for _, keep in ipairs({ "head", "tail" }) do
+    for _, count in ipairs({ 1, 5 }) do
+      local label = keep .. " count=" .. count
+      local buf = mock_buf()
+      local view = ToolView.new(buf, { max_lines = 0, keep = keep })
+      view:set_header({ "cmd" })
+      for i = 1, count do
+        view:append("line" .. i)
+      end
+      view:finish()
+      eq(#buf.lines, 1, label)
+      eq(buf.lines[1], "cmd", label)
+      eq(view:visible_count(), 0, label)
+      view:toggle()
+      eq(#buf.lines, count + 2, label) -- header + separator
+      eq(buf.lines[3], "line1", label)
+    end
+  end
+end)
+
+case("tool_view_expanded_shows_lines_appended_past_the_cap", function()
+  for _, opts in ipairs({ { max_lines = 0, keep = "tail" }, { max_lines = 1, keep = "head" } }) do
+    local label = opts.keep .. " max=" .. opts.max_lines
+    local buf = mock_buf()
+    local view = ToolView.new(buf, opts)
+    view:append("line1")
+    view:toggle()
+    view:append("line2")
+    eq(#buf.lines, 2, label)
+    eq(buf.lines[2], "line2", label)
+  end
+end)
+
 case("tool_view_finish_flushes_head_skipped", function()
   local buf = mock_buf()
   local view = ToolView.new(buf, { max_lines = 2, keep = "head" })

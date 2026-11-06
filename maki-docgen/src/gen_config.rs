@@ -4,8 +4,8 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    DEFAULT_MOUSE_SCROLL_LINES, NetConfig, ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS,
+    TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
@@ -310,7 +310,12 @@ fn write_tool_output_section(out: &mut String) {
     writeln!(
         out,
         "How many lines of output to show per tool in the UI. \
-         All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}.\n"
+         All values are `usize`. The `read` value also applies to the list tool.\n\n\
+         A value of 0 shows only the tool header until you click it. This is the \
+         default for read, index and list, since their header already gives the \
+         line or entry count. Errors and tools without a view of their own, such \
+         as MCP tools, have no count in their header, so they still show their \
+         first line.\n"
     )
     .unwrap();
     writeln!(out, "| Field | Default |").unwrap();

@@ -9091,6 +9091,8 @@ function ToolView.line_nr_fmt(max_line_nr)
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,
 -- max_line_bytes (optional) per-line byte cap. Lines are stored already cut,
 -- so a run of huge lines costs no more than short ones while kept for expansion.
+-- With max_lines 0 only the set_header lines show until a click expands the
+-- view, so the tool header should give the count.
 function ToolView.new(buf, opts)
 function ToolView:set_header(lines)
 function ToolView:clear()

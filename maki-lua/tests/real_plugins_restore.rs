@@ -497,6 +497,33 @@ fn index_dir_renders_identically_live_and_restored() {
     );
 }
 
+const READ_TOOL: &str = "read";
+const LIST_TOOL: &str = "list";
+const MISSING_PATH: &str = "/missing";
+const MISSING_PATH_ERROR: &str = "error: path not found: /missing";
+
+/// A failed read, index or list call publishes no body, so the host draws the
+/// error text. Restore has to do the same. Their own views follow a limit that
+/// is often 0, and that would hide the error. The header still comes from the
+/// tool, as it does live.
+#[test_case(READ_TOOL ; "read")]
+#[test_case(INDEX_TOOL ; "index")]
+#[test_case(LIST_TOOL ; "list")]
+fn failed_call_restores_without_a_body(tool: &str) {
+    let host = PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).unwrap();
+    let mut item = restore_item(
+        tool,
+        json!({ "path": MISSING_PATH }),
+        MISSING_PATH_ERROR,
+        None,
+        Vec::new(),
+    );
+    item.is_error = true;
+    let r = run_restore(&host, item);
+    assert_eq!(r.body, "");
+    assert!(r.header.starts_with(MISSING_PATH), "header: {}", r.header);
+}
+
 /// Nothing else runs the real plugin's restore. It draws the call's list into
 /// the chat from its input alone, so a failed call renders the same.
 #[test]
