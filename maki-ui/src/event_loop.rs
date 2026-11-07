@@ -27,8 +27,8 @@ use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
-    SessionMailbox, Transcript, mcp,
+    AgentConfig, AgentEvent, CancelToken, Envelope, HostPrompt, McpCommand, McpConfigErrors,
+    McpHandle, SessionMailbox, Transcript, mcp,
 };
 use maki_config::project::TrustState;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
@@ -146,6 +146,7 @@ pub struct EventLoopParams {
     /// The mailboxes the generation before handed over, held until this one
     /// registered its own.
     pub handed_over: Vec<SessionMailbox>,
+    pub host_prompt: HostPrompt,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -471,6 +472,7 @@ struct SpawnCtx {
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     trust: TrustState,
+    host_prompt: Arc<HostPrompt>,
 }
 
 impl SpawnCtx {
@@ -500,6 +502,7 @@ impl SpawnCtx {
                 mcp_config_errors: self.mcp_config_errors.clone(),
                 timeouts: self.timeouts,
                 model_policy: Arc::clone(&self.model_policy),
+                host_prompt: Arc::clone(&self.host_prompt),
             },
         );
         let mut app = App::new(
@@ -706,6 +709,7 @@ impl<'t> EventLoop<'t> {
             project_config,
             trust,
             handed_over,
+            host_prompt,
         } = params;
         // A `/reload` generation inherits the handles of the one before it,
         // so every loop has to claim the UI back for itself.
@@ -774,6 +778,7 @@ impl<'t> EventLoop<'t> {
             storage_writer,
             model_policy,
             trust,
+            host_prompt: Arc::new(host_prompt),
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions

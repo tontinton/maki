@@ -19,7 +19,7 @@ use tokio::time::{sleep_until, timeout};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
-use crate::agent::{self, RunContext, RunContextBuilder};
+use crate::agent::{self, HostPrompt, RunContext, RunContextBuilder};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
@@ -349,8 +349,7 @@ struct ContextSpec {
     excluded_tools: Vec<&'static str>,
     mcp: bool,
     background: bool,
-    system_override: Option<String>,
-    append_system: Option<String>,
+    host_prompt: HostPrompt,
 }
 
 impl ContextSpec {
@@ -372,8 +371,7 @@ impl ContextSpec {
             excluded_tools,
             mcp: mcp.is_some(),
             background: true,
-            system_override: None,
-            append_system: None,
+            host_prompt: HostPrompt::default(),
         }
     }
 
@@ -388,19 +386,8 @@ impl ContextSpec {
             self.mcp,
             self.background,
         );
-        let mut context = match &self.system_override {
-            Some(system) => {
-                RunContext::fixed(system.clone(), tools).with_prompt_policy(&self.slots)
-            }
-            None => RunContext::render(&self.vars, &self.instructions, &self.slots, model, tools),
-        };
-        if let Some(append) = &self.append_system {
-            for text in [&mut context.system, &mut context.authored] {
-                text.push('\n');
-                text.push_str(append);
-            }
-        }
-        context
+        self.host_prompt
+            .context(&self.vars, &self.instructions, &self.slots, model, tools)
     }
 
     fn builder(self) -> RunContextBuilder {
@@ -440,8 +427,7 @@ pub struct InteractiveParams {
     /// Nobody answers permission prompts, so they are denied at once instead
     /// of waiting forever.
     pub unattended: bool,
-    pub system_prompt_override: Option<String>,
-    pub append_system_prompt: Option<String>,
+    pub host_prompt: HostPrompt,
     /// The `always_*` knobs. `workflow` picks the tool catalog here; the rest
     /// are what a host without toggles puts on every [`AgentInput`] it sends.
     pub defaults: SessionDefaults,
@@ -492,8 +478,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"), &params.config.instructions);
     let spec = ContextSpec {
-        system_override: params.system_prompt_override,
-        append_system: params.append_system_prompt,
+        host_prompt: params.host_prompt,
         background: params.background.seeded(),
         ..ContextSpec::new(
             vars,
@@ -983,8 +968,7 @@ mod tests {
             storage: dir,
             yolo: false,
             unattended: true,
-            system_prompt_override: None,
-            append_system_prompt: None,
+            host_prompt: HostPrompt::default(),
             defaults: SessionDefaults::default(),
             model_policy: Arc::default(),
             plugin_rules: Arc::default(),
@@ -1083,7 +1067,7 @@ mod tests {
             ..Default::default()
         };
         let spec = ContextSpec {
-            system_override: system_override.map(String::from),
+            host_prompt: HostPrompt::new(system_override, None),
             ..ContextSpec::new(
                 template::Vars::new(),
                 &instructions,
@@ -1112,7 +1096,7 @@ mod tests {
         let mut prompts = ResolvedPrompts::default();
         prompts.set_template(PromptId::System, PLUGIN_SYSTEM.into());
         let spec = ContextSpec {
-            system_override: explicit.map(String::from),
+            host_prompt: HostPrompt::new(explicit, None),
             ..ContextSpec::new(
                 template::Vars::new(),
                 &agent::Instructions {

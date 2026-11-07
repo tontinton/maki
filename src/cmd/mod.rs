@@ -202,6 +202,7 @@ async fn cli_stack(
 }
 
 pub async fn dispatch(mut cli: Cli) -> Result<()> {
+    cli.check_run_path_flags()?;
     // First, so anything moved out of `~/.maki` lands before this start writes
     // a file of its own. `migrate xdg` is the same move asked for by hand.
     let legacy_notice = match cli.command {
@@ -303,17 +304,10 @@ pub async fn dispatch(mut cli: Cli) -> Result<()> {
                 }
             }
         }
-        Some(Command::Prompt {
-            variant,
-            plan,
-            tools,
-            names,
-        }) => {
+        Some(Command::Prompt(args)) => {
             subcmd::prompt(
-                &variant,
-                plan,
-                tools,
-                names,
+                args,
+                cli.host_prompt(),
                 cli.no_plugins,
                 cli.no_jit,
                 trust_mode,

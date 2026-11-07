@@ -488,8 +488,7 @@ fn start_session(
         storage: params.storage.clone(),
         yolo: params.yolo,
         unattended: false,
-        system_prompt_override: None,
-        append_system_prompt: None,
+        host_prompt: params.host_prompt.clone(),
         defaults: params.defaults,
         model_policy: Arc::clone(&params.model_policy),
         plugin_rules: Arc::clone(&params.plugin_rules),
@@ -1149,7 +1148,7 @@ mod tests {
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
-        CancelToken, DoneReason, EventSender, RunTotals, SubagentInfo, ToolStartEvent,
+        CancelToken, DoneReason, EventSender, HostPrompt, RunTotals, SubagentInfo, ToolStartEvent,
         TurnCompleteEvent,
     };
     use maki_config::project::TrustQuestion;
@@ -1439,6 +1438,7 @@ mod tests {
             on_session_end: None,
             storage,
             background: false,
+            host_prompt: HostPrompt::default(),
             stop: CancelToken::none(),
         }
     }

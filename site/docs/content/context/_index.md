@@ -29,7 +29,7 @@ Maki builds the system prompt and tool definitions once per session and sends th
 
 When something changes mid-session (the date, the model, plan mode, the directory after `/cd`, a new memory tag), Maki appends a short update before your next message.
 
-A fresh prompt is built only on compaction, or for a change an update cannot carry: different tools (`/reload`, `/workflow`, a model with other capabilities) or a different system prompt passed in [headless](../headless/) mode. Such a change starts the cache over, and Maki tells you when it happens.
+A fresh prompt is built only on compaction, or for a change an update cannot carry: different tools (`/reload`, `/workflow`, a model with other capabilities) or a different `--system-prompt` or `--append-system-prompt` text when a session is resumed. Such a change starts the cache over, and Maki tells you when it happens.
 
 Claude binds each thinking block to the prompt it was written under. Accounts that enforce this reject a request whose prompt moved under earlier thinking. When that happens Maki drops all earlier thinking once, tells you, and the session goes on. Later thinking is bound to the new prompt.
 
@@ -93,7 +93,7 @@ context updates, including with a complete main template. Changing the static
 system or plan replacement policy starts an announced new request frame.
 A changed plan prompt applies when the agent next enters plan mode.
 Side questions use the stored frame when one exists.
-An explicit SDK system-prompt override takes precedence over a plugin's main
+An explicit `--system-prompt` takes precedence over a plugin's main
 template.
 
 Prompt text does not change tool permissions, plan-mode restrictions, or

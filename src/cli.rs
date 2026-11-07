@@ -1,10 +1,13 @@
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{ArgGroup, Parser, Subcommand, ValueEnum, value_parser};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum, value_parser};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
+use thiserror::Error;
 
+use maki_agent::HostPrompt;
 use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
 use maki_config::AgentConfig;
 
@@ -13,6 +16,51 @@ use crate::print::OutputFormat;
 const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 600;
 /// A week. The deadline is an `Instant`, which panics on overflow.
 const MAX_BACKGROUND_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
+const HOST_PROMPT_PATHS: &[RunPath] = &[
+    RunPath::Tui,
+    RunPath::Print,
+    RunPath::Sdk,
+    RunPath::Acp,
+    RunPath::SystemPromptPreview,
+];
+
+/// Where a run goes, for flags only some paths read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RunPath {
+    Tui,
+    Print,
+    Sdk,
+    Acp,
+    SystemPromptPreview,
+    Other,
+}
+
+impl fmt::Display for RunPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Tui => "the TUI",
+            Self::Print => "--print",
+            Self::Sdk => "SDK mode (--print --input-format stream-json)",
+            Self::Acp => "maki acp",
+            Self::SystemPromptPreview => "maki prompt system (without --tools)",
+            Self::Other => "this subcommand",
+        })
+    }
+}
+
+struct ScopedFlag {
+    name: &'static str,
+    set: bool,
+    paths: &'static [RunPath],
+}
+
+#[derive(Debug, Error)]
+#[error("--{flag} has no effect with {path}. It applies to: {supported}")]
+pub struct UnsupportedFlag {
+    flag: &'static str,
+    path: RunPath,
+    supported: String,
+}
 
 #[derive(Clone, ValueEnum, Default)]
 pub enum PromptVariant {
@@ -126,11 +174,11 @@ pub struct Cli {
     #[arg(long)]
     pub max_turns: Option<u32>,
 
-    /// System prompt override
+    /// Replace the main agent's system prompt
     #[arg(long)]
     pub system_prompt: Option<String>,
 
-    /// Append to system prompt
+    /// Append text to the main agent's system prompt
     #[arg(long)]
     pub append_system_prompt: Option<String>,
 
@@ -245,6 +293,87 @@ impl Cli {
         self.print && matches!(self.input_format, InputFormat::StreamJson)
     }
 
+    pub fn host_prompt(&self) -> HostPrompt {
+        HostPrompt::new(
+            self.system_prompt.as_deref(),
+            self.append_system_prompt.as_deref(),
+        )
+    }
+
+    fn run_path(&self) -> RunPath {
+        match self.command {
+            Some(Command::Acp { .. }) => RunPath::Acp,
+            Some(Command::Prompt(PromptArgs {
+                variant: PromptVariant::System,
+                tools: false,
+                ..
+            })) => RunPath::SystemPromptPreview,
+            Some(_) => RunPath::Other,
+            None if self.is_sdk_mode() => RunPath::Sdk,
+            None if self.print => RunPath::Print,
+            None => RunPath::Tui,
+        }
+    }
+
+    /// The one list of which run paths read which flag. Only flags whose
+    /// silent drop changes what the agent does are here. Output flags like
+    /// `--verbose` stay out, because Claude Code wrappers pass them on every
+    /// path. `every_visible_flag_is_placed` makes each new flag pick a side,
+    /// and the matrix in `site/docs/content/cli/_index.md` is a copy by hand.
+    fn scoped_flags(&self) -> [ScopedFlag; 5] {
+        let host_prompt = self.host_prompt();
+        [
+            ScopedFlag {
+                name: "system-prompt",
+                set: host_prompt.replaces(),
+                paths: HOST_PROMPT_PATHS,
+            },
+            ScopedFlag {
+                name: "append-system-prompt",
+                set: host_prompt.appends(),
+                paths: HOST_PROMPT_PATHS,
+            },
+            ScopedFlag {
+                name: "max-turns",
+                set: self.max_turns.is_some(),
+                paths: &[RunPath::Print, RunPath::Sdk],
+            },
+            ScopedFlag {
+                name: "permission-mode",
+                set: self.permission_mode.is_some(),
+                paths: &[RunPath::Sdk],
+            },
+            ScopedFlag {
+                name: "image",
+                set: !self.images.is_empty(),
+                paths: &[RunPath::Print],
+            },
+        ]
+    }
+
+    /// Runs before anything else, so a run path can read these flags as they
+    /// are without checking again which path it is on.
+    pub fn check_run_path_flags(&self) -> Result<(), UnsupportedFlag> {
+        let path = self.run_path();
+        let Some(flag) = self
+            .scoped_flags()
+            .into_iter()
+            .find(|flag| flag.set && !flag.paths.contains(&path))
+        else {
+            return Ok(());
+        };
+        Err(UnsupportedFlag {
+            flag: flag.name,
+            path,
+            supported: flag
+                .paths
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
+    }
+
     /// `None` when background tasks are off. `-p` has no one to use the wait
     /// and promises one answer, so it only waits when asked to.
     pub fn background_wait(&self) -> Option<Duration> {
@@ -305,20 +434,7 @@ pub enum Command {
         yolo: bool,
     },
     /// Show the rendered system prompt or tool definitions
-    Prompt {
-        /// Prompt variant: system (default), research, general
-        #[arg(value_enum, default_value_t = PromptVariant::System)]
-        variant: PromptVariant,
-        /// Append the plan mode reminder to the system prompt
-        #[arg(long)]
-        plan: bool,
-        /// Show tool definitions (JSON) instead of prompt text
-        #[arg(long)]
-        tools: bool,
-        /// With --tools: show only tool names, one per line
-        #[arg(long, requires = "tools")]
-        names: bool,
-    },
+    Prompt(PromptArgs),
     /// Data migration utilities
     Migrate {
         #[command(subcommand)]
@@ -329,6 +445,22 @@ pub enum Command {
         #[command(subcommand)]
         action: TrustAction,
     },
+}
+
+#[derive(Args)]
+pub struct PromptArgs {
+    /// Prompt variant: system (default), research, general
+    #[arg(value_enum, default_value_t = PromptVariant::System)]
+    pub variant: PromptVariant,
+    /// Append the plan mode reminder to the system prompt
+    #[arg(long)]
+    pub plan: bool,
+    /// Show tool definitions (JSON) instead of prompt text
+    #[arg(long)]
+    pub tools: bool,
+    /// With --tools: show only tool names, one per line
+    #[arg(long, requires = "tools")]
+    pub names: bool,
 }
 
 #[derive(Subcommand)]
@@ -446,10 +578,37 @@ fn normalize_tool_name(name: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use clap::{ArgAction, CommandFactory};
     use test_case::test_case;
 
+    use super::*;
+
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+    const APPEND: &str = "You review the auth module only.";
+    const REPLACE: &str = "You are a reviewer.";
+    /// Visible flags `Cli::scoped_flags` leaves out: every run path reads them
+    /// where they mean something, or they only shape output.
+    const UNGUARDED_FLAGS: &[&str] = &[
+        "print",
+        "model",
+        "verbose",
+        "continue",
+        "resume",
+        "output-format",
+        "input-format",
+        "no-commands",
+        "no-plugins",
+        "no-jit",
+        "yolo",
+        "trust",
+        "exit-on-done",
+        "allowed-tools",
+        "disallowed-tools",
+        "session-id",
+        "fork-session",
+        "include-partial-messages",
+        "background-timeout",
+    ];
 
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]
@@ -508,5 +667,52 @@ mod tests {
         let too_long = (MAX_BACKGROUND_TIMEOUT_SECS + 1).to_string();
 
         assert!(Cli::try_parse_from(["maki", "-p", "--background-timeout", &too_long]).is_err());
+    }
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("maki").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test_case(&["--append-system-prompt", APPEND], None ; "tui_append")]
+    #[test_case(&["-p", "--append-system-prompt", APPEND], None ; "print_append")]
+    #[test_case(&["-p", "--input-format", "stream-json", "--system-prompt", REPLACE], None ; "sdk_replace")]
+    #[test_case(&["--append-system-prompt", APPEND, "acp"], None ; "acp_append")]
+    #[test_case(&["--append-system-prompt", APPEND, "prompt"], None ; "prompt_append")]
+    #[test_case(&["--system-prompt", "", "models"], None ; "empty_is_unset")]
+    #[test_case(&["-p", "--max-turns", "3"], None ; "print_max_turns")]
+    #[test_case(&["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"], None ; "claude_agent_sdk_flags")]
+    #[test_case(&["--append-system-prompt", APPEND, "models"], Some("append-system-prompt") ; "models_append")]
+    #[test_case(&["--append-system-prompt", APPEND, "prompt", "research"], Some("append-system-prompt") ; "subagent_prompt_append")]
+    #[test_case(&["--system-prompt", REPLACE, "prompt", "--tools"], Some("system-prompt") ; "tools_prompt_replace")]
+    #[test_case(&["--max-turns", "3"], Some("max-turns") ; "tui_max_turns")]
+    #[test_case(&["-p", "--permission-mode", "plan"], Some("permission-mode") ; "print_permission_mode")]
+    #[test_case(&["--image", "a.png"], Some("image") ; "tui_image")]
+    fn run_path_flag_check(args: &[&str], rejected: Option<&'static str>) {
+        let checked = parse(args).check_run_path_flags();
+
+        assert_eq!(checked.err().map(|e| e.flag), rejected);
+    }
+
+    #[test]
+    fn every_visible_flag_is_placed() {
+        let scoped = parse(&[]).scoped_flags().map(|flag| flag.name);
+        let command = Cli::command();
+        let flags: Vec<&str> = command
+            .get_arguments()
+            .filter(|arg| {
+                !arg.is_hide_set()
+                    && !matches!(arg.get_action(), ArgAction::Help | ArgAction::Version)
+            })
+            .filter_map(|arg| arg.get_long())
+            .collect();
+        for flag in &flags {
+            assert!(
+                scoped.contains(flag) || UNGUARDED_FLAGS.contains(flag),
+                "--{flag}: add it to `Cli::scoped_flags` if a run path ignores it, else to UNGUARDED_FLAGS, then to the matrix in site/docs/content/cli/_index.md"
+            );
+        }
+        for name in scoped.iter().chain(UNGUARDED_FLAGS) {
+            assert!(flags.contains(name), "--{name} is not a flag");
+        }
     }
 }

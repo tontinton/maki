@@ -27,13 +27,15 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `-c` / `--continue`, `-r` / `--resume` | yes | yes | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
 | `--background-timeout` | with `--exit-on-done` | yes (turns moves on) | yes |
-| `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
+| `--image` | error (use Ctrl+V paste) | yes | error (send images over the wire protocol) |
 | `--verbose`, `--output-format` | no | yes | stream only |
-| `--system-prompt`, `--append-system-prompt` | no | no | yes |
+| `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
 | `--session-id`, `--fork-session` | yes | yes | yes |
-| `--max-turns` | no | yes | yes |
-| `--permission-mode` | no | no | yes |
+| `--max-turns` | error | yes | yes |
+| `--permission-mode` | error | error | yes |
 | `--include-partial-messages` | no | no | yes |
+
+A flag marked error stops Maki before the run starts, so a script cannot think it applied. Subcommands refuse these flags too, except that `maki acp` and `maki prompt system` take `--system-prompt` and `--append-system-prompt`.
 
 ### Shared flags (detail)
 
@@ -59,8 +61,8 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
 | `--max-turns <N>` | Cap agent turns (`--print` and SDK) |
-| `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |
-| `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
+| `--system-prompt <TEXT>` | Replace the main agent's system prompt. Project instructions and the built-in prompt are left out. Subagents keep their own prompts |
+| `--append-system-prompt <TEXT>` | Add text after the main agent's system prompt. Subagents do not get it, so put text they need in `AGENTS.local.md`. Pass it again when you resume a session, or the session's prompt is rebuilt without it |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
 
@@ -196,6 +198,7 @@ maki acp
 maki acp -m anthropic/claude-sonnet-4-6
 maki acp --yolo
 maki --no-jit acp
+maki --append-system-prompt "..." acp
 ```
 
 Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
@@ -217,9 +220,10 @@ maki prompt general
 maki prompt --plan           # system prompt + plan-mode reminder (system only)
 maki prompt --tools          # tool definitions as JSON
 maki prompt --tools --names  # tool names only, one per line
+maki --append-system-prompt "..." prompt   # preview with appended text
 ```
 
-Debug helper for inspecting the prompt and tool surface the agent sees. `--plan` is rejected on non-system variants.
+Debug helper for inspecting the prompt and tool surface the agent sees. `--plan`, `--system-prompt` and `--append-system-prompt` are rejected on non-system variants, and the last two also with `--tools`.
 
 ### `maki migrate`
 

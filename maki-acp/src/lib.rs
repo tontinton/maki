@@ -10,7 +10,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedPrompts;
-use maki_agent::{AgentConfig, CancelToken, SessionEndReason};
+use maki_agent::{AgentConfig, CancelToken, HostPrompt, SessionEndReason};
 use maki_config::project::TrustMode;
 use maki_config::{ModelPolicy, SessionDefaults, TrustConfig};
 use maki_providers::Timeouts;
@@ -48,6 +48,7 @@ pub struct AcpParams {
     /// background and their results ride the next prompt. The server is long
     /// lived, so it never waits for them: closing the session stops them.
     pub background: bool,
+    pub host_prompt: HostPrompt,
     /// Firing it shuts the server down as end of input does, without waiting
     /// for the client to close stdin.
     pub stop: CancelToken,

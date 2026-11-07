@@ -25,7 +25,7 @@ mod session_control;
 pub use session_control::{Activity, Delivery, EndReason, SessionControl};
 mod session_loop;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, Cutter, DisplayItem, History, HistorySnapshot,
+    Agent, AgentParams, AgentRunParams, Cutter, DisplayItem, History, HistorySnapshot, HostPrompt,
     Instructions, LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages,
     Transcript, UNAVAILABLE_RESULT, USER_CANCEL_MARKER, close_dangling_tool_calls, display_order,
     find_subdirectory_instructions, is_instruction_file, observation_detail, observation_line,

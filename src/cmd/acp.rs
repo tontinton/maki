@@ -117,6 +117,7 @@ pub async fn run(
         })),
         storage,
         background: cli.background_wait().is_some(),
+        host_prompt: cli.host_prompt(),
         stop: interrupt.stop(),
     })
     .await?;

@@ -101,10 +101,9 @@ fn load_config(
         config.permissions.yolo = true;
     }
     cli.apply_tool_flags(&mut config.agent)?;
-    // `-p` and SDK mode only: a turn cap would cut an interactive session short.
-    if cli.print {
-        config.agent.max_turns = cli.max_turns;
-    }
+    // A turn cap would cut an interactive session short, so
+    // `Cli::check_run_path_flags` already refused it outside `-p` and SDK mode.
+    config.agent.max_turns = cli.max_turns;
     config.validate()?;
     Ok(config)
 }
@@ -419,6 +418,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
         let background_wait = cli.background_wait();
+        let host_prompt = cli.host_prompt();
         let interrupt = crate::print::run(crate::print::PrintParams {
             model: stack.model,
             prompt: cli.initial_prompt,
@@ -433,6 +433,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
             project_config: trust.project_config.clone(),
+            host_prompt,
             resumed,
             claim,
             storage: storage.clone(),
@@ -516,6 +517,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                 project_config: trust.project_config.clone(),
                 trust: trust.state.clone(),
                 handed_over: std::mem::take(&mut handed_over),
+                host_prompt: cli.host_prompt(),
             },
             initial_prompt.take(),
         )

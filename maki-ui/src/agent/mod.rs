@@ -12,8 +12,8 @@ use maki_agent::mcp::McpSession;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
-    AgentConfig, AgentSeed, CancelMap, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
+    AgentConfig, AgentSeed, CancelMap, Envelope, HistorySnapshot, HostPrompt, McpCommand,
+    McpConfigErrors, McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -50,6 +50,8 @@ pub(crate) struct AgentDeps {
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) timeouts: Timeouts,
     pub(crate) model_policy: Arc<ModelPolicy>,
+    /// Main agent only, so it stays off [`AgentSeed`], which subagents see.
+    pub(crate) host_prompt: Arc<HostPrompt>,
 }
 
 impl AgentDeps {
@@ -283,6 +285,7 @@ fn spawn_agent_internal(
             subagent_cancels: Arc::clone(&subagent_cancels),
         },
         lua_handle,
+        Arc::clone(&deps.host_prompt),
     );
     let task = AbortOnDropHandle::new(tokio::spawn(async move {
         // A loop respawned after a login runs on the new credentials from
@@ -408,6 +411,7 @@ mod tests {
             mcp_config_errors: McpConfigErrors::new(PathBuf::new()),
             timeouts: Timeouts::default(),
             model_policy: Arc::new(ModelPolicy::default()),
+            host_prompt: Arc::default(),
         }
     }
 

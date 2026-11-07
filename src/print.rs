@@ -21,8 +21,8 @@ use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, ImageSource, InputSource,
-    PermissionsConfig, SteerKind,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, HostPrompt, ImageSource,
+    InputSource, PermissionsConfig, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
@@ -223,6 +223,7 @@ pub struct PrintParams {
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub project_config: ProjectConfig,
+    pub host_prompt: HostPrompt,
     /// Which session this run continues and writes under, and where. Resolved
     /// by the caller from the same flags every other entry point reads.
     pub resumed: Resumed,
@@ -252,6 +253,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         model_policy,
         plugin_rules,
         project_config,
+        host_prompt,
         resumed,
         claim,
         storage,
@@ -295,8 +297,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         storage,
         yolo: false,
         unattended: true,
-        system_prompt_override: None,
-        append_system_prompt: None,
+        host_prompt,
         defaults,
         model_policy,
         plugin_rules,
