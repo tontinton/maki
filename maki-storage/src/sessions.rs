@@ -66,12 +66,6 @@ pub const DATA_DIR: &str = "data";
 /// next to the log, because [`session_entries`] reads the sessions dir on every
 /// scan and would wade through one lock file per session.
 const LOCKS_DIR: &str = "locks";
-/// Archives kept per session. The extra ones go on the next archive, not on a
-/// timer.
-const ARCHIVE_KEEP: usize = 3;
-/// Three copies of a log full of tool output add up fast, so the bytes get a
-/// budget of their own. The newest archive always survives, whatever it weighs.
-const ARCHIVE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// A `msg` line starts with this. Matching the prefix beats parsing the log.
 const MSG_PREFIX: &[u8] = br#"{"t":"msg""#;
 /// The two thinking modes that are neither an effort level nor a token count.
@@ -821,7 +815,9 @@ fn sub_msg_snapshot<M>(map: &HashMap<String, Arc<Vec<M>>>) -> HashMap<String, us
 
 /// Compaction and rewind hand the log a shorter message list, and writing that
 /// out would take the dropped turns with it, so the old file gets a second name
-/// under `archive/<id>/` first. Its own path is untouched until the rename, so
+/// under `archive/<id>/` first, where it stays until the session is deleted:
+/// the log's own history lives forever, so the turns compaction drops are
+/// history too. Its own path is untouched until the rename, so
 /// [`SessionLog::rewrite`] keeps its crash-safety promise.
 fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
     let path = jsonl_path(dir, session.id);
@@ -835,21 +831,16 @@ fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
         warn!(error = %e, session_id = %session.id, "cannot create session archive dir");
         return;
     }
-    let existing = archives_newest_first(&archive_dir);
-    let next = existing.first().map_or(0, |a| a.seq) + 1;
+    let next = next_archive_seq(&archive_dir);
     let archive_path = archive_dir.join(format!("{next}.jsonl"));
-    let bytes = match link_archive(&path, &archive_path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            warn!(
-                error = %e,
-                session_id = %session.id,
-                "cannot archive session log before shrink rewrite"
-            );
-            return;
-        }
-    };
-    prune_archives(existing, bytes);
+    if let Err(e) = link_archive(&path, &archive_path) {
+        warn!(
+            error = %e,
+            session_id = %session.id,
+            "cannot archive session log before shrink rewrite"
+        );
+        return;
+    }
     // The live log is about to be renamed away. If the archive's directory
     // entry is not durable by then, a crash frees the only inode holding the
     // dropped turns, which is the loss this whole function exists to prevent.
@@ -895,8 +886,8 @@ fn log_msg_count_exceeds(path: &Path, limit: usize) -> bool {
 /// The archive is a second name for the log's current inode. The rewrite
 /// renames a fresh file over the path, so the old bytes stay whole under the
 /// new name and not one of them is copied. Filesystems with no links (FAT32 on
-/// a stick) fall back to a plain copy. The size is for the byte budget.
-fn link_archive(from: &Path, to: &Path) -> Result<u64, std::io::Error> {
+/// a stick) fall back to a plain copy.
+fn link_archive(from: &Path, to: &Path) -> Result<(), std::io::Error> {
     if fs::hard_link(from, to).is_err() {
         // `create_new` first: the name is only free if the seq scan saw every
         // archive, and `fs::copy` would truncate the one it collided with.
@@ -905,63 +896,32 @@ fn link_archive(from: &Path, to: &Path) -> Result<u64, std::io::Error> {
             let _ = fs::remove_file(to);
         })?;
     }
-    Ok(fs::metadata(to)?.len())
+    Ok(())
 }
 
-/// `<seq>.jsonl`, counting up. A number cannot step back the way a clock does
-/// after an NTP fix or a suspend, so the order is always the truth and pruning
-/// can never mistake the newest archive for the oldest. The mtime says when.
-struct Archive {
-    seq: u64,
-    size: u64,
-    path: PathBuf,
-}
-
-/// Newest first: the next name comes off the front, pruning walks to the back.
-fn archives_newest_first(archive_dir: &Path) -> Vec<Archive> {
+/// The next `<seq>.jsonl`, counting up from the newest name already there. A
+/// number cannot step back the way a clock does after an NTP fix or a suspend,
+/// so the order is always the truth. The mtime says when.
+fn next_archive_seq(archive_dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(archive_dir) else {
-        return Vec::new();
+        return 1;
     };
-    let mut archives: Vec<Archive> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !is_jsonl(&path) {
-                return None;
-            }
-            Some(Archive {
-                seq: path.file_stem()?.to_str()?.parse().ok()?,
-                size: entry.metadata().ok()?.len(),
-                path,
-            })
-        })
-        .collect();
-    archives.sort_unstable_by_key(|a| Reverse(a.seq));
-    archives
-}
-
-/// Walks from the newest and keeps what both budgets allow, so the rest go.
-/// `new_bytes` is the archive we just made: it is not in `existing`, so it can
-/// never be the one dropped.
-fn prune_archives(existing: Vec<Archive>, new_bytes: u64) {
-    let mut total = new_bytes;
-    let mut room = ARCHIVE_KEEP.saturating_sub(1);
-    for archive in existing {
-        total += archive.size;
-        if room > 0 && total <= ARCHIVE_MAX_BYTES {
-            room -= 1;
-            continue;
+    let newest = entries.flatten().filter_map(|entry| {
+        let path = entry.path();
+        if !is_jsonl(&path) {
+            return None;
         }
-        let _ = fs::remove_file(&archive.path);
-    }
+        path.file_stem()?.to_str()?.parse::<u64>().ok()
+    });
+    newest.max().map_or(1, |seq| seq + 1)
 }
 
 impl SessionLog {
     /// Starts the file over: writes the whole log through a rename, so a crash
     /// mid-write leaves the old one intact, then claims the cwd index and
     /// sweeps pre-jsonl leftovers. A rewrite that drops messages (compaction,
-    /// rewind) parks the previous file under `archive/<id>/` first, keeping the
-    /// newest [`ARCHIVE_KEEP`] of them within [`ARCHIVE_MAX_BYTES`]. The only
+    /// rewind) parks the previous file under `archive/<id>/` first, and the
+    /// archives go only when the session is deleted. The only
     /// way to get a usable cursor onto a file this process did not write: a
     /// cursor read back from disk describes the session that was loaded, never
     /// the live one.
@@ -2326,10 +2286,10 @@ mod tests {
     #[cfg(unix)]
     use super::canonical_key;
     use super::{
-        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DATA_DIR, DEFAULT_TITLE,
-        LOG_BLOATED, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR,
-        StoredSubagent, TAIL_BUF, generate_title, jsonl_path, load_cwd_index, lock_path, locks_dir,
-        next_epoch, update_cwd_index, write_full_session,
+        ARCHIVE_DIR, CWD_INDEX_FILE, DATA_DIR, DEFAULT_TITLE, LOG_BLOATED, MAX_APPENDS,
+        MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent, TAIL_BUF,
+        generate_title, jsonl_path, load_cwd_index, lock_path, locks_dir, next_epoch,
+        update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT, OLDEST_LOG_FORMAT_VERSION,
@@ -2364,7 +2324,6 @@ mod tests {
     const QUEUED_PROMPT: &str = "and then the tests";
     const FORK_PLAN: &str = "1. split the parser";
     /// Two of these already break the byte budget.
-    const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
     const ALL_RECORDED: usize = usize::MAX;
     const FRAME_TAG: &str = r#""t":"frame""#;
@@ -3141,8 +3100,10 @@ mod tests {
         assert_eq!(archived.messages(), pre.as_slice());
     }
 
+    /// Nothing prunes an archive any more, so every shrink rewrite leaves its
+    /// file behind: five rounds, five archives, oldest first by seq.
     #[test]
-    fn archive_retention_keeps_newest_three() {
+    fn archives_accumulate_across_rewrites() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("model", "/p");
@@ -3158,14 +3119,14 @@ mod tests {
         }
 
         let archives = archive_paths(dir, session.id);
-        assert_eq!(archives.len(), ARCHIVE_KEEP);
+        assert_eq!(archives.len(), 5);
         let mut msg_counts: Vec<usize> = archives.iter().map(|p| msg_line_count(p)).collect();
         msg_counts.sort_unstable();
-        assert_eq!(msg_counts, [4, 5, 6]);
+        assert_eq!(msg_counts, [2, 3, 4, 5, 6]);
     }
 
-    /// A new name has to beat every name already there, or pruning would read
-    /// the fresh archive as the oldest and eat it.
+    /// A new name has to beat every name already there, or a fresh archive
+    /// would land on an old one and lose the turns it holds.
     #[test]
     fn archive_names_count_up_from_the_newest() {
         let tmp = TempDir::new().unwrap();
@@ -3189,39 +3150,6 @@ mod tests {
             vec![existing, fresh.clone()]
         );
         assert_eq!(msg_line_count(&fresh), 2);
-    }
-
-    #[test]
-    fn archive_retention_honors_the_byte_budget() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("model", "/p");
-        session.push_message(user_message("one"));
-        session.push_message(user_message("two"));
-        session.save_to(&claim_for(dir, &session), dir).unwrap();
-
-        let archive_dir = archive_dir_for(dir, session.id);
-        fs::create_dir_all(&archive_dir).unwrap();
-        let fakes: Vec<PathBuf> = (1..=3)
-            .map(|ms| {
-                let path = archive_dir.join(format!("{ms}.jsonl"));
-                // Sparse: the length is all the budget looks at.
-                fs::File::create(&path)
-                    .unwrap()
-                    .set_len(FAKE_ARCHIVE_BYTES)
-                    .unwrap();
-                path
-            })
-            .collect();
-
-        session.replace_messages(vec![user_message("summary")]);
-        session.save_to(&claim_for(dir, &session), dir).unwrap();
-
-        let archives = archive_paths(dir, session.id);
-        assert_eq!(archives.len(), 2);
-        assert!(archives.contains(&fakes[2]));
-        assert!(!fakes[0].exists());
-        assert!(!fakes[1].exists());
     }
 
     #[test]
