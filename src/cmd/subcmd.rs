@@ -1,19 +1,20 @@
 use std::env;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
+use maki_config::codex::{self, CodexImport};
 use maki_config::project::{self, TrustMode};
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
 use maki_providers::provider::fetch_all_models;
-use maki_providers::spec::Owner;
+use maki_providers::spec::{Owner, ProviderRegistry};
 use maki_providers::{ProviderData, catalog_providers};
 use maki_providers::{copilot_auth, openai_auth, plugin, xai_auth};
 use maki_storage::StateDir;
@@ -22,7 +23,8 @@ use maki_storage::auth::{
     delete_plugin_auth, delete_provider_credentials, load_plugin_auth, load_provider_credentials,
     load_tokens, lock_credentials, save_provider_credentials,
 };
-use maki_storage::model::persist_model;
+use maki_storage::model::{persist_model, read_model};
+use maki_storage::paths::tilde;
 
 use crate::provider_scripts;
 
@@ -192,6 +194,7 @@ enum LoginTarget {
     /// A models.dev provider, which logs in through its catalog entry.
     Catalog(Box<ProviderData>),
     Custom,
+    CodexImport(CodexImport),
 }
 
 impl LoginRow {
@@ -215,6 +218,8 @@ impl LoginRow {
 
 async fn login_interactive(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
+    let catalog = catalog_providers().await;
+    let codex = codex_import(&config, &catalog);
     let mut rows: Vec<LoginRow> = Vec::new();
 
     let saved = |slug: &str| load_provider_credentials(storage, slug).is_some();
@@ -243,7 +248,7 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         let display = def.display_name.as_deref().unwrap_or(slug);
         rows.push(LoginRow::provider(mark(saved(slug)), slug, display));
     }
-    for provider in catalog_providers().await {
+    for provider in catalog {
         let (slug, display) = (provider.slug.clone(), provider.display_name.clone());
         rows.push(LoginRow::new(
             mark(saved(&slug)),
@@ -257,6 +262,14 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         label: CUSTOM_PROVIDER_LABEL.to_owned(),
         target: LoginTarget::Custom,
     });
+    if let Some((path, import)) = codex {
+        let slugs: Vec<&str> = import.providers.keys().map(String::as_str).collect();
+        rows.push(LoginRow {
+            status: UNCONFIGURED,
+            label: format!("Import from Codex ({}): {}", tilde(&path), slugs.join(", ")),
+            target: LoginTarget::CodexImport(import),
+        });
+    }
 
     println!();
     println!("  Available providers:");
@@ -279,6 +292,7 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         LoginTarget::Provider(slug) => login_provider(&slug, storage).await,
         LoginTarget::Catalog(provider) => login_catalog_provider(&provider, storage),
         LoginTarget::Custom => login_custom(storage),
+        LoginTarget::CodexImport(import) => import_codex(&import, config, storage),
     }
 }
 
@@ -379,8 +393,8 @@ fn login_custom(storage: &StateDir) -> Result<()> {
                 .parse()
                 .map_err(|e: String| color_eyre::eyre::eyre!("{e}"))?,
         ),
-        base_url: Some(base_url.clone()),
-        api_key_env: Some(api_key_env.clone()),
+        base_url: Some(base_url),
+        api_key_env: Some(api_key_env),
         discover_models: true,
         ..Default::default()
     };
@@ -394,23 +408,90 @@ fn login_custom(storage: &StateDir) -> Result<()> {
         save_provider_credentials(storage, &slug, &creds).context("save credentials")?;
     }
 
-    config.upsert(slug.clone(), provider_def);
+    config.upsert(slug.clone(), provider_def.clone());
     config.save().context("save providers.toml")?;
 
     println!();
-    println!("  \x1b[32m✓\x1b[0m Configured: {}", slug);
-    println!("  Endpoint: {}", base_url);
-    if has_key {
-        println!("  Credentials: ~/.local/state/maki/auth/{}.json", slug);
-    } else {
-        println!(
-            "  Set API key via: {} or run: maki auth login {}",
-            api_key_env, slug
-        );
-    }
-    println!("  Use with: maki -m {}/<model>", slug);
+    print_custom_provider(&slug, &provider_def, has_key);
 
     Ok(())
+}
+
+/// What a new `providers.toml` entry still needs before its first request.
+fn print_custom_provider(slug: &str, def: &ProviderDef, has_saved_key: bool) {
+    println!("  {CONFIGURED} Configured: {slug}");
+    if let Some(url) = &def.base_url {
+        println!("  Endpoint: {url}");
+    }
+    if has_saved_key {
+        println!("  Credentials: ~/.local/state/maki/auth/{slug}.json");
+    } else {
+        println!(
+            "  Set API key via: {} or run: maki auth login {slug}",
+            resolve_api_key_env(slug, Some(def))
+        );
+    }
+    println!("  Use with: maki -m {slug}/<model>");
+}
+
+/// What Codex's config holds under slugs maki has no use for yet.
+fn codex_import(
+    config: &ProvidersConfig,
+    catalog: &[ProviderData],
+) -> Option<(PathBuf, CodexImport)> {
+    let path = codex::config_path()?;
+    let mut import = codex::load(&path)?;
+    let catalog_slugs: Vec<&str> = catalog.iter().map(|p| p.slug.as_str()).collect();
+    let is_free = |slug: &str| slug_is_free(slug, config, &catalog_slugs);
+    import.providers.retain(|slug, _| is_free(slug));
+    import.unsupported.retain(|(slug, _)| is_free(slug));
+    (!import.providers.is_empty()).then_some((path, import))
+}
+
+/// Whether an import may take `slug`. A `providers.toml` entry outranks a
+/// models.dev provider and would be handed the key saved for it, so a catalog
+/// slug counts as taken like any other.
+fn slug_is_free(slug: &str, config: &ProvidersConfig, catalog_slugs: &[&str]) -> bool {
+    !ProviderRegistry::is_shipped(slug)
+        && !plugin::owns_slug(slug)
+        && config.get(slug).is_none()
+        && !catalog_slugs.contains(&slug)
+}
+
+fn import_codex(
+    import: &CodexImport,
+    mut config: ProvidersConfig,
+    storage: &StateDir,
+) -> Result<()> {
+    for (slug, def) in &import.providers {
+        config.upsert(slug.clone(), def.clone());
+    }
+    config.save().context("save providers.toml")?;
+
+    println!();
+    for (slug, def) in &import.providers {
+        print_custom_provider(slug, def, false);
+    }
+    if let Some(model) = adopt_codex_model(import, storage) {
+        println!("  Default model: {model}");
+    }
+    for (slug, key) in &import.unsupported {
+        println!("  Skipped {slug}: maki has no setting for Codex's `{key}`");
+    }
+    Ok(())
+}
+
+/// Starts maki on the model Codex used, on a first login only: a model the
+/// user already picked stays theirs.
+fn adopt_codex_model<'a>(import: &'a CodexImport, storage: &StateDir) -> Option<&'a str> {
+    let model = import
+        .providers
+        .values()
+        .find_map(|def| def.default_model.as_deref())?;
+    read_model(storage).is_none().then(|| {
+        persist_model(storage, model);
+        model
+    })
 }
 
 fn select_plan(
@@ -851,5 +932,51 @@ mod tests {
             known_outside_catalog(CATALOG_SLUG, &catalog_slugs),
             expected
         );
+    }
+
+    const FREE_SLUG: &str = "team-proxy";
+    const CONFIGURED_SLUG: &str = "my-gateway";
+    const COMPILED_SLUG: &str = "anthropic";
+    const BUNDLED_PLUGIN_SLUG: &str = "openrouter";
+
+    #[test_case(FREE_SLUG, true ; "nothing_answers_for_it")]
+    #[test_case(COMPILED_SLUG, false ; "compiled_provider")]
+    #[test_case(BUNDLED_PLUGIN_SLUG, false ; "bundled_plugin")]
+    #[test_case(CONFIGURED_SLUG, false ; "providers_toml_entry")]
+    #[test_case(CATALOG_SLUG, false ; "catalog_provider")]
+    fn codex_import_only_takes_free_slugs(slug: &str, expected: bool) {
+        let mut config = ProvidersConfig::default();
+        config.upsert(CONFIGURED_SLUG.to_owned(), ProviderDef::default());
+        assert_eq!(slug_is_free(slug, &config, &[CATALOG_SLUG]), expected);
+    }
+
+    const CODEX_MODEL: &str = "team-proxy/gpt-5.5";
+    const SAVED_MODEL: &str = "anthropic/claude-sonnet-5";
+
+    #[test_case(None, Some(CODEX_MODEL), Some(CODEX_MODEL) ; "first_login_starts_on_it")]
+    #[test_case(Some(SAVED_MODEL), Some(CODEX_MODEL), Some(SAVED_MODEL) ; "saved_model_stays")]
+    #[test_case(None, None, None ; "codex_names_no_model")]
+    fn codex_model_is_adopted_on_a_first_login_only(
+        saved: Option<&str>,
+        codex: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(dir.path().to_path_buf());
+        if let Some(model) = saved {
+            persist_model(&storage, model);
+        }
+        let mut import = CodexImport::default();
+        import.providers.insert(
+            FREE_SLUG.to_owned(),
+            ProviderDef {
+                default_model: codex.map(str::to_owned),
+                ..Default::default()
+            },
+        );
+
+        adopt_codex_model(&import, &storage);
+
+        assert_eq!(read_model(&storage).as_deref(), expected);
     }
 }

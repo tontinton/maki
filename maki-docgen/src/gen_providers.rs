@@ -239,6 +239,26 @@ Without `thinking_fields`, maki sends `"thinking": {{"type": "disabled"}}` when 
 
 You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
 
+### Import from Codex
+
+`maki auth login` without a provider reads `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). When it has `[model_providers.<id>]` entries under slugs that maki does not use yet, the picker ends with an import row. Picking it turns each entry into an entry in this file:
+
+| Codex | `providers.toml` |
+|-------|------------------|
+| `<id>` | slug, so `team_proxy` becomes `team-proxy` |
+| `name` | `display_name` |
+| `base_url` | `base_url` |
+| `env_key` | `api_key_env` |
+| `wire_api` | `protocol`: `openai-responses`, or `openai` for the retired `chat` |
+| `http_headers` | `headers` |
+| `env_http_headers` | `headers`, with the variable as `${{VAR}}` |
+
+Every imported entry sets `discover_models = true`. When Codex's `model_provider` names an imported entry, that entry gets Codex's `model` as its `default_model`, and maki starts with it if no model is saved yet.
+
+Codex leaves a header out when its variable is unset. Maki fails the provider and names the variable.
+
+An entry without a `base_url` is skipped. So is one that sets `requires_openai_auth`, `auth`, `gateway_oauth`, `aws`, `query_params` or `experimental_bearer_token`, because `providers.toml` has no setting for them. A slug that a built-in provider, a plugin, a models.dev provider or an existing entry uses is left out.
+
 ### Aperture overrides
 
 Aperture proxies upstream providers, exposing each model as `aperture/<upstream>/<model>`. Overrides keyed by upstream provider id live under `[aperture.overrides]`:
