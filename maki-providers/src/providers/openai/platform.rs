@@ -38,6 +38,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // `coding_plan_context_window`, so they are not listed here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
     "gpt-6-sol",
     "gpt-6-luna",
     "gpt-6-astra",
@@ -58,8 +59,8 @@ const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 // The backend hides models newer than this Codex CLI version, so bump it when
 // a fresh model is missing from the list. 0.156.1 is the first line that
 // surfaces GPT-6 Sol / Luna in the picker, 0.159.x the first with GPT-6.1 Sol;
-// 0.159.1 is latest as of 2026-09-29.
-const CODEX_CLIENT_VERSION: &str = "0.159.1";
+// 0.167.0 is latest as of 2026-10-07
+const CODEX_CLIENT_VERSION: &str = "0.167.0";
 const PLAN_MODELS_PATH: &str = "/models?client_version=";
 const LISTED_VISIBILITY: &str = "list";
 const ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
@@ -629,6 +630,7 @@ mod tests {
     }
 
     #[test_case("gpt-6.1-sol", Some(272_000))]
+    #[test_case("gpt-6.1-terra", Some(272_000))]
     #[test_case("gpt-6-sol", Some(272_000))]
     #[test_case("gpt-6-luna", Some(272_000))]
     #[test_case("gpt-6-astra", Some(272_000))]
@@ -687,6 +689,7 @@ mod tests {
             ("gpt-6-luna", &dialect::GPT_6),
             ("gpt-6-astra", &dialect::GPT_6),
             ("gpt-6.1-sol", &dialect::GPT_6),
+            ("gpt-6.1-terra", &dialect::GPT_6),
             ("gpt-5.6-luna", &dialect::GPT_5_6),
             ("gpt-5.6-terra", &dialect::GPT_5_6),
             ("gpt-5.6-sol", &dialect::GPT_5_6),
