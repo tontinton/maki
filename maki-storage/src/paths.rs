@@ -277,6 +277,15 @@ pub fn session_task_logs_dir(state: &Path, session: MakiId) -> PathBuf {
     state.join(TASK_LOGS_DIR).join(session.to_string())
 }
 
+/// The directory under `state` holding one session's plugin data.
+/// Not created: plugins make their own `<plugin>/` in it.
+pub fn session_data_dir(state: &Path, session: MakiId) -> PathBuf {
+    state
+        .join(crate::sessions::SESSIONS_DIR)
+        .join(crate::sessions::DATA_DIR)
+        .join(session.to_string())
+}
+
 pub fn logs_dir() -> Result<PathBuf, std::io::Error> {
     let p = resolve().ok_or_else(err)?;
     ensure(&p.logs)
