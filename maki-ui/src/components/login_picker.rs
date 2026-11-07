@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
@@ -36,6 +36,9 @@ struct ProviderItem {
     has_key: bool,
     has_env: bool,
     configured: bool,
+    /// Explicitly declared in `providers.toml`: the user asked for this
+    /// provider, so it lists even when its key is missing.
+    from_config: bool,
     section: Option<&'static str>,
 }
 
@@ -109,6 +112,12 @@ enum Step {
         slug: String,
         protocol: String,
     },
+    EditEndpoint {
+        input: TextBuffer,
+        slug: String,
+        name: String,
+        api_key_optional: bool,
+    },
     BuiltinUrl {
         input: TextBuffer,
         slug: String,
@@ -149,6 +158,11 @@ enum StepAction {
         slug: String,
         protocol: String,
     },
+    GoEditEndpoint {
+        slug: String,
+        name: String,
+        api_key_optional: bool,
+    },
     GoBuiltinUrl {
         slug: String,
         display_name: String,
@@ -166,6 +180,8 @@ pub struct LoginPicker {
     step: Step,
     provider_items: Vec<ProviderItem>,
     storage: Option<maki_storage::StateDir>,
+    /// Opened from the model picker: backing out returns there.
+    from_picker: bool,
 }
 
 impl LoginPicker {
@@ -174,7 +190,23 @@ impl LoginPicker {
             step: Step::Closed,
             provider_items: Vec::new(),
             storage: None,
+            from_picker: false,
         }
+    }
+
+    /// Opens the wizard already advanced into `slug`'s flow, so a model
+    /// picker row for a provider that cannot serve models lands straight on
+    /// its setup. Backing out closes the wizard and returns to the picker.
+    pub fn open_for(&mut self, storage: maki_storage::StateDir, slug: &str) {
+        self.open(storage);
+        if !self.provider_items.iter().any(|i| i.slug == slug) {
+            return;
+        }
+        if let Step::PickProvider(picker) = &mut self.step {
+            picker.select_item_by(|i| i.slug == slug);
+        }
+        self.from_picker = true;
+        self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     }
 
     pub fn open(&mut self, storage: maki_storage::StateDir) {
@@ -195,6 +227,7 @@ impl LoginPicker {
                     has_key,
                     has_env,
                     configured,
+                    from_config: false,
                     section: None,
                 }
             })
@@ -215,6 +248,7 @@ impl LoginPicker {
                 has_key,
                 has_env,
                 configured: false,
+                from_config: true,
                 section: None,
             });
         }
@@ -233,6 +267,7 @@ impl LoginPicker {
                     has_key,
                     has_env,
                     configured: false,
+                    from_config: false,
                     section: Some("Providers from Models.dev"),
                 });
             }
@@ -243,6 +278,7 @@ impl LoginPicker {
                 has_key: false,
                 has_env: false,
                 configured: false,
+                from_config: false,
                 section: Some("Providers from Models.dev"),
             });
         }
@@ -253,6 +289,7 @@ impl LoginPicker {
             has_key: false,
             has_env: false,
             configured: false,
+            from_config: false,
             section: None,
         });
 
@@ -273,6 +310,7 @@ impl LoginPicker {
             Step::EnterKey { input, .. }
             | Step::CustomName { input }
             | Step::CustomUrl { input, .. }
+            | Step::EditEndpoint { input, .. }
             | Step::BuiltinUrl { input, .. } => input.insert_text(text),
             Step::Closed | Step::Done { .. } => {}
         }
@@ -291,18 +329,29 @@ impl LoginPicker {
                         let slug = item.slug.clone();
                         let config = providers::ProvidersConfig::load();
                         let def = config.get(&slug);
+                        let display_name =
+                            if providers::builtin_provider(&slug).is_some() || def.is_some() {
+                                providers::resolve_display_name(&slug, def)
+                            } else {
+                                item.display_name.clone()
+                            };
+                        // A declared provider entered from the model picker
+                        // edits its endpoint before pasting the key. An
+                        // existing key or env var can stay, so the prompt
+                        // accepts an empty answer.
+                        if self.from_picker && item.from_config {
+                            return self.transition(StepAction::GoEditEndpoint {
+                                slug,
+                                name: display_name,
+                                api_key_optional: item.has_key || item.has_env,
+                            });
+                        }
                         let has_plans = providers::builtin_provider(&slug)
                             .and_then(|b| b.plans)
                             .is_some_and(|p| p.len() > 1);
                         if has_plans {
                             StepAction::GoPickPlan { slug }
                         } else {
-                            let display_name =
-                                if providers::builtin_provider(&slug).is_some() || def.is_some() {
-                                    providers::resolve_display_name(&slug, def)
-                                } else {
-                                    item.display_name.clone()
-                                };
                             let needs_url =
                                 providers::builtin_provider(&slug).is_some_and(|b| b.needs_url);
                             if needs_url {
@@ -339,6 +388,35 @@ impl LoginPicker {
                 }
                 PickerAction::Close => StepAction::Back,
                 PickerAction::Consumed | PickerAction::Toggle(..) => {
+                    return LoginPickerAction::Consumed;
+                }
+            },
+            Step::EditEndpoint {
+                input,
+                slug,
+                name,
+                api_key_optional,
+            } => match key.code {
+                KeyCode::Enter => {
+                    let base_url = input.value().trim().to_string();
+                    if base_url.is_empty() {
+                        return LoginPickerAction::Consumed;
+                    }
+                    StepAction::GoEnterKey {
+                        slug: slug.clone(),
+                        plan: None,
+                        display_name: name.clone(),
+                        custom: Some(CustomInfo {
+                            base_url,
+                            protocol: "openai".to_string(),
+                        }),
+                        builtin_url: None,
+                        api_key_optional: *api_key_optional,
+                    }
+                }
+                KeyCode::Esc => StepAction::Back,
+                _ => {
+                    input.handle_key(key);
                     return LoginPickerAction::Consumed;
                 }
             },
@@ -637,6 +715,25 @@ impl LoginPicker {
                 };
                 LoginPickerAction::Consumed
             }
+            StepAction::GoEditEndpoint {
+                slug,
+                name,
+                api_key_optional,
+            } => {
+                let url = providers::ProvidersConfig::load()
+                    .get(&slug)
+                    .and_then(|d| d.base_url.clone())
+                    .unwrap_or_default();
+                let mut input = TextBuffer::new(url);
+                input.move_end();
+                self.step = Step::EditEndpoint {
+                    input,
+                    slug,
+                    name,
+                    api_key_optional,
+                };
+                LoginPickerAction::Consumed
+            }
             StepAction::GoDone {
                 message,
                 model_spec,
@@ -648,6 +745,16 @@ impl LoginPicker {
                 } else {
                     LoginPickerAction::Configured { slug }
                 }
+            }
+            StepAction::Back if self.from_picker => {
+                self.from_picker = false;
+                self.step = Step::Closed;
+                LoginPickerAction::BackToPicker
+            }
+            StepAction::Close if self.from_picker => {
+                self.from_picker = false;
+                self.step = Step::Closed;
+                LoginPickerAction::BackToPicker
             }
             StepAction::Back => {
                 let mut picker = ListPicker::new();
@@ -675,6 +782,13 @@ impl LoginPicker {
                 input,
             ),
             Step::CustomProtocol { picker, .. } => picker.view(frame, area),
+            Step::EditEndpoint { input, .. } => input_step_view(
+                frame,
+                area,
+                " Endpoint ",
+                "Edit the base URL, then Enter",
+                input,
+            ),
             Step::CustomUrl { input, .. } => input_step_view(
                 frame,
                 area,
@@ -787,8 +901,15 @@ fn input_step_view(
 pub enum LoginPickerAction {
     Consumed,
     Close,
-    Authenticated { model_spec: String },
-    Configured { slug: String },
+    /// A model-picker-originated flow was backed out of; the host reopens
+    /// the picker instead of staying on the /login provider list.
+    BackToPicker,
+    Authenticated {
+        model_spec: String,
+    },
+    Configured {
+        slug: String,
+    },
 }
 
 #[cfg(test)]
@@ -822,6 +943,7 @@ mod tests {
             has_key: false,
             has_env: false,
             configured: false,
+            from_config: false,
             section: None,
         }
     }

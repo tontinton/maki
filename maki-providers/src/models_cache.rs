@@ -8,6 +8,7 @@
 //! [`crate::model_registry::discovery_complete`] only ever see this run's
 //! probe.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use maki_config::ModelPolicy;
@@ -51,6 +52,21 @@ pub struct ModelList {
     pub live_providers: Vec<String>,
     /// Some provider has not answered yet, so the list may still grow.
     pub loading: bool,
+    /// The live probes that have landed, by slug. A provider missing from
+    /// here has not answered this run, whether it is still being probed or
+    /// was skipped for want of credentials.
+    pub providers: BTreeMap<String, ProviderStatus>,
+}
+
+/// One provider's outcome in the run a [`ModelList`] snapshot belongs to.
+#[derive(Clone, Default)]
+pub struct ProviderStatus {
+    pub models: usize,
+    /// Set when the probe failed and the row is static fallback specs.
+    pub warning: Option<String>,
+    /// Discovery could not build the provider for want of credentials, so the
+    /// row can say `no key` without guessing where keys come from.
+    pub missing_credentials: bool,
 }
 
 /// One discovery run as the picker sees it: last run's specs, with each
@@ -65,6 +81,7 @@ struct Listing {
     /// this, an empty run reads as "offline" even when the real cause is an
     /// expired token or a revoked key.
     degraded: bool,
+    providers: BTreeMap<String, ProviderStatus>,
 }
 
 impl Listing {
@@ -90,6 +107,12 @@ impl Listing {
                 }
             }
         }
+        let status = self.providers.entry(batch.provider.clone()).or_default();
+        status.models = batch.models.len();
+        status.warning = batch.warnings.first().cloned();
+        // Declared specs travel in their own batch, so the skip can land on
+        // either side of a batch carrying models.
+        status.missing_credentials |= batch.missing_credentials;
     }
 
     fn snapshot(&self) -> ModelList {
@@ -97,6 +120,7 @@ impl Listing {
             specs: self.live.iter().chain(&self.replayed).cloned().collect(),
             live_providers: self.live_providers.clone(),
             loading: true,
+            providers: self.providers.clone(),
         }
     }
 
@@ -108,6 +132,7 @@ impl Listing {
             specs: self.live,
             live_providers: self.live_providers,
             loading: false,
+            providers: self.providers,
         }
     }
 }
@@ -327,14 +352,16 @@ mod tests {
         (dir, path)
     }
 
-    fn batch(models: &[&str], warnings: &[&str]) -> ModelBatch {
+    fn batch(provider: &str, models: &[&str], warnings: &[&str]) -> ModelBatch {
         ModelBatch {
+            provider: provider.to_string(),
             models: specs(models),
             providers: models
                 .iter()
                 .map(|spec| provider_of(spec).to_string())
                 .collect(),
             warnings: specs(warnings),
+            missing_credentials: false,
         }
     }
 
@@ -374,10 +401,15 @@ mod tests {
             replayed: specs(&["a/removed", "a/kept", "b/cached"]),
             ..Listing::default()
         };
-        listing.add_live(&batch(&["a/kept", "a/new"], &[]));
+        listing.add_live(&batch("a", &["a/kept", "a/new"], &[]));
         let shown = listing.snapshot();
         assert!(shown.loading);
         assert_eq!(shown.specs, ["a/kept", "a/new", "b/cached"]);
+        assert_eq!(shown.providers["a"].models, 2);
+        assert!(
+            !shown.providers.contains_key("b"),
+            "an unanswered probe must not be in the map"
+        );
 
         let done = listing.finish();
         assert!(!done.loading);
@@ -394,9 +426,31 @@ mod tests {
     #[test]
     fn only_a_clean_batch_marks_its_providers_live() {
         let mut listing = Listing::default();
-        listing.add_live(&batch(&["a/fallback"], &["A: timeout"]));
-        listing.add_live(&batch(&["b/live"], &[]));
+        listing.add_live(&batch("a", &["a/fallback"], &["A: timeout"]));
+        listing.add_live(&batch("b", &["b/live"], &[]));
         assert_eq!(listing.finish().live_providers, ["b"]);
+    }
+
+    #[test]
+    fn provider_status_carries_count_and_first_warning() {
+        let mut listing = Listing::default();
+        listing.add_live(&batch("a", &["a/x"], &["A: down (using static fallback)"]));
+        let status = listing.snapshot().providers.remove("a").unwrap();
+        assert_eq!(status.models, 1);
+        assert_eq!(
+            status.warning.as_deref(),
+            Some("A: down (using static fallback)")
+        );
+    }
+
+    #[test]
+    fn a_second_batch_for_a_slug_replaces_its_status() {
+        let mut listing = Listing::default();
+        listing.add_live(&batch("a", &["a/declared"], &[]));
+        listing.add_live(&batch("a", &["a/declared", "a/discovered"], &[]));
+        let done = listing.finish();
+        assert_eq!(done.specs, ["a/declared", "a/discovered"]);
+        assert_eq!(done.providers["a"].models, 2);
     }
 
     #[test_case(&[],            true,  &["good/model"] ; "degraded_empty_keeps_cache")]
