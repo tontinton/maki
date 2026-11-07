@@ -66,12 +66,6 @@ pub const DATA_DIR: &str = "data";
 /// next to the log, because [`session_entries`] reads the sessions dir on every
 /// scan and would wade through one lock file per session.
 const LOCKS_DIR: &str = "locks";
-/// Archives kept per session. The extra ones go on the next archive, not on a
-/// timer.
-const ARCHIVE_KEEP: usize = 3;
-/// Three copies of a log full of tool output add up fast, so the bytes get a
-/// budget of their own. The newest archive always survives, whatever it weighs.
-const ARCHIVE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// A `msg` line starts with this. Matching the prefix beats parsing the log.
 const MSG_PREFIX: &[u8] = br#"{"t":"msg""#;
 /// The two thinking modes that are neither an effort level nor a token count.
@@ -821,7 +815,9 @@ fn sub_msg_snapshot<M>(map: &HashMap<String, Arc<Vec<M>>>) -> HashMap<String, us
 
 /// Compaction and rewind hand the log a shorter message list, and writing that
 /// out would take the dropped turns with it, so the old file gets a second name
-/// under `archive/<id>/` first. Its own path is untouched until the rename, so
+/// under `archive/<id>/` first, where it stays until the session is deleted:
+/// the log's own history lives forever, so the turns compaction drops are
+/// history too. Its own path is untouched until the rename, so
 /// [`SessionLog::rewrite`] keeps its crash-safety promise.
 fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
     let path = jsonl_path(dir, session.id);
@@ -835,21 +831,16 @@ fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
         warn!(error = %e, session_id = %session.id, "cannot create session archive dir");
         return;
     }
-    let existing = archives_newest_first(&archive_dir);
-    let next = existing.first().map_or(0, |a| a.seq) + 1;
+    let next = next_archive_seq(&archive_dir);
     let archive_path = archive_dir.join(format!("{next}.jsonl"));
-    let bytes = match link_archive(&path, &archive_path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            warn!(
-                error = %e,
-                session_id = %session.id,
-                "cannot archive session log before shrink rewrite"
-            );
-            return;
-        }
-    };
-    prune_archives(existing, bytes);
+    if let Err(e) = link_archive(&path, &archive_path) {
+        warn!(
+            error = %e,
+            session_id = %session.id,
+            "cannot archive session log before shrink rewrite"
+        );
+        return;
+    }
     // The live log is about to be renamed away. If the archive's directory
     // entry is not durable by then, a crash frees the only inode holding the
     // dropped turns, which is the loss this whole function exists to prevent.
@@ -895,8 +886,8 @@ fn log_msg_count_exceeds(path: &Path, limit: usize) -> bool {
 /// The archive is a second name for the log's current inode. The rewrite
 /// renames a fresh file over the path, so the old bytes stay whole under the
 /// new name and not one of them is copied. Filesystems with no links (FAT32 on
-/// a stick) fall back to a plain copy. The size is for the byte budget.
-fn link_archive(from: &Path, to: &Path) -> Result<u64, std::io::Error> {
+/// a stick) fall back to a plain copy.
+fn link_archive(from: &Path, to: &Path) -> Result<(), std::io::Error> {
     if fs::hard_link(from, to).is_err() {
         // `create_new` first: the name is only free if the seq scan saw every
         // archive, and `fs::copy` would truncate the one it collided with.
@@ -905,63 +896,32 @@ fn link_archive(from: &Path, to: &Path) -> Result<u64, std::io::Error> {
             let _ = fs::remove_file(to);
         })?;
     }
-    Ok(fs::metadata(to)?.len())
+    Ok(())
 }
 
-/// `<seq>.jsonl`, counting up. A number cannot step back the way a clock does
-/// after an NTP fix or a suspend, so the order is always the truth and pruning
-/// can never mistake the newest archive for the oldest. The mtime says when.
-struct Archive {
-    seq: u64,
-    size: u64,
-    path: PathBuf,
-}
-
-/// Newest first: the next name comes off the front, pruning walks to the back.
-fn archives_newest_first(archive_dir: &Path) -> Vec<Archive> {
+/// The next `<seq>.jsonl`, counting up from the newest name already there. A
+/// number cannot step back the way a clock does after an NTP fix or a suspend,
+/// so the order is always the truth. The mtime says when.
+fn next_archive_seq(archive_dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(archive_dir) else {
-        return Vec::new();
+        return 1;
     };
-    let mut archives: Vec<Archive> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !is_jsonl(&path) {
-                return None;
-            }
-            Some(Archive {
-                seq: path.file_stem()?.to_str()?.parse().ok()?,
-                size: entry.metadata().ok()?.len(),
-                path,
-            })
-        })
-        .collect();
-    archives.sort_unstable_by_key(|a| Reverse(a.seq));
-    archives
-}
-
-/// Walks from the newest and keeps what both budgets allow, so the rest go.
-/// `new_bytes` is the archive we just made: it is not in `existing`, so it can
-/// never be the one dropped.
-fn prune_archives(existing: Vec<Archive>, new_bytes: u64) {
-    let mut total = new_bytes;
-    let mut room = ARCHIVE_KEEP.saturating_sub(1);
-    for archive in existing {
-        total += archive.size;
-        if room > 0 && total <= ARCHIVE_MAX_BYTES {
-            room -= 1;
-            continue;
+    let newest = entries.flatten().filter_map(|entry| {
+        let path = entry.path();
+        if !is_jsonl(&path) {
+            return None;
         }
-        let _ = fs::remove_file(&archive.path);
-    }
+        path.file_stem()?.to_str()?.parse::<u64>().ok()
+    });
+    newest.max().map_or(1, |seq| seq + 1)
 }
 
 impl SessionLog {
     /// Starts the file over: writes the whole log through a rename, so a crash
     /// mid-write leaves the old one intact, then claims the cwd index and
     /// sweeps pre-jsonl leftovers. A rewrite that drops messages (compaction,
-    /// rewind) parks the previous file under `archive/<id>/` first, keeping the
-    /// newest [`ARCHIVE_KEEP`] of them within [`ARCHIVE_MAX_BYTES`]. The only
+    /// rewind) parks the previous file under `archive/<id>/` first, and the
+    /// archives go only when the session is deleted. The only
     /// way to get a usable cursor onto a file this process did not write: a
     /// cursor read back from disk describes the session that was loaded, never
     /// the live one.
@@ -1966,6 +1926,7 @@ where
         history: Option<&HistorySnapshot<M>>,
         meta: SessionMeta,
         token_usage: U,
+        tool_ids: impl Fn(&M) -> Vec<String>,
     ) where
         M: Clone,
         U: PartialEq + Clone,
@@ -1978,9 +1939,18 @@ where
         if history.is_none() && this.meta == meta && this.token_usage == token_usage {
             return;
         }
+        let dropped = history
+            .map(|h| this.dropped_tool_ids(&h.messages, &tool_ids))
+            .unwrap_or_default();
         let session = Arc::make_mut(this);
         if let Some(snapshot) = history {
             session.set_history(snapshot);
+            // Compaction shrinks the snapshot, so the state its dropped turns
+            // held goes with them and every later rewrite and archive stays
+            // at the session stretch it belongs to. Only those ids are
+            // pruned: a run beside the chat is not in the transcript yet and
+            // must survive the appends its parent keeps making.
+            session.drop_tool_state_of(&dropped, tool_ids);
             // The title comes from the messages, so it goes stale exactly when
             // they move.
             session.update_title_if_default();
@@ -2002,9 +1972,15 @@ where
     /// A transcript that only grew is appended like the main log. A plugin
     /// task hands its whole history over after every prompt, so without this
     /// each prompt would rewrite the session file. Anything else (a
-    /// compaction, a rewritten turn) still starts the file over.
-    pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>)
-    where
+    /// compaction, a rewritten turn) still starts the file over, and a
+    /// replacement drops the outputs only the replaced copy used, the way a
+    /// compaction of the main log drops the state of its dropped turns.
+    pub fn set_subagent_messages(
+        &mut self,
+        id: String,
+        msgs: Vec<M>,
+        tool_ids: impl Fn(&M) -> Vec<String>,
+    ) where
         M: PartialEq,
     {
         let grew = match self.subagent_messages.get(&id) {
@@ -2014,7 +1990,14 @@ where
                 }
                 true
             }
-            Some(_) => false,
+            Some(old) => {
+                // A subagent that compacted leaves its internal tool ids
+                // behind, and nothing else ever reads a replaced transcript,
+                // so their outputs go now and not into every later archive.
+                let stale = Self::lost_ids(old, &msgs, &tool_ids);
+                self.tool_outputs.retain(|id, _| !stale.contains(id));
+                false
+            }
             None => true,
         };
         self.subagent_messages.insert(id, Arc::new(msgs));
@@ -2069,6 +2052,52 @@ where
         }
     }
 
+    /// The tool ids `new` loses against `old`.
+    fn lost_ids(old: &[M], new: &[M], tool_ids: &impl Fn(&M) -> Vec<String>) -> HashSet<String> {
+        let kept: HashSet<String> = new.iter().flat_map(tool_ids).collect();
+        old.iter()
+            .flat_map(tool_ids)
+            .filter(|id| !kept.contains(id))
+            .collect()
+    }
+
+    /// The tool ids the turns behind `new` lose against this log. A pure
+    /// append loses none, so only a compaction or a rewritten log ever
+    /// yields a non-empty set.
+    pub fn dropped_tool_ids(
+        &self,
+        new: &[M],
+        tool_ids: impl Fn(&M) -> Vec<String>,
+    ) -> HashSet<String> {
+        Self::lost_ids(&self.messages, new, &tool_ids)
+    }
+
+    /// Drops the state the given calls held the way [`Self::remove_subagent`]
+    /// does for one: their transcripts, the tool state those transcripts
+    /// referenced, and their own outputs. Only ids that left the log are in
+    /// scope, so runs living beside the chat (a task moved to the background,
+    /// a plugin run whose transcript arrives when its prompt ends) keep their
+    /// state while they are live. Does not touch the cursors; the caller's
+    /// log replacement already voided them when it matters.
+    pub fn drop_tool_state_of(
+        &mut self,
+        dropped: &HashSet<String>,
+        tool_ids: impl Fn(&M) -> Vec<String>,
+    ) {
+        if dropped.is_empty() {
+            return;
+        }
+        let mut stale = dropped.clone();
+        for id in dropped {
+            if let Some(msgs) = self.subagent_messages.remove(id) {
+                stale.extend(msgs.iter().flat_map(&tool_ids));
+            }
+        }
+        self.subagents
+            .retain(|sa| !dropped.contains(&sa.tool_use_id));
+        self.tool_outputs.retain(|id, _| !stale.contains(id));
+    }
+
     pub fn usage_by_model(&self) -> &HashMap<String, StoredTokenUsage> {
         &self.usage_by_model
     }
@@ -2112,11 +2141,12 @@ where
         self.touch();
     }
 
-    /// After `messages` is truncated (rewind), state keyed by tool_use_id can
+    /// After `messages` loses turns (rewind), state keyed by tool_use_id can
     /// point at calls that no longer exist. On restore that shows up as ghost
-    /// subagent tabs and leaked tool outputs, so this drops everything not
-    /// reachable from `messages`. A plugin task is never reachable from them:
-    /// its plugin runs it beside the chat, so a rewind leaves it alone.
+    /// subagent tabs and leaked tool outputs, and every later rewrite and
+    /// archive would carry them again, so this drops everything not reachable
+    /// from `messages`. A plugin task is never reachable from them: its plugin
+    /// runs it beside the chat, so a rewind leaves it alone.
     ///
     /// If you add another field keyed by tool_use_id, prune it here too.
     pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
@@ -2326,10 +2356,10 @@ mod tests {
     #[cfg(unix)]
     use super::canonical_key;
     use super::{
-        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DATA_DIR, DEFAULT_TITLE,
-        LOG_BLOATED, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR,
-        StoredSubagent, TAIL_BUF, generate_title, jsonl_path, load_cwd_index, lock_path, locks_dir,
-        next_epoch, update_cwd_index, write_full_session,
+        ARCHIVE_DIR, CWD_INDEX_FILE, DATA_DIR, DEFAULT_TITLE, LOG_BLOATED, MAX_APPENDS,
+        MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent, TAIL_BUF,
+        generate_title, jsonl_path, load_cwd_index, lock_path, locks_dir, next_epoch,
+        update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT, OLDEST_LOG_FORMAT_VERSION,
@@ -2364,7 +2394,6 @@ mod tests {
     const QUEUED_PROMPT: &str = "and then the tests";
     const FORK_PLAN: &str = "1. split the parser";
     /// Two of these already break the byte budget.
-    const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
     const ALL_RECORDED: usize = usize::MAX;
     const FRAME_TAG: &str = r#""t":"frame""#;
@@ -2390,6 +2419,12 @@ mod tests {
 
     fn user_message(text: &str) -> Value {
         text_message("user", text)
+    }
+
+    /// The test messages carry no tool calls, so a checkpoint never finds
+    /// ids it dropped and leaves all state alone.
+    fn no_tool_ids(_: &Value) -> Vec<String> {
+        Vec::new()
     }
 
     fn assistant_message(text: &str) -> Value {
@@ -2425,6 +2460,85 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(path).unwrap();
         file.write_all(record.as_bytes()).unwrap();
         file.write_all(b"\n").unwrap();
+    }
+
+    /// Compaction reaches the UI's writer as a smaller snapshot through
+    /// `checkpoint`, and the state its dropped turns held must not ride the
+    /// rewrite and every later archive.
+    #[test]
+    fn checkpoint_adoption_drops_state_orphaned_by_compaction() {
+        fn ids(m: &Value) -> Vec<String> {
+            m.as_str().into_iter().map(str::to_owned).collect()
+        }
+        let mut plain: TestSession = Session::new("model", "/p");
+        plain.push_message("gone".into());
+        plain.push_message("kept".into());
+        plain.insert_tool_output("gone".into(), Arc::new(Value::Null));
+        plain.insert_tool_output("kept".into(), Arc::new(Value::Null));
+        let mut session = Arc::new(plain);
+        let snapshot = HistorySnapshot::new(vec![Value::from("kept")]);
+        let meta = session.meta.clone();
+
+        Session::checkpoint(&mut session, Some(&snapshot), meta, Value::Null, ids);
+
+        assert!(session.tool_outputs().contains_key("kept"));
+        assert!(!session.tool_outputs().contains_key("gone"));
+    }
+
+    /// A task moved to the background saves its transcript only when the
+    /// prompt ends, so its ids stay unreachable from the log while it runs.
+    /// Pruning the ids an append lost (none) instead of everything
+    /// unreachable keeps it alive across its parent's turns.
+    #[test]
+    fn checkpoint_adoption_keeps_state_of_runs_beside_the_chat() {
+        fn ids(m: &Value) -> Vec<String> {
+            m.as_str().into_iter().map(str::to_owned).collect()
+        }
+        let mut plain: TestSession = Session::new("model", "/p");
+        plain.push_message("turn-one".into());
+        plain
+            .subagent_messages
+            .insert("live-task".into(), Arc::new(vec![Value::from("live-tool")]));
+        plain.insert_tool_output("live-task".into(), Arc::new(Value::Null));
+        plain.insert_tool_output("live-tool".into(), Arc::new(Value::Null));
+        let mut session = Arc::new(plain);
+        let snapshot = HistorySnapshot::new(vec![Value::from("turn-one"), Value::from("turn-two")]);
+        let meta = session.meta.clone();
+
+        Session::checkpoint(&mut session, Some(&snapshot), meta, Value::Null, ids);
+
+        assert!(session.subagent_messages.contains_key("live-task"));
+        assert!(session.tool_outputs().contains_key("live-task"));
+        assert!(session.tool_outputs().contains_key("live-tool"));
+    }
+
+    /// A subagent that compacts on its own replaces its transcript, and
+    /// nothing reads a replaced copy again, so the outputs only it used go
+    /// with it instead of riding every later archive.
+    #[test]
+    fn subagent_compaction_drops_the_outputs_it_lost() {
+        fn ids(m: &Value) -> Vec<String> {
+            m.as_str().into_iter().map(str::to_owned).collect()
+        }
+        let mut session: TestSession = Session::new("model", "/p");
+        session.set_subagent_messages(
+            "sub-1".into(),
+            vec![Value::from("gone"), Value::from("kept")],
+            ids,
+        );
+        session.insert_tool_output("gone".into(), Arc::new(Value::Null));
+        session.insert_tool_output("kept".into(), Arc::new(Value::Null));
+
+        session.set_subagent_messages("sub-1".into(), vec![Value::from("kept")], ids);
+        assert!(!session.tool_outputs().contains_key("gone"));
+        assert!(session.tool_outputs().contains_key("kept"));
+
+        session.set_subagent_messages(
+            "sub-1".into(),
+            vec![Value::from("kept"), Value::from("more")],
+            ids,
+        );
+        assert!(session.tool_outputs().contains_key("kept"));
     }
 
     #[test]
@@ -2498,6 +2612,7 @@ mod tests {
         session.set_subagent_messages(
             "tool-1".into(),
             vec![user_message("sub-prompt"), assistant_message("sub-reply")],
+            no_tool_ids,
         );
         session.save_to(&claim_for(dir, &session), dir).unwrap();
 
@@ -2813,20 +2928,38 @@ mod tests {
             tools: None,
         };
         let meta = session.meta.clone();
-        Session::checkpoint(&mut session, Some(&run), meta.clone(), Value::Null);
-        Arc::make_mut(&mut session)
-            .set_subagent_messages("sub-1".into(), vec![user_message("old")]);
+        Session::checkpoint(
+            &mut session,
+            Some(&run),
+            meta.clone(),
+            Value::Null,
+            no_tool_ids,
+        );
+        Arc::make_mut(&mut session).set_subagent_messages(
+            "sub-1".into(),
+            vec![user_message("old")],
+            no_tool_ids,
+        );
         let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
-        Arc::make_mut(&mut session)
-            .set_subagent_messages("sub-1".into(), vec![user_message("new")]);
+        Arc::make_mut(&mut session).set_subagent_messages(
+            "sub-1".into(),
+            vec![user_message("new")],
+            no_tool_ids,
+        );
         let advanced = HistorySnapshot {
             epoch: run.epoch,
             messages: Arc::new(vec![user_message("hi"), assistant_message("reply")]),
             frame: None,
             tools: None,
         };
-        Session::checkpoint(&mut session, Some(&advanced), meta, Value::Null);
+        Session::checkpoint(
+            &mut session,
+            Some(&advanced),
+            meta,
+            Value::Null,
+            no_tool_ids,
+        );
         write_through(&mut log, dir, &session);
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
@@ -2859,7 +2992,13 @@ mod tests {
         let mut produced = HistorySnapshot::new(vec![user_message("hi")]);
         let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
         let meta = session.meta.clone();
-        Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
+        Session::checkpoint(
+            &mut session,
+            Some(&produced),
+            meta.clone(),
+            Value::Null,
+            no_tool_ids,
+        );
         let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         let mut frame = frame_with_system(FRAME_SYSTEM);
@@ -2868,11 +3007,23 @@ mod tests {
                 .mcp_tools
                 .push(json!({"name": name, "input_schema": {"type": "object"}}));
             produced.frame = Some(Arc::new(frame.clone()));
-            Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
+            Session::checkpoint(
+                &mut session,
+                Some(&produced),
+                meta.clone(),
+                Value::Null,
+                no_tool_ids,
+            );
             log.append(&claim_for(dir, &session), &session).unwrap();
         }
         produced.messages = Arc::new(vec![user_message("hi"), assistant_message("reply")]);
-        Session::checkpoint(&mut session, Some(&produced), meta, Value::Null);
+        Session::checkpoint(
+            &mut session,
+            Some(&produced),
+            meta,
+            Value::Null,
+            no_tool_ids,
+        );
         log.append(&claim_for(dir, &session), &session).unwrap();
 
         let raw = fs::read_to_string(jsonl_path(dir, session.id)).unwrap();
@@ -2913,10 +3064,10 @@ mod tests {
         let mut session: TestSession = Session::new("m", "/project");
         let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
-        session.set_subagent_messages("sub-1".into(), vec![user_message("old")]);
+        session.set_subagent_messages("sub-1".into(), vec![user_message("old")], no_tool_ids);
         write_through(&mut log, dir, &session);
 
-        session.set_subagent_messages("sub-1".into(), vec![user_message("new")]);
+        session.set_subagent_messages("sub-1".into(), vec![user_message("new")], no_tool_ids);
         write_through(&mut log, dir, &session);
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
@@ -2932,16 +3083,17 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
-        session.set_subagent_messages("sub-1".into(), vec![user_message("first")]);
+        session.set_subagent_messages("sub-1".into(), vec![user_message("first")], no_tool_ids);
         write_through(&mut log, dir, &session);
         let (rewrites, revision) = (session.rewrites, session.revision);
 
-        session.set_subagent_messages("sub-1".into(), vec![user_message("first")]);
+        session.set_subagent_messages("sub-1".into(), vec![user_message("first")], no_tool_ids);
         assert_eq!(session.revision, revision);
 
         session.set_subagent_messages(
             "sub-1".into(),
             vec![user_message("first"), assistant_message("reply")],
+            no_tool_ids,
         );
         assert_eq!(session.rewrites, rewrites);
         assert!(session.revision > revision);
@@ -3041,6 +3193,7 @@ mod tests {
         session.set_subagent_messages(
             "sub-1".into(),
             vec![user_message("sub-prompt"), assistant_message("sub-reply")],
+            no_tool_ids,
         );
         drop(SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap());
 
@@ -3141,8 +3294,10 @@ mod tests {
         assert_eq!(archived.messages(), pre.as_slice());
     }
 
+    /// Nothing prunes an archive any more, so every shrink rewrite leaves its
+    /// file behind: five rounds, five archives, oldest first by seq.
     #[test]
-    fn archive_retention_keeps_newest_three() {
+    fn archives_accumulate_across_rewrites() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("model", "/p");
@@ -3158,14 +3313,14 @@ mod tests {
         }
 
         let archives = archive_paths(dir, session.id);
-        assert_eq!(archives.len(), ARCHIVE_KEEP);
+        assert_eq!(archives.len(), 5);
         let mut msg_counts: Vec<usize> = archives.iter().map(|p| msg_line_count(p)).collect();
         msg_counts.sort_unstable();
-        assert_eq!(msg_counts, [4, 5, 6]);
+        assert_eq!(msg_counts, [2, 3, 4, 5, 6]);
     }
 
-    /// A new name has to beat every name already there, or pruning would read
-    /// the fresh archive as the oldest and eat it.
+    /// A new name has to beat every name already there, or a fresh archive
+    /// would land on an old one and lose the turns it holds.
     #[test]
     fn archive_names_count_up_from_the_newest() {
         let tmp = TempDir::new().unwrap();
@@ -3189,39 +3344,6 @@ mod tests {
             vec![existing, fresh.clone()]
         );
         assert_eq!(msg_line_count(&fresh), 2);
-    }
-
-    #[test]
-    fn archive_retention_honors_the_byte_budget() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("model", "/p");
-        session.push_message(user_message("one"));
-        session.push_message(user_message("two"));
-        session.save_to(&claim_for(dir, &session), dir).unwrap();
-
-        let archive_dir = archive_dir_for(dir, session.id);
-        fs::create_dir_all(&archive_dir).unwrap();
-        let fakes: Vec<PathBuf> = (1..=3)
-            .map(|ms| {
-                let path = archive_dir.join(format!("{ms}.jsonl"));
-                // Sparse: the length is all the budget looks at.
-                fs::File::create(&path)
-                    .unwrap()
-                    .set_len(FAKE_ARCHIVE_BYTES)
-                    .unwrap();
-                path
-            })
-            .collect();
-
-        session.replace_messages(vec![user_message("summary")]);
-        session.save_to(&claim_for(dir, &session), dir).unwrap();
-
-        let archives = archive_paths(dir, session.id);
-        assert_eq!(archives.len(), 2);
-        assert!(archives.contains(&fakes[2]));
-        assert!(!fakes[0].exists());
-        assert!(!fakes[1].exists());
     }
 
     #[test]
@@ -4290,7 +4412,7 @@ mod tests {
                 let msgs = (0..len)
                     .map(|i| user_message(&format!("sub-{i}")))
                     .collect();
-                session.set_subagent_messages(slot, msgs);
+                session.set_subagent_messages(slot, msgs, no_tool_ids);
             }
             4 => {
                 let len = session.messages().len();
@@ -4387,10 +4509,22 @@ mod tests {
         let snapshot = HistorySnapshot::new(session.messages().to_vec());
         let mut session = Arc::new(session);
         let meta = session.meta.clone();
-        Session::checkpoint(&mut session, Some(&snapshot), meta.clone(), Value::Null);
+        Session::checkpoint(
+            &mut session,
+            Some(&snapshot),
+            meta.clone(),
+            Value::Null,
+            no_tool_ids,
+        );
 
         let held = Arc::clone(&session);
-        Session::checkpoint(&mut session, Some(&snapshot), meta.clone(), Value::Null);
+        Session::checkpoint(
+            &mut session,
+            Some(&snapshot),
+            meta.clone(),
+            Value::Null,
+            no_tool_ids,
+        );
         assert!(Arc::ptr_eq(&held, &session), "no change, no clone");
 
         Session::checkpoint(
@@ -4401,6 +4535,7 @@ mod tests {
                 ..meta
             },
             Value::Null,
+            no_tool_ids,
         );
         assert!(!Arc::ptr_eq(&held, &session));
         assert_eq!(session.meta.input_draft.as_deref(), Some("draft"));
@@ -4476,12 +4611,24 @@ mod tests {
         let mut produced = HistorySnapshot::new(vec![user_message("a")]);
         let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
         let meta = session.meta.clone();
-        Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
+        Session::checkpoint(
+            &mut session,
+            Some(&produced),
+            meta.clone(),
+            Value::Null,
+            no_tool_ids,
+        );
 
         let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
         for step in 0..3 {
             Arc::make_mut(&mut produced.messages).push(assistant_message(&format!("reply-{step}")));
-            Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
+            Session::checkpoint(
+                &mut session,
+                Some(&produced),
+                meta.clone(),
+                Value::Null,
+                no_tool_ids,
+            );
             log.append(&claim_for(dir, &session), &session).unwrap();
         }
 
@@ -4505,7 +4652,7 @@ mod tests {
         let live = Arc::make_mut(&mut session);
         live.push_message(assistant_message("b"));
         live.insert_tool_output("t1".into(), Arc::new(Value::from("out")));
-        live.set_subagent_messages("s1".into(), vec![user_message("sub")]);
+        live.set_subagent_messages("s1".into(), vec![user_message("sub")], no_tool_ids);
 
         log.append(&claim_for(dir, &session), &session).unwrap();
 
@@ -4530,7 +4677,13 @@ mod tests {
         ]);
         let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
         let meta = session.meta.clone();
-        Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
+        Session::checkpoint(
+            &mut session,
+            Some(&produced),
+            meta.clone(),
+            Value::Null,
+            no_tool_ids,
+        );
         let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         let live = Arc::make_mut(&mut session);
@@ -4538,7 +4691,13 @@ mod tests {
         live.push_message(user_message("d"));
         write_through(&mut log, dir, &session);
 
-        Session::checkpoint(&mut session, Some(&produced), meta, Value::Null);
+        Session::checkpoint(
+            &mut session,
+            Some(&produced),
+            meta,
+            Value::Null,
+            no_tool_ids,
+        );
         let path = jsonl_path(dir, session.id);
         let size_before = fs::metadata(&path).unwrap().len();
         assert!(matches!(

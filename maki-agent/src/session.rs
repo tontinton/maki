@@ -369,16 +369,26 @@ impl SessionStore {
     /// The receipts still unsettled go with the transcript that holds them,
     /// so a process that dies with work out leaves a resume something to
     /// tell the model.
+    ///
+    /// Compaction lands here as a shorter list, and the tool state its
+    /// dropped turns held would ride every later rewrite and archive, so
+    /// exactly those ids lose their state: runs living beside the chat are
+    /// not in the log yet and must survive the appends around them.
     fn record_turn(
         &mut self,
         messages: &[Message],
         frame: Option<&Arc<StoredFrame>>,
         context_size: u32,
     ) -> Result<(), SessionError> {
+        fn tool_call_ids(m: &Message) -> Vec<String> {
+            m.tool_uses().map(|(id, _, _)| id.to_owned()).collect()
+        }
         if messages.is_empty() {
             return Ok(());
         }
+        let dropped = self.session.dropped_tool_ids(messages, tool_call_ids);
         self.session.replace_messages(messages.to_vec());
+        self.session.drop_tool_state_of(&dropped, tool_call_ids);
         self.session.set_frame(frame.cloned());
         self.session.meta.context_size = context_size;
         self.session.meta.pending_background = self.mailbox.unsettled();
@@ -631,6 +641,71 @@ mod tests {
             before,
             "{UNTOUCHED}"
         );
+    }
+
+    /// Compaction lands on the store as a shorter list, and the tool state
+    /// of the turns it dropped has to go with them: otherwise it rides every
+    /// later rewrite and lands in each archive again.
+    #[test]
+    fn record_turn_drops_tool_state_the_summary_dropped() {
+        fn call(id: &str) -> Message {
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(id, "bash", serde_json::json!({}))],
+                ..Default::default()
+            }
+        }
+        fn output() -> Arc<ToolOutput> {
+            Arc::new(ToolOutput::Plain("output".into()))
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        track
+            .store
+            .session
+            .insert_tool_output("gone".into(), output());
+        track
+            .store
+            .session
+            .insert_tool_output("kept".into(), output());
+
+        track
+            .store
+            .record_turn(&[call("gone"), call("kept")], None, CONTEXT_SIZE)
+            .unwrap();
+        assert!(load(&tmp).tool_outputs().contains_key("gone"));
+
+        track
+            .store
+            .record_turn(
+                &[Message::user("summary".into()), call("kept")],
+                None,
+                CONTEXT_SIZE,
+            )
+            .unwrap();
+        let compacted = load(&tmp);
+        assert!(!compacted.tool_outputs().contains_key("gone"));
+        assert!(compacted.tool_outputs().contains_key("kept"));
+    }
+
+    /// A task moved to the background saves its transcript only when the
+    /// prompt ends, so a plain appended turn must not prune the state it
+    /// holds under ids the log has never seen.
+    #[test]
+    fn record_turn_keeps_state_of_runs_beside_the_chat() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        track
+            .store
+            .session
+            .insert_tool_output("live".into(), Arc::new(ToolOutput::Plain("x".into())));
+
+        track
+            .store
+            .record_turn(&[Message::user("next turn".into())], None, CONTEXT_SIZE)
+            .unwrap();
+
+        assert!(load(&tmp).tool_outputs().contains_key("live"));
     }
 
     #[test]

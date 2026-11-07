@@ -174,6 +174,7 @@ impl App {
             snapshot.as_deref(),
             meta,
             self.state.token_usage,
+            |m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect(),
         );
 
         if !session_has_content(&self.state.session) {
