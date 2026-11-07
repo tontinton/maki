@@ -905,7 +905,8 @@ Listen for one or more events. Returns an id you can pass to
 `del_autocmd` later to remove the listener.
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-`"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
+`"TurnError"`, `"TurnComplete"`, `"ToolStart"`, `"ToolDone"`,
+`"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
@@ -932,6 +933,13 @@ name the session now running or focused. What each event adds:
   turn took). `list_cost` is the un-subsidised list price and `cost` is
   the real bill, so a budget plugin charges against whichever one it
   wants.
+- `"TurnComplete"`: `data.context_size` and `data.context_window` right
+  after a model response, before its tool calls run, so a plugin can act
+  mid-turn while `"AutoCompacting"` has not fired yet. `data.context_size`
+  is absent when the host does not know it. A subagent's response carries
+  its own `context_size` and `context_window` plus a `data.id` that marks
+  the turn as a subagent's; listeners that watch the parent's own context
+  skip the marked ones. The main session's own responses carry no `id`.
 - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
   trigger time.
 - `"CompactionDone"`: `data.context_size_before`,
@@ -1004,8 +1012,10 @@ host event still arrives, carrying only its metadata fields:
 out. Events a plugin fires under its own names arrive as fired.
 
 `"TurnEnd"` fires once per turn and only for the main session, so
-subagent turns never show up. A manual `/compact` ends its run without
-ending a turn, so it stays quiet too.
+subagent turns never show up. Subagent envelopes fire nothing else either,
+with `"TurnComplete"` the one exception. A manual `/compact` ends its run
+without ending a turn: no `"TurnEnd"` fires, only the `"TurnComplete"`
+of its own summariser request.
 
 Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
 `maki-ui` only. `maki-acp` runs the agent on its own loop and does not
