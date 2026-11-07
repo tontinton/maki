@@ -80,6 +80,20 @@ return {
     end,
     format = format_kagi,
   },
+  serply = {
+    label = "Serply",
+    endpoint = "https://api.serply.io/mcp",
+    key_required = true,
+    env = "SERPLY_API_KEY",
+    auth_header = "X-Api-Key",
+    tool = "google_search",
+    arguments = function(query, num_results)
+      return {
+        query = query,
+        num = num_results,
+      }
+    end,
+  },
   searxng = {
     label = "SearXNG",
     transport = "get", -- plain GET /search?format=json, no MCP

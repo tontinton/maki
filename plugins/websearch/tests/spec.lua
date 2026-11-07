@@ -146,6 +146,8 @@ case("providers_count_argument_matches_the_backend", function()
   eq(providers.youcom.arguments(QUERY, 5).numResults, nil)
   eq(providers.kagi.arguments(QUERY, 5).limit, 5)
   eq(providers.kagi.arguments(QUERY, 5).numResults, nil)
+  eq(providers.serply.arguments(QUERY, 5).num, 5)
+  eq(providers.serply.arguments(QUERY, 5).numResults, nil)
 end)
 
 -- Video ahead of search, so only the category order can put search first.
