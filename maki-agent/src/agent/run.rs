@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use maki_providers::provider::Provider;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
-    Model, RequestOptions, Role, StopReason, StreamResponse,
+    Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, model_registry,
 };
 use maki_storage::frame::{LiveFacts, PromptFacts};
 
@@ -84,8 +84,11 @@ pub async fn resolve_compaction_model(
     timeouts: maki_providers::Timeouts,
     model_policy: &ModelPolicy,
 ) -> (Arc<dyn Provider>, Model) {
-    if let Some(spec) =
-        maki_providers::model_registry::resolve_tier(None, maki_providers::ModelTier::Compaction)
+    // When the tier names the session model, the session's own copy wins,
+    // since a rebuild would forget what it learned at runtime, like the
+    // context window the server really serves.
+    if let Some(spec) = model_registry::resolve_tier(Some(&*model.provider), ModelTier::Compaction)
+        && spec != model.spec()
         && let Ok(mut m) = Model::from_spec_with_policy(&spec, model_policy).await
         && let Ok(p) = maki_providers::provider::from_model_async(&mut m, timeouts)
             .await
@@ -3563,11 +3566,15 @@ mod tests {
     }
 
     /// The summary request never asks for fast mode, so a fast session must
-    /// not price it at fast rates, even when the summary turns out unusable.
-    #[test_case(text_response(StopReason::EndTurn) ; "usable_summary")]
-    #[test_case(thinking_response() ; "unusable_summary")]
+    /// not price it at fast rates, even when the summary turns out unusable
+    /// and its retry is paid for too.
+    #[test_case(|| text_response(StopReason::EndTurn), 1 ; "usable_summary")]
+    #[test_case(thinking_response, 2 ; "unusable_summary_and_its_retry")]
     #[tokio::test]
-    async fn fast_session_bills_compaction_at_standard_rates(mut response: StreamResponse) {
+    async fn fast_session_bills_compaction_at_standard_rates(
+        response: fn() -> StreamResponse,
+        attempts: u64,
+    ) {
         const INPUT_TOKENS: u64 = 1_000;
         const OUTPUT_TOKENS: u64 = 100;
         let usage = TokenUsage {
@@ -3575,8 +3582,14 @@ mod tests {
             output: OUTPUT_TOKENS,
             ..Default::default()
         };
-        response.usage = usage;
-        let provider = MockProvider::new(vec![response]);
+        let provider = MockProvider::new(
+            (0..attempts)
+                .map(|_| StreamResponse {
+                    usage,
+                    ..response()
+                })
+                .collect(),
+        );
         let requests = Arc::clone(&provider.requests);
         let mut model = default_model();
         model.supports_fast_override = Some(FastSupport::Supported);
@@ -3596,11 +3609,18 @@ mod tests {
 
         let _ = agent.do_compact(CompactSteer::default()).await;
 
-        assert!(!requests.lock().unwrap()[0].opts.fast);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), attempts as usize);
+        assert!(requests.iter().all(|request| !request.opts.fast));
+        let billed = TokenUsage {
+            input: INPUT_TOKENS * attempts,
+            output: OUTPUT_TOKENS * attempts,
+            ..Default::default()
+        };
         let totals = agent.ledger.totals();
-        assert_eq!(totals.usage, usage);
-        assert_eq!(totals.cost, agent.model.billed_cost(&usage, false));
-        assert_eq!(totals.list_cost, agent.model.list_cost(&usage, false));
+        assert_eq!(totals.usage, billed);
+        assert_eq!(totals.cost, agent.model.billed_cost(&billed, false));
+        assert_eq!(totals.list_cost, agent.model.list_cost(&billed, false));
     }
 
     #[test_case(true,  170_000, true  ; "enabled_and_over_threshold")]

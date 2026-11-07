@@ -203,7 +203,7 @@ supports_vision = false
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `id` | string | required | Model id. Spec becomes `{{slug}}/{{id}}` |
-| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
+| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction`. With `discover_models = true`, a declared tier counts only for models the server lists |
 | `context_window` | u32 | protocol default | Tokens of context |
 | `max_output_tokens` | u32 | protocol default | Max completion tokens |
 | `supports_tool_examples` | bool | protocol default | |
@@ -619,7 +619,9 @@ fn render() -> String {
         "Maki talks to LLM providers over their HTTP APIs. \
          Models are split into three tiers: **weak** (cheap and fast), \
          **medium** (balanced), and **strong** (highest capability, highest cost). \
-         There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.\n"
+         There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long. \
+         The summary comes from the first of: your `/model` compaction pick, a `tier = \"compaction\"` model of the session's provider, \
+         one from any other provider in slug order, then the session model.\n"
     );
     let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");

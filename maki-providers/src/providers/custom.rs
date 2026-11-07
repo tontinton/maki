@@ -14,6 +14,7 @@ use super::catalog;
 use super::codec::{CodecOptions, protocol_spec};
 use crate::AgentError;
 use crate::model::{FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier};
+use crate::model_registry::{self, DeclaredTiers};
 use crate::provider::Provider;
 use crate::providers::Timeouts;
 use crate::spec::{ProviderRegistry, ProviderSpec};
@@ -178,7 +179,7 @@ fn model_from_def(
         .find(|m| m.id == model_id)
         .map(ModelEntry::from)
         .unwrap_or_default();
-    let discovered = crate::model_registry::discovered(slug, model_id);
+    let discovered = model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
     row.max_output_tokens = row
         .max_output_tokens
@@ -293,6 +294,42 @@ pub fn startup_specs(tiers: &[ModelTier]) -> Vec<String> {
 }
 
 fn startup_specs_from(config: &ProvidersConfig, tiers: &[ModelTier]) -> Vec<String> {
+    custom_entries(config)
+        .into_iter()
+        .flat_map(|(slug, def)| {
+            let declared = tiers.iter().filter_map(move |&tier| {
+                declared_at(def, tier).map(|m| format!("{slug}/{}", m.id))
+            });
+            def.default_model.clone().into_iter().chain(declared)
+        })
+        .collect()
+}
+
+/// The tier table [`model_registry`] keeps for custom providers. A broken
+/// `providers.toml` reads as no declarations rather than exiting.
+pub(crate) fn declared_tiers() -> DeclaredTiers {
+    declared_tiers_from(&ProvidersConfig::load_or_default())
+}
+
+/// The first model declared at a tier wins, as in [`declared_at`].
+fn declared_tiers_from(config: &ProvidersConfig) -> DeclaredTiers {
+    let mut declared = DeclaredTiers::new();
+    for (slug, def) in custom_entries(config) {
+        for model in &def.models {
+            declared
+                .entry(slug.clone())
+                .or_default()
+                .entry(model.tier)
+                .or_insert_with(|| model.id.clone());
+        }
+    }
+    declared
+}
+
+/// Custom entries [`lookup_model`] can build a model for. Sorted by slug,
+/// because `providers.toml` loads into a `HashMap` and a startup pick must not
+/// change from one run to the next.
+fn custom_entries(config: &ProvidersConfig) -> Vec<(&String, &ProviderDef)> {
     let mut entries: Vec<_> = config
         .providers
         .iter()
@@ -300,17 +337,10 @@ fn startup_specs_from(config: &ProvidersConfig, tiers: &[ModelTier]) -> Vec<Stri
         .collect();
     entries.sort_unstable_by_key(|(slug, _)| *slug);
     entries
-        .into_iter()
-        .flat_map(|(slug, def)| {
-            let declared = tiers.iter().filter_map(move |&tier| {
-                def.models
-                    .iter()
-                    .find(|m| m.tier == tier)
-                    .map(|m| format!("{slug}/{}", m.id))
-            });
-            def.default_model.clone().into_iter().chain(declared)
-        })
-        .collect()
+}
+
+fn declared_at(def: &ProviderDef, tier: ModelTier) -> Option<&ModelDef> {
+    def.models.iter().find(|m| m.tier == tier)
 }
 
 /// Outcome of resolving a tier against `providers.toml` in a single read.
@@ -336,7 +366,7 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
         return TierLookup::Unknown;
     };
     let base = protocol_spec(protocol);
-    match def.models.iter().find(|m| m.tier == tier) {
+    match declared_at(def, tier) {
         Some(declared) => TierLookup::Model(model_from_def(def, base, slug, &declared.id)),
         None => TierLookup::NoModelForTier(base),
     }
@@ -344,11 +374,13 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
 
 /// Skip definitions handled by [`declared_model_specs`]; only HTTP `/models`
 /// goes through here, so an empty `discover_models = false` provider returns
-/// nothing and never hits the network.
+/// nothing and never hits the network. The declared tiers reach the registry
+/// from this same read, so tier lookups notice edits to `providers.toml`.
 pub async fn discover_models(timeouts: Timeouts) -> Vec<String> {
     let config = spawn_blocking(ProvidersConfig::load)
         .await
         .expect("providers config load panicked");
+    model_registry::set_declared(declared_tiers_from(&config));
     let mut all_specs = Vec::new();
     for slug in config.providers.keys() {
         if is_builtin_slug(slug) {
@@ -368,7 +400,7 @@ pub async fn discover_models(timeouts: Timeouts) -> Vec<String> {
                 match result {
                     Ok(mut models) => {
                         overlay_declared_tiers(def, &mut models);
-                        crate::model_registry::set_known_models(&slug_c, models.clone());
+                        model_registry::set_known_models(&slug_c, models.clone());
                         for m in models {
                             all_specs.push(format!("{slug_c}/{}", m.id));
                         }
@@ -400,6 +432,8 @@ fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use maki_storage::sessions::Effort::High;
     use test_case::test_case;
 
@@ -486,6 +520,25 @@ mod tests {
     fn startup_specs_only_name_models_the_user_declared(toml_src: &str, expected: &[&str]) {
         let config: ProvidersConfig = toml::from_str(toml_src).unwrap();
         assert_eq!(startup_specs_from(&config, &STARTUP_TIERS), expected);
+    }
+
+    #[test]
+    fn declared_tiers_keep_the_first_model_per_tier() {
+        let config: ProvidersConfig = toml::from_str(
+            "[local]\nprotocol = \"openai\"\n\
+             [[local.models]]\nid = \"first\"\ntier = \"compaction\"\n\
+             [[local.models]]\nid = \"second\"\ntier = \"compaction\"\n\
+             [[local.models]]\nid = \"big\"\ntier = \"strong\"",
+        )
+        .unwrap();
+        let local = BTreeMap::from([
+            (ModelTier::Compaction, "first".to_owned()),
+            (ModelTier::Strong, "big".to_owned()),
+        ]);
+        assert_eq!(
+            declared_tiers_from(&config),
+            DeclaredTiers::from([("local".to_owned(), local)])
+        );
     }
 
     // The exact regression this fixes: discovery parsed context_window but

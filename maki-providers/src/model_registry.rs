@@ -1,8 +1,9 @@
 //! Per-model tier assignments (strong / medium / weak).
 //!
 //! Three layers, checked in order: user overrides (persisted, one model per
-//! tier) > static entries from the provider registry > auto-assignment by
-//! position in `list_models()`.
+//! tier) > static entries (the provider registry for builtins, `providers.toml`
+//! declarations for custom providers) > auto-assignment by position in
+//! `list_models()`.
 //!
 //! Discovered metadata (context windows, pricing) from `/models` endpoints is
 //! stored in `known_models` and consulted by [`crate::model::Model::from_base`].
@@ -10,10 +11,14 @@
 //! The global lock never escapes this module: accessors lock internally and
 //! return owned data, so a caller can never hold a read guard across model
 //! construction (recursive read + queued writer = deadlock). The module owns
-//! persistence: [`load_from_storage`] at startup, [`set_and_persist`] on user
-//! edits. Callers never touch the on-disk format directly.
+//! persistence: [`load`] at startup, [`set_and_persist`] on user edits.
+//! Callers never touch the on-disk format directly.
+//!
+//! Lookups never read a file. `providers.toml` declarations are pushed in by
+//! [`load`] and by custom provider discovery, the same way listings are, so a
+//! test that calls neither never sees the config of the machine it runs on.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -21,9 +26,13 @@ use maki_storage::{StateDir, atomic_write};
 use tracing::warn;
 
 use crate::model::{ModelInfo, ModelTier};
+use crate::providers::custom;
 use crate::spec::ProviderRegistry;
 
 const TIERS_FILE: &str = "model-tiers";
+
+/// Each custom provider's `providers.toml` models, slug -> tier -> model id.
+pub(crate) type DeclaredTiers = BTreeMap<String, BTreeMap<ModelTier, String>>;
 
 static REGISTRY: OnceLock<RwLock<ModelRegistry>> = OnceLock::new();
 
@@ -76,6 +85,11 @@ pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
     write().set_known_models(provider, models);
 }
 
+/// Read `providers.toml` before calling, never under the registry lock.
+pub(crate) fn set_declared(declared: DeclaredTiers) {
+    write().declared = declared;
+}
+
 /// Subagents and new sessions build their model from here, so the window a
 /// server reported belongs here too, or each of them would learn it again.
 pub fn record_context_window(provider: &str, model_id: &str, window: u32) {
@@ -93,9 +107,12 @@ pub fn override_tiers(spec: &str) -> Vec<ModelTier> {
     read().override_tiers(spec)
 }
 
-pub fn load_from_storage(dir: &StateDir) {
+/// Seeds the registry at startup: the user's tier picks from `dir`, and the
+/// tiers custom providers declare in `providers.toml`.
+pub fn load(dir: &StateDir) {
     let overrides = read_overrides(dir.path().join(TIERS_FILE).as_path());
     write().set_overrides(overrides);
+    set_declared(custom::declared_tiers());
 }
 
 pub fn set_and_persist(spec: String, tier: ModelTier, dir: &StateDir) {
@@ -126,6 +143,9 @@ struct ModelRegistry {
     /// Not persisted - rebuilt every session. Used for auto-tier assignment
     /// and discovered metadata lookup.
     known_models: HashMap<String, Vec<ModelInfo>>,
+    /// Custom providers' static tier tables, what the provider registry is
+    /// for builtins.
+    declared: DeclaredTiers,
 }
 
 impl ModelRegistry {
@@ -199,21 +219,35 @@ impl ModelRegistry {
             self.discovered_static_candidate(provider, tier)
                 .or_else(|| self.metadata_candidate(provider, tier))
                 .or_else(|| {
+                    // A custom provider's listing is all it serves, so once it
+                    // answered, a declared model it does not list is not picked.
                     let listed_all = self.known_models.contains_key(provider)
                         && ProviderRegistry::get(provider)
-                            .is_some_and(|spec| spec.catalog_is_authoritative);
+                            .is_none_or(|spec| spec.catalog_is_authoritative);
                     if listed_all {
                         None
                     } else {
-                        static_candidate(provider, tier)
+                        self.static_candidate(provider, tier)
                     }
                 })
                 .or_else(|| self.positional_candidate(provider, tier))
         } else {
-            static_candidate(provider, tier)
+            self.static_candidate(provider, tier)
         }?;
 
         (!self.claimed_elsewhere(&candidate, tier)).then_some(candidate)
+    }
+
+    /// The curated default of a registered provider, the `providers.toml`
+    /// declaration of any other. Checked at lookup, not when declarations are
+    /// stored, so a plugin that registers a slug later still owns it.
+    fn static_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
+        let id = if ProviderRegistry::get(provider).is_some() {
+            static_prefixes(provider, tier).next()?
+        } else {
+            self.declared.get(provider)?.get(&tier)?.as_str()
+        };
+        Some(format!("{provider}/{id}"))
     }
 
     /// The curated default the provider actually offers, so discovery cannot
@@ -261,9 +295,14 @@ impl ModelRegistry {
             .or_else(|| self.spec_for_tier_any(tier))
     }
 
+    /// Slug order, so the pick is the same in every process.
     fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
         self.known_models
             .keys()
+            .chain(self.declared.keys())
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .find_map(|provider| self.spec_for_tier(provider, tier))
     }
 
@@ -283,12 +322,6 @@ impl ModelRegistry {
 /// static tier tables.
 fn tiers_from_discovery(provider: &str) -> bool {
     ProviderRegistry::get(provider).is_none_or(|m| m.accepts_arbitrary_models)
-}
-
-fn static_candidate(provider: &str, tier: ModelTier) -> Option<String> {
-    static_prefixes(provider, tier)
-        .next()
-        .map(|prefix| format!("{provider}/{prefix}"))
 }
 
 fn static_prefixes(provider: &str, tier: ModelTier) -> impl Iterator<Item = &'static str> {
@@ -637,5 +670,77 @@ mod tests {
         assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
         assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3");
         assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/qwen3:8b");
+    }
+
+    const SESSION_SLUG: &str = "mybox";
+    const DECLARED_ID: &str = "declared";
+    const DECLARED_SPEC: &str = "mybox/declared";
+    const SESSION_DECLARED: &[(&str, &str)] = &[(SESSION_SLUG, DECLARED_ID)];
+    const BUILTIN_SLUG: &str = "anthropic";
+
+    fn declare_compaction(reg: &mut ModelRegistry, entries: &[(&str, &str)]) {
+        for &(slug, id) in entries {
+            reg.declared
+                .entry(slug.to_owned())
+                .or_default()
+                .insert(ModelTier::Compaction, id.to_owned());
+        }
+    }
+
+    fn tiered_models(ids: &[&str], tier: Option<ModelTier>) -> Vec<ModelInfo> {
+        ids.iter()
+            .map(|id| ModelInfo {
+                tier,
+                ..ModelInfo::id_only(id.to_string())
+            })
+            .collect()
+    }
+
+    #[test_case(&[(ModelTier::Compaction, "zai/glm-5")], &[], SESSION_DECLARED, Some("zai/glm-5") ; "override_beats_declared")]
+    #[test_case(&[], &[], &[("abox", "a"), (SESSION_SLUG, DECLARED_ID)], Some(DECLARED_SPEC) ; "session_provider_declared_beats_another_providers")]
+    #[test_case(&[], &["listed"], SESSION_DECLARED, None ; "discovered_listing_beats_declared")]
+    #[test_case(&[(ModelTier::Strong, DECLARED_SPEC)], &[], SESSION_DECLARED, None ; "declared_model_claimed_by_another_tier")]
+    fn resolve_tier_precedence(
+        overrides: &[(ModelTier, &str)],
+        listed: &[&str],
+        declared: &[(&str, &str)],
+        expected: Option<&str>,
+    ) {
+        let mut reg = make_map(overrides, &[]);
+        declare_compaction(&mut reg, declared);
+        if !listed.is_empty() {
+            reg.set_known_models(SESSION_SLUG, tiered_models(listed, None));
+        }
+        assert_eq!(
+            reg.resolve_tier(Some(SESSION_SLUG), ModelTier::Compaction),
+            expected.map(String::from)
+        );
+    }
+
+    #[test_case(&["mbox", "nbox"], &[("zbox", "z"), ("abox", "a")], "abox/a" ; "declared_slug_first")]
+    #[test_case(&["nbox", "mbox"], &[("zbox", "z")], "mbox/m" ; "discovered_slug_first")]
+    fn any_provider_walk_is_slug_ordered(
+        discovered: &[&str],
+        declared: &[(&str, &str)],
+        expected: &str,
+    ) {
+        let mut reg = ModelRegistry::default();
+        declare_compaction(&mut reg, declared);
+        for slug in discovered {
+            reg.set_known_models(slug, tiered_models(&["m"], Some(ModelTier::Compaction)));
+        }
+        assert_eq!(
+            reg.resolve_tier(None, ModelTier::Compaction),
+            Some(expected.into())
+        );
+    }
+
+    /// Declarations are stored before plugins register their slugs, so the
+    /// lookup itself has to keep a registered provider on its own table.
+    #[test]
+    fn declarations_never_shadow_a_registered_provider() {
+        let mut reg = ModelRegistry::default();
+        declare_compaction(&mut reg, &[(BUILTIN_SLUG, DECLARED_ID)]);
+        assert_eq!(reg.spec_for_tier(BUILTIN_SLUG, ModelTier::Compaction), None);
     }
 }

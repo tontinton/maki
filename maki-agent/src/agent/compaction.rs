@@ -8,7 +8,7 @@ use maki_providers::{
     StreamResponse,
 };
 use serde_json::{Value, json};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::frame::{RunContext, fit_frame};
 use super::history::{History, remove_orphaned_tool_results, strip_thinking};
@@ -44,6 +44,8 @@ const MAX_RESERVED_PERCENT: u32 = 50;
 /// build log to Lua for every result of a long session would cost more than
 /// the layer saves. `bytes` still tells the full size.
 const PREPARE_TEXT_MAX: usize = 4 * 1024;
+/// Overflow pruning and the empty summary retry share this budget.
+const MAX_SUMMARY_ATTEMPTS: u32 = 3;
 
 pub(super) const FIELD_SKIP: &str = "skip";
 const FIELD_INSTRUCTIONS: &str = "instructions";
@@ -179,7 +181,7 @@ pub(super) struct Compacted {
 }
 
 /// Replaces `history` with a summary of itself, retrying on overflow by
-/// pruning what it sends.
+/// pruning what it sends, and once on an empty summary.
 ///
 /// The last `carry_len` messages are held out of the summary and re-appended
 /// after it, so input no turn has answered yet survives verbatim without ever
@@ -208,10 +210,11 @@ pub(super) async fn compact_history(
     compaction_history.push(Message::user(summary_prompt(config, instructions)));
 
     let empty_tools = serde_json::json!([]);
-    let max_attempts = 3;
-    let mut last_error = None;
+    let mut retried_empty = false;
+    let mut attempt = 0;
 
-    for attempt in 0..max_attempts {
+    loop {
+        let can_retry = attempt + 1 < MAX_SUMMARY_ATTEMPTS;
         match stream_with_retry(
             StreamRequest {
                 provider,
@@ -243,21 +246,35 @@ pub(super) async fn compact_history(
                     model.billed_cost(&response.usage, false),
                     model.list_cost(&response.usage, false),
                 );
-                if attempt > 0 {
-                    info!(attempt, "compaction succeeded after pruning history");
-                }
-                let compacted = finish_compact(
+                let stop_reason = response.stop_reason;
+                match finish_compact(
                     response, history, summarized, event_tx, model, hooks, config,
-                )?;
-                info!(
-                    model = %model.id,
-                    duration_ms = compact_start.elapsed().as_millis() as u64,
-                    "compaction completed"
-                );
-                return Ok(compacted);
+                ) {
+                    // Just once. This is the biggest request a session sends,
+                    // and a model that comes back empty twice, say because its
+                    // thinking eats the whole budget, will keep doing it.
+                    Err(AgentError::EmptySummary) if can_retry && !retried_empty => {
+                        retried_empty = true;
+                        warn!(
+                            attempt,
+                            model = %model.id,
+                            ?stop_reason,
+                            "compaction returned no summary text, retrying"
+                        );
+                    }
+                    result => {
+                        let compacted = result?;
+                        info!(
+                            model = %model.id,
+                            duration_ms = compact_start.elapsed().as_millis() as u64,
+                            attempt,
+                            "compaction completed"
+                        );
+                        return Ok(compacted);
+                    }
+                }
             }
-            Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
-                last_error = Some(e);
+            Err(StreamError::Other(e)) if can_retry && e.is_context_overflow() => {
                 // Truncation eats from the front, so it can never shrink an
                 // oversized result sitting in the protected tail. Collapse that
                 // first, and once there is nothing left to collapse, drop the
@@ -268,9 +285,8 @@ pub(super) async fn compact_history(
             }
             Err(e) => return Err(e.into()),
         }
+        attempt += 1;
     }
-
-    Err(last_error.unwrap())
 }
 
 fn finish_compact(
@@ -888,20 +904,23 @@ mod tests {
     #[test_case(vec![ContentBlock::Thinking { thinking: KEPT_TEXT.into(), signature: None }] ; "thinking_only")]
     #[tokio::test]
     async fn a_failed_compaction_leaves_the_context_alone(content: Vec<ContentBlock>) {
-        let provider = MockProvider::new(vec![Ok(StreamResponse {
-            message: Message {
-                role: Role::Assistant,
-                content,
+        let empty = || {
+            Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: content.clone(),
+                    ..Default::default()
+                },
+                usage: TokenUsage {
+                    input: SUMMARISED_INPUT / 2,
+                    output: SUMMARISED_INPUT / 10,
+                    ..Default::default()
+                },
+                stop_reason: Some(StopReason::EndTurn),
                 ..Default::default()
-            },
-            usage: TokenUsage {
-                input: SUMMARISED_INPUT / 2,
-                output: SUMMARISED_INPUT / 10,
-                ..Default::default()
-            },
-            stop_reason: Some(StopReason::EndTurn),
-            ..Default::default()
-        })]);
+            })
+        };
+        let provider = MockProvider::new(vec![empty(), empty()]);
         let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
         let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
         let (raw_tx, rx) = flume::unbounded();
@@ -931,11 +950,107 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
         let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
-        let [AgentEvent::TurnComplete(turn)] = events.as_slice() else {
+        let [
+            AgentEvent::TurnComplete(first),
+            AgentEvent::TurnComplete(retry),
+        ] = events.as_slice()
+        else {
             panic!("{events:?}");
         };
-        assert_eq!(turn.context_size, Some(SUMMARISED_PROMPT));
-        assert_eq!(turn.context_window, model.context_window);
+        for turn in [first, retry] {
+            assert_eq!(turn.context_size, Some(SUMMARISED_PROMPT));
+            assert_eq!(turn.context_window, model.context_window);
+        }
+    }
+
+    const ATTEMPT_INPUT: u64 = 1_000;
+
+    enum Reply {
+        Overflow,
+        Empty,
+        Summary,
+    }
+
+    fn scripted(reply: &Reply) -> Result<StreamResponse, AgentError> {
+        let usage = TokenUsage {
+            input: ATTEMPT_INPUT,
+            ..Default::default()
+        };
+        match reply {
+            Reply::Overflow => Err(overflow_error()),
+            Reply::Empty => Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    ..Default::default()
+                },
+                usage,
+                stop_reason: Some(StopReason::MaxTokens),
+                ..Default::default()
+            }),
+            Reply::Summary => Ok(StreamResponse {
+                usage,
+                ..text_response(StopReason::EndTurn)
+            }),
+        }
+    }
+
+    /// Every attempt that came back is a paid request, so each reports its own
+    /// turn and the `Done` usage sums them all.
+    #[test_case(&[Reply::Empty, Reply::Summary], true ; "empty_then_summary")]
+    #[test_case(&[Reply::Overflow, Reply::Empty, Reply::Summary], true ; "overflow_then_empty_then_summary")]
+    #[test_case(&[Reply::Overflow, Reply::Overflow, Reply::Empty], false ; "no_retry_past_the_attempt_budget")]
+    #[tokio::test]
+    async fn empty_summary_retry(replies: &[Reply], summarised: bool) {
+        let provider = MockProvider::new(replies.iter().map(scripted).collect());
+        let mut history = History::new(vec![
+            Message::user(KEPT_TEXT.into()),
+            Message::user("second".into()),
+        ]);
+        let (raw_tx, rx) = flume::unbounded();
+        let registry = ToolRegistry::new();
+        let model = default_model();
+        let cancel = CancelToken::none();
+
+        let result = compact(
+            &provider,
+            &model,
+            &mut history,
+            &mut ContextGauge::default(),
+            bare_context(&model),
+            None,
+            &EventSender::new(raw_tx, 0),
+            &test_hooks(&registry, None, &model, &cancel),
+            &AgentConfig::default(),
+            None,
+            RetryPolicy::default(),
+        )
+        .await;
+
+        assert_eq!(provider.requests.lock().unwrap().len(), replies.len());
+        let answered = replies
+            .iter()
+            .filter(|reply| !matches!(reply, Reply::Overflow))
+            .count();
+        let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
+        let turns = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnComplete(_)))
+            .count();
+        assert_eq!(turns, answered);
+        let kept = history
+            .as_slice()
+            .iter()
+            .any(|message| message.user_text() == Some(KEPT_TEXT));
+        assert_eq!(kept, !summarised);
+        if summarised {
+            assert_eq!(result.unwrap(), DoneReason::Compact);
+            let Some(AgentEvent::Done { usage, .. }) = events.last() else {
+                panic!("{events:?}");
+            };
+            assert_eq!(usage.input, ATTEMPT_INPUT * answered as u64);
+        } else {
+            assert!(matches!(result, Err(AgentError::EmptySummary)));
+        }
     }
 
     #[tokio::test]
