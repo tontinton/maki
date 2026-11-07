@@ -159,6 +159,7 @@ maki.api.register_tool({
     },
   },
   audiences = { "main", "research_sub", "general_sub" },
+  permission = {},
 
   header = function(input)
     return string.format("%d todos", #(input.todos or {}))

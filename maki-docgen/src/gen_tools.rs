@@ -1,6 +1,8 @@
 use maki_agent::template::Vars;
-use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
-use maki_config::{PluginFileConfig, PluginsConfig};
+use maki_agent::tools::{
+    Authority, DescriptionContext, ToolAudience, ToolFilter, ToolReach, ToolRegistry,
+};
+use maki_config::{Permission, PluginFileConfig, PluginsConfig};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -12,6 +14,8 @@ use maki_lua::{OptionType, PluginHost};
 use crate::lua_util::in_registration_window;
 
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
+const PLUGIN_PERMISSION_LABEL: &str = "[Plugin permission](/docs/lua-api/#plugin-permissions)";
+const INERT_REACH: &str = "nothing (`{}`)";
 /// Tools a plugin registers only when one of its boolean options is on, as
 /// (plugin, option, tool).
 const OPTION_GATED_TOOLS: &[(&str, &str, &str)] = &[("task", "allow_background", "task_message")];
@@ -139,7 +143,32 @@ fn write_param_table(out: &mut String, params: &[Param]) {
     }
 }
 
-fn write_tool_entry(out: &mut String, name: &str, def: &Value, opt_in: &HashSet<String>) {
+fn reach_label(reach: Option<ToolReach>) -> String {
+    match reach {
+        None => {
+            let exempt: Vec<String> = Permission::ALL
+                .iter()
+                .filter(|&&perm| !Authority::Unbounded.requires(perm))
+                .map(|perm| format!("`{}`", perm.manifest_key()))
+                .collect();
+            format!(
+                "not declared (every permission except {})",
+                exempt.join(" and ")
+            )
+        }
+        Some(ToolReach::Inert) => INERT_REACH.to_owned(),
+        Some(ToolReach::Capability { permission, .. }) => {
+            format!("`{}`", permission.manifest_key())
+        }
+    }
+}
+
+fn write_tool_entry(
+    out: &mut String,
+    name: &str,
+    (def, reach): &(Value, Option<ToolReach>),
+    opt_in: &HashSet<String>,
+) {
     let description = def
         .get("description")
         .and_then(|d| d.as_str())
@@ -156,6 +185,8 @@ fn write_tool_entry(out: &mut String, name: &str, def: &Value, opt_in: &HashSet<
     writeln!(out, "### `{name}`{badges} {{#{name}}}").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "{summary}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "{PLUGIN_PERMISSION_LABEL}: {}", reach_label(*reach)).unwrap();
     writeln!(out).unwrap();
     write_param_table(out, &params);
 }
@@ -283,9 +314,12 @@ pub fn generate() -> String {
         .collect();
 
     let snapshot = registry.iter();
-    let tools: HashMap<&str, Value> = snapshot
+    let tools: HashMap<&str, (Value, Option<ToolReach>)> = snapshot
         .iter()
-        .filter_map(|entry| Some((entry.name(), redact_def(def_map.get(entry.name())?))))
+        .filter_map(|entry| {
+            let def = redact_def(def_map.get(entry.name())?);
+            Some((entry.name(), (def, entry.tool.reach())))
+        })
         .collect();
 
     let total = tools.len();

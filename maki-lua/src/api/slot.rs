@@ -101,15 +101,7 @@ impl LayerCost<'_> {
     fn charges(&self, perm: Permission) -> bool {
         match *self {
             Self::Host { authority, content } => {
-                content.contains(&perm)
-                    || match authority {
-                        Authority::Capability(required) => perm == required,
-                        // Steering a call whose reach nobody declared takes every
-                        // capability: a meta-tool like `batch` names none and
-                        // reaches all.
-                        Authority::Unbounded => PluginPermissions::is_reach(perm),
-                        Authority::Total => true,
-                    }
+                content.contains(&perm) || authority.requires(perm)
             }
             Self::Named(needed) => needed.contains(&perm),
         }
@@ -626,6 +618,15 @@ fn declare_slot(
     make_callable(lua, name)
 }
 
+/// The Lua list `get_slots` reports for `capability` and `get_tool` for
+/// `permission`, so both read back in one shape.
+pub(crate) fn permission_list(
+    lua: &Lua,
+    permissions: impl IntoIterator<Item = Permission>,
+) -> LuaResult<Table> {
+    lua.create_sequence_from(permissions.into_iter().map(Permission::manifest_key))
+}
+
 /// The price the owner set in `opts.capability` for what other plugins pay,
 /// weighed against what the owner itself holds: a plugin cannot
 /// price its slot or action in a capability it was never granted, the same
@@ -769,11 +770,7 @@ fn get_slots(lua: &Lua) -> LuaResult<Table> {
         info.set("owner", entry.owner.as_deref())?;
         info.set("declared", entry.default.is_some())?;
         if let Some(priced) = &entry.capability {
-            let capability = lua.create_table()?;
-            for permission in priced.iter() {
-                capability.push(permission.manifest_key())?;
-            }
-            info.set("capability", capability)?;
+            info.set("capability", permission_list(lua, priced.iter().copied())?)?;
         }
         let fillers = lua.create_table()?;
         for layer in &entry.layers {
@@ -899,6 +896,7 @@ mod tests {
     #[test_case(Authority::Total, &[], &[Permission::Agent, Permission::SessionRead] ; "total_names_every_gap")]
     #[test_case(Authority::Capability(Permission::Run), &[Permission::SessionRead, Permission::SessionWrite], &[Permission::SessionRead] ; "content_adds_to_a_held_capability")]
     #[test_case(Authority::Capability(Permission::Agent), &[Permission::SessionRead], &[Permission::Agent, Permission::SessionRead] ; "content_and_authority_both_named")]
+    #[test_case(Authority::Inert, &[Permission::SessionRead, Permission::SessionWrite], &[Permission::SessionRead] ; "content_is_the_whole_price_of_an_inert_tool")]
     fn a_skipped_layer_names_exactly_what_it_lacks(
         authority: Authority,
         content: &'static [Permission],

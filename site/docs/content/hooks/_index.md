@@ -187,12 +187,17 @@ call, and the first skip shows a warning naming every missing key.
 | Tool | A layer needs |
 | --- | --- |
 | declares a permission, like `bash` | that permission, `session_read` and `session_write` |
-| declares none: `read`, `batch`, MCP tools, ACP client tools, `tool_search` | every permission |
+| declares `permission = {}`, like `todo_write` | `session_read` and `session_write` |
+| leaves `permission` out, like `batch`, or is an MCP tool, ACP client tool or `tool_search` | every permission |
 
-Declaring no capability does not mean a tool uses none. `batch`,
+The [Tools](/docs/tools/) page lists what each built-in declares.
+
+Leaving `permission` out does not mean a tool uses none. `batch`,
 `code_execution` and `task` declare nothing while invoking any other tool, so
 reading undeclared as free would hand a plugin everything. Undeclared costs the
-maximum instead. See [plugin permissions](/docs/lua-api/#plugin-permissions).
+maximum instead. Only a tool that declares `permission = {}` is cheap, and its
+owner promises it reaches nothing past the conversation it runs in. See
+[plugin permissions](/docs/lua-api/#plugin-permissions).
 
 **A layer may wait, within a window.** Chains are async, so a layer can read a
 file or run a job before it decides. It runs inside the call it is filtering, so
@@ -493,7 +498,8 @@ end)
 once. An empty list is free for anyone. Leaving `capability` out charges every
 permission, which is what a tool declaring no capability charges: a slot that
 named no price has not promised its default exercises none, only that nobody
-asked. You can only name permissions your own plugin holds.
+asked. You can only name permissions your own plugin holds. `permission = {}` on
+a tool is the same declaration as `capability = {}` on a slot.
 
 The rule is the one the `tool.*` slots use, and it is read the same way: every
 call re-reads what each layer's plugin holds, so a layer registered by a plugin

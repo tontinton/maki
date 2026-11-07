@@ -642,7 +642,8 @@ impl Route<'_> {
 
     /// What hooking this call would lend. Every route answers here, so a new
     /// one cannot reach a hook without naming its price. Only a declared
-    /// capability narrows it: reading undeclared as free is what would let an
+    /// capability, or an explicit declaration that the tool reaches nothing,
+    /// narrows it: reading undeclared as free is what would let an
     /// unprivileged plugin steer `batch` or `code_execution` into any tool it
     /// likes.
     fn authority(&self) -> Option<Authority> {
@@ -1563,6 +1564,10 @@ mod tests {
     const HOOK_DENY_REASON: &str = "not on my watch";
     const HOOK_OUTPUT_TEXT: &str = "trimmed";
     const HOOK_PERMISSION: Permission = Permission::Run;
+    const HOOK_REACH: ToolReach = ToolReach::Capability {
+        permission: HOOK_PERMISSION,
+        prompted: true,
+    };
     const HOOK_FIELD_TYPE: &str = "string";
     const HOOK_DIFF_COMMAND: &str = "apply";
     const HOOK_DIFF_PATH: &str = "/tmp/diffed.txt";
@@ -1726,7 +1731,7 @@ mod tests {
 
     /// Its permission scope, its write target and its output are all its
     /// input, which is how a test sees the input each stage of dispatch got.
-    struct HookMock(Option<Permission>);
+    struct HookMock(Option<ToolReach>);
 
     struct HookMockInvocation(String);
 
@@ -1792,10 +1797,7 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}})
         }
         fn reach(&self) -> Option<ToolReach> {
-            self.0.map(|permission| ToolReach {
-                permission,
-                prompted: true,
-            })
+            self.0
         }
         fn tool_kind(&self) -> Option<&str> {
             Some(HOOK_TOOL_KIND)
@@ -1968,10 +1970,10 @@ mod tests {
 
     fn hooked_with(
         mut ctx: ToolContext,
-        permission: Option<Permission>,
+        reach: Option<ToolReach>,
         hook: RecordingHook,
     ) -> (ToolContext, RecordingHook) {
-        ctx.registry = registered(Arc::new(HookMock(permission)));
+        ctx.registry = registered(Arc::new(HookMock(reach)));
         ctx.registry.set_hook(hook.clone());
         (ctx, hook)
     }
@@ -2060,22 +2062,24 @@ mod tests {
 
     /// Hooking in dispatch is what reaches a route maki did not write the code
     /// behind, and each one has to answer for what that lends. Only a declared
-    /// capability narrows the price; everything else prices at the maximum.
+    /// capability, or a declaration that the tool reaches nothing, narrows the
+    /// price. Everything else prices at the maximum.
     /// The name stays the one the model called, not whatever dispatch routes
     /// it to.
-    #[test_case(build_ctx,      HOOK_TOOL_NAME,        Some(HOOK_PERMISSION), Authority::Capability(HOOK_PERMISSION) ; "a_checked_tool_lends_its_capability")]
-    #[test_case(build_ctx,      HOOK_TOOL_NAME,        None,                  Authority::Unbounded                   ; "a_tool_declaring_nothing_declares_no_limit")]
-    #[test_case(mcp_route_ctx,  TOOL_SEARCH_TOOL_NAME, None,                  Authority::Unbounded                   ; "search_declares_nothing_either")]
-    #[test_case(mcp_route_ctx,  PROBE_WIRE,            None,                  Authority::Unbounded                   ; "an_mcp_tool_is_code_maki_does_not_own")]
-    #[test_case(host_route_ctx, CLIENT_NAME,           None,                  Authority::Unbounded                   ; "a_host_tool_is_code_maki_does_not_own")]
+    #[test_case(build_ctx,      HOOK_TOOL_NAME,        Some(HOOK_REACH),       Authority::Capability(HOOK_PERMISSION) ; "a_checked_tool_lends_its_capability")]
+    #[test_case(build_ctx,      HOOK_TOOL_NAME,        Some(ToolReach::Inert), Authority::Inert                       ; "an_inert_tool_lends_nothing")]
+    #[test_case(build_ctx,      HOOK_TOOL_NAME,        None,                   Authority::Unbounded                   ; "a_tool_declaring_nothing_declares_no_limit")]
+    #[test_case(mcp_route_ctx,  TOOL_SEARCH_TOOL_NAME, None,                   Authority::Unbounded                   ; "search_declares_nothing_either")]
+    #[test_case(mcp_route_ctx,  PROBE_WIRE,            None,                   Authority::Unbounded                   ; "an_mcp_tool_is_code_maki_does_not_own")]
+    #[test_case(host_route_ctx, CLIENT_NAME,           None,                   Authority::Unbounded                   ; "a_host_tool_is_code_maki_does_not_own")]
     #[tokio::test]
     async fn a_route_lends_the_authority_it_declares(
         build: fn() -> ToolContext,
         name: &str,
-        permission: Option<Permission>,
+        reach: Option<ToolReach>,
         expected: Authority,
     ) {
-        let (ctx, hook) = hooked_with(build(), permission, RecordingHook::default());
+        let (ctx, hook) = hooked_with(build(), reach, RecordingHook::default());
         dispatch(&ctx, name, &call_input(HOOK_PLAIN)).await;
 
         let firing = hook.at(HookStage::Input).expect("the input stage fired");

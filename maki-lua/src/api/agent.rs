@@ -1,7 +1,7 @@
 //! `maki.agent` exposes subagent primitives to Lua plugins. Policy (retries,
 //! validation, concurrency) lives in the task plugin, not here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,8 +14,8 @@ use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
-    BackgroundFor, CallOrigin, Deadline, DescriptionContext, LocalTool, LocalTools, RequestTools,
-    ToolAudience, ToolContext, ToolFilter, ToolLive, ToolOutputMode,
+    Authority, BackgroundFor, CallOrigin, Deadline, DescriptionContext, LocalTool, LocalTools,
+    RequestTools, ToolAudience, ToolContext, ToolFilter, ToolLive, ToolOutputMode,
 };
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
@@ -67,8 +67,11 @@ const TASK_SCOPE: &str = "task";
 const SESSION_SCOPE: &str = "session";
 const NO_REGISTRY_ERR: &str = "tool registry not available";
 const TOOLS_ARRAY_ERR: &str = "tools must be an array";
-const MCP_REACH_ERR: &str =
-    "mcp = true reaches whatever its servers do, so a session of your own takes every permission";
+pub const UNPAID_REACH_ERR: &str = "this plugin does not hold what these tools reach";
+pub const UNDECLARED_REACH: &str = "declare no permission and need";
+const MCP_ENTRY: &str = "mcp = true";
+pub const MCP_HINT: &str = "pass mcp = false";
+const GRANT_HINT: &str = "or grant the permissions in plugin.toml";
 const TASK_REQUIRED_ERR: &str = "maki.agent.session({ session = id }) and its prompts must run \
      in a task: maki.async.spawn, an autocmd callback or a tool handler";
 
@@ -168,42 +171,83 @@ fn seed_ctx(
 
 /// A plugin denied `run` could hand `bash` to a model and let YOLO or an allow
 /// rule run it, and in a session of the plugin's own nobody answers a prompt
-/// at all. So a session pays for its reach the way a hook on the same tool
-/// does: a declared capability costs itself, undeclared reach costs
-/// everything. A name the registry does not know never dispatches, so it is
-/// free.
+/// at all. So a session pays for each tool the [`Authority`] a hook on it
+/// pays, minus the content price: a declared capability costs itself, a tool
+/// declaring `{}` is free, undeclared reach costs everything. A name the
+/// registry does not know never dispatches, so it is free. The error names
+/// every unpaid tool at once, so the author fixes them in one edit.
 fn delegated_reach(
     lua: &Lua,
     perms: &PluginPermissions,
     tools: &[JsonValue],
     mcp: bool,
 ) -> Result<(), String> {
-    let holds_all = perms.holds_all_reach();
-    if mcp && !holds_all {
-        return Err(MCP_REACH_ERR.to_owned());
-    }
     let registry = lua
         .app_data_ref::<Arc<ToolRegistry>>()
         .ok_or(NO_REGISTRY_ERR)?;
+    let unpaid = |authority: Authority| -> Vec<Permission> {
+        perms
+            .lacking()
+            .filter(|&perm| authority.requires(perm))
+            .collect()
+    };
+    let undeclared_unpaid = unpaid(Authority::Unbounded);
+    let mcp_unpaid = mcp && !undeclared_unpaid.is_empty();
+    let mut clauses = Vec::new();
+    let mut undeclared = Vec::new();
+    let mut excepted = Vec::new();
+    let mut seen = HashSet::new();
+    if mcp_unpaid {
+        undeclared.push(MCP_ENTRY);
+    }
     for name in tools.iter().filter_map(|def| def["name"].as_str()) {
+        if !seen.insert(name) {
+            continue;
+        }
         let Some(registered) = registry.get(name) else {
             continue;
         };
-        match registered.tool.reach().map(|reach| reach.permission) {
-            Some(required) if !perms.is_allowed(required) => {
-                return Err(format!(
-                    "tool '{name}' needs '{required}', which this plugin does not hold"
-                ));
-            }
-            None if !holds_all => {
-                return Err(format!(
-                    "tool '{name}' declares no capability, so a session of your own takes every permission"
-                ));
-            }
-            _ => {}
+        let authority = Authority::from(registered.tool.reach());
+        let missing = unpaid(authority);
+        if missing.is_empty() {
+            continue;
+        }
+        excepted.push(format!("\"{name}\""));
+        match authority {
+            Authority::Unbounded => undeclared.push(name),
+            _ => clauses.push(format!("{name} ({})", manifest_keys(&missing))),
         }
     }
-    Ok(())
+    if !undeclared.is_empty() {
+        clauses.push(format!(
+            "{} {UNDECLARED_REACH} {}",
+            undeclared.join(", "),
+            manifest_keys(&undeclared_unpaid)
+        ));
+    }
+    if clauses.is_empty() {
+        return Ok(());
+    }
+    let mut fixes = Vec::new();
+    if !excepted.is_empty() {
+        fixes.push(format!(
+            "leave them out of tools with except = {{ {} }} in maki.agent.tools",
+            excepted.join(", ")
+        ));
+    }
+    if mcp_unpaid {
+        fixes.push(MCP_HINT.to_owned());
+    }
+    Err(format!(
+        "{UNPAID_REACH_ERR}: {}. To fix, {}, {GRANT_HINT}",
+        clauses.join("; "),
+        fixes.join(", ")
+    ))
+}
+
+fn manifest_keys(perms: &[Permission]) -> String {
+    let keys: Vec<&str> = perms.iter().map(|perm| perm.manifest_key()).collect();
+    keys.join(", ")
 }
 
 /// Task scope remembers the opening task so its end can retire the entry.
@@ -622,6 +666,10 @@ async fn system_prompt(
 /// straight into `maki.agent.session()` or use it to inspect what tools are
 /// available.
 ///
+/// A session costs what its tools reach (see `maki.agent.session`). To hand
+/// over only what the plugin can pay for, check each tool's `permission`
+/// from `maki.api.get_tool`, as the second example does.
+///
 /// Without a `ctx`, pass `session = id` in `opts` to get the tools a
 /// background session of that chat would have.
 ///
@@ -646,6 +694,19 @@ async fn system_prompt(
 /// })
 /// if err then error(err) end
 /// print(#defs .. " tools available")
+///
+/// -- Keep only tools this plugin can hand to a session. `held` is the
+/// -- set of permission keys the plugin was granted.
+/// local held = { fs_read = true, net = true }
+/// local affordable = {}
+/// for _, def in ipairs(defs) do
+///   local perms = maki.api.get_tool(def.name).permission
+///   local ok = perms ~= nil
+///   for _, p in ipairs(perms or {}) do
+///     ok = ok and held[p] == true
+///   end
+///   if ok then table.insert(affordable, def) end
+/// end
 #[lua_fn]
 async fn tools(
     lua: Lua,
@@ -903,11 +964,18 @@ async fn dispatch_child(
 /// With or without a ctx, the plugin must hold what its tools reach. A prompt
 /// is no gate under YOLO or an allow rule, and a background session has
 /// nobody to prompt. A tool declaring a permission (`bash` with `run`, `read`
-/// with `fs_read`) costs that one. A tool declaring none (`batch`,
-/// `code_execution`), or `mcp = true` on a chat with MCP servers, costs every
-/// permission except `agent`. `local_tools` cost nothing, they run as the
+/// with `fs_read`) costs that one. A tool registered with `permission = {}`
+/// costs nothing. A tool declaring none, or `mcp = true` on a chat with MCP
+/// servers, costs every permission except `agent` and `input`. See each
+/// tool's `permission` in `maki.api.get_tool` and on the
+/// [Tools](/docs/tools/) page. `local_tools` cost nothing, they run as the
 /// plugin. The bundled `task` hands over the whole chat, so it holds every
-/// permission.
+/// permission. If the plugin cannot pay, the error lists every tool it cannot
+/// pay for and the `except` list that leaves them out.
+///
+/// The `general_sub` set in the example includes tools that declare no
+/// permission (`batch`, `code_execution`), so a plugin without every
+/// permission leaves those out.
 ///
 /// `scope` sets the lifetime. `"task"`, the default, ends the session with
 /// the task that opened it: an autocmd callback when it returns, a tool

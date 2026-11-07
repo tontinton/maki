@@ -48,27 +48,50 @@ impl HookStage {
 /// decides what the tool then does, so the host prices that before it lets
 /// untrusted code near it.
 ///
-/// There is no "free" variant on purpose. A tool declaring no capability has
-/// not told us it exercises none, only that nothing asks: `batch`, `task` and
-/// `code_execution` declare nothing and reach every other tool. So a tool
-/// landing tomorrow is never silently free to layer.
+/// Leaving the capability out never makes a tool free. Silence is not a
+/// promise to touch nothing: `batch`, `task` and `code_execution` declare
+/// nothing and reach every other tool. Only a tool that says out loud it
+/// reaches nothing is [`Authority::Inert`], so a tool landing tomorrow is
+/// never free to layer by accident.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Authority {
+    /// The tool declared it reaches nothing, so a layer pays only the content
+    /// price.
+    Inert,
     /// Exactly the capability the tool declares; a layer needs that one.
     Capability(Permission),
     /// Reach nobody declared: a tool naming no capability, an MCP server tool,
     /// an ACP client tool, search. A layer needs every capability a tool can
-    /// reach, because no narrower answer would be honest. `agent` is not one:
-    /// every call already runs inside a turn.
+    /// reach, because no narrower answer would be honest.
     Unbounded,
     /// Steering what the agent does next, up to turns nobody typed. A layer
     /// needs every permission, `agent` included.
     Total,
 }
 
+impl Authority {
+    /// Whether whoever steers or receives the call must hold {perm}. Hooks,
+    /// layers and handed-over sessions all ask here, so a new variant cannot
+    /// be cheap in one place and costly in another.
+    pub fn requires(self, perm: Permission) -> bool {
+        match self {
+            Self::Inert => false,
+            Self::Capability(required) => perm == required,
+            // `agent` is about starting turns, and every call already runs
+            // inside one. No built-in tool changes the chat input.
+            Self::Unbounded => !matches!(perm, Permission::Agent | Permission::Input),
+            Self::Total => true,
+        }
+    }
+}
+
 impl From<Option<ToolReach>> for Authority {
     fn from(reach: Option<ToolReach>) -> Self {
-        reach.map_or(Self::Unbounded, |reach| Self::Capability(reach.permission))
+        match reach {
+            None => Self::Unbounded,
+            Some(ToolReach::Inert) => Self::Inert,
+            Some(ToolReach::Capability { permission, .. }) => Self::Capability(permission),
+        }
     }
 }
 
@@ -209,5 +232,14 @@ mod tests {
         if !answers {
             assert!(started.elapsed() >= grace, "gave up inside the grace");
         }
+    }
+
+    /// Hooks, layers and handed-over sessions all read this table, so a slip
+    /// here makes undeclared tools cheap everywhere at once.
+    #[test_case(Permission::Env, true ; "costs_every_capability")]
+    #[test_case(Permission::Agent, false ; "leaves_agent_out")]
+    #[test_case(Permission::Input, false ; "leaves_input_out")]
+    fn undeclared_reach_requires(perm: Permission, expected: bool) {
+        assert_eq!(Authority::Unbounded.requires(perm), expected);
     }
 }

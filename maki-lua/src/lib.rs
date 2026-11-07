@@ -17,6 +17,7 @@ mod runtime;
 pub mod session_snapshot;
 
 pub use api::action::ActionInfo;
+pub use api::agent::{MCP_HINT, UNDECLARED_REACH, UNPAID_REACH_ERR};
 pub use api::keymap::{
     InputMode, InputSnapshot, KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot,
 };
@@ -24,6 +25,7 @@ pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
 pub use api::session::SessionSnapshotFn;
+pub use api::tool::{INERT_WITH_MUTABLE_PATH_ERR, INERT_WITH_SCOPES_ERR, PERMISSION_SHAPE_ERR};
 pub use api::ui::marks::{
     Decoration, InputRule, InputRulesReader, Mark, PatternRule, Reveal, VirtTextPos,
 };

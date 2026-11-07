@@ -62,7 +62,7 @@ use crate::api::slot::{
     PLAN_FORM_SLOT, SlotLayer, SlotStore, layer_plugins, run_host_chain, run_host_chain_with,
 };
 use crate::api::tool::{
-    LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
+    DeclaredReach, LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, resolve_rules,
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::ui::marks::{InputRuleStore, InputRulesReader};
@@ -4118,7 +4118,7 @@ impl LuaRuntime {
                     plugin: Arc::clone(&name),
                     has_header_fn: t.header_key.is_some(),
                     has_start_fn: t.start_key.is_some(),
-                    permission: t.permission.as_ref().map(ToolPermission::kind),
+                    permission: t.permission.as_ref().map(DeclaredReach::kind),
                     has_describe_fn: t.describe_key.is_some(),
                 });
                 (
@@ -4156,7 +4156,9 @@ impl LuaRuntime {
                         header: t.header_key,
                         restore: t.restore_key,
                         start: t.start_key,
-                        permission_scopes: t.permission.and_then(|p| p.scopes?.callback_key()),
+                        permission_scopes: t
+                            .permission
+                            .and_then(|p| p.into_scopes()?.callback_key()),
                         describe: t.describe_key,
                     },
                 )

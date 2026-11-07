@@ -506,7 +506,7 @@ only in compact mode.
   - `describe` (`function`) Optional. Returns a custom description string for the current context.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
-  - `permission` (`string`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
+  - `permission` (`string|table`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. Pass `{}` when the tool reaches nothing past the conversation it runs in: its handler calls no guarded `maki` function and no other tool. `{}` is the tool form of `capability = {}` on slots and actions, needs no grant, makes the tool free to hand to a session, and cannot go with `permission_scopes` or `mutable_path`. Older maki versions refuse `{}`, so set `min_maki_version`. Leaving `permission` out costs those plugins every permission except `agent` and `input`.
   - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
   - `needs_background` (`boolean`) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
@@ -765,12 +765,17 @@ available tools or for checking which tools are enabled.
 Each entry has the tool's name, schema, audiences, and an `enabled` flag.
 Describe callbacks are not invoked (the static description is used).
 
+`permission` is what the tool reaches, as a list like `get_slots`
+`capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
+it declared none, which costs every permission. A tool registered with
+`permission = "fs_read"` reads back as `{ "fs_read" }`.
+
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
   - `config` (`table`) Optional config table with a `disabled_tools` string[] field used to compute the `enabled` flag on each entry.
 
-**Returns:** (`table[]`) Array of tool entries: { name, schema, audiences, kind?, enabled }.
+**Returns:** (`table[]`) Array of tool entries: { name, schema, audiences, kind?, permission?, enabled }.
 
 **Example:**
 
@@ -804,11 +809,16 @@ so this is not an existence check for MCP tools.
 `background_params` lists the parameters marked `needs_background`,
 which only a session that can move calls to the background sees.
 
+`permission` is what the tool reaches, as a list like `get_slots`
+`capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
+it declared none, which costs every permission. MCP tools and
+`tool_search` declare none.
+
 **Parameters:**
 
 - `{name}` (`string`) Exact tool name.
 
-**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, background_params?, header?, restore?, format? }, or nil if not found.
+**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, permission?, background_params?, header?, restore?, format? }, or nil if not found.
 
 **Example:**
 
@@ -1554,6 +1564,10 @@ Get the list of tool definitions for a given audience. Pass the result
 straight into `maki.agent.session()` or use it to inspect what tools are
 available.
 
+A session costs what its tools reach (see `maki.agent.session`). To hand
+over only what the plugin can pay for, check each tool's `permission`
+from `maki.api.get_tool`, as the second example does.
+
 Without a `ctx`, pass `session = id` in `opts` to get the tools a
 background session of that chat would have.
 
@@ -1586,6 +1600,19 @@ local defs, err = maki.agent.tools(ctx, {
 })
 if err then error(err) end
 print(#defs .. " tools available")
+
+-- Keep only tools this plugin can hand to a session. `held` is the
+-- set of permission keys the plugin was granted.
+local held = { fs_read = true, net = true }
+local affordable = {}
+for _, def in ipairs(defs) do
+  local perms = maki.api.get_tool(def.name).permission
+  local ok = perms ~= nil
+  for _, p in ipairs(perms or {}) do
+    ok = ok and held[p] == true
+  end
+  if ok then table.insert(affordable, def) end
+end
 ```
 
 ---
@@ -1717,11 +1744,18 @@ goes above the chat's current setting.
 With or without a ctx, the plugin must hold what its tools reach. A prompt
 is no gate under YOLO or an allow rule, and a background session has
 nobody to prompt. A tool declaring a permission (`bash` with `run`, `read`
-with `fs_read`) costs that one. A tool declaring none (`batch`,
-`code_execution`), or `mcp = true` on a chat with MCP servers, costs every
-permission except `agent`. `local_tools` cost nothing, they run as the
+with `fs_read`) costs that one. A tool registered with `permission = {}`
+costs nothing. A tool declaring none, or `mcp = true` on a chat with MCP
+servers, costs every permission except `agent` and `input`. See each
+tool's `permission` in `maki.api.get_tool` and on the
+[Tools](/docs/tools/) page. `local_tools` cost nothing, they run as the
 plugin. The bundled `task` hands over the whole chat, so it holds every
-permission.
+permission. If the plugin cannot pay, the error lists every tool it cannot
+pay for and the `except` list that leaves them out.
+
+The `general_sub` set in the example includes tools that declare no
+permission (`batch`, `code_execution`), so a plugin without every
+permission leaves those out.
 
 `scope` sets the lifetime. `"task"`, the default, ends the session with
 the task that opened it: an autocmd callback when it returns, a tool

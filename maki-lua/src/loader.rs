@@ -3039,7 +3039,7 @@ mod bundled_manifests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use include_dir::{Dir, DirEntry, File};
-    use maki_agent::tools::ToolRegistry;
+    use maki_agent::tools::{ToolReach, ToolRegistry};
     use maki_config::{DEFAULT_BUILTINS, PluginsConfig};
     use strum::VariantArray;
     use test_case::test_case;
@@ -3051,6 +3051,10 @@ mod bundled_manifests {
     use crate::plugin_permissions::{Permission, SENDS_PROMPT};
 
     const TEST_DIR: &str = "tests";
+    const READS_FILES: Option<ToolReach> = Some(ToolReach::Capability {
+        permission: Permission::FsRead,
+        prompted: false,
+    });
     const LUA_EXT: &str = "lua";
     const REQUIRE_CALL: &str = "require(";
     const PROVIDER_REGISTER: &str = "maki.provider.register";
@@ -3084,25 +3088,54 @@ mod bundled_manifests {
             .collect()
     }
 
-    /// Read off a real load rather than off the source text, because
-    /// `register_tool` refuses a permission the plugin lacks, which makes
-    /// shipping the tool itself a use of it.
-    fn tool_permissions() -> BTreeMap<String, BTreeSet<Permission>> {
+    /// Every bundled tool as `(plugin, tool, reach)`, read off a real load
+    /// rather than off the source text, because `register_tool` refuses a
+    /// permission the plugin lacks, which makes shipping the tool itself a use
+    /// of it.
+    fn bundled_reaches() -> Vec<(String, String, Option<ToolReach>)> {
         let registry = Arc::new(ToolRegistry::new());
         let mut host = PluginHost::new(Arc::clone(&registry)).expect("host starts");
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .expect("every bundled plugin loads");
+        registry
+            .iter()
+            .iter()
+            .map(|tool| {
+                (
+                    tool.source.plugin.to_string(),
+                    tool.name().to_owned(),
+                    tool.tool.reach(),
+                )
+            })
+            .collect()
+    }
 
+    fn tool_permissions() -> BTreeMap<String, BTreeSet<Permission>> {
         let mut out: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
-        for tool in registry.iter().iter() {
-            let Some(reach) = tool.tool.reach() else {
-                continue;
-            };
-            out.entry(tool.source.plugin.to_string())
-                .or_default()
-                .insert(reach.permission);
+        for (plugin, _, reach) in bundled_reaches() {
+            if let Some(permission) = reach.and_then(ToolReach::permission) {
+                out.entry(plugin).or_default().insert(permission);
+            }
         }
         out
+    }
+
+    /// A declaration here sets the price of the tool for every hook and
+    /// session at once, so changing one should be a choice, never a slip.
+    #[test_case("todo_write",     Some(ToolReach::Inert) ; "todo_write_reaches_nothing")]
+    #[test_case("question",       Some(ToolReach::Inert) ; "question_reaches_nothing")]
+    #[test_case("view_image",     READS_FILES            ; "view_image_reads_files")]
+    #[test_case("skill",          READS_FILES            ; "skill_reads_files")]
+    #[test_case("batch",          None                   ; "batch_is_undeclared")]
+    #[test_case("code_execution", None                   ; "code_execution_is_undeclared")]
+    #[test_case("memory",         None                   ; "memory_is_undeclared")]
+    #[test_case("task",           None                   ; "task_is_undeclared")]
+    fn bundled_tools_declare_their_reach(tool: &str, expected: Option<ToolReach>) {
+        let (_, _, reach) = bundled_reaches()
+            .into_iter()
+            .find(|(_, name, _)| name == tool)
+            .expect("the bundled tool loads");
+        assert_eq!(reach, expected);
     }
 
     /// Specs, not runtime code. What a test calls must not buy the plugin a

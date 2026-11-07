@@ -37,15 +37,28 @@ bitflags! {
     }
 }
 
-/// What a tool declares it reaches. `permission` is the capability it exposes
-/// to the model, and the price of hooking it, pre-approving it or handing it
-/// to a session. `prompted` tells whether a call ever meets the permission
-/// prompt, because a rule pre-approving a tool that never prompts would never
-/// be consulted.
+/// What a tool declares it reaches: the price of hooking it, pre-approving it
+/// or handing it to a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolReach {
-    pub permission: Permission,
-    pub prompted: bool,
+pub enum ToolReach {
+    /// Declared to reach nothing past the conversation it runs in.
+    Inert,
+    /// `permission` is the capability it exposes to the model. `prompted`
+    /// tells whether a call ever meets the permission prompt, because a rule
+    /// pre-approving a tool that never prompts would never be consulted.
+    Capability {
+        permission: Permission,
+        prompted: bool,
+    },
+}
+
+impl ToolReach {
+    pub fn permission(self) -> Option<Permission> {
+        match self {
+            Self::Inert => None,
+            Self::Capability { permission, .. } => Some(permission),
+        }
+    }
 }
 
 impl Default for ToolAudience {
@@ -273,6 +286,7 @@ pub trait Tool: Send + Sync + 'static {
         None
     }
     /// `None` is undeclared reach, which every consumer prices as everything.
+    /// Only an explicit [`ToolReach::Inert`] is free.
     fn reach(&self) -> Option<ToolReach> {
         None
     }
