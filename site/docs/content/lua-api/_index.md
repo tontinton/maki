@@ -894,11 +894,17 @@ since the mode is the same in every session. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
 name the session now running or focused. What each event adds:
 
-- `"ToolStart"`, `"ToolDone"`: `data.tool_id` and `data.tool`.
-- `"ToolDone"` adds `data.is_error` and `data.bytes`, the size of the
+- `"ToolStart"`: `data.tool_id` and `data.tool`.
+- `"ToolDone"`: `data.is_error` and `data.bytes`, the size of the
   text the model reads. A call that ran also carries `data.duration_ms`
   and `data.input`, the input after every `tool.*.input` layer. A call
-  that never ran, like a cancelled one, has neither.
+  that never ran, like a cancelled one, has neither. `data.context_size`
+  and `data.context_window` are the run's usage at dispatch time, so a
+  plugin can nudge the model mid-turn, before `"AutoCompacting"` fires
+  (a window of 0 means no run to ask, so guard divisions). Fires for
+  subagent tool calls too, with the subagent's own usage and a
+  `data.task_id` for `maki.task.send`; the main session's calls carry
+  no `task_id`.
 - `"TurnStart"`: `data.text`, the message that started the turn.
 - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
   `"max_turns"`, `"cancelled"`, or `"dropped"` when an
@@ -980,7 +986,8 @@ host event still arrives, carrying only its metadata fields:
 out. Events a plugin fires under its own names arrive as fired.
 
 `"TurnEnd"` fires once per turn and only for the main session, so
-subagent turns never show up. A manual `/compact` ends its run without
+subagent turns never show up. Every subagent envelope is bounded the
+same way except `"ToolDone"`. A manual `/compact` ends its run without
 ending a turn, so it stays quiet too.
 
 Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
@@ -5649,8 +5656,10 @@ h:stop()
 The subagents of the focused session and their transcripts. Tasks are
 spawned by the `task` tool and addressed by an id that survives a reload.
 Without an interactive UI every function returns
-`nil, "no interactive UI attached"`, except the ones that take a tool
-handler's ctx: they reach the background tasks its agent moved.
+`nil, "no interactive UI attached"`, except the ones that name their
+task directly: `send` and `messages` from a tool handler's ctx, and
+`send` from a plugin holding `session_write` that names its session
+in place of a ctx.
 
 ---
 
@@ -5806,15 +5815,22 @@ returns what it printed so far), then the subagent reads the message and
 carries on with its history intact. With no turn running the message
 waits like any other.
 
-An agent reaches the subagents it moved, and those nested in a call it
+A tool handler reaches the subagents it moved, and those nested in a call it
 moved, until they end. Like `stop(ctx, id)`, it never reaches what
 another agent moved.
 
+Outside a tool call there is no ctx to say who asks, so pass
+`{ session = sid }`: the task is reached in that session whoever moved
+it, bounded only by the plugin's `session_write`, which this form needs.
+Like the ctx form this needs no interactive UI.
+
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) The tool handler's ctx.
-- `{id}` (`string`) Task id, from its receipt.
-- `{text}` (`string`) The message.
+- `{ctx}` (`LuaCtx|table`) The handler's ctx, or `{ session = sid }` (the
+  session the task runs in, as `list()` reports it) outside a tool call.
+- `{id}` (`string`) Task id, from its receipt, or `data.task_id` on a
+  subagent's `ToolDone`.
+- `{text}` (`string`) The message. Must not be blank.
 - `{opts?}` (`table?`) Optional fields:
   - `interrupt` (`boolean?`) cut its current turn short. Default: `false`.
 
@@ -5824,9 +5840,12 @@ another agent moved.
 **Example:**
 
 ```lua
+-- in a tool handler
 local sent, err = maki.task.send(ctx, input.id, input.message)
 if not sent then return { llm_output = err, is_error = true } end
 return "Message queued for " .. sent.name .. "."
+-- in an autocmd, where there is no ctx
+maki.task.send({ session = ev.data.session_id }, ev.data.task_id, "wrap up")
 ```
 
 ---

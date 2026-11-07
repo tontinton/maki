@@ -245,11 +245,17 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"SessionEnd"` that is the session being left behind, the other events
 /// name the session now running or focused. What each event adds:
 ///
-/// - `"ToolStart"`, `"ToolDone"`: `data.tool_id` and `data.tool`.
-/// - `"ToolDone"` adds `data.is_error` and `data.bytes`, the size of the
+/// - `"ToolStart"`: `data.tool_id` and `data.tool`.
+/// - `"ToolDone"`: `data.is_error` and `data.bytes`, the size of the
 ///   text the model reads. A call that ran also carries `data.duration_ms`
 ///   and `data.input`, the input after every `tool.*.input` layer. A call
-///   that never ran, like a cancelled one, has neither.
+///   that never ran, like a cancelled one, has neither. `data.context_size`
+///   and `data.context_window` are the run's usage at dispatch time, so a
+///   plugin can nudge the model mid-turn, before `"AutoCompacting"` fires
+///   (a window of 0 means no run to ask, so guard divisions). Fires for
+///   subagent tool calls too, with the subagent's own usage and a
+///   `data.task_id` for `maki.task.send`; the main session's calls carry
+///   no `task_id`.
 /// - `"TurnStart"`: `data.text`, the message that started the turn.
 /// - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
 ///   `"max_turns"`, `"cancelled"`, or `"dropped"` when an
@@ -331,7 +337,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// out. Events a plugin fires under its own names arrive as fired.
 ///
 /// `"TurnEnd"` fires once per turn and only for the main session, so
-/// subagent turns never show up. A manual `/compact` ends its run without
+/// subagent turns never show up. Every subagent envelope is bounded the
+/// same way except `"ToolDone"`. A manual `/compact` ends its run without
 /// ending a turn, so it stays quiet too.
 ///
 /// Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from

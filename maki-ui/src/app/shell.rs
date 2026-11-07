@@ -158,6 +158,8 @@ impl App {
                     is_error,
                     annotation: None,
                     written_path: None,
+                    context_size: 0,
+                    context_window: 0,
                     backgrounded: false,
                 });
                 if let Some(msg) = result_msg {

@@ -823,6 +823,8 @@ fn tool_done_transitions_plan_to_ready(
         is_error: false,
         annotation: None,
         written_path,
+        context_size: 0,
+        context_window: 0,
         backgrounded: false,
     }))));
 
@@ -2026,6 +2028,8 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
         is_error: false,
         annotation: None,
         written_path: None,
+        context_size: 0,
+        context_window: 0,
         backgrounded: false,
     }))));
 
@@ -2822,6 +2826,8 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
         is_error,
         annotation: None,
         written_path: None,
+        context_size: 0,
+        context_window: 0,
         backgrounded: false,
     }))));
 }
@@ -5896,6 +5902,8 @@ fn search_reaches_output_that_lands_in_an_existing_segment() {
         is_error: false,
         annotation: None,
         written_path: None,
+        context_size: 0,
+        context_window: 0,
         backgrounded: false,
     }))));
     rendered(&mut app);
@@ -6465,6 +6473,8 @@ fn plan_app() -> App {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        context_size: 0,
+        context_window: 0,
         backgrounded: false,
     }))));
     app
@@ -6488,6 +6498,8 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
         is_error: false,
         annotation: None,
         written_path: Some("/tmp/plans/test.md".into()),
+        context_size: 0,
+        context_window: 0,
         backgrounded: false,
     }))));
     assert_eq!(app.plan_form.is_visible(), expect_form);
@@ -6522,6 +6534,8 @@ fn re_edit_keeps_plan_form_visible() {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        context_size: 0,
+        context_window: 0,
         backgrounded: false,
     }))));
     assert!(matches!(app.state.plan, PlanState::Ready(_)));
@@ -6594,6 +6608,8 @@ fn rewrite_plan(app: &mut App) {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        context_size: 0,
+        context_window: 0,
         backgrounded: false,
     }))));
 }
@@ -11820,6 +11836,8 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
             is_error: false,
             annotation: None,
             written_path: None,
+            context_size: 0,
+            context_window: 0,
             backgrounded: false,
         }))));
         app.checkpoint();
@@ -11968,6 +11986,8 @@ fn slow_tool_done(id: &str, backgrounded: bool) -> AgentEvent {
         is_error: false,
         annotation: None,
         written_path: None,
+        context_size: 0,
+        context_window: 0,
         backgrounded,
     }))
 }

@@ -3786,7 +3786,13 @@ mod tests {
 
     /// The task table, called as a model call of the chat reading `mailbox`.
     fn install_task_table(lua: &Lua, mailbox: &SessionMailbox) {
-        let task = create_task_table(lua, None, &PluginPermissions::trusted()).unwrap();
+        let task = create_task_table(
+            lua,
+            None,
+            &PluginPermissions::trusted(),
+            PluginPermissions::trusted(),
+        )
+        .unwrap();
         lua.globals().set("task", task).unwrap();
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PEEK_CALL_ID));
         ctx.mailbox = Some(mailbox.clone());

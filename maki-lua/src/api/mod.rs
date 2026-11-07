@@ -129,7 +129,7 @@ pub(crate) fn create_maki_global(
     )?;
     maki.set(
         "task",
-        task::create_task_table(lua, ui_action_tx.clone(), permissions)?,
+        task::create_task_table(lua, ui_action_tx.clone(), permissions, permissions.clone())?,
     )?;
     maki.set(
         "ui",
