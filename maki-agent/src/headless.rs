@@ -310,14 +310,10 @@ enum Listing {
 
 /// Runs under a turn's cancel, so a host's cancel ends this wait and that turn
 /// instead of being dropped as meant for the turn before. A cancelled wait stays
-/// due, or the session would keep the static rows until its next switch.
-async fn await_listing(
-    model: &mut Model,
-    provider: &dyn Provider,
-    cancel: &CancelToken,
-) -> Listing {
+/// due, so the next turn lists it.
+async fn await_listing(model: &Model, provider: &dyn Provider, cancel: &CancelToken) -> Listing {
     let Ok(answer) = cancel
-        .race(provider::rediscover_model(model, provider))
+        .race(provider::discover_provider(model, provider))
         .await
     else {
         return Listing::Due;
@@ -616,13 +612,17 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                 }
             }
             if matches!(listing, Listing::Due) {
-                listing = await_listing(&mut model, provider.as_ref(), &cancel).await;
-                if let Some(seed) = &seed {
-                    seed.model_slot.store(Arc::new(ModelSlot {
-                        model: model.clone(),
-                        provider: Arc::clone(&provider),
-                    }));
-                }
+                listing = await_listing(&model, provider.as_ref(), &cancel).await;
+            }
+            // The host or another session can discover the provider long after
+            // our own listing gave up, so every turn reads the registry again.
+            provider::refresh_model(&mut model, provider.as_ref());
+            // Plugin work started off the seed must run on this turn's model.
+            if let Some(seed) = &seed {
+                seed.model_slot.store(Arc::new(ModelSlot {
+                    model: model.clone(),
+                    provider: Arc::clone(&provider),
+                }));
             }
             let input = next.into_input();
 
@@ -769,6 +769,7 @@ mod tests {
     use maki_config::project::{self, TrustMode};
     use maki_config::providers::Protocol;
     use maki_providers::model::ModelTier;
+    use maki_providers::model_registry;
     use maki_providers::plugin::{
         self, DeclAuthority, Hook, ProviderDecl, ProviderHooks, Registration,
     };
@@ -828,11 +829,15 @@ mod tests {
     const LISTING_WAITS: &str = "a hung listing holds the turn until it is cancelled";
     const ANSWERING_SLUG: &str = "answering";
     const HANGING_SLUG: &str = "hanging";
+    const FAILING_SLUG: &str = "failing";
     const PLUGIN_ORIGIN: &str = "https://example.com";
     const PLUGIN_HOST: &str = "example.com";
     const LISTED_ONCE: &str = "an answered listing must not be asked again for the same model";
     const LISTING_DUE: &str = "a switch and a cancelled wait must each list before the turn";
     const TURN_ENDS: &str = "a turn must end by itself or on a cancel";
+    const SEED_PUBLISHED: &str = "a detached session publishes its seed";
+    const DISCOVERY_HEALS: &str =
+        "discovery that lands after a failed listing reaches the next turn";
 
     type Listed = BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>;
 
@@ -874,30 +879,21 @@ mod tests {
         Box::pin(pending())
     }
 
-    fn listed_provider_model(id: &str) -> Model {
-        Model::from_spec(&format!("{LISTED_PROVIDER}/{id}")).unwrap()
-    }
-
-    /// The window because it is fixed at resolve time, unlike thinking support,
-    /// which is read from the listing on every call.
-    #[test_case(lists_window, LISTED_MODEL, true ; "a_listing_decides")]
-    #[test_case(fails, UNLISTED_MODEL, false ; "a_failed_listing_is_an_answer_too")]
+    #[test_case(lists_window ; "a_listing_answers")]
+    #[test_case(fails ; "a_failed_listing_is_an_answer_too")]
     #[tokio::test]
-    async fn an_answered_listing_is_no_longer_due(listing: fn() -> Listed, id: &str, listed: bool) {
-        let mut model = listed_provider_model(id);
-        let answer =
-            await_listing(&mut model, &ListingProvider(listing), &CancelToken::none()).await;
+    async fn an_answered_listing_is_no_longer_due(listing: fn() -> Listed) {
+        let model = Model::from_spec(&format!("{LISTED_PROVIDER}/{LISTED_MODEL}")).unwrap();
+        let answer = await_listing(&model, &ListingProvider(listing), &CancelToken::none()).await;
         assert!(matches!(answer, Listing::Answered));
-        assert_eq!(model.context_window == LISTED_WINDOW, listed);
     }
 
     #[tokio::test]
     async fn a_cancel_leaves_a_hung_listing_due() {
         let (trigger, cancel) = CancelToken::new();
-        let mut model =
-            Model::from_spec(&format!("{NEVER_LISTED_PROVIDER}/{UNLISTED_MODEL}")).unwrap();
+        let model = Model::from_spec(&format!("{NEVER_LISTED_PROVIDER}/{UNLISTED_MODEL}")).unwrap();
         let provider = ListingProvider(hangs);
-        let mut waiting = pin!(await_listing(&mut model, &provider, &cancel));
+        let mut waiting = pin!(await_listing(&model, &provider, &cancel));
         assert!(waiting.as_mut().now_or_never().is_none(), "{LISTING_WAITS}");
         trigger.cancel();
         assert!(matches!(waiting.await, Listing::Due));
@@ -963,18 +959,15 @@ mod tests {
     }
 
     /// A `max_turns` of zero ends every run before it would reach the provider.
-    #[tokio::test]
-    async fn a_session_lists_per_model_and_a_cancel_ends_the_wait() {
-        plugin::begin_load();
-        let answered = register_listed(ANSWERING_SLUG, lists_window);
-        let hung = register_listed(HANGING_SLUG, hangs);
-        plugin::commit_load();
-
-        let tmp = TempDir::new().unwrap();
+    fn spawn_listing_session(
+        tmp: &TempDir,
+        model: Model,
+        background: BackgroundMode,
+    ) -> (InteractiveHandle, SessionEvents) {
         let id = MakiId::generate();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let (handle, mut events) = spawn_interactive(InteractiveParams {
-            model: plugin_model(ANSWERING_SLUG),
+        spawn_interactive(InteractiveParams {
+            model,
             config: AgentConfig {
                 max_turns: Some(0),
                 ..AgentConfig::default()
@@ -998,9 +991,21 @@ mod tests {
             project_config: project::resolve_noninteractive(tmp.path(), TrustMode::Session)
                 .project_config,
             local_tools: LocalTools::default(),
-            background: BackgroundMode::Blocking,
+            background,
             stop: CancelToken::none(),
-        });
+        })
+    }
+
+    #[tokio::test]
+    async fn a_session_lists_per_model_and_a_cancel_ends_the_wait() {
+        plugin::begin_load();
+        let answered = register_listed(ANSWERING_SLUG, lists_window);
+        let hung = register_listed(HANGING_SLUG, hangs);
+        plugin::commit_load();
+
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut events) =
+            spawn_listing_session(&tmp, plugin_model(ANSWERING_SLUG), BackgroundMode::Blocking);
 
         for _ in 0..2 {
             handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
@@ -1018,6 +1023,44 @@ mod tests {
             handle.cancel_tx.try_send(()).unwrap();
             next_done(&mut events).await;
         }
+    }
+
+    /// #1264: ACP's own discovery often lands seconds after the session's
+    /// listing gave up. The next turn must pick it up instead of keeping the
+    /// fallback window for good.
+    #[tokio::test]
+    async fn a_failed_listing_heals_when_discovery_lands() {
+        plugin::begin_load();
+        let listed = register_listed(FAILING_SLUG, fails);
+        plugin::commit_load();
+
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut events) =
+            spawn_listing_session(&tmp, plugin_model(FAILING_SLUG), BackgroundMode::Detached);
+        let slot_window = || {
+            AgentSeed::live(handle.session_id.id())
+                .expect(SEED_PUBLISHED)
+                .model_slot
+                .load()
+                .model
+                .context_window
+        };
+
+        handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        next_done(&mut events).await;
+        assert_ne!(slot_window(), LISTED_WINDOW);
+
+        model_registry::set_known_models(
+            FAILING_SLUG,
+            vec![ModelInfo {
+                context_window: Some(LISTED_WINDOW),
+                ..ModelInfo::id_only(LISTED_MODEL.into())
+            }],
+        );
+        handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        next_done(&mut events).await;
+        assert_eq!(slot_window(), LISTED_WINDOW, "{DISCOVERY_HEALS}");
+        assert_eq!(listed.len(), 1, "{LISTED_ONCE}");
     }
 
     /// A host-written prompt never had maki's facts in it. If the frame

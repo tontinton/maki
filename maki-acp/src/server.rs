@@ -202,6 +202,8 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
 
 /// Discovery lands in batches after the client built its selector from the
 /// offline list, so every batch that adds something announces the fuller list.
+/// Running sessions need no push, each one reads its model from the registry
+/// again before its next turn.
 fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     let known = srv.model_specs.len();
     for spec in batch {
