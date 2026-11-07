@@ -2282,6 +2282,7 @@ where
     pub fn delete(claim: &SessionClaim, dir: &StateDir) -> Result<(), SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
         Self::delete_from(claim, &sessions_dir)?;
+        // Bash logs moved under data/<id>. Sweep the old location too.
         let task_logs = session_task_logs_dir(dir.path(), claim.id());
         if let Err(e) = fs::remove_dir_all(&task_logs)
             && e.kind() != ErrorKind::NotFound
@@ -3224,7 +3225,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_task_logs_of_that_session_only() {
+    fn delete_removes_legacy_task_logs_of_that_session_only() {
         let tmp = TempDir::new().unwrap();
         let state = StateDir::from_path(tmp.path().to_path_buf());
         let sessions_dir = state.ensure_subdir(SESSIONS_DIR).unwrap();
