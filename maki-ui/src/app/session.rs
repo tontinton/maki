@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, TaskParent, tab_ending};
+use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, tab_ending};
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::command::PROMPT_NEEDS;
 use crate::components::input::{COMMAND_PREFIX, sent_text};
@@ -660,17 +660,9 @@ impl App {
     }
 
     /// Each running task, keyed by the call whose receipt a rewind would drop.
-    /// A batch child goes by its batch, since only the batch has a receipt.
     fn background_task_names(&self) -> Vec<(Arc<str>, String)> {
         self.running_background_tasks()
-            .filter_map(|chat| {
-                let call = chat
-                    .parent
-                    .as_ref()
-                    .map(TaskParent::call)
-                    .or(chat.task_id())?;
-                Some((Arc::clone(call), chat.name.clone()))
-            })
+            .filter_map(|chat| Some((Arc::clone(chat.receipt()?), chat.name.clone())))
             .collect()
     }
 

@@ -4994,7 +4994,7 @@ const STORED_RECEIPT_ID: &str = "toolu_stored";
 const RECEIPTS_KEPT: &str = "a checkpoint must never erase receipts it cannot read";
 
 /// What the agent hands the app, see `AgentHandles::apply_to_app`.
-fn hold_mailbox(app: &mut App) -> SessionMailbox {
+pub(crate) fn hold_mailbox(app: &mut App) -> SessionMailbox {
     let mailbox = SessionMailbox::register(app.state.session.id);
     app.mailbox = Some(mailbox.clone());
     mailbox

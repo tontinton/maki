@@ -540,6 +540,15 @@ impl Chat {
         }
     }
 
+    /// The call whose receipt the model holds for this task. A batch child
+    /// goes by its batch, since only the batch has a receipt.
+    pub(crate) fn receipt(&self) -> Option<&Arc<str>> {
+        self.parent
+            .as_ref()
+            .map(TaskParent::call)
+            .or(self.task_id())
+    }
+
     /// Ends the transcript with the bubble [`TaskOutcome::role`] picks. A chat
     /// only ever grows one ending, but a caller who knows more than the one who
     /// got here first rewrites it in place. See [`TaskOutcome::refines`].
