@@ -174,7 +174,6 @@ impl App {
             &self.lua_event_handle,
             &self.state.session.id,
             &envelope,
-            envelope.subagent.is_some(),
         );
 
         let subagent_id = envelope
