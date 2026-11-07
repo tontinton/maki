@@ -1,4 +1,5 @@
 pub mod callback;
+mod issuer_fallback;
 pub mod manual;
 mod store;
 
@@ -18,7 +19,7 @@ use self::callback::{CallbackResult, CallbackServer};
 use self::store::AuthStore;
 use super::config::{CallbackScheme, OauthClientConfig};
 use super::error::McpError;
-use super::transport::{CLIENT_NAME, http_client};
+use super::transport::{CLIENT_NAME, oauth_http_client};
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(600);
 /// Per OAuth request while logging in.
@@ -55,7 +56,7 @@ pub async fn authenticate(
     ca_file: Option<&Path>,
 ) -> Result<(), McpError> {
     async {
-        let client = http_client(ca_file, Some(LOGIN_TIMEOUT)).map_err(OAuthError::Other)?;
+        let client = oauth_http_client(ca_file, LOGIN_TIMEOUT).map_err(OAuthError::Other)?;
 
         // We only get here after the server turned the token down, or when the
         // user asks to log in, so a token that hasn't expired yet proves
@@ -150,13 +151,25 @@ async fn discover(
     client: Client,
 ) -> Result<(AuthorizationManager, AuthorizationMetadata), AuthError> {
     let mut manager = AuthorizationManager::new(server_url).await?;
-    manager.with_client(client)?;
+    manager.with_client(client.clone())?;
     // maki never checked the metadata's `issuer`, and some auth servers leave it out.
     manager.set_allow_missing_issuer(true);
-    let metadata = manager
+    let metadata = match manager
         .resolve_metadata_from_challenge(www_authenticate)
-        .await?
-        .metadata;
+        .await
+    {
+        Ok(resolution) => resolution.metadata,
+        // rmcp 3.8 says `MetadataError` when no auth server published anything
+        // usable. Its other errors, like an issuer mismatch, are final.
+        // TODO(rmcp): drop this arm and `issuer_fallback.rs` once rmcp asks for
+        // the appended URL itself.
+        Err(e @ AuthError::MetadataError(_)) => {
+            issuer_fallback::find(&client, server_url, www_authenticate)
+                .await
+                .ok_or(e)?
+        }
+        Err(e) => return Err(e),
+    };
     require_https(&metadata)?;
     Ok((manager, metadata))
 }
@@ -172,21 +185,29 @@ fn require_https(metadata: &AuthorizationMetadata) -> Result<(), AuthError> {
     .into_iter()
     .flatten()
     .try_for_each(|endpoint| {
-        let url = Url::parse(endpoint)?;
-        let loopback = match url.host() {
-            Some(Host::Domain(domain)) => domain == LOCALHOST,
-            Some(Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(Host::Ipv6(ip)) => ip.is_loopback(),
-            None => false,
-        };
-        match url.scheme() {
-            HTTPS => Ok(()),
-            HTTP if loopback => Ok(()),
-            _ => Err(AuthError::MetadataError(format!(
+        if is_secure(&Url::parse(endpoint)?) {
+            Ok(())
+        } else {
+            Err(AuthError::MetadataError(format!(
                 "OAuth endpoint must use HTTPS: {endpoint}"
-            ))),
+            )))
         }
     })
+}
+
+/// HTTPS, or plain HTTP that never leaves this machine.
+fn is_secure(url: &Url) -> bool {
+    let loopback = match url.host() {
+        Some(Host::Domain(domain)) => domain == LOCALHOST,
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    match url.scheme() {
+        HTTPS => true,
+        HTTP => loopback,
+        _ => false,
+    }
 }
 
 fn check_pin(record: &McpAuthData, metadata: &AuthorizationMetadata) -> Result<(), AuthError> {

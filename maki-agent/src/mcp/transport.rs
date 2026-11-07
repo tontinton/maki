@@ -14,7 +14,8 @@ use maki_providers::http::error_chain;
 use maki_providers::strip_provider_keys;
 use maki_storage::StateDir;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderName, HeaderValue};
-use reqwest::{Certificate, Client, Error as ReqwestError, StatusCode};
+use reqwest::redirect::{Action, Attempt, Policy};
+use reqwest::{Certificate, Client, ClientBuilder, Error as ReqwestError, StatusCode};
 use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, ClientConfig, ClientRequest, ConstString,
     ContentBlock, ErrorCode, ErrorData, GetPromptRequestParams, Implementation, InitializeResult,
@@ -354,14 +355,14 @@ async fn connect_http(
     ca_file: Option<&Path>,
     storage: Option<&StateDir>,
 ) -> Result<RunningService<RoleClient, ClientConfig>, McpError> {
-    let client = http_client(ca_file, None).map_err(|reason| start_failed(name, reason))?;
+    let client = http_client(ca_file).map_err(|reason| start_failed(name, reason))?;
     let custom_headers = header_map(name, headers).map_err(|reason| start_failed(name, reason))?;
     let configured_auth = custom_headers.contains_key(&AUTHORIZATION);
     let config = StreamableHttpClientTransportConfig::with_uri(url).custom_headers(custom_headers);
 
     let stored = match storage {
         Some(storage) if !configured_auth => {
-            let oauth_client = http_client(ca_file, Some(oauth::REFRESH_TIMEOUT))
+            let oauth_client = oauth_http_client(ca_file, oauth::REFRESH_TIMEOUT)
                 .map_err(|reason| start_failed(name, reason))?;
             // Without the manager the stored token can't go out, so a new
             // login has to replace it.
@@ -393,31 +394,52 @@ async fn connect_http(
     .await
 }
 
-/// The transport and OAuth both build their client here, so they reach a server the same way.
-/// Only OAuth sets a `timeout`: it would also cut off the transport's event streams, whose
-/// requests are bounded by the server's timeout instead.
+/// No timeout: it would also cut off the event streams, whose requests are bounded by the
+/// server's timeout instead.
+fn http_client(ca_file: Option<&Path>) -> Result<Client, String> {
+    client_builder(ca_file)?.build().map_err(|e| e.to_string())
+}
+
+/// rmcp's own client follows a discovery redirect only within one origin, and never one
+/// for tokens. A client handed to rmcp keeps its own redirect policy, so reqwest's default
+/// would let any server bounce discovery, or a refresh token, to another host.
+pub(super) fn oauth_http_client(
+    ca_file: Option<&Path>,
+    timeout: Duration,
+) -> Result<Client, String> {
+    client_builder(ca_file)?
+        .timeout(timeout)
+        .redirect(Policy::custom(same_origin_redirect))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// A redirect to another origin comes back as the response, which rmcp then refuses.
+fn same_origin_redirect(attempt: Attempt) -> Action {
+    let same_origin = attempt
+        .previous()
+        .last()
+        .is_some_and(|from| from.origin() == attempt.url().origin());
+    if same_origin {
+        Policy::default().redirect(attempt)
+    } else {
+        attempt.stop()
+    }
+}
+
+/// The transport and OAuth both start here, so they reach a server the same way.
 ///
 /// We read `ca_file` here and not while parsing the config, so a disabled server with a
 /// missing bundle still shows as disabled.
-pub(super) fn http_client(
-    ca_file: Option<&Path>,
-    timeout: Option<Duration>,
-) -> Result<Client, String> {
+fn client_builder(ca_file: Option<&Path>) -> Result<ClientBuilder, String> {
     let builder = Client::builder().user_agent(CLIENT_NAME);
-    let builder = match timeout {
-        Some(timeout) => builder.timeout(timeout),
-        None => builder,
+    let Some(path) = ca_file else {
+        return Ok(builder);
     };
-    let builder = match ca_file {
-        Some(path) => {
-            let unreadable = |e: &dyn Error| format!("ca_file '{}': {e}", path.display());
-            let pem = fs::read(path).map_err(|e| unreadable(&e))?;
-            let certs = Certificate::from_pem_bundle(&pem).map_err(|e| unreadable(&e))?;
-            builder.tls_certs_only(certs)
-        }
-        None => builder,
-    };
-    builder.build().map_err(|e| e.to_string())
+    let unreadable = |e: &dyn Error| format!("ca_file '{}': {e}", path.display());
+    let pem = fs::read(path).map_err(|e| unreadable(&e))?;
+    let certs = Certificate::from_pem_bundle(&pem).map_err(|e| unreadable(&e))?;
+    Ok(builder.tls_certs_only(certs))
 }
 
 fn header_map(
@@ -629,6 +651,13 @@ mod tests {
     const TOKEN_PATH: &str = "/token";
     const MOVED_TOKEN_ENDPOINT: &str = "https://moved.example.com/token";
     const LOGIN_RESOURCE: &str = "https://resource.example.com/mcp";
+    const MCP_PATH: &str = "/mcp";
+    const API_ISSUER_PATH: &str = "/api";
+    const OTHER_ISSUER_PATH: &str = "/other";
+    const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource";
+    const AUTH_SERVER_METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
+    const SPA_HTML: &str = "<!doctype html><div id=\"app\"></div>";
+    const REDIRECT_PATH: &str = "/redirect";
 
     struct Request {
         method: String,
@@ -711,9 +740,18 @@ mod tests {
     }
 
     fn spawn_server(handler: impl Fn(&Request) -> Reply + Send + Sync + 'static) -> String {
+        spawn_server_with_base(move |_, req| handler(req))
+    }
+
+    fn spawn_server_with_base(
+        handler: impl Fn(&str, &Request) -> Reply + Send + Sync + 'static,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let handler = Arc::new(handler);
+        let handler = Arc::new({
+            let base = base.clone();
+            move |req: &Request| handler(&base, req)
+        });
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
@@ -775,7 +813,7 @@ mod tests {
             timeout: TIMEOUT,
             always_load: false,
             transport: Transport::Http {
-                url: format!("{base}/mcp"),
+                url: format!("{base}{MCP_PATH}"),
                 headers: headers
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -791,7 +829,7 @@ mod tests {
         metadata.authorization_endpoint = format!("{base}/authorize");
         metadata.token_endpoint = format!("{base}{TOKEN_PATH}");
         McpAuthData {
-            server_url: format!("{base}/mcp"),
+            server_url: format!("{base}{MCP_PATH}"),
             tokens: Some(OAuthTokens {
                 access: OLD_TOKEN.into(),
                 refresh: "refresh-1".into(),
@@ -1014,7 +1052,7 @@ mod tests {
         let bearer = format!("Bearer {sent}");
         let last_seen = seen.lock().unwrap().last().cloned().flatten();
         assert_eq!(last_seen.as_deref(), Some(bearer.as_str()));
-        let url = format!("{base}/mcp");
+        let url = format!("{base}{MCP_PATH}");
         let saved = load_mcp_auth(&storage, SERVER, &url).unwrap();
         assert_eq!(saved.tokens.unwrap().access, sent);
     }
@@ -1045,8 +1083,84 @@ mod tests {
             matches!(result, Err(McpError::OAuthRequired { .. })),
             !usable
         );
-        let saved = load_mcp_auth(&storage, SERVER, &format!("{base}/mcp")).unwrap();
+        let saved = load_mcp_auth(&storage, SERVER, &format!("{base}{MCP_PATH}")).unwrap();
         assert_eq!(saved.auth_server.is_some(), usable);
+    }
+
+    /// The #1341 layout: the metadata lives only under the issuer path, and every
+    /// other path answers with the HTML of a single page app. A document there with
+    /// the wrong `issuer` must not be trusted.
+    #[test_case(API_ISSUER_PATH,   true  ; "named_issuer")]
+    #[test_case(OTHER_ISSUER_PATH, false ; "other_issuer")]
+    #[tokio::test]
+    async fn path_issuer_metadata_is_discovered(metadata_issuer_path: &'static str, usable: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(dir.path().to_path_buf());
+        let base = spawn_server_with_base(move |base, req| {
+            let issuer = format!("{base}{API_ISSUER_PATH}");
+            match req.path.strip_prefix(API_ISSUER_PATH) {
+                Some(MCP_PATH) if req.auth.is_none() => Reply {
+                    headers: vec![(
+                        "WWW-Authenticate",
+                        format!(r#"Bearer resource_metadata="{issuer}{PROTECTED_RESOURCE_PATH}""#),
+                    )],
+                    ..Reply::empty(401)
+                },
+                Some(MCP_PATH) => mcp_reply(req),
+                Some(PROTECTED_RESOURCE_PATH) => Reply::json(json!({
+                    "resource": format!("{issuer}{MCP_PATH}"),
+                    "authorization_servers": [issuer],
+                })),
+                Some(AUTH_SERVER_METADATA_PATH) => Reply::json(json!({
+                    "issuer": format!("{base}{metadata_issuer_path}"),
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}{TOKEN_PATH}"),
+                })),
+                _ => Reply {
+                    headers: vec![("Content-Type", "text/html".into())],
+                    body: SPA_HTML.into(),
+                    ..Reply::empty(200)
+                },
+            }
+        });
+        let issuer = format!("{base}{API_ISSUER_PATH}");
+        // A login saved before `auth_server` existed makes `connect` run discovery.
+        let record = McpAuthData {
+            auth_server: None,
+            ..stored_record(&issuer, HOUR_MS)
+        };
+        save_mcp_auth(&storage, SERVER, &record).unwrap();
+
+        let result = connect(&http_config(&issuer, &[]), Some(&storage)).await;
+
+        assert_eq!(result.is_ok(), usable);
+        let saved = load_mcp_auth(&storage, SERVER, &format!("{issuer}{MCP_PATH}")).unwrap();
+        assert_eq!(saved.auth_server.is_some(), usable);
+    }
+
+    #[test_case(true,  StatusCode::OK    ; "same_origin_followed")]
+    #[test_case(false, StatusCode::FOUND ; "other_origin_returned")]
+    #[tokio::test]
+    async fn oauth_client_redirects_only_within_one_origin(
+        same_origin: bool,
+        expected: StatusCode,
+    ) {
+        let other = spawn_server(|_| Reply::empty(200));
+        let base = spawn_server_with_base(move |base, req| match req.path.as_str() {
+            REDIRECT_PATH => {
+                let target = if same_origin { base } else { other.as_str() };
+                Reply {
+                    headers: vec![("Location", format!("{target}{TOKEN_PATH}"))],
+                    ..Reply::empty(StatusCode::FOUND.as_u16())
+                }
+            }
+            _ => Reply::empty(200),
+        });
+        let client = oauth_http_client(None, TIMEOUT).unwrap();
+
+        let response = client.get(format!("{base}{REDIRECT_PATH}")).send().await;
+
+        assert_eq!(response.unwrap().status(), expected);
     }
 
     #[test_case(None                 ; "server_url_for_older_logins")]
@@ -1080,7 +1194,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = pinned.map_or_else(|| format!("{base}/mcp"), Into::into);
+        let expected = pinned.map_or_else(|| format!("{base}{MCP_PATH}"), Into::into);
         assert_eq!(*resources.lock().unwrap(), [expected]);
     }
 
@@ -1101,7 +1215,7 @@ mod tests {
                 token_reply()
             }
         });
-        let url = format!("{base}/mcp");
+        let url = format!("{base}{MCP_PATH}");
         save_mcp_auth(&storage, SERVER, &stored_record(&base, HOUR_MS)).unwrap();
 
         oauth::authenticate(
