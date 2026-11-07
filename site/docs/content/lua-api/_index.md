@@ -5583,6 +5583,40 @@ Requires the `session_settings` [plugin permission](#plugin-permissions).
 local _, err = maki.session.set_title({ id = id, title = "refactor" })
 ```
 
+---
+
+### `maki.session.data_dir()` {#maki-session-data_dir}
+
+```lua
+maki.session.data_dir({opts?})
+```
+
+This plugin's directory for this session's data, as
+`state/sessions/data/<session>/<plugin>/`. Core owns it: the delete that
+takes the session takes everything written under it. Not created; make it
+with `maki.fs.mkdir` before the first write. A plugin's grants cover it
+like any other path.
+
+The session defaults to the one the calling agent serves, so a tool of
+a background tab gets that tab's dir rather than the one on screen, and
+to the focused session otherwise.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) `session` names another session.
+
+**Returns:** (`string|nil`, `string|nil`) The directory path, or nil and an error.
+
+**Example:**
+
+```lua
+local dir, err = maki.session.data_dir()
+if dir then
+  maki.fs.mkdir(dir, { parents = true })
+  maki.fs.write(maki.fs.joinpath(dir, "scratch.md"), text)
+end
+```
+
 
 ## maki.Timer {#maki-Timer}
 
