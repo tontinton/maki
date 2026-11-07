@@ -161,7 +161,7 @@ The receipt sentence then starts with `Hit its 120 s timeout and was moved to th
 A bash command that moves writes its output to a log in the [state directory](/docs/configuration/#directory-layout):
 
 ```
-<state>/tasks/<session>/<id>.log
+<state>/sessions/data/<session>/bash/<id>.log
 ```
 
 The receipt names the log, and the model reads logs of its own session without a prompt. Only a bounded tail stays in memory. When the tail dropped lines, the final result starts with `[N earlier lines are in the full output log]`.

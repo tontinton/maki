@@ -22,10 +22,8 @@ local RTK_UNSUPPORTED_FLAGS = {
 -- minified code intact. A line that never ends still stays out of the
 -- shared heap.
 local LOG_LINE_BYTES = 1024 * 1024
-local TASK_LOGS_DIR = "tasks"
 local LOG_EXT = ".log"
 local NO_SESSION_ERR = "no chat session to keep the output log under"
-local NO_STATE_DIR_ERR = "no state directory to keep the output log in"
 local FINISHED_ERR = "the command already finished"
 local RECEIPT_TAIL_LINES = 20
 local FALLBACK_TAIL_LINES = 2000
@@ -166,11 +164,11 @@ local function log_path(ctx, session)
     fallback_log_seq = fallback_log_seq + 1
     call_id = ("bash-%d-%d"):format(os.time(), fallback_log_seq)
   end
-  local state = maki.env.state_dir()
-  if not state then
-    return nil, NO_STATE_DIR_ERR
+  local dir, dir_err = maki.session.data_dir({ session = session })
+  if not dir then
+    return nil, dir_err
   end
-  return maki.fs.joinpath(state, TASK_LOGS_DIR, session, call_id:gsub("[^%w_%-]", "_") .. LOG_EXT)
+  return maki.fs.joinpath(dir, call_id:gsub("[^%w_%-]", "_") .. LOG_EXT)
 end
 
 -- Says where the lines the tail pushed out can still be found.

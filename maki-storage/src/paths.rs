@@ -265,14 +265,16 @@ pub fn state_dir() -> Result<PathBuf, std::io::Error> {
     ensure(&p.state)
 }
 
-/// Where background commands log their output, one subdirectory per session.
-/// Not created: callers only compare paths against it.
-pub fn task_logs_dir() -> Result<PathBuf, std::io::Error> {
+/// The root of the per-session plugin data dirs. Not created: callers only
+/// compare paths against it.
+pub fn sessions_data_dir() -> Result<PathBuf, std::io::Error> {
     let p = resolve().ok_or_else(err)?;
-    Ok(p.state.join(TASK_LOGS_DIR))
+    Ok(p.state
+        .join(crate::sessions::SESSIONS_DIR)
+        .join(crate::sessions::DATA_DIR))
 }
 
-/// The directory under `state` holding one session's task logs.
+/// The pre-move location of the bash logs, swept on session delete.
 pub fn session_task_logs_dir(state: &Path, session: MakiId) -> PathBuf {
     state.join(TASK_LOGS_DIR).join(session.to_string())
 }

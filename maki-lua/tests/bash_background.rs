@@ -24,13 +24,14 @@ use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::test_support::runtime;
 use maki_lua::{EventHandle, MoveOutcome, PluginHost};
 use maki_storage::id::MakiId;
-use maki_storage::paths::{session_task_logs_dir, state_dir};
+use maki_storage::paths::{session_data_dir, state_dir};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
 
 const RECEIPT_HEAD: &str = "Running in the background.";
 const LOG_LABEL: &str = "Full output: ";
+const BASH_DIR: &str = "bash";
 /// The runtime's move note follows the plugin's receipt after a blank line.
 const MOVE_NOTE_SEPARATOR: &str = "\n\n";
 const ROTATED_SUFFIX: &str = ".1";
@@ -191,7 +192,8 @@ impl Run {
     }
 
     fn log_path(&self) -> PathBuf {
-        session_task_logs_dir(&state_dir().unwrap(), self.session)
+        session_data_dir(&state_dir().unwrap(), self.session)
+            .join(BASH_DIR)
             .join(format!("{}.log", self.call_id))
     }
 
@@ -515,7 +517,7 @@ fn a_bash_in_a_moved_batch_logs_the_output_it_prints_after_the_move() {
     run.release();
     let notice = run.final_notice();
 
-    let logs = session_task_logs_dir(&state_dir().unwrap(), run.session);
+    let logs = session_data_dir(&state_dir().unwrap(), run.session).join(BASH_DIR);
     let log_path = notice
         .split_once(LOG_LABEL)
         .and_then(|(_, rest)| rest.lines().next())
