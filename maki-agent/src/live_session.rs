@@ -466,6 +466,11 @@ impl SessionMailbox {
         lock(&self.live.mailbox).outstanding.len()
     }
 
+    /// A copy, so nobody calls back into the mailbox while it is locked.
+    pub fn outstanding_receipts(&self) -> Vec<String> {
+        lock(&self.live.mailbox).outstanding.clone()
+    }
+
     pub fn backlog(&self) -> Backlog {
         let mailbox = lock(&self.live.mailbox);
         Backlog {

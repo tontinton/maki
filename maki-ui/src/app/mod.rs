@@ -851,15 +851,15 @@ impl App {
         }
     }
 
-    /// The background count is the receipts the model holds, so it leaves
-    /// out a plugin's own sessions, which wake nobody.
     pub(super) fn input_placeholder(&self) -> Placeholder {
-        let waiting_on = self.live_mailbox().map_or(0, SessionMailbox::outstanding);
         if !self.is_main_chat() {
-            Placeholder::SubagentQueue
-        } else if self.status == Status::Streaming {
-            Placeholder::Queue
-        } else if waiting_on > 0 {
+            return Placeholder::SubagentQueue;
+        }
+        if self.status == Status::Streaming {
+            return Placeholder::Queue;
+        }
+        let waiting_on = self.awaited_tasks();
+        if waiting_on > 0 {
             Placeholder::Background(waiting_on)
         } else if self.state.session.messages().is_empty() {
             Placeholder::Suggestion
