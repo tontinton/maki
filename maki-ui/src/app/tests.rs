@@ -12348,7 +12348,7 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
         started_at: None,
         ended_at: None,
     }]);
-    session.set_subagent_messages(RECEIPT_TURN_ID.into(), vec![]);
+    session.set_subagent_messages(RECEIPT_TURN_ID.into(), vec![], |_: &Message| Vec::new());
 
     app.restore_resumed_session();
 

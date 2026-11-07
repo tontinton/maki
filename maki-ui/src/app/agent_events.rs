@@ -265,7 +265,9 @@ impl App {
             }
             self.state
                 .session_mut()
-                .set_subagent_messages(tool_use_id, messages);
+                .set_subagent_messages(tool_use_id, messages, |m| {
+                    m.tool_uses().map(|(id, _, _)| id.to_owned()).collect()
+                });
             return None;
         }
 
