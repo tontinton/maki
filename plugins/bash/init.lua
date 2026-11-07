@@ -354,7 +354,7 @@ maki.api.register_tool({
       description = { type = "string", description = "What the command does in 3-5 words, not the command itself" },
       background = {
         type = "boolean",
-        description = "Run in the background. The result arrives as a message. Prefer for slow commands.",
+        description = "Run in the background. The result arrives as a message. Prefer for slow commands whose result your next step doesn't need.",
         needs_background = true,
       },
     },
