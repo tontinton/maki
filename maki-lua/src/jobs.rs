@@ -18,12 +18,17 @@ use mlua::{Function, Lua, RegistryKey, Result as LuaResult};
 use shell_words::join as shell_join;
 use tokio::sync::watch;
 
+use crate::agent_autocmd::HostEvent;
 use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
+use crate::loader::EventHandle;
 use crate::plugin_permissions::Ceiling;
 use crate::runtime::{Narrowed, with_jobs};
 
 const DEFAULT_TAIL: usize = 20;
 pub(crate) const MAX_TAIL_LINES: usize = 1024;
+const SHARED_SCOPE_ERR: &str = "jobstart: shared requires a session scope";
+/// The wait thread reports unreapable children as -1; a killed job reuses it.
+const JOB_KILLED_EXIT_CODE: i32 = -1;
 const MAX_COMPLETED_SESSION_JOBS: usize = 256;
 
 const READER_BUF_SIZE: usize = 8 * 1024;
@@ -45,6 +50,47 @@ static SHELL: LazyLock<ArcSwap<ShellPreference>> = LazyLock::new(ArcSwap::defaul
 
 pub fn set_shell_preference(shell: ShellPreference) {
     SHELL.store(Arc::new(shell));
+}
+
+/// The `JobStart` event for a session-owned job, or `None` for the transient
+/// task and plugin jobs the autocmds skip.
+fn job_started_event<'a>(
+    job_id: u32,
+    owner: &'a JobOwner,
+    name: &'a Option<String>,
+    command: &'a str,
+) -> Option<(&'a MakiId, HostEvent<'a>)> {
+    let JobOwner::Session { session, plugin } = owner else {
+        return None;
+    };
+    Some((
+        session,
+        HostEvent::JobStart {
+            id: job_id,
+            plugin,
+            name: name.as_deref(),
+            command,
+        },
+    ))
+}
+
+/// The `JobExit` counterpart, same ownership rule.
+fn job_exit_event<'a>(
+    job_id: u32,
+    owner: &'a JobOwner,
+    code: i32,
+) -> Option<(&'a MakiId, HostEvent<'a>)> {
+    let JobOwner::Session { session, plugin } = owner else {
+        return None;
+    };
+    Some((
+        session,
+        HostEvent::JobExit {
+            id: job_id,
+            plugin,
+            exit_code: code,
+        },
+    ))
 }
 
 #[derive(Clone)]
@@ -136,6 +182,9 @@ pub(crate) struct JobSpec {
     pub on_stdout: Option<RegistryKey>,
     pub on_stderr: Option<RegistryKey>,
     pub on_exit: Option<RegistryKey>,
+    /// Other plugins may list and stop this job, so it can appear in a job
+    /// picker it does not own. Session scope only.
+    pub shared: bool,
     /// The [`Ceiling`] the job was started under, which its callbacks run
     /// under too.
     pub ceiling: Option<Ceiling>,
@@ -157,6 +206,7 @@ impl JobSpec {
             on_stdout: None,
             on_stderr: None,
             on_exit: None,
+            shared: false,
             ceiling: None,
             max_line_bytes: MAX_READ_BYTES,
         }
@@ -174,6 +224,9 @@ struct JobMeta {
     on_stdout: Option<RegistryKey>,
     on_stderr: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
+    /// Session jobs only: lets [`JobStore::list`] answer plugins other than
+    /// the owner.
+    shared: bool,
     ceiling: Option<Ceiling>,
     event_rx: Option<JobEvents>,
     _queue: QueueOwner,
@@ -202,6 +255,20 @@ impl JobMeta {
             JobOwner::Session { session, .. } => Some(session),
             _ => None,
         }
+    }
+
+    /// Listed by plugins other than the owner. A session filter always has to
+    /// name the job's own session, so sharing never reaches past it.
+    fn shared_in(&self, session: Option<MakiId>) -> bool {
+        self.shared && session.is_some_and(|s| self.session() == Some(s))
+    }
+
+    fn lifecycle_started(&self, job_id: u32) -> Option<(&MakiId, HostEvent<'_>)> {
+        job_started_event(job_id, &self.owner, &self.name, &self.command)
+    }
+
+    fn lifecycle_exit(&self, job_id: u32, code: i32) -> Option<(&MakiId, HostEvent<'_>)> {
+        job_exit_event(job_id, &self.owner, code)
     }
 
     /// Owning plugin of a session job. Other owners drop their job on exit, so
@@ -274,6 +341,9 @@ pub(crate) struct JobStore {
     /// landing while a pump is busy delivering still wakes it afterwards. The
     /// store outlives every pump, each one holds the `Lua` that owns it.
     changed: watch::Sender<()>,
+    /// Where the `JobStart` / `JobExit` autocmds go, the same request channel
+    /// every other host autocmd rides.
+    events: Option<EventHandle>,
 }
 
 pub(crate) struct CheckedOutReceiver {
@@ -283,12 +353,13 @@ pub(crate) struct CheckedOutReceiver {
 }
 
 impl JobStore {
-    pub fn new() -> Self {
+    pub fn new(events: Option<EventHandle>) -> Self {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
             scan_cursor: 0,
             changed: watch::Sender::new(()),
+            events,
         }
     }
 
@@ -299,6 +370,9 @@ impl JobStore {
     }
 
     pub fn start(&mut self, spec: JobSpec) -> Result<u32, String> {
+        if spec.shared && !matches!(spec.owner, JobOwner::Session { .. }) {
+            return Err(SHARED_SCOPE_ERR.to_string());
+        }
         let JobSpec {
             owner,
             cmd,
@@ -310,6 +384,7 @@ impl JobStore {
             on_stdout,
             on_stderr,
             on_exit,
+            shared,
             ceiling,
             max_line_bytes,
         } = spec;
@@ -406,6 +481,7 @@ impl JobStore {
                 owner,
                 command: cmd.display(),
                 name,
+                shared,
                 pid,
                 started: Instant::now(),
                 on_stdout,
@@ -427,6 +503,9 @@ impl JobStore {
                 replay_exit: None,
             },
         );
+
+        let notice = self.jobs.get(&id).and_then(|job| job.lifecycle_started(id));
+        self.emit_lifecycle(notice);
 
         Ok(id)
     }
@@ -661,7 +740,9 @@ impl JobStore {
 
     /// List jobs this plugin can see. Task and plugin jobs leave the map on
     /// exit; session-owned jobs stay so exited ids stay findable. Tails live
-    /// on `snapshot` / `jobinfo`.
+    /// on `snapshot` / `jobinfo`. A session filter only ever widens to the
+    /// session's shared jobs, so a plugin still never reads another's
+    /// private command lines.
     pub fn list(
         &self,
         session: Option<MakiId>,
@@ -670,7 +751,7 @@ impl JobStore {
     ) -> Vec<JobSnapshot> {
         self.jobs
             .iter()
-            .filter(|(_, job)| job.can_access(task_id, plugin))
+            .filter(|(_, job)| job.can_access(task_id, plugin) || job.shared_in(session))
             .filter(|(_, job)| session.is_none_or(|s| job.session() == Some(s)))
             .map(|(&id, job)| JobSnapshot::from_job(id, job, false))
             .collect()
@@ -689,9 +770,17 @@ impl JobStore {
 
     pub fn kill(&mut self, job_id: u32, task_id: Option<u64>, plugin: &str) {
         if let Some(job) = self.jobs.get(&job_id)
-            && job.can_access(task_id, plugin)
+            && (job.can_access(task_id, plugin) || job.shared)
         {
             kill_job(job);
+        }
+    }
+
+    /// Fires the `JobStart` / `JobExit` autocmd a lifecycle notice carries,
+    /// the way every other host event goes out.
+    fn emit_lifecycle(&self, notice: Option<(&MakiId, HostEvent<'_>)>) {
+        if let (Some(events), Some((session, event))) = (&self.events, notice) {
+            events.fire(Some(session), event);
         }
     }
 
@@ -713,7 +802,16 @@ impl JobStore {
 
     fn remove(&mut self, lua: &Lua, job_id: u32, kill: bool) {
         if let Some(job) = self.jobs.remove(&job_id) {
-            if kill {
+            // A killed or forgotten job never runs [`Self::complete`], so the
+            // autocmd pair would be left without a close; already-booked exits
+            // were reported there.
+            if job.exit_code.is_none() {
+                if kill {
+                    kill_job(&job);
+                }
+                let notice = job.lifecycle_exit(job_id, JOB_KILLED_EXIT_CODE);
+                self.emit_lifecycle(notice);
+            } else if kill {
                 kill_job(&job);
             }
             for key in [job.on_stdout, job.on_stderr, job.on_exit]
@@ -1057,7 +1155,7 @@ mod tests {
     }
 
     fn make_store() -> JobStore {
-        JobStore::new()
+        JobStore::new(None)
     }
 
     fn next_plugin_event(store: &mut JobStore) -> Option<(u32, JobEvent)> {
@@ -1094,6 +1192,7 @@ mod tests {
             on_stdout,
             on_stderr: None,
             on_exit,
+            shared: false,
             ceiling: None,
             event_rx: None,
             _queue: QueueOwner(Arc::default()),
@@ -1375,7 +1474,7 @@ mod tests {
     #[tokio::test]
     async fn exit_cleanup_runs_before_a_failing_callback() {
         let lua = Lua::new();
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(None));
         let callback = lua
             .create_function(|_, ()| Err::<(), _>(mlua::Error::runtime("callback failed")))
             .unwrap();
