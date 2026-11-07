@@ -31,6 +31,12 @@ use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 use crate::plugin_permissions::{NetEgress, PluginPermissions};
 
+#[cfg(unix)]
+pub(crate) mod unix;
+
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_MAX_BYTES: usize = 5 * 1024 * 1024;
@@ -430,11 +436,7 @@ async fn connect(
     port: u16,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Conn>> {
-    let secs = opts
-        .and_then(|o| o.get::<u64>("timeout").ok())
-        .map_or(DEFAULT_CONNECT_TIMEOUT_SECS, |secs| {
-            secs.min(MAX_CONNECT_TIMEOUT_SECS)
-        });
+    let secs = connect_timeout_secs(opts.as_ref());
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
     let stream = try_pair!(
         timeout(
@@ -444,7 +446,15 @@ async fn connect(
         .await
         .unwrap_or_else(|_| Err(format!("connect to {host}:{port} timed out after {secs}s")))
     );
-    Ok((Some(Conn::track(plugin, stream)), None))
+    Ok((Some(Conn::track(plugin, Stream::Tcp(stream))), None))
+}
+
+/// The `timeout` option every connect takes, capped like the rest.
+fn connect_timeout_secs(opts: Option<&Table>) -> u64 {
+    opts.and_then(|o| o.get::<u64>("timeout").ok())
+        .map_or(DEFAULT_CONNECT_TIMEOUT_SECS, |secs| {
+            secs.min(MAX_CONNECT_TIMEOUT_SECS)
+        })
 }
 
 async fn open_stream(
@@ -486,10 +496,60 @@ async fn dial(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
     Err(last_err)
 }
 
+/// The byte stream behind a `Conn`. Both kinds are driven through their
+/// readiness API, so one read and one write can share the stream.
+enum Stream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl Stream {
+    async fn readable(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.readable().await,
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.readable().await,
+        }
+    }
+
+    fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.try_read(buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.try_read(buf),
+        }
+    }
+
+    async fn writable(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.writable().await,
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.writable().await,
+        }
+    }
+
+    fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.try_write(buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.try_write(buf),
+        }
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => SockRef::from(stream).shutdown(Shutdown::Both),
+            #[cfg(unix)]
+            Self::Unix(stream) => SockRef::from(stream).shutdown(Shutdown::Both),
+        }
+    }
+}
+
 /// A read or write in flight holds its own `Arc`, so the Lua handle can be
 /// collected under it without closing the socket mid-call.
 struct ConnState {
-    stream: TcpStream,
+    stream: Stream,
     closed: AtomicBool,
     /// Reads don't wait in line like writes do. Two readers of one stream
     /// would each get a random slice of it, so a second read is refused.
@@ -505,9 +565,9 @@ impl ConnState {
     /// `Arc`.
     fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel)
-            && let Err(e) = SockRef::from(&self.stream).shutdown(Shutdown::Both)
+            && let Err(e) = self.stream.shutdown()
         {
-            tracing::debug!(error = %e, "tcp shutdown failed");
+            tracing::debug!(error = %e, "socket shutdown failed");
         }
     }
 
@@ -535,7 +595,7 @@ impl Drop for TornWrite<'_> {
 pub(crate) struct Conn(Arc<ConnState>);
 
 impl Conn {
-    fn track(plugin: Arc<str>, stream: TcpStream) -> Self {
+    fn track(plugin: Arc<str>, stream: Stream) -> Self {
         let state = Arc::new(ConnState {
             stream,
             closed: AtomicBool::new(false),
@@ -556,6 +616,8 @@ pub(crate) fn close_plugin_conns(plugin: &str) {
     for conn in conns.iter().flatten().filter_map(Weak::upgrade) {
         conn.close();
     }
+    #[cfg(unix)]
+    unix::close_plugin_listeners(plugin);
 }
 
 /// Wait for data and return what arrived, at most 64 KiB. Returns
@@ -617,7 +679,7 @@ async fn write(_lua: Lua, this: UserDataRef<Conn>, data: LuaString) -> LuaResult
 
 /// The stream is shared by a read and a write at once, so both go through
 /// its readiness API instead of the exclusive `AsyncRead`/`AsyncWrite` one.
-async fn read_some(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+async fn read_some(stream: &Stream, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         stream.readable().await?;
         match stream.try_read(buf) {
@@ -627,7 +689,7 @@ async fn read_some(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-async fn write_all(stream: &TcpStream, mut data: &[u8]) -> io::Result<()> {
+async fn write_all(stream: &Stream, mut data: &[u8]) -> io::Result<()> {
     while !data.is_empty() {
         stream.writable().await?;
         match stream.try_write(data) {
@@ -651,7 +713,10 @@ fn close(_lua: &Lua, this: &Conn) -> LuaResult<()> {
 }
 
 lua_class! {
-    /// A TCP connection opened by `maki.net.connect`.
+    /// A TCP or Unix socket connection.
+    ///
+    /// `maki.net.connect` opens a TCP one and `maki.net.connect_unix` a Unix
+    /// socket one.
     ///
     /// `read` and `write` yield until done and can run at the same time.
     /// The connection closes on `:close()`, when the handle is garbage
@@ -660,7 +725,7 @@ lua_class! {
 }
 
 lua_table! {
-    /// HTTP and plain TCP for plugins.
+    /// HTTP, plain TCP, and Unix sockets for plugins.
     ///
     /// `request` traffic goes over HTTPS (plain HTTP is upgraded). Private
     /// and metadata IP addresses are blocked to prevent SSRF, including
@@ -672,7 +737,8 @@ lua_table! {
     /// keep-alive connection rather than pay a fresh handshake each time.
     ///
     /// `connect` follows the same rules, but only reaches hosts the plugin
-    /// lists in `net_hosts`.
+    /// lists in `net_hosts`. On Unix, `connect_unix` and `listen_unix` reach
+    /// local sockets, and need the `run` permission instead.
     ///
     /// ```lua
     /// local res, err = maki.net.request("https://example.com")
@@ -2418,7 +2484,7 @@ mod tests {
         let stream = TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().unwrap();
         let lua = Lua::new();
-        let conn = Conn::track(Arc::from(TEST_PLUGIN), stream);
+        let conn = Conn::track(Arc::from(TEST_PLUGIN), Stream::Tcp(stream));
         lua.globals().set("conn", conn).unwrap();
         (lua, server)
     }
