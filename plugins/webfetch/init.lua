@@ -68,7 +68,7 @@ local opts = maki.api.register_options(output_limits.extend({
   max_response_bytes = {
     default = 5 * 1024 * 1024,
     min = 1024,
-    desc = "Stop reading a response after this many bytes.",
+    desc = "Stop reading a response after this many bytes, at most 64 MiB.",
   },
 }))
 

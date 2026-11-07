@@ -26,6 +26,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 use url::Url;
 
+use crate::api::fs::MAX_READ_BYTES;
 use crate::api::util::convert::{TableExt, bytes_arg};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 
@@ -39,7 +40,8 @@ use tokio::net::UnixStream;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
-const DEFAULT_MAX_BYTES: usize = 5 * 1024 * 1024;
+const DEFAULT_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const RESPONSE_TOO_LARGE: &str = "response too large";
 const MAX_RETRIES: u32 = 3;
 /// What a provider hook's GET retries: the codec's own side requests never do.
 const PROVIDER_GET_RETRIES: u32 = 0;
@@ -244,7 +246,7 @@ struct RequestParams {
     body: Vec<u8>,
     /// The caller's own total bound, when it stated one.
     timeout: Option<Duration>,
-    max_bytes: usize,
+    max_bytes: u64,
     retries: u32,
     /// Keep only response lines this matches. `None` disables the filter.
     line_match: Option<Regex>,
@@ -358,7 +360,9 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 ///   `body` (string|buffer) Request body, sent as is.
 ///   `timeout` (integer) Total timeout in seconds, max 120 (default 30,
 ///     none on a provider's origin). 0 means the default.
-///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
+///   `max_bytes` (integer) Max response size in bytes, max 64 MiB (default
+///     5 MiB). 0 means the default. The whole body is held in memory, so a
+///     bigger download belongs in a job such as `curl -o`.
 ///   `retry` (integer) Retries on 5xx errors (default 3).
 ///   `line_match` (string) Regex. Keep only the response lines it
 ///     matches. Filtering happens after the body is read, so `max_bytes`
@@ -410,6 +414,7 @@ async fn request(
 ///
 /// {opts} fields:
 ///   `timeout` (integer) Connect timeout in seconds, max 60 (default 10).
+///     0 means the default.
 ///
 /// @param host string Host name or IP address.
 /// @param port integer Port to connect to.
@@ -436,7 +441,7 @@ async fn connect(
     port: u16,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Conn>> {
-    let secs = connect_timeout_secs(opts.as_ref());
+    let secs = connect_timeout_secs(opts.as_ref())?;
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
     let stream = try_pair!(
         timeout(
@@ -450,11 +455,12 @@ async fn connect(
 }
 
 /// The `timeout` option every connect takes, capped like the rest.
-fn connect_timeout_secs(opts: Option<&Table>) -> u64 {
-    opts.and_then(|o| o.get::<u64>("timeout").ok())
-        .map_or(DEFAULT_CONNECT_TIMEOUT_SECS, |secs| {
+fn connect_timeout_secs(opts: Option<&Table>) -> LuaResult<u64> {
+    Ok(opts
+        .opt_nonzero("timeout")?
+        .map_or(DEFAULT_CONNECT_TIMEOUT_SECS, |secs: u64| {
             secs.min(MAX_CONNECT_TIMEOUT_SECS)
-        })
+        }))
 }
 
 async fn open_stream(
@@ -823,12 +829,13 @@ async fn extract_request_params(
         .map_err(|e| e.to_string())?;
 
     let timeout = opts
-        .and_then(|o| o.get::<u64>("timeout").ok())
-        .filter(|secs| *secs > 0)
+        .opt_nonzero::<u64>("timeout")
+        .map_err(|e| e.to_string())?
         .map(|secs| Duration::from_secs(secs.min(MAX_TIMEOUT_SECS)));
 
     let max_bytes = opts
-        .and_then(|o| o.get::<usize>("max_bytes").ok())
+        .opt_nonzero("max_bytes")
+        .map_err(|e| e.to_string())?
         .unwrap_or(DEFAULT_MAX_BYTES);
 
     let retries = opts
@@ -1159,28 +1166,7 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, NetError>
         .unwrap_or("")
         .to_string();
 
-    if let Some(len) = response
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        && len > params.max_bytes
-    {
-        return Err(format!("response too large: {len} bytes").into());
-    }
-
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| NetError::Read(e.without_url()))?
-    {
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() > params.max_bytes {
-            return Err(format!("response too large: {} bytes", bytes.len()).into());
-        }
-    }
-
+    let bytes = read_body(&mut response, params.max_bytes).await?;
     let bytes = match &params.line_match {
         Some(pattern) => keep_lines_matching(&bytes, pattern),
         None => bytes,
@@ -1191,6 +1177,46 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, NetError>
         content_type,
         headers: collect_headers(response.headers()),
     })
+}
+
+/// `max_bytes` is what the caller can live with. This is where the body is
+/// buffered, so [`MAX_READ_BYTES`] caps it here and no caller can get around
+/// it. Asking for more is fine: every response that fits still comes through.
+///
+/// The buffer's capacity never goes past the limit either. A `Vec` left to
+/// grow on its own can hold twice the body in capacity, which is how the
+/// reporter of #1453 saw an 80 MiB body cost 200 MiB. So we size it from the
+/// length hyper will stream, and without one we double only up to the limit.
+/// We trust hyper's length and not the header, because a HEAD or a 304 names
+/// the full size of a body that never comes.
+async fn read_body(response: &mut Response, max_bytes: u64) -> Result<Vec<u8>, NetError> {
+    let max_bytes = max_bytes.min(MAX_READ_BYTES);
+    let declared = response.content_length();
+    if let Some(len) = declared
+        && len > max_bytes
+    {
+        return Err(
+            format!("{RESPONSE_TOO_LARGE}: {len} bytes, over the {max_bytes}-byte limit").into(),
+        );
+    }
+
+    let mut bytes = Vec::with_capacity(declared.unwrap_or(0) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| NetError::Read(e.without_url()))?
+    {
+        let len = bytes.len() + chunk.len();
+        if len as u64 > max_bytes {
+            return Err(format!("{RESPONSE_TOO_LARGE}: over the {max_bytes}-byte limit").into());
+        }
+        if len > bytes.capacity() {
+            let capacity = (bytes.capacity() * 2).clamp(len, max_bytes as usize);
+            bytes.reserve_exact(capacity - bytes.len());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 impl RequestParams {
@@ -1435,6 +1461,10 @@ mod tests {
     const AUTH_PROBE_PATH: &str = "/search";
     const EXAMPLE_URL: &str = "https://example.com";
     const ZERO_CONTENT_LENGTH: &str = "content-length: 0";
+    const BODY_LIMIT: u64 = 8;
+    const BODY_AT_LIMIT: &str = "12345678";
+    const BODY_OVER_LIMIT: &str = "123456789";
+    const HEAD: &str = "HEAD";
     const QUERY_SECRET: &str = "sk-not-for-logs";
     const BINARY_PAYLOAD: &[u8] = b"before\0\xff\x80after\r\n";
     const AUTH_HEADER: &str = "Authorization";
@@ -1902,9 +1932,12 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Answers one request on loopback with an empty 200 and hands back its
-    /// head.
     fn serve_one() -> (u16, JoinHandle<String>) {
+        serve_one_with(response_head(0))
+    }
+
+    /// Answers one request on loopback with {response} and hands back its head.
+    fn serve_one_with(response: String) -> (u16, JoinHandle<String>) {
         let (listener, port) = loopback_listener();
         let server = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
@@ -1920,8 +1953,7 @@ mod tests {
                     break;
                 }
             }
-            conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                .unwrap();
+            conn.write_all(response.as_bytes()).unwrap();
             String::from_utf8_lossy(&request).into_owned()
         });
         (port, server)
@@ -1934,6 +1966,78 @@ mod tests {
         send_with_retries(&client, params)
             .await
             .map(|response| response.status().as_u16())
+    }
+
+    /// A 200 head that declares {content_length} bytes of body.
+    fn response_head(content_length: u64) -> String {
+        format!("HTTP/1.1 200 OK\r\ncontent-length: {content_length}\r\n\r\n")
+    }
+
+    fn sized_response(body: &str) -> String {
+        response_head(body.len() as u64) + body
+    }
+
+    fn chunked(chunks: &[&str]) -> String {
+        let body: String = chunks
+            .iter()
+            .map(|chunk| format!("{:x}\r\n{chunk}\r\n", chunk.len()))
+            .collect();
+        format!("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n{body}0\r\n\r\n")
+    }
+
+    async fn read_body_served(
+        method: &str,
+        response: String,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, NetError> {
+        let (port, server) = serve_one_with(response);
+        let mut params = redirect_params(&format!("http://{LOOPBACK_HOST}:{port}/"));
+        params.method = method.to_owned();
+        let client = build_client(&ClientKey::of(&params)).unwrap();
+        let mut response = send_with_retries(&client, &params).await.unwrap();
+        let body = read_body(&mut response, max_bytes).await;
+        server.join().unwrap();
+        body
+    }
+
+    #[test_case(sized_response(BODY_OVER_LIMIT), BODY_LIMIT ; "declared_length_over_the_limit")]
+    #[test_case(chunked(&[BODY_OVER_LIMIT]), BODY_LIMIT ; "streamed_body_over_the_limit")]
+    #[test_case(response_head(MAX_READ_BYTES + 1), u64::MAX ; "any_limit_is_capped_at_the_read_limit")]
+    #[tokio::test]
+    async fn read_body_refuses_a_body_over_the_limit(response: String, max_bytes: u64) {
+        let error = read_body_served(GET, response, max_bytes)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with(RESPONSE_TOO_LARGE), "{error}");
+    }
+
+    #[test_case(sized_response(BODY_AT_LIMIT) ; "declared")]
+    #[test_case(chunked(&[BODY_AT_LIMIT]) ; "chunked")]
+    #[test_case(chunked(&[&BODY_AT_LIMIT[..5], &BODY_AT_LIMIT[5..]]) ; "doubling_the_first_chunk_would_overshoot")]
+    #[tokio::test]
+    async fn read_body_keeps_a_body_at_the_limit(response: String) {
+        let body = read_body_served(GET, response, BODY_LIMIT).await.unwrap();
+        assert_eq!(body, BODY_AT_LIMIT.as_bytes());
+        assert!(body.capacity() as u64 <= BODY_LIMIT, "{}", body.capacity());
+    }
+
+    /// A HEAD answer names the size of the body it leaves out.
+    #[tokio::test]
+    async fn read_body_ignores_the_length_a_head_response_declares() {
+        let body = read_body_served(HEAD, response_head(BODY_LIMIT + 1), BODY_LIMIT)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[test_case(0, DEFAULT_CONNECT_TIMEOUT_SECS ; "zero_counts_as_unset")]
+    #[test_case(MAX_CONNECT_TIMEOUT_SECS + 1, MAX_CONNECT_TIMEOUT_SECS ; "clamped_to_max")]
+    fn connect_timeout_secs_bounds(secs: u64, expected: u64) {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("timeout", secs).unwrap();
+        assert_eq!(connect_timeout_secs(Some(&opts)).unwrap(), expected);
     }
 
     #[test_case(&[], USER_P_AT_SS_BASIC ; "credentials_come_from_the_url_userinfo")]
@@ -2094,6 +2198,17 @@ mod tests {
         opts.set("timeout", secs).unwrap();
         let params = request_params(PUBLIC_URL, Some(&opts)).await.unwrap();
         assert_eq!(params.timeout, expected);
+    }
+
+    #[test_case(BODY_LIMIT, BODY_LIMIT ; "set_value_kept")]
+    #[test_case(0, DEFAULT_MAX_BYTES ; "zero_counts_as_unset")]
+    #[tokio::test]
+    async fn extract_params_max_bytes(max_bytes: u64, expected: u64) {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("max_bytes", max_bytes).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).await.unwrap();
+        assert_eq!(params.max_bytes, expected);
     }
 
     #[test_case(false ; "string")]

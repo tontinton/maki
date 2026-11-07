@@ -60,6 +60,7 @@ fn absolute(path: &str) -> Result<PathBuf, String> {
 ///
 /// {opts} fields:
 ///   `timeout` (integer) Connect timeout in seconds, max 60 (default 10).
+///     0 means the default.
 ///
 /// @param path string Absolute path of the socket, or one starting with `~/`.
 /// @param opts table? Options (see above).
@@ -79,7 +80,7 @@ async fn connect_unix(
     path: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Conn>> {
-    let secs = connect_timeout_secs(opts.as_ref());
+    let secs = connect_timeout_secs(opts.as_ref())?;
     let path = try_pair!(absolute(&path));
     let stream = match timeout(Duration::from_secs(secs), UnixStream::connect(&path)).await {
         Ok(Ok(stream)) => stream,

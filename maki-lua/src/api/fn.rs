@@ -78,8 +78,8 @@ const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv tabl
 ///     `jobwait` (default 20, 0 disables, max 1024).
 ///   `max_line_bytes` (integer?) longest line delivered, in bytes. A longer
 ///     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
-///     skipped without being read into memory (default and `0`: 64 MiB, the
-///     `maki.fs` read limit).
+///     skipped without being read into memory (default, `0`, and max: 64 MiB,
+///     the `maki.fs` read limit).
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
 ///     plugin can see. Starting a second job under a live name is an error.
 /// @return (integer?, string?) Job id, or nil plus an error message when the
@@ -122,8 +122,7 @@ fn jobstart(
         spec.ceiling = Ceiling::current_for(lua, &plugin);
         spec.stdout = parse_redirect(lua, opts, "stdout", spec.on_stdout.is_some(), &grants)?;
         spec.stderr = parse_redirect(lua, opts, "stderr", spec.on_stderr.is_some(), &grants)?;
-        // 0 means no cap of the caller's own, as in `maki.fs` reads.
-        if let Some(max) = opts.opt::<u64>("max_line_bytes")?.filter(|max| *max > 0) {
+        if let Some(max) = opts.opt_nonzero("max_line_bytes")? {
             spec.max_line_bytes = max;
         }
         tail = opts.opt("tail").ok().flatten();

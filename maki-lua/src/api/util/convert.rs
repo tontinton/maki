@@ -58,11 +58,32 @@ pub(crate) trait TableExt {
     fn opt_bool(&self, key: &str) -> Option<bool> {
         self.opt(key).ok().flatten()
     }
+
+    /// A size or a timeout, where `0` means "use the default", so
+    /// it gives `None` like a missing key. There is no ceiling here on purpose:
+    /// sizes are capped where the buffer is taken, so no caller can forget it.
+    /// The error names {key} because mlua's conversion error does not.
+    fn opt_nonzero<T: FromLua + PartialEq + Default>(&self, key: &str) -> LuaResult<Option<T>> {
+        let value = self
+            .opt::<T>(key)
+            .map_err(|e| mlua::Error::runtime(format!("invalid {key}: {e}")))?;
+        Ok(value.filter(|v| *v != T::default()))
+    }
 }
 
 impl TableExt for Table {
     fn opt<T: FromLua>(&self, key: &str) -> LuaResult<Option<T>> {
         Ok(self.get::<NilAsNone<T>>(key)?.0)
+    }
+}
+
+/// A missing `opts` table reads like an empty one.
+impl TableExt for Option<&Table> {
+    fn opt<T: FromLua>(&self, key: &str) -> LuaResult<Option<T>> {
+        match self {
+            Some(table) => table.opt(key),
+            None => Ok(None),
+        }
     }
 }
 
@@ -430,7 +451,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use mlua::{Lua, Value};
+    use mlua::{Lua, Table, Value};
     use regex::Regex;
     use serde_json::Value as JsonValue;
     use test_case::test_case;
@@ -442,6 +463,7 @@ mod tests {
     };
 
     const FLAG_KEY: &str = "flag";
+    const BOUND_KEY: &str = "bound";
 
     const SRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
     const TEST_MODULE_ATTR: &str = "#[cfg(test)]";
@@ -540,6 +562,25 @@ mod tests {
         let tbl = lua.create_table().unwrap();
         tbl.raw_set(FLAG_KEY, lua.create_table().unwrap()).unwrap();
         assert!(tbl.opt::<String>(FLAG_KEY).is_err());
+    }
+
+    #[test_case("{}", None ; "absent_is_none")]
+    #[test_case("{ bound = 0 }", None ; "zero_is_none")]
+    #[test_case("{ bound = 5 }", Some(5) ; "set_value_kept")]
+    fn opt_nonzero_reads_a_bound(table: &str, expected: Option<u64>) {
+        let lua = Lua::new();
+        let tbl: Table = lua.load(format!("return {table}")).eval().unwrap();
+        assert_eq!(tbl.opt_nonzero(BOUND_KEY).unwrap(), expected);
+    }
+
+    #[test_case("{ bound = 'big' }" ; "string")]
+    #[test_case("{ bound = -1 }" ; "negative")]
+    #[test_case("{ bound = math.huge }" ; "infinity")]
+    fn opt_nonzero_rejects_a_non_integer_and_names_the_key(table: &str) {
+        let lua = Lua::new();
+        let tbl: Table = lua.load(format!("return {table}")).eval().unwrap();
+        let error = tbl.opt_nonzero::<u64>(BOUND_KEY).unwrap_err().to_string();
+        assert!(error.contains(BOUND_KEY), "{error}");
     }
 
     #[test_case(Value::Nil, JsonValue::Null ; "nil_to_null")]

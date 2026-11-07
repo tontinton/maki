@@ -2581,8 +2581,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
     `jobwait` (default 20, 0 disables, max 1024).
   - `max_line_bytes` (`integer?`) longest line delivered, in bytes. A longer
     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
-    skipped without being read into memory (default and `0`: 64 MiB, the
-    `maki.fs` read limit).
+    skipped without being read into memory (default, `0`, and max: 64 MiB,
+    the `maki.fs` read limit).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
     plugin can see. Starting a second job under a live name is an error.
 
@@ -3021,7 +3021,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
-- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
+- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
 
 **Returns:** (`table?`, `string?`) `{ lines = string[], total = integer? }`, or nil plus an error message.
 
@@ -4614,7 +4614,9 @@ one. This holds only for an origin the user set (`<SLUG>_BASE_URL`,
 - `body` (`string|buffer`) Request body, sent as is.
 - `timeout` (`integer`) Total timeout in seconds, max 120 (default 30,
   none on a provider's origin). 0 means the default.
-- `max_bytes` (`integer`) Max response size in bytes (default 5 MB).
+- `max_bytes` (`integer`) Max response size in bytes, max 64 MiB (default
+  5 MiB). 0 means the default. The whole body is held in memory, so a
+  bigger download belongs in a job such as `curl -o`.
 - `retry` (`integer`) Retries on 5xx errors (default 3).
 - `line_match` (`string`) Regex. Keep only the response lines it
   matches. Filtering happens after the body is read, so `max_bytes`
@@ -4673,6 +4675,7 @@ garbage collected, and when the plugin unloads.
 
 {opts} fields:
 - `timeout` (`integer`) Connect timeout in seconds, max 60 (default 10).
+  0 means the default.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -4713,6 +4716,7 @@ Connect to the Unix socket at {path}. The connection is a
 
 {opts} fields:
 - `timeout` (`integer`) Connect timeout in seconds, max 60 (default 10).
+  0 means the default.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 

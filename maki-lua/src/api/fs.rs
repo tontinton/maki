@@ -26,6 +26,10 @@ use crate::runtime::LUA_MEMORY_LIMIT;
 /// big read fails here with a clear error, before it can run some other tool
 /// out of memory.
 pub(crate) const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64 / 8;
+const _: () = assert!(
+    MAX_READ_BYTES == 64 * 1024 * 1024,
+    "the Lua API docs and plugin option descs say 64 MiB, change them too"
+);
 const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
 const SCAN_CHUNK: usize = 64 * 1024;
 pub(crate) const LINE_CUT_MARKER: &str = "...";
@@ -238,7 +242,9 @@ impl From<&str> for Line {
 }
 
 /// The next line without its `\n` or `\r\n`, or `None` at the end of the file.
-/// A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. The rest of it
+/// A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. This is where
+/// the line is buffered, so `max_bytes` is capped at [`MAX_READ_BYTES`] here
+/// and no caller can ask for more. The rest of it
 /// is skipped without ever landing in memory, which is how a file that is one
 /// 300 MB line still pages fine. Without `max_bytes`, a line over
 /// [`MAX_READ_BYTES`] fails the read. Bytes that are not UTF-8 fail the read,
@@ -248,7 +254,7 @@ pub(crate) fn next_line(
     max_bytes: Option<u64>,
     lossy: bool,
 ) -> IoResult<Option<Line>> {
-    let keep = max_bytes.unwrap_or(MAX_READ_BYTES);
+    let keep = max_bytes.map_or(MAX_READ_BYTES, |max| max.min(MAX_READ_BYTES));
     // The extra 2 bytes let a line of exactly `keep` bytes see its `\r\n`, so it is not cut.
     let window = keep + 2;
     let mut line = Vec::new();
@@ -348,7 +354,7 @@ impl PageQuery {
         Ok(Self {
             offset: opts.opt("offset")?.unwrap_or(1),
             limit: opts.opt::<u64>("limit")?.filter(|l| *l > 0),
-            max_line_bytes: opts.opt::<u64>("max_line_bytes")?.filter(|b| *b > 0),
+            max_line_bytes: opts.opt_nonzero("max_line_bytes")?,
             count: opts.opt_bool("count").unwrap_or(true),
         })
     }
@@ -481,7 +487,7 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 /// UTF-8.
 ///
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
-/// @param opts table? `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
+/// @param opts table? `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
 /// @return (table?, string?) `{ lines = string[], total = integer? }`, or nil plus an error message.
 /// @example
 /// local page, err = maki.fs.read_lines("server.log", { offset = 101, limit = 100, max_line_bytes = 500 })
@@ -1565,6 +1571,18 @@ mod tests {
             max_line_bytes: Some(CUT),
             ..PageQuery::default()
         }
+    }
+
+    #[test]
+    fn next_line_caps_max_bytes_at_the_read_limit() {
+        let mut huge_line = BufReader::new(repeat(b'x').take(MAX_READ_BYTES + 1));
+        let line = next_line(&mut huge_line, Some(u64::MAX), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            line.text.len() as u64,
+            MAX_READ_BYTES + LINE_CUT_MARKER.len() as u64
+        );
     }
 
     #[test_case("", &[]; "empty")]
