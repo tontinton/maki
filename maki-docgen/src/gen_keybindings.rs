@@ -32,6 +32,8 @@ const PLUGIN_BINDS: &[(&str, &str)] = &[
     ("`Ctrl+P`", "Browse sessions"),
     ("`Ctrl+X`", "Open tasks"),
     ("`Alt+T`", "Thinking effort"),
+    ("`Alt+,`", "Less thinking"),
+    ("`Alt+.`", "More thinking"),
 ];
 
 const MAIN_CONTEXTS: &[KeybindContext] = &[

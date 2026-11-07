@@ -33,6 +33,9 @@ local DIGIT = "^%d$"
 -- heard of gets nothing rather than invented prose.
 local MODE_NOTES = { off = "no reasoning", adaptive = "model decides" }
 local SENDS_PREFIX = "sends "
+-- The step keys walk the effort levels only. Switching a mode on or off stays a
+-- choice made in the picker.
+local MODES = { off = true, adaptive = true }
 
 local STYLE_NAME = "item"
 local STYLE_NAME_PICKED = "bold"
@@ -198,6 +201,32 @@ function M.click(state, row)
   if state.rows[row] and selectable(state.rows[row]) then
     place(state, row)
     state.editing = false
+  end
+end
+
+local function sent(option)
+  return option.sends or option.name
+end
+
+-- The level one row past the one {model} sends, toward {delta}: what moving
+-- the picker's cursor that way and pressing Enter would send. Rows that go out
+-- as the same level are skipped, so every step changes the request. Nil at
+-- either end, or when the session is not on an effort level.
+function M.step(model, delta)
+  local levels = {}
+  for _, option in ipairs(model.thinking_options) do
+    if not MODES[option.name] then
+      levels[#levels + 1] = option
+    end
+  end
+  for i, option in ipairs(levels) do
+    if option.name == model.thinking_shown then
+      local target = i + delta
+      while levels[target] and sent(levels[target]) == sent(option) do
+        target = target + delta
+      end
+      return levels[target] and sent(levels[target])
+    end
   end
 end
 
