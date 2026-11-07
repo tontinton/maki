@@ -67,7 +67,7 @@ use maki_agent::{
     AgentEvent, Envelope, McpConfigErrors, McpSnapshotReader, SessionMailbox, SharedBuf,
     SharedMessages, ToolPart,
 };
-use maki_config::project::{self, GatedFile, TrustQuestion};
+use maki_config::project::{self, GatedFile, TrustState};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
@@ -161,6 +161,9 @@ const AGENT_BUSY_MSG: &str = "Agent is busy, try again later";
 const SHELL_CD_REFUSED_MSG: &str = "Only /cd can change the working directory";
 const UNKNOWN_COMMAND_PREFIX: &str = "Unknown command:";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
+pub(crate) const ALREADY_TRUSTED_MSG: &str = "this folder is already trusted";
+pub(crate) const TRUSTED_VACANT_MSG: &str =
+    "Trusted this folder, project answers are saved from now on";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
 const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
@@ -565,11 +568,10 @@ pub struct App {
     pub(super) tool_parts: HashMap<String, Vec<ToolPart>>,
 
     pub(crate) storage: StateDir,
-    /// The folder trust question this run was started with, `None` when the
-    /// folder is trusted or has nothing to ask about. Frozen at startup on
+    /// The folder trust state this run was started with. Frozen at startup on
     /// purpose: a kind the project adds mid-session is not something the user
     /// was shown, so `/trust` must not cover it and the next start asks.
-    pub(crate) trust_question: Option<TrustQuestion>,
+    pub(crate) trust: TrustState,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) paste_rx: Vec<flume::Receiver<Result<PastedContent, String>>>,
@@ -706,7 +708,7 @@ impl App {
             early_finals: HashMap::new(),
             tool_parts: HashMap::new(),
             storage,
-            trust_question: None,
+            trust: TrustState::Inert,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             paste_rx: vec![],
@@ -2360,16 +2362,24 @@ impl App {
     /// `maki trust` lives outside the TUI, so without this a "not now" or a
     /// `.maki/` created mid-session is unrecoverable without quitting.
     fn trust_folder(&mut self) -> Vec<Action> {
-        let Some(question) = self.trust_question.clone() else {
-            self.flash(NOTHING_TO_TRUST_MSG.into());
+        let Some(question) = self.trust.grantable().cloned() else {
+            let reason = match self.trust {
+                TrustState::Trusted => ALREADY_TRUSTED_MSG,
+                _ => NOTHING_TO_TRUST_MSG,
+            };
+            self.flash(reason.into());
             return Vec::new();
         };
         if let Err(error) = project::grant(&self.storage, &question) {
             self.flash(error);
             return Vec::new();
         }
-        let covered: Vec<String> = question.present.iter().map(GatedFile::to_string).collect();
-        self.flash(format!("{TRUSTED_PREFIX}{}", covered.join(", ")));
+        if question.present.is_empty() {
+            self.flash(TRUSTED_VACANT_MSG.into());
+        } else {
+            let covered: Vec<String> = question.present.iter().map(GatedFile::to_string).collect();
+            self.flash(format!("{TRUSTED_PREFIX}{}", covered.join(", ")));
+        }
         self.quit_with(ExitRequest::Reload)
     }
 

@@ -28,7 +28,9 @@ main UI opens, listing the gated files it found. It takes three answers:
 
 "Not now" is preselected, so Enter and Escape are both safe. `t` or `y` answers
 Trust, `n` answers Not now, and "Never" needs the arrow keys and Enter. Ctrl-C
-exits Maki. A project that ships no gated file is never asked about.
+exits Maki. A project that ships no gated file is never asked about. It still
+starts untrusted, so its project permission answers last for the session until
+you trust it with `/trust`, `maki trust add` or a [trust policy](#trust-policy).
 
 One answer covers one project root: the active Git checkout, or the working
 directory outside Git. Linked worktrees answer for themselves. Your home
@@ -57,12 +59,14 @@ what the agent may do inside it.
 
 Maki writes nothing into a folder you declined, and the status bar carries a
 `[restricted]` indicator for the whole session. A folder with no `.maki` at all
-shows no indicator.
+shows no indicator unless you declined it.
 
 The project answers in a [permission prompt](/docs/permissions/#permission-prompts)
 still work and last until the session ends, labelled `Project (this session)`.
 For an answer that outlives the session, use `A` or `D` to save it in your own
-`~/.config/maki/permissions.toml`, or trust the folder.
+`~/.config/maki/permissions.toml`, or trust the folder. In a folder that ships
+no gated file and that you never declined, the prompt points at `/trust`
+instead.
 
 ## Managing Trust
 
@@ -80,7 +84,9 @@ stored outside the project and follow the checkout path.
 Inside the TUI, `/trust` trusts the current folder and reloads plugins and
 configuration. Typing it is the consent, so there is no second question. It
 covers the gated files the folder had when the session started, so a kind the
-project adds while Maki runs is asked about on the next start.
+project adds while Maki runs is asked about on the next start. In a folder that
+ships no gated file, it loads nothing but saves project answers from then on,
+and any gated file added later is still asked about.
 
 ## Trust Policy
 
@@ -104,9 +110,9 @@ segment, `**` crosses segments, and `~` expands to your home directory.
 `paths = { "**" }` trusts every folder. A match is recorded like any other yes,
 so `maki trust list` shows it and `maki trust remove` clears it.
 
-The policy answers only a folder that has no answer yet, so a recorded `Never`
-stays a `Never` however the globs are written. Clear it with
-`maki trust remove PATH`, or `/trust` inside the TUI.
+The policy answers only a folder that has no answer yet, including one that
+ships no gated file, so a recorded `Never` stays a `Never` however the globs are
+written. Clear it with `maki trust remove PATH`, or `/trust` inside the TUI.
 
 `prompt = false` drops the card and leaves the folder restricted unless a
 `paths` entry matches.

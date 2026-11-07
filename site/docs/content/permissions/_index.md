@@ -182,7 +182,8 @@ Session and always-allow / always-deny choices need a second key (`Enter` or `y`
 
 The keys are the same in a folder you have not
 [trusted](/docs/folder-trust/), where `a` and `d` last for the session instead
-of reaching `.maki/permissions.toml`.
+of reaching `.maki/permissions.toml`. A folder with no `.maki` directory counts
+as untrusted too. Run `/trust` there to save later project answers.
 
 ACP clients offer the four options the protocol defines. "Allow always" lasts
 for the session, and "Reject always" is a project answer that follows folder

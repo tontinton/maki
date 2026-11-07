@@ -324,20 +324,19 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
     // in the UI's first frame. A headless run returns before the UI exists and
     // drops it; its grant is already visible through `maki trust list`.
     let mut notice = None;
-    // `unanswered` rather than `question`: a recorded `Never` is an answer, and
-    // neither the card nor the policy may overturn one.
-    let answer = trust.state.unanswered().and_then(|question| {
-        policy_grant(question, &stack.config.trust)
-            .map(|pattern| {
-                notice = Some(format!("{POLICY_GRANT_NOTICE} {pattern}"));
-                TrustAnswer::Trust
-            })
-            // `prompt = false` silences the card only: a `paths` match is an
-            // answer given in advance, not a prompt.
-            .or_else(|| {
-                (can_ask && stack.config.trust.prompt).then(|| maki_ui::ask_trust(question))
-            })
-    });
+    let answer = match policy_grant(&trust.state, &stack.config.trust) {
+        Some(pattern) => {
+            notice = Some(format!("{POLICY_GRANT_NOTICE} {pattern}"));
+            Some(TrustAnswer::Trust)
+        }
+        // `prompt = false` silences the card only: a `paths` match is an
+        // answer given in advance, not a prompt.
+        None => trust
+            .state
+            .unanswered()
+            .filter(|_| can_ask && stack.config.trust.prompt)
+            .map(maki_ui::ask_trust),
+    };
     match answer {
         Some(answer) => {
             let was_trusted = trust.project_config.is_trusted();
@@ -515,7 +514,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),
-                trust_question: trust.state.question().cloned(),
+                trust: trust.state.clone(),
                 handed_over: std::mem::take(&mut handed_over),
             },
             initial_prompt.take(),

@@ -12,6 +12,7 @@ use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::key as kb;
 use crate::components::lua_float::CURSOR_STYLE_NAME;
 use crate::components::messages::{ClickOutcome, ScrollPos};
+use crate::components::permission_prompt::ProjectAnswers;
 use crate::components::plan_form::builtin_menu;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
@@ -39,7 +40,7 @@ use maki_agent::{
     SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SteerKind, SubagentInfo, TaskLabel,
     ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
 };
-use maki_config::project::{self, TrustMode};
+use maki_config::project::{self, TrustMode, TrustQuestion, TrustState};
 use maki_config::{Effect, PermissionRule, PermissionsConfig, PluginsConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{
     HintWriterHandle, RequestProbe, TestBinding, hint_writer_pair, keymap_reader_from,
@@ -3762,7 +3763,7 @@ fn open_deny_prompt(app: &mut App, scope: &str) {
         ToolKey::native(IME_TOOL),
         vec![scope.into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
     press(app, KeyCode::Char(IME_DENY_KEY));
@@ -4273,7 +4274,7 @@ fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
 
@@ -7649,7 +7650,7 @@ fn open_permission_prompt(app: &mut App) {
         ToolKey::native("bash"),
         vec!["execute".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
 }
@@ -9669,7 +9670,7 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
 
@@ -10526,7 +10527,7 @@ fn ctrl_c_denies_permission_prompt() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
     assert!(app.permission_prompt.is_open());
@@ -10746,7 +10747,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         maki_config::ToolKey::native("bash"),
         vec!["ls".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
 
@@ -11175,7 +11176,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
     assert_eq!(
@@ -11191,7 +11192,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         maki_config::ToolKey::Wildcard,
         vec![],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
     assert_eq!(
@@ -11874,6 +11875,11 @@ fn turn_end_keeps_every_subagent_tab_in_the_meta() {
     assert_eq!(ids, [FINISHED_TASK_ID, UNFINISHED_TASK_ID, LATER_TASK_ID]);
 }
 
+/// The question a start in `project` would pose, with no stored answer.
+fn question_about_a_folder(project: &Path) -> TrustQuestion {
+    TrustQuestion::for_folder(&CanonicalFolder::resolve(project).unwrap())
+}
+
 /// A folder that ships exactly one gated file, plus the question a start in it
 /// would pose. Written into a tempdir so the grant is about a path nothing else
 /// on the machine owns.
@@ -11881,44 +11887,54 @@ fn question_about_a_gated_folder(project: &Path) -> TrustQuestion {
     let gated = project.join(GatedFile::InitLua.to_string());
     fs::create_dir_all(gated.parent().unwrap()).unwrap();
     fs::write(&gated, GATED_INIT_SOURCE).unwrap();
-    TrustQuestion::for_folder(&CanonicalFolder::resolve(project).unwrap())
+    question_about_a_folder(project)
 }
 
 /// `/trust` is `maki trust add --yes` from inside the TUI, so it has to leave
 /// the same record on disk. The reload is the other half: the project config it
-/// just granted only loads on a fresh start.
-#[test]
-fn trust_command_records_the_folder_and_reloads() {
+/// just granted only loads on a fresh start. A folder with nothing to load gets
+/// the same yes, which is what lets its project answers be saved.
+#[test_case(true ; "gated_folder")]
+#[test_case(false ; "vacant_folder")]
+fn trust_command_records_the_folder_and_reloads(gated: bool) {
     let (_state, storage, _writer, mut app) = tempdir_app();
     let project = TempDir::new().unwrap();
-    let question = question_about_a_gated_folder(project.path());
-    app.trust_question = Some(question.clone());
+    let (state, expected_flash) = if gated {
+        (
+            TrustState::Unanswered(question_about_a_gated_folder(project.path())),
+            format!("{TRUSTED_PREFIX}{}", GatedFile::InitLua),
+        )
+    } else {
+        (
+            TrustState::Vacant(question_about_a_folder(project.path())),
+            TRUSTED_VACANT_MSG.to_owned(),
+        )
+    };
+    let folder = state.grantable().unwrap().folder.clone();
+    app.trust = state;
 
     app.execute_command(cmd(TRUST), 0);
 
     assert!(
-        TrustedFolders::new(&storage)
-            .contains(&question.folder)
-            .unwrap(),
+        TrustedFolders::new(&storage).contains(&folder).unwrap(),
         "the grant must outlive the process"
     );
     assert_eq!(app.exit_request, ExitRequest::Reload);
-    assert_eq!(
-        app.status_bar.flash_text().unwrap(),
-        format!("{TRUSTED_PREFIX}{}", GatedFile::InitLua)
-    );
+    assert_eq!(app.status_bar.flash_text().unwrap(), expected_flash);
 }
 
 /// Nothing to grant is not a reason to tear the session down: the user would
 /// lose the chat to a no-op.
-#[test]
-fn trust_command_without_a_question_flashes_and_stays() {
+#[test_case(TrustState::Inert, NOTHING_TO_TRUST_MSG ; "nothing_to_trust")]
+#[test_case(TrustState::Trusted, ALREADY_TRUSTED_MSG ; "already_trusted")]
+fn trust_command_without_a_question_flashes_and_stays(state: TrustState, expected_flash: &str) {
     let (_state, _storage, _writer, mut app) = tempdir_app();
+    app.trust = state;
 
     let actions = app.execute_command(cmd(TRUST), 0);
 
     assert!(actions.is_empty());
-    assert_eq!(app.status_bar.flash_text(), Some(NOTHING_TO_TRUST_MSG));
+    assert_eq!(app.status_bar.flash_text(), Some(expected_flash));
     assert_eq!(app.exit_request, ExitRequest::None);
 }
 

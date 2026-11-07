@@ -11,6 +11,7 @@ use super::{
 };
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent};
 use crate::chat::{Chat, ChatEventResult, DONE_TEXT, ERROR_TEXT};
+use crate::components::permission_prompt::ProjectAnswers;
 use crate::components::{
     BackgroundOutcome, DisplayMessage, DisplayRole, ExitRequest, RetryInfo, Status,
 };
@@ -400,14 +401,15 @@ impl App {
                 scopes,
                 reason,
             } => {
-                let project_trusted = self.permissions.project_is_trusted();
+                let project_answers =
+                    ProjectAnswers::new(self.permissions.project_is_trusted(), &self.trust);
                 self.open_prompt(|app| {
                     app.permission_prompt.push(
                         id,
                         tool,
                         scopes,
                         subagent_id,
-                        project_trusted,
+                        project_answers,
                         reason,
                     );
                 });

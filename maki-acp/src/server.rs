@@ -663,16 +663,10 @@ fn trusted_project_config(
     policy: &TrustConfig,
 ) -> ProjectConfig {
     let mut decision = project::resolve(storage, cwd, mode);
-    let matched = decision
-        .state
-        .unanswered()
-        .and_then(|question| policy_grant(question, policy));
-    if let Some(pattern) = matched {
+    if let Some(pattern) = policy_grant(&decision.state, policy) {
         // ACP has no card, so policy is the only yes a cwd with no stored
         // decision can get. Recorded like any other yes so `maki trust list`
-        // shows what this server trusted on the client's behalf. `unanswered`
-        // and not `question`: a recorded `Never` is a stored decision, and
-        // granting over it would wipe the rejection out of the store.
+        // shows what this server trusted on the client's behalf.
         info!(%pattern, cwd = %cwd.display(), "ACP folder trusted by trust.paths policy");
         decision = project::apply_answer(storage, decision, TrustAnswer::Trust);
     }

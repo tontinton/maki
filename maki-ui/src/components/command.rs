@@ -192,7 +192,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/trust",
-        description: "Trust this folder and load its shared project config",
+        description: "Trust this folder: load its project config and save project answers",
         max_args: 0,
         bang: false,
         plugin_access: PluginAccess::UserOnly,

@@ -24,11 +24,11 @@ pub fn add(storage: &StateDir, path: Option<&Path>, yes: bool) -> Result<()> {
         println!("Already trusted: {}", folder.path().display());
         return Ok(());
     }
-    // A folder shipping nothing gated poses no question, but this is also how
-    // you vouch for one before it ships anything, so it records either way.
+    // A broken store or folder already bailed above, so only the home
+    // directory gets here with nothing grantable.
     let question = decision
         .state
-        .question()
+        .grantable()
         .cloned()
         .unwrap_or_else(|| TrustQuestion::for_folder(&folder));
 

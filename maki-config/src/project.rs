@@ -189,35 +189,61 @@ pub enum TrustState {
     /// Project config loads: a recorded yes, a grandfathered or v1 folder just
     /// written down, or `--trust`.
     Trusted,
-    /// Nothing loads and nothing to ask: the home directory, a folder shipping
-    /// no gated file, or a store this run could not read.
+    /// Nothing loads and no answer can be given: the home directory, or a
+    /// store or folder this run could not read.
     Inert,
+    /// Nothing gated and no answer recorded. Nothing was skipped, so it stays
+    /// quiet, but a yes typed on purpose still counts: it is what lets Maki
+    /// save project permission answers here.
+    Vacant(TrustQuestion),
     /// Gated files present, no answer recorded. This is what the card asks.
     Unanswered(TrustQuestion),
-    /// A recorded `Never`. Indicator and `/trust`, no card.
+    /// A recorded `Never`, even if the folder ships nothing now. Indicator and
+    /// `/trust`, no card.
     Declined(TrustQuestion),
 }
 
 impl TrustState {
-    /// `Some` for both restricted variants, which is what the status-bar
-    /// indicator and `/trust` key off. Deliberately not `!is_trusted()`: that
-    /// is true in every folder with no `.maki` at all.
+    /// `Some` when something was skipped or refused, which is what the
+    /// `[restricted]` indicator and notice key off. Not `!is_trusted()`, which
+    /// is also true in every folder with no `.maki` at all.
     pub fn question(&self) -> Option<&TrustQuestion> {
         match self {
             TrustState::Unanswered(question) | TrustState::Declined(question) => Some(question),
+            TrustState::Trusted | TrustState::Inert | TrustState::Vacant(_) => None,
+        }
+    }
+
+    /// The question the card asks. A folder with nothing gated is never asked
+    /// about, and a `Never` is never asked again.
+    pub fn unanswered(&self) -> Option<&TrustQuestion> {
+        match self {
+            TrustState::Unanswered(question) => Some(question),
+            TrustState::Trusted
+            | TrustState::Inert
+            | TrustState::Vacant(_)
+            | TrustState::Declined(_) => None,
+        }
+    }
+
+    /// What a typed `/trust` or `maki trust add` says yes to. Typing the
+    /// command is the consent, so it may overturn a `Never`.
+    pub fn grantable(&self) -> Option<&TrustQuestion> {
+        match self {
+            TrustState::Unanswered(question)
+            | TrustState::Vacant(question)
+            | TrustState::Declined(question) => Some(question),
             TrustState::Trusted | TrustState::Inert => None,
         }
     }
 
-    /// The question an answer may still be given to. `None` for a recorded
-    /// `Never`, which is why this exists next to [`TrustState::question`]: a
-    /// permanent no is a stored decision, and [`grant`] replaces a rejection in
-    /// the store, so a card or a `trust.paths` match keyed off `question` would
-    /// erase the very answer the user gave on purpose. Only `/trust` and
-    /// `maki trust add`, where typing the command is the consent, overturn one.
-    pub fn unanswered(&self) -> Option<&TrustQuestion> {
+    /// What the card or a `trust.paths` match may answer. A `Never` is left
+    /// out, because [`grant`] would overwrite a rejection given on purpose.
+    /// [`policy_grant`] and [`apply_answer`] check this themselves, so no
+    /// caller can forget.
+    fn unrecorded(&self) -> Option<&TrustQuestion> {
         match self {
-            TrustState::Unanswered(question) => Some(question),
+            TrustState::Unanswered(question) | TrustState::Vacant(question) => Some(question),
             TrustState::Trusted | TrustState::Inert | TrustState::Declined(_) => None,
         }
     }
@@ -364,18 +390,6 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
         Err(error) => return ProjectDecision::inert(project_config, format!("{error}; {SKIPPED}")),
     };
 
-    // Nothing to load means nothing to ask about, so report whatever the store
-    // already says and stay quiet. A folder that predates folder trust is the
-    // exception: writing its record down even with nothing to load is what
-    // bounds the grant to today's files.
-    if present.is_empty() && decision != TrustDecision::Grandfathered {
-        let state = match decision {
-            TrustDecision::Trusted => TrustState::Trusted,
-            _ => TrustState::Inert,
-        };
-        return ProjectDecision::new(project_config, state, None);
-    }
-
     let question = |added: Vec<GatedFile>| TrustQuestion {
         folder: folder.clone(),
         present: present.clone(),
@@ -390,7 +404,8 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
         // does can put a folder into it, and that is what makes it safe on a
         // path that cannot ask anybody. What the folder shipped back then is
         // unknowable, so the record covers what it ships today and nothing
-        // more, and a file added after this asks like any other.
+        // more, and a file added after this asks like any other. That is why
+        // it is recorded even when the folder ships nothing.
         TrustDecision::Grandfathered => {
             info!(folder = %folder.path().display(), "trusting folder that was in use before folder trust existed");
             record_trust(storage, &question(Vec::new()), project_config)
@@ -398,6 +413,13 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
         TrustDecision::Rejected => ProjectDecision::new(
             project_config,
             TrustState::Declined(question(Vec::new())),
+            None,
+        ),
+        // Nothing to load means nothing to ask about, and asking anyway trains
+        // people to click through.
+        TrustDecision::Unknown if present.is_empty() => ProjectDecision::new(
+            project_config,
+            TrustState::Vacant(question(Vec::new())),
             None,
         ),
         TrustDecision::Unknown => ProjectDecision::new(
@@ -426,19 +448,20 @@ pub fn grant(storage: &StateDir, question: &TrustQuestion) -> Result<(), String>
         .map_err(|error| format!("{error}; {TRUST_NOT_SAVED}"))
 }
 
-/// Answers a question from policy alone, returning the `trust.paths` pattern
-/// that matched. `None` when nothing matched; the caller then asks, or stays
-/// restricted if it cannot.
+/// Answers a folder from policy alone, returning the `trust.paths` pattern
+/// that matched. `None` when nothing matched or the folder already has an
+/// answer, so a `Never` stays a `Never` however the globs are written. The
+/// caller then asks, or stays restricted if it cannot.
 ///
 /// The answer is only half of it: a caller that gets a pattern back records it
 /// through [`grant`] like any other yes, so `maki trust list` stays the single
 /// source of truth and no later start has to evaluate globs before it can read
 /// the store.
 pub fn policy_grant<'policy>(
-    question: &TrustQuestion,
+    state: &TrustState,
     policy: &'policy TrustConfig,
 ) -> Option<&'policy str> {
-    policy.matched_pattern(question.folder.path())
+    policy.matched_pattern(state.unrecorded()?.folder.path())
 }
 
 /// Records a permanent no. The counterpart to [`grant`]; "not now" records
@@ -452,7 +475,9 @@ pub fn deny(storage: &StateDir, question: &TrustQuestion) -> Result<(), String> 
 
 /// Records an answer and returns the decision the rest of the run uses. The
 /// card and the policy auto-grant both land here, so what was written down and
-/// what this process does cannot disagree.
+/// what this process does cannot disagree. A folder that already has an answer
+/// comes back untouched, so neither can overturn a `Never`. `/trust` and
+/// `maki trust add` may, and call [`grant`] directly.
 ///
 /// A store that refused the write keeps the grant the user just gave for this
 /// process and reports it, which is the one documented exception to "any
@@ -462,7 +487,7 @@ pub fn apply_answer(
     decision: ProjectDecision,
     answer: TrustAnswer,
 ) -> ProjectDecision {
-    let Some(question) = decision.state.question() else {
+    let Some(question) = decision.state.unrecorded() else {
         return decision;
     };
     match answer {
@@ -861,9 +886,28 @@ mod tests {
         let (_state, project, _storage) = setup();
         let policy = trust_policy(paths, prompt);
 
-        let answer = policy_grant(&question_at(project.path()), &policy);
+        let state = TrustState::Unanswered(question_at(project.path()));
 
-        assert_eq!(answer, expected);
+        assert_eq!(policy_grant(&state, &policy), expected);
+    }
+
+    /// A policy is a yes given in advance, so it only lands on a folder with no
+    /// answer yet. Landing on a `Never` would quietly erase it.
+    #[test_case(TrustState::Unanswered, Some(BLANKET_GLOB) ; "unanswered")]
+    #[test_case(TrustState::Vacant, Some(BLANKET_GLOB) ; "vacant")]
+    #[test_case(TrustState::Declined, None ; "declined")]
+    #[test_case(|_| TrustState::Trusted, None ; "trusted")]
+    #[test_case(|_| TrustState::Inert, None ; "inert")]
+    fn policy_grant_answers_only_an_unrecorded_folder(
+        state: fn(TrustQuestion) -> TrustState,
+        expected: Option<&str>,
+    ) {
+        let (_state, project, _storage) = setup();
+        let policy = trust_policy(&[BLANKET_GLOB], None);
+
+        let state = state(question_at(project.path()));
+
+        assert_eq!(policy_grant(&state, &policy), expected);
     }
 
     #[test]
@@ -1091,14 +1135,13 @@ mod tests {
         assert!(!again.config.is_trusted());
     }
 
-    /// The split between the two accessors, pinned on the one state where they
-    /// disagree. Everything automatic (the card, `trust.paths`) keys off
-    /// `unanswered`, so a `Never` is never granted over; the indicator, `/trust`
-    /// and the restriction notice key off `question`, so a rejected folder
-    /// still says so and can still be recovered by hand.
+    /// A `Never` stays visible and a typed `/trust` can still clear it, but
+    /// nothing automatic gets past it. `apply_answer` checks this itself, so a
+    /// caller that forgets to look first still cannot undo the rejection.
     #[test]
     fn a_rejection_is_reported_but_never_answered_again() {
         let (_state, project, storage) = setup();
+        let folder = CanonicalFolder::resolve(project.path()).unwrap();
         deny(&storage, &question_at(project.path())).unwrap();
 
         let decision = resolve_recorded(&storage, project_at(project.path()));
@@ -1106,9 +1149,18 @@ mod tests {
         assert!(matches!(decision.state, TrustState::Declined(_)));
         assert_eq!(decision.state.unanswered(), None);
         assert!(decision.state.question().is_some());
+        assert!(decision.state.grantable().is_some());
         let notices = decision.notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains(CLEAR_THE_REJECTION), "{notices:?}");
+
+        let answered = apply_answer(&storage, decision, TrustAnswer::Trust);
+
+        assert!(!answered.project_config.is_trusted());
+        assert_eq!(
+            TrustedFolders::new(&storage).status(&folder).unwrap(),
+            TrustStatus::Rejected
+        );
     }
 
     /// A run that cannot ask reports through `notices`, and the reason it is
@@ -1373,32 +1425,98 @@ mod tests {
         assert!(answered.warning.is_empty(), "{:?}", answered.warning);
     }
 
-    #[test_case(false, false ; "an_unreadable_store_warns_and_stays_untrusted")]
-    #[test_case(true, true ; "stored_trust_still_applies")]
-    fn a_project_without_shared_files_is_never_asked(store_trust: bool, expected: bool) {
+    fn vacant_setup() -> (tempfile::TempDir, tempfile::TempDir, StateDir) {
         let (state, project, storage) = setup();
-        let folder = CanonicalFolder::resolve(project.path()).unwrap();
-        if store_trust {
-            TrustedFolders::new(&storage).add(&folder, &[]).unwrap();
-        } else {
-            fs::write(state.path().join(TRUST_FILE), UNREADABLE_STORE).unwrap();
-        }
         fs::remove_dir_all(project.path().join(PROJECT_DIR)).unwrap();
+        (state, project, storage)
+    }
 
-        let answered = answer_question(
-            &storage,
-            project_at(project.path()),
-            Some(TrustAnswer::Trust),
-        );
+    #[derive(Clone, Copy, Debug)]
+    enum Stored {
+        Nothing,
+        Trust,
+        Rejection,
+        Unreadable,
+    }
 
-        assert_eq!(answered.config.is_trusted(), expected);
-        assert!(answered.asked.is_none());
+    /// Only a `Never` shows the `[restricted]` indicator here. Everything else
+    /// stays quiet, because nothing was skipped.
+    #[test_case(Stored::Nothing, |state| matches!(state, TrustState::Vacant(_)) ; "no_stored_answer_is_vacant")]
+    #[test_case(Stored::Trust, |state| *state == TrustState::Trusted ; "stored_trust_still_applies")]
+    #[test_case(Stored::Rejection, |state| matches!(state, TrustState::Declined(_)) ; "a_stored_rejection_still_applies")]
+    #[test_case(Stored::Unreadable, |state| *state == TrustState::Inert ; "an_unreadable_store_warns_and_stays_untrusted")]
+    fn a_project_without_shared_files_is_never_asked(
+        stored: Stored,
+        expected: fn(&TrustState) -> bool,
+    ) {
+        let (state, project, storage) = vacant_setup();
+        let folder = CanonicalFolder::resolve(project.path()).unwrap();
+        let trusted_folders = TrustedFolders::new(&storage);
+        match stored {
+            Stored::Nothing => {}
+            Stored::Trust => {
+                trusted_folders.add(&folder, &[]).unwrap();
+            }
+            Stored::Rejection => {
+                trusted_folders.reject(&folder).unwrap();
+            }
+            Stored::Unreadable => {
+                fs::write(state.path().join(TRUST_FILE), UNREADABLE_STORE).unwrap();
+            }
+        }
+
+        let decision = resolve_recorded(&storage, project_at(project.path()));
+
+        assert!(expected(&decision.state), "{:?}", decision.state);
         assert_eq!(
-            answered.warning.is_empty(),
-            store_trust,
-            "a store nobody can read must be reported here too: {:?}",
-            answered.warning
+            decision.state.question().is_some(),
+            matches!(stored, Stored::Rejection),
+            "{:?}",
+            decision.state
         );
+        assert_eq!(
+            decision.warning.is_some(),
+            matches!(stored, Stored::Unreadable),
+            "a store nobody can read must be reported here too: {:?}",
+            decision.warning
+        );
+    }
+
+    /// A yes given to a folder with nothing to load names no file kind, so it
+    /// cannot cover code the project ships afterwards.
+    #[test]
+    fn a_vacant_grant_covers_no_kind_shipped_later() {
+        let (_state, project, storage) = vacant_setup();
+        let decision = resolve_recorded(&storage, project_at(project.path()));
+        let granted = apply_answer(&storage, decision, TrustAnswer::Trust);
+        assert!(granted.project_config.is_trusted());
+
+        fs::create_dir(project.path().join(PROJECT_DIR)).unwrap();
+        fs::write(project.path().join(INIT_FILE), INIT_SOURCE).unwrap();
+        let later = resolve_recorded(&storage, project_at(project.path()));
+
+        match later.state {
+            TrustState::Unanswered(question) => {
+                assert_eq!(question.added, vec![GatedFile::InitLua]);
+            }
+            state => panic!("a kind shipped after the grant must ask: {state:?}"),
+        }
+    }
+
+    /// Saving project answers is the reason to trust a vacant folder, so the
+    /// `permissions.toml` Maki writes after the grant must not ask again.
+    #[test]
+    fn a_vacant_grant_keeps_permissions_maki_wrote() {
+        let (_state, project, storage) = vacant_setup();
+        let decision = resolve_recorded(&storage, project_at(project.path()));
+        let granted = apply_answer(&storage, decision, TrustAnswer::Trust);
+
+        fs::create_dir(project.path().join(PROJECT_DIR)).unwrap();
+        fs::write(project.path().join(PERMISSIONS_FILE), PERMISSIONS_SOURCE).unwrap();
+        record_written_file_in(&storage, &granted.project_config, PERMISSIONS_NAME);
+        let later = resolve_recorded(&storage, project_at(project.path()));
+
+        assert_eq!(later.state, TrustState::Trusted);
     }
 
     #[test]
