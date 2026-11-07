@@ -161,6 +161,7 @@ declare maki: {
     notify: @checked (text: string, opts: any) -> (boolean?, string?),
     set_mode: @checked (mode: string, opts: any) -> (boolean?, string?),
     set_title: @checked (opts: any) -> (boolean?, string?),
+    data_dir: @checked (opts: any) -> (string?, string?),
   },
   task: {
     list: @checked () -> (any, string?),
