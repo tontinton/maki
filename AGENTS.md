@@ -65,6 +65,8 @@ Invariant: requests are append-only. Never rebuild `system`/`tools` or edit earl
 
 Invariant: the serde of `Message`, `ContentBlock`, `FactsUpdate` and `PromptFacts` is public API (session files, `maki session export`, Lua). Fields are only added, with defaults. Variants are only added. Content an older build must not lose goes in a new `ContentBlock` variant, never a field. Only `ContentBlock` keeps a variant it does not know, so a new variant of any other enum in them (`Role`, `MessageKind`, `PlanChange`) needs a `LOG_FORMAT_VERSION` bump, or an older build drops the whole message.
 
+Invariant: no `Drop` in maki-lua touches the Lua VM. Anything Lua owns can be dropped inside a Luau GC sweep, where any `Lua` call aborts the process: a `UserData` field, a closure capture, or a local held across an `.await` in a Lua-callable async fn. Such a type holds no `Lua` (move the `Drop` onto a field, like `ScopeEnd`), takes no lock that is ever held across a Lua call, and leaves VM work for a safe point (like `JobReaper`). Dropping a `RegistryKey` is fine, because `collect_turn_garbage` frees its value at turn end. Run Lua callbacks with `Function::call_async` (clippy bans `Thread::into_async`), so a dropped call ends at once instead of waiting for the GC. Each such type gets a case in `dropped_by_collector_releases_its_hold` (`maki-lua/src/runtime.rs`).
+
 ## Docs
 
 Homepage: ./site/. User docs: ./site/docs/.

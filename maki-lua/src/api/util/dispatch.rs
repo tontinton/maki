@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use mlua::{FromLuaMulti, Function, IntoLuaMulti, Lua};
 
@@ -39,9 +40,25 @@ impl Reentry {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct DepthStore {
-    depths: HashMap<(&'static str, String, u64), u8>,
+type DepthKey = (&'static str, String, u64);
+
+/// Shared, so a [`DepthGuard`] can give its count back without the VM.
+#[derive(Clone, Default)]
+pub(crate) struct DepthStore(Arc<Mutex<HashMap<DepthKey, u8>>>);
+
+impl DepthStore {
+    fn of(lua: &Lua) -> Self {
+        if let Some(store) = lua.app_data_ref::<Self>() {
+            return store.clone();
+        }
+        let store = Self::default();
+        lua.set_app_data(store.clone());
+        store
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<DepthKey, u8>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 #[derive(Debug)]
@@ -49,9 +66,12 @@ pub(crate) struct DepthExceeded;
 
 /// Reentrancy bound as RAII: `Drop` is the only decrement, so an error
 /// path can never leave the depth stuck high.
+///
+/// The collector drops it too, when it frees a coroutine parked in a slot
+/// chain or in `exec_autocmds`, so the decrement stays away from the VM.
 pub(crate) struct DepthGuard {
-    lua: Lua,
-    key: (&'static str, String, u64),
+    depths: DepthStore,
+    key: DepthKey,
 }
 
 impl DepthGuard {
@@ -61,33 +81,27 @@ impl DepthGuard {
         name: &str,
         scope: Reentry,
     ) -> Result<Self, DepthExceeded> {
-        if lua.app_data_ref::<DepthStore>().is_none() {
-            lua.set_app_data(DepthStore::default());
-        }
         let key = (kind, name.to_owned(), scope.task(lua));
-        let mut store = lua
-            .app_data_mut::<DepthStore>()
-            .expect("DepthStore just ensured");
-        let depth = store.depths.entry(key.clone()).or_insert(0);
-        if *depth >= MAX_HOOK_DEPTH {
-            return Err(DepthExceeded);
+        let depths = DepthStore::of(lua);
+        {
+            let mut map = depths.lock();
+            let depth = map.entry(key.clone()).or_insert(0);
+            if *depth >= MAX_HOOK_DEPTH {
+                return Err(DepthExceeded);
+            }
+            *depth += 1;
         }
-        *depth += 1;
-        Ok(Self {
-            lua: lua.clone(),
-            key,
-        })
+        Ok(Self { depths, key })
     }
 }
 
 impl Drop for DepthGuard {
     fn drop(&mut self) {
-        if let Some(mut store) = self.lua.app_data_mut::<DepthStore>()
-            && let Some(depth) = store.depths.get_mut(&self.key)
-        {
+        let mut map = self.depths.lock();
+        if let Some(depth) = map.get_mut(&self.key) {
             *depth -= 1;
             if *depth == 0 {
-                store.depths.remove(&self.key);
+                map.remove(&self.key);
             }
         }
     }
@@ -135,7 +149,7 @@ mod tests {
         drop(guards);
         assert!(DepthGuard::enter(&lua, "test", SEAM, scope).is_ok());
         let store = lua.app_data_ref::<DepthStore>().unwrap();
-        assert!(store.depths.is_empty(), "zero entries removed");
+        assert!(store.lock().is_empty(), "zero entries removed");
     }
 
     /// Chains running at once are separate tasks and never add up, while

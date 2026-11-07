@@ -378,12 +378,10 @@ pub(crate) async fn run_hook(
     let spec = slot.spec();
     let template = spec.refines.and_then(|field| payload.get(field).cloned());
     let args = call_args(lua, keys, spec, payload).map_err(|e| e.to_string())?;
-    let call = async {
-        lua.create_thread(func)?
-            .into_async::<(LuaValue, LuaValue)>(args)?
-            .await
-    };
-    let (value, second) = call.await.map_err(|e| e.to_string())?;
+    let (value, second) = func
+        .call_async::<(LuaValue, LuaValue)>(args)
+        .await
+        .map_err(|e| e.to_string())?;
     if let LuaValue::UserData(reported) = second
         && let Ok(ProviderError(error)) = reported.take::<ProviderError>()
     {

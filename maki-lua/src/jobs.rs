@@ -5,7 +5,7 @@ use std::mem;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::thread;
 use std::time::Instant;
 
@@ -175,7 +175,10 @@ struct JobMeta {
     on_stderr: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
     ceiling: Option<Ceiling>,
-    event_rx: Option<JobEvents>,
+    events: JobEvents,
+    /// Set while a `jobwait` holds the events. Pumps leave the job alone
+    /// until its [`WaitLease`] drops.
+    waited: Arc<AtomicBool>,
     _queue: QueueOwner,
     stdout_tail: VecDeque<String>,
     stderr_tail: VecDeque<String>,
@@ -233,7 +236,11 @@ impl JobMeta {
     }
 
     fn has_pending(&self) -> bool {
-        self.replay_exit.is_some() || self.event_rx.as_ref().is_some_and(|rx| !rx.is_empty())
+        self.replay_exit.is_some() || self.pumpable().is_some_and(|events| !events.is_empty())
+    }
+
+    fn pumpable(&self) -> Option<&JobEvents> {
+        (!self.waited.load(Ordering::Acquire)).then_some(&self.events)
     }
 }
 
@@ -274,12 +281,8 @@ pub(crate) struct JobStore {
     /// landing while a pump is busy delivering still wakes it afterwards. The
     /// store outlives every pump, each one holds the `Lua` that owns it.
     changed: watch::Sender<()>,
-}
-
-pub(crate) struct CheckedOutReceiver {
-    lua: Lua,
-    job_id: u32,
-    receiver: Option<JobEvents>,
+    /// Tasks a [`JobReaper`] reported, reaped on the next access.
+    ended: Arc<Mutex<Vec<u64>>>,
 }
 
 impl JobStore {
@@ -289,6 +292,31 @@ impl JobStore {
             next_id: 1,
             scan_cursor: 0,
             changed: watch::Sender::new(()),
+            ended: Arc::default(),
+        }
+    }
+
+    pub fn reaper(&self) -> JobReaper {
+        JobReaper {
+            ended: Arc::clone(&self.ended),
+            changed: self.changed.clone(),
+        }
+    }
+
+    /// Kills and forgets the jobs of every task a [`JobReaper`] reported.
+    /// Coming late is fine: only the dead scope's own pump delivered its
+    /// `Task` jobs, so none of their callbacks can run in between.
+    pub fn reap_ended(&mut self, lua: &Lua) {
+        let ended = mem::take(&mut *self.ended.lock().unwrap_or_else(PoisonError::into_inner));
+        for task in ended {
+            let killed = self.kill_owner(lua, &JobOwner::Task(task));
+            if !killed.is_empty() {
+                tracing::warn!(
+                    task,
+                    jobs = ?killed,
+                    "scope finished with live jobs; they were killed"
+                );
+            }
         }
     }
 
@@ -412,7 +440,8 @@ impl JobStore {
                 on_stderr,
                 on_exit,
                 ceiling,
-                event_rx: Some(events),
+                events,
+                waited: Arc::default(),
                 _queue: queue,
                 stdout_tail: VecDeque::new(),
                 stderr_tail: VecDeque::new(),
@@ -456,24 +485,22 @@ impl JobStore {
         self.jobs.get(&job_id)?.ceiling.clone()
     }
 
-    pub fn take_receiver(
-        &mut self,
+    /// None for a job this caller can't see, or one another wait holds.
+    pub fn lease_events(
+        &self,
         job_id: u32,
         task_id: Option<u64>,
         plugin: &str,
-    ) -> Option<JobEvents> {
-        let job = self.jobs.get_mut(&job_id)?;
-        job.can_access(task_id, plugin)
-            .then(|| job.event_rx.take())?
-    }
-
-    pub fn restore_receiver(&mut self, job_id: u32, receiver: JobEvents) {
-        if let Some(job) = self.jobs.get_mut(&job_id)
-            && job.event_rx.is_none()
-        {
-            job.event_rx = Some(receiver);
-            self.changed.send_replace(());
+    ) -> Option<WaitLease> {
+        let job = self.jobs.get(&job_id)?;
+        if !job.can_access(task_id, plugin) || job.waited.swap(true, Ordering::AcqRel) {
+            return None;
         }
+        Some(WaitLease {
+            events: job.events.clone(),
+            waited: Arc::clone(&job.waited),
+            changed: self.changed.clone(),
+        })
     }
 
     /// Pop one queued event. Deliberately one at a time: a batch pulled into
@@ -503,7 +530,7 @@ impl JobStore {
         if let Some(code) = job.replay_exit.take() {
             return Some(JobEvent::Exit(code));
         }
-        job.event_rx.as_ref()?.try_recv()
+        job.pumpable()?.try_recv()
     }
 
     /// Round-robins over the jobs holding events: taking the first match every
@@ -739,27 +766,46 @@ impl Drop for JobStore {
     }
 }
 
-impl CheckedOutReceiver {
-    pub fn new(lua: &Lua, job_id: u32, receiver: JobEvents) -> Self {
-        Self {
-            lua: lua.clone(),
-            job_id,
-            receiver: Some(receiver),
-        }
-    }
+/// A `jobwait`'s exclusive hold on one job's events. The store keeps its own
+/// receiver, so there is nothing to give back: dropping the lease only lets
+/// the pumps in again.
+pub(crate) struct WaitLease {
+    events: JobEvents,
+    waited: Arc<AtomicBool>,
+    changed: watch::Sender<()>,
+}
 
-    pub fn get(&self) -> &JobEvents {
-        self.receiver.as_ref().expect("receiver is checked out")
+impl WaitLease {
+    pub fn events(&self) -> &JobEvents {
+        &self.events
     }
 }
 
-impl Drop for CheckedOutReceiver {
+/// The GC runs this when it frees a coroutine parked in `jobwait`, so it
+/// must stay Lua-free. The bump wakes a parked pump for the events the wait
+/// left queued.
+impl Drop for WaitLease {
     fn drop(&mut self) {
-        if let Some(receiver) = self.receiver.take() {
-            with_jobs(&self.lua, |store| {
-                store.restore_receiver(self.job_id, receiver);
-            });
-        }
+        self.waited.store(false, Ordering::Release);
+        self.changed.send_replace(());
+    }
+}
+
+/// Hands a finished task's jobs to the store. A scope can end inside a GC
+/// sweep, where neither the store nor the VM is in reach, so it leaves the
+/// task here and [`JobStore::reap_ended`] does the rest.
+pub(crate) struct JobReaper {
+    ended: Arc<Mutex<Vec<u64>>>,
+    changed: watch::Sender<()>,
+}
+
+impl JobReaper {
+    pub fn task_ended(&self, task_id: u64) {
+        self.ended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(task_id);
+        self.changed.send_replace(());
     }
 }
 
@@ -830,7 +876,7 @@ fn drop_callbacks(lua: &Lua, job: &mut JobMeta) {
 /// Counts the bytes a job has queued. Readers wait here once the count hits
 /// [`JOB_QUEUE_BYTES`] and go on when consumers drain it to
 /// [`JOB_QUEUE_RESUME`]. Dropping the job closes it for good, which frees
-/// them even while `jobwait` holds the receiver inside a callback that is
+/// them even while a `jobwait` lease keeps the pump off a job whose waiter is
 /// not draining.
 #[derive(Default)]
 struct JobQueue {
@@ -871,6 +917,7 @@ fn queued_bytes(event: &JobEvent) -> usize {
 /// A job's receiving end. Taking an event through it settles that event's
 /// bytes with the [`JobQueue`], so no consumer can forget to and leave the
 /// readers waiting on a queue that is long drained.
+#[derive(Clone)]
 pub(crate) struct JobEvents {
     rx: flume::Receiver<JobEvent>,
     queue: Arc<JobQueue>,
@@ -982,10 +1029,10 @@ fn kill_job(job: &JobMeta) {
 /// dead on exit. Shared by `jobwait` and the async dispatch loop so
 /// both deliver events identically.
 ///
-/// The callback runs in a fresh coroutine so it may suspend (the
-/// `maki.fs.*` helpers park on `spawn_blocking`); resumed inline from a
-/// poll loop it would die with "attempt to yield across metamethod /
-/// C-call boundary" on its first suspension.
+/// The callback runs through `call_async`, in a coroutine of its own, so it
+/// may suspend (the `maki.fs.*` helpers park on `spawn_blocking`). Resumed
+/// inline from a poll loop, it would die with "attempt to yield across
+/// metamethod / C-call boundary" on its first suspension.
 pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) -> LuaResult<()> {
     let (callback, ceiling) = with_jobs(lua, |store| {
         store.record_event(job_id, event);
@@ -998,7 +1045,6 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
         with_jobs(lua, |store| store.complete(lua, job_id, *code));
     }
     if let Some(callback) = callback {
-        let thread = lua.create_thread(callback)?;
         let call = match event {
             JobEvent::Stdout(line) | JobEvent::Stderr(line) => {
                 // The stream name sits third, where Neovim passes it.
@@ -1008,9 +1054,9 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
                     STDERR_STREAM
                 };
                 let text = lua.create_string(&line.text)?;
-                thread.into_async::<()>((job_id, text, stream, line.bytes))?
+                callback.call_async::<()>((job_id, text, stream, line.bytes))
             }
-            JobEvent::Exit(code) => thread.into_async::<()>((job_id, *code))?,
+            JobEvent::Exit(code) => callback.call_async::<()>((job_id, *code)),
         };
         Narrowed::under(lua, ceiling, call).await?;
     }
@@ -1085,6 +1131,7 @@ mod tests {
         on_stdout: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
     ) -> JobMeta {
+        let (_, events, queue) = job_queue(watch::Sender::new(()));
         JobMeta {
             owner,
             command: String::new(),
@@ -1095,8 +1142,9 @@ mod tests {
             on_stderr: None,
             on_exit,
             ceiling: None,
-            event_rx: None,
-            _queue: QueueOwner(Arc::default()),
+            events,
+            waited: Arc::default(),
+            _queue: queue,
             stdout_tail: VecDeque::new(),
             stderr_tail: VecDeque::new(),
             tail_cap: DEFAULT_TAIL,
@@ -1196,9 +1244,13 @@ mod tests {
 
         let id = start_echo(&mut store);
         assert!(!store.is_empty(&owner));
-        let receiver = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
+        let lease = store.lease_events(id, Some(1), TEST_PLUGIN).unwrap();
         while !matches!(
-            receiver.rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            lease
+                .events
+                .rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
             JobEvent::Exit(_)
         ) {}
 
@@ -1210,24 +1262,28 @@ mod tests {
     fn unknown_job_operations_are_noops() {
         let mut store = make_store();
         store.kill(999, Some(1), TEST_PLUGIN);
-        assert!(store.take_receiver(999, Some(1), TEST_PLUGIN).is_none());
+        assert!(store.lease_events(999, Some(1), TEST_PLUGIN).is_none());
         assert!(store.callback_key(999, &JobEvent::Exit(0)).is_none());
     }
 
     #[test]
-    fn take_receiver_lifecycle() {
+    fn lease_lifecycle() {
         let mut store = make_store();
-        assert!(store.take_receiver(999, Some(1), TEST_PLUGIN).is_none());
-
         let id = start_echo(&mut store);
         assert!(
-            store.take_receiver(id, Some(2), TEST_PLUGIN).is_none(),
+            store.lease_events(id, Some(2), TEST_PLUGIN).is_none(),
             "another task must not access the job"
         );
-        assert!(store.take_receiver(id, Some(1), TEST_PLUGIN).is_some());
+        let lease = store.lease_events(id, Some(1), TEST_PLUGIN);
+        assert!(lease.is_some());
         assert!(
-            store.take_receiver(id, Some(1), TEST_PLUGIN).is_none(),
-            "second take should fail (receiver already moved)"
+            store.lease_events(id, Some(1), TEST_PLUGIN).is_none(),
+            "a second wait must not share the lease"
+        );
+        drop(lease);
+        assert!(
+            store.lease_events(id, Some(1), TEST_PLUGIN).is_some(),
+            "dropping the lease frees the job"
         );
     }
 
@@ -1238,8 +1294,8 @@ mod tests {
             .start(JobSpec::new(plugin_owner(), "echo hello"))
             .unwrap();
 
-        assert!(store.take_receiver(id, Some(1), "other-plugin").is_none());
-        assert!(store.take_receiver(id, None, TEST_PLUGIN).is_some());
+        assert!(store.lease_events(id, Some(1), "other-plugin").is_none());
+        assert!(store.lease_events(id, None, TEST_PLUGIN).is_some());
     }
 
     #[cfg(unix)]
@@ -1302,15 +1358,15 @@ mod tests {
     }
 
     #[test]
-    fn take_receiver_delivers_events() {
+    fn lease_delivers_events() {
         let mut store = make_store();
         let id = start_echo(&mut store);
-        let rx = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
+        let lease = store.lease_events(id, Some(1), TEST_PLUGIN).unwrap();
 
         let mut got_exit = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            match rx.rx.recv_timeout(Duration::from_millis(200)) {
+            match lease.events.rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(JobEvent::Exit(_)) => {
                     got_exit = true;
                     break;
@@ -1339,14 +1395,14 @@ mod tests {
     }
 
     #[test]
-    fn next_event_is_empty_after_take() {
+    fn next_event_is_empty_while_leased() {
         let mut store = make_store();
         let id = start_echo(&mut store);
-        let _rx = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
+        let _lease = store.lease_events(id, Some(1), TEST_PLUGIN).unwrap();
 
         assert!(
             store.next_event(&task_owner(1)).is_none(),
-            "a checked out receiver yields no events to the pump"
+            "a leased job yields no events to the pump"
         );
     }
 
@@ -1360,7 +1416,7 @@ mod tests {
                 sender.send(JobEvent::Stdout("spam".into()));
             }
             let mut job = stub_job(task_owner(1), None, None);
-            job.event_rx = Some(events);
+            job.events = events;
             job._queue = queue;
             store.jobs.insert(id, job);
         }
@@ -1375,7 +1431,6 @@ mod tests {
     #[tokio::test]
     async fn exit_cleanup_runs_before_a_failing_callback() {
         let lua = Lua::new();
-        lua.set_app_data(JobStore::new());
         let callback = lua
             .create_function(|_, ()| Err::<(), _>(mlua::Error::runtime("callback failed")))
             .unwrap();
@@ -1719,7 +1774,7 @@ mod tests {
         let mut store = make_store();
         let (sender, events, queue) = job_queue(store.changed.clone());
         let mut job = stub_job(plugin_owner(), None, None);
-        job.event_rx = Some(events);
+        job.events = events;
         job._queue = queue;
         job.exit_code = Some(0);
         store.jobs.insert(1, job);
@@ -1730,10 +1785,19 @@ mod tests {
         sender.send(JobEvent::Stdout("line".into()));
         assert!(woke(), "a queued event");
 
-        let receiver = store.take_receiver(1, None, TEST_PLUGIN).unwrap();
-        assert!(!woke(), "checking the receiver out hides events");
-        store.restore_receiver(1, receiver);
-        assert!(woke(), "a returned receiver may hold events");
+        let lease = store.lease_events(1, None, TEST_PLUGIN).unwrap();
+        assert!(!woke(), "taking the lease is not a change");
+        assert!(
+            store.plugin_jobs_with_events().is_empty(),
+            "a leased job hides its queued event from the pump"
+        );
+        drop(lease);
+        assert!(woke(), "a released lease may leave events queued");
+        assert_eq!(
+            store.plugin_jobs_with_events(),
+            [1],
+            "the queued event shows again once the lease drops"
+        );
 
         assert!(store.attach(&lua, 1, None, TEST_PLUGIN, exit_updates(&lua)));
         assert!(woke(), "an exit replayed to a new on_exit");
@@ -1976,13 +2040,7 @@ mod tests {
         /// parked on a send.
         fn start_blocked(store: &mut JobStore, owner: JobOwner, cmd: &str) -> u32 {
             let id = store.start(JobSpec::new(owner, cmd)).unwrap();
-            let queue = Arc::clone(
-                &store.jobs[&id]
-                    .event_rx
-                    .as_ref()
-                    .expect("receiver in store")
-                    .queue,
-            );
+            let queue = Arc::clone(&store.jobs[&id].events.queue);
             wait_until(NEVER_FILLED, || queue.is_full());
             id
         }
@@ -2019,17 +2077,17 @@ mod tests {
             KillPlugin,
             KillSession,
             DropStore,
-            RemoveWhileCheckedOut,
+            RemoveWhileLeased,
         }
 
-        /// The checked-out case is `jobwait` holding the receiver inside a
-        /// callback: nothing drains it, so only closing the job's queue can
+        /// The leased case is `jobwait` holding the events inside a
+        /// callback: nothing drains them, so only closing the job's queue can
         /// release the readers and the wait thread.
         #[test_case::test_case(Teardown::KillTask ; "kill_task")]
         #[test_case::test_case(Teardown::KillPlugin ; "kill_plugin")]
         #[test_case::test_case(Teardown::KillSession ; "kill_session")]
         #[test_case::test_case(Teardown::DropStore ; "drop_store")]
-        #[test_case::test_case(Teardown::RemoveWhileCheckedOut ; "remove_while_checked_out")]
+        #[test_case::test_case(Teardown::RemoveWhileLeased ; "remove_while_leased")]
         fn teardown_releases_blocked_readers(teardown: Teardown) {
             let lua = Lua::new();
             let session = MakiId::generate();
@@ -2041,8 +2099,8 @@ mod tests {
             let mut store = make_store();
             let id = start_blocked(&mut store, owner.clone(), FLOOD_CMD);
             let reaped = Arc::clone(&store.jobs[&id].reaped);
-            let held = matches!(teardown, Teardown::RemoveWhileCheckedOut)
-                .then(|| store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap());
+            let held = matches!(teardown, Teardown::RemoveWhileLeased)
+                .then(|| store.lease_events(id, Some(1), TEST_PLUGIN).unwrap());
 
             match teardown {
                 Teardown::KillSession => store.kill_session(&lua, session),
@@ -2053,8 +2111,8 @@ mod tests {
             }
 
             wait_until(NEVER_RELEASED, || reaped.load(Ordering::Relaxed));
-            if let Some(rx) = held {
-                wait_until(NEVER_RELEASED, || rx.rx.is_disconnected());
+            if let Some(lease) = held {
+                wait_until(NEVER_RELEASED, || lease.events.rx.is_disconnected());
             }
         }
 

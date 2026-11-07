@@ -138,12 +138,7 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
                 return;
             }
         };
-        if let Err(e) = run_detached(&lua, async {
-            let thread = lua.create_thread(callback)?;
-            thread.into_async::<()>(ev)?.await
-        })
-        .await
-        {
+        if let Err(e) = run_detached(&lua, callback.call_async::<()>(ev)).await {
             tracing::warn!(
                 event,
                 plugin = &*plugin,

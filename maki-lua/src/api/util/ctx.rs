@@ -437,7 +437,7 @@ impl UserData for LuaCtx {
                 // Made outside the lock: allocating can run the GC, and a
                 // finalizer may want the same cell.
                 let key = lua.create_registry_value(hook)?;
-                lock_cell(&handle).background_hook = Some(key);
+                lock_cell(&handle).background_hook = Some(Arc::new(key));
                 announce_movable(&handle, agent, true);
                 Ok((Some(true), None))
             },
