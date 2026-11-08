@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+mimalloc = { workspace = true }
 monty = { workspace = true }
 monty-types = { workspace = true }
 serde_json = { workspace = true }

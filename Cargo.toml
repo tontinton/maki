@@ -203,6 +203,7 @@ tree-sitter-css = "0.25"
 tree-sitter-hcl = "1.1"
 tree-sitter-json = "0.24"
 tree-sitter-make = "1.1"
+mimalloc = "0.1"
 monty = "1"
 monty-types = "1"
 notify = { version = "9.0.0-rc.5", default-features = false, features = ["flume", "macos_fsevent"] }

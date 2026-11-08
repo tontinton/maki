@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui_image::{
     Image,
@@ -112,7 +112,11 @@ impl RenderCursor {
             .saturating_sub(self.skip)
             .min(self.bottom.saturating_sub(self.y));
         let seg_area = Rect::new(self.viewport.x, self.y, self.viewport.width, visible_h);
-        let mut p = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+        // `Paragraph` owns its text, so `to_vec()` copied and then freed every
+        // visible span's string each frame. The per-line `Vec`s are still built;
+        // only the string copies go.
+        let text = lines.iter().map(borrow_line).collect::<Text>();
+        let mut p = Paragraph::new(text).wrap(Wrap { trim: false });
         let mut base = style.unwrap_or_default();
         if highlight {
             base = base.add_modifier(Modifier::REVERSED);
@@ -153,6 +157,15 @@ impl RenderCursor {
             self.render(lines, rows.end - rows.start, style, highlight, frame);
         }
     }
+}
+
+fn borrow_line<'a>(line: &'a Line<'_>) -> Line<'a> {
+    let spans = line
+        .spans
+        .iter()
+        .map(|span| Span::styled(span.content.as_ref(), span.style))
+        .collect();
+    Line { spans, ..*line }
 }
 
 #[cfg(test)]
