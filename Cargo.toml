@@ -31,6 +31,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+dial9 = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
@@ -137,6 +138,7 @@ semver = "1"
 toml = "1.1"
 toml_edit = "0.25"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "net", "io-util", "io-std", "signal", "fs"] }
+dial9 = { version = "0.5", features = ["tokio", "cpu-profiling", "process-resource", "memory-profiling", "schedule-latency", "taskdump"] }
 arc-swap = "1"
 bitflags = "2"
 event-listener = "5"

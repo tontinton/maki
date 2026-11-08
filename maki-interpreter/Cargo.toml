@@ -11,6 +11,7 @@ serde_json = { workspace = true }
 getrandom = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+dial9 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

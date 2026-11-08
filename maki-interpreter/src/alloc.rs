@@ -26,7 +26,9 @@
 //! monty ships `set_memory_probe` (pydantic/monty#740) the counter becomes
 //! thread-local and the sharing and rebasing go away.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
+
+use dial9::memory::Dial9Allocator;
 use std::cell::Cell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
@@ -35,6 +37,8 @@ use monty_types::{BASELINE_MEMORY, LIVE_MEMORY};
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;
+
+static INNER: Dial9Allocator = Dial9Allocator::system();
 
 thread_local! {
     static IN_SANDBOX: Cell<bool> = const { Cell::new(false) };
@@ -66,17 +70,17 @@ fn refund(size: usize) {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         charge(layout.size());
-        unsafe { System.alloc(layout) }
+        unsafe { INNER.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         charge(layout.size());
-        unsafe { System.alloc_zeroed(layout) }
+        unsafe { INNER.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         refund(layout.size());
-        unsafe { System.dealloc(ptr, layout) }
+        unsafe { INNER.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -85,7 +89,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         } else {
             refund(layout.size() - new_size);
         }
-        unsafe { System.realloc(ptr, layout, new_size) }
+        unsafe { INNER.realloc(ptr, layout, new_size) }
     }
 }
 

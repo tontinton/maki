@@ -33,14 +33,19 @@ impl Drop for ExitOnPanic {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let (recorder, runtime) = dial9::recorder_from_env().expect("dial9 runtime");
+    runtime.block_on(async_main(recorder));
+}
+
+async fn async_main(recorder: dial9::Recorder) {
     color_eyre::install().ok();
     let _exit = ExitOnPanic;
     let result = cmd::dispatch(Cli::parse()).await;
     // Detached export tasks die with the process; drain them here, before
     // the `exit` below skips every destructor.
     maki_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);
+    recorder.graceful_shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);
     let code = match result {
         Ok(()) => 0,
         Err(e) => {
