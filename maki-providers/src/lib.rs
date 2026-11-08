@@ -46,5 +46,5 @@ pub use types::{
     Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
     StopReason, StreamResponse, THINKING_USAGE, TaskAnswer, TaskEnd, TaskSettled, ThinkingConfig,
     ThinkingFallback, UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model,
-    dialect, is_deferred_tool,
+    dialect, is_deferred_tool, non_empty_tool_result,
 };

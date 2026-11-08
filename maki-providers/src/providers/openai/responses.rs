@@ -91,7 +91,7 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                             input.push(json!({
                                 "type": "function_call_output",
                                 "call_id": tool_use_id,
-                                "output": content,
+                                "output": crate::types::non_empty_tool_result(content),
                             }));
                         }
                         ContentBlock::ToolUse { .. }
@@ -783,6 +783,19 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         assert_eq!(items[3]["type"], "function_call_output");
         assert_eq!(items[3]["call_id"], "tc_1");
         assert_eq!(items[3]["output"], "file.txt");
+    }
+
+    #[test]
+    fn convert_input_blank_tool_result_gets_marker() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::tool_result("tc_1", "", false)],
+            ..Default::default()
+        }];
+
+        let input = convert_input(&messages);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["output"], crate::types::EMPTY_RESPONSE_MARKER);
     }
 
     #[tokio::test]

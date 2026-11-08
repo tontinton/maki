@@ -363,7 +363,7 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                             tool_results.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_use_id,
-                                "content": content,
+                                "content": crate::types::non_empty_tool_result(content),
                             }));
                         }
                         ContentBlock::ToolUse { .. }
@@ -1458,6 +1458,19 @@ data: [DONE]\n";
         assert_eq!(result[1]["tool_call_id"], "t1");
         assert_eq!(result[2]["role"], "user");
         assert_eq!(result[2]["content"][0]["type"], "image_url");
+    }
+
+    #[test_case("" ; "empty")]
+    #[test_case("  \n " ; "whitespace_only")]
+    fn convert_messages_blank_tool_result_gets_marker(blank: &str) {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::tool_result("t1", blank, false)],
+            ..Default::default()
+        }];
+        let result = convert_messages(&msgs, "system");
+        assert_eq!(result[1]["role"], "tool");
+        assert_eq!(result[1]["content"], crate::types::EMPTY_RESPONSE_MARKER);
     }
 
     #[test]
