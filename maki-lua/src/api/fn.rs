@@ -75,6 +75,9 @@ const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv tabl
 ///     with the current call. `"plugin"` keeps it alive until the plugin
 ///     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
 ///     session ends, and survives plugin reload.
+///   `shared` (boolean?) session jobs only: let other plugins list and stop
+///     this job, the way `JobStart` already announces it. Defaults to false,
+///     which keeps the job private to the plugin that started it.
 ///   `tail` (integer?) trailing lines per stream kept for `jobinfo` and
 ///     `jobwait` (default 20, 0 disables, max 1024).
 ///   `max_line_bytes` (integer?) longest line delivered, in bytes. A longer
@@ -341,8 +344,10 @@ fn callback_update(lua: &Lua, opts: &Table, key: &str) -> LuaResult<CallbackUpda
 
 /// List jobs this plugin can see, including exited session-owned jobs (so an
 /// id started before a reload stays findable). Rows identify the job; call
-/// `jobinfo` for tails. Pass a session id to list only that session's jobs.
-/// Plugin and task jobs carry no session, so a filter never matches them.
+/// `jobinfo` for tails. Pass a session id to list only that session's jobs:
+/// its shared jobs from other plugins come with it, while their private ones
+/// stay out. Plugin and task jobs carry no session, so a filter never matches
+/// them.
 ///
 /// @param session string? Session id filter.
 /// @return (table) array of `{ id, command, name, pid, session, status,
@@ -400,7 +405,9 @@ fn snapshot_table(lua: &Lua, snap: &JobSnapshot, tails: bool) -> LuaResult<Table
 }
 
 /// Kill a running job immediately (SIGKILL on Unix). Safe to call on
-/// jobs that already exited or on unknown ids.
+/// jobs that already exited or on unknown ids. A session job started with
+/// `shared = true` can be killed by any plugin, which is how a job picker
+/// stops a job it did not start.
 ///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @return

@@ -541,7 +541,6 @@ fn set_mode(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String) -> LuaResult<()> {
     Ok(())
 }
 
-<<<<<<< HEAD
 const SET_CURSOR_SHAPE: &str = "set_cursor_shape";
 const CURSOR_SHAPE_OPTIONS: &[&str] = &["blink"];
 
