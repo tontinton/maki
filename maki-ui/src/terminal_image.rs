@@ -36,6 +36,7 @@ fn decode_jobs() -> &'static flume::Sender<DecodeJob> {
         thread::Builder::new()
             .name(DECODE_THREAD.into())
             .spawn(move || {
+                let _dial9 = dial9::Dial9Handle::current().track_current_thread();
                 while let Ok(job) = rx.recv() {
                     if catch_unwind(AssertUnwindSafe(job)).is_err() {
                         tracing::error!("inline image decode panicked");

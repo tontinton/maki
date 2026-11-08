@@ -284,7 +284,7 @@ fn spawn_agent_internal(
         },
         lua_handle,
     );
-    let task = AbortOnDropHandle::new(tokio::spawn(async move {
+    let task = AbortOnDropHandle::new(dial9::spawn(async move {
         // A loop respawned after a login runs on the new credentials from
         // its first request on.
         if reload_auth && let Err(e) = provider.reload_auth().await {
@@ -776,7 +776,7 @@ mod tests {
         join_all(Vec::new(), LONG_TIMEOUT).await;
         join_all(
             (0..3)
-                .map(|_| AbortOnDropHandle::new(tokio::spawn(async {})))
+                .map(|_| AbortOnDropHandle::new(dial9::spawn(async {})))
                 .collect(),
             LONG_TIMEOUT,
         )
@@ -788,8 +788,8 @@ mod tests {
         let start = Instant::now();
         join_all(
             vec![
-                AbortOnDropHandle::new(tokio::spawn(async {})),
-                AbortOnDropHandle::new(tokio::spawn(std::future::pending::<()>())),
+                AbortOnDropHandle::new(dial9::spawn(async {})),
+                AbortOnDropHandle::new(dial9::spawn(std::future::pending::<()>())),
             ],
             SHORT_TIMEOUT,
         )

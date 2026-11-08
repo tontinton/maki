@@ -279,7 +279,7 @@ fn request_path(target: &str) -> &str {
 /// Non-empty lines typed on stdin, until it closes or nobody listens.
 fn paste_lines() -> UnboundedReceiver<String> {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
+    dial9::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let pasted = line.trim().to_owned();

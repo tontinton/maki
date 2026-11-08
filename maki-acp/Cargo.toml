@@ -13,6 +13,7 @@ maki-storage = { workspace = true }
 agent-client-protocol-schema = { workspace = true }
 jiff = { workspace = true }
 tokio = { workspace = true }
+dial9 = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
 flume = { workspace = true }

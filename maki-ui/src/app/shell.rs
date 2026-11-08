@@ -177,7 +177,7 @@ pub(crate) fn spawn_shell(
     cancel: CancelToken,
     config: AgentConfig,
 ) {
-    tokio::spawn(async move {
+    dial9::spawn(async move {
         let _ = tx.send(ShellEvent::Start {
             id: id.clone(),
             command: command.clone(),
@@ -332,7 +332,7 @@ fn spawn_line_reader<R: AsyncRead + Unpin + Send + 'static>(
     reader: BufReader<R>,
     tx: flume::Sender<String>,
 ) {
-    tokio::spawn(async move {
+    dial9::spawn(async move {
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
             if tx.send(line).is_err() {

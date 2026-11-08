@@ -233,7 +233,7 @@ pub(crate) async fn stream_with_retry(
         let model = &fitted;
         let started = Instant::now();
         let (ptx, prx) = flume::unbounded();
-        let forwarder = tokio::spawn({
+        let forwarder = dial9::spawn({
             let event_tx = event_tx.clone();
             async move { forward_provider_events(prx, &event_tx).await }
         });

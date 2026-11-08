@@ -315,7 +315,7 @@ mod tests {
             .await
             .unwrap();
         let port = server.port;
-        let handle = tokio::spawn(async move { server.wait_for_callback(TEST_STATE).await });
+        let handle = dial9::spawn(async move { server.wait_for_callback(TEST_STATE).await });
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let req = redirect_request(path.unwrap_or(CALLBACK_PATH));
@@ -379,7 +379,7 @@ mod tests {
             .await
             .unwrap();
         let port = server.port;
-        let handle = tokio::spawn(async move { server.wait_for_callback(TEST_STATE).await });
+        let handle = dial9::spawn(async move { server.wait_for_callback(TEST_STATE).await });
 
         let config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
             .with_safe_default_protocol_versions()

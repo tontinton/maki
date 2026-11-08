@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 arboard = { workspace = true }
 jiff = { workspace = true }
 tokio = { workspace = true }
+dial9 = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 flume = { workspace = true }

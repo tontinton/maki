@@ -979,7 +979,7 @@ struct EventPump {
 impl EventPump {
     /// Ends with what its results reported.
     fn spawn(mut self, mut events: SessionEvents) -> JoinHandle<RunTotals> {
-        tokio::spawn(async move {
+        dial9::spawn(async move {
             while let Some(envelope) = events.next().await {
                 // Folded in first, so a plugin handling `TurnEnd` finds the
                 // finished totals when it calls `maki.session.read()`.

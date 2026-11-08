@@ -641,7 +641,7 @@ fn fetch_models(
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    dial9::spawn(async move {
         fetch_all_models_cached(&policy, |list, warnings| {
             for w in warnings {
                 let _ = warn_tx.try_send(w);
@@ -2202,7 +2202,7 @@ impl<'t> EventLoop<'t> {
         let provider = Arc::clone(&rt.slot.load().provider);
         let slot = Arc::clone(&rt.app.usage_slot);
         slot.store(Some(Arc::new(UsageFetchState::Loading)));
-        tokio::spawn(async move {
+        dial9::spawn(async move {
             let state = match provider.fetch_usage().await {
                 Ok(Some(usage)) => UsageFetchState::Ready(usage),
                 Ok(None) => UsageFetchState::Unsupported,

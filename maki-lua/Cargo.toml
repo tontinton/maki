@@ -32,6 +32,7 @@ semver = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+dial9 = { workspace = true }
 strum = { workspace = true }
 event-listener = { workspace = true }
 flume = { workspace = true }

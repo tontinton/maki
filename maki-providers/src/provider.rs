@@ -260,7 +260,7 @@ pub async fn fetch_all_models(
             continue;
         };
         let tx = tx.clone();
-        tokio::spawn(async move {
+        dial9::spawn(async move {
             let listed = provider.list_models().await;
             let batch = listing_batch(spec, &listed);
             if let Ok(models) = listed {
@@ -271,7 +271,7 @@ pub async fn fetch_all_models(
     }
 
     let tx_catalog = tx.clone();
-    tokio::spawn(async move {
+    dial9::spawn(async move {
         for cat in catalog_providers().await {
             // No `Owner::Custom` here, unlike `available_model_specs` above:
             // a long-standing asymmetry, changing it is a behaviour change.
@@ -296,7 +296,7 @@ pub async fn fetch_all_models(
     });
 
     let tx_custom = tx.clone();
-    tokio::spawn(async move {
+    dial9::spawn(async move {
         let (declared, declared_providers) = custom::declared_batch();
         if !declared.is_empty() {
             let _ = tx_custom

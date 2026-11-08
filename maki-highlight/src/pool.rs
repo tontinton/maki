@@ -39,6 +39,7 @@ fn jobs() -> &'static flume::Sender<Job> {
             .name("highlight".into())
             .spawn(move || {
                 ON_HIGHLIGHT_THREAD.set(true);
+                let _dial9 = dial9::Dial9Handle::current().track_current_thread();
                 while let Ok(job) = rx.recv() {
                     if let Err(payload) = catch_unwind(AssertUnwindSafe(job)) {
                         error!(panic = panic_message(&*payload), "highlight job panicked");

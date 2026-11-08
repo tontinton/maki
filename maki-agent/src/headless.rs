@@ -544,7 +544,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let task_permissions = Arc::clone(&permissions);
     let spend = Arc::<RunLedger>::default();
     let track_spend = Arc::clone(&spend);
-    let task = tokio::spawn(run_session(guard, params.mcp_handle.clone(), async move {
+    let task = dial9::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let mut provider = connect(&mut model, params.timeouts, &base_tx).await?;
         let mut track = SessionTrack::open(
@@ -712,7 +712,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 fn relay_cancel(cancel_rx: &Receiver<()>, trigger: CancelTrigger) -> AbortOnDropHandle<()> {
     while cancel_rx.try_recv().is_ok() {}
     let cancel_rx = cancel_rx.clone();
-    AbortOnDropHandle::new(tokio::spawn(async move {
+    AbortOnDropHandle::new(dial9::spawn(async move {
         if cancel_rx.recv_async().await.is_ok() {
             trigger.cancel();
         }
@@ -1478,7 +1478,7 @@ mod tests {
     async fn await_shutdown_waits_for_a_task_that_still_works() {
         let (release_tx, release_rx) = flume::bounded::<()>(1);
         let finished = Arc::new(AtomicBool::new(false));
-        let task = AbortOnDropHandle::new(tokio::spawn({
+        let task = AbortOnDropHandle::new(dial9::spawn({
             let finished = Arc::clone(&finished);
             async move {
                 let _ = release_rx.recv_async().await;

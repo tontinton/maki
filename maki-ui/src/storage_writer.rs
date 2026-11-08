@@ -58,6 +58,7 @@ impl StorageWriter {
         std::thread::Builder::new()
             .name("storage-writer".into())
             .spawn(move || {
+                let _dial9 = dial9::Dial9Handle::current().track_current_thread();
                 let mut writer = Writer {
                     dir,
                     warn_tx,

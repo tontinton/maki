@@ -1077,7 +1077,7 @@ impl PluginEntry {
         // hook still holds the token nor drop what the hook minted with it.
         let auth = Arc::clone(&self.auth);
         let (done, outcome) = flume::bounded(1);
-        tokio::spawn(async move {
+        dial9::spawn(async move {
             let minted = auth
                 .gate
                 .single_flight(seen, auth.locked_mint(&slug, hook.as_ref(), purpose))

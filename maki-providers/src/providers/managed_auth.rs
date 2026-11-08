@@ -76,7 +76,7 @@ impl ManagedAuth {
         let shared = Arc::clone(&self.auth);
         let held = Arc::clone(&self.tokens);
         let flow = self.flow;
-        tokio::spawn(async move {
+        dial9::spawn(async move {
             match refreshed_tokens(
                 &storage,
                 flow.provider,

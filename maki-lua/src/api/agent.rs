@@ -1164,7 +1164,7 @@ async fn session(
     {
         let _ = sink.send(ToolLive::Task(ui_id.clone()));
     }
-    tokio::spawn(relay_session_events(
+    dial9::spawn(relay_session_events(
         sub_events,
         upstream.clone(),
         Arc::clone(&subagent_info),
@@ -1798,7 +1798,7 @@ impl SessionCancellation {
         let token = self.control.token();
         let registry = self.registry.clone();
         let mailbox = self.mailbox.clone();
-        tokio::spawn(async move {
+        dial9::spawn(async move {
             token.cancelled().await;
             registry.end_mailbox(&mailbox);
         });
@@ -1820,7 +1820,7 @@ impl Drop for LuaSession {
             // and cancel entry are never silently leaked.
             Err(_) => {
                 let inner = Arc::clone(&self.inner);
-                tokio::spawn(async move { inner.lock().await.close() });
+                dial9::spawn(async move { inner.lock().await.close() });
             }
         }
     }

@@ -43,7 +43,7 @@ impl Interrupt {
         let caught = Arc::new(OnceLock::new());
         let signals = watched();
         if !signals.is_empty() {
-            tokio::spawn(watch(signals, trigger, Arc::clone(&caught)));
+            dial9::spawn(watch(signals, trigger, Arc::clone(&caught)));
         }
         Self { stop, caught }
     }

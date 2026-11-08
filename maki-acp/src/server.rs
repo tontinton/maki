@@ -116,7 +116,7 @@ enum Incoming {
 pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let (out_tx, out_rx) = flume::unbounded::<Value>();
 
-    let writer_task = tokio::spawn(async move {
+    let writer_task = dial9::spawn(async move {
         let stdout = std::io::stdout();
         while let Ok(msg) = out_rx.recv_async().await {
             let mut handle = stdout.lock();
@@ -140,7 +140,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let (in_tx, in_rx) = flume::unbounded::<Incoming>();
     // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
     discover_models(Arc::clone(&params.model_policy), in_tx.downgrade());
-    let reader_task = tokio::spawn(read_stdin(in_tx));
+    let reader_task = dial9::spawn(read_stdin(in_tx));
 
     while let Ok(Ok(incoming)) = params.stop.race(in_rx.recv_async()).await {
         match incoming {
@@ -186,7 +186,7 @@ async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
 /// is a cold catalog download, and a provider the client could already pick from
 /// should not wait behind it.
 fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
-    tokio::spawn(async move {
+    dial9::spawn(async move {
         fetch_all_models(
             &policy,
             |batch| {
@@ -958,7 +958,7 @@ fn start_event_pump(
     project_trusted: bool,
     initial_cost: Option<f64>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    dial9::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
         let mut cost = CostTally::starting_at(initial_cost);
         // A permission request only carries scopes, which are matching keys and
@@ -1405,7 +1405,7 @@ mod tests {
                     .project_config,
                 Arc::default(),
             )),
-            task: AbortOnDropHandle::new(tokio::spawn(async { SessionEnd::default() })),
+            task: AbortOnDropHandle::new(dial9::spawn(async { SessionEnd::default() })),
             spend: Arc::default(),
         };
         let server = Server {
@@ -2134,7 +2134,7 @@ mod tests {
     async fn close_session_returns_at_once_with_background_work_out() {
         let (mut srv, ..) = test_server();
         srv.session.as_mut().unwrap().handle.task =
-            AbortOnDropHandle::new(tokio::spawn(future::pending()));
+            AbortOnDropHandle::new(dial9::spawn(future::pending()));
 
         let closed = timeout(
             STDIN_DEADLOCK_TIMEOUT,

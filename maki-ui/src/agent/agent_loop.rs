@@ -384,7 +384,7 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
         let www_auth = url.clone();
         let oauth = info.oauth.clone();
         let ca_file = info.ca_file.clone();
-        tokio::spawn(async move {
+        dial9::spawn(async move {
             let storage = match maki_storage::StateDir::resolve() {
                 Ok(s) => s,
                 Err(e) => {

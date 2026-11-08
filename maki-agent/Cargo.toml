@@ -24,6 +24,7 @@ similar = { workspace = true }
 jsonrepair = { workspace = true }
 jiff = { workspace = true }
 tokio = { workspace = true }
+dial9 = { workspace = true }
 flume = { workspace = true }
 arc-swap = { workspace = true }
 bitflags = { workspace = true }

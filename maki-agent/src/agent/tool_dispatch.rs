@@ -341,7 +341,7 @@ impl MovedPipeline {
             return;
         }
         let MovedCall { result, land } = moved;
-        tokio::spawn(self.land(result, Landing(Some(land))));
+        dial9::spawn(self.land(result, Landing(Some(land))));
     }
 
     async fn land(self, result: BoxFuture<'static, Option<ToolExecResult>>, landing: Landing) {
@@ -1394,7 +1394,7 @@ pub(super) async fn process_tool_calls(
         let guard = CallGuard::new(scope);
         ids.push(id.clone());
         // Abort on drop, so a run that ends mid-turn takes its calls with it.
-        calls.push(AbortOnDropHandle::new(tokio::spawn(async move {
+        calls.push(AbortOnDropHandle::new(dial9::spawn(async move {
             let _guard = guard;
             let done = run(id, &name, &input, &tool_ctx, CallOrigin::Model).await;
             event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));

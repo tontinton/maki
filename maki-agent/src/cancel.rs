@@ -402,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn race_interrupted_by_concurrent_cancel() {
         let (trigger, token) = CancelToken::new();
-        tokio::spawn(async move { trigger.cancel() });
+        dial9::spawn(async move { trigger.cancel() });
         let result = token.race(std::future::pending::<()>()).await;
         assert!(result.is_err());
     }

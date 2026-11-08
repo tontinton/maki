@@ -3953,7 +3953,7 @@ mod tests {
         let mut agent = agent.with_cancel(cancel);
 
         let mut trigger = Some(trigger);
-        let pump = tokio::spawn(async move {
+        let pump = dial9::spawn(async move {
             while let Ok(envelope) = event_rx.recv_async().await {
                 if matches!(envelope.event, AgentEvent::Retry { .. })
                     && let Some(t) = trigger.take()

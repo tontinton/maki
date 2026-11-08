@@ -30,6 +30,7 @@ static PARSES: LazyLock<Sender<Job>> = LazyLock::new(|| {
     thread::Builder::new()
         .name(PARSE_THREAD.into())
         .spawn(move || {
+            let _dial9 = dial9::Dial9Handle::current().track_current_thread();
             while let Ok(job) = queued.recv() {
                 if catch_unwind(AssertUnwindSafe(job)).is_err() {
                     tracing::error!("input parse panicked");

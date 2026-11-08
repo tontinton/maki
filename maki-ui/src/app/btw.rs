@@ -92,7 +92,7 @@ impl App {
             tools,
             messages,
         };
-        tokio::spawn(request.run(tx));
+        dial9::spawn(request.run(tx));
     }
 }
 

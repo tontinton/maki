@@ -34,8 +34,89 @@ impl Drop for ExitOnPanic {
 }
 
 fn main() {
-    let (recorder, runtime) = dial9::recorder_from_env().expect("dial9 runtime");
+    let (recorder, runtime) = dial9_runtime();
+    let installed = recorder.install_global_handle();
+    let sampled = recorder.handle().track_current_thread();
+    dial9_note(&format!(
+        "global handle installed: {installed:?}, track main thread: {:?}",
+        sampled.as_ref().map(|_| ())
+    ));
     runtime.block_on(async_main(recorder));
+}
+
+/// Appends a line to `$DIAL9_TRACE_DIR/maki-dial9.log`, the only place a
+/// message can go before the TUI owns the terminal and tracing is set up.
+fn dial9_note(msg: &str) {
+    use std::io::Write;
+    let Some(dir) = std::env::var_os("DIAL9_TRACE_DIR") else { return };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::Path::new(&dir).join("maki-dial9.log"))
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+/// `recorder_from_env` picks the CPU backend automatically and silently falls
+/// back to per-thread timers, which only sample threads that register. This
+/// forces the process-wide perf backend when it is available and says so.
+fn dial9_runtime() -> dial9::AttachedRuntime {
+    use dial9::cpu::{CpuProfiler, CpuProfilingConfig, SchedEventConfig};
+    use dial9::memory::MemoryProfilingConfig;
+    use dial9::process::ProcessResourceUsageConfig;
+    use dial9::{
+        Dial9HandleTokioExt, RecorderPerfExt, RecorderSourceExt, TaskDumpConfig, TokioAttachOptions,
+    };
+
+    let dir = std::env::var_os("DIAL9_TRACE_DIR")
+        .filter(|_| std::env::var_os("DIAL9_ENABLED").is_some_and(|v| v == "true"));
+    let Some(dir) = dir else {
+        return dial9::recorder_from_env().expect("tokio runtime");
+    };
+    let writer = dial9::DiskBuffer::builder()
+        .base_path(std::path::PathBuf::from(dir))
+        .max_total_size(1 << 30)
+        .rotation_period(Duration::from_secs(900))
+        .build()
+        .expect("dial9 trace writer");
+    let builder = match CpuProfiler::start(CpuProfilingConfig::with_perf_backend()) {
+        Ok(cpu) => {
+            dial9_note("cpu profiler: perf (process-wide)");
+            dial9::recorder(writer).source(cpu)
+        }
+        Err(e) => {
+            dial9_note(&format!("cpu profiler: perf failed ({e}), falling back to auto"));
+            dial9::recorder(writer).with_cpu_profiling(CpuProfilingConfig::default())
+        }
+    };
+    let recorder = builder
+        .with_sched_events(SchedEventConfig::default())
+        .with_process_resource_usage(ProcessResourceUsageConfig::default())
+        .with_memory_profiling(
+            MemoryProfilingConfig::builder()
+                .sample_rate_bytes(64 * 1024)
+                .track_liveset(true)
+                .build(),
+        )
+        .build();
+    let mut rt = tokio::runtime::Builder::new_multi_thread();
+    rt.enable_all();
+    let options = TokioAttachOptions::builder()
+        .runtime_name("maki")
+        .task_tracking_enabled(true)
+        .task_dump_config(
+            TaskDumpConfig::builder()
+                .idle_threshold(Duration::from_millis(5))
+                .build(),
+        )
+        .build();
+    let runtime = recorder
+        .handle()
+        .attach_tokio_runtime(rt, options)
+        .expect("attach tokio runtime");
+    recorder.enable();
+    (recorder, runtime)
 }
 
 async fn async_main(recorder: dial9::Recorder) {

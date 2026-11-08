@@ -5624,6 +5624,7 @@ pub fn spawn(
             // request loop has returned, so the thread stays inside the
             // runtime for its whole life.
             let _runtime = runtime.enter();
+            let _dial9 = dial9::Dial9Handle::current().track_current_thread();
             install_ui_attachment(ui_attachment_thread);
             let mut rt = match LuaRuntime::new(
                 registry,

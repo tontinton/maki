@@ -792,7 +792,7 @@ pub fn start_with_config(config: McpConfig) -> Option<McpHandle> {
 
     info!(total = inner.entries.len(), "MCP servers connecting");
 
-    tokio::spawn(run(inner, index, snapshot, cmd_rx, ready_tx));
+    dial9::spawn(run(inner, index, snapshot, cmd_rx, ready_tx));
     Some(handle)
 }
 
@@ -2249,7 +2249,7 @@ mod tests {
         let entered = t.call_entered_rx.clone();
         let call_handle = {
             let handle = handle.clone();
-            tokio::spawn(async move { handle.call_tool(TOOL_NAME, &json!({})).await.unwrap() })
+            dial9::spawn(async move { handle.call_tool(TOOL_NAME, &json!({})).await.unwrap() })
         };
 
         entered.recv_async().await.unwrap();
@@ -2274,7 +2274,7 @@ mod tests {
         let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
         let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
         let (cmd_tx, cmd_rx) = flume::unbounded();
-        let loop_task = tokio::spawn(run(
+        let loop_task = dial9::spawn(run(
             inner,
             Arc::clone(&index),
             Arc::clone(&snapshot),

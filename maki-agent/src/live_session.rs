@@ -505,7 +505,7 @@ impl SessionMailbox {
         });
         for (id, tool, header) in late {
             let mailbox = self.clone();
-            tokio::spawn(async move {
+            dial9::spawn(async move {
                 let label = TaskLabel::new(&tool, Some(&header.await.text()));
                 mailbox.change(|state| state.relabel_lost(&id, &label));
             });

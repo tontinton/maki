@@ -3914,6 +3914,7 @@ version = "0.7.1"
 dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
+ "dial9",
  "flume",
  "futures",
  "jiff",
@@ -3938,6 +3939,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bitflags 2.13.2",
+ "dial9",
  "event-listener",
  "flume",
  "futures",
@@ -4025,6 +4027,7 @@ dependencies = [
 name = "maki-highlight"
 version = "0.7.1"
 dependencies = [
+ "dial9",
  "flume",
  "serde_json",
  "syntect",
@@ -4056,6 +4059,7 @@ dependencies = [
  "base64 0.23.1",
  "criterion",
  "crossterm",
+ "dial9",
  "event-listener",
  "fastrand",
  "flume",
@@ -4195,6 +4199,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "base64 0.23.1",
+ "dial9",
  "fastrand",
  "flume",
  "futures",
@@ -4251,6 +4256,7 @@ dependencies = [
  "color-eyre",
  "criterion",
  "crossterm",
+ "dial9",
  "fastrand",
  "flume",
  "futures",

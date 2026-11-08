@@ -332,7 +332,7 @@ fn spawn_stdio(
     };
     let process = StdioProcess {
         child: ChildGuard::new(child),
-        _stderr: AbortOnDropHandle::new(tokio::spawn(log_stderr(Arc::from(name), stderr))),
+        _stderr: AbortOnDropHandle::new(dial9::spawn(log_stderr(Arc::from(name), stderr))),
     };
     Ok((stdout, stdin, process))
 }
