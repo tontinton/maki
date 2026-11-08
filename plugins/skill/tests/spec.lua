@@ -149,7 +149,8 @@ case("discovery_keeps_valid_empty_body_and_skips_bad_neighbors", function()
     end
     local skills = {}
     local diagnostics = helpers.scan_skill_dir(dir, skills)
-    eq(skills.valid.content, "")
+    local _, body = parse_frontmatter(skills.valid.content)
+    eq(body, "")
     eq(skills.broken, nil)
     eq(skills.missing, nil)
     eq(skills.portable.description, "Use when: testing")
@@ -193,6 +194,15 @@ case("build_skill_list_sorted_alphabetically", function()
   local zebra_pos = result:find("zebra")
   assert(alpha_pos < middle_pos, "alpha should come before middle")
   assert(middle_pos < zebra_pos, "middle should come before zebra")
+end)
+
+case("activation_retains_metadata_and_relative_path_base", function()
+  local source =
+    "---\nname: release\ndescription: Example\nlicense: MIT\ncompatibility: Requires python3\nmetadata:\n  version: '1'\nallowed-tools: Bash(git:*) Read\n---\n# Release"
+  local location, content = parse_output(helpers.activation_output({ location = LOCATION, content = source }))
+  eq(location, LOCATION)
+  assert(content:find(source, 1, true), "activation must retain all metadata")
+  assert(content:find(maki.fs.dirname(LOCATION), 1, true), "activation must identify the resource base")
 end)
 
 -- ── llm text round trip ──

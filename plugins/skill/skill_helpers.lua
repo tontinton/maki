@@ -14,6 +14,8 @@ local STRING_METADATA_FIELDS = {
 
 local M = {}
 
+M.BUILTIN_PREFIX = "builtin:"
+
 local function decode_yaml(yaml)
   local ok, fm, err = pcall(maki.yaml.decode, yaml)
   if not ok then
@@ -96,7 +98,7 @@ function M.scan_skill_dir(dir, skills)
       local path = maki.fs.joinpath(dir, entry[1], SKILL_FILE)
       local content = maki.fs.read(path)
       if content then
-        local fm, body, err = M.parse_frontmatter(content)
+        local fm, _, err = M.parse_frontmatter(content)
         local warnings
         if fm then
           warnings, err = M.validate_frontmatter(fm, entry[1])
@@ -109,7 +111,12 @@ function M.scan_skill_dir(dir, skills)
           for _, warning in ipairs(warnings) do
             diagnostics[#diagnostics + 1] = path .. ": " .. warning
           end
-          skills[fm.name] = { name = fm.name, description = fm.description, content = body, location = path }
+          skills[fm.name] = {
+            name = fm.name,
+            description = fm.description,
+            content = content,
+            location = path,
+          }
         end
       end
     end
@@ -145,6 +152,15 @@ function M.format_output(location, content)
     lines[i + 1] = string.format(LINE_FMT, i, line)
   end
   return table.concat(lines, "\n")
+end
+
+function M.activation_output(skill)
+  local directory = skill.location:sub(1, #M.BUILTIN_PREFIX) ~= M.BUILTIN_PREFIX and maki.fs.dirname(skill.location)
+  local content = skill.content
+  if directory then
+    content = content .. "\n\nSkill directory: " .. directory .. "\nResolve relative paths from this directory."
+  end
+  return M.format_output(skill.location, content)
 end
 
 function M.parse_output(output)
