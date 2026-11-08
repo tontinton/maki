@@ -1134,13 +1134,16 @@
   // what a card shows; a live result that differs in any of it rebuilds the card
   const listing = p => JSON.stringify([p.description, p.stargazers_count, p.topics, p.created_at, p.pushed_at, p.license?.spdx_id]);
 
-  // a live result keeps the snapshot's README facts and reuses the cover, so its media never reloads
+  // a live result keeps the snapshot's README facts and reuses the cover, so its media never reloads,
+  // unless the repo was pushed since the build: then its README may have changed, so the cover is found anew
   function ingest(items) {
     plugins = items.filter(p => !BLOCKLIST.has(p.full_name.toLowerCase())).map(item => {
       const known = byName.get(item.full_name);
       if (known && listing(known.p) === listing(item)) return known;
-      const x = known ?? { cover: null };
-      x.p = { ...known?.p, ...item };
+      const x = known ?? {};
+      const unpushed = known?.p.pushed_at === item.pushed_at;
+      x.p = unpushed ? { ...known.p, ...item } : item;
+      if (!unpushed) x.cover = null;
       x.haystack = [x.p.full_name, x.p.description ?? '', ...x.p.topics].join(' ').toLowerCase();
       const card = buildCard(x);
       x.card?.replaceWith(card);
