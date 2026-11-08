@@ -35,6 +35,8 @@ use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::TryRecvError;
 use tokio::task::{LocalSet, spawn_local, yield_now};
 use tokio::time::{sleep, sleep_until, timeout, timeout_at};
 
@@ -480,7 +482,7 @@ pub enum Request {
         input: Value,
         ctx: Box<LuaCtx>,
         deadline: Option<Instant>,
-        reply: flume::Sender<ToolCallReply>,
+        reply: oneshot::Sender<ToolCallReply>,
         live: Option<LiveCtx>,
         /// Runs on the caller's slot instead of taking one of its own.
         /// See [`under_inflight_slot`].
@@ -517,25 +519,25 @@ pub enum Request {
         plugin: Arc<str>,
         tool: Arc<str>,
         input: Value,
-        reply: flume::Sender<HeaderResult>,
+        reply: oneshot::Sender<HeaderResult>,
     },
     ComputePermissionScopes {
         plugin: Arc<str>,
         tool: Arc<str>,
         input: Value,
-        reply: flume::Sender<Option<PermissionScopes>>,
+        reply: oneshot::Sender<Option<PermissionScopes>>,
     },
     /// A host-owned slot chain (`tool.<name>.input`, `tool.<name>.output`,
     /// `agent.*`). Only sent when the slot has layers, so the idle case never
     /// reaches the request loop at all.
     RunHook {
         run: HookRun,
-        reply: flume::Sender<Verdict>,
+        reply: oneshot::Sender<Verdict>,
     },
     /// The `permission.prompt` chain, sent only when it has layers.
     RunPrompt {
         run: PromptRun,
-        reply: flume::Sender<Option<LayerAnswer>>,
+        reply: oneshot::Sender<Option<LayerAnswer>>,
     },
     ClearPlugin {
         plugin: Arc<str>,
@@ -615,7 +617,7 @@ pub enum Request {
         input: Value,
         live: LiveCtx,
         ctx: Box<LuaCtx>,
-        reply: flume::Sender<()>,
+        reply: oneshot::Sender<()>,
         /// See [`Request::CallTool::nested`].
         nested: bool,
     },
@@ -1014,14 +1016,14 @@ fn not_movable(reason: &str) -> MoveOutcome {
 /// comes first answers and the other finds it gone. A move leaves its tail's
 /// sender behind, so the final reply of a moved call takes `reply` too.
 struct CallAnswer {
-    reply: RefCell<Option<flume::Sender<ToolCallReply>>>,
+    reply: RefCell<Option<oneshot::Sender<ToolCallReply>>>,
     /// The call's [`MAX_INFLIGHT_TOOLS`] slot. A move gives it back, so long
     /// background work never starves foreground calls.
     slot: RefCell<Option<GateGuard>>,
 }
 
 impl CallAnswer {
-    fn new(reply: flume::Sender<ToolCallReply>, slot: Option<GateGuard>) -> Self {
+    fn new(reply: oneshot::Sender<ToolCallReply>, slot: Option<GateGuard>) -> Self {
         Self {
             reply: RefCell::new(Some(reply)),
             slot: RefCell::new(slot),
@@ -1032,7 +1034,7 @@ impl CallAnswer {
         self.reply
             .borrow()
             .as_ref()
-            .is_some_and(|tx| !tx.is_disconnected())
+            .is_some_and(|tx| !tx.is_closed())
     }
 
     /// The final reply goes to the dispatcher, or once the call moved, to
@@ -1266,7 +1268,7 @@ impl LiveTask {
             return MoveOutcome::NotMovable(e);
         }
         let ui = host_ui(lua);
-        let (tail_tx, tail_rx) = flume::bounded(1);
+        let (tail_tx, tail_rx) = oneshot::channel();
         receipt.result = receipt.result.map(|text| {
             format!(
                 "{text}\n\n{}",
@@ -1275,7 +1277,7 @@ impl LiveTask {
         });
         receipt.moved = Some(MovedCall {
             result: Box::pin(async move {
-                let reply: ToolCallReply = tail_rx.recv_async().await.ok()?;
+                let reply: ToolCallReply = tail_rx.await.ok()?;
                 Some(reply.into_exec_result())
             }),
             land: {
@@ -3313,7 +3315,7 @@ fn spawn_keybind_callback(lua: &Lua, gate: &Rc<InflightGate>, mut ticket: Keybin
     };
     // Dropped when the handler returns, which is how the task below learns it
     // may hand the slot back before the hold lapses.
-    let (done_tx, done_rx) = flume::bounded::<()>(1);
+    let (done_tx, done_rx) = oneshot::channel::<()>();
     let handler_lua = lua.clone();
     let handler_plugin = Arc::clone(&plugin);
     spawn_local(async move {
@@ -3327,10 +3329,7 @@ fn spawn_keybind_callback(lua: &Lua, gate: &Rc<InflightGate>, mut ticket: Keybin
     let gate = Rc::clone(gate);
     spawn_local(async move {
         let _guard = GateGuard::new(&gate);
-        if timeout(KEYBIND_GATE_HOLD, done_rx.recv_async())
-            .await
-            .is_err()
-        {
+        if timeout(KEYBIND_GATE_HOLD, done_rx).await.is_err() {
             tracing::warn!(key = %key.notation(), ticket = id, plugin = %plugin, "keybind handler outlived its drain-barrier slot");
         }
     });
@@ -4726,7 +4725,7 @@ fn extract_restore_reply(ret: &LuaValue) -> Option<RestoreReply> {
 fn cancel_hook_reply(
     lua: &Lua,
     handle: &TaskHandle,
-    finish_rx: &flume::Receiver<ToolCallReply>,
+    finish_rx: &mut oneshot::Receiver<ToolCallReply>,
     reason: KillReason,
 ) -> Option<ToolCallReply> {
     fire_cancel_hooks(lua, handle, reason);
@@ -4735,8 +4734,8 @@ fn cancel_hook_reply(
 
 /// The jobs are gone, so all that can still answer is a `ctx:finish()` already
 /// on its way. A dropped `ctx` ends the wait early: nothing can finish any more.
-async fn late_finish(finish_rx: &flume::Receiver<ToolCallReply>) -> ToolCallReply {
-    timeout(FINISH_GRACE, finish_rx.recv_async())
+async fn late_finish(finish_rx: &mut oneshot::Receiver<ToolCallReply>) -> ToolCallReply {
+    timeout(FINISH_GRACE, finish_rx)
         .await
         .ok()
         .and_then(Result::ok)
@@ -4750,7 +4749,7 @@ async fn dispatch_async(
     handle: TaskHandle,
     plugin: &str,
     tool: &str,
-    finish_rx: flume::Receiver<ToolCallReply>,
+    mut finish_rx: oneshot::Receiver<ToolCallReply>,
 ) -> ToolCallReply {
     let (owner, cancel) = {
         let cell = lock_cell(&handle);
@@ -4759,7 +4758,7 @@ async fn dispatch_async(
     let mut jobs_changed = with_jobs(lua, |store| store.subscribe());
     if with_jobs(lua, |store| store.is_empty(&owner)) {
         lua.gc_collect().ok();
-        return late_finish(&finish_rx).await;
+        return late_finish(&mut finish_rx).await;
     }
 
     loop {
@@ -4768,7 +4767,7 @@ async fn dispatch_async(
         // before `timeout_reply`, which locks the same cell.
         let kill = lock_cell(&handle).doomed(Instant::now());
         if let Some(reason) = kill {
-            if let Some(reply) = cancel_hook_reply(lua, &handle, &finish_rx, reason) {
+            if let Some(reply) = cancel_hook_reply(lua, &handle, &mut finish_rx, reason) {
                 return reply;
             }
             return match reason {
@@ -4779,10 +4778,10 @@ async fn dispatch_async(
 
         match finish_rx.try_recv() {
             Ok(reply) => return reply,
-            Err(flume::TryRecvError::Disconnected) => {
+            Err(TryRecvError::Closed) => {
                 return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
             }
-            Err(flume::TryRecvError::Empty) => {}
+            Err(TryRecvError::Empty) => {}
         }
 
         if let Some((job_id, event)) = with_jobs(lua, |store| store.next_event(&owner)) {
@@ -4794,7 +4793,7 @@ async fn dispatch_async(
         }
 
         if with_jobs(lua, |store| store.is_empty(&owner)) {
-            return late_finish(&finish_rx).await;
+            return late_finish(&mut finish_rx).await;
         }
 
         // A doomed task goes first, so its cancel hooks still get the last word
@@ -4803,7 +4802,7 @@ async fn dispatch_async(
             biased;
             () = cancel.cancelled() => {}
             () = deadline_lapsed(&handle) => {}
-            reply = finish_rx.recv_async() => {
+            reply = &mut finish_rx => {
                 return reply.unwrap_or_else(|_| ToolCallReply::err(NIL_WITHOUT_FINISH_MSG));
             }
             Ok(()) = jobs_changed.changed() => {}
@@ -5414,7 +5413,7 @@ async fn run_tool_call(
         return ToolCallReply::err("plugin host shutting down");
     }
 
-    let (finish_tx, finish_rx) = flume::bounded::<ToolCallReply>(1);
+    let (finish_tx, mut finish_rx) = oneshot::channel::<ToolCallReply>();
     ctx.finish_tx = Some(finish_tx);
     let cancel = ctx.cancel.clone();
 
@@ -5498,7 +5497,7 @@ async fn run_tool_call(
             // hooks run: they lock the same cell.
             Err(e) => {
                 let kill = lock_cell(&handle).doomed(Instant::now());
-                match kill.and_then(|reason| cancel_hook_reply(&lua, &handle, &finish_rx, reason)) {
+                match kill.and_then(|reason| cancel_hook_reply(&lua, &handle, &mut finish_rx, reason)) {
                     // The reply wins, but a doom-window error is still the
                     // only trace of a plugin bug that raised on its way out.
                     Some(reply) => {
@@ -7717,7 +7716,7 @@ mod tests {
     /// armed cancel hooks.
     fn drive_dispatch_with(
         cell: TaskCell,
-        setup: impl FnOnce(&Lua, flume::Sender<ToolCallReply>) + Send + 'static,
+        setup: impl FnOnce(&Lua, oneshot::Sender<ToolCallReply>) + Send + 'static,
     ) -> (Result<String, String>, Duration) {
         let (tx, rx) = flume::bounded(1);
         thread::spawn(move || {
@@ -7728,7 +7727,7 @@ mod tests {
                 store.start(JobSpec::new(owner, DISPATCH_TEST_JOB))
             })
             .unwrap();
-            let (finish_tx, finish_rx) = flume::bounded(1);
+            let (finish_tx, finish_rx) = oneshot::channel();
             {
                 let _active = scope.enter();
                 setup(&lua, finish_tx);
@@ -7827,7 +7826,7 @@ mod tests {
                 store.start(JobSpec::new(owner.clone(), PARKED_DISPATCH_JOB))
             })
             .unwrap();
-            let (finish_tx, finish_rx) = flume::bounded(1);
+            let (finish_tx, finish_rx) = oneshot::channel();
             let reply = HOST_RUNTIME.block_on(async {
                 let mut dispatch = pin!(dispatch_async(
                     &lua,
@@ -7847,9 +7846,11 @@ mod tests {
                         cell.deadline.set(Some(Instant::now()));
                         cell.deadline_changed.notify(usize::MAX);
                     }
-                    ParkedWake::Finish => finish_tx
-                        .send(ToolCallReply::plain(Ok(PARKED_DISPATCH_REPLY.to_owned())))
-                        .unwrap(),
+                    ParkedWake::Finish => assert!(
+                        finish_tx
+                            .send(ToolCallReply::plain(Ok(PARKED_DISPATCH_REPLY.to_owned())))
+                            .is_ok()
+                    ),
                     ParkedWake::ContextDropped => drop(finish_tx),
                     ParkedWake::JobsGone => {
                         with_jobs(&lua, |store| store.kill_owner(&lua, &owner));
@@ -8013,13 +8014,16 @@ mod tests {
         };
 
         let (result, _) = drive_dispatch_with(cell, |lua, finish_tx| {
+            let finish_tx = Mutex::new(Some(finish_tx));
             let hook = lua
                 .create_function(move |_, reason: String| {
-                    finish_tx
-                        .send(ToolCallReply::err(format!(
-                            "{PARTIAL_REPLY_OUTPUT}:{reason}"
-                        )))
-                        .ok();
+                    if let Some(finish_tx) = finish_tx.lock().unwrap().take() {
+                        finish_tx
+                            .send(ToolCallReply::err(format!(
+                                "{PARTIAL_REPLY_OUTPUT}:{reason}"
+                            )))
+                            .ok();
+                    }
                     Ok(())
                 })
                 .unwrap();

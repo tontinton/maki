@@ -20,6 +20,7 @@ use maki_agent::{
 use maki_storage::id::MakiId;
 use mlua::Lua;
 use serde::Serialize;
+use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout_at};
 
 use crate::api::session::not_live;
@@ -254,7 +255,7 @@ pub(crate) struct BackgroundTasks {
     entries: Arc<Mutex<Vec<BackgroundTask>>>,
     /// The model's `task_stop`, parked until the final reply of the call it
     /// stopped. Whoever removes the sender decides who gets the output.
-    waiters: Arc<Mutex<HashMap<String, flume::Sender<String>>>>,
+    waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -385,8 +386,8 @@ impl BackgroundTasks {
         // Armed before the stop fires, so a call that ignores the stop is
         // abandoned (cancel + the same wait) only after this gives up.
         let deadline = Instant::now() + wait;
-        let (reply, name) = self.begin_model_stop(mailbox, id)?;
-        let arrived = timeout_at(deadline, reply.recv_async())
+        let (mut reply, name) = self.begin_model_stop(mailbox, id)?;
+        let arrived = timeout_at(deadline, &mut reply)
             .await
             .ok()
             .and_then(Result::ok);
@@ -402,7 +403,7 @@ impl BackgroundTasks {
         &self,
         mailbox: Option<MakiId>,
         id: &str,
-    ) -> Result<(flume::Receiver<String>, String), String> {
+    ) -> Result<(oneshot::Receiver<String>, String), String> {
         let running: Vec<_> = self
             .locked()
             .iter()
@@ -414,7 +415,7 @@ impl BackgroundTasks {
             return Err(no_running_task_err(id, &ids));
         };
         let name = target.name.clone();
-        let (waiter, reply) = flume::bounded(1);
+        let (waiter, reply) = oneshot::channel();
         lock(&self.waiters).insert(id.to_owned(), waiter);
         self.stop(id, Cutter::Parent);
         Ok((reply, name))

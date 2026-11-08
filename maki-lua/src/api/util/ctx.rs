@@ -15,6 +15,7 @@ use mlua::{
     AnyUserData, Function, LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods,
     Value as LuaValue,
 };
+use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 
 use crate::api::tool::{LuaOutputFormat, ToolCallReply, extract_format};
@@ -174,7 +175,7 @@ pub(crate) struct LuaCtx {
     /// re-rendered.
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
-    pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
+    pub(crate) finish_tx: Option<oneshot::Sender<ToolCallReply>>,
 }
 
 enum Caps {

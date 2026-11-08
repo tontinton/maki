@@ -29,6 +29,7 @@ use mlua::{
     Value as LuaValue,
 };
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 use crate::api::image::LuaImage;
@@ -382,7 +383,7 @@ impl ToolInvocation for LuaToolInvocation {
         if !self.has_header_fn {
             return HeaderFuture::Ready(HeaderResult::plain(self.tool.to_string()));
         }
-        let (reply_tx, reply_rx) = flume::bounded::<HeaderResult>(1);
+        let (reply_tx, reply_rx) = oneshot::channel::<HeaderResult>();
         let tool = Arc::clone(&self.tool);
         let plugin = Arc::clone(&self.plugin);
         let input = self.input.clone();
@@ -403,7 +404,6 @@ impl ToolInvocation for LuaToolInvocation {
                     return HeaderResult::plain(fallback);
                 }
                 reply_rx
-                    .recv_async()
                     .await
                     .unwrap_or_else(|_| HeaderResult::plain(fallback))
             }),
@@ -435,7 +435,7 @@ impl ToolInvocation for LuaToolInvocation {
         let Some(id) = id else {
             return Box::pin(std::future::ready(()));
         };
-        let (reply_tx, reply_rx) = flume::bounded::<()>(1);
+        let (reply_tx, reply_rx) = oneshot::channel::<()>();
         let req = Request::StartTool {
             plugin: Arc::clone(&self.plugin),
             tool: Arc::clone(&self.tool),
@@ -451,7 +451,7 @@ impl ToolInvocation for LuaToolInvocation {
         let tx = self.tx.clone();
         Box::pin(async move {
             if tx.send_async(req).await.is_ok() {
-                let _ = reply_rx.recv_async().await;
+                let _ = reply_rx.await;
             }
         })
     }
@@ -460,7 +460,7 @@ impl ToolInvocation for LuaToolInvocation {
         match &self.permission_state {
             PermissionState::Ready(v) => Box::pin(std::future::ready(v.clone())),
             PermissionState::NeedsCompute => {
-                let (reply_tx, reply_rx) = flume::bounded(1);
+                let (reply_tx, reply_rx) = oneshot::channel();
                 let tx = self.tx.clone();
                 let plugin = Arc::clone(&self.plugin);
                 let tool = Arc::clone(&self.tool);
@@ -479,7 +479,7 @@ impl ToolInvocation for LuaToolInvocation {
                     {
                         return Some(PermissionScopes::force_prompt(fallback));
                     }
-                    match reply_rx.recv_async().await {
+                    match reply_rx.await {
                         Ok(Some(scopes)) => Some(scopes),
                         _ => Some(PermissionScopes::force_prompt(fallback)),
                     }
@@ -517,7 +517,7 @@ impl ToolInvocation for LuaToolInvocation {
                 Err(e) => return Err(e).into(),
             };
 
-            let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
+            let (reply_tx, reply_rx) = oneshot::channel::<ToolCallReply>();
             let live = ctx.tool_use_id.clone().map(|id| LiveCtx {
                 event_tx: ctx.event_tx.clone(),
                 tool_use_id: id,
@@ -541,7 +541,7 @@ impl ToolInvocation for LuaToolInvocation {
                 return Err("lua thread disconnected".to_string()).into();
             }
 
-            let recv = async { Some(reply_rx.recv_async().await) };
+            let recv = async { Some(reply_rx.await) };
             let call = ctx.call.as_deref();
             let own_call = call.is_some_and(|call| ctx.tool_use_id.as_deref() == Some(call.id()));
             let result = match effective_secs {
