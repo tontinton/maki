@@ -34,9 +34,11 @@ use strum::{EnumString, IntoStaticStr};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
-use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{LocalSet, spawn_local, yield_now};
 use tokio::time::{sleep, sleep_until, timeout, timeout_at};
+use tokio_util::task::task_tracker::TaskTrackerToken;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use maki_config::RawConfig;
 use maki_providers::plugin::DeclAuthority;
@@ -103,6 +105,7 @@ const HANDLER_TIMEOUT_MSG: &str = "timeout";
 /// The cancel hook reason of a background task the model's `task_stop` ended.
 const STOPPED_MSG: &str = "stopped";
 pub const MAX_INFLIGHT_TOOLS: usize = 64;
+const GATE_SLOTS_OPEN: &str = "the inflight gate never closes";
 /// Finished tools kept clickable without a restore round-trip. Purely a
 /// cache: a click that misses it falls back to the restore item carried
 /// by the request, so eviction only costs latency, never correctness.
@@ -2245,10 +2248,10 @@ pub(crate) fn host_senders(
 /// [`run_detached`] for plugin code a host caller is blocked on, carrying every
 /// obligation that waiting creates:
 ///
-/// - counted against the [`InflightGate`], so a reload drains the code instead
-///   of tearing its environment away;
-/// - [`covered`], so a tool call the code makes rides this slot rather than
-///   queueing behind a gate its own caller is holding;
+/// - holding the [`InflightGate`]'s drain barrier, so a reload drains the
+///   code instead of tearing its environment away;
+/// - [`covered`], so a tool call the code makes rides this hold rather than
+///   queueing for a slot of its own;
 /// - scoped to the caller's cancellation and `deadline`, so the watchdog can
 ///   interrupt code that spins past either;
 /// - [`until_abandoned`], the only thing that ends code parked in an await,
@@ -2265,14 +2268,14 @@ async fn run_awaited<F: Future>(
     fut: F,
 ) -> Result<F::Output, &'static str> {
     covered(
-        Some(GateGuard::new(gate)),
+        Some(GateGuard::hold_only(gate)),
         run_abandonable(lua, cancel, Some(deadline), fut),
     )
     .await
 }
 
-/// [`run_awaited`] without the [`InflightGate`] slot, for code a reload must
-/// not wait on, yet that still ends with its caller's cancel and deadline.
+/// [`run_awaited`] without the drain hold, for code a reload must not wait
+/// on, yet that still ends with its caller's cancel and deadline.
 async fn run_abandonable<F: Future>(
     lua: &Lua,
     cancel: CancelToken,
@@ -2736,84 +2739,42 @@ fn halfway_to(live: usize, limit: usize) -> usize {
 /// Also serves as a drain barrier for load/clear ops.
 struct InflightGate {
     gc: GcPacer,
-    count: Cell<usize>,
-    /// What [`Self::drain`] waits on. Unlike `count`, it leaves out work under
-    /// a `maki.async.spawn` task and includes work still waiting for a slot.
-    held: Cell<usize>,
-    /// Holds of nested calls, by the model call they run under. Once that
-    /// call moves to the background they stop holding the drain: the work may
-    /// go on for hours, and it survives `/reload` anyway.
-    call_holds: RefCell<Vec<Arc<CallScope>>>,
-    event: Notify,
+    /// One permit per coroutine, handed out in the order asked for.
+    slots: Arc<Semaphore>,
+    /// What [`Self::drain`] waits on: a token per piece of held work, from the
+    /// moment it queues for a slot until it gives the slot back. Unlike the
+    /// slots, it leaves out work under a `maki.async.spawn` task. Closed from
+    /// the start, so `wait` resolves whenever it is empty; tokens can still be
+    /// taken.
+    held: TaskTracker,
 }
 
 impl InflightGate {
     fn new(lua: Lua) -> Self {
+        let held = TaskTracker::new();
+        held.close();
         Self {
             gc: GcPacer::new(lua, LUA_MEMORY_LIMIT),
-            count: Cell::new(0),
-            held: Cell::new(0),
-            call_holds: RefCell::new(Vec::new()),
-            event: Notify::new(),
+            slots: Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS)),
+            held,
         }
     }
 
-    fn increment(&self) {
-        self.count.set(self.count.get() + 1);
-        self.gc.relieve_pressure();
-    }
-
-    fn decrement(&self) {
-        self.count.set(self.count.get().saturating_sub(1));
-        self.event.notify_waiters();
-        self.gc.op_finished();
-    }
-
-    async fn wait_until(&self, ready: impl Fn() -> bool) {
-        loop {
-            if ready() {
-                return;
-            }
-            let notified = self.event.notified();
-            if ready() {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    async fn wait_below(&self, limit: usize) {
-        self.wait_until(|| self.count.get() < limit).await;
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        MAX_INFLIGHT_TOOLS - self.slots.available_permits()
     }
 
     /// Guards are taken on a task's first poll (`acquire`), so one yield
-    /// lets just-spawned tasks register before the barrier reads the count;
+    /// lets just-spawned tasks take their tokens before the barrier looks;
     /// a `drain` queued right behind a spawn cannot slip past it.
     async fn drain(&self) {
         yield_now().await;
-        loop {
-            let released = self.event.notified();
-            if self.held.get() > 0 {
-                released.await;
-                continue;
-            }
-            let Some(call) = self.unmoved_call_hold() else {
-                return;
-            };
-            tokio::select! {
-                biased;
-                () = released => {}
-                () = call.moved() => {}
-            }
+        // `wait` also resolves on a wake from a moment the tracker was empty,
+        // so a hold dropped and retaken in one poll needs the check again.
+        while !self.held.is_empty() {
+            self.held.wait().await;
         }
-    }
-
-    fn unmoved_call_hold(&self) -> Option<Arc<CallScope>> {
-        self.call_holds
-            .borrow()
-            .iter()
-            .find(|call| call.home().is_none())
-            .cloned()
     }
 
     /// Admission and accounting in one step, on the task's own poll: the
@@ -2827,15 +2788,17 @@ impl InflightGate {
     /// The hold is taken before waiting for a slot. Otherwise held work stuck
     /// behind a cap full of detached slots would let the barrier through.
     async fn admit(self: &Rc<Self>, hold: Option<DrainHold>) -> GateGuard {
-        self.wait_below(MAX_INFLIGHT_TOOLS).await;
-        GateGuard::with_hold(self, hold)
+        let slot = Arc::clone(&self.slots)
+            .acquire_owned()
+            .await
+            .expect(GATE_SLOTS_OPEN);
+        GateGuard::new(self, Some(slot), hold)
     }
 
     /// [`Self::acquire`] for a call the host cannot interrupt yet. A call
     /// still queued here has no [`TaskCell`], so the watchdog and
     /// [`until_abandoned`] have nothing to end. The wait ends itself once
-    /// nobody is left waiting for the reply, and reports what the handler
-    /// would have reported.
+    /// nobody waits for the reply any more.
     async fn acquire_before_abandoned(
         self: &Rc<Self>,
         cancel: &CancelToken,
@@ -2863,11 +2826,11 @@ thread_local! {
 /// Whether the caller already runs under an in-flight slot.
 ///
 /// A tool call made from there cannot finish before its caller does, and the
-/// caller holds its slot all that time. Charge the child a slot of its own and
-/// the gate deadlocks against itself: park as many callers as there are slots
-/// and no child is ever admitted, so no caller ever returns. The child rides
-/// the caller's slot instead, which also keeps the drain barrier honest, since
-/// that slot outlives the whole subtree.
+/// caller holds its slot, or at least its drain hold, all that time. Charge the
+/// child a slot of its own and the gate deadlocks against itself: park as many
+/// callers as there are slots and no child is ever admitted, so no caller ever
+/// returns. The child rides the caller's slot instead, which also keeps the
+/// drain barrier honest, since that hold outlives the whole subtree.
 pub(crate) fn under_inflight_slot() -> bool {
     SLOT_COVERED.get()
 }
@@ -2903,66 +2866,68 @@ fn covered<F: Future>(slot: Option<GateGuard>, inner: F) -> SlotCovered<F> {
 /// Keeps [`InflightGate::drain`] waiting from the moment work queues for a
 /// slot until it gives the slot back. A nested call riding its caller's slot
 /// takes one of its own, since a detached caller's slot holds none.
-struct DrainHold {
-    gate: Rc<InflightGate>,
-    /// The model call a nested call runs under: its move releases the hold.
-    call: Option<Arc<CallScope>>,
+enum DrainHold {
+    /// Ends with the work.
+    Work { _token: TaskTrackerToken },
+    /// A nested call's hold ends with the work or with its call's move,
+    /// whichever comes first: the work may go on for hours, and it survives
+    /// `/reload` anyway.
+    UntilMoved { _watcher: AbortOnDropHandle<()> },
 }
 
 impl DrainHold {
-    fn new(gate: &Rc<InflightGate>) -> Self {
-        Self::under(gate, None)
-    }
-
-    fn under(gate: &Rc<InflightGate>, call: Option<Arc<CallScope>>) -> Self {
-        match &call {
-            Some(call) => gate.call_holds.borrow_mut().push(Arc::clone(call)),
-            None => gate.held.set(gate.held.get() + 1),
-        }
-        Self {
-            gate: Rc::clone(gate),
-            call,
+    fn new(gate: &InflightGate) -> Self {
+        Self::Work {
+            _token: gate.held.token(),
         }
     }
-}
 
-impl Drop for DrainHold {
-    fn drop(&mut self) {
-        match &self.call {
-            Some(call) => {
-                let mut holds = self.gate.call_holds.borrow_mut();
-                if let Some(at) = holds.iter().position(|held| Arc::ptr_eq(held, call)) {
-                    holds.swap_remove(at);
-                }
-            }
-            None => self.gate.held.set(self.gate.held.get().saturating_sub(1)),
+    /// Runs on the host's `LocalSet`: a nested hold spawns its watcher there.
+    fn under(gate: &InflightGate, call: Option<Arc<CallScope>>) -> Self {
+        let token = gate.held.token();
+        match call {
+            None => Self::Work { _token: token },
+            Some(call) => Self::UntilMoved {
+                _watcher: AbortOnDropHandle::new(spawn_local(async move {
+                    call.moved().await;
+                    drop(token);
+                })),
+            },
         }
-        self.gate.event.notify_waiters();
     }
 }
 
+/// `slot` is `None` for hooks, keybind holds and awaited chains
+/// ([`run_awaited`]): they hold the barrier but never wait for a slot, so
+/// tool calls never queue behind them.
 struct GateGuard {
     gate: Rc<InflightGate>,
+    _slot: Option<OwnedSemaphorePermit>,
     _hold: Option<DrainHold>,
 }
 
 impl GateGuard {
-    fn new(gate: &Rc<InflightGate>) -> Self {
-        Self::with_hold(gate, Some(DrainHold::new(gate)))
-    }
-
-    fn with_hold(gate: &Rc<InflightGate>, hold: Option<DrainHold>) -> Self {
-        gate.increment();
+    fn new(
+        gate: &Rc<InflightGate>,
+        slot: Option<OwnedSemaphorePermit>,
+        hold: Option<DrainHold>,
+    ) -> Self {
+        gate.gc.relieve_pressure();
         Self {
             gate: Rc::clone(gate),
+            _slot: slot,
             _hold: hold,
         }
+    }
+
+    fn hold_only(gate: &Rc<InflightGate>) -> Self {
+        Self::new(gate, None, Some(DrainHold::new(gate)))
     }
 }
 
 impl Drop for GateGuard {
     fn drop(&mut self) {
-        self.gate.decrement();
+        self.gate.gc.op_finished();
     }
 }
 
@@ -3334,7 +3299,7 @@ fn spawn_keybind_callback(lua: &Lua, gate: &Rc<InflightGate>, mut ticket: Keybin
     });
     let gate = Rc::clone(gate);
     spawn_local(async move {
-        let _guard = GateGuard::new(&gate);
+        let _guard = GateGuard::hold_only(&gate);
         if timeout(KEYBIND_GATE_HOLD, done_rx).await.is_err() {
             tracing::warn!(key = %key.notation(), ticket = id, plugin = %plugin, "keybind handler outlived its drain-barrier slot");
         }
@@ -5695,9 +5660,9 @@ pub fn spawn(
                 let gate = Rc::clone(&gate);
                 local.spawn_local(async move {
                     while let Ok(hook) = hook_rx.recv_async().await {
-                        // Counted as in-flight so a plugin reload waiting on
-                        // `drain_barrier` cannot land mid-handler.
-                        let _guard = GateGuard::new(&gate);
+                        // Holds the drain barrier so a plugin reload waiting
+                        // on `drain_barrier` cannot land mid-handler.
+                        let _guard = GateGuard::hold_only(&gate);
                         run_host_hook(&lua, hook).await;
                     }
                 });
@@ -6406,8 +6371,8 @@ mod tests {
     async fn inflight_gate_drain_requires_all_guards_dropped() {
         wake_or_fail(LocalSet::new().run_until(async {
             let g = Rc::new(gate());
-            let first = GateGuard::new(&g);
-            let second = GateGuard::new(&g);
+            let first = GateGuard::hold_only(&g);
+            let second = GateGuard::hold_only(&g);
             let g2 = Rc::clone(&g);
             let waiter = spawn_local(async move { g2.drain().await });
             yield_now().await;
@@ -6444,6 +6409,62 @@ mod tests {
         .await;
     }
 
+    /// The watcher that would end the hold on a move is aborted with the
+    /// hold, and the barrier has to see that too.
+    #[tokio::test]
+    async fn drain_lets_go_of_nested_work_once_its_hold_drops() {
+        wake_or_fail(LocalSet::new().run_until(async {
+            let g = Rc::new(gate());
+            let (call, _run, _) = call_scope(false);
+            let nested = DrainHold::under(&g, Some(Arc::clone(&call)));
+            let g2 = Rc::clone(&g);
+            let waiter = spawn_local(async move { g2.drain().await });
+            for _ in 0..SETTLE_YIELDS {
+                yield_now().await;
+            }
+            assert!(!waiter.is_finished());
+
+            drop(nested);
+            waiter.await.unwrap();
+        }))
+        .await;
+    }
+
+    /// The hook loop drops one hold and takes the next in the same poll. The
+    /// barrier must not slip through that gap.
+    #[tokio::test]
+    async fn drain_waits_through_back_to_back_holds() {
+        wake_or_fail(LocalSet::new().run_until(async {
+            let g = Rc::new(gate());
+            let (done_tx, done_rx) = oneshot::channel::<()>();
+            let g2 = Rc::clone(&g);
+            let chain = spawn_local(async move {
+                let mut hold = GateGuard::hold_only(&g2);
+                for _ in 0..SETTLE_YIELDS {
+                    drop(hold);
+                    hold = GateGuard::hold_only(&g2);
+                    yield_now().await;
+                }
+                let _ = done_rx.await;
+                drop(hold);
+            });
+            yield_now().await;
+            let g3 = Rc::clone(&g);
+            let waiter = spawn_local(async move { g3.drain().await });
+            for _ in 0..2 * SETTLE_YIELDS {
+                yield_now().await;
+            }
+            assert!(
+                !waiter.is_finished(),
+                "the barrier slipped between two holds"
+            );
+            let _ = done_tx.send(());
+            chain.await.unwrap();
+            waiter.await.unwrap();
+        }))
+        .await;
+    }
+
     #[tokio::test]
     async fn drain_waits_for_held_work_queued_behind_detached_slots() {
         wake_or_fail(LocalSet::new().run_until(async {
@@ -6475,14 +6496,15 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let g = Rc::new(gate());
+                let mut full = Vec::new();
                 for _ in 0..MAX_INFLIGHT_TOOLS {
-                    g.increment();
+                    full.push(g.admit(None).await);
                 }
                 let g2 = Rc::clone(&g);
-                let waiter = spawn_local(async move { g2.wait_below(MAX_INFLIGHT_TOOLS).await });
+                let waiter = spawn_local(async move { drop(g2.acquire().await) });
                 yield_now().await;
                 assert!(!waiter.is_finished());
-                g.decrement();
+                drop(full.pop());
                 waiter.await.unwrap();
             })
             .await;
@@ -6507,12 +6529,12 @@ mod tests {
                 for _ in 0..MAX_INFLIGHT_TOOLS + 2 {
                     yield_now().await;
                 }
-                assert_eq!(g.count.get(), MAX_INFLIGHT_TOOLS);
+                assert_eq!(g.in_flight(), MAX_INFLIGHT_TOOLS);
                 drop(release_tx);
                 for t in tasks {
                     t.await.unwrap();
                 }
-                assert_eq!(g.count.get(), 0);
+                assert_eq!(g.in_flight(), 0);
             })
             .await;
     }
@@ -6551,8 +6573,9 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let g = Rc::new(gate());
+                let mut full = Vec::new();
                 for _ in 0..MAX_INFLIGHT_TOOLS {
-                    g.increment();
+                    full.push(g.admit(None).await);
                 }
                 let (trigger, token) = CancelToken::new();
                 if cancelled {
@@ -6561,7 +6584,8 @@ mod tests {
                 let deadline = lapsed.then(|| Instant::now() - Duration::from_secs(1));
                 let admitted = g.acquire_before_abandoned(&token, deadline).await;
                 assert_eq!(admitted.err(), Some(expected));
-                assert_eq!(g.count.get(), MAX_INFLIGHT_TOOLS);
+                assert_eq!(g.in_flight(), MAX_INFLIGHT_TOOLS);
+                assert!(g.held.is_empty(), "a given-up admission left its hold");
             })
             .await;
     }
@@ -6602,16 +6626,20 @@ mod tests {
         lua.create_registry_value(func).unwrap()
     }
 
-    #[test]
-    fn gate_guard_tracks_count_via_raii() {
-        let g = Rc::new(gate());
-        let g1 = GateGuard::new(&g);
-        let g2 = GateGuard::new(&g);
-        assert_eq!(g.count.get(), 2);
-        drop(g1);
-        assert_eq!(g.count.get(), 1);
-        drop(g2);
-        assert_eq!(g.count.get(), 0);
+    #[tokio::test]
+    async fn gate_guard_tracks_in_flight_via_raii() {
+        LocalSet::new()
+            .run_until(async {
+                let g = Rc::new(gate());
+                let g1 = g.admit(None).await;
+                let g2 = g.admit(None).await;
+                assert_eq!(g.in_flight(), 2);
+                drop(g1);
+                assert_eq!(g.in_flight(), 1);
+                drop(g2);
+                assert_eq!(g.in_flight(), 0);
+            })
+            .await;
     }
 
     #[test]
@@ -6820,7 +6848,7 @@ mod tests {
                 let g = Rc::new(gate());
                 spawn_async_task(&lua, &g, pending_task(&lua, token, None));
                 yield_now().await;
-                assert_eq!(g.count.get(), 0);
+                assert_eq!(g.in_flight(), 0);
             })
             .await;
     }
@@ -8134,7 +8162,7 @@ mod tests {
 
                 for _ in 0..10 {
                     yield_now().await;
-                    if g.count.get() == 0 {
+                    if g.in_flight() == 0 {
                         return;
                     }
                 }
