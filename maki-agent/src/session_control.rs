@@ -16,8 +16,8 @@ use std::mem;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use arc_swap::ArcSwap;
-use event_listener::Event;
 use thiserror::Error;
+use tokio::sync::Notify;
 
 use crate::cancel::{CancelHandle, CancelToken, CancelTrigger};
 use crate::{
@@ -101,7 +101,7 @@ struct ControlState {
 
 pub struct SessionControl {
     state: Mutex<ControlState>,
-    pushed: Event,
+    pushed: Notify,
     cancel: CancelTrigger,
     transcript: SharedMessages,
 }
@@ -123,7 +123,7 @@ impl SessionControl {
                 ended: None,
                 turn: Turn::under(&cancel),
             }),
-            pushed: Event::new(),
+            pushed: Notify::new(),
             cancel,
             transcript: Arc::new(ArcSwap::from_pointee(HistorySnapshot::default())),
         }
@@ -143,7 +143,7 @@ impl SessionControl {
             state.turn.trigger.handle().fire();
         }
         drop(state);
-        self.pushed.notify(usize::MAX);
+        self.pushed.notify_waiters();
         Ok(())
     }
 
@@ -234,11 +234,11 @@ impl SessionControl {
 
     pub(crate) async fn wait_nonempty(&self) {
         loop {
-            let listener = self.pushed.listen();
+            let notified = self.pushed.notified();
             if !self.is_empty() {
                 return;
             }
-            listener.await;
+            notified.await;
         }
     }
 
