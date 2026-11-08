@@ -742,6 +742,8 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// List the contents of the directory at {path}.
 /// Each entry is a two-element array `{name, type}` where type is one of
 /// `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
+/// `name` is relative to {path}, so with `depth` > 1 nested entries keep
+/// their directory: "d/nested.txt", unambiguous and joinable onto {path}.
 ///
 /// @param path string Directory path.
 /// @param opts table? `depth` (integer, default 1): how many levels deep to recurse.
@@ -750,7 +752,7 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// local entries, err = maki.fs.dir("src", { depth = 2 })
 /// if err then return end
 /// for _, e in ipairs(entries) do
-///   print(e[1], e[2]) -- "main.rs"  "file"
+///   print(e[1], e[2]) -- "main.rs" "file", "tests/lib.rs" "file"
 /// end
 #[lua_fn(guard = FsRead)]
 async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
@@ -2000,7 +2002,10 @@ mod tests {
         }
         names.sort();
         assert!(names.contains(&"d".to_owned()));
-        assert!(names.iter().any(|n| n.contains("nested.txt")));
+        assert!(
+            names.contains(&"d/nested.txt".to_owned()),
+            "recursive entries must be relative to the root dir, got {names:?}"
+        );
     }
 
     #[tokio::test]
