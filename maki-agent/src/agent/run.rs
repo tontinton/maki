@@ -1353,6 +1353,7 @@ mod tests {
 
     use maki_providers::model::FastSupport;
     use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::test_support::isolated_home;
     use maki_providers::{
         ContentBlock, FastPricing, Message, Model, ModelPricing, ProviderEvent, RequestOptions,
         Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
@@ -2331,6 +2332,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_definitions_refresh_per_request() {
+        let _home = isolated_home();
         let (tools, result) = search_turn(Model::from_spec("openai/gpt-5").unwrap()).await;
         assert_eq!(tools.len(), 2);
         let first = tool_names(&tools[0]);
@@ -2345,6 +2347,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_deferral_keeps_tools_array_stable_across_a_load() {
+        let _home = isolated_home();
         let (tools, result) = search_turn(tool_search_model()).await;
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0], tools[1]);
@@ -3166,6 +3169,7 @@ mod tests {
     /// tools its frame went out with and only appends the new ones.
     #[tokio::test]
     async fn resumed_session_keeps_the_mcp_part_of_its_frame() {
+        let _home = isolated_home();
         let mut h = Harness::new(Vec::new());
         h.model = tool_search_model();
         let reply = || vec![text_response(StopReason::EndTurn)];

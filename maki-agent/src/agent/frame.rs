@@ -354,6 +354,8 @@ pub(crate) fn context_update(
 mod tests {
     use std::path::PathBuf;
 
+    use maki_providers::test_support::isolated_home;
+
     use super::super::history::{HistorySnapshot, SharedMessages};
     use super::*;
     use crate::AgentConfig;
@@ -466,6 +468,7 @@ mod tests {
 
     #[test]
     fn fingerprint_tracks_tools_authored_text_and_deferral() {
+        let _home = isolated_home();
         let native = model(NATIVE_MODEL);
         let base = fingerprint(&context("a", ""), None, &native);
         assert_eq!(base, fingerprint(&context("a", ""), None, &native));
