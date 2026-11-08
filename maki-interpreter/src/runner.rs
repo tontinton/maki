@@ -397,6 +397,9 @@ impl OsHost<'_> {
             | OsFunctionCall::Time(_)
             | OsFunctionCall::Import(_)
             | OsFunctionCall::ImportStubs(_)) => Err(call.on_no_handler().into()),
+            // maki sends no host functions or classes the script could ask
+            // hints for, so the empty dict is the honest answer.
+            OsFunctionCall::GetTypeHints(_) => Ok(MontyObject::dict([])),
         }
     }
 
