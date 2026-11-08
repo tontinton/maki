@@ -3285,6 +3285,8 @@ maki.fs.dir({path}, {opts?})
 List the contents of the directory at {path}.
 Each entry is a two-element array `{name, type}` where type is one of
 `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
+`name` is relative to {path}, so with `depth` > 1 nested entries keep
+their directory: "d/nested.txt", unambiguous and joinable onto {path}.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
@@ -3301,7 +3303,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 local entries, err = maki.fs.dir("src", { depth = 2 })
 if err then return end
 for _, e in ipairs(entries) do
-  print(e[1], e[2]) -- "main.rs"  "file"
+  print(e[1], e[2]) -- "main.rs" "file", "tests/lib.rs" "file"
 end
 ```
 
