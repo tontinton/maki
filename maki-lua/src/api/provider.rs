@@ -22,6 +22,7 @@ use mlua::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 
@@ -226,7 +227,7 @@ where
     fn call(&self, input: In) -> BoxFuture<'_, Result<Out, AgentError>> {
         Box::pin(async move {
             let payload = serde_json::to_value(input)?;
-            let (reply, answer) = flume::bounded(1);
+            let (reply, answer) = oneshot::channel();
             // Fires when this future goes, answered or not: a caller that timed
             // out or was cancelled takes the hook down with it.
             let (_abandon, cancel) = CancelToken::new();
@@ -247,7 +248,7 @@ where
                     }),
                 })
                 .map_err(|_| AgentError::Channel)?;
-            let answered = async { answer.recv_async().await.map_err(|_| AgentError::Channel) };
+            let answered = async { answer.await.map_err(|_| AgentError::Channel) };
             let value = match self.timeout {
                 Some(limit) => timeout(limit, answered)
                     .await

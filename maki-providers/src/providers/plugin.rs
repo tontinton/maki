@@ -14,6 +14,7 @@ use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 use url::{Host, Url};
@@ -1076,7 +1077,7 @@ impl PluginEntry {
         // that timed out, must neither release the gate and the lock while the
         // hook still holds the token nor drop what the hook minted with it.
         let auth = Arc::clone(&self.auth);
-        let (done, outcome) = flume::bounded(1);
+        let (done, outcome) = oneshot::channel();
         tokio::spawn(async move {
             let minted = auth
                 .gate
@@ -1084,10 +1085,7 @@ impl PluginEntry {
                 .await;
             let _ = done.send(minted);
         });
-        outcome
-            .recv_async()
-            .await
-            .map_err(|_| AgentError::Channel)?
+        outcome.await.map_err(|_| AgentError::Channel)?
     }
 }
 
