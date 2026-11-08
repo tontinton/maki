@@ -5,7 +5,6 @@ local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local helpers = require("skill_helpers")
 local build_skill_list = helpers.build_skill_list
-local format_output = helpers.format_output
 local parse_output = helpers.parse_output
 
 local PROJECT_SKILL_DIRS = {
@@ -88,7 +87,7 @@ local function discover_skills(skipped)
       name = builtin.name,
       description = builtin.description,
       content = builtin.content,
-      location = "builtin:" .. builtin.name,
+      location = helpers.BUILTIN_PREFIX .. builtin.name,
       resolve = resolve_builtin_content,
     }
   end
@@ -184,7 +183,7 @@ maki.api.register_tool({
       skill.content = skill.resolve()
     end
 
-    local llm_output = format_output(skill.location, skill.content)
+    local llm_output = helpers.activation_output(skill)
     local result = skill_view(llm_output, ctx)
     result.llm_output = llm_output
     return result
