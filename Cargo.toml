@@ -139,7 +139,6 @@ toml_edit = "0.25"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "net", "io-util", "io-std", "signal", "fs"] }
 arc-swap = "1"
 bitflags = "2"
-event-listener = "5"
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rmcp = { version = "3", default-features = false, features = ["client", "auth", "reqwest", "transport-async-rw", "transport-streamable-http-client-reqwest"] }

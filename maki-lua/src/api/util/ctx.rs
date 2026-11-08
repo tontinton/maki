@@ -567,7 +567,7 @@ impl UserData for LuaCtx {
                 cell.deadline_secs.set(Some(secs));
                 cell.deadline
                     .set(Some(Instant::now() + Duration::from_secs(secs)));
-                cell.deadline_changed.notify(usize::MAX);
+                cell.deadline_changed.send_replace(());
                 Ok((Some(true), None))
             },
         );

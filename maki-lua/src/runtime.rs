@@ -14,8 +14,6 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use event_listener::Event;
-
 use include_dir::Dir;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
@@ -34,9 +32,9 @@ use mlua::{Function, Lua, MaybeSend, MultiValue, RegistryKey, Table, Value as Lu
 use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 use tokio::runtime::Handle;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
+use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
 use tokio::task::{LocalSet, spawn_local, yield_now};
 use tokio::time::{sleep, sleep_until, timeout, timeout_at};
 
@@ -785,9 +783,9 @@ pub(crate) struct TaskCell {
     pub(crate) call: Option<Arc<CallScope>>,
     /// `ctx:on_background`, at most one per call.
     pub(crate) background_hook: Option<RegistryKey>,
-    /// Notified by `ctx:set_deadline`, so [`until_abandoned`] re-arms on the
+    /// Bumped by `ctx:set_deadline`, so [`until_abandoned`] re-arms on the
     /// new deadline instead of staying parked on the one it started with.
-    pub(crate) deadline_changed: Event,
+    pub(crate) deadline_changed: watch::Sender<()>,
     pub(crate) bufs: BufferStore,
     pub(crate) live: Option<LiveCtx>,
     /// The buf that owns click routing for this task: the last one passed
@@ -843,6 +841,15 @@ impl Lineage {
 }
 
 impl TaskCell {
+    /// Resolves at the next deadline change. Owned, so it can be armed under
+    /// the cell's lock and awaited once the lock is gone.
+    pub(crate) fn deadline_change(&self) -> impl Future<Output = ()> + use<> {
+        let mut changed = self.deadline_changed.subscribe();
+        async move {
+            let _ = changed.changed().await;
+        }
+    }
+
     pub(crate) fn new(
         cancel: CancelToken,
         deadline: Option<Instant>,
@@ -859,7 +866,7 @@ impl TaskCell {
             deadline_expire: Cell::new(DeadlineExpire::Timeout),
             call: None,
             background_hook: None,
-            deadline_changed: Event::new(),
+            deadline_changed: watch::Sender::new(()),
             bufs: BufferStore::new(),
             live,
             root_buf: None,
@@ -1409,7 +1416,7 @@ async fn expire_to_background(
             let held = cell.deadline_expire.get() == DeadlineExpire::Background;
             let due = cell.deadline.get().filter(|_| held);
             let secs = cell.deadline_secs.get().unwrap_or(0);
-            (cell.deadline_changed.listen(), due.map(|at| (at, secs)))
+            (cell.deadline_change(), due.map(|at| (at, secs)))
         };
         match due {
             Some((at, secs)) if at <= Instant::now() => break secs,
@@ -1424,7 +1431,7 @@ async fn expire_to_background(
     let cell = lock_cell(handle);
     if !cell.moved() {
         cell.deadline_expire.set(DeadlineExpire::Timeout);
-        cell.deadline_changed.notify(usize::MAX);
+        cell.deadline_changed.send_replace(());
     }
 }
 
@@ -2737,7 +2744,7 @@ struct InflightGate {
     /// call moves to the background they stop holding the drain: the work may
     /// go on for hours, and it survives `/reload` anyway.
     call_holds: RefCell<Vec<Arc<CallScope>>>,
-    event: Event,
+    event: Notify,
 }
 
 impl InflightGate {
@@ -2747,7 +2754,7 @@ impl InflightGate {
             count: Cell::new(0),
             held: Cell::new(0),
             call_holds: RefCell::new(Vec::new()),
-            event: Event::new(),
+            event: Notify::new(),
         }
     }
 
@@ -2758,7 +2765,7 @@ impl InflightGate {
 
     fn decrement(&self) {
         self.count.set(self.count.get().saturating_sub(1));
-        self.event.notify(usize::MAX);
+        self.event.notify_waiters();
         self.gc.op_finished();
     }
 
@@ -2767,11 +2774,11 @@ impl InflightGate {
             if ready() {
                 return;
             }
-            let listener = self.event.listen();
+            let notified = self.event.notified();
             if ready() {
                 return;
             }
-            listener.await;
+            notified.await;
         }
     }
 
@@ -2785,7 +2792,7 @@ impl InflightGate {
     async fn drain(&self) {
         yield_now().await;
         loop {
-            let released = self.event.listen();
+            let released = self.event.notified();
             if self.held.get() > 0 {
                 released.await;
                 continue;
@@ -2793,13 +2800,10 @@ impl InflightGate {
             let Some(call) = self.unmoved_call_hold() else {
                 return;
             };
-            let moved = call.moved_listener();
-            if call.home().is_none() {
-                tokio::select! {
-                    biased;
-                    () = released => {}
-                    () = moved => {}
-                }
+            tokio::select! {
+                biased;
+                () = released => {}
+                () = call.moved() => {}
             }
         }
     }
@@ -2933,7 +2937,7 @@ impl Drop for DrainHold {
             }
             None => self.gate.held.set(self.gate.held.get().saturating_sub(1)),
         }
-        self.gate.event.notify(usize::MAX);
+        self.gate.event.notify_waiters();
     }
 }
 
@@ -3160,14 +3164,16 @@ impl DeferQueue {
 /// Resolves once the task's live deadline passes, following it as it moves.
 async fn deadline_lapsed(handle: &TaskHandle) {
     loop {
-        // Listen before reading: a `ctx:set_deadline` or a move landing
-        // between the two wakes us instead of leaving us armed on the
-        // stale deadline. Scoped so the guard never outlives an await.
-        let (changed, moved, deadline) = {
+        // Arm before reading: a `ctx:set_deadline` or a move landing between
+        // the two wakes us instead of leaving us armed on the stale deadline.
+        // A call that already moved has no deadline to re-arm on, so only an
+        // unmoved one is waited for. Scoped so the guard never outlives an
+        // await.
+        let (changed, unmoved, deadline) = {
             let cell = lock_cell(handle);
             (
-                cell.deadline_changed.listen(),
-                cell.call.as_ref().map(|call| call.moved_listener()),
+                cell.deadline_change(),
+                cell.call.clone().filter(|call| call.home().is_none()),
                 cell.live_deadline(),
             )
         };
@@ -3176,8 +3182,8 @@ async fn deadline_lapsed(handle: &TaskHandle) {
                 biased;
                 () = changed => {}
                 () = async {
-                    match moved {
-                        Some(moved) => moved.await,
+                    match unmoved {
+                        Some(call) => call.moved().await,
                         None => pending().await,
                     }
                 } => {}
@@ -7262,7 +7268,7 @@ mod tests {
             sleep(Duration::from_millis(1)).await;
             let cell = lock_cell(&cell);
             cell.deadline.set(Some(Instant::now()));
-            cell.deadline_changed.notify(usize::MAX);
+            cell.deadline_changed.send_replace(());
         };
         let wait = until_abandoned(std::future::pending::<()>(), &handle);
         let ((), err) = tokio::join!(set, wait);
@@ -7844,7 +7850,7 @@ mod tests {
                     ParkedWake::DeadlineMoved => {
                         let cell = lock_cell(scope.handle());
                         cell.deadline.set(Some(Instant::now()));
-                        cell.deadline_changed.notify(usize::MAX);
+                        cell.deadline_changed.send_replace(());
                     }
                     ParkedWake::Finish => assert!(
                         finish_tx
