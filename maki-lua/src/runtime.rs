@@ -3585,6 +3585,7 @@ impl LuaRuntime {
         layered: Arc<LayeredTools>,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
+        let jit = jit && unsafe { ffi::luau_codegen_supported() != 0 };
         let compiler = install_compiler(&lua, jit);
         lua.set_memory_limit(LUA_MEMORY_LIMIT)
             .map_err(|e| PluginError::Lua {

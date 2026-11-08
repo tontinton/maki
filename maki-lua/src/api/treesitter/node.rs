@@ -109,26 +109,21 @@ fn id(_lua: &Lua, this: &LuaNode) -> LuaResult<String> {
 /// local sr, sc, er, ec = node:range()
 /// local sr, sc, sb, er, ec, eb = node:range(true)
 #[lua_fn]
-fn range(_lua: &Lua, this: &LuaNode, include_bytes: Option<bool>) -> LuaResult<MultiValue> {
+fn range(lua: &Lua, this: &LuaNode, include_bytes: Option<bool>) -> LuaResult<MultiValue> {
     let node = this.ts_node()?;
     let sp = node.start_position();
     let ep = node.end_position();
     if include_bytes.unwrap_or(false) {
-        Ok(MultiValue::from_iter([
-            Value::Integer(sp.row as i64),
-            Value::Integer(sp.column as i64),
-            Value::Integer(node.start_byte() as i64),
-            Value::Integer(ep.row as i64),
-            Value::Integer(ep.column as i64),
-            Value::Integer(node.end_byte() as i64),
-        ]))
+        lua.pack_multi((
+            sp.row,
+            sp.column,
+            node.start_byte(),
+            ep.row,
+            ep.column,
+            node.end_byte(),
+        ))
     } else {
-        Ok(MultiValue::from_iter([
-            Value::Integer(sp.row as i64),
-            Value::Integer(sp.column as i64),
-            Value::Integer(ep.row as i64),
-            Value::Integer(ep.column as i64),
-        ]))
+        lua.pack_multi((sp.row, sp.column, ep.row, ep.column))
     }
 }
 

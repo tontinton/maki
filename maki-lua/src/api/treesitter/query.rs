@@ -229,7 +229,7 @@ impl IterEntry for CaptureEntry {
             meta_table.set(k.as_str(), v.as_str())?;
         }
         Ok(MultiValue::from_iter([
-            LuaValue::Integer((self.capture_index + 1) as i64),
+            lua.pack(self.capture_index + 1)?,
             lua.pack(self.node.clone())?,
             LuaValue::Table(meta_table),
             LuaValue::Table(lua.create_table()?),
@@ -259,7 +259,7 @@ impl IterEntry for MatchEntry {
             meta_table.set(k.as_str(), v.as_str())?;
         }
         Ok(MultiValue::from_iter([
-            LuaValue::Integer((self.pattern_index + 1) as i64),
+            lua.pack(self.pattern_index + 1)?,
             LuaValue::Table(captures_table),
             LuaValue::Table(meta_table),
             LuaValue::Integer(1),
