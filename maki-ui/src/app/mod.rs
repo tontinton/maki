@@ -74,8 +74,7 @@ use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
     BuiltinAction, ChatItem, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit,
     InputMarks, InputMode, InputRule, InputRulesReader, InputSnapshot, InputSubmit, Key,
-    KeymapReader, LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
-    PackCommand, PackPreparation, Permission, PlanActionOutcome, PlanMenu, PlanRowAction,
+    KeymapReader, LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, Permission,
     PluginReach, WinView, is_reserved,
 };
 use maki_providers::models_cache::ModelList;
