@@ -448,6 +448,10 @@ impl App {
             workflow: self.state.workflow,
             restricted: self.trust.question().is_some(),
             yolo: self.permissions.is_yolo(),
+            plugin_segments: self
+                .hints
+                .get()
+                .map_or_else(Vec::new, |snap| snap.segments.clone()),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }
