@@ -2713,10 +2713,15 @@ fn jobstop_kills_running_job() {
     assert_eq!(out, "killed=true");
 }
 
+/// The job exits only once the test opens its gate. A `sleep` raced the
+/// 1ms `jobwait` against the clock: a Lua thread stalled past the job's exit
+/// let `jobwait` collect the result and the handler report "did not time out".
 #[test]
 fn plugin_owned_job_outlives_its_starting_tool() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("gate");
     let src = format!(
         r#"
 local output = "pending"
@@ -2727,7 +2732,7 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local id = maki.fn.jobstart("sleep 0.1; printf plugin-output; exit 7", {{
+        local id = maki.fn.jobstart("while [ ! -e '{gate}' ]; do sleep 0.01; done; printf plugin-output; exit 7", {{
             scope = "plugin",
             on_stdout = function(_, line) output = line end,
             on_exit = function(_, code) exit_code = tostring(code) end,
@@ -2744,13 +2749,15 @@ maki.api.register_tool({{
         return output .. "/" .. exit_code
     end,
 }})
-"#
+"#,
+        gate = gate.display(),
     );
     host.load_source("plugin_job", &src).unwrap();
     assert_eq!(
         exec_tool(&reg, "start_plugin_job", json!({})).unwrap(),
         "started"
     );
+    std::fs::write(&gate, "").unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
