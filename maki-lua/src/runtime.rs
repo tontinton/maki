@@ -451,6 +451,9 @@ pub enum Request {
     SealPackOps {
         reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
     },
+    SetProjectDirs {
+        dirs: Vec<PathBuf>,
+    },
     LoadSource {
         name: Arc<str>,
         chunks: Vec<LoadChunk>,
@@ -5768,6 +5771,9 @@ pub fn spawn(
                         Request::InstallSessionSnapshot { provider } => {
                             rt.lua
                                 .set_app_data(crate::api::session::SessionSnapshotSlot(provider));
+                        }
+                        Request::SetProjectDirs { dirs } => {
+                            rt.lua.set_app_data(crate::api::env::TrustedProjectDirs(dirs));
                         }
                         Request::LoadSource {
                             name,

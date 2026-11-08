@@ -163,6 +163,31 @@ case("discovery_keeps_valid_empty_body_and_skips_bad_neighbors", function()
   assert(ok, err)
 end)
 
+case("collisions_are_deterministic_and_identify_both_files", function()
+  local th = require("maki.test_helpers")
+  local dir = th.mktmpdir("skill_collisions")
+  local ok, err = pcall(function()
+    for _, name in ipairs({ "z", "a" }) do
+      maki.fs.mkdir(maki.fs.joinpath(dir, name))
+      maki.fs.write(maki.fs.joinpath(dir, name, "SKILL.md"), "---\nname: shared\ndescription: Example\n---\n" .. name)
+    end
+    local skills = {}
+    local diagnostics = helpers.scan_skill_dir(dir, skills)
+    local _, body = parse_frontmatter(skills.shared.content)
+    eq(body, "z")
+    local collision
+    for _, message in ipairs(diagnostics) do
+      if message:find("shadows", 1, true) then
+        collision = message
+      end
+    end
+    assert(collision and collision:find(maki.fs.joinpath(dir, "a", "SKILL.md"), 1, true), "identify the shadowed file")
+    assert(collision:find(maki.fs.joinpath(dir, "z", "SKILL.md"), 1, true), "identify the winning file")
+  end)
+  th.rmtree(dir)
+  assert(ok, err)
+end)
+
 -- ── build_skill_list ──
 
 case("build_skill_list_empty", function()

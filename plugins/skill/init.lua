@@ -29,24 +29,6 @@ local function scan_skill_dir(dir, skills, skipped)
   end
 end
 
-local function find_project_ancestors()
-  local cwd = maki.uv.cwd()
-  if not cwd then
-    return {}
-  end
-  local dirs = { cwd }
-  if maki.fs.metadata(maki.fs.joinpath(cwd, ".git")) then
-    return dirs
-  end
-  for _, parent in ipairs(maki.fs.parents(cwd)) do
-    dirs[#dirs + 1] = parent
-    if maki.fs.metadata(maki.fs.joinpath(parent, ".git")) then
-      break
-    end
-  end
-  return dirs
-end
-
 local opts = maki.api.register_options({
   plugin_dev = { default = true, desc = "Offer the builtin maki-plugin-dev skill for writing maki plugins." },
 })
@@ -104,7 +86,7 @@ local function discover_skills(skipped)
     end
   end
 
-  for _, ancestor in ipairs(find_project_ancestors()) do
+  for _, ancestor in ipairs(maki.env.project_dirs()) do
     for _, rel in ipairs(PROJECT_SKILL_DIRS) do
       scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills, skipped)
     end

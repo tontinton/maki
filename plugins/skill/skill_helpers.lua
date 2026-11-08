@@ -93,7 +93,11 @@ end
 
 function M.scan_skill_dir(dir, skills)
   local diagnostics, skipped = {}, {}
-  for _, entry in ipairs(maki.fs.dir(dir) or {}) do
+  local entries = maki.fs.dir(dir) or {}
+  table.sort(entries, function(a, b)
+    return a[1] < b[1]
+  end)
+  for _, entry in ipairs(entries) do
     if entry[2] == "directory" then
       local path = maki.fs.joinpath(dir, entry[1], SKILL_FILE)
       local content = maki.fs.read(path)
@@ -110,6 +114,10 @@ function M.scan_skill_dir(dir, skills)
         else
           for _, warning in ipairs(warnings) do
             diagnostics[#diagnostics + 1] = path .. ": " .. warning
+          end
+          local previous = skills[fm.name]
+          if previous and previous.location ~= path then
+            diagnostics[#diagnostics + 1] = path .. " shadows " .. previous.location .. " (" .. fm.name .. ")"
           end
           skills[fm.name] = {
             name = fm.name,
