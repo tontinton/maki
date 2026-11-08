@@ -1,8 +1,13 @@
--- Mistral, as a declaration plus the two hooks the openai codec cannot spell.
+-- Mistral, as a declaration plus the hooks the openai codec cannot spell.
 
 local parse = require("maki.provider_parse")
 
 local MODELS_PATH = "/models"
+-- The billing endpoints sit in the versioned API, next to /models. The budget
+-- needs the `see_org_inference_usage` permission, so its failure is a normal
+-- "no allowance to show", not an error.
+local SUBSCRIPTION_PATH = "/billing/subscription"
+local BUDGET_PATH = "/billing/budget"
 
 -- Rows whose cards publish an effort ladder wider than the provider default,
 -- as the API answers when asked: medium is refused outside Large 4, and the
@@ -23,6 +28,46 @@ local function effort_ladder(id)
       return ladder[2]
     end
   end
+end
+
+-- A side answer the caller can do without: a failed request, a status other
+-- than 200 or a shape the reader refuses all read as no answer.
+local function fetch_optional(ctx, path, read)
+  local body = ctx.get_json(path)
+  if type(body) ~= "table" then
+    return nil
+  end
+  return read(body)
+end
+
+local function plan_name(subscription)
+  local name = subscription and subscription.plan_name
+  return type(name) == "string" and name or nil
+end
+
+-- The monthly Vibe Code allowance. A budget of zero or less is no allowance,
+-- and past 100% is billed instead of paused when pay-as-you-go is on.
+local function budget_limit(budget)
+  local detail = budget and budget.vibe_budget
+  if type(detail) ~= "table" then
+    return nil
+  end
+  local percentage = parse.as_f64(detail.usage_percentage)
+  local initial = parse.as_f64(detail.initial_budget)
+  if percentage == nil or initial == nil or initial <= 0 then
+    return nil
+  end
+  local reset = detail.reset_at
+  if reset ~= nil and type(reset) ~= "string" then
+    reset = nil
+  end
+  local payg = detail.payg_enabled == true
+  return {
+    label = "Monthly Vibe Code allowance",
+    percentage = math.clamp(math.floor(percentage), 0, 100),
+    reset_at = reset,
+    detail = payg and "past 100% is billed (PAYG)" or nil,
+  }
 end
 
 -- Mistral takes reasoning back as a `thinking` part at the front of the
@@ -88,6 +133,9 @@ maki.provider.register({
   max_output_tokens = false,
   context_window = 128000,
   aperture = { path_prefix = "/v1" },
+  docs = {
+    features = "`/usage` reads the plan and monthly Vibe Code allowance from `/v1/billing/subscription` and `/v1/billing/budget` (the budget needs the `see_org_inference_usage` permission)",
+  },
   models = {
     {
       prefixes = { "mistral-large-4", "mistral-large-4-0" },
@@ -174,5 +222,22 @@ maki.provider.register({
       return nil, err
     end
     return parse.models(body, parse_model)
+  end,
+
+  -- The plan and the monthly Vibe Code allowance. A failed subscription is
+  -- the hook's error: the key is refused. The budget is optional, though: a
+  -- key without the usage permission, or a self-hosted platform without
+  -- billing, answers without it.
+  fetch_usage = function(ctx)
+    local subscription, sub_err = ctx.get_json(SUBSCRIPTION_PATH)
+    local budget = fetch_optional(ctx, BUDGET_PATH, budget_limit)
+    local limits = {}
+    if budget then
+      table.insert(limits, budget)
+    end
+    if sub_err then
+      return nil, sub_err
+    end
+    return { plan = plan_name(subscription), limits = limits }
   end,
 })

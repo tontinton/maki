@@ -292,6 +292,7 @@ Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 
 - **Env var**: `MISTRAL_API_KEY`
 - **API**: `https://api.mistral.ai/v1`
+- **Features**: `/usage` reads the plan and monthly Vibe Code allowance from `/v1/billing/subscription` and `/v1/billing/budget` (the budget needs the `see_org_inference_usage` permission)
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|

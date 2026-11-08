@@ -1,0 +1,64 @@
+{
+  "call": {
+    "endpoint": "usage"
+  },
+  "script": [
+    {
+      "body": "{\"plan_name\": \"vibe-code-pro\", \"vibe_payg_enabled\": true}",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "path": "/v1/billing/subscription",
+      "status": 200
+    },
+    {
+      "body": "{\"vibe_budget\": {\"usage_percentage\": 42.5, \"initial_budget\": 200.0, \"reset_at\": \"2026-12-01T00:00:00Z\", \"payg_enabled\": true}}",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "path": "/v1/billing/budget",
+      "status": 200
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "usage": {
+        "limits": [
+          {
+            "detail": "past 100% is billed (PAYG)",
+            "label": "Monthly Vibe Code allowance",
+            "percentage": 42,
+            "reset_at": 1796083200000
+          }
+        ],
+        "plan": "vibe-code-pro"
+      }
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/billing/budget"
+      },
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/billing/subscription"
+      }
+    ]
+  }
+}
