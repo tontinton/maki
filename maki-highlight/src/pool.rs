@@ -39,7 +39,18 @@ fn jobs() -> &'static flume::Sender<Job> {
             .name("highlight".into())
             .spawn(move || {
                 ON_HIGHLIGHT_THREAD.set(true);
-                let _dial9 = dial9::Dial9Handle::current().track_current_thread();
+                let tracked = dial9::Dial9Handle::current().track_current_thread();
+                if let Some(dir) = std::env::var_os("DIAL9_TRACE_DIR") {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(std::path::Path::new(&dir).join("maki-dial9.log"))
+                    {
+                        let _ = writeln!(f, "highlight thread tracked: {:?}", tracked.as_ref().map(|_| ()));
+                    }
+                }
+                let _dial9 = tracked;
                 while let Ok(job) = rx.recv() {
                     if let Err(payload) = catch_unwind(AssertUnwindSafe(job)) {
                         error!(panic = panic_message(&*payload), "highlight job panicked");
