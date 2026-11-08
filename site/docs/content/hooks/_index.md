@@ -274,6 +274,15 @@ inside a subagent), `model`, `context_size`, `context_window`, and
 A layer on any of them needs every permission, because it steers what the agent
 does next. The chain gets 30 seconds, then the loop carries on without it.
 
+The verdict strings the host reads off the final value, `continue` and
+`instructions`, are one string shared by every layer, and only the last write
+survives. A layer that has something to say appends its own text to whatever is
+already there, and tolerates the field being absent:
+
+```lua
+value.continue = (value.continue and value.continue .. "\n" or "") .. "Re-read PLAN.md."
+```
+
 ### agent.user_message
 
 `images` is the number of attached images. `source` is `"tui"`, `"acp"`,
@@ -297,14 +306,15 @@ end)
 ### agent.stop
 
 `reason` is `"finished"` or `"max_tokens"`, and `last_message` is the text of
-the final answer. Return `{ continue = text }` to send `text` as the next
-message and keep going:
+the final answer. Append to `continue` to send the text as the next message
+and keep going:
 
 ```lua
 maki.api.set_slot("agent.stop", function(prev, stop, ctx)
   local todo = maki.fs.read("TODO.md")
   if todo and todo:find("%- %[ %]") then
-    return { continue = "TODO.md still has open items. Keep going." }
+    stop.continue = (stop.continue and stop.continue .. "\n" or "")
+      .. "TODO.md still has open items. Keep going."
   end
   return prev(stop, ctx)
 end)
@@ -326,7 +336,7 @@ Return a table with any of:
   cannot be skipped, because the run cannot go on without compacting.
 - `instructions`: appended to the summary prompt, after the configured and
   requested ones.
-- `continue`: appended to the message the agent resumes with.
+- `continue`: text appended to the message the agent resumes with.
 
 ### agent.compact.prepare
 
