@@ -191,7 +191,7 @@ pub(crate) fn json_to_lua_with(lua: &Lua, value: &JsonValue, luanil: &Luanil) ->
         JsonValue::Null => Value::NULL,
         JsonValue::Bool(b) => Value::Boolean(*b),
         JsonValue::Number(n) => match (n.as_i64(), n.as_f64()) {
-            (Some(i), _) => Value::Integer(i),
+            (Some(i), _) => lua.pack(i)?,
             (_, Some(f)) => Value::Number(f),
             _ => Value::Nil,
         },
@@ -451,7 +451,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use mlua::{Lua, Table, Value};
+    use mlua::{Integer, Lua, Table, Value};
     use regex::Regex;
     use serde_json::Value as JsonValue;
     use test_case::test_case;
@@ -595,6 +595,18 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    #[test_case(0 ; "zero")]
+    #[test_case(i64::from(i32::MAX) ; "i32_max")]
+    #[test_case(i64::from(i32::MIN) ; "i32_min")]
+    #[test_case(i64::from(i32::MAX) + 1 ; "above_i32_max")]
+    #[test_case(i64::from(i32::MIN) - 1 ; "below_i32_min")]
+    fn json_to_lua_integers_use_numbers_when_outside_lua_integer_range(n: i64) {
+        let lua = Lua::new();
+        let value = json_to_lua(&lua, &serde_json::json!(n)).unwrap();
+        assert_eq!(value.is_integer(), Integer::try_from(n).is_ok());
+        assert_eq!(lua.unpack::<i64>(value).unwrap(), n);
+    }
+
     #[test_case(f64::NAN ; "nan")]
     #[test_case(f64::INFINITY ; "positive_infinity")]
     #[test_case(f64::NEG_INFINITY ; "negative_infinity")]
@@ -604,10 +616,10 @@ mod tests {
         assert_eq!(result, JsonValue::Null);
     }
 
-    #[test_case(i64::MAX ; "i64_max")]
-    #[test_case(i64::MIN ; "i64_min")]
+    #[test_case(Integer::MAX ; "integer_max")]
+    #[test_case(Integer::MIN ; "integer_min")]
     #[test_case(0 ; "zero")]
-    fn lua_to_json_integer_boundaries(n: i64) {
+    fn lua_to_json_integer_boundaries(n: Integer) {
         let lua = Lua::new();
         let result = lua_to_json(&lua, &Value::Integer(n)).unwrap();
         assert_eq!(result, serde_json::json!(n));
