@@ -66,7 +66,7 @@ fn dial9_runtime() -> dial9::AttachedRuntime {
     use dial9::memory::MemoryProfilingConfig;
     use dial9::process::ProcessResourceUsageConfig;
     use dial9::{
-        Dial9HandleTokioExt, RecorderPerfExt, RecorderSourceExt, TaskDumpConfig, TokioAttachOptions,
+        Dial9HandleTokioExt, RecorderPerfExt, TaskDumpConfig, TokioAttachOptions,
     };
 
     let dir = std::env::var_os("DIAL9_TRACE_DIR")
@@ -85,15 +85,19 @@ fn dial9_runtime() -> dial9::AttachedRuntime {
             dial9_note("cpu profiler: perf (process-wide)");
             dial9::recorder(writer).source(cpu)
         }
+        // Auto would pick per-thread perf events, whose rings exhaust the
+        // unprivileged `perf_event_mlock_kb` budget after a dozen threads and
+        // leave every later thread unsampled. The timer backend has no such
+        // limit.
         Err(e) => {
-            dial9_note(&format!("cpu profiler: perf failed ({e}), falling back to auto"));
-            dial9::recorder(writer).with_cpu_profiling(CpuProfilingConfig::default())
+            dial9_note(&format!("cpu profiler: perf failed ({e}), using the ctimer backend"));
+            dial9::recorder(writer).with_cpu_profiling(CpuProfilingConfig::with_ctimer_backend())
         }
     };
     // Every tracked thread's sched events take a perf ring out of the
     // unprivileged `perf_event_mlock_kb` budget; once it is spent, the
     // registration of a whole thread fails, CPU sampling included.
-    let sched = std::env::var("DIAL9_SCHEDULE_PROFILE_ENABLED").is_none_or(|v| v != "false");
+    let sched = !std::env::var("DIAL9_SCHEDULE_PROFILE_ENABLED").is_ok_and(|v| v == "false");
     let builder = if sched {
         builder.with_sched_events(SchedEventConfig::default())
     } else {
