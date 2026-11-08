@@ -90,8 +90,16 @@ fn dial9_runtime() -> dial9::AttachedRuntime {
             dial9::recorder(writer).with_cpu_profiling(CpuProfilingConfig::default())
         }
     };
+    // Every tracked thread's sched events take a perf ring out of the
+    // unprivileged `perf_event_mlock_kb` budget; once it is spent, the
+    // registration of a whole thread fails, CPU sampling included.
+    let sched = std::env::var("DIAL9_SCHEDULE_PROFILE_ENABLED").is_none_or(|v| v != "false");
+    let builder = if sched {
+        builder.with_sched_events(SchedEventConfig::default())
+    } else {
+        builder
+    };
     let recorder = builder
-        .with_sched_events(SchedEventConfig::default())
         .with_process_resource_usage(ProcessResourceUsageConfig::default())
         .with_memory_profiling(
             MemoryProfilingConfig::builder()
