@@ -65,7 +65,14 @@ jobs:
       STYLUA_VERSION: v2.6.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Release downloads 504 for long stretches, so only a cache miss hits them.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: stylua-cache
+        with:
+          path: stylua
+          key: stylua-${{ runner.os }}-${{ env.STYLUA_VERSION }}
       - name: Install stylua
+        if: steps.stylua-cache.outputs.cache-hit != 'true'
         run: |
           .github/scripts/retry.sh curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o stylua.zip \
             "https://github.com/JohnnyMorganz/StyLua/releases/download/${STYLUA_VERSION}/stylua-linux-x86_64.zip"
@@ -84,7 +91,13 @@ jobs:
       LUTE_VERSION: v1.0.1-nightly.20261103
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: lute-cache
+        with:
+          path: lute
+          key: lute-${{ runner.os }}-${{ env.LUTE_VERSION }}
       - name: Install lute
+        if: steps.lute-cache.outputs.cache-hit != 'true'
         run: |
           .github/scripts/retry.sh curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o lute.zip \
             "https://github.com/luau-lang/lute/releases/download/${LUTE_VERSION}/lute-linux-x86_64.zip"
