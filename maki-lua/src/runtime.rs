@@ -642,7 +642,7 @@ enum HostHook {
     Autocmd {
         event: String,
         data: Value,
-        message: Option<Message>,
+        message: Option<Box<Message>>,
     },
     EndSession(EndSession),
 }
@@ -2543,7 +2543,14 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
         } => {
             let data = json_to_lua(lua, &data).unwrap_or(LuaValue::Nil);
             let is_turn_end = event == TURN_END_EVENT;
-            crate::api::autocmd::dispatch(lua.clone(), event, None, data, message).await;
+            crate::api::autocmd::dispatch(
+                lua.clone(),
+                event,
+                None,
+                data,
+                message.map(|message| *message),
+            )
+            .await;
             if is_turn_end {
                 collect_turn_garbage(lua);
             }
@@ -6218,7 +6225,7 @@ pub fn spawn(
                             let _ = hook_tx.send(HostHook::Autocmd {
                                 event,
                                 data,
-                                message,
+                                message: message.map(Box::new),
                             });
                         }
                         Request::EndSession(end) => {

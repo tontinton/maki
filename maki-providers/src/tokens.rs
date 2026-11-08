@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::types::{ContentBlock, Message, is_deferred_tool};
 
-const CHARS_PER_TOKEN: usize = 4;
+pub const CHARS_PER_TOKEN: usize = 4;
 /// Flat per image, because all we have is the encoded blob, and its size
 /// tracks compression rather than the tile count the provider bills. A
 /// screenshot at the sizes [`crate::adapt_images_for_model`] allows lands near

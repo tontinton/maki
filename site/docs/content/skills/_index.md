@@ -66,6 +66,15 @@ The `skill` tool lists every skill it found, the agent calls it with a name and 
 
 Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
 
+Skills loaded by a direct `skill` call survive compaction. A skill loaded
+inside `batch` or `code_execution` does not. Maki keeps the latest load of each
+skill verbatim, in the order they were loaded. They share half the room left below
+the compaction threshold, up to 64 KiB and a tenth of the model's context window.
+Maki fills that room newest first and skips a load that does not fit, so an
+older, smaller skill can still be kept. A skill that is no longer in
+the list, for example after its folder lost trust, is dropped at the next
+compaction.
+
 ## The builtin: maki-plugin-dev
 
 Maki ships one skill, `maki-plugin-dev`. It teaches the agent how to write maki Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
