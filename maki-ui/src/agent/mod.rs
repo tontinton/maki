@@ -347,7 +347,12 @@ mod tests {
     const SEED_NOT_LIVE: &str = "the respawned loop publishes a seed for the app's session";
     const LOST_ID: &str = "toolu_lost_on_exit";
 
-    struct StubProvider;
+    /// `auth_gate` parks a respawned loop in `reload_auth`, before it reads
+    /// its queue, until the test drops the gate's sender.
+    #[derive(Default)]
+    struct StubProvider {
+        auth_gate: Option<flume::Receiver<()>>,
+    }
 
     impl Provider for StubProvider {
         fn stream_message<'a>(
@@ -366,6 +371,15 @@ mod tests {
         fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+
+        fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+            Box::pin(async {
+                if let Some(ref gate) = self.auth_gate {
+                    let _ = gate.recv_async().await;
+                }
+                Ok(())
+            })
+        }
     }
 
     fn stub_spawn() -> (AgentHandles, Arc<ArcSwap<ModelSlot>>) {
@@ -373,9 +387,16 @@ mod tests {
     }
 
     fn stub_spawn_with(initial_history: Vec<Message>) -> (AgentHandles, Arc<ArcSwap<ModelSlot>>) {
+        stub_spawn_on(StubProvider::default(), initial_history)
+    }
+
+    fn stub_spawn_on(
+        provider: StubProvider,
+        initial_history: Vec<Message>,
+    ) -> (AgentHandles, Arc<ArcSwap<ModelSlot>>) {
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: crate::components::test_model(),
-            provider: Arc::new(StubProvider),
+            provider: Arc::new(provider),
         }));
         let handles = spawn_on(&model_slot, initial_history);
         (handles, model_slot)
@@ -624,11 +645,19 @@ mod tests {
 
     /// Senders captured before any respawn (Lua restore replies, clicks) must
     /// still reach the live receiver, and restored queue items must land in
-    /// the freshly wired queue, not the one that just died.
+    /// the freshly wired queue, not the one that just died. The respawned
+    /// loop stays parked in `reload_auth` until the queue has been checked:
+    /// running free, it could pop the item first and leave the queue empty.
     #[test]
     fn respawn_twice_keeps_channel_and_delivers_restored_queue() {
         let _runtime = enter_runtime();
-        let (mut handles, model_slot) = stub_spawn();
+        let (open_auth, auth_gate) = flume::unbounded::<()>();
+        let (mut handles, model_slot) = stub_spawn_on(
+            StubProvider {
+                auth_gate: Some(auth_gate),
+            },
+            Vec::new(),
+        );
         let pre_gen1_sender =
             maki_agent::EventSender::new(handles.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
 
@@ -649,6 +678,7 @@ mod tests {
             [RESTORED_TEXT],
             "the restored item lands in the new queue exactly once"
         );
+        drop(open_auth);
 
         pre_gen1_sender
             .send(AgentEvent::TextDelta {
