@@ -7178,11 +7178,16 @@ mod read_tool_required_params {
     }
 
     #[test]
-    fn offset_beyond_file_returns_empty() {
+    fn offset_beyond_file_says_past_end_instead_of_empty() {
+        const NOTE: &str = "offset 100 is past the end of the file (10 lines)";
         let (reg, _host) = builtins_host();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("small.txt");
-        std::fs::write(&path, "just one line\n").unwrap();
+        let content = (1..=10i32)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
 
         let out = exec_tool(
             &reg,
@@ -7194,10 +7199,28 @@ mod read_tool_required_params {
             }),
         );
         let out = out.expect("read should succeed");
-        assert!(
-            out.is_empty(),
-            "offset beyond file should return empty, got: {out}"
-        );
+        assert!(out.contains(NOTE), "got: {out}");
+    }
+
+    #[test]
+    fn empty_file_says_so_instead_of_empty() {
+        const NOTE: &str = "(empty file)";
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1,
+                "limit": 0
+            }),
+        )
+        .expect("read should succeed");
+        assert_eq!(out, NOTE);
     }
 }
 

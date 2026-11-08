@@ -127,6 +127,10 @@ local function read_file(path, offset, limit, ctx)
     parts[#parts + 1] = string.format(nr_fmt, start + i - 1, line)
   end
   local llm_output = table.concat(parts, "\n")
+  if #lines == 0 then
+    llm_output = total_lines == 0 and "(empty file)"
+      or ("offset %d is past the end of the file (%d lines)"):format(start, total_lines)
+  end
 
   local trunc_start = start + #lines
   if trunc_start <= total_lines then
