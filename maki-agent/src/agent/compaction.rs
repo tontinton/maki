@@ -4,8 +4,8 @@ use std::env;
 use maki_config::AgentConfig;
 use maki_providers::retry::RetryPolicy;
 use maki_providers::{
-    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
-    StreamResponse,
+    CHARS_PER_TOKEN, ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions,
+    Role, StreamResponse, estimate_message_tokens, estimate_prompt_tokens,
 };
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -17,7 +17,7 @@ use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry
 use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
-use crate::tools::truncate_bytes;
+use crate::tools::{ToolRegistry, truncate_bytes};
 use crate::{AgentError, AgentEvent, DoneReason, EventSender, RunLedger, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
@@ -27,6 +27,10 @@ const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
 /// cheap ones, so one giant MCP dump could sit in the protected tail and blow
 /// the window on every retry.
 const RECENT_TOOL_RESULT_BUDGET: usize = 64 * 1024;
+const DURABLE_KEY_SEPARATOR: char = ':';
+/// Share of the context window that carried durable results may fill, so they
+/// never push a small window back over the compaction threshold.
+const DURABLE_CONTEXT_PERCENT: u32 = 10;
 /// A summary runs to a few thousand tokens. Giving compaction the full turn
 /// budget would reserve tens of thousands it cannot use, on the one request
 /// already sent under the most context pressure a session ever sees.
@@ -139,6 +143,81 @@ pub(super) async fn steer_compaction(
         instructions: join_lines([request, added]),
         continue_text: continue_with.map(str::to_owned),
     })
+}
+
+/// The latest durable result per key that the summary replaces, oldest first,
+/// as long as its tool still declares it durable. The newest are kept within
+/// [`RECENT_TOOL_RESULT_BUDGET`] and `max_tokens`. A newer result for the key
+/// in the carried tail wins, so it is left where it is.
+fn durable_messages(
+    history: &[Message],
+    summarized: usize,
+    registry: &ToolRegistry,
+    max_tokens: u32,
+) -> Vec<Message> {
+    let durable_field = |name: &str| {
+        registry
+            .get(name)
+            .and_then(|entry| entry.tool.durable_field().map(str::to_owned))
+    };
+    let mut calls = HashMap::new();
+    let mut latest = HashMap::new();
+    let mut seq = 0..;
+    for (at, message) in history.iter().enumerate() {
+        if let Some(key) = &message.durable
+            && let Some((name, _)) = key.split_once(DURABLE_KEY_SEPARATOR)
+            && durable_field(name).is_some()
+            && let Some(text) = message.first_text_content()
+        {
+            latest.insert(key.clone(), (seq.next(), at, text));
+        }
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
+                    if let Some(value) = durable_field(name)
+                        .and_then(|field| input.get(field)?.as_str().map(str::to_owned))
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        calls.insert(id.as_str(), format!("{name}{DURABLE_KEY_SEPARATOR}{value}"));
+                    }
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error: false,
+                    ..
+                } if !content.trim().is_empty() => {
+                    if let Some(key) = calls.remove(tool_use_id.as_str()) {
+                        latest.insert(key, (seq.next(), at, content.as_str()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut carried: Vec<_> = latest
+        .into_iter()
+        .filter(|(_, (_, at, _))| *at < summarized)
+        .collect();
+    carried.sort_by_key(|(_, (order, _, _))| std::cmp::Reverse(*order));
+    let mut budget = RECENT_TOOL_RESULT_BUDGET.min(max_tokens as usize * CHARS_PER_TOKEN);
+    carried.retain(|(_, (_, _, text))| {
+        let fits = text.len() <= budget;
+        if fits {
+            budget -= text.len();
+        }
+        fits
+    });
+    carried
+        .into_iter()
+        .rev()
+        .map(|(key, (_, _, text))| Message {
+            durable: Some(key),
+            ..Message::observation(text.to_owned())
+        })
+        .collect()
 }
 
 fn percent_of(tokens: u32, percent: u32) -> u32 {
@@ -331,6 +410,24 @@ fn finish_compact(
         normalize(config.post_compaction_instructions.as_deref())
             .map(|text| Message::synthetic(text.to_owned())),
     );
+    // Carried results get at most half of what the prefix, summary and tail
+    // leave below the threshold, so the next turns have room before the next
+    // compaction. Without a frame yet, as on resume, the window share bounds it.
+    let tail = &history.as_slice()[summarized..];
+    let kept = history.request_prefix().map_or_else(
+        || estimate_message_tokens(&new_history),
+        |(system, tools)| estimate_prompt_tokens(&new_history, system, tools),
+    ) + estimate_message_tokens(tail);
+    let room = (usable(hooks.model, config).saturating_sub(kept) / 2).min(percent_of(
+        hooks.model.context_window,
+        DURABLE_CONTEXT_PERCENT,
+    ));
+    new_history.extend(durable_messages(
+        history.as_slice(),
+        summarized,
+        hooks.registry,
+        room,
+    ));
     let summary_len = new_history.len();
     new_history.extend_from_slice(&history.as_slice()[summarized..]);
     history.restart(new_history);

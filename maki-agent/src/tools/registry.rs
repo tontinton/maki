@@ -285,6 +285,10 @@ pub trait Tool: Send + Sync + 'static {
     fn tool_kind(&self) -> Option<&str> {
         None
     }
+    /// The input field whose value names a result that survives compaction.
+    fn durable_field(&self) -> Option<&str> {
+        None
+    }
     /// `None` is undeclared reach, which every consumer prices as everything.
     /// Only an explicit [`ToolReach::Inert`] is free.
     fn reach(&self) -> Option<ToolReach> {

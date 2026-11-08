@@ -38,7 +38,7 @@ pub use providers::plugin;
 pub use providers::xai::auth as xai_auth;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 pub use providers::{Timeouts, user_agent};
-pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
+pub use tokens::{CHARS_PER_TOKEN, ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
     CONTEXT_UPDATE_WITHOUT_FACTS, ContentBlock, DEFER_LOADING_KEY, EMPTY_RESPONSE_MARKER, Effort,
     EffortDialect, FACTS_WITHOUT_CONTEXT_UPDATE, IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE,
