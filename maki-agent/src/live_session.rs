@@ -2,11 +2,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
-use event_listener::Event;
 use maki_config::ModelPolicy;
 use maki_providers::{Message, RequestOptions, TaskAnswer, TaskEnd, TaskSettled, Timeouts};
 use maki_storage::id::{MakiId, SessionRef};
 use thiserror::Error;
+use tokio::sync::Notify;
 
 use crate::agent::default_instruction_files;
 use crate::cancel::CancelToken;
@@ -41,7 +41,7 @@ struct LiveSession {
     mailbox: Mutex<Mailbox>,
     seed: Mutex<Weak<AgentSeed>>,
     /// Fires on every change a [`SessionMailbox::next_wake`] waiter waits for.
-    changed: Event,
+    changed: Notify,
 }
 
 /// Besides the notices, it tracks every background receipt the model holds
@@ -539,7 +539,7 @@ impl SessionMailbox {
 
     async fn wait_for_wake(&self, take_quiet: bool) -> Option<Vec<Message>> {
         loop {
-            let listener = self.live.changed.listen();
+            let notified = self.live.changed.notified();
             {
                 let mut mailbox = lock(&self.live.mailbox);
                 if mailbox.wake {
@@ -549,13 +549,13 @@ impl SessionMailbox {
                     return (take_quiet && !mailbox.pending.is_empty()).then(|| mailbox.take());
                 }
             }
-            listener.await;
+            notified.await;
         }
     }
 
     fn change<T>(&self, apply: impl FnOnce(&mut Mailbox) -> T) -> T {
         let changed = apply(&mut lock(&self.live.mailbox));
-        self.live.changed.notify(usize::MAX);
+        self.live.changed.notify_waiters();
         changed
     }
 

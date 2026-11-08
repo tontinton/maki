@@ -4,9 +4,9 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use event_listener::{Event, EventListener};
 use maki_storage::id::MakiId;
 use thiserror::Error;
+use tokio::sync::SetOnce;
 
 use crate::cancel::{CancelToken, CancelTrigger};
 use crate::session_control::SessionControl;
@@ -47,8 +47,7 @@ pub struct CallScope {
     owner: CancelToken,
     cancel: CancelToken,
     trigger: Mutex<Option<CancelTrigger>>,
-    home: OnceLock<TaskHome>,
-    moved: Event,
+    home: SetOnce<TaskHome>,
     sessions: Mutex<Vec<SessionStub>>,
 }
 
@@ -62,8 +61,7 @@ impl CallScope {
             owner: run.follower(),
             cancel,
             trigger: Mutex::new(Some(trigger)),
-            home: OnceLock::new(),
-            moved: Event::new(),
+            home: SetOnce::new(),
             sessions: Mutex::new(Vec::new()),
         }
     }
@@ -84,17 +82,9 @@ impl CallScope {
         self.home.get()
     }
 
-    /// Notified once, by the move. Check [`home`](Self::home) after creating
-    /// the listener to close the race with a move in between.
-    pub fn moved_listener(&self) -> EventListener {
-        self.moved.listen()
-    }
-
+    /// Resolves once the call moved.
     pub async fn moved(&self) {
-        let listener = self.moved_listener();
-        if self.home().is_none() {
-            listener.await;
-        }
+        self.home.wait().await;
     }
 
     /// Takes the gate of a move, detaches the subtree from the run token and
@@ -176,7 +166,6 @@ impl MoveClaim<'_> {
     pub fn land(self, home: TaskHome) {
         // Only the holder of the trigger sets the home, so this cannot fail.
         let _ = self.0.home.set(home);
-        self.0.moved.notify(usize::MAX);
     }
 }
 

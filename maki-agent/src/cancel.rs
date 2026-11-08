@@ -1,7 +1,7 @@
 //! Cooperative cancellation with parent-to-child propagation.
 //!
 //! `CancelTrigger` fires on Drop, so cleanup happens even if the trigger is forgotten.
-//! `cancelled()` uses a double-check around the listener to close the TOCTOU window between flag read and listener registration.
+//! `cancelled()` uses a double-check around the `Notified` future to close the TOCTOU window between flag read and registration.
 //! A parent holds its children weakly and fires them itself, so propagation needs no background task and a dropped child leaves nothing behind.
 
 use std::collections::HashMap;
@@ -9,19 +9,19 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use event_listener::Event;
+use tokio::sync::Notify;
 
 #[derive(Default)]
 struct Shared {
     cancelled: AtomicBool,
-    event: Event,
+    event: Notify,
     children: Mutex<Vec<Weak<Shared>>>,
 }
 
 impl Shared {
     fn fire(&self) {
         self.cancelled.store(true, Ordering::Release);
-        self.event.notify(usize::MAX);
+        self.event.notify_waiters();
         let children = std::mem::take(&mut *self.children());
         for child in children.iter().filter_map(Weak::upgrade) {
             child.fire();
@@ -71,11 +71,11 @@ impl CancelToken {
             if self.is_cancelled() {
                 return;
             }
-            let listener = self.0.event.listen();
+            let notified = self.0.event.notified();
             if self.is_cancelled() {
                 return;
             }
-            listener.await;
+            notified.await;
         }
     }
 
