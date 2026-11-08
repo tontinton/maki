@@ -1,0 +1,57 @@
+{
+  "call": {
+    "endpoint": "usage"
+  },
+  "script": [
+    {
+      "body": "{\"plan_name\": \"vibe-code-free\", \"vibe_payg_enabled\": null}",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "path": "/v1/billing/subscription",
+      "status": 200
+    },
+    {
+      "body": "{\"error\": {\"message\": \"forbidden: missing see_org_inference_usage\"}}",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "path": "/v1/billing/budget",
+      "status": 403
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "usage": {
+        "limits": [],
+        "plan": "vibe-code-free"
+      }
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/billing/budget"
+      },
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/billing/subscription"
+      }
+    ]
+  }
+}
