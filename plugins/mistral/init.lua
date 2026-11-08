@@ -30,16 +30,6 @@ local function effort_ladder(id)
   end
 end
 
--- A side answer the caller can do without: a failed request, a status other
--- than 200 or a shape the reader refuses all read as no answer.
-local function fetch_optional(ctx, path, read)
-  local body = ctx.get_json(path)
-  if type(body) ~= "table" then
-    return nil
-  end
-  return read(body)
-end
-
 local function plan_name(subscription)
   local name = subscription and subscription.plan_name
   return type(name) == "string" and name or nil
@@ -224,20 +214,38 @@ maki.provider.register({
     return parse.models(body, parse_model)
   end,
 
-  -- The plan and the monthly Vibe Code allowance. A failed subscription is
-  -- the hook's error: the key is refused. The budget is optional, though: a
-  -- key without the usage permission, or a self-hosted platform without
-  -- billing, answers without it.
+  -- The plan and the monthly Vibe Code allowance, read in one round trip:
+  -- neither needs the other's answer. A failed subscription is the hook's
+  -- error: the key is refused. The budget is optional, though: a key without
+  -- the usage permission, or a self-hosted platform without billing, answers
+  -- without it.
   fetch_usage = function(ctx)
-    local subscription, sub_err = ctx.get_json(SUBSCRIPTION_PATH)
-    local budget = fetch_optional(ctx, BUDGET_PATH, budget_limit)
+    -- gather keeps only each child's first return value, so a child answers
+    -- with a single table rather than a (body, err) pair.
+    local results = maki.async.gather({
+      function()
+        local body, err = ctx.get_json(SUBSCRIPTION_PATH)
+        return { body = body, err = err }
+      end,
+      function()
+        local body, err = ctx.get_json(BUDGET_PATH)
+        return { body = body, err = err }
+      end,
+    })
+    local function unwrap(result)
+      return result.ok and result.value or { err = result.err }
+    end
+    local subscription, budget = unwrap(results[1]), unwrap(results[2])
+    if subscription.err then
+      return nil, subscription.err
+    end
     local limits = {}
-    if budget then
-      table.insert(limits, budget)
+    if type(budget.body) == "table" then
+      local limit = budget_limit(budget.body)
+      if limit then
+        table.insert(limits, limit)
+      end
     end
-    if sub_err then
-      return nil, sub_err
-    end
-    return { plan = plan_name(subscription), limits = limits }
+    return { plan = plan_name(subscription.body), limits = limits }
   end,
 })
