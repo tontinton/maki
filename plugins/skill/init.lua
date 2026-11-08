@@ -7,44 +7,20 @@ local helpers = require("skill_helpers")
 local build_skill_list = helpers.build_skill_list
 local parse_output = helpers.parse_output
 
-local PROJECT_SKILL_DIRS = {
-  ".maki/skills",
-  ".claude/skills",
-  ".opencode/skills",
-  ".agents/skills",
-}
 local GLOBAL_SKILL_DIRS = {
   ".claude/skills",
   ".config/opencode/skills",
   ".agents/skills",
 }
 
-local function scan_skill_dir(dir, skills, skipped)
+-- The startup scan runs before logging is up, so it keeps what it finds for
+-- the first skill call to log. Rescans pass no report and log nothing.
+local function scan_skill_dir(dir, skills, report)
   local diagnostics, invalid = helpers.scan_skill_dir(dir, skills)
-  for _, diagnostic in ipairs(diagnostics) do
-    maki.log.warn(diagnostic)
+  if report then
+    table.move(diagnostics, 1, #diagnostics, #report.diagnostics + 1, report.diagnostics)
+    table.move(invalid, 1, #invalid, #report.skipped + 1, report.skipped)
   end
-  if skipped then
-    table.move(invalid, 1, #invalid, #skipped + 1, skipped)
-  end
-end
-
-local function find_project_ancestors()
-  local cwd = maki.uv.cwd()
-  if not cwd then
-    return {}
-  end
-  local dirs = { cwd }
-  if maki.fs.metadata(maki.fs.joinpath(cwd, ".git")) then
-    return dirs
-  end
-  for _, parent in ipairs(maki.fs.parents(cwd)) do
-    dirs[#dirs + 1] = parent
-    if maki.fs.metadata(maki.fs.joinpath(parent, ".git")) then
-      break
-    end
-  end
-  return dirs
 end
 
 local opts = maki.api.register_options({
@@ -79,7 +55,7 @@ local function resolve_builtin_content()
   return content .. "\n---\n\n" .. reference.content
 end
 
-local function discover_skills(skipped)
+local function discover_skills(report)
   local skills = {}
 
   if builtin and opts.plugin_dev then
@@ -94,20 +70,18 @@ local function discover_skills(skipped)
 
   local config = maki.env.config_dir()
   if config then
-    scan_skill_dir(maki.fs.joinpath(config, "skills"), skills, skipped)
+    scan_skill_dir(maki.fs.joinpath(config, "skills"), skills, report)
   end
 
   local home = maki.uv.os_homedir()
   if home then
     for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(home, rel), skills, skipped)
+      scan_skill_dir(maki.fs.joinpath(home, rel), skills, report)
     end
   end
 
-  for _, ancestor in ipairs(find_project_ancestors()) do
-    for _, rel in ipairs(PROJECT_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills, skipped)
-    end
+  for _, dir in ipairs(maki.env.project_skill_dirs()) do
+    scan_skill_dir(dir, skills, report)
   end
 
   return skills
@@ -139,9 +113,9 @@ local function skill_view(output, ctx)
   return { body = buf, header = header }
 end
 
-local skipped = {}
-local boot_skills = discover_skills(skipped)
-for _, diagnostic in ipairs(skipped) do
+local boot_report = { diagnostics = {}, skipped = {} }
+local boot_skills = discover_skills(boot_report)
+for _, diagnostic in ipairs(boot_report.skipped) do
   maki.notify(diagnostic, "warn", { title = "Skipped skill" })
 end
 local names = helpers.skill_names(boot_skills)
@@ -175,6 +149,13 @@ maki.api.register_tool({
   handler = function(input, ctx)
     if not input.name then
       return { llm_output = "error: name is required", is_error = true }
+    end
+
+    if boot_report then
+      for _, diagnostic in ipairs(boot_report.diagnostics) do
+        maki.log.warn(diagnostic)
+      end
+      boot_report = nil
     end
 
     local skills = discover_skills()

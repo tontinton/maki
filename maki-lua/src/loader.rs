@@ -496,6 +496,16 @@ impl PluginHost {
         Ok(())
     }
 
+    /// Share the existing folder-trust decision with plugins before loading them.
+    pub fn set_project_config(&self, project: &ProjectConfig) -> Result<(), PluginError> {
+        self.inner
+            .tx
+            .send(Request::SetSkillDirs {
+                dirs: project.project_skill_dirs(),
+            })
+            .map_err(|_| PluginError::HostDead)
+    }
+
     pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
         let result = self.send_builtin_loads(config);
         // Armed even when a load failed, so a caller that only warns about the

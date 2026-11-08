@@ -126,7 +126,8 @@ AGENTS.local.md        # personal per-project instructions (gitignored)
 ```
 
 A project `.maki` directory can run code, so Maki asks once per folder before
-loading it. `AGENTS.md`, commands and skills load either way. See
+loading it, and project skills wait for the same answer. `AGENTS.md` and
+commands load either way. See
 [Folder Trust](/docs/folder-trust/).
 
 Which instruction file wins, when subdirectory rules load, and how skills and memory fit together: [Context](/docs/context/). All settings: [Configuration](/docs/configuration/).

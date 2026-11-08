@@ -16,6 +16,7 @@ anything. Maki loads none of it until you trust the folder.
 | `.maki/permissions.toml` | decides which tools run without asking |
 | `.maki/init.lua` | runs Lua inside Maki's own process at startup |
 | `.maki/mcp.toml` | starts MCP servers as child processes |
+| `.maki/skills`, `.claude/skills`, `.opencode/skills`, `.agents/skills` | adds agent instructions from project skill directories |
 
 The first interactive start in an untrusted project draws a card before the
 main UI opens, listing the gated files it found. It takes three answers:
@@ -38,13 +39,11 @@ configuration.
 
 ## What Trust Does Not Cover
 
-Trust gates code. Text that a project puts into the prompt loads at any trust
-level:
+Trust gates code and project skills. Other text that a project puts into the
+prompt loads at any trust level:
 
 - `AGENTS.md` and the other instruction files
 - Commands under `.maki/commands` and `.claude/commands`
-- Skills under `.maki/skills`, `.claude/skills`, `.opencode/skills` and
-  `.agents/skills`
 
 A repository can still steer the agent through what the model reads, so trust
 is not a sandbox. What limits the agent on each tool call is
@@ -146,7 +145,9 @@ maki.setup({
 ## What a Yes Covers
 
 Your yes covers the kinds of gated file the folder had that day. A project that
-later adds a kind you were never asked about asks again.
+later adds a kind you were never asked about asks again. Project skills are the
+exception: a yes always covers them, so a trusted folder that gains skills stays
+trusted.
 
 Maki records the file names rather than their contents, so Lua that changes in a
 later pull runs under the answer you already gave. Run `maki trust remove` when

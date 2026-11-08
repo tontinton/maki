@@ -2570,6 +2570,23 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) Legacy directory path, or nil if not present.
 
+---
+
+### `maki.env.project_skill_dirs()` {#maki-env-project_skill_dirs}
+
+```lua
+maki.env.project_skill_dirs()
+```
+
+Every directory a project skill can come from, whether it exists or not:
+each [project skill directory](/docs/skills/) in each canonical directory
+from the working directory up to the project root, nearest first. Empty
+unless the folder is trusted.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Returns:** (`string[]`) Trusted project skill directories.
+
 
 ## maki.fn {#maki-fn}
 

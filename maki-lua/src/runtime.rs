@@ -455,6 +455,9 @@ pub enum Request {
     SealPackOps {
         reply: SyncSender<Vec<crate::api::pack::PackOp>>,
     },
+    SetSkillDirs {
+        dirs: Vec<PathBuf>,
+    },
     LoadSource {
         name: Arc<str>,
         chunks: Vec<LoadChunk>,
@@ -5944,6 +5947,9 @@ pub fn spawn(
                         Request::InstallSessionSnapshot { provider } => {
                             rt.lua
                                 .set_app_data(crate::api::session::SessionSnapshotSlot(provider));
+                        }
+                        Request::SetSkillDirs { dirs } => {
+                            rt.lua.set_app_data(crate::api::env::TrustedSkillDirs(dirs));
                         }
                         Request::LoadSource {
                             name,
