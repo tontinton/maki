@@ -165,6 +165,15 @@ pub const IMAGE_EVICTED_NOTE: &str = "[image omitted: too many images in this co
 pub const IMAGE_PLACEHOLDER: &str = "[image]";
 /// See [`Message::empty_marker`].
 pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
+/// Strict backends (Cohere behind OpenRouter) reject a tool result that carries
+/// no output text, so an empty one goes on the wire as the marker instead.
+pub fn non_empty_tool_result(content: &str) -> &str {
+    if content.trim().is_empty() {
+        EMPTY_RESPONSE_MARKER
+    } else {
+        content
+    }
+}
 /// Marks a definition the API keeps out of the model's context until a
 /// `tool_reference` loads it (see [`crate::Model::supports_deferred_tools`]).
 pub const DEFER_LOADING_KEY: &str = "defer_loading";
