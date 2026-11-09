@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use common::{Chat, Gate, WAIT, done_result, isolated_state, poll_until, request_move};
+use common::{Chat, Gate, WAIT, done_result, poll_until, request_move};
 use maki_agent::agent::tool_dispatch;
 use maki_agent::template::Vars;
 use maki_agent::tools::{
@@ -23,6 +23,7 @@ use maki_agent::{
 use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::test_support::runtime;
 use maki_lua::{EventHandle, MoveOutcome, PluginHost};
+use maki_providers::test_support::isolated_home;
 use maki_storage::id::MakiId;
 use maki_storage::paths::{session_data_dir, state_dir};
 use serde_json::{Value, json};
@@ -98,7 +99,7 @@ struct Run {
     thread: Option<JoinHandle<()>>,
     _seed: Arc<AgentSeed>,
     _run_trigger: CancelTrigger,
-    _state: TempDir,
+    _home: TempDir,
 }
 
 impl Run {
@@ -122,9 +123,9 @@ impl Run {
         Self::launch(json!({}), BATCH_TOOL, input, gate)
     }
 
-    /// Isolates the state directory before the call's thread starts.
+    /// Isolates the home before the call's thread starts.
     fn launch(opts: Value, tool: &str, input: Value, gate: Gate) -> Self {
-        let state = isolated_state();
+        let home = isolated_home();
         let Chat {
             id: session,
             mailbox,
@@ -187,7 +188,7 @@ impl Run {
             thread: Some(thread),
             _seed: seed,
             _run_trigger: run_trigger,
-            _state: state,
+            _home: home,
         }
     }
 
