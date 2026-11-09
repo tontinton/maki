@@ -302,6 +302,11 @@ mod tests {
     #[test_case(r#"{"a":[1,null,{"c":null}],"b":[]}"# ; "nested_nulls_and_empty_array")]
     #[test_case(r#"{"input":{"files":[],"limit":null,"tags":[null,"x",null]}}"# ; "tool_use_input")]
     #[test_case("null" ; "top_level_null")]
+    #[test_case("3000000000" ; "positive_large_integer")]
+    #[test_case("-3000000000" ; "negative_large_integer")]
+    #[test_case("[2147483647,2147483648,-2147483648,-2147483649]" ; "i32_boundaries")]
+    #[test_case("[9007199254740991,9007199254740992,-9007199254740991,-9007199254740992]" ; "exact_integer_limits")]
+    #[test_case(r#"{"count":3000000000,"items":[-3000000000,{"limit":9007199254740992}]}"# ; "nested_large_integers")]
     fn decode_then_encode_gives_the_same_json(doc: &str) {
         let lua = lua_with_json();
         lua.globals().set("doc", doc).unwrap();
