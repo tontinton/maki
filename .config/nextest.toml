@@ -1,8 +1,18 @@
+nextest-version = { required = "0.9.98", recommended = "0.9.151" }
+experimental = ["setup-scripts"]
+
+# Tests that don't call `isolated_home` still never see this machine's config.
+[scripts.setup.isolated-home]
+command = ".config/nextest/isolated-home.sh"
+
 [profile.default]
 fail-fast = false
 status-level = "slow"
-test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.scripts]]
+platform = { host = "cfg(unix)" }
+setup = "isolated-home"
 
 [profile.ci]
 test-threads = 64
