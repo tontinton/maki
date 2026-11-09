@@ -77,13 +77,14 @@ jobs:
       - name: Upload artifact
         run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
 
-  build-netbsd:
+  build-bsd:
     name: Build (${{ matrix.target }})
     needs: create-release
     runs-on: ubuntu-latest
-    # tier 3 on an unpinned nightly breaks on its own schedule, so a failure
-    # there must not hold back the release of every other target
-    continue-on-error: ${{ matrix.toolchain == 'nightly' }}
+    # best effort rows (tier 3 on an unpinned nightly, FreeBSD) must not
+    # hold back the release of the other targets: a failure ships without
+    # those binaries and the installer 404s on that platform
+    continue-on-error: ${{ matrix.best_effort }}
     strategy:
       fail-fast: false
       matrix:
@@ -92,17 +93,32 @@ jobs:
             zig_target: x86_64-netbsd.10.1
             toolchain: stable
             std: precompiled
+            best_effort: false
           - target: aarch64-unknown-netbsd
             zig_target: aarch64-netbsd.10.1
             toolchain: nightly
             std: build-std
+            best_effort: true
+          # pinned to the oldest supported release so the binaries run on
+          # every one, same policy as the .10.1 netbsd baseline
+          - target: x86_64-unknown-freebsd
+            zig_target: x86_64-freebsd.14.0
+            toolchain: stable
+            std: precompiled
+            best_effort: true
+          - target: aarch64-unknown-freebsd
+            zig_target: aarch64-freebsd.14.0
+            toolchain: stable
+            std: precompiled
+            best_effort: true
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # zig bundles NetBSD 10.1 libc headers, crt objects and stub shared
-      # libraries, so it is a self-contained NetBSD cross toolchain: Ubuntu has
-      # no gcc-*-netbsd packages and NetBSD ships no cross kits for Linux.
+      # zig bundles NetBSD 10.1 and FreeBSD 14 libc headers, crt objects and
+      # stub shared libraries, so it is a self-contained cross toolchain for
+      # both BSDs: Ubuntu has no gcc-*-bsd packages and neither BSD ships a
+      # cross kit for Linux.
       - name: Install zig
         env:
           # renovate: datasource=forgejo-tags depName=ziglang/zig registryUrl=https://codeberg.org
@@ -153,9 +169,24 @@ jobs:
           exec zig $zm -target $ZIG_TARGET "\${args[@]}"
           EOF
           done
+          # the FreeBSD precompiled std links libkvm, libmemstat, libprocstat
+          # and libdevstat: zig only stubs the core libraries and no binary
+          # references these, so empty stubs let the link pass and lld's
+          # --as-needed drops the NEEDED entries again
+          link_extra=
+          case "$TARGET" in
+            *-freebsd)
+              mkdir -p "$w/stubs"
+              : > "$w/stub.c"
+              for lib in kvm memstat procstat devstat; do
+                zig cc -target "$ZIG_TARGET" -shared -x c -o "$w/stubs/lib$lib.so" "$w/stub.c"
+              done
+              link_extra="-L$w/stubs"
+              ;;
+          esac
           cat > "$w/linker" <<EOF
           #!/bin/bash
-          exec zig cc -target $ZIG_TARGET "\$@"
+          exec zig cc -target $ZIG_TARGET $link_extra "\$@"
           EOF
           # wrappers, not "AR=zig ar": openssl-src splits a multi-word AR
           printf '#!/bin/sh\nexec zig ar "$@"\n' > "$w/ar"
@@ -249,7 +280,7 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [build-linux, build-netbsd, build-other]
+    needs: [build-linux, build-bsd, build-other]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
