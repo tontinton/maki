@@ -159,11 +159,12 @@ async fn discover(
         .await
     {
         Ok(resolution) => resolution.metadata,
-        // rmcp 3.8 says `MetadataError` when no auth server published anything
-        // usable. Its other errors, like an issuer mismatch, are final.
+        // rmcp says `AuthorizationServersUnavailable` when no auth server
+        // published anything usable. Its other errors, like an issuer mismatch,
+        // are final.
         // TODO(rmcp): drop this arm and `issuer_fallback.rs` once rmcp asks for
         // the appended URL itself.
-        Err(e @ AuthError::MetadataError(_)) => {
+        Err(e @ AuthError::AuthorizationServersUnavailable { .. }) => {
             issuer_fallback::find(&client, server_url, www_authenticate)
                 .await
                 .ok_or(e)?
