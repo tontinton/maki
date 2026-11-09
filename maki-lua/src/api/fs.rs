@@ -1501,7 +1501,7 @@ mod tests {
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
     use futures::FutureExt;
-    use mlua::Lua;
+    use mlua::{Integer, Lua};
     use tempfile::TempDir;
     use test_case::test_case;
     use tokio::runtime::Builder;
@@ -2755,7 +2755,7 @@ mod tests {
     #[test_case(None, 0 ; "omitted_key_keeps_the_true_default")]
     #[test_case(Some(false), 1 ; "false_includes_ignored_files")]
     #[tokio::test]
-    async fn glob_gitignore_option(gitignore: Option<bool>, expected_hits: i64) {
+    async fn glob_gitignore_option(gitignore: Option<bool>, expected_hits: Integer) {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".ignore"), "sub/\n").unwrap();
         std::fs::create_dir(tmp.path().join("sub")).unwrap();

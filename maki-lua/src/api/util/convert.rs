@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 
 use mlua::{FromLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
-use serde_json::Value as JsonValue;
+use serde_json::{Number, Value as JsonValue};
 
 use crate::api::image::LuaImage;
 
@@ -12,6 +12,7 @@ const RECURSIVE_TABLE_ERR: &str = "cannot convert to JSON a table that contains 
 const TOO_DEEP_ERR: &str = "cannot convert to JSON tables nested deeper than";
 pub(crate) const UNKNOWN_FIELD_ERR: &str = "unknown field";
 pub(crate) const REQUIRED_ERR: &str = "is required";
+const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0;
 
 /// How many nulls an array encoding may invent for keys the table does not
 /// hold. A JSON null arrives as an absent Lua key, so a round trip has to be
@@ -322,7 +323,10 @@ fn within_template(
         _ if val.is_null() => JsonValue::Null,
         Value::Boolean(b) => JsonValue::Bool(*b),
         Value::Integer(n) => JsonValue::Number((*n).into()),
-        Value::Number(n) => serde_json::Number::from_f64(*n)
+        Value::Number(n) if n.fract() == 0.0 && n.abs() <= MAX_EXACT_INTEGER => {
+            JsonValue::Number((*n as i64).into())
+        }
+        Value::Number(n) => Number::from_f64(*n)
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
         Value::String(s) => JsonValue::String(s.to_str()?.to_owned()),
@@ -593,6 +597,28 @@ mod tests {
         let lua = Lua::new();
         let result = lua_to_json(&lua, &input).unwrap();
         assert_eq!(result, expected);
+    }
+
+    #[test_case(0.0, "0" ; "zero")]
+    #[test_case(-0.0, "0" ; "negative_zero")]
+    #[test_case(2_147_483_647.0, "2147483647" ; "i32_max")]
+    #[test_case(2_147_483_648.0, "2147483648" ; "above_i32_max")]
+    #[test_case(-2_147_483_648.0, "-2147483648" ; "i32_min")]
+    #[test_case(-2_147_483_649.0, "-2147483649" ; "below_i32_min")]
+    #[test_case(3_000_000_000.0, "3000000000" ; "positive_large_integer")]
+    #[test_case(-3_000_000_000.0, "-3000000000" ; "negative_large_integer")]
+    #[test_case(9_007_199_254_740_991.0, "9007199254740991" ; "below_exact_limit")]
+    #[test_case(-9_007_199_254_740_991.0, "-9007199254740991" ; "above_negative_exact_limit")]
+    #[test_case(9_007_199_254_740_992.0, "9007199254740992" ; "exact_limit")]
+    #[test_case(-9_007_199_254_740_992.0, "-9007199254740992" ; "negative_exact_limit")]
+    #[test_case(9_007_199_254_740_994.0, "9007199254740994.0" ; "past_exact_limit_stays_float")]
+    #[test_case(-9_007_199_254_740_994.0, "-9007199254740994.0" ; "past_negative_exact_limit_stays_float")]
+    #[test_case(1.5, "1.5" ; "positive_fraction")]
+    #[test_case(-1.5, "-1.5" ; "negative_fraction")]
+    fn lua_to_json_numbers_preserve_exact_integers(n: f64, expected: &str) {
+        let lua = Lua::new();
+        let result = lua_to_json(&lua, &Value::Number(n)).unwrap();
+        assert_eq!(serde_json::to_string(&result).unwrap(), expected);
     }
 
     #[test_case(0 ; "zero")]
