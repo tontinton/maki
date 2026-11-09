@@ -214,22 +214,23 @@ fn load_inline(host: &PluginHost, source: &str, net_host: &str, slugs: &[&str]) 
 }
 
 /// The fixture plugin, loaded from disk with the grant its `plugin.toml`
-/// declares, talking to a recorded server instead of Acme.
+/// declares, talking to a recorded server instead of Acme. Fields drop in
+/// order, so the host goes before the home it may write to on its way out.
 struct Fixture {
     provider: Box<dyn Provider>,
     server: Requests,
-    _state: TempDir,
     _host: PluginHost,
+    _home: TempDir,
 }
 
 impl Fixture {
     fn start(script: &'static [Canned]) -> Self {
+        let home = isolated_home();
         let (base_url, server) = serve(script);
-        Self::at(&base_url, server)
+        Self::at(home, &base_url, server)
     }
 
-    fn at(base_url: &str, server: Requests) -> Self {
-        let state = isolated_home();
+    fn at(home: TempDir, base_url: &str, server: Requests) -> Self {
         unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
 
         let host = plugin_host();
@@ -239,8 +240,8 @@ impl Fixture {
         Self {
             provider: plugin::create(SLUG, Timeouts::default()).expect(CREATE_FAILED),
             server,
-            _state: state,
             _host: host,
+            _home: home,
         }
     }
 
@@ -472,7 +473,7 @@ fn a_side_request_that_cannot_connect_is_a_transport_error() {
     let closed = TcpListener::bind((LOOPBACK_HOST, 0)).expect(IO_FAILED);
     let base_url = format!("http://{}", closed.local_addr().expect(IO_FAILED));
     drop(closed);
-    let fixture = Fixture::at(&base_url, Requests::default());
+    let fixture = Fixture::at(isolated_home(), &base_url, Requests::default());
 
     let error = runtime()
         .block_on(fixture.provider.list_models())

@@ -31,7 +31,6 @@ use tempfile::TempDir;
 /// so only an already failing test pays this.
 pub const WAIT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const STATE_ENV_VARS: [&str; 2] = ["HOME", "XDG_STATE_HOME"];
 const GATE_FILE: &str = "go";
 const GATE_POLL_SECS: &str = "0.02";
 
@@ -164,19 +163,6 @@ pub fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
         assert!(Instant::now() < deadline, "{what}");
         thread::sleep(POLL_INTERVAL);
     }
-}
-
-/// Points the state directory at a throwaway tree, so task logs never land in
-/// the user's. Dropping the tree is the cleanup.
-pub fn isolated_state() -> TempDir {
-    let dir = TempDir::new().unwrap();
-    for var in STATE_ENV_VARS {
-        // SAFETY: setting a variable is only sound while no other thread reads
-        // the environment. Every test runs in its own process under nextest
-        // and calls this before it starts a thread.
-        unsafe { std::env::set_var(var, dir.path()) };
-    }
-    dir
 }
 
 /// Holds a shell command until released, and lets it finish whatever happens
