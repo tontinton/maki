@@ -20,6 +20,7 @@ const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
 const LOCAL_ENDPOINT_SLUGS: [&str; 2] = ["ollama", "llama-cpp"];
+pub const BASE_URL_ENV_SUFFIX: &str = "_BASE_URL";
 
 /// Where the last parse came from and what the file looked like then. The
 /// config path follows the project directory, so one process can read more
@@ -492,7 +493,10 @@ pub fn resolve_api_key_env(slug: &str, def: Option<&ProviderDef>) -> String {
 /// The `<SLUG>_BASE_URL` env var name (e.g. `anthropic` -> `ANTHROPIC_BASE_URL`,
 /// `llama-cpp` -> `LLAMA_CPP_BASE_URL`).
 pub fn base_url_env_var(slug: &str) -> String {
-    format!("{}_BASE_URL", slug.to_uppercase().replace('-', "_"))
+    format!(
+        "{}{BASE_URL_ENV_SUFFIX}",
+        slug.to_uppercase().replace('-', "_")
+    )
 }
 
 /// The `<SLUG>_BASE_URL` override, or `None` when unset or empty.

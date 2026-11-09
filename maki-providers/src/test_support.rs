@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+use maki_config::providers::BASE_URL_ENV_SUFFIX;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -28,7 +29,6 @@ const IO_FAILED: &str = "the recorded connection broke";
 const QUERY_START: char = '?';
 const BAD_DECLARATION: &str = "the test declaration must register";
 const TEMPDIR_FAILED: &str = "cannot create the isolated home";
-const BASE_URL_SUFFIX: &str = "_BASE_URL";
 const HOME_VARS: &[&str] = &["HOME", "USERPROFILE"];
 // Logs sit beside the state base, so keep its parent inside the guard.
 // Windows reads `APPDATA` and `LOCALAPPDATA` instead of the XDG variables.
@@ -293,9 +293,11 @@ pub(crate) mod transport {
 }
 
 /// Points every per-user directory at a fresh temp dir and clears every
-/// `<SLUG>_BASE_URL` override, so a test reads none of this machine's provider
-/// config or credentials and writes its own. Call it first, since the base
-/// dirs are resolved once per process, and keep the guard for the whole test.
+/// `<SLUG>_BASE_URL` override, so a test reads none of this machine's
+/// `providers.toml` or stored credentials and writes its own. Other variables
+/// stay, API keys and host overrides like `OLLAMA_HOST` included. Call it
+/// first, since the base dirs are resolved once per process, and keep the
+/// guard for the whole test.
 pub fn isolated_home() -> TempDir {
     let home = TempDir::new().expect(TEMPDIR_FAILED);
     // SAFETY: Nextest runs each test in its own process. Callers set up the
@@ -304,7 +306,7 @@ pub fn isolated_home() -> TempDir {
         for (key, _) in std::env::vars_os() {
             if key
                 .to_str()
-                .is_some_and(|key| key.ends_with(BASE_URL_SUFFIX))
+                .is_some_and(|key| key.ends_with(BASE_URL_ENV_SUFFIX))
             {
                 std::env::remove_var(key);
             }
