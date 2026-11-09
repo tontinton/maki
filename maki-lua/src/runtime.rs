@@ -570,7 +570,7 @@ pub enum Request {
         reply: flume::Sender<Vec<crate::api::pack::Declared>>,
     },
     CollectPackageContext {
-        reply: flume::Sender<(Vec<crate::api::pack::Declared>, BTreeSet<String>)>,
+        reply: oneshot::Sender<(Vec<crate::api::pack::Declared>, BTreeSet<String>)>,
     },
     RunPackLoader {
         declared: crate::api::pack::Declared,

@@ -1194,13 +1194,13 @@ impl EventHandle {
         rx.recv().unwrap_or_default()
     }
 
-    pub fn package_context(&self) -> Result<crate::pack::PackContext, String> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
+    pub async fn package_context(&self) -> Result<crate::pack::PackContext, String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Request::CollectPackageContext { reply: reply_tx })
             .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
         let (declared, active) = reply_rx
-            .recv()
+            .await
             .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
         let installed = crate::pack::installed_names()
             .ok_or_else(|| "could not read the package lockfile".to_owned())?;
