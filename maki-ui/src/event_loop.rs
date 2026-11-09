@@ -10,7 +10,6 @@
 
 use std::future::{pending, ready};
 use std::mem;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,7 +51,6 @@ use maki_storage::model::persist_model;
 use maki_storage::sessions::normalize_title;
 use ratatui::layout::Rect;
 use serde_json::json;
-use tokio::runtime::Handle;
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
 use tokio_util::task::AbortOnDropHandle;
@@ -566,12 +564,10 @@ pub(crate) struct EventLoop<'t> {
     ui_action_rx: flume::Receiver<UiAction>,
     ui_wake_rx: flume::Receiver<()>,
     ui_attachment: UiAttachment,
-    pack_tx: flume::Sender<Box<PackPreparation>>,
-    pack_rx: flume::Receiver<Box<PackPreparation>>,
-    /// One package command at a time. The work runs on its own thread, so
-    /// without this a second `/packupdate` would race the first over the same
-    /// clones and locks.
-    pack_running: bool,
+    /// One package command at a time. The work runs as its own task, so a
+    /// second `/packupdate` would otherwise race the first over the same clones
+    /// and locks.
+    pack: Option<JoinHandle<PackPreparation>>,
     _model_fetch_task: AbortOnDropHandle<()>,
 }
 
@@ -601,6 +597,23 @@ async fn recv_or_pending<T>(rx: &flume::Receiver<T>) -> T {
         Ok(value) => value,
         Err(_) => pending().await,
     }
+}
+
+/// The running package command's answer, or never, when none is running.
+///
+/// The handle is only cleared once it has answered, so a `select!` that drops
+/// this future for another wake leaves the task in place. A panic still
+/// answers, or every later package command would report "already running"
+/// until the next `/reload`.
+async fn pack_done(pack: &mut Option<JoinHandle<PackPreparation>>) -> PackPreparation {
+    let Some(task) = pack else {
+        return pending().await;
+    };
+    let preparation = task
+        .await
+        .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
+    *pack = None;
+    preparation
 }
 
 /// The first agent envelope or shell event from any session.
@@ -818,7 +831,6 @@ impl<'t> EventLoop<'t> {
             app.open_alert(alert);
         }
 
-        let (pack_tx, pack_rx) = flume::unbounded();
         Ok(Self {
             terminal,
             sessions: runtimes,
@@ -838,9 +850,7 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             ui_wake_rx,
             ui_attachment,
-            pack_tx,
-            pack_rx,
-            pack_running: false,
+            pack: None,
             _model_fetch_task: bg.task,
         })
     }
@@ -960,7 +970,7 @@ impl<'t> EventLoop<'t> {
             () = recv_or_pending(&self.ui_wake_rx) => Wake::PluginWindow,
             () = recv_or_pending(decor_worker::wakes()) => Wake::Decor,
             warning = recv_or_pending(&self.warn_rx) => Wake::Warn(warning),
-            preparation = recv_or_pending(&self.pack_rx) => Wake::Pack(preparation),
+            preparation = pack_done(&mut self.pack) => Wake::Pack(Box::new(preparation)),
             () = recv_or_pending(&self.models_rx) => Wake::ModelsDiscovered,
             wake = session_wake(&self.sessions) => wake,
         }
@@ -2155,39 +2165,30 @@ impl<'t> EventLoop<'t> {
         Ok(())
     }
 
-    /// Prepares a package command on its own thread.
+    /// Prepares a package command as a task.
     ///
-    /// Preparation fetches over the network through a git child process nothing
-    /// here can cancel. Inline it would freeze drawing and input for as long as
-    /// the slowest remote takes, so the answer comes back as an event instead.
+    /// Preparation fetches over the network, and inline it would freeze drawing
+    /// and input for as long as the slowest remote takes, so the answer comes
+    /// back as a wake instead.
     fn start_pack(&mut self, idx: usize, command: PackCommand) {
-        if self.pack_running {
+        if self.pack.is_some() {
             self.sessions[idx].app.flash(PACK_BUSY_ERR.to_owned());
             return;
         }
-        self.pack_running = true;
         self.sessions[idx].app.flash(PACK_PREPARING.to_owned());
         let handle = self.ctx.lua_event_handle.clone();
-        let tx = self.pack_tx.clone();
-        let runtime = Handle::current();
-        std::thread::spawn(move || {
-            // Without this a panic drops the sender with no answer, and
-            // `pack_running` stays set for the rest of the process, so every
-            // later package command reports "already running".
-            let preparation = catch_unwind(AssertUnwindSafe(|| match handle.package_context() {
-                Ok(context) => runtime.block_on(maki_lua::prepare_pack_command(&command, &context)),
+        self.pack = Some(tokio::spawn(async move {
+            match handle.package_context().await {
+                Ok(context) => maki_lua::prepare_pack_command(&command, &context).await,
                 Err(error) => PackPreparation::failed(error),
-            }))
-            .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
-            let _ = tx.send(Box::new(preparation));
-        });
+            }
+        }));
     }
 
     /// The answer lands on the focused session, not on the one that asked: a
     /// package command reloads the whole Lua host, and only the focused session
     /// is read for an exit request or seen by whoever answers the review.
     fn finish_pack(&mut self, preparation: PackPreparation) {
-        self.pack_running = false;
         let actions = self.focused_app().handle_pack_preparation(preparation);
         self.dispatch(self.focused, actions);
     }
@@ -2338,6 +2339,7 @@ mod tests {
     use maki_agent::DoneReason;
     use maki_providers::TokenUsage;
     use test_case::test_case;
+    use tokio::sync::oneshot;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
@@ -2534,5 +2536,33 @@ mod tests {
 
         app.end_task(MOVED_ID, BackgroundOutcome::Done);
         assert_eq!(SessionStatus::of(&app), SessionStatus::Idle);
+    }
+
+    const PACK_ANSWER: &str = "prepared";
+
+    #[tokio::test]
+    async fn a_panicked_pack_task_still_answers_and_frees_the_slot() {
+        let mut pack: Option<JoinHandle<PackPreparation>> =
+            Some(tokio::spawn(async { panic!("the preparation broke") }));
+        let answer = pack_done(&mut pack).await;
+        assert_eq!(answer, PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
+        assert!(pack.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_pack_wait_keeps_the_task() {
+        let (answer_tx, answer_rx) = oneshot::channel();
+        let mut pack = Some(tokio::spawn(async move { answer_rx.await.unwrap() }));
+        tokio::select! {
+            biased;
+            _ = pack_done(&mut pack) => panic!("the task has not answered yet"),
+            () = ready(()) => {}
+        }
+        assert!(pack.is_some());
+
+        let expected = PackPreparation::failed(PACK_ANSWER.to_owned());
+        answer_tx.send(expected.clone()).unwrap();
+        assert_eq!(pack_done(&mut pack).await, expected);
+        assert!(pack.is_none());
     }
 }
