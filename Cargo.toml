@@ -206,7 +206,7 @@ tree-sitter-json = "0.24"
 tree-sitter-make = "1"
 monty = "1"
 monty-types = "1"
-notify = { version = "9.0.0-rc.8", default-features = false, features = ["flume", "macos_fsevent"] }
+notify = { version = "9.0.0-rc.8", default-features = false, features = ["macos_fsevent"] }
 notify-rust = "4"
 serde-saphyr = { version = "2", default-features = false }
 serde-value = "0.7"
