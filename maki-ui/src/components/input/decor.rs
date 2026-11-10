@@ -10,11 +10,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem;
 use std::ops::Range;
 
-use flume::{Receiver, TryRecvError};
 use maki_agent::SpanStyle;
 use maki_highlight::Highlighter;
 use ratatui::style::Style;
 use ratatui::text::Span;
+use tokio::sync::oneshot::error::TryRecvError;
+use tokio::sync::oneshot::{self, Receiver};
 
 use super::layout::Row;
 use crate::components::tool_display::resolve_span_style;
@@ -354,7 +355,7 @@ impl LangCache {
     pub fn poll(&mut self) -> bool {
         let colored = match self
             .pending
-            .as_ref()
+            .as_mut()
             .map(|pending| pending.colored.try_recv())
         {
             None | Some(Err(TryRecvError::Empty)) => return false,
@@ -424,7 +425,7 @@ impl LangCache {
         if self.pending.is_some() {
             return;
         }
-        let (paints, colored) = flume::bounded(1);
+        let (paints, colored) = oneshot::channel();
         self.pending = Some(Pending {
             lang: lang.to_owned(),
             bytes: Some(bytes.clone()),

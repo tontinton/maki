@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::thread;
 
 use crate::{clipboard, image};
-use flume::Receiver;
 use maki_agent::{ImageMediaType, ImageSource};
+use tokio::sync::oneshot::{self, Receiver};
 
 use crate::repaint::Dirty;
 
@@ -40,7 +40,7 @@ fn pick_paste(
 pub(super) fn spawn_read<T: Send + 'static>(
     read: impl FnOnce() -> T + Send + 'static,
 ) -> Receiver<T> {
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
     thread::spawn(move || {
         let _ = tx.send(read());
     });
@@ -49,7 +49,7 @@ pub(super) fn spawn_read<T: Send + 'static>(
 
 pub(super) fn take_ready<T>(receivers: &mut Vec<Receiver<T>>) -> Option<T> {
     let (i, value) = receivers
-        .iter()
+        .iter_mut()
         .enumerate()
         .find_map(|(i, rx)| rx.try_recv().ok().map(|value| (i, value)))?;
     receivers.swap_remove(i);
