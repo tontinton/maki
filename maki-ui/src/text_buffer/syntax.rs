@@ -18,8 +18,9 @@ use std::mem;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
-use flume::{Receiver, TryRecvError};
 use maki_lua::{SyntaxDoc, SyntaxEdit, SyntaxIndex, SyntaxInput};
+use tokio::sync::oneshot::error::TryRecvError;
+use tokio::sync::oneshot::{self, Receiver};
 
 use super::Change;
 use super::marks::{Placed, remap};
@@ -123,7 +124,7 @@ impl SyntaxMarks {
     /// Hands the worker what the text did since its last parse, which
     /// leaves the text at {version}.
     pub fn parse(&mut self, input: SyntaxInput, version: u64) {
-        let (reply, replies) = flume::bounded(1);
+        let (reply, replies) = oneshot::channel();
         let mut doc = match mem::replace(&mut self.state, State::Parsing { replies, version }) {
             State::Idle(doc) => doc,
             State::Died(_) => SyntaxDoc::default(),
@@ -150,13 +151,13 @@ impl SyntaxMarks {
     /// Takes in a finished parse. `Some` with where the marks changed, in
     /// the text of the new result, see [`Reply::changed`].
     pub fn receive(&mut self) -> Option<Option<Vec<Range<usize>>>> {
-        let State::Parsing { replies, version } = &self.state else {
+        let State::Parsing { replies, version } = &mut self.state else {
             return None;
         };
         let reply = match replies.try_recv() {
             Ok(reply) => reply,
             Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => {
+            Err(TryRecvError::Closed) => {
                 self.state = State::Died(*version);
                 self.shown = Shown::default();
                 return Some(None);
@@ -241,6 +242,7 @@ mod tests {
     use maki_agent::SpanStyle;
     use maki_lua::{SyntaxInput, SyntaxRule};
     use test_case::test_case;
+    use tokio::sync::oneshot;
 
     use super::{State, SyntaxMarks, SyntaxRules};
     use crate::decor_worker;
@@ -309,7 +311,7 @@ mod tests {
     #[test_case(VERSION + 1 => true  ; "once_the_text_changed")]
     fn a_parse_that_died_runs_again(version: u64) -> bool {
         let mut marks = SyntaxMarks::new(listed(&rule(HEADING)));
-        let (_, replies) = flume::bounded(1);
+        let (_, replies) = oneshot::channel();
         marks.state = State::Parsing {
             replies,
             version: VERSION,

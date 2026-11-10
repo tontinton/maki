@@ -16,6 +16,8 @@ use ratatui_image::{
     picker::{Picker, ProtocolType},
     sliced::SlicedProtocol,
 };
+use tokio::sync::oneshot::error::TryRecvError;
+use tokio::sync::oneshot::{self, Receiver};
 
 use crate::image::{MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS};
 use crate::repaint::Dirty;
@@ -109,7 +111,7 @@ enum ImageState {
     Pending {
         width: u16,
         height: u16,
-        result: flume::Receiver<Result<SlicedProtocol>>,
+        result: Receiver<Result<SlicedProtocol>>,
     },
     Ready {
         width: u16,
@@ -183,7 +185,7 @@ impl InlineImage {
             } if *encoded_width == width => return,
             _ => {}
         }
-        let (tx, result) = flume::bounded(1);
+        let (tx, result) = oneshot::channel();
         let source = self.source.clone();
         let picker = picker.clone();
         self.state = ImageState::Pending {
@@ -192,20 +194,20 @@ impl InlineImage {
             result,
         };
         let _ = decode_jobs().send(Box::new(move || {
-            if !tx.is_disconnected() {
+            if !tx.is_closed() {
                 let _ = tx.send(encode(&source, &picker, width));
             }
         }));
     }
 
     pub fn poll(&mut self) -> Dirty {
-        let ImageState::Pending { width, result, .. } = &self.state else {
+        let ImageState::Pending { width, result, .. } = &mut self.state else {
             return Dirty::NO;
         };
         let result = match result.try_recv() {
             Ok(result) => result,
-            Err(flume::TryRecvError::Empty) => return Dirty::NO,
-            Err(flume::TryRecvError::Disconnected) => {
+            Err(TryRecvError::Empty) => return Dirty::NO,
+            Err(TryRecvError::Closed) => {
                 self.state = ImageState::Failed;
                 return Dirty::YES;
             }
@@ -273,6 +275,7 @@ mod tests {
         picker::{Picker, ProtocolType},
     };
     use test_case::test_case;
+    use tokio::sync::oneshot;
 
     use super::{ImageState, InlineImage, encode, protocol_from_env};
     use crate::repaint::Dirty;
@@ -348,8 +351,8 @@ mod tests {
         // Encode here and hand the answer over instead of waiting on the real
         // decode thread, which is how this test would start failing at 3am on a
         // loaded machine.
-        let (tx, result) = flume::bounded(1);
-        tx.send(encode(&source, &picker, IMAGE_WIDTH))?;
+        let (tx, result) = oneshot::channel();
+        assert!(tx.send(encode(&source, &picker, IMAGE_WIDTH)).is_ok());
         image.state = ImageState::Pending {
             width: IMAGE_WIDTH,
             height: 1,

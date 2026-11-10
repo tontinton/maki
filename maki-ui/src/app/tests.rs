@@ -898,7 +898,7 @@ fn paste_loads_every_image_path_in_the_text() {
 #[test_case(None,               ""           ; "empty_selection_ignored")]
 fn primary_selection_read_lands_on_tick(selection: Option<&str>, expected: &str) {
     let mut app = test_app();
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
     app.mouse_paste_rx.push(rx);
     tx.send(selection.map(String::from)).unwrap();
     assert_eq!(app.tick(), Dirty::YES);
@@ -910,10 +910,12 @@ fn primary_selection_read_lands_on_tick(selection: Option<&str>, expected: &str)
 fn clipboard_text_lands_in_input_and_clears_flash() {
     let mut app = test_app();
     app.status_bar.flash(READING_CLIPBOARD_MSG.into());
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
     app.paste_rx.push(rx);
-    tx.send(Ok(PastedContent::Text(CLIPBOARD_TEXT.into())))
-        .unwrap();
+    assert!(
+        tx.send(Ok(PastedContent::Text(CLIPBOARD_TEXT.into())))
+            .is_ok()
+    );
     let _ = app.tick();
     assert_eq!(app.input_box.buffer.value(), CLIPBOARD_TEXT);
     assert_eq!(app.status_bar.flash_text(), None);
@@ -7634,7 +7636,7 @@ fn a_primary_paste_waits_behind_held_keys(paste_bound: bool) {
 
     let tab = press_bound(&mut app, &probe, KeyCode::Tab);
     type_keys(&mut app, TYPED);
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
     app.mouse_paste_rx.push(rx);
     tx.send(Some(PRIMARY_TEXT.into())).unwrap();
     // The poll alone, since a full tick lets a hold older than the slow
