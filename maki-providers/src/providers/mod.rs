@@ -5,17 +5,18 @@ use std::iter;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use futures::TryStreamExt;
+use bytes::Buf;
+use futures::stream::try_unfold;
+use futures::{Stream, TryStreamExt};
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufRead, Lines};
+use sse_stream::{Error as SseError, Sse, SseByteStream};
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
-use tokio_util::io::StreamReader;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
@@ -51,8 +52,8 @@ const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
 
-/// Boxed so [`ok_sse`] can name the reader its parse closure takes.
-pub(crate) type SseBody = Pin<Box<dyn AsyncBufRead + Send>>;
+/// Boxed so [`ok_sse`] can name the events its parse closure takes.
+pub(crate) type SseBody = Pin<Box<dyn Stream<Item = Result<Sse, AgentError>> + Send>>;
 
 fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")
@@ -412,24 +413,6 @@ impl SseErrorPayload {
     }
 }
 
-pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
-    lines: &mut Lines<R>,
-    deadline: &mut Instant,
-    stream_timeout: Duration,
-) -> Result<Option<String>, AgentError> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let result = match timeout(remaining, lines.next_line()).await {
-        Ok(line) => line.map_err(AgentError::from),
-        Err(_) => Err(AgentError::Timeout {
-            secs: stream_timeout.as_secs(),
-        }),
-    };
-    if let Ok(Some(_)) = &result {
-        *deadline = Instant::now() + stream_timeout;
-    }
-    result
-}
-
 impl Timeouts {
     /// The connect and stall bounds every request to a provider runs under.
     /// No total cap: a slow but moving download is not a dead one. The read
@@ -519,6 +502,7 @@ pub(crate) async fn ok_text(client: &Client, request: Request) -> Result<String,
 pub(crate) async fn ok_sse<T, F, Fut>(
     client: &Client,
     request: Request,
+    stream_timeout: Duration,
     parse: F,
 ) -> Result<T, AgentError>
 where
@@ -529,23 +513,53 @@ where
         if response.status().as_u16() != 200 {
             return Err(AgentError::from_response(response).await);
         }
-        parse(Box::pin(body_reader(response))).await
+        parse(sse_events(body_chunks(response), stream_timeout)).await
     })
     .await
 }
 
-/// The body as the line reader the SSE parsers take. A stall is an io timeout,
-/// so it retries as transient and never as the stream deadline, and the URL is
-/// left out before the error is worded.
-pub(crate) fn body_reader(response: Response) -> impl AsyncBufRead + Unpin {
-    StreamReader::new(response.bytes_stream().map_err(|e| {
+/// The body in the chunks it arrives in. A stall is an io timeout, so it
+/// retries as transient and never as the stream deadline, and the URL is left
+/// out before the error is worded.
+fn body_chunks(
+    response: Response,
+) -> impl Stream<Item = Result<impl Buf + Send, AgentError>> + Send {
+    response.bytes_stream().map_err(|e| {
         let kind = if e.is_timeout() {
             io::ErrorKind::TimedOut
         } else {
             io::ErrorKind::Other
         };
-        io::Error::new(kind, error_chain(&e.without_url()))
-    }))
+        io::Error::new(kind, error_chain(&e.without_url())).into()
+    })
+}
+
+/// The events the SSE parsers take. Every chunk re-arms `stream_timeout`, also
+/// one that completes no event, so a server's keep-alive comments hold a slow
+/// stream open.
+pub(crate) fn sse_events<S, B>(chunks: S, stream_timeout: Duration) -> SseBody
+where
+    S: Stream<Item = Result<B, AgentError>> + Send + 'static,
+    B: Buf + Send + 'static,
+{
+    let chunks = try_unfold(Box::pin(chunks), move |mut chunks| async move {
+        match timeout(stream_timeout, chunks.try_next()).await {
+            Ok(chunk) => Ok(chunk?.map(|chunk| (chunk, chunks))),
+            Err(_) => Err(AgentError::Timeout {
+                secs: stream_timeout.as_secs(),
+            }),
+        }
+    });
+    Box::pin(SseByteStream::new(chunks).map_err(sse_error))
+}
+
+fn sse_error(error: SseError) -> AgentError {
+    match error {
+        SseError::Body(source) => source
+            .downcast()
+            .map_or_else(|other| io::Error::other(other).into(), |error| *error),
+        malformed => io::Error::new(io::ErrorKind::InvalidData, malformed).into(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -722,12 +736,15 @@ mod tests {
 
     use super::*;
     use crate::retry::RetryKind;
+    use futures::{StreamExt, stream};
     use test_case::test_case;
-    use tokio::io::{AsyncBufReadExt, AsyncRead, ReadBuf};
     use tokio::time::sleep;
 
-    use crate::test_support::{Canned, serve, transport::LOOPBACK_HOST};
+    use crate::test_support::{Canned, serve, sse_body, transport::LOOPBACK_HOST};
 
+    const KEEP_ALIVE: &[u8] = b": keep-alive\n\n";
+    const LAST_EVENT: &[u8] = b"data: done\n\n";
+    const LAST_DATA: &str = "done";
     const ERROR_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const PARSE_FAILED: &str = "SSE error payload should deserialize";
     const UNAVAILABLE_STATUS: u16 = 502;
@@ -924,38 +941,31 @@ mod tests {
         assert_eq!(urlenc(input), expected);
     }
 
-    struct NeverReader;
-
-    impl AsyncRead for NeverReader {
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Pending
-        }
+    #[tokio::test(start_paused = true)]
+    async fn a_keep_alive_comment_re_arms_the_stream_deadline() {
+        let chunks = stream::iter([KEEP_ALIVE, KEEP_ALIVE, LAST_EVENT]).then(|chunk| async move {
+            sleep(SHORT * 2 / 3).await;
+            Ok(chunk)
+        });
+        let event = sse_events(chunks, SHORT).try_next().await.unwrap();
+        assert_eq!(
+            event.and_then(|event| event.data).as_deref(),
+            Some(LAST_DATA)
+        );
     }
 
-    impl AsyncBufRead for NeverReader {
-        fn poll_fill_buf(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<&[u8]>> {
-            std::task::Poll::Pending
-        }
-
-        fn consume(self: std::pin::Pin<&mut Self>, _amt: usize) {}
-    }
-
+    #[test_case("retry: 5\nmade-up: field\nno colon\ndata: a\n\n", &["a"] ; "fields_no_parser_reads_are_skipped")]
+    #[test_case("data: a\ndata: b\n\n", &["a\nb"]                         ; "data_lines_of_one_event_are_joined")]
+    #[test_case("data: a\r\n\r\ndata: b\r\r", &["a", "b"]                 ; "every_line_ending_ends_an_event")]
+    #[test_case("data: a\n\ndata: b\n", &["a"]                             ; "an_event_cut_before_its_blank_line_is_dropped")]
     #[tokio::test]
-    async fn next_sse_line_expired_deadline_returns_timeout() {
-        let mut lines = NeverReader.lines();
-        let mut past = Instant::now() - Duration::from_secs(1);
-        let stream_timeout = Duration::from_secs(300);
-        let err = next_sse_line(&mut lines, &mut past, stream_timeout)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AgentError::Timeout { .. }));
+    async fn events_follow_the_sse_framing_rules(body: &str, expected: &[&str]) {
+        let events: Vec<Sse> = sse_body(body).try_collect().await.unwrap();
+        let data: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.data.as_deref())
+            .collect();
+        assert_eq!(data, expected);
     }
 
     /// Reads the request head, answers `head` and then sends nothing until
@@ -985,16 +995,14 @@ mod tests {
         timeouts.bound(builder).build().unwrap()
     }
 
-    async fn first_sse_line(
+    async fn first_sse_event(
         client: &Client,
         url: &str,
         stream: Duration,
-    ) -> Result<Option<String>, AgentError> {
+    ) -> Result<Option<Sse>, AgentError> {
         let request = client.get(url).build()?;
         send_request(client, request, |response| async move {
-            let mut lines = body_reader(response).lines();
-            let mut deadline = Instant::now() + stream;
-            next_sse_line(&mut lines, &mut deadline, stream).await
+            sse_events(body_chunks(response), stream).try_next().await
         })
         .await
     }
@@ -1022,7 +1030,7 @@ mod tests {
             stream,
             ..Timeouts::default()
         });
-        let error = first_sse_line(&client, &url, stream).await.unwrap_err();
+        let error = first_sse_event(&client, &url, stream).await.unwrap_err();
         assert!(expected(&error), "{error}");
         assert_eq!(error.retry_kind(), Some(kind));
     }
@@ -1032,7 +1040,7 @@ mod tests {
         let (url, hold) = stalled_sse_server(CHUNKED_HEAD);
         drop(hold);
         let client = direct_client(Timeouts::default());
-        let error = first_sse_line(&client, &url, LONG).await.unwrap_err();
+        let error = first_sse_event(&client, &url, LONG).await.unwrap_err();
         assert!(
             matches!(&error, AgentError::Io(e) if e.kind() == io::ErrorKind::Other),
             "{error}"
