@@ -16,7 +16,7 @@ use agent_client_protocol_schema::v1::{
     SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
 };
 use color_eyre::eyre::Context;
-use flume::{Sender, WeakSender};
+use flume::Sender;
 use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
@@ -39,6 +39,7 @@ use maki_storage::sessions::{SessionClaim, SessionError};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::{debug, info, warn};
 
@@ -93,7 +94,7 @@ struct SessionState {
 }
 
 struct Server {
-    out_tx: Sender<Value>,
+    out_tx: UnboundedSender<Value>,
     model_specs: Vec<String>,
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
@@ -114,11 +115,11 @@ enum Incoming {
 }
 
 pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
-    let (out_tx, out_rx) = flume::unbounded::<Value>();
+    let (out_tx, mut out_rx) = unbounded_channel::<Value>();
 
     let writer_task = tokio::spawn(async move {
         let stdout = std::io::stdout();
-        while let Ok(msg) = out_rx.recv_async().await {
+        while let Some(msg) = out_rx.recv().await {
             let mut handle = stdout.lock();
             if serde_json::to_writer(&mut handle, &msg).is_ok() {
                 let _ = handle.write_all(b"\n");
@@ -137,12 +138,12 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         on_session_end: params.on_session_end.clone(),
     };
 
-    let (in_tx, in_rx) = flume::unbounded::<Incoming>();
+    let (in_tx, mut in_rx) = unbounded_channel::<Incoming>();
     // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
     discover_models(Arc::clone(&params.model_policy), in_tx.downgrade());
     let reader_task = tokio::spawn(read_stdin(in_tx));
 
-    while let Ok(Ok(incoming)) = params.stop.race(in_rx.recv_async()).await {
+    while let Ok(Some(incoming)) = params.stop.race(in_rx.recv()).await {
         match incoming {
             Incoming::Line(line) => handle_line(&mut server, &line, &params).await,
             Incoming::Models(specs) => refresh_models(&mut server, specs),
@@ -167,14 +168,14 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
 /// Lives in its own task because `read_line` is not cancel safe: the main loop
 /// waits on discovery too, and a dropped read would eat half a line.
-async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
+async fn read_stdin(tx: UnboundedSender<Incoming>) -> std::io::Result<()> {
     let mut reader = BufReader::new(tokio::io::stdin());
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).await? == 0 {
             return Ok(());
         }
-        if tx.send_async(Incoming::Line(line)).await.is_err() {
+        if tx.send(Incoming::Line(line)).is_err() {
             return Ok(());
         }
     }
@@ -185,7 +186,7 @@ async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
 /// in the background. Each batch leaves the moment it lands: the slowest source
 /// is a cold catalog download, and a provider the client could already pick from
 /// should not wait behind it.
-fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
+fn discover_models(policy: Arc<ModelPolicy>, tx: WeakUnboundedSender<Incoming>) {
     tokio::spawn(async move {
         fetch_all_models(
             &policy,
@@ -528,7 +529,7 @@ fn start_session(
 
 /// Registers each ask before sending so a response cannot race past it.
 fn ask_client(
-    out_tx: &Sender<Value>,
+    out_tx: &UnboundedSender<Value>,
     pending: &PendingState,
     ask: Ask,
     request: AgentRequest,
@@ -552,7 +553,7 @@ fn ask_client(
 /// Weak, because `LocalTools` is captured verbatim by every `LuaCtx` a tool
 /// call parks and an idle VM never collects it. A strong clone here outlives
 /// `serve()` and leaves `writer_task` waiting on a sender nobody will drop.
-fn question_tool(out_tx: WeakSender<Value>, pending: PendingState) -> LocalTool {
+fn question_tool(out_tx: WeakUnboundedSender<Value>, pending: PendingState) -> LocalTool {
     // The audience the Lua `question` tool carries: shadowing a tool must not
     // widen who may call it.
     local_tool(ToolAudience::MAIN, move |input, ctx| {
@@ -946,7 +947,7 @@ fn image_media_type(mime: &str) -> ImageMediaType {
 fn start_event_pump(
     mut events: SessionEvents,
     session_id: SessionRef,
-    out_tx: Sender<Value>,
+    out_tx: UnboundedSender<Value>,
     pending: PendingState,
     cwd: PathBuf,
     home: Option<PathBuf>,
@@ -1109,13 +1110,13 @@ fn finish_turn(pending: &PendingState) -> Option<RequestId> {
     pending.lock().unwrap().prompt.take()
 }
 
-fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
+fn send(out_tx: &UnboundedSender<Value>, msg: impl Serialize) {
     if let Ok(json) = serde_json::to_value(JsonRpcMessage::wrap(msg)) {
         let _ = out_tx.send(json);
     }
 }
 
-fn session_update(out_tx: &Sender<Value>, sid: &SessionId, update: SessionUpdate) {
+fn session_update(out_tx: &UnboundedSender<Value>, sid: &SessionId, update: SessionUpdate) {
     let notification =
         AgentNotification::SessionNotification(SessionNotification::new(sid.clone(), update));
     send(
@@ -1158,9 +1159,11 @@ mod tests {
     use maki_storage::sessions::{Session, StoredTokenUsage};
     use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
     use std::future;
+    use std::iter;
 
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::time::timeout;
     use tokio_util::task::AbortOnDropHandle;
 
@@ -1381,9 +1384,13 @@ mod tests {
         assert_eq!(permission_answer(&raw), expected);
     }
 
-    fn test_server() -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
+    fn drain(out_rx: &mut UnboundedReceiver<Value>) -> Vec<Value> {
+        iter::from_fn(|| out_rx.try_recv().ok()).collect()
+    }
+
+    fn test_server() -> (Server, flume::Receiver<String>, UnboundedReceiver<Value>) {
         let (answer_tx, answer_rx) = flume::unbounded();
-        let (out_tx, out_rx) = flume::unbounded();
+        let (out_tx, out_rx) = unbounded_channel();
         let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
         let handle = InteractiveHandle {
             tool_names: Vec::new(),
@@ -1494,7 +1501,7 @@ mod tests {
         }
     }
 
-    fn server_with_ask(ask: Ask) -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
+    fn server_with_ask(ask: Ask) -> (Server, flume::Receiver<String>, UnboundedReceiver<Value>) {
         let (server, answer_rx, out_rx) = test_server();
         pending(&server)
             .lock()
@@ -1614,7 +1621,7 @@ mod tests {
     #[test_case(true ; "cancel_keeps_the_asks_a_moved_call_may_wait_on")]
     #[tokio::test]
     async fn concurrent_subagent_permissions(cancel: bool) {
-        let (srv, main_rx, out_rx) = test_server();
+        let (srv, main_rx, mut out_rx) = test_server();
         let children = [flume::unbounded(), flume::unbounded()];
         run_pump(&srv, None, |sender| {
             for ((answer_tx, _), child_id) in children.iter().zip(CHILD_TOOL_USE_IDS) {
@@ -1638,7 +1645,7 @@ mod tests {
         })
         .await;
 
-        let requests: Vec<_> = out_rx.try_iter().collect();
+        let requests: Vec<_> = drain(&mut out_rx);
         assert_eq!(
             requests.len(),
             3,
@@ -1775,7 +1782,7 @@ mod tests {
     /// the channel for the next turn.
     #[tokio::test]
     async fn an_answer_for_a_cancelled_ask_is_not_consumed_by_the_next_turn() {
-        let (srv, answer_rx, out_rx) = test_server();
+        let (srv, answer_rx, mut out_rx) = test_server();
         handle_notification(&srv, "session/cancel");
         run_pump(&srv, None, |sender| {
             sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
@@ -1841,7 +1848,7 @@ mod tests {
     /// client's outstanding `session/prompt` is answered instead of hanging.
     #[tokio::test]
     async fn event_pump_delivers_everything_queued_before_the_close() {
-        let (srv, .., out_rx) = test_server();
+        let (srv, .., mut out_rx) = test_server();
         pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
             sender
@@ -1870,7 +1877,7 @@ mod tests {
     /// child, like the rest of its stream.
     #[tokio::test]
     async fn an_accepted_notice_reaches_the_client_in_stream_order() {
-        let (srv, .., out_rx) = test_server();
+        let (srv, .., mut out_rx) = test_server();
         pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
             sender
@@ -1909,7 +1916,7 @@ mod tests {
         })
         .await;
 
-        let wire: Vec<Value> = out_rx.try_iter().collect();
+        let wire: Vec<Value> = drain(&mut out_rx);
         let text = serde_json::to_value(translate::text_delta(QUEUED_TEXT)).unwrap();
         assert_eq!(wire.len(), 5, "{wire:?}");
         let card = &wire[0]["params"]["update"];
@@ -1936,7 +1943,7 @@ mod tests {
     #[test_case(false, AcpError::internal_error() ; "other_error_is_internal")]
     #[tokio::test]
     async fn a_failed_turn_answers_the_prompt_with_its_error_kind(auth: bool, expected: AcpError) {
-        let (srv, .., out_rx) = test_server();
+        let (srv, .., mut out_rx) = test_server();
         pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
             sender
@@ -1966,7 +1973,7 @@ mod tests {
         terminal: Option<AgentEvent>,
         keeps_input: bool,
     ) {
-        let (srv, .., out_rx) = test_server();
+        let (srv, .., mut out_rx) = test_server();
         run_pump(&srv, None, |sender| {
             sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
             if let Some(event) = terminal {
@@ -1976,9 +1983,8 @@ mod tests {
         })
         .await;
 
-        let request = out_rx
-            .try_iter()
-            .last()
+        let request = drain(&mut out_rx)
+            .pop()
             .expect("the permission request reaches the client");
         let call = &request["params"]["toolCall"];
         assert_eq!(request["method"], "session/request_permission");
@@ -1991,7 +1997,7 @@ mod tests {
     /// would name a file the subagent is not touching.
     #[tokio::test]
     async fn a_subagent_permission_ignores_a_colliding_cached_input() {
-        let (srv, .., out_rx) = test_server();
+        let (srv, .., mut out_rx) = test_server();
         let (answer_tx, _answer_rx) = flume::unbounded();
         run_pump(&srv, None, |sender| {
             sender
@@ -2007,9 +2013,8 @@ mod tests {
         })
         .await;
 
-        let request = out_rx
-            .try_iter()
-            .last()
+        let request = drain(&mut out_rx)
+            .pop()
             .expect("the permission request reaches the client");
         let call = &request["params"]["toolCall"];
         assert_eq!(request["method"], "session/request_permission");
@@ -2024,7 +2029,7 @@ mod tests {
     #[test_case(None, MAIN_PERMISSION_TITLE ; "no_reason_keeps_the_plain_title")]
     #[tokio::test]
     async fn permission_title_carries_the_escalation_reason(reason: Option<&str>, title: &str) {
-        let (srv, .., out_rx) = test_server();
+        let (srv, .., mut out_rx) = test_server();
         run_pump(&srv, None, |sender| {
             sender
                 .send(AgentEvent::PermissionRequest {
@@ -2048,7 +2053,7 @@ mod tests {
     /// even though their events never enter the transcript.
     #[tokio::test]
     async fn event_pump_folds_restored_and_subagent_cost_into_the_usage_update() {
-        let (srv, .., out_rx) = test_server();
+        let (srv, .., mut out_rx) = test_server();
         run_pump(&srv, Some(RECORDED_COST), |sender| {
             sender
                 .send_envelope(Envelope {
@@ -2083,7 +2088,7 @@ mod tests {
     #[test_case(true ; "a_failed_run")]
     #[tokio::test]
     async fn event_pump_settles_a_run_on_its_ledger(failed: bool) {
-        let (srv, .., out_rx) = test_server();
+        let (srv, .., mut out_rx) = test_server();
         let ledger = RunTotals {
             cost: Some(LEDGER_COST),
             ..RunTotals::default()
@@ -2116,7 +2121,7 @@ mod tests {
         })
         .await;
 
-        let last = out_rx.try_iter().last().expect("the next turn reports");
+        let last = drain(&mut out_rx).pop().expect("the next turn reports");
         assert_eq!(
             last["params"]["update"]["cost"]["amount"].as_f64(),
             Some(RECORDED_COST + LEDGER_COST + TURN_COST)
@@ -2232,7 +2237,7 @@ mod tests {
 
     #[tokio::test]
     async fn discovered_models_are_pushed_to_the_client() {
-        let (mut srv, .., out_rx) = test_server();
+        let (mut srv, .., mut out_rx) = test_server();
         srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
         let batch = vec![DISCOVERED_SPEC.to_owned()];
 
@@ -2319,7 +2324,7 @@ mod tests {
             )
             .unwrap();
 
-        let (mut srv, _answer_rx, out_rx) = test_server();
+        let (mut srv, _answer_rx, mut out_rx) = test_server();
         srv.session = None;
         let params = acp_params(storage);
         let raw = serde_json::json!({ "params": {} });
@@ -2331,7 +2336,7 @@ mod tests {
             &params,
         )
         .await;
-        let resp = out_rx.recv().unwrap();
+        let resp = out_rx.try_recv().unwrap();
         let resp = resp.to_string();
         assert!(
             resp.contains(&session.id.to_string()),
