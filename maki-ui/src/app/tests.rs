@@ -341,6 +341,10 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
 }
 
 pub(crate) fn done() -> AgentEvent {
+    done_with_reason(DoneReason::EndTurn)
+}
+
+fn done_with_reason(reason: DoneReason) -> AgentEvent {
     AgentEvent::Done {
         usage: TokenUsage::default(),
         cost: None,
@@ -348,7 +352,7 @@ pub(crate) fn done() -> AgentEvent {
         context_size: 0,
         context_window: 0,
         num_turns: 1,
-        reason: DoneReason::EndTurn,
+        reason,
     }
 }
 
@@ -589,6 +593,7 @@ fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedSte
             LiveStep::Consumed(text) => AgentEvent::QueueItemConsumed {
                 text: text.into(),
                 images: Vec::new(),
+                plan: false,
             },
             LiveStep::Reply => AgentEvent::TextDelta {
                 text: NOTICE_REPLY.into(),
@@ -805,10 +810,10 @@ fn toggle_mode_state_machine() {
 #[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/plans/test.md".into()), Some("/tmp/plans/test.md".into()), true  ; "write_matching")]
 #[test_case(ToolOutput::Diff { path: "/tmp/plans/test.md".into(), before: String::new(), after: String::new(), summary: String::new() }, None, true  ; "edit_matching")]
 #[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/other.rs".into()), Some("/tmp/other.rs".into()), false ; "write_non_matching")]
-fn tool_done_transitions_plan_to_ready(
+fn tool_done_write_starts_a_cycle_without_approval(
     output: ToolOutput,
     written_path: Option<String>,
-    expect_ready: bool,
+    expect_cycle: bool,
 ) {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
@@ -827,7 +832,10 @@ fn tool_done_transitions_plan_to_ready(
         backgrounded: false,
     }))));
 
-    assert_eq!(app.state.plan.is_ready(), expect_ready);
+    assert!(!app.state.plan.is_ready(), "a write is not approval");
+    assert!(!app.plan_form.is_visible(), "and never opens the menu");
+    assert_eq!(app.plan_cycle.refining, expect_cycle);
+    assert_eq!(app.plan_cycle.written, expect_cycle);
 }
 
 #[test]
@@ -950,6 +958,7 @@ fn queue_item_consumed_pushes_deferred_user_message() {
         AgentEvent::QueueItemConsumed {
             text: "queued".into(),
             images: Vec::new(),
+            plan: false,
         },
         app.run_id,
     ));
@@ -974,6 +983,7 @@ fn queue_item_consumed_marks_agent_streaming() {
         AgentEvent::QueueItemConsumed {
             text: "restored".into(),
             images: Vec::new(),
+            plan: false,
         },
         app.run_id,
     ));
@@ -1430,24 +1440,38 @@ fn reset_session_clears_drafting_plan_in_build_mode() {
     assert_eq!(app.state.plan, PlanState::None);
 }
 
-/// A retried write hits the same transition again, and the plugin still gets
-/// one event with the draft path it needs to open.
+/// A write is not approval. The event waits for the run and the queue behind
+/// it to settle, and fires once for the revision that settled.
 #[test]
-fn plan_ready_fires_once_per_draft() {
+fn plan_ready_fires_once_per_settled_revision() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
     let mut app = test_app();
     let probe = probe_events(&mut app);
 
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    app.state.plan = PlanState::Drafting(path.clone());
     app.transition_plan(PlanTrigger::WriteDone);
     app.transition_plan(PlanTrigger::WriteDone);
-
-    let (event, data) = probe.try_recv_autocmd().expect("PlanReady fired");
-    assert_eq!(event, PLAN_READY_EVENT);
-    assert_eq!(data["path"], serde_json::json!(PLAN_DRAFT_PATH));
     assert!(
         probe.try_recv_autocmd().is_none(),
-        "second WriteDone must not re-emit"
+        "a write while the run is active is not ready yet"
+    );
+    assert!(!app.state.plan.is_ready());
+    assert!(!app.plan_form.is_visible());
+
+    app.transition_plan(PlanTrigger::Settled);
+    let (event, data) = probe.try_recv_autocmd().expect("PlanReady fired");
+    assert_eq!(event, PLAN_READY_EVENT);
+    assert_eq!(data["path"], serde_json::json!(path.display().to_string()));
+    assert!(app.state.plan.is_ready());
+    assert!(app.plan_form.is_visible());
+
+    app.transition_plan(PlanTrigger::Settled);
+    assert!(
+        probe.try_recv_autocmd().is_none(),
+        "a second settle must not re-emit"
     );
 }
 
@@ -1468,6 +1492,9 @@ fn plan_ready_does_not_fire_outside_plan_mode() {
 #[test_case(false ; "no_host_at_all")]
 #[test_case(true ; "a_host_with_no_layer")]
 fn an_unlayered_plan_form_opens_without_asking(hosted: bool) {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
     let mut app = test_app();
     let _probe = hosted.then(|| {
         let (handle, probe) = probed_event_handle();
@@ -1475,8 +1502,9 @@ fn an_unlayered_plan_form_opens_without_asking(hosted: bool) {
         probe
     });
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    app.state.plan = PlanState::Drafting(path);
     app.transition_plan(PlanTrigger::WriteDone);
+    app.transition_plan(PlanTrigger::Settled);
 
     assert!(app.plan_form.is_visible());
     assert!(app.plan_answers.form.is_none(), "nothing to wait for");
@@ -1486,13 +1514,17 @@ fn an_unlayered_plan_form_opens_without_asking(hosted: bool) {
 /// open in front of whatever the plugin is about to draw.
 #[test]
 fn a_layered_plan_form_waits_for_the_slots() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
     let mut app = test_app();
     let (handle, _probe) = maki_lua::test_support::probed_event_handle_layering_plan_form();
     app.lua_event_handle = handle;
 
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    app.state.plan = PlanState::Drafting(path);
     app.transition_plan(PlanTrigger::WriteDone);
+    app.transition_plan(PlanTrigger::Settled);
 
     assert!(!app.plan_form.is_visible(), "the chains answer first");
     assert!(app.plan_answers.form.is_some());
@@ -1515,10 +1547,15 @@ fn plan_menu(rows: Vec<maki_lua::PlanFormRow>) -> maki_lua::PlanMenu {
     }
 }
 
-/// The draft a menu answer is allowed to open for.
-fn ready_plan(app: &mut App) {
+/// A reviewable plan with a file the form can actually read. The returned
+/// guard keeps the directory alive for the test.
+fn ready_plan_with_file(app: &mut App) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    app.state.plan = PlanState::Ready(path);
+    tmp
 }
 
 /// Arms the form's answer slot with a wait that has not run out yet.
@@ -1535,7 +1572,7 @@ fn awaiting_plan_form(app: &mut App) -> flume::Sender<Option<maki_lua::PlanMenu>
 #[test_case(None, false ; "a_layer_took_the_surface")]
 fn the_plan_form_slot_answer_drives_the_form(answer: Option<Vec<&str>>, visible: bool) {
     let mut app = test_app();
-    ready_plan(&mut app);
+    let _tmp = ready_plan_with_file(&mut app);
     let tx = awaiting_plan_form(&mut app);
 
     let menu = answer.map(|ids| plan_menu(ids.into_iter().map(plugin_row).collect()));
@@ -1555,7 +1592,7 @@ fn the_plan_form_slot_answer_drives_the_form(answer: Option<Vec<&str>>, visible:
 #[test]
 fn a_layer_taking_the_surface_drops_the_previous_menu() {
     let mut app = test_app();
-    ready_plan(&mut app);
+    let _tmp = ready_plan_with_file(&mut app);
     app.plan_form
         .open_with(plan_menu(vec![plugin_row(PLUGIN_ROW_ID)]));
     let tx = awaiting_plan_form(&mut app);
@@ -1571,7 +1608,7 @@ fn a_layer_taking_the_surface_drops_the_previous_menu() {
 #[test]
 fn a_dropped_plan_form_answer_opens_the_builtin() {
     let mut app = test_app();
-    ready_plan(&mut app);
+    let _tmp = ready_plan_with_file(&mut app);
     let tx = awaiting_plan_form(&mut app);
     drop(tx);
 
@@ -1598,7 +1635,7 @@ fn a_silent_plan_form_slot_leaves_the_form_closed() {
 #[test]
 fn a_plan_form_answer_that_never_comes_falls_back_to_the_builtin() {
     let mut app = test_app();
-    ready_plan(&mut app);
+    let _tmp = ready_plan_with_file(&mut app);
     let (_tx, rx) = flume::bounded::<Option<maki_lua::PlanMenu>>(1);
     app.plan_answers.form = Some((Instant::now() - WAIT_AHEAD, rx));
 
@@ -1632,8 +1669,7 @@ fn awaiting_plan_action(
 #[test]
 fn a_plugin_row_handler_that_agrees_runs_the_builtin_action() {
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    let _tmp = ready_plan_with_file(&mut app);
     let tx = awaiting_plan_action(&mut app, Some(maki_lua::PlanRowAction::Implement));
 
     tx.send(PlanActionOutcome::Proceed).unwrap();
@@ -1752,8 +1788,7 @@ fn plan_pick_action(pick: u64, answer: flume::Receiver<PlanActionOutcome>) -> Pl
 #[test]
 fn a_stale_pick_answer_cannot_fire_a_second_implement() {
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    let _tmp = ready_plan_with_file(&mut app);
     let (tx, rx) = flume::bounded(1);
     let pick = app.plan_answers.abandon();
     app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
@@ -1985,10 +2020,8 @@ fn an_interactive_prompt_retires_a_pending_plan_form_answer() {
 
     assert!(app.plan_answers.form.is_none());
     assert!(!app.plan_form.is_visible());
-    assert_eq!(
-        app.state.plan,
-        PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH))
-    );
+    assert!(app.state.plan.is_ready(), "the file is still written");
+    assert!(app.plan_cycle.refining, "but it is not approvable now");
 }
 
 /// Readiness is checked when the answer lands, not only when the chain was
@@ -2568,6 +2601,7 @@ fn next_prompt() -> AgentEvent {
     AgentEvent::QueueItemConsumed {
         text: SECOND_PROMPT.into(),
         images: vec![],
+        plan: false,
     }
 }
 
@@ -6606,32 +6640,46 @@ fn plan_app() -> (TempDir, App) {
         written_path: Some(written),
         backgrounded: false,
     }))));
+    app.transition_plan(PlanTrigger::Settled);
     (tmp, app)
 }
 
-#[test_case(Mode::Plan,  true  ; "plan_mode_tooldone_opens_form")]
-#[test_case(Mode::Build, false ; "build_mode_tooldone_no_form")]
-fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
+/// A write mid-run starts a cycle but does not offer approval. Only a run
+/// that settled can be reviewed, so the menu waits for the queue drain.
+#[test_case(Mode::Plan ; "plan_mode_write_waits_for_settle")]
+#[test_case(Mode::Build ; "build_mode_write_is_ignored")]
+fn tool_done_write_does_not_open_plan_form(mode: Mode) {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = path.display().to_string();
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
     app.state.mode = mode;
-    app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
+    app.state.plan = PlanState::Drafting(path);
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         call: None,
         id: "t1".into(),
         tool: "write".into(),
         output: Arc::new(ToolOutput::Plain(
-            "wrote 42 bytes to /tmp/plans/test.md".into(),
+            format!("wrote 42 bytes to {written}").into(),
         )),
         is_error: false,
         annotation: None,
-        written_path: Some("/tmp/plans/test.md".into()),
+        written_path: Some(written),
         backgrounded: false,
     }))));
-    assert_eq!(app.plan_form.is_visible(), expect_form);
-    if expect_form {
+
+    assert!(!app.plan_form.is_visible(), "a write is not approval");
+    assert!(!app.state.plan.is_ready());
+    if mode == Mode::Plan {
+        assert!(app.plan_cycle.refining);
+        app.transition_plan(PlanTrigger::Settled);
+        assert!(app.plan_form.is_visible());
         assert!(app.state.plan.is_ready());
+    } else {
+        assert!(!app.plan_cycle.refining);
     }
 }
 
@@ -6647,13 +6695,12 @@ fn done_event_does_not_open_plan_form() {
 }
 
 #[test]
-fn re_edit_keeps_plan_form_visible() {
+fn re_edit_waits_for_the_run_to_settle() {
     let (_tmp, mut app) = plan_app();
     assert!(app.state.plan.is_ready());
     assert!(app.plan_form.is_visible());
     let written = app.state.plan.path().unwrap().display().to_string();
 
-    // Agent edits the plan again (second write to same path) — idempotent, stays Ready
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         call: None,
         id: "t2".into(),
@@ -6666,8 +6713,203 @@ fn re_edit_keeps_plan_form_visible() {
         written_path: Some(written),
         backgrounded: false,
     }))));
+
     assert!(matches!(app.state.plan, PlanState::Ready(_)));
+    assert!(app.plan_cycle.refining);
+    assert!(!app.plan_form.is_visible(), "the revision is not settled");
+
+    app.transition_plan(PlanTrigger::Settled);
     assert!(app.plan_form.is_visible());
+}
+
+/// Approval waits for the queue drain, not the run's `Done`: a refinement
+/// queued behind the writer may still change the plan.
+#[test]
+fn a_plan_waits_for_the_queue_to_drain_before_review() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = path.display().to_string();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path);
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
+        id: "t1".into(),
+        tool: "write".into(),
+        output: Arc::new(ToolOutput::Plain(
+            format!("wrote 42 bytes to {written}").into(),
+        )),
+        is_error: false,
+        annotation: None,
+        written_path: Some(written),
+        backgrounded: false,
+    }))));
+
+    app.update(done_event());
+    assert!(
+        !app.plan_form.is_visible(),
+        "a queued turn may still follow"
+    );
+    assert!(!app.state.plan.is_ready());
+
+    app.on_queue_drained();
+    assert!(app.state.plan.is_ready());
+    assert!(app.plan_form.is_visible());
+}
+
+/// A queued plan message suspends the review when the agent picks it up. A
+/// build message in the same place leaves the review alone.
+#[test_case(true, true  ; "plan_message_suspends_review")]
+#[test_case(false, false ; "build_message_leaves_it_alone")]
+fn a_consumed_message_controls_the_plan_review(plan: bool, refining: bool) {
+    let (_tmp, mut app) = plan_app();
+    assert!(app.plan_form.is_visible());
+
+    app.update(agent_msg(AgentEvent::QueueItemConsumed {
+        text: "refine".into(),
+        images: Vec::new(),
+        plan,
+    }));
+
+    assert_eq!(app.plan_cycle.refining, refining);
+    assert_eq!(app.plan_form.is_visible(), !refining);
+    assert!(app.state.plan.is_ready());
+}
+
+/// Immediate plan input suspends the review before the first tool runs. A run
+/// that changes nothing hands the old revision back without a new menu.
+#[test]
+fn a_plan_prompt_suspends_review_until_settled() {
+    let (_tmp, mut app) = plan_app();
+    let actions = app.start_from_queue(&queued_msg("refine"));
+    assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
+    assert!(app.plan_cycle.refining);
+    assert!(!app.plan_form.is_visible());
+    assert!(app.state.plan.is_ready());
+
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    app.on_queue_drained();
+
+    assert!(!app.plan_cycle.refining);
+    assert!(app.state.plan.is_ready());
+    assert!(
+        !app.plan_form.is_visible(),
+        "the unchanged revision needs no new menu"
+    );
+}
+
+/// A write from an interrupted run stays a draft. Only a settled run can
+/// offer it for approval.
+#[test]
+fn an_interrupted_write_is_not_approvable() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = path.display().to_string();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path);
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
+        id: "t1".into(),
+        tool: "write".into(),
+        output: Arc::new(ToolOutput::Plain(
+            format!("wrote 42 bytes to {written}").into(),
+        )),
+        is_error: false,
+        annotation: None,
+        written_path: Some(written),
+        backgrounded: false,
+    }))));
+
+    app.plan_turn_interrupted();
+
+    assert!(!app.plan_cycle.refining);
+    assert!(!app.state.plan.is_ready());
+    assert!(!app.plan_form.is_visible());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(FLASH_PLAN_DRAFT_INTERRUPTED)
+    );
+}
+
+/// A limit or other non-`EndTurn` ending interrupts the cycle immediately,
+/// even after a write.
+#[test]
+fn a_limited_run_does_not_offer_its_write() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = path.display().to_string();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path);
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
+        id: "t1".into(),
+        tool: "write".into(),
+        output: Arc::new(ToolOutput::Plain(
+            format!("wrote 42 bytes to {written}").into(),
+        )),
+        is_error: false,
+        annotation: None,
+        written_path: Some(written),
+        backgrounded: false,
+    }))));
+
+    app.update(agent_msg_with_run_id(
+        done_with_reason(DoneReason::MaxTurns),
+        app.run_id,
+    ));
+
+    assert!(!app.plan_cycle.refining);
+    assert!(!app.state.plan.is_ready());
+    assert!(!app.plan_form.is_visible());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(FLASH_PLAN_DRAFT_INTERRUPTED)
+    );
+}
+
+/// A form already on screen cannot implement a plan whose run is still going.
+#[test]
+fn implementing_while_refining_changes_nothing() {
+    let (_tmp, mut app) = plan_app();
+    app.start_from_queue(&queued_msg("refine"));
+
+    let actions = app.handle_plan_form_action(PlanFormAction::Implement);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(app.state.plan.is_ready());
+    assert!(app.plan_cycle.refining);
+    assert_eq!(app.status_bar.flash_text(), Some(FLASH_PLAN_NOT_READY));
+}
+
+/// A plan file that moved since the review is not implemented on the first
+/// press. The press records the new revision, the next one implements it.
+#[test]
+fn a_plan_changed_after_review_needs_another_enter() {
+    let (_tmp, mut app) = plan_app();
+    let path = app.state.plan.path().unwrap().to_path_buf();
+    fs::write(&path, "changed plan body").unwrap();
+
+    let actions = app.handle_plan_form_action(PlanFormAction::Implement);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(app.status_bar.flash_text(), Some(FLASH_PLAN_CHANGED));
+
+    let actions = app.handle_plan_form_action(PlanFormAction::Implement);
+    assert!(!actions.is_empty());
+    assert_eq!(app.state.mode, Mode::Build);
 }
 
 #[test_case(1, Mode::Build, true,  true  ; "clear_and_implement")]
@@ -6810,8 +7052,10 @@ fn dismiss_plan_esc(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Esc)));
 }
 
+/// Dismissal covers the revision it was made for. A rewrite is a new
+/// revision, so it gets its own review once the run settles.
 #[test]
-fn rewrite_does_not_reopen_after_dismiss() {
+fn a_rewrite_after_dismiss_needs_a_new_review() {
     let (_tmp, mut app) = plan_app();
     assert!(app.plan_form.is_visible());
 
@@ -6820,8 +7064,15 @@ fn rewrite_does_not_reopen_after_dismiss() {
     assert!(app.state.plan.is_ready());
 
     rewrite_plan(&mut app);
-    assert!(!app.plan_form.is_visible());
+    assert!(
+        !app.plan_form.is_visible(),
+        "the new revision is not settled"
+    );
     assert!(app.state.plan.is_ready());
+    assert!(app.plan_cycle.refining);
+
+    app.transition_plan(PlanTrigger::Settled);
+    assert!(app.plan_form.is_visible(), "a new revision needs a review");
 }
 
 #[test]
@@ -11168,6 +11419,7 @@ fn inbox_consumed_draws_in_subagent_chat() {
         AgentEvent::QueueItemConsumed {
             text: "q".into(),
             images: Vec::new(),
+            plan: false,
         },
         TASK_ID,
         None,

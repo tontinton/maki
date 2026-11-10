@@ -1,16 +1,19 @@
 use std::borrow::Cow;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::agent::QueuedMessage;
 use crate::theme;
-use maki_agent::{AgentInput, AgentMode, InputSource};
+use maki_agent::{AgentInput, AgentMode, DoneReason, InputSource};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_providers::RequestOptions;
 use maki_storage::StateDir;
 use maki_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
 
-use super::App;
+use super::{
+    App, FLASH_PLAN_ACTION_LOST, FLASH_PLAN_DRAFT_INTERRUPTED, FLASH_PLAN_UNREADABLE_PREFIX,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -19,8 +22,33 @@ pub(crate) enum Mode {
 }
 
 pub(crate) enum PlanTrigger {
+    /// A successful write to the plan file landed. It starts a review cycle
+    /// but is not itself approval: the run that wrote it may still change it.
     WriteDone,
+    /// A focused window means the plan is being discussed again.
     InteractivePrompt,
+    /// User input in plan mode started a new drafting cycle.
+    RefinementStarted,
+    /// The run and everything queued behind it ended normally.
+    Settled,
+    /// The cycle ended without a normal end: error, cancellation or a limit.
+    Interrupted,
+}
+
+/// The part of the plan lifecycle that is not the plan file itself. `Ready`
+/// keeps meaning "the agent wrote the plan", as `maki.plan.read` documents;
+/// approval waits for this cycle to settle.
+#[derive(Default)]
+pub(crate) struct PlanCycle {
+    /// A drafting cycle is active, so the plan is not approvable however
+    /// written its file is.
+    pub(super) refining: bool,
+    /// A successful write landed during this cycle.
+    pub(super) written: bool,
+    /// The content the user is allowed to approve. Cleared by a write and set
+    /// again when a settled revision is offered, so implementing a file that
+    /// moved underneath the review has to be approved again.
+    pub(super) reviewed: Option<String>,
 }
 
 impl Mode {
@@ -54,12 +82,6 @@ impl PlanState {
         }
     }
 
-    pub(crate) fn mark_drafting(&mut self) {
-        if let Self::Ready(p) = self {
-            *self = Self::Drafting(std::mem::take(p));
-        }
-    }
-
     pub(crate) fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
     }
@@ -75,30 +97,108 @@ impl PlanState {
 
 impl App {
     pub(crate) fn transition_plan(&mut self, trigger: PlanTrigger) {
-        if self.state.mode != Mode::Plan {
+        match trigger {
+            PlanTrigger::WriteDone => self.plan_wrote(),
+            PlanTrigger::InteractivePrompt => {
+                if self.state.mode == Mode::Plan {
+                    self.begin_plan_refinement();
+                }
+            }
+            PlanTrigger::RefinementStarted => {
+                self.plan_last_done = None;
+                self.begin_plan_refinement();
+            }
+            PlanTrigger::Settled => self.settle_plan(true),
+            PlanTrigger::Interrupted => self.settle_plan(false),
+        }
+    }
+
+    fn plan_wrote(&mut self) {
+        if (self.state.mode != Mode::Plan && !self.plan_cycle.refining)
+            || self.state.plan.path().is_none()
+        {
             return;
         }
-        match trigger {
-            PlanTrigger::WriteDone => {
-                if self.state.plan.is_ready() {
-                    return;
-                }
-                self.state.plan.mark_ready();
-                let path = self.state.plan.path().map(|p| p.display().to_string());
-                self.offer_plan_form(path.as_deref());
-                // The path is the whole point here, so with no path we stay
-                // quiet instead of handing a plugin an empty one to open.
-                if let Some(path) = path {
-                    self.fire_session_event(HostEvent::PlanReady { path: &path });
-                }
+        self.begin_plan_refinement();
+        self.plan_cycle.written = true;
+        self.plan_cycle.reviewed = None;
+    }
+
+    /// A new drafting cycle owns the plan until the run and everything queued
+    /// behind it settles. Hiding the form is what keeps a mid-run write from
+    /// looking like an approval opportunity.
+    fn begin_plan_refinement(&mut self) {
+        if self.state.plan.path().is_none() {
+            return;
+        }
+        let lost_pick = self.plan_answers.action.is_some();
+        self.plan_answers.abandon();
+        if lost_pick {
+            self.flash(FLASH_PLAN_ACTION_LOST.into());
+        }
+        self.plan_cycle.refining = true;
+        self.plan_form.on_plan_drafting();
+        self.plan_form.forget_menu();
+    }
+
+    fn settle_plan(&mut self, success: bool) {
+        if !self.plan_cycle.refining {
+            return;
+        }
+        let written = self.plan_cycle.written;
+        self.plan_cycle.refining = false;
+        self.plan_cycle.written = false;
+        self.plan_last_done = None;
+        if !success {
+            self.plan_answers.abandon();
+            if written {
+                self.plan_cycle.reviewed = None;
+                self.flash(FLASH_PLAN_DRAFT_INTERRUPTED.into());
             }
-            PlanTrigger::InteractivePrompt => {
-                if self.state.plan.is_ready() {
-                    self.plan_answers.abandon();
-                    self.state.plan.mark_drafting();
-                    self.plan_form.on_plan_drafting();
-                }
+            return;
+        }
+        if !written {
+            return;
+        }
+        let Some(path) = self.state.plan.path().map(|path| path.to_path_buf()) else {
+            return;
+        };
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                self.plan_cycle.reviewed = None;
+                self.flash(format!(
+                    "{FLASH_PLAN_UNREADABLE_PREFIX} {}: {error}",
+                    path.display()
+                ));
+                return;
             }
+        };
+        self.state.plan.mark_ready();
+        self.plan_cycle.reviewed = Some(content);
+        let path = path.display().to_string();
+        self.offer_plan_form(Some(&path));
+        self.fire_session_event(HostEvent::PlanReady { path: &path });
+    }
+
+    /// A run that reaches the queue drain after a normal end, or an ending
+    /// that is not approval material.
+    pub(super) fn note_plan_turn_end(&mut self, reason: DoneReason) {
+        match reason {
+            DoneReason::EndTurn => self.plan_last_done = Some(reason),
+            DoneReason::Compact => {}
+            _ => self.plan_turn_interrupted(),
+        }
+    }
+
+    pub(super) fn plan_turn_interrupted(&mut self) {
+        self.plan_last_done = None;
+        self.transition_plan(PlanTrigger::Interrupted);
+    }
+
+    pub(crate) fn on_queue_drained(&mut self) {
+        if self.plan_last_done.take() == Some(DoneReason::EndTurn) {
+            self.transition_plan(PlanTrigger::Settled);
         }
     }
 

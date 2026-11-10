@@ -2020,6 +2020,7 @@ async fn prompt(
         let _ = s.sub_event_tx.send(AgentEvent::QueueItemConsumed {
             text: message.clone(),
             images: Vec::new(),
+            plan: false,
         });
     }
 

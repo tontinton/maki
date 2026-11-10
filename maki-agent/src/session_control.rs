@@ -21,8 +21,8 @@ use tokio::sync::Notify;
 
 use crate::cancel::{CancelHandle, CancelToken, CancelTrigger};
 use crate::{
-    AgentEvent, AgentInput, Cutter, EarlierInput, EventSender, ExtractedCommand, HistorySnapshot,
-    InterruptSource, SharedMessages,
+    AgentEvent, AgentInput, AgentMode, Cutter, EarlierInput, EventSender, ExtractedCommand,
+    HistorySnapshot, InterruptSource, SharedMessages,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,9 +188,11 @@ impl SessionControl {
         inputs
             .into_iter()
             .map(|input| {
+                let plan = matches!(input.mode, AgentMode::Plan(_));
                 let _ = event_tx.send(AgentEvent::QueueItemConsumed {
                     text: input.message.clone(),
                     images: input.images.clone(),
+                    plan,
                 });
                 EarlierInput::from(input)
             })

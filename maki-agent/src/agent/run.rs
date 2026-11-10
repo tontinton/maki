@@ -1232,9 +1232,11 @@ impl<'h> Agent<'h> {
                 let mut kept_any = false;
                 let last = inputs.len().saturating_sub(1);
                 for (index, input) in inputs.into_iter().enumerate() {
+                    let plan = matches!(input.mode, AgentMode::Plan(_));
                     self.event_tx.send(AgentEvent::QueueItemConsumed {
                         text: input.message.clone(),
                         images: input.images.clone(),
+                        plan,
                     })?;
                     let kept = self
                         .filter_user_message(input.message, input.images.len(), input.source)

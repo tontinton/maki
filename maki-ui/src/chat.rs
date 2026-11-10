@@ -20,8 +20,8 @@ use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
-    AgentEvent, BufferSnapshot, DisplayItem, SessionControl, SharedBuf, SteerKind, ToolDoneEvent,
-    ToolOutput, ToolStartEvent, display_order, observation_detail,
+    AgentEvent, BufferSnapshot, DisplayItem, DoneReason, SessionControl, SharedBuf, SteerKind,
+    ToolDoneEvent, ToolOutput, ToolStartEvent, display_order, observation_detail,
 };
 use maki_config::{ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
@@ -49,7 +49,7 @@ pub(crate) const INBOX_DROPPED_SUFFIX: &str =
 
 pub enum ChatEventResult {
     Continue,
-    Done,
+    Done(DoneReason),
     Error(String),
 }
 
@@ -292,9 +292,9 @@ impl Chat {
             }
             // Parts belong to `/tasks`, which the App keeps, never to a transcript.
             AgentEvent::ToolParts { .. } => {}
-            AgentEvent::Done { .. } => {
+            AgentEvent::Done { reason, .. } => {
                 self.messages_panel.flush();
-                return ChatEventResult::Done;
+                return ChatEventResult::Done(reason);
             }
             AgentEvent::Error { message, .. } => {
                 self.messages_panel.flush();

@@ -325,7 +325,8 @@ impl App {
     }
 
     fn record_tool_done(&mut self, chat_idx: usize, done: &ToolDoneEvent) {
-        if self.state.mode == Mode::Plan
+        if chat_idx == MAIN_CHAT
+            && (self.state.mode == Mode::Plan || self.plan_cycle.refining)
             && self.state.plan.path().is_some_and(|pp| done.wrote_to(pp))
         {
             self.transition_plan(PlanTrigger::WriteDone);
@@ -388,9 +389,9 @@ impl App {
         event: AgentEvent,
     ) -> Option<AgentEvent> {
         match event {
-            AgentEvent::QueueItemConsumed { text, images } => {
+            AgentEvent::QueueItemConsumed { text, images, plan } => {
                 if chat_idx == MAIN_CHAT {
-                    self.on_queue_item_consumed(text, images);
+                    self.on_queue_item_consumed(text, images, plan);
                 } else {
                     self.chats[chat_idx].show_user_message(text, images);
                 }
@@ -448,7 +449,7 @@ impl App {
     fn end_plugin_prompt(&mut self, chat_idx: usize, result: ChatEventResult) {
         let chat = &mut self.chats[chat_idx];
         match result {
-            ChatEventResult::Done => chat.cancel_in_progress(),
+            ChatEventResult::Done(_) => chat.cancel_in_progress(),
             ChatEventResult::Error(message) => {
                 chat.cancel_in_progress();
                 // Esc in the tab already wrote the task's ending, and the
@@ -466,8 +467,9 @@ impl App {
 
     fn end_main_turn(&mut self, result: ChatEventResult) {
         match result {
-            ChatEventResult::Done => {
+            ChatEventResult::Done(reason) => {
                 self.status_bar.clear_flash();
+                self.note_plan_turn_end(reason);
                 self.terminalize_turn(MISSING_TOOL_COMPLETION);
                 self.chat_index.clear();
                 self.status = Status::Idle;
@@ -481,6 +483,7 @@ impl App {
             ChatEventResult::Error(message) => {
                 self.status = Status::error(message.clone());
                 self.status_bar.clear_flash();
+                self.plan_turn_interrupted();
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Error,
                     cap_error_text(&message),

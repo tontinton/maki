@@ -270,10 +270,12 @@ impl App {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
             let placeholder = self.input_placeholder();
-            let panel_hint = (self.state.mode == Mode::Plan)
-                .then(|| self.plan_form.hint_line())
-                .flatten()
-                .or_else(|| self.lua_hint_line());
+            let panel_hint = (self.state.mode == Mode::Plan
+                && !self.plan_cycle.refining
+                && self.state.plan.is_ready())
+            .then(|| self.plan_form.hint_line())
+            .flatten()
+            .or_else(|| self.lua_hint_line());
             let caret = self.input_box.view(
                 frame,
                 layout.input_area,

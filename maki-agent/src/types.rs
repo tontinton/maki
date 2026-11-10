@@ -731,6 +731,9 @@ pub enum AgentEvent {
     QueueItemConsumed {
         text: String,
         images: Vec<ImageSource>,
+        /// The consumed input runs in plan mode. The host suspends the current
+        /// plan review until that run and anything queued behind it settles.
+        plan: bool,
     },
     QueueDrained,
     Done {

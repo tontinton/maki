@@ -1040,6 +1040,7 @@ impl<'t> EventLoop<'t> {
             AgentEvent::QueueDrained => {
                 if current {
                     rt.notifications.on_drain();
+                    rt.app.on_queue_drained();
                 }
                 return;
             }

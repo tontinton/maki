@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use maki_agent::{AgentInput, AgentMode, Delivery, ImageSource, InputSource, SessionMailbox};
 use maki_lua::agent_autocmd::HostEvent;
 
-use super::{Action, App, Status};
+use super::{Action, App, PlanTrigger, Status};
 
 use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
 use crate::components::queue_panel::QueueEntry;
@@ -278,8 +278,16 @@ impl App {
     /// queue items start runs without `start_run`, so this is where the app
     /// learns the agent is busy. Immediate-dispatch items skip this event,
     /// so no dedup needed.
-    pub(super) fn on_queue_item_consumed(&mut self, text: String, images: Vec<ImageSource>) {
+    pub(super) fn on_queue_item_consumed(
+        &mut self,
+        text: String,
+        images: Vec<ImageSource>,
+        plan: bool,
+    ) {
         self.status = Status::Streaming;
+        if plan {
+            self.transition_plan(PlanTrigger::RefinementStarted);
+        }
         self.main_chat().show_user_message(text, images);
     }
 
@@ -320,6 +328,11 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
+        if matches!(input.mode, AgentMode::Plan(_))
+            && (!display.is_empty() || !input.images.is_empty())
+        {
+            self.transition_plan(PlanTrigger::RefinementStarted);
+        }
         self.run_id += 1;
         self.clear_exit_request();
         // New work supersedes text held for recovery after an agent error.

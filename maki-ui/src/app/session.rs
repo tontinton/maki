@@ -25,7 +25,7 @@ use maki_storage::sessions::{
 use crate::{AppSession, OpenSession};
 
 use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
-use super::{App, MAIN_CHAT, Mode, PlanState, Sending, Status};
+use super::{App, MAIN_CHAT, Mode, PlanCycle, PlanState, Sending, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
@@ -225,7 +225,7 @@ impl App {
         SessionMeta {
             mode: Some(state.mode.into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
-            plan_written: state.plan.is_ready(),
+            plan_written: state.plan.is_ready() && !self.plan_cycle.refining,
             session_rules: rules_to_stored(&self.permissions.session_rules_snapshot()),
             context_size: state.context_size,
             input_draft_writers: stored_writers(writers).filter(|_| has_draft),
@@ -321,6 +321,8 @@ impl App {
         self.forget_untasked_parts();
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
+        self.plan_cycle = PlanCycle::default();
+        self.plan_last_done = None;
         // The draft this chrome belonged to is gone, and the Lua thread still
         // owes answers about it. Retiring them here is what keeps a handler
         // that comes back after a `/new`, a rewind or a tab switch from

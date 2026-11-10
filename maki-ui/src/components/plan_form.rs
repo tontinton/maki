@@ -207,7 +207,7 @@ impl PlanForm {
     }
 
     pub fn hint_line(&self) -> Option<Line<'static>> {
-        if self.visibility != Visibility::UserDismissed {
+        if self.is_visible() {
             return None;
         }
         let t = theme::current();
@@ -458,9 +458,9 @@ mod tests {
     }
 
     #[test]
-    fn hint_line_only_when_dismissed() {
+    fn hint_line_unless_shown() {
         let mut form = PlanForm::new();
-        assert!(form.hint_line().is_none());
+        assert!(form.hint_line().is_some());
         form.on_plan_ready();
         assert!(form.hint_line().is_none());
         form.hide();

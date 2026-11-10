@@ -9,9 +9,10 @@ use maki_agent::template;
 use maki_agent::template::Vars;
 use maki_agent::tools::{BackgroundFor, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, AgentSeed, CancelMap,
-    CancelToken, DoneReason, Envelope, EventSender, History, HostPrompt, Instructions, McpCommand,
-    PromptRole, RunContextBuilder, RunLedger, RunTotals, SessionMailbox, SharedMessages,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed,
+    CancelMap, CancelToken, DoneReason, Envelope, EventSender, History, HostPrompt, Instructions,
+    McpCommand, PromptRole, RunContextBuilder, RunLedger, RunTotals, SessionMailbox,
+    SharedMessages,
 };
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, ContextGauge, Message, Model};
@@ -164,9 +165,11 @@ impl AgentLoop {
                     .into_iter()
                     .map(|queued| {
                         if !queued.displayed {
+                            let plan = matches!(queued.input.mode, AgentMode::Plan(_));
                             let _ = event_tx.send(AgentEvent::QueueItemConsumed {
                                 text: queued.text,
                                 images: queued.input.images.clone(),
+                                plan,
                             });
                         }
                         queued.input

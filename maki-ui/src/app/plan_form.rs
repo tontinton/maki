@@ -5,10 +5,10 @@ use flume::{Receiver, TryRecvError};
 use maki_lua::{PlanActionOutcome, PlanMenu, PlanRowAction};
 
 use super::{
-    App, FLASH_NO_PLAN, FLASH_PLAN_ACTION_FAILED, FLASH_PLAN_ACTION_LOST, FLASH_PLAN_FORM_SLOW,
-    FLASH_PLAN_NOT_READY, FLASH_PLAN_UNREADABLE_PREFIX, IMPLEMENT_MSG_PREFIX,
-    IMPLEMENT_PARALLEL_HINT, Mode, PLAN_ACTION_ANSWER_WAIT, PLAN_FORM_ANSWER_WAIT, PlanState,
-    QueuedMessage,
+    App, FLASH_NO_PLAN, FLASH_PLAN_ACTION_FAILED, FLASH_PLAN_ACTION_LOST, FLASH_PLAN_CHANGED,
+    FLASH_PLAN_FORM_SLOW, FLASH_PLAN_NOT_READY, FLASH_PLAN_UNREADABLE_PREFIX, IMPLEMENT_MSG_PREFIX,
+    IMPLEMENT_PARALLEL_HINT, Mode, PLAN_ACTION_ANSWER_WAIT, PLAN_FORM_ANSWER_WAIT, PlanCycle,
+    PlanState, QueuedMessage,
 };
 use crate::components::plan_form::{PlanFormAction, builtin_menu, builtin_rows};
 use crate::components::{Action, DisplayMessage};
@@ -94,7 +94,8 @@ impl App {
             Err(TryRecvError::Empty) => return Dirty::NO,
         };
         self.plan_answers.abandon();
-        if self.state.mode != Mode::Plan || !self.state.plan.is_ready() {
+        if self.state.mode != Mode::Plan || self.plan_cycle.refining || !self.state.plan.is_ready()
+        {
             self.plan_form.forget_menu();
             return Dirty::NO;
         }
@@ -191,7 +192,32 @@ impl App {
     }
 
     fn open_plan_form(&mut self, menu: PlanMenu) {
+        if !self.refresh_plan_review() {
+            return;
+        }
         self.open_prompt(|app| app.plan_form.open_with(menu));
+    }
+
+    /// Read the revision the user is about to review. A failed read leaves no
+    /// reviewable content, so the form stays shut and the error says why.
+    pub(super) fn refresh_plan_review(&mut self) -> bool {
+        let Some(path) = self.state.plan.path() else {
+            return false;
+        };
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                self.plan_cycle.reviewed = Some(content);
+                true
+            }
+            Err(error) => {
+                self.plan_cycle.reviewed = None;
+                self.flash(format!(
+                    "{FLASH_PLAN_UNREADABLE_PREFIX} {}: {error}",
+                    path.display()
+                ));
+                false
+            }
+        }
     }
 
     pub(super) fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
@@ -285,7 +311,11 @@ impl App {
             .state
             .plan
             .path()
-            .filter(|_| self.state.mode == Mode::Plan && self.state.plan.is_ready())
+            .filter(|_| {
+                self.state.mode == Mode::Plan
+                    && !self.plan_cycle.refining
+                    && self.state.plan.is_ready()
+            })
             .map(|path| path.to_path_buf())
         else {
             self.flash(FLASH_PLAN_NOT_READY.into());
@@ -304,8 +334,17 @@ impl App {
                 return vec![];
             }
         };
+        if let Some(reviewed) = &self.plan_cycle.reviewed
+            && reviewed != &content
+        {
+            self.plan_cycle.reviewed = Some(content);
+            self.flash(FLASH_PLAN_CHANGED.into());
+            return vec![];
+        }
+        self.plan_cycle.reviewed = Some(content.clone());
         let parallel = self.plan_form.parallel();
         self.plan_form.reset();
+        self.plan_cycle = PlanCycle::default();
         self.state.plan = PlanState::None;
         self.state.mode = Mode::Build;
 

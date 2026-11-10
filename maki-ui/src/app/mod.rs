@@ -64,8 +64,8 @@ use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
-    AgentEvent, Envelope, McpConfigErrors, McpSnapshotReader, SessionMailbox, SharedBuf,
-    SharedMessages, ToolPart,
+    AgentEvent, DoneReason, Envelope, McpConfigErrors, McpSnapshotReader, SessionMailbox,
+    SharedBuf, SharedMessages, ToolPart,
 };
 use maki_config::project::{self, GatedFile, TrustState};
 use maki_config::{ModelPolicy, UiConfig};
@@ -90,7 +90,7 @@ pub(crate) use crate::agent::QueuedMessage;
 use image_paste::PastedContent;
 #[cfg(test)]
 use image_paste::READING_CLIPBOARD_MSG;
-pub(crate) use mode::{Mode, PlanState, PlanTrigger};
+pub(crate) use mode::{Mode, PlanCycle, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 #[cfg(test)]
@@ -125,6 +125,8 @@ const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_PLAN_NOT_READY: &str = "No plan is ready to implement";
+const FLASH_PLAN_CHANGED: &str = "The plan changed since it was reviewed, review it again";
+const FLASH_PLAN_DRAFT_INTERRUPTED: &str = "The plan draft was saved, but the run did not finish";
 const FLASH_PLAN_UNREADABLE_PREFIX: &str = "Could not read the plan";
 const FLASH_PLAN_ACTION_LOST: &str = "The plugin host never took that plan action";
 const FLASH_PLAN_ACTION_FAILED: &str = "That plan action did not run";
@@ -607,6 +609,10 @@ pub struct App {
     pub(super) input_rules_reader: InputRulesReader,
     input_rules: Watch<Vec<InputRule>>,
     pub(super) plan_answers: PlanAnswers,
+    pub(super) plan_cycle: PlanCycle,
+    /// The reason the last main run ended, kept until the queue drains so a
+    /// queued refinement cannot flash an approval between two runs.
+    pub(super) plan_last_done: Option<DoneReason>,
     /// Actions produced outside key handling, drained by the event loop. A
     /// plan row handler answers long after the key press that started it.
     pub(super) pending_actions: Vec<Action>,
@@ -732,6 +738,8 @@ impl App {
             input_rules: Watch::seeded(input_rules),
             input_rules_reader,
             plan_answers: PlanAnswers::default(),
+            plan_cycle: PlanCycle::default(),
+            plan_last_done: None,
             pending_actions: Vec::new(),
             typeahead: Typeahead::default(),
             restore_event_tx: None,
@@ -896,7 +904,7 @@ impl App {
     }
 
     fn plan_form_open(&self) -> bool {
-        self.state.mode == Mode::Plan && self.plan_form.is_visible()
+        self.state.mode == Mode::Plan && !self.plan_cycle.refining && self.plan_form.is_visible()
     }
 
     fn plan_form_active(&self) -> bool {
@@ -1702,7 +1710,7 @@ impl App {
     }
 
     fn plan_toggle_ready(&self) -> bool {
-        self.state.mode == Mode::Plan && self.state.plan.is_ready()
+        self.state.mode == Mode::Plan && !self.plan_cycle.refining && self.state.plan.is_ready()
     }
 
     /// [`Self::run_action`] for a default key, which has no one to answer.
@@ -1763,7 +1771,7 @@ impl App {
                 let ready = self.plan_toggle_ready();
                 if ready && self.plan_form.is_visible() {
                     self.plan_form.hide();
-                } else if ready {
+                } else if ready && self.refresh_plan_review() {
                     self.open_prompt(|app| app.plan_form.toggle());
                 }
                 ready
@@ -2465,6 +2473,7 @@ impl App {
         self.retry_info = None;
         self.close_all_overlays();
         self.plan_answers.abandon();
+        self.plan_turn_interrupted();
         self.finish_subagents(TaskOutcome::Cancelled, CANCELLED_TEXT);
         self.chats[MAIN_CHAT].auth_parked = false;
         self.shell.cancel_all();
