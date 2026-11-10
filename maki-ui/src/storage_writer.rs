@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +22,8 @@ use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionClaim, SessionError};
 use maki_storage::{StateDir, StorageError};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
 use tracing::warn;
 
 use crate::AppSession;
@@ -47,8 +49,7 @@ enum Entry {
 pub struct StorageWriter {
     pending: Pending,
     wake: Sender<()>,
-    /// Behind a lock only so the writer stays `Sync`: `shutdown` is the one reader.
-    done_rx: Mutex<Receiver<Vec<MakiId>>>,
+    done_rx: oneshot::Receiver<Vec<MakiId>>,
 }
 
 impl StorageWriter {
@@ -56,7 +57,7 @@ impl StorageWriter {
         let pending: Pending = Arc::default();
         let writer_pending = Arc::clone(&pending);
         let (wake, wake_rx) = channel::<()>();
-        let (done_tx, done_rx) = channel::<Vec<MakiId>>();
+        let (done_tx, done_rx) = oneshot::channel::<Vec<MakiId>>();
 
         std::thread::Builder::new()
             .name("storage-writer".into())
@@ -77,7 +78,7 @@ impl StorageWriter {
         Self {
             pending,
             wake,
-            done_rx: Mutex::new(done_rx),
+            done_rx,
         }
     }
 
@@ -111,13 +112,16 @@ impl StorageWriter {
     /// Returns the sessions whose last write never reached disk. The caller
     /// reports them, since the screen is still up here.
     #[must_use]
-    pub fn shutdown(self, timeout: Duration) -> Vec<MakiId> {
+    pub async fn shutdown(self, limit: Duration) -> Vec<MakiId> {
         drop(self.wake);
-        let done_rx = self.done_rx.into_inner().unwrap_or_else(|e| e.into_inner());
-        done_rx.recv_timeout(timeout).unwrap_or_else(|_| {
-            warn!("storage writer did not drain within {timeout:?}");
-            Vec::new()
-        })
+        timeout(limit, self.done_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_else(|| {
+                warn!("storage writer did not drain within {limit:?}");
+                Vec::new()
+            })
     }
 }
 
@@ -205,7 +209,6 @@ mod tests {
     use maki_storage::sessions::SESSIONS_DIR;
     use tempfile::TempDir;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-    use tokio::time::timeout;
 
     use super::*;
     use crate::OpenSession;
@@ -244,7 +247,8 @@ mod tests {
     }
 
     fn drain(writer: StorageWriter) {
-        assert!(writer.shutdown(DRAIN_TIMEOUT).is_empty(), "{ALL_LANDED}");
+        let unsaved = runtime().block_on(writer.shutdown(DRAIN_TIMEOUT));
+        assert!(unsaved.is_empty(), "{ALL_LANDED}");
     }
 
     fn fresh(dir: &StateDir) -> (AppSession, SessionClaim) {
@@ -442,7 +446,7 @@ mod tests {
         writer.send(Arc::new(session), claim);
 
         assert_eq!(
-            writer.shutdown(DRAIN_TIMEOUT),
+            runtime().block_on(writer.shutdown(DRAIN_TIMEOUT)),
             vec![id],
             "{REPORTED_UNSAVED}"
         );
