@@ -124,6 +124,8 @@ const NEW_MANY_RUNNING_SUFFIX: &str = " background tasks would stop. /new! start
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
+const FLASH_PLAN_NOT_READY: &str = "No plan is ready to implement";
+const FLASH_PLAN_UNREADABLE_PREFIX: &str = "Could not read the plan";
 const FLASH_PLAN_ACTION_LOST: &str = "The plugin host never took that plan action";
 const FLASH_PLAN_ACTION_FAILED: &str = "That plan action did not run";
 const FLASH_PLAN_FORM_SLOW: &str = "The plugin host was slow, opened the built-in plan form";

@@ -6602,6 +6602,66 @@ fn plan_form_open_editor() {
     assert!(matches!(&actions[..], [Action::OpenEditor(p)] if p == Path::new("test-plan.md")));
 }
 
+fn plan_action(clear_context: bool) -> PlanFormAction {
+    if clear_context {
+        PlanFormAction::ClearAndImplement
+    } else {
+        PlanFormAction::Implement
+    }
+}
+
+/// Both implementation options must reject a plan the user cannot approve yet,
+/// before consuming it, changing mode or resetting the session.
+#[test_case(false ; "implement")]
+#[test_case(true ; "clear_and_implement")]
+fn implementing_needs_a_ready_plan(clear_context: bool) {
+    for plan in [
+        PlanState::None,
+        PlanState::Drafting(PathBuf::from("draft.md")),
+    ] {
+        let mut app = test_app();
+        let session = app.state.session.id;
+        app.state.mode = Mode::Plan;
+        app.state.plan = plan.clone();
+
+        let actions = app.handle_plan_form_action(plan_action(clear_context));
+
+        assert!(actions.is_empty());
+        assert_eq!(app.state.mode, Mode::Plan);
+        assert_eq!(app.state.plan, plan);
+        assert_eq!(app.state.session.id, session, "the session is untouched");
+        assert_eq!(app.status_bar.flash_text(), Some(FLASH_PLAN_NOT_READY));
+    }
+}
+
+/// A plan that cannot be read is refused before anything remembers it as
+/// implemented. The directory case is deterministic without permission bits.
+#[test_case(false ; "implement")]
+#[test_case(true ; "clear_and_implement")]
+fn implementing_an_unreadable_plan_changes_nothing(clear_context: bool) {
+    let tmp = TempDir::new().unwrap();
+    let missing = tmp.path().join("missing.md");
+    let directory = tmp.path().join("plan-dir");
+    fs::create_dir(&directory).unwrap();
+
+    for path in [missing, directory] {
+        let mut app = test_app();
+        let session = app.state.session.id;
+        app.state.mode = Mode::Plan;
+        app.state.plan = PlanState::Ready(path.clone());
+
+        let actions = app.handle_plan_form_action(plan_action(clear_context));
+
+        assert!(actions.is_empty());
+        assert_eq!(app.state.mode, Mode::Plan);
+        assert_eq!(app.state.plan, PlanState::Ready(path.clone()));
+        assert_eq!(app.state.session.id, session, "the session is untouched");
+        let flash = app.status_bar.flash_text().unwrap();
+        assert!(flash.starts_with(FLASH_PLAN_UNREADABLE_PREFIX), "{flash}");
+        assert!(flash.contains(&path.display().to_string()), "{flash}");
+    }
+}
+
 fn rewrite_plan(app: &mut App) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         call: None,
