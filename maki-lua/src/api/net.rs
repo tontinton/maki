@@ -989,7 +989,7 @@ fn redirect_location(response: &Response) -> Option<String> {
 /// redirect, so the client has to as well.
 fn build_client(key: &ClientKey) -> Result<Client, String> {
     // The providers' base, so a plugin's side requests trust the same CA
-    // bundle and go through the same proxy and DNS rules as its chat requests.
+    // bundle and go through the same proxy as its chat requests.
     // Redirects stay off there too, which here means every hop goes through
     // the SSRF check instead of bouncing into 169.254.169.254.
     //
@@ -2091,7 +2091,6 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains(UNRESOLVABLE_HOST), "{error}");
         assert!(!error.contains(QUERY_SECRET), "{error}");
     }
 

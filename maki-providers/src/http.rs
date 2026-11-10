@@ -1,6 +1,6 @@
-//! The transport rules the provider client and maki.net share: which proxy a
-//! URL goes through and how names are looked up. How a failed request is read
-//! is shared by the MCP transport too.
+//! The proxy rules the provider client and maki.net share, and the name lookup
+//! maki.net vets addresses with. How a failed request is read is shared by the
+//! MCP transport too.
 
 use std::env;
 use std::error::Error;
@@ -11,9 +11,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use maki_config::split_host_port;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Error as ReqwestError, Proxy};
-use thiserror::Error as ThisError;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 
@@ -27,14 +25,6 @@ const NO_PROXY_SEPARATOR: char = ',';
 const NO_PROXY_BLANKS: [char; 2] = [' ', '\t'];
 const CIDR_SEPARATOR: char = '/';
 const DNS_RETRY_DELAY: Duration = Duration::from_millis(150);
-pub(crate) const NO_ADDRESSES: &str = "the name has no addresses";
-/// How a connect fails when nothing answers, besides a name that does not
-/// resolve.
-const UNANSWERED: [io::ErrorKind; 3] = [
-    io::ErrorKind::ConnectionRefused,
-    io::ErrorKind::HostUnreachable,
-    io::ErrorKind::NetworkUnreachable,
-];
 
 static PROXY_ENV: LazyLock<ProxyEnv> =
     LazyLock::new(|| ProxyEnv::from_env(|name| env::var(name).ok()));
@@ -199,8 +189,9 @@ pub fn error_chain(error: &(dyn Error + 'static)) -> String {
         .join(": ")
 }
 
-/// Nothing answered: no socket listening, no route to it, or a name that does
-/// not resolve.
+/// The connection was never made: no socket listening, no route to it, a name
+/// that does not resolve, a handshake that failed, or a proxy that refused the
+/// tunnel.
 ///
 /// A timeout stays out: both the connect timeout and the read timeout answer
 /// `is_timeout()`, and an expired connect and a stall on a stream that was
@@ -209,57 +200,22 @@ pub fn error_chain(error: &(dyn Error + 'static)) -> String {
 /// trying where a refused port gives up in seconds. Splitting the two means
 /// tracking whether any byte ever arrived.
 pub fn is_connect_failure(error: &ReqwestError) -> bool {
-    error.is_connect()
-        && !error.is_timeout()
-        && causes(error).any(|e| {
-            e.is::<Unresolved>()
-                || e.downcast_ref::<io::Error>()
-                    .is_some_and(|e| UNANSWERED.contains(&e.kind()))
-        })
+    error.is_connect() && !error.is_timeout()
 }
 
 fn causes<'a>(error: &'a (dyn Error + 'static)) -> impl Iterator<Item = &'a (dyn Error + 'static)> {
     iter::successors(Some(error), |&e| e.source())
 }
 
-#[derive(Debug, ThisError)]
-#[error("cannot resolve {host}")]
-pub(crate) struct Unresolved {
-    pub(crate) host: String,
-    pub(crate) source: io::Error,
-}
-
-/// The client's own name lookups. They run here rather than in reqwest so a
-/// name that does not resolve, or resolves to nothing, fails as
-/// [`Unresolved`], which is how [`is_connect_failure`] knows it.
-pub struct Lookup;
-
-impl Resolve for Lookup {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_owned();
-        Box::pin(async move {
-            match resolve(&host, 0, DNS_ATTEMPTS).await {
-                Ok(addrs) if !addrs.is_empty() => Ok(Box::new(addrs.into_iter()) as Addrs),
-                Ok(_) => Err(Unresolved {
-                    host,
-                    source: io::Error::other(NO_ADDRESSES),
-                }
-                .into()),
-                Err(source) => Err(Unresolved { host, source }.into()),
-            }
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use reqwest::Client;
-    use std::sync::Arc;
     use test_case::test_case;
 
     use crate::test_support::transport::{
-        LOOPBACK_HOST, QUERY_SECRET, UNRESOLVABLE_HOST, URL_MARKER, closed_port, plain_http_port,
+        LOOPBACK_HOST, QUERY_SECRET, UNRESOLVABLE_HOST, URL_MARKER, closed_port, hangup_port,
+        plain_http_port,
     };
 
     const PROXY_URL: &str = "http://127.0.0.1:3128";
@@ -270,11 +226,7 @@ mod tests {
 
     /// The shell's proxy is left out, so the request goes where the test points it.
     async fn failed_request(url: &str) -> ReqwestError {
-        let client = Client::builder()
-            .no_proxy()
-            .dns_resolver(Arc::new(Lookup))
-            .build()
-            .unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
         client
             .get(url)
             .send()
@@ -356,11 +308,19 @@ mod tests {
         format!("https://{LOOPBACK_HOST}:{}/", plain_http_port())
     }
 
-    #[test_case(closed_port_url, true ; "a_closed_port_draws_on_the_connect_budget")]
-    #[test_case(unresolvable_url, true ; "an_unresolvable_name_draws_on_the_connect_budget")]
-    #[test_case(plain_tcp_behind_https_url, false ; "a_failed_handshake_retries_as_transient")]
+    fn hangup_url() -> String {
+        format!("http://{LOOPBACK_HOST}:{}/", hangup_port())
+    }
+
+    #[test_case(closed_port_url, true ; "a_closed_port")]
+    #[test_case(unresolvable_url, true ; "an_unresolvable_name")]
+    #[test_case(plain_tcp_behind_https_url, true ; "a_failed_handshake")]
+    #[test_case(hangup_url, false ; "a_hangup_after_connecting")]
     #[tokio::test]
-    async fn transport_failures_classify_like_a_providers(url: fn() -> String, expected: bool) {
+    async fn only_a_connection_never_made_is_a_connect_failure(
+        url: fn() -> String,
+        expected: bool,
+    ) {
         let error = failed_request(&url()).await;
         assert_eq!(
             is_connect_failure(&error),

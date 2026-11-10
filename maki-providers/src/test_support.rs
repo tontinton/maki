@@ -290,6 +290,14 @@ pub(crate) mod transport {
         });
         port
     }
+
+    /// A loopback port that takes the connection and hangs up without an
+    /// answer.
+    pub(crate) fn hangup_port() -> u16 {
+        let (listener, port) = loopback_listener();
+        thread::spawn(move || drop(listener.accept()));
+        port
+    }
 }
 
 /// Points every per-user directory at a fresh temp dir and clears every
