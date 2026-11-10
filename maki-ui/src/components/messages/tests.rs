@@ -351,6 +351,212 @@ fn rebuild(panel: &mut MessagesPanel) {
 }
 
 #[test]
+fn scroll_to_block_jumps_by_outline_id() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "first question".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        "pondering".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "an answer".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "second question".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "another answer".into(),
+    ));
+    panel.push(DisplayMessage::plan(
+        "the plan text".into(),
+        "plans/x.md".into(),
+    ));
+    rebuild(&mut panel);
+
+    let seg_of = |panel: &MessagesPanel, msg_idx: usize| {
+        panel
+            .cache
+            .segments()
+            .iter()
+            .position(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none())
+    };
+
+    let listed = panel.outline();
+    assert_eq!(
+        listed.len(),
+        5,
+        "the plan bubble is Assistant but is listed by no entry"
+    );
+
+    assert!(panel.scroll_to_block(listed[3].id), "the second turn");
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 3).unwrap());
+    assert!(!panel.auto_scroll, "jumping releases the bottom pin");
+
+    assert!(panel.scroll_to_block(listed[0].id));
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 0).unwrap());
+
+    assert!(panel.scroll_to_block(listed[1].id), "the thinking block");
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 1).unwrap());
+
+    assert!(panel.scroll_to_block(listed[2].id), "the first reply");
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 2).unwrap());
+
+    assert!(panel.scroll_to_block(listed[4].id), "the second reply");
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 4).unwrap());
+
+    assert!(
+        !panel.scroll_to_block(panel.messages[5].id),
+        "a message the outline lists no entry for is no jump target"
+    );
+    assert!(
+        !panel.scroll_to_block(0),
+        "ids come from the counter, so none of them is 0"
+    );
+    assert!(
+        !panel.scroll_to_block(u64::MAX),
+        "an id from another chat names nothing here"
+    );
+}
+
+/// The point of an id over a position: what a pane listed is what it jumps
+/// to, whatever the transcript did in the meantime.
+#[test]
+fn outline_id_outlives_later_messages_and_dies_with_the_transcript() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "asked".into()));
+    rebuild(&mut panel);
+    let listed = panel.outline();
+    assert_eq!(listed.len(), 1);
+    let asked = listed[0].id;
+
+    panel.push(DisplayMessage::new(DisplayRole::User, "asked again".into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "answered".into(),
+    ));
+    rebuild(&mut panel);
+
+    assert!(
+        panel.scroll_to_block(asked),
+        "the entry the pane listed is still the same message"
+    );
+    assert_eq!(
+        panel.scroll.seg, 0,
+        "and it still lands on the first turn, not on a later one"
+    );
+
+    // A reload rebuilds the transcript from the stored messages, so every id
+    // a pane holds names nothing any more.
+    panel.load_messages(vec![DisplayMessage::new(
+        DisplayRole::User,
+        "rewound".into(),
+    )]);
+    rebuild(&mut panel);
+    assert!(
+        !panel.scroll_to_block(asked),
+        "a stale id answers an error rather than jumping somewhere else"
+    );
+    let listed = panel.outline();
+    assert_ne!(listed[0].id, asked, "the reloaded row is a new message");
+    assert!(panel.scroll_to_block(listed[0].id));
+}
+
+#[test]
+fn outline_lists_jumpable_blocks_with_first_line_previews() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "first line\nignored".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Tool(Box::new(ToolRole {
+            id: "t1".into(),
+            status: ToolStatus::Success,
+            name: "bash".into(),
+        })),
+        "tool noise".into(),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "an answer\nignored".into(),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Error, "boom".into()));
+    panel.push(DisplayMessage::plan(
+        "the plan text".into(),
+        "plans/x.md".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "x".repeat(OUTLINE_PREVIEW_BYTES + 60),
+    ));
+    rebuild(&mut panel);
+
+    let outline = panel.outline();
+    let kinds: Vec<&str> = outline
+        .iter()
+        .map(|entry| <&'static str>::from(entry.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["turn", "thinking", "reply", "turn"],
+        "tools, errors and plan announcements are not jumpable blocks"
+    );
+    assert_eq!(
+        outline[0].text, "first line",
+        "preview stops at the first line"
+    );
+    assert_eq!(outline[2].text, "an answer");
+    assert_eq!(
+        outline[3].text.len(),
+        OUTLINE_PREVIEW_BYTES,
+        "a long first line is cut at the cap"
+    );
+    let ids: Vec<u64> = outline.iter().map(|entry| entry.id).collect();
+    assert_eq!(
+        ids.iter().collect::<HashSet<_>>().len(),
+        ids.len(),
+        "every entry carries its own id"
+    );
+
+    for entry in &outline {
+        assert!(
+            panel.scroll_to_block(entry.id),
+            "every id the outline hands out is a jump the panel answers"
+        );
+    }
+    assert!(
+        !panel.scroll_to_block(ids.len() as u64 + 1000),
+        "an id nobody was handed lands nowhere"
+    );
+}
+
+#[test]
+fn outline_preview_ends_on_a_char_boundary() {
+    // Two bytes wide and it straddles the cap, so a cut at the cap alone
+    // would hand the pane half a character.
+    const STRADDLING: &str = "é";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        format!("{}{STRADDLING}tail", "x".repeat(OUTLINE_PREVIEW_BYTES - 1)),
+    ));
+    rebuild(&mut panel);
+
+    assert_eq!(
+        panel.outline()[0].text,
+        "x".repeat(OUTLINE_PREVIEW_BYTES - 1),
+        "the preview drops the whole character the cap falls inside"
+    );
+}
+
+#[test]
 fn ctrl_d_to_bottom_re_enables_auto_scroll() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.streaming_text.set_buffer(&"a\n".repeat(30));

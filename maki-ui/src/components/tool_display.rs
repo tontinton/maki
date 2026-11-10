@@ -1042,7 +1042,7 @@ mod tests {
     use super::*;
 
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
-    use crate::components::{DisplayRole, ToolRole};
+    use crate::components::{DisplayRole, ToolRole, display_id};
     use crate::markdown::TRUNCATION_PREFIX;
     use maki_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
     use maki_agent::types::{DefaultColor, InlineStyle};
@@ -1092,6 +1092,7 @@ mod tests {
         output: Option<ToolOutput>,
     ) -> DisplayMessage {
         DisplayMessage {
+            id: display_id(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status,
@@ -1307,6 +1308,7 @@ mod tests {
 
     fn task_msg(output: String) -> DisplayMessage {
         DisplayMessage {
+            id: display_id(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
@@ -1408,6 +1410,7 @@ mod tests {
 
     fn index_msg(body: &str) -> DisplayMessage {
         DisplayMessage {
+            id: display_id(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
@@ -1454,6 +1457,7 @@ mod tests {
 
     fn snapshot_msg(snapshot: BufferSnapshot) -> DisplayMessage {
         DisplayMessage {
+            id: display_id(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
@@ -1781,6 +1785,7 @@ mod tests {
             )
         };
         DisplayMessage {
+            id: display_id(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status,
@@ -1882,6 +1887,7 @@ mod tests {
     ) -> DisplayMessage {
         let lines: Vec<String> = (0..line_count).map(|i| format!("{prefix} {i}")).collect();
         DisplayMessage {
+            id: display_id(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
@@ -2004,6 +2010,7 @@ mod tests {
             style: SpanStyle::Default,
         }]]);
         let msg = DisplayMessage {
+            id: display_id(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
@@ -2043,6 +2050,7 @@ mod tests {
             style: SpanStyle::Default,
         }]]);
         let msg = DisplayMessage {
+            id: display_id(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
@@ -2079,6 +2087,7 @@ mod tests {
     fn search_text_reaches_the_live_buffer_of_a_running_tool() {
         const LIVE_TEXT: &str = "streaming_line";
         let msg = DisplayMessage {
+            id: display_id(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::InProgress,

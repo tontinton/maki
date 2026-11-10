@@ -31,6 +31,7 @@ pub(crate) mod tool_display;
 pub(crate) mod usage_modal;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -392,8 +393,25 @@ pub enum ToolStatus {
     Error,
 }
 
+/// Next id handed out by [`display_id`]. Process wide, so an id from one
+/// chat never names a message in another: a plugin that listed the main
+/// transcript and then finds a subagent chat focused gets a miss, not a jump
+/// into the wrong conversation.
+static NEXT_DISPLAY_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The address a transcript outline entry carries and `scroll_to_block`
+/// answers to. Assigned when the message is built, so it survives a scroll,
+/// a rerender and a rewind of everything after it.
+pub(crate) fn display_id() -> u64 {
+    NEXT_DISPLAY_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone)]
 pub struct DisplayMessage {
+    /// Unique among the messages of every chat in the process, so an id from
+    /// one transcript names nothing in another. Not stable across a reload:
+    /// the rows read back from disk are new messages with new ids.
+    pub id: u64,
     pub role: DisplayRole,
     pub text: String,
     pub images: Vec<ImageSource>,
@@ -476,6 +494,7 @@ impl From<TaskEnd> for BackgroundOutcome {
 impl DisplayMessage {
     pub fn new(role: DisplayRole, text: String) -> Self {
         Self {
+            id: display_id(),
             role,
             text,
             images: Vec::new(),
@@ -514,27 +533,8 @@ impl DisplayMessage {
 
     pub fn plan(text: String, plan_path: String) -> Self {
         Self {
-            role: DisplayRole::Assistant,
-            text,
-            images: Vec::new(),
-            tool_input: None,
-            tool_raw_input: None,
-            tool_output: None,
-            live_output: None,
-            annotation: None,
             plan_path: Some(plan_path),
-            timestamp: None,
-            turn_usage: None,
-            truncated_lines: 0,
-            render_snapshot: None,
-            render_header: None,
-            snapshot_theme_gen: 0,
-            thinking_expanded: false,
-            movable: false,
-            background: None,
-            detail: None,
-            detail_expanded: false,
-            task_end: None,
+            ..Self::new(DisplayRole::Assistant, text)
         }
     }
 

@@ -10673,6 +10673,91 @@ fn split_question_keeps_transcript_selectable_and_keyboard_focus(dir: Split) {
     assert!(app.awaiting_input());
 }
 
+/// A plugin window over the whole screen, every line filled with one glyph, so
+/// any cell a modal can paint over is a cell the window answers to.
+fn open_full_pane(app: &mut App, line: &str) -> UnboundedReceiver<WinEvent> {
+    let buf = Arc::new(SharedBuf::new());
+    for _ in 0..PANE_ROWS {
+        buf.append(SnapshotLine::plain(line.into()));
+    }
+    let (event_tx, event_rx) = unbounded_channel::<WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
+    app.float_mgr.open(
+        buf,
+        FloatConfig {
+            width: Dimension::Abs(TEST_AREA.width),
+            height: Dimension::Abs(TEST_AREA.height),
+            border: Border::None,
+            ..FloatConfig::default()
+        },
+        true,
+        event_tx,
+        cmd_rx,
+    );
+    event_rx
+}
+
+fn glyph_at(buffer: &Buffer, row: u16, col: u16) -> String {
+    buffer
+        .cell(Position::new(col, row))
+        .expect("cell on screen")
+        .symbol()
+        .to_owned()
+}
+
+fn click_left(app: &mut App, row: u16, col: u16) {
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        col,
+        row,
+    ));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), col, row));
+}
+
+const PANE_ROWS: usize = 30;
+const PANE_GLYPH: char = '.';
+const PANE_CLICK_ROW: u16 = 20;
+const PANE_CLICK_COL: u16 = 40;
+const ALERT_OVER_PANE: &str = "an alert opened over the window";
+
+/// The modal owns the screen while it is up, keys and mouse alike. A click
+/// inside it must not reach the window drawn under it, or a contents pane
+/// jumps the transcript on a click meant for the alert.
+#[test]
+fn modal_over_a_window_takes_the_click_the_window_would_hear() {
+    let mut app = test_app();
+    let mut events = open_full_pane(&mut app, &PANE_GLYPH.to_string().repeat(60));
+    let (_, buffer) = draw_to_buffer(&mut app);
+    assert_eq!(
+        glyph_at(&buffer, PANE_CLICK_ROW, PANE_CLICK_COL),
+        PANE_GLYPH.to_string(),
+        "the clicked cell belongs to the window before the alert"
+    );
+
+    click_left(&mut app, PANE_CLICK_ROW, PANE_CLICK_COL);
+    assert!(
+        iter::from_fn(|| events.try_recv().ok())
+            .any(|event| matches!(event, WinEvent::Click { .. })),
+        "a window answers a click on its own line"
+    );
+    let _ = iter::from_fn(|| events.try_recv().ok()).count();
+
+    app.open_alert(ALERT_OVER_PANE.into());
+    let (_, buffer) = draw_to_buffer(&mut app);
+    assert_ne!(
+        glyph_at(&buffer, PANE_CLICK_ROW, PANE_CLICK_COL),
+        PANE_GLYPH.to_string(),
+        "the alert is painted over the clicked cell"
+    );
+
+    click_left(&mut app, PANE_CLICK_ROW, PANE_CLICK_COL);
+    assert!(
+        iter::from_fn(|| events.try_recv().ok())
+            .all(|event| !matches!(event, WinEvent::Click { .. })),
+        "a click inside a modal belongs to the modal, not to the window behind it"
+    );
+}
+
 #[test]
 fn below_split_reserves_bottom_and_suppresses_input() {
     let mut app = test_app();

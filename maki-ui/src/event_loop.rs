@@ -38,8 +38,8 @@ use maki_lua::session_snapshot::{
 };
 use maki_lua::{
     EventHandle, HintReader, InputMode, InputRequest, InputRulesReader, Key, KeymapReader,
-    LuaCommandReader, ModelRequest, PackCommand, PackPreparation, PlanRequest, SessionEndReason,
-    SessionRequest, TaskRequest, UiAction, UiReply, WinEvent,
+    LuaCommandReader, ModelRequest, PackCommand, PackPreparation, PlanRequest, STALE_OUTLINE_ERR,
+    SessionEndReason, SessionRequest, TaskRequest, UiAction, UiReply, WinEvent,
 };
 use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
@@ -1174,6 +1174,40 @@ impl<'t> EventLoop<'t> {
             }
             UiAction::WinRestView { scroll_top } => {
                 self.focused_app().scroll_to_row(scroll_top);
+            }
+            UiAction::ScrollToBlock {
+                id,
+                session,
+                reply_tx,
+            } => {
+                let reply = match self.tab_of(session) {
+                    None => Err(NOT_LIVE_ERR.to_owned()),
+                    Some(idx) => {
+                        if self.sessions[idx].app.scroll_to_block(id) {
+                            Ok(json!(true))
+                        } else {
+                            Err(format!("{STALE_OUTLINE_ERR}: {id}"))
+                        }
+                    }
+                };
+                let _ = reply_tx.send(reply);
+            }
+            UiAction::TranscriptOutline { session, reply_tx } => {
+                let reply = match self.tab_of(session) {
+                    None => Err(NOT_LIVE_ERR.to_owned()),
+                    Some(idx) => Ok(json!(
+                        self.sessions[idx]
+                            .app
+                            .transcript_outline()
+                            .iter()
+                            .map(|entry| {
+                                let kind: &'static str = entry.kind.into();
+                                json!({ "id": entry.id, "kind": kind, "text": entry.text })
+                            })
+                            .collect::<Vec<_>>()
+                    )),
+                };
+                let _ = reply_tx.send(reply);
             }
             // Answered before dispatching, which can hold the loop for as long
             // as `$EDITOR` is open.

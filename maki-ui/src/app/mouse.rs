@@ -9,13 +9,14 @@ use crate::selection::{
 };
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use strum::IntoEnumIterator;
 
 use crate::components::input::InputAction;
 use crate::image;
 use crate::repaint::Dirty;
 
 use super::image_paste::{spawn_read, take_ready};
-use super::{App, InputWriter, MAIN_CHAT, Msg};
+use super::{App, InputWriter, KeyboardOwner, MAIN_CHAT, Msg};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -64,6 +65,11 @@ impl App {
                     } else {
                         let zone = sel.zone;
                         self.selection_state = None;
+                        if !self.modal_above_panes()
+                            && self.float_mgr.click_at(event.row, event.column)
+                        {
+                            return;
+                        }
                         if zone == SelectionZone::Messages {
                             self.click_messages(event.row, event.column);
                         }
@@ -72,6 +78,17 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Whether a click can land on a plugin window. [`KeyboardOwner`] is in
+    /// draw order, so anything above the window that holds the keys is also
+    /// painted over it: an alert that popped up over a pane takes the click
+    /// the pane behind it would otherwise hear. The window's own focus is not
+    /// a blocker, since a focused popup is exactly what the click means.
+    fn modal_above_panes(&self) -> bool {
+        KeyboardOwner::iter()
+            .take_while(|&owner| owner != KeyboardOwner::FocusedWindow)
+            .any(|owner| self.holds_keyboard(owner))
     }
 
     /// A moved row whose task tab was deleted, or never restored, has no task

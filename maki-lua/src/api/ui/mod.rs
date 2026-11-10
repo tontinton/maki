@@ -42,6 +42,8 @@ const INPUT_EDIT: &str = "input_edit";
 const INPUT_DECORATE: &str = "input_decorate";
 const INPUT_SUBMIT: &str = "input_submit";
 const OPEN_WIN: &str = "open_win";
+const SCROLL_TO_BLOCK: &str = "scroll_to_block";
+const TRANSCRIPT_OUTLINE: &str = "transcript_outline";
 const SET_STATUS_HINT: &str = "set_status_hint";
 const SESSION_OPT: &str = "session";
 const SINGLE_EDIT_KEYS: [&str; 3] = ["start", "stop", "text"];
@@ -627,6 +629,97 @@ async fn action(
         .await
     );
     Ok((Some(reply), None))
+}
+
+/// Scrolls a chat to the entry with {id}, one of the ids
+/// `maki.ui.transcript_outline()` returned.
+///
+/// The id names one message rather than one position in a list, so the jump
+/// lands on the block the pane showed even when the transcript moved in the
+/// meantime. When that message is gone, after a rewind or because the tab now
+/// shows another chat, nothing moves and the call answers an error: read the
+/// outline again and list from there.
+///
+/// The scroll releases the bottom pin, so streaming output stops dragging the
+/// view away from the block you jumped to.
+///
+/// @param id integer The `id` of an entry from `maki.ui.transcript_outline()`.
+/// @param opts table? `session` (string?) Session id of the tab to scroll. Defaults to the focused one.
+/// @return (boolean|nil, string|nil) `true` on success, or nil and an error when the entry is gone, the session is open in no tab, or there is no UI.
+/// @example
+/// -- A pane that lists the outline, one entry per line, jumps on click:
+/// local entries = assert(maki.ui.transcript_outline())
+/// local ev = win:recv() -- {type = "click", row} for a painted line
+/// maki.ui.scroll_to_block(entries[ev.row].id)
+#[lua_fn]
+async fn scroll_to_block(
+    _lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+    id: u64,
+    opts: Option<Table>,
+) -> LuaResult<Pair<bool>> {
+    let session = match &opts {
+        Some(opts) => {
+            reject_unknown_fields(opts, &[SESSION_OPT], SCROLL_TO_BLOCK)?;
+            session_opt(SCROLL_TO_BLOCK, opts)?
+        }
+        None => None,
+    };
+    let reply = try_pair!(
+        ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::ScrollToBlock {
+            id,
+            session,
+            reply_tx
+        })
+        .await
+    );
+    try_pair!(reply);
+    Ok((Some(true), None))
+}
+
+/// Reads a transcript as the chat itself lists it: one entry per jumpable
+/// block, in display order. Each entry is `{ id, kind, text }`, where `id` is
+/// what [`scroll_to_block`](#maki-ui-scroll_to_block) jumps with, `kind` is
+/// one of the kinds below, and `text` is a first-line preview meant for a
+/// contents pane to clip to its own width.
+///
+/// The kinds, the items a contents pane shows:
+///
+/// - `"turn"`: a visible user message. A turn starts where the user spoke;
+///   everything the model answered with sits under it. Nudges, observations
+///   and other entries the transcript never shows are not listed.
+/// - `"thinking"`: a non-empty thinking block, in order.
+/// - `"reply"`: a non-empty assistant text block, in order.
+///
+/// More kinds may show up later, so skip an entry whose `kind` you do not
+/// know rather than stop on it. Tool calls and results show in the transcript
+/// but are not jumpable entries. A collapsed thinking block jumps to its
+/// indicator line; expanding it is a click in the chat, not a scroll.
+///
+/// @param opts table? `session` (string?) Session id of the tab to read. Defaults to the focused one.
+/// @return (table|nil, string|nil) Array of outline entries, or nil and an error when the session is open in no tab or there is no UI.
+/// @example
+/// -- Print every entry a jump can answer to:
+/// for _, b in ipairs(maki.ui.transcript_outline() or {}) do
+///   print(b.kind, b.id, b.text)
+/// end
+#[lua_fn(guard = SessionRead)]
+async fn transcript_outline(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<mlua::Value>> {
+    let session = match &opts {
+        Some(opts) => {
+            reject_unknown_fields(opts, &[SESSION_OPT], TRANSCRIPT_OUTLINE)?;
+            session_opt(TRANSCRIPT_OUTLINE, opts)?
+        }
+        None => None,
+    };
+    ui_json_roundtrip(&lua, tx.as_ref(), move |reply_tx| {
+        UiAction::TranscriptOutline { session, reply_tx }
+    })
+    .await
 }
 
 async fn input_roundtrip(
@@ -1265,9 +1358,9 @@ lua_table! {
     /// Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
     /// still work. The calls that need a screen behave like this:
     ///
-    /// - `input`, `input_edit`, `input_decorate`, `input_submit`, and `action`
-    ///   on a built-in name return `nil, "no interactive UI attached"`.
-    ///   Plugin actions still run.
+    /// - `input`, `input_edit`, `input_decorate`, `input_submit`, `scroll_to_block`,
+    ///   `transcript_outline`, and `action` on a built-in name return
+    ///   `nil, "no interactive UI attached"`. Plugin actions still run.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
     /// - `open_win`, `set_status_hint`, `set_window_title`, `set_mode`, `set_cursor_shape` and `input_rules` have no effect.
@@ -1431,7 +1524,8 @@ lua_table! {
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual set_mode, manual set_cursor_shape, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
+        manual set_mode, manual set_cursor_shape, manual flash, manual action, manual scroll_to_block,
+        manual transcript_outline, manual open_editor, manual open_win, manual set_status_hint,
         manual set_window_title, manual input, manual input_rules, manual input_decorate,
         manual input_edit, manual input_submit,
     ]
@@ -1457,6 +1551,8 @@ pub(crate) fn create_ui_table(
         Arc::clone(&plugin),
         reach.clone(),
     )?;
+    scroll_to_block__register(&t, lua, ui_action_tx.clone())?;
+    transcript_outline__register(&t, lua, reach.permissions(), ui_action_tx.clone())?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
     input__register(&t, lua, reach.permissions(), ui_action_tx.clone())?;
     input_edit__register(

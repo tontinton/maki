@@ -74,8 +74,8 @@ use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks,
     InputMode, InputRule, InputRulesReader, InputSnapshot, InputSubmit, Key, KeymapReader,
-    LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, Permission, PluginReach,
-    WinView, is_reserved,
+    LuaCommandReader, OutlineEntry, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, Permission,
+    PluginReach, WinView, is_reserved,
 };
 use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig};
@@ -1251,6 +1251,14 @@ impl App {
 
     pub(crate) fn scroll_to_row(&mut self, doc_row: u32) {
         self.active_chat().scroll_to_row(doc_row);
+    }
+
+    pub(crate) fn scroll_to_block(&mut self, id: u64) -> bool {
+        self.active_chat().scroll_to_block(id)
+    }
+
+    pub(crate) fn transcript_outline(&self) -> Vec<OutlineEntry> {
+        self.chats[self.active_chat].outline()
     }
 
     fn clear_selection_unless_pending_copy(&mut self) {
