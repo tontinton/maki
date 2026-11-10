@@ -80,7 +80,7 @@ pub fn user_style() -> RoleStyle {
         prefix: "you> ",
         text_style: theme::current().assistant,
         prefix_style: theme::current().user,
-        use_markdown: true,
+        use_markdown: false,
         max_line_bytes: None,
     }
 }

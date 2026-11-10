@@ -828,6 +828,18 @@ fn search_text_instruction_segment_indexes_its_own_blocks() {
     );
 }
 
+#[test_case("fix src/__init__.py" ; "underscores")]
+#[test_case("--- a/x\n+++ b/x\n- old\n+ new" ; "pasted_diff")]
+#[test_case("    indented\n# not a heading" ; "indentation_and_hash")]
+fn user_message_shows_as_typed(text: &str) {
+    let message = DisplayMessage::new(DisplayRole::User, text.into());
+    let rows: Vec<String> = build_message_lines(&message, VIEW_WIDTH)
+        .iter()
+        .map(|row| row.to_string())
+        .collect();
+    assert_eq!(rows.join("\n"), format!("{}{text}", user_style().prefix));
+}
+
 #[test]
 fn search_text_includes_role_prefix() {
     let md = "# Heading\n\nSome **bold** text";
