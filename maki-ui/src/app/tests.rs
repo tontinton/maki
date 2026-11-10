@@ -6719,12 +6719,13 @@ fn re_edit_waits_for_the_run_to_settle() {
         backgrounded: false,
     }))));
 
-    assert!(matches!(app.state.plan, PlanState::Ready(_)));
+    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
     assert!(app.plan_cycle.refining);
     assert!(!app.plan_form.is_visible(), "the revision is not settled");
 
     app.transition_plan(PlanTrigger::Settled);
     assert!(app.plan_form.is_visible());
+    assert!(app.state.plan.is_ready());
 }
 
 /// Approval waits for the queue drain, not the run's `Done`: a refinement
@@ -7002,20 +7003,135 @@ fn a_resumed_ready_plan_shows_the_review_hint() {
     );
 }
 
-/// A plan whose refinement is still in flight is not saved as written, so a
-/// crash mid-cycle does not come back looking approved.
+/// An input-only refinement leaves the old settled revision on disk, so it
+/// stays persisted. A write demotes it, and only a settle persists it again.
 #[test]
-fn a_refining_plan_is_not_persisted_as_written() {
+fn a_refining_plan_persists_only_a_settled_revision() {
     let (_tmp, mut app) = plan_app();
     assert!(app.build_meta().plan_written);
 
     app.start_from_queue(&queued_msg("refine"));
-    assert!(!app.build_meta().plan_written);
+    assert!(
+        app.build_meta().plan_written,
+        "the old revision is still valid"
+    );
     assert!(app.plan_cycle.refining);
+
+    rewrite_plan(&mut app);
+    assert!(!app.build_meta().plan_written);
+    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
 
     app.update(agent_msg_with_run_id(done(), app.run_id));
     app.on_queue_drained();
     assert!(app.build_meta().plan_written);
+    assert!(app.state.plan.is_ready());
+}
+
+/// An interrupted rewrite of a previously ready plan is a draft, not a new
+/// approval. Ctrl+T must not resurrect it.
+#[test]
+fn an_interrupted_rewrite_demotes_a_ready_plan() {
+    let (_tmp, mut app) = plan_app();
+    rewrite_plan(&mut app);
+    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
+
+    app.plan_turn_interrupted();
+
+    assert!(!app.state.plan.is_ready());
+    assert!(!app.plan_cycle.refining);
+    assert!(!app.plan_form.is_visible());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(FLASH_PLAN_DRAFT_INTERRUPTED)
+    );
+
+    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    assert!(
+        !app.plan_form.is_visible(),
+        "an interrupted draft has no review surface"
+    );
+}
+
+/// Leaving plan mode ends its cycle. A later write from the still-running
+/// turn cannot arm an approval the user asked to leave behind.
+#[test]
+fn leaving_plan_mode_ends_the_cycle() {
+    let (_tmp, mut app) = plan_app();
+    app.start_from_queue(&queued_msg("refine"));
+    assert!(app.plan_cycle.refining);
+
+    app.toggle_mode();
+    assert_eq!(app.state.mode, Mode::Build);
+    assert!(!app.plan_cycle.refining);
+    assert!(
+        app.state.plan.is_ready(),
+        "no write, the old revision stays"
+    );
+
+    rewrite_plan(&mut app);
+    assert!(
+        app.state.plan.is_ready(),
+        "a write after leaving is ignored"
+    );
+    assert!(!app.plan_cycle.refining);
+    assert!(!app.plan_form.is_visible());
+
+    app.toggle_mode();
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(!app.plan_form.is_visible());
+    assert!(app.plan_form.hint_line().is_some());
+}
+
+/// The approval waits through every queued turn, including two that reuse
+/// the current run id. Only the drain opens the form.
+#[test]
+fn a_queued_refinement_defers_approval_until_the_queue_drains() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = path.display().to_string();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path);
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
+        id: "t1".into(),
+        tool: "write".into(),
+        output: Arc::new(ToolOutput::Plain(
+            format!("wrote 42 bytes to {written}").into(),
+        )),
+        is_error: false,
+        annotation: None,
+        written_path: Some(written),
+        backgrounded: false,
+    }))));
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    assert!(!app.plan_form.is_visible());
+
+    app.update(agent_msg(AgentEvent::QueueItemConsumed {
+        text: "again".into(),
+        images: Vec::new(),
+        plan: true,
+    }));
+    assert!(app.plan_cycle.refining);
+    assert!(!app.plan_form.is_visible());
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+
+    app.update(agent_msg(AgentEvent::QueueItemConsumed {
+        text: "and again".into(),
+        images: Vec::new(),
+        plan: true,
+    }));
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    assert!(!app.plan_form.is_visible(), "no approval between turns");
+
+    // The event loop calls this for the current run's drain.
+    app.on_queue_drained();
+
+    assert!(app.state.plan.is_ready());
+    assert!(app.plan_form.is_visible());
 }
 
 /// A plan file that moved since the review is not implemented on the first
@@ -7159,18 +7275,22 @@ fn implementing_an_unreadable_plan_changes_nothing(clear_context: bool) {
 
 fn rewrite_plan(app: &mut App) {
     let written = app.state.plan.path().unwrap().display().to_string();
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t2".into(),
-        tool: "write".into(),
-        output: Arc::new(ToolOutput::Plain(
-            format!("wrote 99 bytes to {written}").into(),
-        )),
-        is_error: false,
-        annotation: None,
-        written_path: Some(written),
-        backgrounded: false,
-    }))));
+    let run_id = app.run_id;
+    app.update(agent_msg_with_run_id(
+        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
+            id: "t2".into(),
+            tool: "write".into(),
+            output: Arc::new(ToolOutput::Plain(
+                format!("wrote 99 bytes to {written}").into(),
+            )),
+            is_error: false,
+            annotation: None,
+            written_path: Some(written),
+            backgrounded: false,
+        })),
+        run_id,
+    ));
 }
 
 fn dismiss_plan_esc(app: &mut App) {
@@ -7193,11 +7313,12 @@ fn a_rewrite_after_dismiss_needs_a_new_review() {
         !app.plan_form.is_visible(),
         "the new revision is not settled"
     );
-    assert!(app.state.plan.is_ready());
+    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
     assert!(app.plan_cycle.refining);
 
     app.transition_plan(PlanTrigger::Settled);
     assert!(app.plan_form.is_visible(), "a new revision needs a review");
+    assert!(app.state.plan.is_ready());
 }
 
 #[test]

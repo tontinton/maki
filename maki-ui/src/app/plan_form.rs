@@ -94,8 +94,7 @@ impl App {
             Err(TryRecvError::Empty) => return Dirty::NO,
         };
         self.plan_answers.abandon();
-        if self.state.mode != Mode::Plan || self.plan_cycle.refining || !self.state.plan.is_ready()
-        {
+        if !self.plan_review_ready() {
             self.plan_form.forget_menu();
             return Dirty::NO;
         }

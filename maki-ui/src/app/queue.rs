@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use maki_agent::{AgentInput, AgentMode, Delivery, ImageSource, InputSource, SessionMailbox};
 use maki_lua::agent_autocmd::HostEvent;
 
-use super::{Action, App, PlanTrigger, Status};
+use super::{Action, App, Mode, PlanTrigger, Status};
 
 use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
 use crate::components::queue_panel::QueueEntry;
@@ -285,7 +285,7 @@ impl App {
         plan: bool,
     ) {
         self.status = Status::Streaming;
-        if plan {
+        if plan && self.state.mode == Mode::Plan {
             self.transition_plan(PlanTrigger::RefinementStarted);
         }
         self.main_chat().show_user_message(text, images);
@@ -328,7 +328,8 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
-        if matches!(input.mode, AgentMode::Plan(_))
+        if self.state.mode == Mode::Plan
+            && matches!(input.mode, AgentMode::Plan(_))
             && (!display.is_empty() || !input.images.is_empty())
         {
             self.transition_plan(PlanTrigger::RefinementStarted);

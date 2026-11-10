@@ -334,7 +334,7 @@ impl App {
     /// A write this session can review. `None` is a result that failed or no
     /// write at all.
     fn note_plan_write(&mut self, written: Option<&str>) {
-        if (self.state.mode != Mode::Plan && !self.plan_cycle.refining)
+        if self.state.mode != Mode::Plan
             || written.is_none()
             || !self
                 .state

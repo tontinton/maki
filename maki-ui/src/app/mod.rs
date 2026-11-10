@@ -904,11 +904,13 @@ impl App {
         }
     }
 
+    /// The one definition of a plan the user may review or implement.
+    fn plan_review_ready(&self) -> bool {
+        self.state.mode == Mode::Plan && !self.plan_cycle.refining && self.state.plan.is_ready()
+    }
+
     fn plan_form_open(&self) -> bool {
-        self.state.mode == Mode::Plan
-            && !self.plan_cycle.refining
-            && self.state.plan.is_ready()
-            && self.plan_form.is_visible()
+        self.plan_review_ready() && self.plan_form.is_visible()
     }
 
     fn plan_form_active(&self) -> bool {
@@ -1714,7 +1716,7 @@ impl App {
     }
 
     fn plan_toggle_ready(&self) -> bool {
-        self.state.mode == Mode::Plan && !self.plan_cycle.refining && self.state.plan.is_ready()
+        self.plan_review_ready()
     }
 
     /// [`Self::run_action`] for a default key, which has no one to answer.

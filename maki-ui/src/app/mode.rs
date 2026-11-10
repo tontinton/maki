@@ -36,8 +36,8 @@ pub(crate) enum PlanTrigger {
 }
 
 /// The part of the plan lifecycle that is not the plan file itself. `Ready`
-/// keeps meaning "the agent wrote the plan", as `maki.plan.read` documents;
-/// approval waits for this cycle to settle.
+/// is a settled revision the user can review; a write starts a new cycle and
+/// demotes it until the run and everything queued behind it finish.
 #[derive(Default)]
 pub(crate) struct PlanCycle {
     /// A drafting cycle is active, so the plan is not approvable however
@@ -82,6 +82,12 @@ impl PlanState {
         }
     }
 
+    pub(crate) fn mark_drafting(&mut self) {
+        if let Self::Ready(p) = self {
+            *self = Self::Drafting(std::mem::take(p));
+        }
+    }
+
     pub(crate) fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
     }
@@ -123,12 +129,12 @@ impl App {
     }
 
     fn plan_wrote(&mut self) {
-        if (self.state.mode != Mode::Plan && !self.plan_cycle.refining)
-            || self.state.plan.path().is_none()
-        {
+        if self.state.mode != Mode::Plan || self.state.plan.path().is_none() {
             return;
         }
         self.begin_plan_refinement();
+        // The revision the user could approve is no longer the one on disk.
+        self.state.plan.mark_drafting();
         self.plan_cycle.written = true;
         self.plan_cycle.reviewed = None;
     }
@@ -161,6 +167,7 @@ impl App {
         if !success {
             self.plan_answers.abandon();
             if written {
+                self.state.plan.mark_drafting();
                 self.plan_cycle.reviewed = None;
                 self.flash(FLASH_PLAN_DRAFT_INTERRUPTED.into());
             }
@@ -224,6 +231,9 @@ impl App {
             return;
         }
         self.plan_answers.abandon();
+        if self.state.mode == Mode::Plan && mode == Mode::Build {
+            self.plan_turn_interrupted();
+        }
         match mode {
             Mode::Plan => self.enter_plan(),
             Mode::Build => self.state.mode = Mode::Build,
@@ -232,6 +242,10 @@ impl App {
 
     pub(super) fn toggle_mode(&mut self) -> Vec<super::Action> {
         self.plan_answers.abandon();
+        let leaving_plan = self.state.mode == Mode::Plan;
+        if leaving_plan {
+            self.plan_turn_interrupted();
+        }
         match self.state.mode {
             Mode::Build => self.enter_plan(),
             Mode::Plan => self.state.mode = Mode::Build,

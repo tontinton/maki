@@ -1376,7 +1376,10 @@ maki.plan.read({opts?})
 Read the current plan state. Returns `{ mode, path, content, ready }`:
 - `mode` is `"plan"` or `"build"`.
 - `path` is the absolute plan path once the session has one, else `nil`.
-- `ready` is `true` once the agent has written the plan file.
+- `ready` is `true` once the plan file has a settled revision the user can
+  review. A write alone is not enough: the turn and anything queued behind
+  it have to finish. Review can still be suspended while a refinement is in
+  flight over an earlier settled revision.
 - `content` is the file contents, `nil` when the plan is not ready or the
   read failed.
 
