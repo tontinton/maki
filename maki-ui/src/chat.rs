@@ -283,6 +283,7 @@ impl Chat {
             }
             // The App takes these before they reach a chat.
             AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::FileWritten { .. }
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::Retry { .. } => {}

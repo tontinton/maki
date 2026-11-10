@@ -189,6 +189,13 @@ pub async fn run(
             tail.publish(&mut done, moved).await;
         }
     }
+    if origin == CallOrigin::Nested
+        && let Some(path) = done.written_path()
+    {
+        ctx.event_tx.try_send(AgentEvent::FileWritten {
+            path: path.to_owned(),
+        });
+    }
     done.call = Some(Box::new(CallRecord {
         input: input.into_owned(),
         duration: took,
@@ -1537,11 +1544,13 @@ mod tests {
     use crate::tools::{
         BackgroundFor, BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture,
         HeaderResult, MovedCall, ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool,
-        ToolAudience, ToolExecResult, ToolFilter, ToolHook, ToolReach, local_tool,
+        ToolAudience, ToolExecResult, ToolFilter, ToolHook, ToolInvocation, ToolReach, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
     const TEST_ID: &str = "t1";
+    const NESTED_WRITE_PATH: &str = "/plans/nested.md";
+    const EFFECT_RUN_ID: u64 = 7;
     const PROBE_WIRE: &str = "srv__probe";
     const PROBE_QUALIFIED: &str = "srv.probe";
     const OTHER_WIRE: &str = "srv__other";
@@ -1668,6 +1677,91 @@ mod tests {
 
     fn mcp_ctx(mcp: &McpSession) -> ToolContext {
         with_mcp(stub_ctx(&AgentMode::Build), mcp)
+    }
+
+    struct WritingMock;
+
+    struct WritingInvocation;
+
+    impl ToolInvocation for WritingInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("write".into()))
+        }
+
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async {
+                ToolExecResult {
+                    output: Ok(ToolOutput::Plain("wrote".into())),
+                    annotation: None,
+                    written_path: Some(NESTED_WRITE_PATH.into()),
+                    moved: None,
+                }
+            })
+        }
+    }
+
+    impl Tool for WritingMock {
+        fn name(&self) -> &str {
+            "writer"
+        }
+
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "writer".into()
+        }
+
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+
+        fn audience(&self) -> ToolAudience {
+            ToolAudience::all()
+        }
+
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(WritingInvocation))
+        }
+    }
+
+    /// A nested call's write has to reach the host even though the wrapper
+    /// flattens its result to text. The effect is sent before the wrapper can
+    /// fail.
+    #[tokio::test]
+    async fn a_nested_write_reports_its_effect_on_its_own() {
+        let (tx, rx) = flume::unbounded();
+        let sender = EventSender::new(tx, EFFECT_RUN_ID);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&sender), None);
+        ctx.registry = registered(Arc::new(WritingMock));
+
+        let done = dispatch_nested(&ctx, "writer", &serde_json::json!({})).await;
+
+        assert_eq!(done.written_path(), Some(NESTED_WRITE_PATH));
+        let envelope = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the nested effect never reached the host");
+        assert_eq!(envelope.run_id, EFFECT_RUN_ID);
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::FileWritten { ref path } if path == NESTED_WRITE_PATH
+        ));
+    }
+
+    /// A top-level write already carries its path on `ToolDone`, so the
+    /// separate effect would be a duplicate.
+    #[tokio::test]
+    async fn a_top_level_write_reports_no_separate_effect() {
+        let (tx, rx) = flume::unbounded();
+        let sender = EventSender::new(tx, EFFECT_RUN_ID);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&sender), None);
+        ctx.registry = registered(Arc::new(WritingMock));
+
+        let done = dispatch(&ctx, "writer", &serde_json::json!({})).await;
+
+        assert_eq!(done.written_path(), Some(NESTED_WRITE_PATH));
+        assert!(
+            !rx.try_iter()
+                .any(|envelope| matches!(envelope.event, AgentEvent::FileWritten { .. })),
+            "the effect would be a duplicate"
+        );
     }
 
     fn registered(tool: Arc<dyn Tool>) -> Arc<ToolRegistry> {

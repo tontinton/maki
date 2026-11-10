@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -145,6 +146,12 @@ impl App {
                     current_run_id = self.run_id,
                     "tool render event dropped: stale run_id"
                 );
+            }
+            return;
+        }
+        if let AgentEvent::FileWritten { path } = &envelope.event {
+            if envelope.subagent.is_none() {
+                self.note_plan_write(Some(path));
             }
             return;
         }
@@ -324,12 +331,25 @@ impl App {
         }
     }
 
-    fn record_tool_done(&mut self, chat_idx: usize, done: &ToolDoneEvent) {
-        if chat_idx == MAIN_CHAT
-            && (self.state.mode == Mode::Plan || self.plan_cycle.refining)
-            && self.state.plan.path().is_some_and(|pp| done.wrote_to(pp))
+    /// A write this session can review. `None` is a result that failed or no
+    /// write at all.
+    fn note_plan_write(&mut self, written: Option<&str>) {
+        if (self.state.mode != Mode::Plan && !self.plan_cycle.refining)
+            || written.is_none()
+            || !self
+                .state
+                .plan
+                .path()
+                .is_some_and(|plan| written.is_some_and(|path| Path::new(path) == plan))
         {
-            self.transition_plan(PlanTrigger::WriteDone);
+            return;
+        }
+        self.transition_plan(PlanTrigger::WriteDone);
+    }
+
+    fn record_tool_done(&mut self, chat_idx: usize, done: &ToolDoneEvent) {
+        if chat_idx == MAIN_CHAT {
+            self.note_plan_write(done.written_path());
         }
         self.state
             .session_mut()

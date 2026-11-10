@@ -391,6 +391,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             | AgentEvent::ToolMovable { .. }
             | AgentEvent::ToolParts { .. }
             | AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::FileWritten { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionStarted

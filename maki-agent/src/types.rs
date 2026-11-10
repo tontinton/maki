@@ -713,6 +713,12 @@ pub enum AgentEvent {
         content: String,
     },
     ToolDone(Box<ToolDoneEvent>),
+    /// A nested call wrote a file. Its wrapper's result cannot carry that:
+    /// batch and interpreter children flatten to text. The effect travels on
+    /// its own so a plan write survives a failing wrapper.
+    FileWritten {
+        path: String,
+    },
     /// A running top-level call gained (`true`) or lost a background hook, so
     /// a Ctrl+B press would move it now.
     ToolMovable {

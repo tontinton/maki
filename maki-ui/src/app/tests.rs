@@ -6760,6 +6760,39 @@ fn a_plan_waits_for_the_queue_to_drain_before_review() {
     assert!(app.plan_form.is_visible());
 }
 
+/// A nested write reports its own effect, so a batch or interpreter child
+/// still starts the plan cycle.
+#[test_case(true, true  ; "the_plan_path_starts_a_cycle")]
+#[test_case(false, false ; "another_file_is_ignored")]
+fn a_file_written_event_controls_the_plan_cycle(matching: bool, refining: bool) {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = if matching {
+        path.display().to_string()
+    } else {
+        tmp.path().join("other.md").display().to_string()
+    };
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path);
+
+    app.update(agent_msg(AgentEvent::FileWritten { path: written }));
+
+    assert_eq!(app.plan_cycle.refining, refining);
+    assert_eq!(app.plan_cycle.written, refining);
+    assert!(!app.plan_form.is_visible());
+    assert!(!app.state.plan.is_ready());
+
+    if matching {
+        app.transition_plan(PlanTrigger::Settled);
+        assert!(app.state.plan.is_ready());
+        assert!(app.plan_form.is_visible());
+    }
+}
+
 /// A queued plan message suspends the review when the agent picks it up. A
 /// build message in the same place leaves the review alone.
 #[test_case(true, true  ; "plan_message_suspends_review")]

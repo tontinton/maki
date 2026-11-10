@@ -1104,6 +1104,7 @@ impl EventPump {
             | AgentEvent::ToolMovable { .. }
             | AgentEvent::ToolParts { .. }
             | AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::FileWritten { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionStarted
