@@ -1,3 +1,4 @@
+mod code_blocks;
 mod render;
 mod scroll;
 mod segment;
@@ -7,6 +8,7 @@ mod tests;
 
 pub use self::scroll::ScrollPos;
 
+use self::code_blocks::{CodeBlockRenders, Refresh};
 use self::render::RenderCursor;
 use self::scroll::Layout;
 use self::segment::{Segment, SegmentCache, body_width};
@@ -23,7 +25,9 @@ use super::{
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
-use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
+use crate::markdown::{
+    hr_line, plain_lines, text_to_lines, text_to_lines_with_code_blocks, truncate_output,
+};
 use crate::render_worker::RenderWorker;
 use crate::selection::{DocPos, RowPos, Selection};
 use crate::splash::{ColorTransition, Splash};
@@ -93,6 +97,7 @@ pub struct MessagesPanel {
     viewport_height: u16,
     viewport_width: u16,
     cache: SegmentCache,
+    code_blocks: CodeBlockRenders,
     hl_worker: RenderWorker,
     image_picker: Option<Picker>,
     inline_images: bool,
@@ -158,6 +163,7 @@ impl MessagesPanel {
             viewport_height: 24,
             viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
             cache: SegmentCache::new(),
+            code_blocks: CodeBlockRenders::new(lua_event_handle.clone()),
             hl_worker: RenderWorker::new(),
             image_picker: terminal_image::picker(ui_config.inline_images),
             inline_images: ui_config.inline_images,
@@ -240,6 +246,8 @@ impl MessagesPanel {
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.messages = msgs;
         self.cache.clear();
+        self.code_blocks.clear();
+        self.streaming_text.invalidate_render();
         self.expanded_tools.clear();
         self.lua_clicks.clear();
         self.live_bufs.clear();
@@ -923,7 +931,10 @@ impl MessagesPanel {
     /// running tool had to claim it was animating: it was the only way to keep
     /// them fed.
     pub fn tick(&mut self) -> Dirty {
-        let mut dirty = self.drain_highlights() | self.poll_live_bufs() | self.refresh_images();
+        let mut dirty = self.drain_highlights()
+            | self.poll_live_bufs()
+            | self.refresh_images()
+            | self.refresh_code_blocks();
         if self.show_idle_splash() {
             dirty |= self.idle_splash.poll_update(update::latest_version());
         }
@@ -943,6 +954,7 @@ impl MessagesPanel {
             // may tick for hours.
             self.elapsed_due().map_or(Cadence::IDLE, Cadence::clock),
             Cadence::when(smooth, Cadence::SMOOTH),
+            Cadence::when(self.code_blocks.has_pending(), Cadence::PENDING),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
         ])
     }
@@ -951,6 +963,26 @@ impl MessagesPanel {
         self.messages.is_empty()
             && self.streaming_thinking.is_empty()
             && self.streaming_text.is_empty()
+    }
+
+    /// Reflows only the messages whose code blocks a finished render or a
+    /// layer change redraws. The live reply is message `messages.len()`.
+    fn refresh_code_blocks(&mut self) -> Dirty {
+        let refresh = self.code_blocks.poll(Instant::now());
+        let redraws = |message: usize| match &refresh {
+            Refresh::Idle => false,
+            Refresh::All => true,
+            Refresh::Messages(messages) => messages.contains(&message),
+        };
+        for seg in self.cache.segments_mut() {
+            if seg.msg_index.is_some_and(redraws) {
+                seg.stale = true;
+            }
+        }
+        if redraws(self.messages.len()) {
+            self.streaming_text.invalidate_render();
+        }
+        Dirty::from(!matches!(refresh, Refresh::Idle))
     }
 
     /// A resume can come back to a terminal whose font size changed while we
@@ -999,7 +1031,11 @@ impl MessagesPanel {
         let width = area.width.saturating_sub(1);
         let theme_gen = theme::generation();
         let theme_changed = self.theme_generation != theme_gen;
-        let needs_reflow = self.viewport_width != width || theme_changed;
+        let resized = self.viewport_width != width;
+        let needs_reflow = resized || theme_changed;
+        if resized {
+            self.code_blocks.resized(Instant::now());
+        }
         if needs_reflow {
             self.viewport_width = width;
             self.theme_generation = theme_gen;
@@ -1051,6 +1087,8 @@ impl MessagesPanel {
         let mut cursor = RenderCursor::new(self.scroll.row, viewport);
 
         let mut last_drawn = self.scroll.seg;
+        let (live_start, live_message) = (self.live_start, self.messages.len());
+        let mut visible = Vec::new();
         for (i, seg) in self
             .cache
             .segments_mut()
@@ -1061,6 +1099,7 @@ impl MessagesPanel {
             if cursor.past_bottom() {
                 break;
             }
+            visible.extend(seg.msg_index.or((i >= live_start).then_some(live_message)));
             let highlight = self.highlight_segment == Some(i);
             let style = if seg.tool_id.is_some() {
                 Some(theme::current().tool_bg)
@@ -1080,6 +1119,7 @@ impl MessagesPanel {
             last_drawn = i;
         }
         self.release_images_outside(last_drawn);
+        self.code_blocks.schedule(&visible, Instant::now());
 
         if let Some(pp) = self.prompt_progress
             && pp.total > 0
@@ -1140,7 +1180,13 @@ impl MessagesPanel {
             self.push_live_segment(lines, drawn_collapsed);
         }
         if !self.streaming_text.is_empty() {
-            let lines = self.streaming_text.render_lines(width).to_vec();
+            let message = self.messages.len();
+            let lines = self
+                .streaming_text
+                .render_lines_with_code_blocks(width, |info, source, width| {
+                    self.code_blocks.lookup(message, info, source, width)
+                })
+                .to_vec();
             self.push_live_segment(lines, false);
         }
     }
@@ -1636,7 +1682,13 @@ impl MessagesPanel {
                     self.upsert_instruction_segment(&id, &blocks);
                 }
             } else {
-                let view = message_view(msg, self.thinking_lines, self.viewport_width);
+                let view = message_view(
+                    msg,
+                    i,
+                    self.thinking_lines,
+                    self.viewport_width,
+                    &mut self.code_blocks,
+                );
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_lines(view.lines, Some(i));
                 seg.gutter = view.gutter;
@@ -1734,7 +1786,13 @@ impl MessagesPanel {
         let Some(msg) = self.messages.get(msg_idx) else {
             return;
         };
-        let view = message_view(msg, self.thinking_lines, width);
+        let view = message_view(
+            msg,
+            msg_idx,
+            self.thinking_lines,
+            width,
+            &mut self.code_blocks,
+        );
         let Some(seg) = self.cache.get_mut(seg_idx) else {
             return;
         };
@@ -1797,7 +1855,13 @@ struct MessageView {
 
 /// A non-Tool message's lines. Prose sits flush left; only a finished task's
 /// notice keeps a gutter, for its outcome dot.
-fn message_view(msg: &DisplayMessage, mode: ThinkingLines, width: u16) -> MessageView {
+fn message_view(
+    msg: &DisplayMessage,
+    message_index: usize,
+    mode: ThinkingLines,
+    width: u16,
+    code_blocks: &mut CodeBlockRenders,
+) -> MessageView {
     let style = message_style(&msg.role);
     let gutter = msg.task_end.map(outcome_glyph);
     let body = if gutter.is_some() {
@@ -1819,7 +1883,7 @@ fn message_view(msg: &DisplayMessage, mode: ThinkingLines, width: u16) -> Messag
             collapsed: true,
         };
     }
-    let mut lines = build_message_lines(msg, &style, body, width);
+    let mut lines = build_message_lines(msg, message_index, &style, body, width, code_blocks);
     if matches!(msg.role, DisplayRole::Notice)
         && let Some(detail) = &msg.detail
     {
@@ -1875,9 +1939,11 @@ fn notice_detail_lines(detail: &NoticeDetail, width: u16) -> impl Iterator<Item 
 /// identical segments. Plan rules span the full `width`, prose the `body`.
 fn build_message_lines(
     msg: &DisplayMessage,
+    message_index: usize,
     style: &RoleStyle,
     body: u16,
     width: u16,
+    code_blocks: &mut CodeBlockRenders,
 ) -> Vec<Line<'static>> {
     let prefix = message_label(msg, style);
     let text = if !msg.images.is_empty() && msg.text == IMAGE_PLACEHOLDER {
@@ -1885,7 +1951,17 @@ fn build_message_lines(
     } else {
         &msg.text
     };
-    let mut lines = if style.use_markdown {
+    let mut lines = if matches!(msg.role, DisplayRole::Assistant) {
+        text_to_lines_with_code_blocks(
+            text,
+            prefix,
+            style.text_style,
+            style.label_style(),
+            body,
+            style.max_line_bytes,
+            |info, source, width| code_blocks.lookup(message_index, info, source, width),
+        )
+    } else if style.use_markdown {
         text_to_lines(
             text,
             prefix,

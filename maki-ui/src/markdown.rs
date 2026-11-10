@@ -99,11 +99,13 @@ fn style_for_token(
 }
 
 /// Heading lines preserve heading colour through emphasis. Code lines start
-/// from `Style::default()` so highlighter colours stand alone.
+/// from `Style::default()` so highlighter colours stand alone. Literal lines a
+/// code-block renderer drew take the theme's plain code style.
 fn paint_line(line: &RLine, text_style: Style, t: &Theme) -> Line<'static> {
     let (base, preserve_color) = match line.kind {
         LineKind::Heading => (t.heading, true),
         LineKind::Code => (Style::default(), false),
+        LineKind::Literal => (t.code_block, false),
         _ => (text_style, false),
     };
     let spans = line
@@ -236,6 +238,26 @@ pub fn text_to_lines(
     width: u16,
     max_line_bytes: Option<usize>,
 ) -> Vec<Line<'static>> {
+    text_to_lines_with_code_blocks(
+        text,
+        prefix,
+        text_style,
+        prefix_style,
+        width,
+        max_line_bytes,
+        |_, _, _| None,
+    )
+}
+
+pub(crate) fn text_to_lines_with_code_blocks(
+    text: &str,
+    prefix: &str,
+    text_style: Style,
+    prefix_style: Style,
+    width: u16,
+    max_line_bytes: Option<usize>,
+    callback: impl FnMut(&str, &str, u16) -> Option<Vec<String>>,
+) -> Vec<Line<'static>> {
     let truncated;
     let text = match max_line_bytes {
         Some(limit) => {
@@ -244,7 +266,7 @@ pub fn text_to_lines(
         }
         None => text,
     };
-    let semantic = render::Renderer::unwrapped().render(text, width);
+    let semantic = render::Renderer::unwrapped().render_with_code_blocks(text, width, callback);
     paint_semantic(&semantic, prefix, text_style, prefix_style)
 }
 
@@ -299,6 +321,19 @@ mod tests {
     const WRAPPING_CODE_TEXT: &str = "```rust\nfn main() { let answer: usize = compute_the_answer(&universe, &everything); }\nlet x = 1;\n```";
     const NARROW_WIDTH: u16 = 24;
     const WIDE_WIDTH: u16 = 200;
+
+    #[test]
+    fn literal_lines_take_the_plain_code_style() {
+        theme::set(theme::load_by_name(THEME_A).expect(THEME_A));
+        let line = RLine {
+            kind: LineKind::Literal,
+            spans: vec![RSpan::new("[a] --> [b]", StyleToken::Text)],
+        };
+        let t = theme::current();
+        let painted = paint_line(&line, Style::default(), &t);
+        assert_ne!(t.code_block, Style::default());
+        assert_eq!(painted.spans[0].style, t.code_block);
+    }
 
     fn text_to_lines(
         text: &str,
