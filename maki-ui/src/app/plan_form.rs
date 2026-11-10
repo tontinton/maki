@@ -94,6 +94,10 @@ impl App {
             Err(TryRecvError::Empty) => return Dirty::NO,
         };
         self.plan_answers.abandon();
+        if self.state.mode != Mode::Plan || !self.state.plan.is_ready() {
+            self.plan_form.forget_menu();
+            return Dirty::NO;
+        }
         self.open_plan_form(menu);
         if slow {
             self.flash(FLASH_PLAN_FORM_SLOW.into());
@@ -281,7 +285,7 @@ impl App {
             .state
             .plan
             .path()
-            .filter(|_| self.state.plan.is_ready())
+            .filter(|_| self.state.mode == Mode::Plan && self.state.plan.is_ready())
             .map(|path| path.to_path_buf())
         else {
             self.flash(FLASH_PLAN_NOT_READY.into());

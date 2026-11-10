@@ -2464,6 +2464,7 @@ impl App {
         self.run_id += 1;
         self.retry_info = None;
         self.close_all_overlays();
+        self.plan_answers.abandon();
         self.finish_subagents(TaskOutcome::Cancelled, CANCELLED_TEXT);
         self.chats[MAIN_CHAT].auth_parked = false;
         self.shell.cancel_all();

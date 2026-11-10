@@ -94,6 +94,7 @@ impl App {
             }
             PlanTrigger::InteractivePrompt => {
                 if self.state.plan.is_ready() {
+                    self.plan_answers.abandon();
                     self.state.plan.mark_drafting();
                     self.plan_form.on_plan_drafting();
                 }
@@ -110,6 +111,10 @@ impl App {
     /// without the toggling. Build mode is what makes the next prompt an
     /// implementation of the plan instead of another draft.
     pub(crate) fn set_mode(&mut self, mode: Mode) {
+        if self.state.mode == mode {
+            return;
+        }
+        self.plan_answers.abandon();
         match mode {
             Mode::Plan => self.enter_plan(),
             Mode::Build => self.state.mode = Mode::Build,
@@ -117,6 +122,7 @@ impl App {
     }
 
     pub(super) fn toggle_mode(&mut self) -> Vec<super::Action> {
+        self.plan_answers.abandon();
         match self.state.mode {
             Mode::Build => self.enter_plan(),
             Mode::Plan => self.state.mode = Mode::Build,
