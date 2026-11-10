@@ -5,10 +5,10 @@ use flume::{Receiver, TryRecvError};
 use maki_lua::{PlanActionOutcome, PlanMenu, PlanRowAction};
 
 use super::{
-    App, FLASH_NO_PLAN, FLASH_PLAN_ACTION_FAILED, FLASH_PLAN_ACTION_LOST, FLASH_PLAN_CHANGED,
-    FLASH_PLAN_FORM_SLOW, FLASH_PLAN_NOT_READY, FLASH_PLAN_UNREADABLE_PREFIX, IMPLEMENT_MSG_PREFIX,
-    IMPLEMENT_PARALLEL_HINT, Mode, PLAN_ACTION_ANSWER_WAIT, PLAN_FORM_ANSWER_WAIT, PlanCycle,
-    PlanState, QueuedMessage,
+    App, FLASH_NO_PLAN, FLASH_PLAN_ACTION_FAILED, FLASH_PLAN_ACTION_LOST, FLASH_PLAN_BUSY,
+    FLASH_PLAN_CHANGED, FLASH_PLAN_FORM_SLOW, FLASH_PLAN_NOT_READY, FLASH_PLAN_UNREADABLE_PREFIX,
+    IMPLEMENT_MSG_PREFIX, IMPLEMENT_PARALLEL_HINT, Mode, PLAN_ACTION_ANSWER_WAIT,
+    PLAN_FORM_ANSWER_WAIT, PlanCycle, PlanState, QueuedMessage, Status,
 };
 use crate::components::plan_form::{PlanFormAction, builtin_menu, builtin_rows};
 use crate::components::{Action, DisplayMessage};
@@ -312,16 +312,16 @@ impl App {
             .state
             .plan
             .path()
-            .filter(|_| {
-                self.state.mode == Mode::Plan
-                    && !self.plan_cycle.refining
-                    && self.state.plan.is_ready()
-            })
+            .filter(|_| self.state.mode == Mode::Plan && self.state.plan.is_ready())
             .map(|path| path.to_path_buf())
         else {
             self.flash(FLASH_PLAN_NOT_READY.into());
             return vec![];
         };
+        if self.plan_cycle.refining || self.status == Status::Streaming || !self.queue.is_empty() {
+            self.flash(FLASH_PLAN_BUSY.into());
+            return vec![];
+        }
         // Read first: a failed read must leave the session, the plan and the
         // mode exactly where the user left them, especially for the option
         // that starts a fresh session.
@@ -342,7 +342,6 @@ impl App {
             self.flash(FLASH_PLAN_CHANGED.into());
             return vec![];
         }
-        self.plan_cycle.reviewed = Some(content.clone());
         let parallel = self.plan_form.parallel();
         self.plan_form.reset();
         self.plan_cycle = PlanCycle::default();

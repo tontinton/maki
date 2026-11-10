@@ -218,7 +218,7 @@ impl App {
     /// a new `SessionMeta` field forces a decision here. Every frame calls it,
     /// so it stays cheap: an idle UI has an empty draft, queue and rule list,
     /// and an empty `Vec` does not allocate.
-    fn build_meta(&self) -> SessionMeta {
+    pub(super) fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
         let (draft, writers) = self.main_draft();
         let has_draft = !draft.is_empty();

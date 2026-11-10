@@ -6178,7 +6178,11 @@ fn mcp_toggle_dispatches_action() {
 }
 
 #[test_case(
-    |app: &mut App| { app.state.mode = Mode::Plan; app.plan_form.on_plan_ready(); },
+    |app: &mut App| {
+        app.state.mode = Mode::Plan;
+        app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+        app.plan_form.on_plan_ready();
+    },
     ""
     ; "consumed_by_plan_form"
 )]
@@ -6641,6 +6645,7 @@ fn plan_app() -> (TempDir, App) {
         backgrounded: false,
     }))));
     app.transition_plan(PlanTrigger::Settled);
+    app.status = Status::Idle;
     (tmp, app)
 }
 
@@ -6937,7 +6942,80 @@ fn implementing_while_refining_changes_nothing() {
     assert_eq!(app.state.mode, Mode::Plan);
     assert!(app.state.plan.is_ready());
     assert!(app.plan_cycle.refining);
-    assert_eq!(app.status_bar.flash_text(), Some(FLASH_PLAN_NOT_READY));
+    assert_eq!(app.status_bar.flash_text(), Some(FLASH_PLAN_BUSY));
+}
+
+#[test]
+fn implementing_while_a_run_is_active_is_refused() {
+    let (_tmp, mut app) = plan_app();
+    app.status = Status::Streaming;
+
+    let actions = app.handle_plan_form_action(PlanFormAction::Implement);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(app.status_bar.flash_text(), Some(FLASH_PLAN_BUSY));
+}
+
+#[test]
+fn implementing_with_queued_work_is_refused() {
+    let (_tmp, mut app) = plan_app();
+    app.queue_and_notify(queued_msg("later"));
+    assert!(!app.queue.is_empty());
+
+    let actions = app.handle_plan_form_action(PlanFormAction::Implement);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(app.status_bar.flash_text(), Some(FLASH_PLAN_BUSY));
+}
+
+/// A resumed ready plan has no menu to pop in front of the transcript, but
+/// the hint and Ctrl+T make the review discoverable. Opening it reads the
+/// revision the user is about to approve.
+#[test]
+fn a_resumed_ready_plan_shows_the_review_hint() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let mut stored = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
+    stored.meta.mode = Some(StoredMode::Plan);
+    stored.meta.plan_path = Some(path.display().to_string());
+    stored.meta.plan_written = true;
+    let mut app = test_app();
+    let model = app.state.model.clone();
+    app.apply_loaded_session(OpenSession::claimed(stored, &app.storage), &model);
+
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(app.state.plan.is_ready());
+    assert!(!app.plan_form.is_visible());
+    assert!(
+        app.plan_form.hint_line().is_some(),
+        "the review must be discoverable"
+    );
+
+    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    assert!(app.plan_form.is_visible());
+    assert!(
+        app.plan_cycle.reviewed.is_some(),
+        "opening the form reads the revision"
+    );
+}
+
+/// A plan whose refinement is still in flight is not saved as written, so a
+/// crash mid-cycle does not come back looking approved.
+#[test]
+fn a_refining_plan_is_not_persisted_as_written() {
+    let (_tmp, mut app) = plan_app();
+    assert!(app.build_meta().plan_written);
+
+    app.start_from_queue(&queued_msg("refine"));
+    assert!(!app.build_meta().plan_written);
+    assert!(app.plan_cycle.refining);
+
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    app.on_queue_drained();
+    assert!(app.build_meta().plan_written);
 }
 
 /// A plan file that moved since the review is not implemented on the first
@@ -7480,6 +7558,7 @@ fn permission_request_reason_reaches_the_prompt() {
 
 fn open_plan_form(app: &mut App) {
     app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
     app.plan_form.on_plan_ready();
 }
 

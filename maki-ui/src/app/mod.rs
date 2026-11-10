@@ -125,6 +125,7 @@ const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_PLAN_NOT_READY: &str = "No plan is ready to implement";
+const FLASH_PLAN_BUSY: &str = "Finish the current turn before implementing the plan";
 const FLASH_PLAN_CHANGED: &str = "The plan changed since it was reviewed, review it again";
 const FLASH_PLAN_DRAFT_INTERRUPTED: &str = "The plan draft was saved, but the run did not finish";
 const FLASH_PLAN_UNREADABLE_PREFIX: &str = "Could not read the plan";
@@ -904,7 +905,10 @@ impl App {
     }
 
     fn plan_form_open(&self) -> bool {
-        self.state.mode == Mode::Plan && !self.plan_cycle.refining && self.plan_form.is_visible()
+        self.state.mode == Mode::Plan
+            && !self.plan_cycle.refining
+            && self.state.plan.is_ready()
+            && self.plan_form.is_visible()
     }
 
     fn plan_form_active(&self) -> bool {
