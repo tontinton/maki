@@ -44,7 +44,7 @@ use maki_config::project::{self, TrustMode, TrustQuestion, TrustState};
 use maki_config::{Effect, PermissionRule, PermissionsConfig, PluginsConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{
     HintWriterHandle, RequestProbe, TestBinding, hint_writer_pair, keymap_reader_from,
-    probed_event_handle, set_mode,
+    probed_event_handle, runtime, set_mode,
 };
 use maki_lua::{
     Border, BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest,
@@ -4948,10 +4948,10 @@ fn checkpoint_persists_observations_without_using_them_as_title() {
 
 fn drain_writer(app: App, writer: Arc<StorageWriter>) {
     drop(app);
-    let unsaved = Arc::try_unwrap(writer)
+    let writer = Arc::try_unwrap(writer)
         .ok()
-        .expect("app must hold the only other writer reference")
-        .shutdown(WRITER_DRAIN_TIMEOUT);
+        .expect("app must hold the only other writer reference");
+    let unsaved = runtime().block_on(writer.shutdown(WRITER_DRAIN_TIMEOUT));
     assert!(unsaved.is_empty(), "{ALL_LANDED}");
 }
 

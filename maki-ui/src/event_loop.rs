@@ -2299,7 +2299,7 @@ impl<'t> EventLoop<'t> {
         }
         let mcp_shutdown_ms = lap();
         let unsaved = match Arc::try_unwrap(self.ctx.storage_writer) {
-            Ok(writer) => writer.shutdown(AGENT_SHUTDOWN_TIMEOUT),
+            Ok(writer) => writer.shutdown(AGENT_SHUTDOWN_TIMEOUT).await,
             Err(_) => {
                 warn!("storage writer has outstanding references, skipping graceful shutdown");
                 Vec::new()
