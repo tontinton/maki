@@ -414,7 +414,7 @@ fn parse_table_cells(line: &str) -> Vec<String> {
             i += 2;
         } else if bytes[i] == b'|' {
             cells.push(current.trim().to_owned());
-            current = String::new();
+            current.clear();
             i += 1;
         } else {
             let ch = inner[i..].chars().next().unwrap();
