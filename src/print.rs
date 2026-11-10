@@ -393,6 +393,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
+            | AgentEvent::CompactionStarted
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::AllowedByPlugin { .. }

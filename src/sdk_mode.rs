@@ -1104,6 +1104,7 @@ impl EventPump {
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
+            | AgentEvent::CompactionStarted
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::AllowedByPlugin { .. }

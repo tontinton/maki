@@ -1168,7 +1168,11 @@ impl<'h> Agent<'h> {
             cancel: &self.cancel,
             context_size: context_size_before,
         };
-        let Compacted { summary, carried } = compaction::compact_history(
+        let Compacted {
+            summary,
+            duration,
+            carried,
+        } = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
@@ -1208,6 +1212,7 @@ impl<'h> Agent<'h> {
             context_size_after,
             context_window: self.model.context_window,
             summary,
+            duration_ms: duration.as_millis() as u64,
         })
     }
 
@@ -2240,6 +2245,21 @@ mod tests {
             events.push(e);
         }
         events
+    }
+
+    fn compaction_events(events: &[Envelope]) -> Vec<&AgentEvent> {
+        events
+            .iter()
+            .map(|envelope| &envelope.event)
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::AutoCompacting { .. }
+                        | AgentEvent::CompactionStarted
+                        | AgentEvent::CompactionDone { .. }
+                )
+            })
+            .collect()
     }
 
     async fn run_agent(provider: MockProvider, max_turns: Option<u32>) -> (u32, DoneReason) {
@@ -3491,13 +3511,20 @@ mod tests {
         let source = MockInterruptSource::new(commands);
 
         let mut history = History::new(prior);
-        let (agent, _event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let (agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
         let result = agent
             .with_interrupt_source(source)
             .run(default_input())
             .await;
 
         assert!(result.is_ok());
+        assert!(matches!(
+            compaction_events(&drain_events(&event_rx)).as_slice(),
+            [
+                AgentEvent::CompactionStarted,
+                AgentEvent::CompactionDone { .. }
+            ]
+        ));
     }
 
     /// `TurnComplete`, `Done` and the auto-compaction trigger all report the
@@ -3644,13 +3671,21 @@ mod tests {
         agent.auto_compact = enabled;
         agent.try_auto_compact().await.unwrap();
         drop(agent);
+        let events = drain_events(&event_rx);
         assert_eq!(
-            has_event(&drain_events(&event_rx), |e| matches!(
-                e,
-                AgentEvent::AutoCompacting { .. }
-            )),
+            matches!(
+                compaction_events(&events).as_slice(),
+                [
+                    AgentEvent::AutoCompacting { .. },
+                    AgentEvent::CompactionStarted,
+                    AgentEvent::CompactionDone { .. }
+                ]
+            ),
             expected,
         );
+        if !expected {
+            assert!(compaction_events(&events).is_empty());
+        }
     }
 
     const OVERFLOW_CHUNK: &str = "restored transcript chunk ";
@@ -4549,13 +4584,21 @@ mod tests {
         agent.compact_now(reason).await.unwrap();
         drop(agent);
 
+        let events = drain_events(&event_rx);
         assert_eq!(
-            has_event(&drain_events(&event_rx), |e| matches!(
-                e,
-                AgentEvent::CompactionDone { .. }
-            )),
+            matches!(
+                compaction_events(&events).as_slice(),
+                [
+                    AgentEvent::AutoCompacting { .. },
+                    AgentEvent::CompactionStarted,
+                    AgentEvent::CompactionDone { .. }
+                ]
+            ),
             compacts
         );
+        if !compacts {
+            assert!(compaction_events(&events).is_empty());
+        }
     }
 
     const POST_COMPACTION: &str = "Re-read plan.md";

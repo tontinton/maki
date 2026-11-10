@@ -5632,23 +5632,39 @@ fn rewind_recomputes_context_size(measured: u32, floor: u32) {
 
 /// Left at the pre-compaction value, a session compacted just before exit
 /// compacts itself again on resume.
-#[test]
-fn compaction_lowers_the_stored_context_size() {
+#[test_case(false ; "manual")]
+#[test_case(true ; "automatic")]
+fn compaction_feedback_stays_out_of_history_and_updates_context(automatic: bool) {
     const AFTER: u32 = SMALL_HISTORY;
     let mut app = test_app();
     app.run_id = 1;
     app.state.context_size = MEASURED_CONTEXT;
     app.chats[0].context_size = MEASURED_CONTEXT;
+    let history = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+    if automatic {
+        app.update(agent_msg(AgentEvent::AutoCompacting {
+            context_size: MEASURED_CONTEXT,
+            context_window: app.state.model.context_window,
+        }));
+    }
+    app.update(agent_msg(AgentEvent::CompactionStarted));
+    assert_eq!(app.chats[0].message_count(), 1);
 
     app.update(agent_msg(AgentEvent::CompactionDone {
         context_size_before: MEASURED_CONTEXT,
         context_size_after: AFTER,
         context_window: 0,
         summary: String::new(),
+        duration_ms: 0,
     }));
+    app.checkpoint();
 
     assert_eq!(app.state.context_size, AFTER);
     assert_eq!(app.chats[0].context_size, AFTER);
+    assert_eq!(app.state.session.meta.context_size, AFTER);
+    assert_eq!(app.chats[0].message_count(), 2);
+    assert_eq!(app.chats[0].last_message_role(), Some(&DisplayRole::Notice));
+    assert_eq!(app.state.session.messages(), history.as_slice());
 }
 
 #[test]

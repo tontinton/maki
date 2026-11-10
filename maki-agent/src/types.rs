@@ -751,12 +751,14 @@ pub enum AgentEvent {
         context_size: u32,
         context_window: u32,
     },
+    CompactionStarted,
     CompactionDone {
         context_size_before: u32,
         context_size_after: u32,
         context_window: u32,
         /// So a plugin can check the summary kept what matters.
         summary: String,
+        duration_ms: u64,
     },
     Retry {
         attempt: u32,
