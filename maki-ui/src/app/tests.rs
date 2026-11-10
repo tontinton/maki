@@ -78,7 +78,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use test_case::test_case;
 use tokio::runtime::EnterGuard;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{channel, unbounded_channel};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Metadata, Subscriber};
 
@@ -1194,7 +1194,7 @@ fn reset_session_clears_plan() {
     app.queue_and_notify(queued_msg("q"));
     app.queue.set_focus_at(0);
     app.help_modal.toggle();
-    let (_tx, rx) = flume::bounded::<crate::components::btw_modal::BtwEvent>(1);
+    let (_tx, rx) = channel::<BtwEvent>(1);
     app.btw_modal.open("q", rx);
     let actions = app.reset_session();
     assert!(matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()));
@@ -4021,7 +4021,7 @@ fn open_usage(app: &mut App) {
 }
 
 fn open_btw(app: &mut App) {
-    let (_tx, rx) = flume::bounded::<BtwEvent>(1);
+    let (_tx, rx) = channel::<BtwEvent>(1);
     app.btw_modal.open(IME_MODAL_TEXT, rx);
 }
 
@@ -6121,14 +6121,14 @@ fn btw_with_question_returns_action() {
 #[test]
 fn btw_modal_key_routing_and_animation() {
     let mut app = test_app();
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = channel(1);
     app.btw_modal.open("test", rx);
 
     // A pending stream is data, drained by `poll`. Only the typewriter
     // revealing the answer moves on its own.
     assert!(app.btw_modal.is_streaming());
     assert_eq!(app.btw_modal.cadence(), Cadence::IDLE);
-    tx.send(BtwEvent::TextDelta("hi".into())).unwrap();
+    tx.try_send(BtwEvent::TextDelta("hi".into())).unwrap();
     assert_eq!(app.btw_modal.poll(), Dirty::YES);
     assert_eq!(app.btw_modal.cadence(), Cadence::SMOOTH);
 

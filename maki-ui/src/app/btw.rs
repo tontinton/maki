@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use flume::Sender;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionTools;
 use serde_json::Value;
+use tokio::sync::mpsc::{Sender, channel};
 
 use crate::components::btw_modal::BtwEvent;
 
@@ -21,6 +21,7 @@ const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answer co
 from the conversation context.";
 
 const NO_TOOLS: Value = Value::Array(Vec::new());
+const BTW_EVENT_CAPACITY: usize = 64;
 
 /// The reminder leads so the model treats the question as a quick aside, not a task to act on.
 fn btw_question(question: &str) -> Message {
@@ -81,7 +82,7 @@ impl App {
             }
         };
 
-        let (tx, rx) = flume::bounded(64);
+        let (tx, rx) = channel(BTW_EVENT_CAPACITY);
         self.open_prompt(|app| app.btw_modal.open(&question, rx));
         let request = BtwRequest {
             opts: opts.clamped(&model),
@@ -138,12 +139,12 @@ impl BtwRequest {
                     ProviderEvent::TextDelta { text } => BtwEvent::TextDelta(text),
                     ProviderEvent::ThinkingDelta { text } => BtwEvent::ThinkingDelta(text),
                     ProviderEvent::ToolUseStart { name, .. } => {
-                        let _ = btw_tx.send(BtwEvent::Error(reached_for_tool(&name)));
+                        let _ = btw_tx.send(BtwEvent::Error(reached_for_tool(&name))).await;
                         return false;
                     }
                     ProviderEvent::PromptProgress { .. } => continue,
                 };
-                if btw_tx.send(event).is_err() {
+                if btw_tx.send(event).await.is_err() {
                     return false;
                 }
             }
@@ -160,10 +161,12 @@ impl BtwRequest {
             _ = &mut forward => return,
         };
         if forward.await {
-            let _ = btw_tx.send(match result {
-                Ok(_) => BtwEvent::Done,
-                Err(e) => BtwEvent::Error(e.to_string()),
-            });
+            let _ = btw_tx
+                .send(match result {
+                    Ok(_) => BtwEvent::Done,
+                    Err(e) => BtwEvent::Error(e.to_string()),
+                })
+                .await;
         }
     }
 }
@@ -185,6 +188,7 @@ mod tests {
     };
     use maki_storage::frame::{PromptFacts, StoredFrame};
     use serde_json::json;
+    use std::iter;
     use test_case::test_case;
 
     const Q: &str = "why sqlite?";
@@ -202,7 +206,7 @@ mod tests {
     }
 
     struct FakeProvider {
-        sent: Sender<Recorded>,
+        sent: flume::Sender<Recorded>,
         script: Vec<ProviderEvent>,
     }
 
@@ -213,7 +217,7 @@ mod tests {
             messages: &'a [Message],
             system: &'a str,
             tools: &'a Value,
-            events: &'a Sender<ProviderEvent>,
+            events: &'a flume::Sender<ProviderEvent>,
             opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -339,7 +343,7 @@ mod tests {
     #[test_case(Some("read"), BtwEvent::Error(reached_for_tool("read")) ; "tool_call_is_a_note")]
     #[tokio::test]
     async fn forwards_every_delta_then_stops_the_modal(tool: Option<&str>, last: BtwEvent) {
-        let (tx, rx) = flume::bounded(64);
+        let (tx, mut rx) = channel(BTW_EVENT_CAPACITY);
         let mut script = vec![ProviderEvent::TextDelta {
             text: ANSWER.into(),
         }];
@@ -362,7 +366,7 @@ mod tests {
         }
         .run(tx)
         .await;
-        let events: Vec<BtwEvent> = rx.drain().collect();
+        let events: Vec<BtwEvent> = iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(events, [BtwEvent::TextDelta(ANSWER.into()), last]);
     }
 
