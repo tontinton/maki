@@ -14,6 +14,7 @@ use maki_config::ShellPreference;
 use maki_providers::{Message, shell_command, strip_provider_keys};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::time::timeout_at;
 
 use super::App;
@@ -173,7 +174,7 @@ pub(crate) fn spawn_shell(
     command: String,
     id: String,
     visible: bool,
-    tx: flume::Sender<ShellEvent>,
+    tx: UnboundedSender<ShellEvent>,
     cancel: CancelToken,
     config: AgentConfig,
 ) {
@@ -212,7 +213,7 @@ pub(crate) fn spawn_shell(
 async fn run_command(
     command: &str,
     id: &str,
-    tx: &flume::Sender<ShellEvent>,
+    tx: &UnboundedSender<ShellEvent>,
     cancel: &CancelToken,
     max_output_lines: usize,
     max_output_bytes: usize,
@@ -236,7 +237,7 @@ async fn run_command(
 
     let mut child = cmd.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
 
-    let (line_tx, line_rx) = flume::unbounded::<String>();
+    let (line_tx, mut line_rx) = unbounded_channel::<String>();
     if let Some(stdout) = child.stdout.take() {
         spawn_line_reader(BufReader::new(stdout), line_tx.clone());
     }
@@ -253,10 +254,7 @@ async fn run_command(
     let deadline = Instant::now() + SHELL_TIMEOUT;
 
     loop {
-        let line = bounded_by(deadline, cancel, async {
-            Ok(line_rx.recv_async().await.ok())
-        })
-        .await;
+        let line = bounded_by(deadline, cancel, async { Ok(line_rx.recv().await) }).await;
         match line {
             Ok(Some(line)) => {
                 if !truncated {
@@ -321,7 +319,7 @@ async fn bounded_by<T>(
     }
 }
 
-fn flush_output(tx: &flume::Sender<ShellEvent>, id: &str, output: &str) {
+fn flush_output(tx: &UnboundedSender<ShellEvent>, id: &str, output: &str) {
     let _ = tx.send(ShellEvent::Output {
         id: id.to_string(),
         content: output.to_string(),
@@ -330,7 +328,7 @@ fn flush_output(tx: &flume::Sender<ShellEvent>, id: &str, output: &str) {
 
 fn spawn_line_reader<R: AsyncRead + Unpin + Send + 'static>(
     reader: BufReader<R>,
-    tx: flume::Sender<String>,
+    tx: UnboundedSender<String>,
 ) {
     tokio::spawn(async move {
         let mut lines = reader.lines();

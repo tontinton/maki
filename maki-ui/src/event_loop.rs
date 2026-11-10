@@ -51,6 +51,8 @@ use maki_storage::model::persist_model;
 use maki_storage::sessions::normalize_title;
 use ratatui::layout::Rect;
 use serde_json::json;
+use tokio::sync::Notify;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
 use tokio_util::task::AbortOnDropHandle;
@@ -407,8 +409,8 @@ fn parse_mode(mode: &str) -> Result<Mode, String> {
 struct SessionRuntime {
     app: App,
     handles: AgentHandles,
-    shell_tx: flume::Sender<ShellEvent>,
-    shell_rx: flume::Receiver<ShellEvent>,
+    shell_tx: UnboundedSender<ShellEvent>,
+    shell_rx: UnboundedReceiver<ShellEvent>,
     last_status: SessionStatus,
     last_title: String,
     last_tasks: TaskWatch,
@@ -527,7 +529,7 @@ impl SpawnCtx {
         if resumed {
             app.restore_resumed_session();
         }
-        let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
+        let (shell_tx, shell_rx) = unbounded_channel::<ShellEvent>();
         let last_title = app.state.session.title.clone();
         SessionRuntime {
             app,
@@ -557,10 +559,9 @@ pub(crate) struct EventLoop<'t> {
     ctx: SpawnCtx,
     slots: ModelSlots,
     input: InputReader,
-    warn_rx: flume::Receiver<String>,
-    warn_tx: flume::Sender<String>,
-    models_rx: flume::Receiver<()>,
-    models_tx: flume::Sender<()>,
+    warn_rx: UnboundedReceiver<String>,
+    warn_tx: UnboundedSender<String>,
+    models_fetched: Arc<Notify>,
     ui_action_rx: flume::Receiver<UiAction>,
     ui_wake_rx: flume::Receiver<()>,
     ui_attachment: UiAttachment,
@@ -617,16 +618,21 @@ async fn pack_done(pack: &mut Option<JoinHandle<PackPreparation>>) -> PackPrepar
 }
 
 /// The first agent envelope or shell event from any session.
-async fn session_wake(sessions: &[SessionRuntime]) -> Wake {
+async fn session_wake(sessions: &mut [SessionRuntime]) -> Wake {
     let waits: Vec<LocalBoxFuture<'_, Wake>> = sessions
-        .iter()
+        .iter_mut()
         .enumerate()
         .flat_map(|(i, rt)| {
+            let (agent_rx, shell_rx) = (&rt.handles.agent_rx, &mut rt.shell_rx);
             [
+                Box::pin(async move { Wake::Agent(i, Box::new(recv_or_pending(agent_rx).await)) })
+                    as LocalBoxFuture<'_, Wake>,
                 Box::pin(async move {
-                    Wake::Agent(i, Box::new(recv_or_pending(&rt.handles.agent_rx).await))
-                }) as LocalBoxFuture<'_, Wake>,
-                Box::pin(async move { Wake::Shell(i, recv_or_pending(&rt.shell_rx).await) }),
+                    match shell_rx.recv().await {
+                        Some(event) => Wake::Shell(i, event),
+                        None => pending().await,
+                    }
+                }),
             ]
         })
         .collect();
@@ -638,52 +644,50 @@ async fn session_wake(sessions: &[SessionRuntime]) -> Wake {
 
 struct BackgroundModels {
     available: Arc<ArcSwapOption<ModelList>>,
-    warn_rx: flume::Receiver<String>,
-    warn_tx: flume::Sender<String>,
-    models_rx: flume::Receiver<()>,
-    models_tx: flume::Sender<()>,
+    warn_rx: UnboundedReceiver<String>,
+    warn_tx: UnboundedSender<String>,
+    models_fetched: Arc<Notify>,
     task: AbortOnDropHandle<()>,
 }
 
 /// The one way discovery starts, so startup and `/models refresh` cannot drift
 /// apart. It only reports that it finished and leaves rebuilding to the UI
-/// thread, over a channel so the loop wakes on it instead of noticing at the
-/// next tick. The channel holds one slot, which collapses overlapping fetches
-/// into a single rebuild.
+/// thread, over a `Notify` so the loop wakes on it instead of noticing at the
+/// next tick. It keeps one permit, which collapses overlapping fetches into a
+/// single rebuild.
 fn fetch_models(
     available: Arc<ArcSwapOption<ModelList>>,
     policy: Arc<ModelPolicy>,
-    warn_tx: flume::Sender<String>,
-    models_tx: flume::Sender<()>,
+    warn_tx: UnboundedSender<String>,
+    models_fetched: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         fetch_all_models_cached(&policy, |list, warnings| {
             for w in warnings {
-                let _ = warn_tx.try_send(w);
+                let _ = warn_tx.send(w);
             }
             available.store(Some(Arc::new(list)));
         })
         .await;
-        let _ = models_tx.try_send(());
+        models_fetched.notify_one();
     })
 }
 
 fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
     let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
-    let (warn_tx, warn_rx) = flume::unbounded::<String>();
-    let (models_tx, models_rx) = flume::bounded::<()>(1);
+    let (warn_tx, warn_rx) = unbounded_channel::<String>();
+    let models_fetched = Arc::new(Notify::new());
     let task = AbortOnDropHandle::new(fetch_models(
         Arc::clone(&available),
         policy,
         warn_tx.clone(),
-        models_tx.clone(),
+        Arc::clone(&models_fetched),
     ));
     BackgroundModels {
         available,
         warn_rx,
         warn_tx,
-        models_rx,
-        models_tx,
+        models_fetched,
         task,
     }
 }
@@ -845,8 +849,7 @@ impl<'t> EventLoop<'t> {
             input: InputReader::new().context("watch terminal input")?,
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
-            models_rx: bg.models_rx,
-            models_tx: bg.models_tx,
+            models_fetched: bg.models_fetched,
             ui_action_rx,
             ui_wake_rx,
             ui_attachment,
@@ -969,10 +972,10 @@ impl<'t> EventLoop<'t> {
             action = recv_or_pending(&self.ui_action_rx) => Wake::Ui(action),
             () = recv_or_pending(&self.ui_wake_rx) => Wake::PluginWindow,
             () = recv_or_pending(decor_worker::wakes()) => Wake::Decor,
-            warning = recv_or_pending(&self.warn_rx) => Wake::Warn(warning),
+            Some(warning) = self.warn_rx.recv() => Wake::Warn(warning),
             preparation = pack_done(&mut self.pack) => Wake::Pack(Box::new(preparation)),
-            () = recv_or_pending(&self.models_rx) => Wake::ModelsDiscovered,
-            wake = session_wake(&self.sessions) => wake,
+            () = self.models_fetched.notified() => Wake::ModelsDiscovered,
+            wake = session_wake(&mut self.sessions) => wake,
         }
     }
 
@@ -2198,7 +2201,7 @@ impl<'t> EventLoop<'t> {
             Arc::clone(&self.ctx.available_models),
             Arc::clone(&self.ctx.model_policy),
             self.warn_tx.clone(),
-            self.models_tx.clone(),
+            Arc::clone(&self.models_fetched),
         );
     }
 

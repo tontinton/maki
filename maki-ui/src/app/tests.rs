@@ -78,6 +78,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use test_case::test_case;
 use tokio::runtime::EnterGuard;
+use tokio::sync::mpsc::unbounded_channel;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Metadata, Subscriber};
 
@@ -235,7 +236,7 @@ fn build_app_with_session(
 }
 
 fn test_writer(dir: StateDir) -> StorageWriter {
-    StorageWriter::new(dir, flume::unbounded().0)
+    StorageWriter::new(dir, unbounded_channel().0)
 }
 
 /// A synchronous test that spawns tasks or blocks on them the way the UI
