@@ -32,6 +32,7 @@ use mlua::{Function, Lua, MaybeSend, MultiValue, RegistryKey, Table, Value as Lu
 use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 use tokio::runtime::Handle;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, watch};
@@ -194,6 +195,7 @@ const PLAN_HANDLERS_MISSING_ERR: &str = "plan row handlers not initialized";
 const PLAN_HANDLER_GONE_ERR: &str = "plan row handler was reaped";
 const NO_PLUGIN_HOST: &str = "no plugin host is running this code";
 const SPAWN_QUEUE_NOT_INIT: &str = "spawn queue not initialized";
+const QUEUE_RX_TAKEN: &str = "a queue's receiver is taken once, by the dispatcher";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
 pub(crate) const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
@@ -2244,7 +2246,7 @@ pub(crate) struct ProviderRequests(flume::Sender<Request>);
 /// together because a handle without both is of no use.
 pub(crate) fn host_senders(
     lua: &Lua,
-) -> mlua::Result<(flume::Sender<Request>, flume::Sender<DeferredCallback>)> {
+) -> mlua::Result<(flume::Sender<Request>, UnboundedSender<DeferredCallback>)> {
     let no_host = || mlua::Error::runtime(NO_PLUGIN_HOST);
     let requests = lua.app_data_ref::<ProviderRequests>().ok_or_else(no_host)?;
     let release = lua.app_data_ref::<DeferQueue>().ok_or_else(no_host)?;
@@ -3052,14 +3054,41 @@ impl Drop for BufsClaim {
 /// one arm of its biased select, so a send wakes the loop even while the
 /// enqueuing coroutine stays parked.
 pub(crate) struct SpawnQueue {
-    tx: flume::Sender<PendingAsyncTask>,
-    rx: flume::Receiver<PendingAsyncTask>,
+    tx: UnboundedSender<PendingAsyncTask>,
+    rx: QueueRx<PendingAsyncTask>,
 }
 
 impl SpawnQueue {
     fn new() -> Self {
-        let (tx, rx) = flume::unbounded();
-        Self { tx, rx }
+        let (tx, rx) = unbounded_channel();
+        Self {
+            tx,
+            rx: QueueRx::new(rx),
+        }
+    }
+}
+
+/// A queue's receiving end, kept next to its sender until the dispatcher
+/// takes it, so the queue has exactly one reader.
+pub(crate) struct QueueRx<T>(RefCell<Option<UnboundedReceiver<T>>>);
+
+impl<T> QueueRx<T> {
+    fn new(rx: UnboundedReceiver<T>) -> Self {
+        Self(RefCell::new(Some(rx)))
+    }
+
+    fn take(&self) -> UnboundedReceiver<T> {
+        self.0.take().expect(QUEUE_RX_TAKEN)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_recv(&self) -> Option<T> {
+        self.0.borrow_mut().as_mut()?.try_recv().ok()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.borrow().as_ref().expect(QUEUE_RX_TAKEN).is_empty()
     }
 }
 
@@ -3081,8 +3110,8 @@ pub(crate) struct DeferredCallback {
 }
 
 pub(crate) struct DeferQueue {
-    tx: flume::Sender<DeferredCallback>,
-    pub(crate) rx: flume::Receiver<DeferredCallback>,
+    tx: UnboundedSender<DeferredCallback>,
+    pub(crate) rx: QueueRx<DeferredCallback>,
     /// Timers that have not fired yet, by owner. A sleeping timer holds no
     /// [`GateGuard`], so [`drain_barrier`] walks straight past it and a reload
     /// would leave the callback to wake up against a torn down env. Cancelling
@@ -3102,10 +3131,10 @@ pub(crate) struct SpawnedTasks(CancelMap<Arc<str>>);
 
 impl DeferQueue {
     pub(crate) fn new() -> Self {
-        let (tx, rx) = flume::unbounded();
+        let (tx, rx) = unbounded_channel();
         Self {
             tx,
-            rx,
+            rx: QueueRx::new(rx),
             timers: Mutex::new(Vec::new()),
         }
     }
@@ -3118,7 +3147,7 @@ impl DeferQueue {
     /// the two can never drift apart.
     pub(crate) fn push(&self, cb: DeferredCallback) -> Result<(), DeferredCallback> {
         let pending = (Arc::clone(&cb.plugin), Arc::clone(&cb.cancel));
-        self.tx.try_send(cb).map_err(|e| e.into_inner())?;
+        self.tx.send(cb).map_err(|e| e.0)?;
         self.locked().push(pending);
         Ok(())
     }
@@ -3489,7 +3518,7 @@ fn spawn_plugin_task(lua: &Lua, spawned: SpawnedTask, task: PendingAsyncTask) {
 async fn drain_barrier(
     lua: &Lua,
     gate: &Rc<InflightGate>,
-    spawn_rx: &flume::Receiver<PendingAsyncTask>,
+    spawn_rx: &mut UnboundedReceiver<PendingAsyncTask>,
 ) {
     loop {
         gate.drain().await;
@@ -5659,12 +5688,12 @@ pub fn spawn(
             }
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
             let restores = Rc::new(RestoreTracker::default());
-            let (hook_tx, hook_rx) = flume::unbounded::<HostHook>();
+            let (hook_tx, mut hook_rx) = unbounded_channel::<HostHook>();
             {
                 let lua = rt.lua.clone();
                 let gate = Rc::clone(&gate);
                 local.spawn_local(async move {
-                    while let Ok(hook) = hook_rx.recv_async().await {
+                    while let Some(hook) = hook_rx.recv().await {
                         // Holds the drain barrier so a plugin reload waiting
                         // on `drain_barrier` cannot land mid-handler.
                         let _guard = GateGuard::hold_only(&gate);
@@ -5672,18 +5701,18 @@ pub fn spawn(
                     }
                 });
             }
-            let spawn_rx = rt
+            let mut spawn_rx = rt
                 .lua
                 .app_data_ref::<SpawnQueue>()
                 .expect("spawn queue installed at init")
                 .rx
-                .clone();
-            let defer_rx = rt
+                .take();
+            let mut defer_rx = rt
                 .lua
                 .app_data_ref::<DeferQueue>()
                 .expect("defer queue installed at init")
                 .rx
-                .clone();
+                .take();
 
             let mut codegen_armed = false;
 
@@ -5716,14 +5745,14 @@ pub fn spawn(
                     let next = tokio::select! {
                         biased;
                         msg = prio_rx.recv_async() => msg.map(Some),
-                        task = spawn_rx.recv_async() => task.map(|task| {
+                        Some(task) = spawn_rx.recv() => {
                             spawn_async_task(&rt.lua, &gate, task);
-                            None
-                        }),
-                        cb = defer_rx.recv_async() => cb.map(|cb| {
+                            Ok(None)
+                        }
+                        Some(cb) = defer_rx.recv() => {
                             spawn_deferred_callback(&rt.lua, &gate, cb);
-                            None
-                        }),
+                            Ok(None)
+                        }
                         msg = rx.recv_async() => msg.map(Some),
                     };
                     let msg = match next {
@@ -5747,7 +5776,7 @@ pub fn spawn(
                             context,
                             reply,
                         } => {
-                            drain_barrier(&rt.lua, &gate, &spawn_rx).await;
+                            drain_barrier(&rt.lua, &gate, &mut spawn_rx).await;
                             let res = rt
                                 .load_source(
                                     Arc::clone(&name),
@@ -5847,7 +5876,7 @@ pub fn spawn(
                             let _ = reply.send(ops);
                         }
                         Request::ClearPlugin { plugin, reply } => {
-                            drain_barrier(&rt.lua, &gate, &spawn_rx).await;
+                            drain_barrier(&rt.lua, &gate, &mut spawn_rx).await;
                             rt.clear_plugin(&plugin);
                             // The explicit unload: the one place a package's
                             // grant is released.
@@ -5965,7 +5994,7 @@ pub fn spawn(
                             plugin_dir,
                             reply,
                         } => {
-                            drain_barrier(&rt.lua, &gate, &spawn_rx).await;
+                            drain_barrier(&rt.lua, &gate, &mut spawn_rx).await;
                             let res = rt.run_init_lua(&source, scope, plugin_dir).await;
                             let _ = reply.send(res);
                         }
@@ -5991,7 +6020,7 @@ pub fn spawn(
                             context,
                             reply,
                         } => {
-                            drain_barrier(&rt.lua, &gate, &spawn_rx).await;
+                            drain_barrier(&rt.lua, &gate, &mut spawn_rx).await;
                             let result = rt.run_pack_loader(declared, context).await;
                             let _ = reply.send(result);
                         }
@@ -7114,11 +7143,11 @@ mod tests {
             let _active = scope.enter();
             spawn_src(&lua, SPAWN_PLUGIN, QUEUE_RUN_AND_PARK_SRC)
         };
-        let spawn_rx = lua.app_data_ref::<SpawnQueue>().unwrap().rx.clone();
+        let mut spawn_rx = lua.app_data_ref::<SpawnQueue>().unwrap().rx.take();
 
         let run = wake_or_fail(LocalSet::new().run_until(async {
             spawn_async_task(&lua, &Rc::new(gate()), task);
-            spawn_rx.recv_async().await.unwrap()
+            spawn_rx.recv().await.unwrap()
         }))
         .await;
 
