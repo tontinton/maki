@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::components::code_view::{self, RenderLimits};
 use maki_agent::{ToolInput, ToolOutput};
@@ -15,13 +16,13 @@ pub struct RenderResult {
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(0);
 
 pub struct RenderWorker {
-    result_tx: flume::Sender<RenderResult>,
-    result_rx: flume::Receiver<RenderResult>,
+    result_tx: Sender<RenderResult>,
+    result_rx: Receiver<RenderResult>,
 }
 
 impl RenderWorker {
     pub fn new() -> Self {
-        let (result_tx, result_rx) = flume::unbounded();
+        let (result_tx, result_rx) = channel();
         Self {
             result_tx,
             result_rx,
