@@ -414,6 +414,8 @@ named_styles!(t => {
     "tool_annotation" => t.tool_annotation,
     "spinner" => t.spinner,
     "thinking" => t.thinking,
+    "user_bg" => t.user_bg,
+    "user_text" => t.user_text,
     "error" => t.error,
     "bold" => t.bold,
     "italic" => t.italic,
@@ -462,6 +464,8 @@ pub struct Theme {
     pub foreground: Color,
 
     pub user: Style,
+    pub user_bg: Style,
+    pub user_text: Style,
     pub assistant: Style,
     pub assistant_prefix: Style,
     pub thinking: Style,
@@ -867,6 +871,8 @@ impl Theme {
             foreground: color("foreground"),
 
             user: style("user"),
+            user_bg: style("user_bg"),
+            user_text: style_or("user_text", "assistant"),
             assistant: style("assistant"),
             assistant_prefix: style("assistant_prefix"),
             thinking: brighten_toward(
@@ -1089,6 +1095,7 @@ mod tests {
         assert_eq!(t.background, Color::Rgb(0x28, 0x2a, 0x36));
         assert_eq!(t.foreground, Color::Rgb(0xf8, 0xf8, 0xf2));
         assert_eq!(t.user.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
+        assert_eq!(t.user_text.fg, Some(Color::Rgb(0xf8, 0xf8, 0xf2)));
         assert_eq!(t.error.fg, Some(Color::Rgb(0xff, 0x55, 0x55)));
         assert!(t.bold.add_modifier.contains(Modifier::BOLD));
         assert!(t.thinking.add_modifier.contains(Modifier::ITALIC));
@@ -1245,6 +1252,8 @@ scrollbar_thumb = { fg = "magenta", bg = "default" }
 "#;
         let theme = Theme::from_toml(toml).unwrap();
         assert_eq!(theme.user, Style::default());
+        assert_eq!(theme.user_bg, Style::default());
+        assert_eq!(theme.user_text, theme.assistant);
     }
 
     #[test]
@@ -1447,6 +1456,8 @@ diff_new_line_nr = { fg = "red" }
     fn style_by_name_resolves() {
         set(dracula());
         let t = current();
+        assert_eq!(style_by_name("user_bg"), t.user_bg);
+        assert_eq!(style_by_name("user_text"), t.user_text);
         assert_eq!(style_by_name("dim"), t.tool_dim);
         assert_eq!(style_by_name("tool_dim"), t.tool_dim);
         assert_eq!(style_by_name("path"), t.tool_path);

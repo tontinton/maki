@@ -16,7 +16,7 @@ use maki_config::DEFAULT_THINKING_LINES;
 use maki_markdown::render::CODE_BAR;
 use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::time::Duration;
@@ -2844,17 +2844,63 @@ const FOLLOW_UP_TEXT: &str = "and then deploy";
 const STALE_BUBBLE_MSG: &str = "the superseded bubble must disappear from the viewport";
 const UNTOUCHED_MSG: &str = "a rejected replace must leave the transcript untouched";
 
-fn style_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> Style {
+fn row_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> u16 {
     let buf = terminal.backend().buffer();
     for y in 0..buf.area.height {
         let row: String = (0..buf.area.width)
             .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
             .collect();
-        if let Some(col) = row.find(text) {
-            return buf.cell((col as u16, y)).unwrap().style();
+        if row.contains(text) {
+            return y;
         }
     }
     panic!("{text} was never rendered");
+}
+
+fn style_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> Style {
+    let buf = terminal.backend().buffer();
+    let y = row_of(terminal, text);
+    let row: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+        .collect();
+    let col = row.find(text).expect("row_of found the text");
+    buf.cell((col as u16, y)).unwrap().style()
+}
+
+const USER_BG_THEME: &str = r##"
+[palette]
+background = "#000000"
+surface = "#1d2021"
+assistant_fg = "#111111"
+user_fg = "#eeeeee"
+[ui]
+assistant = { fg = "assistant_fg" }
+user_text = { fg = "user_fg" }
+user_bg = { bg = "surface" }
+"##;
+
+#[test]
+fn user_message_uses_user_bg_and_user_text() {
+    crate::theme::set(Theme::from_toml(USER_BG_THEME).unwrap());
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "hello\nworld".into(),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "reply".into()));
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let buf = terminal.backend().buffer();
+    let user_bg = Color::Rgb(0x1d, 0x20, 0x21);
+    let user_fg = Color::Rgb(0xee, 0xee, 0xee);
+    let assistant_fg = Color::Rgb(0x11, 0x11, 0x11);
+    for row in [row_of(&terminal, "you> hello"), row_of(&terminal, "world")] {
+        assert_eq!(buf.cell((0, row)).unwrap().bg, user_bg);
+        assert_eq!(buf.cell((VIEW_WIDTH - 2, row)).unwrap().bg, user_bg);
+    }
+    assert_eq!(style_of(&terminal, "hello").fg, Some(user_fg));
+    assert_eq!(style_of(&terminal, "reply").fg, Some(assistant_fg));
+    let reply_row = row_of(&terminal, "reply");
+    assert_ne!(buf.cell((VIEW_WIDTH - 2, reply_row)).unwrap().bg, user_bg);
 }
 
 /// `Chat::mark_finished` corrects a bubble long after it was drawn, with the

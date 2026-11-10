@@ -1063,7 +1063,17 @@ impl MessagesPanel {
                 break;
             }
             let highlight = self.highlight_segment == Some(i);
-            let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
+            let style = if seg.tool_id.is_some() {
+                Some(theme::current().tool_bg)
+            } else if seg.msg_index.is_some_and(|idx| {
+                self.messages
+                    .get(idx)
+                    .is_some_and(|m| matches!(&m.role, DisplayRole::User))
+            }) {
+                Some(theme::current().user_bg)
+            } else {
+                None
+            };
             cursor.render_segment(seg, style, highlight, frame);
             for image in &mut seg.images {
                 cursor.render_image(image, self.image_picker.as_ref(), images_visible, frame);

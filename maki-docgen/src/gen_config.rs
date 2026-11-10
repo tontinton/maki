@@ -144,6 +144,23 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
+        "`user_bg` is the user-message counterpart to `tool_bg`. It fills \
+         the full width behind a user message, including the `you> ` prefix, \
+         and does not add vertical padding. Use `user` for the prefix \
+         foreground, `user_text` for the message body, and `user_bg` for the \
+         surface behind the whole message. `user_text` defaults to \
+         `assistant`. `user_bg` defaults to no background.\n\n\
+         ```toml\n\
+         # themes/<name>.toml\n\
+         [ui]\n\
+         user = {{ fg = \"blue\" }}\n\
+         user_text = {{ fg = \"foreground\" }}\n\
+         user_bg = {{ bg = \"#1d2021\" }}\n\
+         ```\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Diff signs use `diff_old_sign` and `diff_new_sign`, which default to \
          `diff_old` and `diff_new`. These styles are applied after `code_block`, \
          so their properties take precedence. Diff gutters use \

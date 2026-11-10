@@ -100,6 +100,16 @@ Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppucci
 
 You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
 
+`user_bg` is the user-message counterpart to `tool_bg`. It fills the full width behind a user message, including the `you> ` prefix, and does not add vertical padding. Use `user` for the prefix foreground, `user_text` for the message body, and `user_bg` for the surface behind the whole message. `user_text` defaults to `assistant`. `user_bg` defaults to no background.
+
+```toml
+# themes/<name>.toml
+[ui]
+user = { fg = "blue" }
+user_text = { fg = "foreground" }
+user_bg = { bg = "#1d2021" }
+```
+
 Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
 
 The input caret uses `cursor` when the terminal has focus and `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults to `cursor`, so themes only need it when the two should differ. Terminals that do not report focus events keep the focused caret.

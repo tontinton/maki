@@ -60,8 +60,8 @@ pub(super) struct Segment {
     pub tool_id: Option<String>,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
     /// collapsed thinking view has no tool_id to route by, so this is how
-    /// the click finds its message. It looks unused; delete it and the
-    /// thinking_lines toggle breaks.
+    /// the click finds its message. Rendering also reads it to give user
+    /// messages the `user_bg` base style.
     pub msg_index: Option<usize>,
     /// What a click can expand. On thinking, `output` means it is drawn
     /// collapsed: the click answers what the reader sees, not the config.
