@@ -763,6 +763,7 @@ mod tests {
     use maki_storage::id::MakiId;
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::live_session::BACKGROUND_PLAN_WRITE_DENIED;
@@ -1164,7 +1165,7 @@ mod tests {
         let (guard, mut events) = event_stream();
         let retained = guard.sender(RUN_ID);
         let event_tx = retained.clone();
-        let (cmd_tx, cmd_rx) = flume::unbounded();
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
 
         let ended = run_session(guard, Some(McpHandle::for_test(cmd_tx)), async move {
             let _ = event_tx.send(AgentEvent::Error {

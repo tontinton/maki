@@ -625,12 +625,14 @@ mod tests {
     use std::io::{BufRead, BufReader as StdBufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Mutex;
+    use std::sync::mpsc::channel;
     use std::thread;
 
     use maki_storage::auth::{McpAuthData, OAuthTokens, load_mcp_auth, now_millis, save_mcp_auth};
     use rmcp::transport::auth::AuthorizationMetadata;
     use serde_json::json;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
     use url::form_urlencoded;
 
     const SERVER: &str = "srv";
@@ -1237,17 +1239,18 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_call_sends_cancelled_to_the_server() {
-        let (entered_tx, entered_rx) = flume::bounded(1);
-        let (cancelled_tx, cancelled_rx) = flume::bounded(1);
-        let (release_tx, release_rx) = flume::bounded::<()>(1);
+        let (entered_tx, mut entered_rx) = unbounded_channel();
+        let (cancelled_tx, mut cancelled_rx) = unbounded_channel();
+        let (release_tx, release_rx) = channel::<()>();
+        let release_rx = Mutex::new(release_rx);
         let base = spawn_server(move |req| {
             match req.body["method"].as_str() {
                 Some("tools/call") => {
-                    let _ = entered_tx.try_send(req.body["id"].clone());
-                    let _ = release_rx.recv_timeout(TIMEOUT);
+                    let _ = entered_tx.send(req.body["id"].clone());
+                    let _ = release_rx.lock().unwrap().recv_timeout(TIMEOUT);
                 }
                 Some("notifications/cancelled") => {
-                    let _ = cancelled_tx.try_send(req.body["params"]["requestId"].clone());
+                    let _ = cancelled_tx.send(req.body["params"]["requestId"].clone());
                 }
                 _ => {}
             }
@@ -1262,12 +1265,9 @@ mod tests {
                     call.unwrap();
                     Value::Null
                 }
-                entered = entered_rx.recv_async() => entered.unwrap(),
+                entered = entered_rx.recv() => entered.unwrap(),
             };
-            let cancelled_id = timeout(TIMEOUT, cancelled_rx.recv_async())
-                .await
-                .ok()
-                .and_then(Result::ok);
+            let cancelled_id = timeout(TIMEOUT, cancelled_rx.recv()).await.ok().flatten();
             (call_id, cancelled_id)
         }
         .await;

@@ -22,7 +22,6 @@ pub mod transport;
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
 use std::future::pending;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -33,7 +32,8 @@ use maki_config::ProjectConfig;
 use maki_providers::{ContentBlock, DEFER_LOADING_KEY, Message, Model};
 use rmcp::model::{Prompt, PromptArgument, Tool};
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinSet, spawn_blocking};
 use tokio::time::timeout;
 use tracing::{info, warn};
@@ -300,7 +300,7 @@ pub enum McpCommand {
 
 #[derive(Clone)]
 pub struct McpHandle {
-    cmd_tx: flume::Sender<McpCommand>,
+    cmd_tx: UnboundedSender<McpCommand>,
     index: Arc<ArcSwap<ToolIndex>>,
     snapshot: Arc<ArcSwap<McpSnapshot>>,
     /// Never changes after startup, so it lives here instead of being
@@ -308,7 +308,7 @@ pub struct McpHandle {
     defer_tools: usize,
     /// Nothing is ever sent on it. `run` drops the sender once the first
     /// connect pass has published, and that disconnect is the signal.
-    ready_rx: flume::Receiver<Infallible>,
+    ready_rx: watch::Receiver<()>,
 }
 
 /// Who keeps a deferred definition out of the model's context until it is
@@ -630,7 +630,7 @@ fn loadable(d: &ToolDescriptor, deferral: ToolDeferral) -> bool {
 
 impl McpHandle {
     pub fn send(&self, cmd: McpCommand) {
-        if let Err(e) = self.cmd_tx.try_send(cmd) {
+        if let Err(e) = self.cmd_tx.send(cmd) {
             warn!(error = %e, "MCP command loop is gone");
         }
     }
@@ -639,7 +639,7 @@ impl McpHandle {
     /// before building a request's tool list, or an early prompt ships without
     /// the MCP tools.
     pub async fn ready(&self) {
-        let _ = self.ready_rx.recv_async().await;
+        let _ = self.ready_rx.clone().changed().await;
     }
 
     pub fn reader(&self) -> McpSnapshotReader {
@@ -702,13 +702,13 @@ impl McpHandle {
     /// Handle whose command loop is whatever the caller does with `cmd_rx`,
     /// so a test can hold a `Shutdown` unacked and observe a wedged teardown.
     #[cfg(test)]
-    pub(crate) fn for_test(cmd_tx: flume::Sender<McpCommand>) -> Self {
+    pub(crate) fn for_test(cmd_tx: UnboundedSender<McpCommand>) -> Self {
         Self {
             cmd_tx,
             index: Arc::new(ArcSwap::from_pointee(ToolIndex::default())),
             snapshot: Arc::new(ArcSwap::from_pointee(McpSnapshot::default())),
             defer_tools: 0,
-            ready_rx: flume::bounded(0).1,
+            ready_rx: watch::channel(()).1,
         }
     }
 }
@@ -778,8 +778,8 @@ pub fn start_with_config(config: McpConfig) -> Option<McpHandle> {
     let index: Arc<ArcSwap<ToolIndex>> = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
     publish(&inner, &index, &snapshot);
 
-    let (cmd_tx, cmd_rx) = flume::unbounded();
-    let (ready_tx, ready_rx) = flume::bounded(0);
+    let (cmd_tx, cmd_rx) = unbounded_channel();
+    let (ready_tx, ready_rx) = watch::channel(());
     let handle = McpHandle {
         cmd_tx,
         index: Arc::clone(&index),
@@ -807,10 +807,10 @@ async fn run(
     mut inner: McpManagerInner,
     index: Arc<ArcSwap<ToolIndex>>,
     snapshot: Arc<ArcSwap<McpSnapshot>>,
-    cmd_rx: flume::Receiver<McpCommand>,
-    ready_tx: flume::Sender<Infallible>,
+    mut cmd_rx: UnboundedReceiver<McpCommand>,
+    ready_tx: watch::Sender<()>,
 ) {
-    let (connected_tx, connected_rx) = flume::unbounded();
+    let (connected_tx, mut connected_rx) = unbounded_channel();
     // Held: dropping the set aborts a pending connect, which drops the
     // transport it owns and kills the child process group it just spawned.
     let connects = spawn_connects(&inner, connected_tx);
@@ -824,16 +824,13 @@ async fn run(
         let step = tokio::select! {
             biased;
             connected = async {
-                match connected_rx.recv_async().await {
-                    Ok((i, result)) => Step::Connected(i, result),
+                match connected_rx.recv().await {
+                    Some((i, result)) => Step::Connected(i, result),
                     // Every connect landed, so only commands wake us now.
-                    Err(_) => pending().await,
+                    None => pending().await,
                 }
             } => connected,
-            cmd = cmd_rx.recv_async() => match cmd {
-                Ok(cmd) => Step::Command(cmd),
-                Err(_) => Step::Closed,
-            },
+            cmd = cmd_rx.recv() => cmd.map_or(Step::Closed, Step::Command),
         };
 
         match step {
@@ -871,7 +868,7 @@ async fn run(
 
 /// Nothing left in `Connecting` means every server landed and the last publish
 /// already carried its tools, so waiters can go.
-fn release_ready(inner: &McpManagerInner, ready: &mut Option<flume::Sender<Infallible>>) {
+fn release_ready(inner: &McpManagerInner, ready: &mut Option<watch::Sender<()>>) {
     if ready.is_none()
         || inner
             .entries
@@ -1069,7 +1066,7 @@ fn parse_entries(config: McpConfig) -> McpManagerInner {
 /// publishes a fast server's tools without waiting for the slowest.
 fn spawn_connects(
     inner: &McpManagerInner,
-    tx: flume::Sender<(usize, Result<StartResult, McpError>)>,
+    tx: UnboundedSender<(usize, Result<StartResult, McpError>)>,
 ) -> JoinSet<()> {
     inner
         .entries
@@ -1080,7 +1077,7 @@ fn spawn_connects(
         .map(|(i, config)| {
             let tx = tx.clone();
             async move {
-                let _ = tx.send_async((i, start_server(&config).await)).await;
+                let _ = tx.send((i, start_server(&config).await));
             }
         })
         .collect()
@@ -1196,6 +1193,8 @@ pub mod test_support {
 
     use arc_swap::ArcSwap;
     use serde_json::{Value, json};
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::watch;
 
     use std::collections::HashMap;
 
@@ -1240,11 +1239,11 @@ pub mod test_support {
         publish(&inner, &index, &snapshot);
         McpSession::new(
             McpHandle {
-                cmd_tx: flume::unbounded().0,
+                cmd_tx: unbounded_channel().0,
                 index,
                 snapshot,
                 defer_tools: 0,
-                ready_rx: flume::bounded(0).1,
+                ready_rx: watch::channel(()).1,
             },
             &[],
         )
@@ -1404,7 +1403,7 @@ mod tests {
     #[cfg(unix)]
     use std::time::Instant;
     use test_case::test_case;
-    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::{Mutex as AsyncMutex, Notify};
 
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
     const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
@@ -1448,18 +1447,15 @@ mod tests {
     /// RPC at a known point without polling.
     struct FakeTransport {
         shutdowns: AtomicUsize,
-        call_entered: flume::Sender<()>,
-        call_entered_rx: flume::Receiver<()>,
+        call_entered: Notify,
         call_gate: AsyncMutex<()>,
     }
 
     impl FakeTransport {
         fn new() -> Arc<Self> {
-            let (call_entered, call_entered_rx) = flume::bounded(1);
             Arc::new(Self {
                 shutdowns: AtomicUsize::new(0),
-                call_entered,
-                call_entered_rx,
+                call_entered: Notify::new(),
                 call_gate: AsyncMutex::new(()),
             })
         }
@@ -1476,7 +1472,7 @@ mod tests {
             _args: &'a Value,
         ) -> transport::BoxFuture<'a, Result<String, McpError>> {
             Box::pin(async move {
-                let _ = self.call_entered.try_send(());
+                self.call_entered.notify_one();
                 let _g = self.call_gate.lock().await;
                 Ok("ok".into())
             })
@@ -1544,11 +1540,11 @@ mod tests {
         let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
         publish(&inner, &index, &snapshot);
         let handle = McpHandle {
-            cmd_tx: flume::unbounded().0,
+            cmd_tx: unbounded_channel().0,
             index,
             snapshot,
             defer_tools,
-            ready_rx: flume::bounded(0).1,
+            ready_rx: watch::channel(()).1,
         };
         (inner, McpSession::new(handle, &[]))
     }
@@ -2244,13 +2240,12 @@ mod tests {
         let (mut inner, handle) = setup(vec![fake_entry("srv", Arc::clone(&t) as _)]);
 
         let held = t.call_gate.lock().await;
-        let entered = t.call_entered_rx.clone();
         let call_handle = {
             let handle = handle.clone();
             tokio::spawn(async move { handle.call_tool(TOOL_NAME, &json!({})).await.unwrap() })
         };
 
-        entered.recv_async().await.unwrap();
+        t.call_entered.notified().await;
         inner.generation += 1;
         publish(&inner, &handle.index, &handle.snapshot);
         assert_eq!(handle.snapshot.load().generation, 1);
@@ -2271,13 +2266,13 @@ mod tests {
         };
         let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
         let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
-        let (cmd_tx, cmd_rx) = flume::unbounded();
+        let (cmd_tx, cmd_rx) = unbounded_channel();
         let loop_task = tokio::spawn(run(
             inner,
             Arc::clone(&index),
             Arc::clone(&snapshot),
             cmd_rx,
-            flume::bounded(0).0,
+            watch::channel(()).0,
         ));
 
         let (ack_tx, ack_rx) = oneshot::channel();
