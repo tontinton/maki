@@ -13,10 +13,11 @@ use std::cell::RefCell;
 #[cfg(test)]
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::thread;
 
-use flume::{Receiver, Sender};
+use flume::Receiver;
 use maki_agent::UiWaker;
 
 const PARSE_THREAD: &str = "input-parse";
@@ -26,7 +27,7 @@ type Job = Box<dyn FnOnce() + Send>;
 static WAKER: LazyLock<(UiWaker, Receiver<()>)> = LazyLock::new(UiWaker::new);
 
 static PARSES: LazyLock<Sender<Job>> = LazyLock::new(|| {
-    let (jobs, queued) = flume::unbounded::<Job>();
+    let (jobs, queued) = channel::<Job>();
     thread::Builder::new()
         .name(PARSE_THREAD.into())
         .spawn(move || {

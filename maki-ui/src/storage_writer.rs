@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,16 +45,17 @@ enum Entry {
 
 pub struct StorageWriter {
     pending: Pending,
-    wake: flume::Sender<()>,
-    done_rx: flume::Receiver<Vec<MakiId>>,
+    wake: Sender<()>,
+    /// Behind a lock only so the writer stays `Sync`: `shutdown` is the one reader.
+    done_rx: Mutex<Receiver<Vec<MakiId>>>,
 }
 
 impl StorageWriter {
     pub fn new(dir: StateDir, warn_tx: flume::Sender<String>) -> Self {
         let pending: Pending = Arc::default();
         let writer_pending = Arc::clone(&pending);
-        let (wake, wake_rx) = flume::unbounded::<()>();
-        let (done_tx, done_rx) = flume::bounded::<Vec<MakiId>>(1);
+        let (wake, wake_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<Vec<MakiId>>();
 
         std::thread::Builder::new()
             .name("storage-writer".into())
@@ -74,7 +76,7 @@ impl StorageWriter {
         Self {
             pending,
             wake,
-            done_rx,
+            done_rx: Mutex::new(done_rx),
         }
     }
 
@@ -110,7 +112,8 @@ impl StorageWriter {
     #[must_use]
     pub fn shutdown(self, timeout: Duration) -> Vec<MakiId> {
         drop(self.wake);
-        self.done_rx.recv_timeout(timeout).unwrap_or_else(|_| {
+        let done_rx = self.done_rx.into_inner().unwrap_or_else(|e| e.into_inner());
+        done_rx.recv_timeout(timeout).unwrap_or_else(|_| {
             warn!("storage writer did not drain within {timeout:?}");
             Vec::new()
         })
@@ -296,7 +299,7 @@ mod tests {
         let (session, claim) = fresh(&dir);
         let id = session.id;
         writer.send(Arc::new(session), claim.clone());
-        let (done_tx, done_rx) = flume::bounded(1);
+        let (done_tx, done_rx) = channel();
         writer.delete(id, Some(claim), move |res| {
             let _ = done_tx.send(res);
         });
@@ -365,7 +368,7 @@ mod tests {
         // The save is enqueued before the delete, so the flush that runs the
         // delete has already drained it; a repeat failure must stay silent.
         writer.send(Arc::clone(&session), claim.clone());
-        let (done_tx, done_rx) = flume::bounded(1);
+        let (done_tx, done_rx) = channel();
         writer.delete(MakiId::generate(), None, move |res| {
             let _ = done_tx.send(res);
         });
@@ -491,7 +494,7 @@ mod tests {
         session.push_message(user_message(0));
         writer.send(Arc::new(session.clone()), claim.clone());
 
-        let (done_tx, done_rx) = flume::bounded(1);
+        let (done_tx, done_rx) = channel();
         writer.delete(id, Some(claim.clone()), move |res| {
             let _ = done_tx.send(res);
         });
