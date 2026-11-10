@@ -637,9 +637,9 @@ enum HostHook {
 pub struct EndSession {
     pub session: MakiId,
     pub reason: SessionEndReason,
-    /// Set on the paths that block on the dispatch: the instant the caller
+    /// Set on the paths that wait for the dispatch: the instant the caller
     /// stops waiting, and where to answer it. Absent on the queued paths.
-    pub wait: Option<(Instant, flume::Sender<()>)>,
+    pub wait: Option<(Instant, oneshot::Sender<()>)>,
 }
 
 pub struct RestoreItem {

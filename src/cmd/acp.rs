@@ -113,7 +113,7 @@ pub async fn run(
         trust_policy: Arc::new(config.trust),
         on_session_end: Some(Arc::new(move |id, reason| {
             let handle = event_handle.clone();
-            Box::pin(async move { handle.end_session_async(id, reason).await })
+            Box::pin(async move { handle.end_sessions([id], reason).await })
         })),
         storage,
         background: cli.background_wait().is_some(),

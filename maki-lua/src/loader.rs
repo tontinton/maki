@@ -14,7 +14,8 @@ use maki_agent::{Cutter, SessionEndReason};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::{DeclAuthority, keep_granted};
 use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
-use tokio::task::spawn_blocking;
+use tokio::sync::oneshot;
+use tokio::time::timeout_at;
 
 use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
@@ -1294,7 +1295,8 @@ impl EventHandle {
 
     /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,
     /// then return. Call from every session-end path so a Lua monitor can
-    /// stay a plugin. Process exit wants [`Self::end_sessions_blocking`].
+    /// stay a plugin. A caller that must not outrun the handlers wants
+    /// [`Self::end_sessions`].
     ///
     /// Nothing waits here, so handlers get no deadline and the UI is still
     /// there to answer them.
@@ -1306,13 +1308,13 @@ impl EventHandle {
         }));
     }
 
-    /// [`Self::end_session`] for process exit: block until the handlers ran
-    /// and the jobs were reaped, so the `Shutdown` that follows on the
-    /// priority lane cannot skip ahead of them.
+    /// [`Self::end_session`] for process exit and an ACP session close: wait
+    /// until the handlers ran and the jobs were reaped, so the `Shutdown`
+    /// that follows on the priority lane cannot skip ahead of them.
     ///
     /// Every session is queued first and the deadline is shared, so quitting
     /// with many tabs open costs one `SHUTDOWN_TIMEOUT`, not one per tab.
-    pub fn end_sessions_blocking(
+    pub async fn end_sessions(
         &self,
         sessions: impl IntoIterator<Item = MakiId>,
         reason: SessionEndReason,
@@ -1325,8 +1327,7 @@ impl EventHandle {
             })
             .collect();
         for (session, reply_rx) in waits {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if reply_rx.recv_timeout(left).is_err() {
+            if !matches!(timeout_at(deadline.into(), reply_rx).await, Ok(Ok(()))) {
                 tracing::warn!(
                     session = %session,
                     "SessionEnd did not finish within timeout, continuing teardown"
@@ -1335,23 +1336,13 @@ impl EventHandle {
         }
     }
 
-    /// [`Self::end_sessions_blocking`] parked on a spare thread. ACP calls
-    /// this from its executor, where blocking would freeze stdin for the
-    /// whole grace period.
-    pub async fn end_session_async(&self, session: MakiId, reason: SessionEndReason) {
-        let handle = self.clone();
-        spawn_blocking(move || handle.end_sessions_blocking([session], reason))
-            .await
-            .expect("end_sessions_blocking panicked");
-    }
-
     fn send_end_session(
         &self,
         session: MakiId,
         reason: SessionEndReason,
         deadline: Instant,
-    ) -> Option<flume::Receiver<()>> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
+    ) -> Option<oneshot::Receiver<()>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Request::EndSession(EndSession {
                 session,

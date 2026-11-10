@@ -17,7 +17,7 @@ use maki_agent::{
     SessionMailbox, SharedBuf, ToolDoneEvent,
 };
 use maki_lua::test_support::runtime;
-use maki_lua::{EventHandle, MoveOutcome, UiAction};
+use maki_lua::{EventHandle, MoveOutcome, PluginHost, SessionEndReason, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
@@ -152,6 +152,10 @@ pub fn next_task_done(ui: &flume::Receiver<UiAction>) -> ToolDoneEvent {
             return *done;
         }
     }
+}
+
+pub fn end_session(host: &PluginHost, session: MakiId, reason: SessionEndReason) {
+    runtime().block_on(host.event_handle().end_sessions([session], reason));
 }
 
 pub fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
