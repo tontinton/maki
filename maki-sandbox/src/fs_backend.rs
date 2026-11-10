@@ -125,7 +125,11 @@ impl FsBackend for SandboxFs {
             FsReply::Value {
                 payload: Value::Object(map),
             } => map,
-            other => return Err(fs_err(format!("read_line_page: unexpected reply {other:?}"))),
+            other => {
+                return Err(fs_err(format!(
+                    "read_line_page: unexpected reply {other:?}"
+                )));
+            }
         };
         let lines = map
             .get("lines")

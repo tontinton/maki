@@ -3813,7 +3813,6 @@ dependencies = [
  "serde-saphyr",
  "serde-value",
  "serde_json",
- "shell-words",
  "socket2",
  "strum 0.28.0",
  "tempfile",

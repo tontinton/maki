@@ -27,8 +27,8 @@ use maki_config::ShellPreference;
 use maki_fs::grep::{GrepFileEntry, GrepParams};
 use maki_fs::search::{glob_walk, grep_search, mtime};
 use maki_fs::{
-    FsBackend, FsError, JobCommand, JobHandle, JobOut, JobRequest, JobSink, JobStream, LineSplitter,
-    PageQuery,
+    FsBackend, FsError, JobCommand, JobHandle, JobOut, JobRequest, JobSink, JobStream,
+    LineSplitter, PageQuery,
 };
 use maki_providers::{shell_command, strip_provider_keys};
 

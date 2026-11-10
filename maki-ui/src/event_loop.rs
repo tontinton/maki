@@ -681,21 +681,13 @@ async fn session_wake(sessions: &mut [SessionRuntime]) -> Wake {
             let (agent_rx, shell_rx) = (&mut rt.handles.agent_rx, &mut rt.shell_rx);
             #[cfg(all(feature = "sandbox", target_os = "linux"))]
             let sandbox_rx = &mut rt.sandbox_rx;
-            let mut waits = vec![
+            vec![
                 Box::pin(async move { Wake::Agent(i, Box::new(next_or_pending(agent_rx).await)) })
                     as LocalBoxFuture<'_, Wake>,
-                Box::pin(async move {
-                    match shell_rx.recv().await {
-                        Some(event) => Wake::Shell(i, event),
-                        None => pending().await,
-                    }
-                }),
-            ];
-            #[cfg(all(feature = "sandbox", target_os = "linux"))]
-            waits.push(Box::pin(async move {
-                Wake::Sandbox(i, next_or_pending(sandbox_rx).await)
-            }));
-            waits
+                Box::pin(async move { Wake::Shell(i, next_or_pending(shell_rx).await) }),
+                #[cfg(all(feature = "sandbox", target_os = "linux"))]
+                Box::pin(async move { Wake::Sandbox(i, next_or_pending(sandbox_rx).await) }),
+            ]
         })
         .collect();
     if waits.is_empty() {

@@ -300,9 +300,7 @@ pub fn read_line_page(
 mod tests {
     use std::io::{BufReader, Error as IoError, ErrorKind, Read, repeat};
 
-    use super::{
-        PageQuery, next_line, read_line_page, LINE_CUT_MARKER, NON_UTF8_CONTENT_ERR,
-    };
+    use super::{LINE_CUT_MARKER, NON_UTF8_CONTENT_ERR, PageQuery, next_line, read_line_page};
     use test_case::test_case;
 
     const CUT: u64 = 5;
@@ -371,8 +369,7 @@ mod tests {
             count: false,
             ..PageQuery::default()
         };
-        let (lines, total) =
-            read_line_page(&mut reader, &query, TEST_MAX_BYTES).unwrap();
+        let (lines, total) = read_line_page(&mut reader, &query, TEST_MAX_BYTES).unwrap();
         assert_eq!(lines, ["l2"]);
         assert_eq!(total, None);
         let next = next_line(&mut reader, None, TEST_MAX_BYTES, false)
@@ -445,8 +442,7 @@ mod tests {
     #[test_case(b"ok\xff\n"; "inside_the_kept_bytes")]
     #[test_case(b"ab\xffcdefgh\n"; "inside_a_cut_line")]
     fn read_line_page_rejects_non_utf8(content: &[u8]) {
-        let err =
-            read_line_page(small_reader(content), &cut_query(), TEST_MAX_BYTES).unwrap_err();
+        let err = read_line_page(small_reader(content), &cut_query(), TEST_MAX_BYTES).unwrap_err();
         assert_eq!(err.to_string(), NON_UTF8_CONTENT_ERR);
     }
 
@@ -462,13 +458,11 @@ mod tests {
     fn read_line_page_cuts_a_line_bigger_than_the_read_limit() {
         let huge_line = || BufReader::new(repeat(b'x').take(TEST_MAX_BYTES * 2));
 
-        let (lines, total) =
-            read_line_page(huge_line(), &cut_query(), TEST_MAX_BYTES).unwrap();
+        let (lines, total) = read_line_page(huge_line(), &cut_query(), TEST_MAX_BYTES).unwrap();
         assert_eq!(lines, ["x".repeat(CUT as usize) + LINE_CUT_MARKER]);
         assert_eq!(total, Some(1));
 
-        let err =
-            read_line_page(huge_line(), &PageQuery::default(), TEST_MAX_BYTES).unwrap_err();
+        let err = read_line_page(huge_line(), &PageQuery::default(), TEST_MAX_BYTES).unwrap_err();
         assert_eq!(err.to_string(), READ_LIMIT_ERROR);
     }
 }

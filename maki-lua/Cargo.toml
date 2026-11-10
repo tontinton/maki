@@ -25,7 +25,6 @@ mlua = { workspace = true }
 nucleo-matcher = { workspace = true }
 open = { workspace = true }
 serde = { workspace = true }
-shell-words = { workspace = true }
 serde_json = { workspace = true }
 serde-saphyr = { workspace = true, features = ["deserialize", "serialize"] }
 serde-value = { workspace = true }

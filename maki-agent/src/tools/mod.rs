@@ -16,12 +16,12 @@ use crate::Envelope;
 pub use deadline::Deadline;
 pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
+pub(crate) use maki_fs::search::truncate_bytes;
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, MovedCall, MovedLand, ParseError,
     PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult,
     ToolInvocation, ToolReach, ToolRegistry, ToolSource,
 };
-pub(crate) use maki_fs::search::truncate_bytes;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;

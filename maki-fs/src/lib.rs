@@ -29,7 +29,7 @@ pub mod search;
 pub mod window;
 pub use grep::{GrepFileEntry, GrepLine, GrepMatchGroup, GrepParams};
 pub use job::{JobCommand, JobHandle, JobOut, JobRequest, JobSink, JobStream, LineSplitter};
-pub use window::{Line, PageQuery, read_line_page, LINE_CUT_MARKER, NON_UTF8_CONTENT_ERR};
+pub use window::{LINE_CUT_MARKER, Line, NON_UTF8_CONTENT_ERR, PageQuery, read_line_page};
 
 /// An opaque filesystem/exec failure; the message is already human-readable
 /// and shown to the model verbatim.

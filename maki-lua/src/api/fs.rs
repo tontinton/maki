@@ -5,10 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use maki_agent::{FileQuery, FileReader, Ranked};
-use maki_fs::{
-    FsBackend, GrepParams, PageQuery,
-    window::NON_UTF8_CONTENT_ERR,
-};
+use maki_fs::{FsBackend, GrepParams, PageQuery, window::NON_UTF8_CONTENT_ERR};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 use tokio::task::spawn_blocking;
@@ -52,9 +49,13 @@ fn path_to_string(p: &Path) -> LuaResult<String> {
 }
 
 async fn read_backend(backend: Arc<dyn FsBackend>, path: PathBuf) -> Result<Vec<u8>, String> {
-    spawn_blocking(move || backend.read(&path, MAX_READ_BYTES).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| e.to_string())?
+    spawn_blocking(move || {
+        backend
+            .read(&path, MAX_READ_BYTES)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Read the file at {path} as a UTF-8 string. Pass {opts} to read only some
@@ -83,10 +84,9 @@ async fn read(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Str
             let offset: i64 = opts.opt::<i64>("offset")?.unwrap_or(1);
             let limit: Option<u64> = opts.opt::<u64>("limit")?.filter(|l| *l > 0);
             try_pair!(
-                spawn_blocking(
-                    move || backend.read_line_window(&abs, offset, limit, MAX_READ_BYTES)
-                        .map_err(|e| e.to_string()),
-                )
+                spawn_blocking(move || backend
+                    .read_line_window(&abs, offset, limit, MAX_READ_BYTES)
+                    .map_err(|e| e.to_string()),)
                 .await
                 .map_err(mlua::Error::external)?
             )
@@ -120,10 +120,9 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
             let offset: i64 = opts.opt::<i64>("offset")?.unwrap_or(0);
             let len: Option<u64> = opts.opt("len")?;
             try_pair!(
-                spawn_blocking(
-                    move || backend.read_byte_window(&abs, offset, len, MAX_READ_BYTES)
-                        .map_err(|e| e.to_string()),
-                )
+                spawn_blocking(move || backend
+                    .read_byte_window(&abs, offset, len, MAX_READ_BYTES)
+                    .map_err(|e| e.to_string()),)
                 .await
                 .map_err(mlua::Error::external)?
             )
@@ -165,10 +164,9 @@ async fn read_lines(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
     let query = page_query(opts.as_ref())?;
     let backend = resolve_backend(&lua);
     let (lines, total) = try_pair!(
-        spawn_blocking(
-            move || backend.read_line_page(&abs, &query, MAX_READ_BYTES)
-                .map_err(|e| e.to_string()),
-        )
+        spawn_blocking(move || backend
+            .read_line_page(&abs, &query, MAX_READ_BYTES)
+            .map_err(|e| e.to_string()),)
         .await
         .map_err(mlua::Error::external)?
     );
@@ -1332,8 +1330,9 @@ mod tests {
         let file = tmp.path().join("log.txt");
         std::fs::write(&file, content).unwrap();
 
-        let bytes = maki_fs::window::read_line_window(&file, offset, limit, MAX_READ_BYTES, chunk_size)
-            .unwrap();
+        let bytes =
+            maki_fs::window::read_line_window(&file, offset, limit, MAX_READ_BYTES, chunk_size)
+                .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), expected);
     }
 

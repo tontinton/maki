@@ -368,7 +368,11 @@ pub const KEYBINDS: &[Keybind] = &[
     single(key::PLAN_TOGGLE.label, "Toggle plan panel", Ctx::General),
     single(key::MODEL_PICKER.label, "Model picker", Ctx::General),
     single(key::SUSPEND.label, "Suspend process", Ctx::General).on(Platform::UnixOnly),
-    single(key::SANDBOX.label, "Inspect sandbox configuration", Ctx::General),
+    single(
+        key::SANDBOX.label,
+        "Inspect sandbox configuration",
+        Ctx::General,
+    ),
     single("Enter", "Submit prompt", Ctx::Editing),
     kb(
         KeyLabel::MacMulti(
@@ -477,7 +481,11 @@ pub const KEYBINDS: &[Keybind] = &[
     single("Esc", "Close / go back", Ctx::Sandbox),
     single("Backspace", "Go to parent directory", Ctx::Sandbox),
     kb(KeyLabel::Alt("↑", "↓"), "Navigate entries", Ctx::Sandbox),
-    kb(KeyLabel::Alt("PageUp", "PageDown"), "Scroll page up / down", Ctx::Sandbox),
+    kb(
+        KeyLabel::Alt("PageUp", "PageDown"),
+        "Scroll page up / down",
+        Ctx::Sandbox,
+    ),
     kb(
         KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
         "Scroll half page up / down",

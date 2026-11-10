@@ -1,12 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use maki_fs::{FsBackend, JobHandle, JobOut, JobRequest, JobSink, JobStream, Line};
 pub(crate) use maki_fs::JobCommand;
+use maki_fs::{FsBackend, JobHandle, JobOut, JobRequest, JobSink, JobStream, Line};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -270,10 +269,7 @@ impl JobStore {
         // The owner exists before any thread does, so a failed spawn below
         // still closes the queue on a reader that is already waiting on it.
         let (sender, events, queue) = job_queue(self.changed.clone());
-        let dropped_output = !matches!(
-            (&stdout, &stderr),
-            (JobOut::Capture, JobOut::Capture)
-        );
+        let dropped_output = !matches!((&stdout, &stderr), (JobOut::Capture, JobOut::Capture));
         // Start the job on the backend that will run it: a routed handler's
         // backend, or the host, which streams a process of its own.
         let command = cmd.display();
@@ -979,10 +975,10 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use maki_fs::LINE_CUT_MARKER;
     use crate::test_support::runtime;
     use futures::FutureExt;
+    #[cfg(unix)]
+    use maki_fs::LINE_CUT_MARKER;
     use std::thread;
     use std::time::Duration;
     use tokio::time::timeout;
@@ -1906,10 +1902,7 @@ mod tests {
         for (_, event) in collect_until_exit(id, || next_plugin_event(&mut store)) {
             store.record_event(id, &event);
         }
-        assert!(
-            store.jobs[&id].handle.is_reaped(),
-            "{EXIT_WITHOUT_REAP}"
-        );
+        assert!(store.jobs[&id].handle.is_reaped(), "{EXIT_WITHOUT_REAP}");
         store.complete(&lua, id, 0);
         store.kill(id, None, TEST_PLUGIN);
         let snap = store

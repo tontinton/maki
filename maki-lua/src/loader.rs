@@ -1058,7 +1058,7 @@ impl PluginHost {
 
     /// Install the fs backend that routed tool calls run against.
     pub fn set_sandbox_backend(&self, backend: Arc<dyn FsBackend>) -> Result<(), PluginError> {
-        if let Err(e) = self.inner.tx.try_send(Request::SetSandboxBackend(backend)) {
+        if let Err(e) = self.inner.tx.send(Request::SetSandboxBackend(backend)) {
             tracing::warn!("failed to send sandbox backend to lua runtime: {e}");
             Err(PluginError::HostDead)
         } else {
