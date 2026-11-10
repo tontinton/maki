@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
 use crate::components::input::Draft;
@@ -24,7 +25,7 @@ use maki_agent::{
 };
 use maki_config::{ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
-use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
+use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role, format_tokens};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -35,6 +36,7 @@ use crate::repaint::{Cadence, Dirty};
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
+const COMPACTING_TEXT: &str = "Compacting...";
 pub(crate) const LOST_TEXT: &str = "Lost";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
@@ -254,15 +256,30 @@ impl Chat {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);
                 }
             }
-            AgentEvent::AutoCompacting { .. } => {
+            AgentEvent::AutoCompacting { .. } => {}
+            AgentEvent::CompactionStarted => {
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
                     DisplayRole::Assistant,
-                    "Auto-compacting conversation...".into(),
+                    COMPACTING_TEXT.into(),
                 ));
             }
-            AgentEvent::CompactionDone { .. } => {
+            AgentEvent::CompactionDone {
+                context_size_before,
+                context_size_after,
+                duration_ms,
+                ..
+            } => {
                 self.messages_panel.flush();
+                self.messages_panel.push(DisplayMessage::new(
+                    DisplayRole::Notice,
+                    format!(
+                        "Compacted in {:.1}s · context {} → {} tokens",
+                        Duration::from_millis(duration_ms).as_secs_f64(),
+                        format_tokens(context_size_before),
+                        format_tokens(context_size_after),
+                    ),
+                ));
             }
             // The App takes these before they reach a chat.
             AgentEvent::QueueItemConsumed { .. }
@@ -1028,13 +1045,19 @@ mod tests {
     use super::*;
     use crate::components::IMAGE_PLACEHOLDER;
     use maki_agent::{
-        AgentEvent, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+        AgentEvent, DoneReason, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent,
+        TurnCompleteEvent,
     };
     use maki_config::UiConfig;
     use maki_providers::{ImageMediaType, TaskAnswer, TaskEnd, TaskSettled};
     use test_case::test_case;
 
     const IMAGE_DATA: &str = "dGVzdA==";
+    const COMPACTION_SUMMARY: &str = "summary";
+    const COMPACTION_THINKING: &str = "thinking";
+    const COMPACTION_ERROR: &str = "compaction failed";
+    const COMPACTED_ZERO: &str = "Compacted in 0.0s · context 0 → 0 tokens";
+    const COMPACTED_CONTEXT: &str = "Compacted in 12.4s · context 148.0k → 23.0k tokens";
 
     fn image() -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))
@@ -1660,28 +1683,64 @@ mod tests {
         assert!(restore_item_for(&no_output, tol, RESTORE_THEME_GEN).is_none());
     }
 
-    #[test]
-    fn compaction_done_flushes_streaming_buffers() {
+    fn message_rows(chat: &Chat) -> Vec<(&DisplayRole, &str)> {
+        (0..chat.message_count())
+            .map(|index| {
+                let message = chat.message_at(index).unwrap();
+                (&message.role, message.text.as_str())
+            })
+            .collect()
+    }
+
+    #[test_case(false ; "manual")]
+    #[test_case(true ; "automatic")]
+    fn compaction_started_flushes_prior_stream_once(automatic: bool) {
         let mut chat = chat();
-
-        chat.handle_event(
-            AgentEvent::AutoCompacting {
-                context_size: 0,
-                context_window: 0,
-            },
-            None,
-        );
-        assert_eq!(chat.message_count(), 1);
-
-        chat.handle_event(
-            AgentEvent::TextDelta {
-                text: "summary".into(),
-            },
-            None,
-        );
+        text_delta(&mut chat, REPLY_TEXT);
         chat.handle_event(
             AgentEvent::ThinkingDelta {
-                text: "thinking".into(),
+                text: COMPACTION_THINKING.into(),
+            },
+            None,
+        );
+        if automatic {
+            chat.handle_event(
+                AgentEvent::AutoCompacting {
+                    context_size: 0,
+                    context_window: 0,
+                },
+                None,
+            );
+        }
+
+        chat.handle_event(AgentEvent::CompactionStarted, None);
+
+        assert!(chat.streaming_text_is_empty());
+        assert!(chat.streaming_thinking_is_empty());
+        assert_eq!(
+            message_rows(&chat),
+            [
+                (&DisplayRole::Thinking, COMPACTION_THINKING),
+                (&DisplayRole::Assistant, REPLY_TEXT),
+                (&DisplayRole::Assistant, COMPACTING_TEXT),
+            ]
+        );
+    }
+
+    #[test_case(0, 0, 0, COMPACTED_ZERO ; "zero")]
+    #[test_case(12_400, 148_000, 23_000, COMPACTED_CONTEXT ; "typical_context")]
+    fn compaction_done_flushes_streaming_buffers(
+        duration_ms: u64,
+        context_size_before: u32,
+        context_size_after: u32,
+        expected: &str,
+    ) {
+        let mut chat = chat();
+        chat.handle_event(AgentEvent::CompactionStarted, None);
+        text_delta(&mut chat, COMPACTION_SUMMARY);
+        chat.handle_event(
+            AgentEvent::ThinkingDelta {
+                text: COMPACTION_THINKING.into(),
             },
             None,
         );
@@ -1690,21 +1749,50 @@ mod tests {
 
         chat.handle_event(
             AgentEvent::CompactionDone {
-                context_size_before: 0,
-                context_size_after: 0,
+                context_size_before,
+                context_size_after,
                 context_window: 0,
-                summary: String::new(),
+                summary: COMPACTION_SUMMARY.into(),
+                duration_ms,
             },
             None,
         );
         assert!(chat.streaming_text_is_empty());
         assert!(chat.streaming_thinking_is_empty());
-        assert_eq!(chat.message_count(), 3);
+        assert_eq!(
+            message_rows(&chat),
+            [
+                (&DisplayRole::Assistant, COMPACTING_TEXT),
+                (&DisplayRole::Thinking, COMPACTION_THINKING),
+                (&DisplayRole::Assistant, COMPACTION_SUMMARY),
+                (&DisplayRole::Notice, expected),
+            ]
+        );
 
-        chat.handle_event(AgentEvent::TextDelta { text: "new".into() }, None);
+        text_delta(&mut chat, REPLY_TEXT);
         chat.flush();
-        assert_eq!(chat.message_count(), 4);
-        assert_eq!(chat.last_message_text(), "new");
+        assert_eq!(chat.message_count(), 5);
+        assert_eq!(chat.last_message_text(), REPLY_TEXT);
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
+    }
+
+    #[test_case(AgentEvent::Error { message: COMPACTION_ERROR.into(), auth: false, totals: RunTotals::default() } ; "error")]
+    #[test_case(AgentEvent::Done { usage: Default::default(), cost: None, list_cost: None, context_size: 0, context_window: 0, num_turns: 0, reason: DoneReason::Cancelled } ; "cancelled")]
+    fn interrupted_compaction_has_no_success_notice(ending: AgentEvent) {
+        let mut chat = chat();
+        chat.handle_event(AgentEvent::CompactionStarted, None);
+        text_delta(&mut chat, COMPACTION_SUMMARY);
+
+        chat.handle_event(ending, None);
+
+        assert!(chat.streaming_text_is_empty());
+        assert_eq!(
+            message_rows(&chat),
+            [
+                (&DisplayRole::Assistant, COMPACTING_TEXT),
+                (&DisplayRole::Assistant, COMPACTION_SUMMARY),
+            ]
+        );
     }
 
     /// The transcript keeps growing after the ending, since the subagent chat

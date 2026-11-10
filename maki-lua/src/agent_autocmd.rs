@@ -268,6 +268,7 @@ pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<Host
             context_size_after,
             context_window,
             summary,
+            ..
         } => Some(HostEvent::CompactionDone {
             context_size_before: *context_size_before,
             context_size_after: *context_size_after,
@@ -393,6 +394,7 @@ mod tests {
                 context_size_after: 30_000,
                 context_window: 200_000,
                 summary: String::new(),
+                duration_ms: 0,
             },
             done(DoneReason::EndTurn),
             AgentEvent::Error {
