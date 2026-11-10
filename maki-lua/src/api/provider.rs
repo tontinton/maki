@@ -22,6 +22,7 @@ use mlua::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
@@ -187,7 +188,7 @@ pub struct LuaHookKeys {
     /// The registering plugin's reach, which `ctx.get_json` goes out under.
     egress: NetEgress,
     requests: flume::Sender<Request>,
-    release: flume::Sender<DeferredCallback>,
+    release: UnboundedSender<DeferredCallback>,
 }
 
 impl Drop for LuaHookKeys {
@@ -1090,6 +1091,7 @@ mod tests {
     use maki_providers::plugin::DeclAuthority;
     use serde_json::json;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use mlua::AnyUserData;
 
@@ -1132,7 +1134,7 @@ mod tests {
                 .collect(),
             egress: NetEgress::default(),
             requests: flume::unbounded().0,
-            release: flume::unbounded().0,
+            release: unbounded_channel().0,
         }
     }
 
