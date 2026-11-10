@@ -117,6 +117,10 @@ struct SessionMenu {
 #[derive(Default)]
 pub(crate) struct PlanRowHandlers {
     menus: HashMap<String, SessionMenu>,
+    /// The newest menu request each session has published. A chain that
+    /// finishes after a newer request for the same session must not replace
+    /// the handlers of the menu that is about to be drawn.
+    latest_request: HashMap<String, u64>,
     /// Never reused, so a stale pick can only ever miss.
     next_generation: u64,
 }
@@ -154,12 +158,24 @@ fn handlers_mut(lua: &Lua) -> LuaResult<mlua::AppDataRefMut<'_, PlanRowHandlers>
 /// Publish the menu a session is about to draw, dropping the handlers of the
 /// menu it replaces so a long-lived session does not accumulate registry
 /// keys. The generation it answers with is what a pick has to echo back.
+///
+/// A {request} older than the newest one published for the session answers
+/// [`None`] and drops its own handlers: the menu it belongs to is already
+/// superseded, even if its chain happened to finish last.
 pub(crate) fn install_row_handlers(
     lua: &Lua,
     session: String,
+    request: u64,
     rows: Vec<Option<RowHandler>>,
-) -> LuaResult<u64> {
+) -> LuaResult<Option<u64>> {
     let mut store = handlers_mut(lua)?;
+    let latest = store.latest_request.entry(session.clone()).or_insert(0);
+    if request < *latest {
+        drop(store);
+        drop_keys(lua, rows.into_iter());
+        return Ok(None);
+    }
+    *latest = request;
     store.next_generation += 1;
     let generation = store.next_generation;
     let replaced = store
@@ -167,7 +183,7 @@ pub(crate) fn install_row_handlers(
         .insert(session, SessionMenu { generation, rows });
     drop(store);
     drop_keys(lua, replaced.into_iter().flat_map(|m| m.rows));
-    Ok(generation)
+    Ok(Some(generation))
 }
 
 /// Reap the handlers a plugin owns. The rows stay on screen and go on naming
@@ -213,6 +229,7 @@ pub(crate) fn clear_session_rows(lua: &Lua, session: &str) {
         return;
     };
     let removed = store.menus.remove(session);
+    store.latest_request.remove(session);
     drop(store);
     drop_keys(lua, removed.into_iter().flat_map(|m| m.rows));
 }
@@ -708,18 +725,23 @@ mod tests {
         assert!(!rows[0].desc.contains('\n'));
     }
 
-    fn install(lua: &Lua, plugin: &str) -> u64 {
+    fn row_handler(lua: &Lua, plugin: &str) -> RowHandler {
         let func: Function = lua.load("return function() end").eval().unwrap();
-        let handler = lua.create_registry_value(func).unwrap();
+        RowHandler {
+            plugin: Arc::from(plugin),
+            key: lua.create_registry_value(func).unwrap(),
+        }
+    }
+
+    fn install(lua: &Lua, plugin: &str, request: u64) -> u64 {
         install_row_handlers(
             lua,
             SESSION.to_owned(),
-            vec![Some(RowHandler {
-                plugin: Arc::from(plugin),
-                key: handler,
-            })],
+            request,
+            vec![Some(row_handler(lua, plugin))],
         )
         .unwrap()
+        .expect("the request is current")
     }
 
     /// The revoked plugin's code stops being reachable the moment it is
@@ -728,7 +750,7 @@ mod tests {
     fn unloading_a_plugin_reaps_its_row_handlers() {
         let lua = Lua::new();
         lua.set_app_data(PlanRowHandlers::default());
-        let generation = install(&lua, PLUGIN);
+        let generation = install(&lua, PLUGIN, 1);
         let store = lua.app_data_ref::<PlanRowHandlers>().unwrap();
         assert!(store.handler(SESSION, generation, 0).is_ok());
         drop(store);
@@ -758,7 +780,7 @@ mod tests {
     fn closing_a_session_reaps_its_menu() {
         let lua = Lua::new();
         lua.set_app_data(PlanRowHandlers::default());
-        let generation = install(&lua, PLUGIN);
+        let generation = install(&lua, PLUGIN, 5);
 
         clear_session_rows(&lua, SESSION);
         assert_eq!(
@@ -768,6 +790,7 @@ mod tests {
                 .err(),
             Some(NO_MENU_ERR)
         );
+        install(&lua, PLUGIN, 1);
     }
 
     /// A chain that answered after the form stopped waiting published a menu
@@ -777,7 +800,7 @@ mod tests {
     fn a_menu_nobody_is_drawing_is_reaped() {
         let lua = Lua::new();
         lua.set_app_data(PlanRowHandlers::default());
-        let orphan = install(&lua, PLUGIN);
+        let orphan = install(&lua, PLUGIN, 1);
 
         clear_menu_generation(&lua, SESSION, orphan);
         assert_eq!(
@@ -796,10 +819,35 @@ mod tests {
     fn reaping_an_orphan_spares_the_menu_that_replaced_it() {
         let lua = Lua::new();
         lua.set_app_data(PlanRowHandlers::default());
-        let orphan = install(&lua, PLUGIN);
-        let on_screen = install(&lua, PLUGIN);
+        let orphan = install(&lua, PLUGIN, 1);
+        let on_screen = install(&lua, PLUGIN, 2);
 
         clear_menu_generation(&lua, SESSION, orphan);
+        assert!(
+            lua.app_data_ref::<PlanRowHandlers>()
+                .unwrap()
+                .handler(SESSION, on_screen, 0)
+                .is_ok()
+        );
+    }
+
+    /// The reverse order is the bug: an older request that finishes last must
+    /// not replace the handlers of the menu the newer request is drawing.
+    #[test]
+    fn a_late_answer_for_an_older_request_keeps_the_current_menu() {
+        let lua = Lua::new();
+        lua.set_app_data(PlanRowHandlers::default());
+        let on_screen = install(&lua, PLUGIN, 2);
+
+        let late = install_row_handlers(
+            &lua,
+            SESSION.to_owned(),
+            1,
+            vec![Some(row_handler(&lua, PLUGIN))],
+        )
+        .unwrap();
+
+        assert_eq!(late, None);
         assert!(
             lua.app_data_ref::<PlanRowHandlers>()
                 .unwrap()
@@ -814,8 +862,8 @@ mod tests {
     fn a_pick_from_a_replaced_menu_is_rejected() {
         let lua = Lua::new();
         lua.set_app_data(PlanRowHandlers::default());
-        let drawn = install(&lua, PLUGIN);
-        let installed_later = install(&lua, PLUGIN);
+        let drawn = install(&lua, PLUGIN, 1);
+        let installed_later = install(&lua, PLUGIN, 2);
         assert_ne!(drawn, installed_later);
 
         let store = lua.app_data_ref::<PlanRowHandlers>().unwrap();

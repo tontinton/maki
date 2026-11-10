@@ -1369,6 +1369,7 @@ fn ask_plan_form(host: &PluginHost) -> Option<PlanMenu> {
         .open_plan_form(
             PLAN_PATH.to_owned(),
             PLAN_SESSION.to_owned(),
+            1,
             builtin_rows(),
         )
         .recv_timeout(DISPATCH_TIMEOUT)

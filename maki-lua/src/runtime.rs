@@ -511,6 +511,9 @@ pub enum Request {
     OpenPlanForm {
         path: String,
         session: String,
+        /// The UI's monotonic request number, so a chain that answers after a
+        /// newer request cannot publish its handlers over that menu.
+        request: u64,
         /// The rows the host proposes, i.e. the bottom of the actions chain.
         rows: Vec<PlanFormRow>,
         /// The menu to draw, or `None` when a layer took the form over.
@@ -5005,12 +5008,14 @@ async fn plan_form_opens(
 /// what a layer that throws, parks for good, or answers off contract leaves
 /// behind. Layering costs [`PLAN_FORM_COST`], since a row decides what
 /// the agent does next.
+#[allow(clippy::too_many_arguments)]
 async fn plan_form_rows(
     lua: &Lua,
     plugins: &PluginMap,
     gate: &Rc<InflightGate>,
     deadline: Instant,
     session: &str,
+    request: u64,
     args: MultiValue,
     proposed: Vec<PlanFormRow>,
 ) -> PlanMenu {
@@ -5077,8 +5082,12 @@ async fn plan_form_rows(
     let (rows, handlers) = answered
         .filter(|answered| !answered.0.is_empty())
         .unwrap_or_else(|| (proposed, Vec::new()));
-    match install_row_handlers(lua, session.to_owned(), handlers) {
-        Ok(generation) => PlanMenu { generation, rows },
+    match install_row_handlers(lua, session.to_owned(), request, handlers) {
+        Ok(Some(generation)) => PlanMenu { generation, rows },
+        Ok(None) => PlanMenu {
+            generation: 0,
+            rows: rows.into_iter().filter_map(without_handler).collect(),
+        },
         Err(e) => {
             // Nothing was stashed, so no row may go on claiming a handler: a
             // pick would echo a generation that answers for nothing, and the
@@ -5109,6 +5118,7 @@ async fn open_plan_form(
     gate: &Rc<InflightGate>,
     path: String,
     session: &str,
+    request: u64,
     rows: Vec<PlanFormRow>,
 ) -> Option<PlanMenu> {
     let deadline = Instant::now() + PLAN_FORM_SLOT_DEADLINE;
@@ -5125,7 +5135,7 @@ async fn open_plan_form(
     if !plan_form_opens(lua, plugins, gate, deadline, args.clone()).await {
         return None;
     }
-    Some(plan_form_rows(lua, plugins, gate, deadline, session, args, rows).await)
+    Some(plan_form_rows(lua, plugins, gate, deadline, session, request, args, rows).await)
 }
 
 /// Fires a host-owned chain and reads back the one contract every host slot
@@ -5867,6 +5877,7 @@ pub fn spawn(
                         Request::OpenPlanForm {
                             path,
                             session,
+                            request,
                             rows,
                             reply,
                         } => {
@@ -5877,9 +5888,10 @@ pub fn spawn(
                             let plugins = Rc::clone(&rt.plugins);
                             let gate = Rc::clone(&gate);
                             spawn_local(async move {
-                                let menu =
-                                    open_plan_form(&lua, &plugins, &gate, path, &session, rows)
-                                        .await;
+                                let menu = open_plan_form(
+                                    &lua, &plugins, &gate, path, &session, request, rows,
+                                )
+                                .await;
                                 let generation = menu.as_ref().map_or(0, |m| m.generation);
                                 if reply.send(menu).is_err() {
                                     // The form gave up on this answer, or the

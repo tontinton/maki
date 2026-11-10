@@ -1136,12 +1136,14 @@ impl EventHandle {
         &self,
         path: String,
         session: String,
+        request: u64,
         rows: Vec<PlanFormRow>,
     ) -> flume::Receiver<Option<PlanMenu>> {
         let (reply, rx) = flume::bounded(1);
         let _ = self.prio_tx.try_send(Request::OpenPlanForm {
             path,
             session,
+            request,
             rows,
             reply,
         });
