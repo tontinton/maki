@@ -1,12 +1,12 @@
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use flume::Sender;
+use futures::TryStreamExt;
 use maki_storage::id::{MakiId, SessionRef};
 use reqwest::{Client, Method, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::warn;
 
 use maki_config::providers::Protocol;
@@ -25,9 +25,7 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{
-    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line, ok_sse, ok_text,
-};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, SseBody, http_client, ok_sse, ok_text};
 
 pub(crate) const SLUG: &str = "google";
 const DISPLAY_NAME: &str = "Google";
@@ -261,8 +259,8 @@ impl Google {
             .body(json_body)
             .build()?;
 
-        ok_sse(&self.client, request, |body| {
-            parse_sse(body, event_tx, self.stream_timeout)
+        ok_sse(&self.client, request, self.stream_timeout, |body| {
+            parse_sse(body, event_tx)
         })
         .await
     }
@@ -591,24 +589,19 @@ fn push_or_extend_thinking(
 }
 
 async fn parse_sse(
-    reader: impl AsyncBufRead + Unpin,
+    mut events: SseBody,
     event_tx: &Sender<ProviderEvent>,
-    stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let mut lines = reader.lines();
-
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
-    let mut deadline = Instant::now() + stream_timeout;
 
-    while let Some(line) = next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.strip_prefix(' ').unwrap_or(d),
-            _ => continue,
+    while let Some(event) = events.try_next().await? {
+        let Some(data) = event.data else {
+            continue;
         };
 
-        let chunk: SseResponse = match serde_json::from_str(data) {
+        let chunk: SseResponse = match serde_json::from_str(&data) {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "failed to parse Gemini SSE chunk");
@@ -689,11 +682,10 @@ mod tests {
     use super::*;
     use crate::error::ErrorProjection;
     use crate::model::{ModelPricing, ModelTier};
-    use std::io::Cursor;
+    use crate::test_support::sse_body;
     use std::sync::Arc;
     use test_case::test_case;
 
-    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
     const GEMINI_API_KEY: &str = "test-key";
     const MALFORMED_BASE_URL: &str = "http://[";
     const TOOL_NAME: &str = "word_count";
@@ -1059,9 +1051,9 @@ mod tests {
     #[tokio::test]
     async fn parse_sse_plain_text() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":10}}\n\n";
-        let response = Cursor::new(data);
+        let response = sse_body(data);
         let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(result.usage.input, 5);
         assert_eq!(result.usage.output, 10);
@@ -1082,9 +1074,9 @@ mod tests {
         let mut data = String::new();
         data.push_str(&event("Hello, "));
         data.push_str(&event("world."));
-        let response = Cursor::new(data);
+        let response = sse_body(data);
         let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(
             result.message.content.len(),
             1,
@@ -1111,9 +1103,9 @@ mod tests {
         let mut data = String::new();
         data.push_str(&event("reasoning... ", None));
         data.push_str(&event("more.", Some("sig-final")));
-        let response = Cursor::new(data);
+        let response = sse_body(data);
         let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.message.content.len(), 1);
         assert!(matches!(
             &result.message.content[0],
@@ -1127,9 +1119,9 @@ mod tests {
         let part = r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"}}}"#;
         let payload = format!(r#"{{"candidates":[{{"content":{{"parts":[{part},{part}]}}}}]}}"#,);
         let data = format!("data: {payload}\n\n");
-        let response = Cursor::new(data);
+        let response = sse_body(data);
         let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let result = parse_sse(response, &tx).await.unwrap();
         let ids: Vec<&str> = result
             .message
             .content
@@ -1146,9 +1138,9 @@ mod tests {
     #[tokio::test]
     async fn parse_sse_thinking_part() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":30}}\n\n";
-        let response = Cursor::new(data);
+        let response = sse_body(data);
         let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.usage.output, 50);
         assert!(matches!(
             &result.message.content[0],
@@ -1163,9 +1155,9 @@ mod tests {
     #[tokio::test]
     async fn parse_sse_tool_call() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{\"cmd\":\"ls\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":15}}\n\n";
-        let response = Cursor::new(data);
+        let response = sse_body(data);
         let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
         assert!(matches!(
             &result.message.content[0],
@@ -1188,9 +1180,9 @@ mod tests {
             r#"{{"candidates":[{{"content":{{"parts":[{part_json}]}},"finishReason":"STOP"}}],"usageMetadata":{{"promptTokenCount":5,"candidatesTokenCount":15}}}}"#,
         );
         let data = format!("data: {payload}\n\n");
-        let response = Cursor::new(data);
+        let response = sse_body(data);
         let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::ToolUse { thought_signature: Some(s), .. } if s == SIG
@@ -1209,9 +1201,9 @@ mod tests {
             metadata["cachedContentTokenCount"] = json!(cached);
         }
         let data = format!("data: {}\n\n", json!({"usageMetadata": metadata}));
-        let response = Cursor::new(data);
+        let response = sse_body(data);
         let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, cached.unwrap_or_default());
@@ -1240,9 +1232,9 @@ mod tests {
             json!({"usageMetadata": initial_metadata}),
             json!({"usageMetadata": metadata}),
         );
-        let response = Cursor::new(data);
+        let response = sse_body(data);
         let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, expected_cache_read);

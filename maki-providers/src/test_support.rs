@@ -10,16 +10,27 @@
 //! to decide for itself what counts as a difference.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::time::Duration;
+
+#[cfg(test)]
+use futures::stream;
 
 use maki_config::providers::BASE_URL_ENV_SUFFIX;
 use serde_json::Value;
 use tempfile::TempDir;
 
 use crate::providers::plugin::{self, DeclAuthority, ProviderDecl, ProviderHooks, Registration};
+#[cfg(test)]
+use crate::providers::{SseBody, sse_events};
 
+#[cfg(test)]
+const SSE_BODY_TIMEOUT: Duration = Duration::from_secs(300);
 const LOOPBACK: &str = "127.0.0.1:0";
 const REASON_PHRASE: &str = "Recorded";
 const CONTENT_LENGTH: &str = "content-length";
@@ -249,6 +260,13 @@ pub fn register_bundled(authored: Value, host: &str) {
 /// an escaped string.
 pub fn sse_event(event: &str, data: &Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
+}
+
+/// A whole body in one chunk, as the events a parser test reads.
+#[cfg(test)]
+pub(crate) fn sse_body(body: impl AsRef<[u8]>) -> SseBody {
+    let chunk = Cursor::new(body.as_ref().to_vec());
+    sse_events(stream::iter([Ok(chunk)]), SSE_BODY_TIMEOUT)
 }
 
 /// What the transport tests in `http` and `error` fail against: a port that

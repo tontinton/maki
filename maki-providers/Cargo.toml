@@ -14,8 +14,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 strum = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 flume = { workspace = true }
+bytes = { workspace = true }
+sse-stream = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true, features = ["socks", "gzip", "deflate", "stream"] }
 aws-config = { workspace = true }
@@ -37,6 +38,7 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 
 [lints]

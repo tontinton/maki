@@ -5,14 +5,14 @@ pub(crate) mod bedrock;
 pub(crate) mod shared;
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use flume::Sender;
+use futures::TryStreamExt;
 use maki_storage::id::SessionRef;
 use reqwest::{Client, Method, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::debug;
 use url::Url;
 
@@ -30,7 +30,7 @@ use crate::{
 };
 
 use super::codec::SessionCarrier;
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, SseBody, Timeouts};
 
 const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = "https://api.anthropic.com";
@@ -467,8 +467,8 @@ impl Anthropic {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
         let request = builder.body(json_body).build()?;
-        super::ok_sse(&self.client, request, |body| {
-            parse_sse(body, event_tx, self.stream_timeout)
+        super::ok_sse(&self.client, request, self.stream_timeout, |body| {
+            parse_sse(body, event_tx)
         })
         .await
     }
@@ -667,28 +667,18 @@ struct ModelsPage {
 }
 
 pub(crate) async fn parse_sse(
-    reader: impl AsyncBufRead + Unpin,
+    mut events: SseBody,
     event_tx: &Sender<ProviderEvent>,
-    stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let mut lines = reader.lines();
     let mut parser = shared::EventParser::new();
-    let mut current_event = String::new();
-    let mut deadline = Instant::now() + stream_timeout;
 
-    while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        if let Some(rest) = line.strip_prefix("event:") {
-            current_event = rest.strip_prefix(' ').unwrap_or(rest).to_string();
+    while let Some(event) = events.try_next().await? {
+        let Some(data) = event.data else {
             continue;
-        }
-
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.strip_prefix(' ').unwrap_or(d),
-            None => continue,
         };
 
         if parser
-            .process(&current_event, data, event_tx)
+            .process(event.event.as_deref().unwrap_or_default(), &data, event_tx)
             .await?
             .is_break()
         {
@@ -702,18 +692,15 @@ pub(crate) async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Canned, serve, sse_event};
+    use crate::test_support::{Canned, serve, sse_body, sse_event};
     use crate::{
         ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, ProviderEvent, Role, StopReason,
         TokenUsage,
     };
     use serde_json::{Value, json};
     use shared::{DISPLACED_ERROR_PREFIX, build_wire_messages};
-    use std::io::Cursor;
-    use std::time::Duration;
     use test_case::test_case;
 
-    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
     const THINKING_SIGNATURE: &str = "sig";
     const UNKNOWN_BLOCK_TYPE: &str = "server_tool_use";
@@ -899,12 +886,10 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10}}\n\
 \n\
 event: message_stop\n\
-data: {\"type\":\"message_stop\"}\n";
+data: {\"type\":\"message_stop\"}\n\n";
 
         let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert_eq!(
             resp.usage,
@@ -952,9 +937,7 @@ data: {{\"type\":\"message_stop\"}}\n"
         );
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert_eq!(
             resp.usage,
@@ -997,9 +980,7 @@ data: {{\"type\":\"message_stop\"}}\n"
         .concat();
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert_eq!(
             resp.usage,
@@ -1052,9 +1033,7 @@ event: message_stop\n\
 data: {{\"type\":\"message_stop\"}}\n"
         );
         let (tx, _rx) = flume::unbounded();
-        parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap()
+        parse_sse(sse_body(sse_data), &tx).await.unwrap()
     }
 
     #[test_case(None, true ; "from_message_start")]
@@ -1104,12 +1083,10 @@ event:message_delta\n\
 data:{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\
 \n\
 event:message_stop\n\
-data:{\"type\":\"message_stop\"}\n";
+data:{\"type\":\"message_stop\"}\n\n";
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert!(matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "OK"));
         assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
@@ -1136,12 +1113,10 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\"}\n\
 \n\
 event: message_delta\n\
-data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
 
         let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let resp = parse_sse(sse_body(sse_data.as_bytes()), &tx).await.unwrap();
 
         let tools: Vec<_> = resp.message.tool_uses().collect();
         assert_eq!(tools.len(), 1);
@@ -1664,11 +1639,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
 
     #[tokio::test]
     async fn parse_sse_overloaded_error() {
-        let input = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
+        let input = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
         let (tx, _rx) = flume::unbounded();
-        let err = parse_sse(Cursor::new(input), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap_err();
+        let err = parse_sse(sse_body(input), &tx).await.unwrap_err();
         match err {
             AgentError::Api {
                 status, message, ..
@@ -1682,11 +1655,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
 
     #[tokio::test]
     async fn parse_sse_unparseable_error() {
-        let input = b"event: error\ndata: not-json\n";
+        let input = b"event: error\ndata: not-json\n\n";
         let (tx, _rx) = flume::unbounded();
-        let err = parse_sse(Cursor::new(input), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap_err();
+        let err = parse_sse(sse_body(input), &tx).await.unwrap_err();
         match err {
             AgentError::Api {
                 status, message, ..
@@ -1714,12 +1685,10 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\"}\n\
 \n\
 event: message_delta\n\
-data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n";
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n";
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let resp = parse_sse(sse_body(sse_data.as_bytes()), &tx).await.unwrap();
 
         let tools: Vec<_> = resp.message.tool_uses().collect();
         assert_eq!(tools.len(), 1);
@@ -1758,12 +1727,10 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\"}\n\
 \n\
 event: message_delta\n\
-data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n";
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n";
 
         let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert!(
             matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature }
@@ -1803,12 +1770,10 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\"}\n\
 \n\
 event: message_delta\n\
-data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n";
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert!(
             matches!(&resp.message.content[0], ContentBlock::RedactedThinking { data } if data == "opaque_data")

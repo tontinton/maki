@@ -843,8 +843,8 @@ impl CatalogTransport {
                     .body(serde_json::to_vec(&body)?)
                     .build()?;
                 debug!(model = %model.id, "sending Anthropic-format request via catalog");
-                ok_sse(&self.client, request, |body| {
-                    anthropic::parse_sse(body, event_tx, self.stream_timeout)
+                ok_sse(&self.client, request, self.stream_timeout, |body| {
+                    anthropic::parse_sse(body, event_tx)
                 })
                 .await
             }

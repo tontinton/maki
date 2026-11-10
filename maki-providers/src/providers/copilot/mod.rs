@@ -272,8 +272,8 @@ impl Copilot {
             )?
             .body(serde_json::to_vec(&body)?)
             .build()?;
-        super::ok_sse(&self.client, request, |body| {
-            openai_compat::parse_sse(body, event_tx, self.stream_timeout, false)
+        super::ok_sse(&self.client, request, self.stream_timeout, |body| {
+            openai_compat::parse_sse(body, event_tx, false)
         })
         .await
     }
@@ -336,8 +336,8 @@ impl Copilot {
             .header("anthropic-version", "2023-06-01")
             .body(serde_json::to_vec(&body)?)
             .build()?;
-        super::ok_sse(&self.client, request, |body| {
-            super::anthropic::parse_sse(body, event_tx, self.stream_timeout)
+        super::ok_sse(&self.client, request, self.stream_timeout, |body| {
+            super::anthropic::parse_sse(body, event_tx)
         })
         .await
     }
