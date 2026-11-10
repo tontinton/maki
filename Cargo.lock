@@ -3620,6 +3620,7 @@ dependencies = [
  "maki-lua",
  "maki-otel",
  "maki-providers",
+ "maki-sandbox",
  "maki-storage",
  "maki-ui",
  "open",
@@ -3669,12 +3670,11 @@ dependencies = [
  "bitflags 2.13.2",
  "flume",
  "futures",
- "grep-regex",
- "grep-searcher",
  "ignore",
  "jiff",
  "jsonrepair",
  "maki-config",
+ "maki-fs",
  "maki-otel",
  "maki-providers",
  "maki-storage",
@@ -3750,6 +3750,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "maki-fs"
+version = "0.7.1"
+dependencies = [
+ "etcetera",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "rustix 1.1.6",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tempfile",
+ "test-case",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "maki-highlight"
 version = "0.7.1"
 dependencies = [
@@ -3793,6 +3811,7 @@ dependencies = [
  "jsonschema",
  "maki-agent",
  "maki-config",
+ "maki-fs",
  "maki-highlight",
  "maki-interpreter",
  "maki-lua-macro",
@@ -3952,6 +3971,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "maki-sandbox"
+version = "0.7.1"
+dependencies = [
+ "base64 0.23.1",
+ "libc",
+ "maki-fs",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "test-case",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "maki-storage"
 version = "0.7.1"
 dependencies = [
@@ -3987,11 +4023,13 @@ dependencies = [
  "libc",
  "maki-agent",
  "maki-config",
+ "maki-fs",
  "maki-highlight",
  "maki-lua",
  "maki-markdown",
  "maki-otel",
  "maki-providers",
+ "maki-sandbox",
  "maki-storage",
  "notify",
  "notify-rust",

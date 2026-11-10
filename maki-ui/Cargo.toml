@@ -7,12 +7,14 @@ license.workspace = true
 [dependencies]
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
+maki-fs = { workspace = true }
 maki-otel = { workspace = true }
 maki-highlight = { workspace = true }
 maki-markdown = { workspace = true }
 maki-providers = { workspace = true }
 maki-lua = { workspace = true }
 maki-storage = { workspace = true }
+maki-sandbox = { workspace = true, optional = true }
 ratatui = { workspace = true }
 ratatui-image = { workspace = true }
 crossterm = { workspace = true }
@@ -52,10 +54,14 @@ arboard = { workspace = true, features = ["wayland-data-control"] }
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
+[features]
+sandbox = ["dep:maki-sandbox", "maki-sandbox/sandbox"]
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
 [dev-dependencies]
+maki-sandbox = { workspace = true, features = ["testing"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }

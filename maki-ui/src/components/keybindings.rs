@@ -10,12 +10,103 @@ macro_rules! mod_key {
     };
 }
 
+macro_rules! upper {
+    ('a') => {
+        "A"
+    };
+    ('b') => {
+        "B"
+    };
+    ('c') => {
+        "C"
+    };
+    ('d') => {
+        "D"
+    };
+    ('e') => {
+        "E"
+    };
+    ('f') => {
+        "F"
+    };
+    ('g') => {
+        "G"
+    };
+    ('h') => {
+        "H"
+    };
+    ('i') => {
+        "I"
+    };
+    ('j') => {
+        "J"
+    };
+    ('k') => {
+        "K"
+    };
+    ('l') => {
+        "L"
+    };
+    ('m') => {
+        "M"
+    };
+    ('n') => {
+        "N"
+    };
+    ('o') => {
+        "O"
+    };
+    ('p') => {
+        "P"
+    };
+    ('q') => {
+        "Q"
+    };
+    ('r') => {
+        "R"
+    };
+    ('s') => {
+        "S"
+    };
+    ('t') => {
+        "T"
+    };
+    ('u') => {
+        "U"
+    };
+    ('v') => {
+        "V"
+    };
+    ('w') => {
+        "W"
+    };
+    ('x') => {
+        "X"
+    };
+    ('y') => {
+        "Y"
+    };
+    ('z') => {
+        "Z"
+    };
+}
+
 macro_rules! ctrl_bind {
     ($upper:literal) => {
         Bind {
             code: KeyCode::Char($upper.as_bytes()[0].to_ascii_lowercase() as char),
             modifiers: KeyModifiers::CONTROL,
             label: mod_key!($upper),
+        }
+    };
+}
+
+macro_rules! ctrl_str_bind {
+    ($char:tt) => {
+        Bind {
+            code: KeyCode::Char($char),
+            modifiers: KeyModifiers::SUPER,
+            label: mod_key!(upper!($char)),
         }
     };
 }
@@ -77,6 +168,7 @@ pub mod key {
     pub const DELETE_WORD: Bind = ctrl_bind!("W");
     pub const SEARCH: Bind = ctrl_bind!("F");
     pub const FORK: Bind = ctrl_bind!("F");
+    pub const SANDBOX: Bind = ctrl_str_bind!('s');
     pub const FILE_PICKER: Bind = ctrl_bind!("S");
     pub const OPEN_EDITOR: Bind = ctrl_bind!("O");
     pub const PLAN_TOGGLE: Bind = ctrl_bind!("T");
@@ -113,6 +205,7 @@ pub enum KeybindContext {
     CommandPalette,
     Search,
     FilePicker,
+    Sandbox,
 }
 
 impl KeybindContext {
@@ -130,6 +223,7 @@ impl KeybindContext {
             Self::CommandPalette => "Commands",
             Self::Search => "Search",
             Self::FilePicker => "File Picker",
+            Self::Sandbox => "Sandbox",
         }
     }
 
@@ -141,7 +235,8 @@ impl KeybindContext {
             | Self::QueueFocus
             | Self::CommandPalette
             | Self::Search
-            | Self::FilePicker => Some(Self::Picker),
+            | Self::FilePicker
+            | Self::Sandbox => Some(Self::Picker),
             _ => None,
         }
     }
@@ -273,6 +368,7 @@ pub const KEYBINDS: &[Keybind] = &[
     single(key::PLAN_TOGGLE.label, "Toggle plan panel", Ctx::General),
     single(key::MODEL_PICKER.label, "Model picker", Ctx::General),
     single(key::SUSPEND.label, "Suspend process", Ctx::General).on(Platform::UnixOnly),
+    single(key::SANDBOX.label, "Inspect sandbox configuration", Ctx::General),
     single("Enter", "Submit prompt", Ctx::Editing),
     kb(
         KeyLabel::MacMulti(
@@ -375,6 +471,17 @@ pub const KEYBINDS: &[Keybind] = &[
         Ctx::ModelPicker,
     ),
     single("%", "Fold or unfold provider", Ctx::ModelPicker),
+    single("Tab", "Switch mode (Info/Browse/Shell)", Ctx::Sandbox),
+    single("Enter", "Open directory / run command", Ctx::Sandbox),
+    single("Esc", "Close / go back", Ctx::Sandbox),
+    single("Backspace", "Go to parent directory", Ctx::Sandbox),
+    kb(KeyLabel::Alt("↑", "↓"), "Navigate entries", Ctx::Sandbox),
+    kb(KeyLabel::Alt("PageUp", "PageDown"), "Scroll page up / down", Ctx::Sandbox),
+    kb(
+        KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
+        "Scroll half page up / down",
+        Ctx::Sandbox,
+    ),
 ];
 
 pub fn all_contexts() -> impl Iterator<Item = KeybindContext> {
