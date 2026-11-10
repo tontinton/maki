@@ -2260,7 +2260,8 @@ impl<'t> EventLoop<'t> {
         };
         self.ctx
             .lua_event_handle
-            .end_sessions_blocking(self.sessions.iter().map(SessionRuntime::id), reason);
+            .end_sessions(self.sessions.iter().map(SessionRuntime::id), reason)
+            .await;
         let session_end_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);

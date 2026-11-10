@@ -779,7 +779,9 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     // Reaps session-owned plugin jobs before the writer thread joins: an
     // orphan inheriting stdout would keep an orchestrator's read blocked
     // after maki exits.
-    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+    lua_handle
+        .end_sessions([session_id.id()], SessionEndReason::Completed)
+        .await;
     // Background work and plugin jobs are stopped by now, so nothing spends
     // any more. Dropping the track saves the full bill, also what no result
     // was left to report.

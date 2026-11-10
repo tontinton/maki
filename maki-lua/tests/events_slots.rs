@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +20,7 @@ use maki_lua::{
 };
 use maki_storage::id::MakiId;
 use test_case::test_case;
+use tokio::join;
 use tokio::time::timeout;
 
 const PROBE_SCHEMA: &str = r#"{ type = "object", properties = {}, additionalProperties = false }"#;
@@ -39,6 +41,10 @@ fn load(host: &PluginHost, name: &str, source: &str) {
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str) -> String {
+    runtime().block_on(run_tool(reg, name))
+}
+
+async fn run_tool(reg: &ToolRegistry, name: &str) -> String {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
@@ -47,8 +53,9 @@ fn exec_tool(reg: &ToolRegistry, name: &str) -> String {
         .parse(&serde_json::json!({}))
         .expect("parse failed");
     let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    let out = runtime()
-        .block_on(inv.execute(&ctx))
+    let out = inv
+        .execute(&ctx)
+        .await
         .output
         .unwrap_or_else(|e| panic!("tool {name} failed: {e}"));
     match out {
@@ -458,7 +465,7 @@ end }})
 
 /// A handler has to tell the teardown paths apart, so every reason arrives
 /// naming the session it left behind. Only the paths someone waits on carry a
-/// deadline, and by the time `end_sessions_blocking` is back the handler has
+/// deadline, and by the time `end_sessions` is back the handler has
 /// already had its say.
 #[test]
 fn session_end_carries_session_reason_and_deadline() {
@@ -483,13 +490,13 @@ end }})
         SessionEndReason::Completed,
     ] {
         let session = MakiId::generate();
-        host.event_handle().end_sessions_blocking([session], reason);
+        runtime().block_on(host.event_handle().end_sessions([session], reason));
         expected.push(format!("{session}|{reason}|number"));
     }
     assert_eq!(
         exec_tool(&reg, "probe_session_end"),
         expected.join(";"),
-        "end_sessions_blocking must only return once the handler ran"
+        "end_sessions must only return once the handler ran"
     );
 
     for reason in [
@@ -516,6 +523,49 @@ end }})
         );
         std::thread::sleep(DISPATCH_POLL);
     }
+}
+
+const PARK_POLL_MS: u64 = 1;
+const HANDLER_FINISHED: &str = "finished";
+const WAIT_BLOCKED_THREAD: &str = "end_sessions returned before its thread ran anything else";
+
+/// On one thread the release only runs if the wait yields, and the handler
+/// only finishes once it did.
+#[tokio::test]
+async fn end_sessions_yields_its_thread_while_a_handler_is_parked() {
+    let (reg, host) = host();
+    let parker = format!(
+        r#"
+local released, state = false, "parked"
+maki.api.create_autocmd("SessionEnd", {{ callback = function()
+    while not released do maki.async.sleep({PARK_POLL_MS}) end
+    state = "{HANDLER_FINISHED}"
+end }})
+{}{}
+"#,
+        probe_tool("release_session_end", "released = true return \"\""),
+        probe_tool("probe_parked_session_end", "return state")
+    );
+    load(&host, "parker", &parker);
+
+    let ended = Cell::new(false);
+    join!(
+        async {
+            host.event_handle()
+                .end_sessions([MakiId::generate()], SessionEndReason::Shutdown)
+                .await;
+            ended.set(true);
+        },
+        async {
+            assert!(!ended.get(), "{WAIT_BLOCKED_THREAD}");
+            run_tool(&reg, "release_session_end").await;
+        },
+    );
+
+    assert_eq!(
+        run_tool(&reg, "probe_parked_session_end").await,
+        HANDLER_FINISHED
+    );
 }
 
 #[test]

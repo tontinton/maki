@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use common::poll_until;
+use common::{end_session, poll_until};
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
 use maki_agent::template::Vars;
 use maki_agent::tools::test_support::stub_seed;
@@ -3096,8 +3096,7 @@ maki.api.register_tool({{
         "reloaded plugin should see the live session job, got {state}"
     );
 
-    host.event_handle()
-        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+    end_session(&host, session, SessionEndReason::Shutdown);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while test_kill_process_group(pid).is_ok() {
         assert!(
@@ -3205,8 +3204,7 @@ maki.api.register_tool({{
     host.load_source("spy", &spy).unwrap();
     assert_eq!(exec_tool(&reg, "spy_attach", json!({})).unwrap(), NOT_FOUND);
 
-    host.event_handle()
-        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+    end_session(&host, session, SessionEndReason::Shutdown);
 }
 
 #[cfg(unix)]
@@ -3321,8 +3319,7 @@ maki.api.register_tool({{
         "a tail that held everything is not truncated, an empty one we never filled is"
     );
 
-    host.event_handle()
-        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+    end_session(&host, session, SessionEndReason::Shutdown);
 }
 
 /// The gate holds `three` back until the second wait owns the receiver, and
@@ -3445,8 +3442,7 @@ maki.api.register_tool({{
         "a name must survive the reload that dropped the callbacks"
     );
 
-    host.event_handle()
-        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+    end_session(&host, session, SessionEndReason::Shutdown);
 }
 
 #[cfg(unix)]
@@ -3518,10 +3514,9 @@ local seen
     let pid = Pid::from_raw(pid).unwrap();
     assert!(test_kill_process_group(pid).is_ok());
 
-    host.event_handle()
-        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+    end_session(&host, session, SessionEndReason::Shutdown);
 
-    // `end_sessions_blocking` only answers once the handlers ran and the jobs
+    // `end_sessions` only answers once the handlers ran and the jobs
     // were reaped, so what the handler saw is settled by now.
     let seen = exec_tool(&reg, "probe_order_job", json!({})).unwrap();
     assert!(
@@ -7411,8 +7406,7 @@ maki.api.register_tool({{
     poll_until("jobwait never parked", || {
         parked_path.exists().then_some(())
     });
-    host.event_handle()
-        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+    end_session(&host, session, SessionEndReason::Shutdown);
     let out = wait_handle.join().expect("wait thread must not panic");
     assert!(
         out.starts_with("exit:"),
@@ -8389,8 +8383,7 @@ fn a_retired_background_session_refuses_later_prompts() {
         exec_tool(&reg, "open_background", json!({})).unwrap(),
         "nil"
     );
-    host.event_handle()
-        .end_sessions_blocking([session], maki_lua::SessionEndReason::Delete);
+    end_session(&host, session, maki_lua::SessionEndReason::Delete);
     let reply = call_on_thread(&reg, "prompt_background", CancelToken::none())
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("a retired session must reject its next prompt");
@@ -8845,8 +8838,7 @@ fn background_session_is_listed_until_its_chat_session_ends() {
         format!("{BACKGROUND_PLUGIN}:{BACKGROUND_NAME}:idle:true")
     );
 
-    host.event_handle()
-        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+    end_session(&host, session, SessionEndReason::Shutdown);
 
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
@@ -9180,8 +9172,7 @@ mod session_owned_ui {
             exec_with_ctx(&reg, HINT_TOOL, input, &ctx_in(MakiId::generate())).unwrap();
         }
 
-        host.event_handle()
-            .end_sessions_blocking([ended], SessionEndReason::Delete);
+        end_session(&host, ended, SessionEndReason::Delete);
 
         assert_eq!(hint_owners(&host), [None, Some(kept)]);
     }
