@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -177,26 +178,33 @@ pub async fn from_model_async(
 }
 
 pub struct ModelBatch {
+    /// The slug whose live answer this batch carries. The catalog and custom
+    /// sources send one batch per slug.
+    pub provider: String,
     pub models: Vec<String>,
     /// The providers this batch covers, independent of `ModelPolicy`: the
     /// policy filters `models`, but the picker still needs to know which
     /// providers answered.
     pub providers: Vec<String>,
     pub warnings: Vec<String>,
+    /// The provider could not be built for want of credentials. The picker
+    /// says so instead of resolving auth a second time.
+    pub missing_credentials: bool,
 }
 
 pub(crate) fn provider_of(spec: &str) -> &str {
     spec.split_once('/').map_or(spec, |(provider, _)| provider)
 }
 
-fn providers_of(specs: &[String]) -> Vec<String> {
-    let mut providers: Vec<String> = Vec::new();
-    for provider in specs.iter().map(|spec| provider_of(spec)) {
-        if !providers.iter().any(|known| known == provider) {
-            providers.push(provider.to_string());
-        }
+/// Splits qualified specs into per-slug batches, keeping the order within a
+/// slug and sorting slugs so the batches are deterministic.
+fn group_by_slug(specs: Vec<String>) -> BTreeMap<String, Vec<String>> {
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for spec in specs {
+        let slug = provider_of(&spec).to_string();
+        groups.entry(slug).or_default().push(spec);
     }
-    providers
+    groups
 }
 
 /// The offline twin of [`fetch_all_models`]. It never waits for the catalog
@@ -253,12 +261,27 @@ pub async fn fetch_all_models(
 
     for spec in ProviderRegistry::all() {
         let slug = spec.slug;
-        let Ok(provider) = spawn_blocking(move || provider_for_slug(slug, timeouts))
+        let provider = match spawn_blocking(move || provider_for_slug(slug, timeouts))
             .await
             .expect("provider construction panicked")
-        else {
-            warn!(provider = slug, "failed to create provider, skipping");
-            continue;
+        {
+            Ok(provider) => provider,
+            Err(e) => {
+                warn!(provider = slug, error = %e, "failed to create provider, skipping");
+                if matches!(e, AgentError::MissingCredentials { .. }) {
+                    // An empty `providers` keeps the slug out of
+                    // `live_providers`: a skip is not a live answer, and the
+                    // picker must not treat recents from it as retired.
+                    let _ = tx.send(ModelBatch {
+                        providers: Vec::new(),
+                        provider: slug.to_string(),
+                        models: Vec::new(),
+                        warnings: Vec::new(),
+                        missing_credentials: true,
+                    });
+                }
+                continue;
+            }
         };
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -287,29 +310,43 @@ pub async fn fetch_all_models(
             let slug = cat.slug;
             let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
             let _ = tx_catalog.send(ModelBatch {
+                providers: vec![slug.clone()],
+                provider: slug,
                 models,
-                providers: vec![slug],
                 warnings: Vec::new(),
+                missing_credentials: false,
             });
         }
     });
 
     let tx_custom = tx.clone();
     tokio::spawn(async move {
-        let (declared, declared_providers) = custom::declared_batch();
-        if !declared.is_empty() {
+        for (provider, models) in group_by_slug(custom::declared_model_specs()) {
             let _ = tx_custom.send(ModelBatch {
-                providers: declared_providers,
-                models: declared,
+                providers: vec![provider.clone()],
+                provider,
+                models,
                 warnings: Vec::new(),
+                missing_credentials: false,
             });
         }
-        let custom_specs = custom::discover_models(timeouts).await;
-        if !custom_specs.is_empty() {
+        let custom = custom::discover_models(timeouts).await;
+        for (provider, models) in group_by_slug(custom.specs) {
             let _ = tx_custom.send(ModelBatch {
-                providers: providers_of(&custom_specs),
-                models: custom_specs,
+                providers: vec![provider.clone()],
+                provider,
+                models,
                 warnings: Vec::new(),
+                missing_credentials: false,
+            });
+        }
+        for slug in custom.missing_credentials {
+            let _ = tx_custom.send(ModelBatch {
+                providers: Vec::new(),
+                provider: slug,
+                models: Vec::new(),
+                warnings: Vec::new(),
+                missing_credentials: true,
             });
         }
     });
@@ -361,9 +398,11 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
         }
     };
     ModelBatch {
+        provider: slug.to_string(),
         models,
         providers: vec![slug.to_string()],
         warnings,
+        missing_credentials: false,
     }
 }
 
