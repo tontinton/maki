@@ -22,8 +22,9 @@ pub enum RetryKind {
     /// 5xx and network failures on a connection that was made. Nothing came
     /// back, so trying again only costs time.
     Transient,
-    /// A connection that was never established: refused, or a host name that
-    /// does not resolve.
+    /// A connection that was never established: refused, a host name that
+    /// does not resolve, a handshake that failed, or a proxy that refused the
+    /// tunnel.
     Connect,
     /// A 429. Whether the server sent a `Retry-After` decides which budget it
     /// draws from, so [`RetryState`] splits it further.

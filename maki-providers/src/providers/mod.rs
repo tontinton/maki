@@ -22,7 +22,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, lock_tokens, save_tokens};
 
 use crate::AgentError;
-use crate::http::{Lookup, error_chain, proxy_env};
+use crate::http::{error_chain, proxy_env};
 use crate::retry::RetryPolicy;
 
 pub(crate) mod anthropic;
@@ -445,18 +445,16 @@ impl Timeouts {
 }
 
 /// Where every client in the crate starts, so a side request (OAuth, the
-/// catalogs) shares the providers' redirect, proxy,
-/// DNS and trust rules. Redirects stay off: a 3xx reaches
-/// [`AgentError::from_response`] and a key header is never replayed
-/// cross-origin. HTTP/1.1 stays pinned in case a dependency turns on reqwest's
-/// http2 feature.
+/// catalogs) shares the providers' redirect, proxy and trust rules. Redirects
+/// stay off: a 3xx reaches [`AgentError::from_response`] and a key header is
+/// never replayed cross-origin. HTTP/1.1 stays pinned in case a dependency
+/// turns on reqwest's http2 feature.
 pub fn client_builder() -> ClientBuilder {
     Client::builder()
         .redirect(Policy::none())
         .http1_only()
         .user_agent(user_agent())
         .proxy(Proxy::custom(|url| proxy_env().proxy_for(url.as_str())))
-        .dns_resolver(Arc::new(Lookup))
 }
 
 /// Trust comes from the platform verifier, which on Linux reads
