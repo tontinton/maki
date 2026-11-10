@@ -3,6 +3,7 @@ use std::thread;
 
 use crate::{clipboard, image};
 use maki_agent::{ImageMediaType, ImageSource};
+use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::oneshot::{self, Receiver};
 
 use crate::repaint::Dirty;
@@ -47,13 +48,24 @@ pub(super) fn spawn_read<T: Send + 'static>(
     rx
 }
 
+/// A reader that died without an answer goes too, or a paste gated on the
+/// list being empty would stay off for the rest of the session.
 pub(super) fn take_ready<T>(receivers: &mut Vec<Receiver<T>>) -> Option<T> {
-    let (i, value) = receivers
-        .iter_mut()
-        .enumerate()
-        .find_map(|(i, rx)| rx.try_recv().ok().map(|value| (i, value)))?;
-    receivers.swap_remove(i);
-    Some(value)
+    let mut ready = None;
+    receivers.retain_mut(|rx| {
+        if ready.is_some() {
+            return true;
+        }
+        match rx.try_recv() {
+            Ok(value) => {
+                ready = Some(value);
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Closed) => false,
+        }
+    });
+    ready
 }
 
 impl App {
@@ -148,5 +160,18 @@ mod tests {
             Ok(PastedContent::Text(_)) => Pasted::Text,
             Err(e) => Pasted::Error(e),
         }
+    }
+
+    #[test]
+    fn take_ready_drops_a_reader_that_died() {
+        let (_, died) = oneshot::channel();
+        let (answer, answered) = oneshot::channel();
+        let (_reading, pending) = oneshot::channel();
+        answer.send(TEXT).unwrap();
+        let mut receivers = vec![died, answered, pending];
+
+        assert_eq!(take_ready(&mut receivers), Some(TEXT));
+        assert_eq!(take_ready(&mut receivers), None);
+        assert_eq!(receivers.len(), 1);
     }
 }
