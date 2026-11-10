@@ -77,6 +77,8 @@ pub enum LineKind {
     Heading,
     ListItem,
     Code,
+    /// A line a code-block renderer returned, drawn as is.
+    Literal,
     TableBorder,
     TableRow,
     HorizontalRule,
@@ -102,7 +104,8 @@ impl Line {
     }
 
     pub fn is_blank(&self) -> bool {
-        self.spans.is_empty() || self.spans.iter().all(|s| s.text.is_empty())
+        self.kind != LineKind::Literal
+            && (self.spans.is_empty() || self.spans.iter().all(|s| s.text.is_empty()))
     }
 }
 
@@ -114,7 +117,7 @@ pub fn render(text: &str, width: u16) -> Vec<Line> {
 /// (successive prefixes of a growing message) doesn't re-highlight completed
 /// code lines. Caches are flushed automatically when the syntax theme changes.
 pub struct Renderer {
-    highlighters: Vec<CodeHighlighter>,
+    highlighters: Vec<Option<CodeHighlighter>>,
     table_col_widths: Vec<Vec<usize>>,
     theme_gen: u64,
     wrap_paragraphs: bool,
@@ -167,6 +170,19 @@ impl Renderer {
     }
 
     pub fn render(&mut self, text: &str, width: u16) -> Vec<Line> {
+        self.render_with_code_blocks(text, width, |_, _, _| None)
+    }
+
+    /// Replaces closed fenced blocks with literal lines when the callback
+    /// returns `Some`. The callback receives the language, source, and width.
+    /// Replacement lines keep their spacing and are neither parsed nor wrapped.
+    /// An open fence or `None` retains the normal code rendering.
+    pub fn render_with_code_blocks(
+        &mut self,
+        text: &str,
+        width: u16,
+        mut code_block: impl FnMut(&str, &str, u16) -> Option<Vec<String>>,
+    ) -> Vec<Line> {
         let theme_gen = maki_highlight::theme_generation();
         if theme_gen != self.theme_gen {
             self.highlighters.clear();
@@ -188,7 +204,7 @@ impl Renderer {
         };
 
         for block in &blocks {
-            render_block(block, &mut lines, &mut state, &ctx);
+            render_block(block, &mut lines, &mut state, &ctx, &mut code_block);
         }
 
         state.highlighters.truncate(state.code_idx);
@@ -206,7 +222,7 @@ struct RenderCtx {
 struct RenderState<'a> {
     code_idx: usize,
     table_idx: usize,
-    highlighters: &'a mut Vec<CodeHighlighter>,
+    highlighters: &'a mut Vec<Option<CodeHighlighter>>,
     table_col_widths: &'a mut Vec<Vec<usize>>,
     incremental: bool,
 }
@@ -221,9 +237,12 @@ impl RenderState<'_> {
             return maki_highlight::highlight_block(lang, code).as_ref().clone();
         }
         if self.code_idx >= self.highlighters.len() {
-            self.highlighters.push(CodeHighlighter::new(lang));
+            self.highlighters.resize_with(self.code_idx + 1, || None);
         }
-        self.highlighters[self.code_idx].update(code).to_vec()
+        self.highlighters[self.code_idx]
+            .get_or_insert_with(|| CodeHighlighter::new(lang))
+            .update(code)
+            .to_vec()
     }
 }
 
@@ -255,14 +274,31 @@ fn render_block(
     lines: &mut Vec<Line>,
     state: &mut RenderState<'_>,
     ctx: &RenderCtx,
+    code_block: &mut impl FnMut(&str, &str, u16) -> Option<Vec<String>>,
 ) {
+    if let Block::Code {
+        lang,
+        code,
+        closed: true,
+    } = block
+        && let Some(replacement) = code_block(lang, code, ctx.width)
+    {
+        ensure_blank_line(lines);
+        lines.extend(replacement.into_iter().map(|text| Line {
+            kind: LineKind::Literal,
+            spans: vec![Span::new(text, StyleToken::Text)],
+        }));
+        ensure_blank_line(lines);
+        state.code_idx += 1;
+        return;
+    }
     match block {
         Block::Lines(line_blocks) => {
             for lb in line_blocks {
                 render_line_block(lb, lines, ctx);
             }
         }
-        Block::Code { lang, code } => {
+        Block::Code { lang, code, .. } => {
             ensure_blank_line(lines);
             let segments = state.code_segments(lang, code);
             let start = lines.len();
@@ -852,6 +888,8 @@ mod tests {
         "```rust\nfn a() { let a = 1; let b = 2; }\nfn b() {}\nlet c = 3;\n```";
     const SHORT_RUST_BLOCK: &str = "```rust\nlet c = 3;\n```";
     const STREAMED_CODE: &str = "```rust\nfn main() {\n    let x = 1;\n}\n```";
+    const MERMAID_BLOCK: &str = "```mermaid\na --> b\n```";
+    const LITERAL_DIAGRAM: &[&str] = &["  [a] --> [b]  ", "", "", "**literal**", ""];
 
     const AGREEMENT_CORPUS: &[&str] = &[
         "hello world\n# heading\n\npara",
@@ -973,6 +1011,69 @@ mod tests {
                 .all(|s| matches!(s.style, StyleToken::Highlight { .. })),
             "code line content spans must be highlight tokens"
         );
+    }
+
+    #[test]
+    fn blank_lines_around_normal_code_blocks_collapse() {
+        let lines = Renderer::new().render("a\n\n\n```\nx\n\ny\n```\n\n\nb", TEST_WIDTH);
+        assert_eq!(lines_text(&lines), ["a", "", "│ x", "│ ", "│ y", "", "b"]);
+    }
+
+    #[test]
+    fn custom_code_block_lines_stay_literal() {
+        let mut renderer = Renderer::new();
+        let lines = renderer.render_with_code_blocks(MERMAID_BLOCK, 1, |_, _, _| {
+            Some(
+                LITERAL_DIAGRAM
+                    .iter()
+                    .map(|line| (*line).to_owned())
+                    .collect(),
+            )
+        });
+        assert_eq!(lines_text(&lines[1..]), LITERAL_DIAGRAM);
+        assert!(lines[1..].iter().all(|line| line.kind == LineKind::Literal
+            && line.spans.len() == 1
+            && line.spans[0].style == StyleToken::Text));
+    }
+
+    #[test]
+    fn custom_code_block_callback_only_receives_closed_fences() {
+        let input = format!("{MERMAID_BLOCK}\n```python\nprint('streaming')");
+        let mut calls = Vec::new();
+        let lines =
+            Renderer::new().render_with_code_blocks(&input, TEST_WIDTH, |lang, code, width| {
+                calls.push((lang.to_owned(), code.to_owned(), width));
+                Some(vec![LITERAL_DIAGRAM[0].to_owned()])
+            });
+        assert_eq!(
+            calls,
+            [("mermaid".to_owned(), "a --> b".to_owned(), TEST_WIDTH)]
+        );
+        assert_eq!(lines.last().unwrap().spans[0].style, StyleToken::CodeBar);
+    }
+
+    #[test]
+    fn streaming_custom_blocks_preserve_following_highlighter_positions() {
+        let input = format!("{MERMAID_BLOCK}\n{STREAMED_CODE}");
+        let mut renderer = Renderer::streaming();
+        let mut plain = Renderer::streaming();
+        let fallback = plain.render(&input, TEST_WIDTH);
+        let rendered = renderer.render_with_code_blocks(&input, TEST_WIDTH, |lang, _, _| {
+            (lang == "mermaid").then(|| vec![LITERAL_DIAGRAM[0].to_owned()])
+        });
+        let following_code = |lines: Vec<Line>| {
+            lines
+                .into_iter()
+                .filter(|line| {
+                    line.kind == LineKind::Code && line.spans[0].style == StyleToken::CodeBar
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            following_code(rendered),
+            following_code(fallback.clone())[1..]
+        );
+        assert_eq!(renderer.render(&input, TEST_WIDTH), fallback);
     }
 
     #[test]
