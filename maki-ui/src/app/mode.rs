@@ -96,6 +96,15 @@ impl PlanState {
 }
 
 impl App {
+    /// The plan-review policy for plugin windows, kept here rather than at
+    /// the UI action so it can be tested on its own. Only a window that says
+    /// it needs input is a question; a picker or info popup is not.
+    pub(crate) fn on_window_opened(&mut self, needs_input: bool) {
+        if needs_input {
+            self.transition_plan(PlanTrigger::InteractivePrompt);
+        }
+    }
+
     pub(crate) fn transition_plan(&mut self, trigger: PlanTrigger) {
         match trigger {
             PlanTrigger::WriteDone => self.plan_wrote(),

@@ -6779,6 +6779,20 @@ fn a_consumed_message_controls_the_plan_review(plan: bool, refining: bool) {
     assert!(app.state.plan.is_ready());
 }
 
+/// Only a window that says it needs input is a question. A picker the user
+/// opened must not take a settled plan's review away.
+#[test_case(true, true  ; "needs_input_suspends_review")]
+#[test_case(false, false ; "a_picker_leaves_it_alone")]
+fn only_a_window_that_needs_input_suspends_the_plan(needs_input: bool, refining: bool) {
+    let (_tmp, mut app) = plan_app();
+
+    app.on_window_opened(needs_input);
+
+    assert_eq!(app.plan_cycle.refining, refining);
+    assert_eq!(app.plan_form.is_visible(), !refining);
+    assert!(app.state.plan.is_ready());
+}
+
 /// Immediate plan input suspends the review before the first tool runs. A run
 /// that changes nothing hands the old revision back without a new menu.
 #[test]

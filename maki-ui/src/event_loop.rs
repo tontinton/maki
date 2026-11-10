@@ -1137,10 +1137,11 @@ impl<'t> EventLoop<'t> {
                     return;
                 };
                 let app = &mut self.sessions[idx].app;
+                let needs_input = config.visible && config.needs_input;
                 app.float_mgr.open(buf, config, focus, event_tx, cmd_rx);
-                if focus {
-                    app.transition_plan(crate::app::mode::PlanTrigger::InteractivePrompt);
-                }
+                // A question means the plan is not settled. A picker or an
+                // info window the user opened is not one.
+                app.on_window_opened(needs_input);
             }
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);
