@@ -12,7 +12,7 @@ use maki_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
 
 use super::{
-    App, FLASH_PLAN_ACTION_LOST, FLASH_PLAN_DRAFT_INTERRUPTED, FLASH_PLAN_UNREADABLE_PREFIX,
+    App, FLASH_PLAN_ACTION_LOST, FLASH_PLAN_DRAFT_INTERRUPTED, FLASH_PLAN_UNREADABLE_PREFIX, Status,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,11 +132,17 @@ impl App {
         if self.state.mode != Mode::Plan || self.state.plan.path().is_none() {
             return;
         }
+        // A write from a background call can land after the run drained. No
+        // later turn will settle it, so the write is the settle point.
+        let idle = self.status != Status::Streaming && self.queue.is_empty();
         self.begin_plan_refinement();
         // The revision the user could approve is no longer the one on disk.
         self.state.plan.mark_drafting();
         self.plan_cycle.written = true;
         self.plan_cycle.reviewed = None;
+        if idle {
+            self.settle_plan(true);
+        }
     }
 
     /// A new drafting cycle owns the plan until the run and everything queued

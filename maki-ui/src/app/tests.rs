@@ -1452,6 +1452,7 @@ fn plan_ready_fires_once_per_settled_revision() {
 
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(path.clone());
+    app.status = Status::Streaming;
     app.transition_plan(PlanTrigger::WriteDone);
     app.transition_plan(PlanTrigger::WriteDone);
     assert!(
@@ -1503,6 +1504,7 @@ fn an_unlayered_plan_form_opens_without_asking(hosted: bool) {
     });
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(path);
+    app.status = Status::Streaming;
     app.transition_plan(PlanTrigger::WriteDone);
     app.transition_plan(PlanTrigger::Settled);
 
@@ -1523,6 +1525,7 @@ fn a_layered_plan_form_waits_for_the_slots() {
 
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(path);
+    app.status = Status::Streaming;
     app.transition_plan(PlanTrigger::WriteDone);
     app.transition_plan(PlanTrigger::Settled);
 
@@ -2070,6 +2073,7 @@ fn a_new_draft_flashes_the_pick_it_retires() {
     let (tx, rx) = flume::bounded(1);
     let pick = app.plan_answers.abandon();
     app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.status = Status::Streaming;
 
     app.transition_plan(PlanTrigger::WriteDone);
 
@@ -6705,6 +6709,7 @@ fn re_edit_waits_for_the_run_to_settle() {
     assert!(app.state.plan.is_ready());
     assert!(app.plan_form.is_visible());
     let written = app.state.plan.path().unwrap().display().to_string();
+    app.status = Status::Streaming;
 
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         call: None,
@@ -7027,11 +7032,57 @@ fn a_refining_plan_persists_only_a_settled_revision() {
     assert!(app.state.plan.is_ready());
 }
 
+/// A write from a background call can land after the run drained. No later
+/// turn will settle it, so the write settles in place instead of arming a
+/// cycle nobody will close.
+#[test]
+fn a_plan_write_after_the_drain_settles_in_place() {
+    let (_tmp, mut app) = plan_app();
+    assert_eq!(app.status, Status::Idle);
+
+    rewrite_plan(&mut app);
+
+    assert!(app.state.plan.is_ready());
+    assert!(!app.plan_cycle.refining);
+    assert!(app.plan_form.is_visible());
+}
+
+/// The same for the first write of a draft: a background child can finish
+/// after the main run and still make the plan reviewable.
+#[test]
+fn a_background_write_settles_a_draft() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = path.display().to_string();
+    let mut app = test_app();
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path);
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
+        id: "t1".into(),
+        tool: "write".into(),
+        output: Arc::new(ToolOutput::Plain(
+            format!("wrote 42 bytes to {written}").into(),
+        )),
+        is_error: false,
+        annotation: None,
+        written_path: Some(written),
+        backgrounded: false,
+    }))));
+
+    assert!(app.state.plan.is_ready());
+    assert!(!app.plan_cycle.refining);
+    assert!(app.plan_form.is_visible());
+}
+
 /// An interrupted rewrite of a previously ready plan is a draft, not a new
 /// approval. Ctrl+T must not resurrect it.
 #[test]
 fn an_interrupted_rewrite_demotes_a_ready_plan() {
     let (_tmp, mut app) = plan_app();
+    app.status = Status::Streaming;
     rewrite_plan(&mut app);
     assert!(matches!(app.state.plan, PlanState::Drafting(_)));
 
@@ -7307,6 +7358,7 @@ fn a_rewrite_after_dismiss_needs_a_new_review() {
     dismiss_plan_esc(&mut app);
     assert!(!app.plan_form.is_visible());
     assert!(app.state.plan.is_ready());
+    app.status = Status::Streaming;
 
     rewrite_plan(&mut app);
     assert!(
