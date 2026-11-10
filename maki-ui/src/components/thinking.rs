@@ -9,8 +9,8 @@ use crate::markdown::{
 use crate::theme;
 
 use maki_config::ThinkingLines;
-use maki_markdown::code_block_start;
 use maki_markdown::render::{Line as RLine, Renderer};
+use maki_markdown::render_start;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -150,14 +150,14 @@ pub(crate) fn render_tail(
     }
 }
 
-/// Where the end of `text` holding its last `min_lines` lines starts. If that
-/// is inside a code block it starts at the opening fence instead, so the code
-/// still renders as code.
+/// Where the end of `text` holding its last `min_lines` lines starts, moved
+/// back when the text would read differently from there (see
+/// [`render_start`]).
 fn tail_start(text: &str, min_lines: usize) -> usize {
     let Some((newline, _)) = text.rmatch_indices('\n').nth(min_lines.saturating_sub(1)) else {
         return 0;
     };
-    code_block_start(text, newline + 1)
+    render_start(text, newline + 1)
 }
 
 fn is_blank(line: &Line<'_>) -> bool {
