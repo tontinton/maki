@@ -21,6 +21,7 @@ use std::time::Duration;
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionClaim, SessionError};
 use maki_storage::{StateDir, StorageError};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use crate::AppSession;
@@ -51,7 +52,7 @@ pub struct StorageWriter {
 }
 
 impl StorageWriter {
-    pub fn new(dir: StateDir, warn_tx: flume::Sender<String>) -> Self {
+    pub fn new(dir: StateDir, warn_tx: UnboundedSender<String>) -> Self {
         let pending: Pending = Arc::default();
         let writer_pending = Arc::clone(&pending);
         let (wake, wake_rx) = channel::<()>();
@@ -132,7 +133,7 @@ fn writer_gone() -> SessionError {
 /// here needs a lock.
 struct Writer {
     dir: StateDir,
-    warn_tx: flume::Sender<String>,
+    warn_tx: UnboundedSender<String>,
     /// Sessions whose last write failed, so a sick disk warns once instead of
     /// once per frame.
     /// Whatever is still in here when the thread stops never reached disk.
@@ -200,8 +201,11 @@ impl Writer {
 mod tests {
     use std::path::PathBuf;
 
+    use maki_lua::test_support::runtime;
     use maki_storage::sessions::SESSIONS_DIR;
     use tempfile::TempDir;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio::time::timeout;
 
     use super::*;
     use crate::OpenSession;
@@ -216,6 +220,8 @@ mod tests {
     const TITLE: &str = "renamed after reload";
     const OWED_WRITE_HOLDS: &str = "a session with a write still owed must stay claimed";
     const LANDED_RELEASES: &str = "a session let go is free once its last snapshot landed";
+    const NO_WARNING: &str = "the writer never warned";
+    const WRITER_GONE: &str = "the writer thread ended without warning";
     const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
     const REPORTED_UNSAVED: &str = "a transcript that never landed must be named on the way out";
 
@@ -225,9 +231,16 @@ mod tests {
         (tmp, dir)
     }
 
-    fn writer(dir: &StateDir) -> (StorageWriter, flume::Receiver<String>) {
-        let (warn_tx, warn_rx) = flume::unbounded();
+    fn writer(dir: &StateDir) -> (StorageWriter, UnboundedReceiver<String>) {
+        let (warn_tx, warn_rx) = unbounded_channel();
         (StorageWriter::new(dir.clone(), warn_tx), warn_rx)
+    }
+
+    fn next_warning(warn_rx: &mut UnboundedReceiver<String>) -> String {
+        runtime()
+            .block_on(async { timeout(DRAIN_TIMEOUT, warn_rx.recv()).await })
+            .expect(NO_WARNING)
+            .expect(WRITER_GONE)
     }
 
     fn drain(writer: StorageWriter) {
@@ -356,13 +369,13 @@ mod tests {
     fn failing_flush_warns_once_and_reports_recovery() {
         let (_tmp, dir) = state_dir();
         block_sessions_dir(&dir);
-        let (writer, warn_rx) = writer(&dir);
+        let (writer, mut warn_rx) = writer(&dir);
         let (session, claim) = fresh(&dir);
         let session = Arc::new(session);
         let id = session.id;
 
         writer.send(Arc::clone(&session), claim.clone());
-        let warning = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
+        let warning = next_warning(&mut warn_rx);
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
         // The save is enqueued before the delete, so the flush that runs the
@@ -377,7 +390,7 @@ mod tests {
 
         std::fs::remove_file(sessions_dir(&dir)).unwrap();
         writer.send(session, claim);
-        let recovered = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
+        let recovered = next_warning(&mut warn_rx);
         assert_eq!(recovered, SAVE_RECOVERED);
         drain(writer);
 
@@ -391,14 +404,14 @@ mod tests {
     #[test]
     fn a_session_let_go_stays_claimed_until_its_last_snapshot_lands() {
         let (_tmp, dir) = state_dir();
-        let (writer, warn_rx) = writer(&dir);
+        let (writer, mut warn_rx) = writer(&dir);
         let (mut session, claim) = fresh(&dir);
         session.push_message(user_message(0));
         let id = session.id;
         let blocker = block_log(&dir, id);
 
         writer.send(Arc::new(session), claim);
-        let warning = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
+        let warning = next_warning(&mut warn_rx);
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
         assert!(
             SessionClaim::acquire(id, &dir).is_err(),
@@ -466,19 +479,19 @@ mod tests {
     fn failed_write_is_retried_by_a_later_flush() {
         let (_tmp, dir) = state_dir();
         block_sessions_dir(&dir);
-        let (writer, warn_rx) = writer(&dir);
+        let (writer, mut warn_rx) = writer(&dir);
         let (session, claim) = fresh(&dir);
         let id = session.id;
 
         writer.send(Arc::new(session), claim);
-        let warning = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
+        let warning = next_warning(&mut warn_rx);
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
         std::fs::remove_file(sessions_dir(&dir)).unwrap();
         drain(writer);
 
         assert!(AppSession::load(id, &dir).is_ok());
-        assert_eq!(warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap(), SAVE_RECOVERED);
+        assert_eq!(next_warning(&mut warn_rx), SAVE_RECOVERED);
     }
 
     /// After a delete the cursor still holds an open handle to the unlinked

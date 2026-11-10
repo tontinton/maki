@@ -15,6 +15,7 @@ use maki_lua::{
 use maki_providers::{Model, ModelTier};
 use maki_storage::StateDir;
 use ratatui::layout::Rect;
+use tokio::sync::mpsc::unbounded_channel;
 
 use crate::OpenSession;
 use crate::app::App;
@@ -55,7 +56,7 @@ const STRONG_CAPTURE: &str = "strong";
 pub fn app(storage: StateDir) -> App {
     let model = Model::from_tier(PROVIDER, ModelTier::Medium).expect("provider has a default");
     let tab = OpenSession::fresh(&model.spec(), CWD, &storage);
-    let writer = Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
+    let writer = Arc::new(StorageWriter::new(storage.clone(), unbounded_channel().0));
     let permissions = Arc::new(PermissionManager::new(
         PermissionsConfig::default(),
         PathBuf::from(CWD),
