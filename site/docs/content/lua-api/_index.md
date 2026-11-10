@@ -1240,6 +1240,20 @@ Maki fires two slots around the plan form, both with
 menu, and `ui.plan_form` asks whether the form opens at all. Both are
 documented under [maki.plan](/docs/lua-api/#maki-plan).
 
+`ui.code_block.<language>`, for example `ui.code_block.mermaid`, renders
+closed fenced blocks in assistant messages whose info string starts with
+that language, in any case. Its layer receives `function(prev, ev)` with
+`ev = { language = string, code = string, width = integer }` and returns a
+nonempty array of plain text lines, or `prev(ev)` to keep the source.
+Lines are drawn as is: at most 256 lines and 64 KiB, each at most
+`ev.width` cells, with no control characters. Only blocks on screen are
+rendered, one at a time, and each only once: a decline, invalid output, an
+error, or the two-second deadline keeps the source until the width or a
+`ui.code_block` layer changes. A timeout also stops that language until a
+resize, a chat load, or a layer change. Sources over 32 KiB are never sent.
+Layers need
+`session_read`. Stored messages and model context keep the source.
+
 Maki fires two slots per tool itself: `tool.<name>.input` before
 permissions look at the call, and `tool.<name>.output` on the text it
 produced. Both take `function(prev, value, ctx)` and answer with a
