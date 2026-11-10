@@ -78,7 +78,7 @@ pub fn assistant_style() -> RoleStyle {
 pub fn user_style() -> RoleStyle {
     RoleStyle {
         prefix: "you> ",
-        text_style: theme::current().assistant,
+        text_style: theme::current().user_text,
         prefix_style: theme::current().user,
         use_markdown: false,
         max_line_bytes: None,
