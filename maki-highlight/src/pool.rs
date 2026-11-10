@@ -20,6 +20,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::OnceLock;
+use std::sync::mpsc::{Sender, channel};
 use std::thread::{self, Result as ThreadResult};
 
 use flume::{Receiver, RecvError};
@@ -30,11 +31,11 @@ const THREAD_GONE: &str = "the highlight thread is gone";
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-static JOBS: OnceLock<flume::Sender<Job>> = OnceLock::new();
+static JOBS: OnceLock<Sender<Job>> = OnceLock::new();
 
-fn jobs() -> &'static flume::Sender<Job> {
+fn jobs() -> &'static Sender<Job> {
     JOBS.get_or_init(|| {
-        let (tx, rx) = flume::unbounded::<Job>();
+        let (tx, rx) = channel::<Job>();
         thread::Builder::new()
             .name("highlight".into())
             .spawn(move || {
@@ -109,6 +110,7 @@ mod tests {
     use std::panic::catch_unwind;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::channel;
     use std::task::{Context, Poll, Waker};
     use std::thread;
 
@@ -123,7 +125,7 @@ mod tests {
     #[test_case(true; "cancelled")]
     #[test_case(false; "awaited")]
     fn dropped_async_waiter_discards_queued_work(cancel: bool) {
-        let (release_tx, release_rx) = flume::bounded::<()>(1);
+        let (release_tx, release_rx) = channel::<()>();
         spawn(move || {
             let _ = release_rx.recv();
         });

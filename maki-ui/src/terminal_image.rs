@@ -3,6 +3,7 @@ use std::io::{Cursor, IsTerminal, stdout};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::thread;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -23,16 +24,16 @@ const MAX_IMAGE_ROWS: u16 = 20;
 const FALLBACK_FONT_SIZE: FontSize = FontSize::new(10, 20);
 const DECODE_THREAD: &str = "inline-image";
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-static DECODE_JOBS: OnceLock<flume::Sender<DecodeJob>> = OnceLock::new();
+static DECODE_JOBS: OnceLock<Sender<DecodeJob>> = OnceLock::new();
 
 type DecodeJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// Decoding gets its own thread rather than `maki_highlight::pool`: that one is
 /// single threaded to bound syntect's regex cache, and a multi-megabyte decode
 /// queued ahead of the transcript's highlight jobs stalls the whole UI.
-fn decode_jobs() -> &'static flume::Sender<DecodeJob> {
+fn decode_jobs() -> &'static Sender<DecodeJob> {
     DECODE_JOBS.get_or_init(|| {
-        let (tx, rx) = flume::unbounded::<DecodeJob>();
+        let (tx, rx) = channel::<DecodeJob>();
         thread::Builder::new()
             .name(DECODE_THREAD.into())
             .spawn(move || {

@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
@@ -81,7 +82,7 @@ pub struct StatusBar {
     started_at: Instant,
     cwd_branch: String,
     pub flash_duration: Duration,
-    branch_update_rx: Option<flume::Receiver<()>>,
+    branch_update_rx: Option<Receiver<()>>,
     /// Nobody reads this. It is here so it dies with the bar, and dropping it
     /// stops notify's event thread and closes the inotify fd. Every session
     /// builds its own bar, so a watcher that outlives it leaks a thread.
@@ -419,10 +420,10 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
 /// Access events are left out. Reading `HEAD` is one, so a watcher that
 /// took them would wake the poll that reads it, and that read would wake
 /// it again, every tick for as long as the app runs.
-fn watch_branch() -> Option<(flume::Receiver<()>, RecommendedWatcher)> {
+fn watch_branch() -> Option<(Receiver<()>, RecommendedWatcher)> {
     let cwd = env::current_dir().ok()?;
     let git_dir = find_git_dir(&cwd)?;
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = sync_channel(1);
     let on_event = move |res: Result<Event, _>| {
         if res.is_ok_and(|e| e.paths.iter().any(|p| p.ends_with("HEAD"))) {
             let _ = tx.try_send(());
@@ -749,7 +750,7 @@ mod tests {
     #[test_case(true  => Dirty::YES ; "switched_branch")]
     fn poll_branch_update_reports_only_real_changes(stale: bool) -> Dirty {
         let label = cwd_branch_label();
-        let (tx, rx) = flume::bounded(1);
+        let (tx, rx) = sync_channel(1);
         let mut bar = StatusBar::new(FLASH_TTL);
         bar.cwd_branch = if stale {
             STALE_BRANCH.into()
