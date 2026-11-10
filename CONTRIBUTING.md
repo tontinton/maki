@@ -4,6 +4,14 @@ Thanks for taking an interest in contributing to maki.
 
 Just remember I'd like to keep the project minimal to not become bloat - think if some functionality you need can be done as a Lua plugin, and if not, think about the Lua APIs you need in order to implement the plugin. Do these APIs exist in neovim? If so, shoot up a PR. If the APIs don't exist, open an issue about it, let's discuss.
 
+## Scope
+
+- Core speaks protocols, not vendors. Vendor-specific behavior goes in a plugin; if the plugin API can't express it, open an issue for the generic API it needs.
+- No new bundled provider plugins or built-in search backends. Publish a plugin with the `maki` and `plugin` topics and it gets listed on [/plugins/](https://maki.sh/plugins/), or use an MCP server.
+- A new Lua API needs a concrete use case; link the plugin that uses it if there is one.
+- A new tool, command or config key needs a case that a plugin or the default can't serve.
+- New protocols and core features start as an issue.
+
 When opening an issue, validate there is no open / closed issue talking about the exact thing you want to post about.
 
 Regarding AI use in PRs, describe how you used AI, even include the prompts if unsure.
