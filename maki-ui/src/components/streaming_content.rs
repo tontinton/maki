@@ -3,9 +3,10 @@ use crate::components::thinking::{self, LiveTail};
 use crate::markdown::paint_semantic;
 use crate::theme;
 
-use maki_markdown::render::Renderer;
+use maki_markdown::render::{Line as SemanticLine, Renderer};
 use ratatui::style::Style;
 use ratatui::text::Line;
+use std::borrow::Cow;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 const STREAMING_MAX_LINE_BYTES: usize = 5_000;
@@ -64,12 +65,31 @@ impl StreamingCache {
         prefix_style: Style,
         width: u16,
     ) -> bool {
+        self.get_or_update_with(
+            |text, width| renderer.render(text.as_ref(), width),
+            visible,
+            prefix,
+            text_style,
+            prefix_style,
+            width,
+        )
+    }
+
+    fn get_or_update_with(
+        &mut self,
+        render: impl FnOnce(Cow<'_, str>, u16) -> Vec<SemanticLine>,
+        visible: &str,
+        prefix: &str,
+        text_style: Style,
+        prefix_style: Style,
+        width: u16,
+    ) -> bool {
         let key = CacheKey::for_text(visible, width, theme::generation());
         if self.key == Some(key) {
             return false;
         }
         let text = maki_markdown::render::truncate_long_lines_at(visible, STREAMING_MAX_LINE_BYTES);
-        let semantic = renderer.render(text.as_ref(), width);
+        let semantic = render(text, width);
         self.lines = paint_semantic(&semantic, prefix, text_style, prefix_style);
         self.key = Some(key);
         true
@@ -161,6 +181,38 @@ impl StreamingContent {
         self.cache.get_or_update(
             &mut self.renderer,
             self.typewriter.visible(),
+            self.prefix,
+            self.text_style,
+            self.prefix_style,
+            width,
+        );
+        &self.cache.lines
+    }
+
+    pub fn invalidate_render(&mut self) {
+        self.cache.invalidate();
+    }
+
+    pub fn render_lines_with_code_blocks(
+        &mut self,
+        width: u16,
+        mut callback: impl FnMut(&str, &str, u16) -> Option<Vec<String>>,
+    ) -> &[Line<'static>] {
+        self.typewriter.tick();
+        let visible = self.typewriter.visible();
+        self.cache.get_or_update_with(
+            |text, width| {
+                let truncated = matches!(text, Cow::Owned(_));
+                // A fence the truncation cut no longer appears in the text as
+                // written, and its changed source must not reach a renderer.
+                self.renderer
+                    .render_with_code_blocks(&text, width, |info, code, width| {
+                        (!truncated || visible.contains(code))
+                            .then(|| callback(info, code, width))
+                            .flatten()
+                    })
+            },
+            visible,
             self.prefix,
             self.text_style,
             self.prefix_style,
