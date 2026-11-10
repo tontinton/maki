@@ -899,7 +899,7 @@ impl PluginHost {
         // installed the first round is empty, and the names `init.lua` already
         // recorded still have to be collected.
         loop {
-            for pkg in round {
+            for pkg in round.drain(..) {
                 let opts = config
                     .opts
                     .get(&pkg.name)
@@ -971,7 +971,6 @@ impl PluginHost {
                     break;
                 }
             };
-            round = Vec::new();
             for op in ops {
                 let crate::api::pack::PackOp::Activate { name } = op;
                 if loaded.contains(&name.as_str()) {
