@@ -175,7 +175,7 @@ pub fn plain_lines(
     text_style: Style,
     prefix_style: Style,
 ) -> Vec<Line<'static>> {
-    let text = text.trim_start_matches('\n');
+    let text = text.trim_start_matches('\n').trim_end();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut first_line = true;
 
@@ -474,6 +474,7 @@ mod tests {
         &["p> before", "```rust", "fn main() {}", "```", "after"]
         ; "plain_preserves_code_fences_literally"
     )]
+    #[test_case("\n  pasted\r\n  \n", &["p>   pasted"] ; "plain_drops_surrounding_blank_lines")]
     fn plain_content(input: &str, expected: &[&str]) {
         let base = Style::new().fg(ratatui::style::Color::Cyan);
         let lines = plain_lines(input, "p> ", base, base);

@@ -1837,12 +1837,7 @@ fn notice_detail_lines(detail: &NoticeDetail, width: u16) -> impl Iterator<Item 
         let body_width = width.saturating_sub(NOTICE_DETAIL_INDENT.len() as u16);
         text_to_lines(&detail.text, "", text_style, text_style, body_width, None)
     } else {
-        plain_lines(
-            detail.text.trim_end_matches('\n'),
-            "",
-            text_style,
-            text_style,
-        )
+        plain_lines(&detail.text, "", text_style, text_style)
     };
     lines.into_iter().map(|mut line| {
         for span in &mut line.spans {
