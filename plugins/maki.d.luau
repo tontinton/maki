@@ -156,6 +156,8 @@ declare maki: {
     read: @checked (opts: any) -> (any, string?),
     export: @checked (opts: any) -> (any, string?),
     messages: @checked (opts: any) -> (any, string?),
+    windows: @checked (opts: any) -> (any, string?),
+    subagents: @checked (opts: any) -> (any, string?),
     focus: @checked (id: string) -> (boolean?, string?),
     delete: @checked (id: string) -> (boolean?, string?),
     new: @checked (opts: any) -> (string?, string?),
