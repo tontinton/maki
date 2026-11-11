@@ -51,6 +51,12 @@ pub(crate) struct PlanCycle {
     /// again when a settled revision is offered, so implementing a file that
     /// moved underneath the review has to be approved again.
     pub(super) reviewed: Option<String>,
+    /// The revision already shown in the transcript, so a preview is pushed
+    /// once per settled content and not once per write event.
+    pub(super) previewed: Option<String>,
+    /// The plan file when this cycle began. A settle compares it with the
+    /// file to catch a write from a tool that reports no path, such as MCP.
+    pub(super) baseline: Option<String>,
 }
 
 impl Mode {
@@ -134,16 +140,24 @@ impl App {
         if self.state.mode != Mode::Plan || self.state.plan.path().is_none() {
             return;
         }
-        // A write from a background call can land after the run drained. No
-        // later turn will settle it, so the write is the settle point.
-        let idle = self.status != Status::Streaming && self.queue.is_empty();
+        let active = self.status == Status::Streaming || !self.queue.is_empty();
+        let drain_pending = self.plan_last_done == Some(DoneReason::EndTurn);
+        self.plan_run_owns = true;
         self.begin_plan_refinement();
+        // The old menu answered for the revision before this write.
+        self.plan_form.forget_menu();
         // The revision the user could approve is no longer the one on disk.
         self.state.plan.mark_drafting();
         self.plan_cycle.written = true;
         self.plan_cycle.reviewed = None;
-        if idle {
-            self.settle_plan(true);
+        if !active && !drain_pending {
+            // A background call can land after the run drained. Only a run
+            // that settled normally may turn its write into a review.
+            if self.plan_settled {
+                self.settle_plan(true);
+            } else {
+                self.settle_plan(false);
+            }
         }
     }
 
@@ -159,48 +173,59 @@ impl App {
         if lost_pick {
             self.flash(FLASH_PLAN_ACTION_LOST.into());
         }
+        if !self.plan_cycle.refining {
+            self.plan_cycle.baseline = self
+                .state
+                .plan
+                .path()
+                .and_then(|path| fs::read_to_string(path).ok());
+        }
         self.plan_cycle.refining = true;
         self.plan_form.on_plan_drafting();
-        self.plan_form.forget_menu();
     }
 
     fn settle_plan(&mut self, success: bool) {
         if !self.plan_cycle.refining {
             return;
         }
-        let written = self.plan_cycle.written;
+        let baseline = self.plan_cycle.baseline.take();
+        let event_written = self.plan_cycle.written;
+        self.plan_run_owns = false;
         self.plan_cycle.refining = false;
         self.plan_cycle.written = false;
         self.plan_last_done = None;
         if !success {
+            self.plan_settled = false;
             self.plan_answers.abandon();
-            if written {
+            if event_written {
                 self.state.plan.mark_drafting();
                 self.plan_cycle.reviewed = None;
                 self.flash(FLASH_PLAN_DRAFT_INTERRUPTED.into());
             }
             return;
         }
-        if !written {
-            return;
-        }
+        self.plan_settled = true;
         let Some(path) = self.state.plan.path().map(|path| path.to_path_buf()) else {
             return;
         };
-        let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(error) => {
-                self.plan_cycle.reviewed = None;
-                self.flash(format!(
-                    "{FLASH_PLAN_UNREADABLE_PREFIX} {}: {error}",
-                    path.display()
-                ));
-                return;
-            }
+        let content = fs::read_to_string(&path).ok();
+        // A tool that reports no path, an MCP write, still changed the file.
+        let written = event_written
+            || content
+                .as_deref()
+                .is_some_and(|content| baseline.as_deref() != Some(content));
+        if !written {
+            return;
+        }
+        let Some(content) = content else {
+            self.plan_cycle.reviewed = None;
+            self.flash(format!("{FLASH_PLAN_UNREADABLE_PREFIX} {}", path.display()));
+            return;
         };
         self.state.plan.mark_ready();
-        self.plan_cycle.reviewed = Some(content);
+        self.plan_cycle.reviewed = Some(content.clone());
         let path = path.display().to_string();
+        self.preview_plan(&content, &path);
         self.offer_plan_form(Some(&path));
         self.fire_session_event(HostEvent::PlanReady { path: &path });
     }
@@ -209,19 +234,50 @@ impl App {
     /// that is not approval material.
     pub(super) fn note_plan_turn_end(&mut self, reason: DoneReason) {
         match reason {
+            // Any successful main run can leave a late background write that
+            // is worth reviewing. Only a failure has to know whose plan it is.
             DoneReason::EndTurn => self.plan_last_done = Some(reason),
             DoneReason::Compact => {}
-            _ => self.plan_turn_interrupted(),
+            _ => {
+                if self.plan_run_owns {
+                    self.plan_turn_interrupted();
+                }
+            }
         }
     }
 
     pub(super) fn plan_turn_interrupted(&mut self) {
         self.plan_last_done = None;
+        self.plan_settled = false;
+        self.plan_run_owns = false;
         self.transition_plan(PlanTrigger::Interrupted);
+    }
+
+    /// A failed main run only invalidates the plan when it was planning or
+    /// wrote the plan. A build turn failing after a plan already landed must
+    /// not throw that plan away.
+    pub(super) fn plan_run_failed(&mut self) {
+        if self.plan_run_owns {
+            self.plan_turn_interrupted();
+        }
+    }
+
+    /// Esc ends the current work. A plan run that was cancelled leaves a
+    /// draft; a build turn cancelled after a plan run settled keeps that plan.
+    pub(super) fn plan_cancelled(&mut self) {
+        self.plan_answers.abandon();
+        if self.plan_run_owns {
+            self.plan_turn_interrupted();
+        } else if self.plan_last_done == Some(DoneReason::EndTurn) {
+            self.settle_plan(true);
+        } else if self.plan_cycle.refining {
+            self.plan_turn_interrupted();
+        }
     }
 
     pub(crate) fn on_queue_drained(&mut self) {
         if self.plan_last_done.take() == Some(DoneReason::EndTurn) {
+            self.plan_settled = true;
             self.transition_plan(PlanTrigger::Settled);
         }
     }
@@ -239,6 +295,8 @@ impl App {
             && self.queue.is_empty()
         {
             self.plan_cycle.refining = false;
+            self.plan_cycle.baseline = None;
+            self.plan_run_owns = false;
             self.plan_answers.abandon();
             return Dirty::YES;
         }

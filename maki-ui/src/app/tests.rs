@@ -6648,7 +6648,8 @@ fn plan_app() -> (TempDir, App) {
         written_path: Some(written),
         backgrounded: false,
     }))));
-    app.transition_plan(PlanTrigger::Settled);
+    app.plan_last_done = Some(DoneReason::EndTurn);
+    app.on_queue_drained();
     app.status = Status::Idle;
     (tmp, app)
 }
@@ -6766,6 +6767,12 @@ fn a_plan_waits_for_the_queue_to_drain_before_review() {
     );
     assert!(!app.state.plan.is_ready());
 
+    // The write lands after Done but before the drain. It waits for the
+    // queued work rather than offering a revision in between.
+    app.transition_plan(PlanTrigger::WriteDone);
+    assert!(!app.plan_form.is_visible());
+    assert!(!app.state.plan.is_ready());
+
     app.on_queue_drained();
     assert!(app.state.plan.is_ready());
     assert!(app.plan_form.is_visible());
@@ -6830,6 +6837,9 @@ fn a_file_written_event_controls_the_plan_cycle(matching: bool, refining: bool) 
     assert_eq!(app.plan_cycle.written, refining);
     assert!(!app.plan_form.is_visible());
     assert!(!app.state.plan.is_ready());
+    if matching {
+        assert_eq!(app.main_chat().last_message_text(), "plan body");
+    }
 
     if matching {
         app.transition_plan(PlanTrigger::Settled);
@@ -7091,6 +7101,7 @@ fn a_background_write_settles_a_draft() {
     let written = path.display().to_string();
     let mut app = test_app();
     app.run_id = 1;
+    app.plan_settled = true;
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(path);
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
@@ -7109,6 +7120,259 @@ fn a_background_write_settles_a_draft() {
     assert!(app.state.plan.is_ready());
     assert!(!app.plan_cycle.refining);
     assert!(app.plan_form.is_visible());
+}
+
+/// Cancelling a build turn that followed a successful plan run must not
+/// discard the plan. Cancelling the plan run itself still leaves a draft.
+#[test]
+fn a_build_cancel_after_a_plan_write_keeps_the_plan_review() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = path.display().to_string();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path);
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
+        id: "t1".into(),
+        tool: "write".into(),
+        output: Arc::new(ToolOutput::Plain(
+            format!("wrote 42 bytes to {written}").into(),
+        )),
+        is_error: false,
+        annotation: None,
+        written_path: Some(written),
+        backgrounded: false,
+    }))));
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    app.update(agent_msg(AgentEvent::QueueItemConsumed {
+        text: "build".into(),
+        images: Vec::new(),
+        plan: false,
+    }));
+
+    let _ = app.handle_cancel();
+
+    assert!(app.state.plan.is_ready());
+    assert!(app.plan_form.is_visible());
+}
+
+/// A build turn failing after a plan run already wrote and ended cleanly must
+/// not throw that plan away.
+#[test]
+fn a_build_error_after_a_plan_write_keeps_the_plan_review() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = path.display().to_string();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path);
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
+        id: "t1".into(),
+        tool: "write".into(),
+        output: Arc::new(ToolOutput::Plain(
+            format!("wrote 42 bytes to {written}").into(),
+        )),
+        is_error: false,
+        annotation: None,
+        written_path: Some(written),
+        backgrounded: false,
+    }))));
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    app.update(agent_msg(AgentEvent::QueueItemConsumed {
+        text: "build".into(),
+        images: Vec::new(),
+        plan: false,
+    }));
+    app.update(agent_msg_with_run_id(agent_error(), app.run_id));
+
+    assert!(app.plan_cycle.refining, "the plan run is still pending");
+    app.on_queue_drained();
+
+    assert!(app.state.plan.is_ready());
+    assert!(app.plan_form.is_visible());
+}
+
+/// A plugin task is its own session. A write it makes to the plan path must
+/// not drive the main plan review.
+#[test]
+fn a_plugin_task_write_does_not_drive_the_plan() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = path.display().to_string();
+    let mut app = app_with_plugin_task();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path);
+    plugin_event(
+        &mut app,
+        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
+            id: "t1".into(),
+            tool: "write".into(),
+            output: Arc::new(ToolOutput::Plain(
+                format!("wrote 42 bytes to {written}").into(),
+            )),
+            is_error: false,
+            annotation: None,
+            written_path: Some(written),
+            backgrounded: false,
+        })),
+    );
+
+    assert!(!app.plan_cycle.refining);
+    assert!(!app.plan_cycle.written);
+    assert_eq!(app.main_chat().message_count(), 0);
+}
+
+/// A delegated subagent can write the plan. It joins the main run's cycle and
+/// leaves a preview in the main transcript.
+#[test]
+fn a_subagent_plan_write_is_reviewed() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = path.display().to_string();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path);
+    app.update(subagent_msg(
+        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
+            id: "t1".into(),
+            tool: "write".into(),
+            output: Arc::new(ToolOutput::Plain(
+                format!("wrote 42 bytes to {written}").into(),
+            )),
+            is_error: false,
+            annotation: None,
+            written_path: Some(written),
+            backgrounded: false,
+        })),
+        TASK_ID,
+        Some("task"),
+    ));
+
+    assert!(app.plan_cycle.refining);
+    assert!(app.plan_cycle.written);
+    assert_eq!(app.main_chat().last_message_text(), "plan body");
+
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    app.on_queue_drained();
+
+    assert!(app.state.plan.is_ready());
+    assert!(app.plan_form.is_visible());
+}
+
+/// A refinement that changes nothing keeps the menu the layer built. The plan
+/// is the same revision, so its plugin rows still answer for it.
+#[test]
+fn a_no_op_refinement_keeps_the_plugin_menu() {
+    let (_tmp, mut app) = plan_app();
+    app.plan_form
+        .open_with(plan_menu(vec![plugin_row(PLUGIN_ROW_ID)]));
+
+    app.start_from_queue(&queued_msg("refine"));
+    assert!(app.plan_cycle.refining);
+    assert!(!app.plan_form.is_visible());
+
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    app.on_queue_drained();
+    assert!(!app.plan_form.is_visible(), "nothing changed");
+
+    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    assert!(app.plan_form.is_visible());
+    assert!(
+        app.plan_form
+            .menu()
+            .rows
+            .iter()
+            .any(|row| row.id == PLUGIN_ROW_ID)
+    );
+}
+
+/// A write that lands after a run already ended interrupted is not approval
+/// material, even though no run is in flight.
+#[test]
+fn a_late_write_after_an_interrupted_run_stays_a_draft() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    fs::write(&path, "plan body").unwrap();
+    let written = path.display().to_string();
+    let mut app = test_app();
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path);
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
+        id: "t1".into(),
+        tool: "write".into(),
+        output: Arc::new(ToolOutput::Plain(
+            format!("wrote 42 bytes to {written}").into(),
+        )),
+        is_error: false,
+        annotation: None,
+        written_path: Some(written),
+        backgrounded: false,
+    }))));
+
+    assert!(!app.state.plan.is_ready());
+    assert!(!app.plan_cycle.refining);
+    assert!(!app.plan_form.is_visible());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(FLASH_PLAN_DRAFT_INTERRUPTED)
+    );
+}
+
+/// A tool that reports no path, like an MCP write, still changed the plan.
+/// The settle compares the file with the cycle's baseline.
+#[test]
+fn an_unreported_plan_change_is_detected_at_settle() {
+    let (_tmp, mut app) = plan_app();
+    let path = app.state.plan.path().unwrap().to_path_buf();
+    app.start_from_queue(&queued_msg("refine"));
+    fs::write(&path, "unreported change").unwrap();
+
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    app.on_queue_drained();
+
+    assert!(app.state.plan.is_ready());
+    assert!(app.plan_form.is_visible());
+    assert_eq!(
+        app.plan_cycle.reviewed.as_deref(),
+        Some("unreported change")
+    );
+}
+
+/// The same for a first draft written by a tool that reports no path.
+#[test]
+fn an_unreported_first_write_settles_a_draft() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plan.md");
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(path.clone());
+    app.start_from_queue(&queued_msg("write the plan"));
+    fs::write(&path, "draft").unwrap();
+
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    app.on_queue_drained();
+
+    assert!(app.state.plan.is_ready());
+    assert!(app.plan_form.is_visible());
+    assert_eq!(app.plan_cycle.reviewed.as_deref(), Some("draft"));
 }
 
 /// An interrupted rewrite of a previously ready plan is a draft, not a new

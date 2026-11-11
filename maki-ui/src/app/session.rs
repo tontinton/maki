@@ -323,6 +323,8 @@ impl App {
         self.plan_form.reset();
         self.plan_cycle = PlanCycle::default();
         self.plan_last_done = None;
+        self.plan_settled = false;
+        self.plan_run_owns = false;
         // The draft this chrome belonged to is gone, and the Lua thread still
         // owes answers about it. Retiring them here is what keeps a handler
         // that comes back after a `/new`, a rewind or a tab switch from

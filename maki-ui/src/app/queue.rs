@@ -237,6 +237,11 @@ impl App {
             return false;
         };
         let input = self.build_agent_input(&msg);
+        // A queued plan refinement suspends review before it starts. A build
+        // message leaves a settled plan alone.
+        if matches!(input.mode, AgentMode::Plan(_)) {
+            self.plan_settled = false;
+        }
         shared.push(QueueItem::Message(QueuedInput {
             text: msg.text,
             input,
@@ -284,6 +289,11 @@ impl App {
         images: Vec<ImageSource>,
         plan: bool,
     ) {
+        self.plan_settled = false;
+        self.plan_run_owns = plan;
+        if plan {
+            self.plan_last_done = None;
+        }
         self.status = Status::Streaming;
         if plan && self.state.mode == Mode::Plan {
             self.transition_plan(PlanTrigger::RefinementStarted);
@@ -328,6 +338,11 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
+        self.plan_settled = false;
+        self.plan_run_owns = matches!(input.mode, AgentMode::Plan(_));
+        if self.plan_run_owns {
+            self.plan_last_done = None;
+        }
         if self.state.mode == Mode::Plan
             && matches!(input.mode, AgentMode::Plan(_))
             && (!display.is_empty() || !input.images.is_empty())

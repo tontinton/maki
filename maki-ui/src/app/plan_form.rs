@@ -206,6 +206,7 @@ impl App {
         };
         match fs::read_to_string(path) {
             Ok(content) => {
+                self.preview_plan(&content, &path.display().to_string());
                 self.plan_cycle.reviewed = Some(content);
                 true
             }
@@ -218,6 +219,18 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Show the revision in the transcript once. The per-write previews and
+    /// the settle/open paths share it, so a plan body never appears twice for
+    /// the same content.
+    pub(super) fn preview_plan(&mut self, content: &str, path: &str) {
+        if self.plan_cycle.previewed.as_deref() == Some(content) {
+            return;
+        }
+        self.main_chat()
+            .push(DisplayMessage::plan(content.to_owned(), path.to_owned()));
+        self.plan_cycle.previewed = Some(content.to_owned());
     }
 
     pub(super) fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
@@ -341,6 +354,7 @@ impl App {
         if let Some(reviewed) = &self.plan_cycle.reviewed
             && reviewed != &content
         {
+            self.preview_plan(&content, &path.display().to_string());
             self.plan_cycle.reviewed = Some(content);
             self.flash(FLASH_PLAN_CHANGED.into());
             return vec![];

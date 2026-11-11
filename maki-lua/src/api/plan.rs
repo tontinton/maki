@@ -217,6 +217,12 @@ pub(crate) fn clear_menu_generation(lua: &Lua, session: &str, generation: u64) {
         .menus
         .get(session)
         .is_some_and(|menu| menu.generation == generation);
+    if stale {
+        // A chain can answer after its session ended. Its late install must
+        // not leave a high-water mark that rejects the reopened tab's lower
+        // request numbers.
+        store.latest_request.remove(session);
+    }
     let removed = stale.then(|| store.menus.remove(session)).flatten();
     drop(store);
     drop_keys(lua, removed.into_iter().flat_map(|m| m.rows));
@@ -830,6 +836,27 @@ mod tests {
             lua.app_data_ref::<PlanRowHandlers>()
                 .unwrap()
                 .handler(SESSION, on_screen, 0)
+                .is_ok()
+        );
+    }
+
+    /// A chain that answers after its session ended would otherwise leave a
+    /// request high-water mark behind. Reopening the session must be able to
+    /// start its request numbers over.
+    #[test]
+    fn a_late_menu_after_a_session_end_does_not_poison_a_reopen() {
+        let lua = Lua::new();
+        lua.set_app_data(PlanRowHandlers::default());
+        clear_session_rows(&lua, SESSION);
+
+        let late = install(&lua, PLUGIN, 5);
+        clear_menu_generation(&lua, SESSION, late);
+
+        let reopened = install(&lua, PLUGIN, 1);
+        assert!(
+            lua.app_data_ref::<PlanRowHandlers>()
+                .unwrap()
+                .handler(SESSION, reopened, 0)
                 .is_ok()
         );
     }

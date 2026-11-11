@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -150,8 +151,12 @@ impl App {
             return;
         }
         if let AgentEvent::FileWritten { path } = &envelope.event {
-            if envelope.subagent.is_none() {
-                self.note_plan_write(Some(path));
+            let plugin_task = envelope
+                .subagent
+                .as_ref()
+                .is_some_and(|info| self.task_plugin(&info.parent_tool_use_id).is_some());
+            if !plugin_task && self.note_plan_write(Some(path)) {
+                self.push_plan_preview(path);
             }
             return;
         }
@@ -204,7 +209,7 @@ impl App {
         self.chats[chat_idx].track_run(&event);
 
         if let AgentEvent::ToolDone(ref done) = event {
-            self.record_tool_done(chat_idx, done);
+            self.record_tool_done(chat_idx, done, plugin.is_none());
         }
 
         if let AgentEvent::Retry {
@@ -333,7 +338,7 @@ impl App {
 
     /// A write this session can review. `None` is a result that failed or no
     /// write at all.
-    fn note_plan_write(&mut self, written: Option<&str>) {
+    fn note_plan_write(&mut self, written: Option<&str>) -> bool {
         if self.state.mode != Mode::Plan
             || written.is_none()
             || !self
@@ -342,14 +347,30 @@ impl App {
                 .path()
                 .is_some_and(|plan| written.is_some_and(|path| Path::new(path) == plan))
         {
-            return;
+            return false;
         }
         self.transition_plan(PlanTrigger::WriteDone);
+        true
     }
 
-    fn record_tool_done(&mut self, chat_idx: usize, done: &ToolDoneEvent) {
-        if chat_idx == MAIN_CHAT {
-            self.note_plan_write(done.written_path());
+    /// A nested or delegated write has no plan preview of its own, so the
+    /// main transcript gets the revision that is about to be reviewed.
+    fn push_plan_preview(&mut self, path: &str) {
+        if let Ok(content) = fs::read_to_string(path) {
+            self.preview_plan(&content, path);
+        }
+    }
+
+    fn record_tool_done(&mut self, chat_idx: usize, done: &ToolDoneEvent, allow_plan: bool) {
+        let written = done.written_path();
+        if allow_plan && self.note_plan_write(written) {
+            if chat_idx == MAIN_CHAT {
+                // The chat previews a top-level write itself; the diff an
+                // edit shows is the preview for that one.
+                self.plan_cycle.previewed = written.and_then(|path| fs::read_to_string(path).ok());
+            } else if let Some(path) = written {
+                self.push_plan_preview(path);
+            }
         }
         self.state
             .session_mut()
@@ -503,7 +524,7 @@ impl App {
             ChatEventResult::Error(message) => {
                 self.status = Status::error(message.clone());
                 self.status_bar.clear_flash();
-                self.plan_turn_interrupted();
+                self.plan_run_failed();
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Error,
                     cap_error_text(&message),

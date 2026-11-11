@@ -614,6 +614,13 @@ pub struct App {
     /// The reason the last main run ended, kept until the queue drains so a
     /// queued refinement cannot flash an approval between two runs.
     pub(super) plan_last_done: Option<DoneReason>,
+    /// The last main run and everything queued behind it drained after a
+    /// normal end. A late write from a background call may use this to settle.
+    pub(super) plan_settled: bool,
+    /// A plan write or plan-mode input belongs to the current main run, so a
+    /// failure of that run has to invalidate the draft. A build turn that
+    /// only followed a successful plan run does not.
+    pub(super) plan_run_owns: bool,
     /// Actions produced outside key handling, drained by the event loop. A
     /// plan row handler answers long after the key press that started it.
     pub(super) pending_actions: Vec<Action>,
@@ -741,6 +748,8 @@ impl App {
             plan_answers: PlanAnswers::default(),
             plan_cycle: PlanCycle::default(),
             plan_last_done: None,
+            plan_settled: false,
+            plan_run_owns: false,
             pending_actions: Vec::new(),
             typeahead: Typeahead::default(),
             restore_event_tx: None,
@@ -2483,8 +2492,7 @@ impl App {
         self.run_id += 1;
         self.retry_info = None;
         self.close_all_overlays();
-        self.plan_answers.abandon();
-        self.plan_turn_interrupted();
+        self.plan_cancelled();
         self.finish_subagents(TaskOutcome::Cancelled, CANCELLED_TEXT);
         self.chats[MAIN_CHAT].auth_parked = false;
         self.shell.cancel_all();
