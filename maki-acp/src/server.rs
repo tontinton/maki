@@ -841,7 +841,7 @@ fn handle_notification(srv: &Server, method: &str) {
             // and may be parked on one, and a stale answer is tagged, so
             // whoever waits next drops it.
             if let Some(session) = &srv.session {
-                let _ = session.handle.cancel_tx.try_send(());
+                let _ = session.handle.cancel_tx.send(());
             }
         }
         _ => debug!(method, "unknown notification"),
@@ -1159,6 +1159,7 @@ mod tests {
     use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
     use std::future;
     use std::iter;
+    use tokio::sync::watch;
 
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1394,11 +1395,11 @@ mod tests {
         let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
         let handle = InteractiveHandle {
             tool_names: Vec::new(),
-            input_tx: flume::unbounded().0,
+            input_tx: unbounded_channel().0,
             answer_tx,
-            cancel_tx: flume::unbounded().0,
-            model_tx: flume::unbounded().0,
-            mode_tx: flume::unbounded().0,
+            cancel_tx: watch::channel(()).0,
+            model_tx: unbounded_channel().0,
+            mode_tx: unbounded_channel().0,
             session_id: SessionRef::from(claim.id()),
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),

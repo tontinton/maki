@@ -13,7 +13,6 @@ use std::mem;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
-use tokio::sync::mpsc::UnboundedSender;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
@@ -37,6 +36,7 @@ use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -875,7 +875,7 @@ async fn handle_control_request(
             )
         }
         "interrupt" => {
-            let _ = handle.cancel_tx.try_send(());
+            let _ = handle.cancel_tx.send(());
             writer.emit_control_response(&cr.request_id, ok, None)
         }
         "set_permission_mode" => {
@@ -1275,12 +1275,12 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
-    use tokio::sync::mpsc::UnboundedSender;
-    use tokio::sync::mpsc::unbounded_channel;
 
     use maki_agent::SubagentInfo;
     use maki_config::ToolKey;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
 

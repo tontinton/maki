@@ -1,13 +1,11 @@
 use std::future::Future;
+use std::iter;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::mpsc::unbounded_channel;
 
 use arc_swap::ArcSwap;
-use flume::{Receiver, Sender};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
@@ -17,6 +15,8 @@ use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::watch;
 use tokio::time::{sleep_until, timeout};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
@@ -228,8 +228,8 @@ impl Next {
 
 /// Where an interactive session's turns come from.
 struct Inputs {
-    prompts: Receiver<AgentInput>,
-    modes: Receiver<AgentMode>,
+    prompts: UnboundedReceiver<AgentInput>,
+    modes: UnboundedReceiver<AgentMode>,
     keep_alive: KeepAlive,
     /// Ends the session at once, whatever is still out.
     stop: CancelToken,
@@ -246,10 +246,10 @@ impl Inputs {
     async fn next(&mut self) -> Option<Next> {
         let stop = self.stop.clone();
         let next = async {
-            if let Ok(input) = self.prompts.recv_async().await {
+            if let Some(input) = self.prompts.recv().await {
                 return Some(Next::Prompt(input));
             }
-            if let Some(mode) = self.modes.try_iter().last() {
+            if let Some(mode) = iter::from_fn(|| self.modes.try_recv().ok()).last() {
                 self.keep_alive.switch_mode(mode);
             }
             self.keep_alive.next_input().await.map(Next::Woken)
@@ -450,12 +450,12 @@ pub struct InteractiveParams {
 
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
-    pub input_tx: Sender<AgentInput>,
+    pub input_tx: UnboundedSender<AgentInput>,
     pub answer_tx: UnboundedSender<String>,
-    pub cancel_tx: Sender<()>,
-    pub model_tx: Sender<Model>,
+    pub cancel_tx: watch::Sender<()>,
+    pub model_tx: UnboundedSender<Model>,
     /// Send through [`Self::switch_mode`], which also tells background work.
-    pub mode_tx: Sender<AgentMode>,
+    pub mode_tx: UnboundedSender<AgentMode>,
     pub session_id: SessionRef,
     pub permissions: Arc<PermissionManager>,
     pub task: SessionTask,
@@ -502,11 +502,11 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
-    let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
+    let (input_tx, input_rx) = unbounded_channel::<AgentInput>();
     let (answer_tx, answer_rx) = unbounded_channel::<String>();
-    let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
-    let (model_tx, model_rx) = flume::unbounded::<Model>();
-    let (mode_tx, mode_rx) = flume::unbounded::<AgentMode>();
+    let (cancel_tx, cancel_rx) = watch::channel(());
+    let (model_tx, mut model_rx) = unbounded_channel::<Model>();
+    let (mode_tx, mode_rx) = unbounded_channel::<AgentMode>();
 
     let session_ref = params.resumed.id.clone();
     let mailbox = open_mailbox(&params.resumed);
@@ -579,8 +579,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             let event_tx = base_tx.with_run_id(run_id);
             let error_tx = event_tx.clone();
 
-            if let Some(mut new_model) = model_rx
-                .try_iter()
+            if let Some(mut new_model) = iter::from_fn(|| model_rx.try_recv().ok())
                 .last()
                 .filter(|candidate| params.model_policy.allows(&candidate.spec()))
                 && new_model.spec() != model.spec()
@@ -696,11 +695,11 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 /// meant for the turn before. Prompt and cancel ride separate channels, so a
 /// cancel sent right after a prompt, before the loop picked that prompt up,
 /// is dropped with it.
-fn relay_cancel(cancel_rx: &Receiver<()>, trigger: CancelTrigger) -> AbortOnDropHandle<()> {
-    while cancel_rx.try_recv().is_ok() {}
-    let cancel_rx = cancel_rx.clone();
+fn relay_cancel(cancel_rx: &watch::Receiver<()>, trigger: CancelTrigger) -> AbortOnDropHandle<()> {
+    let mut cancel_rx = cancel_rx.clone();
+    cancel_rx.mark_unchanged();
     AbortOnDropHandle::new(tokio::spawn(async move {
-        if cancel_rx.recv_async().await.is_ok() {
+        if cancel_rx.changed().await.is_ok() {
             trigger.cancel();
         }
     }))
@@ -748,6 +747,7 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use flume::{Receiver, Sender};
     use std::future::{pending, ready};
     use std::pin::pin;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -767,6 +767,7 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
+    use tokio::task::yield_now;
 
     use super::*;
     use crate::live_session::BACKGROUND_PLAN_WRITE_DENIED;
@@ -1008,7 +1009,7 @@ mod tests {
                 .await
                 .expect(LISTING_DUE)
                 .unwrap();
-            handle.cancel_tx.try_send(()).unwrap();
+            handle.cancel_tx.send(()).unwrap();
             next_done(&mut events).await;
         }
     }
@@ -1206,14 +1207,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancel_sent_between_turns_does_not_end_the_next_one() {
-        let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
-        cancel_tx.try_send(()).unwrap();
+        let (cancel_tx, cancel_rx) = watch::channel(());
+        cancel_tx.send(()).unwrap();
         let (trigger, cancel) = CancelToken::none().child();
         let relay = relay_cancel(&cancel_rx, trigger);
-        assert!(cancel_rx.is_empty(), "{STALE_CANCEL_IGNORED}");
+        yield_now().await;
         assert!(!cancel.is_cancelled(), "{STALE_CANCEL_IGNORED}");
 
-        cancel_tx.send_async(()).await.unwrap();
+        cancel_tx.send(()).unwrap();
         relay.await.unwrap();
         assert!(cancel.is_cancelled(), "{LIVE_CANCEL_ENDS_TURN}");
     }
@@ -1221,13 +1222,13 @@ mod tests {
     /// A turn skipped by a failed model switch drops its relay unawaited.
     #[tokio::test]
     async fn a_dropped_relay_does_not_take_the_next_turns_cancel() {
-        let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
+        let (cancel_tx, cancel_rx) = watch::channel(());
         let (stale_trigger, _stale) = CancelToken::none().child();
         drop(relay_cancel(&cancel_rx, stale_trigger));
         let (trigger, cancel) = CancelToken::none().child();
         let relay = relay_cancel(&cancel_rx, trigger);
 
-        cancel_tx.send_async(()).await.unwrap();
+        cancel_tx.send(()).unwrap();
         assert!(
             timeout(RELAY_WAIT, relay).await.is_ok(),
             "{DROPPED_RELAY_FREES_CHANNEL}"
@@ -1270,9 +1271,13 @@ mod tests {
         mailbox: &SessionMailbox,
         background: BackgroundMode,
         stop: CancelToken,
-    ) -> (Inputs, Sender<AgentInput>, Sender<AgentMode>) {
-        let (prompt_tx, prompts) = flume::unbounded();
-        let (mode_tx, modes) = flume::unbounded();
+    ) -> (
+        Inputs,
+        UnboundedSender<AgentInput>,
+        UnboundedSender<AgentMode>,
+    ) {
+        let (prompt_tx, prompts) = unbounded_channel();
+        let (mode_tx, modes) = unbounded_channel();
         let inputs = Inputs {
             prompts,
             modes,
