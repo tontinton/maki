@@ -12,6 +12,8 @@ use maki_agent::{Envelope, SharedBuf, SubagentInfo, TaskEnd, Transcript};
 use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 use crate::api::ui::marks::Mark;
@@ -780,8 +782,8 @@ pub enum UiAction {
         buf: Arc<SharedBuf>,
         config: FloatConfig,
         focus: bool,
-        event_tx: flume::Sender<WinEvent>,
-        cmd_rx: flume::Receiver<WinCommand>,
+        event_tx: UnboundedSender<WinEvent>,
+        cmd_rx: UnboundedReceiver<WinCommand>,
     },
     Flash(String),
     SetWindowTitle(String),

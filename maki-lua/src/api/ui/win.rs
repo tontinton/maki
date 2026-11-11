@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
@@ -5,6 +6,8 @@ use std::time::Duration;
 use maki_agent::UiWaker;
 use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{AnyUserData, Lua, Result as LuaResult, Table};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::timeout;
 
 use super::{parse_footer, try_parse_dimension};
@@ -19,21 +22,18 @@ use crate::docs::{FnDoc, ParamDoc};
 /// typing by up to a whole poll.
 #[derive(Clone)]
 pub(crate) struct WinSender {
-    tx: flume::Sender<WinCommand>,
+    tx: UnboundedSender<WinCommand>,
     waker: Option<UiWaker>,
 }
 
 impl WinSender {
-    pub fn new(tx: flume::Sender<WinCommand>, waker: Option<UiWaker>) -> Self {
+    pub fn new(tx: UnboundedSender<WinCommand>, waker: Option<UiWaker>) -> Self {
         Self { tx, waker }
     }
 
     /// False once the UI side has gone.
     pub fn send(&self, cmd: WinCommand) -> bool {
-        let sent = !matches!(
-            self.tx.try_send(cmd),
-            Err(flume::TrySendError::Disconnected(_))
-        );
+        let sent = self.tx.send(cmd).is_ok();
         if let Some(waker) = &self.waker {
             waker.wake();
         }
@@ -41,7 +41,7 @@ impl WinSender {
     }
 
     pub fn is_disconnected(&self) -> bool {
-        self.tx.is_disconnected()
+        self.tx.is_closed()
     }
 }
 
@@ -50,7 +50,7 @@ impl WinSender {
 /// mlua's userdata lock is exclusive even for shared borrows, so `recv`
 /// additionally must not hold any borrow across its await; see below.
 pub(crate) struct WinHandle {
-    event_rx: flume::Receiver<WinEvent>,
+    event_rx: Arc<AsyncMutex<UnboundedReceiver<WinEvent>>>,
     cmd_tx: WinSender,
     closed: AtomicBool,
     visible: AtomicBool,
@@ -60,14 +60,14 @@ pub(crate) struct WinHandle {
 
 impl WinHandle {
     pub fn new(
-        event_rx: flume::Receiver<WinEvent>,
+        event_rx: UnboundedReceiver<WinEvent>,
         cmd_tx: WinSender,
         init_width: u16,
         init_height: u16,
         visible: bool,
     ) -> Self {
         Self {
-            event_rx,
+            event_rx: Arc::new(AsyncMutex::new(event_rx)),
             cmd_tx,
             closed: AtomicBool::new(false),
             visible: AtomicBool::new(visible),
@@ -158,7 +158,7 @@ const recv__doc: FnDoc = FnDoc {
 // userdata borrow is held across the await, and mlua's lock rejects ALL
 // other borrows meanwhile (shared ones included), so any win call from
 // another coroutine would fail while a recv is parked, which is
-// virtually always for an event-loop plugin. Only the cloned receiver is
+// virtually always for an event-loop plugin. Only the shared receiver is
 // kept across the suspension.
 fn win_extra<M: mlua::UserDataMethods<WinHandle>>(methods: &mut M) {
     methods.add_async_function(
@@ -169,23 +169,24 @@ fn win_extra<M: mlua::UserDataMethods<WinHandle>>(methods: &mut M) {
                 if this.closed.load(Relaxed) {
                     return Ok(mlua::Value::Nil);
                 }
-                this.event_rx.clone()
+                Arc::clone(&this.event_rx)
             };
+            let next = async { rx.lock().await.recv().await };
             let event = match timeout_ms {
-                Some(ms) => match timeout(Duration::from_millis(ms), rx.recv_async()).await {
+                Some(ms) => match timeout(Duration::from_millis(ms), next).await {
                     Ok(res) => res,
                     Err(_) => return Ok(mlua::Value::Table(tagged(&lua, "timeout")?)),
                 },
-                None => rx.recv_async().await,
+                None => next.await,
             };
             match event {
-                Ok(event) => {
+                Some(event) => {
                     if matches!(event, WinEvent::Close) {
                         ud.borrow::<WinHandle>()?.closed.store(true, Relaxed);
                     }
                     Ok(mlua::Value::Table(event_table(&lua, event)?))
                 }
-                Err(_) => {
+                None => {
                     ud.borrow::<WinHandle>()?.closed.store(true, Relaxed);
                     Ok(mlua::Value::Nil)
                 }
@@ -380,27 +381,31 @@ lua_class! {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::task::{LocalSet, spawn_local, yield_now};
+
     use super::*;
     use crate::api::util::command::FloatConfig;
     use crate::key::Key;
-    use tokio::task::{LocalSet, spawn_local, yield_now};
 
     const NOT_WOKEN: &str = "a command the UI only reads on a tick has to wake it";
 
     fn make_channels() -> (
-        flume::Sender<WinEvent>,
-        flume::Receiver<WinCommand>,
+        UnboundedSender<WinEvent>,
+        UnboundedReceiver<WinCommand>,
         WinHandle,
     ) {
-        let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-        let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+        let (event_tx, event_rx) = unbounded_channel::<WinEvent>();
+        let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
         let handle = WinHandle::new(event_rx, WinSender::new(cmd_tx, None), 80, 24, true);
         (event_tx, cmd_rx, handle)
     }
 
     #[test]
     fn close_is_idempotent_including_drop() {
-        let (_event_tx, cmd_rx, handle) = make_channels();
+        let (_event_tx, mut cmd_rx, handle) = make_channels();
         handle.close();
         assert!(handle.closed.load(Relaxed));
         handle.close();
@@ -411,14 +416,14 @@ mod tests {
 
     #[test]
     fn drop_auto_closes() {
-        let (_event_tx, cmd_rx, handle) = make_channels();
+        let (_event_tx, mut cmd_rx, handle) = make_channels();
         drop(handle);
         assert!(matches!(cmd_rx.try_recv(), Ok(WinCommand::Close)));
     }
 
     #[test]
     fn drop_after_close_does_not_resend() {
-        let (_event_tx, cmd_rx, handle) = make_channels();
+        let (_event_tx, mut cmd_rx, handle) = make_channels();
         handle.close();
         assert!(matches!(cmd_rx.try_recv(), Ok(WinCommand::Close)));
         drop(handle);
@@ -427,8 +432,8 @@ mod tests {
 
     #[test]
     fn close_does_not_panic_when_receiver_dropped() {
-        let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-        let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+        let (event_tx, event_rx) = unbounded_channel::<WinEvent>();
+        let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
         let handle = WinHandle::new(event_rx, WinSender::new(cmd_tx, None), 80, 24, true);
         drop(cmd_rx);
         handle.close();
@@ -438,8 +443,8 @@ mod tests {
 
     #[test]
     fn every_command_wakes_the_ui_once_until_it_looks() {
-        let (_event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-        let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
+        let (_event_tx, event_rx) = unbounded_channel::<WinEvent>();
+        let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
         let (waker, wake_rx) = UiWaker::new();
         let handle = WinHandle::new(event_rx, WinSender::new(cmd_tx, Some(waker)), 80, 24, true);
 
@@ -480,7 +485,7 @@ mod tests {
         let lua = mlua::Lua::new();
         let (event_tx, _cmd_rx, handle) = make_channels();
         event_tx
-            .try_send(WinEvent::Key {
+            .send(WinEvent::Key {
                 key: Key::parse("<CR>").unwrap(),
             })
             .unwrap();
@@ -496,7 +501,7 @@ mod tests {
     #[tokio::test]
     async fn win_methods_work_while_recv_is_parked() {
         let lua = mlua::Lua::new();
-        let (event_tx, cmd_rx, handle) = make_channels();
+        let (event_tx, mut cmd_rx, handle) = make_channels();
         lua.globals().set("win", handle).unwrap();
         LocalSet::new()
             .run_until(async {
@@ -509,10 +514,9 @@ mod tests {
                 }
                 lua.load("win:set_cursor(3)").exec_async().await.unwrap();
                 event_tx
-                    .send_async(WinEvent::Key {
+                    .send(WinEvent::Key {
                         key: Key::parse("x").unwrap(),
                     })
-                    .await
                     .unwrap();
                 assert_eq!(recv_task.await.unwrap().unwrap(), "key");
             })
@@ -523,7 +527,7 @@ mod tests {
     #[test]
     fn set_config_without_needs_input_keeps_flag() {
         let lua = mlua::Lua::new();
-        let (_event_tx, cmd_rx, handle) = make_channels();
+        let (_event_tx, mut cmd_rx, handle) = make_channels();
         lua.globals().set("win", handle).unwrap();
         lua.load("win:set_config({ title = \"t\" })")
             .exec()
@@ -546,7 +550,7 @@ mod tests {
     #[test]
     fn set_config_with_needs_input_false_clears_flag() {
         let lua = mlua::Lua::new();
-        let (_event_tx, cmd_rx, handle) = make_channels();
+        let (_event_tx, mut cmd_rx, handle) = make_channels();
         lua.globals().set("win", handle).unwrap();
         lua.load("win:set_config({ needs_input = false })")
             .exec()
