@@ -612,9 +612,9 @@ pub enum PlanActionOutcome {
     /// all.
     Failed,
 }
-/// The menu one draft's chain answered with. The form echoes `generation`
-/// back on a pick, so a chain that resumes late and installs its handlers
-/// over a menu already on screen cannot have a pick routed to it.
+/// The menu one draft's chain answered with. `generation` is the request
+/// number the UI asked with, and the form echoes it back on a pick, so a pick
+/// from a menu a newer draft replaced cannot reach that draft's handlers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanMenu {
     pub generation: u64,

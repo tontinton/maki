@@ -1324,6 +1324,8 @@ const PLUGIN_LABEL: &str = "Commit and implement";
 /// parked on it can only answer after the form has given up on it.
 const PLAN_PARKED_FOR: Duration = Duration::from_secs(15);
 const NO_PICK: &str = "none";
+const PLAN_REQUEST: u64 = 1;
+const NEXT_PLAN_REQUEST: u64 = 2;
 
 /// Stands in for what the UI proposes: one row it knows how to run itself.
 fn builtin_rows() -> Vec<PlanFormRow> {
@@ -1368,9 +1370,14 @@ fn plugin_row(extra: &str) -> String {
 }
 
 fn ask_plan_form(host: &PluginHost) -> Option<PlanMenu> {
+    ask_plan_form_request(host, PLAN_REQUEST)
+}
+
+fn ask_plan_form_request(host: &PluginHost, request: u64) -> Option<PlanMenu> {
     let answer = host.event_handle().open_plan_form(
         PLAN_PATH.to_owned(),
         PLAN_SESSION.to_owned(),
+        request,
         builtin_rows(),
     );
     wait_reply(answer, DISPATCH_TIMEOUT).expect("the plan form chains must answer")
@@ -1767,9 +1774,8 @@ fn unloading_a_plugin_reaps_the_handlers_of_a_drawn_menu() {
     );
 }
 
-/// A chain that parked and resumed installs its handlers over a menu already
-/// on screen, and the generation keeps a pick out of a menu the user never
-/// saw.
+/// A pick still in flight from a menu a newer request replaced names the old
+/// generation, and so cannot reach the new menu's handlers.
 #[test]
 fn a_pick_from_a_replaced_menu_reaches_no_handler() {
     let (_reg, host) = host();
@@ -1786,8 +1792,8 @@ fn a_pick_from_a_replaced_menu_reaches_no_handler() {
 
     let drawn = plan_menu(&host);
     let row = plugin_row_index(&drawn);
-    let replacement = plan_menu(&host);
-    assert_ne!(drawn.generation, replacement.generation);
+    let replacement =
+        ask_plan_form_request(&host, NEXT_PLAN_REQUEST).expect("the built-in form must open");
 
     assert_eq!(
         pick_row(&host, &drawn, row),
@@ -1797,6 +1803,70 @@ fn a_pick_from_a_replaced_menu_reaches_no_handler() {
     assert_eq!(
         pick_row(&host, &replacement, row),
         PlanActionOutcome::Proceed
+    );
+}
+
+/// A chain that finishes after a newer request went out answers nobody: the
+/// newer request dropped its receiver first, so its rows never replace the
+/// handlers of the menu on screen.
+#[test]
+fn a_chain_that_finishes_late_leaves_the_newer_menu_alone() {
+    let (reg, host) = host();
+    load(
+        &host,
+        PLANNER,
+        &format!(
+            r#"
+local calls, parked, released, finished, picked = 0, false, false, false, "{NO_PICK}"
+maki.api.set_slot("ui.plan_form.actions", function(prev, ev)
+    calls = calls + 1
+    local request = calls
+    if request == {PLAN_REQUEST} then
+        parked = true
+        while not released do maki.async.sleep({PARK_POLL_MS}) end
+    end
+    local rows = prev(ev)
+    table.insert(rows, {})
+    finished = finished or request == {PLAN_REQUEST}
+    return rows
+end)
+{}{}{}
+"#,
+            plugin_row("handler = function() picked = tostring(request) end"),
+            probe_tool(
+                "await_parked_plan_chain",
+                &format!(r#"while not parked do maki.async.sleep({PARK_POLL_MS}) end return """#)
+            ),
+            probe_tool(
+                "release_plan_chain",
+                &format!(
+                    r#"released = true
+                       while not finished do maki.async.sleep({PARK_POLL_MS}) end
+                       return """#
+                )
+            ),
+            probe_tool("probe_picked_plan_row", "return picked")
+        ),
+    );
+
+    drop(host.event_handle().open_plan_form(
+        PLAN_PATH.to_owned(),
+        PLAN_SESSION.to_owned(),
+        PLAN_REQUEST,
+        builtin_rows(),
+    ));
+    exec_tool(&reg, "await_parked_plan_chain");
+    let drawn =
+        ask_plan_form_request(&host, NEXT_PLAN_REQUEST).expect("the built-in form must open");
+    exec_tool(&reg, "release_plan_chain");
+
+    assert_eq!(
+        pick_row(&host, &drawn, plugin_row_index(&drawn)),
+        PlanActionOutcome::Proceed
+    );
+    assert_eq!(
+        exec_tool(&reg, "probe_picked_plan_row"),
+        NEXT_PLAN_REQUEST.to_string()
     );
 }
 

@@ -168,7 +168,7 @@ impl App {
         // but its answer is stamped with a pick nobody waits on any more, so
         // the outcome the row promised is gone and the user is told.
         let lost_pick = self.plan_answers.action.is_some();
-        self.plan_answers.abandon();
+        let request = self.plan_answers.abandon();
         if lost_pick {
             self.flash(FLASH_PLAN_ACTION_LOST.into());
         }
@@ -182,6 +182,7 @@ impl App {
         let answer = self.lua_event_handle.open_plan_form(
             path.to_owned(),
             self.state.session.id.to_string(),
+            request,
             builtin_rows(),
         );
         self.plan_answers.form = Some((Instant::now() + PLAN_FORM_ANSWER_WAIT, answer));
