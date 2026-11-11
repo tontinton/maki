@@ -2,8 +2,9 @@ use std::fs;
 use std::mem;
 use std::time::Instant;
 
-use flume::{Receiver, TryRecvError};
 use maki_lua::{PlanActionOutcome, PlanMenu, PlanRowAction};
+use tokio::sync::oneshot::Receiver;
+use tokio::sync::oneshot::error::TryRecvError;
 
 use super::{
     App, FLASH_NO_PLAN, FLASH_PLAN_ACTION_FAILED, FLASH_PLAN_ACTION_LOST, FLASH_PLAN_FORM_SLOW,
@@ -74,7 +75,7 @@ impl App {
     /// plan-toggle key still reopens it. A chain that says nothing at all
     /// runs out of [`PLAN_FORM_ANSWER_WAIT`] and leaves the built-in form.
     pub(crate) fn tick_plan_form(&mut self) -> Dirty {
-        let Some((deadline, rx)) = self.plan_answers.form.as_ref() else {
+        let Some((deadline, rx)) = self.plan_answers.form.as_mut() else {
             return Dirty::NO;
         };
         let (answered, expired) = (rx.try_recv(), Instant::now() >= *deadline);
@@ -89,7 +90,7 @@ impl App {
             }
             Ok(Some(menu)) => (menu, false),
             // The host went away mid-question, so nobody is drawing the plan.
-            Err(TryRecvError::Disconnected) => (builtin_menu(), false),
+            Err(TryRecvError::Closed) => (builtin_menu(), false),
             Err(TryRecvError::Empty) if expired => (builtin_menu(), true),
             Err(TryRecvError::Empty) => return Dirty::NO,
         };
@@ -109,7 +110,7 @@ impl App {
     /// handler, left the user watching the menu vanish for nothing, and says
     /// so.
     pub(super) fn tick_plan_action(&mut self) -> Dirty {
-        let Some(pending) = self.plan_answers.action.as_ref() else {
+        let Some(pending) = self.plan_answers.action.as_mut() else {
             return Dirty::NO;
         };
         // "Lost" is the host never having taken the pick, which reads
@@ -120,7 +121,7 @@ impl App {
         );
         let (outcome, lost) = match answered {
             Ok(outcome) => (outcome, false),
-            Err(TryRecvError::Disconnected) => (PlanActionOutcome::Failed, true),
+            Err(TryRecvError::Closed) => (PlanActionOutcome::Failed, true),
             Err(TryRecvError::Empty) if expired => (PlanActionOutcome::Failed, true),
             Err(TryRecvError::Empty) => return Dirty::NO,
         };

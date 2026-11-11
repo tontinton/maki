@@ -51,8 +51,8 @@ use maki_storage::model::persist_model;
 use maki_storage::sessions::normalize_title;
 use ratatui::layout::Rect;
 use serde_json::json;
-use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{Notify, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
 use tokio_util::task::AbortOnDropHandle;
@@ -1430,7 +1430,7 @@ impl<'t> EventLoop<'t> {
     /// `List` replies from a background task (the scan can be slow); every
     /// other request is answered synchronously by the event loop, which owns
     /// the live runtimes.
-    fn handle_session_request(&mut self, req: SessionRequest, reply_tx: flume::Sender<UiReply>) {
+    fn handle_session_request(&mut self, req: SessionRequest, reply_tx: oneshot::Sender<UiReply>) {
         match req {
             SessionRequest::List => {
                 let storage = self.ctx.storage.clone();
@@ -1681,7 +1681,7 @@ impl<'t> EventLoop<'t> {
         transcript: Transcript,
         prompt: Option<String>,
         focus: bool,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     ) {
         let inherits_model = transcript.model.is_none();
         let open = match self.sessions[self.focused].app.session_from(transcript) {
@@ -1725,7 +1725,7 @@ impl<'t> EventLoop<'t> {
     fn answer_from_disk<T: Send + 'static>(
         &self,
         id: MakiId,
-        reply_tx: flume::Sender<Result<T, String>>,
+        reply_tx: oneshot::Sender<Result<T, String>>,
         answer: impl FnOnce(AppSession) -> Result<T, String> + Send + 'static,
     ) {
         let storage = self.ctx.storage.clone();

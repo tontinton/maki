@@ -14,6 +14,7 @@ use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{AgentMode, Envelope, SessionMailbox, ToolDoneEvent};
+use maki_lua::test_support::wait_reply;
 use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_storage::id::MakiId;
 use serde_json::{Value, json};
@@ -698,7 +699,7 @@ fn an_esc_while_the_hook_is_parked_ends_the_call_quietly() {
     host.release(HOOK);
 
     assert_eq!(
-        outcome.recv_timeout(WAIT).expect("move outcome"),
+        wait_reply(outcome, WAIT).expect("move outcome"),
         MoveOutcome::NotMovable(CANCELLED.to_owned())
     );
     host.release(MOVABLE);

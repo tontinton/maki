@@ -688,14 +688,13 @@ mod tests {
             let Ok(UiAction::WinSaveView { reply_tx }) = rx.recv() else {
                 panic!("expected winsaveview request");
             };
-            reply_tx
-                .send(WinView {
-                    scroll_top: SCROLL_TOP,
-                    line_count: LINE_COUNT,
-                    height: HEIGHT,
-                    auto_scroll: false,
-                })
-                .unwrap();
+            let sent = reply_tx.send(WinView {
+                scroll_top: SCROLL_TOP,
+                line_count: LINE_COUNT,
+                height: HEIGHT,
+                auto_scroll: false,
+            });
+            assert!(sent.is_ok());
         });
         let (view, err): (Table, Option<String>) = lua
             .load("return f.winsaveview()")

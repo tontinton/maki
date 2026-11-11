@@ -12,7 +12,7 @@ use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
 use maki_lua::agent_autocmd::host_event_fields;
 use maki_lua::test_support::{
-    content_omitted_message, fire_autocmd, layer_skipped_message, runtime,
+    content_omitted_message, fire_autocmd, layer_skipped_message, runtime, wait_reply,
 };
 use maki_lua::{
     Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
@@ -1365,14 +1365,12 @@ fn plugin_row(extra: &str) -> String {
 }
 
 fn ask_plan_form(host: &PluginHost) -> Option<PlanMenu> {
-    host.event_handle()
-        .open_plan_form(
-            PLAN_PATH.to_owned(),
-            PLAN_SESSION.to_owned(),
-            builtin_rows(),
-        )
-        .recv_timeout(DISPATCH_TIMEOUT)
-        .expect("the plan form chains must answer")
+    let answer = host.event_handle().open_plan_form(
+        PLAN_PATH.to_owned(),
+        PLAN_SESSION.to_owned(),
+        builtin_rows(),
+    );
+    wait_reply(answer, DISPATCH_TIMEOUT).expect("the plan form chains must answer")
 }
 
 fn plan_menu(host: &PluginHost) -> PlanMenu {
@@ -1389,16 +1387,14 @@ fn menu_labels(host: &PluginHost) -> Vec<String> {
 
 /// Picks {row} of {menu} and waits for the host to say what became of it.
 fn pick_row(host: &PluginHost, menu: &PlanMenu, row: usize) -> PlanActionOutcome {
-    host.event_handle()
-        .run_plan_action(
-            PLAN_SESSION.to_owned(),
-            menu.generation,
-            row,
-            PLAN_PATH.to_owned(),
-            true,
-        )
-        .recv_timeout(DISPATCH_TIMEOUT)
-        .expect("a pick must be answered")
+    let answer = host.event_handle().run_plan_action(
+        PLAN_SESSION.to_owned(),
+        menu.generation,
+        row,
+        PLAN_PATH.to_owned(),
+        true,
+    );
+    wait_reply(answer, DISPATCH_TIMEOUT).expect("a pick must be answered")
 }
 
 fn plugin_row_index(menu: &PlanMenu) -> usize {
