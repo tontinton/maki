@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use maki_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
@@ -807,7 +808,7 @@ impl PermissionManager {
         scopes: &PermissionScopes,
         session: Option<&SessionRef>,
         event_tx: &EventSender,
-        user_response_rx: Option<&AsyncMutex<flume::Receiver<String>>>,
+        user_response_rx: Option<&AsyncMutex<UnboundedReceiver<String>>>,
         request_id: &str,
         cancel: &CancelToken,
         plan_path: Option<&Path>,
@@ -894,7 +895,7 @@ impl PermissionManager {
 
         // A call moved to the background can stay parked on its ask across
         // turns, so waiting for the channel must end with ours.
-        let Ok(guard) = cancel.race(rx.lock()).await else {
+        let Ok(mut guard) = cancel.race(rx.lock()).await else {
             return Err(deny(
                 DECISION_SOURCE_USER_ABORT,
                 PROMPT_UNANSWERED_REASON.to_owned(),
@@ -922,9 +923,9 @@ impl PermissionManager {
         // wait continues: consuming it would approve or deny this tool on a
         // decision the user made about another one.
         let answer = loop {
-            let response = cancel.race(guard.recv_async()).await;
+            let response = cancel.race(guard.recv()).await;
             match response {
-                Ok(Ok(raw)) => match TaggedAnswer::decode(&raw) {
+                Ok(Some(raw)) => match TaggedAnswer::decode(&raw) {
                     Some(tagged) if tagged.request_id == request_id => break tagged.answer,
                     tagged => warn!(
                         tool = %tool,
@@ -934,7 +935,7 @@ impl PermissionManager {
                         "discarding a permission answer that does not name this request"
                     ),
                 },
-                Ok(Err(_)) => {
+                Ok(None) => {
                     drop(guard);
                     warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
                     return Err(deny(
@@ -1173,6 +1174,7 @@ mod tests {
     use super::*;
     use maki_config::project::{self, TrustMode};
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const PLAN_FILE: &str = "/home/user/.local/state/maki/plans/test.md";
     const TEST_CWD: &str = "/tmp";
@@ -1285,7 +1287,7 @@ mod tests {
     #[tokio::test]
     async fn an_unattended_answer_denies_like_a_missing_channel() {
         let (event_tx, _events) = flume::unbounded();
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (answer_tx, answer_rx) = unbounded_channel();
         let answers = AsyncMutex::new(answer_rx);
         answer_tx
             .send(TaggedAnswer::new(TAGGED_REQUEST_ID, PermissionAnswer::Unattended).encode())

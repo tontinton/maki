@@ -6,6 +6,7 @@ mod common;
 
 use std::sync::Arc;
 use std::thread;
+use tokio::sync::mpsc::unbounded_channel;
 
 use common::{Chat, Parked, WAIT, call_ctx, done_text, exec, next_task_event, request_move};
 use maki_agent::permissions::PermissionManager;
@@ -323,7 +324,7 @@ fn a_background_subagent_asks_for_permission_instead_of_being_denied() {
         ProjectConfig::discover(project.path()),
         Arc::default(),
     ));
-    let (_answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (_answer_tx, answer_rx) = unbounded_channel::<String>();
     ctx.user_response_rx = Some(Arc::new(tokio::sync::Mutex::new(answer_rx)));
 
     assert!(exec(&reg, TASK_TOOL, task_input(), &ctx).backgrounded);

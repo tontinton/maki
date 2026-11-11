@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 use common::{end_session, poll_until};
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
@@ -8997,7 +8998,7 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
         .parse(&json!({}))
         .unwrap();
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    let (_answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (_answer_tx, answer_rx) = unbounded_channel::<String>();
     ctx.user_response_rx = answerable.then(|| Arc::new(tokio::sync::Mutex::new(answer_rx)));
 
     let result = runtime().block_on(inv.execute(&ctx)).output;

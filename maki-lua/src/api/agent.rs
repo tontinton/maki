@@ -1188,7 +1188,7 @@ async fn session(
     let (answer_tx, answer_rx) = agent_ctx
         .user_response_rx
         .is_some()
-        .then(flume::unbounded::<String>)
+        .then(unbounded_channel::<String>)
         .map(|(tx, rx)| (tx, Arc::new(AsyncMutex::new(rx))))
         .unzip();
 
@@ -1614,8 +1614,8 @@ struct SessionState {
     /// [`EventSender`] clones alive past the run, so the relay cannot key off
     /// sender disconnect. `None` once closed.
     stream_guard: Option<EventStreamGuard>,
-    answer_rx: Option<Arc<AsyncMutex<flume::Receiver<String>>>>,
-    answer_tx: Option<flume::Sender<String>>,
+    answer_rx: Option<Arc<AsyncMutex<UnboundedReceiver<String>>>>,
+    answer_tx: Option<UnboundedSender<String>>,
     reauth: bool,
     cancellation: Arc<SessionCancellation>,
     upstream: Upstream,
@@ -2231,6 +2231,7 @@ mod tests {
     use maki_storage::sessions::Effort;
     use mlua::AnyUserData;
     use serde_json::json;
+    use std::iter;
     use test_case::test_case;
     use tokio::sync::mpsc::UnboundedSender;
     use tokio::time::timeout;
@@ -3026,7 +3027,7 @@ mod tests {
         unattended: String,
         watched: bool,
     ) {
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (answer_tx, mut answer_rx) = unbounded_channel();
         let info = Arc::new(OnceLock::new());
         info.set(SubagentInfo {
             answer_tx: Some(answer_tx),
@@ -3053,7 +3054,10 @@ mod tests {
         } else {
             (vec![unattended], Vec::new())
         };
-        assert_eq!(answer_rx.drain().collect::<Vec<_>>(), answers);
+        assert_eq!(
+            iter::from_fn(|| answer_rx.try_recv().ok()).collect::<Vec<_>>(),
+            answers
+        );
         assert_eq!(event_names(&chat_events(&ui_rx, session)), shown);
     }
 

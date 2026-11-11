@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use maki_agent::agent::{self, AgentHooks};
 use maki_agent::mcp::McpHandle;
@@ -44,7 +45,7 @@ fn base_tools(
 pub(super) struct LoopEnds {
     pub(super) shared_history: SharedMessages,
     pub(super) agent_tx: flume::Sender<Envelope>,
-    pub(super) answer_rx: flume::Receiver<String>,
+    pub(super) answer_rx: UnboundedReceiver<String>,
     pub(super) queue: Arc<QueueReceiver>,
     pub(super) cancels: Arc<RunCancels>,
     pub(super) mailbox: SessionMailbox,
@@ -63,7 +64,7 @@ pub(super) struct AgentLoop {
     gauge: ContextGauge,
     cancels: Arc<RunCancels>,
     agent_tx: flume::Sender<Envelope>,
-    answer_rx: Arc<Mutex<flume::Receiver<String>>>,
+    answer_rx: Arc<Mutex<UnboundedReceiver<String>>>,
     queue: Arc<QueueReceiver>,
     mailbox: SessionMailbox,
     lua_handle: EventHandle,
