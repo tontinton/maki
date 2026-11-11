@@ -654,8 +654,8 @@ pub(super) fn auto_compact_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
     use std::sync::Mutex;
-    use tokio::sync::mpsc::UnboundedSender;
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -665,6 +665,8 @@ mod tests {
     use maki_storage::id::SessionRef;
     use serde_json::Value;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::AgentConfig;
@@ -793,7 +795,7 @@ mod tests {
         instructions: Option<&str>,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
-        let (raw_tx, _rx) = flume::unbounded();
+        let (raw_tx, _rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         compact(
@@ -818,7 +820,7 @@ mod tests {
         carry_len: usize,
         session_id: Option<&SessionRef>,
     ) {
-        let (raw_tx, _rx) = flume::unbounded();
+        let (raw_tx, _rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         let cancel = CancelToken::none();
@@ -932,7 +934,7 @@ mod tests {
         let provider = MockProvider::new(vec![empty(), empty()]);
         let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
         let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
-        let (raw_tx, rx) = flume::unbounded();
+        let (raw_tx, mut rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         let cancel = CancelToken::none();
@@ -958,7 +960,9 @@ mod tests {
         assert_eq!(gauge.size(), SUMMARISED_PROMPT);
         assert_eq!(history.len(), 1);
         assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
-        let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
+        let events: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| e.event)
+            .collect();
         let [
             AgentEvent::CompactionStarted,
             AgentEvent::TurnComplete(first),
@@ -1016,7 +1020,7 @@ mod tests {
             Message::user(KEPT_TEXT.into()),
             Message::user("second".into()),
         ]);
-        let (raw_tx, rx) = flume::unbounded();
+        let (raw_tx, mut rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         let cancel = CancelToken::none();
@@ -1041,7 +1045,9 @@ mod tests {
             .iter()
             .filter(|reply| !matches!(reply, Reply::Overflow))
             .count();
-        let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
+        let events: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| e.event)
+            .collect();
         assert_eq!(
             events
                 .iter()
@@ -1160,7 +1166,7 @@ mod tests {
         instructions: Option<&str>,
         answer: impl Fn(AgentSlot, &Value) -> Verdict + Send + Sync + 'static,
     ) -> (Result<DoneReason, AgentError>, Vec<AgentEvent>) {
-        let (raw_tx, rx) = flume::unbounded();
+        let (raw_tx, mut rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         script(&registry, answer);
         let model = default_model();
@@ -1179,7 +1185,12 @@ mod tests {
             RetryPolicy::default(),
         )
         .await;
-        (result, rx.try_iter().map(|e| e.event).collect())
+        (
+            result,
+            iter::from_fn(|| rx.try_recv().ok())
+                .map(|e| e.event)
+                .collect(),
+        )
     }
 
     /// The mock holds no responses, so any request would panic.

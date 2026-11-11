@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::iter;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -15,6 +16,7 @@ use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_storage::id::MakiId;
 use serde_json::json;
 use test_case::test_case;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 const PLUGIN: &str = "session_move_test";
 const CALL_ID: &str = "toolu_session_move";
@@ -120,7 +122,7 @@ impl Host {
 }
 
 struct Running {
-    events: flume::Receiver<Envelope>,
+    events: UnboundedReceiver<Envelope>,
     call: JoinHandle<ToolDoneEvent>,
     run: CancelTrigger,
     /// The run's `subagent_cancels`, which run end drains.
@@ -160,7 +162,7 @@ fn a_moved_subagent_outlives_its_run_and_reports_to_the_chat() {
     parked.wait_started();
     assert_eq!(host.request(), MoveOutcome::Moved);
     let Running {
-        events,
+        mut events,
         call,
         run,
         cancels,
@@ -184,8 +186,7 @@ fn a_moved_subagent_outlives_its_run_and_reports_to_the_chat() {
         "{turn:?} {run_done:?}"
     );
     assert!(
-        !events
-            .try_iter()
+        !iter::from_fn(|| events.try_recv().ok())
             .any(|envelope| matches!(envelope.event, AgentEvent::TurnComplete(_)))
     );
     assert_eq!(chat.mailbox.drain().len(), 1);

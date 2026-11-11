@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::UnboundedReceiver;
 
 use maki_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
@@ -11,6 +10,7 @@ use maki_config::{
 use maki_storage::id::SessionRef;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{info, warn};
 
 use crate::tools::PermissionScopes;
@@ -1261,7 +1261,7 @@ mod tests {
 
     #[tokio::test]
     async fn unattended_denies_prompt_without_parking() {
-        let (event_tx, events) = flume::unbounded();
+        let (event_tx, events) = unbounded_channel();
         let err = default_mgr()
             .enforce(
                 &ToolKey::native(BASH_TOOL),
@@ -1286,7 +1286,7 @@ mod tests {
     /// answers that nobody will, and the call needs an allow rule instead.
     #[tokio::test]
     async fn an_unattended_answer_denies_like_a_missing_channel() {
-        let (event_tx, _events) = flume::unbounded();
+        let (event_tx, _events) = unbounded_channel();
         let (answer_tx, answer_rx) = unbounded_channel();
         let answers = AsyncMutex::new(answer_rx);
         answer_tx

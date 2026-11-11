@@ -78,6 +78,7 @@ pub mod test_support {
     use maki_agent::SharedBuf;
     use maki_storage::id::MakiId;
     use tokio::runtime::Runtime;
+    use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::sync::oneshot;
     use tokio::time::timeout;
 
@@ -94,6 +95,15 @@ pub mod test_support {
             .block_on(async { timeout(limit, reply).await })
             .ok()?
             .ok()
+    }
+
+    /// The next item on {events}, for the sync side of a test. `None` once
+    /// {limit} passed or every sender is gone.
+    pub fn wait_next<T>(events: &mut UnboundedReceiver<T>, limit: Duration) -> Option<T> {
+        runtime()
+            .block_on(async { timeout(limit, events.recv()).await })
+            .ok()
+            .flatten()
     }
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);

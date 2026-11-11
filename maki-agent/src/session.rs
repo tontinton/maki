@@ -407,6 +407,7 @@ mod tests {
     use maki_storage::sessions::{SESSIONS_DIR, generate_title};
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use crate::tools::RequestTools;
     use crate::{BackgroundNotice, InputSource, RunContext, SessionDefaults, TaskEnd};
@@ -530,7 +531,7 @@ mod tests {
 
     fn run_params<'a>(turn: &'a mut SessionTurn<'_>) -> AgentRunParams<'a> {
         turn.run_params(
-            EventSender::new(flume::unbounded().0, 0),
+            EventSender::new(unbounded_channel().0, 0),
             Arc::new(|_, _| RunContext::fixed(String::new(), RequestTools::default())),
         )
     }

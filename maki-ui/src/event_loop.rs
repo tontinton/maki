@@ -53,6 +53,7 @@ use ratatui::layout::Rect;
 use serde_json::json;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{Notify, oneshot};
+use tokio::task::coop::unconstrained;
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
 use tokio_util::task::AbortOnDropHandle;
@@ -600,6 +601,15 @@ async fn recv_or_pending<T>(rx: &flume::Receiver<T>) -> T {
     }
 }
 
+/// Outside tokio's coop budget: it would report an empty queue after 128
+/// envelopes in one poll and end the drain at half of [`DRAIN_BUDGET`].
+async fn next_or_pending<T>(rx: &mut UnboundedReceiver<T>) -> T {
+    match unconstrained(rx.recv()).await {
+        Some(value) => value,
+        None => pending().await,
+    }
+}
+
 /// The running package command's answer, or never, when none is running.
 ///
 /// The handle is only cleared once it has answered, so a `select!` that drops
@@ -623,9 +633,9 @@ async fn session_wake(sessions: &mut [SessionRuntime]) -> Wake {
         .iter_mut()
         .enumerate()
         .flat_map(|(i, rt)| {
-            let (agent_rx, shell_rx) = (&rt.handles.agent_rx, &mut rt.shell_rx);
+            let (agent_rx, shell_rx) = (&mut rt.handles.agent_rx, &mut rt.shell_rx);
             [
-                Box::pin(async move { Wake::Agent(i, Box::new(recv_or_pending(agent_rx).await)) })
+                Box::pin(async move { Wake::Agent(i, Box::new(next_or_pending(agent_rx).await)) })
                     as LocalBoxFuture<'_, Wake>,
                 Box::pin(async move {
                     match shell_rx.recv().await {

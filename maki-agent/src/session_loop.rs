@@ -153,7 +153,6 @@ async fn next_wake(
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use tokio::sync::mpsc::UnboundedSender;
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -163,6 +162,9 @@ mod tests {
     use maki_storage::id::{MakiId, SessionRef};
     use serde_json::Value;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::agent::testing::{agent_params, fixed_context};
@@ -247,7 +249,7 @@ mod tests {
         history: History,
         gauge: ContextGauge,
         event_tx: EventSender,
-        _events: flume::Receiver<Envelope>,
+        _events: UnboundedReceiver<Envelope>,
         /// One per run, in order, done as the run ends.
         after_runs: VecDeque<AfterRun>,
     }
@@ -288,7 +290,7 @@ mod tests {
             let (parent, parent_token) = CancelToken::new();
             let control = Arc::new(SessionControl::new(&parent_token));
             let (started_tx, started) = flume::unbounded();
-            let (raw_tx, events) = flume::unbounded();
+            let (raw_tx, events) = unbounded_channel();
             let host = Host {
                 provider: Arc::new(Scripted {
                     replies: Mutex::new(replies.into()),

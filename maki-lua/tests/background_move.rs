@@ -19,6 +19,7 @@ use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_storage::id::MakiId;
 use serde_json::{Value, json};
 use test_case::test_case;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 const PLUGIN: &str = "background_move_test";
 const CALL_ID: &str = "toolu_move";
@@ -269,7 +270,7 @@ fn as_subagent(ctx: &mut ToolContext, mailbox: &SessionMailbox) {
 
 struct Running {
     id: String,
-    events: flume::Receiver<Envelope>,
+    events: UnboundedReceiver<Envelope>,
     call: JoinHandle<ToolDoneEvent>,
     run: CancelTrigger,
 }
@@ -303,12 +304,12 @@ impl Running {
         }
     }
 
-    fn wait_movable(&self) {
-        wait_movable(&self.events, &self.id);
+    fn wait_movable(&mut self) {
+        wait_movable(&mut self.events, &self.id);
     }
 
-    fn wait_live_buf(&self) {
-        wait_live_buf(&self.events, &self.id);
+    fn wait_live_buf(&mut self) {
+        wait_live_buf(&mut self.events, &self.id);
     }
 
     /// Ends the run once the call answered, the way a turn ends on its last
@@ -326,7 +327,7 @@ fn movable_input() -> Value {
 
 /// Moves a running `movable` call by the user and checks its receipt.
 fn moved(host: &Host, chat: &Chat) -> Running {
-    let running = Running::start(host, chat.id, MOVABLE, movable_input());
+    let mut running = Running::start(host, chat.id, MOVABLE, movable_input());
     running.wait_movable();
     assert_eq!(host.request(), MoveOutcome::Moved);
     running
@@ -391,8 +392,8 @@ fn clicks_still_reach_a_moved_call() {
 fn async_run_from_a_moved_call_outlives_its_final_reply() {
     let host = Host::new();
     let chat = Chat::live();
-    let running = Running::start(&host, chat.id, LATE, json!({}));
-    let body = wait_live_buf(&running.events, &running.id);
+    let mut running = Running::start(&host, chat.id, LATE, json!({}));
+    let body = wait_live_buf(&mut running.events, &running.id);
     running.wait_movable();
     assert_eq!(host.request(), MoveOutcome::Moved);
     assert!(running.result().backgrounded);
@@ -416,7 +417,7 @@ fn a_declining_hook_keeps_the_call_in_the_foreground(reason: Option<&str>, expec
     if let Some(reason) = reason {
         input["reason"] = json!(reason);
     }
-    let running = Running::start(&host, chat.id, MOVABLE, input);
+    let mut running = Running::start(&host, chat.id, MOVABLE, input);
     running.wait_movable();
 
     assert_eq!(host.request(), MoveOutcome::NotMovable(expected.to_owned()));
@@ -432,7 +433,7 @@ fn a_declining_hook_keeps_the_call_in_the_foreground(reason: Option<&str>, expec
 fn a_call_without_a_hook_has_nothing_to_move() {
     let host = Host::new();
     let chat = Chat::live();
-    let running = Running::start(&host, chat.id, PLAIN, json!({}));
+    let mut running = Running::start(&host, chat.id, PLAIN, json!({}));
     running.wait_live_buf();
 
     assert_eq!(host.request(), MoveOutcome::NoHook);
@@ -449,7 +450,7 @@ fn a_call_without_a_hook_has_nothing_to_move() {
 fn a_finish_that_beats_the_move_is_the_only_answer() {
     let host = Host::new();
     let chat = Chat::live();
-    let running = Running::start(&host, chat.id, RACING, json!({}));
+    let mut running = Running::start(&host, chat.id, RACING, json!({}));
     running.wait_movable();
 
     assert_eq!(host.request(), MoveOutcome::NoHook);
@@ -466,7 +467,7 @@ fn a_finish_that_beats_the_move_is_the_only_answer() {
 fn a_nested_call_outlives_its_deadlines_once_the_scope_moved() {
     let host = Host::new();
     let chat = Chat::live();
-    let running = Running::start(
+    let mut running = Running::start(
         &host,
         chat.id,
         OUTER,
@@ -490,7 +491,7 @@ fn a_nested_call_outlives_its_deadlines_once_the_scope_moved() {
 fn a_reload_passes_a_moved_call_with_a_parked_nested_child() {
     let host = Host::new();
     let chat = Chat::live();
-    let running = Running::start(&host, chat.id, NESTING, json!({}));
+    let mut running = Running::start(&host, chat.id, NESTING, json!({}));
     running.wait_movable();
     assert_eq!(host.request(), MoveOutcome::Moved);
     assert!(running.result().backgrounded);
@@ -572,7 +573,7 @@ fn the_user_moves_a_subagents_call_and_it_reports_to_the_subagent() {
     let host = Host::new();
     let chat = Chat::live();
     let subagent = SessionMailbox::register(MakiId::generate());
-    let running = Running::start_as(&host, chat.id, CALL_ID, MOVABLE, movable_input(), |ctx| {
+    let mut running = Running::start_as(&host, chat.id, CALL_ID, MOVABLE, movable_input(), |ctx| {
         as_subagent(ctx, &subagent)
     });
     running.wait_movable();
@@ -661,7 +662,7 @@ fn a_refused_entry_leaves_the_call_unmoved() {
     let host = Host::new();
     let chat = Chat::live();
     let mut scope = None;
-    let running = Running::start_as(&host, chat.id, CALL_ID, MOVABLE, movable_input(), |ctx| {
+    let mut running = Running::start_as(&host, chat.id, CALL_ID, MOVABLE, movable_input(), |ctx| {
         scope = ctx.call.clone();
     });
     running.wait_movable();
@@ -687,7 +688,7 @@ fn an_esc_while_the_hook_is_parked_ends_the_call_quietly() {
     let host = Host::new();
     let chat = Chat::live();
     let input = json!({ "receipt": RECEIPT, "final": FINAL, "park_hook": true });
-    let running = Running::start(&host, chat.id, MOVABLE, input);
+    let mut running = Running::start(&host, chat.id, MOVABLE, input);
     running.wait_movable();
     let outcome = host
         .host
@@ -715,7 +716,7 @@ fn a_call_over_the_task_cap_stays_in_the_foreground() {
     let chat = Chat::live();
     for n in 0..TASK_CAP {
         let id = format!("{CALL_ID}_{n}");
-        let running = Running::start_as(&host, chat.id, &id, MOVABLE, movable_input(), |_| {});
+        let mut running = Running::start_as(&host, chat.id, &id, MOVABLE, movable_input(), |_| {});
         running.wait_movable();
         assert_eq!(
             request_move(&host.host.event_handle(), &id),
@@ -724,7 +725,7 @@ fn a_call_over_the_task_cap_stays_in_the_foreground() {
         assert!(running.result().backgrounded);
     }
 
-    let running = Running::start(&host, chat.id, MOVABLE, movable_input());
+    let mut running = Running::start(&host, chat.id, MOVABLE, movable_input());
     running.wait_movable();
     assert_eq!(
         host.request(),

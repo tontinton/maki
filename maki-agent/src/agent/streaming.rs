@@ -1,6 +1,4 @@
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::unbounded_channel;
 
 use maki_providers::provider::Provider;
 use maki_providers::retry::{RetryPolicy, RetryState};
@@ -10,6 +8,8 @@ use maki_providers::{
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
 use tracing::warn;
 
@@ -381,14 +381,15 @@ fn error_description(error: &AgentError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
     use std::sync::Mutex;
-    use tokio::sync::mpsc::UnboundedSender;
 
     use maki_providers::{
         Effort, KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Role, ThinkingConfig, TokenUsage,
     };
     use serde_json::json;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
 
     use super::*;
 
@@ -660,7 +661,7 @@ mod tests {
         gauge: Option<&mut ContextGauge>,
         retry: RetryPolicy,
     ) -> (Result<StreamResponse, StreamError>, Vec<AgentEvent>) {
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         let result = stream_with_retry(
             StreamRequest {
                 provider,
@@ -680,7 +681,9 @@ mod tests {
         .await;
         (
             result,
-            rx.try_iter().map(|envelope| envelope.event).collect(),
+            iter::from_fn(|| rx.try_recv().ok())
+                .map(|envelope| envelope.event)
+                .collect(),
         )
     }
 
@@ -712,7 +715,7 @@ mod tests {
         };
         let (trigger, cancel) = CancelToken::new();
         trigger.cancel();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
 
         let result = stream_with_retry(
             StreamRequest {

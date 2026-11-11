@@ -2386,7 +2386,7 @@ mod tests {
     async fn session_close_does_not_wait_for_the_prompt_lock(dispose: bool) {
         let lua = Lua::new();
         let (started_tx, started_rx) = flume::unbounded();
-        let (event_tx, events) = flume::unbounded();
+        let (event_tx, mut events) = unbounded_channel();
         let event_tx = EventSender::new(event_tx, RUN_ID);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
         ctx.provider = Arc::new(PendingProvider(started_tx));
@@ -2431,7 +2431,7 @@ mod tests {
                     if let AgentEvent::SubagentHistory {
                         tool_use_id,
                         messages,
-                    } = events.recv_async().await.unwrap().event
+                    } = events.recv().await.unwrap().event
                     {
                         assert_eq!(tool_use_id, PARENT_ID);
                         assert!(messages.iter().any(|message| {
@@ -2444,8 +2444,7 @@ mod tests {
                     }
                 }
                 assert!(
-                    !events
-                        .try_iter()
+                    !iter::from_fn(|| events.try_recv().ok())
                         .any(|event| matches!(event.event, AgentEvent::SubagentHistory { .. }))
                 );
             })
@@ -2649,7 +2648,7 @@ mod tests {
         let lua = Lua::new();
         let (requests_tx, requests) = flume::unbounded();
         let (release, release_rx) = flume::unbounded();
-        let (event_tx, events) = flume::unbounded();
+        let (event_tx, mut events) = unbounded_channel();
         let event_tx = EventSender::new(event_tx, RUN_ID);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
         ctx.provider = Arc::new(GatedProvider {
@@ -2695,7 +2694,7 @@ mod tests {
             .await
             .expect("the prompt never finished");
         assert!(requests.is_empty());
-        assert!(events.drain().any(|envelope| {
+        assert!(iter::from_fn(|| events.try_recv().ok()).any(|envelope| {
             matches!(&envelope.event, AgentEvent::QueueItemConsumed { text, .. } if text == NUDGE)
                 && envelope
                     .subagent
@@ -2981,8 +2980,8 @@ mod tests {
             .collect()
     }
 
-    fn parent_upstream() -> (Upstream, flume::Receiver<Envelope>) {
-        let (parent_raw_tx, parent_rx) = flume::unbounded();
+    fn parent_upstream() -> (Upstream, UnboundedReceiver<Envelope>) {
+        let (parent_raw_tx, parent_rx) = unbounded_channel();
         let upstream = Upstream::Parent {
             tx: EventSender::new(parent_raw_tx, RUN_ID),
             adoption: None,
@@ -3069,7 +3068,7 @@ mod tests {
     /// tool result.
     #[tokio::test]
     async fn relay_to_parent_reports_each_turn_and_keeps_run_ends_behind() {
-        let (upstream, parent_rx) = parent_upstream();
+        let (upstream, mut parent_rx) = parent_upstream();
         let (done_tx, mut done_rx) = unbounded_channel();
         let (live_tx, mut live_rx) = unbounded_channel();
 
@@ -3089,7 +3088,7 @@ mod tests {
         assert_eq!(live_usages(&mut live_rx), expected_live);
         assert_eq!(done_rx.try_recv(), Ok(()));
 
-        let forwarded = parent_rx.drain().collect::<Vec<_>>();
+        let forwarded = iter::from_fn(|| parent_rx.try_recv().ok()).collect::<Vec<_>>();
         assert_eq!(forwarded.len(), expected_live.len());
         assert!(forwarded.iter().all(|envelope| {
             matches!(envelope.event, AgentEvent::TurnComplete(_))
@@ -3104,7 +3103,7 @@ mod tests {
     /// close sends has to carry the parent's run like the relayed events do.
     #[test]
     fn history_sent_to_the_parent_carries_its_run() {
-        let (upstream, parent_rx) = parent_upstream();
+        let (upstream, mut parent_rx) = parent_upstream();
         upstream.send_history(PARENT_ID, Vec::new());
         let envelope = parent_rx.try_recv().unwrap();
         assert_eq!(envelope.run_id, RUN_ID);
@@ -3182,7 +3181,7 @@ mod tests {
         let call = Arc::new(CallScope::new(PARENT_ID.into(), &run));
         let registry = BackgroundTasks::default();
         registry.register(call_entry(chat, PARENT_ID)).unwrap();
-        let (parent_tx, parent_rx) = flume::unbounded();
+        let (parent_tx, mut parent_rx) = unbounded_channel();
         let (ui_tx, ui_rx) = flume::unbounded();
         let upstream = Upstream::Parent {
             tx: EventSender::new(parent_tx, RUN_ID),
@@ -3201,7 +3200,7 @@ mod tests {
             sub_tx
                 .send(turn(SESSION_MODEL, tokens(100, 20), 0.25))
                 .unwrap();
-            let before = parent_rx.recv_async().await.unwrap();
+            let before = parent_rx.recv().await.unwrap();
             let trigger = call.move_to(home(chat, PARENT_ID)).unwrap();
             let [error, done] = run_end();
             for event in [turn(SESSION_MODEL, tokens(50, 10), 0.5), error, done] {

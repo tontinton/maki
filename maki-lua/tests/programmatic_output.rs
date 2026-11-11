@@ -2,6 +2,7 @@
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
+use std::iter;
 use std::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -25,6 +26,7 @@ use maki_config::{
 use maki_lua::test_support::runtime;
 use maki_lua::{PluginHost, set_allowed_private_hosts};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::unbounded_channel;
 
 const TOOLS: &[&str] = &[
     "bash",
@@ -447,7 +449,7 @@ fn a_write_a_plugin_allowed_inside_python_marks_the_code_execution_row() {
         ProjectConfig::discover(project.path()),
         Arc::default(),
     ));
-    let (event_tx, events) = flume::unbounded();
+    let (event_tx, mut events) = unbounded_channel();
     ctx.event_tx = EventSender::new(event_tx, 0);
     ctx.tool_use_id = Some(CALL_ID.to_owned());
     let path = outside.path().join("allowed.txt");
@@ -462,8 +464,7 @@ fn a_write_a_plugin_allowed_inside_python_marks_the_code_execution_row() {
     .expect("the plugin allowed the write");
 
     assert_eq!(fs::read_to_string(&path).unwrap(), LAST_ITEM);
-    let marked: Vec<(String, String)> = events
-        .try_iter()
+    let marked: Vec<(String, String)> = iter::from_fn(|| events.try_recv().ok())
         .filter_map(|envelope| match envelope.event {
             AgentEvent::AllowedByPlugin { id, plugin } => Some((id, plugin)),
             _ => None,

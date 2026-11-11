@@ -3,6 +3,7 @@
 //! move hook. Each scenario follows the move from the Ctrl+B request to what
 //! the model reads and what the transcript shows.
 
+use maki_lua::test_support::wait_next;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -406,11 +407,11 @@ impl World {
     fn wait_for(&mut self, is_wanted: impl Fn(&AgentEvent) -> bool) {
         let deadline = Instant::now() + WAIT;
         loop {
-            let envelope = self
-                .handles
-                .agent_rx
-                .recv_deadline(deadline)
-                .expect(NO_EVENT);
+            let envelope = wait_next(
+                &mut self.handles.agent_rx,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .expect(NO_EVENT);
             let wanted = is_wanted(&envelope.event);
             self.seen.push(envelope.event);
             if wanted {

@@ -13,6 +13,7 @@ pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
+use crate::Envelope;
 pub use deadline::Deadline;
 pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
@@ -23,6 +24,7 @@ pub use registry::{
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 use std::collections::HashMap;
 use std::env;
@@ -689,7 +691,7 @@ pub fn interpreter_ctx(
 /// Minimal ToolContext for CLI one-shot tool execution (e.g. `maki index`).
 /// Allows everything, sends events to a dummy channel, uses no model.
 pub fn cli_tool_ctx() -> ToolContext {
-    let (tx, _rx) = flume::unbounded::<crate::Envelope>();
+    let (tx, _rx) = unbounded_channel::<Envelope>();
     let event_tx = crate::EventSender::new(tx, 0);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     interpreter_ctx(
@@ -718,6 +720,7 @@ pub mod test_support {
     use arc_swap::ArcSwap;
     use maki_providers::Timeouts;
     use maki_storage::id::MakiId;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use crate::live_session::AgentSeed;
     use crate::{Envelope, EventSender, ModelSlot, ToolOutput};
@@ -846,7 +849,7 @@ pub mod test_support {
         let event_tx = match event_tx {
             Some(tx) => tx,
             None => {
-                fallback_tx = EventSender::new(flume::unbounded::<Envelope>().0, 0);
+                fallback_tx = EventSender::new(unbounded_channel::<Envelope>().0, 0);
                 &fallback_tx
             }
         };
@@ -891,7 +894,7 @@ pub mod test_support {
         mode: &AgentMode,
         permissions: Arc<PermissionManager>,
     ) -> ToolContext {
-        let (tx, _rx) = flume::unbounded::<crate::Envelope>();
+        let (tx, _rx) = unbounded_channel::<Envelope>();
         let event_tx = EventSender::new(tx, 0);
         let mut ctx = interpreter_ctx(
             mode,

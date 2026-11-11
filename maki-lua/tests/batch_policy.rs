@@ -3,9 +3,13 @@
 
 mod common;
 
+use maki_lua::test_support::wait_next;
+use std::iter;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::unbounded_channel;
 
 use common::{Chat, call_ctx, exec, next_task_done, poll_until, request_move};
 use maki_agent::cancel::{CancelToken, CancelTrigger};
@@ -353,7 +357,7 @@ struct RunningBatch {
     body: Arc<SharedBuf>,
     result: flume::Receiver<Result<String, String>>,
     /// Kept alive so the handler's later events still have a receiver.
-    _events: flume::Receiver<Envelope>,
+    _events: UnboundedReceiver<Envelope>,
 }
 
 fn start_batch(tool_calls: Value) -> RunningBatch {
@@ -361,7 +365,7 @@ fn start_batch(tool_calls: Value) -> RunningBatch {
 }
 
 fn start_batch_with(child_src: String, tool_calls: Value) -> RunningBatch {
-    let (event_tx, events) = flume::unbounded();
+    let (event_tx, mut events) = unbounded_channel();
     let event_tx = EventSender::new(event_tx, 0);
     let (trigger, token) = CancelToken::new();
     let (result_tx, result) = flume::bounded(1);
@@ -376,15 +380,15 @@ fn start_batch_with(child_src: String, tool_calls: Value) -> RunningBatch {
     });
     RunningBatch {
         trigger,
-        body: recv_live_buf(&events),
+        body: recv_live_buf(&mut events),
         result,
         _events: events,
     }
 }
 
-fn recv_live_buf(rx: &flume::Receiver<Envelope>) -> Arc<SharedBuf> {
+fn recv_live_buf(rx: &mut UnboundedReceiver<Envelope>) -> Arc<SharedBuf> {
     let deadline = Instant::now() + PAINT_TIMEOUT;
-    while let Ok(env) = rx.recv_deadline(deadline) {
+    while let Some(env) = wait_next(rx, deadline.saturating_duration_since(Instant::now())) {
         if let AgentEvent::LiveToolBuf { id, body } = env.event
             && id == BATCH_ID
         {
@@ -663,7 +667,7 @@ fn restore_snapshot_lines_opts(
     clicks: Vec<usize>,
 ) -> Vec<Vec<(String, SpanStyle)>> {
     let handle = host.event_handle();
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     handle.request_restore(
         maki_lua::RestoreItem {
             tool: Arc::from(BATCH_TOOL),
@@ -684,7 +688,7 @@ fn restore_snapshot_lines_opts(
     handle.wait_restore_complete_for_test();
     barrier(host);
     snapshot_lines(
-        drain_snapshots(&rx, BATCH_ID)
+        drain_snapshots(&mut rx, BATCH_ID)
             .last()
             .expect("no snapshot emitted"),
     )
@@ -696,8 +700,8 @@ fn barrier(host: &PluginHost) {
     host.load_source("barrier", "").unwrap();
 }
 
-fn drain_snapshots(rx: &flume::Receiver<Envelope>, tool_use_id: &str) -> Vec<BufferSnapshot> {
-    rx.drain()
+fn drain_snapshots(rx: &mut UnboundedReceiver<Envelope>, tool_use_id: &str) -> Vec<BufferSnapshot> {
+    iter::from_fn(|| rx.try_recv().ok())
         .filter_map(|env| match env.event {
             AgentEvent::ToolSnapshot { id, snapshot, .. } => {
                 assert_eq!(id, tool_use_id);
@@ -1258,7 +1262,7 @@ fn exec_live(
     tool: &str,
     input: &Value,
 ) -> (ToolExecResult, Vec<BufferSnapshot>) {
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     let event_tx = EventSender::new(tx, 0);
     let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(tool_use_id));
     ctx.registry = Arc::clone(reg);
@@ -1270,7 +1274,7 @@ fn exec_live(
         .expect("parse failed");
     let result = runtime().block_on(inv.execute(&ctx));
     barrier(host);
-    (result, drain_snapshots(&rx, tool_use_id))
+    (result, drain_snapshots(&mut rx, tool_use_id))
 }
 
 fn exec_batch_live(
@@ -1507,7 +1511,7 @@ struct MovableBatch {
     body: Arc<SharedBuf>,
     _seed: Arc<AgentSeed>,
     run: Option<CancelTrigger>,
-    events: flume::Receiver<Envelope>,
+    events: UnboundedReceiver<Envelope>,
 }
 
 impl MovableBatch {
@@ -1524,12 +1528,12 @@ impl MovableBatch {
         let ui = host.ui_action_rx();
         let Chat { id, mailbox, seed } = Chat::live();
         let (run, run_token) = CancelToken::new();
-        let (ctx, events) = call_ctx(&reg, id, &run_token, BATCH_ID);
+        let (ctx, mut events) = call_ctx(&reg, id, &run_token, BATCH_ID);
         let call = thread::spawn({
             let reg = Arc::clone(&reg);
             move || exec(&reg, BATCH_TOOL, batch_input(tool_calls), &ctx)
         });
-        let body = recv_live_buf(&events);
+        let body = recv_live_buf(&mut events);
         let batch = Self {
             reg,
             host,
@@ -1567,10 +1571,9 @@ impl MovableBatch {
     }
 
     /// Waits for the batch to say it is made of {want}, as `(id, name, status)`.
-    fn wait_parts(&self, want: &[(&str, &str, PartStatus)]) {
+    fn wait_parts(&mut self, want: &[(&str, &str, PartStatus)]) {
         poll_until(&format!("parts never became {want:?}"), || {
-            self.events
-                .try_iter()
+            iter::from_fn(|| self.events.try_recv().ok())
                 .any(|envelope| match &envelope.event {
                     AgentEvent::ToolParts { id, parts } if id == BATCH_ID => parts
                         .iter()
@@ -1761,7 +1764,7 @@ fn a_background_child_moves_the_batch_once_the_rest_finished() {
 /// is a task of its own and no part, leaves the other ids alone.
 #[test]
 fn batch_parts_keep_their_place_and_leave_subagents_out() {
-    let (batch, call) = MovableBatch::start(json!([
+    let (mut batch, call) = MovableBatch::start(json!([
         { "tool": HOOKED_TOOL, "parameters": { "tag": "agent", "subagent": true } },
         { "tool": EDIT_TOOL, "parameters": { "tag": "quick" } },
         { "tool": HOOKED_TOOL, "parameters": { "tag": "slow" } },
