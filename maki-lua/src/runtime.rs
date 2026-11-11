@@ -2239,14 +2239,14 @@ pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
 /// Provider hooks are called from the async side of the process, so the way
 /// back in has to be something the Lua code that registers them can pick up
 /// while it runs.
-pub(crate) struct ProviderRequests(flume::Sender<Request>);
+pub(crate) struct ProviderRequests(UnboundedSender<Request>);
 
 /// The two ways back to the Lua thread that a provider hook handle keeps: one
 /// to ask for a call, one to hand its registry keys back when it dies. Taken
 /// together because a handle without both is of no use.
 pub(crate) fn host_senders(
     lua: &Lua,
-) -> mlua::Result<(flume::Sender<Request>, UnboundedSender<DeferredCallback>)> {
+) -> mlua::Result<(UnboundedSender<Request>, UnboundedSender<DeferredCallback>)> {
     let no_host = || mlua::Error::runtime(NO_PLUGIN_HOST);
     let requests = lua.app_data_ref::<ProviderRequests>().ok_or_else(no_host)?;
     let release = lua.app_data_ref::<DeferQueue>().ok_or_else(no_host)?;
@@ -3591,7 +3591,7 @@ struct LuaRuntime {
     live_tasks: LiveTasks,
     warm_tools: WarmTools,
     registry: Arc<ToolRegistry>,
-    tx: flume::Sender<Request>,
+    tx: UnboundedSender<Request>,
     shutdown: Arc<AtomicBool>,
     bundled: BundledModules,
     codegen_queue: CodegenQueue,
@@ -3602,7 +3602,7 @@ impl LuaRuntime {
     #[allow(clippy::too_many_arguments)]
     fn new(
         registry: Arc<ToolRegistry>,
-        tx: flume::Sender<Request>,
+        tx: UnboundedSender<Request>,
         shutdown: Arc<AtomicBool>,
         bundled_dirs: &'static [&'static Dir<'static>],
         ui_action_tx: Option<flume::Sender<UiAction>>,
@@ -5579,8 +5579,8 @@ async fn run_tool_call(
 }
 
 pub(crate) struct LuaThread {
-    pub tx: flume::Sender<Request>,
-    pub prio_tx: flume::Sender<Request>,
+    pub tx: UnboundedSender<Request>,
+    pub prio_tx: UnboundedSender<Request>,
     pub moves: UnboundedSender<MoveRequest>,
     /// Shared with the runtime on the Lua thread, so a handle can answer "is
     /// anyone layering this" without a roundtrip.
@@ -5612,8 +5612,8 @@ pub fn spawn(
     jit: bool,
     plugin_rules: Arc<PluginRuleStore>,
 ) -> Result<LuaThread, PluginError> {
-    let (tx, rx) = flume::unbounded::<Request>();
-    let (prio_tx, prio_rx) = flume::unbounded::<Request>();
+    let (tx, mut rx) = unbounded_channel::<Request>();
+    let (prio_tx, mut prio_rx) = unbounded_channel::<Request>();
     let prio_tx_thread = prio_tx.clone();
     let (moves, move_requests) = unbounded_channel::<MoveRequest>();
     let moves_thread = moves.clone();
@@ -5763,24 +5763,24 @@ pub fn spawn(
                     // behind the next unrelated request.
                     let next = tokio::select! {
                         biased;
-                        msg = prio_rx.recv_async() => msg.map(Some),
+                        msg = prio_rx.recv() => msg.map(Some),
                         Some(task) = spawn_rx.recv() => {
                             spawn_async_task(&rt.lua, &gate, task);
-                            Ok(None)
+                            Some(None)
                         }
                         Some(cb) = defer_rx.recv() => {
                             spawn_deferred_callback(&rt.lua, &gate, cb);
-                            Ok(None)
+                            Some(None)
                         }
-                        msg = rx.recv_async() => msg.map(Some),
+                        msg = rx.recv() => msg.map(Some),
                     };
                     let msg = match next {
-                        Ok(Some(m)) => m,
-                        Ok(None) => {
+                        Some(Some(m)) => m,
+                        Some(None) => {
                             yield_now().await;
                             continue;
                         }
-                        Err(_) => break,
+                        None => break,
                     };
                     match msg {
                         Request::Shutdown => break,
@@ -6112,11 +6112,10 @@ pub fn spawn(
             }));
             BackgroundTasks::of(&rt.lua).lose_all();
             // Clones of the host (`EventHandle`, `LuaTool`) can still hold
-            // a live sender, so dropping the receivers alone does not free
-            // queued requests. Drain them so their reply channels drop and
-            // no caller blocks on a dead host.
-            for _ in rx.drain() {}
-            for _ in prio_rx.drain() {}
+            // a live sender. Dropping the receivers frees the queued
+            // requests, so their reply channels drop and no caller blocks on
+            // a dead host.
+            drop((rx, prio_rx));
             // Each pooled client owns a connection pool.
             // Nothing else hands them back, so a host that fetched once would
             // keep its sockets open for the rest of the process.

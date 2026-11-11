@@ -187,7 +187,7 @@ pub struct LuaHookKeys {
     keys: HashMap<HookSlot, RegistryKey>,
     /// The registering plugin's reach, which `ctx.get_json` goes out under.
     egress: NetEgress,
-    requests: flume::Sender<Request>,
+    requests: UnboundedSender<Request>,
     release: UnboundedSender<DeferredCallback>,
 }
 
@@ -1133,7 +1133,7 @@ mod tests {
                 .map(|(slot, func)| (slot, lua.create_registry_value(func).unwrap()))
                 .collect(),
             egress: NetEgress::default(),
-            requests: flume::unbounded().0,
+            requests: unbounded_channel().0,
             release: unbounded_channel().0,
         }
     }
@@ -1316,7 +1316,7 @@ mod tests {
     async fn call_usage_hook(source: &str) -> Result<Option<ProviderUsage>, AgentError> {
         let lua = provider_lua(true);
         let func: Function = lua.load(source).eval().unwrap();
-        let (requests, served) = flume::unbounded();
+        let (requests, mut served) = unbounded_channel();
         let mut keys = keys_from(&lua, [(HookSlot::FetchUsage, func)]);
         keys.requests = requests;
         let bridge: LuaHook<(), Option<ProviderUsage>> = LuaHook {
@@ -1326,13 +1326,13 @@ mod tests {
             _types: PhantomData,
         };
         let host = async {
-            let Ok(Request::CallProviderHook {
+            let Some(Request::CallProviderHook {
                 hook,
                 slot,
                 payload,
                 answer,
                 ..
-            }) = served.recv_async().await
+            }) = served.recv().await
             else {
                 panic!("{HOOK_NEVER_CALLED}");
             };

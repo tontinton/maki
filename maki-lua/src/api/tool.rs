@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use flume::Sender;
 use maki_agent::agent::tool_dispatch::routed_view;
 use maki_agent::permissions::is_universal_scope;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
@@ -29,6 +28,7 @@ use mlua::{
     Value as LuaValue,
 };
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
@@ -276,7 +276,7 @@ pub(crate) type PendingRules = Arc<Mutex<Vec<PendingRule>>>;
 
 pub(crate) struct LuaTool {
     pub(crate) meta: ToolMeta,
-    pub(crate) tx: Sender<Request>,
+    pub(crate) tx: UnboundedSender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
@@ -405,7 +405,7 @@ struct LuaToolInvocation {
     has_header_fn: bool,
     has_start_fn: bool,
     input: Value,
-    tx: Sender<Request>,
+    tx: UnboundedSender<Request>,
     permission_state: PermissionState,
     mutable_path_field: Option<Arc<str>>,
     timeout: Option<Duration>,
@@ -426,14 +426,12 @@ impl ToolInvocation for LuaToolInvocation {
         HeaderFuture::Pending {
             fallback: fallback.clone(),
             fut: Box::pin(async move {
-                let sent = tx
-                    .send_async(Request::ComputeHeader {
-                        plugin: Arc::clone(&plugin),
-                        tool: Arc::clone(&tool),
-                        input,
-                        reply: reply_tx,
-                    })
-                    .await;
+                let sent = tx.send(Request::ComputeHeader {
+                    plugin: Arc::clone(&plugin),
+                    tool: Arc::clone(&tool),
+                    input,
+                    reply: reply_tx,
+                });
                 if sent.is_err() {
                     return HeaderResult::plain(fallback);
                 }
@@ -484,7 +482,7 @@ impl ToolInvocation for LuaToolInvocation {
         };
         let tx = self.tx.clone();
         Box::pin(async move {
-            if tx.send_async(req).await.is_ok() {
+            if tx.send(req).is_ok() {
                 let _ = reply_rx.await;
             }
         })
@@ -502,13 +500,12 @@ impl ToolInvocation for LuaToolInvocation {
                 let fallback = input.to_string();
                 Box::pin(async move {
                     if tx
-                        .send_async(Request::ComputePermissionScopes {
+                        .send(Request::ComputePermissionScopes {
                             plugin,
                             tool,
                             input,
                             reply: reply_tx,
                         })
-                        .await
                         .is_err()
                     {
                         return Some(PermissionScopes::force_prompt(fallback));
@@ -559,7 +556,7 @@ impl ToolInvocation for LuaToolInvocation {
             let lua_ctx = LuaCtx::handler(ctx);
 
             if tx
-                .send_async(Request::CallTool {
+                .send(Request::CallTool {
                     plugin: Arc::clone(&plugin),
                     tool: Arc::clone(&tool),
                     input,
@@ -569,7 +566,6 @@ impl ToolInvocation for LuaToolInvocation {
                     live,
                     nested,
                 })
-                .await
                 .is_err()
             {
                 return Err("lua thread disconnected".to_string()).into();
@@ -2142,10 +2138,12 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::task::yield_now;
+
     use super::*;
     use crate::runtime::test_support::{call_scope, moved_home};
     use crate::runtime::wake_or_fail;
-    use tokio::task::yield_now;
 
     const BACKGROUND_PARAM: &str = "background";
 
@@ -2240,7 +2238,7 @@ mod tests {
     }
 
     fn invocation(input: Value) -> LuaToolInvocation {
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         LuaToolInvocation {
             tool: Arc::from("test_tool"),
             plugin: Arc::from("test"),
@@ -2291,7 +2289,7 @@ mod tests {
             "required": ["url"],
         }))
         .unwrap();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         LuaTool {
             meta: ToolMeta {
                 name: Arc::from("test_tool"),
@@ -2420,7 +2418,7 @@ mod tests {
     #[tokio::test]
     async fn needs_compute_fallback_on_failure() {
         // Closed channel → fallback to force_prompt
-        let (tx, rx) = flume::bounded(0);
+        let (tx, rx) = unbounded_channel();
         drop(rx);
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
@@ -2439,7 +2437,7 @@ mod tests {
         assert!(!scopes.scopes.is_empty());
 
         // Callback returns None → fallback to force_prompt
-        let (tx2, rx2) = flume::bounded(1);
+        let (tx2, mut rx2) = unbounded_channel();
         let inv2 = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
@@ -2453,7 +2451,7 @@ mod tests {
             has_start_fn: false,
         };
         std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
+            if let Some(Request::ComputePermissionScopes { reply, .. }) = rx2.blocking_recv() {
                 let _ = reply.send(None);
             }
         });
@@ -2463,7 +2461,7 @@ mod tests {
 
     #[tokio::test]
     async fn needs_compute_returns_callback_result() {
-        let (tx, rx) = flume::bounded(1);
+        let (tx, mut rx) = unbounded_channel();
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
@@ -2477,7 +2475,7 @@ mod tests {
             has_start_fn: false,
         };
         std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
+            if let Some(Request::ComputePermissionScopes { reply, .. }) = rx.blocking_recv() {
                 let _ = reply.send(Some(PermissionScopes {
                     scopes: vec!["cargo".into(), "test".into()],
                     force_prompt: false,

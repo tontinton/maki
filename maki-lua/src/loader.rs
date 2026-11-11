@@ -396,8 +396,8 @@ impl PluginHost {
     pub fn begin_shutdown(&mut self) {
         self.inner.shutdown.store(true, Ordering::Release);
         let _ = self.inner.prio_tx.send(Request::Shutdown);
-        self.inner.tx = flume::unbounded().0;
-        self.inner.prio_tx = flume::unbounded().0;
+        self.inner.tx = unbounded_channel().0;
+        self.inner.prio_tx = unbounded_channel().0;
     }
 
     /// Boots the runtime and loads every default bundled plugin into
@@ -1059,9 +1059,9 @@ impl PluginHost {
 
 #[derive(Clone)]
 pub struct EventHandle {
-    pub(crate) tx: flume::Sender<Request>,
+    pub(crate) tx: UnboundedSender<Request>,
     /// User-initiated requests bypass queued bulk work (session restores).
-    prio_tx: flume::Sender<Request>,
+    prio_tx: UnboundedSender<Request>,
     moves: UnboundedSender<MoveRequest>,
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
@@ -1070,10 +1070,10 @@ pub struct EventHandle {
 }
 
 impl EventHandle {
-    pub(crate) fn from_tx(tx: flume::Sender<Request>) -> Self {
+    pub(crate) fn from_tx(tx: UnboundedSender<Request>) -> Self {
         Self {
             tx,
-            prio_tx: flume::unbounded().0,
+            prio_tx: unbounded_channel().0,
             moves: unbounded_channel().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
@@ -1090,7 +1090,7 @@ impl EventHandle {
 
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
-        Self::from_tx(flume::unbounded().0)
+        Self::from_tx(unbounded_channel().0)
     }
 
     /// Whether a plugin is layering either of the plan form slots. False on a
@@ -1118,7 +1118,7 @@ impl EventHandle {
         parallel: bool,
     ) -> oneshot::Receiver<PlanActionOutcome> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.prio_tx.try_send(Request::RunPlanAction {
+        let _ = self.prio_tx.send(Request::RunPlanAction {
             session,
             generation,
             row,
@@ -1140,7 +1140,7 @@ impl EventHandle {
         rows: Vec<PlanFormRow>,
     ) -> oneshot::Receiver<Option<PlanMenu>> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.prio_tx.try_send(Request::OpenPlanForm {
+        let _ = self.prio_tx.send(Request::OpenPlanForm {
             path,
             session,
             rows,
@@ -1155,14 +1155,14 @@ impl EventHandle {
     /// this to skip async side effects (e.g. a restore-complete flip) that
     /// no live consumer would ever observe.
     pub fn is_disconnected(&self) -> bool {
-        self.tx.is_disconnected() && self.prio_tx.is_disconnected()
+        self.tx.is_closed() && self.prio_tx.is_closed()
     }
 
     /// Test probe sibling of `from_tx`: collapses both senders onto one
     /// channel so a `RequestProbe` sees every request, including the
     /// `prio_tx`-routed commands and keybind callbacks that `from_tx`
     /// would route to a disconnected channel.
-    pub(crate) fn probed_for_test(shared: flume::Sender<Request>) -> Self {
+    pub(crate) fn probed_for_test(shared: UnboundedSender<Request>) -> Self {
         Self {
             tx: shared.clone(),
             prio_tx: shared,
@@ -1180,7 +1180,7 @@ impl EventHandle {
     }
 
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
-        let _ = self.prio_tx.try_send(Request::RunCommand {
+        let _ = self.prio_tx.send(Request::RunCommand {
             plugin,
             command,
             args,
@@ -1287,7 +1287,7 @@ impl EventHandle {
     /// [`HostEventKind::fields`](crate::agent_autocmd::HostEventKind::fields)
     /// classifies. {session_id} is the session the event is about.
     pub fn fire(&self, session_id: Option<&dyn Display>, event: HostEvent<'_>) {
-        let _ = self.tx.try_send(Request::FireAutocmd {
+        let _ = self.tx.send(Request::FireAutocmd {
             event: event.name().to_owned(),
             data: event.payload(session_id),
         });
@@ -1298,9 +1298,7 @@ impl EventHandle {
     /// leaves the slot empty and answers through its event loop, which owns the
     /// live session runtimes.
     pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
-        let _ = self
-            .tx
-            .try_send(Request::InstallSessionSnapshot { provider });
+        let _ = self.tx.send(Request::InstallSessionSnapshot { provider });
     }
 
     /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,
@@ -1311,7 +1309,7 @@ impl EventHandle {
     /// Nothing waits here, so handlers get no deadline and the UI is still
     /// there to answer them.
     pub fn end_session(&self, session: MakiId, reason: SessionEndReason) {
-        let _ = self.tx.try_send(Request::EndSession(EndSession {
+        let _ = self.tx.send(Request::EndSession(EndSession {
             session,
             reason,
             wait: None,
@@ -1368,7 +1366,7 @@ impl EventHandle {
     /// for the key in the same keystroke.
     pub fn run_keybind_callback(&self, ticket: KeybindTicket) -> bool {
         self.prio_tx
-            .try_send(Request::RunKeybindCallback { ticket })
+            .send(Request::RunKeybindCallback { ticket })
             .is_ok()
     }
 }
@@ -1518,8 +1516,8 @@ mod tests {
 
     #[test]
     fn run_command_sends_correct_request() {
-        let (prio_tx, prio_rx) = flume::bounded(8);
-        let (tx, _rx) = flume::bounded(8);
+        let (prio_tx, mut prio_rx) = unbounded_channel();
+        let (tx, _rx) = unbounded_channel();
         let handle = EventHandle {
             tx,
             prio_tx,
