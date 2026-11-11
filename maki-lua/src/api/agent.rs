@@ -42,6 +42,7 @@ use mlua::{
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::spawn_blocking;
 use tracing::info;
 
@@ -470,7 +471,7 @@ async fn relay_session_events(
     mut sub_events: SessionEvents,
     mut upstream: Upstream,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
-    done_tx: flume::Sender<()>,
+    done_tx: UnboundedSender<()>,
     live_sink: Option<flume::Sender<ToolLive>>,
 ) {
     let mut cost = None;
@@ -1192,7 +1193,7 @@ async fn session(
         .unzip();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
-    let (done_tx, done_rx) = flume::unbounded();
+    let (done_tx, done_rx) = unbounded_channel();
     // Doubles as the task id tools see. The fallback gets its own id: it keys
     // `subagent_cancels`, where two subagents sharing the session id would
     // collide.
@@ -1632,12 +1633,12 @@ struct SessionState {
 /// Events carry no prompt tag, so the next prompt can't tell a leftover from
 /// its own. It counts how many it is owed instead and reads past the old ones.
 struct RunDones {
-    rx: flume::Receiver<()>,
+    rx: UnboundedReceiver<()>,
     unread: usize,
 }
 
 impl RunDones {
-    fn new(rx: flume::Receiver<()>) -> Self {
+    fn new(rx: UnboundedReceiver<()>) -> Self {
         Self { rx, unread: 0 }
     }
 
@@ -1647,12 +1648,12 @@ impl RunDones {
 
     /// Safe to drop mid-wait, because a `Done` only stops being owed once it
     /// has been read.
-    async fn caught_up(&mut self) -> Result<(), flume::RecvError> {
+    async fn caught_up(&mut self) -> Option<()> {
         while self.unread > 0 {
-            self.rx.recv_async().await?;
+            self.rx.recv().await?;
             self.unread -= 1;
         }
-        Ok(())
+        Some(())
     }
 }
 
@@ -2079,7 +2080,7 @@ async fn prompt(
     // The relay reaches `Done` only after every `TurnComplete`, so once it has,
     // all our `ToolLive::Usage` messages sit in the live channel before
     // `dispatch_racing_live` drains it for the last time.
-    if s.dones.caught_up().await.is_err() {
+    if s.dones.caught_up().await.is_none() {
         tracing::warn!(name = %s.name, "subagent event relay stopped, live usage may lag");
     }
     let usage = s.params.ledger.totals().usage;
@@ -2862,7 +2863,7 @@ mod tests {
     /// halfway and asked again.
     #[tokio::test]
     async fn next_prompt_waits_past_a_leftover_done() {
-        let (tx, rx) = flume::unbounded();
+        let (tx, rx) = unbounded_channel();
         let mut dones = RunDones::new(rx);
         dones.expect_one();
         tx.send(()).unwrap();
@@ -2870,8 +2871,8 @@ mod tests {
         assert!(dones.caught_up().now_or_never().is_none());
 
         tx.send(()).unwrap();
-        assert_eq!(dones.caught_up().await, Ok(()));
-        assert!(tx.is_empty());
+        assert_eq!(dones.caught_up().await, Some(()));
+        assert!(dones.rx.is_empty());
     }
 
     const RUN_ID: u64 = 7;
@@ -3045,7 +3046,7 @@ mod tests {
         guard.sender(RUN_ID).send(ask()).unwrap();
         drop(guard);
 
-        relay_session_events(sub_events, upstream, info, flume::unbounded().0, None).await;
+        relay_session_events(sub_events, upstream, info, unbounded_channel().0, None).await;
 
         let (answers, shown) = if watched {
             (Vec::new(), event_names(&[ask(), AgentEvent::StreamClosed]))
@@ -3065,7 +3066,7 @@ mod tests {
     #[tokio::test]
     async fn relay_to_parent_reports_each_turn_and_keeps_run_ends_behind() {
         let (upstream, parent_rx) = parent_upstream();
-        let (done_tx, done_rx) = flume::unbounded();
+        let (done_tx, mut done_rx) = unbounded_channel();
         let (live_tx, live_rx) = flume::unbounded();
 
         relay_session_events(
@@ -3141,7 +3142,7 @@ mod tests {
     #[tokio::test]
     async fn relay_to_chat_forwards_run_ends_and_closes_the_task() {
         let session = MakiId::generate();
-        let (done_tx, done_rx) = flume::unbounded();
+        let (done_tx, mut done_rx) = unbounded_channel();
         let (ui_tx, ui_rx) = flume::unbounded();
 
         relay_session_events(
@@ -3191,7 +3192,7 @@ mod tests {
         };
         let (guard, sub_events) = event_stream();
         let sub_tx = guard.sender(RUN_ID);
-        let (done_tx, done_rx) = flume::unbounded();
+        let (done_tx, mut done_rx) = unbounded_channel();
         let moving = async {
             sub_tx
                 .send(turn(SESSION_MODEL, tokens(100, 20), 0.25))
@@ -3240,7 +3241,7 @@ mod tests {
         ledger.add(DONE_USAGE, None, None);
         drop(settle);
         drop(guard);
-        let (done_tx, done_rx) = flume::unbounded();
+        let (done_tx, done_rx) = unbounded_channel();
         let (ui_tx, ui_rx) = flume::unbounded();
 
         relay_session_events(
