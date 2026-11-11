@@ -1115,8 +1115,8 @@ impl EventHandle {
         row: usize,
         path: String,
         parallel: bool,
-    ) -> flume::Receiver<PlanActionOutcome> {
-        let (reply, rx) = flume::bounded(1);
+    ) -> oneshot::Receiver<PlanActionOutcome> {
+        let (reply, rx) = oneshot::channel();
         let _ = self.prio_tx.try_send(Request::RunPlanAction {
             session,
             generation,
@@ -1137,8 +1137,8 @@ impl EventHandle {
         path: String,
         session: String,
         rows: Vec<PlanFormRow>,
-    ) -> flume::Receiver<Option<PlanMenu>> {
-        let (reply, rx) = flume::bounded(1);
+    ) -> oneshot::Receiver<Option<PlanMenu>> {
+        let (reply, rx) = oneshot::channel();
         let _ = self.prio_tx.try_send(Request::OpenPlanForm {
             path,
             session,
@@ -1257,7 +1257,7 @@ impl EventHandle {
 
     /// Asks the call to move to the background. The answer arrives once its
     /// `ctx:on_background` hook ran.
-    pub fn request_background(&self, tool_use_id: String) -> flume::Receiver<MoveOutcome> {
+    pub fn request_background(&self, tool_use_id: String) -> oneshot::Receiver<MoveOutcome> {
         let (request, rx) = MoveRequest::by_user(tool_use_id);
         let _ = self.moves.send(request);
         rx

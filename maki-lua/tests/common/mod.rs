@@ -16,7 +16,7 @@ use maki_agent::{
     AgentEvent, AgentMode, AgentSeed, CallScope, CancelToken, Envelope, EventSender,
     SessionMailbox, SharedBuf, ToolDoneEvent,
 };
-use maki_lua::test_support::runtime;
+use maki_lua::test_support::{runtime, wait_reply};
 use maki_lua::{EventHandle, MoveOutcome, PluginHost, SessionEndReason, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -128,10 +128,7 @@ pub fn wait_live_buf(events: &flume::Receiver<Envelope>, call_id: &str) -> Arc<S
 
 /// What Ctrl+B on the call's row gets back.
 pub fn request_move(handle: &EventHandle, call_id: &str) -> MoveOutcome {
-    handle
-        .request_background(call_id.to_owned())
-        .recv_timeout(WAIT)
-        .expect("move outcome")
+    wait_reply(handle.request_background(call_id.to_owned()), WAIT).expect("move outcome")
 }
 
 /// The next event a task tab was sent.

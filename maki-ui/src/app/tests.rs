@@ -1519,8 +1519,8 @@ fn plan_menu(rows: Vec<maki_lua::PlanFormRow>) -> maki_lua::PlanMenu {
 }
 
 /// Arms the form's answer slot with a wait that has not run out yet.
-fn awaiting_plan_form(app: &mut App) -> flume::Sender<Option<maki_lua::PlanMenu>> {
-    let (tx, rx) = flume::bounded(1);
+fn awaiting_plan_form(app: &mut App) -> oneshot::Sender<Option<maki_lua::PlanMenu>> {
+    let (tx, rx) = oneshot::channel();
     app.plan_answers.form = Some((Instant::now() + WAIT_AHEAD, rx));
     tx
 }
@@ -1592,7 +1592,7 @@ fn a_silent_plan_form_slot_leaves_the_form_closed() {
 #[test]
 fn a_plan_form_answer_that_never_comes_falls_back_to_the_builtin() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded::<Option<maki_lua::PlanMenu>>(1);
+    let (_tx, rx) = oneshot::channel::<Option<maki_lua::PlanMenu>>();
     app.plan_answers.form = Some((Instant::now() - WAIT_AHEAD, rx));
 
     assert_eq!(app.tick_plan_form(), Dirty::YES);
@@ -1607,8 +1607,8 @@ fn a_plan_form_answer_that_never_comes_falls_back_to_the_builtin() {
 fn awaiting_plan_action(
     app: &mut App,
     then: Option<maki_lua::PlanRowAction>,
-) -> flume::Sender<PlanActionOutcome> {
-    let (tx, rx) = flume::bounded(1);
+) -> oneshot::Sender<PlanActionOutcome> {
+    let (tx, rx) = oneshot::channel();
     let pick = app.plan_answers.abandon();
     app.plan_answers.action = Some(PlanAction {
         pick,
@@ -1704,7 +1704,7 @@ fn a_pick_the_host_never_took_is_flashed() {
 #[test]
 fn a_parked_plan_row_handler_gives_up_and_flashes() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded(1);
+    let (_tx, rx) = oneshot::channel();
     let pick = app.plan_answers.abandon();
     app.plan_answers.action = Some(PlanAction {
         pick,
@@ -1729,7 +1729,7 @@ fn a_parked_plan_row_handler_gives_up_and_flashes() {
 
 /// A pick of a plugin row that kept the implement outcome, stamped with
 /// {pick} so a test can re-arm the same one the user made.
-fn plan_pick_action(pick: u64, answer: flume::Receiver<PlanActionOutcome>) -> PlanAction {
+fn plan_pick_action(pick: u64, answer: oneshot::Receiver<PlanActionOutcome>) -> PlanAction {
     PlanAction {
         pick,
         then: Some(maki_lua::PlanRowAction::Implement),
@@ -1747,9 +1747,10 @@ fn a_stale_pick_answer_cannot_fire_a_second_implement() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
 
     // The user reopens the form and picks a built-in row while the handler is
     // still parked.
@@ -1781,9 +1782,10 @@ fn a_pick_answered_after_a_session_reset_submits_nothing() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
     let before = app.state.session.id;
 
     app.reset_session();
@@ -1819,9 +1821,10 @@ fn a_pick_answered_after_another_session_loaded_submits_nothing() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
     let _menu_tx = awaiting_plan_form(&mut app);
 
     // The session the user switched to is planning too, with a draft of its
@@ -1868,7 +1871,7 @@ fn a_pick_answered_after_another_session_loaded_submits_nothing() {
 #[test]
 fn the_plan_form_fallback_outlasts_the_host_budget() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded::<Option<maki_lua::PlanMenu>>(1);
+    let (_tx, rx) = oneshot::channel::<Option<maki_lua::PlanMenu>>();
     // Armed one whole host budget ago, so the chains have just run out of
     // their own time and the answer is still on its way.
     let armed = Instant::now() - PLAN_FORM_SLOT_DEADLINE;
@@ -1892,7 +1895,7 @@ fn the_plan_form_fallback_outlasts_the_host_budget() {
 #[test]
 fn the_plan_action_fallback_outlasts_the_handler_budget() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded(1);
+    let (_tx, rx) = oneshot::channel();
     let pick = app.plan_answers.abandon();
     // Armed one whole handler budget ago, so the handler has just run out of
     // its own time and the answer is still on its way.
@@ -1926,9 +1929,10 @@ fn a_new_draft_flashes_the_pick_it_retires() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
 
     app.transition_plan(PlanTrigger::WriteDone);
 

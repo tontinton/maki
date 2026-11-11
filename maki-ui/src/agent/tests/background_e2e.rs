@@ -18,6 +18,7 @@ use maki_agent::{
 };
 use maki_config::project::{self, TrustMode};
 use maki_config::{PermissionsConfig, PluginsConfig};
+use maki_lua::test_support::wait_reply;
 use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -427,12 +428,8 @@ impl World {
         self.wait_for(
             |event| matches!(event, AgentEvent::ToolMovable { id: movable, movable: true } if movable == id),
         );
-        let outcome = self
-            .host
-            .event_handle()
-            .request_background(id.to_owned())
-            .recv_timeout(WAIT)
-            .expect(NO_OUTCOME);
+        let answer = self.host.event_handle().request_background(id.to_owned());
+        let outcome = wait_reply(answer, WAIT).expect(NO_OUTCOME);
         assert_eq!(outcome, MoveOutcome::Moved);
     }
 

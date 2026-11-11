@@ -63,6 +63,7 @@ pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {
     use std::sync::Arc;
+    use std::time::Duration;
 
     pub use crate::api::autocmd::content_omitted_message;
     use crate::api::keymap::{InputMode, KeymapStore, KeymapWriter, SetOpts};
@@ -77,11 +78,22 @@ pub mod test_support {
     use maki_agent::SharedBuf;
     use maki_storage::id::MakiId;
     use tokio::runtime::Runtime;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
 
     /// The runtime [`crate::PluginHost::start`] puts a host on, for the sync
     /// side of a test to drive futures with.
     pub fn runtime() -> &'static Runtime {
         &crate::loader::HOST_RUNTIME
+    }
+
+    /// The host's answer on {reply}, for the sync side of a test. `None` once
+    /// {limit} passed or the host dropped the reply.
+    pub fn wait_reply<T>(reply: oneshot::Receiver<T>, limit: Duration) -> Option<T> {
+        runtime()
+            .block_on(async { timeout(limit, reply).await })
+            .ok()?
+            .ok()
     }
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);

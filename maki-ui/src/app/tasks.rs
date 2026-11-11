@@ -9,13 +9,14 @@ use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flume::TryRecvError;
 use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry};
 use maki_agent::{AgentEvent, PartStatus, SessionMailbox, ToolDoneEvent, ToolPart};
 use maki_lua::MoveOutcome;
 use maki_storage::id::MakiId;
 use serde::Serialize;
 use strum::IntoStaticStr;
+use tokio::sync::oneshot::Receiver;
+use tokio::sync::oneshot::error::TryRecvError;
 
 use crate::app::{App, MAIN_CHAT};
 use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, LOST_TEXT};
@@ -236,7 +237,7 @@ pub(crate) struct TaskInfo {
 /// come in. One flash sums them up once the last one is in.
 #[derive(Default)]
 pub(crate) struct BackgroundMoves {
-    pub(super) pending: Vec<flume::Receiver<MoveOutcome>>,
+    pub(super) pending: Vec<Receiver<MoveOutcome>>,
     moved: usize,
     declined: Option<String>,
 }
@@ -259,13 +260,13 @@ impl BackgroundMoves {
             return None;
         }
         let mut pending = mem::take(&mut self.pending);
-        pending.retain(|reply| match reply.try_recv() {
+        pending.retain_mut(|reply| match reply.try_recv() {
             Ok(outcome) => {
                 self.record(outcome);
                 false
             }
             Err(TryRecvError::Empty) => true,
-            Err(TryRecvError::Disconnected) => false,
+            Err(TryRecvError::Closed) => false,
         });
         self.pending = pending;
         self.pending.is_empty().then(|| self.summary())
@@ -939,6 +940,7 @@ mod tests {
     use maki_agent::{Envelope, SharedBuf, ToolOutput};
     use maki_config::ToolKey;
     use test_case::test_case;
+    use tokio::sync::oneshot;
 
     const TASK_ID: &str = "toolu_01";
     const OTHER_ID: &str = "toolu_02";
@@ -967,8 +969,8 @@ mod tests {
         app.update(Msg::Key(key::BACKGROUND.to_key_event()));
     }
 
-    fn answered(outcome: MoveOutcome) -> flume::Receiver<MoveOutcome> {
-        let (reply, answer) = flume::bounded(1);
+    fn answered(outcome: MoveOutcome) -> Receiver<MoveOutcome> {
+        let (reply, answer) = oneshot::channel();
         reply.send(outcome).unwrap();
         answer
     }
@@ -995,7 +997,7 @@ mod tests {
     fn background_key_flashes_once_every_call_answered() {
         let mut app = app_running(2);
         press_background(&mut app);
-        let (late_reply, late_answer) = flume::bounded(1);
+        let (late_reply, late_answer) = oneshot::channel();
         app.background_moves.pending = vec![answered(MoveOutcome::Moved), late_answer];
 
         assert_eq!(app.tick_background_moves(), Dirty::NO);
@@ -1130,7 +1132,7 @@ mod tests {
         let (mut app, _buf) = app_with_moved_call();
         end_turn(&mut app);
         app.end_task(MOVED_ID, BackgroundOutcome::Done);
-        let (reply, answer) = flume::bounded(1);
+        let (reply, answer) = oneshot::channel();
         app.background_moves.pending = vec![answer];
         assert_eq!(app.cadence(), Cadence::PENDING);
 

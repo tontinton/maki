@@ -506,7 +506,7 @@ pub enum Request {
         /// Whether the row's built-in action still runs, and if not, whether
         /// that was the handler's decision or the host failing to take the
         /// pick at all.
-        reply: flume::Sender<PlanActionOutcome>,
+        reply: oneshot::Sender<PlanActionOutcome>,
     },
     /// Fires the two `ui.plan_form*` chains for a session whose plan just
     /// landed: whether the built-in form opens, and with which rows.
@@ -516,7 +516,7 @@ pub enum Request {
         /// The rows the host proposes, i.e. the bottom of the actions chain.
         rows: Vec<PlanFormRow>,
         /// The menu to draw, or `None` when a layer took the form over.
-        reply: flume::Sender<Option<PlanMenu>>,
+        reply: oneshot::Sender<Option<PlanMenu>>,
     },
     ComputeHeader {
         plugin: Arc<str>,
@@ -1330,16 +1330,16 @@ impl LiveTask {
 pub(crate) struct MoveRequest {
     tool_use_id: String,
     trigger: MoveTrigger,
-    reply: flume::Sender<MoveOutcome>,
+    reply: oneshot::Sender<MoveOutcome>,
 }
 
 impl MoveRequest {
-    pub(crate) fn by_user(tool_use_id: String) -> (Self, flume::Receiver<MoveOutcome>) {
+    pub(crate) fn by_user(tool_use_id: String) -> (Self, oneshot::Receiver<MoveOutcome>) {
         Self::new(tool_use_id, MoveTrigger::User)
     }
 
-    fn new(tool_use_id: String, trigger: MoveTrigger) -> (Self, flume::Receiver<MoveOutcome>) {
-        let (reply, rx) = flume::bounded(1);
+    fn new(tool_use_id: String, trigger: MoveTrigger) -> (Self, oneshot::Receiver<MoveOutcome>) {
+        let (reply, rx) = oneshot::channel();
         let request = Self {
             tool_use_id,
             trigger,
@@ -1395,9 +1395,7 @@ pub(crate) async fn move_self(lua: &Lua, tool_use_id: &str) -> MoveOutcome {
     if tx.send(request).is_err() {
         return not_movable(NOT_LIVE_CALL_MSG);
     }
-    rx.recv_async()
-        .await
-        .unwrap_or_else(|_| not_movable(NOT_LIVE_CALL_MSG))
+    rx.await.unwrap_or_else(|_| not_movable(NOT_LIVE_CALL_MSG))
 }
 
 /// Moves a call whose `expire = "background"` deadline passed. A call that
@@ -4385,7 +4383,7 @@ impl LuaRuntime {
         row: usize,
         path: String,
         parallel: bool,
-        reply: flume::Sender<PlanActionOutcome>,
+        reply: oneshot::Sender<PlanActionOutcome>,
     ) {
         let found = self
             .lua

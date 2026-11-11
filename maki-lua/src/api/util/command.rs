@@ -12,6 +12,7 @@ use maki_agent::{Envelope, SharedBuf, SubagentInfo, TaskEnd, Transcript};
 use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
+use tokio::sync::oneshot;
 
 use crate::api::ui::marks::Mark;
 use crate::api::util::convert::json_to_lua;
@@ -786,11 +787,11 @@ pub enum UiAction {
     SetWindowTitle(String),
     OpenEditor {
         path: PathBuf,
-        reply_tx: flume::Sender<i32>,
+        reply_tx: oneshot::Sender<i32>,
     },
     Session {
         req: SessionRequest,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     },
     /// `maki.session.export` and `messages`: a live tab answers from memory,
     /// unsaved messages included, any other id from disk. Typed rather than
@@ -798,26 +799,26 @@ pub enum UiAction {
     /// thread copies them.
     ExportSession {
         id: MakiId,
-        reply_tx: flume::Sender<Result<SessionExport, String>>,
+        reply_tx: oneshot::Sender<Result<SessionExport, String>>,
     },
     Model {
         req: ModelRequest,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     },
     Plan {
         req: PlanRequest,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     },
     Input {
         req: InputRequest,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     },
     Task {
         req: TaskRequest,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     },
     WinSaveView {
-        reply_tx: flume::Sender<WinView>,
+        reply_tx: oneshot::Sender<WinView>,
     },
     WinRestView {
         scroll_top: u32,
@@ -827,7 +828,7 @@ pub enum UiAction {
     Builtin {
         action: BuiltinAction,
         caller: PluginReach,
-        reply_tx: flume::Sender<bool>,
+        reply_tx: oneshot::Sender<bool>,
     },
     /// The handler of the keystroke with this ticket id returned. It comes
     /// after everything the handler asked of the UI, so the keys typed after
@@ -849,7 +850,7 @@ pub enum UiAction {
         /// Checked on the UI side, since only the UI knows what each command
         /// can reach.
         caller: PluginReach,
-        reply_tx: flume::Sender<Result<(), String>>,
+        reply_tx: oneshot::Sender<Result<(), String>>,
     },
     /// An event from a subagent session a plugin opened on a chat session,
     /// which shows it as a task. A tab keeps its channels across `/new`, so
@@ -968,14 +969,14 @@ pub(crate) async fn as_plugin_load<F: Future>(load: F) -> F::Output {
 /// detaches the UI instead, which fails the send outright.
 pub(crate) async fn ui_roundtrip<T>(
     tx: Option<&flume::Sender<UiAction>>,
-    action: impl FnOnce(flume::Sender<T>) -> UiAction,
+    action: impl FnOnce(oneshot::Sender<T>) -> UiAction,
 ) -> Result<T, &'static str> {
     if PLUGIN_LOADING.get() {
         return Err(PLUGIN_LOADING_ERR);
     }
-    let (reply_tx, reply_rx) = flume::bounded(1);
+    let (reply_tx, reply_rx) = oneshot::channel();
     ui_send(tx, action(reply_tx))?;
-    reply_rx.recv_async().await.map_err(|_| UI_DROPPED_ERR)
+    reply_rx.await.map_err(|_| UI_DROPPED_ERR)
 }
 
 /// `ui_roundtrip` for JSON replies, shaped into the `(value, err)` pair Lua
@@ -984,7 +985,7 @@ pub(crate) async fn ui_roundtrip<T>(
 pub(crate) async fn ui_json_roundtrip(
     lua: &Lua,
     tx: Option<&flume::Sender<UiAction>>,
-    action: impl FnOnce(flume::Sender<UiReply>) -> UiAction,
+    action: impl FnOnce(oneshot::Sender<UiReply>) -> UiAction,
 ) -> LuaResult<Pair<Value>> {
     let reply = try_pair!(ui_roundtrip(tx, action).await);
     let value = try_pair!(reply);

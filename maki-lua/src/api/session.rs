@@ -1715,7 +1715,8 @@ mod tests {
             let mut session = StoredSession::new(MODEL, FACTS_CWD);
             session.set_title(TITLE.into());
             session.replace_messages(vec![Message::user(TEXT.into())]);
-            reply_tx.send(Ok(SessionExport::stored(session))).unwrap();
+            let sent = reply_tx.send(Ok(SessionExport::stored(session)));
+            assert!(sent.is_ok());
         });
 
         let doc: Value = eval(
