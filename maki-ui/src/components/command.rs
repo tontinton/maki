@@ -9,7 +9,7 @@ use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
@@ -743,7 +743,8 @@ impl CommandPalette {
 
                 if selected {
                     let s = t.item_selected;
-                    let highlighted_name = self.build_highlighted_spans(&name, &m.indices, s);
+                    let highlighted_name =
+                        highlighted_spans(&name, &m.indices, s, t.item_match_selected);
                     let mut spans = vec![Span::styled(" ".repeat(PAD), s)];
                     spans.extend(highlighted_name);
                     spans.push(Span::styled(" ".repeat(name_pad), s));
@@ -751,7 +752,8 @@ impl CommandPalette {
                     spans.push(Span::styled(" ".repeat(PAD), s));
                     Line::from(spans)
                 } else {
-                    let highlighted_name = self.build_highlighted_spans(&name, &m.indices, t.item);
+                    let highlighted_name =
+                        highlighted_spans(&name, &m.indices, t.item, t.item_match);
                     let mut spans = vec![Span::raw(" ".repeat(PAD))];
                     spans.extend(highlighted_name);
                     spans.push(Span::raw(" ".repeat(name_pad)));
@@ -770,39 +772,39 @@ impl CommandPalette {
 
         Some(popup)
     }
+}
 
-    fn build_highlighted_spans(&self, text: &str, indices: &[u32], base: Style) -> Vec<Span<'_>> {
-        if indices.is_empty() {
-            return vec![Span::styled(text.to_string(), base)];
-        }
-
-        let t = theme::current();
-        let highlight = base
-            .fg(t.accent.fg.unwrap_or_default())
-            .add_modifier(Modifier::BOLD);
-
-        let mut spans = Vec::new();
-        let mut in_match = false;
-        let mut run = String::new();
-
-        for (i, ch) in text.chars().enumerate() {
-            let is_match = indices.binary_search(&(i as u32)).is_ok();
-            if is_match != in_match && !run.is_empty() {
-                spans.push(Span::styled(
-                    mem::take(&mut run),
-                    if in_match { highlight } else { base },
-                ));
-            }
-            in_match = is_match;
-            run.push(ch);
-        }
-
-        if !run.is_empty() {
-            spans.push(Span::styled(run, if in_match { highlight } else { base }));
-        }
-
-        spans
+fn highlighted_spans<'a>(
+    text: &str,
+    indices: &[u32],
+    base: Style,
+    highlight: Style,
+) -> Vec<Span<'a>> {
+    if indices.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
     }
+
+    let mut spans = Vec::new();
+    let mut in_match = false;
+    let mut run = String::new();
+
+    for (i, ch) in text.chars().enumerate() {
+        let is_match = indices.binary_search(&(i as u32)).is_ok();
+        if is_match != in_match && !run.is_empty() {
+            spans.push(Span::styled(
+                mem::take(&mut run),
+                if in_match { highlight } else { base },
+            ));
+        }
+        in_match = is_match;
+        run.push(ch);
+    }
+
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if in_match { highlight } else { base }));
+    }
+
+    spans
 }
 
 #[cfg(test)]
@@ -813,6 +815,7 @@ mod tests {
     use maki_lua::PluginPermissions;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
     use test_case::test_case;
 
     fn empty_snapshot() -> McpSnapshotReader {
@@ -1438,5 +1441,21 @@ mod tests {
             text.contains(&first_name),
             "window stayed scrolled after the filter shrank the list:\n{text}"
         );
+    }
+
+    #[test]
+    fn match_highlight_marks_only_the_matched_runs() {
+        let base = Style::new().fg(Color::Black).bg(Color::Yellow);
+        let highlight = base.add_modifier(Modifier::UNDERLINED);
+
+        let spans = highlighted_spans("abcd", &[1, 2], base, highlight);
+
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content.as_ref(), "a");
+        assert_eq!(spans[1].content.as_ref(), "bc");
+        assert_eq!(spans[2].content.as_ref(), "d");
+        assert_eq!(spans[0].style, base);
+        assert_eq!(spans[1].style, highlight, "match keeps the selection bg");
+        assert_eq!(spans[2].style, base);
     }
 }
