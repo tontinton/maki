@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use arc_swap::ArcSwap;
 use serde_json::{Value, json};
@@ -162,7 +163,7 @@ pub struct Agent<'h> {
     /// within a run, and not before every request.
     prompt_facts: Option<PromptFacts>,
     mode: AgentMode,
-    user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
+    user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
     ledger: Arc<RunLedger>,
@@ -262,7 +263,7 @@ impl<'h> Agent<'h> {
         self
     }
 
-    pub fn with_user_response_rx(mut self, rx: Arc<Mutex<flume::Receiver<String>>>) -> Self {
+    pub fn with_user_response_rx(mut self, rx: Arc<Mutex<UnboundedReceiver<String>>>) -> Self {
         self.user_response_rx = Some(rx);
         self
     }
@@ -982,9 +983,9 @@ impl<'h> Agent<'h> {
         self.reauth_attempts += 1;
         warn!(error = %err, attempt = self.reauth_attempts, "auth error, waiting for re-authentication");
         self.event_tx.send(AgentEvent::AuthRequired)?;
-        let rx = rx.lock().await;
-        match self.cancel.race(rx.recv_async()).await {
-            Ok(Ok(_)) => {
+        let mut rx = rx.lock().await;
+        match self.cancel.race(rx.recv()).await {
+            Ok(Some(_)) => {
                 self.provider.refresh_auth().await?;
                 Ok(TurnOutcome::Continue)
             }
@@ -1359,6 +1360,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use maki_providers::model::FastSupport;
     use maki_providers::provider::{BoxFuture, Provider};
@@ -4052,7 +4054,7 @@ mod tests {
         };
         let mut history = History::new(Vec::new());
         let (agent, event_rx) = make_agent(provider, &mut history);
-        let answer_rx = flume::unbounded::<String>().1;
+        let answer_rx = unbounded_channel::<String>().1;
         let mut agent = agent.with_user_response_rx(Arc::new(AsyncMutex::new(answer_rx)));
 
         assert!(agent.run(default_input()).await.is_err());

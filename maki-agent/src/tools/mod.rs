@@ -21,6 +21,7 @@ pub use registry::{
     PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult,
     ToolInvocation, ToolReach, ToolRegistry, ToolSource,
 };
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 
 use std::collections::HashMap;
@@ -375,7 +376,7 @@ pub struct ToolContext {
     /// otel), so this is what tells their chats apart.
     pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
-    pub user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
+    pub user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     /// See [`crate::Agent::with_reauth`]. Carried here so a subagent session
     /// offers a re-login only where its parent does.
     pub reauth: bool,
@@ -640,7 +641,7 @@ pub fn interpreter_ctx(
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_access: Arc<FileAccess>,
-    user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
+    user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));

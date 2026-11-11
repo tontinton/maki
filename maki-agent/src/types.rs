@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
 
 use flume::{Receiver, Sender};
 use maki_config::ToolKey;
@@ -1344,7 +1345,7 @@ pub struct SubagentInfo {
     #[serde(skip)]
     pub opts: Option<RequestOptions>,
     #[serde(skip)]
-    pub answer_tx: Option<flume::Sender<String>>,
+    pub answer_tx: Option<UnboundedSender<String>>,
     /// How a host reaches this subagent: its inbox, status and stop. Every
     /// subagent has one, so a chat without one has not heard from its
     /// subagent yet.

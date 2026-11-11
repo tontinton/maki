@@ -78,6 +78,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use test_case::test_case;
 use tokio::runtime::EnterGuard;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::{channel, unbounded_channel};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Metadata, Subscriber};
@@ -376,7 +378,7 @@ pub(crate) fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
 fn subagent_info_with_tx(
     parent_id: &str,
     name: &str,
-    answer_tx: Option<flume::Sender<String>>,
+    answer_tx: Option<UnboundedSender<String>>,
 ) -> SubagentInfo {
     SubagentInfo {
         parent_tool_use_id: parent_id.into(),
@@ -5771,7 +5773,7 @@ fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     app.answer_tx = Some(tx);
 
     app.update(agent_msg(AgentEvent::AuthRequired));
@@ -5783,9 +5785,9 @@ fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     assert_eq!(rx.try_recv().unwrap(), "");
 }
 
-fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Receiver<String>) {
-    let (sub_tx, sub_rx) = flume::unbounded();
-    let (main_tx, main_rx) = flume::unbounded();
+fn app_with_subagent_tx(id: &str) -> (App, UnboundedReceiver<String>, UnboundedReceiver<String>) {
+    let (sub_tx, sub_rx) = unbounded_channel();
+    let (main_tx, main_rx) = unbounded_channel();
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -5807,8 +5809,8 @@ fn allow_once(ask_id: &str) -> String {
 /// or that tool call waits forever.
 #[test]
 fn concurrent_subagent_permission_requests_are_each_answered() {
-    let (first_tx, first_rx) = flume::unbounded();
-    let (second_tx, second_rx) = flume::unbounded();
+    let (first_tx, mut first_rx) = unbounded_channel();
+    let (second_tx, mut second_rx) = unbounded_channel();
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -5854,7 +5856,7 @@ fn auth_required_in_subagent_shows_in_both_chats() {
 
 #[test]
 fn auth_retry_in_subagent_routes_to_subagent_channel() {
-    let (mut app, sub_rx, main_rx) = app_with_subagent_tx("sub1");
+    let (mut app, mut sub_rx, mut main_rx) = app_with_subagent_tx("sub1");
     app.update(subagent_msg(
         AgentEvent::AuthRequired,
         "sub1",
@@ -5870,7 +5872,7 @@ fn auth_retry_in_subagent_routes_to_subagent_channel() {
 
 #[test]
 fn cancel_clears_subagent_auth_retry() {
-    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx("sub1");
+    let (mut app, mut sub_rx, _main_rx) = app_with_subagent_tx("sub1");
     app.update(subagent_msg(
         AgentEvent::AuthRequired,
         "sub1",
@@ -6962,10 +6964,10 @@ fn assert_unsent(app: &App, actions: &[Action], left: &str) {
 }
 
 /// Streams a turn on {app}, and returns where its answers to the agent go.
-fn answer_channel(app: &mut App) -> flume::Receiver<String> {
+fn answer_channel(app: &mut App) -> UnboundedReceiver<String> {
     app.status = Status::Streaming;
     app.run_id = 1;
-    let (answer_tx, answer_rx) = flume::unbounded();
+    let (answer_tx, answer_rx) = unbounded_channel();
     app.answer_tx = Some(answer_tx);
     answer_rx
 }
@@ -10854,11 +10856,11 @@ fn stop_in_its_tab(app: &mut App) {
 fn an_ended_task_lets_go_of_its_answer_sender(setup: fn(&mut App), end: fn(&mut App)) {
     let (mut app, sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     setup(&mut app);
-    assert!(!sub_rx.is_disconnected());
+    assert!(!sub_rx.is_closed());
 
     end(&mut app);
 
-    assert!(sub_rx.is_disconnected());
+    assert!(sub_rx.is_closed());
 }
 
 #[test]
@@ -12674,7 +12676,7 @@ fn an_adopted_subagents_events_outlive_its_run() {
 /// after the turn ended still gets its answer, and the main agent none.
 #[test]
 fn a_moved_subagent_asking_after_its_turn_ended_gets_its_answer() {
-    let (mut app, sub_rx, main_rx) = app_with_subagent_tx(TASK_ID);
+    let (mut app, mut sub_rx, main_rx) = app_with_subagent_tx(TASK_ID);
     receive_receipt(&mut app);
     end_turn(&mut app);
 
@@ -12700,7 +12702,7 @@ fn a_moved_subagent_asking_after_its_turn_ended_gets_its_answer() {
 /// on one: the prompt takes the keys first, Esc included.
 #[test]
 fn esc_cannot_cancel_the_turn_over_a_moved_subagents_ask() {
-    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
+    let (mut app, mut sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     receive_receipt(&mut app);
     moved_subagent_event(
         &mut app,
@@ -12820,7 +12822,7 @@ fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
     app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
     app.update(agent_msg(moved_done(MOVED_ID)));
     let control = Arc::new(SessionControl::default());
-    let (answer_tx, _answer_rx) = flume::unbounded();
+    let (answer_tx, _answer_rx) = unbounded_channel();
     let mut info = subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx));
     info.model = Some(MOVED_MODEL.into());
     info.opts = Some(MOVED_OPTS);
@@ -13191,13 +13193,13 @@ fn clicking_a_moved_row_whose_tab_is_gone_takes_the_rows_own_click() {
 
 /// A `task` call moved off its turn, whose subagent asks the user through a
 /// channel of its own.
-fn app_with_moved_subagent() -> (App, flume::Receiver<String>, flume::Receiver<String>) {
+fn app_with_moved_subagent() -> (App, UnboundedReceiver<String>, UnboundedReceiver<String>) {
     let mut app = streaming_app();
-    let (main_tx, main_rx) = flume::unbounded();
+    let (main_tx, main_rx) = unbounded_channel();
     app.answer_tx = Some(main_tx);
     app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
     app.update(agent_msg(moved_done(MOVED_ID)));
-    let (answer_tx, answer_rx) = flume::unbounded();
+    let (answer_tx, answer_rx) = unbounded_channel();
     speak_after_the_move(
         &mut app,
         subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx)),
@@ -13210,7 +13212,7 @@ fn app_with_moved_subagent() -> (App, flume::Receiver<String>, flume::Receiver<S
 #[test_case(false ; "enter")]
 #[test_case(true  ; "esc_then_enter")]
 fn one_enter_retries_every_run_parked_on_auth(esc_first: bool) {
-    let (mut app, sub_rx, main_rx) = app_with_moved_subagent();
+    let (mut app, mut sub_rx, mut main_rx) = app_with_moved_subagent();
     app.update(agent_msg(AgentEvent::AuthRequired));
     moved_subagent_event(&mut app, MOVED_ID, AgentEvent::AuthRequired);
     let tab = app.chat_of_task(MOVED_ID).unwrap();
@@ -13233,7 +13235,7 @@ fn one_enter_retries_every_run_parked_on_auth(esc_first: bool) {
 /// user's, sent as usual on top of the retry.
 #[test]
 fn a_task_awaiting_auth_lets_the_main_chat_go_on() {
-    let (mut app, sub_rx, _main_rx) = app_with_moved_subagent();
+    let (mut app, mut sub_rx, _main_rx) = app_with_moved_subagent();
     end_turn(&mut app);
     moved_subagent_event(&mut app, MOVED_ID, AgentEvent::AuthRequired);
 
@@ -13288,7 +13290,7 @@ fn a_finished_subagent_late_auth_ask_never_parks() {
 #[test]
 fn a_plugin_task_nobody_can_answer_gets_no_auth_retry() {
     let mut app = app_with_plugin_task();
-    let (main_tx, main_rx) = flume::unbounded();
+    let (main_tx, main_rx) = unbounded_channel();
     app.answer_tx = Some(main_tx);
 
     plugin_event(&mut app, AgentEvent::AuthRequired);

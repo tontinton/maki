@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
 use crate::components::input::Draft;
@@ -93,7 +94,7 @@ pub struct Chat {
     /// Where a subagent's permission answers go. It lives until the chat
     /// finishes, not the turn, so a subagent moved off its turn can still be
     /// answered.
-    pub(crate) answer_tx: Option<flume::Sender<String>>,
+    pub(crate) answer_tx: Option<UnboundedSender<String>>,
     /// Parked while another chat is in front, see `App::set_active_chat`.
     pub(crate) draft: Draft,
     pending_turn_usage: Option<String>,

@@ -3,6 +3,8 @@ use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 use arc_swap::ArcSwap;
 use flume::{Receiver, Sender};
@@ -449,7 +451,7 @@ pub struct InteractiveParams {
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
     pub input_tx: Sender<AgentInput>,
-    pub answer_tx: Sender<String>,
+    pub answer_tx: UnboundedSender<String>,
     pub cancel_tx: Sender<()>,
     pub model_tx: Sender<Model>,
     /// Send through [`Self::switch_mode`], which also tells background work.
@@ -501,7 +503,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (answer_tx, answer_rx) = unbounded_channel::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
     let (mode_tx, mode_rx) = flume::unbounded::<AgentMode>();
@@ -616,7 +618,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             // taker. A call moved to the background can still be parked on
             // it after its run ended: then whatever is queued may be its
             // answer, and the new run must not wait for it to arrive.
-            if let Ok(answers) = answer_rx.try_lock() {
+            if let Ok(mut answers) = answer_rx.try_lock() {
                 while answers.try_recv().is_ok() {}
             }
 

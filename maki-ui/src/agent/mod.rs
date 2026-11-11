@@ -6,6 +6,8 @@ pub(crate) mod shared_queue;
 use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 use arc_swap::ArcSwap;
 use maki_agent::mcp::McpSession;
@@ -88,7 +90,7 @@ impl AgentDeps {
 pub(crate) struct AgentHandles {
     pub(crate) agent_rx: flume::Receiver<Envelope>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
-    pub(crate) answer_tx: flume::Sender<String>,
+    pub(crate) answer_tx: UnboundedSender<String>,
     pub(crate) history: SharedMessages,
     pub(crate) deps: AgentDeps,
     pub(crate) queue: QueueSender,
@@ -259,7 +261,7 @@ fn spawn_agent_internal(
     deps: AgentDeps,
     reload_auth: bool,
 ) -> AgentHandles {
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (answer_tx, answer_rx) = unbounded_channel::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
     // Seeded empty because `AgentLoop::new` below publishes the real snapshot
     // synchronously, before any handle escapes.

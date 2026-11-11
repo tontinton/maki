@@ -1506,6 +1506,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::mpsc::unbounded_channel;
 
     use flume::Receiver;
     use futures::FutureExt;
@@ -2638,7 +2639,7 @@ mod tests {
         answer: PermissionAnswer,
     ) -> (ToolContext, Receiver<Envelope>) {
         let (event_tx, events) = flume::unbounded();
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (answer_tx, answer_rx) = unbounded_channel();
         answer_tx
             .send(TaggedAnswer::new(TEST_ID, answer).encode())
             .unwrap();
@@ -2792,7 +2793,7 @@ mod tests {
     #[tokio::test]
     async fn a_move_withdraws_the_ask_and_frees_the_prompt_channel() {
         let (event_tx, events) = flume::unbounded();
-        let (_answer_tx, answer_rx) = flume::unbounded::<String>();
+        let (_answer_tx, answer_rx) = unbounded_channel::<String>();
         let mut ctx = build_ctx();
         ctx.event_tx = EventSender::new(event_tx, 0);
         let channel = Arc::new(AsyncMutex::new(answer_rx));
@@ -3439,7 +3440,7 @@ mod tests {
         let mut ctx = rules_ctx(&AgentMode::Build, Vec::new());
         ctx.registry = registered(Arc::new(GuardedMock));
         let (event_tx, events) = flume::unbounded();
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (answer_tx, answer_rx) = unbounded_channel();
         ctx.event_tx = EventSender::new(event_tx, 0);
         ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(answer_rx)));
         ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);

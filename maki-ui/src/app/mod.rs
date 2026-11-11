@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::OpenSession;
 use crate::app::tasks::{BackgroundMoves, TaskOutcome, TaskStatus, count_phrase};
@@ -542,7 +543,7 @@ pub struct App {
     background_deadline: Option<Instant>,
     pub(crate) queue: MessageQueue,
     recoverable_queue: Vec<String>,
-    pub answer_tx: Option<flume::Sender<String>>,
+    pub answer_tx: Option<UnboundedSender<String>>,
     /// Bumped whenever the host opens a prompt, see [`Self::open_prompt`].
     /// The plugin windows that need input count their own, see
     /// [`Self::prompts`].
@@ -1315,7 +1316,7 @@ impl App {
             .and_then(|id| self.chat_of_task(id).ok())
             .unwrap_or(MAIN_CHAT);
         if let Some(tx) = self.answer_channel(idx) {
-            let _ = tx.try_send(answer);
+            let _ = tx.send(answer);
         }
     }
 
@@ -1324,7 +1325,7 @@ impl App {
     /// nobody to ask, so its run fails rather than park, and its caller hears.
     /// A finished chat has no run left to answer, and the turn's channel is
     /// not its to borrow.
-    fn answer_channel(&self, idx: usize) -> Option<&flume::Sender<String>> {
+    fn answer_channel(&self, idx: usize) -> Option<&UnboundedSender<String>> {
         let chat = &self.chats[idx];
         if chat.is_finished() {
             return None;
@@ -1351,7 +1352,7 @@ impl App {
             if mem::take(&mut self.chats[idx].auth_parked)
                 && let Some(tx) = self.answer_channel(idx)
             {
-                let _ = tx.try_send(String::new());
+                let _ = tx.send(String::new());
             }
         }
     }
