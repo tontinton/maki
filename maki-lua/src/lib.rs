@@ -35,7 +35,7 @@ pub use api::util::command::{
     HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit,
     LuaCommandInfo, LuaCommandReader, ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow,
     PlanMenu, PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest, TextEdit, TitlePos,
-    UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
+    UiAction, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;

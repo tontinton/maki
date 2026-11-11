@@ -1094,7 +1094,7 @@ fn register_command(
 #[lua_fn]
 async fn run_command(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] caller: PluginReach,
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
@@ -1335,7 +1335,7 @@ pub(crate) fn create_api_table(
     reach: PluginReach,
     plugin: Arc<str>,
     opts: PluginOpts,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
+    ui_action_tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     run_command__register(&t, lua, ui_action_tx, reach.clone())?;

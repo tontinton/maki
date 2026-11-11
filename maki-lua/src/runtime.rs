@@ -71,7 +71,7 @@ use crate::api::ui::{HintStore, WinStore, clear_session_hints};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
     LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
-    UiAttachment, as_plugin_load, install_ui_attachment, ui_send,
+    as_plugin_load, ui_send,
 };
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{DeadlineExpire, LuaCtx, RestoreCtx};
@@ -1948,7 +1948,7 @@ pub(crate) fn any_plugin_loaded(lua: &Lua, mut test: impl FnMut(&str) -> bool) -
 /// instead of going through `maki.notify`, because a notify handler is
 /// plugin code too. If that handler were the one stuck, every kill would
 /// call it again and freeze maki for another few seconds, forever.
-struct HostUi(Option<flume::Sender<UiAction>>);
+struct HostUi(Option<UnboundedSender<UiAction>>);
 
 fn host_flash(lua: &Lua, msg: String) {
     host_ui_send(lua, UiAction::Flash(msg));
@@ -1959,7 +1959,7 @@ fn host_ui_send(lua: &Lua, action: UiAction) {
 }
 
 /// For host code that has the VM but no `#[ctx]` sender of its own.
-pub(crate) fn host_ui(lua: &Lua) -> Option<flume::Sender<UiAction>> {
+pub(crate) fn host_ui(lua: &Lua) -> Option<UnboundedSender<UiAction>> {
     lua.app_data_ref::<HostUi>()?.0.clone()
 }
 
@@ -3595,7 +3595,7 @@ struct LuaRuntime {
     shutdown: Arc<AtomicBool>,
     bundled: BundledModules,
     codegen_queue: CodegenQueue,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
+    ui_action_tx: Option<UnboundedSender<UiAction>>,
 }
 
 impl LuaRuntime {
@@ -3605,7 +3605,7 @@ impl LuaRuntime {
         tx: UnboundedSender<Request>,
         shutdown: Arc<AtomicBool>,
         bundled_dirs: &'static [&'static Dir<'static>],
-        ui_action_tx: Option<flume::Sender<UiAction>>,
+        ui_action_tx: Option<UnboundedSender<UiAction>>,
         command_writer: LuaCommandWriter,
         keymap_writer: KeymapWriter,
         hint_writer: HintWriter,
@@ -5594,9 +5594,8 @@ pub(crate) struct LuaThread {
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
     pub input_rules_reader: InputRulesReader,
-    pub ui_action_rx: flume::Receiver<UiAction>,
+    pub ui_action_rx: Mutex<Option<UnboundedReceiver<UiAction>>>,
     pub ui_wake_rx: flume::Receiver<()>,
-    pub ui_attachment: UiAttachment,
     /// What [`load_user_source`] found on the Lua thread, for the host to
     /// report.
     pub key_lint: KeyLint,
@@ -5623,10 +5622,8 @@ pub fn spawn(
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let shutdown_thread = Arc::clone(&shutdown);
     let (init_tx, init_rx) = flume::bounded::<Result<(), PluginError>>(1);
-    let (ui_action_tx, ui_action_rx) = flume::unbounded::<UiAction>();
+    let (ui_action_tx, ui_action_rx) = unbounded_channel::<UiAction>();
     let (ui_waker, ui_wake_rx) = UiWaker::new();
-    let ui_attachment = UiAttachment::default();
-    let ui_attachment_thread = ui_attachment.clone();
     let (command_writer, command_reader) = LuaCommandWriter::new();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
@@ -5647,7 +5644,6 @@ pub fn spawn(
             // request loop has returned, so the thread stays inside the
             // runtime for its whole life.
             let _runtime = runtime.enter();
-            install_ui_attachment(ui_attachment_thread);
             let mut rt = match LuaRuntime::new(
                 registry,
                 tx_clone,
@@ -6143,9 +6139,8 @@ pub fn spawn(
         keymap_reader,
         hint_reader,
         input_rules_reader,
-        ui_action_rx,
+        ui_action_rx: Mutex::new(Some(ui_action_rx)),
         ui_wake_rx,
-        ui_attachment,
         key_lint,
     })
 }
@@ -6189,6 +6184,7 @@ mod tests {
     use futures::FutureExt;
     use maki_agent::cancel::CancelTrigger;
     use std::future::poll_fn;
+    use std::iter;
     use std::task::{Context, Poll, Wake, Waker};
     use test_case::test_case;
     use tokio::sync::Notify;
@@ -7109,7 +7105,7 @@ mod tests {
         raises: bool,
     ) {
         let lua = spawn_test_lua();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
         lua.set_app_data(HostUi(Some(ui_tx)));
         let cancel = if cancels_itself { "task:cancel()" } else { "" };
         let raise = if raises {
@@ -7124,8 +7120,7 @@ mod tests {
         run_spawned_to_idle(&lua, task).await;
 
         assert!(token.is_cancelled(), "its trigger must leave SpawnedTasks");
-        let flashes: Vec<String> = ui_rx
-            .try_iter()
+        let flashes: Vec<String> = iter::from_fn(|| ui_rx.try_recv().ok())
             .filter_map(|action| match action {
                 UiAction::Flash(msg) => Some(msg),
                 _ => None,
@@ -7359,7 +7354,7 @@ mod tests {
         envs.0
             .insert(Arc::from(STUCK_PLUGIN), lua.globals().to_pointer() as usize);
         lua.set_app_data(envs);
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
         lua.set_app_data(HostUi(Some(ui_tx)));
         let cell = TaskCell::new(
             CancelToken::none(),
@@ -8305,8 +8300,8 @@ mod tests {
     const WARNED_SUBJECT: &str = "TurnStart";
     const OTHER_SUBJECT: &str = "tool.*.input";
 
-    fn flashes(rx: &flume::Receiver<UiAction>) -> Vec<String> {
-        rx.try_iter()
+    fn flashes(rx: &mut UnboundedReceiver<UiAction>) -> Vec<String> {
+        iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|action| match action {
                 UiAction::Flash(msg) => Some(msg),
                 _ => None,
@@ -8319,7 +8314,7 @@ mod tests {
     #[test]
     fn a_permission_gap_is_shown_once_per_plugin_per_subject() {
         let lua = Lua::new();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
         lua.set_app_data(HostUi(Some(ui_tx)));
         let warn = |plugin: &str, subject: &str| {
             warn_plugin_once(&lua, plugin, subject, || format!("{plugin}/{subject}"));
@@ -8331,7 +8326,7 @@ mod tests {
         warn(SECOND_WARNED_PLUGIN, WARNED_SUBJECT);
 
         assert_eq!(
-            flashes(&ui_rx),
+            flashes(&mut ui_rx),
             [
                 format!("{WARNED_PLUGIN}/{WARNED_SUBJECT}"),
                 format!("{WARNED_PLUGIN}/{OTHER_SUBJECT}"),

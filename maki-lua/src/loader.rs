@@ -14,6 +14,7 @@ use maki_agent::{Cutter, SessionEndReason};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::{DeclAuthority, keep_granted};
 use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::time::timeout_at;
@@ -24,7 +25,7 @@ use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
 use crate::api::ui::marks::InputRulesReader;
 use crate::api::util::command::{
-    HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
+    HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
 };
 use crate::background::BackgroundTasks;
 use crate::error::PluginError;
@@ -1039,21 +1040,17 @@ impl PluginHost {
         self.inner.input_rules_reader.clone()
     }
 
-    pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
-        self.inner.ui_action_rx.clone()
+    /// The one receiver of what plugins ask of the UI, for the event loop to
+    /// own. `None` once taken. The loop closes it when it stops draining, before
+    /// teardown runs `SessionEnd`, so a handler is turned away at the send
+    /// instead of parking on a reply that never comes.
+    pub fn take_ui_action_rx(&self) -> Option<UnboundedReceiver<UiAction>> {
+        self.inner.ui_action_rx.lock().unwrap().take()
     }
 
     /// Rings when a plugin changes a window or what one shows.
     pub fn ui_wake_rx(&self) -> flume::Receiver<()> {
         self.inner.ui_wake_rx.clone()
-    }
-
-    /// The bit every `maki.ui` and `maki.fn` roundtrip consults. The event
-    /// loop attaches while it drains [`Self::ui_action_rx`] and detaches
-    /// before teardown runs `SessionEnd`, since that receiver is a clone and
-    /// dropping it would leave a handler parked on a reply that never comes.
-    pub fn ui_attachment(&self) -> UiAttachment {
-        self.inner.ui_attachment.clone()
     }
 }
 
@@ -1382,6 +1379,7 @@ mod tests {
     use crate::key_lint::{MODE_WARNING, UPGRADE_DOCS};
     use crate::plugin_permissions::{Permission, PluginReach, denied_error};
     use crate::runtime::{FALLBACK_SPENT_ERR, OUTSIDE_TASK_ERR};
+    use crate::test_support::wait_next;
     use crossterm::event::KeyCode;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, assemble};
     use maki_agent::tools::ToolRegistry;
@@ -1619,10 +1617,10 @@ mod tests {
     /// one of them registered {FIRED_COMMAND}, which is how a test on this
     /// side of the channel sees that a handler ran.
     fn assert_fired_after(host: &PluginHost, presses: usize) {
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
         for _ in 0..presses {
             while !matches!(
-                ui.recv_timeout(KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_DONE),
+                wait_next(&mut ui, KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_DONE),
                 UiAction::KeybindDone(_)
             ) {}
         }
@@ -1702,18 +1700,18 @@ mod tests {
         .unwrap();
         let reader = host.keymap_reader();
         let handle = host.event_handle();
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
         let press = |lhs| {
             let mode = reader.sync_mode(true);
             reader.dispatch(Key::parse(lhs).unwrap(), mode, None, |t| {
                 handle.run_keybind_callback(t)
             })
         };
-        let flashed_mode = || {
-            let Ok(UiAction::Flash(mode)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+        let mut flashed_mode = || {
+            let Some(UiAction::Flash(mode)) = wait_next(&mut ui, KEYBIND_TIMEOUT) else {
                 panic!("{KEYBIND_NEVER_RAN}");
             };
-            let Ok(UiAction::KeybindDone(_)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+            let Some(UiAction::KeybindDone(_)) = wait_next(&mut ui, KEYBIND_TIMEOUT) else {
                 panic!("{KEYBIND_NEVER_DONE}");
             };
             mode
@@ -1794,7 +1792,7 @@ mod tests {
         )
         .unwrap();
         let reader = host.keymap_reader();
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
         host.event_handle().run_command(
             Arc::from(VIM_PLUGIN),
             Arc::from(PARKED_COMMAND),
@@ -1803,7 +1801,7 @@ mod tests {
         );
         let parked = loop {
             if let UiAction::Input { reply_tx, .. } =
-                ui.recv_timeout(KEYBIND_TIMEOUT).expect(PARKED_NEVER_RAN)
+                wait_next(&mut ui, KEYBIND_TIMEOUT).expect(PARKED_NEVER_RAN)
             {
                 break reply_tx;
             }
@@ -1812,7 +1810,7 @@ mod tests {
         host.unload(VIM_PLUGIN).unwrap();
         parked.send(Ok(serde_json::Value::Null)).unwrap();
         while !matches!(
-            ui.recv_timeout(KEYBIND_TIMEOUT).expect(PARKED_NEVER_DONE),
+            wait_next(&mut ui, KEYBIND_TIMEOUT).expect(PARKED_NEVER_DONE),
             UiAction::Flash(said) if said == PARKED_DONE
         ) {}
 
@@ -1845,7 +1843,7 @@ mod tests {
         .unwrap();
         let reader = host.keymap_reader();
         let handle = host.event_handle();
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
 
         let mut pressed = None;
         assert!(reader.dispatch(
@@ -1865,10 +1863,10 @@ mod tests {
             }
         ));
 
-        let Ok(UiAction::Input {
+        let Some(UiAction::Input {
             req: InputRequest::Edit(edit),
             reply_tx,
-        }) = ui.recv_timeout(KEYBIND_TIMEOUT)
+        }) = wait_next(&mut ui, KEYBIND_TIMEOUT)
         else {
             panic!("{KEYBIND_NEVER_RAN}");
         };
@@ -1880,7 +1878,7 @@ mod tests {
         assert_eq!(edit.edits[0].text, TAB, "`ev.key` names the key");
         reply_tx.send(Ok(serde_json::Value::Null)).unwrap();
 
-        let Ok(UiAction::KeybindDone(done)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+        let Some(UiAction::KeybindDone(done)) = wait_next(&mut ui, KEYBIND_TIMEOUT) else {
             panic!("{KEYBIND_NEVER_DONE}");
         };
         assert_eq!(Some(done), pressed);
@@ -1913,7 +1911,7 @@ mod tests {
         .unwrap();
         let reader = host.keymap_reader();
         let handle = host.event_handle();
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
         let press = |key: Key| {
             let mut id = None;
             assert!(reader.dispatch(key, reader.sync_mode(true), None, |t| {
@@ -1923,7 +1921,7 @@ mod tests {
             }));
             id.unwrap()
         };
-        let next = || ui.recv_timeout(KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_RAN);
+        let mut next = || wait_next(&mut ui, KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_RAN);
 
         let paste = press(PASTE);
         assert!(matches!(next(), UiAction::KeybindFallback(id) if id == paste));
@@ -1995,7 +1993,9 @@ mod tests {
                     handle.run_keybind_callback(t)
                 })
         );
-        let Ok(UiAction::Flash(said)) = host.ui_action_rx().recv_timeout(KEYBIND_TIMEOUT) else {
+        let Some(UiAction::Flash(said)) =
+            wait_next(&mut host.take_ui_action_rx().unwrap(), KEYBIND_TIMEOUT)
+        else {
             panic!("{KEYBIND_NEVER_RAN}");
         };
         said
@@ -2038,7 +2038,9 @@ mod tests {
                 handle.run_keybind_callback(t)
             }
         ));
-        let Ok(UiAction::Flash(said)) = host.ui_action_rx().recv_timeout(KEYBIND_TIMEOUT) else {
+        let Some(UiAction::Flash(said)) =
+            wait_next(&mut host.take_ui_action_rx().unwrap(), KEYBIND_TIMEOUT)
+        else {
             panic!("{KEYBIND_NEVER_RAN}");
         };
         said
@@ -2980,11 +2982,11 @@ mod tests {
     #[test]
     fn a_ui_roundtrip_fails_fast_while_its_plugin_loads() {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
         host.load_source("early_ui", UI_CALLS_AT_LOAD).unwrap();
-        let next = || loop {
+        let mut next = || loop {
             if let action @ (UiAction::Flash(_) | UiAction::Builtin { .. }) =
-                ui.recv_timeout(KEYBIND_TIMEOUT).expect(UI_NEVER_HEARD)
+                wait_next(&mut ui, KEYBIND_TIMEOUT).expect(UI_NEVER_HEARD)
             {
                 break action;
             }

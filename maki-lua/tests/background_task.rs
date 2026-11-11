@@ -6,7 +6,6 @@ mod common;
 
 use std::sync::Arc;
 use std::thread;
-use tokio::sync::mpsc::unbounded_channel;
 
 use common::{Chat, Parked, WAIT, call_ctx, done_text, exec, next_task_event, request_move};
 use maki_agent::permissions::PermissionManager;
@@ -19,6 +18,8 @@ use maki_storage::id::MakiId;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::unbounded_channel;
 
 const PLUGIN: &str = "background_task_test";
 const GUARDED_PLUGIN: &str = "guarded_tool_test";
@@ -107,13 +108,12 @@ maki.api.register_tool({
 struct Host {
     reg: Arc<ToolRegistry>,
     host: PluginHost,
-    ui: flume::Receiver<UiAction>,
+    ui: UnboundedReceiver<UiAction>,
 }
 
 impl Host {
     fn attached(reg: Arc<ToolRegistry>, host: PluginHost) -> Self {
-        host.ui_attachment().attach();
-        let ui = host.ui_action_rx();
+        let ui = host.take_ui_action_rx().unwrap();
         Self { reg, host, ui }
     }
 
@@ -151,15 +151,15 @@ impl Host {
     }
 
     /// The final reply of the moved call, as its task tab gets it.
-    fn task_done(&self) -> ToolDoneEvent {
+    fn task_done(&mut self) -> ToolDoneEvent {
         self.task_dones(&[CALL_ID]).remove(0)
     }
 
     /// The final replies of {ids}, in that order, whichever ends first.
-    fn task_dones(&self, ids: &[&str]) -> Vec<ToolDoneEvent> {
+    fn task_dones(&mut self, ids: &[&str]) -> Vec<ToolDoneEvent> {
         let mut found: Vec<Option<ToolDoneEvent>> = ids.iter().map(|_| None).collect();
         while found.iter().any(Option::is_none) {
-            let envelope = next_task_event(&self.ui);
+            let envelope = next_task_event(&mut self.ui);
             if let (AgentEvent::ToolDone(done), None) = (envelope.event, envelope.subagent)
                 && let Some(slot) = ids.iter().position(|id| *id == done.id)
             {
@@ -170,9 +170,9 @@ impl Host {
     }
 
     /// Waits for the moved subagent to ask the user, failing if it ends first.
-    fn wait_permission_request(&self) {
+    fn wait_permission_request(&mut self) {
         loop {
-            let envelope = next_task_event(&self.ui);
+            let envelope = next_task_event(&mut self.ui);
             match (envelope.event, envelope.subagent) {
                 (AgentEvent::PermissionRequest { .. }, _) => return,
                 (AgentEvent::ToolDone(done), None) if done.id == CALL_ID => {
@@ -231,7 +231,7 @@ fn assert_refused(host: &Host, chat: MakiId, id: &str) {
 /// all means the call did not wait for its subagent.
 #[test]
 fn a_background_task_returns_a_receipt_and_its_reply_arrives_as_the_notice() {
-    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
     let chat = Chat::live();
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
@@ -259,7 +259,7 @@ fn a_background_task_returns_a_receipt_and_its_reply_arrives_as_the_notice() {
 /// the model's turn. The second task keeps waiting in the background.
 #[test]
 fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
-    let host = Host::task_with_slots(Arc::new(ToolRegistry::new()), 1);
+    let mut host = Host::task_with_slots(Arc::new(ToolRegistry::new()), 1);
     let chat = Chat::live();
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
@@ -302,7 +302,7 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
 #[test]
 fn a_background_subagent_asks_for_permission_instead_of_being_denied() {
     let reg = Arc::clone(ToolRegistry::global_arc());
-    let host = Host::task(Arc::clone(&reg));
+    let mut host = Host::task(Arc::clone(&reg));
     host.host.load_source(GUARDED_PLUGIN, GUARDED_SRC).unwrap();
     let chat = Chat::live();
     let parked = Parked::with_first_turn(
@@ -339,7 +339,7 @@ fn a_background_subagent_asks_for_permission_instead_of_being_denied() {
 #[test_case(true ; "with_agent_it_moves")]
 #[test_case(false ; "without_agent_it_stays")]
 fn ctx_background_needs_the_agent_permission(agent: bool) {
-    let host = Host::mover(agent);
+    let mut host = Host::mover(agent);
     let chat = Chat::live();
     let (_run, run_token) = CancelToken::new();
     let (ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
@@ -440,7 +440,7 @@ fn ctx_background_without_a_seed_names_the_cause(session_up: bool, reason: &str)
 /// message as an interrupt from its parent once its current turn ends.
 #[test]
 fn a_message_reaches_a_running_background_task_at_its_next_turn() {
-    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
     let chat = Chat::live();
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
@@ -475,7 +475,7 @@ fn a_message_reaches_a_running_background_task_at_its_next_turn() {
 /// prompt.
 #[test]
 fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
-    let host = Host::task_with_slots(Arc::new(ToolRegistry::new()), 1);
+    let mut host = Host::task_with_slots(Arc::new(ToolRegistry::new()), 1);
     let chat = Chat::live();
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
@@ -504,7 +504,7 @@ fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
 /// and the same prompt goes on with the message.
 #[test]
 fn an_interrupt_cuts_a_background_tasks_turn_and_it_goes_on() {
-    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
     let chat = Chat::live();
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
@@ -534,7 +534,7 @@ fn an_interrupt_cuts_a_background_tasks_turn_and_it_goes_on() {
 /// queue for a prompt that is already unwinding.
 #[test]
 fn a_message_is_refused_by_a_task_the_user_just_stopped() {
-    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
     let chat = Chat::live();
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
@@ -575,7 +575,7 @@ fn a_message_is_refused_by_tasks_the_caller_cannot_reach() {
 /// `task_message` is not offered.
 #[test]
 fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports() {
-    let host = Host::task_with_opts(Arc::new(ToolRegistry::new()), false, DEFAULT_SLOTS);
+    let mut host = Host::task_with_opts(Arc::new(ToolRegistry::new()), false, DEFAULT_SLOTS);
     assert!(host.reg.get(MESSAGE_TOOL).is_none());
     let chat = Chat::live();
     let parked = Parked::new(RESULT);

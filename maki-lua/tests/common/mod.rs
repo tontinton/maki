@@ -137,10 +137,10 @@ pub fn request_move(handle: &EventHandle, call_id: &str) -> MoveOutcome {
 }
 
 /// The next event a task tab was sent.
-pub fn next_task_event(ui: &flume::Receiver<UiAction>) -> Envelope {
+pub fn next_task_event(ui: &mut UnboundedReceiver<UiAction>) -> Envelope {
     loop {
         if let UiAction::PluginTaskEvent { envelope, .. } =
-            ui.recv_timeout(WAIT).expect("task tab event")
+            wait_next(ui, WAIT).expect("task tab event")
         {
             return *envelope;
         }
@@ -148,7 +148,7 @@ pub fn next_task_event(ui: &flume::Receiver<UiAction>) -> Envelope {
 }
 
 /// The next final reply a task tab got, of a moved call or of a subagent's.
-pub fn next_task_done(ui: &flume::Receiver<UiAction>) -> ToolDoneEvent {
+pub fn next_task_done(ui: &mut UnboundedReceiver<UiAction>) -> ToolDoneEvent {
     loop {
         if let AgentEvent::ToolDone(done) = next_task_event(ui).event {
             return *done;

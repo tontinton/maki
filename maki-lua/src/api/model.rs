@@ -7,6 +7,7 @@ use std::fmt::Display;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{Model, ModelTier, model_registry};
 use mlua::{Error as LuaError, Lua, Result as LuaResult, Table, Value};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::TableExt;
@@ -23,7 +24,7 @@ pub(crate) fn stale_tier_err(tier: ModelTier, spec: &str, cause: impl Display) -
 
 async fn roundtrip(
     lua: Lua,
-    tx: Option<flume::Sender<UiAction>>,
+    tx: Option<UnboundedSender<UiAction>>,
     req: ModelRequest,
 ) -> LuaResult<Pair<Value>> {
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Model {
@@ -175,7 +176,7 @@ async fn tier(lua: Lua, name: String, provider: Option<String>) -> LuaResult<Pai
 ///   print(option.name, option.tokens, option.sends)
 /// end
 #[lua_fn]
-async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn get(lua: Lua, #[ctx] tx: Option<UnboundedSender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, ModelRequest::Get).await
 }
 
@@ -187,7 +188,10 @@ async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<
 /// @example
 /// local specs = maki.model.available()
 #[lua_fn]
-async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn available(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, ModelRequest::Available).await
 }
 
@@ -208,7 +212,7 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 #[lua_fn(guard = SessionSettings)]
 async fn set(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Value,
 ) -> LuaResult<Pair<Value>> {
     let req = match opts {
@@ -238,7 +242,7 @@ lua_table! {
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
     "maki.model" => pub(crate) fn create_model_table(
-        tx: Option<flume::Sender<UiAction>>,
+        tx: Option<UnboundedSender<UiAction>>,
         perms: &PluginPermissions,
     ),
     DOCS [get(tx), available(tx), set(perms, tx), tier(), info()]
@@ -254,6 +258,8 @@ mod tests {
     use serde_json::{Value as Json, json};
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const SPEC: &str = "anthropic/claude-opus-4-6";
     const THINKING: &str = "high";
@@ -275,7 +281,7 @@ mod tests {
         model_registry::unset_and_persist(&spec, tier, &storage);
     }
 
-    fn lua_with_model(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn lua_with_model(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         let lua = Lua::new();
         let t = create_model_table(&lua, tx, &PluginPermissions::trusted()).unwrap();
         lua.globals().set("model", t).unwrap();
@@ -284,7 +290,7 @@ mod tests {
 
     /// The receiver is dropped up front, so the request cannot even leave.
     fn closed_ui() -> Lua {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, rx) = unbounded_channel::<UiAction>();
         drop(rx);
         lua_with_model(Some(tx))
     }
@@ -292,9 +298,9 @@ mod tests {
     /// Answering `None` drops the reply channel, like a UI that took the
     /// request and then vanished.
     fn stub_ui(answer: fn(ModelRequest) -> Option<UiReply>) -> Lua {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         std::thread::spawn(move || {
-            while let Ok(UiAction::Model { req, reply_tx }) = rx.recv() {
+            while let Some(UiAction::Model { req, reply_tx }) = rx.blocking_recv() {
                 if let Some(reply) = answer(req) {
                     let _ = reply_tx.send(reply);
                 }

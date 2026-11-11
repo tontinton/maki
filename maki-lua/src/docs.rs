@@ -115,6 +115,7 @@ mod tests {
     use std::sync::Arc;
 
     use mlua::{Lua, Table, Value};
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::{DocKind, api_docs};
     use crate::api::{Owner, create_maki_global};
@@ -152,7 +153,7 @@ mod tests {
     #[test]
     fn docs_match_registered_api() {
         let lua = Lua::new();
-        let (ui_tx, _ui_rx) = flume::unbounded();
+        let (ui_tx, _ui_rx) = unbounded_channel();
         let maki = create_maki_global(
             &lua,
             Arc::default(),

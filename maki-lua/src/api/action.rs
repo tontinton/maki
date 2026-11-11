@@ -4,6 +4,7 @@ use std::sync::Arc;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table};
 use strum::VariantNames;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::keymap::KeymapWriter;
 use crate::api::slot::parse_capability;
@@ -123,7 +124,7 @@ fn action_prefix(plugin: &str) -> Option<&str> {
 /// [`Ceiling`]: crate::plugin_permissions::Ceiling
 pub(crate) async fn run_plugin_action(
     lua: &Lua,
-    tx: Option<&flume::Sender<UiAction>>,
+    tx: Option<&UnboundedSender<UiAction>>,
     name: &str,
     plugin: &str,
     caller: &PluginReach,

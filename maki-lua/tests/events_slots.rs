@@ -1,7 +1,10 @@
+use maki_lua::test_support::wait_next;
 use std::cell::Cell;
 use std::future::Future;
+use std::iter;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use maki_agent::AgentMode;
 use maki_agent::agent::{AgentCall, AgentSlot};
@@ -116,14 +119,14 @@ fn sorted_keys<'a>(keys: impl Iterator<Item = &'a &'static str>) -> String {
 
 /// Everything flashed up to the first sentinel. Dispatch is sequential on the
 /// Lua thread, so whatever the events before it caused is already in.
-fn flashes_until_sentinel(ui: &flume::Receiver<UiAction>) -> Vec<String> {
+fn flashes_until_sentinel(ui: &mut UnboundedReceiver<UiAction>) -> Vec<String> {
     let mut out = Vec::new();
     loop {
-        match ui.recv_timeout(DISPATCH_TIMEOUT) {
-            Ok(UiAction::Flash(msg)) if msg == SENTINEL_FLASH => return out,
-            Ok(UiAction::Flash(msg)) => out.push(msg),
-            Ok(_) => {}
-            Err(e) => panic!("sentinel never flashed: {e}, got {out:?}"),
+        match wait_next(ui, DISPATCH_TIMEOUT) {
+            Some(UiAction::Flash(msg)) if msg == SENTINEL_FLASH => return out,
+            Some(UiAction::Flash(msg)) => out.push(msg),
+            Some(_) => {}
+            None => panic!("sentinel never flashed, got {out:?}"),
         }
     }
 }
@@ -137,7 +140,7 @@ fn flashes_until_sentinel(ui: &flume::Receiver<UiAction>) -> Vec<String> {
 fn content_fields_are_left_out_without_session_read(event: &str) {
     let fields = host_event_fields(event).expect("a content event is classified");
     let (_reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     load(&host, CONTENT_READER, &key_reporter(CONTENT_READER, event));
     load_granted(
         &host,
@@ -164,7 +167,7 @@ fn content_fields_are_left_out_without_session_read(event: &str) {
     let metadata = format!("{CONTENT_BLIND}:{}", sorted_keys(fields.metadata.iter()));
     let warning = content_omitted_message(CONTENT_BLIND, event, fields.content);
     assert_eq!(
-        flashes_until_sentinel(&ui),
+        flashes_until_sentinel(&mut ui),
         [
             everything.clone(),
             warning,
@@ -192,7 +195,7 @@ const CUSTOM_EVENT: &str = "MyPluginEvent";
 #[test_case(CUSTOM_EVENT, true ; "a_plugin_event_arrives_whole")]
 fn only_classified_metadata_reaches_a_plugin_without_session_read(event: &str, whole: bool) {
     let (_reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     load_granted(
         &host,
         CONTENT_BLIND,
@@ -218,7 +221,7 @@ fn only_classified_metadata_reaches_a_plugin_without_session_read(event: &str, w
             format!("{CONTENT_BLIND}:{SESSION_ID_KEY}"),
         ]
     };
-    assert_eq!(flashes_until_sentinel(&ui), expected);
+    assert_eq!(flashes_until_sentinel(&mut ui), expected);
 }
 
 const KEY_FIRER: &str = "key_firer";
@@ -250,7 +253,7 @@ maki.api.create_autocmd("{SENTINEL_EVENT}", {{
 fn a_key_that_cannot_be_named_does_not_drop_the_event() {
     let event = "TurnEnd";
     let (_reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     load(&host, CONTENT_READER, &key_counter(CONTENT_READER, event));
     load_granted(
         &host,
@@ -271,7 +274,7 @@ maki.api.exec_autocmds("{SENTINEL_EVENT}")
     );
 
     assert_eq!(
-        flashes_until_sentinel(&ui),
+        flashes_until_sentinel(&mut ui),
         [
             format!("{CONTENT_READER}:2"),
             content_omitted_message(CONTENT_BLIND, event, &[UNNAMEABLE_KEY]),
@@ -933,7 +936,7 @@ fn an_output_layer_pays_for_the_content_it_changes(granted: fn() -> PluginPermis
 #[test]
 fn a_skipped_layer_warns_once_per_gap() {
     let (reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     guarded_tool(&host);
     let slot = format!("tool.{GUARDED_TOOL}.{}", HookStage::Output.as_str());
 
@@ -954,7 +957,7 @@ fn a_skipped_layer_warns_once_per_gap() {
     assert_eq!(output(&reg, GUARDED_TOOL, "secret", false), None);
 
     let both = [Permission::SessionRead, Permission::SessionWrite];
-    let about_the_slot: Vec<String> = flashes(&ui)
+    let about_the_slot: Vec<String> = flashes(&mut ui)
         .into_iter()
         .filter(|msg| msg.contains(&slot))
         .collect();
@@ -967,8 +970,8 @@ fn a_skipped_layer_warns_once_per_gap() {
     );
 }
 
-fn flashes(ui: &flume::Receiver<UiAction>) -> Vec<String> {
-    ui.try_iter()
+fn flashes(ui: &mut UnboundedReceiver<UiAction>) -> Vec<String> {
+    iter::from_fn(|| ui.try_recv().ok())
         .filter_map(|action| match action {
             UiAction::Flash(msg) => Some(msg),
             _ => None,

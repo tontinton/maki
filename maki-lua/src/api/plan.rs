@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::util::command::{
     PlanFormRow, PlanRequest, PlanRowAction, UiAction, ui_json_roundtrip,
@@ -408,7 +409,7 @@ pub(crate) fn row_handler_opts(
 #[lua_fn(guard = SessionRead)]
 async fn read(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
     let session = match opts {
@@ -474,7 +475,7 @@ lua_table! {
     /// end)
     /// ```
     "maki.plan" => pub(crate) fn create_plan_table(
-        tx: Option<flume::Sender<UiAction>>,
+        tx: Option<UnboundedSender<UiAction>>,
         perms: &PluginPermissions,
     ),
     DOCS [read(perms, tx)]
@@ -483,6 +484,7 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::api::util::command::NO_UI_ERR;
@@ -840,11 +842,11 @@ mod tests {
     #[tokio::test]
     async fn the_session_option_travels_to_the_ui(call: &str, expected: Option<&str>) {
         let lua = Lua::new();
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let table = create_plan_table(&lua, Some(tx), &PluginPermissions::trusted()).unwrap();
         lua.globals().set("plan", table).unwrap();
         let served = std::thread::spawn(move || {
-            let Ok(UiAction::Plan { req, reply_tx }) = rx.recv() else {
+            let Some(UiAction::Plan { req, reply_tx }) = rx.blocking_recv() else {
                 panic!("expected a Plan UiAction");
             };
             reply_tx.send(Ok(serde_json::json!(true))).unwrap();

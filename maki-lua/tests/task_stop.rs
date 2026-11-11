@@ -4,10 +4,12 @@
 
 mod common;
 
+use maki_lua::test_support::wait_next;
 use std::collections::HashMap;
 use std::iter;
 use std::sync::Arc;
 use std::thread;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use common::{
     Chat as LiveChat, WAIT, call_ctx, done_result, exec, next_task_done, request_move, wait_movable,
@@ -134,7 +136,7 @@ fn park_and_move(
     honor_cancel: bool,
 ) {
     let (ctx, mut events) = call_ctx(reg, chat.id, &chat.run, id);
-    let (receipt_tx, receipt_rx) = flume::bounded(1);
+    let (receipt_tx, mut receipt_rx) = unbounded_channel();
     let reg = Arc::clone(reg);
     thread::spawn(move || {
         let input = json!({ "honor_cancel": honor_cancel });
@@ -144,14 +146,14 @@ fn park_and_move(
     wait_movable(&mut events, id);
     assert_eq!(request_move(&host.event_handle(), id), MoveOutcome::Moved);
 
-    let receipt = receipt_rx.recv_timeout(WAIT).unwrap();
+    let receipt = wait_next(&mut receipt_rx, WAIT).unwrap();
     assert!(receipt.backgrounded);
     assert!(done_result(&receipt).unwrap().contains(RECEIPT));
 }
 
 /// The chat's notice for a task that ended on its own. The host sends it
 /// before the task tab's final reply, so that reply is the signal to look.
-fn next_notice(chat: &Chat, ui: &flume::Receiver<UiAction>) -> (String, bool) {
+fn next_notice(chat: &Chat, ui: &mut UnboundedReceiver<UiAction>) -> (String, bool) {
     next_task_done(ui);
     let mut woken = chat.mailbox.claim_wake();
     let woke = !woken.is_empty();
@@ -197,14 +199,13 @@ fn a_stopped_calls_output_passes_its_output_layers() {
 #[test]
 fn a_user_stop_reaches_the_cancel_hook_as_a_cancel() {
     let (reg, host) = host();
-    host.ui_attachment().attach();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     let chat = chat();
     park_and_move(&reg, &host, &chat, FIRST_ID, true);
 
     host.event_handle().cancel_plugin_session(FIRST_ID);
 
-    let (notice, _) = next_notice(&chat, &ui);
+    let (notice, _) = next_notice(&chat, &mut ui);
     assert!(
         notice.contains(&format!("{PARTIAL_OUTPUT}: {CANCELLED_REASON}")),
         "{notice}"
@@ -214,15 +215,14 @@ fn a_user_stop_reaches_the_cancel_hook_as_a_cancel() {
 #[test]
 fn a_stop_that_times_out_still_delivers_the_late_result_quietly() {
     let (reg, host) = host();
-    host.ui_attachment().attach();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     let chat = chat();
     park_and_move(&reg, &host, &chat, FIRST_ID, false);
 
     let output = stop(&reg, &chat, FIRST_ID).unwrap();
     assert!(output.contains(STOP_REQUESTED_FRAGMENT), "{output}");
 
-    let (notice, woke) = next_notice(&chat, &ui);
+    let (notice, woke) = next_notice(&chat, &mut ui);
     assert!(notice.contains(PARK_TOOL), "{notice}");
     assert!(notice.contains(FIRST_ID), "{notice}");
     assert!(!woke, "a stopped task must not wake the chat");

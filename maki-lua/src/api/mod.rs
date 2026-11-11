@@ -33,6 +33,7 @@ pub(crate) mod yaml;
 use std::sync::Arc;
 
 use mlua::{Lua, Result as LuaResult, Table, Value};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::options::PluginOpts;
 use crate::api::tool::{PendingRules, PendingTools};
@@ -56,7 +57,7 @@ pub(crate) fn create_maki_global(
     pending: PendingTools,
     pending_rules: PendingRules,
     owner: Owner,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
+    ui_action_tx: Option<UnboundedSender<UiAction>>,
     reach: &PluginReach,
     opts: PluginOpts,
 ) -> LuaResult<Table> {

@@ -1,5 +1,6 @@
 mod common;
 
+use maki_lua::test_support::wait_next;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -4542,13 +4543,11 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
         "#,
     )
     .unwrap();
-    let rx = host.ui_action_rx();
+    let mut rx = host.take_ui_action_rx().unwrap();
     host.event_handle()
         .run_command(Arc::from("p"), Arc::from("/echo"), args.into(), 0);
 
-    let action = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("command handler did not run");
+    let action = wait_next(&mut rx, Duration::from_secs(5)).expect("command handler did not run");
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
 
@@ -4585,7 +4584,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
             .reach
             .is_allowed(maki_lua::Permission::Agent)
     );
-    let rx = host.ui_action_rx();
+    let mut rx = host.take_ui_action_rx().unwrap();
     host.event_handle()
         .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
 
@@ -4594,9 +4593,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         depth,
         caller,
         reply_tx,
-    } = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect(RUN_COMMAND_NO_ACTION)
+    } = wait_next(&mut rx, Duration::from_secs(5)).expect(RUN_COMMAND_NO_ACTION)
     else {
         panic!("{RUN_COMMAND_NO_ACTION}");
     };
@@ -4604,9 +4601,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
     assert!(!caller.is_allowed(maki_lua::Permission::Agent));
     reply_tx.send(reply).unwrap();
 
-    let action = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect(RUN_COMMAND_NO_ACTION);
+    let action = wait_next(&mut rx, Duration::from_secs(5)).expect(RUN_COMMAND_NO_ACTION);
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
 #[test_case::test_case(
@@ -7047,12 +7042,11 @@ fn async_run_from_parked_command_handler_runs_promptly() {
         "#,
     )
     .unwrap();
-    let rx = host.ui_action_rx();
+    let mut rx = host.take_ui_action_rx().unwrap();
     let handle = host.event_handle();
     handle.run_command(Arc::from("p"), Arc::from("/park"), String::new(), 0);
 
-    let action = rx
-        .recv_timeout(Duration::from_secs(5))
+    let action = wait_next(&mut rx, Duration::from_secs(5))
         .expect("async.run task starved while its command handler was parked");
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "task-ran"));
 }
@@ -7078,12 +7072,11 @@ fn job_callbacks_fire_while_command_handler_parked() {
         "#,
     )
     .unwrap();
-    let rx = host.ui_action_rx();
+    let mut rx = host.take_ui_action_rx().unwrap();
     let handle = host.event_handle();
     handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new(), 0);
 
-    let action = rx
-        .recv_timeout(Duration::from_secs(5))
+    let action = wait_next(&mut rx, Duration::from_secs(5))
         .expect("job callbacks starved while command handler was parked");
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "job:hi"));
 }
@@ -8150,10 +8143,10 @@ impl Provider for TurnThenPark {
 /// What this chat session's task tabs were sent since the last drain. The
 /// notice that opens a tab carries no event, so it is skipped.
 fn task_events(
-    ui: &flume::Receiver<maki_lua::UiAction>,
+    ui: &mut UnboundedReceiver<maki_lua::UiAction>,
     session: MakiId,
 ) -> impl Iterator<Item = AgentEvent> {
-    ui.drain().filter_map(move |action| match action {
+    iter::from_fn(|| ui.try_recv().ok()).filter_map(move |action| match action {
         maki_lua::UiAction::PluginTaskEvent {
             session: owner,
             envelope,
@@ -8166,7 +8159,7 @@ fn task_events(
 
 /// The paid turns the tab was told about, in order.
 fn billed_turns(
-    ui: &flume::Receiver<maki_lua::UiAction>,
+    ui: &mut UnboundedReceiver<maki_lua::UiAction>,
     session: MakiId,
 ) -> Vec<TurnCompleteEvent> {
     task_events(ui, session)
@@ -8181,13 +8174,12 @@ fn billed_turns(
 /// so the provider being asked for the next turn says nothing about whether
 /// the tab heard of the last one yet.
 fn await_billed_turn(
-    ui: &flume::Receiver<maki_lua::UiAction>,
+    ui: &mut UnboundedReceiver<maki_lua::UiAction>,
     session: MakiId,
 ) -> TurnCompleteEvent {
     let deadline = Instant::now() + CANCEL_TEST_TIMEOUT;
     loop {
-        let action = ui
-            .recv_deadline(deadline)
+        let action = wait_next(ui, deadline.saturating_duration_since(Instant::now()))
             .expect("the paid turn must reach the tab while the prompt still runs");
         match action {
             maki_lua::UiAction::PluginTaskEvent {
@@ -8207,7 +8199,7 @@ fn await_billed_turn(
 
 /// The transcript the tab was last handed for task `id`.
 fn handed_over_history(
-    ui: &flume::Receiver<maki_lua::UiAction>,
+    ui: &mut UnboundedReceiver<maki_lua::UiAction>,
     session: MakiId,
     id: &str,
 ) -> Option<Vec<Message>> {
@@ -8236,7 +8228,7 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     let mailbox = SessionMailbox::register(session);
     let seed = mailbox.publish_seed(stub_seed(session));
     let parked = TurnThenPark::install(&seed);
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     host.load_source(
         BACKGROUND_PLUGIN,
         &background_monitor_src(&session.to_string()),
@@ -8251,9 +8243,9 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     parked
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("the prompt must reach its second turn");
-    let turn = await_billed_turn(&ui, session);
+    let turn = await_billed_turn(&mut ui, session);
     assert!(
-        billed_turns(&ui, session).is_empty(),
+        billed_turns(&mut ui, session).is_empty(),
         "one paid turn must reach the tab once"
     );
     assert_eq!(turn.usage.input, PAID_TURN_INPUT);
@@ -8276,7 +8268,7 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
         listed_cost
     );
     assert!(
-        billed_turns(&ui, session).is_empty(),
+        billed_turns(&mut ui, session).is_empty(),
         "the cancel must not bill the turn again"
     );
 }
@@ -8294,7 +8286,7 @@ fn stopping_a_plugin_task_from_the_tab_ends_its_prompt_as_stopped_by_user() {
     let mailbox = SessionMailbox::register(session);
     let seed = mailbox.publish_seed(stub_seed(session));
     let parked = TurnThenPark::install(&seed);
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     host.load_source(
         BACKGROUND_PLUGIN,
         &background_monitor_src(&session.to_string()),
@@ -8316,7 +8308,7 @@ fn stopping_a_plugin_task_from_the_tab_ends_its_prompt_as_stopped_by_user() {
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("the stopped prompt must settle");
     assert_eq!(ended, Ok(STOPPED_BY_USER_ERR.to_owned()));
-    let history = handed_over_history(&ui, session, &id)
+    let history = handed_over_history(&mut ui, session, &id)
         .expect("the stopped prompt must hand its transcript to the tab");
     assert!(
         history.iter().any(|m| matches!(m.role, Role::Assistant)),
@@ -8338,7 +8330,7 @@ fn opening_a_background_session_shows_its_task_before_any_prompt() {
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
     let _seed = mailbox.publish_seed(stub_seed(session));
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     host.load_source(
         BACKGROUND_PLUGIN,
         &background_monitor_src(&session.to_string()),
@@ -8349,7 +8341,7 @@ fn opening_a_background_session_shows_its_task_before_any_prompt() {
         "nil"
     );
     let id = exec_tool(&reg, "background_id", json!({})).unwrap();
-    let opened: Vec<_> = ui.drain().collect();
+    let opened: Vec<_> = iter::from_fn(|| ui.try_recv().ok()).collect();
     let [
         maki_lua::UiAction::PluginTaskOpened {
             session: owner,
@@ -8377,7 +8369,7 @@ fn a_retired_background_session_refuses_later_prompts() {
     let mailbox = SessionMailbox::register(session);
     let seed = mailbox.publish_seed(stub_seed(session));
     let parked = TurnThenPark::install(&seed);
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     host.load_source(
         BACKGROUND_PLUGIN,
         &background_monitor_src(&session.to_string()),
@@ -8393,7 +8385,7 @@ fn a_retired_background_session_refuses_later_prompts() {
         .expect("a retired session must reject its next prompt");
     assert_eq!(reply, Ok(CANCELLED_MSG.to_owned()));
     assert!(parked.try_recv().is_err());
-    assert_eq!(task_events(&ui, session).count(), 0);
+    assert_eq!(task_events(&mut ui, session).count(), 0);
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
@@ -9016,6 +9008,7 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
 /// the tab the user is looking at.
 mod session_owned_ui {
     use super::*;
+    use maki_lua::test_support::wait_next;
 
     const PLUGIN: &str = "owned_ui";
     const OPEN_TOOL: &str = "open_owned";
@@ -9086,10 +9079,10 @@ mod session_owned_ui {
 
     /// Waits, since a `maki.async.run` window opens after the call returns.
     fn opened_in(host: &PluginHost) -> Option<MakiId> {
-        let rx = host.ui_action_rx();
+        let mut rx = host.take_ui_action_rx().unwrap();
         loop {
             if let maki_lua::UiAction::OpenWin { session, .. } =
-                rx.recv_timeout(OPEN_WIN_TIMEOUT).expect(NO_OPEN_WIN)
+                wait_next(&mut rx, OPEN_WIN_TIMEOUT).expect(NO_OPEN_WIN)
             {
                 return session;
             }

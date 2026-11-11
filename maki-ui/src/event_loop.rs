@@ -39,7 +39,7 @@ use maki_lua::session_snapshot::{
 use maki_lua::{
     EventHandle, HintReader, InputMode, InputRequest, InputRulesReader, Key, KeymapReader,
     LuaCommandReader, ModelRequest, PackCommand, PackPreparation, PlanRequest, SessionEndReason,
-    SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply, WinEvent,
+    SessionRequest, TaskRequest, UiAction, UiReply, WinEvent,
 };
 use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
@@ -136,9 +136,8 @@ pub struct EventLoopParams {
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
     pub input_rules_reader: InputRulesReader,
-    pub ui_action_rx: flume::Receiver<UiAction>,
+    pub ui_action_rx: UnboundedReceiver<UiAction>,
     pub ui_wake_rx: flume::Receiver<()>,
-    pub ui_attachment: UiAttachment,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
     pub project_config: ProjectConfig,
@@ -563,9 +562,8 @@ pub(crate) struct EventLoop<'t> {
     warn_rx: UnboundedReceiver<String>,
     warn_tx: UnboundedSender<String>,
     models_fetched: Arc<Notify>,
-    ui_action_rx: flume::Receiver<UiAction>,
+    ui_action_rx: UnboundedReceiver<UiAction>,
     ui_wake_rx: flume::Receiver<()>,
-    ui_attachment: UiAttachment,
     /// One package command at a time. The work runs as its own task, so a
     /// second `/packupdate` would otherwise race the first over the same clones
     /// and locks.
@@ -730,7 +728,6 @@ impl<'t> EventLoop<'t> {
             input_rules_reader,
             ui_action_rx,
             ui_wake_rx,
-            ui_attachment,
             lua_event_handle,
             model_policy,
             project_config,
@@ -738,10 +735,6 @@ impl<'t> EventLoop<'t> {
             handed_over,
             host_prompt,
         } = params;
-        // A `/reload` generation inherits the handles of the one before it,
-        // so every loop has to claim the UI back for itself.
-        ui_attachment.attach();
-
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme. Only the
         // in-memory name is set, so the user's saved pick survives.
@@ -862,7 +855,6 @@ impl<'t> EventLoop<'t> {
             models_fetched: bg.models_fetched,
             ui_action_rx,
             ui_wake_rx,
-            ui_attachment,
             pack: None,
             _model_fetch_task: bg.task,
         })
@@ -979,7 +971,7 @@ impl<'t> EventLoop<'t> {
         tokio::select! {
             biased;
             event = self.input.next() => event.map_or(Wake::InputGone, Wake::Input),
-            action = recv_or_pending(&self.ui_action_rx) => Wake::Ui(action),
+            action = next_or_pending(&mut self.ui_action_rx) => Wake::Ui(action),
             () = recv_or_pending(&self.ui_wake_rx) => Wake::PluginWindow,
             () = recv_or_pending(decor_worker::wakes()) => Wake::Decor,
             Some(warning) = self.warn_rx.recv() => Wake::Warn(warning),
@@ -2260,12 +2252,11 @@ impl<'t> EventLoop<'t> {
         if !self.sessions[self.focused].app.exits_on_done() {
             self.clear_program_status();
         }
-        // The loop already stopped draining `UiAction`, so say so before the
-        // handlers run. Dropping the receiver does not, since the Lua runtime
-        // holds one of its own, and a handler touching the UI would then park
-        // until the shared deadline, taking every later tab's `SessionEnd`
-        // down with it.
-        self.ui_attachment.detach();
+        // The loop already stopped draining `UiAction`, so close the channel
+        // before the handlers run. The receiver lives until this returns, and
+        // a handler touching the UI would otherwise park until the shared
+        // deadline, taking every later tab's `SessionEnd` down with it.
+        self.ui_action_rx.close();
         // `/reload` hands these same sessions to the next generation, so
         // their handlers must not hear that the process is quitting.
         let reason = match exit {

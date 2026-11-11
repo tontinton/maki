@@ -278,7 +278,7 @@ enum Upstream {
     Chat {
         session: MakiId,
         plugin: Arc<str>,
-        ui: Option<flume::Sender<UiAction>>,
+        ui: Option<UnboundedSender<UiAction>>,
         registry: BackgroundTasks,
         id: String,
     },
@@ -288,7 +288,7 @@ enum Upstream {
 #[derive(Clone)]
 struct Adoption {
     call: Arc<CallScope>,
-    ui: Option<flume::Sender<UiAction>>,
+    ui: Option<UnboundedSender<UiAction>>,
     registry: BackgroundTasks,
     /// The session's `ui_id`.
     id: String,
@@ -318,7 +318,7 @@ impl Adoption {
 /// look dead once the turn that started it ends.
 pub(crate) fn adopt_session(
     registry: &BackgroundTasks,
-    ui: Option<&flume::Sender<UiAction>>,
+    ui: Option<&UnboundedSender<UiAction>>,
     home: &TaskHome,
     stub: SessionStub,
 ) {
@@ -349,7 +349,7 @@ pub(crate) fn adopt_session(
         return;
     }
     if let (Some(ui), Some(info)) = (ui, stub.info.get()) {
-        let _ = ui.try_send(UiAction::PluginTaskOpened {
+        let _ = ui.send(UiAction::PluginTaskOpened {
             session: home.chat,
             plugin: stub.plugin,
             info: Box::new(info.clone()),
@@ -369,7 +369,7 @@ impl Upstream {
                 ui: Some(ui),
                 ..
             } => {
-                let _ = ui.try_send(UiAction::PluginTaskEvent {
+                let _ = ui.send(UiAction::PluginTaskEvent {
                     session: *session,
                     plugin: Arc::clone(plugin),
                     envelope: Box::new(envelope),
@@ -429,7 +429,7 @@ impl Upstream {
             ..
         } = self
         {
-            let _ = ui.try_send(UiAction::PluginTaskOpened {
+            let _ = ui.send(UiAction::PluginTaskOpened {
                 session: *session,
                 plugin: Arc::clone(plugin),
                 info: Box::new(info),
@@ -2989,7 +2989,7 @@ mod tests {
         (upstream, parent_rx)
     }
 
-    fn chat_upstream(session: MakiId, ui_tx: Sender<UiAction>) -> Upstream {
+    fn chat_upstream(session: MakiId, ui_tx: UnboundedSender<UiAction>) -> Upstream {
         Upstream::Chat {
             session,
             plugin: Arc::from(PLUGIN),
@@ -3034,7 +3034,7 @@ mod tests {
         })
         .unwrap();
         let session = MakiId::generate();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
         let upstream = Upstream::Chat {
             session,
             plugin: Arc::from(PLUGIN),
@@ -3057,7 +3057,7 @@ mod tests {
             iter::from_fn(|| answer_rx.try_recv().ok()).collect::<Vec<_>>(),
             answers
         );
-        assert_eq!(event_names(&chat_events(&ui_rx, session)), shown);
+        assert_eq!(event_names(&chat_events(&mut ui_rx, session)), shown);
     }
 
     /// Dropping the guard is what ends the relay: a Lua tool context keeps a
@@ -3115,9 +3115,8 @@ mod tests {
 
     /// What reached the tab of this chat, each event checked to name the
     /// owning plugin and the subagent.
-    fn chat_events(ui_rx: &flume::Receiver<UiAction>, session: MakiId) -> Vec<AgentEvent> {
-        ui_rx
-            .drain()
+    fn chat_events(ui_rx: &mut UnboundedReceiver<UiAction>, session: MakiId) -> Vec<AgentEvent> {
+        iter::from_fn(|| ui_rx.try_recv().ok())
             .map(|action| match action {
                 UiAction::PluginTaskEvent {
                     session: owner,
@@ -3146,7 +3145,7 @@ mod tests {
     async fn relay_to_chat_forwards_run_ends_and_closes_the_task() {
         let session = MakiId::generate();
         let (done_tx, mut done_rx) = unbounded_channel();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
 
         relay_session_events(
             relayed_run(),
@@ -3159,7 +3158,7 @@ mod tests {
 
         assert_eq!(done_rx.try_recv(), Ok(()));
         assert_eq!(
-            event_names(&chat_events(&ui_rx, session)),
+            event_names(&chat_events(&mut ui_rx, session)),
             [
                 "turn_complete",
                 "turn_complete",
@@ -3182,7 +3181,7 @@ mod tests {
         let registry = BackgroundTasks::default();
         registry.register(call_entry(chat, PARENT_ID)).unwrap();
         let (parent_tx, mut parent_rx) = unbounded_channel();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
         let upstream = Upstream::Parent {
             tx: EventSender::new(parent_tx, RUN_ID),
             adoption: Some(Adoption {
@@ -3221,7 +3220,7 @@ mod tests {
         assert!(parent_rx.is_empty());
         assert_eq!(done_rx.try_recv(), Ok(()));
         assert_eq!(
-            event_names(&chat_events(&ui_rx, chat)),
+            event_names(&chat_events(&mut ui_rx, chat)),
             ["turn_complete", "error", "done", "stream_closed"]
         );
         let costs = registry
@@ -3245,7 +3244,7 @@ mod tests {
         drop(settle);
         drop(guard);
         let (done_tx, done_rx) = unbounded_channel();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
 
         relay_session_events(
             sub_events,
@@ -3257,8 +3256,7 @@ mod tests {
         .await;
 
         assert!(done_rx.is_empty());
-        let events = ui_rx
-            .drain()
+        let events = iter::from_fn(|| ui_rx.try_recv().ok())
             .map(|action| match action {
                 UiAction::PluginTaskEvent { envelope, .. } => envelope.event,
                 _ => panic!("relay must only send task events"),
@@ -3364,7 +3362,7 @@ mod tests {
         lua: &Lua,
         call: &CallScope,
         chat: MakiId,
-        ui: Option<&Sender<UiAction>>,
+        ui: Option<&UnboundedSender<UiAction>>,
     ) -> MovedTrigger {
         let home = home(chat, CALL_ID);
         let trigger = call.move_to(home.clone()).unwrap();
@@ -3552,12 +3550,11 @@ mod tests {
             let info = subagent_info().get().cloned().unwrap();
             session_state(&sess, |state| state.subagent_info.set(info).unwrap());
         }
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
 
         let _call_trigger = move_call(&lua, &call, chat, Some(&ui_tx));
 
-        let opened = ui_rx
-            .drain()
+        let opened = iter::from_fn(|| ui_rx.try_recv().ok())
             .filter_map(|action| match action {
                 UiAction::PluginTaskOpened {
                     session,
