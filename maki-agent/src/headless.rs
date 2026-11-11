@@ -749,6 +749,7 @@ mod tests {
     use std::future::{pending, ready};
     use std::pin::pin;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::mpsc::UnboundedSender;
 
     use futures::FutureExt;
     use maki_config::project::{self, TrustMode};
@@ -836,7 +837,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a Value,
-            _event_tx: &'a Sender<ProviderEvent>,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

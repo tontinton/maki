@@ -433,6 +433,7 @@ fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use maki_storage::sessions::Effort::High;
     use test_case::test_case;
@@ -727,7 +728,7 @@ mod tests {
         }
 
         async fn ask(&self) -> Result<StreamResponse, AgentError> {
-            let (tx, _rx) = flume::unbounded();
+            let (tx, _rx) = unbounded_channel();
             self.provider
                 .stream_message(
                     &self.model,

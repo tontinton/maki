@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::unbounded_channel;
 
 use maki_agent::tools::ToolRegistry;
 use maki_config::providers::{base_url_env_var, builtin_provider};
@@ -158,7 +159,7 @@ fn only_opted_in_providers_read_usage_cost(slug: &str, spec: &str, expected: Opt
 
     let provider = plugin::create(slug, Timeouts::default()).expect(NOT_BUILT);
     let model = Model::from_spec(spec).expect(UNKNOWN_MODEL);
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let resp = runtime()
         .block_on(provider.stream_message(
             &model,

@@ -655,6 +655,7 @@ pub(super) fn auto_compact_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use tokio::sync::mpsc::UnboundedSender;
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -718,7 +719,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

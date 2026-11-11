@@ -7,12 +7,12 @@ pub(crate) mod shared;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use flume::Sender;
 use futures::TryStreamExt;
 use maki_storage::id::SessionRef;
 use reqwest::{Client, Method, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use url::Url;
 
@@ -456,7 +456,7 @@ impl Anthropic {
         &self,
         auth: &ResolvedAuth,
         body: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         betas: &[&str],
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
@@ -511,7 +511,7 @@ impl Provider for Anthropic {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -668,7 +668,7 @@ struct ModelsPage {
 
 pub(crate) async fn parse_sse(
     mut events: SseBody,
-    event_tx: &Sender<ProviderEvent>,
+    event_tx: &UnboundedSender<ProviderEvent>,
 ) -> Result<StreamResponse, AgentError> {
     let mut parser = shared::EventParser::new();
 
@@ -678,8 +678,7 @@ pub(crate) async fn parse_sse(
         };
 
         if parser
-            .process(event.event.as_deref().unwrap_or_default(), &data, event_tx)
-            .await?
+            .process(event.event.as_deref().unwrap_or_default(), &data, event_tx)?
             .is_break()
         {
             break;
@@ -699,7 +698,9 @@ mod tests {
     };
     use serde_json::{Value, json};
     use shared::{DISPLACED_ERROR_PREFIX, build_wire_messages};
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
     const THINKING_SIGNATURE: &str = "sig";
@@ -888,7 +889,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
 
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert_eq!(
@@ -936,7 +937,7 @@ event: message_stop\n\
 data: {{\"type\":\"message_stop\"}}\n"
         );
 
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert_eq!(
@@ -979,7 +980,7 @@ data: {{\"type\":\"message_stop\"}}\n"
         ]
         .concat();
 
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert_eq!(
@@ -1032,7 +1033,7 @@ data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"
 event: message_stop\n\
 data: {{\"type\":\"message_stop\"}}\n"
         );
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         parse_sse(sse_body(sse_data), &tx).await.unwrap()
     }
 
@@ -1085,7 +1086,7 @@ data:{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usag
 event:message_stop\n\
 data:{\"type\":\"message_stop\"}\n\n";
 
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert!(matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "OK"));
@@ -1115,7 +1116,7 @@ data: {\"type\":\"content_block_stop\"}\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
 
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         let resp = parse_sse(sse_body(sse_data.as_bytes()), &tx).await.unwrap();
 
         let tools: Vec<_> = resp.message.tool_uses().collect();
@@ -1123,8 +1124,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
         assert_eq!(tools[0].0, "tu_1");
         assert_eq!(tools[0].1, "bash");
 
-        let starts: Vec<_> = rx
-            .drain()
+        let starts: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|e| match e {
                 ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
                 _ => None,
@@ -1640,7 +1640,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
     #[tokio::test]
     async fn parse_sse_overloaded_error() {
         let input = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let err = parse_sse(sse_body(input), &tx).await.unwrap_err();
         match err {
             AgentError::Api {
@@ -1656,7 +1656,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
     #[tokio::test]
     async fn parse_sse_unparseable_error() {
         let input = b"event: error\ndata: not-json\n\n";
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let err = parse_sse(sse_body(input), &tx).await.unwrap_err();
         match err {
             AgentError::Api {
@@ -1687,7 +1687,7 @@ data: {\"type\":\"content_block_stop\"}\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n";
 
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let resp = parse_sse(sse_body(sse_data.as_bytes()), &tx).await.unwrap();
 
         let tools: Vec<_> = resp.message.tool_uses().collect();
@@ -1729,7 +1729,7 @@ data: {\"type\":\"content_block_stop\"}\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n";
 
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert!(
@@ -1738,8 +1738,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         );
         assert!(matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello"));
 
-        let thinking_deltas: Vec<_> = rx
-            .drain()
+        let thinking_deltas: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|e| match e {
                 ProviderEvent::ThinkingDelta { text } => Some(text),
                 _ => None,
@@ -1772,7 +1771,7 @@ data: {\"type\":\"content_block_stop\"}\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
 
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert!(

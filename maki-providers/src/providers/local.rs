@@ -1,11 +1,11 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use flume::Sender;
 use futures::future::join_all;
 use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use maki_config::providers::{Protocol, ProvidersConfig};
@@ -153,7 +153,7 @@ impl Provider for LocalEndpoint {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -858,6 +858,7 @@ mod tests {
     /// on a local slug, so each one has to pick its wire here.
     mod protocol_wire {
         use test_case::test_case;
+        use tokio::sync::mpsc::unbounded_channel;
 
         use super::super::*;
         use crate::Timeouts;
@@ -876,7 +877,7 @@ mod tests {
             let ep =
                 LocalEndpoint::build(&LLAMACPP, Timeouts::default(), None, host, protocol).unwrap();
             let model = Model::from_spec("llama-cpp/default").unwrap();
-            let (tx, _rx) = flume::unbounded();
+            let (tx, _rx) = unbounded_channel();
             let _ = ep
                 .stream_message(
                     &model,

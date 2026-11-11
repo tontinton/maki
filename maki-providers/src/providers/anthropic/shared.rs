@@ -2,9 +2,9 @@ use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
-use flume::Sender;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use crate::model::Model;
@@ -426,11 +426,11 @@ impl EventParser {
         }
     }
 
-    pub async fn process(
+    pub fn process(
         &mut self,
         event_type: &str,
         data: &str,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
     ) -> Result<ControlFlow<(), ()>, AgentError> {
         match event_type {
             "message_start" => {
@@ -464,12 +464,10 @@ impl EventParser {
                         }
                         SseContentBlock::ToolUse { id, name } => {
                             self.current_tool_json.clear();
-                            event_tx
-                                .send_async(ProviderEvent::ToolUseStart {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                })
-                                .await?;
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: id.clone(),
+                                name: name.clone(),
+                            })?;
                             self.content_blocks
                                 .push(ContentBlock::tool_use(id, name, Value::Null));
                         }
@@ -487,9 +485,7 @@ impl EventParser {
                                 if let Some(ContentBlock::Text { text: t }) = block {
                                     t.push_str(&text);
                                 }
-                                event_tx
-                                    .send_async(ProviderEvent::TextDelta { text })
-                                    .await?;
+                                event_tx.send(ProviderEvent::TextDelta { text })?;
                             }
                         }
                         Delta::Thinking { thinking } => {
@@ -497,9 +493,7 @@ impl EventParser {
                                 if let Some(ContentBlock::Thinking { thinking: t, .. }) = block {
                                     t.push_str(&thinking);
                                 }
-                                event_tx
-                                    .send_async(ProviderEvent::ThinkingDelta { text: thinking })
-                                    .await?;
+                                event_tx.send(ProviderEvent::ThinkingDelta { text: thinking })?;
                             }
                         }
                         Delta::Signature { signature } => {

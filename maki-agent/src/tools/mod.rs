@@ -21,6 +21,7 @@ pub use registry::{
     PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult,
     ToolInvocation, ToolReach, ToolRegistry, ToolSource,
 };
+use tokio::sync::mpsc::UnboundedSender;
 
 use std::collections::HashMap;
 use std::env;
@@ -619,7 +620,7 @@ impl Provider for NullProvider {
         _: &'a [Message],
         _: &'a str,
         _: &'a Value,
-        _: &'a flume::Sender<ProviderEvent>,
+        _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {

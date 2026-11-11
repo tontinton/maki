@@ -4,8 +4,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use flume::Sender;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
@@ -37,7 +37,7 @@ pub trait Provider: Send + Sync {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
@@ -144,7 +144,7 @@ impl Provider for UnconfiguredProvider {
         _messages: &'a [Message],
         _system: &'a str,
         _tools: &'a Value,
-        _event_tx: &'a Sender<ProviderEvent>,
+        _event_tx: &'a UnboundedSender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -447,7 +447,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a Value,
-            _event_tx: &'a Sender<ProviderEvent>,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

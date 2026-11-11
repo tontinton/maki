@@ -316,6 +316,7 @@ mod tests {
 
     use std::path::{Path, PathBuf};
     use std::time::Instant;
+    use tokio::sync::mpsc::UnboundedSender;
 
     use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
     use maki_agent::{AgentEvent, AgentInput, AgentMode, AgentSeed, InputSource};
@@ -364,7 +365,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a serde_json::Value,
-            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -475,7 +476,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a serde_json::Value,
-            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

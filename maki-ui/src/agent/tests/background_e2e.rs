@@ -7,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 
 use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
@@ -271,7 +272,7 @@ impl Provider for ScriptedProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        _event_tx: &'a flume::Sender<ProviderEvent>,
+        _event_tx: &'a UnboundedSender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

@@ -2231,6 +2231,7 @@ mod tests {
     use mlua::AnyUserData;
     use serde_json::json;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
     use tokio::time::timeout;
 
     use super::*;
@@ -2317,7 +2318,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a JsonValue,
-            events: &'a flume::Sender<ProviderEvent>,
+            events: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2467,7 +2468,7 @@ mod tests {
             _: &'a [Message],
             system: &'a str,
             _: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2602,7 +2603,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2712,7 +2713,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -3588,7 +3589,7 @@ mod tests {
             messages: &'a [Message],
             system: &'a str,
             tools: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

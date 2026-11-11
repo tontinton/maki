@@ -2,13 +2,13 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use flume::Sender;
 use reqwest::header::{
     CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, TRANSFER_ENCODING,
 };
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use maki_config::providers::{Protocol, ProvidersConfig, configured_base_url};
@@ -526,7 +526,7 @@ impl CompatProvider {
         model: &Model,
         headers: &[(&str, &str)],
         mut body: Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         auth: &ResolvedAuth,
     ) -> Result<StreamResponse, AgentError> {
         if !custom::carries_undeclared_thinking(model, &body) {
@@ -581,7 +581,7 @@ impl Provider for CompatProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

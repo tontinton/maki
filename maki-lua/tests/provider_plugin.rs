@@ -12,10 +12,12 @@
 //! every test its own process.
 
 use std::fs;
+use std::iter;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::unbounded_channel;
 
 use maki_agent::tools::ToolRegistry;
 use maki_lua::test_support::runtime;
@@ -281,7 +283,7 @@ fn stream(
     thinking: ThinkingConfig,
 ) -> (Vec<ProviderEvent>, Result<StreamResponse, AgentError>) {
     let messages = [Message::user(PROMPT.to_owned())];
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     let result = runtime().block_on(provider.stream_message(
         model,
         &messages,
@@ -295,7 +297,7 @@ fn stream(
         None,
     ));
     drop(tx);
-    (rx.drain().collect(), result)
+    (iter::from_fn(|| rx.try_recv().ok()).collect(), result)
 }
 
 /// One turn, both ways round: the events a transcript produces in the order the

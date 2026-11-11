@@ -17,11 +17,11 @@ use aws_credential_types::provider::error::CredentialsError;
 use aws_sigv4::http_request::{self as sigv4, SignableBody, SignableRequest, SigningSettings};
 use aws_sigv4::sign::v4;
 use base64::Engine;
-use flume::Sender;
 use maki_storage::id::SessionRef;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, Request};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -435,7 +435,7 @@ impl Provider for Bedrock {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -528,9 +528,7 @@ impl Provider for Bedrock {
 
                     let (event_type, json) = decode_event_payload(&payload)?;
 
-                    if let ControlFlow::Break(()) =
-                        parser.process(&event_type, &json, event_tx).await?
-                    {
+                    if let ControlFlow::Break(()) = parser.process(&event_type, &json, event_tx)? {
                         return Ok(parser.finish());
                     }
                 }
@@ -593,6 +591,7 @@ mod tests {
     use std::future::{Ready, ready};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::UNIX_EPOCH;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use reqwest::header::HeaderMap;
 
@@ -869,7 +868,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_parser_text_stream() {
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         let mut parser = shared::EventParser::new();
 
         let steps: &[(&str, &str)] = &[
@@ -887,18 +886,11 @@ mod tests {
             ),
         ];
         for (event, data) in steps {
-            assert!(
-                parser
-                    .process(event, data, &tx)
-                    .await
-                    .unwrap()
-                    .is_continue()
-            );
+            assert!(parser.process(event, data, &tx).unwrap().is_continue());
         }
         assert!(
             parser
                 .process("message_stop", r#"{"type":"message_stop"}"#, &tx)
-                .await
                 .unwrap()
                 .is_break()
         );
@@ -907,7 +899,7 @@ mod tests {
         assert_eq!(resp.usage.input, 10);
         assert!(matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello"));
         assert!(
-            rx.drain()
+            iter::from_fn(|| rx.try_recv().ok())
                 .any(|e| matches!(e, ProviderEvent::TextDelta { text } if text == "Hello"))
         );
     }
