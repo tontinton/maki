@@ -8,6 +8,7 @@ use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::{MakiId, MakiIdParseError};
 use mlua::{Lua, Result as LuaResult, Table};
+use tokio::sync::mpsc::unbounded_channel;
 
 use crate::api::action::run_plugin_action;
 use crate::api::keymap::{InputMode, accept_key, switch_mode};
@@ -1153,8 +1154,8 @@ fn open_win(
     // worse, a Close command, leaving a zombie modal. Producers are human- or
     // plugin-rate and both ends are drained every tick, so growth is bounded
     // in practice.
-    let (event_tx, event_rx) = flume::unbounded::<WinEvent>();
-    let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
+    let (event_tx, event_rx) = unbounded_channel::<WinEvent>();
+    let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
     let waker = lua.app_data_ref::<UiWaker>().map(|waker| waker.clone());
     if let Some(waker) = &waker {
         buf_handle.buf.wake_on_change(waker);
@@ -1631,6 +1632,7 @@ mod tests {
     use maki_highlight::StyledSegment;
     use mlua::Lua;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const MISSING_KEY: &str = "missing";
     const ORANGE_HEX: &str = "#ff8000";
@@ -2354,8 +2356,8 @@ mod tests {
     #[test]
     fn unloading_a_plugin_closes_the_windows_it_opened() {
         let mut store = WinStore::default();
-        let (mine, mine_rx) = flume::unbounded::<WinCommand>();
-        let (theirs, theirs_rx) = flume::unbounded::<WinCommand>();
+        let (mine, mut mine_rx) = unbounded_channel::<WinCommand>();
+        let (theirs, mut theirs_rx) = unbounded_channel::<WinCommand>();
         store.track(Arc::from(WIN_PLUGIN), WinSender::new(mine, None));
         store.track(Arc::from(OTHER_WIN_PLUGIN), WinSender::new(theirs, None));
 
@@ -2373,11 +2375,11 @@ mod tests {
     #[test]
     fn a_window_already_gone_is_forgotten_on_the_next_open() {
         let mut store = WinStore::default();
-        let (gone, gone_rx) = flume::unbounded::<WinCommand>();
+        let (gone, gone_rx) = unbounded_channel::<WinCommand>();
         store.track(Arc::from(WIN_PLUGIN), WinSender::new(gone, None));
         drop(gone_rx);
 
-        let (live, _live_rx) = flume::unbounded::<WinCommand>();
+        let (live, _live_rx) = unbounded_channel::<WinCommand>();
         store.track(Arc::from(WIN_PLUGIN), WinSender::new(live, None));
 
         assert_eq!(store.open[WIN_PLUGIN].len(), 1);

@@ -1145,7 +1145,7 @@ impl<'t> EventLoop<'t> {
             } => {
                 let Some(idx) = self.tab_of(session) else {
                     debug!(session = ?session, "open_win for a session open in no tab, closed");
-                    let _ = event_tx.try_send(WinEvent::Close);
+                    let _ = event_tx.send(WinEvent::Close);
                     return;
                 };
                 let app = &mut self.sessions[idx].app;
