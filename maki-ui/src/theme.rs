@@ -1680,6 +1680,42 @@ magenta    = "magenta"
     }
 
     #[test]
+    fn item_match_selected_keeps_todays_default_and_yields_to_an_override() {
+        let t = Theme::from_toml(
+            r##"
+[palette]
+item_fg = "#010203"
+item_bg = "#040506"
+
+[ui]
+item_selected = { fg = "item_fg", bg = "item_bg" }
+accent = { fg = "#ff0000" }
+"##,
+        )
+        .unwrap();
+        assert_eq!(
+            t.item_match_selected.fg, t.accent.fg,
+            "an unset match keeps today's accent ink so no theme changes without opting in"
+        );
+        assert_eq!(t.item_match_selected.bg, t.item_selected.bg);
+
+        let t = Theme::from_toml(
+            r##"
+[ui]
+item_selected = { fg = "#010203", bg = "#040506" }
+item_match_selected = { fg = "#040506", bg = "#010203", modifiers = ["underlined"] }
+"##,
+        )
+        .unwrap();
+        assert_eq!(t.item_match_selected.fg, Some(Color::Rgb(4, 5, 6)));
+        assert!(
+            t.item_match_selected
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+    }
+
+    #[test]
     fn ui_entries_resolve_through_the_palette() {
         let toml = r##"
 [palette]
