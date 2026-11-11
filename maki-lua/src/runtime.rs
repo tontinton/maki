@@ -1352,15 +1352,15 @@ impl MoveRequest {
 /// Where every move is asked for. [`serve_moves`] answers apart from the
 /// request queue, which would wait behind a plugin load draining the very
 /// call to move.
-struct Moves(flume::Sender<MoveRequest>);
+struct Moves(UnboundedSender<MoveRequest>);
 
 async fn serve_moves(
     lua: Lua,
     live_tasks: LiveTasks,
     plugins: PluginMap,
-    requests: flume::Receiver<MoveRequest>,
+    mut requests: UnboundedReceiver<MoveRequest>,
 ) {
-    while let Ok(request) = requests.recv_async().await {
+    while let Some(request) = requests.recv().await {
         spawn_local(serve_move(
             lua.clone(),
             Rc::clone(&live_tasks),
@@ -5581,7 +5581,7 @@ async fn run_tool_call(
 pub(crate) struct LuaThread {
     pub tx: flume::Sender<Request>,
     pub prio_tx: flume::Sender<Request>,
-    pub moves: flume::Sender<MoveRequest>,
+    pub moves: UnboundedSender<MoveRequest>,
     /// Shared with the runtime on the Lua thread, so a handle can answer "is
     /// anyone layering this" without a roundtrip.
     pub layered: Arc<LayeredTools>,
@@ -5615,7 +5615,7 @@ pub fn spawn(
     let (tx, rx) = flume::unbounded::<Request>();
     let (prio_tx, prio_rx) = flume::unbounded::<Request>();
     let prio_tx_thread = prio_tx.clone();
-    let (moves, move_requests) = flume::unbounded::<MoveRequest>();
+    let (moves, move_requests) = unbounded_channel::<MoveRequest>();
     let moves_thread = moves.clone();
     let tx_clone = tx.clone();
     let layered: Arc<LayeredTools> = Arc::default();

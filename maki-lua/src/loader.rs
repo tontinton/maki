@@ -14,6 +14,7 @@ use maki_agent::{Cutter, SessionEndReason};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::{DeclAuthority, keep_granted};
 use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::time::timeout_at;
 
@@ -1061,7 +1062,7 @@ pub struct EventHandle {
     pub(crate) tx: flume::Sender<Request>,
     /// User-initiated requests bypass queued bulk work (session restores).
     prio_tx: flume::Sender<Request>,
-    moves: flume::Sender<MoveRequest>,
+    moves: UnboundedSender<MoveRequest>,
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
     layered: Arc<LayeredTools>,
@@ -1073,7 +1074,7 @@ impl EventHandle {
         Self {
             tx,
             prio_tx: flume::unbounded().0,
-            moves: flume::unbounded().0,
+            moves: unbounded_channel().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         }
@@ -1165,7 +1166,7 @@ impl EventHandle {
         Self {
             tx: shared.clone(),
             prio_tx: shared,
-            moves: flume::unbounded().0,
+            moves: unbounded_channel().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         }
@@ -1522,7 +1523,7 @@ mod tests {
         let handle = EventHandle {
             tx,
             prio_tx,
-            moves: flume::unbounded().0,
+            moves: unbounded_channel().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         };
