@@ -16,6 +16,10 @@ use crate::ipc::{self, SYNC_GO, SYNC_READY};
 
 pub const DEFAULT_ALLOWED_ENV: &[&str] = &["LANG", "TERM", "TMPDIR", "RUST_LOG"];
 
+/// Maki's per-project config directory. Hidden from the sandbox by default so
+/// code inside it cannot read permissions or plant init code.
+const PROJECT_DIR: &str = ".maki";
+
 /// Flags for every tmpfs mounted inside the sandbox. Mirrors what bubblewrap does.
 const TMPFS_FLAGS: MsFlags = MsFlags::MS_NOSUID.union(MsFlags::MS_NODEV);
 
@@ -25,6 +29,7 @@ const DEVICE_NAMES: &[&str] = &["null", "zero", "full", "random", "urandom", "co
 const PROBE_OK: i32 = 0;
 const PROBE_NO_MOUNTNS: i32 = 1;
 const PROBE_NO_USERNS: i32 = 2;
+const PROBE_NO_PIDNS: i32 = 3;
 
 const ENV_DESCRIPTIONS: &[(&str, &str)] = &[
     ("LANG", "locale"),
@@ -56,6 +61,10 @@ pub struct NamespaceConfig {
     /// Host symlinks to recreate inside the sandbox.
     /// Each entry is `(host_symlink_path, sandbox_internal_path)`.
     pub symlinks: Vec<(PathBuf, String)>,
+    /// Host paths hidden from the sandbox by mounting an empty tmpfs over
+    /// their sandbox-side counterpart. A missing path is created as an empty
+    /// directory first, so sandboxed code cannot create it either.
+    pub masked_paths: Vec<PathBuf>,
 }
 
 fn build_sandbox_path(path_dirs: &[String]) -> String {
@@ -168,6 +177,7 @@ impl NamespaceConfig {
         Self {
             allowed_env,
             env_vars,
+            masked_paths: default_masked_paths(&workspace_dir),
             workspace_dir,
             workspace_name,
             home_mounts,
@@ -260,7 +270,17 @@ impl NamespaceConfig {
     /// Returns [`SandboxError::Mount`] if any mount or `pivot_root` step
     /// fails.
     pub fn setup_mounts(&self) -> Result<(), SandboxError> {
-        setup_mounts_impl(self)
+        setup_mounts_impl(self, std::process::id())
+    }
+
+    /// [`setup_mounts`](Self::setup_mounts) with an explicit staging id.
+    ///
+    /// A child in its own PID namespace sees itself as PID 1, so
+    /// `std::process::id()` no longer identifies it on the host. The sandbox
+    /// child passes the host-visible pid of its supervisor instead, keeping
+    /// the staging trees keyed by the pid the host cleans up after.
+    pub(crate) fn setup_mounts_with_pid(&self, staging_pid: u32) -> Result<(), SandboxError> {
+        setup_mounts_impl(self, staging_pid)
     }
 
     /// Build a `NamespaceConfig` from agent config fields.
@@ -445,6 +465,16 @@ fn sandbox_workspace_root(workspace_name: &str) -> PathBuf {
     PathBuf::from(format!("/home/maki/workspace/{workspace_name}"))
 }
 
+/// Paths every workspace hides from the sandbox. `NamespaceConfig::new`
+/// starts with the project's own `.maki` directory; callers may extend the
+/// field afterwards.
+fn default_masked_paths(workspace_dir: &Path) -> Vec<PathBuf> {
+    if workspace_dir.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    vec![workspace_dir.join(PROJECT_DIR)]
+}
+
 /// The sandbox side of a home/readonly mount: a trailing slash means the
 /// whole `maki` home. Names are relative to `$HOME`, so `name == ""` is the
 /// home directory itself.
@@ -499,6 +529,23 @@ pub fn isolate_mount_ns() -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// Put the next forked child into a new PID namespace.
+///
+/// `unshare(CLONE_NEWPID)` only moves future children, so the caller has to
+/// fork afterwards; that child becomes PID 1 and sees only processes in the
+/// namespace. Call this after [`isolate_user_ns`], whose capabilities the
+/// kernel checks.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Namespace`] if the host refuses the call.
+pub fn isolate_pid_ns() -> Result<(), SandboxError> {
+    unshare(CloneFlags::CLONE_NEWPID)
+        .map_err(|e| SandboxError::Namespace(format!("unshare(CLONE_NEWPID): {e}")))?;
+    debug!("sandbox: pid namespace isolated");
+    Ok(())
+}
+
 /// Per-child staging root under /tmp, keyed by the child's pid. A fixed
 /// path would let concurrent sandbox children delete each other's
 /// mountpoints mid-setup.
@@ -516,8 +563,8 @@ fn device_stage_dir(pid: u32) -> String {
 /// Bind host device nodes onto placeholder files in the device stage dir.
 /// Per-device failures are warned about and skipped, matching the old
 /// bind-into-tmpfs behavior.
-fn prepare_device_stage() -> Result<String, SandboxError> {
-    let dir = device_stage_dir(std::process::id());
+fn prepare_device_stage(staging_pid: u32) -> Result<String, SandboxError> {
+    let dir = device_stage_dir(staging_pid);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)
         .map_err(|e| SandboxError::Mount(format!("create device stage {dir}: {e}")))?;
@@ -542,7 +589,7 @@ pub(crate) fn cleanup_staging(pid: Pid) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn setup_mounts_impl(config: &NamespaceConfig) -> Result<(), SandboxError> {
+fn setup_mounts_impl(config: &NamespaceConfig, staging_pid: u32) -> Result<(), SandboxError> {
     mount(
         None::<&str>,
         "/",
@@ -553,7 +600,7 @@ fn setup_mounts_impl(config: &NamespaceConfig) -> Result<(), SandboxError> {
     .map_err(|e| SandboxError::Mount(format!("make root private: {e}")))?;
     debug!("sandbox: mount tree made private");
 
-    let staging = staging_dir(std::process::id());
+    let staging = staging_dir(staging_pid);
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)
         .map_err(|e| SandboxError::Mount(format!("create staging {staging}: {e}")))?;
@@ -583,7 +630,7 @@ fn setup_mounts_impl(config: &NamespaceConfig) -> Result<(), SandboxError> {
     // directory: a device bind-mounted over a file on a tmpfs created inside
     // this user namespace cannot be opened (EACCES), while the same bind on
     // an init-namespace filesystem works.
-    let dev_stage = prepare_device_stage()?;
+    let dev_stage = prepare_device_stage(staging_pid)?;
     let dev_path = format!("{staging}/dev");
     mount(
         Some(dev_stage.as_str()),
@@ -610,33 +657,19 @@ fn setup_mounts_impl(config: &NamespaceConfig) -> Result<(), SandboxError> {
         }
     }
 
-    // Mount proc (may fail in user namespace — fall back to bind-mount from host)
-    if mount(
+    // Mount a fresh proc for the child's own PID namespace. Never fall back to
+    // the host's /proc: it is bound to the host PID namespace and would leak
+    // every process name the sandbox is supposed to hide.
+    if let Err(e) = mount(
         Some("proc"),
         format!("{staging}/proc").as_str(),
         Some("proc"),
         MsFlags::empty(),
         None::<&str>,
-    )
-    .is_ok()
-    {
-        debug!("sandbox: proc mounted");
+    ) {
+        warn!("sandbox: /proc mount failed: {e}, continuing without proc");
     } else {
-        let proc_target = format!("{staging}/proc");
-        if mount(
-            Some("/proc"),
-            proc_target.as_str(),
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        )
-        .is_ok()
-        {
-            debug!("sandbox: /proc bind-mounted from host");
-        } else {
-            let e = std::io::Error::last_os_error();
-            warn!("sandbox: /proc mount failed: {e}, continuing without proc");
-        }
+        debug!("sandbox: proc mounted");
     }
 
     let old_root = format!("{staging}/.old_root");
@@ -750,6 +783,13 @@ fn setup_mounts_impl(config: &NamespaceConfig) -> Result<(), SandboxError> {
         }
     }
 
+    // Hide configured paths before the sandbox can see them. The target is
+    // resolved through the mount map, so this works for the workspace, extra
+    // workspace dirs, and home mounts alike.
+    for host_path in &config.masked_paths {
+        mask_path(config, &staging, host_path)?;
+    }
+
     mount(
         Some("tmpfs"),
         format!("{staging}/tmp").as_str(),
@@ -777,7 +817,7 @@ fn setup_mounts_impl(config: &NamespaceConfig) -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// Probe whether user and mount namespaces are available in a throwaway
+/// Probe whether user, mount, and pid namespaces are available in a throwaway
 /// fork, without disturbing the calling process.
 ///
 /// # Errors
@@ -799,15 +839,18 @@ pub fn probe() -> Result<(), SandboxError> {
             sync_tx.write_all(b"\x01").ok();
             let mut buf = [0u8; 1];
             sync_tx.read_exact(&mut buf).ok();
-            if unshare(CloneFlags::CLONE_NEWNS).is_ok() {
-                std::process::exit(PROBE_OK);
+            if unshare(CloneFlags::CLONE_NEWNS).is_err() {
+                // Only observable here: the AppArmor profile transition happens
+                // as part of the CLONE_NEWUSER above, so the parent is still
+                // unconfined and cannot read the child's confinement itself.
+                let stripped = u8::from(apparmor::capabilities_stripped());
+                sync_tx.write_all(&[stripped]).ok();
+                std::process::exit(PROBE_NO_MOUNTNS);
             }
-            // Only observable here: the AppArmor profile transition happens as
-            // part of the CLONE_NEWUSER above, so the parent is still
-            // unconfined and cannot read the child's confinement itself.
-            let stripped = u8::from(apparmor::capabilities_stripped());
-            sync_tx.write_all(&[stripped]).ok();
-            std::process::exit(PROBE_NO_MOUNTNS);
+            if unshare(CloneFlags::CLONE_NEWPID).is_err() {
+                std::process::exit(PROBE_NO_PIDNS);
+            }
+            std::process::exit(PROBE_OK);
         }
         ForkResult::Parent { child: child_pid } => {
             drop(sync_tx);
@@ -850,6 +893,13 @@ pub fn probe() -> Result<(), SandboxError> {
                      To use --sandbox, try:\n\
                      - Run maki as root: sudo maki --sandbox\n\
                      - Enable user namespaces: echo 1 > /proc/sys/kernel/unprivileged_userns_clone"
+                        .into(),
+                )),
+                PROBE_NO_PIDNS => Err(SandboxError::Namespace(
+                    "pid namespace (CLONE_NEWPID) is not available on this system.\n\
+                     Without a pid namespace the sandbox cannot hide host processes.\n\n\
+                     To use --sandbox, try:\n\
+                     - Run maki as root: sudo maki --sandbox"
                         .into(),
                 )),
                 sig if sig & 0x7f != 0 => Err(SandboxError::Ipc(format!(
@@ -1190,6 +1240,67 @@ fn bind_mount_ro(source: &Path, target: &str) -> Result<(), SandboxError> {
     bind_mount(source, target, true)
 }
 
+/// Hide a host path from the sandbox by mounting an empty tmpfs over its
+/// sandbox counterpart, or an empty device for a file.
+///
+/// A missing target is created as an empty directory on the host. Skipping it
+/// would leave that path writable inside the shared workspace, letting
+/// sandboxed code plant project config the host reads on a later start.
+fn mask_path(
+    config: &NamespaceConfig,
+    staging: &str,
+    host_path: &Path,
+) -> Result<(), SandboxError> {
+    let sandbox_path = config.host_to_sandbox(host_path);
+    let target = format!("{staging}{}", sandbox_path.display());
+    if std::fs::symlink_metadata(&target).is_err() {
+        std::fs::create_dir_all(&target)
+            .map_err(|e| SandboxError::Mount(format!("create mask target {target}: {e}")))?;
+        debug!(
+            host = %host_path.display(),
+            target,
+            "sandbox: created mask target"
+        );
+    }
+    match std::fs::metadata(&target) {
+        Ok(meta) if meta.is_dir() => mount(
+            Some("tmpfs"),
+            target.as_str(),
+            Some("tmpfs"),
+            TMPFS_FLAGS,
+            None::<&str>,
+        )
+        .map_err(|e| SandboxError::Mount(format!("mask {target}: {e}"))),
+        Ok(_) => bind_mount_existing_ro(Path::new("/dev/null"), &target),
+        // A symlink whose target is not in the sandbox leaks nothing.
+        Err(e) => {
+            debug!(target, error = %e, "sandbox: mask target unresolvable, nothing to hide");
+            Ok(())
+        }
+    }
+}
+
+/// Bind `source` over an existing file. [`bind_mount`] creates its target,
+/// which would truncate a real file and fail on a non-directory.
+fn bind_mount_existing_ro(source: &Path, target: &str) -> Result<(), SandboxError> {
+    mount(
+        Some(source),
+        target,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .map_err(|e| SandboxError::Mount(format!("bind {} -> {target}: {e}", source.display())))?;
+    mount(
+        None::<&str>,
+        target,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
+        None::<&str>,
+    )
+    .map_err(|e| SandboxError::Mount(format!("remount ro {target}: {e}")))
+}
+
 /// Bind-mount a device file from host into the sandbox.
 /// Unlike `bind_mount`, creates a regular file (not a directory) at the target
 /// so that `mount` can overlay a character/block device over it.
@@ -1439,6 +1550,28 @@ mod tests {
         assert!(cfg.is_allowed("TERM"));
         assert!(cfg.is_allowed("TMPDIR"));
         assert!(cfg.is_allowed("RUST_LOG"));
+    }
+
+    #[test]
+    fn new_masks_the_project_dir_by_default() {
+        let cfg = config_with_env(vec![]);
+        assert_eq!(cfg.masked_paths, vec![PathBuf::from("/workspace/.maki")]);
+    }
+
+    #[test]
+    fn an_empty_workspace_masks_nothing() {
+        let cfg = NamespaceConfig::new(
+            vec![],
+            vec![],
+            PathBuf::new(),
+            String::new(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(cfg.masked_paths.is_empty());
     }
 
     #[test]

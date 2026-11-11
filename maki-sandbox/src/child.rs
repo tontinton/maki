@@ -21,7 +21,7 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, close, dup2, execve, fork, pipe, read as nix_read};
+use nix::unistd::{ForkResult, Pid, close, dup2, execve, fork, pipe, read as nix_read};
 use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
@@ -55,28 +55,32 @@ static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct SandboxChild {
     sock: UnixStream,
     config: NamespaceConfig,
+    /// Host-visible pid of this process, captured before entering the PID
+    /// namespace. Staging trees are keyed by it so the host cleans up after
+    /// the same path the child created.
+    host_pid: u32,
 }
 
 impl SandboxChild {
     fn new(sock: UnixStream, config: NamespaceConfig) -> Self {
-        Self { sock, config }
+        Self {
+            sock,
+            config,
+            host_pid: std::process::id(),
+        }
     }
 
     pub fn run(mut self) -> ! {
-        match self.setup_sandbox() {
-            Ok(()) => {
-                let _ = ipc::send_child_msg(&mut self.sock, &ChildMsg::Setup { error: None });
-                self.exec_inner()
-            }
+        match self.setup_namespaces() {
+            Ok(()) => self.run_init(),
             Err(e) => {
-                error!("sandbox child: setup failed: {e}");
-                let _ = ipc::send_child_msg(&mut self.sock, &ChildMsg::Setup { error: Some(e) });
+                report_setup_error(&mut self.sock, e);
                 exit(1);
             }
         }
     }
 
-    fn setup_sandbox(&mut self) -> Result<(), SandboxError> {
+    fn setup_namespaces(&mut self) -> Result<(), SandboxError> {
         let parent_name = ipc::recv_handshake(&mut self.sock)?;
         if parent_name != "maki-server" {
             return Err(SandboxError::Ipc(format!(
@@ -94,10 +98,45 @@ impl SandboxChild {
         namespace::isolate_mount_ns()?;
         debug!("sandbox child: mount namespace created");
 
-        self.config.setup_mounts()?;
-        debug!("sandbox child: mounts set up");
+        namespace::isolate_pid_ns()?;
+        debug!("sandbox child: pid namespace created");
 
         Ok(())
+    }
+
+    /// Fork the PID 1 process that sets up mounts and runs the inner loop.
+    ///
+    /// `unshare(CLONE_NEWPID)` only moves children, so this fork is what
+    /// enters the namespace. The parent stays behind as a supervisor in the
+    /// host namespace and forwards the init's exit status to the host.
+    fn run_init(mut self) -> ! {
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => self.setup_mounts_and_exec(),
+            Ok(ForkResult::Parent { child }) => {
+                drop(self.sock);
+                exit(wait_for_init(child));
+            }
+            Err(e) => {
+                report_setup_error(
+                    &mut self.sock,
+                    SandboxError::Fork(format!("pid namespace fork: {e}")),
+                );
+                exit(1);
+            }
+        }
+    }
+
+    fn setup_mounts_and_exec(mut self) -> ! {
+        match self.config.setup_mounts_with_pid(self.host_pid) {
+            Ok(()) => {
+                let _ = ipc::send_child_msg(&mut self.sock, &ChildMsg::Setup { error: None });
+                self.exec_inner()
+            }
+            Err(e) => {
+                report_setup_error(&mut self.sock, e);
+                exit(1);
+            }
+        }
     }
 
     fn exec_inner(self) -> ! {
@@ -112,17 +151,10 @@ impl SandboxChild {
             .arg("--sandbox-inner")
             .spawn();
         match child {
-            Ok(mut child) => {
-                let status = child.wait();
-                match status {
-                    Ok(s) if s.success() => {
-                        exit(0);
-                    }
-                    _ => {
-                        warn!("sandbox child: inner exec failed, continuing in-place");
-                        Self::run_inner_static()
-                    }
-                }
+            Ok(child) => {
+                let inner = Pid::from_raw(child.id() as i32);
+                drop(child);
+                reap_until_exit(inner)
             }
             Err(e) => {
                 warn!(
@@ -153,13 +185,50 @@ impl SandboxChild {
     }
 }
 
+fn report_setup_error(sock: &mut UnixStream, e: SandboxError) {
+    error!("sandbox child: setup failed: {e}");
+    let _ = ipc::send_child_msg(sock, &ChildMsg::Setup { error: Some(e) });
+}
+
+/// Wait for the init process, forwarding its status. PID 1's own children
+/// are not this process's children, so no other wait status is meaningful.
+fn wait_for_init(child: Pid) -> i32 {
+    loop {
+        match waitpid(child, None) {
+            Ok(WaitStatus::Exited(_, code)) => return code,
+            Ok(WaitStatus::Signaled(_, sig, _)) => return 128 + sig as i32,
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "sandbox child: waiting for pid namespace init failed");
+                return 1;
+            }
+        }
+    }
+}
+
+/// PID 1 must reap every child, not only the inner loop, or daemonized
+/// grandchildren accumulate as zombies for the life of the sandbox.
+fn reap_until_exit(inner: Pid) -> ! {
+    loop {
+        match waitpid(Pid::from_raw(-1), None) {
+            Ok(WaitStatus::Exited(pid, code)) if pid == inner => exit(code),
+            Ok(WaitStatus::Signaled(pid, sig, _)) if pid == inner => exit(128 + sig as i32),
+            Ok(_) => {}
+            Err(nix::errno::Errno::ECHILD) => exit(0),
+            Err(e) => {
+                warn!(error = %e, "sandbox child: reaping pid namespace children failed");
+                exit(1);
+            }
+        }
+    }
+}
+
 /// Entry point for the sandbox child's first invocation (fork child).
 ///
-/// Sets up namespaces and mounts. When mount namespace is available, it
-/// `pivot_roots` into the new root and execs `/proc/self/exe --sandbox-inner`
-/// so the inner instance starts with a clean process state inside the
-/// isolated filesystem. When mount namespace is unavailable, it calls the
-/// inner loop directly (no isolation, no exec).
+/// Sets up the namespaces, then forks the PID 1 process that `pivot_root`s
+/// into the new root and execs `/proc/self/exe --sandbox-inner`, so the inner
+/// instance starts with a clean process state inside the isolated filesystem.
+/// The original process stays behind as the supervisor.
 pub fn child_main(sock: UnixStream, ns_config: NamespaceConfig) -> ! {
     SandboxChild::new(sock, ns_config).run()
 }
