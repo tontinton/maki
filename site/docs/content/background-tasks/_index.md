@@ -243,15 +243,15 @@ The message does not start a turn and reaches the model with your next prompt. A
 
 ## Headless, SDK and ACP
 
-These modes have no `Ctrl+B`, but the model can still move work with `background = true`, `ctx:background()` and `background_on_timeout`:
+These modes have no `Ctrl+B`. Where moves are on, the model can still move work with `background = true`, `ctx:background()` and `background_on_timeout`:
 
 | Mode | Results |
 |------|---------|
 | `-p` / `--print` | Off by default, so `background = true` runs in the foreground. With `--background-timeout`, the process stays alive while background work runs, and each result starts a new turn. |
-| SDK, stdin open | Results ride along with the next user message. No turn starts on its own. |
+| SDK, stdin open | Off by default, as `-p`. With `--background-timeout`, results ride along with the next user message, and no turn starts on its own. |
 | SDK, stdin closed | As `-p` with `--background-timeout`. |
-| ACP | Results arrive with the next prompt. No turn starts on its own. Closing the session stops the work. |
+| ACP | On by default. Results arrive with the next prompt. No turn starts on its own. Closing the session stops the work. |
 
 Nobody answers a moved subagent's prompts here, so they are denied and its tools need [allow rules](/docs/permissions/).
 
-`--background-timeout <SECS>` bounds the wait, and `0` turns moves off. It defaults to 600 in SDK mode and with `--exit-on-done`. `-p` keeps moves off by default because a dev server the model moves never ends and would hold a CI job for the full timeout. See [Headless Mode](/docs/headless/#background-tasks) and [ACP](/docs/acp/#background-tasks).
+`--background-timeout <SECS>` bounds the wait, and `0` turns moves off. It defaults to 600 with `--exit-on-done`. `-p` and SDK mode keep moves off by default. A dev server the model moves never ends and would hold a CI job for the full timeout, and an SDK client that takes a result as finished work would act on a turn whose subagents still run. See [Headless Mode](/docs/headless/#background-tasks) and [ACP](/docs/acp/#background-tasks).

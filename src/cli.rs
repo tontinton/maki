@@ -193,10 +193,10 @@ pub struct Cli {
     /// How long --print, SDK mode and --exit-on-done stay up for background
     /// tasks once their input ends. Each result that comes back in time wakes
     /// the model for another turn. Tasks still running after this are stopped.
-    /// Unset: 600 for SDK mode and --exit-on-done, while --print runs with
-    /// background tasks off so it exits right after its answer. 0 turns them
-    /// off for --print, SDK and ACP, so every tool call blocks until it
-    /// finishes. At most a week
+    /// Unset: --print and SDK mode run with background tasks off, so every
+    /// tool call blocks until it finishes and a result means the work is
+    /// done, while --exit-on-done waits 600. 0 turns them off for ACP as
+    /// well. At most a week
     #[arg(
         long,
         value_name = "SECS",
@@ -374,16 +374,16 @@ impl Cli {
         })
     }
 
-    /// `None` when background tasks are off. `-p` has no one to use the wait
-    /// and promises one answer, so it only waits when asked to.
+    /// `None` when background tasks are off. `-p` promises one answer. An SDK
+    /// client reads each result as finished work, and no turn wakes while its
+    /// stdin is open, so a turn that ends with tasks still out looks done
+    /// when it is not. Both only wait when asked to.
     pub fn background_wait(&self) -> Option<Duration> {
-        let secs = self
-            .background_timeout
-            .unwrap_or(if self.print && !self.is_sdk_mode() {
-                0
-            } else {
-                DEFAULT_BACKGROUND_TIMEOUT_SECS
-            });
+        let secs = self.background_timeout.unwrap_or(if self.print {
+            0
+        } else {
+            DEFAULT_BACKGROUND_TIMEOUT_SECS
+        });
         (secs > 0).then(|| Duration::from_secs(secs))
     }
 }
@@ -646,7 +646,8 @@ mod tests {
     }
 
     #[test_case(&["-p"], None ; "print_default_is_off")]
-    #[test_case(&["-p", "--input-format", "stream-json"], Some(DEFAULT_BACKGROUND_TIMEOUT_SECS) ; "sdk_default")]
+    #[test_case(&["-p", "--input-format", "stream-json"], None ; "sdk_default_is_off")]
+    #[test_case(&["-p", "--input-format", "stream-json", "--background-timeout", "30"], Some(30) ; "sdk_set")]
     #[test_case(&["--exit-on-done"], Some(DEFAULT_BACKGROUND_TIMEOUT_SECS) ; "tui_default")]
     #[test_case(&["acp"], Some(DEFAULT_BACKGROUND_TIMEOUT_SECS) ; "acp_default_is_on")]
     #[test_case(&["-p", "--background-timeout", "30"], Some(30) ; "print_set")]

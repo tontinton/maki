@@ -88,9 +88,11 @@ unlocked.
 
 ## Background Tasks
 
-SDK mode moves work with `background = true`, `ctx:background()` and `background_on_timeout` as the TUI does. See [Background Tasks](/docs/background-tasks/) for what can move.
+`--print` and SDK mode run with moves off unless you pass `--background-timeout <SECS>`. Every call blocks until it finishes, and `background = true` runs in the foreground.
 
-`--print` runs with moves off unless you pass `--background-timeout <SECS>`. It promises one answer and a predictable exit, and a dev server the model moves never ends, so it would hold a CI job for the full timeout. Every call blocks until it finishes, and `background = true` runs in the foreground. The rest of this section applies to SDK mode, and to `--print` with the flag set.
+`--print` promises one answer and a predictable exit, and a dev server the model moves never ends, so it would hold a CI job for the full timeout. An SDK client reads each result as the end of that message's work. With moves on, a turn can end while its subagents still run, and a client that sends its next message on the result finds the work unfinished.
+
+The rest of this section applies with the flag set. Work then moves with `background = true`, `ctx:background()` and `background_on_timeout` as in the TUI. See [Background Tasks](/docs/background-tasks/) for what can move.
 
 If background work still runs when the run ends, the process stays alive and each result starts a new turn. The final result covers those turns. With `text` output it prints the last turn's text. `total_cost_usd` and `usage` also include spend after the last turn, such as a subagent stopped mid-run, and so does the stored session.
 
@@ -100,7 +102,7 @@ With `--verbose`, the result that wakes a turn comes first as a notice, so the w
 {"type":"system","subtype":"notice","text":"Background bash finished: cargo test","session_id":"..."}
 ```
 
-The process exits once nothing is running. If `--background-timeout <SECS>` runs out first (default 600 in SDK mode), Maki stops the tasks and warns on stderr:
+The process exits once nothing is running. If `--background-timeout <SECS>` runs out first, Maki stops the tasks and warns on stderr:
 
 ```
 N background task result(s) never reached the model before --background-timeout ran out ...
@@ -115,8 +117,6 @@ An SDK result is sent when its run ends, so it cannot include spend that came la
 ```json
 {"type":"system","subtype":"background_usage","total_cost_usd":0.12,"usage":{"input_tokens":5300,"output_tokens":800,...},"session_id":"..."}
 ```
-
-`--background-timeout 0` turns moves off in SDK mode, and the work runs in the foreground. SDK emits a result per turn, so consumers expect woken turns, and the default keeps them on.
 
 ## Stopping a Run
 

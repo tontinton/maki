@@ -26,7 +26,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
 | `-c` / `--continue`, `-r` / `--resume` | yes | yes | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
-| `--background-timeout` | with `--exit-on-done` | yes (turns moves on) | yes |
+| `--background-timeout` | with `--exit-on-done` | yes (turns moves on) | yes (turns moves on) |
 | `--image` | error (use Ctrl+V paste) | yes | error (send images over the wire protocol) |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
@@ -55,7 +55,7 @@ A flag marked error stops Maki before the run starts, so a script cannot think i
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
 | `--trust` | Load the project's `.maki` config for this run without asking, recording no decision. See [Folder Trust](/docs/folder-trust/#containers-and-ci) |
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers). Waits for running background tasks, bounded by `--background-timeout` |
-| `--background-timeout <SECS>` | How long a run waits for [background tasks](/docs/background-tasks/#headless-sdk-and-acp) after it ends, at most a week. Unset, it is `600` in SDK mode and with `--exit-on-done`, and `-p` runs with background moves off. `0` turns them off everywhere. Global, so it goes before a subcommand |
+| `--background-timeout <SECS>` | How long a run waits for [background tasks](/docs/background-tasks/#headless-sdk-and-acp) after it ends, at most a week. Unset, it is `600` with `--exit-on-done`, and `-p` and SDK mode run with background moves off. `0` turns them off everywhere. Global, so it goes before a subcommand |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
