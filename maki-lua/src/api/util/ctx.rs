@@ -657,6 +657,7 @@ fn resolve_abs_with_cwd(path: String, cwd: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::tools::{LocalTool, ToolAudience};
@@ -703,7 +704,7 @@ mod tests {
             }),
         );
         ctx.local_tools = Arc::new(tools);
-        ctx.live_sink = Some(flume::unbounded().0);
+        ctx.live_sink = Some(unbounded_channel().0);
         ctx
     }
 

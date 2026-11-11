@@ -802,7 +802,7 @@ pub(crate) struct TaskCell {
     pub(crate) root_buf: Option<Arc<SharedBuf>>,
     /// Forwards live bufs and annotations to the `maki.agent.call_tool` that
     /// dispatched this task.
-    pub(crate) live_sink: Option<flume::Sender<ToolLive>>,
+    pub(crate) live_sink: Option<UnboundedSender<ToolLive>>,
     /// When `Some`, `maki.async.run` tasks queue here instead of the global
     /// `SpawnQueue` so restore can run them inline before snapshotting.
     pub(crate) inline_spawn: Option<Vec<PendingAsyncTask>>,
