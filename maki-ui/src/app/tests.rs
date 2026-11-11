@@ -6771,6 +6771,40 @@ fn a_plan_waits_for_the_queue_to_drain_before_review() {
     assert!(app.plan_form.is_visible());
 }
 
+/// A question window owns the keys while it is up, even over a settled plan.
+/// When it closes, a window-only suspension gives the review back.
+#[test]
+fn a_needs_input_window_holds_the_plan_surface_until_it_closes() {
+    let (_tmp, mut app) = plan_app();
+    let buf = Arc::new(SharedBuf::new());
+    let config = FloatConfig {
+        needs_input: true,
+        ..FloatConfig::default()
+    };
+    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
+    app.on_window_opened(true);
+    assert!(app.plan_cycle.refining);
+    app.plan_form.on_plan_ready();
+    assert!(app.plan_form.is_visible());
+    assert!(
+        !app.plan_form_active(),
+        "the question keeps the keys over the form"
+    );
+
+    cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
+    let _ = app.tick();
+
+    assert!(!app.float_mgr.needs_input());
+    assert!(!app.plan_cycle.refining);
+    assert!(app.state.plan.is_ready());
+    assert!(
+        app.plan_form_active(),
+        "the review comes back when the question closes"
+    );
+}
+
 /// A nested write reports its own effect, so a batch or interpreter child
 /// still starts the plan cycle.
 #[test_case(true, true  ; "the_plan_path_starts_a_cycle")]

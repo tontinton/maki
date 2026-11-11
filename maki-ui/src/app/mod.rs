@@ -904,13 +904,18 @@ impl App {
         }
     }
 
-    /// The one definition of a plan the user may review or implement.
+    /// A settled revision while no drafting cycle is active. This is what the
+    /// plan surface may draw; a window that needs input still owns the keys.
     fn plan_review_ready(&self) -> bool {
         self.state.mode == Mode::Plan && !self.plan_cycle.refining && self.state.plan.is_ready()
     }
 
+    fn plan_surface_ready(&self) -> bool {
+        self.plan_review_ready() && !self.float_mgr.needs_input()
+    }
+
     fn plan_form_open(&self) -> bool {
-        self.plan_review_ready() && self.plan_form.is_visible()
+        self.plan_surface_ready() && self.plan_form.is_visible()
     }
 
     fn plan_form_active(&self) -> bool {
@@ -1716,7 +1721,7 @@ impl App {
     }
 
     fn plan_toggle_ready(&self) -> bool {
-        self.plan_review_ready()
+        self.plan_surface_ready()
     }
 
     /// [`Self::run_action`] for a default key, which has no one to answer.
@@ -2620,6 +2625,7 @@ impl App {
             | self.poll_input_rules()
             | Dirty::from(self.input_box.poll_decor())
             | self.tick_plan()
+            | self.tick_plan_window()
             | self.tick_file_picker()
             | self.tick_input_changed()
             | self.tick_background_moves()
@@ -2659,6 +2665,7 @@ impl App {
         self.input_fired_this_frame = false;
         let _ = self.float_mgr.tick();
         let _ = self.tick_plan();
+        let _ = self.tick_plan_window();
         let _ = self.poll_input_rules();
         let _ = self.input_box.poll_decor();
         let _ = self.tick_background_moves();

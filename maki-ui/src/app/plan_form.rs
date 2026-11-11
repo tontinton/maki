@@ -317,7 +317,11 @@ impl App {
             self.flash(FLASH_PLAN_NOT_READY.into());
             return vec![];
         };
-        if self.plan_cycle.refining || self.status == Status::Streaming || !self.queue.is_empty() {
+        if self.plan_cycle.refining
+            || self.status == Status::Streaming
+            || !self.queue.is_empty()
+            || self.float_mgr.needs_input()
+        {
             self.flash(FLASH_PLAN_BUSY.into());
             return vec![];
         }

@@ -271,7 +271,7 @@ impl App {
             }
             let placeholder = self.input_placeholder();
             let panel_hint = self
-                .plan_review_ready()
+                .plan_surface_ready()
                 .then(|| self.plan_form.hint_line())
                 .flatten()
                 .or_else(|| self.lua_hint_line());

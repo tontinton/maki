@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::repaint::Dirty;
+
 use crate::agent::QueuedMessage;
 use crate::theme;
 use maki_agent::{AgentInput, AgentMode, DoneReason, InputSource};
@@ -222,6 +224,25 @@ impl App {
         if self.plan_last_done.take() == Some(DoneReason::EndTurn) {
             self.transition_plan(PlanTrigger::Settled);
         }
+    }
+
+    /// A question window can suspend a settled plan without a run that would
+    /// ever settle it. Once it closes, the review comes back; the form stays
+    /// hidden and the hint points at it.
+    pub(super) fn tick_plan_window(&mut self) -> Dirty {
+        if self.plan_cycle.refining
+            && !self.plan_cycle.written
+            && self.state.mode == Mode::Plan
+            && self.state.plan.is_ready()
+            && !self.float_mgr.needs_input()
+            && self.status != Status::Streaming
+            && self.queue.is_empty()
+        {
+            self.plan_cycle.refining = false;
+            self.plan_answers.abandon();
+            return Dirty::YES;
+        }
+        Dirty::NO
     }
 
     pub(super) fn enter_plan(&mut self) {
