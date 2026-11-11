@@ -58,7 +58,7 @@ use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter, release_cursor, release_mode};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
 use crate::api::plan::{
-    PlanRowHandlers, RowOwners, clear_menu_generation, clear_plugin_rows, clear_session_rows,
+    PlanRowHandlers, RowHandler, RowOwners, clear_plugin_rows, clear_session_rows,
     install_row_handlers, row_handler_opts, rows_from_table, rows_to_table,
 };
 use crate::api::slot::{
@@ -514,6 +514,9 @@ pub enum Request {
     OpenPlanForm {
         path: String,
         session: String,
+        /// The UI's request number, which the menu answers with as its
+        /// generation.
+        request: u64,
         /// The rows the host proposes, i.e. the bottom of the actions chain.
         rows: Vec<PlanFormRow>,
         /// The menu to draw, or `None` when a layer took the form over.
@@ -5235,9 +5238,8 @@ async fn plan_form_opens(
     }
 }
 
-/// Asks the `ui.plan_form.actions` chain for the menu the form draws, and
-/// stashes the handlers of the plugin rows that came back so a pick can find
-/// them, under the generation the form has to echo back.
+/// Asks the `ui.plan_form.actions` chain for the menu the form draws, and the
+/// handlers of the plugin rows that came back.
 ///
 /// The default answers with {proposed}, the host's own rows, which is also
 /// what a layer that throws, parks for good, or answers off contract leaves
@@ -5248,10 +5250,9 @@ async fn plan_form_rows(
     plugins: &PluginMap,
     gate: &Rc<InflightGate>,
     deadline: Instant,
-    session: &str,
     args: MultiValue,
     proposed: Vec<PlanFormRow>,
-) -> PlanMenu {
+) -> (Vec<PlanFormRow>, Vec<Option<RowHandler>>) {
     let allow_layer = layer_delegation(lua, plugins, PLAN_FORM_COST);
     let host_rows = proposed.clone();
     // Which layer put which handler in the menu, the one thing the answered
@@ -5312,29 +5313,9 @@ async fn plan_form_rows(
     };
     // A plugin that wants no form keeps `ui.plan_form` closed instead of
     // answering with an empty menu.
-    let (rows, handlers) = answered
+    answered
         .filter(|answered| !answered.0.is_empty())
-        .unwrap_or_else(|| (proposed, Vec::new()));
-    match install_row_handlers(lua, session.to_owned(), handlers) {
-        Ok(generation) => PlanMenu { generation, rows },
-        Err(e) => {
-            // Nothing was stashed, so no row may go on claiming a handler: a
-            // pick would echo a generation that answers for nothing, and the
-            // built-in outcome the row named would go with it.
-            tracing::warn!(error = %e, "could not stash the plan form row handlers");
-            PlanMenu {
-                generation: 0,
-                rows: rows.into_iter().filter_map(without_handler).collect(),
-            }
-        }
-    }
-}
-
-/// A row the host could not stash a handler for. What is left is the built-in
-/// outcome it named, and a row that named none is one nobody can run.
-fn without_handler(mut row: PlanFormRow) -> Option<PlanFormRow> {
-    row.plugin = None;
-    row.action.is_some().then_some(row)
+        .unwrap_or_else(|| (proposed, Vec::new()))
 }
 
 /// Both chains a landed plan fires, under one deadline: they run back to back
@@ -5348,22 +5329,19 @@ async fn open_plan_form(
     path: String,
     session: &str,
     rows: Vec<PlanFormRow>,
-) -> Option<PlanMenu> {
+) -> Option<(Vec<PlanFormRow>, Vec<Option<RowHandler>>)> {
     let deadline = Instant::now() + PLAN_FORM_SLOT_DEADLINE;
     let args = match plan_form_event(lua, &path, session) {
         Ok(args) => args,
         Err(e) => {
             tracing::warn!(error = %e, "could not build the plan form slot event");
-            return Some(PlanMenu {
-                generation: 0,
-                rows,
-            });
+            return Some((rows, Vec::new()));
         }
     };
     if !plan_form_opens(lua, plugins, gate, deadline, args.clone()).await {
         return None;
     }
-    Some(plan_form_rows(lua, plugins, gate, deadline, session, args, rows).await)
+    Some(plan_form_rows(lua, plugins, gate, deadline, args, rows).await)
 }
 
 /// Fires a host-owned chain and reads back the one contract every host slot
@@ -6102,6 +6080,7 @@ pub fn spawn(
                         Request::OpenPlanForm {
                             path,
                             session,
+                            request,
                             rows,
                             reply,
                         } => {
@@ -6112,16 +6091,22 @@ pub fn spawn(
                             let plugins = Rc::clone(&rt.plugins);
                             let gate = Rc::clone(&gate);
                             spawn_local(async move {
-                                let menu =
+                                let (rows, handlers) =
                                     open_plan_form(&lua, &plugins, &gate, path, &session, rows)
-                                        .await;
-                                let generation = menu.as_ref().map_or(0, |m| m.generation);
-                                if reply.send(menu).is_err() {
-                                    // The form gave up on this answer, or the
-                                    // session it was asked about is gone. The
-                                    // handlers stashed for a menu nobody will
-                                    // ever draw go with it.
-                                    clear_menu_generation(&lua, &session, generation);
+                                        .await
+                                        .unzip();
+                                let menu = rows.map(|rows| PlanMenu {
+                                    generation: request,
+                                    rows,
+                                });
+                                // No await after send: newer requests drop this receiver first.
+                                if reply.send(menu).is_ok() {
+                                    install_row_handlers(
+                                        &lua,
+                                        session,
+                                        request,
+                                        handlers.unwrap_or_default(),
+                                    );
                                 }
                             });
                         }

@@ -106,7 +106,8 @@ pub(crate) struct RowHandler {
 }
 
 /// The menu one session is drawing, and the generation the form echoes back
-/// on a pick.
+/// on a pick. The generation is the UI's request number, unique per session
+/// within one `App`.
 struct SessionMenu {
     generation: u64,
     rows: Vec<Option<RowHandler>>,
@@ -118,8 +119,6 @@ struct SessionMenu {
 #[derive(Default)]
 pub(crate) struct PlanRowHandlers {
     menus: HashMap<String, SessionMenu>,
-    /// Never reused, so a stale pick can only ever miss.
-    next_generation: u64,
 }
 
 impl PlanRowHandlers {
@@ -147,28 +146,28 @@ pub(crate) const NO_MENU_ERR: &str = "no plan form menu for this session";
 pub(crate) const STALE_MENU_ERR: &str = "plan form menu is no longer the one on screen";
 pub(crate) const NO_HANDLER_ERR: &str = "plan form row has no handler";
 
-fn handlers_mut(lua: &Lua) -> LuaResult<mlua::AppDataRefMut<'_, PlanRowHandlers>> {
-    lua.app_data_mut::<PlanRowHandlers>()
-        .ok_or_else(|| mlua::Error::runtime("plan row handlers not initialized"))
-}
-
 /// Publish the menu a session is about to draw, dropping the handlers of the
 /// menu it replaces so a long-lived session does not accumulate registry
-/// keys. The generation it answers with is what a pick has to echo back.
+/// keys. The request is what the form echoes back on a pick.
 pub(crate) fn install_row_handlers(
     lua: &Lua,
     session: String,
+    request: u64,
     rows: Vec<Option<RowHandler>>,
-) -> LuaResult<u64> {
-    let mut store = handlers_mut(lua)?;
-    store.next_generation += 1;
-    let generation = store.next_generation;
-    let replaced = store
-        .menus
-        .insert(session, SessionMenu { generation, rows });
+) {
+    let Some(mut store) = lua.app_data_mut::<PlanRowHandlers>() else {
+        drop_keys(lua, rows.into_iter());
+        return;
+    };
+    let replaced = store.menus.insert(
+        session,
+        SessionMenu {
+            generation: request,
+            rows,
+        },
+    );
     drop(store);
     drop_keys(lua, replaced.into_iter().flat_map(|m| m.rows));
-    Ok(generation)
 }
 
 /// Reap the handlers a plugin owns. The rows stay on screen and go on naming
@@ -187,24 +186,6 @@ pub(crate) fn clear_plugin_rows(lua: &Lua, plugin: &str) {
     }
     drop(store);
     drop_keys(lua, dropped.into_iter().map(Some));
-}
-
-/// Reap a menu that was published for nobody, leaving a newer one for the
-/// same session alone: a draft that landed while this one was still being
-/// answered has already replaced it, and that one is on screen.
-///
-/// A {generation} of zero is a menu no handler was stashed under.
-pub(crate) fn clear_menu_generation(lua: &Lua, session: &str, generation: u64) {
-    let Some(mut store) = lua.app_data_mut::<PlanRowHandlers>() else {
-        return;
-    };
-    let stale = store
-        .menus
-        .get(session)
-        .is_some_and(|menu| menu.generation == generation);
-    let removed = stale.then(|| store.menus.remove(session)).flatten();
-    drop(store);
-    drop_keys(lua, removed.into_iter().flat_map(|m| m.rows));
 }
 
 /// Reap a session's menu, or its handlers outlive every tab that could run
@@ -496,6 +477,8 @@ mod tests {
     const PLUGIN: &str = "planner";
     const OTHER_PLUGIN: &str = "other";
     const SESSION: &str = "s1";
+    const REQUEST: u64 = 1;
+    const NEXT_REQUEST: u64 = 2;
     /// A row nothing is wrong with, next to the one the case breaks.
     const KEEPER_ID: &str = "keeper";
 
@@ -710,18 +693,18 @@ mod tests {
         assert!(!rows[0].desc.contains('\n'));
     }
 
-    fn install(lua: &Lua, plugin: &str) -> u64 {
+    fn install(lua: &Lua, plugin: &str, request: u64) {
         let func: Function = lua.load("return function() end").eval().unwrap();
         let handler = lua.create_registry_value(func).unwrap();
         install_row_handlers(
             lua,
             SESSION.to_owned(),
+            request,
             vec![Some(RowHandler {
                 plugin: Arc::from(plugin),
                 key: handler,
             })],
-        )
-        .unwrap()
+        );
     }
 
     /// The revoked plugin's code stops being reachable the moment it is
@@ -730,16 +713,16 @@ mod tests {
     fn unloading_a_plugin_reaps_its_row_handlers() {
         let lua = Lua::new();
         lua.set_app_data(PlanRowHandlers::default());
-        let generation = install(&lua, PLUGIN);
+        install(&lua, PLUGIN, REQUEST);
         let store = lua.app_data_ref::<PlanRowHandlers>().unwrap();
-        assert!(store.handler(SESSION, generation, 0).is_ok());
+        assert!(store.handler(SESSION, REQUEST, 0).is_ok());
         drop(store);
 
         clear_plugin_rows(&lua, OTHER_PLUGIN);
         assert!(
             lua.app_data_ref::<PlanRowHandlers>()
                 .unwrap()
-                .handler(SESSION, generation, 0)
+                .handler(SESSION, REQUEST, 0)
                 .is_ok(),
             "another plugin's unload must not touch this handler"
         );
@@ -748,7 +731,7 @@ mod tests {
         assert_eq!(
             lua.app_data_ref::<PlanRowHandlers>()
                 .unwrap()
-                .handler(SESSION, generation, 0)
+                .handler(SESSION, REQUEST, 0)
                 .err(),
             Some(NO_HANDLER_ERR)
         );
@@ -760,69 +743,33 @@ mod tests {
     fn closing_a_session_reaps_its_menu() {
         let lua = Lua::new();
         lua.set_app_data(PlanRowHandlers::default());
-        let generation = install(&lua, PLUGIN);
+        install(&lua, PLUGIN, REQUEST);
 
         clear_session_rows(&lua, SESSION);
         assert_eq!(
             lua.app_data_ref::<PlanRowHandlers>()
                 .unwrap()
-                .handler(SESSION, generation, 0)
+                .handler(SESSION, REQUEST, 0)
                 .err(),
             Some(NO_MENU_ERR)
         );
     }
 
-    /// A chain that answered after the form stopped waiting published a menu
-    /// nobody can pick from. It is reaped rather than left for the life of
-    /// the session.
-    #[test]
-    fn a_menu_nobody_is_drawing_is_reaped() {
-        let lua = Lua::new();
-        lua.set_app_data(PlanRowHandlers::default());
-        let orphan = install(&lua, PLUGIN);
-
-        clear_menu_generation(&lua, SESSION, orphan);
-        assert_eq!(
-            lua.app_data_ref::<PlanRowHandlers>()
-                .unwrap()
-                .handler(SESSION, orphan, 0)
-                .err(),
-            Some(NO_MENU_ERR)
-        );
-    }
-
-    /// Reaping an orphan must not take the menu that replaced it: a draft
-    /// that landed while the first was still being answered is the one on
-    /// screen.
-    #[test]
-    fn reaping_an_orphan_spares_the_menu_that_replaced_it() {
-        let lua = Lua::new();
-        lua.set_app_data(PlanRowHandlers::default());
-        let orphan = install(&lua, PLUGIN);
-        let on_screen = install(&lua, PLUGIN);
-
-        clear_menu_generation(&lua, SESSION, orphan);
-        assert!(
-            lua.app_data_ref::<PlanRowHandlers>()
-                .unwrap()
-                .handler(SESSION, on_screen, 0)
-                .is_ok()
-        );
-    }
-
-    /// A chain that answers late installs its handlers over a menu already on
-    /// screen, and the generation keeps a pick from reaching them.
+    /// A pick still in flight from a menu a newer request replaced names the
+    /// old generation, and so cannot reach the new menu's handlers.
     #[test]
     fn a_pick_from_a_replaced_menu_is_rejected() {
         let lua = Lua::new();
         lua.set_app_data(PlanRowHandlers::default());
-        let drawn = install(&lua, PLUGIN);
-        let installed_later = install(&lua, PLUGIN);
-        assert_ne!(drawn, installed_later);
+        install(&lua, PLUGIN, REQUEST);
+        install(&lua, PLUGIN, NEXT_REQUEST);
 
         let store = lua.app_data_ref::<PlanRowHandlers>().unwrap();
-        assert_eq!(store.handler(SESSION, drawn, 0).err(), Some(STALE_MENU_ERR));
-        assert!(store.handler(SESSION, installed_later, 0).is_ok());
+        assert_eq!(
+            store.handler(SESSION, REQUEST, 0).err(),
+            Some(STALE_MENU_ERR)
+        );
+        assert!(store.handler(SESSION, NEXT_REQUEST, 0).is_ok());
     }
 
     #[tokio::test]

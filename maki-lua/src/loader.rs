@@ -1129,19 +1129,22 @@ impl EventHandle {
     }
 
     /// Asks the `ui.plan_form*` chains what to draw for a draft that just
-    /// landed, starting from the {rows} the host proposes. The receiver
-    /// answers `None` when a layer took the form over, and disconnects when
-    /// the host is gone, which leaves the caller the built-in form.
+    /// landed, starting from the {rows} the host proposes. The menu answers
+    /// with {request} as its generation. The receiver answers `None` when a
+    /// layer took the form over, and disconnects when the host is gone, which
+    /// leaves the caller the built-in form.
     pub fn open_plan_form(
         &self,
         path: String,
         session: String,
+        request: u64,
         rows: Vec<PlanFormRow>,
     ) -> oneshot::Receiver<Option<PlanMenu>> {
         let (reply, rx) = oneshot::channel();
         let _ = self.prio_tx.send(Request::OpenPlanForm {
             path,
             session,
+            request,
             rows,
             reply,
         });
