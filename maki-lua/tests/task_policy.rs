@@ -812,8 +812,7 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     let mut opts = serde_json::Map::new();
     opts.insert("max_concurrent".into(), json!(1));
     let (reg, host) = load_task_host_with_opts(opts);
-    host.ui_attachment().attach();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     let chat = Chat::live();
     let (_run_trigger, run) = CancelToken::new();
 
@@ -859,7 +858,7 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     wait(&reg, json!({ "parked": SCENARIO_PARKED }));
     release(&reg, SCENARIO_PARKED);
     assert_eq!(
-        done_text(&next_task_done(&ui)),
+        done_text(&next_task_done(&mut ui)),
         (PLAIN_TEXT.to_owned(), false)
     );
     assert_eq!(probe(&reg)["released"], json!(1));

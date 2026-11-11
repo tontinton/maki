@@ -20,6 +20,7 @@ use maki_agent::{
 use maki_storage::id::MakiId;
 use mlua::Lua;
 use serde::Serialize;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout_at};
 
@@ -201,7 +202,7 @@ pub(crate) struct BackgroundInfo {
 pub(crate) struct MovedEnd {
     registry: BackgroundTasks,
     id: String,
-    ui: Option<flume::Sender<UiAction>>,
+    ui: Option<UnboundedSender<UiAction>>,
     landed: bool,
 }
 
@@ -209,7 +210,7 @@ impl MovedEnd {
     pub(crate) fn new(
         registry: BackgroundTasks,
         id: String,
-        ui: Option<flume::Sender<UiAction>>,
+        ui: Option<UnboundedSender<UiAction>>,
     ) -> Self {
         Self {
             registry,
@@ -228,7 +229,7 @@ impl MovedEnd {
             if let Some(session) = self.registry.lose(&self.id)
                 && let Some(ui) = ui
             {
-                let _ = ui.try_send(UiAction::PluginTaskEnded {
+                let _ = ui.send(UiAction::PluginTaskEnded {
                     session,
                     id: self.id.clone(),
                     end: TaskEnd::Lost,
@@ -431,7 +432,7 @@ impl BackgroundTasks {
         &self,
         id: &str,
         done: ToolDoneEvent,
-        ui: Option<flume::Sender<UiAction>>,
+        ui: Option<UnboundedSender<UiAction>>,
     ) {
         let Some(task) = self.take(id) else {
             tracing::debug!(id, "final reply of a background task that already settled");
@@ -460,7 +461,7 @@ impl BackgroundTasks {
             // A killed process usually exits with an error, so the tab hears
             // of the stop first and ends cancelled, not failed.
             if task.stopped.is_some() {
-                let _ = ui.try_send(UiAction::PluginTaskEnded {
+                let _ = ui.send(UiAction::PluginTaskEnded {
                     session: task.session,
                     id: id.to_owned(),
                     end: TaskEnd::Cancelled,
@@ -470,7 +471,7 @@ impl BackgroundTasks {
                 AgentEvent::ToolDone(Box::new(done)),
                 AgentEvent::StreamClosed,
             ] {
-                let _ = ui.try_send(UiAction::PluginTaskEvent {
+                let _ = ui.send(UiAction::PluginTaskEvent {
                     session: task.session,
                     plugin: Arc::clone(&task.info.plugin),
                     envelope: Box::new(Envelope {
@@ -675,7 +676,9 @@ pub(crate) mod tests {
     use maki_agent::cancel::CancelToken;
     use maki_agent::tools::test_support::stub_seed;
     use maki_providers::TaskSettled;
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::runtime::test_support::call_scope;
@@ -970,12 +973,11 @@ pub(crate) mod tests {
         let session = MakiId::generate();
         let _live = live(session);
         let (registry, ..) = registry_with_call(session);
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
 
         registry.deliver(CALL_ID, done(OUTPUT, false), Some(tx));
 
-        let events: Vec<_> = rx
-            .try_iter()
+        let events: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
             .map(|action| {
                 let UiAction::PluginTaskEvent {
                     session: chat,
@@ -1000,7 +1002,7 @@ pub(crate) mod tests {
         let session = MakiId::generate();
         let _live = live(session);
         let (registry, ..) = registry_with_call(session);
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         registry.stop(CALL_ID, stop);
 
         registry.deliver(CALL_ID, done(OUTPUT, true), Some(tx));
@@ -1219,7 +1221,7 @@ pub(crate) mod tests {
         let session = MakiId::generate();
         let (mailbox, _seed) = live(session);
         let (registry, token) = registry_with_call(session);
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
 
         match retire {
             Retire::Session => registry.end_session(session),
@@ -1235,8 +1237,7 @@ pub(crate) mod tests {
         assert!(!registry.contains(CALL_ID));
         assert!(mailbox.claim_wake().is_empty());
         assert_eq!(mailbox.drain().len(), 1);
-        let tab_events = rx
-            .try_iter()
+        let tab_events = iter::from_fn(|| rx.try_recv().ok())
             .filter(|action| matches!(action, UiAction::PluginTaskEvent { .. }))
             .count();
         assert_eq!(tab_events, 2, "{TAB_CLOSED}");
@@ -1344,14 +1345,14 @@ pub(crate) mod tests {
         let session = MakiId::generate();
         let _live = live(session);
         let (registry, ..) = registry_with_call(session);
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         if !settles_it {
             registry.lose_all();
         }
 
         MovedEnd::new(registry, CALL_ID.to_owned(), Some(tx)).land(None);
 
-        let told = rx.try_iter().any(|action| {
+        let told = iter::from_fn(|| rx.try_recv().ok()).any(|action| {
             matches!(
                 action,
                 UiAction::PluginTaskEnded { session: chat, id, end: TaskEnd::Lost }

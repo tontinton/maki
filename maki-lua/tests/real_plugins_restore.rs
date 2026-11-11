@@ -576,7 +576,8 @@ fn todo_load_restore_leaves_the_panel_closed() {
     );
     host.load_source("barrier", "").unwrap();
 
-    let opened = host.ui_action_rx().drain().any(
+    let mut ui = host.take_ui_action_rx().unwrap();
+    let opened = iter::from_fn(|| ui.try_recv().ok()).any(
         |action| matches!(action, UiAction::OpenWin { config, .. } if config.split == Split::Panel),
     );
     assert!(!opened, "a load restore must not refill the panel");
@@ -600,9 +601,8 @@ fn todo_panel_opens_in_the_tab_of_each_writing_session() {
         runtime().block_on(tool.parse(&input).unwrap().execute(&ctx));
     }
 
-    let owners: Vec<_> = host
-        .ui_action_rx()
-        .drain()
+    let mut ui = host.take_ui_action_rx().unwrap();
+    let owners: Vec<_> = iter::from_fn(|| ui.try_recv().ok())
         .filter_map(|action| match action {
             UiAction::OpenWin {
                 session, config, ..

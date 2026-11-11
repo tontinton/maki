@@ -3,6 +3,7 @@
 //! move hook. Each scenario follows the move from the Ctrl+B request to what
 //! the model reads and what the transcript shows.
 
+use crate::agent::UnboundedReceiver;
 use maki_lua::test_support::wait_next;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -320,7 +321,7 @@ fn expected_display(outcome: &str) -> String {
 struct World {
     handles: AgentHandles,
     host: PluginHost,
-    ui: flume::Receiver<UiAction>,
+    ui: UnboundedReceiver<UiAction>,
     requests: flume::Receiver<SeenRequest>,
     seen: Vec<AgentEvent>,
     _serial: MutexGuard<'static, ()>,
@@ -335,8 +336,7 @@ impl World {
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .and_then(|()| host.load_source(PLUGIN, PLUGIN_SRC))
             .expect(PLUGINS_LOAD);
-        host.ui_attachment().attach();
-        let ui = host.ui_action_rx();
+        let ui = host.take_ui_action_rx().unwrap();
 
         let (seen_requests, requests) = flume::unbounded();
         let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
@@ -461,10 +461,14 @@ impl World {
 
     /// The final reply of the moved call, as its task tab gets it. The chat
     /// was told before this is sent.
-    fn task_done(&self) -> ToolDoneEvent {
+    fn task_done(&mut self) -> ToolDoneEvent {
         let deadline = Instant::now() + WAIT;
         loop {
-            let action = self.ui.recv_deadline(deadline).expect(NO_TASK_EVENT);
+            let action = wait_next(
+                &mut self.ui,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .expect(NO_TASK_EVENT);
             if let UiAction::PluginTaskEvent { envelope, .. } = action
                 && let AgentEvent::ToolDone(done) = envelope.event
             {

@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::util::command::{UiAction, ui_send};
 use crate::api::util::convert::TableExt;
@@ -128,7 +129,7 @@ lua_class! {
 #[lua_fn]
 fn notify(
     lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     msg: String,
     level: Option<String>,
@@ -308,6 +309,9 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
 
@@ -318,7 +322,7 @@ mod tests {
     /// way `create_maki_global` wires it: `notify` on the metatable's
     /// `__index` so `maki.notify = fn` hits `__newindex` and lands in the
     /// shared slot instead of shadowing it.
-    fn install(lua: &Lua, tx: Option<flume::Sender<UiAction>>, plugin: &str) {
+    fn install(lua: &Lua, tx: Option<UnboundedSender<UiAction>>, plugin: &str) {
         if lua.app_data_ref::<NotifyHandler>().is_none() {
             lua.set_app_data(NotifyHandler::default());
         }
@@ -342,7 +346,7 @@ mod tests {
         lua.globals().set(plugin, maki).unwrap();
     }
 
-    fn flashed(rx: &flume::Receiver<UiAction>) -> String {
+    fn flashed(rx: &mut UnboundedReceiver<UiAction>) -> String {
         match rx.try_recv().expect("a flash") {
             UiAction::Flash(msg) => msg,
             _ => panic!("expected Flash"),
@@ -353,23 +357,23 @@ mod tests {
     #[test_case("maki.set_notify_handler(function() end) maki.set_notify_handler(nil)" ; "handler removed again")]
     fn notify_falls_back_to_flash(prelude: &str) {
         let lua = Lua::new();
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         install(&lua, Some(tx), "maki");
         lua.load(format!(r#"{prelude} maki.notify("hi")"#))
             .exec()
             .unwrap();
-        assert_eq!(flashed(&rx), "hi");
+        assert_eq!(flashed(&mut rx), "hi");
     }
 
     #[test]
     fn notify_title_labels_the_flash() {
         let lua = Lua::new();
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         install(&lua, Some(tx), "maki");
         lua.load(r#"maki.notify("hi", nil, { title = "make" })"#)
             .exec()
             .unwrap();
-        assert_eq!(flashed(&rx), "make: hi");
+        assert_eq!(flashed(&mut rx), "make: hi");
     }
 
     /// Headless runs (`maki -p`, sdk) have no UI to flash to, and a plugin
@@ -388,7 +392,7 @@ mod tests {
     #[test_case(BY_ASSIGNMENT ; "assignment")]
     fn override_reroutes_every_plugins_notify(install_handler: &str) {
         let lua = Lua::new();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         install(&lua, Some(tx.clone()), "maki");
         install(&lua, Some(tx), "maki_b");
 
@@ -411,7 +415,7 @@ mod tests {
     #[test]
     fn unloading_the_installer_restores_the_default() {
         let lua = Lua::new();
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         install(&lua, Some(tx.clone()), "maki");
         install(&lua, Some(tx), "maki_b");
         lua.load(r#"seen = "" maki_b.set_notify_handler(function(msg) seen = msg end)"#)
@@ -425,13 +429,13 @@ mod tests {
 
         clear_notify_handler(&lua, "maki_b");
         lua.load(r#"maki.notify("back to flash")"#).exec().unwrap();
-        assert_eq!(flashed(&rx), "back to flash");
+        assert_eq!(flashed(&mut rx), "back to flash");
     }
 
     #[test]
     fn notify_assignment_rejects_non_function() {
         let lua = Lua::new();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         install(&lua, Some(tx), "maki");
         let err = lua
             .load(r#"maki.notify = 42"#)

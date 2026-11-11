@@ -18,6 +18,7 @@ use maki_storage::id::MakiId;
 use maki_storage::paths::session_data_dir;
 use mlua::{IntoLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::{Map, Value as JsonValue};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::{spawn_blocking, yield_now};
 
 use crate::api::image::LuaImage;
@@ -128,7 +129,7 @@ async fn from_disk<T: Send + 'static>(
 
 async fn roundtrip(
     lua: Lua,
-    tx: Option<flume::Sender<UiAction>>,
+    tx: Option<UnboundedSender<UiAction>>,
     req: SessionRequest,
 ) -> LuaResult<Pair<Value>> {
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Session {
@@ -145,7 +146,7 @@ async fn roundtrip(
 /// @example
 /// local stored, err = maki.session.list()
 #[lua_fn]
-async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn list(lua: Lua, #[ctx] tx: Option<UnboundedSender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::List).await
 }
 
@@ -157,7 +158,7 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 /// @example
 /// local live, err = maki.session.live()
 #[lua_fn]
-async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn live(lua: Lua, #[ctx] tx: Option<UnboundedSender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Live).await
 }
 
@@ -214,7 +215,7 @@ async fn unhosted_snapshot(lua: &Lua, raw: &str) -> Result<JsonValue, String> {
 #[lua_fn]
 async fn read(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
     let id = match opts {
@@ -252,7 +253,7 @@ async fn read(
 /// The focused tab, or under a headless driver the one session it runs.
 async fn focused_session(
     lua: &Lua,
-    tx: Option<&flume::Sender<UiAction>>,
+    tx: Option<&UnboundedSender<UiAction>>,
 ) -> Result<String, String> {
     // Asked in its own statement, so the borrow of the app data ends before
     // the roundtrip below parks the task.
@@ -280,7 +281,7 @@ async fn focused_session(
 
 async fn named_or_focused(
     lua: &Lua,
-    tx: Option<&flume::Sender<UiAction>>,
+    tx: Option<&UnboundedSender<UiAction>>,
     id: Option<String>,
 ) -> Result<MakiId, String> {
     let raw = match id {
@@ -296,7 +297,7 @@ async fn named_or_focused(
 /// yet reads too.
 async fn transcript(
     lua: &Lua,
-    tx: Option<&flume::Sender<UiAction>>,
+    tx: Option<&UnboundedSender<UiAction>>,
     id: MakiId,
 ) -> Result<SessionExport, String> {
     match ui_roundtrip(tx, |reply_tx| UiAction::ExportSession { id, reply_tx }).await {
@@ -396,7 +397,7 @@ async fn transcript_table(lua: &Lua, export: SessionExport) -> LuaResult<Table> 
 #[lua_fn(guard = SessionRead)]
 async fn export(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let id = match &opts {
@@ -461,7 +462,7 @@ async fn export(
 #[lua_fn(guard = SessionRead)]
 async fn messages(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let (id, last) = match &opts {
@@ -486,7 +487,10 @@ async fn messages(
 /// @example
 /// local id = maki.session.current()
 #[lua_fn]
-async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<String>> {
+async fn current(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+) -> LuaResult<Pair<String>> {
     Ok(pair(focused_session(&lua, tx.as_ref()).await))
 }
 
@@ -512,7 +516,7 @@ async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRes
 async fn data_dir(
     lua: Lua,
     #[ctx] plugin: Arc<str>,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<String>> {
     let named = match &opts {
@@ -549,7 +553,7 @@ async fn data_dir(
 #[lua_fn]
 async fn focus(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Focus { id }).await
@@ -565,7 +569,7 @@ async fn focus(
 #[lua_fn(guard = SessionWrite)]
 async fn delete(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Delete { id }).await
@@ -706,7 +710,7 @@ fn headless_cwd(lua: &Lua) -> Result<String, String> {
 #[lua_fn(guard = SessionWrite)]
 async fn new(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] grants: PluginPermissions,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
@@ -770,7 +774,7 @@ async fn new(
 #[lua_fn(guard = [Agent, SessionWrite])]
 async fn prompt(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
@@ -841,7 +845,7 @@ fn notify(
 #[lua_fn(guard = SessionSettings)]
 async fn set_mode(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     mode: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
@@ -862,7 +866,7 @@ async fn set_mode(
 #[lua_fn(guard = SessionSettings)]
 async fn set_title(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Table,
 ) -> LuaResult<Pair<Value>> {
     let req = SessionRequest::SetTitle {
@@ -881,7 +885,7 @@ lua_table! {
     /// `prompt` or `focus` still work. ACP has no focused session, so there
     /// `current` fails and `read`, `export` and `messages` need `session`.
     "maki.session" => pub(crate) fn create_session_table(
-        tx: Option<flume::Sender<UiAction>>,
+        tx: Option<UnboundedSender<UiAction>>,
         perms: &PluginPermissions,
         grants: PluginPermissions,
         plugin: Arc<str>,
@@ -910,6 +914,8 @@ mod tests {
     use maki_storage::frame::{FactsUpdate, PromptFacts, StoredFrame};
     use maki_storage::sessions::{StoredMode, StoredThinking};
     use tempfile::TempDir;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::api::base64::create_base64_table;
@@ -938,11 +944,11 @@ mod tests {
     const FACTS_CWD: &str = "/origin";
     const ONE_MESSAGE: &str = "{ { role = 'user', content = { { type = 'text', text = 'hi' } } } }";
 
-    fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn lua_with_session(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         lua_granted(tx, PluginPermissions::trusted())
     }
 
-    fn lua_granted(tx: Option<flume::Sender<UiAction>>, grants: PluginPermissions) -> Lua {
+    fn lua_granted(tx: Option<UnboundedSender<UiAction>>, grants: PluginPermissions) -> Lua {
         let lua = Lua::new();
         let t = create_session_table(&lua, tx, &grants, grants.clone(), PLUGIN.into()).unwrap();
         lua.globals().set("session", t).unwrap();
@@ -1017,13 +1023,13 @@ mod tests {
 
     #[tokio::test]
     async fn focus_roundtrips_through_ui_channel() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         std::thread::spawn(move || {
-            let Ok(UiAction::Session {
+            let Some(UiAction::Session {
                 req: SessionRequest::Focus { id },
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected focus request");
             };
@@ -1042,14 +1048,14 @@ mod tests {
     #[test_case("return session.prompt('hi')", None ; "defaults_to_focused")]
     #[tokio::test]
     async fn prompt_forwards_text_and_session_id(code: &str, expected_id: Option<&str>) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let expected_id = expected_id.map(str::to_owned);
         let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
+            let Some(UiAction::Session {
                 req: SessionRequest::Prompt { id, text },
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected prompt request");
             };
@@ -1073,15 +1079,15 @@ mod tests {
         expected_id: Option<&str>,
         expected_mode: &str,
     ) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let expected_id = expected_id.map(str::to_owned);
         let expected_mode = expected_mode.to_owned();
         let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
+            let Some(UiAction::Session {
                 req: SessionRequest::SetMode { id, mode },
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected set_mode request");
             };
@@ -1099,7 +1105,7 @@ mod tests {
     fn notify_is_synchronous_and_queues_an_observation() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         lua.globals().set("session_id", id.to_string()).unwrap();
 
@@ -1258,12 +1264,12 @@ mod tests {
 
     /// The UI answers `Current` with the bare id, not a snapshot.
     fn ui_focused_on(id: MakiId) -> Lua {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         std::thread::spawn(move || {
-            let Ok(UiAction::Session {
+            let Some(UiAction::Session {
                 req: SessionRequest::Current,
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected current request");
             };
@@ -1314,10 +1320,10 @@ mod tests {
 
     #[tokio::test]
     async fn messages_without_a_focused_session_is_an_error_pair() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         std::thread::spawn(move || {
-            let Ok(UiAction::Session { reply_tx, .. }) = rx.recv() else {
+            let Some(UiAction::Session { reply_tx, .. }) = rx.blocking_recv() else {
                 panic!("expected session request");
             };
             reply_tx.send(Ok(serde_json::Value::Null)).unwrap();
@@ -1332,7 +1338,7 @@ mod tests {
 
     /// `session` plus the `maki` pieces a plugin round trips with, and
     /// `one_message`, the smallest history `new` stores.
-    fn plugin_lua(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn plugin_lua(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         with_plugin_globals(lua_with_session(tx))
     }
 
@@ -1666,11 +1672,11 @@ mod tests {
     /// blank session, so the transcript arrives as parsed.
     #[tokio::test]
     async fn new_with_a_ui_hands_it_the_parsed_transcript() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = plugin_lua(Some(tx));
         let id = MakiId::generate();
         let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
+            let Some(UiAction::Session {
                 req:
                     SessionRequest::New {
                         transcript,
@@ -1678,7 +1684,7 @@ mod tests {
                         focus,
                     },
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected new request");
             };
@@ -1700,14 +1706,14 @@ mod tests {
 
     #[tokio::test]
     async fn export_with_a_ui_is_answered_by_it() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let id = MakiId::generate();
         std::thread::spawn(move || {
-            let Ok(UiAction::ExportSession {
+            let Some(UiAction::ExportSession {
                 id: asked,
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected export request");
             };

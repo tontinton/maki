@@ -228,7 +228,7 @@ end)
 struct Host {
     reg: Arc<ToolRegistry>,
     host: PluginHost,
-    ui: flume::Receiver<UiAction>,
+    ui: UnboundedReceiver<UiAction>,
 }
 
 impl Host {
@@ -236,8 +236,7 @@ impl Host {
         let reg = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&reg)).unwrap();
         host.load_source(PLUGIN, SRC).unwrap();
-        host.ui_attachment().attach();
-        let ui = host.ui_action_rx();
+        let ui = host.take_ui_action_rx().unwrap();
         Self { reg, host, ui }
     }
 
@@ -256,8 +255,8 @@ impl Host {
     }
 
     /// The final reply of a moved call, as its task tab gets it.
-    fn task_done(&self) -> ToolDoneEvent {
-        next_task_done(&self.ui)
+    fn task_done(&mut self) -> ToolDoneEvent {
+        next_task_done(&mut self.ui)
     }
 }
 
@@ -335,7 +334,7 @@ fn moved(host: &Host, chat: &Chat) -> Running {
 
 #[test]
 fn a_receipt_answers_the_dispatcher_and_the_final_reply_reaches_the_chat_once() {
-    let host = Host::new();
+    let mut host = Host::new();
     let chat = Chat::live();
     let result = moved(&host, &chat).result();
 
@@ -356,7 +355,7 @@ fn a_receipt_answers_the_dispatcher_and_the_final_reply_reaches_the_chat_once() 
 
 #[test]
 fn a_second_request_finds_the_call_already_moved() {
-    let host = Host::new();
+    let mut host = Host::new();
     let chat = Chat::live();
     let running = moved(&host, &chat);
 
@@ -372,7 +371,7 @@ fn a_second_request_finds_the_call_already_moved() {
 
 #[test]
 fn clicks_still_reach_a_moved_call() {
-    let host = Host::new();
+    let mut host = Host::new();
     let chat = Chat::live();
     assert!(moved(&host, &chat).result().backgrounded);
 
@@ -390,7 +389,7 @@ fn clicks_still_reach_a_moved_call() {
 /// batch child to settle queues its highlight as the batch returns.
 #[test]
 fn async_run_from_a_moved_call_outlives_its_final_reply() {
-    let host = Host::new();
+    let mut host = Host::new();
     let chat = Chat::live();
     let mut running = Running::start(&host, chat.id, LATE, json!({}));
     let body = wait_live_buf(&mut running.events, &running.id);
@@ -465,7 +464,7 @@ fn a_finish_that_beats_the_move_is_the_only_answer() {
 /// Rust backstop both lapse while it sleeps, and neither may end it.
 #[test]
 fn a_nested_call_outlives_its_deadlines_once_the_scope_moved() {
-    let host = Host::new();
+    let mut host = Host::new();
     let chat = Chat::live();
     let mut running = Running::start(
         &host,
@@ -506,7 +505,7 @@ fn a_reload_passes_a_moved_call_with_a_parked_nested_child() {
         Ok(true),
         "the reload drain waited on the moved call's child"
     );
-    let host = reloading.join().expect("reload thread");
+    let mut host = reloading.join().expect("reload thread");
 
     host.release(CHILD);
     assert_eq!(
@@ -517,7 +516,7 @@ fn a_reload_passes_a_moved_call_with_a_parked_nested_child() {
 
 #[test]
 fn a_background_deadline_moves_the_call_with_a_live_chat() {
-    let host = Host::new();
+    let mut host = Host::new();
     let chat = Chat::live();
     let mut input = movable_input();
     input["deadline"] = json!(0);
@@ -554,7 +553,7 @@ fn a_background_deadline_times_out_without_a_live_chat() {
 /// so a quit before then keeps it for the session meta.
 #[test]
 fn a_moved_calls_receipt_is_unsettled_until_its_notice_is_drained() {
-    let host = Host::new();
+    let mut host = Host::new();
     let chat = Chat::live();
     assert!(moved(&host, &chat).result().backgrounded);
 
@@ -570,7 +569,7 @@ fn a_moved_calls_receipt_is_unsettled_until_its_notice_is_drained() {
 
 #[test]
 fn the_user_moves_a_subagents_call_and_it_reports_to_the_subagent() {
-    let host = Host::new();
+    let mut host = Host::new();
     let chat = Chat::live();
     let subagent = SessionMailbox::register(MakiId::generate());
     let mut running = Running::start_as(&host, chat.id, CALL_ID, MOVABLE, movable_input(), |ctx| {
@@ -618,7 +617,7 @@ fn a_subagents_background_deadline_times_out() {
 /// layers before the chat, the task tab, or a waiting `task_stop` sees it.
 #[test]
 fn a_moved_calls_receipt_and_final_reply_pass_the_output_layers() {
-    let host = Host::new();
+    let mut host = Host::new();
     host.host
         .load_source(REDACTOR_PLUGIN, REDACTOR_SRC)
         .unwrap();

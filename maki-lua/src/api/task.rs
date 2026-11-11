@@ -8,6 +8,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::RequestOptions;
 use maki_storage::id::MakiId;
 use mlua::{Either as LuaEither, Lua, LuaSerdeExt, Result as LuaResult, Table, UserDataRef, Value};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::agent::{delivery, plugin_input};
 use crate::api::session::newest_messages_table;
@@ -28,7 +29,7 @@ const NAME_KEY: &str = "name";
 
 async fn roundtrip(
     lua: Lua,
-    tx: Option<flume::Sender<UiAction>>,
+    tx: Option<UnboundedSender<UiAction>>,
     req: TaskRequest,
 ) -> LuaResult<Pair<Value>> {
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Task {
@@ -64,7 +65,7 @@ async fn roundtrip(
 ///   print(t.name, t.status or "main")
 /// end
 #[lua_fn]
-async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn list(lua: Lua, #[ctx] tx: Option<UnboundedSender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, TaskRequest::List).await
 }
 
@@ -78,7 +79,7 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 #[lua_fn]
 async fn focus(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, TaskRequest::Focus { id }).await
@@ -94,7 +95,7 @@ async fn focus(
 #[lua_fn(guard = SessionWrite)]
 async fn remove(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, TaskRequest::Remove { id }).await
@@ -136,7 +137,7 @@ async fn remove(
 #[lua_fn]
 async fn stop(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     id: LuaEither<UserDataRef<LuaCtx>, String>,
     opts: Value,
 ) -> LuaResult<Pair<Value>> {
@@ -280,7 +281,7 @@ lua_table! {
     /// `nil, "no interactive UI attached"`, except the ones that take a tool
     /// handler's ctx: they reach the background tasks its agent moved.
     "maki.task" => pub(crate) fn create_task_table(
-        tx: Option<flume::Sender<UiAction>>,
+        tx: Option<UnboundedSender<UiAction>>,
         perms: &PluginPermissions,
     ),
     DOCS [list(tx), focus(tx), remove(perms, tx), stop(tx), send, messages(perms)]
@@ -294,6 +295,9 @@ mod tests {
     use serde_json::json;
     use std::thread::JoinHandle;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use crate::runtime::{TaskCell, TaskScope, run_command_scoped};
     use maki_agent::cancel::CancelToken;
@@ -325,7 +329,7 @@ mod tests {
         return table.concat(ids, ','), table.concat(statuses, ','), tasks[1].name
     ";
 
-    fn lua_with_task(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn lua_with_task(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         let lua = Lua::new();
         let t = create_task_table(&lua, tx, &PluginPermissions::trusted()).unwrap();
         lua.globals().set("task", t).unwrap();
@@ -335,9 +339,9 @@ mod tests {
     /// Answers the first request with {reply} and hands it back to assert on.
     /// Join only after dropping the `Lua` that holds the sender, or a missing
     /// request parks the thread forever.
-    fn spawn_host(rx: flume::Receiver<UiAction>, reply: UiReply) -> JoinHandle<TaskRequest> {
+    fn spawn_host(mut rx: UnboundedReceiver<UiAction>, reply: UiReply) -> JoinHandle<TaskRequest> {
         std::thread::spawn(move || {
-            let Ok(UiAction::Task { req, reply_tx }) = rx.recv() else {
+            let Some(UiAction::Task { req, reply_tx }) = rx.blocking_recv() else {
                 panic!("{NO_REQUEST_ERR}");
             };
             reply_tx.send(reply).unwrap();
@@ -363,7 +367,7 @@ mod tests {
     #[test_case(REMOVE_CALL ; "remove")]
     #[tokio::test]
     async fn host_error_reply_surfaces_as_error_pair(code: &str) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_task(Some(tx));
         let host = spawn_host(rx, Err(UNKNOWN_TASK_ERR.to_owned()));
 
@@ -383,7 +387,7 @@ mod tests {
     /// so a missing key has to stay missing on the Lua side.
     #[tokio::test]
     async fn list_passes_host_array_through_unchanged() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_task(Some(tx));
         let host = spawn_host(
             rx,
@@ -410,13 +414,13 @@ mod tests {
 
     #[tokio::test]
     async fn focus_roundtrips_through_ui_channel() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_task(Some(tx));
         std::thread::spawn(move || {
-            let Ok(UiAction::Task {
+            let Some(UiAction::Task {
                 req: TaskRequest::Focus { id },
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected focus request");
             };
@@ -433,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_roundtrips_through_ui_channel() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_task(Some(tx));
         let host = spawn_host(rx, Ok(json!(true)));
 
@@ -447,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_from_a_user_command_roundtrips_through_ui_channel() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_task(Some(tx));
         let host = spawn_host(rx, Ok(json!(true)));
 
@@ -476,7 +480,7 @@ mod tests {
     #[test_case(Caller::ChildOfUserCommand ; "task_nested_in_a_user_command")]
     #[tokio::test]
     async fn stop_without_user_authority_never_reaches_the_host(caller: Caller) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_task(Some(tx));
         let stop = lua.load(STOP_CALL).eval_async();
         let (val, err): (Value, Option<String>) = async {

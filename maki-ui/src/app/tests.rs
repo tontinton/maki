@@ -7248,15 +7248,15 @@ end)
 #[test]
 fn a_normal_mode_key_never_types_through_its_fallback() {
     let host = granted_host(MODE_FLIPPING_LOGGER, &["session_read"]);
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
     app.update(Msg::Key(KeyEvent::new(
         KeyCode::Char('n'),
         KeyModifiers::ALT,
     )));
-    serve_handler(&mut app, &ui);
+    serve_handler(&mut app, &mut ui);
 
     app.update(Msg::Key(key(KeyCode::Char('a'))));
-    serve_handler(&mut app, &ui);
+    serve_handler(&mut app, &mut ui);
 
     assert_eq!(app.input_box.buffer.value(), "");
 }
@@ -7833,15 +7833,15 @@ fn new_host() -> PluginHost {
 }
 
 /// Wires {host} into a fresh app the way the event loop does.
-fn hosted_app(host: &PluginHost) -> (App, flume::Receiver<UiAction>) {
+fn hosted_app(host: &PluginHost) -> (App, UnboundedReceiver<UiAction>) {
     let mut app = test_app();
     app.keymap_reader = host.keymap_reader();
     app.lua_event_handle = host.event_handle();
-    (app, host.ui_action_rx())
+    (app, host.take_ui_action_rx().unwrap())
 }
 
 /// A host running {source} as {plugin}, and a fresh app wired to it.
-fn plugin_app(plugin: &str, source: &str) -> (PluginHost, App, flume::Receiver<UiAction>) {
+fn plugin_app(plugin: &str, source: &str) -> (PluginHost, App, UnboundedReceiver<UiAction>) {
     let host = new_host();
     host.load_source(plugin, source).unwrap();
     let (app, ui) = hosted_app(&host);
@@ -7851,10 +7851,13 @@ fn plugin_app(plugin: &str, source: &str) -> (PluginHost, App, flume::Receiver<U
 /// Plays the event loop for one key handler until it reports done. Returns
 /// what it asked for, in order, with the text of each flash, and the actions
 /// its fallback and built-in actions made.
-fn serve_handler(app: &mut App, ui: &flume::Receiver<UiAction>) -> (Vec<String>, Vec<Action>) {
+fn serve_handler(
+    app: &mut App,
+    ui: &mut UnboundedReceiver<UiAction>,
+) -> (Vec<String>, Vec<Action>) {
     let (mut asked, mut actions) = (Vec::new(), Vec::new());
     loop {
-        match ui.recv_timeout(HANDLER_TIMEOUT).expect(HANDLER_NEVER_DONE) {
+        match wait_next(ui, HANDLER_TIMEOUT).expect(HANDLER_NEVER_DONE) {
             UiAction::Input {
                 req: InputRequest::Read,
                 reply_tx,
@@ -7903,16 +7906,16 @@ fn serve_handler(app: &mut App, ui: &flume::Receiver<UiAction>) -> (Vec<String>,
 
 #[test]
 fn backslash_enter_works_as_a_plugin_built_on_fallback() {
-    let (_host, mut app, ui) = plugin_app("continuation", CONTINUATION_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app("continuation", CONTINUATION_PLUGIN);
 
     type_keys(&mut app, "a\\");
     app.update(Msg::Key(key(KeyCode::Enter)));
     type_keys(&mut app, "b");
-    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, [ASKED_EDIT]);
     assert_eq!(app.input_box.buffer.value(), "a\nb");
 
     app.update(Msg::Key(key(KeyCode::Enter)));
-    let (asked, actions) = serve_handler(&mut app, &ui);
+    let (asked, actions) = serve_handler(&mut app, &mut ui);
     assert_eq!(asked, [ASKED_FALLBACK]);
     assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == "a\nb"));
 }
@@ -7960,11 +7963,11 @@ fn granted_host(source: &str, grants: &[&str]) -> PluginHost {
 #[test_case(EDITING_ENTER_PLUGIN, &["input", "agent", "session_read", "session_write"], "hi!", false ; "edited_sends_nothing")]
 fn a_fallback_enter_sends(source: &str, grants: &[&str], text: &str, sends: bool) {
     let host = granted_host(source, grants);
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
 
     type_keys(&mut app, "hi");
     app.update(Msg::Key(key(KeyCode::Enter)));
-    let (_, actions) = serve_handler(&mut app, &ui);
+    let (_, actions) = serve_handler(&mut app, &mut ui);
     if sends {
         assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == text));
     } else {
@@ -8000,11 +8003,11 @@ fn an_enter_held_while_a_handler_changed_the_input_sends_nothing(
     flash: Option<&str>,
 ) {
     let host = granted_host(source, grants);
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
 
     type_keys(&mut app, "hix");
     app.update(Msg::Key(key(KeyCode::Enter)));
-    serve_handler(&mut app, &ui);
+    serve_handler(&mut app, &mut ui);
 
     assert_eq!(app.input_box.buffer.value(), left);
     assert_eq!(app.status_bar.flash_text(), flash);
@@ -8030,11 +8033,11 @@ end)
 /// queue.
 #[test]
 fn a_handler_edits_then_submits_like_a_typed_enter() {
-    let (_host, mut app, ui) = plugin_app("shout", SUBMIT_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app("shout", SUBMIT_PLUGIN);
 
     type_keys(&mut app, "hi");
     app.update(Msg::Key(key(KeyCode::Enter)));
-    let (asked, actions) = serve_handler(&mut app, &ui);
+    let (asked, actions) = serve_handler(&mut app, &mut ui);
     let [edit, refusal] = &asked[..] else {
         panic!("{asked:?}");
     };
@@ -8045,7 +8048,7 @@ fn a_handler_edits_then_submits_like_a_typed_enter() {
 
     type_keys(&mut app, "more");
     app.update(Msg::Key(key(KeyCode::Enter)));
-    let (_, actions) = serve_handler(&mut app, &ui);
+    let (_, actions) = serve_handler(&mut app, &mut ui);
     assert!(!actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
     assert_eq!(app.queue.text_messages(), ["more!"]);
 
@@ -8624,13 +8627,13 @@ fn an_edit_without_a_manifest_says_where_to_grant_input() {
     let host = new_host();
     host.load_source_with_permissions(USER_CONFIG, NO_GRANTS_EDIT, PluginPermissions::denied())
         .unwrap();
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
 
     app.update(Msg::Key(KeyEvent::new(
         KeyCode::Char('x'),
         KeyModifiers::CONTROL,
     )));
-    let asked = serve_handler(&mut app, &ui).0;
+    let asked = serve_handler(&mut app, &mut ui).0;
     let [refusal] = &asked[..] else {
         panic!("the edit never reached the UI, only the flash did: {asked:?}");
     };
@@ -8659,12 +8662,12 @@ const DECORATE_NEVER_CAME: &str = "the plugin never pushed its marks";
 const UNLOAD_NEVER_CAME: &str = "the UI never heard of the unload";
 
 /// Plays the event loop until the plugin pushes marks, and answers them.
-fn serve_decorate(app: &mut App, ui: &flume::Receiver<UiAction>) -> serde_json::Value {
+fn serve_decorate(app: &mut App, ui: &mut UnboundedReceiver<UiAction>) -> serde_json::Value {
     loop {
         if let UiAction::Input {
             req: InputRequest::Decorate(req),
             reply_tx,
-        } = ui.recv_timeout(HANDLER_TIMEOUT).expect(DECORATE_NEVER_CAME)
+        } = wait_next(ui, HANDLER_TIMEOUT).expect(DECORATE_NEVER_CAME)
         {
             let reply = app.decorate_input(req);
             let _ = reply_tx.send(reply.clone());
@@ -8685,25 +8688,25 @@ fn assert_one_ghost_after(app: &mut App, typed: &str) {
 /// drops a point mark.
 #[test]
 fn ghost_text_follows_typing_and_leaves_with_its_plugin() {
-    let (host, mut app, ui) = plugin_app(GHOST_PLUGIN_NAME, GHOST_PLUGIN);
+    let (host, mut app, mut ui) = plugin_app(GHOST_PLUGIN_NAME, GHOST_PLUGIN);
 
     type_keys(&mut app, "ab");
     let _ = app.tick();
     type_keys(&mut app, "c");
-    let reply = serve_decorate(&mut app, &ui);
+    let reply = serve_decorate(&mut app, &mut ui);
     assert_eq!(reply["version"], app.input_box.buffer.version());
     assert_one_ghost_after(&mut app, "abc");
 
     type_keys(&mut app, "d");
     assert_one_ghost_after(&mut app, "abcd");
     let _ = app.tick();
-    serve_decorate(&mut app, &ui);
+    serve_decorate(&mut app, &mut ui);
     assert_one_ghost_after(&mut app, "abcd");
 
     host.unload(GHOST_PLUGIN_NAME).unwrap();
     loop {
         if let UiAction::PluginUnloaded(plugin) =
-            ui.recv_timeout(HANDLER_TIMEOUT).expect(UNLOAD_NEVER_CAME)
+            wait_next(&mut ui, HANDLER_TIMEOUT).expect(UNLOAD_NEVER_CAME)
         {
             app.clear_plugin_marks(&plugin);
             break;
@@ -8733,11 +8736,11 @@ const PASTE_CHIP: &str = "see [3 lines]";
 /// show the raw lines shows the chip instead.
 #[test]
 fn a_collapsed_paste_shows_its_chip_in_the_first_frame() {
-    let (_host, mut app, ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
     type_keys(&mut app, "see ");
 
     app.update(Msg::Paste(PASTED_LINES.into()));
-    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, [ASKED_EDIT]);
     let screen = rendered(&mut app);
     assert!(screen.contains(PASTE_CHIP), "{screen}");
     assert!(!screen.contains(PASTED_WORD), "{screen}");
@@ -8748,12 +8751,12 @@ fn a_collapsed_paste_shows_its_chip_in_the_first_frame() {
 /// paste and never the user's text after it.
 #[test]
 fn a_paste_chip_counted_over_ev_text_covers_exactly_the_paste() {
-    let (_host, mut app, ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
     let typed = "see ";
     type_keys(&mut app, typed);
 
     app.update(Msg::Paste(TABBED_PASTE.into()));
-    serve_handler(&mut app, &ui);
+    serve_handler(&mut app, &mut ui);
     let landed = format!("a{TAB_SPACES}b\nc");
     let buffer = &app.input_box.buffer;
     assert_eq!(buffer.value(), format!("{typed}{landed}"));
@@ -8793,7 +8796,7 @@ const BURST_EDIT_THEN_RAISE: &str = r#"
 #[test_case("ev.fallback()", "x" ; "falls_back")]
 #[test_case("", "" ; "spends_the_key")]
 fn a_burst_through_slow_handlers_lands_in_order(body: &str, bound_lands_as: &str) {
-    let (_host, mut app, ui) = plugin_app(
+    let (_host, mut app, mut ui) = plugin_app(
         BURST_PLUGIN,
         &format!(r#"maki.keymap.set("i", "{BURST_BOUND}", function(ev) {body} end)"#),
     );
@@ -8801,7 +8804,7 @@ fn a_burst_through_slow_handlers_lands_in_order(body: &str, bound_lands_as: &str
 
     type_keys(&mut app, &typed);
     for _ in typed.matches(BURST_BOUND) {
-        serve_handler(&mut app, &ui);
+        serve_handler(&mut app, &mut ui);
     }
     type_keys(&mut app, "z");
 
@@ -8824,7 +8827,7 @@ fn a_handler_edits_and_falls_back_before_the_keys_behind_it(
     left: &str,
 ) {
     const TYPED_BEHIND: &str = "next";
-    let (_host, mut app, ui) = plugin_app(
+    let (_host, mut app, mut ui) = plugin_app(
         "shout",
         &format!(
             r#"
@@ -8845,7 +8848,7 @@ fn a_handler_edits_and_falls_back_before_the_keys_behind_it(
 
     app.update(Msg::Key(key(KeyCode::Enter)));
     type_keys(&mut app, TYPED_BEHIND);
-    let (asked, actions) = serve_handler(&mut app, &ui);
+    let (asked, actions) = serve_handler(&mut app, &mut ui);
 
     assert_eq!(asked, [ASKED_EDIT, EDITED_FLASH, ASKED_FALLBACK]);
     let sends: Vec<_> = actions
@@ -8907,7 +8910,7 @@ const BOLD_WORD: &str = "bold";
 /// keystroke, and one undo takes the wrap back with the selection it had.
 #[test]
 fn ctrl_b_wraps_the_selection_in_one_step() {
-    let (_host, mut app, ui) = plugin_app("bold", BOLD_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app("bold", BOLD_PLUGIN);
     type_keys(&mut app, UNBOLDED);
     for _ in 0..BOLD_WORD.len() {
         app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
@@ -8918,7 +8921,7 @@ fn ctrl_b_wraps_the_selection_in_one_step() {
         KeyCode::Char('b'),
         KeyModifiers::CONTROL,
     )));
-    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, [ASKED_EDIT]);
     assert_eq!(app.input_box.buffer.value(), BOLDED);
     assert_eq!(app.input_box.buffer.version(), version + 1);
     assert_eq!(
@@ -8961,11 +8964,11 @@ end)
 #[test_case("2",   &["input", "session_read"], DRAFT     ; "a_selection_made_with_input")]
 fn a_fallback_lands_where_the_user_typed(anchor: &str, grants: &[&str], left: &str) {
     let host = granted_host(&steering_bang(anchor), grants);
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
     type_keys(&mut app, DRAFT);
 
     app.update(Msg::Key(key(KeyCode::Char('!'))));
-    serve_handler(&mut app, &ui);
+    serve_handler(&mut app, &mut ui);
 
     assert_eq!(app.input_box.buffer.value(), left);
 }
@@ -8997,7 +9000,7 @@ fn an_action_writes_the_input_with_its_price_alone() {
     let host = new_host();
     host.load_source(PRICED_OWNER, BANG_ACTION).unwrap();
     host.load_source(USER_CONFIG, BANG_CALLER).unwrap();
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
     type_keys(&mut app, DRAFT);
 
     app.update(Msg::Key(KeyEvent::new(
@@ -9005,7 +9008,7 @@ fn an_action_writes_the_input_with_its_price_alone() {
         KeyModifiers::CONTROL,
     )));
 
-    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT, "true"]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, [ASKED_EDIT, "true"]);
     assert_eq!(app.input_box.buffer.value(), format!("!{DRAFT}"));
     assert_eq!(
         press_enter(&mut app).err(),
@@ -9039,9 +9042,9 @@ const POPUP_NEVER_SHOWN: &str = "the completion popup never came up";
 
 /// Plays the event loop until the completion popup is on screen with its
 /// rows, which it shows only after painting them.
-fn serve_until_popup(ui: &flume::Receiver<UiAction>) -> UnboundedReceiver<WinCommand> {
+fn serve_until_popup(ui: &mut UnboundedReceiver<UiAction>) -> UnboundedReceiver<WinCommand> {
     loop {
-        match ui.recv_timeout(HANDLER_TIMEOUT).expect(POPUP_NEVER_SHOWN) {
+        match wait_next(ui, HANDLER_TIMEOUT).expect(POPUP_NEVER_SHOWN) {
             UiAction::Session { reply_tx, .. } => {
                 let _ = reply_tx.send(Ok(serde_json::json!({ "cwd": "/" })));
             }
@@ -9080,21 +9083,21 @@ fn tab_composed_in_init_lua_accepts_a_completion_or_falls_back(
         PluginPermissions::from_approved(grants.iter().copied()),
     )
     .unwrap();
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
 
     type_keys(&mut app, "$re");
     let _ = app.tick();
-    let _popup = serve_until_popup(&ui);
+    let _popup = serve_until_popup(&mut ui);
     let mode = app.state.mode;
     app.update(Msg::Key(key(KeyCode::Tab)));
-    let asked = serve_handler(&mut app, &ui).0;
+    let asked = serve_handler(&mut app, &mut ui).0;
 
     match missing {
         None => {
             assert_eq!(asked, [ASKED_EDIT]);
             assert_eq!(app.input_box.buffer.value(), "$review ");
             app.update(Msg::Key(key(KeyCode::Tab)));
-            assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_FALLBACK]);
+            assert_eq!(serve_handler(&mut app, &mut ui).0, [ASKED_FALLBACK]);
             press_enter(&mut app).unwrap();
         }
         Some(perm) => {
@@ -9116,16 +9119,16 @@ end)
 
 #[test]
 fn a_builtin_action_answers_the_handler_in_normal_mode() {
-    let (_host, mut app, ui) = plugin_app("vim", UNDO_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app("vim", UNDO_PLUGIN);
     type_keys(&mut app, "ab");
     set_mode(&app.keymap_reader, InputMode::Normal);
 
     app.update(Msg::Key(key(KeyCode::Char('u'))));
-    assert_eq!(serve_handler(&mut app, &ui).0, ["true"]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, ["true"]);
     assert_eq!(app.input_box.buffer.value(), "");
 
     app.update(Msg::Key(key(KeyCode::Char('u'))));
-    assert_eq!(serve_handler(&mut app, &ui).0, ["false"]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, ["false"]);
 }
 
 #[test]
