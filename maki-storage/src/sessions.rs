@@ -59,6 +59,8 @@ const LOG_BLOATED: &str = "too many stale meta records";
 const MAX_APPENDS: usize = 512;
 /// Where a shrink rewrite parks the log it is about to drop, as `archive/<id>/`.
 const ARCHIVE_DIR: &str = "archive";
+/// Beside `<seq>.jsonl`, what sealed that window.
+const ARCHIVE_META_EXT: &str = "meta";
 /// Where plugins keep session-scoped data, as `data/<id>/<plugin>/`, swept on
 /// delete without knowing the contents, installed plugin or not.
 pub const DATA_DIR: &str = "data";
@@ -488,6 +490,11 @@ pub struct Session<M, U, T> {
     /// erase a locally minted void: cursor validity is the pair.
     #[serde(skip)]
     rewrites: u64,
+    /// Why the next shrink rewrite would park the log. Set by the mutator
+    /// that dropped messages, read when the archive is written, and never
+    /// serialized: a loaded session has no pending shrink.
+    #[serde(skip)]
+    sealed_by: SealedBy,
 }
 
 #[derive(Serialize)]
@@ -845,9 +852,11 @@ fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
     // entry is not durable by then, a crash frees the only inode holding the
     // dropped turns, which is the loss this whole function exists to prevent.
     crate::sync_parent_dir(&archive_path);
+    write_archive_meta(&archive_path, session.sealed_by, session.updated_at);
     info!(
         session_id = %session.id,
         new_msgs = new_count,
+        sealed_by = session.sealed_by.as_str(),
         archive = %archive_path.display(),
         "archived session log before shrink rewrite"
     );
@@ -916,6 +925,111 @@ fn next_archive_seq(archive_dir: &Path) -> u64 {
     newest.max().map_or(1, |seq| seq + 1)
 }
 
+/// What sealed a window: the rewrite that parked its log under
+/// `archive/<id>/`. Recorded beside the file, because the archive is the old
+/// log and cannot say why it was replaced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SealedBy {
+    /// The turns were summarized away.
+    Compaction,
+    /// The turns were cut off.
+    Rewind,
+    /// Written before this build recorded the reason, or replaced by a path
+    /// that did not drop messages.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl SealedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Compaction => "compaction",
+            Self::Rewind => "rewind",
+        }
+    }
+}
+
+/// An archived window without its messages, so listing windows never parses
+/// a transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveWindow {
+    pub seq: u64,
+    pub sealed_at: u64,
+    pub sealed_by: SealedBy,
+}
+
+/// What sealed an archive, written next to it as `<seq>.meta`.
+#[derive(Serialize, Deserialize)]
+struct ArchiveMeta {
+    #[serde(default)]
+    sealed_by: SealedBy,
+    #[serde(default)]
+    sealed_at: u64,
+}
+
+/// The session's archived windows, oldest first.
+fn archives_oldest_first(archive_dir: &Path) -> Vec<ArchiveWindow> {
+    let Ok(entries) = fs::read_dir(archive_dir) else {
+        return Vec::new();
+    };
+    let mut windows: Vec<ArchiveWindow> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !is_jsonl(&path) {
+                return None;
+            }
+            let meta = read_archive_meta(&path);
+            Some(ArchiveWindow {
+                seq: path.file_stem()?.to_str()?.parse().ok()?,
+                sealed_at: meta.sealed_at,
+                sealed_by: meta.sealed_by,
+            })
+        })
+        .collect();
+    windows.sort_unstable_by_key(|window| window.seq);
+    windows
+}
+
+fn archive_meta_path(archive: &Path) -> PathBuf {
+    archive.with_extension(ARCHIVE_META_EXT)
+}
+
+/// An archive written before the sidecar existed answers `Unknown` and the
+/// time its file was last written, which is the closest thing to a seal time
+/// it still holds.
+fn read_archive_meta(archive: &Path) -> ArchiveMeta {
+    fs::read(archive_meta_path(archive))
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok())
+        .unwrap_or_else(|| ArchiveMeta {
+            sealed_by: SealedBy::Unknown,
+            sealed_at: file_signature(archive).map_or(0, |(_, mtime_ms)| mtime_ms / 1000),
+        })
+}
+
+fn write_archive_meta(archive: &Path, sealed_by: SealedBy, sealed_at: u64) {
+    let meta = ArchiveMeta {
+        sealed_by,
+        sealed_at,
+    };
+    let path = archive_meta_path(archive);
+    let written = serde_json::to_vec(&meta)
+        .map_err(StorageError::from)
+        .and_then(|data| atomic_write(&path, &data));
+    match written {
+        Ok(()) => crate::sync_parent_dir(&path),
+        Err(e) => warn!(
+            error = %e,
+            archive = %archive.display(),
+            "cannot record what sealed a session archive"
+        ),
+    }
+}
+
 impl SessionLog {
     /// Starts the file over: writes the whole log through a rename, so a crash
     /// mid-write leaves the old one intact, then claims the cwd index and
@@ -978,8 +1092,8 @@ impl SessionLog {
         let mut tmp_file = File::create(&tmp).map_err(StorageError::from)?;
         write_full_session(&mut tmp_file, session)?;
         tmp_file.sync_data().map_err(StorageError::from)?;
-        // Last thing before the rename: a write that never lands must not
-        // spend an archive slot, since taking one prunes the oldest.
+        // Last thing before the rename: only a write that lands may archive
+        // the log it replaces.
         archive_if_shrinking(dir, session);
         fs::rename(&tmp, &path).map_err(StorageError::from)?;
         crate::sync_parent_dir(&path);
@@ -1405,6 +1519,7 @@ where
         content_revision: 0,
         epoch: next_epoch(),
         rewrites: 0,
+        sealed_by: SealedBy::Unknown,
     })
 }
 
@@ -1552,6 +1667,8 @@ struct JsonlHeader {
     v: u32,
     id: MakiId,
     cwd: String,
+    #[serde(default)]
+    created_at: u64,
 }
 
 #[derive(Deserialize)]
@@ -1771,6 +1888,7 @@ where
             content_revision: 0,
             epoch: next_epoch(),
             rewrites: 0,
+            sealed_by: SealedBy::Unknown,
         }
     }
 
@@ -1897,6 +2015,7 @@ where
 
     pub fn replace_messages(&mut self, messages: Vec<M>) {
         self.messages = Arc::new(messages);
+        self.sealed_by = SealedBy::Compaction;
         self.rewrite_messages();
     }
 
@@ -1905,12 +2024,17 @@ where
             return;
         }
         Arc::make_mut(&mut self.messages).truncate(len);
+        self.sealed_by = SealedBy::Rewind;
         self.rewrite_messages();
     }
 
     /// Adopting a producer's snapshot inherits its run token, so the log's
     /// cursors survive exactly when the snapshot was an append.
     fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
+        // Only compaction replaces a producer's history with a shorter one.
+        if snapshot.messages.len() < self.messages.len() {
+            self.sealed_by = SealedBy::Compaction;
+        }
         self.messages = Arc::clone(&snapshot.messages);
         self.frame = snapshot.frame.clone();
         self.epoch = snapshot.epoch;
@@ -2196,6 +2320,49 @@ where
         locate_session_file(&dir.path().join(SESSIONS_DIR), id).is_some()
     }
 
+    /// The session's archived windows, oldest first, labeled with the
+    /// sequence numbers their filenames carry and what sealed each one. Reads
+    /// only names and sidecars, so it never parses a transcript and never
+    /// creates the directory it looks in.
+    pub fn archive_windows(id: MakiId, dir: &StateDir) -> Vec<ArchiveWindow> {
+        Self::archive_windows_in(id, &dir.path().join(SESSIONS_DIR))
+    }
+
+    pub fn archive_windows_in(id: MakiId, dir: &Path) -> Vec<ArchiveWindow> {
+        archives_oldest_first(&dir.join(ARCHIVE_DIR).join(id.to_string()))
+    }
+
+    /// One archived window by the sequence number its filename carries.
+    pub fn archive(id: MakiId, seq: u64, dir: &StateDir) -> Result<Option<Self>, SessionError> {
+        Self::archive_in(id, seq, &dir.path().join(SESSIONS_DIR))
+    }
+
+    pub fn archive_in(id: MakiId, seq: u64, dir: &Path) -> Result<Option<Self>, SessionError> {
+        let path = dir
+            .join(ARCHIVE_DIR)
+            .join(id.to_string())
+            .join(format!("{seq}.jsonl"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        load_session_at(&path).map(Some)
+    }
+
+    /// When the session began, from its header record alone. `None` when the
+    /// file is missing or its header no longer parses.
+    pub fn started_at(id: MakiId, dir: &StateDir) -> Option<u64> {
+        Self::started_at_in(id, &dir.path().join(SESSIONS_DIR))
+    }
+
+    pub fn started_at_in(id: MakiId, dir: &Path) -> Option<u64> {
+        let path = locate_session_file(dir, id)?;
+        let mut file = File::open(path).ok()?;
+        let mut line = String::new();
+        BufReader::new(&mut file).read_line(&mut line).ok()?;
+        let header: JsonlHeader = serde_json::from_str(line.trim_end()).ok()?;
+        Some(header.created_at)
+    }
+
     pub fn load_from(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
         Self::read_from(id, dir, None)
     }
@@ -2357,14 +2524,14 @@ mod tests {
     use super::canonical_key;
     use super::{
         ARCHIVE_DIR, CWD_INDEX_FILE, DATA_DIR, DEFAULT_TITLE, LOG_BLOATED, MAX_APPENDS,
-        MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent, TAIL_BUF,
-        generate_title, jsonl_path, load_cwd_index, lock_path, locks_dir, next_epoch,
-        update_cwd_index, write_full_session,
+        MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, SealedBy, StoredSubagent,
+        TAIL_BUF, generate_title, is_jsonl, jsonl_path, load_cwd_index, lock_path, locks_dir,
+        next_epoch, update_cwd_index, write_full_session,
     };
     use super::{
-        HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT, OLDEST_LOG_FORMAT_VERSION,
-        SCAN_CACHE_FILE, Session, SessionClaim, SessionError, SessionLog, SessionMeta,
-        StorageError, StoredWriters, TitleSource, check_log_format,
+        ArchiveWindow, HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT,
+        OLDEST_LOG_FORMAT_VERSION, SCAN_CACHE_FILE, Session, SessionClaim, SessionError,
+        SessionLog, SessionMeta, StorageError, StoredWriters, TitleSource, check_log_format,
     };
     use crate::StateDir;
     use crate::frame::PromptFacts;
@@ -3221,6 +3388,7 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
+            .filter(|path| is_jsonl(path))
             .collect::<Vec<_>>();
         paths.sort();
         paths
@@ -3407,6 +3575,107 @@ mod tests {
         TestSession::delete_from(&claim_id(dir, session.id), dir).unwrap();
         assert!(!data_dir.exists());
         assert!(foreign.join("notes/scratch.md").exists());
+    }
+
+    #[test]
+    fn archives_list_windows_oldest_first_with_what_sealed_them() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.push_message(user_message("two"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        // Shrink rewrite parks the full log under archive/1/.
+        session.replace_messages(vec![user_message("summary")]);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        session.push_message(user_message("later"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        // A rewind parks the second window under archive/2/.
+        session.truncate_messages(1);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        // A file that is not a window still lists by name; reading it fails
+        // without hiding the ones that parse.
+        fs::write(
+            archive_dir_for(dir, session.id).join("3.jsonl"),
+            "CORRUPT\n",
+        )
+        .unwrap();
+
+        let windows = TestSession::archive_windows_in(session.id, dir);
+        let seqs: Vec<u64> = windows.iter().map(|window| window.seq).collect();
+        assert_eq!(seqs, [1, 2, 3]);
+        assert_eq!(windows[0].sealed_by, SealedBy::Compaction);
+        assert_eq!(windows[1].sealed_by, SealedBy::Rewind);
+
+        let first = TestSession::archive_in(session.id, 1, dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.messages().len(), 2);
+        let second = TestSession::archive_in(session.id, 2, dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.messages().len(), 2);
+        assert!(
+            TestSession::archive_in(session.id, 9, dir)
+                .unwrap()
+                .is_none()
+        );
+        assert!(TestSession::archive_in(session.id, 3, dir).is_err());
+    }
+
+    #[test]
+    fn archive_windows_lists_metadata_without_parsing_messages() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.push_message(user_message("two"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        session.replace_messages(vec![user_message("summary")]);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let windows = TestSession::archive_windows_in(session.id, dir);
+        assert_eq!(
+            windows,
+            [ArchiveWindow {
+                seq: 1,
+                sealed_at: session.updated_at,
+                sealed_by: SealedBy::Compaction,
+            }]
+        );
+    }
+
+    /// An archive written before the sidecar existed still lists, with the
+    /// closest seal time its file still carries.
+    #[test]
+    fn an_archive_without_a_sidecar_answers_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.push_message(user_message("two"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        session.replace_messages(vec![user_message("summary")]);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        fs::remove_file(archive_dir_for(dir, session.id).join("1.meta")).unwrap();
+
+        let windows = TestSession::archive_windows_in(session.id, dir);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].sealed_by, SealedBy::Unknown);
+        assert_ne!(windows[0].sealed_at, 0);
+    }
+
+    #[test]
+    fn started_at_reads_the_header_alone() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.created_at = 42;
+        session.push_message(user_message("one"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        assert_eq!(TestSession::started_at_in(session.id, dir), Some(42));
+        assert_eq!(TestSession::started_at_in(MakiId::generate(), dir), None);
     }
 
     /// A rename with no new messages must survive restart, while a no-op
