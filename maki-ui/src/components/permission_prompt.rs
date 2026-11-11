@@ -429,18 +429,13 @@ impl PermissionPrompt {
         let mut field = None;
         if *state == PromptState::DenyEditing {
             let (text, cursor_byte, tail_style) = if buffer.value().is_empty() {
-                (DEFAULT_DENY_GUIDANCE, 0, t.tool_dim)
+                (DEFAULT_DENY_GUIDANCE, 0, t.input_placeholder)
             } else {
                 (buffer.value(), buffer.cursor_byte(), Style::default())
             };
             let prefix = vec![Span::raw("  "), Span::styled("guide ", label_style)];
-            let (line, caret) = field_line(
-                prefix,
-                text,
-                cursor_byte,
-                Style::new().reversed(),
-                tail_style,
-            );
+            let (line, caret) =
+                field_line(prefix, text, cursor_byte, tail_style.reversed(), tail_style);
             field = Some(FieldCaret {
                 row: lines.len(),
                 caret,
