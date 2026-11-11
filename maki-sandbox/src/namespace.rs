@@ -46,6 +46,44 @@ pub struct EnvEntry {
     pub description: &'static str,
 }
 
+/// What to do when a masked host path does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingMask {
+    /// Skip the mask: an absent path hides nothing.
+    Skip,
+    /// Create an empty directory so sandboxed code cannot create the path.
+    CreateDirectory,
+}
+
+/// A host path hidden from the sandbox by mounting an empty tmpfs over its
+/// sandbox counterpart, or an empty device for a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskedPath {
+    pub path: PathBuf,
+    pub missing: MissingMask,
+}
+
+impl MaskedPath {
+    /// Mask an existing path. An absent one is skipped.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            missing: MissingMask::Skip,
+        }
+    }
+
+    /// Mask a directory, creating it empty when absent so sandboxed code
+    /// cannot create it either.
+    #[must_use]
+    pub fn directory(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            missing: MissingMask::CreateDirectory,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NamespaceConfig {
     pub allowed_env: Vec<String>,
@@ -61,10 +99,9 @@ pub struct NamespaceConfig {
     /// Host symlinks to recreate inside the sandbox.
     /// Each entry is `(host_symlink_path, sandbox_internal_path)`.
     pub symlinks: Vec<(PathBuf, String)>,
-    /// Host paths hidden from the sandbox by mounting an empty tmpfs over
-    /// their sandbox-side counterpart. A missing path is created as an empty
-    /// directory first, so sandboxed code cannot create it either.
-    pub masked_paths: Vec<PathBuf>,
+    /// Host paths hidden from the sandbox, e.g. the project's `.maki` folder
+    /// or a profile's credential file.
+    pub masked_paths: Vec<MaskedPath>,
 }
 
 fn build_sandbox_path(path_dirs: &[String]) -> String {
@@ -348,6 +385,7 @@ impl NamespaceConfig {
         let mut path_dirs: Vec<String> = Vec::new();
         let mut readonly_mounts: Vec<(PathBuf, String)> = Vec::new();
         let mut symlinks: Vec<(PathBuf, String)> = Vec::new();
+        let mut masked_paths: Vec<MaskedPath> = Vec::new();
 
         if let Some(h) = home {
             let flat = crate::profiles::FlatMounts::from_profiles_under(enabled_profiles, h);
@@ -363,9 +401,10 @@ impl NamespaceConfig {
             }
             path_dirs.extend(flat.path_dirs);
             symlinks.extend(flat.symlinks);
+            masked_paths.extend(flat.masked);
         }
 
-        Self::new(
+        let mut config = Self::new(
             allowed_env,
             vec![],
             workspace_dir,
@@ -375,7 +414,9 @@ impl NamespaceConfig {
             path_dirs,
             extra_workspace_dirs,
             symlinks,
-        )
+        );
+        config.masked_paths.extend(masked_paths);
+        config
     }
 
     /// Drop bind-mount entries whose host source does not exist.
@@ -468,11 +509,11 @@ fn sandbox_workspace_root(workspace_name: &str) -> PathBuf {
 /// Paths every workspace hides from the sandbox. `NamespaceConfig::new`
 /// starts with the project's own `.maki` directory; callers may extend the
 /// field afterwards.
-fn default_masked_paths(workspace_dir: &Path) -> Vec<PathBuf> {
+fn default_masked_paths(workspace_dir: &Path) -> Vec<MaskedPath> {
     if workspace_dir.as_os_str().is_empty() {
         return Vec::new();
     }
-    vec![workspace_dir.join(PROJECT_DIR)]
+    vec![MaskedPath::directory(workspace_dir.join(PROJECT_DIR))]
 }
 
 /// The sandbox side of a home/readonly mount: a trailing slash means the
@@ -786,8 +827,8 @@ fn setup_mounts_impl(config: &NamespaceConfig, staging_pid: u32) -> Result<(), S
     // Hide configured paths before the sandbox can see them. The target is
     // resolved through the mount map, so this works for the workspace, extra
     // workspace dirs, and home mounts alike.
-    for host_path in &config.masked_paths {
-        mask_path(config, &staging, host_path)?;
+    for masked in &config.masked_paths {
+        mask_path(config, &staging, masked)?;
     }
 
     mount(
@@ -1243,21 +1284,30 @@ fn bind_mount_ro(source: &Path, target: &str) -> Result<(), SandboxError> {
 /// Hide a host path from the sandbox by mounting an empty tmpfs over its
 /// sandbox counterpart, or an empty device for a file.
 ///
-/// A missing target is created as an empty directory on the host. Skipping it
-/// would leave that path writable inside the shared workspace, letting
-/// sandboxed code plant project config the host reads on a later start.
+/// A missing directory can be created empty on the host, so sandboxed code
+/// cannot create a path the host reads later. Missing files are skipped:
+/// there is nothing to hide and creating a placeholder could break the tool
+/// that expects to own the file.
 fn mask_path(
     config: &NamespaceConfig,
     staging: &str,
-    host_path: &Path,
+    masked: &MaskedPath,
 ) -> Result<(), SandboxError> {
-    let sandbox_path = config.host_to_sandbox(host_path);
+    let sandbox_path = config.host_to_sandbox(&masked.path);
     let target = format!("{staging}{}", sandbox_path.display());
     if std::fs::symlink_metadata(&target).is_err() {
+        if masked.missing == MissingMask::Skip {
+            debug!(
+                host = %masked.path.display(),
+                target,
+                "sandbox: mask target absent, nothing to hide"
+            );
+            return Ok(());
+        }
         std::fs::create_dir_all(&target)
             .map_err(|e| SandboxError::Mount(format!("create mask target {target}: {e}")))?;
         debug!(
-            host = %host_path.display(),
+            host = %masked.path.display(),
             target,
             "sandbox: created mask target"
         );
@@ -1271,7 +1321,14 @@ fn mask_path(
             None::<&str>,
         )
         .map_err(|e| SandboxError::Mount(format!("mask {target}: {e}"))),
-        Ok(_) => bind_mount_existing_ro(Path::new("/dev/null"), &target),
+        Ok(meta) if meta.is_file() => bind_mount_existing_ro(Path::new("/dev/null"), &target),
+        Ok(_) => {
+            debug!(
+                target,
+                "sandbox: mask target is not a file or directory, skipping"
+            );
+            Ok(())
+        }
         // A symlink whose target is not in the sandbox leaks nothing.
         Err(e) => {
             debug!(target, error = %e, "sandbox: mask target unresolvable, nothing to hide");
@@ -1555,7 +1612,10 @@ mod tests {
     #[test]
     fn new_masks_the_project_dir_by_default() {
         let cfg = config_with_env(vec![]);
-        assert_eq!(cfg.masked_paths, vec![PathBuf::from("/workspace/.maki")]);
+        assert_eq!(
+            cfg.masked_paths,
+            vec![MaskedPath::directory("/workspace/.maki")]
+        );
     }
 
     #[test]
@@ -1866,6 +1926,12 @@ mod tests {
                 .home_mounts
                 .contains(&(tmp.path().join("go"), "go".into())),
             "disabled go profile must not contribute mounts even though ~/go exists"
+        );
+        assert!(
+            config
+                .masked_paths
+                .contains(&MaskedPath::new(tmp.path().join(".cargo/credentials.toml"))),
+            "enabled rust profile must mask cargo credentials"
         );
     }
 

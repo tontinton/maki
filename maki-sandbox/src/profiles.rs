@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::namespace::NamespaceConfig;
+use crate::namespace::{MaskedPath, NamespaceConfig};
 
 /// How a profile directory is mounted inside the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +13,8 @@ pub enum MountUsage {
     OnlyPath,
     /// Recreate the host symlink inside the sandbox (e.g. /etc/localtime).
     SymLink,
+    /// Hide the path from the sandbox.
+    Mask,
 }
 
 impl MountUsage {
@@ -23,6 +25,7 @@ impl MountUsage {
             Self::ReadOnly => "ro",
             Self::OnlyPath => "on $PATH",
             Self::SymLink => "symlink",
+            Self::Mask => "masked",
         }
     }
 }
@@ -62,6 +65,14 @@ impl ProfileMount {
         Self {
             path: path.into(),
             usage: MountUsage::SymLink,
+        }
+    }
+
+    #[must_use]
+    pub fn mask(path: &str) -> Self {
+        Self {
+            path: path.into(),
+            usage: MountUsage::Mask,
         }
     }
 
@@ -118,6 +129,8 @@ pub fn builtin_profiles() -> Vec<SandboxProfile> {
                 ProfileMount::rw("~/.cargo"),
                 ProfileMount::only_path("~/.cargo/bin"),
                 ProfileMount::read_only("~/.rustup"),
+                ProfileMount::mask("~/.cargo/credentials.toml"),
+                ProfileMount::mask("~/.cargo/credentials"),
             ],
         },
         SandboxProfile {
@@ -179,6 +192,7 @@ pub(crate) struct FlatMounts {
     pub readonly: Vec<(PathBuf, String)>,
     pub path_dirs: Vec<String>,
     pub symlinks: Vec<(PathBuf, String)>,
+    pub masked: Vec<MaskedPath>,
 }
 
 impl FlatMounts {
@@ -195,6 +209,7 @@ impl FlatMounts {
             readonly: Vec::new(),
             path_dirs: Vec::new(),
             symlinks: Vec::new(),
+            masked: Vec::new(),
         };
         for profile in enabled {
             for mount in &profile.mounts {
@@ -205,6 +220,7 @@ impl FlatMounts {
                     MountUsage::ReadOnly => out.readonly.push((path, name)),
                     MountUsage::OnlyPath => out.path_dirs.push(mount.sandbox_internal_path()),
                     MountUsage::SymLink => out.symlinks.push((path, name)),
+                    MountUsage::Mask => out.masked.push(MaskedPath::new(path)),
                 }
             }
         }
@@ -227,7 +243,7 @@ pub fn build_namespace_config(
     let flat = FlatMounts::from_profiles(profiles);
     let mut home_mounts = extra_home_mounts;
     home_mounts.extend(flat.home);
-    NamespaceConfig::new(
+    let mut config = NamespaceConfig::new(
         vec![],
         vec![],
         workspace_dir,
@@ -237,7 +253,9 @@ pub fn build_namespace_config(
         flat.path_dirs,
         extra_workspace_dirs,
         flat.symlinks,
-    )
+    );
+    config.masked_paths.extend(flat.masked);
+    config
 }
 
 #[cfg(test)]
@@ -337,13 +355,17 @@ mod tests {
     fn builtin_profiles_rust_has_cargo_mounts() {
         let profiles = builtin_profiles();
         let rust = profiles.into_iter().find(|p| p.name == "rust").unwrap();
-        assert_eq!(rust.mounts.len(), 3);
+        assert_eq!(rust.mounts.len(), 5);
         assert_eq!(rust.mounts[0].path, "~/.cargo");
         assert_eq!(rust.mounts[0].usage, MountUsage::Write);
         assert_eq!(rust.mounts[1].path, "~/.cargo/bin");
         assert_eq!(rust.mounts[1].usage, MountUsage::OnlyPath);
         assert_eq!(rust.mounts[2].path, "~/.rustup");
         assert_eq!(rust.mounts[2].usage, MountUsage::ReadOnly);
+        assert_eq!(rust.mounts[3].path, "~/.cargo/credentials.toml");
+        assert_eq!(rust.mounts[3].usage, MountUsage::Mask);
+        assert_eq!(rust.mounts[4].path, "~/.cargo/credentials");
+        assert_eq!(rust.mounts[4].usage, MountUsage::Mask);
     }
 
     /// On Debian/Ubuntu `/usr/bin/cc` resolves through `/etc/alternatives`,
@@ -376,6 +398,44 @@ mod tests {
         assert_eq!(MountUsage::Write.label(), "rw");
         assert_eq!(MountUsage::ReadOnly.label(), "ro");
         assert_eq!(MountUsage::OnlyPath.label(), "on $PATH");
+        assert_eq!(MountUsage::Mask.label(), "masked");
+    }
+
+    #[test]
+    fn profile_masks_resolve_against_home() {
+        let home = tempfile::TempDir::new().unwrap();
+        let rust: Vec<SandboxProfile> = builtin_profiles()
+            .into_iter()
+            .filter(|p| p.name == "rust")
+            .collect();
+        let flat = FlatMounts::from_profiles_under(&rust, home.path());
+        assert_eq!(
+            flat.masked,
+            vec![
+                MaskedPath::new(home.path().join(".cargo/credentials.toml")),
+                MaskedPath::new(home.path().join(".cargo/credentials")),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_namespace_config_masks_project_and_profile_paths() {
+        let rust: Vec<SandboxProfile> = builtin_profiles()
+            .into_iter()
+            .filter(|p| p.name == "rust")
+            .collect();
+        let config = build_namespace_config(&rust, "/ws".into(), "ws".into(), vec![], vec![]);
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+        assert!(
+            config
+                .masked_paths
+                .contains(&MaskedPath::directory("/ws/.maki"))
+        );
+        assert!(
+            config
+                .masked_paths
+                .contains(&MaskedPath::new(home.join(".cargo/credentials.toml")))
+        );
     }
 
     #[test]

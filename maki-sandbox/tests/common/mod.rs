@@ -13,7 +13,7 @@ use maki_sandbox::namespace::NamespaceConfig;
 /// failure is a real bug in the sandbox, so it panics rather than hiding behind
 /// a green test.
 pub fn sandbox_for(root: &Path) -> Option<Arc<Sandbox>> {
-    let config = NamespaceConfig::new(
+    sandbox_with(NamespaceConfig::new(
         vec![],
         vec![],
         root.to_path_buf(),
@@ -23,7 +23,11 @@ pub fn sandbox_for(root: &Path) -> Option<Arc<Sandbox>> {
         vec![],
         vec![],
         vec![],
-    );
+    ))
+}
+
+/// Like [`sandbox_for`], but with a caller-built config.
+pub fn sandbox_with(config: NamespaceConfig) -> Option<Arc<Sandbox>> {
     match Sandbox::new(config) {
         Ok(sandbox) => Some(sandbox),
         Err(e) if e.is_isolation_unavailable() => {

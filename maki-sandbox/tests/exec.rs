@@ -3,6 +3,8 @@
 use std::fs::{create_dir_all, read_dir, read_to_string, write};
 use std::path::Path;
 
+use maki_sandbox::namespace::{MaskedPath, NamespaceConfig};
+
 mod common;
 
 const EXEC_FAILED: &str = "exec failed";
@@ -116,6 +118,57 @@ fn sandbox_cannot_create_the_masked_project_dir() {
     assert_eq!(
         read_dir(&masked).expect("read masked dir").count(),
         0,
+        "writes to the mask must not reach the host"
+    );
+}
+
+/// A masked file inside a profile mount reads as empty and writes do not
+/// reach the host, matching the credential files profiles declare.
+#[test]
+fn sandbox_masks_a_file_inside_a_mounted_directory() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let home = tempfile::TempDir::new().expect("temp home");
+    let cargo = home.path().join(".cargo");
+    create_dir_all(&cargo).expect("create cargo dir");
+    let credentials = cargo.join("credentials.toml");
+    write(&credentials, SECRET).expect("write credentials");
+
+    let mut config = NamespaceConfig::new(
+        vec![],
+        vec![],
+        dir.path().to_path_buf(),
+        "test".into(),
+        vec![(cargo, ".cargo".into())],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    );
+    config
+        .masked_paths
+        .push(MaskedPath::new(credentials.clone()));
+
+    let Some(sandbox) = common::sandbox_with(config) else {
+        return;
+    };
+
+    let (output, exit_code) = sandbox
+        .exec("cat /home/maki/.cargo/credentials.toml", None, None)
+        .expect(EXEC_FAILED);
+    assert_eq!(exit_code, 0, "{output}");
+    assert!(!output.contains(SECRET), "masked file leaked: {output}");
+
+    let (output, exit_code) = sandbox
+        .exec(
+            "echo planted > /home/maki/.cargo/credentials.toml",
+            None,
+            None,
+        )
+        .expect(EXEC_FAILED);
+    assert_eq!(exit_code, 0, "{output}");
+    assert_eq!(
+        read_to_string(&credentials).expect("read credentials"),
+        SECRET,
         "writes to the mask must not reach the host"
     );
 }

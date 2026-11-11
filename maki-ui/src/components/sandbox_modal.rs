@@ -1314,6 +1314,12 @@ impl SandboxModal {
                         mount.path,
                         profile.name
                     )
+                } else if mount.usage == MountUsage::Mask {
+                    format!(
+                        "    {}  (masked)  [{}]",
+                        mount.sandbox_internal_path(),
+                        profile.name
+                    )
                 } else {
                     format!(
                         "    /home/maki/{}  ←  {}  ({})  [{}]",
