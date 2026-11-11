@@ -232,6 +232,16 @@ declare maki: {
     os_homedir: @checked () -> (string?),
     os_getenv: @checked (name: string) -> (string?),
   },
+  version: {
+    parse: @checked (version: string, opts: any) -> (any, string?),
+    cmp: @checked (v1: any, v2: any) -> (number?, string?),
+    eq: @checked (v1: any, v2: any) -> (boolean?, string?),
+    lt: @checked (v1: any, v2: any) -> (boolean?, string?),
+    le: @checked (v1: any, v2: any) -> (boolean?, string?),
+    gt: @checked (v1: any, v2: any) -> (boolean?, string?),
+    ge: @checked (v1: any, v2: any) -> (boolean?, string?),
+    last: @checked (versions: any) -> (any, string?),
+  },
   yaml: {
     encode: @checked (value: any) -> (string?, string?),
     decode: @checked (str: string) -> (any, string?),

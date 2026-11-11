@@ -158,6 +158,7 @@ The rules:
 | [`maki.ui.Win`](#maki-ui-Win) | Handle to a floating or split window. |
 | [`maki.ui.Buf`](#maki-ui-Buf) | A content buffer that holds styled lines of text. |
 | [`maki.uv`](#maki-uv) | System and environment utilities, modelled after `vim.uv`. |
+| [`maki.version`](#maki-version) | Version parsing and comparison with the same API as Neovim's |
 | [`maki.yaml`](#maki-yaml) | YAML encoding and decoding. |
 
 ## maki {#maki}
@@ -9043,6 +9044,194 @@ Requires the `env` [plugin permission](#plugin-permissions).
 
 ```lua
 local editor = maki.uv.os_getenv("EDITOR") or "vi"
+```
+
+
+## maki.version {#maki-version}
+
+Version parsing and comparison with the same API as Neovim's
+`vim.version`. Call `maki.version()` to get the running maki version
+as a version table.
+
+Invalid version strings return `(nil, err)`. Passing a type other than
+a string or table raises a Lua error.
+
+```lua
+if maki.version.ge(maki.version(), "0.7.0") then ... end
+```
+
+---
+
+### `maki.version.parse()` {#maki-version-parse}
+
+```lua
+maki.version.parse({version}, {opts?})
+```
+
+Parse a version string, such as "1.2.3-rc.1+build.5", into a version
+table with `major`, `minor`, `patch`, and optional `prerelease` and `build`
+fields. Index `[1]`, `[2]`, and `[3]` alias the numbers. Version tables
+work with comparison operators (`==`, `~=`, `<`, `<=`, `>`, `>=`) and can
+be printed with `tostring`.
+
+Parsing is loose by default, like Neovim: the version starts at the first
+digit and ends at whitespace, so "v1.2", "tmux 3.2a" and
+"git version 2.43.0" all parse. Missing minor and patch numbers are 0, and
+text after the numbers is dropped unless it is a valid SemVer
+`-prerelease` or `+build` suffix.
+
+**Parameters:**
+
+- `{version}` (`string`) Version string to parse.
+- `{opts?}` (`table?`) Options:
+  - `strict` (`boolean`) only accept a full SemVer 2.0.0 string, with no coercion. Off by default.
+
+**Returns:** (`table?`, `string?`) Version table, or nil plus an error.
+
+**Example:**
+
+```lua
+local v = maki.version.parse("1.0.1-rc1+build.2")
+print(v.major, v.prerelease, tostring(v)) -- 1  rc1  1.0.1-rc1+build.2
+maki.version.parse("git version 2.43.0") -- 2.43.0
+maki.version.parse("1.0", { strict = true }) -- nil, invalid version: "1.0"
+```
+
+---
+
+### `maki.version.cmp()` {#maki-version-cmp}
+
+```lua
+maki.version.cmp({v1}, {v2})
+```
+
+Compare two versions by SemVer precedence. Each one can be a version
+table, a `{major, minor, patch}` tuple, or a string, parsed loosely like
+`maki.version.parse`. Build metadata is ignored, and a prerelease comes
+before its release.
+
+**Parameters:**
+
+- `{v1}` (`table|string`) First version.
+- `{v2}` (`table|string`) Version to compare with `v1`.
+
+**Returns:** (`integer?`, `string?`) -1, 0, or 1 when `v1` is lower, equal, or
+  higher, or nil plus an error for a string that does not parse.
+
+**Example:**
+
+```lua
+maki.version.cmp({1, 0, 3}, "0.2.1") -- 1, nil
+maki.version.cmp("1.2.3-rc.2", "1.2.3-rc.10") -- -1, nil
+maki.version.cmp("v1.2", "1.2.0") -- 0, nil
+```
+
+---
+
+### `maki.version.eq()` {#maki-version-eq}
+
+```lua
+maki.version.eq({v1}, {v2})
+```
+
+Whether `v1` equals `v2`. See `maki.version.cmp` for the accepted forms.
+
+**Parameters:**
+
+- `{v1}` (`table|string`) First version.
+- `{v2}` (`table|string`) Second version.
+
+**Returns:** (`boolean?`, `string?`) The answer, or nil plus an error.
+
+---
+
+### `maki.version.lt()` {#maki-version-lt}
+
+```lua
+maki.version.lt({v1}, {v2})
+```
+
+Whether `v1 < v2`. See `maki.version.cmp` for the accepted forms.
+
+**Parameters:**
+
+- `{v1}` (`table|string`) First version.
+- `{v2}` (`table|string`) Second version.
+
+**Returns:** (`boolean?`, `string?`) The answer, or nil plus an error.
+
+---
+
+### `maki.version.le()` {#maki-version-le}
+
+```lua
+maki.version.le({v1}, {v2})
+```
+
+Whether `v1 <= v2`. See `maki.version.cmp` for the accepted forms.
+
+**Parameters:**
+
+- `{v1}` (`table|string`) First version.
+- `{v2}` (`table|string`) Second version.
+
+**Returns:** (`boolean?`, `string?`) The answer, or nil plus an error.
+
+---
+
+### `maki.version.gt()` {#maki-version-gt}
+
+```lua
+maki.version.gt({v1}, {v2})
+```
+
+Whether `v1 > v2`. See `maki.version.cmp` for the accepted forms.
+
+**Parameters:**
+
+- `{v1}` (`table|string`) First version.
+- `{v2}` (`table|string`) Second version.
+
+**Returns:** (`boolean?`, `string?`) The answer, or nil plus an error.
+
+---
+
+### `maki.version.ge()` {#maki-version-ge}
+
+```lua
+maki.version.ge({v1}, {v2})
+```
+
+Whether `v1 >= v2`. See `maki.version.cmp` for the accepted forms.
+
+**Parameters:**
+
+- `{v1}` (`table|string`) First version.
+- `{v2}` (`table|string`) Second version.
+
+**Returns:** (`boolean?`, `string?`) The answer, or nil plus an error.
+
+---
+
+### `maki.version.last()` {#maki-version-last}
+
+```lua
+maki.version.last({versions})
+```
+
+Return the highest version in a list, as the element itself.
+
+**Parameters:**
+
+- `{versions}` (`table`) List of version tables, tuples, or strings.
+
+**Returns:** (`any`, `string?`) The highest element, nil for an empty list, or
+  nil plus an error for a string that does not parse.
+
+**Example:**
+
+```lua
+maki.version.last({ "1.9.0", "1.10.0", "1.2.0" }) -- "1.10.0", nil
 ```
 
 
