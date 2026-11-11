@@ -1,4 +1,6 @@
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::unbounded_channel;
 
 use maki_providers::provider::Provider;
 use maki_providers::retry::{RetryPolicy, RetryState};
@@ -44,11 +46,11 @@ fn canonicalize_tool_names(message: &mut Message) {
 }
 
 async fn forward_provider_events(
-    prx: flume::Receiver<ProviderEvent>,
+    mut prx: UnboundedReceiver<ProviderEvent>,
     event_tx: &EventSender,
 ) -> String {
     let mut streamed = String::new();
-    while let Ok(pe) = prx.recv_async().await {
+    while let Some(pe) = prx.recv().await {
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
                 streamed.push_str(&text);
@@ -232,7 +234,7 @@ pub(crate) async fn stream_with_retry(
         let fitted = model.with_turn_output(budget);
         let model = &fitted;
         let started = Instant::now();
-        let (ptx, prx) = flume::unbounded();
+        let (ptx, prx) = unbounded_channel();
         let forwarder = tokio::spawn({
             let event_tx = event_tx.clone();
             async move { forward_provider_events(prx, &event_tx).await }
@@ -380,6 +382,7 @@ fn error_description(error: &AgentError) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use tokio::sync::mpsc::UnboundedSender;
 
     use maki_providers::{
         Effort, KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Role, ThinkingConfig, TokenUsage,
@@ -593,7 +596,7 @@ mod tests {
             messages: &'a [Message],
             system: &'a str,
             tools: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -861,7 +864,7 @@ mod tests {
             _: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {

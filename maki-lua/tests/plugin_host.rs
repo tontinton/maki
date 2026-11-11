@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 
 use common::{end_session, poll_until};
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
@@ -8109,7 +8110,7 @@ impl Provider for TurnThenPark {
         _: &'a [Message],
         _: &'a str,
         _: &'a Value,
-        _: &'a flume::Sender<ProviderEvent>,
+        _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -8505,7 +8506,7 @@ impl Provider for OptsRecorder {
         _: &'a [Message],
         _: &'a str,
         _: &'a Value,
-        _: &'a flume::Sender<ProviderEvent>,
+        _: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -8643,7 +8644,7 @@ impl Provider for CallOnce {
         messages: &'a [Message],
         _: &'a str,
         _: &'a Value,
-        _: &'a flume::Sender<ProviderEvent>,
+        _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

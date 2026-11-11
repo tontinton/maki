@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 
 use maki_agent::agent::tool_dispatch;
 use maki_agent::tools::test_support::{stub_ctx_with, stub_seed};
@@ -216,7 +217,7 @@ impl Provider for ParkedProvider {
         messages: &'a [Message],
         _: &'a str,
         _: &'a Value,
-        _: &'a flume::Sender<ProviderEvent>,
+        _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

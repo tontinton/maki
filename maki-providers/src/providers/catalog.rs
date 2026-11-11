@@ -15,11 +15,11 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use flume::Sender;
 use maki_config::providers::ProvidersConfig;
 use reqwest::Client;
 use serde_json::Value;
 use tokio::sync::OnceCell;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
@@ -792,7 +792,7 @@ impl CatalogTransport {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
     ) -> Result<StreamResponse, AgentError> {
@@ -906,7 +906,7 @@ impl Provider for CatalogProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1031,7 +1031,7 @@ impl Provider for LazyCatalogProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1108,6 +1108,7 @@ pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use tokio::sync::OnceCell;
 
@@ -1288,7 +1289,7 @@ mod tests {
             context_window: 0,
             thinking_fields: None,
         };
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = provider
             .stream_message(
                 &model,

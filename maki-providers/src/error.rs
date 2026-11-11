@@ -9,6 +9,7 @@ use std::{io, time::Duration};
 
 use reqwest::Response;
 use serde_json::Value;
+use tokio::sync::mpsc::error::SendError;
 use tokio::task::JoinError;
 
 use crate::{
@@ -457,8 +458,8 @@ impl AgentError {
     }
 }
 
-impl<T> From<flume::SendError<T>> for AgentError {
-    fn from(_: flume::SendError<T>) -> Self {
+impl<T> From<SendError<T>> for AgentError {
+    fn from(_: SendError<T>) -> Self {
         Self::Channel
     }
 }

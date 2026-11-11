@@ -153,6 +153,7 @@ async fn next_wake(
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use tokio::sync::mpsc::UnboundedSender;
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -204,7 +205,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            events: &'a flume::Sender<ProviderEvent>,
+            events: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

@@ -1,12 +1,12 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use flume::Sender;
 use maki_storage::StateDir;
 use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
@@ -274,7 +274,7 @@ impl Provider for Opencode {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

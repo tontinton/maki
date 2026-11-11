@@ -1,12 +1,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use flume::Sender;
 use futures::TryStreamExt;
 use maki_storage::id::{MakiId, SessionRef};
 use reqwest::{Client, Method, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use maki_config::providers::Protocol;
@@ -245,7 +245,7 @@ impl Google {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let top_p = self.auth.lock().unwrap().top_p;
@@ -273,7 +273,7 @@ impl Provider for Google {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -590,7 +590,7 @@ fn push_or_extend_thinking(
 
 async fn parse_sse(
     mut events: SseBody,
-    event_tx: &Sender<ProviderEvent>,
+    event_tx: &UnboundedSender<ProviderEvent>,
 ) -> Result<StreamResponse, AgentError> {
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
     let mut usage = TokenUsage::default();
@@ -641,12 +641,10 @@ async fn parse_sse(
                     let id = format!("call_{}_{}", func_call.name, MakiId::generate());
                     let input = func_call.args.unwrap_or_default();
                     let thought_signature = func_call.thought_signature.or(part.thought_signature);
-                    event_tx
-                        .send_async(ProviderEvent::ToolUseStart {
-                            id: id.clone(),
-                            name: func_call.name.clone(),
-                        })
-                        .await?;
+                    event_tx.send(ProviderEvent::ToolUseStart {
+                        id: id.clone(),
+                        name: func_call.name.clone(),
+                    })?;
                     content_blocks.push(ContentBlock::ToolUse {
                         id,
                         name: func_call.name,
@@ -657,16 +655,12 @@ async fn parse_sse(
                 } else if let Some(text) = part.text {
                     if part.thought.unwrap_or(false) {
                         if !text.is_empty() {
-                            event_tx
-                                .send_async(ProviderEvent::ThinkingDelta { text: text.clone() })
-                                .await?;
+                            event_tx.send(ProviderEvent::ThinkingDelta { text: text.clone() })?;
                         }
                         push_or_extend_thinking(&mut content_blocks, text, part.thought_signature);
                     } else if !text.is_empty() {
                         // TODO: preserve part.thought_signature if ContentBlock::Text adds signature support.
-                        event_tx
-                            .send_async(ProviderEvent::TextDelta { text: text.clone() })
-                            .await?;
+                        event_tx.send(ProviderEvent::TextDelta { text: text.clone() })?;
                         push_or_extend_text(&mut content_blocks, text);
                     }
                 }
@@ -685,6 +679,7 @@ mod tests {
     use crate::test_support::sse_body;
     use std::sync::Arc;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const GEMINI_API_KEY: &str = "test-key";
     const MALFORMED_BASE_URL: &str = "http://[";
@@ -1052,7 +1047,7 @@ mod tests {
     async fn parse_sse_plain_text() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":10}}\n\n";
         let response = sse_body(data);
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(result.usage.input, 5);
@@ -1075,7 +1070,7 @@ mod tests {
         data.push_str(&event("Hello, "));
         data.push_str(&event("world."));
         let response = sse_body(data);
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(
             result.message.content.len(),
@@ -1104,7 +1099,7 @@ mod tests {
         data.push_str(&event("reasoning... ", None));
         data.push_str(&event("more.", Some("sig-final")));
         let response = sse_body(data);
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.message.content.len(), 1);
         assert!(matches!(
@@ -1120,7 +1115,7 @@ mod tests {
         let payload = format!(r#"{{"candidates":[{{"content":{{"parts":[{part},{part}]}}}}]}}"#,);
         let data = format!("data: {payload}\n\n");
         let response = sse_body(data);
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = parse_sse(response, &tx).await.unwrap();
         let ids: Vec<&str> = result
             .message
@@ -1139,7 +1134,7 @@ mod tests {
     async fn parse_sse_thinking_part() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":30}}\n\n";
         let response = sse_body(data);
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.usage.output, 50);
         assert!(matches!(
@@ -1156,7 +1151,7 @@ mod tests {
     async fn parse_sse_tool_call() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{\"cmd\":\"ls\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":15}}\n\n";
         let response = sse_body(data);
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
         assert!(matches!(
@@ -1181,7 +1176,7 @@ mod tests {
         );
         let data = format!("data: {payload}\n\n");
         let response = sse_body(data);
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = parse_sse(response, &tx).await.unwrap();
         assert!(matches!(
             &result.message.content[0],
@@ -1202,7 +1197,7 @@ mod tests {
         }
         let data = format!("data: {}\n\n", json!({"usageMetadata": metadata}));
         let response = sse_body(data);
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);
@@ -1233,7 +1228,7 @@ mod tests {
             json!({"usageMetadata": metadata}),
         );
         let response = sse_body(data);
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);

@@ -1,11 +1,11 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use flume::Sender;
 use maki_config::providers::{Protocol, ProviderPlan};
 use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ThinkingSupport};
@@ -225,7 +225,7 @@ impl Provider for Zai {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

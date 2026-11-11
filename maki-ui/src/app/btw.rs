@@ -5,7 +5,7 @@ use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionTools;
 use serde_json::Value;
-use tokio::sync::mpsc::{Sender, channel};
+use tokio::sync::mpsc::{Sender, channel, unbounded_channel};
 
 use crate::components::btw_modal::BtwEvent;
 
@@ -109,7 +109,7 @@ struct BtwRequest {
 
 impl BtwRequest {
     async fn run(self, btw_tx: Sender<BtwEvent>) {
-        let (event_tx, event_rx) = flume::unbounded();
+        let (event_tx, mut event_rx) = unbounded_channel();
         let messages = maki_providers::adapt_images_for_model(&self.model, &self.messages).await;
 
         // The pinned future outlives the stream, so the sender is dropped by
@@ -134,7 +134,7 @@ impl BtwRequest {
         // False when it stopped early, on a tool call or a closed modal, so the
         // stream's outcome never reaches the modal.
         let forward = async {
-            while let Ok(event) = event_rx.recv_async().await {
+            while let Some(event) = event_rx.recv().await {
                 let event = match event {
                     ProviderEvent::TextDelta { text } => BtwEvent::TextDelta(text),
                     ProviderEvent::ThinkingDelta { text } => BtwEvent::ThinkingDelta(text),
@@ -190,6 +190,7 @@ mod tests {
     use serde_json::json;
     use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
 
     const Q: &str = "why sqlite?";
     const FRAME_POLICY: &str = "Use the active conversation policy.";
@@ -217,7 +218,7 @@ mod tests {
             messages: &'a [Message],
             system: &'a str,
             tools: &'a Value,
-            events: &'a flume::Sender<ProviderEvent>,
+            events: &'a UnboundedSender<ProviderEvent>,
             opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

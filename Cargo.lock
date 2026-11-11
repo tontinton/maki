@@ -3920,7 +3920,6 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "fastrand",
- "flume",
  "futures",
  "getrandom 0.4.3",
  "image",

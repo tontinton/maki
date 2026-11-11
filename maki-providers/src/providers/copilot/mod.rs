@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use flume::Sender;
 use maki_storage::id::SessionRef;
 use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use super::anthropic::shared;
@@ -248,7 +248,7 @@ impl Copilot {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
         let wire_tools = openai_compat::convert_tools(tools);
@@ -284,7 +284,7 @@ impl Copilot {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
@@ -326,7 +326,7 @@ impl Copilot {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
@@ -808,7 +808,7 @@ impl Provider for Copilot {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

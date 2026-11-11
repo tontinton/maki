@@ -22,12 +22,14 @@
 //! this binary. Nothing one case leaves behind can reach the next.
 
 use std::collections::BTreeMap;
+use std::iter;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{env, fs, thread};
+use tokio::sync::mpsc::unbounded_channel;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -403,7 +405,7 @@ impl Replay {
             .clone()
             .unwrap_or_else(|| vec![Message::user(PROMPT.to_owned())]);
         let tools = turn.tools.clone().unwrap_or_else(tools);
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         let result = runtime().block_on(self.provider.stream_message(
             model,
             &messages,
@@ -417,7 +419,7 @@ impl Replay {
             turn.session.as_ref(),
         ));
         drop(tx);
-        (rx.drain().collect(), result)
+        (iter::from_fn(|| rx.try_recv().ok()).collect(), result)
     }
 
     /// Arrival order, unless the script is routed. Routed requests raced each

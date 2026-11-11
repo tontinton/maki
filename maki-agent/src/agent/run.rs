@@ -1358,6 +1358,7 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc::UnboundedSender;
 
     use maki_providers::model::FastSupport;
     use maki_providers::provider::{BoxFuture, Provider};
@@ -1492,7 +1493,7 @@ mod tests {
             messages: &'a [Message],
             system: &'a str,
             tools: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1538,7 +1539,7 @@ mod tests {
             _: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            ptx: &'a flume::Sender<ProviderEvent>,
+            ptx: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -3763,7 +3764,7 @@ mod tests {
             _: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -3827,7 +3828,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
