@@ -10,103 +10,12 @@ macro_rules! mod_key {
     };
 }
 
-macro_rules! upper {
-    ('a') => {
-        "A"
-    };
-    ('b') => {
-        "B"
-    };
-    ('c') => {
-        "C"
-    };
-    ('d') => {
-        "D"
-    };
-    ('e') => {
-        "E"
-    };
-    ('f') => {
-        "F"
-    };
-    ('g') => {
-        "G"
-    };
-    ('h') => {
-        "H"
-    };
-    ('i') => {
-        "I"
-    };
-    ('j') => {
-        "J"
-    };
-    ('k') => {
-        "K"
-    };
-    ('l') => {
-        "L"
-    };
-    ('m') => {
-        "M"
-    };
-    ('n') => {
-        "N"
-    };
-    ('o') => {
-        "O"
-    };
-    ('p') => {
-        "P"
-    };
-    ('q') => {
-        "Q"
-    };
-    ('r') => {
-        "R"
-    };
-    ('s') => {
-        "S"
-    };
-    ('t') => {
-        "T"
-    };
-    ('u') => {
-        "U"
-    };
-    ('v') => {
-        "V"
-    };
-    ('w') => {
-        "W"
-    };
-    ('x') => {
-        "X"
-    };
-    ('y') => {
-        "Y"
-    };
-    ('z') => {
-        "Z"
-    };
-}
-
 macro_rules! ctrl_bind {
     ($upper:literal) => {
         Bind {
             code: KeyCode::Char($upper.as_bytes()[0].to_ascii_lowercase() as char),
             modifiers: KeyModifiers::CONTROL,
             label: mod_key!($upper),
-        }
-    };
-}
-
-macro_rules! ctrl_str_bind {
-    ($char:tt) => {
-        Bind {
-            code: KeyCode::Char($char),
-            modifiers: KeyModifiers::SUPER,
-            label: mod_key!(upper!($char)),
         }
     };
 }
@@ -168,7 +77,11 @@ pub mod key {
     pub const DELETE_WORD: Bind = ctrl_bind!("W");
     pub const SEARCH: Bind = ctrl_bind!("F");
     pub const FORK: Bind = ctrl_bind!("F");
-    pub const SANDBOX: Bind = ctrl_str_bind!('s');
+    pub const SANDBOX: Bind = Bind {
+        code: KeyCode::Char('s'),
+        modifiers: KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+        label: mod_key!("Alt+S"),
+    };
     pub const FILE_PICKER: Bind = ctrl_bind!("S");
     pub const OPEN_EDITOR: Bind = ctrl_bind!("O");
     pub const PLAN_TOGGLE: Bind = ctrl_bind!("T");

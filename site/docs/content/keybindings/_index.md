@@ -20,7 +20,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+O` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |
 | `Ctrl+L` | Model picker |
-| `Ctrl+S` | Inspect sandbox configuration |
+| `Ctrl+Alt+S` | Inspect sandbox configuration |
 
 ## Editing
 
