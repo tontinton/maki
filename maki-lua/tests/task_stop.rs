@@ -5,6 +5,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::iter;
 use std::sync::Arc;
 use std::thread;
 
@@ -18,6 +19,7 @@ use maki_lua::{MoveOutcome, PluginHost, RestoreItem, RestoreReason, UiAction};
 use maki_storage::id::MakiId;
 use serde_json::{Value, json};
 use test_case::test_case;
+use tokio::sync::mpsc::unbounded_channel;
 
 const STOP_TOOL: &str = "task_stop";
 const PARK_TOOL: &str = "park";
@@ -131,7 +133,7 @@ fn park_and_move(
     id: &str,
     honor_cancel: bool,
 ) {
-    let (ctx, events) = call_ctx(reg, chat.id, &chat.run, id);
+    let (ctx, mut events) = call_ctx(reg, chat.id, &chat.run, id);
     let (receipt_tx, receipt_rx) = flume::bounded(1);
     let reg = Arc::clone(reg);
     thread::spawn(move || {
@@ -139,7 +141,7 @@ fn park_and_move(
         receipt_tx.send(exec(&reg, PARK_TOOL, input, &ctx)).unwrap();
     });
 
-    wait_movable(&events, id);
+    wait_movable(&mut events, id);
     assert_eq!(request_move(&host.event_handle(), id), MoveOutcome::Moved);
 
     let receipt = receipt_rx.recv_timeout(WAIT).unwrap();
@@ -296,7 +298,7 @@ fn a_subagent_cannot_stop_a_task_its_chat_moved() {
 fn restore_shows_the_task_as_the_header(state: Option<Value>, expected: &str) {
     let (_reg, host) = host();
     let handle = host.event_handle();
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     let item = RestoreItem {
         tool: Arc::from(STOP_TOOL),
         tool_use_id: "restore_id".to_owned(),
@@ -315,8 +317,7 @@ fn restore_shows_the_task_as_the_header(state: Option<Value>, expected: &str) {
     handle.request_restore(item, EventSender::new(tx, RUN_ID));
     handle.wait_restore_complete_for_test();
 
-    let header = rx
-        .drain()
+    let header = iter::from_fn(|| rx.try_recv().ok())
         .find_map(|env| match env.event {
             AgentEvent::ToolHeaderSnapshot { snapshot, .. } => Some(snapshot.text()),
             _ => None,

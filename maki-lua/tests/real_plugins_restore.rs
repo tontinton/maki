@@ -3,6 +3,7 @@
 //! things only the real views produce (gutters, command headers, truncation).
 
 use std::env::current_dir;
+use std::iter;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use maki_lua::{PluginHost, RestoreReason, Split, UiAction};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
 use test_case::test_case;
+use tokio::sync::mpsc::unbounded_channel;
 
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
@@ -132,7 +134,7 @@ fn restore(
 
 fn run_restore(host: &PluginHost, item: maki_lua::RestoreItem) -> Restored {
     let handle = host.event_handle();
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     handle.request_restore(item, maki_agent::EventSender::new(tx, 0));
     handle.wait_restore_complete_for_test();
     // The empty LoadSource drains the async gate, so spawned highlight tasks
@@ -142,7 +144,7 @@ fn run_restore(host: &PluginHost, item: maki_lua::RestoreItem) -> Restored {
         body: String::new(),
         header: String::new(),
     };
-    for env in rx.drain() {
+    for env in iter::from_fn(|| rx.try_recv().ok()) {
         match env.event {
             AgentEvent::ToolSnapshot { snapshot, .. } => out.body = snapshot.text(),
             AgentEvent::ToolHeaderSnapshot { snapshot, .. } => out.header = snapshot.text(),
@@ -170,7 +172,7 @@ fn read_restore_keeps_nearby_comment_colors_with_large_context(ending: &str) {
     host.load_source("read", READ_SRC).unwrap();
     let render = |path: &Path, offset: usize| {
         let handle = host.event_handle();
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         handle.request_restore(
             restore_item(
                 "read",
@@ -183,8 +185,7 @@ fn read_restore_keeps_nearby_comment_colors_with_large_context(ending: &str) {
         );
         handle.wait_restore_complete_for_test();
         host.load_source("barrier", "").unwrap();
-        let snapshot = rx
-            .drain()
+        let snapshot = iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|env| match env.event {
                 AgentEvent::ToolSnapshot { snapshot, .. } => Some(snapshot),
                 _ => None,
@@ -398,7 +399,7 @@ struct Live {
 }
 
 fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) -> Live {
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     let event_tx = maki_agent::EventSender::new(tx, 0);
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
         &maki_agent::AgentMode::Build,
@@ -415,7 +416,7 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
     let result = runtime().block_on(inv.execute(&ctx));
     host.load_source("live_barrier", "").unwrap();
     let mut body = String::new();
-    for env in rx.drain() {
+    for env in iter::from_fn(|| rx.try_recv().ok()) {
         if let AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
             body = snapshot.text();
         }

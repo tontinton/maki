@@ -6,8 +6,6 @@ pub(crate) mod shared_queue;
 use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::mpsc::unbounded_channel;
 
 use arc_swap::ArcSwap;
 use maki_agent::mcp::McpSession;
@@ -20,6 +18,9 @@ use maki_agent::{
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 use self::run_cancels::RunCancels;
 use maki_providers::{Message, Timeouts};
@@ -88,8 +89,8 @@ impl AgentDeps {
 /// restore reply, a click, an old agent winding down) can always deliver.
 /// Stale events are filtered by `run_id`, not by killing the channel.
 pub(crate) struct AgentHandles {
-    pub(crate) agent_rx: flume::Receiver<Envelope>,
-    pub(crate) agent_tx: flume::Sender<Envelope>,
+    pub(crate) agent_rx: UnboundedReceiver<Envelope>,
+    pub(crate) agent_tx: UnboundedSender<Envelope>,
     pub(crate) answer_tx: UnboundedSender<String>,
     pub(crate) history: SharedMessages,
     pub(crate) deps: AgentDeps,
@@ -112,7 +113,7 @@ impl AgentHandles {
         deps: AgentDeps,
     ) -> Self {
         let seed = deps.seed(&resumed, model_slot, config, tool_output_lines, permissions);
-        spawn_agent_internal(flume::unbounded(), seed, resumed, lua_handle, deps, false)
+        spawn_agent_internal(unbounded_channel(), seed, resumed, lua_handle, deps, false)
     }
 
     pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
@@ -203,7 +204,10 @@ impl AgentHandles {
             &app.permissions,
         );
         let new = spawn_agent_internal(
-            (self.agent_tx.clone(), self.agent_rx.clone()),
+            (
+                self.agent_tx.clone(),
+                mem::replace(&mut self.agent_rx, unbounded_channel().1),
+            ),
             seed,
             resumed,
             app.lua_event_handle.clone(),
@@ -254,7 +258,7 @@ pub(crate) async fn join_all(tasks: Vec<AbortOnDropHandle<()>>, timeout: Duratio
 }
 
 fn spawn_agent_internal(
-    (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
+    (agent_tx, agent_rx): (UnboundedSender<Envelope>, UnboundedReceiver<Envelope>),
     seed: AgentSeed,
     resumed: Resumed,
     lua_handle: EventHandle,
@@ -316,6 +320,7 @@ fn spawn_agent_internal(
 mod tests {
     mod background_e2e;
 
+    use maki_lua::test_support::wait_next;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
     use tokio::sync::mpsc::UnboundedSender;
@@ -555,12 +560,9 @@ mod tests {
     /// The failed turn's `Error` is what says the run is over. Queue the next
     /// prompt before it and the running turn swallows it as an interrupt, so
     /// the second request never happens.
-    fn await_turn_end(handles: &AgentHandles) {
+    fn await_turn_end(handles: &mut AgentHandles) {
         loop {
-            let envelope = handles
-                .agent_rx
-                .recv_timeout(LONG_TIMEOUT)
-                .expect(NO_TURN_END);
+            let envelope = wait_next(&mut handles.agent_rx, LONG_TIMEOUT).expect(NO_TURN_END);
             if matches!(envelope.event, AgentEvent::Error { .. }) {
                 return;
             }
@@ -568,7 +570,7 @@ mod tests {
     }
 
     fn drive_turn(
-        handles: &AgentHandles,
+        handles: &mut AgentHandles,
         reported: &flume::Receiver<String>,
         run_id: u64,
         text: &str,
@@ -588,17 +590,17 @@ mod tests {
         let (provider_two, reported_two) = recorder();
         let cell_one = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_one)));
         let cell_two = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_two)));
-        let handles_one = spawn_on(&cell_one, Vec::new());
-        let handles_two = spawn_on(&cell_two, Vec::new());
+        let mut handles_one = spawn_on(&cell_one, Vec::new());
+        let mut handles_two = spawn_on(&cell_two, Vec::new());
 
         cell_one.store(slot(MODEL_B, &provider_one));
 
         assert_eq!(
-            drive_turn(&handles_one, &reported_one, 1, FIRST_PROMPT),
+            drive_turn(&mut handles_one, &reported_one, 1, FIRST_PROMPT),
             MODEL_B
         );
         assert_eq!(
-            drive_turn(&handles_two, &reported_two, 1, SECOND_PROMPT),
+            drive_turn(&mut handles_two, &reported_two, 1, SECOND_PROMPT),
             MODEL_A,
             "a swap on one runtime's cell must not move another runtime's model"
         );
@@ -618,7 +620,7 @@ mod tests {
 
         cell.store(slot(MODEL_B, &provider));
         assert_eq!(
-            drive_turn(&handles, &reported, app.run_id, FIRST_PROMPT),
+            drive_turn(&mut handles, &reported, app.run_id, FIRST_PROMPT),
             MODEL_B
         );
     }
@@ -631,19 +633,19 @@ mod tests {
         let _runtime = enter_runtime();
         let (provider, reported, release) = gated_recorder();
         let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
-        let handles = spawn_on(&cell, Vec::new());
+        let mut handles = spawn_on(&cell, Vec::new());
 
         push_prompt(&handles, 1, FIRST_PROMPT);
         let in_flight = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
         cell.store(slot(MODEL_B, &provider));
         release.send(()).expect(GATE_CLOSED);
-        await_turn_end(&handles);
+        await_turn_end(&mut handles);
         assert_eq!(in_flight, MODEL_A);
 
         push_prompt(&handles, 2, SECOND_PROMPT);
         let next = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
         release.send(()).expect(GATE_CLOSED);
-        await_turn_end(&handles);
+        await_turn_end(&mut handles);
         assert_eq!(
             next, MODEL_B,
             "a swap stored mid-flight must still land on the next turn"
@@ -696,9 +698,7 @@ mod tests {
         let mut probe_seen = false;
         let mut consumed_seen = false;
         while !(probe_seen && consumed_seen) {
-            let envelope = handles
-                .agent_rx
-                .recv_timeout(LONG_TIMEOUT)
+            let envelope = wait_next(&mut handles.agent_rx, LONG_TIMEOUT)
                 .expect("probe or restored queue item never reached the tab channel");
             match envelope.event {
                 AgentEvent::TextDelta { ref text } if text == PROBE_TEXT => probe_seen = true,
@@ -773,10 +773,7 @@ mod tests {
 
         let mut observed = false;
         loop {
-            let envelope = handles
-                .agent_rx
-                .recv_timeout(LONG_TIMEOUT)
-                .expect(NO_TURN_END);
+            let envelope = wait_next(&mut handles.agent_rx, LONG_TIMEOUT).expect(NO_TURN_END);
             match envelope.event {
                 AgentEvent::ObservationLine { end, .. } => observed |= end == Some(TaskEnd::Lost),
                 AgentEvent::Error { .. } => break,

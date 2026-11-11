@@ -1,5 +1,5 @@
+use crate::agent::UnboundedSender;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedReceiver;
 
 use maki_agent::agent::{self, AgentHooks};
 use maki_agent::mcp::McpHandle;
@@ -17,6 +17,7 @@ use maki_agent::{
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, ContextGauge, Message, Model};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::spawn_blocking;
 use tracing::error;
 
@@ -44,7 +45,7 @@ fn base_tools(
 /// The loop's side of everything it shares with its `AgentHandles`.
 pub(super) struct LoopEnds {
     pub(super) shared_history: SharedMessages,
-    pub(super) agent_tx: flume::Sender<Envelope>,
+    pub(super) agent_tx: UnboundedSender<Envelope>,
     pub(super) answer_rx: UnboundedReceiver<String>,
     pub(super) queue: Arc<QueueReceiver>,
     pub(super) cancels: Arc<RunCancels>,
@@ -63,7 +64,7 @@ pub(super) struct AgentLoop {
     /// every run over it, so the provider's own counts pile up between turns.
     gauge: ContextGauge,
     cancels: Arc<RunCancels>,
-    agent_tx: flume::Sender<Envelope>,
+    agent_tx: UnboundedSender<Envelope>,
     answer_rx: Arc<Mutex<UnboundedReceiver<String>>>,
     queue: Arc<QueueReceiver>,
     mailbox: SessionMailbox,

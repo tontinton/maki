@@ -11365,7 +11365,7 @@ fn loading_a_session_stamps_its_restores_as_a_load_of_that_session() {
         .save(&SessionClaim::acquire(stored.id, &dir).unwrap(), &dir)
         .unwrap();
     let probe = probe_events(&mut app);
-    app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
+    app.restore_event_tx = Some(maki_agent::EventSender::new(unbounded_channel().0, 0));
 
     load_session(&mut app, stored.id, &test_model());
 
@@ -11385,7 +11385,7 @@ fn reset_session_stamps_the_new_main_chat_with_the_new_session() {
     let mut app = test_app();
     let previous = app.state.session.id;
     let probe = probe_events(&mut app);
-    app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
+    app.restore_event_tx = Some(maki_agent::EventSender::new(unbounded_channel().0, 0));
     let (_, items) = crate::chat::history_to_display(
         &[
             tool_use_msg(SUB_TOOL_ID),

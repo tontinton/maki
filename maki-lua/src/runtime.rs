@@ -4579,7 +4579,7 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
     };
     let input_lua = json_to_lua(lua, &item.input).ok()?;
 
-    let (dummy_tx, _) = flume::unbounded();
+    let (dummy_tx, _) = unbounded_channel();
     let cell = TaskCell::new(
         CancelToken::none(),
         Some(Instant::now() + RESTORE_ITEM_TIMEOUT),
@@ -6407,7 +6407,7 @@ mod tests {
     fn with_live_ctx_follows_task_live_field() {
         let lua = Lua::new();
 
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let with_live = task_cell(Some(LiveCtx {
             event_tx: maki_agent::EventSender::new(tx, 0),
             tool_use_id: "tool_abc".into(),

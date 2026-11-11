@@ -7,6 +7,7 @@ use maki_providers::{Message, RequestOptions, TaskAnswer, TaskEnd, TaskSettled, 
 use maki_storage::id::{MakiId, SessionRef};
 use thiserror::Error;
 use tokio::sync::Notify;
+use tokio::sync::mpsc::unbounded_channel;
 
 use crate::agent::default_instruction_files;
 use crate::cancel::CancelToken;
@@ -658,7 +659,7 @@ impl AgentSeed {
     /// Nobody can answer a permission prompt either, so there is no answer
     /// channel and `enforce` denies the call instead of waiting.
     pub fn tool_context(&self, cancel: CancelToken) -> ToolContext {
-        let (sink, _) = flume::unbounded();
+        let (sink, _) = unbounded_channel();
         let slot = self.model_slot.load();
         ToolContext {
             provider: Arc::clone(&slot.provider),

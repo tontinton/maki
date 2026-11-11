@@ -2,8 +2,12 @@
 //! gates both `describe` text and the handler's fn-map, so what the model
 //! sees is exactly what the interpreter can call.
 
+use maki_lua::test_support::wait_next;
 use std::collections::HashMap;
+use std::iter;
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::unbounded_channel;
 
 use maki_agent::AgentMode;
 use maki_agent::mcp::test_support::stub_session;
@@ -547,8 +551,8 @@ const MAX_SCRIPT_LINES: usize = 2000;
 const EXPAND_NOTICE: &str = "click to expand";
 const DIVIDER_LINE: &str = "──────";
 
-fn event_ctx(reg: &Arc<ToolRegistry>) -> (ToolContext, flume::Receiver<maki_agent::Envelope>) {
-    let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
+fn event_ctx(reg: &Arc<ToolRegistry>) -> (ToolContext, UnboundedReceiver<maki_agent::Envelope>) {
+    let (tx, rx) = unbounded_channel::<maki_agent::Envelope>();
     let event_tx = maki_agent::EventSender::new(tx, 0);
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
         &AgentMode::Build,
@@ -570,10 +574,9 @@ fn parse_code(reg: &ToolRegistry, code: &str) -> Box<dyn maki_agent::tools::Tool
 fn start_preview_text(code: &str) -> String {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, code);
-    let (ctx, rx) = event_ctx(&reg);
+    let (ctx, mut rx) = event_ctx(&reg);
     runtime().block_on(inv.start(&ctx));
-    let body = rx
-        .drain()
+    let body = iter::from_fn(|| rx.try_recv().ok())
         .find_map(|env| match env.event {
             maki_agent::AgentEvent::LiveToolBuf { id, body } if id == SCRIPT_TOOL_ID => Some(body),
             _ => None,
@@ -616,8 +619,8 @@ fn start_preview_caps_script_at_max_lines(total: usize, truncated: bool) {
 /// The async highlight task may snapshot mid-run, but the reply's
 /// `LiveToolBuf` and final `ToolSnapshot` always come after it, so the last
 /// body event holds the final content whatever the highlight timing.
-fn final_body_text(rx: &flume::Receiver<maki_agent::Envelope>) -> String {
-    rx.drain()
+fn final_body_text(rx: &mut UnboundedReceiver<maki_agent::Envelope>) -> String {
+    iter::from_fn(|| rx.try_recv().ok())
         .filter_map(|env| match env.event {
             maki_agent::AgentEvent::ToolSnapshot { id, snapshot, .. } if id == SCRIPT_TOOL_ID => {
                 Some(snapshot.text())
@@ -636,12 +639,12 @@ fn final_body_text(rx: &flume::Receiver<maki_agent::Envelope>) -> String {
 fn handler_renders_script_when_start_never_ran() {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, "print('hi')");
-    let (ctx, rx) = event_ctx(&reg);
+    let (ctx, mut rx) = event_ctx(&reg);
     runtime()
         .block_on(inv.execute(&ctx))
         .output
         .expect("execute ok");
-    let text = final_body_text(&rx);
+    let text = final_body_text(&mut rx);
     assert!(text.contains("1 print('hi')"), "script section: {text}");
     assert!(text.contains("\nhi"), "interpreter output below: {text}");
 }
@@ -664,12 +667,12 @@ fn start_preview_renders_single_line(code: &str) {
 fn handler_error_keeps_script_and_drops_waiting_notice() {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, "print(boom_undefined)");
-    let (ctx, rx) = event_ctx(&reg);
+    let (ctx, mut rx) = event_ctx(&reg);
     let err = runtime()
         .block_on(inv.execute(&ctx))
         .output
         .expect_err("undefined name must error");
-    let text = final_body_text(&rx);
+    let text = final_body_text(&mut rx);
 
     assert!(
         text.contains("1 print(boom_undefined)"),
@@ -689,7 +692,7 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
 fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usize>) -> Vec<String> {
     let (_reg, host) = setup();
     let eh = host.event_handle();
-    let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
+    let (tx, mut rx) = unbounded_channel::<maki_agent::Envelope>();
     eh.request_restore(
         maki_lua::RestoreItem {
             tool: Arc::from("code_execution"),
@@ -708,8 +711,7 @@ fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usiz
         maki_agent::EventSender::new(tx, 0),
     );
     let snapshot = loop {
-        let env = rx
-            .recv_timeout(std::time::Duration::from_secs(60))
+        let env = wait_next(&mut rx, std::time::Duration::from_secs(60))
             .expect("restore must emit a snapshot");
         if let maki_agent::AgentEvent::ToolSnapshot { id, snapshot, .. } = env.event
             && id == SCRIPT_TOOL_ID
