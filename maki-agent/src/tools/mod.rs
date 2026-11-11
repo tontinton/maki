@@ -417,7 +417,7 @@ pub struct ToolContext {
     /// Streams a dispatched child's live bufs and annotations back to its
     /// caller (`maki.agent.call_tool`). Never inherited: `to_tool_context`
     /// clears it, and each caller sets it for its own call only.
-    pub live_sink: Option<flume::Sender<ToolLive>>,
+    pub live_sink: Option<UnboundedSender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
 }
 

@@ -3724,7 +3724,9 @@ mod telemetry_tests {
 
 #[cfg(test)]
 mod layer_mark_tests {
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::tools::test_support::stub_ctx_with;
@@ -3744,7 +3746,7 @@ mod layer_mark_tests {
     ) {
         let (event_tx, events) = flume::unbounded();
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&EventSender::new(event_tx, 0)), row);
-        let (sink, live) = flume::unbounded();
+        let (sink, mut live) = unbounded_channel();
         ctx.live_sink = Some(sink);
 
         mark_allowed_by(&ctx, Arc::from(PLUGIN));
@@ -3756,8 +3758,7 @@ mod layer_mark_tests {
                 _ => None,
             })
             .collect();
-        let sent: Vec<String> = live
-            .try_iter()
+        let sent: Vec<String> = iter::from_fn(|| live.try_recv().ok())
             .filter_map(|ev| match ev {
                 ToolLive::AllowedBy(plugin) => Some(plugin.to_string()),
                 _ => None,

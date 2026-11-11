@@ -6,7 +6,6 @@ use std::pin::pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
@@ -472,7 +471,7 @@ async fn relay_session_events(
     mut upstream: Upstream,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     done_tx: UnboundedSender<()>,
-    live_sink: Option<flume::Sender<ToolLive>>,
+    live_sink: Option<UnboundedSender<ToolLive>>,
 ) {
     let mut cost = None;
     while let Some(mut envelope) = sub_events.next().await {
@@ -896,7 +895,7 @@ async fn dispatch_child(
     tctx.output_mode = ToolOutputMode::Full;
     // Open even without callbacks: when a plugin answers the child's
     // permission prompt, the user still has to see it somewhere.
-    let (live_tx, live_rx) = flume::unbounded();
+    let (live_tx, live_rx) = unbounded_channel();
     tctx.live_sink = Some(live_tx);
     let (mut on_buf, mut on_ann, mut on_usage, mut on_movable, mut on_task) =
         (None, None, None, None, None);
@@ -1566,7 +1565,7 @@ async fn dispatch_racing_live(
     tctx: &ToolContext,
     name: &str,
     input: &JsonValue,
-    rx: flume::Receiver<ToolLive>,
+    mut rx: UnboundedReceiver<ToolLive>,
     cbs: &LiveCallbacks<'_>,
 ) -> ToolDoneEvent {
     let mut run = pin!(tool_dispatch::run(
@@ -1577,16 +1576,16 @@ async fn dispatch_racing_live(
         CallOrigin::Nested
     ));
     loop {
-        match select(run.as_mut(), pin!(rx.recv_async())).await {
-            Either::Left((done, _)) => {
+        tokio::select! {
+            biased;
+            done = &mut run => {
                 while let Ok(ev) = rx.try_recv() {
                     cbs.deliver(ev).await;
                 }
                 return done;
             }
-            Either::Right((Ok(ev), _)) => cbs.deliver(ev).await,
-            // The sender is gone but no result arrived: just wait for the run.
-            Either::Right((Err(_), _)) => return run.await,
+            // Once the sender is gone this arm is off and only the run is left.
+            Some(ev) = rx.recv() => cbs.deliver(ev).await,
         }
     }
 }
@@ -2213,6 +2212,7 @@ fn call_local_tool(
 mod tests {
     use flume::Sender;
     use futures::FutureExt;
+    use futures::future::select;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
     use maki_agent::tools::test_support::{mock_tool, stub_ctx_with, stub_seed};
     use maki_agent::tools::{ToolAudience, ToolSource};
@@ -2960,8 +2960,8 @@ mod tests {
         sub_events
     }
 
-    fn live_usages(rx: &flume::Receiver<ToolLive>) -> Vec<String> {
-        rx.drain()
+    fn live_usages(rx: &mut UnboundedReceiver<ToolLive>) -> Vec<String> {
+        iter::from_fn(|| rx.try_recv().ok())
             .map(|event| match event {
                 ToolLive::Usage(usage) => usage,
                 _ => panic!("relay must only publish usage"),
@@ -3071,7 +3071,7 @@ mod tests {
     async fn relay_to_parent_reports_each_turn_and_keeps_run_ends_behind() {
         let (upstream, parent_rx) = parent_upstream();
         let (done_tx, mut done_rx) = unbounded_channel();
-        let (live_tx, live_rx) = flume::unbounded();
+        let (live_tx, mut live_rx) = unbounded_channel();
 
         relay_session_events(
             relayed_run(),
@@ -3086,7 +3086,7 @@ mod tests {
             tokens(100, 20).format_sum_cost(Some(0.25)),
             tokens(50, 10).format_sum_cost(Some(0.75)),
         ];
-        assert_eq!(live_usages(&live_rx), expected_live);
+        assert_eq!(live_usages(&mut live_rx), expected_live);
         assert_eq!(done_rx.try_recv(), Ok(()));
 
         let forwarded = parent_rx.drain().collect::<Vec<_>>();
