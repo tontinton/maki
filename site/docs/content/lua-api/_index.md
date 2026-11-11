@@ -5287,9 +5287,10 @@ Host session primitives. The interactive UI can run several sessions
 at once. These functions list, create, focus, rename, and delete them.
 
 Without a UI, most functions return `nil, "no interactive UI attached"`.
-`current`, `read`, `export`, `messages`, `notify` and `new` without
-`prompt` or `focus` still work. ACP has no focused session, so there
-`current` fails and `read`, `export` and `messages` need `session`.
+`current`, `read`, `export`, `messages`, `windows`, `subagents`,
+`notify` and `new` without `prompt` or `focus` still work. ACP has no
+focused session, so there `current` fails and the readers need
+`session`.
 
 ---
 
@@ -5492,12 +5493,18 @@ from disk. Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no
 focused session, so pass `session` there. Hook and event payloads carry
 the `session_id` to pass.
 
+`window` reads one archived window instead, as `maki.session.windows`
+lists it. Archives never change, so they read the same in every mode and
+need no live session.
+
 Requires the `session_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
   - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+  - `window` (`string?`) `"current"` or an archive id from `maki.session.windows`.
+    Defaults to the current window.
   - `last` (`integer?`) only the newest `last` messages.
 
 **Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and an error.
@@ -5509,6 +5516,113 @@ local msgs = maki.session.messages({ last = 1 })
 local last = msgs and msgs[1]
 if last and last.role == "assistant" and last.content[1].type == "text" then
   print(last.content[1].text)
+end
+```
+
+---
+
+### `maki.session.windows()` {#maki-session-windows}
+
+```lua
+maki.session.windows({opts?})
+```
+
+Lists a session's transcript windows, newest first: the current window is
+`[1]` and holds the conversation that has not been sealed yet, then the
+archived windows from the most recent seal back to the session start,
+each labeled with the rewrite that sealed it. A compaction parks the
+turns it summarized, a rewind the turns it cut, and both stay readable.
+
+Each window is:
+```text
+{
+  id = "current" | "<seq>",  -- pass back to `messages`/`subagents`
+  created_at,                -- when the window began, in Unix seconds: the
+                             -- session start for the oldest, otherwise the
+                             -- seal time of the window before it in time;
+                             -- nil when the session header is missing or
+                             -- unreadable
+  kind = "current" | "compaction" | "rewind" | "unknown",
+}
+```
+
+Listing never parses a transcript, so it stays cheap however long the
+session is. `messages` reads one window; `subagents` reads the asked
+window and its neighbors.
+
+Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no focused
+session, so pass `session` there. Hook and event payloads carry the
+`session_id` to pass.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+
+**Returns:** (`table|nil`, `string|nil`) Array of windows, or nil and an error.
+
+**Example:**
+
+```lua
+for _, window in ipairs(assert(maki.session.windows())) do
+  print(window.id, window.kind, window.created_at)
+end
+```
+
+---
+
+### `maki.session.subagents()` {#maki-session-subagents}
+
+```lua
+maki.session.subagents({opts?})
+```
+
+Reads the subagent transcripts that belong to one window, in spawn order
+where the session recorded it; transcripts with no record come last, by
+id. A transcript attaches to the window holding the `tool_use` that
+started it. A plugin run beside the chat has no parent `tool_use` and
+keeps its records across rewrites, so it attaches to the newest window
+that holds them.
+
+Each entry is:
+```text
+{
+  id,       -- the `tool_use` id that spawned it, stable in the session
+  nr,       -- 1-based position in the window's subagent list, not the
+            -- array index; a rewrite can drop entries, so numbers repeat
+            -- across windows
+  name,     -- the task description that spawned it, or "subagent"
+  messages, -- same shape as `maki.session.messages`
+}
+```
+
+Only what the host stored is visible. The TUI records subagent
+transcripts; `maki -p`, the SDK and ACP do not, so `subagents` answers an
+empty list for sessions they ran. The current window's transcripts come
+from the stored copy too, so they trail the run: a running subagent shows
+only the turns saved so far.
+
+ACP has no focused session, so pass `session` there. Hook and event
+payloads carry the `session_id` to pass.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+  - `window` (`string?`) `"current"` or an archive id from `maki.session.windows`.
+    Defaults to the current window.
+
+**Returns:** (`table|nil`, `string|nil`) Array of subagents, or nil and an error.
+
+**Example:**
+
+```lua
+for _, sub in ipairs(assert(maki.session.subagents())) do
+  print(sub.id, sub.nr, sub.name, #sub.messages)
 end
 ```
 
