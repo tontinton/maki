@@ -1,5 +1,4 @@
 use std::env;
-use std::io::{self, Write};
 use std::path::Path;
 
 use color_eyre::Result;
@@ -24,6 +23,7 @@ use maki_storage::auth::{
     load_tokens, lock_credentials, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
+use maki_storage::stdin;
 
 use crate::cli::{PromptArgs, PromptVariant};
 use crate::provider_scripts;
@@ -48,7 +48,7 @@ pub async fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()
                 && ProvidersConfig::load().get(&slug).is_none()
                 && let Some(provider_data) = maki_providers::catalog_provider(&slug).await
             {
-                login_catalog_provider(&provider_data, storage)?;
+                login_catalog_provider(&provider_data, storage).await?;
             } else {
                 login_provider(&slug, storage).await?;
             }
@@ -92,15 +92,18 @@ async fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
         );
     }
 
-    let plan = select_plan(slug, builtin, def.as_ref())?;
+    let plan = select_plan(slug, builtin, def.as_ref()).await?;
 
     let needs_url = builtin.is_some_and(|b| b.needs_url);
     let host_url = if needs_url {
-        Some(prompt_host_url(
-            slug,
-            &resolve_display_name(slug, def.as_ref()),
-            def.as_ref(),
-        )?)
+        Some(
+            prompt_host_url(
+                slug,
+                &resolve_display_name(slug, def.as_ref()),
+                def.as_ref(),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -111,7 +114,8 @@ async fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
         login_url.as_deref(),
         &resolve_display_name(slug, def.as_ref()),
         api_key_optional,
-    )?;
+    )
+    .await?;
 
     let mut provider_def = def.unwrap_or_default();
     if let Some(plan_name) = &plan {
@@ -268,19 +272,18 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
     }
     println!();
 
-    print!("  Select [1-{}]: ", rows.len());
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let choice: usize = input.trim().parse().context("enter a number")?;
+    let choice: usize = stdin::prompt(&format!("  Select [1-{}]: ", rows.len()))
+        .await?
+        .parse()
+        .context("enter a number")?;
 
     let Some(row) = choice.checked_sub(1).and_then(|i| rows.into_iter().nth(i)) else {
         bail!("invalid selection");
     };
     match row.target {
         LoginTarget::Provider(slug) => login_provider(&slug, storage).await,
-        LoginTarget::Catalog(provider) => login_catalog_provider(&provider, storage),
-        LoginTarget::Custom => login_custom(storage),
+        LoginTarget::Catalog(provider) => login_catalog_provider(&provider, storage).await,
+        LoginTarget::Custom => login_custom(storage).await,
     }
 }
 
@@ -293,18 +296,14 @@ fn hooked_login_providers() -> Vec<(String, String)> {
         .collect()
 }
 
-fn login_catalog_provider(provider: &ProviderData, storage: &StateDir) -> Result<()> {
+async fn login_catalog_provider(provider: &ProviderData, storage: &StateDir) -> Result<()> {
     println!();
     if let Some(ref var) = provider.env_keys.first() {
         println!("  Provider: {} (env: {var})", provider.slug);
     } else {
         println!("  Provider: {}", provider.slug);
     }
-    print!("  API key: ");
-    io::stdout().flush()?;
-    let mut key = String::new();
-    io::stdin().read_line(&mut key)?;
-    let key = key.trim().to_string();
+    let key = stdin::prompt("  API key: ").await?;
     if key.is_empty() {
         println!("  Skipped (no key entered)");
         return Ok(());
@@ -330,12 +329,8 @@ fn login_catalog_provider(provider: &ProviderData, storage: &StateDir) -> Result
     Ok(())
 }
 
-fn login_custom(storage: &StateDir) -> Result<()> {
-    print!("  Provider name: ");
-    io::stdout().flush()?;
-    let mut name = String::new();
-    io::stdin().read_line(&mut name)?;
-    let slug = slugify(&name);
+async fn login_custom(storage: &StateDir) -> Result<()> {
+    let slug = slugify(&stdin::prompt("  Provider name: ").await?);
     if slug.is_empty() {
         bail!("provider name cannot be empty");
     }
@@ -344,22 +339,14 @@ fn login_custom(storage: &StateDir) -> Result<()> {
     println!("    1. openai   (OpenAI-compatible chat completions)");
     println!("    2. anthropic (Anthropic messages API)");
     println!("    3. google   (Google Gemini API)");
-    print!("  Select [1-3]: ");
-    io::stdout().flush()?;
-    let mut proto_input = String::new();
-    io::stdin().read_line(&mut proto_input)?;
-    let protocol = match proto_input.trim() {
+    let protocol = match stdin::prompt("  Select [1-3]: ").await?.as_str() {
         "1" | "openai" => "openai",
         "2" | "anthropic" => "anthropic",
         "3" | "google" => "google",
         _ => bail!("invalid protocol selection"),
     };
 
-    print!("  Base URL: ");
-    io::stdout().flush()?;
-    let mut url_input = String::new();
-    io::stdin().read_line(&mut url_input)?;
-    let base_url = url_input.trim().to_string();
+    let base_url = stdin::prompt("  Base URL: ").await?;
     if base_url.is_empty() {
         bail!("base URL cannot be empty");
     }
@@ -367,11 +354,7 @@ fn login_custom(storage: &StateDir) -> Result<()> {
     let display_name = format!("Custom ({slug})");
     let api_key_env = format!("{}_API_KEY", slug.to_uppercase().replace('-', "_"));
 
-    print!("  API key (or Enter to skip): ");
-    io::stdout().flush()?;
-    let mut key_input = String::new();
-    io::stdin().read_line(&mut key_input)?;
-    let api_key = key_input.trim().to_string();
+    let api_key = stdin::prompt("  API key (or Enter to skip): ").await?;
 
     let mut config = ProvidersConfig::load();
     let provider_def = ProviderDef {
@@ -415,7 +398,7 @@ fn login_custom(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-fn select_plan(
+async fn select_plan(
     slug: &str,
     builtin: Option<&'static maki_config::providers::BuiltInProvider>,
     def: Option<&ProviderDef>,
@@ -441,48 +424,40 @@ fn select_plan(
         println!("    {}. {} ({})", i + 1, plan.display_name, plan.base_url);
     }
     println!();
-    print!("  Select [1-{}]: ", plans.len());
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let choice: usize = input.trim().parse().context("enter a number")?;
+    let choice: usize = stdin::prompt(&format!("  Select [1-{}]: ", plans.len()))
+        .await?
+        .parse()
+        .context("enter a number")?;
     if choice == 0 || choice > plans.len() {
         bail!("invalid plan selection");
     }
     Ok(Some(plans[choice - 1].0.to_string()))
 }
 
-fn prompt_host_url(slug: &str, display_name: &str, def: Option<&ProviderDef>) -> Result<String> {
+async fn prompt_host_url(
+    slug: &str,
+    display_name: &str,
+    def: Option<&ProviderDef>,
+) -> Result<String> {
     let default = resolve_base_url(slug, def).unwrap_or_default();
-    print!("  {} host URL [{}]: ", display_name, default);
-    io::stdout().flush()?;
-
-    let mut url = String::new();
-    io::stdin().read_line(&mut url)?;
-    let url = url.trim().to_string();
+    let url = stdin::prompt(&format!("  {display_name} host URL [{default}]: ")).await?;
 
     Ok(if url.is_empty() { default } else { url })
 }
 
-fn prompt_api_key(url: Option<&str>, display_name: &str, optional: bool) -> Result<String> {
+async fn prompt_api_key(url: Option<&str>, display_name: &str, optional: bool) -> Result<String> {
     if let Some(url) = url {
         if let Err(e) = open::that(url) {
             tracing::warn!(error = %e, "failed to open browser");
         }
         println!("  Opened {} in your browser.", url);
     }
-    if optional {
-        print!("  {} API key (or Enter to skip): ", display_name);
+    let question = if optional {
+        format!("  {display_name} API key (or Enter to skip): ")
     } else {
-        print!("  {} API key: ", display_name);
-    }
-    io::stdout().flush()?;
-
-    let mut api_key = String::new();
-    io::stdin().read_line(&mut api_key)?;
-    let api_key = api_key.trim().to_string();
-
-    Ok(api_key)
+        format!("  {display_name} API key: ")
+    };
+    Ok(stdin::prompt(&question).await?)
 }
 
 pub async fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {

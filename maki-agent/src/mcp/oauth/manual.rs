@@ -1,4 +1,4 @@
-use tokio::io::{AsyncBufReadExt, BufReader, stdin};
+use maki_storage::stdin;
 
 use super::callback::{CallbackResult, parse_query};
 
@@ -7,13 +7,7 @@ const MISSING_PARAMS: &str = "missing code or state parameter";
 const STATE_MISMATCH: &str = "state mismatch (wrong or stale login attempt)";
 
 pub(crate) async fn wait_for_paste(expected_state: &str) -> Result<CallbackResult, String> {
-    // If the callback server wins the race, the blocking stdin read is dropped
-    // mid-line and may swallow one buffered line. Fine here: this only runs in
-    // the CLI flow, which exits right after authentication completes.
-    let mut lines = BufReader::new(stdin()).lines();
-
-    while let Some(line) = lines
-        .next_line()
+    while let Some(line) = stdin::read_line()
         .await
         .map_err(|e| format!("stdin read failed: {e}"))?
     {

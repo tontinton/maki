@@ -3940,6 +3940,7 @@ version = "0.7.1"
 dependencies = [
  "bs58",
  "etcetera",
+ "futures",
  "getrandom 0.4.3",
  "reqwest",
  "serde",
@@ -3947,6 +3948,8 @@ dependencies = [
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

@@ -143,7 +143,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rmcp = { version = "3", default-features = false, features = ["client", "auth", "reqwest", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
 oauth2 = { version = "5", default-features = false }
 async-trait = "0.1"
-tokio-util = { version = "0.7", features = ["io", "rt"] }
+tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 sse-stream = "0.3"
 socket2 = "0.6"
 aws-config = { version = "1", features = ["credentials-login"] }
