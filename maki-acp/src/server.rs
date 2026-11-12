@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -37,7 +36,7 @@ use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{SessionClaim, SessionError};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdout};
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::{debug, info, warn};
@@ -117,13 +116,14 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let (out_tx, mut out_rx) = unbounded_channel::<Value>();
 
     let writer_task = tokio::spawn(async move {
-        let stdout = std::io::stdout();
+        let mut out = stdout();
         while let Some(msg) = out_rx.recv().await {
-            let mut handle = stdout.lock();
-            if serde_json::to_writer(&mut handle, &msg).is_ok() {
-                let _ = handle.write_all(b"\n");
-                let _ = handle.flush();
-            }
+            let Ok(mut line) = serde_json::to_vec(&msg) else {
+                continue;
+            };
+            line.push(b'\n');
+            let _ = out.write_all(&line).await;
+            let _ = out.flush().await;
         }
     });
 
