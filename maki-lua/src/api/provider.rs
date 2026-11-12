@@ -3,7 +3,6 @@ use std::fmt::Display;
 use std::io::{self, IsTerminal, Write};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -29,6 +28,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::Owner;
 use crate::api::net::{self, NetError, ResponseData};
@@ -200,12 +200,14 @@ impl Drop for LuaHookKeys {
     /// the existing way back there; a callback handed over already cancelled is
     /// the dispatcher's path for releasing a key without running it.
     fn drop(&mut self) {
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
         for (_, func) in std::mem::take(&mut self.keys) {
             let _ = self.release.send(DeferredCallback {
                 func,
                 delay: Duration::ZERO,
                 plugin: Arc::clone(&self.plugin),
-                cancel: Arc::new(AtomicBool::new(true)),
+                cancel: cancelled.clone(),
                 ceiling: None,
             });
         }
