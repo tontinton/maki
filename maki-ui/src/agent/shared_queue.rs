@@ -1,8 +1,8 @@
 //! Queue of work handed from the UI to the agent loop.
 //!
-//! Shutdown rides on `Drop`: when the last [`QueueSender`] goes away, flume
-//! closes the notify channel, so the receiver's `recv_notify` wakes with an
-//! `Err` and the agent loop falls out of its main loop on its own. That way
+//! Shutdown rides on `Drop`: when the last [`QueueSender`] goes away, the
+//! notify channel closes, so the receiver's `recv_notify` wakes with `None`
+//! and the agent loop falls out of its main loop on its own. That way
 //! nobody needs a separate "please stop" flag, and callers can't forget to
 //! set it.
 
@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use maki_agent::{
     AgentInput, AgentMode, EarlierInput, ExtractedCommand, ImageSource, InterruptSource,
 };
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
@@ -164,23 +166,26 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone)]
 pub(crate) struct QueueSender {
     items: Items,
-    notify_tx: flume::Sender<()>,
+    notify_tx: Sender<()>,
 }
 
 pub(crate) struct QueueReceiver {
     items: Items,
-    notify_rx: flume::Receiver<()>,
+    notify_rx: AsyncMutex<Receiver<()>>,
 }
 
 pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
-    let (notify_tx, notify_rx) = flume::bounded(1);
+    let (notify_tx, notify_rx) = channel(1);
     let items: Items = Arc::new(Mutex::new(VecDeque::new()));
     (
         QueueSender {
             items: Arc::clone(&items),
             notify_tx,
         },
-        QueueReceiver { items, notify_rx },
+        QueueReceiver {
+            items,
+            notify_rx: AsyncMutex::new(notify_rx),
+        },
     )
 }
 
@@ -263,8 +268,8 @@ impl QueueReceiver {
         }
     }
 
-    pub(crate) async fn recv_notify(&self) -> Result<(), flume::RecvError> {
-        self.notify_rx.recv_async().await
+    pub(crate) async fn recv_notify(&self) -> Option<()> {
+        self.notify_rx.lock().await.recv().await
     }
 }
 
