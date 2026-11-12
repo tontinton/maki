@@ -1786,7 +1786,10 @@ mod tests {
     /// and a null inside a tool input included.
     fn rich_history() -> Vec<Message> {
         vec![
-            Message::user(TEXT.into()),
+            Message {
+                durable: Some(TOOL_NAME.into()),
+                ..Message::user(TEXT.into())
+            },
             assistant(vec![
                 ContentBlock::Thinking {
                     thinking: THOUGHT.into(),

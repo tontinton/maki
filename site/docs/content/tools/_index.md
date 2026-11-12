@@ -259,7 +259,7 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 
 ### `skill` {#skill}
 
-Load a skill that provides instructions and workflows for specific tasks.
+When a task matches a listed skill, load it before proceeding.
 
 [Plugin permission](/docs/lua-api/#plugin-permissions): `fs_read`
 
