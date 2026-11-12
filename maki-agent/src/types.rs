@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use flume::{Receiver, Sender};
+use futures::FutureExt;
 use maki_config::ToolKey;
 use maki_providers::{
     AgentError, ContentBlock, ImageSource, Message, RequestOptions, Role, StopReason, TaskEnd,
@@ -15,6 +15,7 @@ use maki_providers::{
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::SessionControl;
@@ -865,17 +866,22 @@ impl AgentEvent {
 /// Wakes the UI loop so a change made on another thread is painted now, not on
 /// the loop's next timed poll. Wakes pile up into one until the loop looks, so
 /// a plugin writing in a tight loop costs one frame, not one per write.
-#[derive(Clone)]
-pub struct UiWaker(Sender<()>);
+#[derive(Clone, Default)]
+pub struct UiWaker(Arc<Notify>);
 
 impl UiWaker {
-    pub fn new() -> (Self, Receiver<()>) {
-        let (tx, rx) = flume::bounded(1);
-        (Self(tx), rx)
+    pub fn wake(&self) {
+        self.0.notify_one();
     }
 
-    pub fn wake(&self) {
-        let _ = self.0.try_send(());
+    /// Resolves once a wake came in that the loop has not taken yet.
+    pub async fn woken(&self) {
+        self.0.notified().await;
+    }
+
+    /// Takes a pending wake without waiting for one.
+    pub fn take_wake(&self) -> bool {
+        self.woken().now_or_never().is_some()
     }
 }
 

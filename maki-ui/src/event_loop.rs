@@ -27,7 +27,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, HostPrompt, McpCommand, McpConfigErrors,
-    McpHandle, SessionMailbox, Transcript, mcp,
+    McpHandle, SessionMailbox, Transcript, UiWaker, mcp,
 };
 use maki_config::project::TrustState;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
@@ -137,7 +137,7 @@ pub struct EventLoopParams {
     pub hint_reader: HintReader,
     pub input_rules_reader: InputRulesReader,
     pub ui_action_rx: UnboundedReceiver<UiAction>,
-    pub ui_wake_rx: flume::Receiver<()>,
+    pub ui_waker: UiWaker,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
     pub project_config: ProjectConfig,
@@ -563,7 +563,7 @@ pub(crate) struct EventLoop<'t> {
     warn_tx: UnboundedSender<String>,
     models_fetched: Arc<Notify>,
     ui_action_rx: UnboundedReceiver<UiAction>,
-    ui_wake_rx: flume::Receiver<()>,
+    ui_waker: UiWaker,
     /// One package command at a time. The work runs as its own task, so a
     /// second `/packupdate` would otherwise race the first over the same clones
     /// and locks.
@@ -592,13 +592,6 @@ enum Wake {
 
 /// A value from the channel, or never, once it is closed: a closed channel
 /// is not an event.
-async fn recv_or_pending<T>(rx: &flume::Receiver<T>) -> T {
-    match rx.recv_async().await {
-        Ok(value) => value,
-        Err(_) => pending().await,
-    }
-}
-
 /// Outside tokio's coop budget: it would report an empty queue after 128
 /// envelopes in one poll and end the drain at half of [`DRAIN_BUDGET`].
 async fn next_or_pending<T>(rx: &mut UnboundedReceiver<T>) -> T {
@@ -727,7 +720,7 @@ impl<'t> EventLoop<'t> {
             hint_reader,
             input_rules_reader,
             ui_action_rx,
-            ui_wake_rx,
+            ui_waker,
             lua_event_handle,
             model_policy,
             project_config,
@@ -854,7 +847,7 @@ impl<'t> EventLoop<'t> {
             warn_tx: bg.warn_tx,
             models_fetched: bg.models_fetched,
             ui_action_rx,
-            ui_wake_rx,
+            ui_waker,
             pack: None,
             _model_fetch_task: bg.task,
         })
@@ -972,8 +965,8 @@ impl<'t> EventLoop<'t> {
             biased;
             event = self.input.next() => event.map_or(Wake::InputGone, Wake::Input),
             action = next_or_pending(&mut self.ui_action_rx) => Wake::Ui(action),
-            () = recv_or_pending(&self.ui_wake_rx) => Wake::PluginWindow,
-            () = recv_or_pending(decor_worker::wakes()) => Wake::Decor,
+            () = self.ui_waker.woken() => Wake::PluginWindow,
+            () = decor_worker::wakes().woken() => Wake::Decor,
             Some(warning) = self.warn_rx.recv() => Wake::Warn(warning),
             preparation = pack_done(&mut self.pack) => Wake::Pack(Box::new(preparation)),
             () = self.models_fetched.notified() => Wake::ModelsDiscovered,

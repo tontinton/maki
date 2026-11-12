@@ -1,3 +1,4 @@
+use maki_agent::UiWaker;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs;
@@ -1049,8 +1050,8 @@ impl PluginHost {
     }
 
     /// Rings when a plugin changes a window or what one shows.
-    pub fn ui_wake_rx(&self) -> flume::Receiver<()> {
-        self.inner.ui_wake_rx.clone()
+    pub fn ui_waker(&self) -> UiWaker {
+        self.inner.ui_waker.clone()
     }
 }
 

@@ -17,14 +17,13 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::thread;
 
-use flume::Receiver;
 use maki_agent::UiWaker;
 
 const PARSE_THREAD: &str = "input-parse";
 
 type Job = Box<dyn FnOnce() + Send>;
 
-static WAKER: LazyLock<(UiWaker, Receiver<()>)> = LazyLock::new(UiWaker::new);
+static WAKER: LazyLock<UiWaker> = LazyLock::new(UiWaker::default);
 
 static PARSES: LazyLock<Sender<Job>> = LazyLock::new(|| {
     let (jobs, queued) = channel::<Job>();
@@ -50,8 +49,8 @@ thread_local! {
 }
 
 /// Ready once a job has finished since the loop last looked.
-pub fn wakes() -> &'static Receiver<()> {
-    &WAKER.1
+pub fn wakes() -> &'static UiWaker {
+    &WAKER
 }
 
 /// Runs {job} on the highlight thread.
@@ -99,7 +98,7 @@ fn send(job: impl FnOnce() + Send + 'static, run: impl FnOnce(Job)) {
     // A job that panicked has finished too, and its input waits to hear it.
     let job: Job = Box::new(move || {
         let finished = catch_unwind(AssertUnwindSafe(job));
-        WAKER.0.wake();
+        WAKER.wake();
         if let Err(panic) = finished {
             resume_unwind(panic);
         }
@@ -147,9 +146,9 @@ mod tests {
     fn a_job_that_panics_still_wakes_the_loop() {
         manual();
         spawn(|| panic!("{JOB_PANIC}"));
-        while wakes().try_recv().is_ok() {}
+        while wakes().take_wake() {}
 
         assert!(catch_unwind(run_queued).is_err());
-        assert!(wakes().try_recv().is_ok());
+        assert!(wakes().take_wake());
     }
 }

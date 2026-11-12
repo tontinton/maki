@@ -5595,7 +5595,7 @@ pub(crate) struct LuaThread {
     pub hint_reader: crate::api::util::command::HintReader,
     pub input_rules_reader: InputRulesReader,
     pub ui_action_rx: Mutex<Option<UnboundedReceiver<UiAction>>>,
-    pub ui_wake_rx: flume::Receiver<()>,
+    pub ui_waker: UiWaker,
     /// What [`load_user_source`] found on the Lua thread, for the host to
     /// report.
     pub key_lint: KeyLint,
@@ -5623,7 +5623,8 @@ pub fn spawn(
     let shutdown_thread = Arc::clone(&shutdown);
     let (init_tx, init_rx) = flume::bounded::<Result<(), PluginError>>(1);
     let (ui_action_tx, ui_action_rx) = unbounded_channel::<UiAction>();
-    let (ui_waker, ui_wake_rx) = UiWaker::new();
+    let ui_waker = UiWaker::default();
+    let ui_waker_thread = ui_waker.clone();
     let (command_writer, command_reader) = LuaCommandWriter::new();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
@@ -5661,7 +5662,7 @@ pub fn spawn(
                     r.lua.set_app_data(key_lint_thread);
                     r.lua.set_app_data(background_thread);
                     r.lua.set_app_data(input_rule_store);
-                    r.lua.set_app_data(ui_waker);
+                    r.lua.set_app_data(ui_waker_thread);
                     let _ = init_tx.send(Ok(()));
                     r
                 }
@@ -6140,7 +6141,7 @@ pub fn spawn(
         hint_reader,
         input_rules_reader,
         ui_action_rx: Mutex::new(Some(ui_action_rx)),
-        ui_wake_rx,
+        ui_waker,
         key_lint,
     })
 }
