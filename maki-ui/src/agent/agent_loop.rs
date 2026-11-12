@@ -114,7 +114,7 @@ impl AgentLoop {
             return;
         }
 
-        while let Ok(()) = self.queue.recv_notify().await {
+        while let Some(()) = self.queue.recv_notify().await {
             let mut last_run_id = None;
             while let Some(mut run) = self.queue.pop_run() {
                 let Some(run_id) = run.drop_cancelled(self.cancels.min_run_id()) else {
