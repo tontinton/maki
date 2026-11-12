@@ -1,7 +1,7 @@
 use shell_words::split;
 use std::io::{Write, stdout};
 use std::path::Path;
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -20,6 +20,8 @@ use crossterm::terminal::{
     self, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use maki_config::NotificationMethod;
+use tokio::process::Command as ProcessCommand;
+use tokio::time::timeout;
 
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Maki needs attention";
 const NOTIFICATION_TITLE: &str = "Maki";
@@ -78,8 +80,8 @@ pub(crate) struct TerminalNotifier {
 }
 
 impl TerminalNotifier {
-    pub(crate) fn new(configured: NotificationMethod) -> Option<Self> {
-        let notifier = resolve_notifier(configured, detect_osc9_support)?;
+    pub(crate) async fn new(configured: NotificationMethod) -> Option<Self> {
+        let notifier = resolve_notifier(configured, detect_osc9_support).await?;
         Some(Self {
             notifier,
             mux: TerminalMux::detect(),
@@ -99,7 +101,7 @@ impl TerminalNotifier {
     }
 }
 
-fn detect_osc9_support() -> bool {
+async fn detect_osc9_support() -> bool {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
     let env = TerminalEnvironment {
@@ -111,10 +113,10 @@ fn detect_osc9_support() -> bool {
         kitty: std::env::var_os("KITTY_WINDOW_ID").is_some(),
         term: term.as_deref(),
     };
-    let tmux = env
-        .term_program
-        .filter(|value| normalize_terminal_id(value) == "tmux")
-        .and_then(|_| query_tmux_client());
+    let tmux = match env.term_program {
+        Some(value) if normalize_terminal_id(value) == "tmux" => query_tmux_client().await,
+        _ => None,
+    };
     auto_supports_osc9(&env, tmux.as_ref())
 }
 
@@ -143,15 +145,15 @@ fn supports_osc9(value: &str) -> bool {
     )
 }
 
-fn resolve_notifier(
+async fn resolve_notifier(
     configured: NotificationMethod,
-    auto_supports_osc9: impl FnOnce() -> bool,
+    auto_supports_osc9: impl AsyncFnOnce() -> bool,
 ) -> Option<ResolvedNotifier> {
     match configured {
         NotificationMethod::Off => None,
         NotificationMethod::Osc9 => Some(ResolvedNotifier::Osc9),
         NotificationMethod::Bell => Some(ResolvedNotifier::Bell),
-        NotificationMethod::Auto => Some(if auto_supports_osc9() {
+        NotificationMethod::Auto => Some(if auto_supports_osc9().await {
             ResolvedNotifier::Osc9
         } else {
             ResolvedNotifier::Bell
@@ -177,8 +179,8 @@ fn auto_supports_osc9(env: &TerminalEnvironment<'_>, tmux: Option<&TmuxClient>) 
     env.wezterm || env.iterm || env.kitty || env.term.is_some_and(supports_osc9)
 }
 
-fn query_tmux_client() -> Option<TmuxClient> {
-    let mut child = ProcessCommand::new("tmux")
+async fn query_tmux_client() -> Option<TmuxClient> {
+    let child = ProcessCommand::new("tmux")
         .args([
             "display-message",
             "-p",
@@ -187,17 +189,16 @@ fn query_tmux_client() -> Option<TmuxClient> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .ok()?;
-    match wait_timeout::ChildExt::wait_timeout(&mut child, TMUX_QUERY_TIMEOUT) {
-        Ok(Some(status)) if status.success() => {}
-        _ => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
+    let output = timeout(TMUX_QUERY_TIMEOUT, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    let output = child.wait_with_output().ok()?;
     let output = String::from_utf8(output.stdout).ok()?;
     let (term_type, term_name) = output.trim_end().split_once('\t')?;
     Some(TmuxClient {
@@ -652,30 +653,42 @@ mod tests {
     // at the start and in the middle of the payload.
     const OSC52_WITH_ST: &str = "\u{1b}]52;c;SGVsbG8=\u{1b}\\";
 
-    #[test]
-    fn configured_notification_method_resolves_once() {
+    #[tokio::test]
+    async fn configured_notification_method_resolves_once() {
         assert_eq!(
-            resolve_notifier(NotificationMethod::Osc9, || panic!("auto detection ran")),
+            resolve_notifier(NotificationMethod::Osc9, async || panic!(
+                "auto detection ran"
+            ))
+            .await,
             Some(ResolvedNotifier::Osc9)
         );
         assert_eq!(
-            resolve_notifier(NotificationMethod::Bell, || panic!("auto detection ran")),
+            resolve_notifier(NotificationMethod::Bell, async || panic!(
+                "auto detection ran"
+            ))
+            .await,
             Some(ResolvedNotifier::Bell)
         );
         assert_eq!(
-            resolve_notifier(NotificationMethod::Notify, || panic!("auto detection ran")),
+            resolve_notifier(NotificationMethod::Notify, async || panic!(
+                "auto detection ran"
+            ))
+            .await,
             Some(ResolvedNotifier::Notify),
         );
         assert_eq!(
-            resolve_notifier(NotificationMethod::Off, || panic!("auto detection ran")),
+            resolve_notifier(NotificationMethod::Off, async || panic!(
+                "auto detection ran"
+            ))
+            .await,
             None
         );
         assert_eq!(
-            resolve_notifier(NotificationMethod::Auto, || true),
+            resolve_notifier(NotificationMethod::Auto, async || true).await,
             Some(ResolvedNotifier::Osc9)
         );
         assert_eq!(
-            resolve_notifier(NotificationMethod::Auto, || false),
+            resolve_notifier(NotificationMethod::Auto, async || false).await,
             Some(ResolvedNotifier::Bell)
         );
     }

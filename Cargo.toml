@@ -212,7 +212,6 @@ serde_path_to_error = "0.1"
 indexmap = { version = "2", features = ["serde"] }
 shell-words = "1"
 agent-client-protocol-schema = "1"
-wait-timeout = "0.2"
 inventory = "0.3"
 
 [profile.bench]
