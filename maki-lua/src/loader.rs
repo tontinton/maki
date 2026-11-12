@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use flume::Sender;
 use include_dir::{Dir, File, include_dir};
+use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{Cutter, SessionEndReason};
@@ -1067,6 +1068,29 @@ pub struct EventHandle {
     background: BackgroundTasks,
 }
 
+/// How a code-block render ended. Each block renders once: the caller keeps
+/// the source after a decline or a timeout until the width or a
+/// `ui.code_block.*` layer changes.
+#[derive(Debug, PartialEq)]
+pub enum CodeBlockOutcome {
+    Rendered(Vec<String>),
+    /// The chain declined, failed, or returned lines outside the limits.
+    Declined,
+    TimedOut,
+}
+
+/// One display-only rendering request. Dropping it cancels the render.
+pub struct CodeBlockRender {
+    reply: flume::Receiver<CodeBlockOutcome>,
+    _cancel: CancelTrigger,
+}
+
+impl CodeBlockRender {
+    pub fn try_recv(&self) -> Result<CodeBlockOutcome, flume::TryRecvError> {
+        self.reply.try_recv()
+    }
+}
+
 impl EventHandle {
     pub(crate) fn from_tx(tx: UnboundedSender<Request>) -> Self {
         Self {
@@ -1098,6 +1122,60 @@ impl EventHandle {
     pub fn plan_form_layered(&self) -> bool {
         self.layered.layers_surface(PLAN_FORM_SLOT)
             || self.layered.layers_surface(PLAN_FORM_ACTIONS_SLOT)
+    }
+
+    /// Moves only when a `ui.code_block.*` layer changes, so a display cache
+    /// keyed on it survives every other slot change.
+    pub fn code_block_revision(&self) -> u64 {
+        self.layered.code_block_revision()
+    }
+
+    /// The language a plugin claims for a fence with this info string, when
+    /// a render of it can reach the plugin: the width is nonzero and the
+    /// source fits the limit.
+    pub fn claimed_code_block(&self, info: &str, code: &str, width: u16) -> Option<Arc<str>> {
+        if width == 0 || code.len() > runtime::MAX_CODE_BLOCK_SOURCE_BYTES {
+            return None;
+        }
+        self.layered.code_block_language(info)
+    }
+
+    /// Starts a display-only `ui.code_block.<language>` render. The caller
+    /// keeps the source visible until it answers with lines.
+    pub fn render_code_block(
+        &self,
+        language: Arc<str>,
+        code: String,
+        width: u16,
+    ) -> CodeBlockRender {
+        self.render_code_block_within(language, code, width, runtime::CODE_BLOCK_DEADLINE)
+    }
+
+    fn render_code_block_within(
+        &self,
+        language: Arc<str>,
+        code: String,
+        width: u16,
+        budget: Duration,
+    ) -> CodeBlockRender {
+        let (reply, rx) = flume::bounded(1);
+        let (trigger, cancel) = CancelToken::new();
+        if self.claimed_code_block(&language, &code, width).is_none() {
+            let _ = reply.send(CodeBlockOutcome::Declined);
+        } else {
+            let _ = self.tx.try_send(Request::RenderCodeBlock {
+                language,
+                code,
+                width,
+                budget,
+                cancel,
+                reply,
+            });
+        }
+        CodeBlockRender {
+            reply: rx,
+            _cancel: trigger,
+        }
     }
 
     /// Runs the handler behind a plugin row of {session}'s plan form, named
@@ -1368,6 +1446,9 @@ impl EventHandle {
             .is_ok()
     }
 }
+
+#[cfg(test)]
+mod code_block_tests;
 
 #[cfg(test)]
 mod tests {

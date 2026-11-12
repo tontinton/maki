@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use futures::FutureExt;
 use include_dir::Dir;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
@@ -40,6 +41,7 @@ use tokio::task::{LocalSet, spawn_local, yield_now};
 use tokio::time::{sleep, sleep_until, timeout, timeout_at};
 use tokio_util::task::task_tracker::TaskTrackerToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
+use unicode_width::UnicodeWidthStr;
 
 use maki_config::RawConfig;
 use maki_providers::plugin::DeclAuthority;
@@ -60,7 +62,8 @@ use crate::api::plan::{
 };
 use crate::api::slot::{
     ChainObserver, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, PLAN_FORM_ACTIONS_SLOT,
-    PLAN_FORM_SLOT, SlotLayer, SlotStore, layer_plugins, run_host_chain, run_host_chain_with,
+    PLAN_FORM_SLOT, SlotLayer, SlotStore, code_block_slot, layer_plugins, run_host_chain,
+    run_host_chain_with,
 };
 use crate::api::tool::{
     DeclaredReach, LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, resolve_rules,
@@ -85,7 +88,7 @@ use crate::docs_render;
 use crate::error::PluginError;
 use crate::jobs::{JobEvent, JobOwner, JobReaper, JobStore, deliver_job_event};
 use crate::key_lint::KeyLint;
-use crate::loader::EventHandle;
+use crate::loader::{CodeBlockOutcome, EventHandle};
 use crate::pack::Interaction;
 use crate::plugin_permissions::{
     Ceiling, Permission, PluginPermissions, PluginReach, denied_error, grant_hint,
@@ -179,6 +182,12 @@ const FINAL_DRAIN_BUDGET: usize = 256;
 /// from. Two budgets would add up to a host worst case no reader of either
 /// constant could predict.
 pub const PLAN_FORM_SLOT_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const CODE_BLOCK_DEADLINE: Duration = Duration::from_secs(2);
+const CODE_BLOCK_COST: LayerCost<'static> = LayerCost::Named(&[Permission::SessionRead]);
+pub(crate) const MAX_CODE_BLOCK_SOURCE_BYTES: usize = 32 * 1024;
+const MAX_CODE_BLOCK_LINES: usize = 256;
+const MAX_CODE_BLOCK_OUTPUT_BYTES: usize = 64 * 1024;
+const INVALID_CODE_BLOCK_ERR: &str = "code block renderer must return a nonempty array of plain text lines within the display limits";
 /// What layering either `ui.plan_form*` chain costs. A layer decides what the
 /// menu says and what pressing Enter on a row does, up to a build-mode turn
 /// with every tool behind it, and it can keep a built-in row's wording while
@@ -518,6 +527,15 @@ pub enum Request {
         /// The menu to draw, or `None` when a layer took the form over.
         reply: oneshot::Sender<Option<PlanMenu>>,
     },
+    RenderCodeBlock {
+        language: Arc<str>,
+        code: String,
+        width: u16,
+        /// Counted from when Lua starts the render, so queue wait is free.
+        budget: Duration,
+        cancel: CancelToken,
+        reply: flume::Sender<CodeBlockOutcome>,
+    },
     ComputeHeader {
         plugin: Arc<str>,
         tool: Arc<str>,
@@ -782,6 +800,10 @@ pub(crate) struct TaskCell {
     slice_started: Cell<Option<Instant>>,
     /// The watchdog pokes every 50ms, and a slow slice should log once.
     slice_warned: Cell<bool>,
+    /// Set once the watchdog raises for the deadline or a stuck slice. A
+    /// slot chain swallows that raise as a layer error, so only this tells
+    /// a killed render from one that merely answered late.
+    overran: Cell<bool>,
     pub(crate) deadline: Cell<Option<Instant>>,
     pub(crate) deadline_secs: Cell<Option<u64>>,
     pub(crate) deadline_expire: Cell<DeadlineExpire>,
@@ -869,6 +891,7 @@ impl TaskCell {
             kill_at: Cell::new(None),
             slice_started: Cell::new(None),
             slice_warned: Cell::new(false),
+            overran: Cell::new(false),
             deadline: Cell::new(deadline),
             deadline_secs: Cell::new(None),
             deadline_expire: Cell::new(DeadlineExpire::Timeout),
@@ -1890,7 +1913,11 @@ fn interrupt_reason(state: *mut ffi::lua_State) -> Option<Cow<'static, str>> {
     let (task, warning, kill) = {
         let handle = lua.app_data_ref::<TaskHandle>()?;
         let cell = lock_cell(&handle);
-        (cell.id, cell.slice_warning(now), cell.kill_due(now))
+        let kill = cell.kill_due(now);
+        if matches!(kill, Some(Kill::Doomed(KillReason::Deadline) | Kill::Stuck)) {
+            cell.overran.set(true);
+        }
+        (cell.id, cell.slice_warning(now), kill)
     };
     if let Some(held) = warning {
         let blame = Blame::of(lua, state);
@@ -4992,6 +5019,62 @@ fn plan_form_event(lua: &Lua, path: &str, session: &str) -> mlua::Result<MultiVa
     Ok(MultiValue::from_vec(vec![LuaValue::Table(ev)]))
 }
 
+async fn code_block_chain(
+    lua: &Lua,
+    plugins: &PluginMap,
+    slot: &str,
+    language: &str,
+    code: String,
+    width: u16,
+) -> mlua::Result<Option<Vec<String>>> {
+    let event = lua.create_table()?;
+    event.set("language", language)?;
+    event.set("code", code)?;
+    event.set("width", width)?;
+    let default = lua.create_function(|_, _: MultiValue| Ok(LuaValue::Nil))?;
+    let allow_layer = layer_delegation(lua, plugins, CODE_BLOCK_COST);
+    let values = run_host_chain_with(
+        lua,
+        &[slot],
+        default,
+        MultiValue::from_vec(vec![LuaValue::Table(event)]),
+        &allow_layer,
+        None,
+    )
+    .await?;
+    code_block_lines(values, width)
+}
+
+fn code_block_lines(values: Option<MultiValue>, width: u16) -> mlua::Result<Option<Vec<String>>> {
+    let invalid = || mlua::Error::runtime(INVALID_CODE_BLOCK_ERR);
+    let table = match values.and_then(|values| values.into_iter().next()) {
+        None | Some(LuaValue::Nil) => return Ok(None),
+        Some(LuaValue::Table(table)) => table,
+        _ => return Err(invalid()),
+    };
+    let mut lines = Vec::new();
+    let mut bytes = 0;
+    for value in table.sequence_values::<LuaValue>() {
+        let LuaValue::String(line) = value? else {
+            return Err(invalid());
+        };
+        let line = line.to_str()?;
+        bytes += line.len();
+        if lines.len() == MAX_CODE_BLOCK_LINES
+            || bytes > MAX_CODE_BLOCK_OUTPUT_BYTES
+            || line.chars().any(char::is_control)
+            || line.width() > usize::from(width)
+        {
+            return Err(invalid());
+        }
+        lines.push(line.to_owned());
+    }
+    if lines.is_empty() {
+        return Err(invalid());
+    }
+    Ok(Some(lines))
+}
+
 /// A `ui.plan_form*` chain that ended without an answer, logged with the
 /// plugins layering it, since a chain that never came back cannot say which
 /// of them parked.
@@ -5933,6 +6016,56 @@ pub fn spawn(
                                     // ever draw go with it.
                                     clear_menu_generation(&lua, &session, generation);
                                 }
+                            });
+                        }
+                        Request::RenderCodeBlock {
+                            language,
+                            code,
+                            width,
+                            budget,
+                            cancel,
+                            reply,
+                        } => {
+                            let lua = rt.lua.clone();
+                            let plugins = Rc::clone(&rt.plugins);
+                            spawn_local(async move {
+                                let slot = code_block_slot(&language);
+                                let deadline = Instant::now() + budget;
+                                let started = Cell::new(false);
+                                let run = async {
+                                    started.set(true);
+                                    let lines = code_block_chain(&lua, &plugins, &slot, &language, code, width).await;
+                                    // The chain swallows a watchdog kill as a layer error.
+                                    (lines, lock_cell(&active_task(&lua)).overran.get())
+                                };
+                                // No gate slot: a display-only render must not hold back tool
+                                // calls or a reload.
+                                let mut render = pin!(run_abandonable(&lua, cancel.clone(), Some(deadline), run));
+                                let outcome = tokio::select! {
+                                    biased;
+                                    () = cancel.cancelled() => {
+                                        // One more poll fires the `on_cancel` hooks of a render
+                                        // that started, then the drop ends it at once.
+                                        if started.get() {
+                                            let _ = render.as_mut().now_or_never();
+                                        }
+                                        tracing::debug!(slot = %slot, "code block render cancelled");
+                                        return;
+                                    }
+                                    result = &mut render => match result {
+                                        Ok((Ok(Some(lines)), false)) => CodeBlockOutcome::Rendered(lines),
+                                        Ok((Ok(None), false)) => CodeBlockOutcome::Declined,
+                                        Ok((Err(error), false)) => {
+                                            tracing::warn!(slot = %slot, plugins = %layer_plugins(&lua, &slot), error = %strip_traceback(&error), "code block renderer failed");
+                                            CodeBlockOutcome::Declined
+                                        }
+                                        Ok((_, true)) | Err(_) => {
+                                            tracing::warn!(slot = %slot, plugins = %layer_plugins(&lua, &slot), "code block renderer timed out");
+                                            CodeBlockOutcome::TimedOut
+                                        }
+                                    },
+                                };
+                                let _ = reply.send(outcome);
                             });
                         }
                         Request::RunCommand {

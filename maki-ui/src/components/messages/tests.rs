@@ -1,3 +1,4 @@
+use super::code_blocks::{MAX_ENTRIES, RESIZE_SETTLE};
 use super::segment;
 use super::*;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
@@ -8,17 +9,20 @@ use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{DocPos, Selection, SelectionZone};
 use crate::theme::Theme;
 use crate::wrap;
-use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
+use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use maki_config::DEFAULT_THINKING_LINES;
+use maki_lua::test_support::{RequestProbe, probed_event_handle_layering};
+use maki_lua::{CodeBlockOutcome, PluginHost};
 use maki_markdown::render::CODE_BAR;
 use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 use std::collections::HashSet;
 use std::ops::Range;
+use std::thread;
 use std::time::Duration;
 use test_case::test_case;
 use tokio::sync::mpsc::unbounded_channel;
@@ -26,6 +30,399 @@ use tokio::sync::mpsc::unbounded_channel;
 const UNDECODABLE_IMAGE: &str = "invalid image";
 const VIEW_WIDTH: u16 = 80;
 const VIEW_HEIGHT: u16 = 24;
+const DIAGRAM_SLOT: &str = "ui.code_block.mermaid";
+const DIAGRAM_SOURCE: &str = "graph LR; A --> B";
+const DIAGRAM_MESSAGE: &str = "```mermaid\ngraph LR; A --> B\n```";
+const DIAGRAM_RENDERED: &str = "  [A] --> [B]  **literal**";
+const DIAGRAM_PLUGIN: &str = "diagram";
+const PLUGIN_DIAGRAM: &str = "[A] --> [B]";
+
+fn code_block_panel() -> (MessagesPanel, RequestProbe) {
+    let (handle, probe) = probed_event_handle_layering(&[DIAGRAM_SLOT]);
+    let config = UiConfig {
+        typewriter_ms_per_char: 0,
+        ..UiConfig::default()
+    };
+    (MessagesPanel::new(config, handle), probe)
+}
+
+fn diagram(id: usize) -> String {
+    format!("```mermaid\ngraph LR; A{id} --> B\n```")
+}
+
+fn rendered(text: &str) -> CodeBlockOutcome {
+    CodeBlockOutcome::Rendered(vec![text.into()])
+}
+
+#[test]
+fn code_block_reply_replaces_terminal_output_and_retains_source() {
+    let (mut panel, probe) = code_block_panel();
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        DIAGRAM_MESSAGE.into(),
+    ));
+    let before = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(buffer_text(&before).contains(DIAGRAM_SOURCE));
+    let (language, source, width, reply, _) = probe.try_recv_code_block().unwrap();
+    assert_eq!(
+        (language.as_ref(), source.as_str(), width),
+        ("mermaid", DIAGRAM_SOURCE, VIEW_WIDTH - 1)
+    );
+    assert_eq!(panel.cadence(), Cadence::PENDING);
+    reply.send(rendered(DIAGRAM_RENDERED)).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    let after = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let text = buffer_text(&after);
+    assert!(text.contains(DIAGRAM_RENDERED));
+    assert!(!text.contains(DIAGRAM_SOURCE));
+    assert_eq!(panel.messages[0].text, DIAGRAM_MESSAGE);
+    assert!(
+        panel
+            .segment_search_texts()
+            .iter()
+            .any(|text| text.contains(DIAGRAM_MESSAGE))
+    );
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(probe.try_recv_code_block().is_none());
+    assert_eq!(panel.tick(), Dirty::NO, "{QUIET}");
+    assert_eq!(panel.cadence(), Cadence::IDLE);
+}
+
+#[test]
+fn streamed_code_block_waits_for_close_and_reuses_result_after_flush() {
+    let (mut panel, probe) = code_block_panel();
+    panel.text_delta("```mermaid\ngraph LR; A --> B\n``");
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(probe.try_recv_code_block().is_none());
+    panel.text_delta("`\nafter chart");
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, source, _, reply, _) = probe.try_recv_code_block().unwrap();
+    assert_eq!(source, DIAGRAM_SOURCE);
+    reply.send(rendered(DIAGRAM_RENDERED)).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    let completed = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(buffer_text(&completed).contains(DIAGRAM_RENDERED));
+    panel.text_delta("\nlater prose");
+    assert!(buffer_text(&render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT)).contains(DIAGRAM_RENDERED));
+    panel.flush();
+    assert!(buffer_text(&render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT)).contains(DIAGRAM_RENDERED));
+    assert!(probe.try_recv_code_block().is_none());
+    assert!(panel.messages[0].text.contains(DIAGRAM_SOURCE));
+}
+
+#[test_case(Some(CodeBlockOutcome::Declined); "declined")]
+#[test_case(Some(CodeBlockOutcome::TimedOut); "timed_out")]
+#[test_case(None; "disconnected")]
+fn a_failed_code_block_render_is_not_retried(outcome: Option<CodeBlockOutcome>) {
+    let (mut panel, probe) = code_block_panel();
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        DIAGRAM_MESSAGE.into(),
+    ));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, _, _, reply, _) = probe.try_recv_code_block().unwrap();
+    if let Some(outcome) = outcome {
+        reply.send(outcome).unwrap();
+    }
+    drop(reply);
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    panel.cache.mark_all_stale();
+    let fallback = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(buffer_text(&fallback).contains(DIAGRAM_SOURCE));
+    assert!(probe.try_recv_code_block().is_none());
+    assert_eq!(panel.cadence(), Cadence::IDLE);
+}
+
+#[test]
+fn a_timeout_stops_rendering_its_language() {
+    let (mut panel, probe) = code_block_panel();
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        format!("{}\n{}", diagram(1), diagram(2)),
+    ));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, _, _, reply, _) = probe.try_recv_code_block().unwrap();
+    reply.send(CodeBlockOutcome::TimedOut).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    panel.cache.mark_all_stale();
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(probe.try_recv_code_block().is_none());
+}
+
+#[test]
+fn code_blocks_render_one_at_a_time() {
+    let (mut panel, probe) = code_block_panel();
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        format!("{}\n{}", diagram(1), diagram(2)),
+    ));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, first, _, reply, _) = probe.try_recv_code_block().unwrap();
+    assert!(probe.try_recv_code_block().is_none());
+    reply.send(rendered(DIAGRAM_RENDERED)).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, second, _, _, _) = probe.try_recv_code_block().unwrap();
+    assert_ne!(first, second);
+}
+
+#[test]
+fn only_code_blocks_on_screen_are_requested() {
+    const FILLER_MESSAGES: usize = 3 * VIEW_HEIGHT as usize;
+    let (mut panel, probe) = code_block_panel();
+    let mut messages = vec![DisplayMessage::new(DisplayRole::Assistant, diagram(0))];
+    messages.extend(
+        (0..FILLER_MESSAGES).map(|i| DisplayMessage::new(DisplayRole::Assistant, format!("{i}"))),
+    );
+    panel.load_messages(messages);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(probe.try_recv_code_block().is_none());
+    panel.scroll_to_top();
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, source, _, _, _) = probe.try_recv_code_block().unwrap();
+    assert_eq!(source, "graph LR; A0 --> B");
+}
+
+#[test]
+fn a_finished_render_reflows_only_its_own_message() {
+    let (mut panel, probe) = code_block_panel();
+    panel.load_messages(vec![
+        DisplayMessage::new(DisplayRole::Assistant, diagram(0)),
+        DisplayMessage::new(DisplayRole::Assistant, diagram(1)),
+    ]);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, _, _, reply, _) = probe.try_recv_code_block().unwrap();
+    reply.send(rendered(DIAGRAM_RENDERED)).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    let stale = |panel: &mut MessagesPanel, message: usize| {
+        panel
+            .cache
+            .segments_mut()
+            .iter()
+            .any(|seg| seg.msg_index == Some(message) && seg.stale)
+    };
+    assert!(stale(&mut panel, 0));
+    assert!(!stale(&mut panel, 1));
+}
+
+#[test]
+fn a_theme_change_keeps_drawn_code_blocks() {
+    let (mut panel, probe) = code_block_panel();
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        DIAGRAM_MESSAGE.into(),
+    ));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, _, _, reply, _) = probe.try_recv_code_block().unwrap();
+    reply.send(rendered(DIAGRAM_RENDERED)).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    theme::set(theme::load_by_name("dracula").unwrap());
+    assert!(buffer_text(&render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT)).contains(DIAGRAM_RENDERED));
+    assert!(probe.try_recv_code_block().is_none());
+}
+
+#[test]
+fn a_wider_view_keeps_a_render_that_still_fits() {
+    let narrow = VIEW_WIDTH / 2;
+    let (mut panel, probe) = code_block_panel();
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        DIAGRAM_MESSAGE.into(),
+    ));
+    render(&mut panel, narrow, VIEW_HEIGHT);
+    let (_, _, _, reply, _) = probe.try_recv_code_block().unwrap();
+    reply.send(rendered(DIAGRAM_RENDERED)).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    render(&mut panel, narrow, VIEW_HEIGHT);
+    assert!(buffer_text(&render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT)).contains(DIAGRAM_RENDERED));
+    assert!(probe.try_recv_code_block().is_none());
+}
+
+#[test]
+fn code_block_resize_cancels_old_request_and_waits_to_settle() {
+    let (mut panel, probe) = code_block_panel();
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        DIAGRAM_MESSAGE.into(),
+    ));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, _, _, old_reply, cancelled) = probe.try_recv_code_block().unwrap();
+    let narrow = VIEW_WIDTH / 2;
+    render(&mut panel, narrow, VIEW_HEIGHT);
+    assert!(cancelled.is_cancelled());
+    assert!(old_reply.send(rendered(DIAGRAM_RENDERED)).is_err());
+    assert!(
+        probe.try_recv_code_block().is_none(),
+        "a resize waits to settle"
+    );
+    panel.code_blocks.poll(Instant::now() + RESIZE_SETTLE);
+    render(&mut panel, narrow, VIEW_HEIGHT);
+    let (_, _, width, reply, _) = probe.try_recv_code_block().unwrap();
+    assert_eq!(width, narrow - 1);
+    reply.send(rendered(DIAGRAM_RENDERED)).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    assert!(buffer_text(&render(&mut panel, narrow, VIEW_HEIGHT)).contains(DIAGRAM_RENDERED));
+}
+
+#[test]
+fn code_block_chat_reset_and_close_cancel_requests() {
+    let (mut panel, probe) = code_block_panel();
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        DIAGRAM_MESSAGE.into(),
+    ));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, _, _, reply, cancelled) = probe.try_recv_code_block().unwrap();
+    panel.load_messages(vec![DisplayMessage::new(
+        DisplayRole::Assistant,
+        DIAGRAM_MESSAGE.into(),
+    )]);
+    assert!(cancelled.is_cancelled());
+    assert!(reply.send(rendered(DIAGRAM_RENDERED)).is_err());
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, _, _, _, cancelled) = probe.try_recv_code_block().unwrap();
+    drop(panel);
+    assert!(cancelled.is_cancelled());
+}
+
+#[test]
+fn streamed_code_block_cache_advances_past_capacity() {
+    const BLOCK_COUNT: usize = MAX_ENTRIES + 12;
+    let (mut panel, probe) = code_block_panel();
+    panel.thinking_delta("diagram preparation");
+    for i in 0..BLOCK_COUNT {
+        panel.text_delta(&format!("```rust\nlet n = {i};\n```\n{}\n", diagram(i)));
+        render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+        let (_, source, _, reply, _) = probe.try_recv_code_block().unwrap();
+        assert_eq!(source, format!("graph LR; A{i} --> B"));
+        assert!(probe.try_recv_code_block().is_none());
+        reply.send(rendered(&format!("diagram {i}"))).unwrap();
+        assert_eq!(panel.tick(), Dirty::YES);
+    }
+    panel.flush();
+    panel.cache.mark_all_stale();
+    let output = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(buffer_text(&output).contains(&format!("diagram {}", BLOCK_COUNT - 1)));
+    assert!(probe.try_recv_code_block().is_none());
+    assert_eq!(panel.tick(), Dirty::NO);
+}
+
+#[test]
+fn code_block_cache_shares_exact_sources_and_keeps_languages_distinct() {
+    let (handle, probe) = probed_event_handle_layering(&[DIAGRAM_SLOT, "ui.code_block.text"]);
+    let mut panel = MessagesPanel::new(UiConfig::default(), handle);
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        format!("{DIAGRAM_MESSAGE}\n{DIAGRAM_MESSAGE}\n```text\n{DIAGRAM_SOURCE}\n```"),
+    ));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (language, _, _, reply, _) = probe.try_recv_code_block().unwrap();
+    assert_eq!(language.as_ref(), "mermaid");
+    reply.send(rendered(DIAGRAM_RENDERED)).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (language, _, _, reply, _) = probe.try_recv_code_block().unwrap();
+    assert_eq!(language.as_ref(), "text");
+    reply.send(CodeBlockOutcome::Declined).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES);
+    let output = buffer_text(&render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT));
+    assert!(probe.try_recv_code_block().is_none());
+    assert_eq!(output.matches(DIAGRAM_RENDERED).count(), 2);
+    assert!(output.contains(DIAGRAM_SOURCE));
+}
+
+#[test_case(DisplayRole::User; "user")]
+#[test_case(DisplayRole::Thinking; "thinking")]
+fn code_block_plugins_do_not_render_other_roles(role: DisplayRole) {
+    let (mut panel, probe) = code_block_panel();
+    panel.push(DisplayMessage::new(role, DIAGRAM_MESSAGE.into()));
+    panel.tool_start(start("diagram_tool", BASH_TOOL_NAME));
+    panel.tool_output("diagram_tool", DIAGRAM_MESSAGE);
+    panel.thinking_delta(DIAGRAM_MESSAGE);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(probe.try_recv_code_block().is_none());
+}
+
+#[test]
+fn a_truncated_stream_skips_only_the_fence_it_cut() {
+    const OVERSIZED_LINE_BYTES: usize = 5_001;
+    let long_line = "x".repeat(OVERSIZED_LINE_BYTES);
+    let (mut panel, probe) = code_block_panel();
+    panel.text_delta(&format!(
+        "{long_line}\n```mermaid\n{long_line}\n```\n{DIAGRAM_MESSAGE}"
+    ));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let (_, source, _, reply, _) = probe.try_recv_code_block().unwrap();
+    assert_eq!(source, DIAGRAM_SOURCE);
+    reply.send(CodeBlockOutcome::Declined).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(probe.try_recv_code_block().is_none());
+}
+
+fn code_block_host() -> PluginHost {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(
+        DIAGRAM_PLUGIN,
+        r#"
+        maki.api.set_slot("ui.code_block.mermaid", function(prev, event)
+            if event.language == "mermaid" then
+                return { "[A] --> [B]" }
+            end
+            return prev(event)
+        end)
+        "#,
+    )
+    .unwrap();
+    host
+}
+
+#[test]
+fn plugin_host_renders_code_block_and_unload_restores_source() {
+    const DEADLINE: Duration = Duration::from_secs(5);
+    let host = code_block_host();
+    let mut panel = MessagesPanel::new(UiConfig::default(), host.event_handle());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        DIAGRAM_MESSAGE.into(),
+    ));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let started = Instant::now();
+    while panel.code_blocks.has_pending() {
+        let _ = panel.tick();
+        assert!(
+            started.elapsed() < DEADLINE,
+            "plugin did not return its diagram"
+        );
+        thread::yield_now();
+    }
+    let rendered = buffer_text(&render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT));
+    assert!(rendered.contains(PLUGIN_DIAGRAM));
+    assert!(!rendered.contains(DIAGRAM_SOURCE));
+    host.unload(DIAGRAM_PLUGIN).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    assert!(buffer_text(&render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT)).contains(DIAGRAM_SOURCE));
+    assert_eq!(panel.messages[0].text, DIAGRAM_MESSAGE);
+}
+
+#[test]
+fn code_block_slot_revision_discards_unpolled_plugin_reply() {
+    let host = code_block_host();
+    let mut panel = MessagesPanel::new(UiConfig::default(), host.event_handle());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        DIAGRAM_MESSAGE.into(),
+    ));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(panel.code_blocks.has_pending());
+    host.unload(DIAGRAM_PLUGIN).unwrap();
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    assert!(!panel.code_blocks.has_pending());
+    let fallback = buffer_text(&render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT));
+    assert!(fallback.contains(DIAGRAM_SOURCE));
+    assert!(!fallback.contains(PLUGIN_DIAGRAM));
+}
 
 #[test_case(false ; "live")]
 #[test_case(true ; "loaded")]

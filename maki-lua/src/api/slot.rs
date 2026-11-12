@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -42,6 +43,12 @@ pub(crate) const PLAN_FORM_SLOT: &str = "ui.plan_form";
 pub(crate) const PLAN_FORM_ACTIONS_SLOT: &str = "ui.plan_form.actions";
 
 const SEAM: &str = "slot";
+
+pub(crate) const CODE_BLOCK_PREFIX: &str = "ui.code_block.";
+
+pub(crate) fn code_block_slot(language: &str) -> String {
+    format!("{CODE_BLOCK_PREFIX}{language}")
+}
 
 #[derive(Clone)]
 pub(crate) struct SlotLayer {
@@ -141,6 +148,10 @@ impl SlotStore {
     }
 
     pub fn clear_plugin(&mut self, plugin: &str) {
+        let code_blocks_changed = self.slots.iter().any(|(name, entry)| {
+            name.starts_with(CODE_BLOCK_PREFIX)
+                && entry.layers.iter().any(|l| l.plugin.as_ref() == plugin)
+        });
         for entry in self.slots.values_mut() {
             entry.layers.retain(|l| l.plugin.as_ref() != plugin);
             if entry.owner.as_deref() == Some(plugin) {
@@ -150,6 +161,9 @@ impl SlotStore {
         self.slots
             .retain(|_, e| e.owner.is_some() || !e.layers.is_empty());
         self.publish();
+        if code_blocks_changed {
+            self.publish_code_blocks();
+        }
     }
 
     /// Rebuilds the published index from `slots`, which stays the only thing
@@ -175,6 +189,23 @@ impl SlotStore {
         self.layered.stages.store(Arc::new(stages));
         self.layered.surfaces.store(Arc::new(surfaces));
     }
+
+    /// Republishes the claimed languages after a `ui.code_block.*` layer
+    /// changed, and moves the revision that display caches key on. Only
+    /// those layers move it, so every other slot change keeps the renders.
+    fn publish_code_blocks(&self) {
+        let languages = self
+            .slots
+            .iter()
+            .filter(|(_, entry)| !entry.layers.is_empty())
+            .filter_map(|(name, _)| name.strip_prefix(CODE_BLOCK_PREFIX))
+            .map(Arc::from)
+            .collect();
+        self.layered.code_block_languages.store(Arc::new(languages));
+        self.layered
+            .code_block_revision
+            .fetch_add(1, Ordering::Release);
+    }
 }
 
 type StageSets = [HashSet<Arc<str>>; HookStage::ALL.len()];
@@ -195,6 +226,10 @@ pub struct LayeredTools {
     /// roundtrip. The agent loop reads it too, so it never leaves its thread for
     /// a slot nobody wrapped.
     surfaces: ArcSwap<HashSet<Arc<str>>>,
+    /// The languages a `ui.code_block.*` layer claims, and a counter that moves
+    /// only when those layers change.
+    code_block_languages: ArcSwap<Vec<Arc<str>>>,
+    code_block_revision: AtomicU64,
 }
 
 impl LayeredTools {
@@ -208,6 +243,21 @@ impl LayeredTools {
         self.surfaces.load().contains(slot)
     }
 
+    pub fn code_block_revision(&self) -> u64 {
+        self.code_block_revision.load(Ordering::Acquire)
+    }
+
+    /// The claimed language of a fence's info string: its first word, in any
+    /// case. Checking allocates nothing, so unclaimed fences cost a scan.
+    pub fn code_block_language(&self, info: &str) -> Option<Arc<str>> {
+        let word = info.split_whitespace().next()?;
+        self.code_block_languages
+            .load()
+            .iter()
+            .find(|language| language.eq_ignore_ascii_case(word))
+            .cloned()
+    }
+
     /// Stands in for a plugin host with {slots} layered, for tests that drive
     /// the UI without one.
     #[doc(hidden)]
@@ -215,6 +265,13 @@ impl LayeredTools {
         let this = Self::default();
         this.surfaces
             .store(Arc::new(slots.iter().map(|s| Arc::from(*s)).collect()));
+        this.code_block_languages.store(Arc::new(
+            slots
+                .iter()
+                .filter_map(|slot| slot.strip_prefix(CODE_BLOCK_PREFIX))
+                .map(Arc::from)
+                .collect(),
+        ));
         this
     }
 }
@@ -694,6 +751,20 @@ pub(crate) fn parse_capability(
 /// menu, and `ui.plan_form` asks whether the form opens at all. Both are
 /// documented under [maki.plan](/docs/lua-api/#maki-plan).
 ///
+/// `ui.code_block.<language>`, for example `ui.code_block.mermaid`, renders
+/// closed fenced blocks in assistant messages whose info string starts with
+/// that language, in any case. Its layer receives `function(prev, ev)` with
+/// `ev = { language = string, code = string, width = integer }` and returns a
+/// nonempty array of plain text lines, or `prev(ev)` to keep the source.
+/// Lines are drawn as is: at most 256 lines and 64 KiB, each at most
+/// `ev.width` cells, with no control characters. Only blocks on screen are
+/// rendered, one at a time, and each only once: a decline, invalid output, an
+/// error, or the two-second deadline keeps the source until the width or a
+/// `ui.code_block` layer changes. A timeout also stops that language until a
+/// resize, a chat load, or a layer change. Sources over 32 KiB are never sent.
+/// Layers need
+/// `session_read`. Stored messages and model context keep the source.
+///
 /// Maki fires two slots per tool itself: `tool.<name>.input` before
 /// permissions look at the call, and `tool.<name>.output` on the text it
 /// produced. Both take `function(prev, value, ctx)` and answer with a
@@ -744,6 +815,9 @@ fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function)
         func: wrapper,
     });
     store.publish();
+    if name.starts_with(CODE_BLOCK_PREFIX) {
+        store.publish_code_blocks();
+    }
     Ok(())
 }
 
