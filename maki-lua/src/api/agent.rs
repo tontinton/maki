@@ -2210,7 +2210,6 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
-    use flume::Sender;
     use futures::FutureExt;
     use futures::future::select;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
@@ -2232,6 +2231,7 @@ mod tests {
     use mlua::AnyUserData;
     use serde_json::json;
     use std::iter;
+    use std::sync::mpsc::{Sender, channel};
     use test_case::test_case;
     use tokio::sync::mpsc::UnboundedSender;
     use tokio::time::timeout;
@@ -2311,7 +2311,7 @@ mod tests {
         }
     }
 
-    struct PendingProvider(flume::Sender<()>);
+    struct PendingProvider(UnboundedSender<()>);
 
     impl Provider for PendingProvider {
         fn stream_message<'a>(
@@ -2385,7 +2385,7 @@ mod tests {
     #[tokio::test]
     async fn session_close_does_not_wait_for_the_prompt_lock(dispose: bool) {
         let lua = Lua::new();
-        let (started_tx, started_rx) = flume::unbounded();
+        let (started_tx, mut started_rx) = unbounded_channel();
         let (event_tx, mut events) = unbounded_channel();
         let event_tx = EventSender::new(event_tx, RUN_ID);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
@@ -2395,7 +2395,7 @@ mod tests {
                 let (result, ()) = futures::future::join(
                     prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into()),
                     async {
-                        started_rx.recv_async().await.unwrap();
+                        started_rx.recv().await.unwrap();
                         if dispose {
                             drop(sess.take::<LuaSession>().unwrap());
                         } else {
@@ -2546,7 +2546,7 @@ mod tests {
         let lua = Lua::new();
         lua.set_app_data(SpawnedTasks::default());
         lua.set_app_data(Arc::new(ToolRegistry::new()));
-        let (sent, requests) = flume::unbounded();
+        let (sent, requests) = channel();
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         ctx.provider = Arc::new(PromptRecorder(sent));
         let mut prompts = ResolvedPrompts::default();
@@ -2593,8 +2593,8 @@ mod tests {
     /// Hands the texts of each request's closing user messages to the test,
     /// then holds the reply until the test lets it go.
     struct GatedProvider {
-        requests: Sender<Vec<String>>,
-        release: flume::Receiver<()>,
+        requests: UnboundedSender<Vec<String>>,
+        release: AsyncMutex<UnboundedReceiver<()>>,
     }
 
     impl Provider for GatedProvider {
@@ -2617,7 +2617,7 @@ mod tests {
                     .collect();
                 user_turn.reverse();
                 self.requests.send(user_turn).unwrap();
-                self.release.recv_async().await.unwrap();
+                self.release.lock().await.recv().await.unwrap();
                 Ok(StreamResponse {
                     message: Message {
                         role: Role::Assistant,
@@ -2646,14 +2646,14 @@ mod tests {
     #[tokio::test]
     async fn send_reaches_the_child(mid_prompt: bool) {
         let lua = Lua::new();
-        let (requests_tx, requests) = flume::unbounded();
-        let (release, release_rx) = flume::unbounded();
+        let (requests_tx, mut requests) = unbounded_channel();
+        let (release, release_rx) = unbounded_channel();
         let (event_tx, mut events) = unbounded_channel();
         let event_tx = EventSender::new(event_tx, RUN_ID);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
         ctx.provider = Arc::new(GatedProvider {
             requests: requests_tx,
-            release: release_rx,
+            release: AsyncMutex::new(release_rx),
         });
         let nudge = |sess: &AnyUserData| {
             let sent = send(&lua, &sess.borrow().unwrap(), NUDGE.into(), None).unwrap();
@@ -2667,11 +2667,11 @@ mod tests {
             let (result, requests_seen) = futures::future::join(
                 prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into()),
                 async {
-                    let mut seen = vec![requests.recv_async().await.unwrap()];
+                    let mut seen = vec![requests.recv().await.unwrap()];
                     if mid_prompt {
                         nudge(&sess);
                         release.send(()).unwrap();
-                        seen.push(requests.recv_async().await.unwrap());
+                        seen.push(requests.recv().await.unwrap());
                     }
                     release.send(()).unwrap();
                     seen
@@ -2745,7 +2745,7 @@ mod tests {
         }
     }
 
-    fn hang_tool(started: Sender<()>) -> LocalTool {
+    fn hang_tool(started: UnboundedSender<()>) -> LocalTool {
         maki_agent::tools::local_tool(ToolAudience::all(), move |_, ctx| {
             let started = started.clone();
             Box::pin(async move {
@@ -2762,8 +2762,8 @@ mod tests {
     #[tokio::test]
     async fn an_interrupting_send_cuts_a_running_tool_and_the_prompt_goes_on() {
         let lua = Lua::new();
-        let (started_tx, started) = flume::unbounded();
-        let (requests_tx, requests) = flume::unbounded();
+        let (started_tx, mut started) = unbounded_channel();
+        let (requests_tx, requests) = channel();
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         ctx.provider = Arc::new(HangingToolProvider {
             requests: requests_tx,
@@ -2780,7 +2780,7 @@ mod tests {
         )]));
 
         let (result, ()) = futures::future::join(prompt_text(&lua, &sess), async {
-            started.recv_async().await.unwrap();
+            started.recv().await.unwrap();
             let opts = lua.create_table_from([(INTERRUPT_OPT, true)]).unwrap();
             let sent = send(&lua, &sess.borrow().unwrap(), NUDGE.into(), Some(opts)).unwrap();
             assert_eq!(sent, (Some(true), None));
@@ -2789,7 +2789,7 @@ mod tests {
         close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
 
         assert_eq!(result, (Some(CHILD_RESPONSE.to_owned()), None));
-        let [first, second] = &requests.drain().collect::<Vec<_>>()[..] else {
+        let [first, second] = &requests.try_iter().collect::<Vec<_>>()[..] else {
             panic!("expected the cut request and the one after it");
         };
         assert!(second.starts_with(first), "earlier messages were edited");
@@ -3579,8 +3579,8 @@ mod tests {
     /// A request waits for its reply while the sender lives, and fails once
     /// it is gone.
     struct ScriptedProvider {
-        requests: Sender<ScriptedRequest>,
-        replies: flume::Receiver<&'static str>,
+        requests: UnboundedSender<ScriptedRequest>,
+        replies: AsyncMutex<UnboundedReceiver<&'static str>>,
     }
 
     impl Provider for ScriptedProvider {
@@ -3606,7 +3606,7 @@ mod tests {
                     message: Message {
                         role: Role::Assistant,
                         content: vec![ContentBlock::Text {
-                            text: self.replies.recv_async().await.unwrap().into(),
+                            text: self.replies.lock().await.recv().await.unwrap().into(),
                         }],
                         ..Default::default()
                     },
@@ -3623,17 +3623,20 @@ mod tests {
 
     fn scripted_provider(
         ctx: &mut ToolContext,
-    ) -> (flume::Receiver<ScriptedRequest>, Sender<&'static str>) {
-        let (requests_tx, requests) = flume::unbounded();
-        let (replies_tx, replies) = flume::unbounded();
+    ) -> (
+        UnboundedReceiver<ScriptedRequest>,
+        UnboundedSender<&'static str>,
+    ) {
+        let (requests_tx, requests) = unbounded_channel();
+        let (replies_tx, replies) = unbounded_channel();
         ctx.provider = Arc::new(ScriptedProvider {
             requests: requests_tx,
-            replies,
+            replies: AsyncMutex::new(replies),
         });
         (requests, replies_tx)
     }
 
-    fn scripted_ctx() -> (ToolContext, flume::Receiver<ScriptedRequest>) {
+    fn scripted_ctx() -> (ToolContext, UnboundedReceiver<ScriptedRequest>) {
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         let (requests, replies) = scripted_provider(&mut ctx);
         for reply in [FIRST_REPLY, WOKEN_REPLY] {
@@ -3696,14 +3699,14 @@ mod tests {
     #[tokio::test]
     async fn a_prompt_waits_for_the_calls_its_session_moved(moved: bool, wake: bool) {
         let lua = Lua::new();
-        let (ctx, requests) = scripted_ctx();
+        let (ctx, mut requests) = scripted_ctx();
         let sess = native_session(&lua, &ctx).await;
         let mailbox = session_mailbox(&sess);
         if moved {
             mailbox.track(MOVED_CALL_ID);
         }
         let ((text, error), first) = futures::future::join(prompt_text(&lua, &sess), async {
-            let first = requests.recv_async().await.unwrap();
+            let first = requests.recv().await.unwrap();
             if moved {
                 mailbox.settle(MOVED_CALL_ID, Some(moved_call_notice(wake)));
             }
@@ -3713,7 +3716,7 @@ mod tests {
         close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
 
         assert!(error.is_none(), "{error:?}");
-        let later = requests.drain().collect::<Vec<_>>();
+        let later = iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
         if !moved {
             assert_eq!(text.as_deref(), Some(FIRST_REPLY));
             assert!(later.is_empty());
@@ -3739,16 +3742,16 @@ mod tests {
     #[tokio::test]
     async fn a_message_sent_while_waiting_for_moved_calls_wakes_the_prompt() {
         let lua = Lua::new();
-        let (ctx, requests) = scripted_ctx();
+        let (ctx, mut requests) = scripted_ctx();
         let sess = native_session(&lua, &ctx).await;
         let mailbox = session_mailbox(&sess);
         mailbox.track(MOVED_CALL_ID);
         let ((text, error), woken) = futures::future::join(prompt_text(&lua, &sess), async {
-            requests.recv_async().await.unwrap();
+            requests.recv().await.unwrap();
             let session = sess.borrow::<LuaSession>().unwrap();
             let (sent, _) = send(&lua, &session, SENT_MESSAGE.into(), None).unwrap();
             assert_eq!(sent, Some(true));
-            let woken = requests.recv_async().await.unwrap();
+            let woken = requests.recv().await.unwrap();
             mailbox.settle(MOVED_CALL_ID, None);
             woken
         })
@@ -3771,7 +3774,7 @@ mod tests {
     #[tokio::test]
     async fn a_fired_session_token_stops_its_moved_calls(prompted: bool) {
         let lua = Lua::new();
-        let (ctx, requests) = scripted_ctx();
+        let (ctx, mut requests) = scripted_ctx();
         let (chat, _chat_mailbox, _seed) = live_chat();
         let sess = native_session(&lua, &ctx).await;
         let (work_trigger, work) = CancelToken::new();
@@ -3784,7 +3787,7 @@ mod tests {
             .unwrap();
         if prompted {
             let prompt = pin!(prompt_text(&lua, &sess));
-            let first_request = pin!(requests.recv_async());
+            let first_request = pin!(requests.recv());
             let _ = select(prompt, first_request).await;
         }
 
@@ -3796,11 +3799,11 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_session_ends_its_prompt_waiting_for_moved_calls() {
         let lua = Lua::new();
-        let (ctx, requests) = scripted_ctx();
+        let (ctx, mut requests) = scripted_ctx();
         let sess = native_session(&lua, &ctx).await;
         session_mailbox(&sess).track(MOVED_CALL_ID);
         let ((_, error), ()) = futures::future::join(prompt_text(&lua, &sess), async {
-            requests.recv_async().await.unwrap();
+            requests.recv().await.unwrap();
             ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
         })
         .await;
@@ -3821,7 +3824,7 @@ mod tests {
         install_task_table(&lua, &chat_mailbox);
         let (_run_trigger, run) = CancelToken::new();
         let (mut ctx, call) = call_ctx(&run, tool_use_id);
-        let (requests, replies) = scripted_provider(&mut ctx);
+        let (mut requests, replies) = scripted_provider(&mut ctx);
         BackgroundTasks::of(&lua)
             .register(BackgroundTask {
                 mailbox: Some(chat_mailbox.clone()),
@@ -3833,9 +3836,9 @@ mod tests {
         let id = session_ui_id(&sess);
         replies.send(FIRST_REPLY).unwrap();
         prompt_text(&lua, &sess).await;
-        requests.drain();
+        while requests.try_recv().is_ok() {}
         let (_, peeked) = futures::future::join(prompt_text(&lua, &sess), async {
-            requests.recv_async().await.unwrap();
+            requests.recv().await.unwrap();
             let peeked = [peek(&lua, &id, None).await, peek(&lua, &id, Some(2)).await];
             replies.send(WOKEN_REPLY).unwrap();
             peeked

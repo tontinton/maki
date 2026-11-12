@@ -9,6 +9,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
 use common::{end_session, poll_until};
@@ -5735,7 +5736,7 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
     let (tx, mut events) = unbounded_channel();
     let event_tx = maki_agent::EventSender::new(tx, 0);
     let (trigger, token) = maki_agent::CancelToken::new();
-    let (result_tx, result_rx) = flume::bounded(1);
+    let (result_tx, result_rx) = sync_channel(1);
     std::thread::spawn(move || {
         let (reg, host) = builtins_host();
         let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
@@ -6680,7 +6681,7 @@ fn nested_calls_run_deeper_than_the_inflight_cap() {
     host.load_source("nested_depth_plugin", NESTED_DEPTH_PLUGIN)
         .unwrap();
 
-    let (done_tx, done_rx) = flume::bounded(1);
+    let (done_tx, done_rx) = sync_channel(1);
     let worker_reg = Arc::clone(&reg);
     std::thread::spawn(move || {
         let out = exec_tool_in(
@@ -7687,7 +7688,7 @@ fn a_spawned_loop_never_blocks_calls_loads_or_unloads(subject: &'static str) {
     let (reg, host) = spawn_host();
     host.load_source(SPAWN_SUBJECT_PLUGIN, subject).unwrap();
 
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = sync_channel(1);
     std::thread::spawn(move || {
         poll_ticking(&reg, "the loop ticks");
         host.load_source(SPAWN_TICKER_PLUGIN, SPAWN_TICKER).unwrap();
@@ -7744,8 +7745,8 @@ fn net_listener() -> (TcpListener, u16, PluginPermissions) {
 
 /// The peer waits for `go` before it reads, so a big write from the plugin
 /// stays stuck until the test says so. Sends back how many bytes arrived.
-fn bytes_until_eof(listener: TcpListener, go: flume::Receiver<()>) -> flume::Receiver<usize> {
-    let (tx, rx) = flume::bounded(1);
+fn bytes_until_eof(listener: TcpListener, go: Receiver<()>) -> Receiver<usize> {
+    let (tx, rx) = sync_channel(1);
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         go.recv().ok();
@@ -7819,7 +7820,7 @@ end)
 #[test]
 fn cancelling_a_task_mid_write_closes_the_conn() {
     let (listener, port, perms) = net_listener();
-    let (go, wait) = flume::bounded(1);
+    let (go, wait) = sync_channel(1);
     let received = bytes_until_eof(listener, wait);
     let body = format!(
         r#"
@@ -7851,7 +7852,7 @@ end)
 #[test]
 fn a_handler_abandoned_mid_write_closes_the_conn() {
     let (listener, port, perms) = net_listener();
-    let (go, wait) = flume::bounded(1);
+    let (go, wait) = sync_channel(1);
     let received = bytes_until_eof(listener, wait);
     let body = format!(
         r#"
@@ -7878,7 +7879,7 @@ end)
 #[test]
 fn unloading_a_plugin_closes_the_conns_it_holds() {
     let (listener, port, perms) = net_listener();
-    let (go, wait) = flume::bounded(1);
+    let (go, wait) = sync_channel(1);
     go.send(()).unwrap();
     let received = bytes_until_eof(listener, wait);
     let body = format!(
@@ -8065,8 +8066,8 @@ fn call_on_thread(
     reg: &Arc<ToolRegistry>,
     name: &'static str,
     cancel: CancelToken,
-) -> flume::Receiver<Result<String, String>> {
-    let (reply_tx, reply) = flume::bounded(1);
+) -> Receiver<Result<String, String>> {
+    let (reply_tx, reply) = sync_channel(1);
     let reg = Arc::clone(reg);
     std::thread::spawn(move || {
         let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
@@ -8082,12 +8083,12 @@ fn call_on_thread(
 /// and tells the test. So the prompt is cut mid-run with a paid turn behind it.
 struct TurnThenPark {
     billed: AtomicBool,
-    parked: flume::Sender<()>,
+    parked: Sender<()>,
 }
 
 impl TurnThenPark {
-    fn install(seed: &AgentSeed) -> flume::Receiver<()> {
-        let (parked, parked_rx) = flume::unbounded();
+    fn install(seed: &AgentSeed) -> Receiver<()> {
+        let (parked, parked_rx) = channel();
         seed.model_slot.store(Arc::new(ModelSlot {
             model: seed.model_slot.load().model.clone(),
             provider: Arc::new(Self {
@@ -8492,7 +8493,7 @@ fn cancelling_a_handler_queued_behind_another_prompt_cuts_it() {
 }
 
 /// Hands the test the options of each request, then ends the prompt there.
-struct OptsRecorder(flume::Sender<RequestOptions>);
+struct OptsRecorder(Sender<RequestOptions>);
 
 impl Provider for OptsRecorder {
     fn stream_message<'a>(
@@ -8536,7 +8537,7 @@ fn background_prompt_is_capped_by_the_chat_settings_of_that_moment() {
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
     let seed = mailbox.publish_seed(stub_seed(session));
-    let (opts_tx, opts_rx) = flume::unbounded();
+    let (opts_tx, opts_rx) = channel();
     seed.model_slot.store(Arc::new(ModelSlot {
         model: seed.model_slot.load().model.clone(),
         provider: Arc::new(OptsRecorder(opts_tx)),
@@ -8609,16 +8610,12 @@ struct CallOnce {
     tool: &'static str,
     input: Value,
     asked: AtomicBool,
-    requests: flume::Sender<Vec<Message>>,
+    requests: Sender<Vec<Message>>,
 }
 
 impl CallOnce {
-    fn install(
-        seed: &AgentSeed,
-        tool: &'static str,
-        input: Value,
-    ) -> flume::Receiver<Vec<Message>> {
-        let (requests, requests_rx) = flume::unbounded();
+    fn install(seed: &AgentSeed, tool: &'static str, input: Value) -> Receiver<Vec<Message>> {
+        let (requests, requests_rx) = channel();
         seed.model_slot.store(Arc::new(ModelSlot {
             model: seed.model_slot.load().model.clone(),
             provider: Arc::new(Self {
@@ -8806,7 +8803,7 @@ fn prompt_after_a_prompt_dropped_mid_tool_sends_no_dangling_tool_calls() {
 
     assert_eq!(reply, Ok(format!("nil:{CALL_ONCE_DONE}")));
     let second = requests
-        .drain()
+        .try_iter()
         .last()
         .expect("the second prompt must reach the provider");
     assert_eq!(unanswered_tool_uses(&second), Vec::<&str>::new());

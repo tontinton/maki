@@ -6,6 +6,7 @@ mod common;
 use maki_lua::test_support::wait_next;
 use std::iter;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -355,7 +356,7 @@ fn runaway_child_under_cancel_still_terminates() {
 struct RunningBatch {
     trigger: maki_agent::cancel::CancelTrigger,
     body: Arc<SharedBuf>,
-    result: flume::Receiver<Result<String, String>>,
+    result: Receiver<Result<String, String>>,
     /// Kept alive so the handler's later events still have a receiver.
     _events: UnboundedReceiver<Envelope>,
 }
@@ -368,7 +369,7 @@ fn start_batch_with(child_src: String, tool_calls: Value) -> RunningBatch {
     let (event_tx, mut events) = unbounded_channel();
     let event_tx = EventSender::new(event_tx, 0);
     let (trigger, token) = CancelToken::new();
-    let (result_tx, result) = flume::bounded(1);
+    let (result_tx, result) = sync_channel(1);
     thread::spawn(move || {
         let (reg, _host) = load_batch_host_with(&child_src);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));

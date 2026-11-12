@@ -3,15 +3,12 @@
 
 #![allow(dead_code, reason = "each test binary uses a different part")]
 
-use maki_lua::test_support::wait_next;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::mpsc::unbounded_channel;
 
 use maki_agent::agent::tool_dispatch;
 use maki_agent::tools::test_support::{stub_ctx_with, stub_seed};
@@ -20,7 +17,7 @@ use maki_agent::{
     AgentEvent, AgentMode, AgentSeed, CallScope, CancelToken, Envelope, EventSender,
     SessionMailbox, SharedBuf, ToolDoneEvent,
 };
-use maki_lua::test_support::{runtime, wait_reply};
+use maki_lua::test_support::{runtime, wait_next, wait_reply};
 use maki_lua::{EventHandle, MoveOutcome, PluginHost, SessionEndReason, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -30,6 +27,8 @@ use maki_providers::{
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
 use tempfile::TempDir;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Generous: every wait ends on an event or a condition, never on the clock,
 /// so only an already failing test pays this.
@@ -207,9 +206,9 @@ impl Drop for Gate {
 /// `first_turn` when set. The test holds `release` for as long as the
 /// subagent must stay mid-turn.
 struct ParkedProvider {
-    started: flume::Sender<()>,
-    user_turns: flume::Sender<Vec<String>>,
-    release: flume::Receiver<()>,
+    started: Sender<()>,
+    user_turns: Sender<Vec<String>>,
+    release: AsyncMutex<UnboundedReceiver<()>>,
     answer: &'static str,
     first_turn: Mutex<Option<ContentBlock>>,
 }
@@ -228,7 +227,7 @@ impl Provider for ParkedProvider {
         Box::pin(async move {
             let _ = self.user_turns.send(closing_user_texts(messages));
             let _ = self.started.send(());
-            let _ = self.release.recv_async().await;
+            let _ = self.release.lock().await.recv().await;
             let first_turn = self.first_turn.lock().unwrap().take();
             let (block, stop_reason) = match first_turn {
                 Some(block) => (block, StopReason::ToolUse),
@@ -271,10 +270,10 @@ fn closing_user_texts(messages: &[Message]) -> Vec<String> {
 
 pub struct Parked {
     pub provider: Arc<dyn Provider>,
-    pub started: flume::Receiver<()>,
+    pub started: Receiver<()>,
     /// What each request's closing user turn says.
-    pub user_turns: flume::Receiver<Vec<String>>,
-    pub release: flume::Sender<()>,
+    pub user_turns: Receiver<Vec<String>>,
+    pub release: UnboundedSender<()>,
 }
 
 impl Parked {
@@ -284,14 +283,14 @@ impl Parked {
 
     /// `first_turn` is a tool call the first turn makes instead of answering.
     pub fn with_first_turn(answer: &'static str, first_turn: Option<ContentBlock>) -> Self {
-        let (started_tx, started) = flume::unbounded();
-        let (release, release_rx) = flume::unbounded();
-        let (user_turns_tx, user_turns) = flume::unbounded();
+        let (started_tx, started) = channel();
+        let (release, release_rx) = unbounded_channel();
+        let (user_turns_tx, user_turns) = channel();
         Self {
             provider: Arc::new(ParkedProvider {
                 started: started_tx,
                 user_turns: user_turns_tx,
-                release: release_rx,
+                release: AsyncMutex::new(release_rx),
                 answer,
                 first_turn: Mutex::new(first_turn),
             }),

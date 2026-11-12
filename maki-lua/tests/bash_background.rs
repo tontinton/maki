@@ -9,6 +9,7 @@ use std::fs;
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 
 use common::{Chat, Gate, WAIT, done_result, poll_until, request_move};
@@ -95,10 +96,10 @@ struct Run {
     session: MakiId,
     mailbox: SessionMailbox,
     events: UnboundedReceiver<Envelope>,
-    result: flume::Receiver<Result<String, String>>,
+    result: Receiver<Result<String, String>>,
     live: Option<Arc<SharedBuf>>,
     gate: Gate,
-    finish: flume::Sender<()>,
+    finish: SyncSender<()>,
     thread: Option<JoinHandle<()>>,
     _seed: Arc<AgentSeed>,
     _run_trigger: CancelTrigger,
@@ -137,9 +138,9 @@ impl Run {
         let call_id = format!("toolu_{}", MakiId::generate());
         let (events_tx, events) = unbounded_channel();
         let (run_trigger, run_token) = CancelToken::new();
-        let (handle_tx, handle_rx) = flume::bounded(1);
-        let (result_tx, result) = flume::bounded(1);
-        let (finish, finished) = flume::bounded::<()>(1);
+        let (handle_tx, handle_rx) = sync_channel(1);
+        let (result_tx, result) = sync_channel(1);
+        let (finish, finished) = sync_channel::<()>(1);
 
         let tool = tool.to_owned();
         let thread = thread::spawn({
