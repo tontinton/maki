@@ -1515,8 +1515,7 @@ mod tests {
     use maki_storage::id::MakiId;
     use test_case::test_case;
     use tokio::sync::Mutex as AsyncMutex;
-    use tokio::sync::mpsc::UnboundedReceiver;
-    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
     use tokio::time::sleep;
 
     use super::*;
@@ -2315,7 +2314,7 @@ mod tests {
     /// and ends as `ending` says. It lands where the test reads it.
     #[derive(Clone)]
     struct MovedMock {
-        landed: flume::Sender<Option<ToolDoneEvent>>,
+        landed: UnboundedSender<Option<ToolDoneEvent>>,
         ending: MovedEnding,
     }
 
@@ -2375,11 +2374,11 @@ mod tests {
         answer: fn(HookStage, &Value) -> Verdict,
     ) -> (
         ToolDoneEvent,
-        flume::Receiver<Option<ToolDoneEvent>>,
+        UnboundedReceiver<Option<ToolDoneEvent>>,
         Arc<CallScope>,
         RecordingHook,
     ) {
-        let (landed, landed_rx) = flume::bounded(1);
+        let (landed, landed_rx) = unbounded_channel();
         let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
         let mut ctx = build_ctx();
         ctx.cancel = scope.cancel().clone();
@@ -2414,10 +2413,10 @@ mod tests {
     /// output carries the instructions found before it.
     #[tokio::test]
     async fn a_moved_calls_receipt_and_final_result_both_take_the_output_pipeline() {
-        let (receipt, landed, scope, hook) =
+        let (receipt, mut landed, scope, hook) =
             dispatch_moved(MovedEnding::Replies, redact_the_output).await;
         let landed = landed
-            .recv_async()
+            .recv()
             .await
             .expect("the tail landed")
             .expect("the call replied");
@@ -2450,16 +2449,10 @@ mod tests {
     #[test_case(MovedEnding::Panics ; "the_pipeline_dies")]
     #[tokio::test]
     async fn a_published_move_always_lands(ending: MovedEnding) {
-        let (receipt, landed, _scope, hook) = dispatch_moved(ending, redact_the_output).await;
+        let (receipt, mut landed, _scope, hook) = dispatch_moved(ending, redact_the_output).await;
 
         assert!(receipt.backgrounded);
-        assert!(
-            landed
-                .recv_async()
-                .await
-                .expect("the tail landed")
-                .is_none()
-        );
+        assert!(landed.recv().await.expect("the tail landed").is_none());
         assert_eq!(hook.stages(), both_stages(Authority::Unbounded));
     }
 
@@ -2472,12 +2465,13 @@ mod tests {
     async fn a_receipt_failed_by_a_layer_unpublishes_the_move(
         answer: fn(HookStage, &Value) -> Verdict,
     ) {
-        let (receipt, landed, _scope, hook) = dispatch_moved(MovedEnding::Replies, answer).await;
+        let (receipt, mut landed, _scope, hook) =
+            dispatch_moved(MovedEnding::Replies, answer).await;
 
         assert!(receipt.is_error);
         assert!(!receipt.backgrounded);
         assert!(
-            landed.recv_async().await.is_err(),
+            landed.recv().await.is_none(),
             "dropped unlanded, which abandons the move"
         );
         let receipts: Vec<_> = output_firings(&hook)

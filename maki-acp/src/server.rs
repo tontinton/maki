@@ -1143,6 +1143,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
+    use std::sync::mpsc::sync_channel;
 
     use maki_agent::headless::SessionEnd;
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
@@ -1280,7 +1281,7 @@ mod tests {
         let cwd = project.path().to_path_buf();
 
         let held = std::io::stdin().lock();
-        let (done_tx, done_rx) = flume::bounded(1);
+        let (done_tx, done_rx) = sync_channel(1);
         let worker = std::thread::spawn(move || {
             let config =
                 trusted_project_config(&cwd, &storage, TrustMode::Consult, &TrustConfig::default());
@@ -2154,7 +2155,7 @@ mod tests {
     async fn close_session_awaits_the_session_end_hook() {
         let (mut srv, ..) = test_server();
         let ended = srv.session.as_ref().unwrap().handle.session_id.id();
-        let (ended_tx, ended_rx) = flume::bounded(1);
+        let (ended_tx, ended_rx) = sync_channel(1);
         srv.on_session_end = Some(Arc::new(move |id, reason| {
             let ended_tx = ended_tx.clone();
             Box::pin(async move {

@@ -747,11 +747,9 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use flume::{Receiver, Sender};
     use std::future::{pending, ready};
     use std::pin::pin;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::sync::mpsc::UnboundedSender;
 
     use futures::FutureExt;
     use maki_config::project::{self, TrustMode};
@@ -766,7 +764,9 @@ mod tests {
     use maki_storage::id::MakiId;
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
     use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::oneshot;
     use tokio::task::yield_now;
 
     use super::*;
@@ -890,7 +890,7 @@ mod tests {
     }
 
     struct CalledListing {
-        called: Sender<()>,
+        called: UnboundedSender<()>,
         listing: fn() -> Listed,
     }
 
@@ -901,8 +901,8 @@ mod tests {
         }
     }
 
-    fn register_listed(slug: &str, listing: fn() -> Listed) -> Receiver<()> {
-        let (called, calls) = flume::unbounded();
+    fn register_listed(slug: &str, listing: fn() -> Listed) -> UnboundedReceiver<()> {
+        let (called, calls) = unbounded_channel();
         plugin::register(
             Registration {
                 decl: ProviderDecl {
@@ -989,7 +989,7 @@ mod tests {
     async fn a_session_lists_per_model_and_a_cancel_ends_the_wait() {
         plugin::begin_load();
         let answered = register_listed(ANSWERING_SLUG, lists_window);
-        let hung = register_listed(HANGING_SLUG, hangs);
+        let mut hung = register_listed(HANGING_SLUG, hangs);
         plugin::commit_load();
 
         let tmp = TempDir::new().unwrap();
@@ -1005,7 +1005,7 @@ mod tests {
         handle.model_tx.send(plugin_model(HANGING_SLUG)).unwrap();
         for _ in 0..2 {
             handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
-            timeout(RELAY_WAIT, hung.recv_async())
+            timeout(RELAY_WAIT, hung.recv())
                 .await
                 .expect(LISTING_DUE)
                 .unwrap();
@@ -1512,12 +1512,12 @@ mod tests {
     /// queued.
     #[tokio::test]
     async fn await_shutdown_waits_for_a_task_that_still_works() {
-        let (release_tx, release_rx) = flume::bounded::<()>(1);
+        let (release_tx, release_rx) = oneshot::channel::<()>();
         let finished = Arc::new(AtomicBool::new(false));
         let task = AbortOnDropHandle::new(tokio::spawn({
             let finished = Arc::clone(&finished);
             async move {
-                let _ = release_rx.recv_async().await;
+                let _ = release_rx.await;
                 finished.store(true, Ordering::SeqCst);
                 SessionEnd::default()
             }
