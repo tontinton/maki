@@ -215,7 +215,7 @@ impl AgentLoop {
         }
         let prompt_slots = Arc::new(
             self.lua_handle
-                .collect_prompt_slots_async(Some(self.seed.session_id.as_str()))
+                .collect_prompt_slots(Some(self.seed.session_id.as_str()))
                 .await,
         );
         let vars = self.vars.clone();

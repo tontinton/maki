@@ -390,7 +390,8 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
         let prompt_slots = stack
             .plugin_host
             .event_handle()
-            .collect_prompt_slots(Some(resolved.id.as_str()));
+            .collect_prompt_slots(Some(resolved.id.as_str()))
+            .await;
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
         let interrupt = crate::sdk_mode::run(crate::sdk_mode::SdkParams {
