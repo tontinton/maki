@@ -1196,6 +1196,7 @@ impl EventHandle {
             .await
             .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
         let installed = crate::pack::installed_names()
+            .await
             .ok_or_else(|| "could not read the package lockfile".to_owned())?;
 
         Ok(crate::pack::PackContext::new(declared, installed, active))

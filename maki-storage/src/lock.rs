@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tokio::task::spawn_blocking;
+
 /// How hard [`Lock::acquire_retrying`] retries before reporting a legitimately
 /// held lock. A close-then-reacquire can transiently report as held if a
 /// concurrent fork/posix_spawn duplicated the lock fd: flock lives on the open
@@ -64,6 +66,14 @@ impl Lock {
                 result => return result,
             }
         }
+    }
+
+    /// [`Self::acquire_retrying`] for async callers. The retry sleeps between
+    /// tries, so the whole loop runs as one blocking job off the runtime.
+    pub async fn acquire_retrying_async(path: PathBuf) -> Result<Self, LockError> {
+        spawn_blocking(move || Self::acquire_retrying(&path))
+            .await
+            .expect("lock acquire panicked")
     }
 
     fn open_and_lock(
