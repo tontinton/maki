@@ -1771,6 +1771,114 @@ assert(b2.name == "b", "cached value should have name='b'")
     host.load_plugin_file(&init_path).unwrap();
 }
 
+#[test_case::test_case(
+    "assert(require('slow').name == 'slow')"
+    ; "a_module_can_yield_at_its_top_level"
+)]
+#[test_case::test_case(
+    r#"
+local out = maki.async.gather({
+  function() return require("slow") end,
+  function() return require("slow") end,
+})
+assert(out[1].ok and out[2].ok, tostring(out[1].err or out[2].err))
+assert(type(out[2].value) == "table", "got " .. type(out[2].value))
+assert(out[1].value == out[2].value, "the module must load once")
+"#
+    ; "a_second_require_waits_for_a_load_in_progress"
+)]
+#[test_case::test_case(
+    r#"
+local items = { 3, 1, 2 }
+table.sort(items, function(a, b) return require("order").less(a, b) end)
+assert(items[1] == 1 and items[3] == 3)
+"#
+    ; "a_plain_module_loads_where_lua_cannot_yield"
+)]
+#[test_case::test_case(
+    r#"
+local out = maki.async.gather({
+  function() return require("ping") end,
+  function() return require("pong") end,
+})
+assert(out[1].ok and out[2].ok, tostring(out[1].err or out[2].err))
+local ping, pong = out[1].value, out[2].value
+assert(ping.pong == pong or pong.ping == ping, "one side must get the other's module")
+assert(ping.pong == true or pong.ping == true, "the other must get the cycle sentinel")
+"#
+    ; "two_loads_of_a_cycle_do_not_wait_on_each_other"
+)]
+#[test_case::test_case(
+    r#"
+local ok, err = pcall(table.sort, { 2, 1 }, function(a, b) require("slow") return a < b end)
+assert(not ok and tostring(err):find("yield across", 1, true), tostring(err))
+assert(require("slow").name == "slow")
+"#
+    ; "a_yielding_module_fails_where_lua_cannot_yield_and_loads_later"
+)]
+#[test_case::test_case(
+    r#"
+local out = maki.async.gather({
+  function() return require("slow") end,
+  function()
+    local ok, err = pcall(table.sort, { 2, 1 }, function(a, b) require("slow") return a < b end)
+    return { ok = ok, err = tostring(err) }
+  end,
+})
+assert(out[1].ok and out[1].value.name == "slow", tostring(out[1].err))
+local blocked = out[2].value
+assert(not blocked.ok and blocked.err:find("still loading", 1, true), blocked.err)
+"#
+    ; "a_require_that_cannot_yield_does_not_wait_for_another_load"
+)]
+#[test_case::test_case(
+    r#"
+local out = maki.async.gather({
+  function() return require("flaky") end,
+  function() return require("flaky") end,
+})
+assert(out[1].ok ~= out[2].ok, "exactly the first load must fail")
+local loaded = out[1].ok and out[1].value or out[2].value
+assert(loaded.loads == 2, "the waiting require must load it again")
+"#
+    ; "a_failed_load_lets_the_waiting_require_try_again"
+)]
+fn require_runs_module_bodies_that_yield(init: &str) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lua_dir = tmp.path().join("lua");
+    std::fs::create_dir_all(&lua_dir).unwrap();
+    let modules = [
+        ("slow", "maki.async.sleep(0)\nreturn { name = \"slow\" }\n"),
+        (
+            "order",
+            "return { less = function(a, b) return a < b end }\n",
+        ),
+        (
+            "ping",
+            "maki.async.sleep(0)\nreturn { pong = require(\"pong\") }\n",
+        ),
+        (
+            "pong",
+            "maki.async.sleep(0)\nreturn { ping = require(\"ping\") }\n",
+        ),
+        ("counter", "return { loads = 0 }\n"),
+        (
+            "flaky",
+            "local counter = require(\"counter\")\ncounter.loads = counter.loads + 1\n\
+             maki.async.sleep(0)\nassert(counter.loads > 1, \"first load fails\")\n\
+             return { loads = counter.loads }\n",
+        ),
+    ];
+    for (name, source) in modules {
+        std::fs::write(lua_dir.join(format!("{name}.lua")), source).unwrap();
+    }
+    let init_path = tmp.path().join("init.lua");
+    std::fs::write(&init_path, init).unwrap();
+
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_plugin_file(&init_path).unwrap();
+}
+
 #[test]
 fn require_nonexistent_module_errors() {
     let tmp = tempfile::TempDir::new().unwrap();

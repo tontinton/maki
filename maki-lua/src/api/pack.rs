@@ -1,11 +1,15 @@
 //! Global package declarations and read-only package state.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_pack::Spec;
+use maki_pack::lockfile::Lockfile;
+use maki_pack::manager::Manager;
 use mlua::{Lua, MultiValue, RegistryKey, Result as LuaResult, Table, Value as LuaValue};
+use tokio::task::spawn_blocking;
 
 use crate::api::util::convert::reject_unknown_fields;
 use crate::api::util::pair::{Pair, err_pair};
@@ -275,12 +279,15 @@ pub(crate) fn add_packadd(lua: &Lua, maki: &Table) -> LuaResult<()> {
 
 /// Get package state without changing the installed set.
 ///
+/// Reading the lockfile yields, so this cannot run in a callback that must
+/// not yield, like a `table.sort` comparator or a metamethod.
+///
 /// @param names table? Package names. Omit for all managed packages.
 /// @param opts table? Reserved. Omit it.
 /// @return (table?, string?) Package records with `spec`, `path`, `rev`, and
 ///   `active`, or nil plus an error when the pack lockfile cannot be read.
 #[lua_fn]
-fn get(lua: &Lua, names: Option<Table>, opts: Option<Table>) -> LuaResult<Pair<Table>> {
+async fn get(lua: Lua, names: Option<Table>, opts: Option<Table>) -> LuaResult<Pair<Table>> {
     if let Some(opts) = opts {
         reject_unknown_fields(&opts, &[], "pack.get")?;
     }
@@ -292,20 +299,40 @@ fn get(lua: &Lua, names: Option<Table>, opts: Option<Table>) -> LuaResult<Pair<T
         .ok_or_else(|| mlua::Error::runtime("pack.get: not available here"))?
         .clone();
     let declarations = store.lock().expect("pack declarations").clone();
-    let Some(lock) = crate::pack::read_lockfile(crate::pack::lockfile_path().as_deref()) else {
+    let Some((lock, paths)) = spawn_blocking(read_recorded)
+        .await
+        .map_err(mlua::Error::external)?
+    else {
         return Ok(err_pair(LOCKFILE_UNREADABLE_ERR));
     };
-    let site = crate::pack::site_dir().ok();
-    let packages = package_state_table(lua, requested, &declarations, &lock, site.as_deref())?;
+    let packages = package_state_table(&lua, requested, &declarations, &lock, &paths)?;
     Ok((Some(packages), None))
+}
+
+/// The lockfile and where each package it records is on disk, read as one
+/// blocking job so the Lua thread yields instead of waiting on the disk.
+fn read_recorded() -> Option<(Lockfile, HashMap<String, PathBuf>)> {
+    let lock = crate::pack::read_lockfile(crate::pack::lockfile_path().as_deref())?;
+    let paths = recorded_paths(&lock, crate::pack::site_dir().ok().as_deref());
+    Some((lock, paths))
+}
+
+fn recorded_paths(lock: &Lockfile, site: Option<&Path>) -> HashMap<String, PathBuf> {
+    let Some(site) = site else {
+        return HashMap::new();
+    };
+    let manager = Manager::new(site);
+    lock.install_order()
+        .filter_map(|name| Some((name.to_owned(), manager.resolve(lock, name)?)))
+        .collect()
 }
 
 fn package_state_table(
     lua: &Lua,
     requested: Option<Vec<String>>,
     declarations: &PackDeclarations,
-    lock: &maki_pack::lockfile::Lockfile,
-    site: Option<&std::path::Path>,
+    lock: &Lockfile,
+    paths: &HashMap<String, PathBuf>,
 ) -> LuaResult<Table> {
     let names = requested.unwrap_or_else(|| {
         let mut names: Vec<String> = declarations
@@ -321,7 +348,6 @@ fn package_state_table(
         names.extend(extras);
         names
     });
-    let manager = site.map(maki_pack::manager::Manager::new);
     let result = lua.create_table()?;
     for (index, name) in names.into_iter().enumerate() {
         let declared = declarations
@@ -356,9 +382,8 @@ fn package_state_table(
         )?;
         item.set(
             "path",
-            manager
-                .as_ref()
-                .and_then(|manager| locked.and_then(|_| manager.resolve(lock, &name)))
+            locked
+                .and_then(|_| paths.get(&name))
                 .map(|path| path.display().to_string()),
         )?;
         item.set("rev", locked.map(|entry| entry.rev.as_str()))?;
@@ -397,7 +422,7 @@ pub(crate) fn create_pack_read_table(lua: &Lua) -> LuaResult<Table> {
     )?;
     table.set(
         "get",
-        lua.create_function(|lua, (names, opts): (Option<Table>, Option<Table>)| {
+        lua.create_async_function(|lua, (names, opts): (Option<Table>, Option<Table>)| {
             get(lua, names, opts)
         })?,
     )?;
@@ -598,8 +623,9 @@ mod tests {
                 .unwrap();
         }
         let declarations = store.lock().unwrap().clone();
+        let paths = recorded_paths(&lock, Some(site.path()));
 
-        let all = package_state_table(&lua, None, &declarations, &lock, Some(site.path())).unwrap();
+        let all = package_state_table(&lua, None, &declarations, &lock, &paths).unwrap();
         assert_eq!(all.raw_len(), 3);
         assert_eq!(
             all.get::<Table>(1)
@@ -625,7 +651,7 @@ mod tests {
             Some(vec!["alpha".to_owned(), "zeta".to_owned()]),
             &declarations,
             &lock,
-            Some(site.path()),
+            &paths,
         )
         .unwrap();
         let alpha: Table = filtered.get(1).unwrap();
@@ -662,7 +688,7 @@ mod tests {
             Some(vec!["demo".to_owned()]),
             &declarations,
             &lock,
-            None,
+            &HashMap::new(),
         )
         .unwrap();
         let item: Table = replaced.get(1).unwrap();
@@ -674,7 +700,7 @@ mod tests {
             Some(vec!["missing".to_owned()]),
             &declarations,
             &lock,
-            None,
+            &HashMap::new(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("not installed"), "{error}");
