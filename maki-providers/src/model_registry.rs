@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use maki_storage::{StateDir, atomic_write};
 use tracing::warn;
@@ -34,18 +34,14 @@ const TIERS_FILE: &str = "model-tiers";
 /// Each custom provider's `providers.toml` models, slug -> tier -> model id.
 pub(crate) type DeclaredTiers = BTreeMap<String, BTreeMap<ModelTier, String>>;
 
-static REGISTRY: OnceLock<RwLock<ModelRegistry>> = OnceLock::new();
+static REGISTRY: LazyLock<RwLock<ModelRegistry>> = LazyLock::new(RwLock::default);
 
 fn read() -> RwLockReadGuard<'static, ModelRegistry> {
-    registry().read().unwrap()
+    REGISTRY.read().unwrap()
 }
 
 fn write() -> RwLockWriteGuard<'static, ModelRegistry> {
-    registry().write().unwrap()
-}
-
-fn registry() -> &'static RwLock<ModelRegistry> {
-    REGISTRY.get_or_init(|| RwLock::new(ModelRegistry::default()))
+    REGISTRY.write().unwrap()
 }
 
 pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {

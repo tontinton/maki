@@ -24,7 +24,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
@@ -1381,11 +1381,8 @@ pub fn kill_process_groups(_pids: &[u32]) {}
 /// Dedup cache for qualified MCP tool names. The set is bounded (finite per session)
 /// and `Arc<str>` means entries get freed when the cache drops, unlike the old `Box::leak`.
 fn intern(name: String) -> Arc<str> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<str>>>> = OnceLock::new();
-    let mut map = CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    static CACHE: LazyLock<Mutex<HashMap<String, Arc<str>>>> = LazyLock::new(Mutex::default);
+    let mut map = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = map.get(&name) {
         return Arc::clone(existing);
     }

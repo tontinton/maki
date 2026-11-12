@@ -19,7 +19,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use std::sync::mpsc::{Sender, channel, sync_channel};
 use std::thread::{self, Result as ThreadResult};
 
@@ -27,28 +27,34 @@ use tokio::sync::oneshot;
 use tracing::error;
 
 const UNKNOWN_PANIC: &str = "<non-string panic payload>";
+const HIGHLIGHT_THREAD: &str = "highlight";
 const THREAD_GONE: &str = "the highlight thread is gone";
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
 
-static JOBS: OnceLock<Sender<Job>> = OnceLock::new();
+static JOBS: LazyLock<Sender<Job>> = LazyLock::new(|| {
+    let jobs = job_thread(HIGHLIGHT_THREAD);
+    // Queued ahead of every other job, so a nested `run` sees it.
+    let _ = jobs.send(Box::new(|| ON_HIGHLIGHT_THREAD.set(true)));
+    jobs
+});
 
-fn jobs() -> &'static Sender<Job> {
-    JOBS.get_or_init(|| {
-        let (tx, rx) = channel::<Job>();
-        thread::Builder::new()
-            .name("highlight".into())
-            .spawn(move || {
-                ON_HIGHLIGHT_THREAD.set(true);
-                while let Ok(job) = rx.recv() {
-                    if let Err(payload) = catch_unwind(AssertUnwindSafe(job)) {
-                        error!(panic = panic_message(&*payload), "highlight job panicked");
-                    }
+/// Spawns a thread named {name} that runs the jobs sent to it one at a time,
+/// in order. A job that panics is logged and the thread goes on with the next.
+pub fn job_thread(name: &str) -> Sender<Job> {
+    let (jobs, queued) = channel::<Job>();
+    let thread_name = name.to_owned();
+    thread::Builder::new()
+        .name(thread_name.clone())
+        .spawn(move || {
+            while let Ok(job) = queued.recv() {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(job)) {
+                    error!(thread = %thread_name, panic = panic_message(&*payload), "job panicked");
                 }
-            })
-            .expect("failed to spawn the highlight thread");
-        tx
-    })
+            }
+        })
+        .unwrap_or_else(|e| panic!("failed to spawn the {name} thread: {e}"));
+    jobs
 }
 
 thread_local! {
@@ -101,7 +107,7 @@ fn receive_result<T>(result: Option<ThreadResult<T>>) -> T {
 }
 
 pub fn spawn(f: impl FnOnce() + Send + 'static) {
-    let _ = jobs().send(Box::new(f));
+    let _ = JOBS.send(Box::new(f));
 }
 
 #[cfg(test)]

@@ -1358,7 +1358,7 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::iter;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use maki_providers::model::FastSupport;
@@ -2727,7 +2727,7 @@ mod tests {
         tool: Arc<Mutex<&'static str>>,
         authored: Arc<Mutex<&'static str>>,
         /// The host wrote the prompt, so it states no facts maki knows of.
-        host_written: Arc<Mutex<bool>>,
+        host_written: Arc<AtomicBool>,
     }
 
     impl World {
@@ -2749,7 +2749,7 @@ mod tests {
                         &AgentConfig::default(),
                         model,
                     ),
-                    facts: (!*world.host_written.lock().unwrap()).then_some(facts),
+                    facts: (!world.host_written.load(Ordering::Relaxed)).then_some(facts),
                     authored: world.authored.lock().unwrap().to_string(),
                 }
             })
@@ -2926,10 +2926,14 @@ mod tests {
     #[tokio::test]
     async fn switching_who_wrote_the_prompt_tells_only_plan_mode(host_written_first: bool) {
         let mut h = Harness::new(Vec::new());
-        *h.world.host_written.lock().unwrap() = host_written_first;
+        h.world
+            .host_written
+            .store(host_written_first, Ordering::Relaxed);
         h.run_in(AgentMode::Plan(PLAN_FILE.into())).await;
         h.world.change(|f| f.date = NEXT_DATE.into());
-        *h.world.host_written.lock().unwrap() = !host_written_first;
+        h.world
+            .host_written
+            .store(!host_written_first, Ordering::Relaxed);
         *h.world.authored.lock().unwrap() = "host prompt";
         h.run_in(AgentMode::Build).await;
 
@@ -3758,7 +3762,7 @@ mod tests {
     const GIVE_UP_MSG: &str = "a second overflow in a row must surface, not compact again";
 
     /// Overflows the next `0` requests, then behaves.
-    struct OverflowProvider(Mutex<u32>);
+    struct OverflowProvider(AtomicU32);
 
     impl Provider for OverflowProvider {
         fn stream_message<'a>(
@@ -3772,13 +3776,12 @@ mod tests {
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
-                let mut remaining = self.0.lock().unwrap();
-                match remaining.checked_sub(1) {
-                    Some(rest) => {
-                        *remaining = rest;
-                        Err(AgentError::api(OVERFLOW_STATUS, OVERFLOW_MESSAGE))
-                    }
-                    None => Ok(text_response(StopReason::EndTurn)),
+                match self
+                    .0
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                {
+                    Ok(_) => Err(AgentError::api(OVERFLOW_STATUS, OVERFLOW_MESSAGE)),
+                    Err(_) => Ok(text_response(StopReason::EndTurn)),
                 }
             })
         }
@@ -3796,7 +3799,8 @@ mod tests {
     #[tokio::test]
     async fn overflow_recovery(recoveries: u32, expected: bool, message: &str) {
         let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, mut event_rx) = make_agent(OverflowProvider(Mutex::new(1)), &mut history);
+        let (mut agent, mut event_rx) =
+            make_agent(OverflowProvider(AtomicU32::new(1)), &mut history);
         agent.auto_compact = true;
         agent.overflow_recoveries = recoveries;
 

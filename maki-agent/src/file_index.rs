@@ -18,7 +18,7 @@ use std::cmp::Reverse;
 use std::mem;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -71,7 +71,7 @@ const WALKS_BUSY: &str = "file index is already walking as many roots as it walk
 const NON_UTF8_SKIPPED: &str = "file index skipped paths that are not valid UTF-8";
 const NOT_DETACHED: &str = "a corpus may only be published by hand on a detached file index";
 
-static INDEXES: OnceLock<Mutex<Vec<FileIndex>>> = OnceLock::new();
+static INDEXES: Mutex<Vec<FileIndex>> = Mutex::new(Vec::new());
 static WALKS: AtomicUsize = AtomicUsize::new(0);
 static WALK_OBSERVER: Mutex<Option<Arc<WalkObserver>>> = Mutex::new(None);
 
@@ -441,7 +441,7 @@ pub fn file_index(root: &Path) -> FileIndex {
 /// somewhere the check never saw. So the path that was checked is the path
 /// that is walked.
 pub fn resolved_index(root: PathBuf) -> FileIndex {
-    let mut roots = lock(INDEXES.get_or_init(Mutex::default));
+    let mut roots = lock(&INDEXES);
     let index = match roots.iter().position(|i| i.shared.root == root) {
         Some(at) => roots.remove(at),
         None => FileIndex::new(root),
@@ -457,7 +457,7 @@ pub fn resolved_index(root: PathBuf) -> FileIndex {
 /// this is called, and a walk of a large tree has no business burning cores
 /// through shutdown.
 pub fn cancel_walks() {
-    for index in lock(INDEXES.get_or_init(Mutex::default)).iter() {
+    for index in lock(&INDEXES).iter() {
         index.cancel();
     }
 }
@@ -477,12 +477,7 @@ pub fn cancel_walks() {
 /// same file through a symlink matches nothing, and one that still holds a
 /// `..` matches the root it climbed out of.
 pub fn invalidate_for(path: &Path) {
-    // Never asked for an index, so there is nothing to forget and no reason
-    // to build the registry from a write path.
-    let Some(indexes) = INDEXES.get() else {
-        return;
-    };
-    for index in lock(indexes)
+    for index in lock(&INDEXES)
         .iter()
         .filter(|index| path.starts_with(&index.shared.root))
     {

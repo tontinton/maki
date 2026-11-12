@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use etcetera::base_strategy::BaseStrategy;
 
@@ -16,7 +16,7 @@ const UNNAMED_PROJECT: &str = "root";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
-static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
+static STRATEGY: LazyLock<Option<Paths>> = LazyLock::new(resolve);
 
 struct Paths {
     config: PathBuf,
@@ -221,21 +221,17 @@ fn state_logs(s: &impl BaseStrategy, fallback: &Path) -> (PathBuf, PathBuf) {
     (state, logs)
 }
 
-fn resolve() -> Option<&'static Paths> {
-    STRATEGY
-        .get_or_init(|| {
-            let s = etcetera::choose_base_strategy().ok()?;
-            let data = s.data_dir().join(APP_NAME);
-            let (state, logs) = state_logs(&s, &data);
-            Some(Paths {
-                config: s.config_dir().join(APP_NAME),
-                data,
-                state,
-                logs,
-                cache: s.cache_dir().join(APP_NAME),
-            })
-        })
-        .as_ref()
+fn resolve() -> Option<Paths> {
+    let s = etcetera::choose_base_strategy().ok()?;
+    let data = s.data_dir().join(APP_NAME);
+    let (state, logs) = state_logs(&s, &data);
+    Some(Paths {
+        config: s.config_dir().join(APP_NAME),
+        data,
+        state,
+        logs,
+        cache: s.cache_dir().join(APP_NAME),
+    })
 }
 
 fn err() -> std::io::Error {
@@ -251,24 +247,24 @@ fn ensure(path: &Path) -> Result<PathBuf, std::io::Error> {
 }
 
 pub fn config_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
+    let p = STRATEGY.as_ref().ok_or_else(err)?;
     ensure(&p.config)
 }
 
 pub fn data_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
+    let p = STRATEGY.as_ref().ok_or_else(err)?;
     ensure(&p.data)
 }
 
 pub fn state_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
+    let p = STRATEGY.as_ref().ok_or_else(err)?;
     ensure(&p.state)
 }
 
 /// The root of the per-session plugin data dirs. Not created: callers only
 /// compare paths against it.
 pub fn sessions_data_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
+    let p = STRATEGY.as_ref().ok_or_else(err)?;
     Ok(p.state
         .join(crate::sessions::SESSIONS_DIR)
         .join(crate::sessions::DATA_DIR))
@@ -289,12 +285,12 @@ pub fn session_data_dir(state: &Path, session: MakiId) -> PathBuf {
 }
 
 pub fn logs_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
+    let p = STRATEGY.as_ref().ok_or_else(err)?;
     ensure(&p.logs)
 }
 
 pub fn cache_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
+    let p = STRATEGY.as_ref().ok_or_else(err)?;
     ensure(&p.cache)
 }
 

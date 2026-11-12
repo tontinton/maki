@@ -1,5 +1,5 @@
 use std::mem;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -21,8 +21,8 @@ pub fn spinner_str(elapsed_ms: u128) -> &'static str {
 /// Spinners need a consistent time reference. Using a static epoch avoids
 /// passing Instant through every render call.
 pub fn animation_elapsed_ms() -> u128 {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    EPOCH.get_or_init(Instant::now).elapsed().as_millis()
+    static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+    EPOCH.elapsed().as_millis()
 }
 
 const DEFAULT_MS_PER_CHAR: u64 = 4;

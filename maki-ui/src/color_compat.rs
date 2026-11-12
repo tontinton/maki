@@ -9,7 +9,7 @@
 //! what saves us over SSH, where env vars are often stripped.
 //! `MAKI_TRUECOLOR=1` or `=0` overrides everything.
 
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
@@ -41,17 +41,17 @@ const TRUECOLOR_TERMS: [&str; 10] = [
 ];
 const VTE_TRUECOLOR_VERSION: u32 = 3600;
 
-static TRUECOLOR: OnceLock<bool> = OnceLock::new();
+static TRUECOLOR: LazyLock<bool> = LazyLock::new(detect);
 
 /// Call in raw mode and before the input reader thread spawns: the DECRQSS
 /// probe reads replies straight from the tty, and a running reader thread
 /// would eat them.
 pub(crate) fn init() {
-    TRUECOLOR.get_or_init(detect);
+    LazyLock::force(&TRUECOLOR);
 }
 
 pub(crate) fn downgrade_if_needed(buf: &mut Buffer) {
-    if *TRUECOLOR.get_or_init(detect) {
+    if *TRUECOLOR {
         return;
     }
     for cell in &mut buf.content {
