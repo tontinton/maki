@@ -2185,17 +2185,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flume"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
-dependencies = [
- "futures-core",
- "futures-sink",
- "spin",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3638,7 +3627,6 @@ version = "0.7.1"
 dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
- "flume",
  "futures",
  "jiff",
  "maki-agent",
@@ -3662,7 +3650,6 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bitflags 2.13.2",
- "flume",
  "futures",
  "grep-regex",
  "grep-searcher",
@@ -3779,7 +3766,6 @@ dependencies = [
  "criterion",
  "crossterm",
  "fastrand",
- "flume",
  "futures",
  "htmd",
  "image",
@@ -3974,7 +3960,6 @@ dependencies = [
  "criterion",
  "crossterm",
  "fastrand",
- "flume",
  "futures",
  "getrandom 0.4.3",
  "image",

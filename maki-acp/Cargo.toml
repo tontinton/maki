@@ -21,7 +21,6 @@ tracing = { workspace = true }
 color-eyre = { workspace = true }
 
 [dev-dependencies]
-flume = { workspace = true }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 
