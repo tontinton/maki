@@ -5,12 +5,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::util::command::{UiAction, ui_send};
 use crate::api::util::convert::TableExt;
@@ -66,13 +66,13 @@ fn defer_fn(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function, ms: u64) -> 
         .app_data_ref::<DeferQueue>()
         .ok_or_else(|| mlua::Error::runtime("defer queue not initialized"))?;
     let func = lua.create_registry_value(callback)?;
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = queue.timer_token(&plugin);
     let ceiling = Ceiling::current_for(lua, &plugin);
     if let Err(rejected) = queue.push(DeferredCallback {
         func,
         delay: Duration::from_millis(ms),
         plugin,
-        cancel: Arc::clone(&cancel),
+        cancel: cancel.clone(),
         ceiling,
     }) {
         // Reclaim the registry slot, the runtime never got the callback.
@@ -82,10 +82,10 @@ fn defer_fn(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function, ms: u64) -> 
     Ok(Timer { cancel })
 }
 
-/// Handle returned by `maki.defer_fn`. The runtime reads the flag once the
-/// timer goes off, so flipping it before then skips the callback entirely.
+/// Handle returned by `maki.defer_fn`. Stopping it ends the timer's wait, so
+/// the callback never runs.
 pub(crate) struct Timer {
-    cancel: Arc<AtomicBool>,
+    cancel: CancellationToken,
 }
 
 /// Cancel the pending callback. Safe to call more than once, and does
@@ -97,7 +97,7 @@ pub(crate) struct Timer {
 /// h:stop()
 #[lua_fn]
 fn stop(_lua: &Lua, this: &Timer) -> LuaResult<()> {
-    this.cancel.store(true, Ordering::Release);
+    this.cancel.cancel();
     Ok(())
 }
 
@@ -443,9 +443,9 @@ mod tests {
     }
 
     /// The sleep-and-dispatch half lives in the runtime, so this only pins
-    /// the contract between the handle and the flag the runtime reads.
+    /// the contract between the handle and the token the runtime waits on.
     #[test]
-    fn defer_handle_stop_marks_cancel_flag() {
+    fn defer_handle_stop_cancels_its_token() {
         let lua = Lua::new();
         lua.set_app_data(DeferQueue::new());
         install(&lua, None, "maki");
@@ -455,11 +455,11 @@ mod tests {
         let cancel = {
             let queue = lua.app_data_ref::<DeferQueue>().unwrap();
             let cb = queue.rx.try_recv().expect("callback queued");
-            Arc::clone(&cb.cancel)
+            cb.cancel.clone()
         };
-        assert!(!cancel.load(Ordering::Acquire));
+        assert!(!cancel.is_cancelled());
         lua.load(r#"H:stop()"#).exec().unwrap();
-        assert!(cancel.load(Ordering::Acquire));
+        assert!(cancel.is_cancelled());
     }
 
     mod deep_copy {

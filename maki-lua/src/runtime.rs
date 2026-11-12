@@ -38,8 +38,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, watch};
-use tokio::task::{LocalSet, spawn_local, yield_now};
+use tokio::task::{JoinHandle as LocalJoinHandle, LocalSet, spawn_local, yield_now};
 use tokio::time::{sleep, sleep_until, timeout, timeout_at};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
@@ -3098,13 +3099,13 @@ impl<T> QueueRx<T> {
 /// script deadline. Meant for UI intent that must outlive the caller
 /// (a toast dismissing itself, a debounced repaint).
 ///
-/// `cancel` is what the `Timer` handed back to Lua flips, and what
-/// [`DeferQueue::cancel_plugin`] flips on unload.
+/// `cancel` is what the `Timer` handed back to Lua cancels, and a child of the
+/// plugin's token, so [`DeferQueue::cancel_plugin`] cancels it on unload.
 pub(crate) struct DeferredCallback {
     pub func: RegistryKey,
     pub delay: Duration,
     pub plugin: Arc<str>,
-    pub cancel: Arc<AtomicBool>,
+    pub cancel: CancellationToken,
     /// The [`Ceiling`] up where the timer was set, which the callback runs
     /// under.
     pub ceiling: Option<Ceiling>,
@@ -3113,12 +3114,12 @@ pub(crate) struct DeferredCallback {
 pub(crate) struct DeferQueue {
     tx: UnboundedSender<DeferredCallback>,
     pub(crate) rx: QueueRx<DeferredCallback>,
-    /// Timers that have not fired yet, by owner. A sleeping timer holds no
+    /// The parent of every timer a plugin set. A sleeping timer holds no
     /// [`GateGuard`], so [`drain_barrier`] walks straight past it and a reload
     /// would leave the callback to wake up against a torn down env. Cancelling
-    /// the doomed plugin's timers in [`LuaRuntime::clear_plugin`] closes that
+    /// the doomed plugin's token in [`LuaRuntime::clear_plugin`] closes that
     /// window: whatever is left is either cancelled or already gated.
-    timers: Mutex<Vec<(Arc<str>, Arc<AtomicBool>)>>,
+    plugins: RefCell<HashMap<Arc<str>, CancellationToken>>,
 }
 
 /// A spawned task holds no [`GateGuard`], so [`drain_barrier`] never waits
@@ -3136,35 +3137,45 @@ impl DeferQueue {
         Self {
             tx,
             rx: QueueRx::new(rx),
-            timers: Mutex::new(Vec::new()),
+            plugins: RefCell::default(),
         }
     }
 
-    fn locked(&self) -> std::sync::MutexGuard<'_, Vec<(Arc<str>, Arc<AtomicBool>)>> {
-        self.timers.lock().unwrap_or_else(|e| e.into_inner())
+    /// The token of a new timer of {plugin}, cancelled along with the plugin.
+    pub(crate) fn timer_token(&self, plugin: &Arc<str>) -> CancellationToken {
+        self.plugins
+            .borrow_mut()
+            .entry(Arc::clone(plugin))
+            .or_default()
+            .child_token()
     }
 
-    /// Hands the callback to the dispatcher and remembers it as pending, so
-    /// the two can never drift apart.
     pub(crate) fn push(&self, cb: DeferredCallback) -> Result<(), DeferredCallback> {
-        let pending = (Arc::clone(&cb.plugin), Arc::clone(&cb.cancel));
-        self.tx.send(cb).map_err(|e| e.0)?;
-        self.locked().push(pending);
-        Ok(())
+        self.tx.send(cb).map_err(|e| e.0)
     }
 
-    fn forget(&self, cancel: &Arc<AtomicBool>) {
-        self.locked().retain(|(_, c)| !Arc::ptr_eq(c, cancel));
-    }
-
+    /// The parent stays, so a timer the plugin sets on its way out is born
+    /// cancelled too, until [`Self::revive`] at its next load.
     fn cancel_plugin(&self, plugin: &str) {
-        self.locked().retain(|(owner, cancel)| {
-            let doomed = &**owner == plugin;
-            if doomed {
-                cancel.store(true, Ordering::Release);
-            }
-            !doomed
-        });
+        let parent = self
+            .plugins
+            .borrow_mut()
+            .entry(plugin.into())
+            .or_default()
+            .clone();
+        parent.cancel();
+    }
+
+    /// A plugin that loads again needs a fresh parent, or every timer it sets
+    /// would be born cancelled.
+    fn revive(&self, plugin: &str) {
+        let mut plugins = self.plugins.borrow_mut();
+        if plugins
+            .get(plugin)
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            plugins.remove(plugin);
+        }
     }
 }
 
@@ -3251,22 +3262,29 @@ async fn run_work_fn(
 /// cheaply, but the bodies compete for the `MAX_INFLIGHT_TOOLS` budget so
 /// `for i=1,10000 do maki.defer_fn(f, 0) end` can't run 10k coroutines at
 /// once. Errors are logged and dropped, nobody is awaiting a result.
-fn spawn_deferred_callback(lua: &Lua, gate: &Rc<InflightGate>, cb: DeferredCallback) {
+fn spawn_deferred_callback(
+    lua: &Lua,
+    gate: &Rc<InflightGate>,
+    cb: DeferredCallback,
+) -> LocalJoinHandle<()> {
     let lua = lua.clone();
     let gate = Rc::clone(gate);
     spawn_local(async move {
-        sleep(cb.delay).await;
-        let _guard = gate.acquire().await;
-        // Only now stop advertising the timer as pending: up to here a
-        // `clear_plugin` can still flip the flag we read below, and from here
-        // on the drain barrier waits for the guard instead.
-        if let Some(queue) = lua.app_data_ref::<DeferQueue>() {
-            queue.forget(&cb.cancel);
-        }
-        if cb.cancel.load(Ordering::Acquire) {
+        // Biased, so a stop that lands as the gate opens still wins. Once the
+        // guard is held the drain barrier waits for it, and a `clear_plugin`
+        // cannot reach the callback any more.
+        let fired = tokio::select! {
+            biased;
+            () = cb.cancel.cancelled() => None,
+            guard = async {
+                sleep(cb.delay).await;
+                gate.acquire().await
+            } => Some(guard),
+        };
+        let Some(_guard) = fired else {
             let _ = lua.remove_registry_value(cb.func);
             return;
-        }
+        };
         let run = async {
             let func: Function = lua.registry_value(&cb.func)?;
             func.call_async::<()>(()).await
@@ -3276,7 +3294,7 @@ fn spawn_deferred_callback(lua: &Lua, gate: &Rc<InflightGate>, cb: DeferredCallb
             tracing::warn!(plugin = %cb.plugin, error = %strip_traceback(&e), "defer_fn callback failed");
         }
         let _ = lua.remove_registry_value(cb.func);
-    });
+    })
 }
 
 /// Runs a keybind callback. The host consumed the key to get here, and the key
@@ -4080,6 +4098,9 @@ impl LuaRuntime {
         }
         if let Some(spawned) = self.lua.app_data_ref::<SpawnedTasks>() {
             spawned.0.revive(&name);
+        }
+        if let Some(queue) = self.lua.app_data_ref::<DeferQueue>() {
+            queue.revive(&name);
         }
 
         // Chunks run in order against one environment, so a later file sees
@@ -6190,7 +6211,6 @@ mod tests {
     use std::task::{Context, Poll, Wake, Waker};
     use test_case::test_case;
     use tokio::sync::Notify;
-    use tokio_util::sync::CancellationToken;
 
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -6427,33 +6447,68 @@ mod tests {
 
     #[test]
     fn defer_queue_cancels_only_the_doomed_plugins_timers() {
-        let lua = Lua::new();
         let queue = DeferQueue::new();
-        let timer = |plugin: &str| {
-            let cancel = Arc::new(AtomicBool::new(false));
-            let queued = queue.push(DeferredCallback {
-                func: lua.create_registry_value(true).unwrap(),
-                delay: Duration::ZERO,
-                plugin: Arc::from(plugin),
-                cancel: Arc::clone(&cancel),
-                ceiling: None,
-            });
-            assert!(queued.is_ok(), "the queue is unbounded");
-            cancel
-        };
-        let doomed = timer("memory");
-        let bystander = timer("other");
+        let (memory, other) = (Arc::from("memory"), Arc::from("other"));
+        let doomed = queue.timer_token(&memory);
+        let bystander = queue.timer_token(&other);
 
         queue.cancel_plugin("memory");
-        assert!(doomed.load(Ordering::Acquire));
-        assert!(!bystander.load(Ordering::Acquire));
 
-        queue.forget(&bystander);
-        queue.cancel_plugin("other");
+        assert!(doomed.is_cancelled());
+        assert!(!bystander.is_cancelled());
         assert!(
-            !bystander.load(Ordering::Acquire),
-            "a timer past the gate is running, not pending"
+            queue.timer_token(&memory).is_cancelled(),
+            "a plugin on its way out sets no live timers"
         );
+
+        queue.revive("memory");
+
+        assert!(
+            !queue.timer_token(&memory).is_cancelled(),
+            "a plugin that loads again sets live timers"
+        );
+    }
+
+    #[test]
+    fn defer_queue_cancels_a_plugin_that_never_set_a_timer() {
+        let queue = DeferQueue::new();
+        let quiet: Arc<str> = Arc::from("quiet");
+
+        queue.cancel_plugin(&quiet);
+
+        assert!(queue.timer_token(&quiet).is_cancelled());
+    }
+
+    /// The clock is paused, so a timer still waiting out its hour lets the
+    /// shorter timeout fire at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_timer_ends_without_waiting_out_its_delay() {
+        const STILL_SLEEPING: &str = "the stopped timer still holds its task";
+        LocalSet::new()
+            .run_until(async {
+                let lua = Lua::new();
+                let cancel = CancellationToken::new();
+                let timer = spawn_deferred_callback(
+                    &lua,
+                    &Rc::new(gate()),
+                    DeferredCallback {
+                        func: lua.create_registry_value(true).unwrap(),
+                        delay: Duration::from_secs(3600),
+                        plugin: Arc::from("memory"),
+                        cancel: cancel.clone(),
+                        ceiling: None,
+                    },
+                );
+                yield_now().await;
+
+                cancel.cancel();
+
+                timeout(Duration::from_secs(1), timer)
+                    .await
+                    .expect(STILL_SLEEPING)
+                    .expect("the timer task panicked");
+            })
+            .await;
     }
 
     fn gate() -> InflightGate {
