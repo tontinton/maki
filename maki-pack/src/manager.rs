@@ -8,6 +8,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use tokio::task::spawn_blocking;
+
 use crate::git::{self, GitError};
 use crate::lock::{Lock, LockError};
 use crate::lockfile::Lockfile;
@@ -80,6 +82,7 @@ const REMOTE_PREFIX: &str = "refs/remotes/origin/";
 /// What the default branch resolves against. See `resolve_revision`.
 const REMOTE_HEAD: &str = "refs/remotes/origin/HEAD";
 
+#[derive(Clone)]
 pub struct Manager {
     site: PathBuf,
 }
@@ -95,6 +98,17 @@ impl Manager {
     /// to a directory with no git call at all, which is what keeps a steady
     /// state start offline.
     pub fn resolve(&self, lock: &Lockfile, name: &str) -> Option<PathBuf> {
+        self.recorded_dir(lock, name).filter(|dir| dir.is_dir())
+    }
+
+    /// [`Self::resolve`] for async callers.
+    pub async fn resolve_async(&self, lock: &Lockfile, name: &str) -> Option<PathBuf> {
+        let dir = self.recorded_dir(lock, name)?;
+        is_dir(&dir).await.then_some(dir)
+    }
+
+    /// The revision directory the lockfile records, whether or not it exists.
+    fn recorded_dir(&self, lock: &Lockfile, name: &str) -> Option<PathBuf> {
         // The lockfile is a file on disk that a user edits and commits, so its
         // contents are input, not fact. Both halves become path components, and
         // an absolute or traversing value would point this outside the site
@@ -106,8 +120,7 @@ impl Manager {
         if !revision_is_safe_component(&entry.rev) {
             return None;
         }
-        let dir = paths::revision_dir(&self.site, name, &entry.rev);
-        dir.is_dir().then_some(dir)
+        Some(paths::revision_dir(&self.site, name, &entry.rev))
     }
 
     /// Deletes stale immutable revisions that no running process is reading.
@@ -253,7 +266,7 @@ impl Manager {
             .get(&spec.name)
             .is_some_and(|entry| entry.src == spec.src);
 
-        if source_matches && let Some(dir) = self.resolve(lock, &spec.name) {
+        if source_matches && let Some(dir) = self.resolve_async(lock, &spec.name).await {
             let rev = lock
                 .get(&spec.name)
                 .expect("resolved from this entry")
@@ -266,8 +279,9 @@ impl Manager {
             });
         }
 
-        let _guard = Lock::acquire_retrying(&paths::package_lock(&self.site, &spec.name))?;
-        let hooks = self.hooks_dir()?;
+        let _guard =
+            Lock::acquire_retrying_async(paths::package_lock(&self.site, &spec.name)).await?;
+        let hooks = self.hooks_dir().await?;
 
         // A recorded revision wins over `version`, even when nothing is on disk
         // yet. That is the case a lockfile exists for: a fresh machine must get
@@ -295,7 +309,7 @@ impl Manager {
             None => self.resolve_revision(&hooks, &work, spec).await?,
         };
         let dest = paths::revision_dir(&self.site, &spec.name, &rev);
-        if !dest.is_dir() {
+        if !is_dir(&dest).await {
             self.materialize(&hooks, &work, &rev, &dest).await?;
         }
 
@@ -331,8 +345,9 @@ impl Manager {
             });
         }
 
-        let _guard = Lock::acquire_retrying(&paths::package_lock(&self.site, &spec.name))?;
-        let hooks = self.hooks_dir()?;
+        let _guard =
+            Lock::acquire_retrying_async(paths::package_lock(&self.site, &spec.name)).await?;
+        let hooks = self.hooks_dir().await?;
         // Restoring already knows the commit it wants, so a clone that still has
         // it can skip the fetch. Resolving `version` always needs fresh refs.
         let want = if restore_lockfile {
@@ -360,7 +375,7 @@ impl Manager {
             old_rev_available,
             new_manifest,
             changed: current.rev != new_rev
-                || !paths::revision_dir(&self.site, &spec.name, &new_rev).is_dir(),
+                || !is_dir(&paths::revision_dir(&self.site, &spec.name, &new_rev)).await,
             new_rev,
         })
     }
@@ -382,13 +397,15 @@ impl Manager {
             });
         }
 
-        let _guard = Lock::acquire_retrying(&paths::package_lock(&self.site, &prepared.spec.name))?;
-        let hooks = self.hooks_dir()?;
+        let _guard =
+            Lock::acquire_retrying_async(paths::package_lock(&self.site, &prepared.spec.name))
+                .await?;
+        let hooks = self.hooks_dir().await?;
         let work = self
             .ensure_work(&hooks, &prepared.spec, Want::Commit(&prepared.new_rev))
             .await?;
         let dest = paths::revision_dir(&self.site, &prepared.spec.name, &prepared.new_rev);
-        let existed = dest.is_dir();
+        let existed = is_dir(&dest).await;
         if !existed {
             self.materialize(&hooks, &work, &prepared.new_rev, &dest)
                 .await?;
@@ -410,8 +427,18 @@ impl Manager {
     /// die half way through, and the rename is the only step that is all or
     /// nothing, so it is what keeps the lockfile from ever pointing at a gutted
     /// directory.
-    pub fn remove(&self, name: &str, lock: &mut Lockfile) -> Result<(), ManagerError> {
+    pub async fn remove(&self, name: &str, lock: &mut Lockfile) -> Result<(), ManagerError> {
         self.check_name(name, "")?;
+        let manager = self.clone();
+        let package = name.to_owned();
+        spawn_blocking(move || manager.remove_files(&package))
+            .await
+            .expect("package removal panicked")?;
+        lock.remove(name);
+        Ok(())
+    }
+
+    fn remove_files(&self, name: &str) -> Result<(), ManagerError> {
         let _package_guard = Lock::acquire(&paths::package_lock(&self.site, name))?;
         let (dirs, failures) = self.package_dirs(name);
         if let Some(failure) = failures.into_iter().next() {
@@ -438,7 +465,6 @@ impl Manager {
             &paths::revision_lock_dir(&self.site, name),
             "package revision locks",
         );
-        lock.remove(name);
         Ok(())
     }
 
@@ -490,13 +516,15 @@ impl Manager {
         // A cached working copy is only reusable if it is a copy of the source
         // being asked for. Reusing one by name alone would materialize the old
         // repository's code while recording the new source.
-        if work.join(".git").is_dir() && !self.work_matches_source(&work, &spec.src).await {
-            fs::remove_dir_all(&work).map_err(|source| ManagerError::Io {
-                path: work.clone(),
-                source,
-            })?;
+        if is_dir(&work.join(".git")).await && !self.work_matches_source(&work, &spec.src).await {
+            tokio::fs::remove_dir_all(&work)
+                .await
+                .map_err(|source| ManagerError::Io {
+                    path: work.clone(),
+                    source,
+                })?;
         }
-        if !work.join(".git").is_dir() {
+        if !is_dir(&work.join(".git")).await {
             // A fresh clone already has everything a fetch would have brought.
             self.clone_into(hooks, &spec.src, &work).await?;
             return Ok(work);
@@ -536,12 +564,14 @@ impl Manager {
         paths::package_root(&self.site, name).join(".work")
     }
 
-    fn hooks_dir(&self) -> Result<PathBuf, ManagerError> {
+    async fn hooks_dir(&self) -> Result<PathBuf, ManagerError> {
         let dir = paths::empty_hooks_dir(&self.site);
-        fs::create_dir_all(&dir).map_err(|source| ManagerError::Io {
-            path: dir.clone(),
-            source,
-        })?;
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|source| ManagerError::Io {
+                path: dir.clone(),
+                source,
+            })?;
         Ok(dir)
     }
 
@@ -552,19 +582,21 @@ impl Manager {
         // has a parent, the site dir standing in only so that no path shape can
         // ever hand the clone back to the cwd.
         let parent = work.parent().unwrap_or(self.site.as_path());
-        fs::create_dir_all(parent).map_err(|source| ManagerError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|source| ManagerError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
         // A clone killed halfway leaves a directory behind with no `.git` in
         // it, and git refuses to clone into a directory that is not empty. So
         // every attempt starts from nothing, not just the retry below.
-        let clear = || {
-            let _ = fs::remove_dir_all(work);
+        let clear = async || {
+            let _ = tokio::fs::remove_dir_all(work).await;
         };
         // A blobless clone is much smaller, but an older server refuses the
         // filter outright, so fall back to a full clone rather than failing.
-        clear();
+        clear().await;
         match git::run(
             git::clone_args(hooks, src, work, true),
             parent.to_path_buf(),
@@ -573,7 +605,7 @@ impl Manager {
         {
             Ok(_) => Ok(()),
             Err(_) => {
-                clear();
+                clear().await;
                 git::run(
                     git::clone_args(hooks, src, work, false),
                     parent.to_path_buf(),
@@ -668,17 +700,22 @@ impl Manager {
     ) -> Result<(), ManagerError> {
         git::run(git::checkout_args(hooks, rev), work.to_path_buf()).await?;
 
-        let staging = dest.with_extension("incoming");
-        let _ = fs::remove_dir_all(&staging);
-        copy_tree(work, &staging).map_err(|source| ManagerError::Io {
-            path: staging.clone(),
-            source,
-        })?;
-        fs::rename(&staging, dest).map_err(|source| ManagerError::Io {
-            path: dest.to_path_buf(),
-            source,
-        })?;
-        Ok(())
+        let (work, dest) = (work.to_path_buf(), dest.to_path_buf());
+        spawn_blocking(move || {
+            let staging = dest.with_extension("incoming");
+            let _ = fs::remove_dir_all(&staging);
+            copy_tree(&work, &staging).map_err(|source| ManagerError::Io {
+                path: staging.clone(),
+                source,
+            })?;
+            fs::rename(&staging, &dest).map_err(|source| ManagerError::Io {
+                path: dest.clone(),
+                source,
+            })?;
+            Ok(())
+        })
+        .await
+        .expect("materializing a revision panicked")
     }
 }
 
@@ -698,6 +735,12 @@ fn discard(path: &Path, what: &str) {
     {
         tracing::warn!(path = %path.display(), %source, "could not remove {what}");
     }
+}
+
+async fn is_dir(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|meta| meta.is_dir())
 }
 
 /// A revision directory name. Revisions are recorded from `git rev-parse`, so a
@@ -1637,22 +1680,22 @@ mod tests {
         assert_eq!(fixture.lock.get("demo").unwrap().rev, installed.rev);
     }
 
-    #[test]
-    fn deletion_removes_a_lock_entry_when_the_package_root_is_missing() {
+    #[tokio::test]
+    async fn deletion_removes_a_lock_entry_when_the_package_root_is_missing() {
         let dir = site();
         let manager = Manager::new(dir.path());
         let mut lock = Lockfile::default();
         lock.record("demo", "https://example.com/demo", TEST_REV);
 
-        manager.remove("demo", &mut lock).unwrap();
+        manager.remove("demo", &mut lock).await.unwrap();
 
         assert!(lock.get("demo").is_none());
     }
 
     /// A delete that died half way leaves a parked root behind, and the next
     /// removal needs that same name to rename onto.
-    #[test]
-    fn deletion_clears_a_leftover_from_an_earlier_failed_delete() {
+    #[tokio::test]
+    async fn deletion_clears_a_leftover_from_an_earlier_failed_delete() {
         let dir = site();
         let manager = Manager::new(dir.path());
         let mut lock = Lockfile::default();
@@ -1663,14 +1706,14 @@ mod tests {
         let leftover = paths::package_trash(dir.path(), "demo");
         fs::create_dir_all(leftover.join("stale")).unwrap();
 
-        manager.remove("demo", &mut lock).unwrap();
+        manager.remove("demo", &mut lock).await.unwrap();
 
         assert!(!paths::package_root(dir.path(), "demo").exists());
         assert!(!leftover.exists());
     }
 
-    #[test]
-    fn deletion_keeps_the_lock_entry_when_the_package_root_is_unreadable() {
+    #[tokio::test]
+    async fn deletion_keeps_the_lock_entry_when_the_package_root_is_unreadable() {
         let dir = site();
         let manager = Manager::new(dir.path());
         let mut lock = Lockfile::default();
@@ -1680,15 +1723,15 @@ mod tests {
         fs::write(&root, "not a directory").unwrap();
 
         assert!(matches!(
-            manager.remove("demo", &mut lock),
+            manager.remove("demo", &mut lock).await,
             Err(ManagerError::Io { .. })
         ));
         assert!(root.is_file());
         assert!(lock.get("demo").is_some());
     }
 
-    #[test]
-    fn deletion_does_not_treat_internal_directories_as_revisions() {
+    #[tokio::test]
+    async fn deletion_does_not_treat_internal_directories_as_revisions() {
         let dir = site();
         let manager = Manager::new(dir.path());
         let mut lock = Lockfile::default();
@@ -1697,14 +1740,14 @@ mod tests {
         let _unrelated =
             Lock::acquire_shared(&paths::revision_lock(dir.path(), "demo", ".work")).unwrap();
 
-        manager.remove("demo", &mut lock).unwrap();
+        manager.remove("demo", &mut lock).await.unwrap();
 
         assert!(!paths::package_root(dir.path(), "demo").exists());
         assert!(lock.get("demo").is_none());
     }
 
-    #[test]
-    fn deletion_preflight_leaves_everything_when_one_revision_is_live() {
+    #[tokio::test]
+    async fn deletion_preflight_leaves_everything_when_one_revision_is_live() {
         let dir = site();
         let manager = Manager::new(dir.path());
         let mut lock = Lockfile::default();
@@ -1716,7 +1759,7 @@ mod tests {
             Lock::acquire_shared(&paths::revision_lock(dir.path(), "demo", OTHER_REV)).unwrap();
 
         assert!(matches!(
-            manager.remove("demo", &mut lock),
+            manager.remove("demo", &mut lock).await,
             Err(ManagerError::Lock(LockError::Held { .. }))
         ));
         assert!(paths::revision_dir(dir.path(), "demo", TEST_REV).is_dir());
@@ -1724,7 +1767,7 @@ mod tests {
         assert!(lock.get("demo").is_some());
 
         drop(live);
-        manager.remove("demo", &mut lock).unwrap();
+        manager.remove("demo", &mut lock).await.unwrap();
         assert!(!paths::package_root(dir.path(), "demo").exists());
         assert!(!paths::revision_lock_dir(dir.path(), "demo").exists());
         assert!(lock.get("demo").is_none());
