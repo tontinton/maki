@@ -320,21 +320,23 @@ fn spawn_agent_internal(
 mod tests {
     mod background_e2e;
 
-    use maki_lua::test_support::wait_next;
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{Receiver, Sender, channel};
     use std::time::Instant;
-    use tokio::sync::mpsc::UnboundedSender;
 
     use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
     use maki_agent::{AgentEvent, AgentInput, AgentMode, AgentSeed, InputSource};
     use maki_config::PermissionsConfig;
     use maki_config::project::{self, TrustMode};
+    use maki_lua::test_support::wait_next;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, TaskEnd,
         ThinkingConfig,
     };
     use test_case::test_case;
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
     use super::shared_queue::{QueueItem, QueuedInput};
     use super::*;
@@ -362,7 +364,7 @@ mod tests {
     /// its queue, until the test drops the gate's sender.
     #[derive(Default)]
     struct StubProvider {
-        auth_gate: Option<flume::Receiver<()>>,
+        auth_gate: Option<AsyncMutex<UnboundedReceiver<()>>>,
     }
 
     impl Provider for StubProvider {
@@ -386,7 +388,7 @@ mod tests {
         fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
             Box::pin(async {
                 if let Some(ref gate) = self.auth_gate {
-                    let _ = gate.recv_async().await;
+                    let _ = gate.lock().await.recv().await;
                 }
                 Ok(())
             })
@@ -472,8 +474,8 @@ mod tests {
     /// non-retryable error so no stream has to be faked. `gate` parks a call in
     /// flight until the test lets it go, one permit per call.
     struct RecordingProvider {
-        calls: flume::Sender<String>,
-        gate: Option<flume::Receiver<()>>,
+        calls: Sender<String>,
+        gate: Option<AsyncMutex<UnboundedReceiver<()>>>,
     }
 
     impl Provider for RecordingProvider {
@@ -491,7 +493,7 @@ mod tests {
             Box::pin(async move {
                 let _ = self.calls.send(id);
                 if let Some(ref gate) = self.gate {
-                    gate.recv_async().await.expect(GATE_CLOSED);
+                    gate.lock().await.recv().await.expect(GATE_CLOSED);
                 }
                 Err(AgentError::Tool {
                     tool: RECORDER_TOOL.into(),
@@ -505,22 +507,18 @@ mod tests {
         }
     }
 
-    fn recorder() -> (Arc<dyn Provider>, flume::Receiver<String>) {
-        let (calls, reported) = flume::unbounded();
+    fn recorder() -> (Arc<dyn Provider>, Receiver<String>) {
+        let (calls, reported) = channel();
         (Arc::new(RecordingProvider { calls, gate: None }), reported)
     }
 
-    fn gated_recorder() -> (
-        Arc<dyn Provider>,
-        flume::Receiver<String>,
-        flume::Sender<()>,
-    ) {
-        let (calls, reported) = flume::unbounded();
-        let (release, gate) = flume::unbounded();
+    fn gated_recorder() -> (Arc<dyn Provider>, Receiver<String>, UnboundedSender<()>) {
+        let (calls, reported) = channel();
+        let (release, gate) = unbounded_channel();
         (
             Arc::new(RecordingProvider {
                 calls,
-                gate: Some(gate),
+                gate: Some(AsyncMutex::new(gate)),
             }),
             reported,
             release,
@@ -571,7 +569,7 @@ mod tests {
 
     fn drive_turn(
         handles: &mut AgentHandles,
-        reported: &flume::Receiver<String>,
+        reported: &Receiver<String>,
         run_id: u64,
         text: &str,
     ) -> String {
@@ -660,10 +658,10 @@ mod tests {
     #[test]
     fn respawn_twice_keeps_channel_and_delivers_restored_queue() {
         let _runtime = enter_runtime();
-        let (open_auth, auth_gate) = flume::unbounded::<()>();
+        let (open_auth, auth_gate) = unbounded_channel::<()>();
         let (mut handles, model_slot) = stub_spawn_on(
             StubProvider {
-                auth_gate: Some(auth_gate),
+                auth_gate: Some(AsyncMutex::new(auth_gate)),
             },
             Vec::new(),
         );
