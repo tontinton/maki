@@ -3,13 +3,11 @@
 //! move hook. Each scenario follows the move from the Ctrl+B request to what
 //! the model reads and what the transcript shows.
 
-use crate::agent::UnboundedReceiver;
-use maki_lua::test_support::wait_next;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedSender;
 
 use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
@@ -21,7 +19,7 @@ use maki_agent::{
 };
 use maki_config::project::{self, TrustMode};
 use maki_config::{PermissionsConfig, PluginsConfig};
-use maki_lua::test_support::wait_reply;
+use maki_lua::test_support::{wait_next, wait_reply};
 use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -31,6 +29,7 @@ use maki_providers::{
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 use tokio::runtime::EnterGuard;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::agent::AgentHandles;
 use crate::agent::shared_queue::{QueueItem, QueuedInput};
@@ -197,7 +196,7 @@ fn assert_append_only(prev: &SeenRequest, next: &SeenRequest) {
 
 struct Step {
     response: StreamResponse,
-    hold: Option<flume::Receiver<()>>,
+    hold: Option<UnboundedReceiver<()>>,
 }
 
 impl Step {
@@ -209,7 +208,7 @@ impl Step {
     }
 
     /// The model answers only once the test sends on the paired sender.
-    fn held(mut self, hold: flume::Receiver<()>) -> Self {
+    fn held(mut self, hold: UnboundedReceiver<()>) -> Self {
         self.hold = Some(hold);
         self
     }
@@ -265,7 +264,7 @@ fn stop_call() -> StreamResponse {
 
 struct ScriptedProvider {
     steps: Mutex<VecDeque<Step>>,
-    requests: flume::Sender<SeenRequest>,
+    requests: Sender<SeenRequest>,
 }
 
 impl Provider for ScriptedProvider {
@@ -296,8 +295,8 @@ impl Provider for ScriptedProvider {
                     message: SCRIPT_EXHAUSTED.into(),
                 });
             };
-            if let Some(hold) = step.hold {
-                let _ = hold.recv_async().await;
+            if let Some(mut hold) = step.hold {
+                let _ = hold.recv().await;
             }
             Ok(step.response)
         })
@@ -322,7 +321,7 @@ struct World {
     handles: AgentHandles,
     host: PluginHost,
     ui: UnboundedReceiver<UiAction>,
-    requests: flume::Receiver<SeenRequest>,
+    requests: Receiver<SeenRequest>,
     seen: Vec<AgentEvent>,
     _serial: MutexGuard<'static, ()>,
     _runtime: EnterGuard<'static>,
@@ -338,7 +337,7 @@ impl World {
             .expect(PLUGINS_LOAD);
         let ui = host.take_ui_action_rx().unwrap();
 
-        let (seen_requests, requests) = flume::unbounded();
+        let (seen_requests, requests) = channel();
         let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
             steps: Mutex::new(steps.into()),
             requests: seen_requests,
@@ -595,7 +594,7 @@ fn a_moved_call_whose_turn_ends_wakes_the_chat_with_its_result() {
 
 #[test]
 fn a_result_landing_mid_run_follows_the_next_tool_results_without_a_new_request() {
-    let (release_model, model_gate) = flume::unbounded::<()>();
+    let (release_model, model_gate) = unbounded_channel::<()>();
     let mut world = World::start(vec![
         Step::new(park_call()),
         Step::new(noop_call()).held(model_gate),
@@ -721,7 +720,7 @@ fn a_task_stop_by_the_model_returns_the_partial_output_and_sends_no_notice() {
 /// other.
 #[test]
 fn esc_leaves_moved_work_running() {
-    let (_model_gate_open, model_gate) = flume::unbounded::<()>();
+    let (_model_gate_open, model_gate) = unbounded_channel::<()>();
     let mut world = World::start(vec![
         Step::new(park_call()),
         Step::new(answer(WAITING_TEXT)).held(model_gate),

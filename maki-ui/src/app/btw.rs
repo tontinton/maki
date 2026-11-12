@@ -207,7 +207,7 @@ mod tests {
     }
 
     struct FakeProvider {
-        sent: flume::Sender<Recorded>,
+        sent: UnboundedSender<Recorded>,
         script: Vec<ProviderEvent>,
     }
 
@@ -276,13 +276,13 @@ mod tests {
     }
 
     async fn ask(app: &mut App) -> Recorded {
-        let (sent, requests) = flume::unbounded();
+        let (sent, mut requests) = unbounded_channel();
         let provider = FakeProvider {
             sent,
             script: Vec::new(),
         };
         app.start_btw(Q.into(), Arc::new(provider), test_model());
-        requests.recv_async().await.unwrap()
+        requests.recv().await.unwrap()
     }
 
     /// An imported session holds a frame with facts and no prompt until its
@@ -353,7 +353,7 @@ mod tests {
             name: name.into(),
         }));
         let provider = FakeProvider {
-            sent: flume::unbounded().0,
+            sent: unbounded_channel().0,
             script,
         };
         BtwRequest {
