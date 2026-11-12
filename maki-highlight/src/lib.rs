@@ -4,6 +4,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
+use arc_swap::ArcSwap;
+
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, Style as SynStyle,
     Theme,
@@ -122,18 +124,14 @@ pub fn ansi_color_index(name: &str) -> Option<u8> {
 }
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME: OnceLock<RwLock<Arc<Theme>>> = OnceLock::new();
-static UI_STYLES: OnceLock<RwLock<HashMap<String, UiStyle>>> = OnceLock::new();
+static THEME: LazyLock<ArcSwap<Theme>> = LazyLock::new(ArcSwap::default);
+static UI_STYLES: LazyLock<ArcSwap<HashMap<String, UiStyle>>> = LazyLock::new(ArcSwap::default);
 static BLOCK_CACHE: LazyLock<RwLock<BlockCache>> = LazyLock::new(RwLock::default);
 static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
-fn theme_lock() -> &'static RwLock<Arc<Theme>> {
-    THEME.get_or_init(|| RwLock::new(Arc::new(Theme::default())))
-}
-
 pub fn warmup() {
     syntax_set();
-    theme_lock();
+    LazyLock::force(&THEME);
     let mut hl = Highlighter::for_token("bash");
     hl.highlight_line("x");
 }
@@ -143,7 +141,7 @@ pub fn is_ready() -> bool {
 }
 
 pub fn set_theme(theme: Theme) {
-    *theme_lock().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(theme);
+    THEME.store(Arc::new(theme));
     // Bump first: a highlight already in flight read the old generation, so its
     // insert lands under a key nobody will look up again.
     THEME_GEN.fetch_add(1, Ordering::Release);
@@ -242,26 +240,15 @@ impl BlockCache {
 }
 
 pub fn theme() -> Arc<Theme> {
-    theme_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-fn ui_styles_lock() -> &'static RwLock<HashMap<String, UiStyle>> {
-    UI_STYLES.get_or_init(RwLock::default)
+    THEME.load_full()
 }
 
 pub fn set_ui_styles(styles: HashMap<String, UiStyle>) {
-    *ui_styles_lock().write().unwrap_or_else(|e| e.into_inner()) = styles;
+    UI_STYLES.store(Arc::new(styles));
 }
 
 pub fn ui_style(name: &str) -> Option<UiStyle> {
-    ui_styles_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(name)
-        .cloned()
+    UI_STYLES.load().get(name).cloned()
 }
 
 /// Colors the syntax theme names itself. UI styles live in [`ui_style`].

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use tokio::sync::mpsc::unbounded_channel;
 
+use arc_swap::ArcSwap;
 use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
 use maki_storage::StateDir;
@@ -475,7 +476,7 @@ type AuthCell = (Option<Arc<str>>, Arc<AuthState>);
 /// What every read answers. Only ever replaced whole, by [`commit_load`], so
 /// there is no moment at which a reader can see a half-built registry: during
 /// a load the previous generation is still the published one.
-static PROVIDERS: LazyLock<RwLock<Arc<Registry>>> = LazyLock::new(RwLock::default);
+static PROVIDERS: LazyLock<ArcSwap<Registry>> = LazyLock::new(ArcSwap::default);
 /// The load in progress. `Some` between [`begin_load`] and [`commit_load`],
 /// and open at process start so a host that loads plugins without driving the
 /// phases (tests, embedders) still registers.
@@ -550,7 +551,7 @@ pub fn commit_load() {
     }
     let logins = staged.values().filter_map(|e| e.built.login).collect();
     maki_config::providers::set_registered_providers(logins);
-    *PROVIDERS.write().unwrap() = Arc::new(staged);
+    PROVIDERS.store(Arc::new(staged));
 }
 
 /// Takes back everything `plugin` staged in the load in progress, for a plugin
@@ -759,7 +760,7 @@ fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
 }
 
 fn entries() -> Arc<Registry> {
-    Arc::clone(&PROVIDERS.read().unwrap())
+    PROVIDERS.load_full()
 }
 
 fn entry(slug: &str) -> Option<Arc<PluginEntry>> {

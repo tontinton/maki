@@ -3735,6 +3735,7 @@ dependencies = [
 name = "maki-highlight"
 version = "0.7.1"
 dependencies = [
+ "arc-swap",
  "serde_json",
  "syntect",
  "test-case",
@@ -3899,6 +3900,7 @@ dependencies = [
 name = "maki-providers"
 version = "0.7.1"
 dependencies = [
+ "arc-swap",
  "aws-config",
  "aws-credential-types",
  "aws-sigv4",
