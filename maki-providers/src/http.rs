@@ -6,13 +6,13 @@ use std::env;
 use std::error::Error;
 use std::io;
 use std::iter;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use maki_config::split_host_port;
 use reqwest::{Error as ReqwestError, Proxy};
-use tokio::task::spawn_blocking;
+use tokio::net::lookup_host;
 use tokio::time::sleep;
 
 pub const HTTP_SCHEME: &str = "http://";
@@ -154,15 +154,13 @@ pub fn extract_host_port(url: &str) -> Option<(&str, u16)> {
     Some((host, port.unwrap_or(default_port)))
 }
 
-/// getaddrinfo blocks, so it runs on the blocking pool rather than on a
-/// worker thread. A resolver saying "try again"
-/// (a cold cache, a link that just came back) has not answered yet, so a few
-/// retries go out before the lookup counts as a failure.
+/// A resolver saying "try again" (a cold cache, a link that just came back)
+/// has not answered yet, so a few retries go out before the lookup counts as
+/// a failure.
 pub async fn resolve(host: &str, port: u16, attempts: u32) -> io::Result<Vec<SocketAddr>> {
     let mut attempt = 1;
     loop {
-        let target = (host.to_string(), port);
-        match spawn_blocking(move || target.to_socket_addrs()).await? {
+        match lookup_host((host, port)).await {
             Ok(addrs) => return Ok(addrs.collect()),
             Err(e) if attempt >= attempts => return Err(e),
             Err(e) => {
