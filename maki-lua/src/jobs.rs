@@ -15,7 +15,10 @@ use maki_providers::{shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult};
 use shell_words::join as shell_join;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, TryAcquireError, watch,
+};
 
 use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
 use crate::plugin_permissions::Ceiling;
@@ -174,10 +177,9 @@ struct JobMeta {
     on_stderr: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
     ceiling: Option<Ceiling>,
+    /// Locked while a `jobwait` holds it through its [`WaitLease`], which keeps
+    /// the pumps off the job until the lease drops.
     events: JobEvents,
-    /// Set while a `jobwait` holds the events. Pumps leave the job alone
-    /// until its [`WaitLease`] drops.
-    waited: Arc<AtomicBool>,
     _queue: QueueOwner,
     stdout_tail: VecDeque<String>,
     stderr_tail: VecDeque<String>,
@@ -235,11 +237,7 @@ impl JobMeta {
     }
 
     fn has_pending(&self) -> bool {
-        self.replay_exit.is_some() || self.pumpable().is_some_and(|events| !events.is_empty())
-    }
-
-    fn pumpable(&self) -> Option<&JobEvents> {
-        (!self.waited.load(Ordering::Acquire)).then_some(&self.events)
+        self.replay_exit.is_some() || !self.events.is_empty()
     }
 }
 
@@ -440,7 +438,6 @@ impl JobStore {
                 on_exit,
                 ceiling,
                 events,
-                waited: Arc::default(),
                 _queue: queue,
                 stdout_tail: VecDeque::new(),
                 stderr_tail: VecDeque::new(),
@@ -492,13 +489,13 @@ impl JobStore {
         plugin: &str,
     ) -> Option<WaitLease> {
         let job = self.jobs.get(&job_id)?;
-        if !job.can_access(task_id, plugin) || job.waited.swap(true, Ordering::AcqRel) {
+        if !job.can_access(task_id, plugin) {
             return None;
         }
         Some(WaitLease {
-            events: job.events.clone(),
-            waited: Arc::clone(&job.waited),
-            changed: self.changed.clone(),
+            rx: Arc::clone(&job.events.rx).try_lock_owned().ok()?,
+            queue: Arc::clone(&job.events.queue),
+            _wake: WakePumps(self.changed.clone()),
         })
     }
 
@@ -529,7 +526,7 @@ impl JobStore {
         if let Some(code) = job.replay_exit.take() {
             return Some(JobEvent::Exit(code));
         }
-        job.pumpable()?.try_recv()
+        job.events.try_recv()
     }
 
     /// Round-robins over the jobs holding events: taking the first match every
@@ -765,28 +762,32 @@ impl Drop for JobStore {
     }
 }
 
-/// A `jobwait`'s exclusive hold on one job's events. The store keeps its own
-/// receiver, so there is nothing to give back: dropping the lease only lets
-/// the pumps in again.
+/// A `jobwait`'s exclusive hold on one job's events: the lock on the job's
+/// receiver, so the pumps cannot read it until the lease drops.
 pub(crate) struct WaitLease {
-    events: JobEvents,
-    waited: Arc<AtomicBool>,
-    changed: watch::Sender<()>,
+    rx: OwnedMutexGuard<UnboundedReceiver<JobEvent>>,
+    queue: Arc<JobQueue>,
+    /// Declared after `rx`, since fields drop in order: the pumps are woken
+    /// only once the receiver is free again.
+    _wake: WakePumps,
 }
 
 impl WaitLease {
-    pub fn events(&self) -> &JobEvents {
-        &self.events
+    pub async fn recv(&mut self) -> Option<JobEvent> {
+        let event = self.rx.recv().await?;
+        self.queue.popped(&event);
+        Some(event)
     }
 }
 
 /// The GC runs this when it frees a coroutine parked in `jobwait`, so it
 /// must stay Lua-free. The bump wakes a parked pump for the events the wait
 /// left queued.
-impl Drop for WaitLease {
+struct WakePumps(watch::Sender<()>);
+
+impl Drop for WakePumps {
     fn drop(&mut self) {
-        self.waited.store(false, Ordering::Release);
-        self.changed.send_replace(());
+        self.0.send_replace(());
     }
 }
 
@@ -914,27 +915,25 @@ fn queued_bytes(event: &JobEvent) -> usize {
 /// A job's receiving end. Taking an event through it settles that event's
 /// bytes with the [`JobQueue`], so no consumer can forget to and leave the
 /// readers waiting on a queue that is long drained.
-#[derive(Clone)]
+///
+/// A [`WaitLease`] holds the receiver's lock while a `jobwait` reads, and the
+/// pumps find it locked and leave the job alone.
 pub(crate) struct JobEvents {
-    rx: flume::Receiver<JobEvent>,
+    rx: Arc<AsyncMutex<UnboundedReceiver<JobEvent>>>,
     queue: Arc<JobQueue>,
 }
 
 impl JobEvents {
     fn try_recv(&self) -> Option<JobEvent> {
-        let event = self.rx.try_recv().ok()?;
+        let event = self.rx.try_lock().ok()?.try_recv().ok()?;
         self.queue.popped(&event);
         Some(event)
     }
 
-    pub async fn recv_async(&self) -> Option<JobEvent> {
-        let event = self.rx.recv_async().await.ok()?;
-        self.queue.popped(&event);
-        Some(event)
-    }
-
+    /// A leased receiver counts as empty, as it does for [`Self::try_recv`]:
+    /// what is queued there is the wait's to take.
     fn is_empty(&self) -> bool {
-        self.rx.is_empty()
+        self.rx.try_lock().ok().is_none_or(|rx| rx.is_empty())
     }
 }
 
@@ -948,7 +947,7 @@ impl Drop for QueueOwner {
 
 /// The sending, receiving and owning ends of one job's queue.
 fn job_queue(changed: watch::Sender<()>) -> (JobEventSender, JobEvents, QueueOwner) {
-    let (tx, rx) = flume::unbounded();
+    let (tx, rx) = unbounded_channel();
     let queue = Arc::new(JobQueue::default());
     let sender = JobEventSender {
         tx,
@@ -957,14 +956,14 @@ fn job_queue(changed: watch::Sender<()>) -> (JobEventSender, JobEvents, QueueOwn
         reserve: None,
     };
     let events = JobEvents {
-        rx,
+        rx: Arc::new(AsyncMutex::new(rx)),
         queue: Arc::clone(&queue),
     };
     (sender, events, QueueOwner(queue))
 }
 
 struct JobEventSender {
-    tx: flume::Sender<JobEvent>,
+    tx: UnboundedSender<JobEvent>,
     queue: Arc<JobQueue>,
     changed: watch::Sender<()>,
     /// The run a parked reader waited for, spent line by line. Given back
@@ -1099,8 +1098,10 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::api::fs::LINE_CUT_MARKER;
+    use crate::test_support::runtime;
     use futures::FutureExt;
     use std::time::Duration;
+    use tokio::time::timeout;
 
     const TEST_PLUGIN: &str = "test-plugin";
     const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1112,6 +1113,17 @@ mod tests {
 
     /// Pull events until {id} reports its exit, so assertions run against a
     /// job that is certainly done.
+    fn recv_within(lease: &mut WaitLease, limit: Duration) -> Option<JobEvent> {
+        runtime()
+            .block_on(async { timeout(limit, lease.recv()).await })
+            .ok()
+            .flatten()
+    }
+
+    fn senders_gone(lease: &WaitLease) -> bool {
+        lease.rx.is_closed()
+    }
+
     fn collect_until_exit(
         id: u32,
         mut next: impl FnMut() -> Option<(u32, JobEvent)>,
@@ -1174,7 +1186,6 @@ mod tests {
             on_exit,
             ceiling: None,
             events,
-            waited: Arc::default(),
             _queue: queue,
             stdout_tail: VecDeque::new(),
             stderr_tail: VecDeque::new(),
@@ -1275,13 +1286,9 @@ mod tests {
 
         let id = start_echo(&mut store);
         assert!(!store.is_empty(&owner));
-        let lease = store.lease_events(id, Some(1), TEST_PLUGIN).unwrap();
+        let mut lease = store.lease_events(id, Some(1), TEST_PLUGIN).unwrap();
         while !matches!(
-            lease
-                .events
-                .rx
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap(),
+            recv_within(&mut lease, Duration::from_secs(5)).unwrap(),
             JobEvent::Exit(_)
         ) {}
 
@@ -1392,19 +1399,19 @@ mod tests {
     fn lease_delivers_events() {
         let mut store = make_store();
         let id = start_echo(&mut store);
-        let lease = store.lease_events(id, Some(1), TEST_PLUGIN).unwrap();
+        let mut lease = store.lease_events(id, Some(1), TEST_PLUGIN).unwrap();
 
         let mut got_exit = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            match lease.events.rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(JobEvent::Exit(_)) => {
+            match recv_within(&mut lease, Duration::from_millis(200)) {
+                Some(JobEvent::Exit(_)) => {
                     got_exit = true;
                     break;
                 }
-                Ok(_) => continue,
-                Err(flume::RecvTimeoutError::Timeout) => continue,
-                Err(flume::RecvTimeoutError::Disconnected) => break,
+                Some(_) => continue,
+                None if senders_gone(&lease) => break,
+                None => continue,
             }
         }
         assert!(got_exit, "should receive exit event for completed job");
@@ -2236,7 +2243,7 @@ mod tests {
 
             wait_until(NEVER_RELEASED, || reaped.load(Ordering::Relaxed));
             if let Some(lease) = held {
-                wait_until(NEVER_RELEASED, || lease.events.rx.is_disconnected());
+                wait_until(NEVER_RELEASED, || senders_gone(&lease));
             }
         }
 

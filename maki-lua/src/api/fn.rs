@@ -472,7 +472,8 @@ async fn jobwait(
             snap.dropped_output,
         );
     }
-    let Some(lease) = with_jobs(&lua, |store| store.lease_events(job_id, task_id, &plugin)) else {
+    let Some(mut lease) = with_jobs(&lua, |store| store.lease_events(job_id, task_id, &plugin))
+    else {
         return Ok(err_pair(JOB_UNWAITABLE_ERR));
     };
 
@@ -487,7 +488,7 @@ async fn jobwait(
     let exit_code = loop {
         let event = tokio::select! {
             biased;
-            event = lease.events().recv_async() => event,
+            event = lease.recv() => event,
             () = &mut deadline => None,
         };
 
