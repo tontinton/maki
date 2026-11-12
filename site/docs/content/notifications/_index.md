@@ -45,7 +45,7 @@ maki.setup({
 
 | Value | Behavior |
 | --- | --- |
-| `auto` | Use OSC 9 in a supported terminal. Use BEL otherwise. |
+| `auto` | Use OSC 9 in a supported terminal or in Zellij. Use BEL otherwise. |
 | `osc9` | Always send an OSC 9 notification. |
 | `bell` | Always send the terminal bell. |
 | `notify` | Show a desktop notification. |
@@ -133,7 +133,12 @@ Maki wraps OSC 9 and OSC 7501 for GNU screen. GNU screen does not pass terminal 
 events to Maki, so Maki does not suppress notifications there. A notification
 can appear while the GNU screen window has focus.
 
-Maki sends OSC 9 and OSC 7501 directly through Zellij.
+Maki sends OSC 9 and OSC 7501 directly through Zellij. Zellij 0.45 and later
+forward OSC 9 to each attached terminal, as OSC 99 for Kitty and as OSC 9 for
+the others. `auto` therefore uses OSC 9 in Zellij whatever terminal you attach
+from. If that terminal does not show OSC 9, set
+`host_notification_protocol "bell"` in your Zellij config. Zellij versions
+before 0.45 drop OSC 9, so use `bell` with them.
 
 ## Focus on Windows
 

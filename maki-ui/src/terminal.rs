@@ -57,6 +57,7 @@ struct TerminalEnvironment<'a> {
     wezterm: bool,
     iterm: bool,
     kitty: bool,
+    zellij: bool,
     term: Option<&'a str>,
 }
 
@@ -79,11 +80,9 @@ pub(crate) struct TerminalNotifier {
 
 impl TerminalNotifier {
     pub(crate) fn new(configured: NotificationMethod) -> Option<Self> {
-        let notifier = resolve_notifier(configured, detect_osc9_support)?;
-        Some(Self {
-            notifier,
-            mux: TerminalMux::detect(),
-        })
+        let mux = TerminalMux::detect();
+        let notifier = resolve_notifier(configured, || detect_osc9_support(mux))?;
+        Some(Self { notifier, mux })
     }
 
     pub(crate) fn notifier(&self) -> ResolvedNotifier {
@@ -99,7 +98,7 @@ impl TerminalNotifier {
     }
 }
 
-fn detect_osc9_support() -> bool {
+fn detect_osc9_support(mux: TerminalMux) -> bool {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
     let env = TerminalEnvironment {
@@ -109,6 +108,7 @@ fn detect_osc9_support() -> bool {
             || std::env::var_os("ITERM_PROFILE").is_some()
             || std::env::var_os("ITERM_PROFILE_NAME").is_some(),
         kitty: std::env::var_os("KITTY_WINDOW_ID").is_some(),
+        zellij: mux == TerminalMux::Zellij,
         term: term.as_deref(),
     };
     let tmux = env
@@ -161,6 +161,11 @@ fn resolve_notifier(
 }
 
 fn auto_supports_osc9(env: &TerminalEnvironment<'_>, tmux: Option<&TmuxClient>) -> bool {
+    // Zellij re-sends OSC 9 to each attached client in whatever protocol that
+    // client's terminal takes, so the terminal behind it does not matter.
+    if env.zellij {
+        return true;
+    }
     if let Some(term_program) = env.term_program.filter(|value| !value.trim().is_empty()) {
         if normalize_terminal_id(term_program) == "tmux" {
             return tmux.is_some_and(|client| {
@@ -747,6 +752,16 @@ mod tests {
         };
         assert!(auto_supports_osc9(&terminal, Some(&ghostty_name)));
         assert!(!auto_supports_osc9(&terminal, None));
+    }
+
+    #[test_case(None ; "unknown_terminal")]
+    #[test_case(Some("Alacritty") ; "terminal_without_osc9")]
+    fn auto_inside_zellij_always_uses_osc9(term_program: Option<&str>) {
+        let terminal = TerminalEnvironment {
+            zellij: true,
+            ..env(term_program)
+        };
+        assert!(auto_supports_osc9(&terminal, None));
     }
 
     #[test_case(None, ProgramState::Working, "", None, "state=working:app=maki" ; "empty_title_omitted")]
