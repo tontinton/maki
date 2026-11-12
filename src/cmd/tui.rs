@@ -516,7 +516,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                     .plugin_host
                     .take_ui_action_rx()
                     .expect("the UI takes the plugin action queue once"),
-                ui_wake_rx: stack.plugin_host.ui_wake_rx(),
+                ui_waker: stack.plugin_host.ui_waker(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),

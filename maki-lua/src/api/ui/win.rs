@@ -445,17 +445,23 @@ mod tests {
     fn every_command_wakes_the_ui_once_until_it_looks() {
         let (_event_tx, event_rx) = unbounded_channel::<WinEvent>();
         let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
-        let (waker, wake_rx) = UiWaker::new();
-        let handle = WinHandle::new(event_rx, WinSender::new(cmd_tx, Some(waker)), 80, 24, true);
+        let waker = UiWaker::default();
+        let handle = WinHandle::new(
+            event_rx,
+            WinSender::new(cmd_tx, Some(waker.clone())),
+            80,
+            24,
+            true,
+        );
 
         handle.send(WinCommand::SetVisible(false));
         handle.send(WinCommand::SetVisible(true));
-        assert!(wake_rx.try_recv().is_ok(), "{NOT_WOKEN}");
-        assert!(wake_rx.try_recv().is_err(), "two commands are one frame");
+        assert!(waker.take_wake(), "{NOT_WOKEN}");
+        assert!(!waker.take_wake(), "two commands are one frame");
         assert_eq!(cmd_rx.len(), 2);
 
         handle.close();
-        assert!(wake_rx.try_recv().is_ok(), "{NOT_WOKEN}");
+        assert!(waker.take_wake(), "{NOT_WOKEN}");
     }
 
     #[test]

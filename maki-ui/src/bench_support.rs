@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use maki_agent::permissions::PermissionManager;
@@ -19,7 +20,6 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::OpenSession;
 use crate::app::App;
-use crate::decor_worker;
 use crate::storage_writer::StorageWriter;
 use crate::text_buffer::{Decoration, Mark, RuleSet, VirtTextPos};
 
@@ -242,8 +242,7 @@ pub fn settle_parse(app: &mut App) {
         if app.input_box.buffer.syntax_is_current() {
             return;
         }
-        decor_worker::wakes()
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("the parse never finished");
+        assert!(Instant::now() < deadline, "the parse never finished");
+        thread::yield_now();
     }
 }
