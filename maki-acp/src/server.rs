@@ -34,9 +34,10 @@ use maki_providers::settle_session;
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{SessionClaim, SessionError};
+use maki_storage::stdin;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdout};
+use tokio::io::{AsyncWriteExt, stdout};
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::{debug, info, warn};
@@ -165,19 +166,13 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// Lives in its own task because `read_line` is not cancel safe: the main loop
-/// waits on discovery too, and a dropped read would eat half a line.
 async fn read_stdin(tx: UnboundedSender<Incoming>) -> std::io::Result<()> {
-    let mut reader = BufReader::new(tokio::io::stdin());
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
-            return Ok(());
-        }
+    while let Some(line) = stdin::read_line().await? {
         if tx.send(Incoming::Line(line)).is_err() {
-            return Ok(());
+            break;
         }
     }
+    Ok(())
 }
 
 /// Static manifests miss providers that only list their models over the wire

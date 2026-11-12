@@ -32,9 +32,10 @@ use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
+use maki_storage::stdin;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdout};
+use tokio::io::{AsyncWriteExt, stdout};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -672,8 +673,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     .spawn(events);
 
     // Read on a blocking thread, so a stop does not wait for the next line.
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Ok(next) = stop.race(lines.next_line()).await {
+    while let Ok(next) = stop.race(stdin::read_line()).await {
         let Some(line) = next.context("read stdin")? else {
             break;
         };

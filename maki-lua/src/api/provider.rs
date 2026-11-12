@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::io::{BufRead, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use futures::StreamExt;
 use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::AgentError;
@@ -15,6 +17,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::{
     delete_plugin_auth, load_plugin_auth, lock_credentials, save_plugin_auth,
 };
+use maki_storage::stdin;
 use mlua::{
     Function, Lua, LuaSerdeExt, LuaString, MetaMethod, MultiValue, RegistryKey,
     Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
@@ -528,9 +531,7 @@ fn add_stdio(lua: &Lua, ctx: &Table) -> LuaResult<()> {
         lua.create_async_function(|_, opts: Table| async move {
             let label: String = opts.get("label").unwrap_or_default();
             let secret = opts.opt::<bool>("secret")?.unwrap_or(false);
-            spawn_blocking(move || read_answer(&label, secret))
-                .await
-                .map_err(mlua::Error::external)
+            Ok(read_answer(&label, secret).await)
         })?,
     )?;
     ctx.set(
@@ -542,58 +543,79 @@ fn add_stdio(lua: &Lua, ctx: &Table) -> LuaResult<()> {
     )
 }
 
-/// Reads one line of an answer from the terminal, off the Lua thread so a slow
+/// Reads one line of an answer from the terminal. The read yields, so a slow
 /// typist does not trip the 5s watchdog.
 ///
-/// A secret is read with the terminal in raw mode so the characters never reach
-/// the scrollback, and echoed as mask characters so there is still feedback
-/// that a key landed. Raw mode is given back whatever the read did.
-fn read_answer(label: &str, secret: bool) -> Pair<String> {
+/// A typed secret is read with the terminal in raw mode so the characters
+/// never reach the scrollback, and echoed as mask characters so there is still
+/// feedback that a key landed. Raw mode is given back whatever the read did. A
+/// piped secret is read as a line, from the same buffer as every other answer.
+async fn read_answer(label: &str, secret: bool) -> Pair<String> {
     print!("{label}");
-    if std::io::stdout().flush().is_err() {
+    if io::stdout().flush().is_err() {
         return (None, Some("cannot write to the terminal".to_owned()));
     }
-    if !secret {
-        let mut line = String::new();
-        return match std::io::stdin().lock().read_line(&mut line) {
-            Ok(_) => (Some(line.trim_end().to_owned()), None),
+    if !secret || !io::stdin().is_terminal() {
+        return match stdin::read_line().await {
+            Ok(line) => (Some(line.unwrap_or_default().trim_end().to_owned()), None),
             Err(e) => (None, Some(e.to_string())),
         };
     }
-    if let Err(e) = crossterm::terminal::enable_raw_mode() {
-        return (None, Some(e.to_string()));
-    }
-    let answer = read_masked();
-    let _ = crossterm::terminal::disable_raw_mode();
+    let answer = match RawMode::enable() {
+        Ok(_raw) => read_masked().await,
+        Err(e) => return (None, Some(e.to_string())),
+    };
     println!();
     answer
 }
 
-/// Raw mode hands over bytes, so the answer is gathered as bytes and decoded
-/// once at the end. Taking each one for a char would turn a typed accented
-/// letter into two wrong ones.
-fn read_masked() -> Pair<String> {
-    const BACKSPACE: u8 = 0x7f;
-    const CTRL_C: u8 = 0x03;
-    let mut answer = Vec::new();
-    for byte in std::io::stdin().lock().bytes() {
-        match byte {
-            Ok(b'\r' | b'\n') => break,
-            Ok(CTRL_C) => return (None, Some("cancelled".to_owned())),
-            Ok(BACKSPACE) => {
+/// Raw mode until dropped, so a prompt dropped mid-answer still gives the
+/// terminal back.
+struct RawMode;
+
+impl RawMode {
+    fn enable() -> io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Key events rather than raw bytes, so an accented letter, a paste and a
+/// backspace each count as whole characters.
+async fn read_masked() -> Pair<String> {
+    let mut keys = EventStream::new();
+    let mut answer = String::new();
+    while let Some(event) = keys.next().await {
+        let key = match event {
+            Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => key,
+            Ok(_) => continue,
+            Err(e) => return (None, Some(e.to_string())),
+        };
+        match key.code {
+            KeyCode::Enter => break,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return (None, Some("cancelled".to_owned()));
+            }
+            KeyCode::Backspace => {
                 if answer.pop().is_some() {
                     print!("\u{8} \u{8}");
                 }
             }
-            Ok(byte) => {
-                answer.push(byte);
+            KeyCode::Char(c) => {
+                answer.push(c);
                 print!("{SECRET_MASK}");
             }
-            Err(e) => return (None, Some(e.to_string())),
+            _ => continue,
         }
-        let _ = std::io::stdout().flush();
+        let _ = io::stdout().flush();
     }
-    (Some(String::from_utf8_lossy(&answer).into_owned()), None)
+    (Some(answer), None)
 }
 
 fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {

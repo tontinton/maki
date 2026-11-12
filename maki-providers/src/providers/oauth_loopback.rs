@@ -1,17 +1,16 @@
 use std::env;
 use std::future::{pending, poll_fn};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::net::{Ipv4Addr, Ipv6Addr, TcpListener as StdListener};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use maki_storage::stdin;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{self, UnboundedReceiver};
-use tokio::task::spawn_blocking;
 use tokio::time::{timeout, timeout_at};
 
 use crate::AgentError;
@@ -123,12 +122,11 @@ impl Server {
     /// A pasted redirect URL wins over a connection that arrives in the same
     /// moment, since the user typed it on purpose.
     pub(crate) async fn wait(&self, expected_state: &str) -> Result<CallbackResult, AgentError> {
-        let mut pastes = self.config.paste_fallback.then(paste_lines);
         let callback = async {
             loop {
                 tokio::select! {
                     biased;
-                    Some(pasted) = next_paste(&mut pastes) => {
+                    Some(pasted) = next_paste(self.config.paste_fallback) => {
                         return parse_callback_input(&pasted, expected_state);
                     }
                     accepted = accept_any(&self.listeners) => {
@@ -197,12 +195,19 @@ async fn accept_any(listeners: &[TcpListener]) -> io::Result<TcpStream> {
     .await
 }
 
-/// `None` once stdin is closed; without a paste reader it never answers.
-async fn next_paste(pastes: &mut Option<UnboundedReceiver<String>>) -> Option<String> {
-    match pastes {
-        Some(lines) => lines.recv().await,
-        None => pending().await,
+/// The next non-empty line typed on stdin, `None` once stdin is closed. Without
+/// the paste fallback it never answers.
+async fn next_paste(paste_fallback: bool) -> Option<String> {
+    if !paste_fallback {
+        return pending().await;
     }
+    while let Ok(Some(line)) = stdin::read_line().await {
+        let pasted = line.trim();
+        if !pasted.is_empty() {
+            return Some(pasted.to_owned());
+        }
+    }
+    None
 }
 
 /// Browsers resolve `localhost` to either stack, so both have to answer.
@@ -274,21 +279,6 @@ async fn write_http(
 
 fn request_path(target: &str) -> &str {
     target.split_once('?').map_or(target, |(path, _)| path)
-}
-
-/// Non-empty lines typed on stdin, until it closes or nobody listens.
-fn paste_lines() -> UnboundedReceiver<String> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(tokio::io::stdin()).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let pasted = line.trim().to_owned();
-            if !pasted.is_empty() && tx.send(pasted).is_err() {
-                return;
-            }
-        }
-    });
-    rx
 }
 
 fn parse_callback_target(target: &str, expected_state: &str) -> Result<CallbackResult, AgentError> {
@@ -401,22 +391,12 @@ pub(crate) async fn select_login_method(provider: &str) -> Result<LoginMethod, A
     }
 }
 
-/// Reads through std's stdin, whose buffer is shared by every prompt, so a
-/// piped answer that arrives together with the next one is not lost.
 pub(crate) async fn prompt(message: &str) -> Result<String, AgentError> {
-    let message = message.to_owned();
-    let line = spawn_blocking(move || {
-        print!("{message}");
-        io::stdout().flush()?;
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        io::Result::Ok(line)
-    })
-    .await?
-    .map_err(|e| AgentError::Config {
-        message: format!("prompt: {e}"),
-    })?;
-    Ok(line.trim().to_string())
+    stdin::prompt(message)
+        .await
+        .map_err(|e| AgentError::Config {
+            message: format!("prompt: {e}"),
+        })
 }
 
 #[cfg(test)]

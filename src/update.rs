@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use maki_storage::paths::canonicalize_clean;
+use maki_storage::stdin;
 use maki_storage::version::{self, VersionError};
 use maki_storage::{StateDir, StorageError};
 
@@ -209,14 +210,13 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
     Ok(())
 }
 
-fn prompt_yes(install_dir: &Path) -> bool {
+async fn prompt_yes(install_dir: &Path) -> bool {
     eprint!(
         "Install to {} and run this script? [y/N] ",
         install_dir.display()
     );
     let _ = std::io::stderr().flush();
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
+    matches!(stdin::read_line().await, Ok(Some(answer)) if answer.trim().eq_ignore_ascii_case("y"))
 }
 
 pub async fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
@@ -252,7 +252,7 @@ pub async fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateErro
         println!("{}", maki_ui::highlight_ansi(INSTALLER.lang, &script));
     }
 
-    if !skip_confirm && !prompt_yes(&install_dir) {
+    if !skip_confirm && !prompt_yes(&install_dir).await {
         println!("Aborted.");
         return Ok(());
     }
