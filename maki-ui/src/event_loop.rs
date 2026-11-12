@@ -770,7 +770,7 @@ impl<'t> EventLoop<'t> {
         let bg = spawn_model_fetch(Arc::clone(&model_policy));
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
 
-        let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
+        let notifier = terminal::TerminalNotifier::new(ui_config.notifications).await;
         let program_status = ui_config.program_status.then(ProgramStatusReporter::new);
         let ctx = SpawnCtx {
             storage,
