@@ -540,6 +540,7 @@ mod tests {
     use maki_agent::cancel::CancelTrigger;
     use mlua::Lua;
     use test_case::test_case;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use tokio::task::{LocalSet, spawn_local};
 
     use super::*;
@@ -854,8 +855,8 @@ mod tests {
     const HOOK_SURVIVED_MSG: &str = "a hook that waits from outside its coroutine must fail there";
     const TASK_SURVIVED_MSG: &str = "the task must keep working after a hook blew up";
 
-    fn install_notify(lua: &Lua) -> flume::Receiver<()> {
-        let (fired_tx, fired_rx) = flume::bounded(1);
+    fn install_notify(lua: &Lua) -> UnboundedReceiver<()> {
+        let (fired_tx, fired_rx) = unbounded_channel();
         let notify = lua
             .create_function(move |_, ()| {
                 fired_tx.send(()).ok();
@@ -886,7 +887,7 @@ mod tests {
     async fn on_cancel_hook_fires_while_gather_is_still_parked(bad_hook_body: &str) {
         let (lua, _tbl) = setup();
         let (trigger, scope) = live_scope(&lua);
-        let fired_rx = install_notify(&lua);
+        let mut fired_rx = install_notify(&lua);
 
         let code = format!(
             r#"
@@ -909,7 +910,7 @@ mod tests {
                 vals = scope.scope_future(lua.load(&code).eval_async::<MultiValue>()) => vals,
                 vals = async {
                     trigger.cancel();
-                    fired_rx.recv_async().await.expect(HOOK_NEVER_FIRED);
+                    fired_rx.recv().await.expect(HOOK_NEVER_FIRED);
                     assert!(
                         !lua.globals().get::<bool>("gather_returned").unwrap(),
                         "{HOOK_LATE_MSG}"

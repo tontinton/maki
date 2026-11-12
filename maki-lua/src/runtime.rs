@@ -6191,6 +6191,7 @@ mod tests {
     use std::task::{Context, Poll, Wake, Waker};
     use test_case::test_case;
     use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
 
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -6641,14 +6642,14 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let g = Rc::new(gate());
-                let (release_tx, release_rx) = flume::unbounded::<()>();
+                let release = CancellationToken::new();
                 let tasks: Vec<_> = (0..MAX_INFLIGHT_TOOLS + 1)
                     .map(|_| {
                         let g = Rc::clone(&g);
-                        let release_rx = release_rx.clone();
+                        let release = release.clone();
                         spawn_local(async move {
                             let _guard = g.acquire().await;
-                            release_rx.recv_async().await.ok();
+                            release.cancelled().await;
                         })
                     })
                     .collect();
@@ -6656,7 +6657,7 @@ mod tests {
                     yield_now().await;
                 }
                 assert_eq!(g.in_flight(), MAX_INFLIGHT_TOOLS);
-                drop(release_tx);
+                release.cancel();
                 for t in tasks {
                     t.await.unwrap();
                 }
@@ -6672,10 +6673,10 @@ mod tests {
     async fn slot_cover_does_not_leak_into_a_sibling_task() {
         LocalSet::new()
             .run_until(async {
-                let (release_tx, release_rx) = flume::unbounded::<()>();
+                let (release_tx, mut release_rx) = unbounded_channel::<()>();
                 let holder = spawn_local(covered(None, async move {
                     let entered = under_inflight_slot();
-                    release_rx.recv_async().await.ok();
+                    release_rx.recv().await;
                     (entered, under_inflight_slot())
                 }));
                 yield_now().await;
@@ -7195,7 +7196,7 @@ mod tests {
     /// before the loop can, so the reported time is a lower bound.
     fn hot_loop_expecting_kill(lua: &Lua) -> (mlua::Error, Duration) {
         let f = lua.load("while true do end").into_function().unwrap();
-        let (tx, rx) = flume::bounded(1);
+        let (tx, rx) = sync_channel(1);
         let start = Instant::now();
         thread::spawn(move || drop(tx.send(f.call::<bool>(()))));
         let err = rx
@@ -7468,7 +7469,7 @@ mod tests {
     const HOOK_NEVER_FIRED: &str = "cancel hook never fired";
     const HOOK_SKIPPED_MSG: &str = "a hook registered after the bad one never fired";
 
-    fn recording_hook(lua: &Lua, tx: &flume::Sender<&'static str>, mark: &'static str) {
+    fn recording_hook(lua: &Lua, tx: &UnboundedSender<&'static str>, mark: &'static str) {
         let tx = tx.clone();
         let hook = lua
             .create_function(move |_, ()| {
@@ -7503,7 +7504,7 @@ mod tests {
         let lua = Lua::new();
         let scope = TaskScope::new(&lua, TaskCell::new(cancelled_token(), None, None));
         let _active = scope.enter();
-        let (tx, fired_rx) = flume::unbounded();
+        let (tx, mut fired_rx) = unbounded_channel();
         let outer = lua
             .create_function(move |lua, ()| {
                 tx.send(HOOK_GOOD_MARK).ok();
@@ -7519,7 +7520,7 @@ mod tests {
         register_cancel_hook(&lua, outer).unwrap();
 
         assert_eq!(
-            fired_rx.try_iter().collect::<Vec<_>>(),
+            iter::from_fn(|| fired_rx.try_recv().ok()).collect::<Vec<_>>(),
             [HOOK_GOOD_MARK, HOOK_NESTED_MARK],
             "{HOOK_NEVER_FIRED}"
         );
@@ -7541,7 +7542,7 @@ mod tests {
         let _active = scope.enter();
         let bad = lua.load(bad_body).into_function().unwrap();
         register_cancel_hook(&lua, bad).unwrap();
-        let (fired_tx, fired_rx) = flume::unbounded();
+        let (fired_tx, mut fired_rx) = unbounded_channel();
         for mark in HOOK_MARKS {
             recording_hook(&lua, &fired_tx, mark);
         }
@@ -7550,7 +7551,7 @@ mod tests {
         poll_cancelled_scope_once(&scope);
 
         assert_eq!(
-            fired_rx.try_iter().collect::<Vec<_>>(),
+            iter::from_fn(|| fired_rx.try_recv().ok()).collect::<Vec<_>>(),
             HOOK_MARKS,
             "{HOOK_SKIPPED_MSG}"
         );
@@ -7565,7 +7566,7 @@ mod tests {
         let lua = Lua::new();
         let (trigger, scope) = live_scope(&lua);
         let _active = scope.enter();
-        let (fired_tx, fired_rx) = flume::unbounded();
+        let (fired_tx, mut fired_rx) = unbounded_channel();
         recording_hook(&lua, &fired_tx, HOOK_GOOD_MARK);
         trigger.cancel();
 
@@ -7574,7 +7575,7 @@ mod tests {
             assert!((&mut nested).now_or_never().is_none());
         }
 
-        assert_eq!(fired_rx.try_iter().count(), 1);
+        assert_eq!(iter::from_fn(|| fired_rx.try_recv().ok()).count(), 1);
     }
 
     /// The `RegistryKey` is the last reference to a hook, so holding it pins
@@ -7650,7 +7651,7 @@ mod tests {
     fn cancel_hook_runs_under_its_own_task_handle() {
         let lua = Lua::new();
         let (trigger, scope) = live_scope(&lua);
-        let (seen_tx, seen_rx) = flume::bounded(1);
+        let (seen_tx, seen_rx) = sync_channel(1);
         let hook = lua
             .create_function(move |lua, ()| {
                 seen_tx.send(active_task(lua)).ok();
@@ -7663,7 +7664,7 @@ mod tests {
         }
         let (_sibling_trigger, sibling) = live_scope(&lua);
         let _sibling_active = sibling.enter();
-        let (sibling_tx, sibling_rx) = flume::bounded(1);
+        let (sibling_tx, mut sibling_rx) = unbounded_channel();
         recording_hook(&lua, &sibling_tx, HOOK_GOOD_MARK);
         trigger.cancel();
 
@@ -7688,17 +7689,17 @@ mod tests {
         let lua = Lua::new();
         let (trigger, scope) = live_scope(&lua);
         let _active = scope.enter();
-        let (fired_tx, fired_rx) = flume::bounded(1);
+        let (fired_tx, mut fired_rx) = unbounded_channel();
         recording_hook(&lua, &fired_tx, HOOK_GOOD_MARK);
-        let (item_tx, item_rx) = flume::bounded(1);
+        let (item_tx, mut item_rx) = unbounded_channel();
 
         let out = wake_or_fail(async {
             tokio::select! {
                 biased;
-                out = scope.scope_future(async move { item_rx.recv_async().await.unwrap() }) => out,
+                out = scope.scope_future(async move { item_rx.recv().await.unwrap() }) => out,
                 out = async move {
                     trigger.cancel();
-                    assert_eq!(fired_rx.recv_async().await.ok(), Some(HOOK_GOOD_MARK));
+                    assert_eq!(fired_rx.recv().await, Some(HOOK_GOOD_MARK));
                     item_tx.send(HOOK_INNER_OUTPUT).unwrap();
                     pending().await
                 } => out,
@@ -7724,7 +7725,7 @@ mod tests {
         let _active = scope.enter();
         let inner_ran = Arc::new(AtomicBool::new(false));
         let seen_by_hook = Arc::clone(&inner_ran);
-        let (fired_tx, fired_rx) = flume::bounded(1);
+        let (fired_tx, fired_rx) = sync_channel(1);
         let hook = lua
             .create_function(move |_, ()| {
                 fired_tx.send(seen_by_hook.load(Ordering::SeqCst)).ok();
@@ -7760,7 +7761,7 @@ mod tests {
         let lua = Lua::new();
         let (trigger, scope) = live_scope(&lua);
         let _active = scope.enter();
-        let (fired_tx, fired_rx) = flume::unbounded();
+        let (fired_tx, mut fired_rx) = unbounded_channel();
         let tx = fired_tx.clone();
         let arming = lua
             .create_function(move |lua, ()| {
@@ -7777,7 +7778,7 @@ mod tests {
 
         poll_cancelled_scope_once(&scope);
 
-        let mut fired = fired_rx.try_iter().collect::<Vec<_>>();
+        let mut fired = iter::from_fn(|| fired_rx.try_recv().ok()).collect::<Vec<_>>();
         fired.sort_unstable();
         let mut expected = HOOK_MARKS.to_vec();
         expected.push(HOOK_NESTED_MARK);
@@ -7804,13 +7805,13 @@ mod tests {
     async fn cancel_hook_in_a_spawned_task_fires_on_the_inherited_cancel() {
         let lua = Lua::new();
         let (trigger, parent) = live_scope(&lua);
-        let (fired_tx, fired_rx) = flume::unbounded();
+        let (fired_tx, mut fired_rx) = unbounded_channel();
         {
             let _active = parent.enter();
             recording_hook(&lua, &fired_tx, HOOK_PARENT_MARK);
         }
 
-        let (armed_tx, armed_rx) = flume::bounded(1);
+        let (armed_tx, mut armed_rx) = unbounded_channel();
         let tx = fired_tx.clone();
         let arm = lua
             .create_function(move |lua, ()| {
@@ -7840,9 +7841,9 @@ mod tests {
 
         wake_or_fail(LocalSet::new().run_until(async {
             spawn_async_task(&lua, &Rc::new(gate()), task);
-            armed_rx.recv_async().await.unwrap();
+            armed_rx.recv().await.unwrap();
             trigger.cancel();
-            assert_eq!(fired_rx.recv_async().await.ok(), Some(HOOK_CHILD_MARK));
+            assert_eq!(fired_rx.recv().await, Some(HOOK_CHILD_MARK));
         }))
         .await;
 
@@ -7854,7 +7855,7 @@ mod tests {
         poll_cancelled_scope_once(&parent);
 
         assert_eq!(
-            fired_rx.try_iter().collect::<Vec<_>>(),
+            iter::from_fn(|| fired_rx.try_recv().ok()).collect::<Vec<_>>(),
             [HOOK_PARENT_MARK],
             "the parent must fire its own hook, once, and not the child's"
         );
@@ -7879,7 +7880,7 @@ mod tests {
         cell: TaskCell,
         setup: impl FnOnce(&Lua, oneshot::Sender<ToolCallReply>) + Send + 'static,
     ) -> (Result<String, String>, Duration) {
-        let (tx, rx) = flume::bounded(1);
+        let (tx, rx) = sync_channel(1);
         thread::spawn(move || {
             let lua = Lua::new();
             let scope = TaskScope::new(&lua, cell);
@@ -7975,7 +7976,7 @@ mod tests {
     #[test_case(ParkedWake::ContextDropped, Err(NIL_WITHOUT_FINISH_MSG.to_owned()) ; "context_dropped")]
     #[test_case(ParkedWake::JobsGone, Err(NIL_WITHOUT_FINISH_MSG.to_owned()) ; "jobs_gone")]
     fn dispatch_async_wakes_from_its_park(wake: ParkedWake, expected: Result<String, String>) {
-        let (tx, rx) = flume::bounded(1);
+        let (tx, rx) = sync_channel(1);
         thread::spawn(move || {
             let (trigger, token) = CancelToken::new();
             let cell = TaskCell::new(token, None, None);

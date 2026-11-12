@@ -5,6 +5,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
 
 use common::{
@@ -770,7 +771,7 @@ fn background_without_a_chat_session_runs_blocking() {
 /// token and its own event channel, executing on its own thread.
 struct ModelCall {
     events: UnboundedReceiver<Envelope>,
-    result: flume::Receiver<ToolDoneEvent>,
+    result: Receiver<ToolDoneEvent>,
 }
 
 impl ModelCall {
@@ -783,7 +784,7 @@ impl ModelCall {
     ) -> Self {
         let (ctx, events) = call_ctx(reg, chat.id, run, id);
         let reg = Arc::clone(reg);
-        let (result_tx, result) = flume::bounded(1);
+        let (result_tx, result) = sync_channel(1);
         thread::spawn(move || {
             let _ = result_tx.send(exec(&reg, TASK_TOOL, input, &ctx));
         });
@@ -852,7 +853,7 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
         request_move(&host.event_handle(), SECOND_CALL_ID),
         MoveOutcome::NoHook
     );
-    assert!(second.result.is_empty());
+    assert!(second.result.try_recv().is_err());
     assert_eq!(probe(&reg)["acquired"], json!(1));
 
     wait(&reg, json!({ "parked": SCENARIO_PARKED }));

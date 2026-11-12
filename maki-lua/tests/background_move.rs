@@ -4,6 +4,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 use std::thread::{self, JoinHandle};
 
 use common::{
@@ -495,7 +496,7 @@ fn a_reload_passes_a_moved_call_with_a_parked_nested_child() {
     assert_eq!(host.request(), MoveOutcome::Moved);
     assert!(running.result().backgrounded);
 
-    let (unloaded_tx, unloaded_rx) = flume::bounded(1);
+    let (unloaded_tx, unloaded_rx) = sync_channel(1);
     let reloading = thread::spawn(move || {
         let _ = unloaded_tx.send(host.host.unload(BYSTANDER_PLUGIN).is_ok());
         host

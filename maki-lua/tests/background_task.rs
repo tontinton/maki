@@ -5,6 +5,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 use std::thread;
 
 use common::{Chat, Parked, WAIT, call_ctx, done_text, exec, next_task_event, request_move};
@@ -272,7 +273,7 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
     parked.wait_started();
 
     let reg = Arc::clone(&host.reg);
-    let (receipt_tx, receipt_rx) = flume::bounded(1);
+    let (receipt_tx, receipt_rx) = sync_channel(1);
     let waiter = thread::spawn(move || {
         receipt_tx
             .send(exec(&reg, TASK_TOOL, task_input(), &second))
@@ -495,7 +496,7 @@ fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
     parked.release.send(()).unwrap();
     parked.wait_started();
     parked.release.send(()).unwrap();
-    let turns: Vec<_> = parked.user_turns.drain().collect();
+    let turns: Vec<_> = parked.user_turns.try_iter().collect();
     assert_eq!(turns, [vec![PROMPT], vec![MESSAGE, PROMPT]]);
     host.task_dones(&[CALL_ID, SECOND_CALL_ID]);
 }
