@@ -95,7 +95,7 @@ pub async fn run(
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
-    let prompt_slots = plugin_host.event_handle().collect_prompt_slots(None);
+    let prompt_slots = plugin_host.event_handle().collect_prompt_slots(None).await;
 
     let event_handle = plugin_host.event_handle();
     let interrupt = Interrupt::install();

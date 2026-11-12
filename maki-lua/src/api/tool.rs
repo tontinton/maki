@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -300,7 +301,7 @@ impl Tool for LuaTool {
                 None => Cow::Borrowed(&self.meta.description),
             };
         }
-        let (reply_tx, reply_rx) = flume::bounded(1);
+        let (reply_tx, reply_rx) = sync_channel(1);
         let sent = self
             .tx
             .send(Request::Describe {

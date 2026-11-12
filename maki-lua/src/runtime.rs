@@ -10,6 +10,8 @@ use std::pin::{Pin, pin};
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -444,7 +446,7 @@ pub enum Request {
     },
     /// Takes the package operations Lua recorded, leaving the queue empty.
     TakePackOps {
-        reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
+        reply: SyncSender<Vec<crate::api::pack::PackOp>>,
     },
     /// Closes the queue and hands over whatever is still in it.
     ///
@@ -452,13 +454,13 @@ pub enum Request {
     /// activation between a read and a separate close, and closing without
     /// taking would strand it in a queue nobody reads again.
     SealPackOps {
-        reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
+        reply: SyncSender<Vec<crate::api::pack::PackOp>>,
     },
     LoadSource {
         name: Arc<str>,
         chunks: Vec<LoadChunk>,
         context: LoadContext,
-        reply: flume::Sender<LoadResult>,
+        reply: SyncSender<LoadResult>,
     },
     /// One call into a hook a plugin registered with `maki.provider`.
     ///
@@ -544,13 +546,13 @@ pub enum Request {
     },
     ClearPlugin {
         plugin: Arc<str>,
-        reply: flume::Sender<()>,
+        reply: SyncSender<()>,
     },
     RunInitLua {
         source: String,
         scope: ConfigScope,
         plugin_dir: Option<PathBuf>,
-        reply: flume::Sender<Result<Option<RawConfig>, PluginError>>,
+        reply: SyncSender<Result<Option<RawConfig>, PluginError>>,
     },
     RunCommand {
         plugin: Arc<str>,
@@ -563,15 +565,15 @@ pub enum Request {
     /// Session whose prompt is being built, if any; see `run_hint_callback`.
     CollectPromptSlots {
         session: Option<String>,
-        reply: flume::Sender<ResolvedPrompts>,
+        reply: oneshot::Sender<ResolvedPrompts>,
     },
     CollectPluginOptions {
-        reply: flume::Sender<PluginOptionSpecs>,
+        reply: SyncSender<PluginOptionSpecs>,
     },
     /// Packages `init.lua` declared. Read after the init files have run, since
     /// that is when the declared set is complete.
     CollectPackages {
-        reply: flume::Sender<Vec<crate::api::pack::Declared>>,
+        reply: SyncSender<Vec<crate::api::pack::Declared>>,
     },
     CollectPackageContext {
         reply: oneshot::Sender<(Vec<crate::api::pack::Declared>, BTreeSet<String>)>,
@@ -579,7 +581,7 @@ pub enum Request {
     RunPackLoader {
         declared: crate::api::pack::Declared,
         context: LoadContext,
-        reply: flume::Sender<LoadResult>,
+        reply: SyncSender<LoadResult>,
     },
     Shutdown,
     RestoreToolAsync {
@@ -611,7 +613,7 @@ pub enum Request {
         plugin: Arc<str>,
         tool: Arc<str>,
         dctx: Value,
-        reply: flume::Sender<Option<String>>,
+        reply: SyncSender<Option<String>>,
     },
     /// Runs the tool's `start` fn so it can publish a live buf before the
     /// permission prompt paints. Best-effort: Lua errors are logged, never
@@ -5621,7 +5623,7 @@ pub fn spawn(
     let layered_thread = Arc::clone(&layered);
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let shutdown_thread = Arc::clone(&shutdown);
-    let (init_tx, init_rx) = flume::bounded::<Result<(), PluginError>>(1);
+    let (init_tx, init_rx) = sync_channel::<Result<(), PluginError>>(1);
     let (ui_action_tx, ui_action_rx) = unbounded_channel::<UiAction>();
     let ui_waker = UiWaker::default();
     let ui_waker_thread = ui_waker.clone();

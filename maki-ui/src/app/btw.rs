@@ -310,7 +310,7 @@ mod tests {
             share_history(&mut app, frame, None);
         }
         assert_eq!(ask(&mut app).await.system, expected);
-        let prompts = host.event_handle().collect_prompt_slots(None);
+        let prompts = host.event_handle().collect_prompt_slots(None).await;
         assert_eq!(
             prompts.get(PromptId::System, Slot::Identity)[0].content,
             "1"
