@@ -112,6 +112,12 @@ without the extension: `lua/browser.lua` is `require("browser")`,
 `lua/acme/tools.lua` is `require("acme.tools")`. `require` is sandboxed to
 that directory, you cannot reach files outside it.
 
+A module's top level may yield, so `maki.fs` and the other async APIs work
+while it loads. A `require` of a module another task is still loading waits
+for that load to finish, and a `require` that closes a cycle gets `true`. Where
+Lua cannot yield, like a `table.sort` comparator, requiring a module that is
+still loading is an error.
+
 ## Creating a plugin
 
 1. Write the code in `~/.config/maki/lua/<name>.lua`. The `maki` global is

@@ -433,6 +433,9 @@ maki.pack.get({names?}, {opts?})
 
 Get package state without changing the installed set.
 
+Reading the lockfile yields, so this cannot run in a callback that must
+not yield, like a `table.sort` comparator or a metamethod.
+
 **Parameters:**
 
 - `{names?}` (`table?`) Package names. Omit for all managed packages.

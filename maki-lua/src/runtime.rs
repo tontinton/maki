@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_int};
 use std::fmt::Display;
-use std::future::{Future, pending};
+use std::future::{Future, pending, poll_fn};
 use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::sync_channel;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle as LocalJoinHandle, LocalSet, spawn_local, yield_now};
 use tokio::time::{sleep, sleep_until, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -1642,13 +1642,150 @@ impl RequireRoot {
     }
 }
 
+/// A module whose body is running.
+#[derive(Default)]
+struct Load {
+    done: Arc<Notify>,
+    /// Modules other tasks are loading that this load waits for, in its own
+    /// body or in a load nested in it.
+    waits_for: Vec<Arc<str>>,
+}
+
+/// One plugin's modules whose body is still running. A body can yield, so
+/// another task can ask for a module halfway through its load.
+#[derive(Default)]
+struct ModuleLoads {
+    pending: Mutex<HashMap<Arc<str>, Load>>,
+    /// The modules whose body the current poll is running, innermost last.
+    polling: Mutex<Vec<Arc<str>>>,
+}
+
+/// What a require of a module that is not loaded yet has to do.
+enum LoadState {
+    Absent,
+    /// The load would wait for this require's own caller, in this task or
+    /// through another task waiting on it.
+    Cycle,
+    Elsewhere(Arc<Notify>, Waiting),
+}
+
+impl ModuleLoads {
+    fn lock_pending(&self) -> MutexGuard<'_, HashMap<Arc<str>, Load>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_polling(&self) -> MutexGuard<'_, Vec<Arc<str>>> {
+        self.polling.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn enter(&self, name: &Arc<str>) -> PollFrame<'_> {
+        self.lock_polling().push(Arc::clone(name));
+        PollFrame(self)
+    }
+
+    fn state(self: &Arc<Self>, modname: &str) -> LoadState {
+        let mut pending = self.lock_pending();
+        let Some(done) = pending.get(modname).map(|load| Arc::clone(&load.done)) else {
+            return LoadState::Absent;
+        };
+        let chain = self.lock_polling().clone();
+        if leads_into(&pending, modname, &chain) {
+            return LoadState::Cycle;
+        }
+        let on = Arc::<str>::from(modname);
+        for name in &chain {
+            if let Some(load) = pending.get_mut(name) {
+                load.waits_for.push(Arc::clone(&on));
+            }
+        }
+        let waiting = Waiting {
+            loads: Arc::clone(self),
+            chain,
+            on,
+        };
+        LoadState::Elsewhere(done, waiting)
+    }
+}
+
+/// Whether `modname` is on `chain` or its load waits, through any number of
+/// other loads, for one that is. Waiting edges only go in after this check, so
+/// they never form a loop.
+fn leads_into(pending: &HashMap<Arc<str>, Load>, modname: &str, chain: &[Arc<str>]) -> bool {
+    chain.iter().any(|name| &**name == modname)
+        || pending.get(modname).is_some_and(|load| {
+            load.waits_for
+                .iter()
+                .any(|next| leads_into(pending, next, chain))
+        })
+}
+
+/// A module on [`ModuleLoads::polling`] for one poll of its body.
+struct PollFrame<'a>(&'a ModuleLoads);
+
+impl Drop for PollFrame<'_> {
+    fn drop(&mut self) {
+        self.0.lock_polling().pop();
+    }
+}
+
+/// Marks a module as loading until its load finishes, fails or is dropped,
+/// then wakes whoever waits for it, so a failed or cancelled require never
+/// leaves the module wedged as in progress. The pending `require` call holds
+/// it, so the collector can drop it.
+struct PendingLoad {
+    loads: Arc<ModuleLoads>,
+    name: Arc<str>,
+}
+
+impl PendingLoad {
+    fn start(loads: &Arc<ModuleLoads>, name: &Arc<str>) -> Self {
+        loads
+            .lock_pending()
+            .insert(Arc::clone(name), Load::default());
+        Self {
+            loads: Arc::clone(loads),
+            name: Arc::clone(name),
+        }
+    }
+}
+
+impl Drop for PendingLoad {
+    fn drop(&mut self) {
+        let load = self.loads.lock_pending().remove(&self.name);
+        if let Some(load) = load {
+            load.done.notify_waiters();
+        }
+    }
+}
+
+/// The loads on one poll's stack, recorded as waiting for `on` until the
+/// wait ends. Held by the pending `require` call, so the collector can drop it.
+struct Waiting {
+    loads: Arc<ModuleLoads>,
+    chain: Vec<Arc<str>>,
+    on: Arc<str>,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let mut pending = self.loads.lock_pending();
+        for name in &self.chain {
+            if let Some(load) = pending.get_mut(name)
+                && let Some(at) = load.waits_for.iter().position(|on| *on == self.on)
+            {
+                load.waits_for.swap_remove(at);
+            }
+        }
+    }
+}
+
 struct ModuleLoader {
     bundled: BundledModules,
     require_root: Option<RequireRoot>,
     env: Table,
     codegen: CodegenQueue,
     loaded: Table,
-    loading: Table,
+    loads: Arc<ModuleLoads>,
 }
 
 impl ModuleLoader {
@@ -1711,7 +1848,11 @@ impl ModuleLoader {
     /// Both forms Neovim accepts are tried, `<mod>.lua` before
     /// `<mod>/init.lua`. Every bundled candidate is tried before any plugin
     /// file, so a package still cannot shadow a bundled module.
-    fn load(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+    ///
+    /// The lookup reads with `std::fs` on purpose: a require of a module that
+    /// does not yield then answers on its first poll, so it still works where
+    /// Lua cannot yield, like a `table.sort` comparator.
+    fn find(&self, lua: &Lua, modname: &str) -> Result<Function, mlua::Error> {
         let base = modname.replace('.', "/");
         let candidates = [format!("{base}.lua"), format!("{base}/init.lua")];
 
@@ -1740,24 +1881,43 @@ impl ModuleLoader {
         };
 
         queue_codegen(&self.codegen, &func);
-        func.call(())
+        Ok(func)
     }
 
-    fn require(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+    /// A module body runs as its own call and may yield, so its top level can
+    /// use the async `maki.*` APIs. A require from another task while it runs
+    /// waits for that load. A require that is part of the load gets `true`, as
+    /// for any cycle.
+    ///
+    /// Where the caller cannot yield, like a `table.sort` comparator, the body
+    /// runs as a plain call instead. A body that yields then fails inside the
+    /// require, rather than leaving a half-run load behind for the collector.
+    async fn require(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
         if modname.is_empty() {
             return Err(mlua::Error::runtime(
                 "require: module name must be non-empty",
             ));
         }
+        // SAFETY: the first poll runs inside the call, so the state is the
+        // live thread that called `require`, and the check only reads it.
+        let can_yield = lua.exec_raw_lua(|raw| unsafe { ffi::lua_isyieldable(raw.state()) } != 0);
 
-        if let Ok(cached) = self.loaded.get::<LuaValue>(modname)
-            && cached != LuaValue::Nil
-        {
-            return Ok(cached);
-        }
-
-        if self.loading.opt_bool(modname).unwrap_or(false) {
-            return Ok(LuaValue::Boolean(true));
+        loop {
+            if let Ok(cached) = self.loaded.get::<LuaValue>(modname)
+                && cached != LuaValue::Nil
+            {
+                return Ok(cached);
+            }
+            match self.loads.state(modname) {
+                LoadState::Absent => break,
+                LoadState::Cycle => return Ok(LuaValue::Boolean(true)),
+                LoadState::Elsewhere(..) if !can_yield => {
+                    return Err(mlua::Error::runtime(format!(
+                        "require '{modname}': still loading in another task, and this call cannot wait for it"
+                    )));
+                }
+                LoadState::Elsewhere(done, _waiting) => done.notified().await,
+            }
         }
 
         if let Some(module) = docs_render::virtual_module(lua, modname) {
@@ -1766,12 +1926,20 @@ impl ModuleLoader {
             return Ok(LuaValue::Table(module));
         }
 
-        // Cleared on every path, so a failed require never leaves the module
-        // wedged as "in progress".
-        self.loading.set(modname, true)?;
-        let result = self.load(lua, modname);
-        self.loading.set(modname, LuaValue::Nil)?;
-        let result = result?;
+        let func = self.find(lua, modname)?;
+        let name = Arc::from(modname);
+        let _pending = PendingLoad::start(&self.loads, &name);
+        let result = if can_yield {
+            let mut body = pin!(func.call_async::<LuaValue>(()));
+            poll_fn(|cx| {
+                let _frame = self.loads.enter(&name);
+                body.as_mut().poll(cx)
+            })
+            .await?
+        } else {
+            let _frame = self.loads.enter(&name);
+            func.call::<LuaValue>(())?
+        };
 
         let stored = if result == LuaValue::Nil {
             LuaValue::Boolean(true)
@@ -3985,17 +4153,19 @@ impl LuaRuntime {
         env: &mlua::Table,
         require_root: Option<RequireRoot>,
     ) -> Result<Function, mlua::Error> {
-        let loader = ModuleLoader {
+        let loader = Arc::new(ModuleLoader {
             bundled: self.bundled.clone(),
             require_root,
             env: env.clone(),
             codegen: self.codegen_queue.clone(),
             loaded: self.lua.create_table()?,
-            loading: self.lua.create_table()?,
-        };
+            loads: Arc::default(),
+        });
 
-        self.lua
-            .create_function(move |lua, modname: String| loader.require(lua, &modname))
+        self.lua.create_async_function(move |lua, modname: String| {
+            let loader = Arc::clone(&loader);
+            async move { loader.require(&lua, &modname).await }
+        })
     }
 
     /// `plugins.<name>` options only reach a plugin through
@@ -6322,7 +6492,12 @@ mod tests {
         WaitLease,
         DepthGuard,
         TaskScope,
+        PendingLoad,
+        Waiting,
     }
+
+    const TEST_MODULE: &str = "slow";
+    const OUTER_MODULE: &str = "outer";
 
     /// Frees `value` the way the collector frees a coroutine parked on it:
     /// inside `collect_userdata`, where any VM call aborts the process.
@@ -6341,6 +6516,8 @@ mod tests {
     #[test_case(LuaOwned::WaitLease ; "wait_lease")]
     #[test_case(LuaOwned::DepthGuard ; "depth_guard")]
     #[test_case(LuaOwned::TaskScope ; "task_scope")]
+    #[test_case(LuaOwned::PendingLoad ; "pending_load")]
+    #[test_case(LuaOwned::Waiting ; "waiting")]
     fn dropped_by_collector_releases_its_hold(owned: LuaOwned) {
         let lua = Lua::new();
         match owned {
@@ -6382,6 +6559,42 @@ mod tests {
                 assert!(
                     with_jobs(&lua, |store| store.is_empty(&owner)),
                     "the next store access must reap the task's jobs"
+                );
+            }
+            LuaOwned::PendingLoad => {
+                let loads = Arc::<ModuleLoads>::default();
+                let pending = PendingLoad::start(&loads, &Arc::from(TEST_MODULE));
+                let LoadState::Elsewhere(done, _waiting) = loads.state(TEST_MODULE) else {
+                    panic!("the load must be pending");
+                };
+                let woken = done.notified();
+
+                drop_in_collector(&lua, pending);
+
+                assert!(woken.now_or_never().is_some(), "a waiter must wake");
+                assert!(
+                    matches!(loads.state(TEST_MODULE), LoadState::Absent),
+                    "the module must be free to load again"
+                );
+            }
+            LuaOwned::Waiting => {
+                let loads = Arc::<ModuleLoads>::default();
+                let outer = Arc::from(OUTER_MODULE);
+                let _outer = PendingLoad::start(&loads, &outer);
+                let _slow = PendingLoad::start(&loads, &Arc::from(TEST_MODULE));
+                let waiting = {
+                    let _frame = loads.enter(&outer);
+                    let LoadState::Elsewhere(_, waiting) = loads.state(TEST_MODULE) else {
+                        panic!("the load must be pending");
+                    };
+                    waiting
+                };
+
+                drop_in_collector(&lua, waiting);
+
+                assert!(
+                    loads.lock_pending()[OUTER_MODULE].waits_for.is_empty(),
+                    "the wait must be taken back"
                 );
             }
         }
