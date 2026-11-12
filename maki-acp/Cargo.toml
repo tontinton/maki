@@ -15,13 +15,13 @@ jiff = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
-flume = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 color-eyre = { workspace = true }
 
 [dev-dependencies]
+flume = { workspace = true }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 

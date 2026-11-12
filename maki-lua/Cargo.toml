@@ -34,7 +34,6 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 strum = { workspace = true }
-flume = { workspace = true }
 futures = { workspace = true }
 pin-project-lite = { workspace = true }
 tree-sitter = { workspace = true }
@@ -90,6 +89,7 @@ rustix = { workspace = true }
 base64 = { workspace = true }
 criterion = { workspace = true }
 fastrand = { workspace = true }
+flume = { workspace = true }
 image = { workspace = true }
 jiff = { workspace = true }
 maki-agent = { workspace = true }

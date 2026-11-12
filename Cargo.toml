@@ -129,7 +129,7 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 keyring = "4"
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-flume = { version = "0.12", default-features = false, features = ["async", "select"] }
+flume = { version = "0.12", default-features = false, features = ["async"] }
 pin-project-lite = "0.2"
 rustix = { version = "1", features = ["event", "fs", "process"] }
 semver = "1"
