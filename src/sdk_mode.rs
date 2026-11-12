@@ -8,10 +8,9 @@
 //! `MakiId` canonical form.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
 use std::mem;
 use std::path::Path;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use color_eyre::Result;
@@ -35,8 +34,8 @@ use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdout};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -413,7 +412,7 @@ fn maki_to_claude_tool_name(name: &str) -> &str {
 #[derive(Clone)]
 struct SdkWriter {
     session_id: SessionRef,
-    out_tx: mpsc::Sender<String>,
+    out_tx: UnboundedSender<String>,
 }
 
 impl SdkWriter {
@@ -599,11 +598,12 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         stop: stop.clone(),
     });
 
-    let (out_tx, out_rx) = mpsc::channel::<String>();
-    let writer_thread = std::thread::spawn(move || {
-        let mut stdout = io::stdout().lock();
-        while let Ok(line) = out_rx.recv() {
-            if writeln!(stdout, "{line}").and(stdout.flush()).is_err() {
+    let (out_tx, mut out_rx) = unbounded_channel::<String>();
+    let writer_task = tokio::spawn(async move {
+        let mut out = stdout();
+        while let Some(mut line) = out_rx.recv().await {
+            line.push('\n');
+            if out.write_all(line.as_bytes()).await.is_err() || out.flush().await.is_err() {
                 break;
             }
         }
@@ -776,7 +776,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     // emits once it has answered every prompt stdin queued.
     let reported = pump.await.context("event pump")?;
     let track = headless::await_shutdown(task).await;
-    // Reaps session-owned plugin jobs before the writer thread joins: an
+    // Reaps session-owned plugin jobs before the writer task ends: an
     // orphan inheriting stdout would keep an orchestrator's read blocked
     // after maki exits.
     lua_handle
@@ -790,7 +790,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         warn!(error = %e, "failed to report background usage");
     }
     drop(writer);
-    let _ = writer_thread.join();
+    let _ = writer_task.await;
     Ok(interrupt)
 }
 
@@ -1274,13 +1274,13 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
     use std::time::Duration;
 
     use maki_agent::SubagentInfo;
     use maki_config::ToolKey;
     use test_case::test_case;
-    use tokio::sync::mpsc::UnboundedSender;
-    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
     use super::*;
 
@@ -1707,8 +1707,8 @@ mod tests {
     fn test_pump(
         permission_mode: PermissionMode,
         answer_tx: UnboundedSender<String>,
-    ) -> (EventPump, mpsc::Receiver<String>) {
-        let (out_tx, out_rx) = mpsc::channel();
+    ) -> (EventPump, UnboundedReceiver<String>) {
+        let (out_tx, out_rx) = unbounded_channel();
         let session_id = SessionRef::from(maki_storage::id::MakiId::generate());
         let pump = EventPump {
             writer: SdkWriter {
@@ -1755,7 +1755,7 @@ mod tests {
     async fn pump_ends_at_stream_close_with_a_retained_sender() {
         let (guard, events) = maki_agent::event_stream();
         let retained = guard.sender(0);
-        let (pump, out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+        let (pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
         let pump = pump.spawn(events);
 
         retained
@@ -1845,7 +1845,7 @@ mod tests {
     #[test]
     fn bypass_answers_immediately_without_recording_or_emitting() {
         let (answer_tx, mut answer_rx) = unbounded_channel();
-        let (mut pump, out_rx) = test_pump(PermissionMode::BypassPermissions, answer_tx);
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::BypassPermissions, answer_tx);
 
         pump.handle(permission_request()).unwrap();
 
@@ -1871,7 +1871,7 @@ mod tests {
     #[test]
     fn permission_request_reaches_the_wire_only_while_answerable() {
         let (answer_tx, mut answer_rx) = unbounded_channel();
-        let (mut pump, out_rx) = test_pump(PermissionMode::Default, answer_tx);
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, answer_tx);
 
         pump.handle(permission_request()).unwrap();
 
@@ -1912,7 +1912,7 @@ mod tests {
     #[test]
     fn a_dropped_prompt_is_an_error_with_its_reason() {
         const DROP_REASON: &str = "blocked by a plugin";
-        let (mut pump, out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
 
         pump.handle(top_level(AgentEvent::Steered {
             kind: SteerKind::MessageDropped,
@@ -1939,7 +1939,7 @@ mod tests {
     /// message. A host notice and a child's line stay out.
     #[test]
     fn an_accepted_notice_is_a_live_system_message() {
-        let (mut pump, out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
 
         pump.handle(top_level(AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
@@ -1983,8 +1983,7 @@ mod tests {
         }))
         .unwrap();
 
-        let wire: Vec<Value> = out_rx
-            .try_iter()
+        let wire: Vec<Value> = iter::from_fn(|| out_rx.try_recv().ok())
             .map(|line| serde_json::from_str(&line).unwrap())
             .collect();
         assert_eq!(wire.len(), 2, "{wire:?}");
@@ -2014,7 +2013,7 @@ mod tests {
     /// own first event.
     #[test]
     fn a_woken_turn_is_timed_from_its_own_start() {
-        let (mut pump, out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
         pump.shared.lock().unwrap().turn_start = Instant::now().checked_sub(STALE_PROMPT_AGE);
 
         pump.handle(top_level(run_done(RunTotals::default())))
@@ -2026,8 +2025,7 @@ mod tests {
         })
         .unwrap();
 
-        let durations: Vec<u128> = out_rx
-            .try_iter()
+        let durations: Vec<u128> = iter::from_fn(|| out_rx.try_recv().ok())
             .map(|line| {
                 let result: Value = serde_json::from_str(&line).unwrap();
                 u128::from(result["duration_ms"].as_u64().unwrap())
@@ -2054,7 +2052,7 @@ mod tests {
         late_cost: f64,
         failed: bool,
     ) {
-        let (mut pump, out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
         let tokens = |input| TokenUsage {
             input,
             ..Default::default()
@@ -2096,8 +2094,7 @@ mod tests {
             "{RESULT_BILLED}"
         );
 
-        let unreported: Vec<(u64, f64)> = out_rx
-            .try_iter()
+        let unreported: Vec<(u64, f64)> = iter::from_fn(|| out_rx.try_recv().ok())
             .map(|line| serde_json::from_str::<Value>(&line).unwrap())
             .filter(|message| {
                 message["type"] == SYSTEM_TYPE && message["subtype"] == BACKGROUND_USAGE_SUBTYPE
