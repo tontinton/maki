@@ -20,10 +20,10 @@ use std::any::Any;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::OnceLock;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Sender, channel, sync_channel};
 use std::thread::{self, Result as ThreadResult};
 
-use flume::{Receiver, RecvError};
+use tokio::sync::oneshot;
 use tracing::error;
 
 const UNKNOWN_PANIC: &str = "<non-string panic payload>";
@@ -70,7 +70,11 @@ pub fn run<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     if ON_HIGHLIGHT_THREAD.get() {
         return f();
     }
-    receive_result(submit(f).recv())
+    let (done_tx, done_rx) = sync_channel(1);
+    spawn(move || {
+        let _ = done_tx.send(catch_unwind(AssertUnwindSafe(f)));
+    });
+    receive_result(done_rx.recv().ok())
 }
 
 /// Waits without occupying a blocking worker. Dropping the future discards
@@ -79,24 +83,20 @@ pub async fn run_async<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static
     if ON_HIGHLIGHT_THREAD.get() {
         return f();
     }
-    receive_result(submit(f).recv_async().await)
-}
-
-fn submit<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Receiver<ThreadResult<T>> {
-    let (done_tx, done_rx) = flume::bounded(1);
+    let (done_tx, done_rx) = oneshot::channel();
     spawn(move || {
-        if !done_tx.is_disconnected() {
+        if !done_tx.is_closed() {
             let _ = done_tx.send(catch_unwind(AssertUnwindSafe(f)));
         }
     });
-    done_rx
+    receive_result(done_rx.await.ok())
 }
 
-fn receive_result<T>(result: Result<ThreadResult<T>, RecvError>) -> T {
+fn receive_result<T>(result: Option<ThreadResult<T>>) -> T {
     match result {
-        Ok(Ok(value)) => value,
-        Ok(Err(payload)) => resume_unwind(payload),
-        Err(_) => panic!("{THREAD_GONE}"),
+        Some(Ok(value)) => value,
+        Some(Err(payload)) => resume_unwind(payload),
+        None => panic!("{THREAD_GONE}"),
     }
 }
 
