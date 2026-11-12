@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -31,7 +30,7 @@ const DEEPCOPY_TOO_DEEP_ERR: &str = "deepcopy: tables nested deeper than";
 /// so [`clear_notify_handler`] can hand the slot back when that plugin is
 /// unloaded, instead of leaving everyone calling into a dead env.
 #[derive(Default)]
-pub(crate) struct NotifyHandler(pub(crate) Mutex<Option<(Arc<str>, RegistryKey)>>);
+pub(crate) struct NotifyHandler(Option<(Arc<str>, RegistryKey)>);
 
 /// Run {callback} once after {ms} milliseconds. It fires even if the tool
 /// call that scheduled it has ended or was cancelled, which is what a
@@ -140,8 +139,7 @@ fn notify(
         None => None,
     };
     let handler_fn = lua.app_data_ref::<NotifyHandler>().and_then(|slot| {
-        let guard = locked(&slot);
-        let (_, key) = guard.as_ref()?;
+        let (_, key) = slot.0.as_ref()?;
         lua.registry_value::<Function>(key).ok()
     });
     if let Some(func) = handler_fn {
@@ -200,27 +198,23 @@ pub(crate) fn install_notify_handler(lua: &Lua, plugin: Arc<str>, handler: Value
             ));
         }
     };
-    let slot = lua
-        .app_data_ref::<NotifyHandler>()
+    let mut slot = lua
+        .app_data_mut::<NotifyHandler>()
         .ok_or_else(|| mlua::Error::runtime("notify handler slot not initialized"))?;
-    let old = std::mem::replace(&mut *locked(&slot), new_key);
+    let old = std::mem::replace(&mut slot.0, new_key);
     if let Some((_, key)) = old {
         let _ = lua.remove_registry_value(key);
     }
     Ok(())
 }
 
-fn locked(slot: &NotifyHandler) -> std::sync::MutexGuard<'_, Option<(Arc<str>, RegistryKey)>> {
-    slot.0.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Hand the slot back when {plugin} is unloaded. Its handler closes over an
 /// env that is going away, and nobody else knows to clean up after it.
 pub(crate) fn clear_notify_handler(lua: &Lua, plugin: &str) {
-    let Some(slot) = lua.app_data_ref::<NotifyHandler>() else {
+    let Some(mut slot) = lua.app_data_mut::<NotifyHandler>() else {
         return;
     };
-    if let Some((_, key)) = locked(&slot).take_if(|(owner, _)| &**owner == plugin) {
+    if let Some((_, key)) = slot.0.take_if(|(owner, _)| &**owner == plugin) {
         let _ = lua.remove_registry_value(key);
     }
 }

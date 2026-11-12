@@ -13,32 +13,17 @@ use std::cell::RefCell;
 #[cfg(test)]
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::thread;
 
 use maki_agent::UiWaker;
+use maki_highlight::pool::{Job, job_thread};
 
 const PARSE_THREAD: &str = "input-parse";
 
-type Job = Box<dyn FnOnce() + Send>;
-
 static WAKER: LazyLock<UiWaker> = LazyLock::new(UiWaker::default);
 
-static PARSES: LazyLock<Sender<Job>> = LazyLock::new(|| {
-    let (jobs, queued) = channel::<Job>();
-    thread::Builder::new()
-        .name(PARSE_THREAD.into())
-        .spawn(move || {
-            while let Ok(job) = queued.recv() {
-                if catch_unwind(AssertUnwindSafe(job)).is_err() {
-                    tracing::error!("input parse panicked");
-                }
-            }
-        })
-        .expect("failed to spawn the input parse thread");
-    jobs
-});
+static PARSES: LazyLock<Sender<Job>> = LazyLock::new(|| job_thread(PARSE_THREAD));
 
 #[cfg(test)]
 thread_local! {

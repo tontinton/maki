@@ -479,12 +479,9 @@ static PROVIDERS: LazyLock<RwLock<Arc<Registry>>> = LazyLock::new(RwLock::defaul
 /// The load in progress. `Some` between [`begin_load`] and [`commit_load`],
 /// and open at process start so a host that loads plugins without driving the
 /// phases (tests, embedders) still registers.
-static STAGING: LazyLock<Mutex<Option<Registry>>> =
-    LazyLock::new(|| Mutex::new(Some(Registry::new())));
-/// One cell of credentials per slug, for the life of the process: see
-/// [`shared_auth`].
+static STAGING: Mutex<Option<Registry>> = Mutex::new(Some(Registry::new()));
 /// The current owner and auth state of each slug: see [`shared_auth`].
-static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLock::default);
+static AUTH: LazyLock<Mutex<HashMap<Box<str>, AuthCell>>> = LazyLock::new(Mutex::default);
 /// Slugs granted to enabled packages, kept even when their load fails so the
 /// catalog client cannot take over the slug and receive the saved key. Maps
 /// the package name to its granted slugs, so unloading the package releases
@@ -750,7 +747,7 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
 /// Reusing stops at the owner, though: a slug another package took over gets
 /// a fresh cell, so a token one of them minted never serves the other.
 fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
-    let mut states = AUTH.write().unwrap();
+    let mut states = AUTH.lock().unwrap();
     let (current_owner, state) = states
         .entry(slug.into())
         .or_insert_with(|| (owner.clone(), Arc::new(AuthState::new())));
@@ -2144,7 +2141,7 @@ mod tests {
 
         assert!(!is_registered(SLUG), "{RELOAD_DROPS_STALE}");
         assert!(
-            AUTH.read().unwrap().contains_key(SLUG),
+            AUTH.lock().unwrap().contains_key(SLUG),
             "{CREDENTIALS_DROPPED}"
         );
     }

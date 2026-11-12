@@ -556,17 +556,16 @@ impl UserData for LuaCtx {
                 }
                 let expire = DeadlineExpire::parse(opts.as_ref())?;
                 let handle = active_task(lua);
-                let cell = lock_cell(&handle);
-                if cell.deadline_secs.get().is_some() {
+                let mut cell = lock_cell(&handle);
+                if cell.deadline_secs.is_some() {
                     return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
                 }
                 // Only a model call can move, anything else just times out.
                 if cell.call.is_some() {
-                    cell.deadline_expire.set(expire);
+                    cell.deadline_expire = expire;
                 }
-                cell.deadline_secs.set(Some(secs));
-                cell.deadline
-                    .set(Some(Instant::now() + Duration::from_secs(secs)));
+                cell.deadline_secs = Some(secs);
+                cell.deadline = Some(Instant::now() + Duration::from_secs(secs));
                 cell.deadline_changed.send_replace(());
                 Ok((Some(true), None))
             },

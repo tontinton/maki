@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::TryStreamExt;
@@ -166,21 +166,14 @@ pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
     )
 }
 
-static SUMMARY_REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-fn init_summary_rejected() -> &'static Mutex<HashSet<String>> {
-    SUMMARY_REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
-}
+static SUMMARY_REJECTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 fn summary_rejected(base: &str) -> bool {
-    init_summary_rejected().lock().unwrap().contains(base)
+    SUMMARY_REJECTED.lock().unwrap().contains(base)
 }
 
 fn reject_summary(base: &str) {
-    init_summary_rejected()
-        .lock()
-        .unwrap()
-        .insert(base.to_owned());
+    SUMMARY_REJECTED.lock().unwrap().insert(base.to_owned());
 }
 
 fn has_summary(body: &Value) -> bool {

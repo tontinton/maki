@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -134,8 +134,7 @@ pub fn lock_plugin_store(dir: &StateDir, slug: &str) -> Option<File> {
 }
 
 /// The slugs this process currently holds the credential lock for.
-static HELD_CREDENTIALS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static HELD_CREDENTIALS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 /// One provider's credential lock, re-entrant within this process and released
 /// on drop.

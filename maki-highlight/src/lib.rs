@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, Style as SynStyle,
@@ -124,7 +124,7 @@ pub fn ansi_color_index(name: &str) -> Option<u8> {
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<Arc<Theme>>> = OnceLock::new();
 static UI_STYLES: OnceLock<RwLock<HashMap<String, UiStyle>>> = OnceLock::new();
-static BLOCK_CACHE: OnceLock<RwLock<BlockCache>> = OnceLock::new();
+static BLOCK_CACHE: LazyLock<RwLock<BlockCache>> = LazyLock::new(RwLock::default);
 static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
 fn theme_lock() -> &'static RwLock<Arc<Theme>> {
@@ -147,7 +147,7 @@ pub fn set_theme(theme: Theme) {
     // Bump first: a highlight already in flight read the old generation, so its
     // insert lands under a key nobody will look up again.
     THEME_GEN.fetch_add(1, Ordering::Release);
-    block_cache_lock()
+    BLOCK_CACHE
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
@@ -158,10 +158,6 @@ pub fn set_theme(theme: Theme) {
 /// this changes.
 pub fn theme_generation() -> u64 {
     THEME_GEN.load(Ordering::Acquire)
-}
-
-fn block_cache_lock() -> &'static RwLock<BlockCache> {
-    BLOCK_CACHE.get_or_init(RwLock::default)
 }
 
 /// The byte length rides along with the hash, so an accidental hit needs both
@@ -454,7 +450,7 @@ pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSeg
 /// it is incremental, and would miss this cache on every token.
 pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
     let key = BlockKey::new(lang, code);
-    if let Some(hit) = block_cache_lock()
+    if let Some(hit) = BLOCK_CACHE
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(key)
@@ -462,7 +458,7 @@ pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
         return hit;
     }
     let segments: BlockSegments = Arc::new(highlight_code(lang, code, ""));
-    block_cache_lock()
+    BLOCK_CACHE
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, Arc::clone(&segments), BLOCK_CACHE_MAX_BYTES);
@@ -961,17 +957,16 @@ mod tests {
 
         set_theme(Theme::default());
         assert_eq!(
-            block_cache_lock().read().unwrap().bytes,
+            BLOCK_CACHE.read().unwrap().bytes,
             0,
             "set_theme must clear the cache"
         );
 
         let racing = one_line();
-        block_cache_lock().write().unwrap().insert(
-            stale_key,
-            Arc::clone(&racing),
-            BLOCK_CACHE_MAX_BYTES,
-        );
+        BLOCK_CACHE
+            .write()
+            .unwrap()
+            .insert(stale_key, Arc::clone(&racing), BLOCK_CACHE_MAX_BYTES);
         assert!(
             !Arc::ptr_eq(&racing, &highlight_block(RUST, CODE)),
             "an insert under a key minted before the bump must be unreachable"
@@ -1143,7 +1138,7 @@ mod tests {
             });
         });
 
-        assert_bytes_match_entries(&block_cache_lock().read().unwrap());
+        assert_bytes_match_entries(&BLOCK_CACHE.read().unwrap());
     }
 
     #[test_case("jsx", "js"; "jsx_alias")]

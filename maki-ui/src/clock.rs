@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use maki_config::ClockFormat;
 
@@ -15,11 +15,11 @@ pub fn hms(format: ClockFormat) -> &'static str {
 }
 
 fn is_12h(format: ClockFormat) -> bool {
-    static SYSTEM_12H: OnceLock<bool> = OnceLock::new();
+    static SYSTEM_12H: LazyLock<bool> = LazyLock::new(system_uses_12h);
     match format {
         ClockFormat::Hour12 => true,
         ClockFormat::Hour24 => false,
-        ClockFormat::System => *SYSTEM_12H.get_or_init(system_uses_12h),
+        ClockFormat::System => *SYSTEM_12H,
     }
 }
 
