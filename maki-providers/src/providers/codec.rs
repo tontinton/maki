@@ -170,6 +170,32 @@ pub struct RequestCtx<'a> {
 }
 
 impl OpenAiWire {
+    /// Whether every field set here is one the responses codec honours: only
+    /// `thinking` (with the default field) and `thinking_overrides`. Body,
+    /// header and usage fields are chat-only, and a custom effort `field`
+    /// names a chat path the responses wire never sees. Destructured without
+    /// `..` like [`Self::apply_body`], so a new field does not compile until
+    /// someone decides.
+    pub(crate) fn responses_compatible(&self) -> bool {
+        let Self {
+            max_tokens_field,
+            include_stream_usage,
+            usage_cost,
+            thinking,
+            headers,
+            extra_body,
+            thinking_overrides: _,
+        } = self;
+        max_tokens_field.is_none()
+            && include_stream_usage.is_none()
+            && !usage_cost
+            && headers.is_empty()
+            && extra_body.is_none()
+            && thinking
+                .as_ref()
+                .is_none_or(|t| t.field == EffortField::default())
+    }
+
     /// Everything this declaration adds to a body the codec built. The static
     /// fragment goes in first, so a thinking pass that writes the same key
     /// has the last word.
@@ -255,6 +281,16 @@ impl ThinkingWire {
         {
             self.field.write(object, effort);
         }
+    }
+
+    /// The responses wire's share: the dialect rendered as the standard
+    /// `reasoning` block, narrowed by what discovery listed for the model.
+    fn apply_responses(&self, body: &mut Value, ctx: &RequestCtx) {
+        if self.requires_support && !ctx.model.supports_thinking() {
+            return;
+        }
+        let dialect = self.dialect_for(ctx.discovered.as_ref());
+        responses::apply_responses_reasoning(body, ctx.opts.thinking, ctx.model, &dialect);
     }
 }
 
@@ -593,7 +629,9 @@ impl Provider for CompatProvider {
                     auth.base_url = Some(resolved);
                 }
                 let mut body = responses::build_body(model, messages, system, tools);
-                // TODO: wire thinking budget into responses API when llama.cpp supports it
+                if let Some(thinking) = &self.openai.thinking {
+                    thinking.apply_responses(&mut body, &ctx);
+                }
                 if let Some(session) = session_id {
                     self.session_id.apply(session, &mut body, &mut auth)?;
                 }
@@ -790,6 +828,21 @@ mod tests {
             error.contains(&WireError::EffortField(field.into()).to_string()),
             "{error}"
         );
+    }
+
+    /// Every field the responses wire cannot spell is refused, not dropped.
+    #[test_case(json!({}), true ; "nothing_declared")]
+    #[test_case(json!({ "thinking": { "dialect": "high-only" } }), true ; "the_dialect")]
+    #[test_case(json!({ "thinking": { "dialect": "high-only", "field": DEFAULT_EFFORT_FIELD } }), true ; "the_default_effort_field")]
+    #[test_case(json!({ "thinking_overrides": { "small-": "no" } }), true ; "the_overrides")]
+    #[test_case(json!({ "max_tokens_field": "max_output_tokens" }), false ; "max_tokens_field")]
+    #[test_case(json!({ "include_stream_usage": true }), false ; "include_stream_usage")]
+    #[test_case(json!({ "usage_cost": true }), false ; "usage_cost")]
+    #[test_case(json!({ "headers": { TITLE_HEADER: SAFE_VALUE } }), false ; "headers")]
+    #[test_case(json!({ "extra_body": { "cache_control": { "type": "ephemeral" } } }), false ; "extra_body")]
+    #[test_case(json!({ "thinking": { "dialect": "high-only", "field": "reasoning.effort" } }), false ; "a_custom_effort_field")]
+    fn the_responses_wire_takes_only_the_thinking_half(declared: Value, honoured: bool) {
+        assert_eq!(wire(declared).unwrap().responses_compatible(), honoured);
     }
 
     #[test]

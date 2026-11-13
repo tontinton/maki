@@ -732,7 +732,11 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///           the model table when `models` is empty.
 ///   `system_prefix` (string) Text prepended to the system prompt. The
 ///           `google` codec refuses it.
-///   `openai` (table) Options for `codec = "openai"`, all optional:
+///   `openai` (table) Options for the openai codecs (`"openai"` and
+///           `"openai-responses"`), all optional. On `"openai-responses"` only
+///           `thinking` and `thinking_overrides` are honoured: the responses
+///           wire writes the standard `reasoning` block, so `field` must stay
+///           unset, and the body/header options below are refused:
 ///     `max_tokens_field` (string) Body field carrying the output cap.
 ///             Defaults to `max_tokens`.
 ///     `include_stream_usage` (boolean) Ask for usage on the stream.
@@ -751,7 +755,10 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///               row's `effort`. A listed row's `effort` replaces these in
 ///               turn.
 ///       `field` (string) Body path for the effort. Dots nest, e.g.
-///               `"reasoning.effort"`. Defaults to `reasoning_effort`.
+///               `"reasoning.effort"`. Defaults to `reasoning_effort`. On the
+///               responses wire the field must stay unset: that wire writes
+///               the standard `reasoning` block, so a custom path would never
+///               be read.
 ///       `requires_support` (boolean) Send effort only to models that
 ///               support thinking. Defaults to `false`.
 ///     `headers` (table) Sent with every request, replacing a header maki
