@@ -21,7 +21,7 @@
 //! slug), so [`every_golden_replays`] runs each file in a child process of
 //! this binary. Nothing one case leaves behind can reach the next.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::iter;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
@@ -48,10 +48,10 @@ use maki_providers::{
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::StoredThinking;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tempfile::TempDir;
 
-use super::load_bundled;
+use super::load_bundled_with_opts;
 
 const GOLDEN_DIR: &str = "tests/goldens";
 const GOLDEN_EXTENSION: &str = "json";
@@ -109,6 +109,10 @@ const NO_MIDNIGHT: &str = "the day after a sampled one is representable";
 struct GoldenFile {
     call: Value,
     script: Value,
+    /// The `plugins` table from `maki.setup`, so a case can load its plugin
+    /// with the options a user who set them would have.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    plugins: HashMap<String, Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected: Option<Value>,
 }
@@ -281,7 +285,7 @@ fn replay(path: &Path) {
         .and_then(|slug| slug.to_str())
         .expect(NO_SLUG);
 
-    let replay = Replay::open(slug, script.leak());
+    let replay = Replay::open(slug, script.leak(), golden.plugins.clone());
     let observed = match &call {
         Call::Stream(turn) => replay.stream(turn),
         Call::Discovered(turn) => replay.discovered(slug, turn),
@@ -328,11 +332,15 @@ impl Replay {
     /// The recorded server goes in `<SLUG>_BASE_URL` because it is the only
     /// origin a test can set. The declared `base_url` is the real provider, and
     /// `auth.base_url` only comes from an auth hook.
-    fn open(slug: &str, script: &'static [Canned]) -> Self {
+    fn open(
+        slug: &str,
+        script: &'static [Canned],
+        opts: HashMap<String, Map<String, Value>>,
+    ) -> Self {
         let home = isolated_home();
         let (base_url, requests) = serve(script);
         unsafe { env::set_var(base_url_env_var(slug), base_url) };
-        let host = load_bundled(slug);
+        let host = load_bundled_with_opts(slug, opts);
         let key_env = plugin::spec(slug).expect(NOT_DECLARED).api_key_env;
         unsafe { env::set_var(key_env, API_KEY) };
         let provider = plugin::create(slug, Timeouts::default()).expect(CREATE_FAILED);

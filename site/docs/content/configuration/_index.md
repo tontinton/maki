@@ -346,6 +346,12 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MB. |
 
+### `plugins.mistral`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `responses_api` | boolean | `false` | - | Speak the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). The responses wire does not send past reasoning back, so follow-ups cannot lean on it. |
+
 ### `plugins.read`
 
 | Field | Type | Default | Min | Description |
