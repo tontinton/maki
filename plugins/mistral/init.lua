@@ -99,10 +99,18 @@ local function parse_model(m)
   }
 end
 
+local opts = maki.api.register_options({
+  responses_api = {
+    default = false,
+    type = "boolean",
+    desc = "Speak the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). The responses wire does not send past reasoning back, so follow-ups cannot lean on it.",
+  },
+})
+
 maki.provider.register({
   slug = "mistral",
   display_name = "Mistral",
-  codec = "openai",
+  codec = opts.responses_api and "openai-responses" or "openai",
   base_url = "https://api.mistral.ai/v1",
   api_key_env = "MISTRAL_API_KEY",
   login_url = "https://admin.mistral.ai/organization/api-keys",
