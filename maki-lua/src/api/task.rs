@@ -279,6 +279,7 @@ lua_table! {
 mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, UiReply};
+    use crate::api::util::fake_picker::{DOWN, ESC, PAGE_DOWN, UP, load_picker};
     use mlua::Table;
     use serde_json::json;
     use std::thread::JoinHandle;
@@ -316,6 +317,14 @@ mod tests {
         end
         return table.concat(ids, ','), table.concat(statuses, ','), tasks[1].name
     ";
+    const CTRL_S: &str = "<C-s>";
+    /// In `TASK_NAME` but not in the main chat's name.
+    const VIM_UP: &str = "k";
+    const TASK_NAME: &str = "work";
+    const OLDEST_ID: &str = "toolu_04";
+    const MIDDLE_ID: &str = "toolu_05";
+    const NEWEST_ID: &str = "toolu_06";
+    const SPAWN_ORDER: [&str; 3] = [OLDEST_ID, MIDDLE_ID, NEWEST_ID];
 
     fn lua_with_task(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         let lua = Lua::new();
@@ -497,7 +506,7 @@ mod tests {
     #[test_case(None ; "stopped")]
     #[test_case(Some(UNKNOWN_TASK_ERR) ; "refused")]
     fn tasks_picker_stops_the_selected_row_and_refreshes(stop_error: Option<&str>) {
-        let lua = picker_lua(stop_error);
+        let lua = picker_lua(stop_error, &[DOWN, CTRL_S, ESC], &[TASK_ID]);
         lua.load("open_tasks()").exec().unwrap();
 
         let globals = lua.globals();
@@ -513,32 +522,45 @@ mod tests {
         );
     }
 
+    /// Rows are main, then the running tasks newest first, and Ctrl+S stops
+    /// whatever the keys left selected. `k` would move up with vim keys, but
+    /// here the filter takes it. It hides main, so the newest task is left
+    /// selected.
+    #[test_case(&[DOWN], NEWEST_ID ; "down_from_main_selects_the_next_row")]
+    #[test_case(&[UP], OLDEST_ID ; "up_from_the_first_row_wraps_to_the_last")]
+    #[test_case(&[PAGE_DOWN], OLDEST_ID ; "page_down_clamps_to_the_last_row")]
+    #[test_case(&[VIM_UP], NEWEST_ID ; "a_letter_filters_instead_of_moving")]
+    fn tasks_picker_keys_move_the_selection(moves: &[&str], selected: &str) {
+        let keys: Vec<&str> = moves.iter().copied().chain([CTRL_S, ESC, ESC]).collect();
+        let lua = picker_lua(None, &keys, &SPAWN_ORDER);
+        lua.load("open_tasks()").exec().unwrap();
+
+        assert_eq!(lua.globals().get::<String>("stopped_id").unwrap(), selected);
+    }
+
     /// Runs `plugins/task/picker.lua` against a fake `maki` that lists the main
-    /// chat and one task, then presses Down, Ctrl+S and Esc.
-    fn picker_lua(stop_error: Option<&str>) -> Lua {
+    /// chat and then {task_ids} in spawn order, all working, and presses {keys}.
+    fn picker_lua(stop_error: Option<&str>, keys: &[&str], task_ids: &[&str]) -> Lua {
         let lua = Lua::new();
         let globals = lua.globals();
-        globals.set("task_id", TASK_ID).unwrap();
+        globals
+            .set(
+                "task_ids",
+                lua.create_sequence_from(task_ids.iter().copied()).unwrap(),
+            )
+            .unwrap();
+        globals.set("task_name", TASK_NAME).unwrap();
         globals.set("chat_session", CHAT_SESSION).unwrap();
         globals.set("stop_error", stop_error).unwrap();
-        lua.load(
+        load_picker(
+            &lua,
+            keys,
             r#"
-            local modules = {}
-            function require(name) return assert(modules[name], name) end
-            function install_module(name, source) modules[name] = assert(loadstring(source))() end
-            local keys = {'<Down>', '<C-s>', '<Esc>'}
-            local tasks = {
-                {id = 'main', session = chat_session, name = 'chat', focused = true},
-                {id = task_id, session = chat_session, name = 'work', status = 'working'},
-            }
-            list_calls = 0
-            local win = {width = 80, height = 20}
-            function win:set_config(_) end
-            function win:set_cursor(_) end
-            function win:close() end
-            function win:recv(_)
-                return {type = 'key', key = assert(table.remove(keys, 1), 'picker did not close')}
+            local tasks = {{id = 'main', session = chat_session, name = 'chat', focused = true}}
+            for _, id in ipairs(task_ids) do
+                tasks[#tasks + 1] = {id = id, session = chat_session, name = task_name, status = 'working'}
             end
+            list_calls = 0
             maki = {
                 task = {
                     list = function() list_calls = list_calls + 1; return tasks end,
@@ -551,7 +573,7 @@ mod tests {
                 },
                 ui = {
                     buf = function() return {set_lines = function() end} end,
-                    open_win = function() return win end,
+                    open_win = function() return fake_win(picker_keys) end,
                     display_width = function(s) return #s end,
                     flash = function(s) flashed = s end,
                 },
@@ -562,33 +584,12 @@ mod tests {
                 keymap = {set = function() end},
             }
         "#,
-        )
-        .exec()
-        .unwrap();
-        let install: mlua::Function = globals.get("install_module").unwrap();
-        for (name, source) in [
-            (
-                "maki.text_input",
-                include_str!("../../../plugins/lib/maki/text_input.lua"),
-            ),
-            (
-                "maki.color",
-                include_str!("../../../plugins/lib/maki/color.lua"),
-            ),
-            (
-                "maki.list_picker",
-                include_str!("../../../plugins/lib/maki/list_picker.lua"),
-            ),
-            (
+            &[(
                 "picker_rows",
                 include_str!("../../../plugins/task/picker_rows.lua"),
-            ),
-        ] {
-            install.call::<()>((name, source)).unwrap();
-        }
-        lua.load(include_str!("../../../plugins/task/picker.lua"))
-            .exec()
-            .unwrap();
+            )],
+            include_str!("../../../plugins/task/picker.lua"),
+        );
         lua
     }
 }

@@ -1310,6 +1310,7 @@ mod tests {
     use crate::api::image::create_image_table;
     use crate::api::json::create_json_table;
     use crate::api::top::add_top_methods;
+    use crate::api::util::fake_picker::{DOWN, ESC, PAGE_DOWN, UP, load_picker};
     use crate::plugin_permissions::denied_error;
     use crate::session_snapshot::{MODE_PLAN, STATUS_IDLE, STATUS_STORED};
     use mlua::Value;
@@ -1317,6 +1318,16 @@ mod tests {
     use test_case::test_case;
 
     const FOCUSED_TEXT: &str = "focused";
+    const ENTER: &str = "<CR>";
+    const CTRL_D: &str = "<C-d>";
+    const CTRL_N: &str = "<C-n>";
+    const NEWEST_SESSION: &str = "session-newest";
+    const MIDDLE_SESSION: &str = "session-middle";
+    const OLDEST_SESSION: &str = "session-oldest";
+    const RECENCY_ORDER: [&str; 3] = [NEWEST_SESSION, MIDDLE_SESSION, OLDEST_SESSION];
+    const SESSION_FOCUS: &str = "focus";
+    const SESSION_NEW: &str = "new";
+    const SESSION_DELETE: &str = "delete";
     const TOOL_ID: &str = "toolu_1";
     const TOOL_ID_2: &str = "toolu_2";
     const PLUGIN_ID: &str = "plugin-1";
@@ -2642,5 +2653,85 @@ mod tests {
             .eval_async()
             .await;
         assert!(result.unwrap_err().to_string().contains("table"));
+    }
+
+    /// Rows are newest first, and the fake window is far taller than three
+    /// rows, so a page lands on an end.
+    #[test_case(&[ENTER], SESSION_FOCUS, Some(NEWEST_SESSION) ; "enter_opens_the_first_row")]
+    #[test_case(&[DOWN, ENTER], SESSION_FOCUS, Some(MIDDLE_SESSION) ; "down_moves_one_row")]
+    #[test_case(&[UP, ENTER], SESSION_FOCUS, Some(OLDEST_SESSION) ; "up_from_the_first_row_wraps_to_the_last")]
+    #[test_case(&[PAGE_DOWN, ENTER], SESSION_FOCUS, Some(OLDEST_SESSION) ; "page_down_clamps_to_the_last_row")]
+    #[test_case(&[DOWN, CTRL_D, CTRL_D, ESC], SESSION_DELETE, Some(MIDDLE_SESSION) ; "ctrl_d_twice_deletes_the_selected_row")]
+    #[test_case(&[CTRL_N], SESSION_NEW, None ; "ctrl_n_starts_a_new_session")]
+    fn sessions_picker_keys_act_on_the_selected_row(
+        keys: &[&str],
+        call: &str,
+        target: Option<&str>,
+    ) {
+        let lua = sessions_lua(keys);
+        lua.load("open_sessions()").exec().unwrap();
+
+        let globals = lua.globals();
+        assert_eq!(globals.get::<String>("called").unwrap(), call);
+        assert_eq!(
+            globals
+                .get::<Option<String>>("called_id")
+                .unwrap()
+                .as_deref(),
+            target
+        );
+    }
+
+    /// Runs `plugins/sessions/init.lua` against a fake `maki` whose live
+    /// sessions are `RECENCY_ORDER`, and presses {keys}. The fake records the
+    /// last `maki.session` focus, new or delete as `called` and the session it
+    /// named as `called_id`, and raises on any flash.
+    fn sessions_lua(keys: &[&str]) -> Lua {
+        let lua = Lua::new();
+        lua.globals()
+            .set(
+                "session_ids",
+                lua.create_sequence_from(RECENCY_ORDER).unwrap(),
+            )
+            .unwrap();
+        load_picker(
+            &lua,
+            keys,
+            r#"
+            local sessions = {}
+            for i, id in ipairs(session_ids) do
+                sessions[i] = {id = id, title = id, updated_at = #session_ids - i}
+            end
+            local session = {
+                live = function() return sessions end,
+                list = function() return {} end,
+            }
+            for _, name in ipairs({'focus', 'new', 'delete'}) do
+                session[name] = function(arg)
+                    called, called_id = name, type(arg) == 'string' and arg or nil
+                    return true
+                end
+            end
+            maki = {
+                session = session,
+                async = {run = function(fn) fn() end},
+                ui = {
+                    buf = function() return {set_lines = function() end} end,
+                    open_win = function() return fake_win(picker_keys) end,
+                    flash = error,
+                },
+                api = {
+                    create_autocmd = function() end,
+                    register_command = function(opts)
+                        if opts.name == '/sessions' then open_sessions = opts.handler end
+                    end,
+                },
+                keymap = {set = function() end},
+            }
+        "#,
+            &[],
+            include_str!("../../../plugins/sessions/init.lua"),
+        );
+        lua
     }
 }

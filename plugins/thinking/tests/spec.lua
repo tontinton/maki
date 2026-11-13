@@ -209,6 +209,8 @@ end)
 case("keys_pick_a_value_or_dismiss_the_picker", function()
   eq(press(picker_on(MEDIUM), { "<Down>", "<Down>", "<CR>" }), "xhigh")
   eq(press(picker_on(MEDIUM), { "<Up>", "<CR>" }), "low")
+  eq(press(picker_on(MEDIUM), { "j", "j", "<CR>" }), "xhigh")
+  eq(press(picker_on(MEDIUM), { "k", "<CR>" }), "low")
   eq(press(picker_on(MEDIUM), { "<Esc>" }), "cancel")
   eq(press(picker_on(MEDIUM), { "8", "1", "9", "2", "<CR>" }), "8192")
   eq(press(picker_on(MEDIUM), { "4", "0", "9", "6", "<BS>", "<CR>" }), "409")
@@ -226,6 +228,15 @@ case("the_cursor_walks_over_blank_rows_and_stops_at_the_ends", function()
   -- The last step falls off the end of the list and stays on the custom row,
   -- which reports what is typed there: nothing yet.
   eq(table.concat(walked, ","), "adaptive,minimal,low,medium,high,xhigh,max,,")
+end)
+
+-- Both ends of the list are blank spacers, so a page settles on the nearest
+-- row that can be picked.
+case("page_keys_jump_past_the_spacers_to_the_first_and_last_rows", function()
+  local state = picker_on(MEDIUM)
+  Picker.handle_key(state, "<PageDown>")
+  eq(state.cursor, state.custom_row)
+  eq(press(state, { "<PageUp>", "<CR>" }), "off")
 end)
 
 case("a_click_selects_a_row_and_ignores_the_rest", function()

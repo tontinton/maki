@@ -7,6 +7,7 @@
 
 local TextInput = require("maki.text_input")
 local ListPicker = require("maki.list_picker")
+local ListNav = require("maki.list_nav")
 local Rows = require("picker_rows")
 
 local TITLE = " Tasks "
@@ -193,22 +194,15 @@ local function finish(commit)
   closing.win:close()
 end
 
+local function page_size()
+  return math.max(board.height - #board.header - 1, 1)
+end
+
 -- Previewing is a real focus, so the transcript behind the float is the one the
 -- host already draws. Render first for an instant cursor and let the host catch
 -- up next frame.
-local function move_sel(delta, wrap)
-  local n = #board.rows
-  if n == 0 then
-    return
-  end
+local function preview(idx)
   board.confirm = nil
-  local cur = Rows.index_of(board.rows, board.sel_id) or 1
-  local idx
-  if wrap then
-    idx = (cur - 1 + delta) % n + 1
-  else
-    idx = math.min(math.max(cur + delta, 1), n)
-  end
   board.sel_id = board.rows[idx].task.id
   render()
   local _, err = maki.task.focus(board.sel_id)
@@ -217,8 +211,9 @@ local function move_sel(delta, wrap)
   end
 end
 
-local function page_size()
-  return math.max(board.height - #board.header - 1, 1)
+local function navigate(key)
+  local cursor = Rows.index_of(board.rows, board.sel_id) or 1
+  return ListNav.handle_key(key, cursor, { count = #board.rows, page = page_size() }, preview)
 end
 
 local function open_selected()
@@ -322,21 +317,13 @@ local function handle_key(key)
       rebuild()
       render()
     end
-  elseif key == "<Up>" then
-    move_sel(-1, true)
-  elseif key == "<Down>" then
-    move_sel(1, true)
-  elseif key == "<PageUp>" then
-    move_sel(-page_size())
-  elseif key == "<PageDown>" then
-    move_sel(page_size())
   elseif key == "<CR>" then
     open_selected()
   elseif key == "<C-d>" then
     delete_selected()
   elseif key == "<C-s>" then
     stop_selected()
-  elseif board.input:handle_key(key) ~= "ignored" then
+  elseif not navigate(key) and board.input:handle_key(key) ~= TextInput.Result.IGNORED then
     board.confirm = nil
     rebuild()
     render()
