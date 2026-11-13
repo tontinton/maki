@@ -1601,6 +1601,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "reasoning".into(),
                     signature: None,
+                    reasoning_id: None,
                 },
                 ContentBlock::Text {
                     text: "answer".into(),

@@ -383,6 +383,7 @@ mod tests {
         ContentBlock::Thinking {
             thinking: PROMPT.into(),
             signature: Some(SIGNATURE.into()),
+            reasoning_id: None,
         }
     }
 

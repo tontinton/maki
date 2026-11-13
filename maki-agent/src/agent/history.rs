@@ -937,6 +937,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: GO.into(),
                     signature: Some(SIGNATURE.into()),
+                    reasoning_id: None,
                 },
             );
         }
@@ -955,6 +956,7 @@ mod tests {
         let thinking = |signature: Option<&str>| ContentBlock::Thinking {
             thinking: GO.into(),
             signature: signature.map(Into::into),
+            reasoning_id: None,
         };
         let tool_use = |thought_signature: Option<&str>| ContentBlock::ToolUse {
             id: FIRST.into(),
