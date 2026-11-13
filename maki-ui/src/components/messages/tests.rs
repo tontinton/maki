@@ -3573,3 +3573,23 @@ fn copy_user_message_excludes_marker() {
     let sel = make_sel(&panel, area, (0, 0), (0, 79));
     assert_eq!(panel.extract_selection_text(&sel, area), "hello");
 }
+
+#[test]
+fn user_bg_fills_the_row_up_to_the_scrollbar_but_not_the_spacer() {
+    const SPACER_ROW: u16 = 1;
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "reply".into()));
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let buf = terminal.backend().buffer();
+    let tint = theme::current().user_bg.bg.expect("tinted theme");
+    let scrollbar_col = VIEW_WIDTH - 1;
+
+    for x in 0..scrollbar_col {
+        assert_eq!(buf.cell((x, 0)).unwrap().bg, tint, "col {x}");
+    }
+    assert_ne!(buf.cell((scrollbar_col, 0)).unwrap().bg, tint);
+    for x in 0..VIEW_WIDTH {
+        assert_ne!(buf.cell((x, SPACER_ROW)).unwrap().bg, tint, "col {x}");
+    }
+}

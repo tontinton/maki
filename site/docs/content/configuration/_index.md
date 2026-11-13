@@ -100,7 +100,7 @@ Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppucci
 
 You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
 
-User messages use `user` for the `you> ` prefix, `user_text` for the body, and `user_bg` for the full-width background behind both. `user_text` defaults to `assistant`, and `user_bg` to no background.
+User messages use `user` for the `❯` marker, `user_text` for the body, and `user_bg` for the full-width background behind both. `user_text` defaults to `assistant`, and `user_bg` to no background.
 
 ```toml
 # themes/<name>.toml

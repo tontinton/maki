@@ -144,7 +144,7 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "User messages use `user` for the `you> ` prefix, `user_text` for the \
+        "User messages use `user` for the `❯` marker, `user_text` for the \
          body, and `user_bg` for the full-width background behind both. \
          `user_text` defaults to `assistant`, and `user_bg` to no background.\n\n\
          ```toml\n\
