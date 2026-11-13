@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use maki_agent::{SessionControl, SessionMailbox};
+use maki_agent::SessionMailbox;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::RequestOptions;
 use maki_storage::id::MakiId;
@@ -23,9 +23,9 @@ use crate::runtime::{CANCEL_ABANDON_AFTER, is_user_action};
 const USER_ACTION_ERR: &str = "stopping a task requires a user command or keybind";
 const TASK_ID_ERR: &str = "stop(ctx, id): id must be a string";
 const STOP_OPTS_ERR: &str = "stop(id, opts): opts must be a table";
-pub(crate) const NO_RUNNING_SUBAGENT: &str = "no running background subagent with id";
 const LAST_KEY: &str = "last";
 const NAME_KEY: &str = "name";
+const NAMES_SEP: &str = ", ";
 
 async fn roundtrip(
     lua: Lua,
@@ -117,8 +117,11 @@ async fn remove(
 /// `"stopped by parent agent"`. It waits up to 5 seconds for the final reply
 /// and returns it, and the agent gets no notice of the end. A late reply
 /// returns no `output`, and the result reaches the agent later as a quiet
-/// notice. A task another agent moved, a finished task or an unknown id
-/// returns an error that names the agent's running task ids.
+/// notice. A subagent nested in a moved call, like a `task` in a `batch`,
+/// stops alone and returns at once, with `parent` set to that call's id: the
+/// call's result carries what the subagent did. A task another agent moved, a
+/// finished task or an unknown id returns an error that names the agent's
+/// running task ids.
 ///
 /// @param id string|LuaCtx Task id, as returned by `list()`. Or the handler's
 ///   ctx, for the model's stop.
@@ -127,9 +130,9 @@ async fn remove(
 ///   rather than stopping a task with the same id in the other session. With a
 ///   ctx: the background task id.
 /// @return (boolean|table|nil, string|nil) true on success, or nil and an
-///   error. With a ctx, success is `{name, output?}`. `name` is the task's
-///   name in `/tasks`, and `output` is the final reply, missing when it was
-///   late.
+///   error. With a ctx, success is `{name, output?, parent?}`. `name` is the
+///   task's name in `/tasks`, `output` is the final reply, missing when it
+///   was late, and `parent` is the call a nested subagent ran under.
 /// @example
 /// local _, err = maki.task.stop(task.id, { session = task.session })
 /// -- in a tool handler
@@ -175,23 +178,6 @@ fn asker(ctx: &LuaCtx, method: &str) -> Result<Option<MakiId>, String> {
     Ok(agent.mailbox.as_ref().map(SessionMailbox::session_id))
 }
 
-/// The live subagent `id` that the agent behind `ctx` reaches, and its name.
-fn reached_subagent(
-    lua: &Lua,
-    ctx: &LuaCtx,
-    method: &str,
-    id: &str,
-) -> Result<(Arc<SessionControl>, String), String> {
-    let asker = asker(ctx, method)?;
-    BackgroundTasks::of(lua)
-        .subagent(asker, id)
-        .ok_or_else(|| not_running(id))
-}
-
-fn not_running(id: &str) -> String {
-    format!("{NO_RUNNING_SUBAGENT} {id}")
-}
-
 /// Messages a background subagent that the calling agent moved, the way the
 /// `task_message` tool does. The subagent reads it as an interrupt from its
 /// parent once its current turn ends, and one still waiting for a slot reads
@@ -204,16 +190,18 @@ fn not_running(id: &str) -> String {
 /// waits like any other.
 ///
 /// An agent reaches the subagents it moved, and those nested in a call it
-/// moved, until they end. Like `stop(ctx, id)`, it never reaches what
-/// another agent moved.
+/// moved, until they end. The id of such a call, like a `batch`, reaches
+/// every subagent still running in it. Like `stop(ctx, id)`, it never reaches
+/// what another agent moved.
 ///
 /// @param ctx LuaCtx The tool handler's ctx.
 /// @param id string Task id, from its receipt.
 /// @param text string The message.
 /// @param opts table? Optional fields:
 ///   `interrupt` (boolean?) - cut its current turn short. Default: `false`.
-/// @return (table|nil, string|nil) `{name}`, the task's name in `/tasks`, or
-///   nil and `"no running background subagent with id <id>"`.
+/// @return (table|nil, string|nil) `{name}`, the task's name in `/tasks` (the
+///   names of all it reached, comma-separated), or nil and
+///   `"no running background subagent with id <id>; running: <id> (<name>), ..."`.
 /// @example
 /// local sent, err = maki.task.send(ctx, input.id, input.message)
 /// if not sent then return { llm_output = err, is_error = true } end
@@ -227,27 +215,26 @@ async fn send(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let delivery = delivery(opts.as_ref());
-    let (control, name) = try_pair!(reached_subagent(&lua, &ctx, "maki.task.send", &id));
+    let asker = try_pair!(asker(&ctx, "maki.task.send"));
     // A sent message never picks the run's settings, so these are inert.
-    let input = plugin_input(text, RequestOptions::default());
-    if control.send(input, delivery).is_err() {
-        return Ok(err_pair(not_running(&id)));
-    }
+    let input = || plugin_input(text.clone(), RequestOptions::default());
+    let names = try_pair!(BackgroundTasks::of(&lua).send(asker, &id, input, delivery));
     let sent = lua.create_table()?;
-    sent.set(NAME_KEY, name)?;
+    sent.set(NAME_KEY, names.join(NAMES_SEP))?;
     Ok((Some(sent), None))
 }
 
 /// Reads the transcript of a background subagent that the calling agent
 /// moved, oldest first, while it works. The messages have the shape
-/// `maki.session.messages` returns. It reaches what `send(ctx, id)` does.
+/// `maki.session.messages` returns. It reaches what `send(ctx, id)` does,
+/// one subagent at a time: the id of a call it runs in reaches none.
 /// Works without an interactive UI.
 ///
 /// @param ctx LuaCtx The tool handler's ctx.
 /// @param id string Task id, from its receipt.
 /// @param opts table? `last` (integer?) only the newest `last` messages.
 /// @return (table|nil, string|nil) Array of messages, or nil and
-///   `"no running background subagent with id <id>"`.
+///   `"no running background subagent with id <id>; running: ..."`.
 /// @example
 /// local msgs = maki.task.messages(ctx, input.id, { last = 1 })
 /// local last = msgs and msgs[1]
@@ -265,8 +252,9 @@ async fn messages(
         .map(|opts| opts.opt::<usize>(LAST_KEY))
         .transpose()?
         .flatten();
-    let (control, _) = try_pair!(reached_subagent(&lua, &ctx, "maki.task.messages", &id));
+    let asker = try_pair!(asker(&ctx, "maki.task.messages"));
     drop(ctx);
+    let control = try_pair!(BackgroundTasks::of(&lua).subagent(asker, &id));
     let history = Arc::clone(&control.transcript().load().messages);
     Ok((
         Some(newest_messages_table(&lua, &history, last).await?),

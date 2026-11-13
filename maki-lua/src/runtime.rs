@@ -81,9 +81,7 @@ use crate::api::util::ctx::{DeadlineExpire, LuaCtx, RestoreCtx};
 use crate::api::util::pair::{Pair, err_pair};
 use crate::api::util::setup::ConfigStore;
 use crate::api::{Owner, create_maki_global};
-use crate::background::{
-    BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime, MovedEnd,
-};
+use crate::background::{BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, MovedEnd};
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::jobs::{JobEvent, JobOwner, JobReaper, JobStore, deliver_job_event};
@@ -1262,7 +1260,6 @@ impl LiveTask {
             },
             session: chat,
             task: None,
-            lifetime: Lifetime::Call,
             stopped,
             control: None,
             replied: false,

@@ -230,7 +230,7 @@ Set interrupt only when it must act now: it cuts the current step, running tools
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `id` | string | yes | Task id from its receipt |
+| `id` | string | yes | Task id from its receipt. A batch's id reaches every subagent in it |
 | `interrupt` | boolean | no | Cut the current step short |
 | `message` | string | yes | What the subagent should know or do |
 

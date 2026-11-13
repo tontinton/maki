@@ -3,7 +3,7 @@
 local DESCRIPTION =
   [[Message a running background subagent by id, e.g. a new fact, a changed scope or "wrap up now". It reads it after its current step.
 Set interrupt only when it must act now: it cuts the current step, running tools included.]]
-local ID_DESCRIPTION = "Task id from its receipt"
+local ID_DESCRIPTION = "Task id from its receipt. A batch's id reaches every subagent in it"
 local MESSAGE_DESCRIPTION = "What the subagent should know or do"
 local INTERRUPT_DESCRIPTION = "Cut the current step short"
 local QUEUED = "Message queued for %s."

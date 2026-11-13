@@ -53,7 +53,7 @@ use crate::api::util::command::UiAction;
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
-use crate::background::{BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime};
+use crate::background::{BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind};
 use crate::plugin_permissions::{Permission, PluginPermissions, require};
 use crate::runtime::{CANCELLED_MSG, active_task_cancel, host_ui};
 
@@ -309,9 +309,10 @@ impl Adoption {
 
 /// Gives a session opened under a moved call an entry of its own, so its
 /// adopted tab can be stopped by its id. It reports where the call does, so
-/// the call's caller reaches it. A top-level `task` shares the call's id, so
-/// the call's entry takes its control instead. An entry its chat refuses
-/// fires the session as it drops, and its chat ending ends the session anyway.
+/// the call's caller reaches it, by its own id or by the call's. A top-level
+/// `task` shares the call's id, so the call's entry takes its control
+/// instead. An entry its chat refuses fires the session as it drops, and its
+/// chat ending ends the session anyway.
 ///
 /// A session that already ran has a chat in the UI, under the call's row.
 /// The UI adopts it now rather than at its next event, or a quiet one would
@@ -331,13 +332,14 @@ pub(crate) fn adopt_session(
             id: stub.ui_id,
             plugin: Arc::clone(&stub.plugin),
             name: stub.name,
-            kind: Kind::Agent,
+            kind: Kind::Nested {
+                parent: home.id.clone(),
+            },
             started_at: now_epoch(),
             cost: None,
         },
         session: home.chat,
         task: None,
-        lifetime: Lifetime::Call,
         cancel: Fire::Handle(stub.control.handle()),
         stopped: None,
         control: Some(stub.control),
@@ -1289,7 +1291,6 @@ async fn session(
                 },
                 session,
                 task,
-                lifetime: Lifetime::Plugin,
                 stopped: None,
                 control: Some(Arc::clone(&cancellation.control)),
                 replied: false,
@@ -2237,7 +2238,8 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::api::task::{NO_RUNNING_SUBAGENT, create_task_table};
+    use crate::api::task::create_task_table;
+    use crate::background::{NO_RUNNING_SUBAGENT, NONE_RUNNING};
     use crate::runtime::{TaskCell, TaskScope};
 
     const PLUGIN: &str = "monitor";
@@ -3339,7 +3341,6 @@ mod tests {
             },
             session: chat,
             task: None,
-            lifetime: Lifetime::Call,
             stopped: None,
             control: None,
             replied: false,
@@ -3490,7 +3491,15 @@ mod tests {
             .into_iter()
             .map(|info| (info.id, info.kind))
             .collect::<Vec<_>>();
-        assert_eq!(kinds, [(id.clone(), Kind::Agent)]);
+        assert_eq!(
+            kinds,
+            [(
+                id.clone(),
+                Kind::Nested {
+                    parent: CALL_ID.into()
+                }
+            )]
+        );
 
         registry.stop(&id, Cutter::User);
         assert!(session_cancelled(&sess));
@@ -3853,7 +3862,10 @@ mod tests {
         close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
         for gone in [id.as_str(), UNKNOWN_TASK_ID] {
             let (_, error) = peek(&lua, gone, None).await.unwrap();
-            assert_eq!(error, Some(format!("{NO_RUNNING_SUBAGENT} {gone}")));
+            assert_eq!(
+                error,
+                Some(format!("{NO_RUNNING_SUBAGENT} {gone}; {NONE_RUNNING}"))
+            );
         }
     }
 
