@@ -1,3 +1,4 @@
+local ListNav = require("maki.list_nav")
 local TextInput = require("maki.text_input")
 
 local QuestionForm = {}
@@ -243,15 +244,7 @@ local function handle_selecting(state, key)
   local q = state.questions[state.tab]
   local n = #q.options + 1
 
-  if key == "<Up>" then
-    if state.cursor > 1 then
-      state.cursor = state.cursor - 1
-    end
-  elseif key == "<Down>" then
-    if state.cursor < n then
-      state.cursor = state.cursor + 1
-    end
-  elseif key == "<CR>" then
+  if key == "<CR>" then
     if state.cursor == n then
       state.mode = MODE.EDITING_CUSTOM
       state.custom_input = TextInput.new()
@@ -274,6 +267,10 @@ local function handle_selecting(state, key)
     end
   elseif key == "<Esc>" or key == "<C-c>" then
     state.done = { type = "dismiss" }
+  else
+    ListNav.handle_key(key, state.cursor, { count = n, keys = ListNav.VIM_KEYS, wrap = false }, function(i)
+      state.cursor = i
+    end)
   end
   return state
 end

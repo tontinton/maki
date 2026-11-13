@@ -10,6 +10,8 @@
 -- Module names are shared across bundled plugins, hence the prefix: a plain
 -- `picker` would collide with the one the task plugin ships.
 
+local ListNav = require("maki.list_nav")
+
 local M = {}
 
 local PICKED = "● "
@@ -145,18 +147,6 @@ local function place(state, i)
   end
 end
 
--- Skips the blank spacers, and stops at either end instead of wrapping.
-local function move(state, delta)
-  local i = state.cursor + delta
-  while state.rows[i] do
-    if selectable(state.rows[i]) then
-      place(state, i)
-      return
-    end
-    i = i + delta
-  end
-end
-
 local function editor_key(state, key)
   if key:match(DIGIT) then
     if #state.custom < MAX_DIGITS then
@@ -180,10 +170,6 @@ function M.handle_key(state, key)
   end
   if key:match(DIGIT) then
     state.cursor, state.custom, state.editing = state.custom_row, key, true
-  elseif key == "<Up>" or key == "k" then
-    move(state, -1)
-  elseif key == "<Down>" or key == "j" then
-    move(state, 1)
   elseif key == "<CR>" then
     -- An empty custom row has nothing to send yet, so Enter starts typing
     -- instead of committing.
@@ -194,6 +180,17 @@ function M.handle_key(state, key)
     end
   elseif key == "<Esc>" or key == "<C-c>" then
     return "cancel"
+  else
+    ListNav.handle_key(key, state.cursor, {
+      count = #state.rows,
+      keys = ListNav.VIM_KEYS,
+      wrap = false,
+      selectable = function(i)
+        return selectable(state.rows[i])
+      end,
+    }, function(i)
+      place(state, i)
+    end)
   end
 end
 

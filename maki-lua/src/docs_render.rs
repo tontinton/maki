@@ -397,7 +397,7 @@ fn is_export(line: &str) -> bool {
     let Some((lhs, rhs)) = line.split_once(" = ") else {
         return false;
     };
-    if rhs.is_empty() || rhs.ends_with('{') {
+    if rhs.is_empty() {
         return false;
     }
     let Some((table, field)) = lhs.split_once('.') else {
@@ -411,6 +411,8 @@ fn is_export(line: &str) -> bool {
     ident(table) && ident(field)
 }
 
+/// A table export keeps its body, so a preset like `ListNav.KEYS` shows its
+/// keys to the reader. The body ends at the first `}` in column 0.
 fn skeleton(src: &str) -> String {
     fn flush(out: &mut String, pending: &mut Vec<&str>) {
         for line in pending.drain(..) {
@@ -421,7 +423,14 @@ fn skeleton(src: &str) -> String {
     let mut out = String::new();
     let mut pending: Vec<&str> = Vec::new();
     let mut leading = true;
+    let mut in_table = false;
     for line in src.lines() {
+        if in_table {
+            out.push_str(line);
+            out.push('\n');
+            in_table = !line.starts_with('}');
+            continue;
+        }
         if line.starts_with("--") {
             pending.push(line);
             continue;
@@ -437,6 +446,7 @@ fn skeleton(src: &str) -> String {
             flush(&mut out, &mut pending);
             out.push_str(line);
             out.push('\n');
+            in_table = line.ends_with('{');
         } else {
             pending.clear();
         }
@@ -758,11 +768,11 @@ mod tests {
 
     const AGENT_VOICE: &str = "ask the user";
 
-    const MODULE: &str = "-- Header line one.\n-- Header line two.\nlocal M = {}\nM.__index = M\nM.CONST = \"x\"\nM.specs = {\n  a = 1,\n}\nlocal function private()\nend\n-- Doc for pub.\nfunction M.pub(a, b)\n  local inner = 1\nend\nfunction M:_hidden()\nend\nfunction M:method()\nend\nreturn M\n";
+    const MODULE: &str = "-- Header line one.\n-- Header line two.\nlocal M = {}\nM.__index = M\nM.CONST = \"x\"\n-- Doc for specs.\nM.specs = {\n  a = 1,\n}\nlocal function private()\nend\n-- Doc for pub.\nfunction M.pub(a, b)\n  local inner = 1\nend\nfunction M:_hidden()\nend\nfunction M:method()\nend\nreturn M\n";
 
     #[test]
     fn skeleton_keeps_public_surface_only() {
-        let expected = "-- Header line one.\n-- Header line two.\nM.CONST = \"x\"\n\n-- Doc for pub.\nfunction M.pub(a, b)\nfunction M:method()\n";
+        let expected = "-- Header line one.\n-- Header line two.\nM.CONST = \"x\"\n\n-- Doc for specs.\nM.specs = {\n  a = 1,\n}\n\n-- Doc for pub.\nfunction M.pub(a, b)\nfunction M:method()\n";
         assert_eq!(skeleton(MODULE), expected);
     }
 

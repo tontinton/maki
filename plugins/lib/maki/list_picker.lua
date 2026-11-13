@@ -1,5 +1,6 @@
-local TextInput = require("maki.text_input")
 local Color = require("maki.color")
+local ListNav = require("maki.list_nav")
+local TextInput = require("maki.text_input")
 
 local ListPicker = {}
 ListPicker.__index = ListPicker
@@ -428,8 +429,10 @@ end
 --     selected row's key are tinted, and the cursor follows its key across a
 --     live swap
 --
--- Keys you pass go through `maki.keymap.normalize`, so `"<Enter>"` and
--- `"<CR>"` are the same binding. An invalid key is dropped with a warning.
+-- A key you bind wins over the arrow keys, the page keys and <C-d>. Only <Esc>
+-- and <C-c> always close. Keys you pass go through `maki.keymap.normalize`, so
+-- `"<Enter>"` and `"<CR>"` are the same binding. An invalid key is dropped
+-- with a warning.
 --
 -- Returns { type = "choice"|"delete", index, item },
 -- { type = "key", key, index?, item? } or { type = "close" }. Prefer {item},
@@ -499,6 +502,10 @@ function ListPicker.open(items, opts)
     return math.max(height - 2, 1)
   end
 
+  local function navigate(key)
+    return ListNav.handle_key(key, cursor, { count = #filtered, page = page_size() }, move_cursor)
+  end
+
   buf:set_lines(build_lines())
   if #filtered > 0 then
     move_cursor(cursor)
@@ -515,27 +522,9 @@ function ListPicker.open(items, opts)
       height = ev.height
       move_cursor(cursor)
     elseif ev.type == "key" then
-      if ev.key == "<Up>" then
-        move_cursor((cursor - 2) % math.max(#filtered, 1) + 1)
-      elseif ev.key == "<Down>" then
-        move_cursor(cursor % math.max(#filtered, 1) + 1)
-      elseif ev.key == "<PageUp>" then
-        move_cursor(cursor - page_size())
-      elseif ev.key == "<PageDown>" then
-        move_cursor(cursor + page_size())
-      elseif ev.key == "<Esc>" or ev.key == "<C-c>" then
+      if ev.key == "<Esc>" or ev.key == "<C-c>" then
         win:close()
         return { type = "close" }
-      elseif ev.key == "<C-d>" then
-        if #filtered > 0 then
-          if confirming == cursor then
-            win:close()
-            return { type = "delete", index = original_indices[cursor], item = filtered[cursor] }
-          else
-            confirming = cursor
-            maki.ui.flash("Press Ctrl+D again to delete")
-          end
-        end
       elseif submit_keys[ev.key] then
         if #filtered > 0 then
           win:close()
@@ -561,7 +550,17 @@ function ListPicker.open(items, opts)
           index = #filtered > 0 and original_indices[cursor] or nil,
           item = filtered[cursor],
         }
-      else
+      elseif ev.key == "<C-d>" then
+        if #filtered > 0 then
+          if confirming == cursor then
+            win:close()
+            return { type = "delete", index = original_indices[cursor], item = filtered[cursor] }
+          else
+            confirming = cursor
+            maki.ui.flash("Press Ctrl+D again to delete")
+          end
+        end
+      elseif not navigate(ev.key) then
         local result = input:handle_key(ev.key)
         if result == TextInput.Result.CHANGED then
           filtered, original_indices = filter_items(items, input:value())

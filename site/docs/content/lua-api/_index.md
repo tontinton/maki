@@ -9350,6 +9350,63 @@ M.EMPTY_OLD_STRING = "old_string must not be empty"
 function M.replace(content, old_string, new_string, replace_all)
 ```
 
+### `require("maki.list_nav")`
+
+```lua
+-- Moves a cursor through a list, so every picker answers a key the same way.
+-- It keeps no state. You give it the key, the row the cursor is on and a
+-- function that moves the cursor. The list and the drawing stay yours, so a
+-- picker that tracks its selection by id works as well as one that tracks a
+-- row number.
+--
+-- Ask it last, after your own keys, so a key you bind always wins:
+--
+--   if key == "<CR>" then
+--     open(cursor)
+--   elseif not ListNav.handle_key(key, cursor, { count = #rows, page = height }, select_row) then
+--     input:handle_key(key)
+--   end
+
+-- For a list under a text input, like a filtered picker. Letters are missing
+-- on purpose, because the input needs them.
+ListNav.KEYS = table.freeze({
+  ["<Up>"] = "up",
+  ["<Down>"] = "down",
+  ["<PageUp>"] = "page_up",
+  ["<PageDown>"] = "page_down",
+})
+
+-- For a list where nothing takes typed text, so j and k are free to move.
+ListNav.VIM_KEYS = table.freeze({
+  ["<Up>"] = "up",
+  ["<Down>"] = "down",
+  ["<PageUp>"] = "page_up",
+  ["<PageDown>"] = "page_down",
+  j = "down",
+  k = "up",
+})
+
+-- Moves the cursor for {key} by calling {move_to}(row), and answers whether
+-- {key} is a navigation key, so you know when to pass it on. It answers true
+-- even when the cursor cannot move, on an empty list or at an end that does
+-- not wrap. That way an arrow key never falls through and types into a
+-- filter.
+--
+-- {move_to} only ever gets a selectable row that exists. A {cursor} past the
+-- end, left behind when the list shrank, is pulled back onto the list first.
+--
+-- {opts}:
+--   count: rows in the list
+--   page: rows a page moves, usually the visible height. Defaults to {count},
+--     so a list without a viewport jumps to its ends
+--   wrap: false stops Up and Down at the ends. Pages never wrap
+--   selectable: function(row) -> boolean, for rows the cursor skips, like
+--     spacers or headings
+--   keys: key -> "up"|"down"|"page_up"|"page_down", in the spelling
+--     `maki.keymap.normalize` gives. Defaults to `ListNav.KEYS`
+function ListNav.handle_key(key, cursor, opts, move_to)
+```
+
 ### `require("maki.list_picker")`
 
 ```lua
@@ -9384,8 +9441,10 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 --     selected row's key are tinted, and the cursor follows its key across a
 --     live swap
 --
--- Keys you pass go through `maki.keymap.normalize`, so `"<Enter>"` and
--- `"<CR>"` are the same binding. An invalid key is dropped with a warning.
+-- A key you bind wins over the arrow keys, the page keys and <C-d>. Only <Esc>
+-- and <C-c> always close. Keys you pass go through `maki.keymap.normalize`, so
+-- `"<Enter>"` and `"<CR>"` are the same binding. An invalid key is dropped
+-- with a warning.
 --
 -- Returns { type = "choice"|"delete", index, item },
 -- { type = "key", key, index?, item? } or { type = "close" }. Prefer {item},
@@ -9410,6 +9469,10 @@ M.FULL_OUTPUT_MAX_LINES = FULL_OUTPUT_MAX_LINES
 --- Appended where full-mode output passed the ceilings, which callers that
 --- promised the whole output report as an error.
 M.FULL_LIMIT_NOTE = "[output passed the full-mode limit; redirect it to a file to keep all of it]"
+M.specs = {
+  max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
+  max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
+}
 function M.extend(spec)
 
 --- Returns max_lines, max_bytes: tool override when set, agent-wide otherwise.
