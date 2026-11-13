@@ -320,6 +320,51 @@ case("the_custom_row_is_named_for_what_it_does", function()
   th.has(line_text(Picker.render(state, WIDE)[state.custom_row]), CUSTOM_ROW_NAME)
 end)
 
+local LESS = -1
+local MORE = 1
+
+local function step_from(shown, delta, options, thinking)
+  return Picker.step(model_with(thinking or shown, options, shown), delta)
+end
+
+case("a_step_moves_one_level_and_stops_at_the_ends", function()
+  eq(step_from(MEDIUM, MORE), HIGH)
+  eq(step_from(MEDIUM, LESS), "low")
+  eq(step_from("max", MORE), nil)
+  eq(step_from("minimal", LESS), nil, "off is left to the picker")
+end)
+
+case("a_step_never_enters_or_leaves_a_mode", function()
+  eq(step_from("off", MORE), nil)
+  eq(step_from(ADAPTIVE, LESS), nil)
+  eq(step_from(ADAPTIVE, MORE, TOGGLE_LADDER), nil)
+  eq(step_from(RAW_BUDGET, MORE), nil, "a raw budget is on no row")
+end)
+
+-- On a model without an adaptive mode the session still holds `adaptive`, but
+-- the request goes out as the level the picker would open on.
+case("a_step_starts_from_the_level_actually_sent", function()
+  eq(step_from(HIGH, LESS, FIXED_LADDER, ADAPTIVE), MEDIUM)
+  eq(step_from(MEDIUM, MORE, NATIVE_LADDER), "xhigh", "a level the model lacks is not offered")
+end)
+
+case("a_step_skips_rows_that_send_the_same_level", function()
+  local options = {
+    { name = "off", sends = "off" },
+    { name = "minimal", sends = "low" },
+    { name = "low", sends = "low" },
+    { name = "medium", sends = MEDIUM },
+    { name = "high", sends = "xhigh" },
+    { name = "xhigh", sends = "xhigh" },
+    { name = "max", sends = "xhigh" },
+  }
+  eq(step_from(MEDIUM, LESS, options), "low")
+  eq(step_from("low", LESS, options), nil)
+  eq(step_from(MEDIUM, MORE, options), HIGH)
+  eq(step_from("xhigh", MORE, options), nil)
+  eq(step_from("xhigh", LESS, options), MEDIUM)
+end)
+
 -- The stubbed half: the window against a scripted event list. Each case is one
 -- way a picker can end, and asserts on what the host was asked to set.
 local function key(name)
@@ -351,7 +396,7 @@ local function run(events, opts)
 
   maki.model = {
     get = function()
-      return model_with(opts.thinking or MEDIUM, opts.options)
+      return model_with(opts.thinking or MEDIUM, opts.options, opts.shown)
     end,
     set = function(args)
       sets[#sets + 1] = args.thinking
@@ -383,7 +428,13 @@ local function run(events, opts)
     end,
   }
 
-  local ok, err = pcall(opts.direct and Window.set or Window.open, opts.direct)
+  local entry = Window.open
+  if opts.step then
+    entry = Window.step
+  elseif opts.direct then
+    entry = Window.set
+  end
+  local ok, err = pcall(entry, opts.step or opts.direct)
   maki.model, maki.ui = saved.model, saved.ui
   return {
     sets = table.concat(sets, ","),
@@ -446,6 +497,25 @@ case("a_model_without_thinking_gets_the_flash_instead_of_a_picker", function()
   local result = run({}, { options = {} })
   eq(result.flashes, UNSUPPORTED)
   eq(result.sets, "")
+end)
+
+case("a_step_key_sends_the_next_level_without_a_picker", function()
+  local result = run({}, { step = MORE })
+  eq(result.sets, HIGH)
+  eq(result.flashes, "Thinking: " .. HIGH)
+  eq(result.closed, false)
+end)
+
+case("a_step_at_the_end_sends_nothing_and_says_where_it_is", function()
+  local result = run({}, { step = MORE, thinking = "max" })
+  eq(result.sets, "")
+  eq(result.flashes, "Thinking: max")
+end)
+
+case("a_step_on_a_model_without_thinking_gets_the_flash", function()
+  local result = run({}, { step = LESS, options = {} })
+  eq(result.sets, "")
+  eq(result.flashes, UNSUPPORTED)
 end)
 
 th.report()
