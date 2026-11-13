@@ -2,7 +2,7 @@
 //! session id instead of a tool ctx, and tool calls moved off their turn
 //! (Ctrl+B, `expire = "background"`). One lives until the first of: its work
 //! ends, the Lua task that opened it ends (only under task scope), its chat
-//! session ends, its plugin unloads ([`Lifetime::Plugin`] only), the run it
+//! session ends, its plugin unloads ([`Kind::Agent`] only), the run it
 //! reports to ends, or the user or the model stops it.
 //! The agent loop never knows about them, so a turn ending or a rewind that
 //! respawns the loop leaves them running.
@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use maki_agent::cancel::{CancelHandle, CancelToken, CancelTrigger};
 use maki_agent::{
-    Activity, AgentEvent, AgentSeed, BackgroundNotice, Cutter, EndReason, Envelope, MovedTrigger,
-    SessionControl, SessionMailbox, TaskEnd, TaskLabel, ToolDoneEvent, result_notice,
+    Activity, AgentEvent, AgentInput, AgentSeed, BackgroundNotice, Cutter, Delivery, EndReason,
+    Envelope, MovedTrigger, SessionControl, SessionMailbox, TaskEnd, TaskLabel, ToolDoneEvent,
+    result_notice,
 };
 use maki_storage::id::MakiId;
 use mlua::Lua;
@@ -29,23 +30,26 @@ use crate::api::util::command::UiAction;
 
 pub(crate) const NONE_RUNNING: &str = "none running";
 pub(crate) const NO_RUNNING_TASK: &str = "no running background task";
+pub(crate) const NO_RUNNING_SUBAGENT: &str = "no running background subagent with id";
 const RUNNING_LIST: &str = "running:";
 pub(crate) const RUN_ENDED: &str = "the run this call reports to has ended";
 const TASK_EVENT_RUN_ID: u64 = 0;
 
+/// What an entry is. This alone decides what ends it (besides a stop or its
+/// chat ending) and how the model reaches it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
+    /// A session a plugin opened by chat session id. Ends when its plugin
+    /// unloads. The model never reaches it.
     Agent,
+    /// A session opened under moved call `parent`, like a `task` in a
+    /// `batch`. The model reaches it by its own id or by `parent`, and the
+    /// call's result carries what it did. Survives its plugin's unload, as
+    /// the call does.
+    Nested { parent: String },
+    /// A moved tool call. Survives its plugin's unload, as an in-flight call
+    /// does.
     Call { tool: Arc<str> },
-}
-
-/// What ends an entry besides a stop and the end of its chat.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Lifetime {
-    /// Ends when its plugin is unloaded.
-    Plugin,
-    /// A moved call: survives its plugin's unload, as an in-flight call does.
-    Call,
 }
 
 /// How retiring an entry reaches its work.
@@ -86,7 +90,6 @@ pub(crate) struct BackgroundTask {
     pub(crate) session: MakiId,
     /// `None` under session scope: nothing but the chat and the plugin ends it.
     pub(crate) task: Option<u64>,
-    pub(crate) lifetime: Lifetime,
     /// Who stopped it. Only [`Self::stop`] writes it, the first stop sticks,
     /// and it is written before the cancel fires, so the work cut short can
     /// tell who did it.
@@ -155,12 +158,41 @@ impl BackgroundTask {
         asker.is_some_and(|asker| self.reports_to(asker))
     }
 
+    fn parent(&self) -> Option<&str> {
+        match &self.info.kind {
+            Kind::Nested { parent } => Some(parent),
+            Kind::Agent | Kind::Call { .. } => None,
+        }
+    }
+
+    fn live_session(&self) -> Option<&Arc<SessionControl>> {
+        self.control
+            .as_ref()
+            .filter(|control| control.ended().is_none())
+    }
+
+    /// The live session `asker` may read and message.
+    fn session_for(&self, asker: Option<MakiId>) -> Option<&Arc<SessionControl>> {
+        self.live_session().filter(|_| self.answers(asker))
+    }
+
+    /// What `asker` may end with `task_stop`: a call until its stop, a nested
+    /// session until it ends.
+    fn stoppable_by(&self, asker: Option<MakiId>) -> bool {
+        self.answers(asker)
+            && match &self.info.kind {
+                Kind::Call { .. } => self.stopped.is_none(),
+                Kind::Nested { .. } => self.live_session().is_some(),
+                Kind::Agent => false,
+            }
+    }
+
     /// The notice text the model reads, the line the transcript shows, and
     /// how the task ended.
     fn notice(&self, done: &ToolDoneEvent, output: &str) -> (String, String, TaskEnd) {
         let tool = match &self.info.kind {
             Kind::Call { tool } => tool,
-            Kind::Agent => &done.tool,
+            Kind::Agent | Kind::Nested { .. } => &done.tool,
         };
         result_notice(
             &self.label(tool),
@@ -173,13 +205,17 @@ impl BackgroundTask {
 }
 
 /// What `maki.task.stop(ctx)` hands Lua. `output` is missing when the final
-/// reply was late. `name` is how the user knows the task, since the model
-/// only knows its id.
+/// reply was late, or there is none to wait for (`parent` is set). `name` is
+/// how the user knows the task, since the model only knows its id.
 #[derive(Debug, PartialEq, Serialize)]
 pub(crate) struct ModelStop {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) output: Option<String>,
     pub(crate) name: String,
+    /// The moved call a nested session ran under, whose result carries what
+    /// the session did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parent: Option<String>,
 }
 
 /// What `maki.agent.list()` and `/tasks` show.
@@ -256,6 +292,7 @@ pub(crate) struct BackgroundTasks {
     entries: Arc<Mutex<Vec<BackgroundTask>>>,
     /// The model's `task_stop`, parked until the final reply of the call it
     /// stopped. Whoever removes the sender decides who gets the output.
+    /// Locked after `entries` when both are, never the other way round.
     waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
 }
 
@@ -267,13 +304,27 @@ fn is_running_call(entry: &BackgroundTask) -> bool {
     entry.is_call() && entry.stopped.is_none()
 }
 
-fn no_running_task_err(id: &str, running: &[String]) -> String {
+/// A missed id names what does run, so a model that guessed wrong can fix it
+/// by itself.
+fn not_found<'a>(
+    head: &str,
+    id: &str,
+    running: impl Iterator<Item = &'a BackgroundTask>,
+) -> String {
+    let running: Vec<_> = running
+        .map(|e| format!("{} ({})", e.info.id, e.info.name))
+        .collect();
     let running = if running.is_empty() {
         NONE_RUNNING.to_owned()
     } else {
         format!("{RUNNING_LIST} {}", running.join(", "))
     };
-    format!("{NO_RUNNING_TASK} {id}; {running}")
+    format!("{head} {id}; {running}")
+}
+
+fn subagent_not_found(entries: &[BackgroundTask], asker: Option<MakiId>, id: &str) -> String {
+    let running = entries.iter().filter(|e| e.session_for(asker).is_some());
+    not_found(NO_RUNNING_SUBAGENT, id, running)
 }
 
 impl BackgroundTasks {
@@ -333,22 +384,50 @@ impl BackgroundTasks {
             .clone()
     }
 
-    /// The live session of subagent `id`, and its name, if the run reading
-    /// mailbox `asker` reaches it by [`BackgroundTask::answers`].
+    /// Live subagent `id`, if the run reading mailbox `asker` reaches it by
+    /// [`BackgroundTask::answers`].
     pub(crate) fn subagent(
         &self,
         asker: Option<MakiId>,
         id: &str,
-    ) -> Option<(Arc<SessionControl>, String)> {
+    ) -> Result<Arc<SessionControl>, String> {
         let entries = self.locked();
-        let entry = entries
+        entries
             .iter()
-            .find(|e| e.info.id == id && e.answers(asker))?;
-        let control = entry.control.as_ref()?;
-        control
-            .ended()
-            .is_none()
-            .then(|| (Arc::clone(control), entry.info.name.clone()))
+            .filter(|e| e.info.id == id)
+            .find_map(|e| e.session_for(asker))
+            .cloned()
+            .ok_or_else(|| subagent_not_found(&entries, asker, id))
+    }
+
+    /// Sends to every live subagent `asker` reaches by `id`: its own id, or
+    /// the moved call it is nested in, so a batch's id reaches each session
+    /// in it. Returns the names of those it reached.
+    pub(crate) fn send(
+        &self,
+        asker: Option<MakiId>,
+        id: &str,
+        input: impl Fn() -> AgentInput,
+        delivery: Delivery,
+    ) -> Result<Vec<String>, String> {
+        let targets: Vec<_> = self
+            .locked()
+            .iter()
+            .filter(|e| e.info.id == id || e.parent() == Some(id))
+            .filter_map(|e| Some((Arc::clone(e.session_for(asker)?), e.info.name.clone())))
+            .collect();
+        let mut names = Vec::with_capacity(targets.len());
+        for (control, name) in targets {
+            if control.send(input(), delivery).is_ok() {
+                names.push(name);
+            }
+        }
+        if names.is_empty() {
+            // Each target may have ended between the lookup and the send, so
+            // list again to show what still runs.
+            return Err(subagent_not_found(&self.locked(), asker, id));
+        }
+        Ok(names)
     }
 
     pub(crate) fn remove(&self, id: &str) {
@@ -374,10 +453,11 @@ impl BackgroundTasks {
     }
 
     /// The model's stop of one of the calls it moved, those reporting to its
-    /// run's `mailbox` (`None` outside a run: it moved none). Waits up to
-    /// `wait` for the final reply and returns its text, and then the run gets
-    /// no notice of the end. When the reply is late this returns no output,
-    /// and the reply still reaches the run as a quiet notice.
+    /// run's `mailbox` (`None` outside a run: it moved none), or of a session
+    /// nested in one. Waits up to `wait` for a call's final reply and returns
+    /// its text, and then the run gets no notice of the end. When the reply
+    /// is late this returns no output, and the reply still reaches the run as
+    /// a quiet notice. A nested session returns at once: its call reports it.
     pub(crate) async fn stop_by_model(
         &self,
         mailbox: Option<MakiId>,
@@ -387,39 +467,50 @@ impl BackgroundTasks {
         // Armed before the stop fires, so a call that ignores the stop is
         // abandoned (cancel + the same wait) only after this gives up.
         let deadline = Instant::now() + wait;
-        let (mut reply, name) = self.begin_model_stop(mailbox, id)?;
+        let (reply, mut stopped) = self.begin_model_stop(mailbox, id)?;
+        let Some(mut reply) = reply else {
+            return Ok(stopped);
+        };
         let arrived = timeout_at(deadline, &mut reply)
             .await
             .ok()
             .and_then(Result::ok);
-        let output = arrived.or_else(|| {
+        stopped.output = arrived.or_else(|| {
             lock(&self.waiters).remove(id);
             reply.try_recv().ok()
         });
-        Ok(ModelStop { output, name })
+        Ok(stopped)
     }
 
-    /// The reply to wait on, and the stopped call's name.
+    /// The final reply to wait on, which only a call has, and the stop so
+    /// far.
     fn begin_model_stop(
         &self,
         mailbox: Option<MakiId>,
         id: &str,
-    ) -> Result<(oneshot::Receiver<String>, String), String> {
-        let running: Vec<_> = self
-            .locked()
-            .iter()
-            .filter(|e| is_running_call(e) && e.answers(mailbox))
-            .map(|e| e.info.clone())
-            .collect();
-        let Some(target) = running.iter().find(|info| info.id == id) else {
-            let ids: Vec<_> = running.into_iter().map(|info| info.id).collect();
-            return Err(no_running_task_err(id, &ids));
+    ) -> Result<(Option<oneshot::Receiver<String>>, ModelStop), String> {
+        let (reply, stopped) = {
+            let entries = self.locked();
+            let stoppable = || entries.iter().filter(|e| e.stoppable_by(mailbox));
+            let Some(target) = stoppable().find(|e| e.info.id == id) else {
+                return Err(not_found(NO_RUNNING_TASK, id, stoppable()));
+            };
+            // `deliver` needs this lock too. Parking the waiter before we let
+            // go means a final reply can't land in the gap and go unseen.
+            let reply = target.is_call().then(|| {
+                let (waiter, reply) = oneshot::channel();
+                lock(&self.waiters).insert(id.to_owned(), waiter);
+                reply
+            });
+            let stopped = ModelStop {
+                output: None,
+                name: target.info.name.clone(),
+                parent: target.parent().map(str::to_owned),
+            };
+            (reply, stopped)
         };
-        let name = target.name.clone();
-        let (waiter, reply) = oneshot::channel();
-        lock(&self.waiters).insert(id.to_owned(), waiter);
         self.stop(id, Cutter::Parent);
-        Ok((reply, name))
+        Ok((reply, stopped))
     }
 
     /// The final reply of a moved call: settles its receipt in the run it
@@ -578,9 +669,10 @@ impl BackgroundTasks {
         self.retire(|e| e.task == Some(task));
     }
 
-    /// Moved calls outlive their plugin's unload, as in-flight calls do.
+    /// Moved calls and the sessions nested in them outlive their plugin's
+    /// unload, as in-flight calls do.
     pub(crate) fn end_plugin(&self, plugin: &str) {
-        self.retire(|e| e.lifetime == Lifetime::Plugin && &*e.info.plugin == plugin);
+        self.retire(|e| e.info.kind == Kind::Agent && &*e.info.plugin == plugin);
     }
 
     /// The host shut down (`/reload`, exit) and every task died with its
@@ -622,9 +714,7 @@ impl BackgroundTasks {
     pub(crate) fn list_agents(&self, session: MakiId) -> Vec<(BackgroundInfo, Activity)> {
         self.locked()
             .iter()
-            .filter(|e| {
-                e.session == session && e.info.kind == Kind::Agent && e.lifetime == Lifetime::Plugin
-            })
+            .filter(|e| e.session == session && e.info.kind == Kind::Agent)
             .filter_map(|e| Some((e.info.clone(), e.control.as_ref()?.activity())))
             .collect()
     }
@@ -675,12 +765,13 @@ pub(crate) mod tests {
     use maki_agent::ToolOutput;
     use maki_agent::cancel::CancelToken;
     use maki_agent::tools::test_support::stub_seed;
-    use maki_providers::TaskSettled;
+    use maki_providers::{RequestOptions, TaskSettled};
     use std::iter;
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
+    use crate::api::agent::plugin_input;
     use crate::runtime::test_support::call_scope;
     use crate::runtime::{TaskCell, TaskScope, lock_cell};
 
@@ -689,6 +780,9 @@ pub(crate) mod tests {
     const CALL_ID: &str = "toolu_01";
     const OTHER_CALL_ID: &str = "toolu_02";
     const UNKNOWN_CALL_ID: &str = "missing";
+    const NESTED_ID: &str = "session-a";
+    const OTHER_NESTED_ID: &str = "session-b";
+    const MESSAGE: &str = "wrap up now";
     const SUMMARY: &str = "cargo build";
     const OUTPUT: &str = "compiled";
     const NOTICE_HEAD: &str = "Background";
@@ -724,7 +818,6 @@ pub(crate) mod tests {
             },
             session,
             task,
-            lifetime: Lifetime::Plugin,
             stopped: None,
             control: Some(Arc::default()),
             replied: false,
@@ -809,7 +902,6 @@ pub(crate) mod tests {
             tool: Arc::from(TOOL),
         };
         entry.control = None;
-        entry.lifetime = Lifetime::Call;
         entry.mailbox = mailbox;
         (entry, token)
     }
@@ -832,23 +924,6 @@ pub(crate) mod tests {
         let (call, token) = call_entry(session, CALL_ID);
         registry.register(call).unwrap();
         (registry, token)
-    }
-
-    #[test]
-    fn plugin_unload_spares_moved_calls() {
-        let session = MakiId::generate();
-        let _live = live(session);
-        let registry = BackgroundTasks::default();
-        let (call, call_token) = call_entry(session, CALL_ID);
-        let (agent, agent_token) = entry(session, None);
-        registry.register(call).unwrap();
-        registry.register(agent).unwrap();
-
-        registry.end_plugin(PLUGIN);
-
-        assert!(agent_token.is_cancelled());
-        assert!(!call_token.is_cancelled());
-        assert!(registry.contains(CALL_ID));
     }
 
     #[test]
@@ -1107,7 +1182,7 @@ pub(crate) mod tests {
         let stopped = registry.stop_by_model(asker, target, FOREVER).await;
 
         let listing = if lists_running {
-            format!("{RUNNING_LIST} {CALL_ID}, {OTHER_CALL_ID}")
+            format!("{RUNNING_LIST} {CALL_ID} ({SUMMARY}), {OTHER_CALL_ID} ({SUMMARY})")
         } else {
             NONE_RUNNING.to_owned()
         };
@@ -1151,13 +1226,124 @@ pub(crate) mod tests {
             Asker::NoRun => None,
         };
 
-        let found = registry.subagent(asker, CALL_ID);
+        let found = registry.subagent(asker, CALL_ID).ok();
 
         assert_eq!(found.is_some(), reached);
-        if let Some((found, name)) = found {
+        if let Some(found) = found {
             assert!(Arc::ptr_eq(&found, &control));
-            assert_eq!(name, SUMMARY);
         }
+    }
+
+    /// A moved batch: the call and two sessions nested in it, registered the
+    /// way `adopt_session` does it.
+    fn registry_with_nested(chat: MakiId) -> (BackgroundTasks, [Arc<SessionControl>; 2]) {
+        let (registry, _) = registry_with_call(chat);
+        let controls = [NESTED_ID, OTHER_NESTED_ID].map(|id| {
+            let (mut nested, _) = entry(chat, None);
+            let control = Arc::new(SessionControl::default());
+            nested.info.id = id.to_owned();
+            nested.info.name = id.to_owned();
+            nested.info.kind = Kind::Nested {
+                parent: CALL_ID.to_owned(),
+            };
+            nested.control = Some(Arc::clone(&control));
+            nested.mailbox = SessionMailbox::open(chat).ok();
+            registry.register(nested).unwrap();
+            control
+        });
+        (registry, controls)
+    }
+
+    #[test]
+    fn plugin_unload_spares_moved_calls_and_their_nested_sessions() {
+        let chat = MakiId::generate();
+        let _live = live(chat);
+        let (registry, _controls) = registry_with_nested(chat);
+        let (agent, agent_token) = entry(chat, None);
+        registry.register(agent).unwrap();
+
+        registry.end_plugin(PLUGIN);
+
+        assert!(agent_token.is_cancelled());
+        for id in [CALL_ID, NESTED_ID, OTHER_NESTED_ID] {
+            assert!(registry.contains(id), "{id}");
+        }
+    }
+
+    fn message() -> AgentInput {
+        plugin_input(MESSAGE.to_owned(), RequestOptions::default())
+    }
+
+    /// The model only knows ids from receipts. The batch's id reaches all its
+    /// subagents, and a subagent's own id reaches just that one.
+    #[test_case(CALL_ID, &[NESTED_ID, OTHER_NESTED_ID] ; "the_calls_id_reaches_all")]
+    #[test_case(NESTED_ID, &[NESTED_ID] ; "a_nested_id_reaches_one")]
+    fn send_reaches_the_sessions_an_id_names(id: &str, want: &[&str]) {
+        let chat = MakiId::generate();
+        let _live = live(chat);
+        let (registry, controls) = registry_with_nested(chat);
+
+        let names = registry.send(Some(chat), id, message, Delivery::NextTurn);
+
+        assert_eq!(names, Ok(want.iter().map(ToString::to_string).collect()));
+        for (name, control) in [NESTED_ID, OTHER_NESTED_ID].iter().zip(&controls) {
+            let sent = want.contains(name).then(|| MESSAGE.to_owned());
+            assert_eq!(control.texts(), Vec::from_iter(sent));
+        }
+    }
+
+    enum Lookup {
+        Messages,
+        Send,
+    }
+
+    /// A model that guessed wrong gets the ids it can use instead. Reading a
+    /// transcript needs one subagent, so a batch's id reads nothing.
+    #[test_case(Lookup::Messages, CALL_ID ; "reading_a_calls_id")]
+    #[test_case(Lookup::Send, OTHER_NESTED_ID ; "sending_to_an_ended_session")]
+    fn a_missed_subagent_lists_those_running(lookup: Lookup, id: &str) {
+        let chat = MakiId::generate();
+        let _live = live(chat);
+        let (registry, [_, ended]) = registry_with_nested(chat);
+        ended.end(EndReason::Closed);
+
+        let missed = match lookup {
+            Lookup::Messages => registry.subagent(Some(chat), id).map(|_| ()),
+            Lookup::Send => registry
+                .send(Some(chat), id, message, Delivery::NextTurn)
+                .map(|_| ()),
+        };
+
+        assert_eq!(
+            missed,
+            Err(format!(
+                "{NO_RUNNING_SUBAGENT} {id}; {RUNNING_LIST} {NESTED_ID} ({NESTED_ID})"
+            ))
+        );
+    }
+
+    /// A nested session has no final reply to wait for. What it did comes back
+    /// in its batch's result, and the batch keeps running.
+    #[tokio::test]
+    async fn model_stop_of_a_nested_session_ends_it_alone_at_once() {
+        let chat = MakiId::generate();
+        let _live = live(chat);
+        let (registry, [stopped, kept]) = registry_with_nested(chat);
+
+        let stop = registry.stop_by_model(Some(chat), NESTED_ID, FOREVER).await;
+
+        assert_eq!(
+            stop,
+            Ok(ModelStop {
+                output: None,
+                name: NESTED_ID.to_owned(),
+                parent: Some(CALL_ID.to_owned()),
+            })
+        );
+        assert_eq!(stopped.ended(), Some(EndReason::Stopped(Cutter::Parent)));
+        assert_eq!(kept.ended(), None);
+        assert!(registry.contains(CALL_ID));
+        assert!(!registry.contains(NESTED_ID));
     }
 
     /// The session a moved call runs hears of the call's stop whichever came

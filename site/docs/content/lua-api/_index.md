@@ -6049,8 +6049,11 @@ A subagent stopped this way ends its pending `:prompt()` with
 `"stopped by parent agent"`. It waits up to 5 seconds for the final reply
 and returns it, and the agent gets no notice of the end. A late reply
 returns no `output`, and the result reaches the agent later as a quiet
-notice. A task another agent moved, a finished task or an unknown id
-returns an error that names the agent's running task ids.
+notice. A subagent nested in a moved call, like a `task` in a `batch`,
+stops alone and returns at once, with `parent` set to that call's id: the
+call's result carries what the subagent did. A task another agent moved, a
+finished task or an unknown id returns an error that names the agent's
+running task ids.
 
 **Parameters:**
 
@@ -6062,9 +6065,9 @@ returns an error that names the agent's running task ids.
   ctx: the background task id.
 
 **Returns:** (`boolean|table|nil`, `string|nil`) true on success, or nil and an
-  error. With a ctx, success is `{name, output?}`. `name` is the task's
-  name in `/tasks`, and `output` is the final reply, missing when it was
-  late.
+  error. With a ctx, success is `{name, output?, parent?}`. `name` is the
+  task's name in `/tasks`, `output` is the final reply, missing when it
+  was late, and `parent` is the call a nested subagent ran under.
 
 **Example:**
 
@@ -6094,8 +6097,9 @@ carries on with its history intact. With no turn running the message
 waits like any other.
 
 An agent reaches the subagents it moved, and those nested in a call it
-moved, until they end. Like `stop(ctx, id)`, it never reaches what
-another agent moved.
+moved, until they end. The id of such a call, like a `batch`, reaches
+every subagent still running in it. Like `stop(ctx, id)`, it never reaches
+what another agent moved.
 
 **Parameters:**
 
@@ -6105,8 +6109,9 @@ another agent moved.
 - `{opts?}` (`table?`) Optional fields:
   - `interrupt` (`boolean?`) cut its current turn short. Default: `false`.
 
-**Returns:** (`table|nil`, `string|nil`) `{name}`, the task's name in `/tasks`, or
-  nil and `"no running background subagent with id <id>"`.
+**Returns:** (`table|nil`, `string|nil`) `{name}`, the task's name in `/tasks` (the
+  names of all it reached, comma-separated), or nil and
+  `"no running background subagent with id <id>; running: <id> (<name>), ..."`.
 
 **Example:**
 
@@ -6126,7 +6131,8 @@ maki.task.messages({ctx}, {id}, {opts?})
 
 Reads the transcript of a background subagent that the calling agent
 moved, oldest first, while it works. The messages have the shape
-`maki.session.messages` returns. It reaches what `send(ctx, id)` does.
+`maki.session.messages` returns. It reaches what `send(ctx, id)` does,
+one subagent at a time: the id of a call it runs in reaches none.
 Works without an interactive UI.
 
 Requires the `session_read` [plugin permission](#plugin-permissions).
@@ -6138,7 +6144,7 @@ Requires the `session_read` [plugin permission](#plugin-permissions).
 - `{opts?}` (`table?`) `last` (integer?) only the newest `last` messages.
 
 **Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and
-  `"no running background subagent with id <id>"`.
+  `"no running background subagent with id <id>; running: ..."`.
 
 **Example:**
 

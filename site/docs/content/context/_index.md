@@ -233,6 +233,8 @@ With `background = true` the tool answers right away and the parent keeps workin
 
 The receipt names the task id. The parent can pass it to `task_message` to tell a running task something new, like a fresh lead or "wrap up now". The task reads it after its current step as a message from its parent, not the user, and a task still waiting for a slot reads it with its first prompt. Only the chat that started a task can reach it, and a stopped or finished task refuses. A message that arrives while the task writes its final answer gets one more turn. Only one sent in the moment after that answer is dropped.
 
+Tasks started in one `batch` move together. The batch receipt gives each task its own id, and the batch id reaches all of its tasks at once, for example to change the scope of every one. An id that reaches nothing is an error that lists the running tasks by id and name.
+
 To stop a task, open `/tasks`, select it, and press Ctrl+S. The parent still gets the result on its next turn, but the notice does not wake it.
 
 Background and blocking tasks share `plugins.task.max_concurrent`. Plan mode still blocks its file writes. [Background Tasks](/docs/background-tasks/) covers permission prompts, what stops a task, and headless runs.

@@ -49,6 +49,12 @@ const NOT_RUNNING: &str = "no running background subagent with id";
 const INTERRUPT_OPEN: &str = "<parent-interrupt>";
 const INIT: &str = include_str!("../../plugins/task/init.lua");
 const RUNNER: &str = include_str!("../../plugins/task/runner.lua");
+const BATCH: &str = include_str!("../../plugins/batch/init.lua");
+const BATCH_PLUGIN: &str = "batch";
+const BATCH_TOOL: &str = "batch";
+const SECOND_NAME: &str = "check the logs";
+const LISTED_TASK: &str = "- task (task ";
+const NESTED_STOPPED: &str = "Stopped. What it did so far arrives with the result of task ";
 
 // Mirrors of the runtime's wording.
 const MOVED_AS_ASKED: &str = "Started in the background as asked";
@@ -604,4 +610,65 @@ fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports()
 
     parked.release.send(()).unwrap();
     assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
+}
+
+/// The model sent its background tasks out in one batch, and the batch moved
+/// as one call. The receipt lists each subagent's id. The batch's id reaches
+/// all of them, a subagent's own id reaches just that one, and stopping one
+/// leaves the rest and the batch running.
+#[test]
+fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
+    host.host
+        .load_source_with_permissions(BATCH_PLUGIN, BATCH, PluginPermissions::trusted())
+        .unwrap();
+    let chat = Chat::live();
+    let parked = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    ctx.provider = Arc::clone(&parked.provider);
+    let tasks = [NAME, SECOND_NAME].map(|name| {
+        json!({
+            "tool": TASK_TOOL,
+            "parameters": { "description": name, "prompt": PROMPT, "background": true },
+        })
+    });
+
+    let result = exec(&host.reg, BATCH_TOOL, json!({ "tool_calls": tasks }), &ctx);
+
+    assert!(result.backgrounded);
+    let (receipt, _) = done_text(&result);
+    let ids: Vec<&str> = receipt
+        .lines()
+        .filter_map(|line| line.strip_prefix(LISTED_TASK)?.split_once(')'))
+        .map(|(id, _)| id)
+        .collect();
+    let [first, second] = ids[..] else {
+        panic!("the receipt lists both tasks:\n{receipt}");
+    };
+    for _ in &tasks {
+        parked.wait_started();
+    }
+
+    let (sent, failed) = message(&host, chat.id, CALL_ID, false);
+    assert!(
+        !failed && sent.contains(NAME) && sent.contains(SECOND_NAME),
+        "{sent}"
+    );
+    let mut agent = chat.seed.tool_context(CancelToken::none());
+    agent.mailbox = Some(chat.mailbox.clone());
+    assert_eq!(
+        done_text(&exec(&host.reg, STOP_TOOL, json!({ "id": second }), &agent)),
+        (format!("{NESTED_STOPPED}{CALL_ID}."), false)
+    );
+    assert_refused(&host, chat.id, second);
+    assert_eq!(
+        message(&host, chat.id, first, false),
+        (QUEUED.to_owned(), false)
+    );
+
+    // Dropping the release sender lets every turn finish, however many the
+    // queued messages add.
+    drop(parked);
+    host.task_done();
 }

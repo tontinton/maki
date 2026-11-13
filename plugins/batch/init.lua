@@ -34,6 +34,9 @@ local BACKGROUND_PARAM = "background"
 local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground.\n\n"
 local MOVED_ITEM_FMT = "- %s"
 local MOVED_ITEM_HEADER_FMT = ": %s"
+-- A subagent child is a task of its own. Without its id the model has no way
+-- to message or stop it alone.
+local MOVED_ITEM_TASK_FMT = " (task %s)"
 local SECTION_FMT = "## %s\n"
 local SECTION_PAT = "^## (.+)$"
 
@@ -530,8 +533,8 @@ function Batch:run_child(c, ctx)
       c.movable = movable
       self:sync_movable()
     end,
-    on_task = function()
-      c.subagent = true
+    on_task = function(id)
+      c.task_id = id
       self:publish_parts()
     end,
   })
@@ -670,7 +673,7 @@ function Batch:publish_parts()
   end
   local parts = {}
   for i, c in ipairs(self.children) do
-    if not c.subagent then
+    if not c.task_id then
       -- A bash call without a description has an empty title.
       local header = header_text(c)
       parts[#parts + 1] = {
@@ -744,6 +747,7 @@ function Batch:hand_over()
   for i, c in ipairs(running) do
     local header = header_text(c)
     items[i] = string.format(MOVED_ITEM_FMT, c.tool)
+      .. (c.task_id and string.format(MOVED_ITEM_TASK_FMT, c.task_id) or "")
       .. (header ~= "" and string.format(MOVED_ITEM_HEADER_FMT, header) or "")
   end
   local sections = render_sections(finished)
