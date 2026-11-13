@@ -5088,6 +5088,11 @@ it does for a built-in provider.
   `{ body_field = "prompt_cache_key" }`, or both. A
   listed header replaces one the credentials set. The `google`
   codec refuses it.
+- `replay_reasoning` (`boolean`) Sends past assistant reasoning back as
+  `reasoning` input items, so a follow-up keeps what the model
+  worked out earlier. Only `codec = "openai-responses"` accepts
+  it, and only a provider that takes plaintext reasoning back
+  should set it. Defaults to `false`.
 - `models` (`table`) Static model rows, read once at registration. They
   describe models and add to the runtime list. See
   [model rows](/docs/providers/#model-rows).

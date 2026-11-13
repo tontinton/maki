@@ -278,7 +278,7 @@ impl Copilot {
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
-        let mut body = responses::build_body(model, messages, system, tools);
+        let mut body = responses::build_body(model, messages, system, tools, false);
         let reasoning_info = model_registry::provider_info::<CopilotModelInfo>(SLUG, &model.id)
             .or_else(|| {
                 self.models

@@ -42,6 +42,7 @@ const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const OPENAI_OPTION: &str = "openai";
 const SESSION_ID_OPTION: &str = "session_id";
+const REPLAY_REASONING_OPTION: &str = "replay_reasoning";
 const BASE_URL_OPTION: &str = "base_url";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
@@ -193,6 +194,11 @@ pub struct ProviderDecl {
     pub openai: Option<OpenAiWire>,
     /// Above the codec tables, because every codec but google carries it.
     pub session_id: Option<SessionCarrier>,
+    /// Send past assistant reasoning back as `reasoning` input items. Only
+    /// `codec = "openai-responses"` reads it, and only some providers take
+    /// plaintext reasoning back.
+    #[serde(default)]
+    pub replay_reasoning: bool,
     /// This and the next three describe a model no row or listing covers.
     /// Each falls back to the native provider behind the codec or base. The
     /// two limits also fill in any row that leaves its own out.
@@ -431,6 +437,16 @@ fn honours_session_id(target: Target) -> bool {
     match target {
         Target::Codec(Protocol::Anthropic | Protocol::Openai | Protocol::OpenaiResponses) => true,
         Target::Codec(Protocol::Google) | Target::Base(_) => false,
+    }
+}
+
+/// Only the responses wire takes a `reasoning` input item, and only some
+/// providers accept one in plaintext.
+fn honours_replay_reasoning(target: Target) -> bool {
+    match target {
+        Target::Codec(Protocol::OpenaiResponses) => true,
+        Target::Codec(Protocol::Openai | Protocol::Anthropic | Protocol::Google)
+        | Target::Base(_) => false,
     }
 }
 
@@ -736,6 +752,9 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     }
     if decl.session_id.is_some() && !honours_session_id(target) {
         return Err(unsupported(SESSION_ID_OPTION));
+    }
+    if decl.replay_reasoning && !honours_replay_reasoning(target) {
+        return Err(unsupported(REPLAY_REASONING_OPTION));
     }
     let states_origin =
         decl.base_url.is_some() || decl.plans.iter().any(|plan| plan.base_url.is_some());
@@ -1426,6 +1445,7 @@ fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
         system_prefix: decl.system_prefix.clone(),
         openai: decl.openai.clone().unwrap_or_default(),
         session_id: decl.session_id.clone().unwrap_or_default(),
+        replay_reasoning: decl.replay_reasoning,
         build_body: entry
             .hooks
             .build_body
@@ -3197,6 +3217,19 @@ mod tests {
         reg.decl.session_id = Some(SessionCarrier::default());
     }
 
+    fn replay_reasoning_on_chat(reg: &mut Registration) {
+        reg.decl.codec = Some(Protocol::Openai);
+        reg.decl.replay_reasoning = true;
+    }
+
+    #[test]
+    fn replay_reasoning_registers_on_the_responses_codec() {
+        let mut reg = registration("replay-reasoning-plugin");
+        reg.decl.codec = Some(Protocol::OpenaiResponses);
+        reg.decl.replay_reasoning = true;
+        register_loaded(reg).unwrap();
+    }
+
     fn system_prefix_on_google(reg: &mut Registration) {
         reg.decl.codec = Some(Protocol::Google);
         reg.decl.system_prefix = Some(SOME_SYSTEM_PREFIX.to_string());
@@ -3241,6 +3274,7 @@ mod tests {
     #[test_case(openai_wire_chat_field_on_responses, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "responses_codec_refuses_chat_only_fields")]
     #[test_case(openai_wire_custom_effort_field_on_responses, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "responses_codec_refuses_a_custom_effort_field")]
     #[test_case(session_id_on_google, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == SESSION_ID_OPTION) ; "google_carries_no_session_id")]
+    #[test_case(replay_reasoning_on_chat, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == REPLAY_REASONING_OPTION) ; "replay_reasoning_needs_the_responses_codec")]
     #[test_case(system_prefix_on_google, |e| matches!(e, RegisterError::Unsupported { .. }) ; "google_drops_the_system_prefix")]
     #[test_case(system_prefix_on_the_google_base, |e| matches!(e, RegisterError::Unsupported { .. }) ; "so_does_the_google_base")]
     #[test_case(base_url_on_a_base, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == BASE_URL_OPTION) ; "base_url_needs_a_codec")]

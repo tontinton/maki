@@ -30,8 +30,9 @@ pub(crate) fn build_body(
     messages: &[Message],
     system: &str,
     tools: &Value,
+    replay_reasoning: bool,
 ) -> Value {
-    let input = convert_input(messages);
+    let input = convert_input(messages, replay_reasoning);
     let wire_tools = convert_tools(tools);
 
     let mut body = json!({
@@ -62,7 +63,7 @@ pub(crate) fn apply_responses_reasoning(
     }
 }
 
-pub(crate) fn convert_input(messages: &[Message]) -> Value {
+pub(crate) fn convert_input(messages: &[Message], replay_reasoning: bool) -> Value {
     let mut input = Vec::new();
 
     for msg in messages {
@@ -103,11 +104,13 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                 }
             }
             Role::Assistant => {
+                let mut reasoning = String::new();
                 let mut text_parts = Vec::new();
                 let mut tool_calls = Vec::new();
 
                 for block in &msg.content {
                     match block {
+                        ContentBlock::Thinking { thinking, .. } => reasoning.push_str(thinking),
                         ContentBlock::Text { text } => text_parts.push(text.as_str()),
                         ContentBlock::ToolUse {
                             id, name, input, ..
@@ -116,10 +119,17 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                         }
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
-                        | ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
                         | ContentBlock::Unknown(_) => {}
                     }
+                }
+
+                if replay_reasoning && !reasoning.is_empty() {
+                    input.push(json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": reasoning}]
+                    }));
                 }
 
                 if !text_parts.is_empty() {
@@ -759,7 +769,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             },
         ];
 
-        let input = convert_input(&messages);
+        let input = convert_input(&messages, false);
         let items = input.as_array().unwrap();
 
         assert_eq!(items[0]["type"], "message");
@@ -782,6 +792,41 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
     }
 
     #[test]
+    fn convert_input_replays_past_reasoning() {
+        let messages = vec![
+            Message::user("hello".to_string()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "weighing it".to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "answer".to_string(),
+                    },
+                ],
+                ..Default::default()
+            },
+        ];
+
+        let input = convert_input(&messages, true);
+        let items = input.as_array().unwrap();
+
+        assert_eq!(items[1]["type"], "reasoning");
+        assert_eq!(items[1]["summary"], json!([]));
+        assert_eq!(items[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(items[1]["content"][0]["text"], "weighing it");
+        assert_eq!(items[2]["type"], "message");
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[2]["content"][0]["text"], "answer");
+
+        let dropped = convert_input(&messages, false);
+        assert_eq!(dropped[1]["type"], "message");
+        assert_eq!(dropped[1]["role"], "assistant");
+    }
+
+    #[test]
     fn convert_input_blank_tool_result_gets_marker() {
         let messages = vec![Message {
             role: Role::User,
@@ -789,7 +834,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             ..Default::default()
         }];
 
-        let input = convert_input(&messages);
+        let input = convert_input(&messages, false);
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["output"], crate::types::EMPTY_RESPONSE_MARKER);
     }
