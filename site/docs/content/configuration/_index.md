@@ -79,7 +79,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `program_status` | bool | `true` | - | Report session state (idle, working, blocked, done, error) to the terminal with OSC 7501 |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
-| `mouse_scroll_lines` | u32 | `1 on macOS, 3 elsewhere` | 1 | Lines per mouse wheel scroll. Set it to 1 if your terminal runs on a Mac and maki runs remotely (e.g. over SSH) |
+| `mouse_scroll_lines` | u32 | `1 on macOS, 3 elsewhere` | 1 | Lines per mouse wheel scroll. Use 1 when your terminal runs on a Mac and Maki runs remotely, e.g. over SSH |
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `thinking_lines` | integer | `3` | - | Collapse model reasoning to its header and last N lines. Click to toggle. 0 shows only the header, -1 never collapses |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
@@ -100,7 +100,7 @@ Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppucci
 
 You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
 
-`user_bg` is the user-message counterpart to `tool_bg`. It fills the full width behind a user message, including the `you> ` prefix, and does not add vertical padding. Use `user` for the prefix foreground, `user_text` for the message body, and `user_bg` for the surface behind the whole message. `user_text` defaults to `assistant`. `user_bg` defaults to no background.
+User messages use `user` for the `you> ` prefix, `user_text` for the body, and `user_bg` for the full-width background behind both. `user_text` defaults to `assistant`, and `user_bg` to no background.
 
 ```toml
 # themes/<name>.toml
@@ -112,7 +112,7 @@ user_bg = { bg = "#1d2021" }
 
 Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
 
-The chat input caret is your terminal's own cursor, in your terminal's shape and colors. Plugins can change its shape with `maki.ui.set_cursor_shape`. The search, file, list and login pickers still paint their caret with `cursor`, and so can plugins.
+The chat input uses your terminal's own cursor, in its shape and colors. The search, file, list and login pickers paint their caret with `cursor`.
 
 Themes use 24-bit colors by default, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
 
@@ -350,7 +350,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `responses_api` | boolean | `false` | - | Speak the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). The responses wire does not send past reasoning back, so follow-ups cannot lean on it. |
+| `responses_api` | boolean | `false` | - | Use the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). Past reasoning is not sent back on this API, so later turns cannot build on it. |
 
 ### `plugins.read`
 

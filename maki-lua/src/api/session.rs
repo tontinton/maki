@@ -439,9 +439,8 @@ async fn export(
 /// notice that answered one, with `end` one of `"finished"`, `"failed"`,
 /// `"cancelled"` or `"lost"`. `partial` has the same shape and marks a notice
 /// that answered one piece early, like one call of a moved batch, and left
-/// the receipt open. `created_at` is the wall clock, in epoch
-/// milliseconds, when the message was appended, or nil for a message older than
-/// the field, so a reader can tell a real zero gap from an unknown one.
+/// the receipt open. `created_at` is when the message was appended, in epoch
+/// milliseconds, and nil for messages saved before the field existed.
 /// `content` lists blocks:
 ///
 /// ```text
@@ -458,13 +457,7 @@ async fn export(
 /// as its raw table. JSON null is `maki.NIL`.
 ///
 /// A live session is read from memory, unsaved messages included, any other
-/// from disk. Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no
-/// focused session, so pass `session` there. Hook and event payloads carry
-/// the `session_id` to pass.
-///
-/// `window` reads one archived window instead, as `maki.session.windows`
-/// lists it. Archives never change, so they read the same in every mode and
-/// need no live session.
+/// from disk.
 ///
 /// @param opts table? Options:
 ///   `session` (string?) Session id, live or stored. Defaults to the focused one.
@@ -525,17 +518,15 @@ async fn current(
     Ok(pair(focused_session(&lua, tx.as_ref()).await))
 }
 
-/// This plugin's directory for this session's data, as
-/// `state/sessions/data/<session>/<plugin>/`. Core owns it: the delete that
-/// takes the session takes everything written under it. Not created; make it
-/// with `maki.fs.mkdir` before the first write. A plugin's grants cover it
-/// like any other path.
+/// Returns this plugin's data directory for a session,
+/// `state/sessions/data/<session>/<plugin>/`. Deleting the session deletes
+/// it. The directory may not exist yet, so create it with `maki.fs.mkdir`
+/// before the first write. Writing there needs `fs_write` like any other path.
 ///
-/// The session defaults to the one the calling agent serves, so a tool of
-/// a background tab gets that tab's dir rather than the one on screen, and
-/// to the focused session otherwise.
-///
-/// @param opts table? `session` names another session.
+/// @param opts table? Options:
+///   `session` (string?) Session id. Defaults to the session the calling
+///     agent serves (so a tool in a background tab gets that tab's
+///     directory), else the focused one.
 /// @return (string|nil, string|nil) The directory path, or nil and an error.
 /// @example
 /// local dir, err = maki.session.data_dir()
@@ -575,32 +566,19 @@ async fn data_dir(
     Ok(pair(path))
 }
 
-/// Lists a session's transcript windows, newest first: the current window is
-/// `[1]` and holds the conversation that has not been sealed yet, then the
-/// archived windows from the most recent seal back to the session start,
-/// each labeled with the rewrite that sealed it. A compaction parks the
-/// turns it summarized, a rewind the turns it cut, and both stay readable.
+/// Lists a session's transcript windows, newest first. `[1]` is the current
+/// window. The rest are archives, each sealed by the compaction or rewind
+/// that replaced its turns. Listing reads no transcript, so it stays cheap.
 ///
 /// Each window is:
 /// ```text
 /// {
-///   id = "current" | "<seq>",  -- pass back to `messages`/`subagents`
-///   created_at,                -- when the window began, in Unix seconds: the
-///                              -- session start for the oldest, otherwise the
-///                              -- seal time of the window before it in time;
-///                              -- nil when the session header is missing or
-///                              -- unreadable
+///   id = "current" | "<seq>",  -- pass to `messages` or `subagents`
+///   created_at,                -- when the window began, in Unix seconds,
+///                              -- or nil if unknown
 ///   kind = "current" | "compaction" | "rewind" | "unknown",
 /// }
 /// ```
-///
-/// Listing never parses a transcript, so it stays cheap however long the
-/// session is. `messages` reads one window; `subagents` reads the asked
-/// window and its neighbors.
-///
-/// Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no focused
-/// session, so pass `session` there. Hook and event payloads carry the
-/// `session_id` to pass.
 ///
 /// @param opts table? Options:
 ///   `session` (string?) Session id, live or stored. Defaults to the focused one.
@@ -637,33 +615,23 @@ async fn windows(
     Ok((Some(windows_table(&lua, &archives, started_at)?), None))
 }
 
-/// Reads the subagent transcripts that belong to one window, in spawn order
-/// where the session recorded it; transcripts with no record come last, by
-/// id. A transcript attaches to the window holding the `tool_use` that
-/// started it. A plugin run beside the chat has no parent `tool_use` and
-/// keeps its records across rewrites, so it attaches to the newest window
-/// that holds them.
+/// Reads the subagent transcripts of one window, in spawn order. A
+/// transcript belongs to the window holding the `tool_use` that started it.
 ///
 /// Each entry is:
 /// ```text
 /// {
-///   id,       -- the `tool_use` id that spawned it, stable in the session
-///   nr,       -- 1-based position in the window's subagent list, not the
-///             -- array index; a rewrite can drop entries, so numbers repeat
-///             -- across windows
+///   id,       -- the `tool_use` id that spawned it, unique in the session
+///   nr,       -- 1-based number in the stored subagent list. Can skip
+///             -- numbers and repeat across windows, so key on `id`
 ///   name,     -- the task description that spawned it, or "subagent"
 ///   messages, -- same shape as `maki.session.messages`
 /// }
 /// ```
 ///
-/// Only what the host stored is visible. The TUI records subagent
-/// transcripts; `maki -p`, the SDK and ACP do not, so `subagents` answers an
-/// empty list for sessions they ran. The current window's transcripts come
-/// from the stored copy too, so they trail the run: a running subagent shows
-/// only the turns saved so far.
-///
-/// ACP has no focused session, so pass `session` there. Hook and event
-/// payloads carry the `session_id` to pass.
+/// Only the TUI stores subagent transcripts. Sessions run by `maki -p`, the
+/// SDK or ACP give an empty list. Transcripts come from disk, so a running
+/// subagent shows only the turns saved so far.
 ///
 /// @param opts table? Options:
 ///   `session` (string?) Session id, live or stored. Defaults to the focused one.
@@ -1269,8 +1237,8 @@ lua_table! {
     /// Without a UI, most functions return `nil, "no interactive UI attached"`.
     /// `current`, `read`, `export`, `messages`, `windows`, `subagents`,
     /// `notify` and `new` without `prompt` or `focus` still work. ACP has no
-    /// focused session, so there `current` fails and the readers need
-    /// `session`.
+    /// focused session, so there `current` fails and the read functions need
+    /// `session`. Hook and event payloads carry it as `session_id`.
     "maki.session" => pub(crate) fn create_session_table(
         tx: Option<UnboundedSender<UiAction>>,
         perms: &PluginPermissions,

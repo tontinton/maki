@@ -668,9 +668,9 @@ async fn system_prompt(
 /// straight into `maki.agent.session()` or use it to inspect what tools are
 /// available.
 ///
-/// A session costs what its tools reach (see `maki.agent.session`). To hand
-/// over only what the plugin can pay for, check each tool's `permission`
-/// from `maki.api.get_tool`, as the second example does.
+/// A session costs what its tools reach (see `maki.agent.session`). To keep
+/// only tools the plugin can pay for, filter on each tool's `permission`
+/// from `maki.api.get_tool`, as the example does.
 ///
 /// Without a `ctx`, pass `session = id` in `opts` to get the tools a
 /// background session of that chat would have.
@@ -963,21 +963,18 @@ async fn dispatch_child(
 /// chat is in plan mode its file-write tools are denied. Its thinking never
 /// goes above the chat's current setting.
 ///
-/// With or without a ctx, the plugin must hold what its tools reach. A prompt
-/// is no gate under YOLO or an allow rule, and a background session has
-/// nobody to prompt. A tool declaring a permission (`bash` with `run`, `read`
-/// with `fs_read`) costs that one. A tool registered with `permission = {}`
-/// costs nothing. A tool declaring none, or `mcp = true` on a chat with MCP
-/// servers, costs every permission except `agent` and `input`. See each
-/// tool's `permission` in `maki.api.get_tool` and on the
-/// [Tools](/docs/tools/) page. `local_tools` cost nothing, they run as the
-/// plugin. The bundled `task` hands over the whole chat, so it holds every
-/// permission. If the plugin cannot pay, the error lists every tool it cannot
-/// pay for and the `except` list that leaves them out.
+/// With or without a ctx, the plugin must hold what its tools reach, because
+/// YOLO, allow rules and background sessions skip the prompt. Each tool costs:
 ///
-/// The `general_sub` set in the example includes tools that declare no
-/// permission (`batch`, `code_execution`), so a plugin without every
-/// permission leaves those out.
+/// - A declared permission (`bash`: `run`, `read`: `fs_read`): that one.
+/// - `permission = {}`, and `local_tools` (they run as the plugin): nothing.
+/// - No declaration (`batch`, `code_execution`), or `mcp = true` on a chat
+///   with MCP servers: every permission except `agent` and `input`.
+///
+/// Look a tool up with `maki.api.get_tool` or on the [Tools](/docs/tools/)
+/// page. If the plugin cannot pay, the error names each tool it cannot pay
+/// for and the `except` list that leaves them out. The bundled `task` plugin
+/// hands over the whole chat, so it holds every permission.
 ///
 /// `scope` sets the lifetime. `"task"`, the default, ends the session with
 /// the task that opened it: an autocmd callback when it returns, a tool
@@ -2160,10 +2157,9 @@ fn send(
 /// Close cancels a running prompt before waiting to flush its history. That
 /// prompt returns `"session closed"` and any partial text.
 ///
-/// Pass {result}, the tool result the session's work came to, so headless
-/// clients learn how the subagent ended and what it found.
+/// {result} tells headless clients how the subagent ended and what it found.
 ///
-/// @param result table? `llm_output` and `is_error`, the shape a tool handler returns.
+/// @param result table? `{ llm_output, is_error }`, the shape a tool handler returns.
 /// @return
 #[lua_fn]
 async fn close(

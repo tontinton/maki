@@ -21,6 +21,13 @@ const PLUGIN_PROVIDER_MANIFEST: &str =
 
 const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/maki/model-tiers` and apply across sessions."#;
 
+const COMPACTION_ORDER: &str = r#"Compaction uses the first model it finds:
+
+1. Your `/model` compaction pick.
+2. A `tier = "compaction"` model of the session's provider.
+3. A `tier = "compaction"` model of any other provider, in slug order.
+4. The session model, also used when the chosen model is unavailable."#;
+
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 
 Maki re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `maki auth login` in another terminal or change an env var, the next session picks it up without a restart.
@@ -188,7 +195,7 @@ supports_vision = false
 | `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
 | `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
-| `headers` | table | Extra HTTP headers sent on every request to this provider. Values expand `${{VAR}}` from the environment; an unset or empty variable fails the provider instead of sending a half-filled header. A same-name header (case-insensitive) replaces the one maki, the plugin or the built-in auth would send, and survives key rotation. `anthropic-beta` values are added to the betas maki sends rather than replacing them. Each name is sent once |
+| `headers` | table | Extra HTTP headers for every request to this provider. Values expand `${{VAR}}` from the environment, and an unset or empty variable fails the provider. A header with the same name (case-insensitive) replaces the one maki would send, auth included, and survives key rotation. `anthropic-beta` values add to the betas maki sends |
 | `default_model` | string | Used after login when no model is saved yet. On a custom entry it is also the startup fallback when no built-in or plugin provider is available. Without it, startup picks a declared `strong` or `medium` model |
 | `top_p` | f64 | Nucleus sampling probability, sent as `top_p` in the request body for OpenAI-compatible, Anthropic, Bedrock and Google providers. Claude and GPT models reject it while thinking is on, and Claude Opus 4.7, Claude 5 and later always do, so it is dropped there. Never sent to Copilot or over the OpenAI responses path. Only sent when set, so the provider's own default applies otherwise. Must be in `(0, 1]` |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
@@ -619,11 +626,10 @@ fn render() -> String {
         "Maki talks to LLM providers over their HTTP APIs. \
          Models are split into three tiers: **weak** (cheap and fast), \
          **medium** (balanced), and **strong** (highest capability, highest cost). \
-         There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long. \
-         The summary comes from the first of: your `/model` compaction pick, a `tier = \"compaction\"` model of the session's provider, \
-         one from any other provider in slug order, then the session model.\n"
+         A fourth tier, **compaction**, picks the model that summarizes the conversation when it grows long.\n"
     );
     let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
+    let _ = writeln!(out, "{COMPACTION_ORDER}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");

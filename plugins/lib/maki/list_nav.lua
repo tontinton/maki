@@ -1,10 +1,8 @@
--- Moves a cursor through a list, so every picker answers a key the same way.
--- It keeps no state. You give it the key, the row the cursor is on and a
--- function that moves the cursor. The list and the drawing stay yours, so a
--- picker that tracks its selection by id works as well as one that tracks a
--- row number.
+-- Moves a cursor through a list, so every picker answers the same keys. It
+-- keeps no state: you pass the key, the cursor row and a function that moves
+-- the cursor. The list and the drawing stay yours.
 --
--- Ask it last, after your own keys, so a key you bind always wins:
+-- Call it after your own keys, so a key you bind wins:
 --
 --   if key == "<CR>" then
 --     open(cursor)
@@ -73,8 +71,8 @@ local ACTIONS = {
   end,
 }
 
--- For a list under a text input, like a filtered picker. Letters are missing
--- on purpose, because the input needs them.
+-- For a list under a text input. It has no letters, because the input needs
+-- them.
 ListNav.KEYS = table.freeze({
   ["<Up>"] = "up",
   ["<Down>"] = "down",
@@ -82,7 +80,7 @@ ListNav.KEYS = table.freeze({
   ["<PageDown>"] = "page_down",
 })
 
--- For a list where nothing takes typed text, so j and k are free to move.
+-- Adds j and k, for a list without a text input.
 ListNav.VIM_KEYS = table.freeze({
   ["<Up>"] = "up",
   ["<Down>"] = "down",
@@ -92,24 +90,19 @@ ListNav.VIM_KEYS = table.freeze({
   k = "up",
 })
 
--- Moves the cursor for {key} by calling {move_to}(row), and answers whether
--- {key} is a navigation key, so you know when to pass it on. It answers true
--- even when the cursor cannot move, on an empty list or at an end that does
--- not wrap. That way an arrow key never falls through and types into a
--- filter.
---
--- {move_to} only ever gets a selectable row that exists. A {cursor} past the
--- end, left behind when the list shrank, is pulled back onto the list first.
+-- Calls {move_to}(row) for a navigation {key} and returns whether {key} is
+-- one, so you know when to pass it on. It returns true even when the cursor
+-- cannot move, so an arrow key never types into a filter. {move_to} only gets
+-- a selectable row that exists.
 --
 -- {opts}:
 --   count: rows in the list
---   page: rows a page moves, usually the visible height. Defaults to {count},
---     so a list without a viewport jumps to its ends
+--   page: rows a page moves, usually the visible height. Defaults to {count}
 --   wrap: false stops Up and Down at the ends. Pages never wrap
---   selectable: function(row) -> boolean, for rows the cursor skips, like
+--   selectable: function(row) -> boolean, false for rows to skip, like
 --     spacers or headings
---   keys: key -> "up"|"down"|"page_up"|"page_down", in the spelling
---     `maki.keymap.normalize` gives. Defaults to `ListNav.KEYS`
+--   keys: key -> "up"|"down"|"page_up"|"page_down", with keys spelled as
+--     `maki.keymap.normalize` returns them. Defaults to `ListNav.KEYS`
 function ListNav.handle_key(key, cursor, opts, move_to)
   local action = (opts.keys or ListNav.KEYS)[key]
   if not action then

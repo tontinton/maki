@@ -1260,7 +1260,7 @@ pub struct UiConfig {
         default = DEFAULT_MOUSE_SCROLL_LINES,
         min = MIN_MOUSE_SCROLL_LINES,
         default_doc = "1 on macOS, 3 elsewhere",
-        desc = "Lines per mouse wheel scroll. Set it to 1 if your terminal runs on a Mac and maki runs remotely (e.g. over SSH)"
+        desc = "Lines per mouse wheel scroll. Use 1 when your terminal runs on a Mac and Maki runs remotely, e.g. over SSH"
     )]
     pub mouse_scroll_lines: u32,
 

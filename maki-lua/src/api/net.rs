@@ -719,10 +719,8 @@ fn close(_lua: &Lua, this: &Conn) -> LuaResult<()> {
 }
 
 lua_class! {
-    /// A TCP or Unix socket connection.
-    ///
-    /// `maki.net.connect` opens a TCP one and `maki.net.connect_unix` a Unix
-    /// socket one.
+    /// A TCP or Unix socket connection, from `maki.net.connect`,
+    /// `maki.net.connect_unix` or `Listener:accept`.
     ///
     /// `read` and `write` yield until done and can run at the same time.
     /// The connection closes on `:close()`, when the handle is garbage
@@ -743,8 +741,11 @@ lua_table! {
     /// keep-alive connection rather than pay a fresh handshake each time.
     ///
     /// `connect` follows the same rules, but only reaches hosts the plugin
-    /// lists in `net_hosts`. On Unix, `connect_unix` and `listen_unix` reach
-    /// local sockets, and need the `run` permission instead.
+    /// lists in `net_hosts`.
+    ///
+    /// `connect_unix` and `listen_unix` exist on Unix only. They need the
+    /// `run` permission rather than `net`, because a plugin that can run
+    /// `socat` already reaches every local socket.
     ///
     /// ```lua
     /// local res, err = maki.net.request("https://example.com")

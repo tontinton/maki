@@ -186,17 +186,14 @@ call, and the first skip shows a warning naming every missing key.
 
 | Tool | A layer needs |
 | --- | --- |
-| declares a permission, like `bash` | that permission, `session_read` and `session_write` |
+| declares a permission, like `bash` (`run`) | that permission, `session_read` and `session_write` |
 | declares `permission = {}`, like `todo_write` | `session_read` and `session_write` |
-| leaves `permission` out, like `batch`, or is an MCP tool, ACP client tool or `tool_search` | every permission |
+| declares nothing, like `batch`, and any MCP tool, ACP client tool or `tool_search` | every permission except `agent` and `input` |
 
-The [Tools](/docs/tools/) page lists what each built-in declares.
-
-Leaving `permission` out does not mean a tool uses none. `batch`,
-`code_execution` and `task` declare nothing while invoking any other tool, so
-reading undeclared as free would hand a plugin everything. Undeclared costs the
-maximum instead. Only a tool that declares `permission = {}` is cheap, and its
-owner promises it reaches nothing past the conversation it runs in. See
+The [Tools](/docs/tools/) page lists what each built-in declares. A tool that
+declares nothing may still reach anything: `batch`, `code_execution` and `task`
+call other tools. A tool author who sets `permission = {}` promises the tool
+reaches nothing past the conversation. See
 [plugin permissions](/docs/lua-api/#plugin-permissions).
 
 **A layer may wait, within a window.** Chains are async, so a layer can read a
@@ -257,9 +254,9 @@ A bare `return` in a `tool.*` layer skips the tool's own layers too, which can
 switch off another plugin's block. Hand the tools you do not care about to
 `prev` instead.
 
-Each call charges the layer what that tool charges. A plugin granted only `run`
-has its `tool.*` layer run for `bash` and skipped for `read`, which declares no
-capability.
+Each call charges the layer what that tool charges. A plugin granted `run`,
+`session_read` and `session_write` has its `tool.*` layer run for `bash` and
+skipped for `read`, which declares `fs_read`.
 
 ## Agent slots
 
@@ -279,10 +276,8 @@ inside a subagent), `model`, `context_size`, `context_window`, and
 A layer on any of them needs every permission, because it steers what the agent
 does next. The chain gets 30 seconds, then the loop carries on without it.
 
-The verdict strings the host reads off the final value, `continue` and
-`instructions`, are one string shared by every layer, and only the last write
-survives. A layer that has something to say appends its own text to whatever is
-already there, and tolerates the field being absent:
+Every layer shares the same `continue` and `instructions` strings, so assigning
+one erases what another layer wrote. Append instead, and allow for `nil`:
 
 ```lua
 value.continue = (value.continue and value.continue .. "\n" or "") .. "Re-read PLAN.md."
@@ -494,12 +489,10 @@ end)
 -- render("hi") now returns "[HI]"
 ```
 
-`capability` is a list of permission names, and a layer needs all of them at
-once. An empty list is free for anyone. Leaving `capability` out charges every
-permission, which is what a tool declaring no capability charges: a slot that
-named no price has not promised its default exercises none, only that nobody
-asked. You can only name permissions your own plugin holds. `permission = {}` on
-a tool is the same declaration as `capability = {}` on a slot.
+`capability` is a list of permission names, and a layer needs all of them. An
+empty list is free for anyone. Leaving `capability` out charges every
+permission, because the owner made no promise about what its default does. You
+can only name permissions your own plugin holds.
 
 The rule is the one the `tool.*` slots use, and it is read the same way: every
 call re-reads what each layer's plugin holds, so a layer registered by a plugin

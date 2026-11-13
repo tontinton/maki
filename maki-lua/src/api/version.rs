@@ -173,21 +173,19 @@ fn test_values(left: &Value, right: &Value, test: fn(Ordering) -> bool) -> LuaRe
 }
 
 /// Parse a version string, such as "1.2.3-rc.1+build.5", into a version
-/// table with `major`, `minor`, `patch`, and optional `prerelease` and `build`
-/// fields. Index `[1]`, `[2]`, and `[3]` alias the numbers. Version tables
-/// work with comparison operators (`==`, `~=`, `<`, `<=`, `>`, `>=`) and can
-/// be printed with `tostring`.
+/// table with `major`, `minor`, `patch`, and optional `prerelease` and `build`.
+/// `[1]`, `[2]` and `[3]` alias the numbers. Two version tables compare with
+/// `==`, `<`, `<=`, `>` and `>=`, and `tostring` prints one.
 ///
-/// Parsing is loose by default, like Neovim: the version starts at the first
-/// digit and ends at whitespace, so "v1.2", "tmux 3.2a" and
-/// "git version 2.43.0" all parse. Missing minor and patch numbers are 0, and
-/// text after the numbers is dropped unless it is a valid SemVer
-/// `-prerelease` or `+build` suffix.
+/// Parsing is loose by default, like Neovim, so "v1.2", "tmux 3.2a" and
+/// "git version 2.43.0" all parse. The version starts at the first digit and
+/// ends at whitespace. Missing minor and patch are 0. Trailing text is dropped
+/// unless it is a valid SemVer `-prerelease` or `+build` suffix.
 ///
 /// @param version string Version string to parse.
 /// @param opts table? Options:
-///   `strict` (boolean) only accept a full SemVer 2.0.0 string, with no coercion. Off by default.
-/// @return (table?, string?) Version table, or nil plus an error.
+///   `strict` (boolean) only accept a full SemVer 2.0.0 string. Off by default.
+/// @return (table?, string?) Version table.
 /// @example
 /// local v = maki.version.parse("1.0.1-rc1+build.2")
 /// print(v.major, v.prerelease, tostring(v)) -- 1  rc1  1.0.1-rc1+build.2
@@ -208,15 +206,12 @@ fn parse(lua: &Lua, version: Value, opts: Option<Table>) -> LuaResult<Pair<Table
     }
 }
 
-/// Compare two versions by SemVer precedence. Each one can be a version
-/// table, a `{major, minor, patch}` tuple, or a string, parsed loosely like
-/// `maki.version.parse`. Build metadata is ignored, and a prerelease comes
-/// before its release.
+/// Compare two versions by SemVer precedence. Build metadata is ignored, and
+/// a prerelease sorts before its release.
 ///
 /// @param v1 table|string First version.
-/// @param v2 table|string Version to compare with `v1`.
-/// @return (integer?, string?) -1, 0, or 1 when `v1` is lower, equal, or
-///   higher, or nil plus an error for a string that does not parse.
+/// @param v2 table|string Second version.
+/// @return (integer?, string?) -1, 0 or 1 when `v1` is lower, equal or higher.
 /// @example
 /// maki.version.cmp({1, 0, 3}, "0.2.1") -- 1, nil
 /// maki.version.cmp("1.2.3-rc.2", "1.2.3-rc.10") -- -1, nil
@@ -227,51 +222,51 @@ fn cmp(_lua: &Lua, v1: Value, v2: Value) -> LuaResult<Pair<i8>> {
     Ok((ordering.map(|ordering| ordering as i8), err))
 }
 
-/// Whether `v1` equals `v2`. See `maki.version.cmp` for the accepted forms.
+/// Whether `v1 == v2`, by `maki.version.cmp` rules.
 ///
 /// @param v1 table|string First version.
 /// @param v2 table|string Second version.
-/// @return (boolean?, string?) The answer, or nil plus an error.
+/// @return (boolean?, string?) The result.
 #[lua_fn]
 fn eq(_lua: &Lua, v1: Value, v2: Value) -> LuaResult<Pair<bool>> {
     test_values(&v1, &v2, Ordering::is_eq)
 }
 
-/// Whether `v1 < v2`. See `maki.version.cmp` for the accepted forms.
+/// Whether `v1 < v2`, by `maki.version.cmp` rules.
 ///
 /// @param v1 table|string First version.
 /// @param v2 table|string Second version.
-/// @return (boolean?, string?) The answer, or nil plus an error.
+/// @return (boolean?, string?) The result.
 #[lua_fn]
 fn lt(_lua: &Lua, v1: Value, v2: Value) -> LuaResult<Pair<bool>> {
     test_values(&v1, &v2, Ordering::is_lt)
 }
 
-/// Whether `v1 <= v2`. See `maki.version.cmp` for the accepted forms.
+/// Whether `v1 <= v2`, by `maki.version.cmp` rules.
 ///
 /// @param v1 table|string First version.
 /// @param v2 table|string Second version.
-/// @return (boolean?, string?) The answer, or nil plus an error.
+/// @return (boolean?, string?) The result.
 #[lua_fn]
 fn le(_lua: &Lua, v1: Value, v2: Value) -> LuaResult<Pair<bool>> {
     test_values(&v1, &v2, Ordering::is_le)
 }
 
-/// Whether `v1 > v2`. See `maki.version.cmp` for the accepted forms.
+/// Whether `v1 > v2`, by `maki.version.cmp` rules.
 ///
 /// @param v1 table|string First version.
 /// @param v2 table|string Second version.
-/// @return (boolean?, string?) The answer, or nil plus an error.
+/// @return (boolean?, string?) The result.
 #[lua_fn]
 fn gt(_lua: &Lua, v1: Value, v2: Value) -> LuaResult<Pair<bool>> {
     test_values(&v1, &v2, Ordering::is_gt)
 }
 
-/// Whether `v1 >= v2`. See `maki.version.cmp` for the accepted forms.
+/// Whether `v1 >= v2`, by `maki.version.cmp` rules.
 ///
 /// @param v1 table|string First version.
 /// @param v2 table|string Second version.
-/// @return (boolean?, string?) The answer, or nil plus an error.
+/// @return (boolean?, string?) The result.
 #[lua_fn]
 fn ge(_lua: &Lua, v1: Value, v2: Value) -> LuaResult<Pair<bool>> {
     test_values(&v1, &v2, Ordering::is_ge)
@@ -279,9 +274,8 @@ fn ge(_lua: &Lua, v1: Value, v2: Value) -> LuaResult<Pair<bool>> {
 
 /// Return the highest version in a list, as the element itself.
 ///
-/// @param versions table List of version tables, tuples, or strings.
-/// @return (any, string?) The highest element, nil for an empty list, or
-///   nil plus an error for a string that does not parse.
+/// @param versions table List of versions.
+/// @return (any, string?) The highest element, or nil for an empty list.
 /// @example
 /// maki.version.last({ "1.9.0", "1.10.0", "1.2.0" }) -- "1.10.0", nil
 #[lua_fn]
@@ -304,11 +298,13 @@ fn last(_lua: &Lua, versions: Table) -> LuaResult<Pair<Value>> {
 
 lua_table! {
     /// Version parsing and comparison with the same API as Neovim's
-    /// `vim.version`. Call `maki.version()` to get the running maki version
-    /// as a version table.
+    /// `vim.version`. `maki.version()` returns the running maki version as a
+    /// version table.
     ///
-    /// Invalid version strings return `(nil, err)`. Passing a type other than
-    /// a string or table raises a Lua error.
+    /// Every function except `parse` takes a version table, a
+    /// `{major, minor, patch}` tuple or a string, parsed loosely like
+    /// `maki.version.parse`. A string that does not parse returns
+    /// `(nil, err)`. Any other type raises a Lua error.
     ///
     /// ```lua
     /// if maki.version.ge(maki.version(), "0.7.0") then ... end

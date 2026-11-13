@@ -29,7 +29,7 @@ Maki builds the system prompt and tool definitions once per session and sends th
 
 When something changes mid-session (the date, the model, plan mode, the directory after `/cd`, a new memory tag), Maki appends a short update before your next message.
 
-A fresh prompt is built only on compaction, or for a change an update cannot carry: different tools (`/reload`, `/workflow`, a model with other capabilities) or a different `--system-prompt` or `--append-system-prompt` text when a session is resumed. Such a change starts the cache over, and Maki tells you when it happens.
+A fresh prompt is built only on compaction, or for a change an update cannot carry: different tools (`/reload`, `/workflow`, a model with other capabilities) or a resume with different [`--system-prompt` or `--append-system-prompt`](/docs/cli/#shared-flags-detail) text. Such a change starts the cache over, and Maki tells you when it happens.
 
 Claude binds each thinking block to the prompt it was written under. Accounts that enforce this reject a request whose prompt moved under earlier thinking. When that happens Maki drops all earlier thinking once, tells you, and the session goes on. Later thinking is bound to the new prompt.
 
@@ -93,8 +93,7 @@ context updates, including with a complete main template. Changing the static
 system or plan replacement policy starts an announced new request frame.
 A changed plan prompt applies when the agent next enters plan mode.
 Side questions use the stored frame when one exists.
-An explicit `--system-prompt` takes precedence over a plugin's main
-template.
+`--system-prompt` wins over a plugin's main template.
 
 Prompt text does not change tool permissions, plan-mode restrictions, or
 instruction-file discovery. Select tools through plugin configuration and
@@ -202,9 +201,9 @@ Plugins can add their own entries to the popup, such as issues after `#` or peop
 
 ## When the window fills
 
-Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/compact keep the repro steps` steers that one summary, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers every summary. The summary comes from the [compaction tier](/docs/providers/) model when one is set, else from the session model. An empty summary is retried once, and after that the session stays as it was.
+Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/compact keep the repro steps` steers that one summary, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers every summary. The [compaction tier](/docs/providers/) model writes the summary when one is set. If the summary comes back empty twice, the session stays as it was.
 
-Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Maki parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). That archive holds the whole log as it stood at the time. The tool state the dropped turns held goes away with them, the same as on a rewind, so each archive carries only its own stretch of the session. Runs that live beside the chat, like a task moved to the background, keep their output until the turn that started them is gone. Archives stay until you delete the session. The names count up, so the highest number is the newest.
+Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Maki parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It holds the dropped turns with their subagent transcripts and tool output, which the live session no longer keeps. Archives stay until you delete the session. The highest number is the newest.
 
 An archive is a complete session file, so `jq` or an editor reads it as it is. To open one in Maki you have to put it back in place of the live log, which drops the session's current state, so move that out of the way first:
 
@@ -231,9 +230,9 @@ maki.setup({
 
 With `background = true` the tool answers right away and the parent keeps working. To wait, the parent ends its turn. When the subagent is done, its result arrives as a notice that wakes the parent. Structured output and the partial output of an interrupted run come back the same way.
 
-The receipt names the task id. The parent can pass it to `task_message` to tell a running task something new, like a fresh lead or "wrap up now". The task reads it after its current step as a message from its parent, not the user, and a task still waiting for a slot reads it with its first prompt. Only the chat that started a task can reach it, and a stopped or finished task refuses. A message that arrives while the task writes its final answer gets one more turn. Only one sent in the moment after that answer is dropped.
+The receipt names the task id. The parent can pass it to `task_message` to tell a running task something new, like a fresh lead or "wrap up now". The task reads it after its current step as a message from its parent, not the user, and a task still waiting for a slot reads it with its first prompt. Only the chat that started a task can reach it, and a stopped or finished task refuses.
 
-Tasks started in one `batch` move together. The batch receipt gives each task its own id, and the batch id reaches all of its tasks at once, for example to change the scope of every one. An id that reaches nothing is an error that lists the running tasks by id and name.
+Tasks started in one `batch` move together. The batch id reaches all of them at once, and each task also has an id of its own. See [Background Tasks](/docs/background-tasks/#let-the-model-start-tasks).
 
 To stop a task, open `/tasks`, select it, and press Ctrl+S. The parent still gets the result on its next turn, but the notice does not wake it.
 

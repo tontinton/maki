@@ -228,8 +228,7 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///
 /// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 /// `"TurnError"`, `"TurnComplete"`, `"ToolStart"`, `"ToolDone"`,
-/// `"AutoCompacting"`,
-/// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
+/// `"AutoCompacting"`, `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 /// `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
 /// `"ModeChanged"` and `"FileIndexReady"`. Plugins can also fire their own
@@ -255,13 +254,11 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   turn took). `list_cost` is the un-subsidised list price and `cost` is
 ///   the real bill, so a budget plugin charges against whichever one it
 ///   wants.
-/// - `"TurnComplete"`: `data.context_size` and `data.context_window` right
-///   after a model response, before its tool calls run, so a plugin can act
-///   mid-turn while `"AutoCompacting"` has not fired yet. `data.context_size`
-///   is absent when the host does not know it. A subagent's response carries
-///   its own `context_size` and `context_window` plus a `data.id` that marks
-///   the turn as a subagent's; listeners that watch the parent's own context
-///   skip the marked ones. The main session's own responses carry no `id`.
+/// - `"TurnComplete"`: `data.context_size` and `data.context_window` after
+///   each model response, before its tool calls run. Use it to act mid-turn,
+///   before `"AutoCompacting"`. `data.context_size` is absent when unknown.
+///   A subagent's response carries its own sizes plus `data.id`, its task id.
+///   To watch only the main context, skip events that have an `id`.
 /// - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
 ///   trigger time.
 /// - `"CompactionDone"`: `data.context_size_before`,
@@ -333,11 +330,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `data.text`. Maki warns once per plugin and event, naming what was left
 /// out. Events a plugin fires under its own names arrive as fired.
 ///
-/// `"TurnEnd"` fires once per turn and only for the main session, so
-/// subagent turns never show up. Subagent envelopes fire nothing else either,
-/// with `"TurnComplete"` the one exception. A manual `/compact` ends its run
-/// without ending a turn: no `"TurnEnd"` fires, only the `"TurnComplete"`
-/// of its own summariser request.
+/// A subagent's run fires only `"TurnComplete"`, never tool or other turn
+/// events. `"TurnEnd"` fires once per turn of the main session. A manual `/compact` fires no `"TurnEnd"`, only the
+/// `"TurnComplete"` of its summary request.
 ///
 /// Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
 /// `maki-ui` only. `maki-acp` runs the agent on its own loop and does not

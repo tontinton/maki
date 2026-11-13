@@ -114,14 +114,14 @@ async fn remove(
 /// background task (a command or subagent) that the calling agent moved,
 /// which is allowed because the tool call belongs to a turn the user started.
 /// A subagent stopped this way ends its pending `:prompt()` with
-/// `"stopped by parent agent"`. It waits up to 5 seconds for the final reply
-/// and returns it, and the agent gets no notice of the end. A late reply
-/// returns no `output`, and the result reaches the agent later as a quiet
-/// notice. A subagent nested in a moved call, like a `task` in a `batch`,
-/// stops alone and returns at once, with `parent` set to that call's id: the
-/// call's result carries what the subagent did. A task another agent moved, a
-/// finished task or an unknown id returns an error that names the agent's
-/// running task ids.
+/// `"stopped by parent agent"`.
+///
+/// It waits up to 5 seconds for the final reply and returns it, and the agent
+/// gets no notice of the end. A later reply reaches the agent as a quiet
+/// notice instead. A subagent nested in a moved call, like a `task` in a
+/// `batch`, stops alone and returns at once, because that call's result
+/// reports what it did. A task another agent moved, a finished task or an
+/// unknown id returns an error that lists the agent's running tasks.
 ///
 /// @param id string|LuaCtx Task id, as returned by `list()`. Or the handler's
 ///   ctx, for the model's stop.
@@ -130,9 +130,9 @@ async fn remove(
 ///   rather than stopping a task with the same id in the other session. With a
 ///   ctx: the background task id.
 /// @return (boolean|table|nil, string|nil) true on success, or nil and an
-///   error. With a ctx, success is `{name, output?, parent?}`. `name` is the
-///   task's name in `/tasks`, `output` is the final reply, missing when it
-///   was late, and `parent` is the call a nested subagent ran under.
+///   error. With a ctx, success is `{name, output?, parent?}`: the task's
+///   name in `/tasks`, the final reply unless it was late, and the id of the
+///   call a nested subagent ran in.
 /// @example
 /// local _, err = maki.task.stop(task.id, { session = task.session })
 /// -- in a tool handler
@@ -189,19 +189,18 @@ fn asker(ctx: &LuaCtx, method: &str) -> Result<Option<MakiId>, String> {
 /// carries on with its history intact. With no turn running the message
 /// waits like any other.
 ///
-/// An agent reaches the subagents it moved, and those nested in a call it
-/// moved, until they end. The id of such a call, like a `batch`, reaches
-/// every subagent still running in it. Like `stop(ctx, id)`, it never reaches
-/// what another agent moved.
+/// {id} can also name a subagent nested in a call the agent moved, like a
+/// `task` in a `batch`. The id of the call itself messages every subagent
+/// still running in it.
 ///
 /// @param ctx LuaCtx The tool handler's ctx.
 /// @param id string Task id, from its receipt.
 /// @param text string The message.
 /// @param opts table? Optional fields:
 ///   `interrupt` (boolean?) - cut its current turn short. Default: `false`.
-/// @return (table|nil, string|nil) `{name}`, the task's name in `/tasks` (the
-///   names of all it reached, comma-separated), or nil and
-///   `"no running background subagent with id <id>; running: <id> (<name>), ..."`.
+/// @return (table|nil, string|nil) `{name}`, the task's name in `/tasks`
+///   (comma-separated when it reached several), or nil and
+///   `"no running background subagent with id <id>; running: ..."`.
 /// @example
 /// local sent, err = maki.task.send(ctx, input.id, input.message)
 /// if not sent then return { llm_output = err, is_error = true } end
@@ -226,9 +225,9 @@ async fn send(
 
 /// Reads the transcript of a background subagent that the calling agent
 /// moved, oldest first, while it works. The messages have the shape
-/// `maki.session.messages` returns. It reaches what `send(ctx, id)` does,
-/// one subagent at a time: the id of a call it runs in reaches none.
-/// Works without an interactive UI.
+/// `maki.session.messages` returns. It takes the ids `send(ctx, id)` takes,
+/// except the id of a call, since it reads one subagent. Works without an
+/// interactive UI.
 ///
 /// @param ctx LuaCtx The tool handler's ctx.
 /// @param id string Task id, from its receipt.

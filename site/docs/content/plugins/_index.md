@@ -27,14 +27,12 @@ plugin.toml     permission grants for every Lua file in the dir
 
 Nothing under `lua/` loads on its own. A module name is its path under `lua/`
 without the extension: `lua/browser.lua` is `require("browser")`,
-`lua/acme/tools.lua` is `require("acme.tools")`. `require` is sandboxed to
-that directory, you cannot reach files outside it.
+`lua/acme/tools.lua` is `require("acme.tools")`. `require` cannot reach files
+outside that directory.
 
-A module's top level may yield, so `maki.fs` and the other async APIs work
-while it loads. A `require` of a module another task is still loading waits
-for that load to finish, and a `require` that closes a cycle gets `true`. Where
-Lua cannot yield, like a `table.sort` comparator, requiring a module that is
-still loading is an error.
+A module can call `maki.fs` and the other async APIs at its top level. In a
+`require` cycle, the `require` that closes the cycle returns `true` rather than
+the module.
 
 ## Creating a plugin
 
@@ -96,10 +94,10 @@ with full debug info.
 
 ## Conventions
 
-- Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
+- Fallible runtime calls return a `(value, err)` pair. Check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
-- Describe parameters as separate fields, never as usage lines like `` `write path content` ``: models copy them into the string field.
+- Give each parameter its own schema field. Models copy a usage line like `` `write path content` `` into a string field.
 - Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
 
 ## A complete real example

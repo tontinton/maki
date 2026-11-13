@@ -429,8 +429,8 @@ end
 --     selected row's key are tinted, and the cursor follows its key across a
 --     live swap
 --
--- A key you bind wins over the arrow keys, the page keys and <C-d>. Only <Esc>
--- and <C-c> always close. Keys you pass go through `maki.keymap.normalize`, so
+-- A key you bind overrides the built-in keys, except <Esc> and <C-c>, which
+-- always close. Keys you pass go through `maki.keymap.normalize`, so
 -- `"<Enter>"` and `"<CR>"` are the same binding. An invalid key is dropped
 -- with a warning.
 --

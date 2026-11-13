@@ -104,14 +104,17 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
 }
 
 /// The model maki uses for a tier, the same one a subagent asking for that
-/// tier gets: user's pick from the `/model` picker for that tier (whatever
-/// provider it names), else the curated or `providers.toml`-declared default
-/// within `provider`, else any provider. `assigned` tells a pick apart from a
-/// default. Pass `provider` to prefer its models, the way subagents prefer the
-/// session's provider.
+/// tier gets. The first match wins:
+///
+/// 1. The user's pick for that tier in the `/model` picker, from any provider.
+/// 2. The tier default within `provider`, curated or set in `providers.toml`.
+/// 3. The tier default of any provider.
+///
+/// `assigned` tells a pick apart from a default. Pass `provider` the way
+/// subagents pass the session's provider.
 ///
 /// Resolving a models.dev model can wait for that catalog to download, so
-/// like `get`, this can't run in a callback that must not yield.
+/// like `get`, this cannot run in a callback that must not yield.
 ///
 /// @param name string `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
 /// @param provider string|nil Provider slug to resolve within first.

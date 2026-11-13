@@ -103,7 +103,7 @@ local opts = maki.api.register_options({
   responses_api = {
     default = false,
     type = "boolean",
-    desc = "Speak the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). The responses wire does not send past reasoning back, so follow-ups cannot lean on it.",
+    desc = "Use the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). Past reasoning is not sent back on this API, so later turns cannot build on it.",
   },
 })
 
@@ -132,7 +132,7 @@ maki.provider.register({
   context_window = 128000,
   aperture = { path_prefix = "/v1" },
   docs = {
-    features = "`/usage` reads the plan and monthly Vibe Code allowance from `/v1/billing/subscription` and `/v1/billing/budget` (the budget needs the `see_org_inference_usage` permission)",
+    features = "`/usage` shows the plan and the monthly Vibe Code allowance. The allowance shows only when the key has the `see_org_inference_usage` permission",
   },
   models = {
     {

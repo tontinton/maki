@@ -504,15 +504,14 @@ const CURSOR_SHAPE_OPTIONS: &[&str] = &["blink"];
 
 /// Sets the shape of the chat input's cursor, like Neovim's `guicursor`.
 ///
-/// The chat input uses your terminal's own cursor. Until a plugin calls this,
-/// maki never changes its shape or blink, so it looks the way you set up your
-/// terminal. `"default"` gives that look back. If your plugin unloads after
-/// setting a shape, maki switches back to `"default"` too.
+/// Until a plugin calls this, the cursor looks the way you set up your
+/// terminal. `"default"` restores that look, and so does unloading the
+/// plugin that set the current shape.
 ///
-/// A shape always sets blinking on or off, because terminals take both in
-/// one setting. Leave out `blink` for a steady cursor.
+/// Terminals set shape and blink together, so any shape other than
+/// `"default"` also sets blinking. Leave out `blink` for a steady cursor.
 ///
-/// Throws on any shape not listed below, and on an unknown option.
+/// Throws on an unknown shape or option.
 ///
 /// @param shape string `"block"`, `"bar"`, `"underline"` or `"default"`.
 /// @param opts table? Optional. `blink` (boolean) blinks the cursor, default false.

@@ -181,9 +181,9 @@ When a gated tool needs permission, Maki asks you.
 Session and always-allow / always-deny choices need a second key (`Enter` or `y`) so a fat-finger does not rewrite your rules. Deny-once with `n` lets you type a short reason the agent will see.
 
 The keys are the same in a folder you have not
-[trusted](/docs/folder-trust/), where `a` and `d` last for the session instead
-of reaching `.maki/permissions.toml`. A folder with no `.maki` directory counts
-as untrusted too. Run `/trust` there to save later project answers.
+[trusted](/docs/folder-trust/#in-an-untrusted-folder), even one with no `.maki`
+files. There `a` and `d` last for the session instead of reaching
+`.maki/permissions.toml`.
 
 ACP clients offer the four options the protocol defines. "Allow always" lasts
 for the session, and "Reject always" is a project answer that follows folder

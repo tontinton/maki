@@ -144,12 +144,9 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "`user_bg` is the user-message counterpart to `tool_bg`. It fills \
-         the full width behind a user message, including the `you> ` prefix, \
-         and does not add vertical padding. Use `user` for the prefix \
-         foreground, `user_text` for the message body, and `user_bg` for the \
-         surface behind the whole message. `user_text` defaults to \
-         `assistant`. `user_bg` defaults to no background.\n\n\
+        "User messages use `user` for the `you> ` prefix, `user_text` for the \
+         body, and `user_bg` for the full-width background behind both. \
+         `user_text` defaults to `assistant`, and `user_bg` to no background.\n\n\
          ```toml\n\
          # themes/<name>.toml\n\
          [ui]\n\
@@ -170,10 +167,9 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "The chat input caret is your terminal's own cursor, in your \
-         terminal's shape and colors. Plugins can change its shape with \
-         `maki.ui.set_cursor_shape`. The search, file, list and login \
-         pickers still paint their caret with `cursor`, and so can plugins.\n"
+        "The chat input uses your terminal's own cursor, in its shape and \
+         colors. The search, file, list and login pickers paint their caret \
+         with `cursor`.\n"
     )
     .unwrap();
     writeln!(

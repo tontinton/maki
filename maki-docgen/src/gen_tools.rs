@@ -14,8 +14,9 @@ use maki_lua::{OptionType, PluginHost};
 use crate::lua_util::in_registration_window;
 
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
-const PLUGIN_PERMISSION_LABEL: &str = "[Plugin permission](/docs/lua-api/#plugin-permissions)";
-const INERT_REACH: &str = "nothing (`{}`)";
+const PERMISSION_LABEL: &str = "**Permission:**";
+const INERT_REACH: &str = "none";
+const UNDECLARED_REACH: &str = "undeclared";
 /// Tools a plugin registers only when one of its boolean options is on, as
 /// (plugin, option, tool).
 const OPTION_GATED_TOOLS: &[(&str, &str, &str)] = &[("task", "allow_background", "task_message")];
@@ -143,19 +144,18 @@ fn write_param_table(out: &mut String, params: &[Param]) {
     }
 }
 
+fn undeclared_exempt() -> String {
+    Permission::ALL
+        .iter()
+        .filter(|&&perm| !Authority::Unbounded.requires(perm))
+        .map(|perm| format!("`{}`", perm.manifest_key()))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 fn reach_label(reach: Option<ToolReach>) -> String {
     match reach {
-        None => {
-            let exempt: Vec<String> = Permission::ALL
-                .iter()
-                .filter(|&&perm| !Authority::Unbounded.requires(perm))
-                .map(|perm| format!("`{}`", perm.manifest_key()))
-                .collect();
-            format!(
-                "not declared (every permission except {})",
-                exempt.join(" and ")
-            )
-        }
+        None => UNDECLARED_REACH.to_owned(),
         Some(ToolReach::Inert) => INERT_REACH.to_owned(),
         Some(ToolReach::Capability { permission, .. }) => {
             format!("`{}`", permission.manifest_key())
@@ -186,7 +186,7 @@ fn write_tool_entry(
     writeln!(out).unwrap();
     writeln!(out, "{summary}").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "{PLUGIN_PERMISSION_LABEL}: {}", reach_label(*reach)).unwrap();
+    writeln!(out, "{PERMISSION_LABEL} {}", reach_label(*reach)).unwrap();
     writeln!(out).unwrap();
     write_param_table(out, &params);
 }
@@ -336,6 +336,17 @@ pub fn generate() -> String {
          ({default_n} on by default, {opt_in_n} opt-in via plugin options). \
          Tools marked **opt-in** are off until you enable them under `plugins` \
          in [Configuration](/docs/configuration/)."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "**Permission** is the [plugin permission](/docs/lua-api/#plugin-permissions) \
+         a tool declares. A plugin must hold it to [hook](/docs/hooks/#rules) the tool \
+         or to give the tool to a `maki.agent` session. A tool marked {INERT_REACH} \
+         reaches nothing past the conversation. A tool marked {UNDECLARED_REACH} \
+         may reach anything, so it costs every permission except {}.",
+        undeclared_exempt()
     )
     .unwrap();
 

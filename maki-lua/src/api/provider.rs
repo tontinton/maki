@@ -732,11 +732,10 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///           the model table when `models` is empty.
 ///   `system_prefix` (string) Text prepended to the system prompt. The
 ///           `google` codec refuses it.
-///   `openai` (table) Options for the openai codecs (`"openai"` and
-///           `"openai-responses"`), all optional. On `"openai-responses"` only
-///           `thinking` and `thinking_overrides` are honoured: the responses
-///           wire writes the standard `reasoning` block, so `field` must stay
-///           unset, and the body/header options below are refused:
+///   `openai` (table) Options for the `"openai"` and `"openai-responses"`
+///           codecs, all optional. The responses codec takes only
+///           thinking options (without `field`) and `thinking_overrides`,
+///           and refuses the rest:
 ///     `max_tokens_field` (string) Body field carrying the output cap.
 ///             Defaults to `max_tokens`.
 ///     `include_stream_usage` (boolean) Ask for usage on the stream.
@@ -751,18 +750,14 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///               `"anthropic-adaptive"`, `"gemini"`, `"tensorx"`, `"grok"`
 ///               or `"ollama"`.
 ///       `effort` (table) Replaces `dialect`'s levels and off switch for
-///               every model the provider serves, same fields as a model
-///               row's `effort`. A listed row's `effort` replaces these in
-///               turn.
+///               every model, with the same fields as a model row's
+///               `effort`. A row's own `effort` wins over it.
 ///       `field` (string) Body path for the effort. Dots nest, e.g.
-///               `"reasoning.effort"`. Defaults to `reasoning_effort`. On the
-///               responses wire the field must stay unset: that wire writes
-///               the standard `reasoning` block, so a custom path would never
-///               be read.
+///               `"reasoning.effort"`. Defaults to `reasoning_effort`.
 ///       `requires_support` (boolean) Send effort only to models that
 ///               support thinking. Defaults to `false`.
-///     `headers` (table) Sent with every request, replacing a header maki
-///             sets itself. A header the credentials set wins. `host`,
+///     `headers` (table) Sent with every request. They replace headers
+///             maki sets, and a header the credentials set wins. `host`,
 ///             `content-length`, `transfer-encoding` and `connection` are
 ///             refused.
 ///     `extra_body` (table) Merged into every request body.
@@ -770,7 +765,7 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///             `"required"`, overriding the model table. Longest prefix wins.
 ///   `session_id` (table) Sends the session id with every request, as
 ///           `{ headers = { "x-affinity" } }`,
-///           `{ body_field = "prompt_cache_key" }`, or both at once. A
+///           `{ body_field = "prompt_cache_key" }`, or both. A
 ///           listed header replaces one the credentials set. The `google`
 ///           codec refuses it.
 ///   `models` (table) Static model rows, read once at registration. They

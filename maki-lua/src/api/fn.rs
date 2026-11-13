@@ -79,8 +79,7 @@ const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv tabl
 ///     `jobwait` (default 20, 0 disables, max 1024).
 ///   `max_line_bytes` (integer?) longest line delivered, in bytes. A longer
 ///     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
-///     skipped without being read into memory (default, `0`, and max: 64 MiB,
-///     the `maki.fs` read limit).
+///     skipped without being read into memory. Default, `0`, and max: 64 MiB.
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
 ///     plugin can see. Starting a second job under a live name is an error.
 /// @return (integer?, string?) Job id, or nil plus an error message when the

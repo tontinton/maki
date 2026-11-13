@@ -748,8 +748,8 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// List the contents of the directory at {path}.
 /// Each entry is a two-element array `{name, type}` where type is one of
 /// `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
-/// `name` is relative to {path}, so with `depth` > 1 nested entries keep
-/// their directory: "d/nested.txt", unambiguous and joinable onto {path}.
+/// `name` is relative to {path}, so nested entries (`depth` > 1) keep their
+/// directory, as in `"tests/lib.rs"`.
 ///
 /// @param path string Directory path.
 /// @param opts table? `depth` (integer, default 1): how many levels deep to recurse.

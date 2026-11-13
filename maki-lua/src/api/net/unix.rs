@@ -55,8 +55,7 @@ fn absolute(path: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Connect to the Unix socket at {path}. The connection is a
-/// `maki.net.Conn`, the same as a TCP one.
+/// Connect to the Unix socket at {path}.
 ///
 /// {opts} fields:
 ///   `timeout` (integer) Connect timeout in seconds, max 60 (default 10).
@@ -100,15 +99,12 @@ async fn connect_unix(
     Ok((Some(Conn::track(plugin, Stream::Unix(stream))), None))
 }
 
-/// Listen on the Unix socket at {path} and answer a `maki.net.Listener`.
+/// Listen on the Unix socket at {path}.
 ///
-/// A path this plugin already listens on is taken over, so it can listen on
-/// its usual path again after `/reload`. Anything else at
-/// {path} is an error: removing a stale socket is up to the plugin, which
-/// knows whether its name is still in use, and so is a private directory
-/// for it. The listener closes, and removes the socket file it
-/// bound, on `:close()`, when it is garbage collected, and when the plugin
-/// unloads.
+/// Fails if a file exists at {path}, so remove a stale socket first. The one
+/// exception is a path this plugin already listens on, which it takes over,
+/// so it can listen again after `/reload`. Keep the socket in a directory
+/// only your user can write, so no other user can swap the file.
 ///
 /// @param path string Absolute path of the socket, or one starting with `~/`.
 /// @return (maki.net.Listener?, string?) The listener, or nil plus an error string.
@@ -242,9 +238,10 @@ impl Drop for Listener {
     }
 }
 
-/// Wait for the next client and answer its connection. Answers `nil, nil`
-/// once the listener is closed, including when it closes while waiting.
-/// Only one `accept` at a time: a second one while one waits is an error.
+/// Wait for the next client and return its connection. Returns `nil, nil`
+/// once the listener is closed, also when it closes during the wait.
+/// Only one `accept` at a time: a second one while one waits returns an
+/// error.
 ///
 /// @return (maki.net.Conn?, string?) The connection, nil plus an error string, or nil, nil once closed.
 /// @example
@@ -265,7 +262,7 @@ async fn accept(_lua: Lua, this: UserDataRef<Listener>) -> LuaResult<Pair<Conn>>
     }
 }
 
-/// Stop listening and remove the socket file. A pending `accept` answers
+/// Stop listening and remove the socket file. A pending `accept` returns
 /// `nil, nil`. Extra calls do nothing.
 ///
 /// @return
@@ -277,6 +274,9 @@ fn listener_close(_lua: &Lua, this: &Listener) -> LuaResult<()> {
 
 lua_class! {
     /// A Unix socket listener opened by `maki.net.listen_unix`.
+    ///
+    /// It closes and removes its socket file on `:close()`, when the handle
+    /// is garbage collected, and when the plugin unloads.
     "maki.net.Listener" => Listener, LISTENER_DOCS [accept, listener_close]
 }
 

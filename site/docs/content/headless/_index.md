@@ -88,21 +88,29 @@ unlocked.
 
 ## Background Tasks
 
-`--print` and SDK mode run with moves off unless you pass `--background-timeout <SECS>`. Every call blocks until it finishes, and `background = true` runs in the foreground.
+`--print` and SDK mode keep background moves off unless you pass `--background-timeout <SECS>`. Every call blocks until it finishes, and `background = true` runs in the foreground. With moves on, a dev server the model moved would hold a CI job for the full timeout, and a turn could end while its subagents still run, which an SDK client would read as finished work.
 
-`--print` promises one answer and a predictable exit, and a dev server the model moves never ends, so it would hold a CI job for the full timeout. An SDK client reads each result as the end of that message's work. With moves on, a turn can end while its subagents still run, and a client that sends its next message on the result finds the work unfinished.
+With the flag set, work moves as in the [TUI](/docs/background-tasks/), and Maki waits for it after the run ends:
 
-The rest of this section applies with the flag set. Work then moves with `background = true`, `ctx:background()` and `background_on_timeout` as in the TUI. See [Background Tasks](/docs/background-tasks/) for what can move.
+| Mode | While background work runs |
+|------|----------------------------|
+| `--print` | The process stays alive and each result starts a new turn. The final result covers those turns, and `text` output prints the last turn's text. |
+| SDK, stdin open | Results ride along with the next user message. No turn starts on its own, so the client gets exactly one result per message. |
+| SDK, stdin closed | As `--print`, but each woken turn sends a result of its own. |
 
-If background work still runs when the run ends, the process stays alive and each result starts a new turn. The final result covers those turns. With `text` output it prints the last turn's text. `total_cost_usd` and `usage` also include spend after the last turn, such as a subagent stopped mid-run, and so does the stored session.
+`--print` counts spend after the last turn, such as a subagent stopped mid-run, in the final `total_cost_usd` and `usage`, and in the stored session. An SDK result cannot include spend that came after it, so Maki sends that spend in one extra message before it exits, only when there is some. Add its `total_cost_usd` to the sum of the results for the full bill:
 
-With `--verbose`, the result that wakes a turn comes first as a notice, so the woken turn's assistant messages do not follow the last turn's without a break. SDK mode sends the same message. Claude Code has no counterpart for it.
+```json
+{"type":"system","subtype":"background_usage","total_cost_usd":0.12,"usage":{"input_tokens":5300,"output_tokens":800,...},"session_id":"..."}
+```
+
+With `--verbose` and in SDK mode, a notice comes before each woken turn, so its messages do not run on from the last turn's. Claude Code has no such message.
 
 ```json
 {"type":"system","subtype":"notice","text":"Background bash finished: cargo test","session_id":"..."}
 ```
 
-The process exits once nothing is running. If `--background-timeout <SECS>` runs out first, Maki stops the tasks and warns on stderr:
+The process exits once nothing is running. If `--background-timeout` runs out first, Maki stops the tasks and warns on stderr:
 
 ```
 N background task result(s) never reached the model before --background-timeout ran out ...
@@ -110,17 +118,15 @@ N background task result(s) never reached the model before --background-timeout 
 
 No turn starts past the deadline, so the count includes results that came in during the last turn. Resuming the session reports all of them as lost.
 
-In SDK mode, while stdin is open, results ride along with the next user message. No turn starts on its own, so the client gets exactly one result per message. After stdin closes, Maki stays alive as `--print` does, but each woken turn sends a result of its own instead of one that covers them all.
-
-An SDK result is sent when its run ends, so it cannot include spend that came later. Maki reports that spend in one extra message before it exits, only when there is some. Add its `total_cost_usd` to the sum of the results for the full bill:
-
-```json
-{"type":"system","subtype":"background_usage","total_cost_usd":0.12,"usage":{"input_tokens":5300,"output_tokens":800,...},"session_id":"..."}
-```
-
 ## Subagents
 
-Parallel subagents interleave their messages in `--verbose`, `stream-json` and SDK output. To tell them apart, Maki sends the same task messages as Claude Code: `task_started` right before a subagent's first message, `task_progress` after each of its turns that called tools, and `task_notification` when it ends.
+Parallel subagents interleave their messages in `--verbose`, `stream-json` and SDK output. Maki tells them apart with Claude Code's task messages:
+
+| `subtype` | Sent |
+|-----------|------|
+| `task_started` | Right before the subagent's first message |
+| `task_progress` | After each of its turns that called tools |
+| `task_notification` | Once, when it ends. It comes right before the result of the call that opened the subagent, or for a call moved to the [background](/docs/background-tasks/), before the first result after the subagent ended |
 
 ```json
 {"type":"system","subtype":"task_started","task_id":"toolu_01...","tool_use_id":"toolu_01...","description":"Find the auth middleware","task_type":"local_agent","prompt":"...","session_id":"..."}
@@ -128,7 +134,7 @@ Parallel subagents interleave their messages in `--verbose`, `stream-json` and S
 {"type":"system","subtype":"task_notification","task_id":"toolu_01...","tool_use_id":"toolu_01...","status":"completed","output_file":"","summary":"Auth is checked in src/auth.rs","usage":{...},"session_id":"..."}
 ```
 
-Each message of a subagent has its `parent_tool_use_id` set to the task's `tool_use_id`. That is the id of the `task` call, or an id of its own when another call such as `batch` opened the subagent. A nested subagent belongs to the top-level task above it. Its messages carry that task's id, and its turns count toward that task's `usage`.
+`task_id` and `tool_use_id` hold the same id: the `task` call's id, or a separate id when another call such as `batch` opened the subagent. Each message of the subagent has `parent_tool_use_id` set to it. A nested subagent counts as part of the top-level task above it, for its messages and its `usage`.
 
 `status` and `summary` come from the result of the call that ran the subagent:
 
@@ -138,11 +144,9 @@ Each message of a subagent has its `parent_tool_use_id` set to the task's `tool_
 | `failed` | The call failed | The error |
 | `stopped` | A stop or cancel cut it, or the output ended first | The reason |
 
-A plugin that runs its own subagents reports this by passing its tool result to [`Session:close()`](/docs/lua-api/#Session-close). A subagent closed without one reads as `completed` with an empty summary.
+A plugin that runs its own subagents sets these by passing its tool result to [`Session:close()`](/docs/lua-api/#Session-close). Without one, the subagent reads as `completed` with an empty summary.
 
-`output_file` is always empty, because Maki keeps subagent transcripts in the session.
-
-Every `task_started` gets exactly one `task_notification`. It comes right before the result of the call that opened the subagent. When that call moved to the [background](/docs/background-tasks/), it comes before the first result after the subagent ended.
+`output_file` is always empty. Maki keeps subagent transcripts in the session.
 
 ## Stopping a Run
 

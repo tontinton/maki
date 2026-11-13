@@ -19,6 +19,8 @@ M.FULL_OUTPUT_MAX_LINES = FULL_OUTPUT_MAX_LINES
 --- Appended where full-mode output passed the ceilings, which callers that
 --- promised the whole output report as an error.
 M.FULL_LIMIT_NOTE = "[output passed the full-mode limit; redirect it to a file to keep all of it]"
+--- Per-tool output limit options. `extend` adds them to a
+--- `maki.api.register_options` spec.
 M.specs = {
   max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
   max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
