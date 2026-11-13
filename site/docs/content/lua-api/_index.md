@@ -5058,6 +5058,10 @@ it does for a built-in provider.
       `"prefer-high"`, `"high-only"`, `"glm"`, `"deepseek"`,
       `"anthropic-adaptive"`, `"gemini"`, `"tensorx"`, `"grok"`
       or `"ollama"`.
+    - `effort` (`table`) Replaces `dialect`'s levels and off switch for
+      every model the provider serves, same fields as a model
+      row's `effort`. A listed row's `effort` replaces these in
+      turn.
     - `field` (`string`) Body path for the effort. Dots nest, e.g.
       `"reasoning.effort"`. Defaults to `reasoning_effort`.
     - `requires_support` (`boolean`) Send effort only to models that
@@ -5089,10 +5093,11 @@ it does for a built-in provider.
   `context_window`, `max_output_tokens`, `pricing`,
   `supports_thinking`, `supports_vision` and `tier`, plus two
   optional fields. `extra` is any JSON value, handed back to
-  `build_body` as `opts.model_info`. `effort` narrows the
-  `openai.thinking` dialect for this model: `supported` lists the
-  effort names the provider accepts, and `send_off` is `true` to
-  send `"none"` for off or `false` to send nothing.
+  `build_body` as `opts.model_info`. `effort` replaces the
+  `openai.thinking` levels and off switch for this model:
+  `supported` lists the effort names the provider accepts, and
+  `send_off` is `true` to send `"none"` for off or `false` to send
+  nothing.
 - `build_body` (`function`) `function(ctx, body, model, opts)` returning
   the body to send. `opts.thinking` is the rendered effort level,
   nil when thinking is off. `openai` codecs only.

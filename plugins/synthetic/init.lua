@@ -11,7 +11,7 @@ maki.provider.register({
   max_output_tokens = 32000,
   context_window = 128000,
   aperture = { path_prefix = "/v1" },
-  docs = { features = "Reasoning effort (low, medium, high), open-weight models" },
+  docs = { features = "Reasoning effort (minimal, low, medium, high, xhigh, max), open-weight models" },
   models = {
     {
       prefixes = { "hf:moonshotai/Kimi-K2.5" },
@@ -44,6 +44,9 @@ maki.provider.register({
   openai = {
     max_tokens_field = "max_completion_tokens",
     include_stream_usage = false,
-    thinking = { dialect = "standard" },
+    thinking = {
+      dialect = "standard",
+      effort = { supported = { "minimal", "low", "medium", "high", "xhigh", "max" } },
+    },
   },
 })
