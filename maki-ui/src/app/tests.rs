@@ -11116,6 +11116,7 @@ fn turn_response_normalizes_text_and_truncates_unicode() {
             ContentBlock::Thinking {
                 thinking: "ignored".into(),
                 signature: None,
+                reasoning_id: None,
             },
             ContentBlock::Text { text: long },
         ],

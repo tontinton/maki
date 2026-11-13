@@ -314,6 +314,11 @@ pub enum ContentBlock {
         thinking: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        /// The provider's id for the reasoning item, replayed by the responses
+        /// codec. Kept apart from `signature`, which every codec reads as its
+        /// own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_id: Option<String>,
     },
     RedactedThinking {
         data: String,
@@ -2979,13 +2984,15 @@ mod tests {
     }
 
     #[test]
-    fn thinking_serde_no_signature_omits_field() {
+    fn thinking_serde_omits_empty_tokens() {
         let block = ContentBlock::Thinking {
             thinking: "x".into(),
             signature: None,
+            reasoning_id: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert!(json.get("signature").is_none());
+        assert!(json.get("reasoning_id").is_none());
     }
 
     const USAGE_LABEL: &str = "Spend";

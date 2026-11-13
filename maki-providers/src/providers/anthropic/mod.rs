@@ -1201,6 +1201,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
         ContentBlock::Thinking {
             thinking: thinking.into(),
             signature: Some(THINKING_SIGNATURE.into()),
+            reasoning_id: None,
         }
     }
 
@@ -1208,6 +1209,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
         ContentBlock::Thinking {
             thinking: thinking.into(),
             signature: None,
+            reasoning_id: None,
         }
     }
 
@@ -1793,7 +1795,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert!(
-            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature }
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature, .. }
                 if thinking == "Let me think" && *signature == Some("sig123".to_string()))
         );
         assert!(matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello"));

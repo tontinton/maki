@@ -258,6 +258,7 @@ mod tests {
         ContentBlock::Thinking {
             thinking: THOUGHT.into(),
             signature: signature.map(Into::into),
+            reasoning_id: None,
         }
     }
 

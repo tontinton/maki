@@ -568,6 +568,7 @@ impl ToolAccumulator {
 pub(crate) struct StreamedText {
     text: String,
     pub(crate) reasoning: String,
+    pub(crate) reasoning_id: Option<String>,
     text_started: bool,
 }
 
@@ -611,6 +612,7 @@ impl StreamedText {
             blocks.push(ContentBlock::Thinking {
                 thinking: self.reasoning,
                 signature: None,
+                reasoning_id: self.reasoning_id,
             });
         }
         if !self.text.is_empty() {
@@ -1435,6 +1437,7 @@ data: [DONE]\n\n";
                 ContentBlock::Thinking {
                     thinking: "Let me think...".into(),
                     signature: None,
+                    reasoning_id: None,
                 },
                 ContentBlock::Text {
                     text: "Hello".into(),
@@ -1456,6 +1459,7 @@ data: [DONE]\n\n";
             content: vec![ContentBlock::Thinking {
                 thinking: "Just thinking...".into(),
                 signature: None,
+                reasoning_id: None,
             }],
             ..Default::default()
         }];

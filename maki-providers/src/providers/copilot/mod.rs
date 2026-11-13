@@ -1191,6 +1191,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "gpt reasoning summary".into(),
                     signature: None,
+                    reasoning_id: None,
                 },
                 ContentBlock::Text { text: REPLY.into() },
             ],

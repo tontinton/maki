@@ -356,6 +356,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                 ContentBlock::Thinking {
                     thinking,
                     signature,
+                    ..
                 } => {
                     let mut part = json!({"text": thinking, "thought": true});
                     if let Some(sig) = signature {
@@ -566,6 +567,7 @@ fn push_or_extend_thinking(
     if let Some(ContentBlock::Thinking {
         thinking: prev,
         signature: prev_sig,
+        ..
     }) = blocks.last_mut()
     {
         prev.push_str(&text);
@@ -576,6 +578,7 @@ fn push_or_extend_thinking(
         blocks.push(ContentBlock::Thinking {
             thinking: text,
             signature,
+            reasoning_id: None,
         });
     }
 }
@@ -883,6 +886,7 @@ mod tests {
             content: vec![ContentBlock::Thinking {
                 thinking: "hmm".into(),
                 signature: Some("sig123".into()),
+                reasoning_id: None,
             }],
             ..Default::default()
         }];
@@ -1096,7 +1100,7 @@ mod tests {
         assert_eq!(result.message.content.len(), 1);
         assert!(matches!(
             &result.message.content[0],
-            ContentBlock::Thinking { thinking, signature }
+            ContentBlock::Thinking { thinking, signature, .. }
                 if thinking == "reasoning... more." && signature.as_deref() == Some("sig-final")
         ));
     }
@@ -1131,7 +1135,7 @@ mod tests {
         assert_eq!(result.usage.output, 50);
         assert!(matches!(
             &result.message.content[0],
-            ContentBlock::Thinking { thinking, signature } if thinking == "thinking..." && signature.as_deref() == Some("sig1")
+            ContentBlock::Thinking { thinking, signature, .. } if thinking == "thinking..." && signature.as_deref() == Some("sig1")
         ));
         assert!(matches!(
             &result.message.content[1],

@@ -1773,6 +1773,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: THOUGHT.into(),
                     signature: Some(SIGNATURE.into()),
+                    reasoning_id: None,
                 },
                 ContentBlock::RedactedThinking {
                     data: SIGNATURE.into(),

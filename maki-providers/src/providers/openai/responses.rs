@@ -105,12 +105,20 @@ pub(crate) fn convert_input(messages: &[Message], replay_reasoning: bool) -> Val
             }
             Role::Assistant => {
                 let mut reasoning = String::new();
+                let mut reasoning_id = None;
                 let mut text_parts = Vec::new();
                 let mut tool_calls = Vec::new();
 
                 for block in &msg.content {
                     match block {
-                        ContentBlock::Thinking { thinking, .. } => reasoning.push_str(thinking),
+                        ContentBlock::Thinking {
+                            thinking,
+                            reasoning_id: id,
+                            ..
+                        } => {
+                            reasoning.push_str(thinking);
+                            reasoning_id = reasoning_id.or_else(|| id.clone());
+                        }
                         ContentBlock::Text { text } => text_parts.push(text.as_str()),
                         ContentBlock::ToolUse {
                             id, name, input, ..
@@ -125,11 +133,15 @@ pub(crate) fn convert_input(messages: &[Message], replay_reasoning: bool) -> Val
                 }
 
                 if replay_reasoning && !reasoning.is_empty() {
-                    input.push(json!({
+                    let mut item = json!({
                         "type": "reasoning",
                         "summary": [],
                         "content": [{"type": "reasoning_text", "text": reasoning}]
-                    }));
+                    });
+                    if let Some(id) = reasoning_id {
+                        item["id"] = json!(id);
+                    }
+                    input.push(item);
                 }
 
                 if !text_parts.is_empty() {
@@ -337,21 +349,27 @@ pub(crate) async fn parse_sse(
                 let output_index = parsed["output_index"]
                     .as_u64()
                     .unwrap_or(tool_accumulators.len() as u64);
-                if item["type"].as_str() == Some("function_call") {
-                    let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
-                    let name = item["name"].as_str().unwrap_or_default().to_string();
-                    if !name.is_empty() {
-                        event_tx.send(ProviderEvent::ToolUseStart {
-                            id: call_id.clone(),
-                            name: name.clone(),
-                        })?;
+                match item["type"].as_str() {
+                    Some("function_call") => {
+                        let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
+                        let name = item["name"].as_str().unwrap_or_default().to_string();
+                        if !name.is_empty() {
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: call_id.clone(),
+                                name: name.clone(),
+                            })?;
+                        }
+                        tool_accumulators.push(ToolAccumulator {
+                            output_index,
+                            call_id,
+                            name,
+                            arguments: String::new(),
+                        });
                     }
-                    tool_accumulators.push(ToolAccumulator {
-                        output_index,
-                        call_id,
-                        name,
-                        arguments: String::new(),
-                    });
+                    Some("reasoning") => {
+                        streamed.reasoning_id = item["id"].as_str().map(str::to_owned);
+                    }
+                    _ => {}
                 }
             }
 
@@ -793,22 +811,21 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
 
     #[test]
     fn convert_input_replays_past_reasoning() {
-        let messages = vec![
-            Message::user("hello".to_string()),
-            Message {
-                role: Role::Assistant,
-                content: vec![
-                    ContentBlock::Thinking {
-                        thinking: "weighing it".to_string(),
-                        signature: None,
-                    },
-                    ContentBlock::Text {
-                        text: "answer".to_string(),
-                    },
-                ],
-                ..Default::default()
-            },
-        ];
+        let assistant = |reasoning_id: Option<String>| Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "weighing it".to_string(),
+                    signature: None,
+                    reasoning_id,
+                },
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let messages = [Message::user("hello".to_string()), assistant(None)];
 
         let input = convert_input(&messages, true);
         let items = input.as_array().unwrap();
@@ -817,6 +834,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         assert_eq!(items[1]["summary"], json!([]));
         assert_eq!(items[1]["content"][0]["type"], "reasoning_text");
         assert_eq!(items[1]["content"][0]["text"], "weighing it");
+        assert!(items[1].get("id").is_none());
         assert_eq!(items[2]["type"], "message");
         assert_eq!(items[2]["role"], "assistant");
         assert_eq!(items[2]["content"][0]["text"], "answer");
@@ -824,6 +842,13 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         let dropped = convert_input(&messages, false);
         assert_eq!(dropped[1]["type"], "message");
         assert_eq!(dropped[1]["role"], "assistant");
+
+        let with_id = [
+            Message::user("hello".to_string()),
+            assistant(Some("rs_1".to_string())),
+        ];
+        let input = convert_input(&with_id, true);
+        assert_eq!(input[1]["id"], "rs_1");
     }
 
     #[test]
@@ -870,7 +895,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
 
         assert_eq!(resp.message.content.len(), 2);
         assert!(
-            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think about this")
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, reasoning_id, .. } if thinking == "Let me think about this" && reasoning_id.as_deref() == Some("rs_1"))
         );
         assert!(
             matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello world")

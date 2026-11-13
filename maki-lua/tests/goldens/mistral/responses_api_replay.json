@@ -14,6 +14,7 @@
       {
         "content": [
           {
+            "reasoning_id": "rs_1",
             "thinking": "weighing the options",
             "type": "thinking"
           },
@@ -49,7 +50,7 @@
       "status": 200
     },
     {
-      "body": "event: response.reasoning_text.delta\ndata: {\"delta\":\"weighing the options\"}\n\nevent: response.output_text.delta\ndata: {\"delta\":\" there\"}\n\nevent: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17}}}\n\n",
+      "body": "event: response.output_item.added\ndata: {\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"content\":[],\"encrypted_content\":\"\",\"status\":\"in_progress\"}}\n\nevent: response.reasoning_text.delta\ndata: {\"delta\":\"weighing the options\"}\n\nevent: response.output_text.delta\ndata: {\"delta\":\" there\"}\n\nevent: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17}}}\n\n",
       "headers": {
         "content-type": "text/event-stream"
       },
@@ -110,6 +111,7 @@
       "message": {
         "content": [
           {
+            "reasoning_id": "rs_1",
             "thinking": "weighing the options",
             "type": "thinking"
           },
@@ -142,12 +144,12 @@
         "path": "/v1/models"
       },
       {
-        "body": "{\"input\":[{\"content\":[{\"text\":\"read a.txt\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"},{\"content\":[{\"text\":\"weighing the options\",\"type\":\"reasoning_text\"}],\"summary\":[],\"type\":\"reasoning\"},{\"content\":[{\"text\":\"there\",\"type\":\"output_text\"}],\"role\":\"assistant\",\"type\":\"message\"},{\"content\":[{\"text\":\"and now?\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}],\"instructions\":\"You are a replay fixture.\",\"model\":\"mistral-large-4\",\"reasoning\":{\"effort\":\"low\",\"summary\":\"auto\"},\"store\":false,\"stream\":true,\"tools\":[{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"strict\":false,\"type\":\"function\"}]}",
+        "body": "{\"input\":[{\"content\":[{\"text\":\"read a.txt\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"},{\"content\":[{\"text\":\"weighing the options\",\"type\":\"reasoning_text\"}],\"id\":\"rs_1\",\"summary\":[],\"type\":\"reasoning\"},{\"content\":[{\"text\":\"there\",\"type\":\"output_text\"}],\"role\":\"assistant\",\"type\":\"message\"},{\"content\":[{\"text\":\"and now?\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}],\"instructions\":\"You are a replay fixture.\",\"model\":\"mistral-large-4\",\"reasoning\":{\"effort\":\"low\",\"summary\":\"auto\"},\"store\":false,\"stream\":true,\"tools\":[{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"strict\":false,\"type\":\"function\"}]}",
         "headers": {
           "accept": "*/*",
           "accept-encoding": "deflate, gzip",
           "authorization": "Bearer sk-replay",
-          "content-length": "694",
+          "content-length": "706",
           "content-type": "application/json",
           "host": "<volatile>",
           "user-agent": "<volatile>"
