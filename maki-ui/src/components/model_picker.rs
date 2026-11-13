@@ -10,6 +10,7 @@ use maki_providers::Model;
 use maki_providers::ModelTier;
 use maki_providers::model_registry;
 use maki_providers::models_cache::ModelList;
+use maki_providers::provider::ProviderStatus;
 use maki_providers::spec::{Build, ProviderRegistry};
 
 use crate::components::Overlay;
@@ -217,9 +218,9 @@ impl ModelPicker {
             list.is_some_and(|l| {
                 !l.loading
                     && !l.specs.contains(spec)
-                    && spec
-                        .split_once('/')
-                        .is_some_and(|(provider, _)| l.live_providers.iter().any(|p| p == provider))
+                    && spec.split_once('/').is_some_and(|(provider, _)| {
+                        l.providers.get(provider) == Some(&ProviderStatus::Live)
+                    })
             })
         };
         let mut entries = Vec::new();
@@ -458,6 +459,8 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::components::keybindings::key as kb;
     use crate::components::{buffer_text, key};
@@ -496,16 +499,14 @@ mod tests {
     }
 
     fn loaded(specs: Vec<String>) -> Arc<ModelList> {
-        let live_providers = specs
+        let providers = specs
             .iter()
-            .filter_map(|spec| {
-                spec.split_once('/')
-                    .map(|(provider, _)| provider.to_string())
-            })
+            .filter_map(|spec| spec.split_once('/'))
+            .map(|(provider, _)| (provider.to_string(), ProviderStatus::Live))
             .collect();
         Arc::new(ModelList {
             specs,
-            live_providers,
+            providers,
             loading: false,
         })
     }
@@ -522,7 +523,7 @@ mod tests {
         let models = Arc::new(ArcSwapOption::empty());
         models.store(Some(Arc::new(ModelList {
             specs: vec![SWAPPED_SPEC.into()],
-            live_providers: Vec::new(),
+            providers: HashMap::new(),
             loading: true,
         })));
         let mut p = ModelPicker::new(Arc::clone(&models));
@@ -897,7 +898,7 @@ mod tests {
         ] {
             models.store(Some(Arc::new(ModelList {
                 specs,
-                live_providers: Vec::new(),
+                providers: HashMap::new(),
                 loading: true,
             })));
             let _ = p.refresh();
@@ -919,7 +920,10 @@ mod tests {
 
         models.store(Some(Arc::new(ModelList {
             specs: vec![SWAPPED_SPEC.into()],
-            live_providers: vec!["anthropic".into(), "zai".into()],
+            providers: HashMap::from([
+                ("anthropic".into(), ProviderStatus::Live),
+                ("zai".into(), ProviderStatus::Live),
+            ]),
             loading: false,
         })));
         let _ = p.refresh();
@@ -955,7 +959,7 @@ mod tests {
 
         models.store(Some(Arc::new(ModelList {
             specs: vec![SWAPPED_SPEC.into()],
-            live_providers: Vec::new(),
+            providers: HashMap::new(),
             loading: true,
         })));
         let _ = p.refresh();

@@ -662,9 +662,9 @@ fn fetch_models(
     models_fetched: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        fetch_all_models_cached(&policy, |list, warnings| {
-            for w in warnings {
-                let _ = warn_tx.send(w);
+        fetch_all_models_cached(&policy, |list, warning| {
+            if let Some(warning) = warning {
+                let _ = warn_tx.send(warning);
             }
             available.store(Some(Arc::new(list)));
         })
