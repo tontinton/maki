@@ -96,18 +96,19 @@ pub struct ModelInfo {
     /// bodies of a discovery run are what pin it.
     #[serde(default, skip_serializing)]
     pub extra: Option<Value>,
-    /// What the model says about effort, narrowing its declared dialect (see
+    /// What the model says about effort, refining its declared dialect (see
     /// [`ModelEffort::refine`]). Never serialized, for the reason
     /// [`Self::extra`] is not.
     #[serde(default, skip_serializing)]
     pub effort: Option<ModelEffort>,
 }
 
-/// A listed model's own effort levels and off switch. The codec folds them
-/// into the declared dialect first, so the effort snaps once, against the
-/// result. Decoding goes through [`Self::known_levels`], the one place a level
-/// maki has no name for is dropped.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+/// Effort levels and off switch, declared under `openai.thinking` or listed by
+/// discovery. The codec folds them into the declared dialect first, so the
+/// effort snaps once, against the result. Decoding goes through
+/// [`Self::known_levels`], the one place a level maki has no name for is
+/// dropped.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelEffort {
     /// Ascending. Empty inherits the declared levels, since a model that

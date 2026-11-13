@@ -18,7 +18,7 @@ use super::custom::{self, THINKING_FIELD};
 use super::openai::responses;
 use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyRotation, ResolvedAuth, Timeouts};
-use crate::model::{Model, ModelInfo, ThinkingSupport};
+use crate::model::{Model, ModelEffort, ModelInfo, ThinkingSupport};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::ProviderSpec;
@@ -104,6 +104,8 @@ pub struct ThinkingWire {
         deserialize_with = "deserialize_dialect"
     )]
     pub dialect: &'static EffortDialect<'static>,
+    #[serde(default)]
+    pub effort: Option<ModelEffort>,
     #[serde(default)]
     pub field: EffortField,
     /// Send effort only to a model that supports thinking, for an API that
@@ -230,9 +232,13 @@ impl OpenAiWire {
 
 impl ThinkingWire {
     fn dialect_for<'a>(&'a self, discovered: Option<&'a ModelInfo>) -> EffortDialect<'a> {
-        match discovered.and_then(|row| row.effort.as_ref()) {
+        let declared = match self.effort.as_ref() {
             Some(effort) => effort.refine(self.dialect),
             None => self.dialect.clone(),
+        };
+        match discovered.and_then(|row| row.effort.as_ref()) {
+            Some(effort) => effort.refine(&declared),
+            None => declared,
         }
     }
 
@@ -244,7 +250,7 @@ impl ThinkingWire {
         self.dialect_for(discovered).sends(choice)
     }
 
-    /// The declared dialect, narrowed by what discovery listed for the model,
+    /// The declared dialect, refined by what discovery listed for the model,
     /// renders the effort: one snap, against the levels the model accepts.
     fn apply(&self, body: &mut Value, ctx: &RequestCtx) {
         if self.requires_support && !ctx.model.supports_thinking() {
@@ -691,6 +697,8 @@ mod tests {
     const SAFE_VALUE: &str = "maki";
     const MODEL_SPEC: &str = "xai/grok-4.6";
 
+    const FULL_LADDER: &[Effort] = &Effort::ALL;
+
     /// One slug per case: `<SLUG>_BASE_URL` is process-wide, and these run in
     /// one process under `cargo test`.
     const DECLARED_SLUG: &str = "codec-declared-origin";
@@ -904,20 +912,28 @@ mod tests {
         assert_eq!(body.get(DEFAULT_EFFORT_FIELD).is_some(), sent, "{body}");
     }
 
-    /// A listed model's levels replace the declared ones before the one snap,
-    /// so a level past the declared ceiling still goes out.
-    #[test_case(Some(vec![Effort::High, Effort::XHigh]), "xhigh" ; "listed_levels_refine_the_dialect")]
-    #[test_case(None, "high" ; "unlisted_model_keeps_the_declared_dialect")]
-    fn a_discovered_effort_refines_the_declared_dialect(
-        listed: Option<Vec<Effort>>,
+    /// Declared levels replace the dialect's, then a listed model's replace
+    /// those, before the one snap.
+    #[test_case(None, None, "high" ; "unlisted_keeps_the_declared_dialect")]
+    #[test_case(Some(FULL_LADDER), None, "max" ; "declared_levels_alone")]
+    #[test_case(Some(&[Effort::High, Effort::XHigh]), None, "xhigh" ; "declared_levels_cap_the_dialect")]
+    #[test_case(Some(FULL_LADDER), Some(&[Effort::High]), "high" ; "listed_levels_narrow_the_declared_ones")]
+    #[test_case(Some(&[Effort::High]), Some(FULL_LADDER), "max" ; "listed_levels_widen_the_declared_ones")]
+    fn a_declared_effort_refines_the_dialect_before_a_listed_one(
+        declared: Option<&[Effort]>,
+        listed: Option<&[Effort]>,
         expected: &str,
     ) {
-        let wire = wire(json!({ "thinking": { "dialect": "prefer-high" } })).unwrap();
+        let mut thinking = json!({ "dialect": "standard" });
+        if let Some(levels) = declared {
+            thinking["effort"] = json!({ "supported": levels });
+        }
+        let wire = wire(json!({ "thinking": thinking })).unwrap();
         let model = curated_model();
         let ctx = RequestCtx {
-            discovered: Some(ModelInfo {
-                effort: listed.map(|supported| ModelEffort {
-                    supported,
+            discovered: listed.map(|supported| ModelInfo {
+                effort: Some(ModelEffort {
+                    supported: supported.to_vec(),
                     send_off: None,
                 }),
                 ..ModelInfo::id_only(model.id.clone())
