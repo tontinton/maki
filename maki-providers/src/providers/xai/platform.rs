@@ -120,7 +120,7 @@ impl Provider for Xai {
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
             if self.auth.is_oauth() {
-                let mut body = responses::build_body(model, messages, system, tools);
+                let mut body = responses::build_body(model, messages, system, tools, false);
                 apply_grok_reasoning(&mut body, &opts, model);
                 if let Some(session) = session_id {
                     body["prompt_cache_key"] = json!(session.as_str());

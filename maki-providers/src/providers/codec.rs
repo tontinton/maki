@@ -426,6 +426,8 @@ pub struct CodecOptions {
     pub openai: OpenAiWire,
     /// Read by every codec but google, which registration refuses it for.
     pub session_id: SessionCarrier,
+    /// Read only by the responses codec, which registration enforces.
+    pub replay_reasoning: bool,
     pub build_body: Option<Arc<dyn BodyHook>>,
 }
 
@@ -443,6 +445,7 @@ impl CodecOptions {
             system_prefix: None,
             openai: OpenAiWire::default(),
             session_id: SessionCarrier::default(),
+            replay_reasoning: false,
             build_body: None,
         }
     }
@@ -509,6 +512,7 @@ pub fn build(
             system_prefix: options.system_prefix,
             openai: options.openai,
             session_id: options.session_id,
+            replay_reasoning: options.replay_reasoning,
             build_body: options.build_body,
         }),
         Protocol::Google => Box::new(
@@ -533,6 +537,7 @@ pub(crate) struct CompatProvider {
     system_prefix: Option<String>,
     openai: OpenAiWire,
     session_id: SessionCarrier,
+    replay_reasoning: bool,
     build_body: Option<Arc<dyn BodyHook>>,
 }
 
@@ -628,7 +633,8 @@ impl Provider for CompatProvider {
                 if !resolved.is_empty() {
                     auth.base_url = Some(resolved);
                 }
-                let mut body = responses::build_body(model, messages, system, tools);
+                let mut body =
+                    responses::build_body(model, messages, system, tools, self.replay_reasoning);
                 if let Some(thinking) = &self.openai.thinking {
                     thinking.apply_responses(&mut body, &ctx);
                 }

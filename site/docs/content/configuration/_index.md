@@ -350,7 +350,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `responses_api` | boolean | `false` | - | Use the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). Past reasoning is not sent back on this API, so later turns cannot build on it. |
+| `responses_api` | boolean | `false` | - | Use the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). Off by default while the path is still being tested. |
 
 ### `plugins.read`
 

@@ -507,7 +507,8 @@ impl Provider for OpenAi {
                     .auth
                     .with_retry(|| async {
                         let mut codex_auth = self.codex_auth()?;
-                        let mut body = super::responses::build_body(model, messages, system, tools);
+                        let mut body =
+                            super::responses::build_body(model, messages, system, tools, false);
                         if let Some(session) = session_id {
                             apply_session_affinity(&mut body, &mut codex_auth, session)?;
                         }
@@ -957,7 +958,7 @@ mod tests {
             fast,
         };
         assert_eq!(opts.clamped(&model).fast, expected);
-        let mut body = responses::build_body(&model, &[], "", &json!([]));
+        let mut body = responses::build_body(&model, &[], "", &json!([]), false);
         responses::apply_responses_reasoning(
             &mut body,
             opts.thinking,

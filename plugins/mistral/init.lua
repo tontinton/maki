@@ -103,7 +103,7 @@ local opts = maki.api.register_options({
   responses_api = {
     default = false,
     type = "boolean",
-    desc = "Use the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). Past reasoning is not sent back on this API, so later turns cannot build on it.",
+    desc = "Use the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). Off by default while the path is still being tested.",
   },
 })
 
@@ -111,6 +111,7 @@ maki.provider.register({
   slug = "mistral",
   display_name = "Mistral",
   codec = opts.responses_api and "openai-responses" or "openai",
+  replay_reasoning = opts.responses_api,
   base_url = "https://api.mistral.ai/v1",
   api_key_env = "MISTRAL_API_KEY",
   login_url = "https://admin.mistral.ai/organization/api-keys",
