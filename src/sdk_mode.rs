@@ -42,6 +42,7 @@ use tracing::warn;
 
 use crate::cli::Cli;
 use crate::interrupt::Interrupt;
+use crate::subagent_tasks::{SubagentTasks, TaskMessage};
 
 /// An accepted observation's line, such as a background result. It goes out
 /// live only, since the SDK has no history replay.
@@ -662,6 +663,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         include_partial_messages: cli.include_partial_messages,
         synth: StreamSynth::new(),
         tool_inputs: HashMap::new(),
+        tasks: SubagentTasks::new(maki_to_claude_tool_name),
         result_text: String::new(),
         reported: RunTotals::default(),
         run_id: None,
@@ -966,6 +968,7 @@ struct EventPump {
     include_partial_messages: bool,
     synth: StreamSynth,
     tool_inputs: HashMap<String, (String, Value)>,
+    tasks: SubagentTasks,
     result_text: String,
     /// What every result so far reported.
     reported: RunTotals,
@@ -990,6 +993,10 @@ impl EventPump {
                     warn!(error = %e, "sdk event pump stopped");
                     break;
                 }
+            }
+            let unended = self.tasks.finish();
+            if let Err(e) = self.emit_tasks(unended) {
+                warn!(error = %e, "sdk event pump could not end its subagent tasks");
             }
             self.reported
         })
@@ -1049,6 +1056,20 @@ impl EventPump {
     }
 
     fn handle(&mut self, envelope: Envelope) -> Result<()> {
+        let task_messages = self.tasks.observe(&envelope);
+        self.emit_tasks(task_messages.before)?;
+        self.handle_event(&envelope)?;
+        self.emit_tasks(task_messages.after)
+    }
+
+    fn emit_tasks(&self, tasks: Vec<TaskMessage>) -> Result<()> {
+        tasks.into_iter().try_for_each(|task| {
+            self.writer
+                .emit_system(task.subtype(), serde_json::to_value(task)?)
+        })
+    }
+
+    fn handle_event(&mut self, envelope: &Envelope) -> Result<()> {
         // A woken turn has no prompt to time it from.
         if self.run_id.replace(envelope.run_id) != Some(envelope.run_id) {
             self.shared
@@ -1671,6 +1692,11 @@ mod tests {
     const CONTROL_REQUEST_TYPE: &str = "control_request";
     const SYSTEM_TYPE: &str = "system";
     const RESULT_TYPE: &str = "result";
+    const USER_TYPE: &str = "user";
+    const TASK_STARTED: &str = "task_started";
+    const TASK_NOTIFICATION: &str = "task_notification";
+    const TASK_A: &str = "session-a";
+    const TASK_B: &str = "session-b";
     const NOTICE_LINE: &str = "Background agent finished: find auth";
     const CHILD_NOTICE_LINE: &str = "a child's own notice";
     const HOST_NOTICE: &str = "the prompt changed, so the cache starts over";
@@ -1719,6 +1745,7 @@ mod tests {
             include_partial_messages: false,
             synth: StreamSynth::new(),
             tool_inputs: HashMap::new(),
+            tasks: SubagentTasks::new(maki_to_claude_tool_name),
             result_text: String::new(),
             reported: RunTotals::default(),
             run_id: None,
@@ -1902,6 +1929,23 @@ mod tests {
         }
     }
 
+    fn from_subagent(id: &str, event: AgentEvent) -> Envelope {
+        Envelope {
+            event,
+            subagent: Some(SubagentInfo {
+                parent_tool_use_id: id.into(),
+                name: id.into(),
+                prompt: None,
+                model: None,
+                opts: None,
+                answer_tx: None,
+                control: Arc::default(),
+                parent_call: None,
+            }),
+            run_id: 0,
+        }
+    }
+
     /// Nothing reached the model, so a client reading `is_error` must not take
     /// the empty turn for an answer.
     #[test]
@@ -1947,25 +1991,15 @@ mod tests {
             text: HOST_NOTICE.into(),
         }))
         .unwrap();
-        pump.handle(Envelope {
-            event: AgentEvent::ObservationLine {
+        pump.handle(from_subagent(
+            NOTICE_CHILD,
+            AgentEvent::ObservationLine {
                 text: CHILD_NOTICE_LINE.into(),
                 detail: None,
                 markdown: false,
                 end: None,
             },
-            subagent: Some(SubagentInfo {
-                parent_tool_use_id: NOTICE_CHILD.into(),
-                name: NOTICE_CHILD.into(),
-                prompt: None,
-                model: None,
-                opts: None,
-                answer_tx: None,
-                control: Arc::default(),
-                parent_call: None,
-            }),
-            run_id: 0,
-        })
+        ))
         .unwrap();
         pump.handle(top_level(AgentEvent::Done {
             usage: TokenUsage::default(),
@@ -1979,7 +2013,8 @@ mod tests {
         .unwrap();
 
         let wire: Vec<Value> = iter::from_fn(|| out_rx.try_recv().ok())
-            .map(|line| serde_json::from_str(&line).unwrap())
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .filter(|message| message["subtype"] != TASK_STARTED)
             .collect();
         assert_eq!(wire.len(), 2, "{wire:?}");
         assert_eq!(wire[0]["type"], SYSTEM_TYPE);
@@ -1990,6 +2025,50 @@ mod tests {
             pump.writer.session_id.to_string().as_str()
         );
         assert_eq!(wire[1]["type"], RESULT_TYPE);
+    }
+
+    /// Each wire line reads as (type or task subtype, the subagent it names).
+    #[test]
+    fn task_messages_frame_each_subagents_own_messages() {
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+        let results = || AgentEvent::ToolResultsSubmitted {
+            message: Box::default(),
+        };
+
+        pump.handle(top_level(results())).unwrap();
+        for id in [TASK_A, TASK_B, TASK_A] {
+            pump.handle(from_subagent(id, results())).unwrap();
+        }
+        pump.handle(top_level(AgentEvent::SubagentHistory {
+            tool_use_id: TASK_A.into(),
+            messages: Vec::new(),
+        }))
+        .unwrap();
+
+        let wire: Vec<(String, String)> = iter::from_fn(|| out_rx.try_recv().ok())
+            .map(|line| {
+                let message: Value = serde_json::from_str(&line).unwrap();
+                let label = message.get("subtype").unwrap_or(&message["type"]);
+                let task = message
+                    .get("task_id")
+                    .unwrap_or(&message["parent_tool_use_id"]);
+                (
+                    label.as_str().unwrap().to_owned(),
+                    task.as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        let expected = [
+            (USER_TYPE, ""),
+            (TASK_STARTED, TASK_A),
+            (USER_TYPE, TASK_A),
+            (TASK_STARTED, TASK_B),
+            (USER_TYPE, TASK_B),
+            (USER_TYPE, TASK_A),
+            (TASK_NOTIFICATION, TASK_A),
+        ]
+        .map(|(label, task)| (label.to_owned(), task.to_owned()));
+        assert_eq!(wire, expected);
     }
 
     fn run_done(totals: RunTotals) -> AgentEvent {

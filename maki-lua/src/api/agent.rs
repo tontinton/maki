@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
@@ -1371,7 +1371,6 @@ async fn session(
         local_tools: Arc::new(local_map),
         name,
         dones: RunDones::new(done_rx),
-        start: Instant::now(),
         background,
     };
 
@@ -1623,7 +1622,6 @@ struct SessionState {
     local_tools: LocalTools,
     name: String,
     dones: RunDones,
-    start: Instant,
     background: Option<Background>,
 }
 
@@ -1735,7 +1733,7 @@ impl SessionState {
             .send_history(&self.cancellation.ui_id, messages);
         info!(
             name = %self.name,
-            duration_ms = self.start.elapsed().as_millis() as u64,
+            duration_ms = self.cancellation.control.opened().elapsed().as_millis() as u64,
             input_tokens = usage.total_input(),
             output_tokens = usage.output,
             "subagent session closed",
@@ -2097,7 +2095,7 @@ async fn prompt(
 
     let tbl = lua.create_table()?;
     tbl.set("text", text)?;
-    tbl.set("duration_ms", s.start.elapsed().as_millis() as u64)?;
+    tbl.set("duration_ms", control.opened().elapsed().as_millis() as u64)?;
     tbl.set("input_tokens", usage.total_input())?;
     tbl.set("output_tokens", usage.output)?;
     Ok((Some(tbl), None))
@@ -2162,9 +2160,26 @@ fn send(
 /// Close cancels a running prompt before waiting to flush its history. That
 /// prompt returns `"session closed"` and any partial text.
 ///
+/// Pass {result}, the tool result the session's work came to, so headless
+/// clients learn how the subagent ended and what it found.
+///
+/// @param result table? `llm_output` and `is_error`, the shape a tool handler returns.
 /// @return
 #[lua_fn]
-async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
+async fn close(
+    _lua: Lua,
+    this: mlua::UserDataRef<LuaSession>,
+    result: Option<Table>,
+) -> LuaResult<()> {
+    if let Some(result) = result {
+        let text = result.opt::<String>("llm_output")?.unwrap_or_default();
+        let result = if result.opt_bool("is_error") == Some(true) {
+            Err(text)
+        } else {
+            Ok(text)
+        };
+        this.cancellation.control.report(result);
+    }
     this.cancellation.close();
     let inner = Arc::clone(&this.inner);
     drop(this);
@@ -2245,6 +2260,7 @@ mod tests {
     const PLUGIN: &str = "monitor";
     const SESSION_PROMPT: &str = "work until closed";
     const PARTIAL_TEXT: &str = "partial response";
+    const TOOL_OUTPUT: &str = "auth lives in src/auth.rs";
     const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
     const CLOSE_SESSION: &str = "function(sess) sess:close() end";
     const THINKING_BUDGET: u32 = 2048;
@@ -2369,17 +2385,52 @@ mod tests {
         if dispose {
             drop(first.take::<LuaSession>().unwrap());
         } else {
-            close(lua.clone(), first.borrow().unwrap()).await.unwrap();
-            close(lua.clone(), first.borrow().unwrap()).await.unwrap();
+            close(lua.clone(), first.borrow().unwrap(), None)
+                .await
+                .unwrap();
+            close(lua.clone(), first.borrow().unwrap(), None)
+                .await
+                .unwrap();
         }
         let replacement = native_session(&lua, &ctx).await;
         if !dispose {
-            close(lua.clone(), first.borrow().unwrap()).await.unwrap();
+            close(lua.clone(), first.borrow().unwrap(), None)
+                .await
+                .unwrap();
         }
         for session in [sibling, replacement] {
             assert!(!session_cancelled(&session));
-            close(lua.clone(), session.borrow().unwrap()).await.unwrap();
+            close(lua.clone(), session.borrow().unwrap(), None)
+                .await
+                .unwrap();
         }
+    }
+
+    #[test_case(None, Ok(TOOL_OUTPUT.into()) ; "answer")]
+    #[test_case(Some(true), Err(TOOL_OUTPUT.into()) ; "error")]
+    #[tokio::test]
+    async fn close_reports_the_tool_result_to_the_host(
+        is_error: Option<bool>,
+        expected: Result<String, String>,
+    ) {
+        let lua = Lua::new();
+        let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        let sess = native_session(&lua, &ctx).await;
+        let result = lua.create_table().unwrap();
+        result.set("llm_output", TOOL_OUTPUT).unwrap();
+        result.set("is_error", is_error).unwrap();
+
+        close(lua.clone(), sess.borrow().unwrap(), Some(result))
+            .await
+            .unwrap();
+
+        let reported = sess
+            .borrow::<LuaSession>()
+            .unwrap()
+            .cancellation
+            .control
+            .result();
+        assert_eq!(reported, Some(expected));
     }
 
     #[test_case(false ; "close_during_prompt")]
@@ -2578,7 +2629,9 @@ mod tests {
         let (_, error) = prompt(lua.clone(), sess.borrow().unwrap(), CHILD_REQUEST.into())
             .await
             .unwrap();
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
         assert!(error.is_none(), "{error:?}");
         assert_eq!(
             requests.recv().unwrap(),
@@ -2680,7 +2733,9 @@ mod tests {
                 },
             )
             .await;
-            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+            close(lua.clone(), sess.borrow().unwrap(), None)
+                .await
+                .unwrap();
             assert!(result.unwrap().1.is_none());
             if mid_prompt {
                 assert_eq!(requests_seen[0], [SESSION_PROMPT]);
@@ -2788,7 +2843,9 @@ mod tests {
             assert_eq!(sent, (Some(true), None));
         })
         .await;
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
 
         assert_eq!(result, (Some(CHILD_RESPONSE.to_owned()), None));
         let [first, second] = &requests.try_iter().collect::<Vec<_>>()[..] else {
@@ -3529,7 +3586,9 @@ mod tests {
         registry.register(call_entry(chat, CALL_ID)).unwrap();
         let (sess, _call_trigger) = open_under_moved_call(&lua, &ctx, &call, chat, opened).await;
         assert_eq!(registry.list(chat).len(), while_open);
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
         let kinds = registry
             .list(chat)
             .into_iter()
@@ -3722,7 +3781,9 @@ mod tests {
             first
         })
         .await;
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
 
         assert!(error.is_none(), "{error:?}");
         let later = iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
@@ -3765,7 +3826,9 @@ mod tests {
             woken
         })
         .await;
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
 
         assert!(error.is_none(), "{error:?}");
         assert_eq!(text.as_deref(), Some(WOKEN_REPLY));
@@ -3802,7 +3865,9 @@ mod tests {
 
         ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
         work.cancelled().await;
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3818,7 +3883,9 @@ mod tests {
         .await;
         assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
         assert!(requests.is_empty());
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
     }
 
     /// A coordinator reads a moved subagent while its run holds the session
@@ -3859,7 +3926,9 @@ mod tests {
             [(Some(all.to_vec()), None), (Some(all[1..].to_vec()), None)]
         );
 
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
         for gone in [id.as_str(), UNKNOWN_TASK_ID] {
             let (_, error) = peek(&lua, gone, None).await.unwrap();
             assert_eq!(

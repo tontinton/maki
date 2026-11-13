@@ -118,6 +118,32 @@ An SDK result is sent when its run ends, so it cannot include spend that came la
 {"type":"system","subtype":"background_usage","total_cost_usd":0.12,"usage":{"input_tokens":5300,"output_tokens":800,...},"session_id":"..."}
 ```
 
+## Subagents
+
+Parallel subagents interleave their messages in `--verbose`, `stream-json` and SDK output. To tell them apart, Maki sends the same task messages as Claude Code: `task_started` right before a subagent's first message, `task_progress` after each of its turns that called tools, and `task_notification` when it ends.
+
+```json
+{"type":"system","subtype":"task_started","task_id":"toolu_01...","tool_use_id":"toolu_01...","description":"Find the auth middleware","task_type":"local_agent","prompt":"...","session_id":"..."}
+{"type":"system","subtype":"task_progress","task_id":"toolu_01...","tool_use_id":"toolu_01...","description":"Find the auth middleware","usage":{"total_tokens":52470,"tool_uses":2,"duration_ms":4314},"last_tool_name":"Read","session_id":"..."}
+{"type":"system","subtype":"task_notification","task_id":"toolu_01...","tool_use_id":"toolu_01...","status":"completed","output_file":"","summary":"Auth is checked in src/auth.rs","usage":{...},"session_id":"..."}
+```
+
+Each message of a subagent has its `parent_tool_use_id` set to the task's `tool_use_id`. That is the id of the `task` call, or an id of its own when another call such as `batch` opened the subagent. A nested subagent belongs to the top-level task above it. Its messages carry that task's id, and its turns count toward that task's `usage`.
+
+`status` and `summary` come from the result of the call that ran the subagent:
+
+| `status` | When | `summary` |
+|----------|------|-----------|
+| `completed` | The call succeeded | Its result |
+| `failed` | The call failed | The error |
+| `stopped` | A stop or cancel cut it, or the output ended first | The reason |
+
+A plugin that runs its own subagents reports this by passing its tool result to [`Session:close()`](/docs/lua-api/#Session-close). A subagent closed without one reads as `completed` with an empty summary.
+
+`output_file` is always empty, because Maki keeps subagent transcripts in the session.
+
+Every `task_started` gets exactly one `task_notification`. It comes right before the result of the call that opened the subagent. When that call moved to the [background](/docs/background-tasks/), it comes before the first result after the subagent ended.
+
 ## Stopping a Run
 
 `Ctrl+C` (SIGINT) or SIGTERM stops a `--print` or SDK run without leaving work behind. Maki cancels the turn in flight, stops the background tasks, and kills the processes its tools started. It then sends the result as usual. If a turn was running, the result holds what that turn produced so far, with `"stop_reason":"cancelled"` and `"is_error":true`. Results that never reached the model get the same warning as a timeout, ending in `before maki was interrupted`.

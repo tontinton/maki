@@ -7,6 +7,7 @@ mod provider_scripts;
 mod resume;
 mod sdk_mode;
 mod setup;
+mod subagent_tasks;
 mod update;
 
 use std::time::Duration;
