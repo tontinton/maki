@@ -1651,8 +1651,19 @@ impl App {
             LoginPickerAction::Consumed => vec![],
             LoginPickerAction::Close => vec![],
             LoginPickerAction::OpenUrl(url) => vec![Action::OpenUrl(url)],
-            LoginPickerAction::Authenticated { model_spec } => {
-                vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+            LoginPickerAction::Authenticated {
+                model_spec,
+                slug,
+                url_changed,
+            } => {
+                let mut actions = if url_changed {
+                    vec![Action::RefreshProvider { slug }]
+                } else {
+                    vec![]
+                };
+                actions.push(Action::ChangeModel(model_spec));
+                actions.push(Action::RefreshModels);
+                actions
             }
             LoginPickerAction::Configured { slug } => {
                 vec![Action::RefreshProvider { slug }, Action::RefreshModels]
