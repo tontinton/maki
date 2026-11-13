@@ -475,15 +475,18 @@ pub struct SdkParams {
 
 /// Routes permission answers between stdin and the agent.
 ///
-/// Owning the outstanding ids *and* the answer channel is the point: an
+/// Owning the outstanding ids *and* their answer channels is the point: an
 /// unanswered request parks the agent forever, so a request may only be
 /// recorded while a source that could answer it exists.
 struct Permissions {
+    /// The main agent's channel. A subagent parks on its own, which its ask
+    /// carries instead.
     answer_tx: UnboundedSender<String>,
-    /// Wire request id to the agent-side ask it stands for. The agent only
-    /// accepts an answer naming the ask it is parked on, so the id it asked
-    /// with has to survive the round trip through stdin.
-    outstanding: HashMap<String, String>,
+    /// Wire request id to the agent-side ask it stands for and the channel
+    /// parked on it. The agent only accepts an answer naming the ask it is
+    /// parked on, so the id it asked with has to survive the round trip
+    /// through stdin.
+    outstanding: HashMap<String, (String, UnboundedSender<String>)>,
     answerable: bool,
 }
 
@@ -496,40 +499,43 @@ impl Permissions {
         }
     }
 
-    fn answer(&self, ask_id: &str, answer: PermissionAnswer) {
-        let _ = self
-            .answer_tx
-            .send(TaggedAnswer::new(ask_id, answer).encode());
+    fn answer(answer_tx: &UnboundedSender<String>, ask_id: &str, answer: PermissionAnswer) {
+        let _ = answer_tx.send(TaggedAnswer::new(ask_id, answer).encode());
     }
 
-    fn deny_unanswerable(&self, request_id: &str, ask_id: &str) {
+    fn deny_unanswerable(answer_tx: &UnboundedSender<String>, request_id: &str, ask_id: &str) {
         warn!(%request_id, %ask_id, "denying tool permission: stdin closed");
-        self.answer(ask_id, PermissionAnswer::Deny);
+        Self::answer(answer_tx, ask_id, PermissionAnswer::Deny);
     }
 
     /// Records an outstanding request against the ask it answers. `false` means
     /// nobody is left to answer it, so it was denied here and must not be put
     /// on the wire.
-    fn ask(&mut self, request_id: String, ask_id: String) -> bool {
+    fn ask(
+        &mut self,
+        request_id: String,
+        ask_id: String,
+        answer_tx: UnboundedSender<String>,
+    ) -> bool {
         if !self.answerable {
-            self.deny_unanswerable(&request_id, &ask_id);
+            Self::deny_unanswerable(&answer_tx, &request_id, &ask_id);
             return false;
         }
-        self.outstanding.insert(request_id, ask_id);
+        self.outstanding.insert(request_id, (ask_id, answer_tx));
         true
     }
 
     fn resolve(&mut self, request_id: &str, answer: PermissionAnswer) {
-        if let Some(ask_id) = self.outstanding.remove(request_id) {
-            self.answer(&ask_id, answer);
+        if let Some((ask_id, answer_tx)) = self.outstanding.remove(request_id) {
+            Self::answer(&answer_tx, &ask_id, answer);
         }
     }
 
     /// No further answers can arrive. Idempotent.
     fn close(&mut self) {
         self.answerable = false;
-        for (request_id, ask_id) in std::mem::take(&mut self.outstanding) {
-            self.deny_unanswerable(&request_id, &ask_id);
+        for (request_id, (ask_id, answer_tx)) in mem::take(&mut self.outstanding) {
+            Self::deny_unanswerable(&answer_tx, &request_id, &ask_id);
         }
     }
 }
@@ -1192,15 +1198,29 @@ impl EventPump {
                 }))?;
             }
             AgentEvent::PermissionRequest { id, tool, .. } => {
-                {
+                let answer_tx = {
                     let shared = self.shared.lock().unwrap();
+                    let answer_tx = match &envelope.subagent {
+                        Some(info) => {
+                            let Some(answer_tx) = info.answer_tx.clone() else {
+                                warn!(
+                                    subagent = info.name,
+                                    parent_tool_use_id = info.parent_tool_use_id,
+                                    tool_use_id = id,
+                                    "dropping subagent permission with no answer channel"
+                                );
+                                return Ok(());
+                            };
+                            answer_tx
+                        }
+                        None => shared.permissions.answer_tx.clone(),
+                    };
                     if shared.permission_mode == PermissionMode::BypassPermissions {
-                        shared
-                            .permissions
-                            .answer(id, PermissionAnswer::AllowSession);
+                        Permissions::answer(&answer_tx, id, PermissionAnswer::AllowSession);
                         return Ok(());
                     }
-                }
+                    answer_tx
+                };
 
                 let (tool_name, input) = self
                     .tool_inputs
@@ -1210,13 +1230,11 @@ impl EventPump {
 
                 self.request_counter += 1;
                 let req_id = format!("req_{}", self.request_counter);
-                if !self
-                    .shared
-                    .lock()
-                    .unwrap()
-                    .permissions
-                    .ask(req_id.clone(), id.clone())
-                {
+                if !self.shared.lock().unwrap().permissions.ask(
+                    req_id.clone(),
+                    id.clone(),
+                    answer_tx,
+                ) {
                     return Ok(());
                 }
 
@@ -1800,15 +1818,19 @@ mod tests {
     #[test]
     fn closing_the_answer_source_denies_outstanding_and_later_requests() {
         let (answer_tx, mut answer_rx) = unbounded_channel();
-        let mut permissions = Permissions::new(answer_tx);
+        let mut permissions = Permissions::new(answer_tx.clone());
 
-        assert!(permissions.ask(OUTSTANDING_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
+        assert!(permissions.ask(
+            OUTSTANDING_REQ.to_owned(),
+            TEST_TOOL_USE_ID.to_owned(),
+            answer_tx.clone()
+        ));
         assert!(answer_rx.is_empty());
 
         permissions.close();
         assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
 
-        assert!(!permissions.ask(LATE_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
+        assert!(!permissions.ask(LATE_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned(), answer_tx));
         assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
 
         permissions.close();
@@ -1821,8 +1843,12 @@ mod tests {
     #[test]
     fn only_requests_the_agent_waits_on_get_answered() {
         let (answer_tx, mut answer_rx) = unbounded_channel();
-        let mut permissions = Permissions::new(answer_tx);
-        assert!(permissions.ask(OUTSTANDING_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
+        let mut permissions = Permissions::new(answer_tx.clone());
+        assert!(permissions.ask(
+            OUTSTANDING_REQ.to_owned(),
+            TEST_TOOL_USE_ID.to_owned(),
+            answer_tx
+        ));
 
         permissions.resolve(LATE_REQ, PermissionAnswer::AllowOnce);
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
@@ -1944,6 +1970,31 @@ mod tests {
             }),
             run_id: 0,
         }
+    }
+
+    /// A subagent parks on its own channel, so an answer sent on the main
+    /// one never wakes it and the main agent drops it as a stray.
+    #[test_case(PermissionMode::BypassPermissions, PermissionAnswer::AllowSession ; "bypass")]
+    #[test_case(PermissionMode::Default, PermissionAnswer::AllowOnce ; "client_answer")]
+    fn subagent_permission_is_answered_on_its_own_channel(
+        permission_mode: PermissionMode,
+        answer: PermissionAnswer,
+    ) {
+        let (main_tx, main_rx) = unbounded_channel();
+        let (child_tx, mut child_rx) = unbounded_channel();
+        let (mut pump, _out_rx) = test_pump(permission_mode, main_tx);
+        let mut request = from_subagent(TASK_A, permission_request().event);
+        request.subagent.as_mut().unwrap().answer_tx = Some(child_tx);
+
+        pump.handle(request).unwrap();
+        pump.shared
+            .lock()
+            .unwrap()
+            .permissions
+            .resolve(OUTSTANDING_REQ, answer.clone());
+
+        assert_eq!(child_rx.try_recv(), Ok(tagged(answer)));
+        assert!(main_rx.is_empty(), "{NO_ANSWER}");
     }
 
     /// Nothing reached the model, so a client reading `is_error` must not take
