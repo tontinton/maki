@@ -20,6 +20,8 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::OpenSession;
 use crate::app::App;
+use crate::components::streaming_content::StreamingContent;
+use crate::components::tool_display::{RoleStyle, assistant_style, thinking_style};
 use crate::storage_writer::StorageWriter;
 use crate::text_buffer::{Decoration, Mark, RuleSet, VirtTextPos};
 
@@ -48,6 +50,7 @@ const FENCE_BLOCK_QUERY: &str = r#"
 const STRONG_QUERY: &str = "(strong_emphasis (emphasis_delimiter) @hidden) @strong";
 const HIDDEN_CAPTURE: &str = "hidden";
 const STRONG_CAPTURE: &str = "strong";
+const INSTANT_REVEAL: u64 = 0;
 
 /// No Lua, no MCP and no agent, so the numbers are the UI's own work. The
 /// model is a tier default rather than a named one, so the bench keeps
@@ -244,5 +247,42 @@ pub fn settle_parse(app: &mut App) {
         }
         assert!(Instant::now() < deadline, "the parse never finished");
         thread::yield_now();
+    }
+}
+
+/// A reply as the transcript streams it. The typewriter shows each push at
+/// once, so the numbers are the render work alone.
+pub struct LiveMessage(StreamingContent);
+
+impl LiveMessage {
+    pub fn text() -> Self {
+        Self::styled(assistant_style())
+    }
+
+    pub fn thinking() -> Self {
+        Self::styled(thinking_style())
+    }
+
+    fn styled(style: RoleStyle) -> Self {
+        Self(StreamingContent::new(
+            style.prefix,
+            style.text_style,
+            style.prefix_style,
+            INSTANT_REVEAL,
+        ))
+    }
+
+    pub fn push(&mut self, text: &str) {
+        self.0.push(text);
+    }
+
+    /// Lines of the whole message, the way a reply is drawn.
+    pub fn render(&mut self, width: u16) -> usize {
+        self.0.render_lines(width).len()
+    }
+
+    /// Lines of the collapsed tail, the way live thinking is drawn.
+    pub fn render_tail(&mut self, rows: usize, width: u16) -> usize {
+        self.0.render_tail(rows, width).map_or(0, <[_]>::len)
     }
 }
