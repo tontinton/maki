@@ -13,7 +13,7 @@ use maki_sandbox::namespace::NamespaceConfig;
 /// failure is a real bug in the sandbox, so it panics rather than hiding behind
 /// a green test.
 pub fn sandbox_for(root: &Path) -> Option<Arc<Sandbox>> {
-    sandbox_with(NamespaceConfig::new(
+    let mut config = NamespaceConfig::new(
         vec![],
         vec![],
         root.to_path_buf(),
@@ -23,7 +23,11 @@ pub fn sandbox_for(root: &Path) -> Option<Arc<Sandbox>> {
         vec![],
         vec![],
         vec![],
-    ))
+    );
+    // The test harness cannot answer the bwrap inner entry flag, so only the
+    // native backend can run these tests.
+    config.backend = maki_sandbox::backend::Backend::Native;
+    sandbox_with(config)
 }
 
 /// Like [`sandbox_for`], but with a caller-built config.

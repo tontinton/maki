@@ -108,7 +108,8 @@ fn load_config(
     config.agent.max_turns = cli.max_turns;
     #[cfg(all(feature = "sandbox", target_os = "linux"))]
     if cli.sandbox {
-        maki_sandbox::namespace::probe()
+        sandbox_backend(config.agent.sandbox_backend)
+            .probe()
             .map_err(|e| color_eyre::eyre::eyre!("{e}"))
             .context("sandbox preflight check failed -- cannot start with --sandbox")?;
         config.agent.sandbox_enabled = true;
@@ -225,6 +226,11 @@ async fn build_stack(
 }
 
 #[cfg(all(feature = "sandbox", target_os = "linux"))]
+fn sandbox_backend(backend: maki_config::SandboxBackend) -> maki_sandbox::backend::Backend {
+    maki_sandbox::backend::Backend::from_label(backend.label()).unwrap_or_default()
+}
+
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
 fn setup_sandbox(
     plugin_host: &mut PluginHost,
     agent_config: &maki_agent::AgentConfig,
@@ -244,6 +250,7 @@ fn setup_sandbox(
                 cwd,
                 workspace_name,
             );
+            cfg.backend = sandbox_backend(agent_config.sandbox_backend);
             cfg.prune_missing_mounts();
             cfg
         };

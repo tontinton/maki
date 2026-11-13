@@ -147,6 +147,7 @@ fn sandbox_masks_a_file_inside_a_mounted_directory() {
     config
         .masked_paths
         .push(MaskedPath::new(credentials.clone()));
+    config.backend = maki_sandbox::backend::Backend::Native;
 
     let Some(sandbox) = common::sandbox_with(config) else {
         return;

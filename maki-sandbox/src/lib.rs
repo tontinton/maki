@@ -1,6 +1,8 @@
 #![cfg(all(feature = "sandbox", target_os = "linux"))]
 
 pub mod apparmor;
+pub mod backend;
+pub mod bwrap;
 pub mod child;
 pub mod error;
 pub mod fs_backend;
@@ -17,10 +19,12 @@ use std::sync::{Arc, Mutex};
 
 use maki_fs::{JobSink, JobStream};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, getgid, getuid};
 use tracing::{debug, error, warn};
 
+use crate::backend::Backend;
 use crate::error::SandboxError;
 use crate::ipc::{ChildMsg, DirEntry, FsResult, ParentMsg, RunId, SYNC_GO, SYNC_READY};
 use crate::namespace::NamespaceConfig;
@@ -43,7 +47,7 @@ pub fn lock_or_poisoned<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_,
 
 pub use sandbox::Sandbox;
 
-/// Spawn a sandboxed child process.
+/// Spawn a sandboxed child process using the configured [`Backend`].
 ///
 /// Returns the child PID and the parent end of the IPC socket.
 /// The child has already:
@@ -52,15 +56,40 @@ pub use sandbox::Sandbox;
 /// - Created a mount namespace
 /// - Set up bind mounts
 ///
-/// After this returns, the child is in its persistent IO loop and accepts
-/// [`ParentMsg`](crate::ipc::ParentMsg) requests (fs ops, execs, queries)
-/// over the socket.
+/// [`Backend::Auto`] tries the native namespaces first and retries with
+/// bubblewrap when the host refuses them. After this returns, the child is in
+/// its persistent IO loop and accepts [`ParentMsg`](crate::ipc::ParentMsg)
+/// requests (fs ops, execs, queries) over the socket.
 ///
 /// # Errors
 ///
-/// Returns a [`SandboxError`] if the fork fails, the handshake or sync
-/// protocol fails, or the uid/gid map cannot be written.
+/// Returns a [`SandboxError`] if the backend cannot start, the handshake or
+/// sync protocol fails, or the uid/gid map cannot be written.
 pub fn spawn_child(config: NamespaceConfig) -> Result<(Pid, UnixStream), SandboxError> {
+    match config.backend {
+        Backend::Native => spawn_native(config),
+        Backend::Bwrap => spawn_bwrap(config),
+        Backend::Auto => match spawn_native(config.clone()) {
+            Ok(child) => Ok(child),
+            Err(native) if native_allows_bwrap_fallback(&native) && bwrap::installed() => {
+                warn!(error = %native, "sandbox: native backend unavailable, falling back to bwrap");
+                spawn_bwrap(config)
+            }
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// Whether a native spawn failure is the host refusing isolation rather than a
+/// bug in the sandbox. Only these failures are worth retrying with bwrap.
+fn native_allows_bwrap_fallback(error: &SandboxError) -> bool {
+    matches!(
+        error,
+        SandboxError::IsolationUnavailable(_) | SandboxError::Namespace(_)
+    )
+}
+
+fn spawn_native(config: NamespaceConfig) -> Result<(Pid, UnixStream), SandboxError> {
     let (mut parent_sock, child_sock) =
         UnixStream::pair().map_err(|e| SandboxError::Ipc(format!("socketpair: {e}")))?;
 
@@ -72,40 +101,93 @@ pub fn spawn_child(config: NamespaceConfig) -> Result<(Pid, UnixStream), Sandbox
         ForkResult::Parent { child } => {
             drop(child_sock);
 
-            let child_pid = child;
-
-            crate::ipc::send_handshake(&mut parent_sock, "maki-server")?;
-            let child_name = crate::ipc::recv_handshake(&mut parent_sock)?;
-            if child_name != "maki-child" {
-                return Err(SandboxError::Ipc(format!(
-                    "unexpected child handshake: got '{child_name}', expected 'maki-child'"
-                )));
-            }
-
-            crate::ipc::recv_sync(&mut parent_sock, SYNC_READY)?;
-
-            crate::namespace::write_uid_map(child_pid, getuid().as_raw(), getgid().as_raw())?;
-
-            crate::ipc::send_sync(&mut parent_sock, SYNC_GO)?;
-
-            // The child only acks once its namespaces and mounts are in place.
-            // Without this wait a host that refuses `unshare(CLONE_NEWNS)` would
-            // hand back a Sandbox whose paths mean nothing, and every fs call
-            // through it would fail later and further from the cause.
-            match crate::ipc::recv_child_msg(&mut parent_sock)? {
-                ChildMsg::Setup { error: None } => {}
-                ChildMsg::Setup { error: Some(e) } => return Err(e),
-                other => {
-                    return Err(SandboxError::Ipc(format!(
-                        "unexpected child message during setup: {other:?}"
-                    )));
+            match finish_native_setup(child, &mut parent_sock) {
+                Ok(()) => {
+                    debug!(child_pid = %child.as_raw(), "sandbox: child spawned");
+                    Ok((child, parent_sock))
+                }
+                Err(e) => {
+                    kill_and_reap(child, &e);
+                    Err(e)
                 }
             }
-
-            debug!(child_pid = %child_pid.as_raw(), "sandbox: child spawned");
-            Ok((child_pid, parent_sock))
         }
     }
+}
+
+fn finish_native_setup(child: Pid, sock: &mut UnixStream) -> Result<(), SandboxError> {
+    crate::ipc::send_handshake(sock, "maki-server")?;
+    let child_name = crate::ipc::recv_handshake(sock)?;
+    if child_name != "maki-child" {
+        return Err(SandboxError::Ipc(format!(
+            "unexpected child handshake: got '{child_name}', expected 'maki-child'"
+        )));
+    }
+
+    crate::ipc::recv_sync(sock, SYNC_READY)?;
+
+    crate::namespace::write_uid_map(child, getuid().as_raw(), getgid().as_raw())?;
+
+    crate::ipc::send_sync(sock, SYNC_GO)?;
+
+    // The child only acks once its namespaces and mounts are in place.
+    // Without this wait a host that refuses `unshare(CLONE_NEWNS)` would
+    // hand back a Sandbox whose paths mean nothing, and every fs call
+    // through it would fail later and further from the cause.
+    match crate::ipc::recv_child_msg(sock)? {
+        ChildMsg::Setup { error: None } => Ok(()),
+        ChildMsg::Setup { error: Some(e) } => Err(e),
+        other => Err(SandboxError::Ipc(format!(
+            "unexpected child message during setup: {other:?}"
+        ))),
+    }
+}
+
+fn spawn_bwrap(config: NamespaceConfig) -> Result<(Pid, UnixStream), SandboxError> {
+    let (mut parent_sock, child_sock) =
+        UnixStream::pair().map_err(|e| SandboxError::Ipc(format!("socketpair: {e}")))?;
+    let mut child = bwrap::spawn(&config, child_sock)?;
+    let pid = Pid::from_raw(child.id() as i32);
+
+    match finish_bwrap_setup(pid, &mut parent_sock) {
+        Ok(()) => {
+            debug!(child_pid = %pid.as_raw(), "sandbox: bwrap child spawned");
+            Ok((pid, parent_sock))
+        }
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(e)
+        }
+    }
+}
+
+fn finish_bwrap_setup(pid: Pid, sock: &mut UnixStream) -> Result<(), SandboxError> {
+    crate::ipc::send_handshake(sock, "maki-server")?;
+    let child_name = crate::ipc::recv_handshake(sock)?;
+    if child_name != "maki-child" {
+        return Err(SandboxError::Ipc(format!(
+            "unexpected bwrap child handshake: got '{child_name}', expected 'maki-child'"
+        )));
+    }
+
+    match crate::ipc::recv_child_msg(sock)? {
+        ChildMsg::Setup { error: None } => {
+            debug!(child_pid = %pid.as_raw(), "sandbox: bwrap inner ready");
+            Ok(())
+        }
+        ChildMsg::Setup { error: Some(e) } => Err(e),
+        other => Err(SandboxError::Ipc(format!(
+            "unexpected bwrap child message during setup: {other:?}"
+        ))),
+    }
+}
+
+fn kill_and_reap(pid: Pid, error: &SandboxError) {
+    warn!(child_pid = %pid.as_raw(), error = %error, "sandbox: native setup failed, killing child");
+    let _ = kill(pid, Signal::SIGKILL);
+    let _ = waitpid(pid, None);
+    crate::namespace::cleanup_staging(pid);
 }
 
 /// Wait for the child process to exit and collect its status.

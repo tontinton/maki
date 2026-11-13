@@ -11,6 +11,7 @@ use nix::unistd::{ForkResult, Pid, getgid, getuid};
 use tracing::{debug, warn};
 
 use crate::apparmor;
+use crate::backend::Backend;
 use crate::error::SandboxError;
 use crate::ipc::{self, SYNC_GO, SYNC_READY};
 
@@ -86,6 +87,8 @@ impl MaskedPath {
 
 #[derive(Debug, Clone)]
 pub struct NamespaceConfig {
+    /// How the child process is isolated.
+    pub backend: Backend,
     pub allowed_env: Vec<String>,
     pub env_vars: Vec<(String, String)>,
     pub workspace_dir: PathBuf,
@@ -212,6 +215,7 @@ impl NamespaceConfig {
         symlinks: Vec<(PathBuf, String)>,
     ) -> Self {
         Self {
+            backend: Backend::default(),
             allowed_env,
             env_vars,
             masked_paths: default_masked_paths(&workspace_dir),
@@ -233,6 +237,37 @@ impl NamespaceConfig {
         compute_env_entries(&self.allowed_env, &self.env_vars, &self.path_dirs)
     }
 
+    /// The environment the sandbox child gets: the allow-listed host
+    /// variables, the sandbox `PATH`, and the sandbox `HOME`/`USER`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Env`] if an env key or value contains a null
+    /// byte.
+    pub fn filtered_env(&self) -> Result<Vec<(String, String)>, SandboxError> {
+        let mut keep: Vec<(String, String)> = std::env::vars()
+            .filter(|(key, _)| self.is_allowed(key))
+            .collect();
+        let new_path = build_sandbox_path(&self.path_dirs);
+        if let Some(path) = keep.iter_mut().find(|(key, _)| key == "PATH") {
+            path.1 = new_path;
+        } else {
+            keep.push(("PATH".to_string(), new_path));
+        }
+
+        keep.retain(|(key, _)| key != "HOME" && key != "USER");
+        keep.push(("HOME".to_string(), "/home/maki".to_string()));
+        keep.push(("USER".to_string(), "maki".to_string()));
+
+        for (key, val) in &keep {
+            CString::new(key.as_str())
+                .map_err(|_| SandboxError::Env("null byte in env key".into()))?;
+            CString::new(val.as_str())
+                .map_err(|_| SandboxError::Env("null byte in env value".into()))?;
+        }
+        Ok(keep)
+    }
+
     /// Replace the child's environment with the filtered allow-listed set.
     ///
     /// # Errors
@@ -240,22 +275,10 @@ impl NamespaceConfig {
     /// Returns [`SandboxError::Env`] if an env key or value contains a null
     /// byte.
     pub fn filter_env(&self) -> Result<(), SandboxError> {
-        let mut keep: Vec<(String, String)> = Vec::new();
-        for (key, val) in std::env::vars() {
-            if self.is_allowed(&key) {
-                keep.push((key, val));
-            }
-        }
+        let keep = self.filtered_env()?;
         unsafe {
             libc::clearenv();
         }
-        let new_path = build_sandbox_path(&self.path_dirs);
-        if let Some(p) = keep.iter_mut().find(|(k, _)| k == "PATH") {
-            p.1 = new_path;
-        } else {
-            keep.push(("PATH".to_string(), new_path));
-        }
-
         for (key, val) in &keep {
             let c_key = CString::new(key.as_str())
                 .map_err(|_| SandboxError::Env("null byte in env key".into()))?;
@@ -264,16 +287,6 @@ impl NamespaceConfig {
             unsafe {
                 libc::setenv(c_key.as_ptr(), c_val.as_ptr(), 1);
             }
-        }
-
-        // Override HOME and USER to sandbox-internal values
-        unsafe {
-            let home = CString::new("/home/maki")
-                .map_err(|_| SandboxError::Env("invalid HOME value".into()))?;
-            let user =
-                CString::new("maki").map_err(|_| SandboxError::Env("invalid USER value".into()))?;
-            libc::setenv(c"HOME".as_ptr(), home.as_ptr(), 1);
-            libc::setenv(c"USER".as_ptr(), user.as_ptr(), 1);
         }
 
         debug!(

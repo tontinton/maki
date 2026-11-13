@@ -523,6 +523,9 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("--sandbox-inner") {
         maki_sandbox::child::child_inner_main();
     }
+    if std::env::args().nth(1).as_deref() == Some("--sandbox-bwrap-inner") {
+        maki_sandbox::child::bwrap_inner_main();
+    }
     sandbox_impl::main();
 }
 

@@ -162,6 +162,10 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub sandbox_inner: bool,
 
+    /// Internal: bubblewrap inner instance after bwrap setup
+    #[arg(long, hide = true)]
+    pub sandbox_bwrap_inner: bool,
+
     /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
     #[arg(long, value_delimiter = ',', visible_alias = "allowedTools")]
     pub allowed_tools: Vec<String>,

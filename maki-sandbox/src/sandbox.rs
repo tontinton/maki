@@ -439,7 +439,7 @@ mod tests {
     }
 
     fn config_for(workspace: &Path) -> NamespaceConfig {
-        NamespaceConfig::new(
+        let mut config = NamespaceConfig::new(
             vec![],
             vec![],
             workspace.to_path_buf(),
@@ -449,7 +449,11 @@ mod tests {
             vec![],
             vec![],
             vec![],
-        )
+        );
+        // The test harness is not the maki binary and cannot answer the inner
+        // entry flag, so a bwrap fallback would fail instead of skipping.
+        config.backend = crate::backend::Backend::Native;
+        config
     }
 
     /// `None` means this host cannot isolate at all, which the tests skip.

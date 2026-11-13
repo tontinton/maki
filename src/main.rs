@@ -43,6 +43,10 @@ async fn main() {
     if cli.sandbox_inner {
         maki_sandbox::child::child_inner_main();
     }
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    if cli.sandbox_bwrap_inner {
+        maki_sandbox::child::bwrap_inner_main();
+    }
     // Detached export tasks die with the process; drain them here, before
     // the `exit` below skips every destructor.
     let result = cmd::dispatch(cli).await;

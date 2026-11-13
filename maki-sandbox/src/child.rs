@@ -166,23 +166,29 @@ impl SandboxChild {
     }
 
     fn run_inner_static() -> ! {
-        let fd: i32 = if let Ok(val) = var(ENV_SANDBOX_FD) {
-            if let Ok(fd) = val.parse() {
-                fd
-            } else {
+        let sock = socket_from_env();
+        InnerChild::new(sock).run()
+    }
+}
+
+fn socket_from_env() -> UnixStream {
+    let fd: i32 = match var(ENV_SANDBOX_FD) {
+        Ok(val) => match val.parse() {
+            Ok(fd) => fd,
+            Err(_) => {
                 eprintln!("MAKI_SANDBOX_FD must be a valid fd number, got: {val}");
                 exit(1);
             }
-        } else {
+        },
+        Err(_) => {
             eprintln!("MAKI_SANDBOX_FD must be set for sandbox inner instance");
             exit(1);
-        };
-        unsafe {
-            remove_var(ENV_SANDBOX_FD);
         }
-        let sock = unsafe { UnixStream::from_raw_fd(fd) };
-        InnerChild::new(sock).run()
+    };
+    unsafe {
+        remove_var(ENV_SANDBOX_FD);
     }
+    unsafe { UnixStream::from_raw_fd(fd) }
 }
 
 fn report_setup_error(sock: &mut UnixStream, e: SandboxError) {
@@ -236,6 +242,33 @@ pub fn child_main(sock: UnixStream, ns_config: NamespaceConfig) -> ! {
 /// Second invocation (post-exec) entry point.
 pub fn child_inner_main() -> ! {
     SandboxChild::run_inner_static()
+}
+
+/// Entry point for the bubblewrap inner instance.
+///
+/// bwrap has already created the namespaces and filesystem, so this only
+/// completes the socket handshake and enters the request loop.
+pub fn bwrap_inner_main() -> ! {
+    let mut sock = socket_from_env();
+    if let Err(e) = bwrap_handshake(&mut sock) {
+        report_setup_error(&mut sock, e);
+        exit(1);
+    }
+    if let Err(e) = ipc::send_child_msg(&mut sock, &ChildMsg::Setup { error: None }) {
+        error!("sandbox child: failed to report bwrap setup: {e}");
+        exit(1);
+    }
+    InnerChild::new(sock).run()
+}
+
+fn bwrap_handshake(sock: &mut UnixStream) -> Result<(), SandboxError> {
+    let parent_name = ipc::recv_handshake(sock)?;
+    if parent_name != "maki-server" {
+        return Err(SandboxError::Ipc(format!(
+            "unexpected parent handshake: got '{parent_name}', expected 'maki-server'"
+        )));
+    }
+    ipc::send_handshake(sock, "maki-child")
 }
 
 /// Runs inside the isolated filesystem after setup.

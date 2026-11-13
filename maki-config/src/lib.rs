@@ -817,6 +817,7 @@ pub struct AgentFileConfig {
     pub rtk: Option<bool>,
     pub shell: Option<ShellPreference>,
     pub sandbox_enabled: Option<bool>,
+    pub sandbox_backend: Option<SandboxBackend>,
     pub sandbox_allowed_env: Option<Vec<String>>,
     pub sandbox_allowed_paths: Option<Vec<String>>,
     pub sandbox_extra_dirs: Option<Vec<String>>,
@@ -1403,6 +1404,51 @@ pub enum ShellPreference {
     Program(PathBuf),
 }
 
+/// Which implementation isolates the sandbox child.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SandboxBackend {
+    /// Native namespaces, falling back to bubblewrap when the host refuses
+    /// them and bwrap is installed.
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    /// Create the user, mount, and pid namespaces with `unshare`.
+    #[serde(rename = "native")]
+    Native,
+    /// Let bubblewrap create the namespaces and filesystem.
+    #[serde(rename = "bwrap")]
+    Bwrap,
+}
+
+impl SandboxBackend {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Native, Self::Bwrap];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Native => "native",
+            Self::Bwrap => "bwrap",
+        }
+    }
+
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|backend| backend.label() == label)
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Native,
+            Self::Native => Self::Bwrap,
+            Self::Bwrap => Self::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Clone, ConfigSection, Serialize)]
 #[config(section = "agent")]
 pub struct AgentConfig {
@@ -1461,6 +1507,14 @@ pub struct AgentConfig {
     )]
     pub sandbox_enabled: bool,
 
+    #[config(
+        default = SandboxBackend::Auto,
+        ty = "string",
+        default_doc = "auto",
+        desc = "Sandbox isolation backend: `auto` (native, then bubblewrap), `native`, or `bwrap`"
+    )]
+    pub sandbox_backend: SandboxBackend,
+
     #[config(skip, default = "Vec::new()")]
     pub sandbox_allowed_env: Vec<String>,
 
@@ -1516,6 +1570,7 @@ impl AgentConfig {
             rtk: file.rtk.unwrap_or(true),
             shell: file.shell.unwrap_or_default(),
             sandbox_enabled: file.sandbox_enabled.unwrap_or(DEFAULT_SANDBOX_ENABLED),
+            sandbox_backend: file.sandbox_backend.unwrap_or_default(),
             sandbox_allowed_env: file.sandbox_allowed_env.unwrap_or_default(),
             sandbox_allowed_paths: file.sandbox_allowed_paths.unwrap_or_default(),
             sandbox_extra_dirs: file.sandbox_extra_dirs.unwrap_or_default(),
@@ -2895,6 +2950,33 @@ pub fn save_sandbox_enabled(cwd: &Path, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Persist `agent.sandbox_backend` to the project's `.maki/config.toml`.
+pub fn save_sandbox_backend(cwd: &Path, backend: SandboxBackend) -> Result<(), String> {
+    let maki_dir = cwd.join(PROJECT_DIR);
+    let path = maki_dir.join("config.toml");
+    let content = if path.exists() {
+        std::fs::read_to_string(&path).map_err(|e| format!("cannot read .maki/config.toml: {e}"))?
+    } else {
+        String::new()
+    };
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| format!("failed to parse .maki/config.toml: {e}"))?;
+
+    let agent = doc
+        .entry("agent")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let agent_table = agent
+        .as_table_mut()
+        .ok_or_else(|| "agent section is not a table".to_string())?;
+    agent_table.insert("sandbox_backend", toml_edit::value(backend.label()));
+
+    std::fs::create_dir_all(&maki_dir).map_err(|e| format!("cannot create .maki dir: {e}"))?;
+    maki_storage::atomic_write(&path, doc.to_string().as_bytes())
+        .map_err(|e| format!("cannot write .maki/config.toml: {e}"))?;
+    Ok(())
+}
+
 /// Persist the enabled sandbox profiles under `agent.sandbox_profiles`.
 pub fn save_sandbox_profiles(cwd: &Path, names: &[String]) -> Result<(), String> {
     let maki_dir = cwd.join(PROJECT_DIR);
@@ -3153,6 +3235,38 @@ mod tests {
     #[test_case("theme = { light = \"a\", dark = \"b\", auto = \"c\" }" ; "unknown_key")]
     fn theme_rejects_bad_pair(line: &str) {
         assert!(toml::from_str::<RawConfig>(&format!("[ui]\n{line}\n")).is_err());
+    }
+
+    #[test_case(SandboxBackend::Auto, "auto" ; "auto")]
+    #[test_case(SandboxBackend::Native, "native" ; "native")]
+    #[test_case(SandboxBackend::Bwrap, "bwrap" ; "bwrap")]
+    fn sandbox_backend_deserializes(backend: SandboxBackend, label: &str) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[agent]\nsandbox_backend = \"{label}\"\n")).unwrap();
+        assert_eq!(raw.agent.sandbox_backend, Some(backend));
+    }
+
+    #[test]
+    fn save_sandbox_backend_writes_and_replaces() {
+        let dir = TempDir::new().unwrap();
+        save_sandbox_backend(dir.path(), SandboxBackend::Bwrap).unwrap();
+        let raw: RawConfig =
+            toml::from_str(&fs::read_to_string(dir.path().join(".maki/config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(raw.agent.sandbox_backend, Some(SandboxBackend::Bwrap));
+
+        save_sandbox_backend(dir.path(), SandboxBackend::Native).unwrap();
+        let raw: RawConfig =
+            toml::from_str(&fs::read_to_string(dir.path().join(".maki/config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(raw.agent.sandbox_backend, Some(SandboxBackend::Native));
+    }
+
+    #[test]
+    fn sandbox_backend_defaults_to_auto() {
+        let raw: RawConfig = toml::from_str("[agent]\n").unwrap();
+        let config = raw.into_config(&[]).unwrap();
+        assert_eq!(config.agent.sandbox_backend, SandboxBackend::Auto);
     }
 
     #[test]

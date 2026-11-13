@@ -691,6 +691,7 @@ impl App {
             sandbox_modal: SandboxModal::new(
                 crate::components::sandbox_modal::SandboxInfo {
                     enabled: false,
+                    backend: maki_config::SandboxBackend::default(),
                     env_entries: vec![],
                     allowed_env: vec![],
                     workspace_dir: String::new(),
@@ -2610,7 +2611,7 @@ impl App {
         vec![]
     }
 
-    /// Persist any sandbox modal toggles (enabled/profiles) to config.
+    /// Persist any sandbox modal toggles (enabled/backend/profiles) to config.
     /// Called after key handling and after background modal events, so a
     /// spawn completing on the event loop survives a restart too.
     #[cfg(all(feature = "sandbox", target_os = "linux"))]
@@ -2622,6 +2623,12 @@ impl App {
         {
             self.status_bar
                 .flash(format!("failed to save sandbox setting: {e}"));
+        }
+        if let Some(backend) = changes.backend
+            && let Err(e) = maki_config::save_sandbox_backend(&cwd, backend)
+        {
+            self.status_bar
+                .flash(format!("failed to save sandbox backend: {e}"));
         }
         if let Some(profiles) = &changes.profiles
             && let Err(e) = maki_config::save_sandbox_profiles(&cwd, profiles)

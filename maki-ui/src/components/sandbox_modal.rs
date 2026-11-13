@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::AgentConfig;
+use maki_config::SandboxBackend;
 use maki_fs::{JobSink, JobStream};
 use maki_sandbox::Sandbox;
 use maki_sandbox::ipc::{DirEntry, RunId};
@@ -45,11 +46,12 @@ enum Mode {
 }
 
 /// Focus position in the info tab options list. The sandbox enable/disable
-/// checkbox is always first; profiles are only present while the sandbox is
-/// enabled.
+/// checkbox and the backend choice are always present; profiles only while the
+/// sandbox is enabled.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum InfoFocus {
     Sandbox,
+    Backend,
     Profile(usize),
 }
 
@@ -99,12 +101,14 @@ enum PendingJob {
 #[derive(Debug, Default)]
 pub struct SandboxModalChanges {
     pub enabled: Option<bool>,
+    pub backend: Option<SandboxBackend>,
     pub profiles: Option<Vec<String>>,
 }
 
 /// Snapshot of sandbox configuration for display.
 pub struct SandboxInfo {
     pub enabled: bool,
+    pub backend: SandboxBackend,
     pub env_entries: Vec<EnvEntry>,
     /// User-configured environment allow list, kept separate so profile
     /// toggling can rebuild `env_entries` without losing it.
@@ -225,6 +229,10 @@ fn expand_home(path: &str) -> String {
         _ if path.starts_with("~/") => format!("{home}{}", &path[1..]),
         _ => path.to_string(),
     }
+}
+
+fn sandbox_backend(backend: SandboxBackend) -> maki_sandbox::backend::Backend {
+    maki_sandbox::backend::Backend::from_label(backend.label()).unwrap_or_default()
 }
 
 /// Hands a running command's lines to the UI thread, so the shell shows the
@@ -367,6 +375,8 @@ pub struct SandboxModal {
     spawn_error: Option<String>,
     /// Set when the user toggles `enabled` via the UI.
     enabled_changed: bool,
+    /// Set when the user cycles the backend via the UI.
+    backend_changed: bool,
     /// Set when the user toggles any profile via the UI.
     profiles_changed: bool,
 }
@@ -389,6 +399,7 @@ impl SandboxModal {
             info_focus,
             spawn_error: None,
             enabled_changed: false,
+            backend_changed: false,
             profiles_changed: false,
         }
     }
@@ -431,6 +442,7 @@ impl SandboxModal {
         let mut modal = Self::new(
             SandboxInfo {
                 enabled: config.sandbox_enabled,
+                backend: config.sandbox_backend,
                 env_entries,
                 allowed_env: config.sandbox_allowed_env.clone(),
                 workspace_dir: workspace_dir
@@ -474,6 +486,7 @@ impl SandboxModal {
             self.pending = None;
             self.spawn_error = None;
             self.enabled_changed = false;
+            self.backend_changed = false;
             self.profiles_changed = false;
             self.info_focus = Self::first_focus();
         } else {
@@ -493,6 +506,12 @@ impl SandboxModal {
     /// The caller should check this after `handle_key` to persist the setting.
     pub fn take_profiles_changed(&mut self) -> bool {
         mem::take(&mut self.profiles_changed)
+    }
+
+    /// Returns and resets the `backend_changed` flag.
+    /// The caller should check this after `handle_key` to persist the setting.
+    pub fn take_backend_changed(&mut self) -> bool {
+        mem::take(&mut self.backend_changed)
     }
 
     /// Names of the currently enabled profiles (config order = built-in order).
@@ -596,6 +615,9 @@ impl SandboxModal {
         if self.take_enabled_changed() {
             changes.enabled = Some(self.is_enabled());
         }
+        if self.take_backend_changed() {
+            changes.backend = Some(self.info.backend);
+        }
         if self.take_profiles_changed() {
             changes.profiles = Some(self.enabled_profile_names());
         }
@@ -608,26 +630,26 @@ impl SandboxModal {
 
     fn focus_count(info: &SandboxInfo) -> usize {
         if info.enabled {
-            info.profiles.len() + 1
+            info.profiles.len() + 2
         } else {
-            1
+            2
         }
     }
 
     fn focus_index(info: &SandboxInfo, focus: &InfoFocus) -> usize {
         match focus {
             InfoFocus::Sandbox => 0,
-            InfoFocus::Profile(i) => usize::from(info.enabled) + i,
+            InfoFocus::Backend => 1,
+            InfoFocus::Profile(i) => usize::from(info.enabled) + 1 + i,
         }
     }
 
     fn focus_at(info: &SandboxInfo, idx: usize) -> Option<InfoFocus> {
-        if !info.enabled {
-            return (idx == 0).then_some(InfoFocus::Sandbox);
-        }
         match idx {
             0 => Some(InfoFocus::Sandbox),
-            i if i <= info.profiles.len() => Some(InfoFocus::Profile(i - 1)),
+            1 => Some(InfoFocus::Backend),
+            _ if !info.enabled => None,
+            i if i <= info.profiles.len() + 1 => Some(InfoFocus::Profile(i - 2)),
             _ => None,
         }
     }
@@ -650,6 +672,13 @@ impl SandboxModal {
         };
         match focus {
             InfoFocus::Sandbox => self.toggle_sandbox_enabled(),
+            InfoFocus::Backend => {
+                self.info.backend = self.info.backend.next();
+                self.backend_changed = true;
+                if self.info.enabled && self.sandbox.is_some() {
+                    self.reinit_sandbox();
+                }
+            }
             InfoFocus::Profile(i) => {
                 if let Some((_, enabled)) = self.info.profiles.get_mut(i) {
                     *enabled = !*enabled;
@@ -668,7 +697,7 @@ impl SandboxModal {
         };
         let info = &self.info;
         let mismatched = match focus {
-            InfoFocus::Sandbox => false,
+            InfoFocus::Sandbox | InfoFocus::Backend => false,
             InfoFocus::Profile(_) => !info.enabled,
         };
         let out_of_range = Self::focus_index(info, &focus) >= Self::focus_count(info);
@@ -699,6 +728,21 @@ impl SandboxModal {
             ),
             Span::styled("] ", Style::default()),
             Span::styled(label.to_owned(), sel_style),
+        ])
+    }
+
+    fn choice_line(&self, selected: bool, label: &str, value: &str) -> Line<'static> {
+        let t = theme::current();
+        let style = if selected {
+            t.item_selected
+        } else {
+            Style::default()
+        };
+        let prefix = if selected { "  ▸ " } else { "    " };
+        Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(format!("{label}: "), style),
+            Span::styled(value.to_owned(), style),
         ])
     }
 
@@ -754,7 +798,7 @@ impl SandboxModal {
         }
         // Enabling: validate kernel support first, surfacing the same
         // preflight result the `--sandbox` startup path reports.
-        if let Err(e) = maki_sandbox::namespace::probe() {
+        if let Err(e) = sandbox_backend(self.info.backend).probe() {
             self.spawn_error = Some(format!("sandbox preflight check failed: {e}"));
             return;
         }
@@ -1019,6 +1063,7 @@ impl SandboxModal {
             extra_workspace_dirs,
         );
         config.allowed_env = self.info.allowed_env.clone();
+        config.backend = sandbox_backend(self.info.backend);
         config
     }
 
@@ -1218,6 +1263,8 @@ impl SandboxModal {
         )));
         let sandbox_selected = self.info_focus == Some(InfoFocus::Sandbox);
         lines.push(self.option_line(sandbox_selected, info.enabled, SANDBOX_LABEL));
+        let backend_selected = self.info_focus == Some(InfoFocus::Backend);
+        lines.push(self.choice_line(backend_selected, "Backend", info.backend.label()));
         if self.pending == Some(PendingJob::Sandbox) {
             lines.push(Line::from(Span::styled("  starting sandbox…", t.tool_dim)));
         }
@@ -1675,6 +1722,7 @@ mod tests {
     fn test_info() -> SandboxInfo {
         SandboxInfo {
             enabled: false,
+            backend: SandboxBackend::default(),
             env_entries: vec![],
             allowed_env: vec![],
             workspace_dir: "/tmp".into(),
@@ -1785,6 +1833,7 @@ mod tests {
         let mut modal = SandboxModal::new(
             SandboxInfo {
                 enabled: true,
+                backend: SandboxBackend::default(),
                 env_entries: vec![],
                 allowed_env: vec![],
                 workspace_dir: "/tmp".into(),
@@ -1814,6 +1863,7 @@ mod tests {
             .collect();
         SandboxInfo {
             enabled,
+            backend: SandboxBackend::default(),
             env_entries: vec![],
             allowed_env: vec![],
             workspace_dir: "/tmp".into(),
@@ -1825,10 +1875,12 @@ mod tests {
     }
 
     #[test]
-    fn updown_navigates_sandbox_and_profiles() {
+    fn updown_navigates_sandbox_backend_and_profiles() {
         let mut modal = SandboxModal::new(info_with(true, 2), None);
         modal.toggle();
         assert_eq!(modal.info_focus, Some(InfoFocus::Sandbox));
+        modal.handle_key(key_ev(KeyCode::Down));
+        assert_eq!(modal.info_focus, Some(InfoFocus::Backend));
         modal.handle_key(key_ev(KeyCode::Down));
         assert_eq!(modal.info_focus, Some(InfoFocus::Profile(0)));
         modal.handle_key(key_ev(KeyCode::Down));
@@ -1841,6 +1893,7 @@ mod tests {
         );
         modal.handle_key(key_ev(KeyCode::Up));
         modal.handle_key(key_ev(KeyCode::Up));
+        modal.handle_key(key_ev(KeyCode::Up));
         assert_eq!(modal.info_focus, Some(InfoFocus::Sandbox));
         modal.handle_key(key_ev(KeyCode::Up));
         assert_eq!(
@@ -1851,15 +1904,21 @@ mod tests {
     }
 
     #[test]
-    fn updown_keeps_sandbox_checkbox_only_when_disabled() {
+    fn updown_reaches_backend_but_not_profiles_when_disabled() {
         let mut modal = SandboxModal::new(info_with(false, 2), None);
         modal.toggle();
         assert_eq!(modal.info_focus, Some(InfoFocus::Sandbox));
         modal.handle_key(key_ev(KeyCode::Down));
         assert_eq!(
             modal.info_focus,
-            Some(InfoFocus::Sandbox),
-            "no other options are shown while the sandbox is disabled"
+            Some(InfoFocus::Backend),
+            "the backend stays selectable while the sandbox is disabled"
+        );
+        modal.handle_key(key_ev(KeyCode::Down));
+        assert_eq!(
+            modal.info_focus,
+            Some(InfoFocus::Backend),
+            "profiles are not shown while the sandbox is disabled"
         );
     }
 
@@ -1888,6 +1947,7 @@ mod tests {
         let mut modal = SandboxModal::new(
             SandboxInfo {
                 enabled: true,
+                backend: SandboxBackend::default(),
                 env_entries: vec![],
                 allowed_env: vec![],
                 workspace_dir: "/tmp".into(),
@@ -2002,11 +2062,45 @@ mod tests {
         let mut modal = SandboxModal::new(info_with(true, 2), None);
         modal.toggle();
         modal.handle_key(key_ev(KeyCode::Down));
+        modal.handle_key(key_ev(KeyCode::Down));
         modal.handle_key(key_ev(KeyCode::Enter));
         assert!(modal.info.profiles[0].1, "Enter should toggle the profile");
         modal.handle_key(key_ev(KeyCode::Down));
         modal.handle_key(key_ev(KeyCode::Char(' ')));
         assert!(modal.info.profiles[1].1, "Space should toggle the profile");
+    }
+
+    #[test]
+    fn cycling_the_backend_persists_and_reports_it() {
+        let mut modal = SandboxModal::new(info_with(true, 0), None);
+        modal.toggle();
+        modal.handle_key(key_ev(KeyCode::Down));
+        assert_eq!(modal.info_focus, Some(InfoFocus::Backend));
+        assert_eq!(modal.info.backend, SandboxBackend::Auto);
+
+        modal.handle_key(key_ev(KeyCode::Enter));
+        assert_eq!(modal.info.backend, SandboxBackend::Native);
+        modal.handle_key(key_ev(KeyCode::Char(' ')));
+        assert_eq!(modal.info.backend, SandboxBackend::Bwrap);
+
+        assert_eq!(modal.take_changes().backend, Some(SandboxBackend::Bwrap));
+        assert_eq!(
+            modal.take_changes().backend,
+            None,
+            "the change is reported once"
+        );
+    }
+
+    #[test]
+    fn info_renders_the_backend_choice() {
+        let mut modal = SandboxModal::new(info_with(false, 0), None);
+        let mut lines = Vec::new();
+        modal.render_info(&mut lines);
+        assert!(
+            lines_text(&lines).contains("Backend: auto"),
+            "the backend is visible even while the sandbox is off:\n{}",
+            lines_text(&lines)
+        );
     }
 
     #[test]
@@ -2029,6 +2123,7 @@ mod tests {
         let mut modal = SandboxModal::new(
             SandboxInfo {
                 enabled: true,
+                backend: SandboxBackend::default(),
                 env_entries: vec![],
                 allowed_env: vec![],
                 workspace_dir: "/tmp".into(),

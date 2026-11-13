@@ -68,6 +68,9 @@ mod sandbox_impl {
         if args().nth(1).as_deref() == Some("--sandbox-inner") {
             maki_sandbox::child::child_inner_main();
         }
+        if args().nth(1).as_deref() == Some("--sandbox-bwrap-inner") {
+            maki_sandbox::child::bwrap_inner_main();
+        }
 
         tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::from_default_env())
@@ -152,7 +155,7 @@ mod sandbox_impl {
             vec![],
         );
 
-        maki_sandbox::namespace::probe().unwrap_or_else(|e| {
+        config.backend.probe().unwrap_or_else(|e| {
             eprintln!("error: sandbox isolation not available:\n{e}");
             exit(1);
         });
