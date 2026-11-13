@@ -263,6 +263,16 @@ impl LoginPicker {
         self.step = Step::PickProvider(picker);
     }
 
+    /// Opens on `slug`'s own setup, as Enter on its row would.
+    pub fn open_for(&mut self, storage: StateDir, slug: &str) {
+        self.open(storage);
+        if let Step::PickProvider(picker) = &mut self.step
+            && picker.select_item_by(|item| item.slug == slug)
+        {
+            self.handle_key(KeyEvent::from(KeyCode::Enter));
+        }
+    }
+
     /// A list step filters on what is pasted, as typing does. A step with no
     /// field drops it.
     pub fn handle_paste(&mut self, text: &str) {

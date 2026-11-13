@@ -50,8 +50,12 @@ pub trait PickerItem {
         false
     }
     /// Drawn in place of its section header, so the cursor can land on the
-    /// section itself.
+    /// section itself. It stands out by style, so it gets no spacer above.
     fn is_section_row(&self) -> bool {
+        false
+    }
+    /// Left out of the list until a search reaches for it.
+    fn is_hidden(&self) -> bool {
         false
     }
 }
@@ -92,10 +96,9 @@ struct State<T> {
 
 impl<T: PickerItem> State<T> {
     fn new(items: Vec<T>) -> Self {
-        let filtered = (0..items.len()).collect();
-        Self {
+        let mut state = Self {
             items,
-            filtered,
+            filtered: Vec::new(),
             selected: 0,
             search: TextBuffer::new(String::new()),
             scroll_offset: 0,
@@ -104,7 +107,9 @@ impl<T: PickerItem> State<T> {
             enabled: None,
             matcher: Matcher::new(Config::DEFAULT),
             notice: None,
-        }
+        };
+        state.rebuild_filter();
+        state
     }
 
     fn replace_items(&mut self, items: Vec<T>) {
@@ -116,7 +121,9 @@ impl<T: PickerItem> State<T> {
     fn rebuild_filter(&mut self) {
         let query = self.search.value();
         if query.is_empty() {
-            self.filtered = (0..self.items.len()).collect();
+            self.filtered = (0..self.items.len())
+                .filter(|&idx| !self.items[idx].is_hidden())
+                .collect();
         } else {
             let pattern = Pattern::new(
                 query,
@@ -635,19 +642,16 @@ fn render_ready<T: PickerItem>(
 
 fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize, start: usize) -> usize {
     let item = &items[filtered[idx]];
-    let Some(sec) = item.section() else {
+    let Some(sec) = item.section().filter(|_| !item.is_section_row()) else {
         return 0;
     };
-    // A section row draws itself where the header would have gone, so it costs
-    // the blank spacer above it and nothing more.
-    let header = usize::from(!item.is_section_row());
     if idx == start {
-        return header;
+        return 1;
     }
     let is_break = items[filtered[idx - 1]]
         .section()
         .is_none_or(|prev| prev != sec);
-    if is_break { 1 + header } else { 0 }
+    if is_break { 2 } else { 0 }
 }
 
 fn visual_rows_in_range<T: PickerItem>(
@@ -740,14 +744,16 @@ fn render_list<T: PickerItem>(
         if let Some(sec) = item.section()
             && last_section.is_none_or(|prev| prev != sec)
         {
-            if !lines.is_empty() && lines.len() < viewport_height {
-                lines.push(Line::raw(""));
-            }
-            if !item.is_section_row() && lines.len() < viewport_height {
-                lines.push(Line::from(Span::styled(
-                    format!("  {sec}"),
-                    theme::current().keybind_section,
-                )));
+            if !item.is_section_row() {
+                if !lines.is_empty() && lines.len() < viewport_height {
+                    lines.push(Line::raw(""));
+                }
+                if lines.len() < viewport_height {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {sec}"),
+                        theme::current().keybind_section,
+                    )));
+                }
             }
             last_section = Some(sec);
         }
@@ -1143,16 +1149,16 @@ mod tests {
     }
 
     #[test]
-    fn a_section_row_costs_its_spacer_and_not_a_second_header() {
+    fn a_section_row_is_its_own_header() {
         let items = headed_entries();
         let filtered: Vec<usize> = (0..items.len()).collect();
 
         let rows = visual_rows_in_range(&filtered, &items, 0, items.len());
-        assert_eq!(rows, 5, "4 items and the one spacer between the sections");
+        assert_eq!(rows, 4, "no spacer or header text beside the section rows");
         assert_eq!(
             find_scroll_offset_for(&filtered, &items, 3, 3),
             2,
-            "scrolling has to count the spacer the second heading brings"
+            "a view that opens under a section row still draws that header"
         );
     }
 

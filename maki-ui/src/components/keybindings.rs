@@ -375,6 +375,7 @@ pub const KEYBINDS: &[Keybind] = &[
         Ctx::ModelPicker,
     ),
     single("%", "Fold or unfold provider", Ctx::ModelPicker),
+    single("*", "Fold or unfold all providers", Ctx::ModelPicker),
 ];
 
 pub fn all_contexts() -> impl Iterator<Item = KeybindContext> {

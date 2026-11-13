@@ -54,6 +54,7 @@ use maki_lua::{
     PlanActionOutcome, PluginHost, PluginPermissions, SessionEndReason, Split, TextEdit, UiAction,
     WinCommand, WinEvent,
 };
+use maki_providers::provider::ProviderStatus;
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TaskAnswer,
     TaskSettled, ThinkingSupport, TokenUsage,
@@ -11953,6 +11954,22 @@ fn run_builtin_model_picker_opens_and_refreshes() {
     let actions = app.run_builtin(BuiltinAction::ModelPicker);
     assert!(app.model_picker.is_open());
     assert!(matches!(&actions[..], [Action::RefreshModels]));
+}
+
+/// A provider row that cannot serve models hands Enter to its login.
+#[test]
+fn enter_on_a_keyless_provider_row_opens_its_login() {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(ModelList {
+        specs: Vec::new(),
+        providers: HashMap::from([("anthropic".into(), ProviderStatus::MissingKey)]),
+        loading: false,
+    })));
+    app.run_builtin(BuiltinAction::ModelPicker);
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.model_picker.is_open());
+    assert!(app.login_picker.is_open());
 }
 
 #[test]
