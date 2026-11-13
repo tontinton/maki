@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::mem;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use thiserror::Error;
@@ -96,6 +97,7 @@ struct ControlState {
     /// Only what [`SessionControl::end`] wrote down. Read through
     /// [`SessionControl::end_reason`], which also sees a cancel from above.
     ended: Option<EndReason>,
+    result: Option<Result<String, String>>,
     turn: Turn,
 }
 
@@ -104,6 +106,7 @@ pub struct SessionControl {
     pushed: Notify,
     cancel: CancelTrigger,
     transcript: SharedMessages,
+    opened: Instant,
 }
 
 impl Default for SessionControl {
@@ -121,11 +124,13 @@ impl SessionControl {
                 inbox: VecDeque::new(),
                 activity: Activity::Idle,
                 ended: None,
+                result: None,
                 turn: Turn::under(&cancel),
             }),
             pushed: Notify::new(),
             cancel,
             transcript: Arc::new(ArcSwap::from_pointee(HistorySnapshot::default())),
+            opened: Instant::now(),
         }
     }
 
@@ -155,6 +160,23 @@ impl SessionControl {
         }
         drop(state);
         self.cancel.handle().fire();
+    }
+
+    /// Durations count from here, since a host can first hear of the session
+    /// as late as its first finished turn.
+    pub fn opened(&self) -> Instant {
+        self.opened
+    }
+
+    /// What the session's work came to, as the plugin that ran it says. Only
+    /// that plugin knows, since its tool can still fail after every prompt
+    /// answered, say on a bad structured result.
+    pub fn report(&self, result: Result<String, String>) {
+        self.lock().result = Some(result);
+    }
+
+    pub fn result(&self) -> Option<Result<String, String>> {
+        self.lock().result.clone()
     }
 
     pub fn ended(&self) -> Option<EndReason> {

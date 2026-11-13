@@ -2000,7 +2000,7 @@ sess:send("Stop, the bug is in lexer.rs, not parser.rs.", { interrupt = true })
 ### `Session:close()` {#Session-close}
 
 ```lua
-Session:close()
+Session:close({result?})
 ```
 
 Close the session and flush its history back to the parent agent. Calling
@@ -2012,6 +2012,13 @@ the VM sits idle, and the subagent's event relay stays alive until it does.
 
 Close cancels a running prompt before waiting to flush its history. That
 prompt returns `"session closed"` and any partial text.
+
+Pass {result}, the tool result the session's work came to, so headless
+clients learn how the subagent ended and what it found.
+
+**Parameters:**
+
+- `{result?}` (`table?`) `llm_output` and `is_error`, the shape a tool handler returns.
 
 ---
 

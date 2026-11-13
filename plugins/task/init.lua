@@ -103,7 +103,7 @@ local function handler(input, ctx)
     return Runner.run(sess, prepared)
   end)
 
-  sess:close()
+  sess:close(ok and out or { llm_output = tostring(out), is_error = true })
   if permit then
     permit:release()
   end
