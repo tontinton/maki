@@ -8,6 +8,7 @@
 //! [`crate::model_registry::discovery_complete`] only ever see this run's
 //! probe.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use maki_config::ModelPolicy;
@@ -17,7 +18,9 @@ use sha2::{Digest, Sha256};
 use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
-use crate::provider::{ModelBatch, fetch_all_models, provider_available, provider_of};
+use crate::provider::{
+    ModelBatch, ProviderStatus, fetch_all_models, provider_available, provider_of,
+};
 use crate::providers::custom;
 use crate::spec::ProviderRegistry;
 
@@ -45,10 +48,10 @@ struct ModelsCache {
 /// What the model picker should show right now.
 pub struct ModelList {
     pub specs: Vec<String>,
-    /// Providers that answered live this run. A recent from one of these that
-    /// is missing from `specs` is retired; a recent from any other provider
-    /// may simply have failed its probe.
-    pub live_providers: Vec<String>,
+    /// What each provider that answered this run said. A recent missing from
+    /// `specs` is retired only if its provider is [`ProviderStatus::Live`];
+    /// any other may simply have failed its probe.
+    pub providers: HashMap<String, ProviderStatus>,
     /// Some provider has not answered yet, so the list may still grow.
     pub loading: bool,
 }
@@ -59,7 +62,7 @@ pub struct ModelList {
 struct Listing {
     replayed: Vec<String>,
     live: Vec<String>,
-    live_providers: Vec<String>,
+    providers: HashMap<String, ProviderStatus>,
     /// A provider that cannot be reached warns and falls back to its static
     /// specs, so warnings are how discovery reports a failed probe. Without
     /// this, an empty run reads as "offline" even when the real cause is an
@@ -71,31 +74,22 @@ impl Listing {
     /// Replaces rather than merges, so a model the provider dropped since
     /// last run leaves the picker instead of failing when picked.
     fn add_live(&mut self, batch: &ModelBatch) {
-        self.degraded |= !batch.warnings.is_empty();
-        self.replayed.retain(|old| {
-            !batch
-                .models
-                .iter()
-                .any(|new| provider_of(new) == provider_of(old))
-        });
+        self.degraded |= matches!(batch.status, ProviderStatus::Failed(_));
+        self.replayed
+            .retain(|old| provider_of(old) != batch.provider);
         for spec in &batch.models {
             if !self.live.contains(spec) {
                 self.live.push(spec.clone());
             }
         }
-        if batch.warnings.is_empty() {
-            for provider in &batch.providers {
-                if !self.live_providers.contains(provider) {
-                    self.live_providers.push(provider.clone());
-                }
-            }
-        }
+        self.providers
+            .insert(batch.provider.clone(), batch.status.clone());
     }
 
     fn snapshot(&self) -> ModelList {
         ModelList {
             specs: self.live.iter().chain(&self.replayed).cloned().collect(),
-            live_providers: self.live_providers.clone(),
+            providers: self.providers.clone(),
             loading: true,
         }
     }
@@ -106,7 +100,7 @@ impl Listing {
         self.replayed.clear();
         ModelList {
             specs: self.live,
-            live_providers: self.live_providers,
+            providers: self.providers,
             loading: false,
         }
     }
@@ -259,11 +253,11 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
 
 /// Like [`fetch_all_models`], but the first `on_update` comes straight from
 /// the on-disk cache. Every call carries the whole list to show, not a delta,
-/// plus the warnings of the batch that changed it. The last call has
+/// plus the warning of the batch that changed it. The last call has
 /// `loading` off and holds only this run's live answer.
 pub async fn fetch_all_models_cached(
     policy: &ModelPolicy,
-    mut on_update: impl FnMut(ModelList, Vec<String>),
+    mut on_update: impl FnMut(ModelList, Option<String>),
 ) {
     let path = cache_path();
     let fingerprint = spawn_blocking(fingerprint)
@@ -276,13 +270,17 @@ pub async fn fetch_all_models_cached(
             .unwrap_or_default(),
         ..Listing::default()
     };
-    on_update(listing.snapshot(), Vec::new());
+    on_update(listing.snapshot(), None);
 
     fetch_all_models(
         policy,
         |batch| {
             listing.add_live(&batch);
-            on_update(listing.snapshot(), batch.warnings);
+            let warning = match batch.status {
+                ProviderStatus::Failed(warning) => Some(warning),
+                ProviderStatus::Live | ProviderStatus::MissingKey => None,
+            };
+            on_update(listing.snapshot(), warning);
         },
         None,
     )
@@ -296,7 +294,7 @@ pub async fn fetch_all_models_cached(
             maki_storage::auth::now_millis(),
         );
     }
-    on_update(listing.finish(), Vec::new());
+    on_update(listing.finish(), None);
 }
 
 #[cfg(test)]
@@ -327,14 +325,11 @@ mod tests {
         (dir, path)
     }
 
-    fn batch(models: &[&str], warnings: &[&str]) -> ModelBatch {
+    fn batch(provider: &str, models: &[&str], status: ProviderStatus) -> ModelBatch {
         ModelBatch {
+            provider: provider.to_string(),
             models: specs(models),
-            providers: models
-                .iter()
-                .map(|spec| provider_of(spec).to_string())
-                .collect(),
-            warnings: specs(warnings),
+            status,
         }
     }
 
@@ -374,7 +369,7 @@ mod tests {
             replayed: specs(&["a/removed", "a/kept", "b/cached"]),
             ..Listing::default()
         };
-        listing.add_live(&batch(&["a/kept", "a/new"], &[]));
+        listing.add_live(&batch("a", &["a/kept", "a/new"], ProviderStatus::Live));
         let shown = listing.snapshot();
         assert!(shown.loading);
         assert_eq!(shown.specs, ["a/kept", "a/new", "b/cached"]);
@@ -386,17 +381,24 @@ mod tests {
             ["a/kept", "a/new"],
             "a provider that never answered live must not keep its cached specs"
         );
-        assert_eq!(done.live_providers, ["a"]);
+        assert_eq!(
+            done.providers,
+            HashMap::from([("a".to_string(), ProviderStatus::Live)])
+        );
     }
 
-    /// A probe that fell back to static specs says nothing about which models
-    /// the provider still serves, so its recents must not look retired.
+    /// A keyless provider answers with no models, and that still clears what
+    /// the cache said about it.
     #[test]
-    fn only_a_clean_batch_marks_its_providers_live() {
-        let mut listing = Listing::default();
-        listing.add_live(&batch(&["a/fallback"], &["A: timeout"]));
-        listing.add_live(&batch(&["b/live"], &[]));
-        assert_eq!(listing.finish().live_providers, ["b"]);
+    fn a_missing_key_clears_that_providers_cached_specs() {
+        let mut listing = Listing {
+            replayed: specs(&["a/cached", "b/cached"]),
+            ..Listing::default()
+        };
+        listing.add_live(&batch("a", &[], ProviderStatus::MissingKey));
+        let shown = listing.snapshot();
+        assert_eq!(shown.specs, ["b/cached"]);
+        assert_eq!(shown.providers["a"], ProviderStatus::MissingKey);
     }
 
     #[test_case(&[],            true,  &["good/model"] ; "degraded_empty_keeps_cache")]

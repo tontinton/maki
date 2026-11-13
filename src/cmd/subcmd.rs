@@ -12,7 +12,7 @@ use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
-use maki_providers::provider::fetch_all_models;
+use maki_providers::provider::{ProviderStatus, fetch_all_models};
 use maki_providers::spec::Owner;
 use maki_providers::{ProviderData, catalog_providers};
 use maki_providers::{copilot_auth, openai_auth, plugin, xai_auth};
@@ -639,7 +639,7 @@ pub async fn models(
             for model in batch.models {
                 println!("{model}");
             }
-            for warning in batch.warnings {
+            if let ProviderStatus::Failed(warning) = batch.status {
                 eprintln!("warning: {warning}");
             }
         },

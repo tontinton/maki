@@ -176,27 +176,25 @@ pub async fn from_model_async(
     Ok(provider)
 }
 
+/// One provider's answer to [`fetch_all_models`].
 pub struct ModelBatch {
+    pub provider: String,
     pub models: Vec<String>,
-    /// The providers this batch covers, independent of `ModelPolicy`: the
-    /// policy filters `models`, but the picker still needs to know which
-    /// providers answered.
-    pub providers: Vec<String>,
-    pub warnings: Vec<String>,
+    pub status: ProviderStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderStatus {
+    /// Listed live, so a model missing from it is gone.
+    Live,
+    /// The listing failed with this warning; any models are a static fallback.
+    Failed(String),
+    /// A `providers.toml` entry with no key to call it with.
+    MissingKey,
 }
 
 pub(crate) fn provider_of(spec: &str) -> &str {
     spec.split_once('/').map_or(spec, |(provider, _)| provider)
-}
-
-fn providers_of(specs: &[String]) -> Vec<String> {
-    let mut providers: Vec<String> = Vec::new();
-    for provider in specs.iter().map(|spec| provider_of(spec)) {
-        if !providers.iter().any(|known| known == provider) {
-            providers.push(provider.to_string());
-        }
-    }
-    providers
 }
 
 /// The offline twin of [`fetch_all_models`]. It never waits for the catalog
@@ -287,34 +285,16 @@ pub async fn fetch_all_models(
             let slug = cat.slug;
             let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
             let _ = tx_catalog.send(ModelBatch {
+                provider: slug,
                 models,
-                providers: vec![slug],
-                warnings: Vec::new(),
+                status: ProviderStatus::Live,
             });
         }
     });
 
-    let tx_custom = tx.clone();
-    tokio::spawn(async move {
-        let (declared, declared_providers) = custom::declared_batch();
-        if !declared.is_empty() {
-            let _ = tx_custom.send(ModelBatch {
-                providers: declared_providers,
-                models: declared,
-                warnings: Vec::new(),
-            });
-        }
-        let custom_specs = custom::discover_models(timeouts).await;
-        if !custom_specs.is_empty() {
-            let _ = tx_custom.send(ModelBatch {
-                providers: providers_of(&custom_specs),
-                models: custom_specs,
-                warnings: Vec::new(),
-            });
-        }
-    });
-
-    drop(tx);
+    tokio::spawn(custom::discover_models(timeouts, move |batch| {
+        let _ = tx.send(batch);
+    }));
 
     while let Some(mut batch) = rx.recv().await {
         batch.models.retain(|spec| policy.allows(spec));
@@ -333,7 +313,7 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
             .flat_map(|entry| &entry.prefixes)
             .map(move |prefix| format!("{slug}/{prefix}"))
     };
-    let (models, warnings) = match listed {
+    let (models, status) = match listed {
         Ok(models) => {
             let mut specs: Vec<String> =
                 models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
@@ -344,7 +324,7 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
                     }
                 }
             }
-            (specs, Vec::new())
+            (specs, ProviderStatus::Live)
         }
         Err(
             e @ AgentError::Api {
@@ -352,18 +332,21 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
             },
         ) if spec.catalog_is_authoritative => {
             warn!(provider = slug, error = %e, "failed to list models");
-            (Vec::new(), vec![format!("{}: {e}", spec.display_name)])
+            (
+                Vec::new(),
+                ProviderStatus::Failed(format!("{}: {e}", spec.display_name)),
+            )
         }
         Err(e) => {
             warn!(provider = slug, error = %e, "failed to list models, using static fallback");
             let warning = format!("{}: {e} (using static fallback)", spec.display_name);
-            (curated().collect(), vec![warning])
+            (curated().collect(), ProviderStatus::Failed(warning))
         }
     };
     ModelBatch {
+        provider: slug.to_string(),
         models,
-        providers: vec![slug.to_string()],
-        warnings,
+        status,
     }
 }
 
