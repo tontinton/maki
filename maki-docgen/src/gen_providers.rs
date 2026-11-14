@@ -267,7 +267,11 @@ Maki sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI
 
 ### Plans
 
-{plans_body}"#
+{plans_body}
+
+### Setup from the model picker
+
+A provider declared here appears in `/model` even without a key. That row reads `no key` and `Enter` opens the provider's setup flow. The flow edits `base_url` first, then asks for the key, so a moved endpoint is fixed before authenticating. An empty key is accepted when the env var or a stored credential already provides one."#
     )
 }
 
