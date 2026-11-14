@@ -10,6 +10,7 @@
 use maki_config::providers::{ModelTier, ThinkingFields};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, names_exactly};
+use crate::providers::anthropic::shared;
 use crate::providers::{catalog, plugin};
 use crate::spec::{ProviderRegistry, ProviderSpec};
 use crate::types::ThinkingFallback;
@@ -31,6 +32,9 @@ pub(crate) struct ModelCaps {
     /// Whether the source's wire can spell the chosen thinking on the generic
     /// chat-completions path. A routed source handles it natively instead.
     pub(crate) thinking_spellable: bool,
+    /// The capability came from guessing a name, not from a provider id or an
+    /// explicit `like`; sending it is an opt-in the user has not made.
+    pub(crate) thinking_guessed: bool,
     pub(crate) source: Option<CapsSource>,
 }
 
@@ -50,6 +54,18 @@ pub(crate) enum CapsSource {
         slug: String,
         model: String,
     },
+}
+
+impl ModelCaps {
+    /// A borrowed thinking flag the current request can actually send.
+    /// `explicit` says the user pinned this model (`like`, or a thinking
+    /// override); `routed` says the request goes through the source's own wire.
+    pub(crate) fn effective_thinking(&self, explicit: bool, routed: bool) -> Option<bool> {
+        if (!self.thinking_spellable && !routed) || (self.thinking_guessed && !explicit) {
+            return None;
+        }
+        self.supports_thinking
+    }
 }
 
 impl CapsSource {
@@ -159,7 +175,7 @@ pub(crate) fn unique_exact(model_id: &str) -> Option<ModelCaps> {
     for variant in variants(model_id) {
         for spec in ProviderRegistry::all_compiled() {
             if let Some(entry) = exact_in(spec.models(), variant) {
-                found.push(caps_from_entry(
+                found.push(guessed(caps_from_entry(
                     entry,
                     Some(spec.slug),
                     variant,
@@ -167,12 +183,15 @@ pub(crate) fn unique_exact(model_id: &str) -> Option<ModelCaps> {
                         slug: spec.slug,
                         model: Some(canonical(entry, variant)),
                     },
-                ));
+                )));
             }
         }
         for &spec in &plugin_specs {
+            if !ProviderRegistry::is_shipped(spec.slug) {
+                continue;
+            }
             if let Some(entry) = exact_in(spec.models(), variant) {
-                found.push(caps_from_entry(
+                found.push(guessed(caps_from_entry(
                     entry,
                     Some(spec.slug),
                     variant,
@@ -180,7 +199,7 @@ pub(crate) fn unique_exact(model_id: &str) -> Option<ModelCaps> {
                         slug: spec.slug.to_string(),
                         model: Some(canonical(entry, variant)),
                     },
-                ));
+                )));
             }
         }
     }
@@ -189,6 +208,11 @@ pub(crate) fn unique_exact(model_id: &str) -> Option<ModelCaps> {
         return None;
     }
     Some(first.clone())
+}
+
+fn guessed(mut caps: ModelCaps) -> ModelCaps {
+    caps.thinking_guessed = true;
+    caps
 }
 
 fn exact_in<'a>(entries: &'a [ModelEntry], model_id: &str) -> Option<&'a ModelEntry> {
@@ -257,6 +281,7 @@ fn same_caps(a: &ModelCaps, b: &ModelCaps) -> bool {
         && a.pricing == b.pricing
         && a.thinking_fields == b.thinking_fields
         && a.thinking_spellable == b.thinking_spellable
+        && a.thinking_guessed == b.thinking_guessed
 }
 
 fn caps_from_entry(
@@ -305,6 +330,7 @@ fn caps_from_entry(
         pricing: entry.pricing.clone(),
         thinking_fields: entry.thinking_fields.clone(),
         thinking_spellable,
+        thinking_guessed: false,
         source: Some(source),
     };
     if let Some(meta) = meta {
@@ -317,6 +343,9 @@ fn caps_from_entry(
         caps.context_window = caps.context_window.or(Some(spec.fallback_context_window));
         caps.max_output_tokens = caps.max_output_tokens.or(spec.fallback_max_output);
     }
+    caps.context_window = caps
+        .context_window
+        .or_else(|| shared::long_context_window(canonical));
     caps
 }
 

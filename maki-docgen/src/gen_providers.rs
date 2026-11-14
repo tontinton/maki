@@ -232,7 +232,7 @@ like = "deepseek/deepseek-flash"
 supports_vision = false
 ```
 
-How a request spells thinking still follows the provider declaration (`thinking_fields`, or the protocol's own dialect), so `like` can enable a thinking model without teaching the provider how to ask for it.
+How a request spells thinking still follows the provider declaration: `thinking_fields` (which the openai codec installs and sends), the protocol's own dialect, or a provider Maki routes to. The responses path has no thinking wiring yet, so a borrowed flag there is not sent.
 
 Custom slugs must not reuse a built-in provider name. Maki exits with code 2 at startup if `providers.toml` does not parse or contains an unknown key, so a typo like `api_key_evn` fails there rather than being silently ignored.
 
@@ -275,7 +275,9 @@ supports_vision = true
 
 Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), `path_prefix`, and `like` (borrows another model's capabilities; see below). Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
 
-Gateways name models after their upstream, so Maki trusts the gateway provider id first and then a unique exact id in its tables (normalizing namespaces like `us.openai.gpt-6-sol`). When the name is opaque or the guess is wrong, `like` pins it: `slug/model` borrows that model's row, while a bare `slug` borrows the provider's family and fallback limits. An explicit field on the same override still wins, and the gateway's published limits and price win over both. A borrowed row's thinking flags and fields come along, but how the wire spells them still follows the provider's own thinking configuration.
+Gateways name models after their upstream, so Maki trusts the gateway provider id first and then a unique exact id in its tables (normalizing namespaces like `us.openai.gpt-6-sol`). When the name is opaque or the guess is wrong, `like` pins it: `slug/model` borrows that model's row, while a bare `slug` borrows the provider's family and fallback limits.
+
+Precedence is explicit fields, then the gateway's published limits and price, then `like`, then the matched row. A name-only match never enables thinking on its own: the guess is unverified, so pin the model with `like` or set `supports_thinking = true`. A borrowed row's thinking flags and fields do come along; whether the request can spell them depends on the wire (openai chat with fields, or a provider Maki routes to).
 
 ```toml
 [aperture.overrides.azureai.models."opaque-terra"]

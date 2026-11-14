@@ -227,9 +227,12 @@ fn model_from_def(
     // slug discovered for a colliding model id.
     let caps_thinking = caps.and_then(|caps| caps.supports_thinking);
     // The openai codec has no thinking dialect of its own: only fields in the
-    // row spell a mode. Anthropic and Google build their native bodies.
-    let caps_spellable = caps.is_some_and(|caps| {
-        caps.thinking_fields.is_some() || def.protocol != Some(Protocol::Openai)
+    // row spell a mode. Anthropic and Google build their native bodies, and
+    // the responses builder has no thinking wiring yet.
+    let caps_spellable = caps.is_some_and(|caps| match def.protocol {
+        Some(Protocol::Openai) => caps.thinking_fields.is_some(),
+        Some(Protocol::Anthropic | Protocol::Google) => caps.supports_thinking.is_some(),
+        Some(Protocol::OpenaiResponses) | None => false,
     });
     row.supports_thinking = match (row.supports_thinking, caps_thinking) {
         // A borrowed capability the current wire cannot spell must not fall
@@ -593,6 +596,19 @@ mod tests {
         assert!(!model.supports_thinking(), "an explicit row field wins");
         assert!(!model.supports_vision(), "a local model may lack vision");
         assert_eq!(model.context_window, 1024);
+    }
+
+    #[test]
+    fn a_responses_provider_does_not_claim_borrowed_thinking() {
+        let def: ProviderDef = serde_json::from_str(
+            r#"{"protocol":"openai-responses","models":[{"id":"local","like":"openai/gpt-6-sol"}]}"#,
+        )
+        .unwrap();
+        let model = model_from_def(&def, openai_spec(), "custom-gw", "local");
+        assert!(
+            !model.supports_thinking(),
+            "the responses builder has no thinking wiring"
+        );
     }
 
     #[test]

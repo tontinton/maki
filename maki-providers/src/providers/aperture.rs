@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use maki_config::providers::{OverrideFields, Protocol, ProviderOverride, ProvidersConfig};
 use reqwest::header::HeaderMap;
@@ -188,7 +188,10 @@ fn validate_overrides(overrides: &Overrides) {
                     model, base, "base is not an OpenAI-compatible provider, ignoring"
                 );
             }
+            // A cold catalog or an unloaded plugin cannot resolve a target
+            // yet, so only a warm miss is worth warning about.
             if let Some(like) = &f.like
+                && catalog::is_warm()
                 && model_directory::resolve_target(like).is_none()
             {
                 warn!(
@@ -380,10 +383,10 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
             let ov = merged_override(overrides, provider_id, id);
             let caps = resolved_caps(&ov, provider_id, id);
             let routed = routed_spec(provider_id, &ov);
+            let explicit = ov.like.is_some() || ov.supports_thinking.is_some();
             let caps_thinking = caps
                 .as_ref()
-                .filter(|caps| caps.thinking_spellable || routed.is_some())
-                .and_then(|caps| caps.supports_thinking);
+                .and_then(|caps| caps.effective_thinking(explicit, routed.is_some()));
             let pricing = m["pricing"].as_object().map(|p| {
                 ModelPricing::per_million(
                     price_per_m(p.get("input")),
@@ -410,7 +413,7 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                 supports_vision: ov
                     .supports_vision
                     .or_else(|| caps.as_ref().and_then(|caps| caps.supports_vision)),
-                tier: caps.as_ref().and_then(|caps| caps.tier),
+                tier: None,
                 provider_info: None,
                 extra: None,
                 effort: None,
@@ -496,41 +499,10 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
     model.supports_vision_override = ov.supports_vision.or(model.supports_vision_override);
 }
 
-type CapsKey = (String, String, Option<String>);
-static CAPS_CACHE: LazyLock<Mutex<HashMap<CapsKey, ModelCaps>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 /// The alias wins over the gateway's own provider id, which wins over a unique
 /// exact shipped id. An unresolved alias falls through instead of disabling
-/// the fallbacks. `sends_thinking` runs every frame, so the no-alias path is
-/// cached; an alias is retried because a cold catalog may answer later.
+/// the fallbacks.
 fn resolved_caps(ov: &OverrideFields, provider_id: &str, model_id: &str) -> Option<ModelCaps> {
-    let key = (
-        provider_id.to_string(),
-        model_id.to_string(),
-        ov.base.clone(),
-    );
-    if ov.like.is_none()
-        && let Ok(cache) = CAPS_CACHE.lock()
-        && let Some(caps) = cache.get(&key)
-    {
-        return Some(caps.clone());
-    }
-    let caps = resolve_caps(ov, provider_id, model_id);
-    // Only compiled rows are static: a plugin reload or a warming catalog can
-    // change the others, so those stay uncached.
-    if ov.like.is_none()
-        && catalog::is_warm()
-        && let Some(caps) = &caps
-        && matches!(caps.source, Some(CapsSource::Curated { .. }))
-        && let Ok(mut cache) = CAPS_CACHE.lock()
-    {
-        cache.insert(key, caps.clone());
-    }
-    caps
-}
-
-fn resolve_caps(ov: &OverrideFields, provider_id: &str, model_id: &str) -> Option<ModelCaps> {
     if let Some(like) = ov.like.as_deref()
         && let Some(caps) = model_directory::resolve_target(like)
     {
@@ -563,7 +535,10 @@ fn caps_from_spec(spec: &'static ProviderSpec, model_id: &str) -> Option<ModelCa
 fn caps_model(overrides: &Overrides, model: &Model) -> Option<(&'static ProviderSpec, Model)> {
     let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", model.id.as_str()));
     let ov = merged_override(overrides, provider_id, model_id);
+    let routed = routed_spec(provider_id, &ov);
+    let explicit = ov.like.is_some() || ov.supports_thinking.is_some();
     match resolved_caps(&ov, provider_id, model_id).and_then(|caps| {
+        caps.effective_thinking(explicit, routed.is_some())?;
         let source = caps.source?;
         Some((source.spec()?, source.model()?.to_string()))
     }) {
@@ -686,7 +661,6 @@ fn explain_facts(overrides: &Overrides, spec: &str, model: Model) -> ModelExplan
             None => "provider defaults".to_string(),
         },
     };
-    let caps_spellable = caps.as_ref().is_some_and(|caps| caps.thinking_spellable);
     let context_source = if ov.context_window.is_some() {
         "override".to_string()
     } else if payload
@@ -730,19 +704,23 @@ fn explain_facts(overrides: &Overrides, spec: &str, model: Model) -> ModelExplan
     } else {
         "fallback".to_string()
     };
+    let explicit = ov.like.is_some() || ov.supports_thinking.is_some();
+    let effective_thinking = caps
+        .as_ref()
+        .and_then(|caps| caps.effective_thinking(explicit, routed.is_some()));
     let thinking_source = if ov.supports_thinking.is_some() {
         "override".to_string()
-    } else if caps
-        .as_ref()
-        .is_some_and(|caps| caps.supports_thinking.is_some())
-        && (caps_spellable || routed.is_some())
-    {
+    } else if effective_thinking.is_some() {
         capability_source.clone()
     } else if caps
         .as_ref()
         .is_some_and(|caps| caps.supports_thinking == Some(true))
     {
-        "borrowed, not sent by this wire".to_string()
+        if caps.as_ref().is_some_and(|caps| caps.thinking_guessed) {
+            "guessed, not sent without like or an override".to_string()
+        } else {
+            "borrowed, not sent by this wire".to_string()
+        }
     } else if let Some(spec) = routed {
         format!("routed {}", spec.slug)
     } else {
@@ -783,6 +761,13 @@ fn explain_facts(overrides: &Overrides, spec: &str, model: Model) -> ModelExplan
     }
 }
 
+/// The generic chat path had no thinking wiring; it now spells the choice the
+/// same way the codec does.
+fn apply_generic_thinking(body: &mut Value, model: &Model, thinking: ThinkingConfig) {
+    let fallback = thinking_fields_fallback(model).unwrap_or(ThinkingFallback::None);
+    thinking.apply_thinking(body, model, fallback);
+}
+
 impl Provider for Aperture {
     fn stream_message<'a>(
         &'a self,
@@ -821,8 +806,7 @@ impl Provider for Aperture {
             let mut body =
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
-            let fallback = thinking_fields_fallback(model).unwrap_or(ThinkingFallback::None);
-            opts.thinking.apply_thinking(&mut body, model, fallback);
+            apply_generic_thinking(&mut body, model, opts.thinking);
             self.compat
                 .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                 .await
@@ -864,7 +848,6 @@ mod tests {
     use crate::Effort;
     use crate::model::ModelFamily;
     use crate::test_support::register_bundled;
-    use maki_config::providers::ModelTier;
     use serde_json::json;
     use test_case::test_case;
 
@@ -1187,7 +1170,10 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].supports_thinking, Some(true));
         assert_eq!(models[0].supports_vision, Some(true));
-        assert_eq!(models[0].tier, Some(ModelTier::Medium));
+        assert_eq!(
+            models[0].tier, None,
+            "a borrowed tier must not change automatic model selection"
+        );
         assert_eq!(
             models[0].context_window,
             Some(222_000),
@@ -1281,7 +1267,10 @@ mod tests {
         assert_eq!(explanation.route, None);
         assert_eq!(explanation.context_source, "curated openai/gpt-6-sol");
         assert_eq!(explanation.max_output_source, "curated openai/gpt-6-sol");
-        assert_eq!(explanation.thinking_source, "curated openai/gpt-6-sol");
+        assert_eq!(
+            explanation.thinking_source,
+            "guessed, not sent without like or an override"
+        );
         let text = explanation.lines().join("\n");
         assert!(text.contains("curated openai/gpt-6-sol"), "{text}");
         assert!(text.contains("generic chat completions"), "{text}");
@@ -1322,13 +1311,29 @@ mod tests {
     }
 
     #[test]
-    fn a_like_alias_lends_its_thinking_dialect() {
+    fn an_unspellable_alias_leaves_the_thinking_choice_alone() {
         let overrides = like_override("azureai", "opaque-glm", "zai/glm-5.3");
         let model = Model::from_spec("aperture/azureai/opaque-glm").unwrap();
         assert_eq!(
             routed_sends_thinking(&overrides, &model, ThinkingConfig::Adaptive).level(),
-            Some(Effort::High)
+            None,
+            "the generic wire cannot spell Zai thinking"
         );
+    }
+
+    #[test]
+    fn the_generic_body_carries_borrowed_thinking_fields() {
+        use maki_config::providers::ThinkingFields;
+        let mut model = Model::from_spec("aperture/azureai/opaque").unwrap();
+        model.thinking_fields = Some(Box::new(
+            serde_json::from_value::<ThinkingFields>(json!({
+                "adaptive": { "reasoning_effort": "medium" }
+            }))
+            .unwrap(),
+        ));
+        let mut body = json!({});
+        apply_generic_thinking(&mut body, &model, ThinkingConfig::Adaptive);
+        assert_eq!(body["reasoning_effort"], "medium");
     }
 
     #[test]
