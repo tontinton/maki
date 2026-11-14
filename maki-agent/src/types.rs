@@ -641,6 +641,11 @@ pub enum SteerKind {
     MessageDropped,
     /// `agent.stop` kept the run going after the model ended its turn.
     Continued,
+    /// `agent.compact.before` deferred an automatic compaction; the text is
+    /// the nudge that becomes the model's next message.
+    CompactDeferred,
+    /// The layer's post-compaction words from `agent.compact.before`.
+    CompactContinued,
 }
 
 /// Why a session ended, as `SessionEnd` handlers see it in `data.reason`.
