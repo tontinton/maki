@@ -107,15 +107,17 @@ pub(super) fn extract_selection_text(
 
 #[cfg(test)]
 mod tests {
-    use super::super::segment::Segment;
+    use super::super::segment::{GUTTER_COLS, Segment};
     use super::{COPY_CHUNK_ROWS, SegmentCache, extract_selection_text};
     use crate::selection::{DocPos, Selection, SelectionZone};
     use ratatui::layout::Rect;
     use ratatui::text::{Line, Span};
+    use test_case::test_case;
 
     const MARKER: &str = "\u{25cf} ";
     const WIDTH: u16 = 20;
     const MSG_X: u16 = 1;
+    const BODY_X: u16 = MSG_X + GUTTER_COLS;
 
     /// What dragging the mouse over one whole segment copies.
     fn copy_whole_segment(lines: Vec<Line<'static>>, width: u16) -> String {
@@ -159,54 +161,28 @@ mod tests {
         extract_selection_text(cache, WIDTH, &sel, area)
     }
 
-    fn gutter_cache(text: &str) -> SegmentCache {
+    #[test_case(&["hello"], pos(0, 0, 0), pos(0, 0, WIDTH), "hello" ; "marker_is_not_copied")]
+    #[test_case(&["hello"], pos(0, 0, BODY_X + 3), pos(0, 0, WIDTH), "lo" ; "columns_count_from_the_body")]
+    #[test_case(&["hello", "world"], pos(0, 0, 0), pos(1, 0, MSG_X), "hello" ; "ending_in_the_gutter_leaves_that_row_out")]
+    fn copy_skips_the_gutter(texts: &[&str], from: DocPos, to: DocPos, expected: &str) {
         let mut cache = SegmentCache::new();
-        cache.push(gutter_segment(text));
-        cache
-    }
-
-    #[test]
-    fn copy_excludes_gutter_marker() {
-        let cache = gutter_cache("hello");
-        assert_eq!(copy_range(&cache, pos(0, 0, 0), pos(0, 0, WIDTH)), "hello");
+        for text in texts {
+            cache.push(gutter_segment(text));
+        }
+        assert_eq!(copy_range(&cache, from, to), expected);
     }
 
     #[test]
     fn copy_wrapped_gutter_prose_joins_with_one_space() {
         let text = "alpha beta gamma delta epsilon zeta";
-        let cache = gutter_cache(text);
+        let mut cache = SegmentCache::new();
+        cache.push(gutter_segment(text));
         let rows = cache.get(0).expect("segment").height(WIDTH);
         assert!(rows > 1);
         assert_eq!(
             copy_range(&cache, pos(0, 0, 0), pos(0, rows - 1, WIDTH)),
             text
         );
-    }
-
-    #[test]
-    fn copy_from_mid_body_column() {
-        let cache = gutter_cache("hello");
-        let col = MSG_X + super::super::segment::GUTTER_COLS + 3;
-        assert_eq!(copy_range(&cache, pos(0, 0, col), pos(0, 0, WIDTH)), "lo");
-    }
-
-    #[test]
-    fn copy_ending_in_gutter_excludes_that_row() {
-        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda";
-        let cache = gutter_cache(text);
-        let rows = cache.get(0).expect("segment").height(WIDTH);
-        assert!(rows > 2);
-        let full = copy_range(&cache, pos(0, 0, 0), pos(0, rows - 2, WIDTH));
-        let in_gutter = copy_range(&cache, pos(0, 0, 0), pos(0, rows - 1, MSG_X));
-        assert_eq!(in_gutter, full);
-        assert!(in_gutter.len() < text.len());
-    }
-
-    #[test]
-    fn copy_ending_in_gutter_of_first_row_skips_segment() {
-        let mut cache = gutter_cache("hello");
-        cache.push(gutter_segment("world"));
-        assert_eq!(copy_range(&cache, pos(0, 0, 0), pos(1, 0, 0)), "hello");
     }
 
     #[test]

@@ -15,23 +15,19 @@ use std::ops::Range;
 use std::time::Duration;
 
 pub(crate) const GUTTER_COLS: u16 = 2;
-
-/// Safety guard against a zero body width on a pane no wider than the gutter,
-/// not a layout feature. It is the one place the rule lives, so the layout and
-/// the renderers that pre-wrap to the body width cannot drift apart.
-pub(crate) fn gutter_cols(has_gutter: bool, width: u16) -> u16 {
-    if has_gutter && width > GUTTER_COLS {
-        GUTTER_COLS
-    } else {
-        0
-    }
-}
-
-pub(crate) fn body_width(has_gutter: bool, width: u16) -> u16 {
-    width - gutter_cols(has_gutter, width)
-}
 const INST_SUFFIX: &str = "__inst";
 const ELAPSED_STEP: Duration = Duration::from_secs(1);
+
+/// On a pane no wider than the gutter the body would get no room, so there
+/// the gutter steps aside. Everything that wraps, draws, copies or clicks asks
+/// here, so they always agree on where the body starts.
+fn gutter_cols(width: u16) -> u16 {
+    if width > GUTTER_COLS { GUTTER_COLS } else { 0 }
+}
+
+pub(crate) fn body_width(width: u16) -> u16 {
+    width - gutter_cols(width)
+}
 
 pub fn is_instruction_segment(id: &str) -> bool {
     id.ends_with(INST_SUFFIX)
@@ -74,9 +70,9 @@ pub(super) struct Segment {
     lines: Vec<Line<'static>>,
     pub images: Vec<InlineImage>,
     pub tool_id: Option<String>,
-    /// First-row marker drawn in a `GUTTER_COLS` wide column left of the body.
+    /// Drawn on the first row only, left of the body. The height cache does
+    /// not see it, so set it before `set_lines`.
     pub gutter: Option<Span<'static>>,
-    /// The gutter holds a spinner frame, advanced by `update_spinners`.
     gutter_spins: bool,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
     /// collapsed thinking view has no tool_id to route by, so this is how
@@ -175,14 +171,12 @@ impl Segment {
         }
     }
 
-    /// Columns reserved left of the body at `width`. Zero without a gutter, and
-    /// zero when the pane is too narrow to give the body any room.
     pub fn gutter_cols(&self, width: u16) -> u16 {
-        gutter_cols(self.gutter.is_some(), width)
+        self.gutter.as_ref().map_or(0, |_| gutter_cols(width))
     }
 
     pub fn body_width(&self, width: u16) -> u16 {
-        body_width(self.gutter.is_some(), width)
+        width - self.gutter_cols(width)
     }
 
     pub fn text_height(&self, width: u16) -> u16 {
@@ -295,7 +289,7 @@ impl Segment {
         self.highlight_range = tl.highlight.as_ref().map(|h| h.range);
         self.highlight_key = HighlightKey::from_request(tl.highlight.as_ref());
         self.spinner_lines = tl.spinner_lines;
-        self.gutter = tl.gutter;
+        self.gutter = Some(tl.gutter);
         self.gutter_spins = tl.gutter_spins;
         self.elapsed = tl.elapsed;
         self.snapshot_base = tl.snapshot_base;
@@ -314,7 +308,7 @@ impl Segment {
         });
         self.truncation = tl.truncation;
         if let Some((s, e)) = reused {
-            self.gutter = tl.gutter;
+            self.gutter = Some(tl.gutter);
             self.gutter_spins = tl.gutter_spins;
             self.set_lines(tl.lines);
             self.highlight_range = Some((s, e));
@@ -511,6 +505,7 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     const OTHER_THEME: &str = "dracula";
+    const WIDTH: u16 = 20;
 
     fn seg_with_base(line_count: usize, base: Option<usize>) -> Segment {
         Segment {
@@ -689,7 +684,7 @@ mod tests {
             lines: vec![Line::raw("header")],
             highlight: None,
             spinner_lines: vec![],
-            gutter: Some(gutter),
+            gutter,
             gutter_spins,
             snapshot_base: None,
             truncation: SectionFlags::default(),
@@ -712,28 +707,26 @@ mod tests {
         assert_eq!(seg.gutter, Some(dot), "finished dot must not animate");
     }
 
-    const WIDTH: u16 = 20;
-
-    fn gutter_seg(text: &str) -> Segment {
+    fn gutter_seg(lines: Vec<Line<'static>>) -> Segment {
         Segment {
             gutter: Some(Span::raw("● ")),
-            ..Segment::with_lines(vec![Line::raw(text.to_owned())], None)
+            ..Segment::with_lines(lines, None)
         }
     }
 
     #[test]
     fn gutter_reduces_body_width_for_height() {
-        let text = "x".repeat(100);
-        let plain = Segment::with_lines(vec![Line::raw(text.clone())], None);
+        let lines = vec![Line::raw("x".repeat(100))];
+        let plain = Segment::with_lines(lines.clone(), None);
         assert_eq!(
-            gutter_seg(&text).height(WIDTH),
+            gutter_seg(lines).height(WIDTH),
             plain.height(WIDTH - GUTTER_COLS)
         );
     }
 
     #[test]
     fn gutter_dropped_when_pane_too_narrow() {
-        let seg = gutter_seg("x");
+        let seg = gutter_seg(vec![Line::raw("x")]);
         assert_eq!(seg.gutter_cols(GUTTER_COLS), 0);
         assert_eq!(seg.gutter_cols(GUTTER_COLS + 1), GUTTER_COLS);
     }
@@ -741,8 +734,7 @@ mod tests {
     #[test]
     fn rows_from_uses_body_width() {
         let body = usize::from(WIDTH - GUTTER_COLS);
-        let mut seg = gutter_seg("");
-        seg.set_lines(vec![Line::raw("a".repeat(body + 1)), Line::raw("b")]);
+        let seg = gutter_seg(vec![Line::raw("a".repeat(body + 1)), Line::raw("b")]);
         assert_eq!(seg.source_line_at(0, WIDTH), Some(0));
         assert_eq!(seg.source_line_at(1, WIDTH), Some(0));
         assert_eq!(seg.source_line_at(2, WIDTH), Some(1));

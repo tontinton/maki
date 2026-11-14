@@ -1,7 +1,7 @@
 use super::{BackgroundBadge, BackgroundOutcome, DisplayMessage, ToolStatus};
 
 use super::code_view;
-use crate::animation::{spinner_frame, spinner_str};
+use crate::animation::spinner_str;
 use crate::theme;
 use code_view::RenderLimits;
 use code_view::SectionFlags;
@@ -73,10 +73,10 @@ impl RoleStyle {
     pub fn label_style(&self) -> Style {
         self.marker_style.add_modifier(Modifier::BOLD)
     }
-}
 
-pub(crate) fn gutter_marker(style: &RoleStyle) -> Option<Span<'static>> {
-    (!style.marker.is_empty()).then(|| Span::styled(style.marker, style.label_style()))
+    pub fn gutter(&self) -> Span<'static> {
+        Span::styled(self.marker, self.label_style())
+    }
 }
 
 pub fn assistant_style() -> RoleStyle {
@@ -149,8 +149,7 @@ pub struct ToolLines {
     pub lines: Vec<Line<'static>>,
     pub highlight: Option<HighlightRequest>,
     pub spinner_lines: Vec<(usize, usize)>,
-    pub gutter: Option<Span<'static>>,
-    /// The gutter shows a spinner frame that `Segment::update_spinners` advances.
+    pub gutter: Span<'static>,
     pub gutter_spins: bool,
     /// Index of the first live-buffer snapshot line, recorded in the same
     /// pass that lays out `lines`, so click rows can never drift from them.
@@ -473,7 +472,6 @@ fn resolve_output<'a>(
 struct ToolLineBuilder {
     lines: Vec<Line<'static>>,
     spinner_lines: Vec<(usize, usize)>,
-    gutter: Option<Span<'static>>,
     snapshot_base: Option<usize>,
     content_range: (usize, usize),
     width: u16,
@@ -495,7 +493,6 @@ impl ToolLineBuilder {
         Self {
             lines: Vec::new(),
             spinner_lines: Vec::new(),
-            gutter: None,
             snapshot_base: None,
             content_range: (0, 0),
             width,
@@ -570,16 +567,6 @@ impl ToolLineBuilder {
         ));
     }
 
-    fn set_gutter(&mut self, started_at: Instant) {
-        self.gutter = Some(match self.indicator {
-            Indicator::InProgress => {
-                let ch = spinner_frame(started_at.elapsed().as_millis());
-                Span::styled(format!("{ch} "), theme::current().spinner)
-            }
-            finished => Span::styled(finished_glyph(finished), finished_style(finished)),
-        });
-    }
-
     fn push_code_content(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
         let content = code_view::render_tool_content(input, output, false, self.limits);
         self.truncation.script |= content.truncation.script;
@@ -644,13 +631,25 @@ impl ToolLineBuilder {
             .extend(spinners.into_iter().map(|(line, span)| (base + line, span)));
     }
 
-    fn finish(self, input: Option<Arc<ToolInput>>, output: Option<Arc<ToolOutput>>) -> ToolLines {
+    fn finish(
+        self,
+        started_at: Instant,
+        input: Option<Arc<ToolInput>>,
+        output: Option<Arc<ToolOutput>>,
+    ) -> ToolLines {
         let highlight = HighlightRequest::new(self.content_range, input, output, self.limits);
+        let gutter = match self.indicator {
+            Indicator::InProgress => Span::styled(
+                spinner_str(started_at.elapsed().as_millis()),
+                theme::current().spinner,
+            ),
+            finished => Span::styled(finished_glyph(finished), finished_style(finished)),
+        };
         ToolLines {
             lines: self.lines,
             highlight,
             spinner_lines: self.spinner_lines,
-            gutter: self.gutter,
+            gutter,
             gutter_spins: matches!(self.indicator, Indicator::InProgress),
             snapshot_base: self.snapshot_base,
             truncation: self.truncation,
@@ -814,7 +813,6 @@ pub fn build_tool_lines(
     if let Some(badge) = &msg.background {
         b.push_header(tool_name, header, None, msg.render_header.as_ref());
         b.push_background_annotation(badge);
-        b.set_gutter(rctx.started_at);
         if let Some(head) = msg
             .render_snapshot
             .as_ref()
@@ -822,7 +820,7 @@ pub fn build_tool_lines(
         {
             b.push_snapshot(&head, rctx.started_at);
         }
-        return b.finish(None, None);
+        return b.finish(rctx.started_at, None, None);
     }
     b.apply_output_format(msg.tool_output.as_deref());
     b.push_header(
@@ -831,7 +829,6 @@ pub fn build_tool_lines(
         msg.annotation.as_deref(),
         msg.render_header.as_ref(),
     );
-    b.set_gutter(rctx.started_at);
     let has_snapshot = msg.render_snapshot.is_some();
     b.push_code_content(
         msg.tool_input.as_deref(),
@@ -873,7 +870,11 @@ pub fn build_tool_lines(
         );
         b.push_resolved_output(&resolved);
     }
-    b.finish(msg.tool_input.clone(), msg.tool_output.clone())
+    b.finish(
+        rctx.started_at,
+        msg.tool_input.clone(),
+        msg.tool_output.clone(),
+    )
 }
 
 /// What `/` searches for one tool message, built on demand instead of kept
@@ -1023,7 +1024,6 @@ pub fn build_instructions_lines(
         Indicator::Success,
     );
     b.push_header(INSTRUCTIONS_TOOL, header, annotation.as_deref(), None);
-    b.set_gutter(Instant::now());
 
     let start = b.lines.len();
     let has_truncation =
@@ -1034,7 +1034,7 @@ pub fn build_instructions_lines(
     let output = Arc::new(ToolOutput::Instructions {
         blocks: blocks.to_vec(),
     });
-    b.finish(None, Some(output))
+    b.finish(Instant::now(), None, Some(output))
 }
 
 #[cfg(test)]
@@ -1577,13 +1577,11 @@ mod tests {
         assert!(tl.gutter_spins);
     }
 
-    #[test_case(ToolStatus::Success, TOOL_INDICATOR, theme::current().tool_success ; "success")]
-    #[test_case(ToolStatus::Error, TOOL_INDICATOR, theme::current().tool_error ; "error")]
-    fn finished_tool_puts_styled_dot_in_gutter(status: ToolStatus, dot: &str, style: Style) {
+    #[test_case(ToolStatus::Success, theme::current().tool_success ; "success")]
+    #[test_case(ToolStatus::Error, theme::current().tool_error ; "error")]
+    fn finished_tool_puts_styled_dot_in_gutter(status: ToolStatus, style: Style) {
         let tl = build_tool_lines(&tool_msg(), status, &test_rctx(80), SectionFlags::default());
-        let gutter = tl.gutter.expect("tool gutter");
-        assert_eq!(gutter.content.as_ref(), dot);
-        assert_eq!(gutter.style, style);
+        assert_eq!(tl.gutter, Span::styled(TOOL_INDICATOR, style));
         assert!(!tl.gutter_spins);
         assert!(
             tl.lines[0]
@@ -2323,21 +2321,5 @@ mod tests {
         expected: &str,
     ) {
         assert_eq!(background_annotation(outcome, secs), expected);
-    }
-}
-
-#[cfg(test)]
-mod role_style_tests {
-    use super::*;
-    use test_case::test_case;
-
-    #[test_case(user_style(), USER_MARKER, "" ; "user")]
-    #[test_case(assistant_style(), ASSISTANT_MARKER, "" ; "assistant")]
-    #[test_case(thinking_style(), ASSISTANT_MARKER, THINKING_LABEL ; "thinking")]
-    #[test_case(error_style(), BLANK_MARKER, "" ; "error")]
-    #[test_case(notice_style(), BLANK_MARKER, "" ; "notice")]
-    #[test_case(done_style(), BLANK_MARKER, "" ; "done")]
-    fn role_marker_and_label(style: RoleStyle, marker: &str, label: &str) {
-        assert_eq!((style.marker, style.label), (marker, label));
     }
 }

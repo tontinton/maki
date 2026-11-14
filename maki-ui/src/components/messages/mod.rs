@@ -14,8 +14,8 @@ use self::segment::{Segment, SegmentCache, body_width};
 use super::tool_display::{
     MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info,
     assistant_style, build_instructions_lines, build_tool_lines, done_style, error_style,
-    format_timestamp_now, gutter_marker, hint_columns, instructions_search_text, notice_style,
-    outcome_glyph, replace_header, search_text_for, thinking_style, truncate_to_header, user_style,
+    format_timestamp_now, hint_columns, instructions_search_text, notice_style, outcome_glyph,
+    replace_header, search_text_for, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER,
@@ -504,8 +504,7 @@ impl MessagesPanel {
             .get(&inst_id)
             .copied()
             .unwrap_or_default();
-        let tl =
-            build_instructions_lines(blocks, body_width(true, self.viewport_width), exp.output);
+        let tl = build_instructions_lines(blocks, body_width(self.viewport_width), exp.output);
 
         // The spacer gets its line only now. Empty means no rows, so a tool
         // that never sends instructions leaves no gap behind.
@@ -1124,7 +1123,7 @@ impl MessagesPanel {
     /// so a [`ScrollPos`] still points at the same text after the flush.
     fn rebuild_live_segments(&mut self, width: u16) {
         self.live_start = self.cache.len();
-        let width = body_width(true, width);
+        let width = body_width(width);
         if !self.streaming_thinking.is_empty() {
             let collapsed = thinking::collapsed_view(
                 thinking::tail_rows(self.thinking_lines, self.live_thinking_expanded),
@@ -1139,18 +1138,23 @@ impl MessagesPanel {
             let drawn_collapsed = collapsed.is_some();
             let lines =
                 collapsed.unwrap_or_else(|| self.streaming_thinking.render_lines(width).to_vec());
-            self.push_live_segment(lines, drawn_collapsed, thinking_style());
+            self.push_live_segment(lines, drawn_collapsed, thinking_style().gutter());
         }
         if !self.streaming_text.is_empty() {
             let lines = self.streaming_text.render_lines(width).to_vec();
-            self.push_live_segment(lines, false, assistant_style());
+            self.push_live_segment(lines, false, assistant_style().gutter());
         }
     }
 
-    fn push_live_segment(&mut self, lines: Vec<Line<'static>>, collapsed: bool, style: RoleStyle) {
+    fn push_live_segment(
+        &mut self,
+        lines: Vec<Line<'static>>,
+        collapsed: bool,
+        gutter: Span<'static>,
+    ) {
         self.cache.push_spacer_if_needed();
         let mut seg = Segment::with_lines(lines, None);
-        seg.gutter = gutter_marker(&style);
+        seg.gutter = Some(gutter);
         seg.truncation.output = collapsed;
         self.cache.push(seg);
     }
@@ -1425,7 +1429,7 @@ impl MessagesPanel {
     fn rctx(&self) -> RenderCtx<'_> {
         RenderCtx {
             started_at: self.started_at,
-            width: body_width(true, self.viewport_width),
+            width: body_width(self.viewport_width),
             tool_output_lines: &self.tool_output_lines,
         }
     }
@@ -1741,8 +1745,8 @@ impl MessagesPanel {
         let Some(seg) = self.cache.get_mut(seg_idx) else {
             return;
         };
-        seg.set_lines(view.lines);
         seg.gutter = view.gutter;
+        seg.set_lines(view.lines);
         seg.truncation.output = view.collapsed;
     }
 }
@@ -1789,13 +1793,14 @@ fn message_gutter(msg: &DisplayMessage, style: &RoleStyle) -> Option<Span<'stati
     } else if let Some(end) = msg.task_end {
         Some(outcome_glyph(end))
     } else {
-        gutter_marker(style)
+        Some(style.gutter())
     }
 }
 
-/// Carries the marker and label so a query can hit either the prose or the
-/// "thinking>" label the reader sees. Collapsed thinking needs no case of its
-/// own: its indicator is drawn from the same label.
+/// Starts with the marker and label the reader sees, so a query for "❯" or
+/// "thinking>" lands on them too. A blank marker trims down to nothing, and
+/// collapsed thinking draws its header from the same label, so neither needs
+/// a case of its own.
 fn message_search_text(msg: &DisplayMessage) -> String {
     let style = message_style(&msg.role);
     let marker = if message_gutter(msg, &style).is_some() {
@@ -1818,7 +1823,11 @@ struct MessageView {
 fn message_view(msg: &DisplayMessage, mode: ThinkingLines, width: u16) -> MessageView {
     let style = message_style(&msg.role);
     let gutter = message_gutter(msg, &style);
-    let body = body_width(gutter.is_some(), width);
+    let body = if gutter.is_some() {
+        body_width(width)
+    } else {
+        width
+    };
     if matches!(msg.role, DisplayRole::Thinking)
         && let Some(lines) = thinking::collapsed_view(
             thinking::tail_rows(mode, msg.thinking_expanded),
