@@ -353,7 +353,7 @@ fn is_snapshot_suffix(suffix: &str) -> bool {
 /// with it. [`lookup_entry`] matches by prefix so dated snapshots resolve to
 /// their base row, which also means `glm-5` answers for `glm-5.4`, a model it
 /// has never been checked against.
-fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
+pub(crate) fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
     entry.prefixes.iter().any(|prefix| {
         model_id
             .strip_prefix(prefix)

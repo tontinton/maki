@@ -1604,6 +1604,14 @@ pub fn specs() -> Vec<&'static ProviderSpec> {
     entries().values().map(|entry| entry.built.spec).collect()
 }
 
+/// Every model row a provider declaration carries. Gateway models borrow
+/// these when their name matches one a plugin already describes.
+pub fn model_entries(slug: &str) -> Vec<ModelEntry> {
+    entry(slug)
+        .map(|entry| entry.decl.models.clone())
+        .unwrap_or_default()
+}
+
 /// The providers whose `maki auth login` runs a `login` hook.
 pub fn auth_providers() -> Vec<(String, String)> {
     entries()

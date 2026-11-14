@@ -434,6 +434,29 @@ impl CatalogData {
             .or_else(|| self.builtin_models.get(slug)?.get(model_id))
     }
 
+    /// Every warm row with this id, whichever provider lists it. Gateway
+    /// resolution does not know which provider a gateway id came from, so the
+    /// caller ranks the answers rather than naming one provider up front.
+    fn metas_by_model(&self, model_id: &str) -> Vec<(String, CatalogMeta)> {
+        let mut found = Vec::new();
+        let mut push = |slug: &str, models: &HashMap<String, CatalogMeta>| {
+            if let Some((_, meta)) = models
+                .iter()
+                .find(|(id, _)| id.eq_ignore_ascii_case(model_id))
+            {
+                found.push((slug.to_string(), meta.clone()));
+            }
+        };
+        for (slug, models) in &self.builtin_models {
+            push(slug, models);
+        }
+        for (slug, data) in &self.providers {
+            push(slug, &data.models);
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found
+    }
+
     pub(crate) fn lookup(
         &self,
         provider: &str,
@@ -1080,6 +1103,18 @@ pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provi
 pub(crate) fn model_meta_if_available(slug: &str, model_id: &str) -> Option<CatalogMeta> {
     let guard = SHARED_CATALOG.get()?.lock().ok()?;
     guard.model_meta(slug, model_id).cloned()
+}
+
+/// Every warm provider listing this model id. Empty on a cold catalog, like
+/// [`model_meta_if_available`].
+pub(crate) fn metas_by_model_if_available(model_id: &str) -> Vec<(String, CatalogMeta)> {
+    let Some(catalog) = SHARED_CATALOG.get() else {
+        return Vec::new();
+    };
+    let Ok(guard) = catalog.lock() else {
+        return Vec::new();
+    };
+    guard.metas_by_model(model_id)
 }
 
 /// True when the model belongs to a provider with a [`FreeTier`] and is free
