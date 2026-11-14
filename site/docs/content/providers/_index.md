@@ -472,7 +472,7 @@ supports_vision = false
 | `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
 | `like` | string | unset | Borrow capabilities from another row: `slug/model`, or a bare `slug` for a provider's family and fallback limits. Fields written on this row win, and the provider's `protocol` still decides the wire |
 
-When a locally hosted model is a known one under another id, `like` imports its family, thinking, vision, limits and pricing without repeating them. Anything the row states still wins, which is how a model that matches upstream but is served without vision is expressed:
+When a locally hosted model is a known one under another id, `like` imports its family, thinking flag, vision, limits and pricing without repeating them. Thinking is only claimed when the row's wire can spell it. Anything the row states still wins, which is how a model that matches upstream but is served without vision is expressed:
 
 ```toml
 [[my-proxy.models]]

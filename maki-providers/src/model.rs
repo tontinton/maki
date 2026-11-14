@@ -587,7 +587,7 @@ impl Model {
     /// Family and tier are about which dialect a model speaks and what role it
     /// plays, which a relative answers just as well, so they read the curated
     /// row whether or not it was an exact match.
-    fn from_base(base: &ProviderSpec, slug: &str, model_id: &str) -> Self {
+    pub(crate) fn from_base(base: &ProviderSpec, slug: &str, model_id: &str) -> Self {
         let sources = ModelSources::resolve(base, model_id);
         let entry = sources.entry;
         let spec = format!("{slug}/{model_id}");

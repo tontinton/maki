@@ -225,12 +225,22 @@ fn model_from_def(
     // reach the same spec through `custom::base_spec` and so re-read
     // providers.toml on every call, and would answer from whatever the builtin
     // slug discovered for a colliding model id.
-    row.supports_thinking = row
-        .supports_thinking
-        .or_else(|| caps.and_then(|caps| caps.supports_thinking))
-        // Spelling out how a model thinks is as good as saying that it does.
-        .or_else(|| row.thinking_fields.as_ref().map(|_| true))
-        .or(Some(base.supports_thinking));
+    let caps_thinking = caps.and_then(|caps| caps.supports_thinking);
+    // The openai codec has no thinking dialect of its own: only fields in the
+    // row spell a mode. Anthropic and Google build their native bodies.
+    let caps_spellable = caps.is_some_and(|caps| {
+        caps.thinking_fields.is_some() || def.protocol != Some(Protocol::Openai)
+    });
+    row.supports_thinking = match (row.supports_thinking, caps_thinking) {
+        // A borrowed capability the current wire cannot spell must not fall
+        // back to the provider's blanket yes.
+        (None, Some(true)) if !caps_spellable => Some(false),
+        (declared, caps_thinking) => declared
+            .or(caps_thinking)
+            // Spelling out how a model thinks is as good as saying that it does.
+            .or_else(|| row.thinking_fields.as_ref().map(|_| true))
+            .or(Some(base.supports_thinking)),
+    };
     // Only the openai chat path merges the fragments into the body: the
     // responses path has no thinking wiring yet, and anthropic and google spell
     // thinking their own way. Anywhere else they would vanish without a trace.
@@ -569,7 +579,10 @@ mod tests {
         assert_eq!(model.family, ModelFamily::Gpt);
         assert_eq!(model.context_window, 1_050_000);
         assert_eq!(model.max_output_tokens, Some(128_000));
-        assert!(model.supports_thinking());
+        assert!(
+            !model.supports_thinking(),
+            "an openai-codec provider has no dialect for the borrowed thinking"
+        );
         assert!(model.supports_vision());
 
         let def: ProviderDef = serde_json::from_str(

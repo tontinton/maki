@@ -9,9 +9,10 @@
 
 use maki_config::providers::{ModelTier, ThinkingFields};
 
-use crate::model::{ModelEntry, ModelFamily, ModelPricing, names_exactly};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, names_exactly};
 use crate::providers::{catalog, plugin};
 use crate::spec::{ProviderRegistry, ProviderSpec};
+use crate::types::ThinkingFallback;
 
 /// Everything a known model row can lend to a gateway model.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -27,6 +28,9 @@ pub(crate) struct ModelCaps {
     pub(crate) max_output_tokens: Option<u32>,
     pub(crate) pricing: Option<ModelPricing>,
     pub(crate) thinking_fields: Option<ThinkingFields>,
+    /// Whether the source's wire can spell the chosen thinking on the generic
+    /// chat-completions path. A routed source handles it natively instead.
+    pub(crate) thinking_spellable: bool,
     pub(crate) source: Option<CapsSource>,
 }
 
@@ -69,22 +73,20 @@ impl CapsSource {
 /// Capabilities from one spec's own table or declarations. Used when the
 /// gateway names the provider, which outranks matching a model name.
 pub(crate) fn caps_for_spec(spec: &'static ProviderSpec, model_id: &str) -> Option<ModelCaps> {
-    if ProviderRegistry::compiled(spec.slug).is_some() {
-        caps_in(spec.models(), model_id, Some(spec.slug), |model| {
+    let compiled = ProviderRegistry::compiled(spec.slug).is_some();
+    caps_in(spec.models(), model_id, Some(spec.slug), |model| {
+        if compiled {
             CapsSource::Curated {
                 slug: spec.slug,
                 model: Some(model),
             }
-        })
-    } else {
-        let entries = plugin::model_entries(spec.slug);
-        caps_in(&entries, model_id, Some(spec.slug), |model| {
+        } else {
             CapsSource::Plugin {
                 slug: spec.slug.to_string(),
                 model: Some(model),
             }
-        })
-    }
+        }
+    })
 }
 
 /// Resolve an explicit `like` target: `slug/model` borrows that row, `slug`
@@ -103,16 +105,15 @@ pub(crate) fn resolve_target(target: &str) -> Option<ModelCaps> {
     {
         return Some(caps);
     }
-    if let Some(spec) = plugin::spec(slug) {
-        let entries = plugin::model_entries(spec.slug);
-        if let Some(caps) = caps_in(&entries, model_id, Some(spec.slug), |model| {
+    if let Some(spec) = plugin::spec(slug)
+        && let Some(caps) = caps_in(spec.models(), model_id, Some(spec.slug), |model| {
             CapsSource::Plugin {
                 slug: spec.slug.to_string(),
                 model: Some(model),
             }
-        }) {
-            return Some(caps);
-        }
+        })
+    {
+        return Some(caps);
     }
     catalog::model_meta_if_available(slug, model_id)
         .as_ref()
@@ -170,8 +171,7 @@ pub(crate) fn unique_exact(model_id: &str) -> Option<ModelCaps> {
             }
         }
         for &spec in &plugin_specs {
-            let entries = plugin::model_entries(spec.slug);
-            if let Some(entry) = exact_in(&entries, variant) {
+            if let Some(entry) = exact_in(spec.models(), variant) {
                 found.push(caps_from_entry(
                     entry,
                     Some(spec.slug),
@@ -256,6 +256,7 @@ fn same_caps(a: &ModelCaps, b: &ModelCaps) -> bool {
         && a.max_output_tokens == b.max_output_tokens
         && a.pricing == b.pricing
         && a.thinking_fields == b.thinking_fields
+        && a.thinking_spellable == b.thinking_spellable
 }
 
 fn caps_from_entry(
@@ -265,14 +266,31 @@ fn caps_from_entry(
     source: CapsSource,
 ) -> ModelCaps {
     let spec = source.spec();
+    let canonical = entry.prefixes.first().map_or(model_id, String::as_str);
+    let meta = slug.and_then(|slug| catalog::model_meta_if_available(slug, canonical));
     let family = entry.family.or_else(|| spec.map(|spec| spec.family));
+    // A spec-level yes is a usable fallback; a spec-level no is not, because
+    // providers like Zai turn thinking on per model elsewhere. The catalog
+    // outranks the spec fallback so a warm release list can say "no".
+    let supports_thinking = entry
+        .supports_thinking
+        .or_else(|| meta.as_ref().and_then(|meta| meta.supports_thinking))
+        .or_else(|| spec.filter(|spec| spec.supports_thinking).map(|_| true));
+    let thinking_spellable = entry.thinking_fields.is_some()
+        || spec.is_some_and(|spec| {
+            // OpenAI's chat path takes `reasoning_effort` even when the
+            // native adapter would use its plan dialect instead.
+            spec.slug == crate::providers::openai::SLUG || {
+                let model = Model::from_base(spec, spec.slug, canonical);
+                matches!(
+                    (spec.thinking_fields_fallback)(&model),
+                    Some(ThinkingFallback::Dialect(_) | ThinkingFallback::BudgetField)
+                )
+            }
+        });
     let mut caps = ModelCaps {
         family,
-        // A spec-level yes is a usable fallback; a spec-level no is not,
-        // because providers like Zai turn thinking on per model elsewhere.
-        supports_thinking: entry
-            .supports_thinking
-            .or_else(|| spec.filter(|spec| spec.supports_thinking).map(|_| true)),
+        supports_thinking,
         requires_thinking: entry.requires_thinking,
         supports_vision: entry
             .supports_vision
@@ -286,13 +304,12 @@ fn caps_from_entry(
         max_output_tokens: entry.max_output_tokens,
         pricing: entry.pricing.clone(),
         thinking_fields: entry.thinking_fields.clone(),
+        thinking_spellable,
         source: Some(source),
     };
-    let canonical = entry.prefixes.first().map_or(model_id, String::as_str);
-    if let Some(meta) = slug.and_then(|slug| catalog::model_meta_if_available(slug, canonical)) {
+    if let Some(meta) = meta {
         caps.context_window = caps.context_window.or(meta.context);
         caps.max_output_tokens = caps.max_output_tokens.or(meta.output);
-        caps.supports_thinking = caps.supports_thinking.or(meta.supports_thinking);
         caps.supports_vision = caps.supports_vision.or(meta.supports_vision);
         caps.pricing = caps.pricing.or(meta.pricing);
     }

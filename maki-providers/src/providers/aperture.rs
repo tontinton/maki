@@ -8,9 +8,9 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
-use crate::model::{
-    Model, ModelError, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry,
-};
+#[cfg(test)]
+use crate::model::ModelError;
+use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
 use crate::model_directory::{self, CapsSource, ModelCaps};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
@@ -24,7 +24,7 @@ use maki_config::providers::ModelTier;
 use maki_storage::id::SessionRef;
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{ResolvedAuth, Timeouts, google, plugin};
+use super::{ResolvedAuth, Timeouts, catalog, google, plugin};
 
 const HOST_ENV: &str = "APERTURE_HOST";
 const PER_MILLION: f64 = 1_000_000.0;
@@ -379,6 +379,11 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
             let provider_id = m["metadata"]["provider"]["id"].as_str().unwrap_or("");
             let ov = merged_override(overrides, provider_id, id);
             let caps = resolved_caps(&ov, provider_id, id);
+            let routed = routed_spec(provider_id, &ov);
+            let caps_thinking = caps
+                .as_ref()
+                .filter(|caps| caps.thinking_spellable || routed.is_some())
+                .and_then(|caps| caps.supports_thinking);
             let pricing = m["pricing"].as_object().map(|p| {
                 ModelPricing::per_million(
                     price_per_m(p.get("input")),
@@ -400,8 +405,8 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                 pricing,
                 supports_thinking: ov
                     .supports_thinking
-                    .or_else(|| caps.as_ref().and_then(|caps| caps.supports_thinking))
-                    .or_else(|| routed_spec(provider_id, &ov).map(|spec| spec.supports_thinking)),
+                    .or(caps_thinking)
+                    .or_else(|| routed.map(|spec| spec.supports_thinking)),
                 supports_vision: ov
                     .supports_vision
                     .or_else(|| caps.as_ref().and_then(|caps| caps.supports_vision)),
@@ -423,9 +428,7 @@ fn payload_u32(model: &Value, field: &str) -> Option<u32> {
 /// (so `aperture/zai/glm-5.2` picks up Zai's real `context_window` without
 /// being hand-duplicated in the overrides config); explicit overrides still win.
 fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
-    let Some((provider_id, model_id)) = model.id.split_once('/') else {
-        return;
-    };
+    let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", model.id.as_str()));
     let ov = merged_override(overrides, provider_id, model_id);
     let caps = resolved_caps(&ov, provider_id, model_id);
     let routed = routed_spec(provider_id, &ov);
@@ -444,9 +447,12 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
         model.family = spec.family;
     }
 
-    let caps_thinking = caps.as_ref().and_then(|caps| {
-        ThinkingSupport::from_flags(caps.supports_thinking, caps.requires_thinking)
-    });
+    let caps_thinking = caps
+        .as_ref()
+        .filter(|caps| caps.thinking_spellable || routed.is_some())
+        .and_then(|caps| {
+            ThinkingSupport::from_flags(caps.supports_thinking, caps.requires_thinking)
+        });
     let routed_thinking =
         routed.and_then(|spec| ThinkingSupport::from_flags(Some(spec.supports_thinking), false));
     model.thinking_override = model
@@ -514,6 +520,7 @@ fn resolved_caps(ov: &OverrideFields, provider_id: &str, model_id: &str) -> Opti
     // Only compiled rows are static: a plugin reload or a warming catalog can
     // change the others, so those stay uncached.
     if ov.like.is_none()
+        && catalog::is_warm()
         && let Some(caps) = &caps
         && matches!(caps.source, Some(CapsSource::Curated { .. }))
         && let Ok(mut cache) = CAPS_CACHE.lock()
@@ -554,7 +561,7 @@ fn caps_from_spec(spec: &'static ProviderSpec, model_id: &str) -> Option<ModelCa
 /// The provider whose thinking behavior should be asked about. This is a
 /// capability source, not the transport route, so a plugin spec is allowed.
 fn caps_model(overrides: &Overrides, model: &Model) -> Option<(&'static ProviderSpec, Model)> {
-    let (provider_id, model_id) = model.id.split_once('/')?;
+    let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", model.id.as_str()));
     let ov = merged_override(overrides, provider_id, model_id);
     match resolved_caps(&ov, provider_id, model_id).and_then(|caps| {
         let source = caps.source?;
@@ -584,7 +591,11 @@ pub struct ModelExplanation {
     pub supports_vision: bool,
     pub tier: ModelTier,
     pub capability_source: String,
-    pub limits_source: &'static str,
+    pub context_source: String,
+    pub max_output_source: String,
+    pub pricing_source: String,
+    pub thinking_source: String,
+    pub vision_source: String,
     pub route: Option<&'static str>,
     pub path_prefix: String,
     pub alias: Option<String>,
@@ -604,28 +615,28 @@ impl ModelExplanation {
             self.spec.clone(),
             format!(
                 "  context     {}  ({})",
-                self.context_window, self.limits_source
+                self.context_window, self.context_source
             ),
             format!(
                 "  max output  {}  ({})",
                 self.max_output_tokens
                     .map_or_else(|| "unknown".to_string(), |tokens| tokens.to_string()),
-                self.limits_source
+                self.max_output_source
             ),
             format!(
-                "  pricing     ${:.4}/M in, ${:.4}/M out",
-                self.input_price, self.output_price
+                "  pricing     ${:.4}/M in, ${:.4}/M out  ({})",
+                self.input_price, self.output_price, self.pricing_source
             ),
             format!("  family      {family}  ({})", self.capability_source),
             format!(
                 "  thinking    {}  ({})",
                 yes(self.supports_thinking),
-                self.capability_source
+                self.thinking_source
             ),
             format!(
                 "  vision      {}  ({})",
                 yes(self.supports_vision),
-                self.capability_source
+                self.vision_source
             ),
             format!("  tier        {tier}"),
             format!("  route       {route} {prefix}", prefix = self.path_prefix),
@@ -635,43 +646,31 @@ impl ModelExplanation {
 }
 
 /// Explain how one gateway model resolves, for `maki models --explain`.
-pub fn explain_model(spec: &str) -> Result<ModelExplanation, ModelError> {
-    explain_with(&load_overrides(), spec)
+pub fn explain_model(spec: &str) -> Result<ModelExplanation, AgentError> {
+    let provider = Aperture::new(Timeouts::default())?;
+    let mut model = Model::from_spec(spec).map_err(|error| AgentError::Config {
+        message: error.to_string(),
+    })?;
+    // Same path a session takes, routed provider adjustments included.
+    provider.adjust_model(&mut model);
+    Ok(explain_facts(&provider.overrides, spec, model))
 }
 
+#[cfg(test)]
 fn explain_with(overrides: &Overrides, spec: &str) -> Result<ModelExplanation, ModelError> {
     let mut model = Model::from_spec(spec)?;
-    let (provider_id, model_id) = model
-        .id
-        .split_once('/')
-        .map_or(("", model.id.clone()), |(provider, id)| {
-            (provider, id.to_string())
-        });
-    let ov = merged_override(overrides, provider_id, &model_id);
-    let payload = model_registry::discovered(SLUG, &model.id);
-    let caps = resolved_caps(&ov, provider_id, &model_id);
-    let routed = routed_spec(provider_id, &ov);
-    let routed_entry = routed.and_then(|spec| lookup_entry(spec.models(), &model_id));
     apply_adjustments(&mut model, overrides);
+    Ok(explain_facts(overrides, spec, model))
+}
 
-    let limits_source = if ov.context_window.is_some() || ov.max_output_tokens.is_some() {
-        "override"
-    } else if payload
-        .as_ref()
-        .is_some_and(|info| info.context_window.is_some() || info.max_output_tokens.is_some())
-    {
-        "gateway"
-    } else if caps
-        .as_ref()
-        .is_some_and(|caps| caps.context_window.is_some() || caps.max_output_tokens.is_some())
-        || routed_entry.is_some_and(|entry| {
-            entry.context_window.is_some() || entry.max_output_tokens.is_some()
-        })
-    {
-        "table"
-    } else {
-        "fallback"
-    };
+fn explain_facts(overrides: &Overrides, spec: &str, model: Model) -> ModelExplanation {
+    let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", model.id.as_str()));
+    let ov = merged_override(overrides, provider_id, model_id);
+    let payload = model_registry::discovered(SLUG, &model.id);
+    let caps = resolved_caps(&ov, provider_id, model_id);
+    let routed = routed_spec(provider_id, &ov);
+    let routed_entry = routed.and_then(|spec| lookup_entry(spec.models(), model_id));
+
     let capability_source = match caps.as_ref().and_then(|caps| caps.source.as_ref()) {
         Some(CapsSource::Curated { slug, model }) => format!(
             "curated {slug}/{}",
@@ -687,7 +686,82 @@ fn explain_with(overrides: &Overrides, spec: &str) -> Result<ModelExplanation, M
             None => "provider defaults".to_string(),
         },
     };
-    Ok(ModelExplanation {
+    let caps_spellable = caps.as_ref().is_some_and(|caps| caps.thinking_spellable);
+    let context_source = if ov.context_window.is_some() {
+        "override".to_string()
+    } else if payload
+        .as_ref()
+        .is_some_and(|info| info.context_window.is_some())
+    {
+        "gateway".to_string()
+    } else if caps
+        .as_ref()
+        .is_some_and(|caps| caps.context_window.is_some())
+    {
+        capability_source.clone()
+    } else if routed_entry.is_some_and(|entry| entry.context_window.is_some()) {
+        "table".to_string()
+    } else {
+        "fallback".to_string()
+    };
+    let max_output_source = if ov.max_output_tokens.is_some() {
+        "override".to_string()
+    } else if payload
+        .as_ref()
+        .is_some_and(|info| info.max_output_tokens.is_some())
+    {
+        "gateway".to_string()
+    } else if caps
+        .as_ref()
+        .is_some_and(|caps| caps.max_output_tokens.is_some())
+    {
+        capability_source.clone()
+    } else if routed_entry.is_some_and(|entry| entry.max_output_tokens.is_some()) {
+        "table".to_string()
+    } else {
+        "fallback".to_string()
+    };
+    let pricing_source = if payload.as_ref().is_some_and(|info| info.pricing.is_some()) {
+        "gateway".to_string()
+    } else if caps.as_ref().is_some_and(|caps| caps.pricing.is_some()) {
+        capability_source.clone()
+    } else if routed_entry.is_some_and(|entry| entry.pricing.is_some()) {
+        "table".to_string()
+    } else {
+        "fallback".to_string()
+    };
+    let thinking_source = if ov.supports_thinking.is_some() {
+        "override".to_string()
+    } else if caps
+        .as_ref()
+        .is_some_and(|caps| caps.supports_thinking.is_some())
+        && (caps_spellable || routed.is_some())
+    {
+        capability_source.clone()
+    } else if caps
+        .as_ref()
+        .is_some_and(|caps| caps.supports_thinking == Some(true))
+    {
+        "borrowed, not sent by this wire".to_string()
+    } else if let Some(spec) = routed {
+        format!("routed {}", spec.slug)
+    } else {
+        "provider default".to_string()
+    };
+    let vision_source = if ov.supports_vision.is_some() {
+        "override".to_string()
+    } else if caps
+        .as_ref()
+        .is_some_and(|caps| caps.supports_vision.is_some())
+    {
+        capability_source.clone()
+    } else if routed_entry.is_some_and(|entry| entry.supports_vision.is_some()) {
+        "table".to_string()
+    } else {
+        "family default".to_string()
+    };
+
+    ModelExplanation {
         spec: spec.to_string(),
         context_window: model.context_window,
         max_output_tokens: model.max_output_tokens,
@@ -698,11 +772,15 @@ fn explain_with(overrides: &Overrides, spec: &str) -> Result<ModelExplanation, M
         supports_vision: model.supports_vision(),
         tier: model.tier,
         capability_source,
-        limits_source,
+        context_source,
+        max_output_source,
+        pricing_source,
+        thinking_source,
+        vision_source,
         route: routed.map(|spec| spec.slug),
         path_prefix: path_prefix(routed, &ov),
         alias: ov.like,
-    })
+    }
 }
 
 impl Provider for Aperture {
@@ -765,17 +843,16 @@ impl Provider for Aperture {
     }
 
     fn adjust_model(&self, model: &mut Model) {
-        if let Some((provider_id, model_id)) = model.id.split_once('/') {
-            let model_id = model_id.to_string();
-            let ov = merged_override(&self.overrides, provider_id, &model_id);
-            if let Some(spec) = routed_spec(provider_id, &ov)
-                && let Some(routed) = self
-                    .routed_provider(spec, routed_auth(&self.auth, &path_prefix(Some(spec), &ov)))
-            {
-                let full_id = std::mem::replace(&mut model.id, model_id);
-                routed.adjust_model(model);
-                model.id = full_id;
-            }
+        let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", model.id.as_str()));
+        let model_id = model_id.to_string();
+        let ov = merged_override(&self.overrides, provider_id, &model_id);
+        if let Some(spec) = routed_spec(provider_id, &ov)
+            && let Some(routed) =
+                self.routed_provider(spec, routed_auth(&self.auth, &path_prefix(Some(spec), &ov)))
+        {
+            let full_id = std::mem::replace(&mut model.id, model_id);
+            routed.adjust_model(model);
+            model.id = full_id;
         }
         apply_adjustments(model, &self.overrides);
     }
@@ -1202,10 +1279,46 @@ mod tests {
         let explanation = explain_with(&Overrides::new(), "aperture/azureai/gpt-6-sol").unwrap();
         assert_eq!(explanation.capability_source, "curated openai/gpt-6-sol");
         assert_eq!(explanation.route, None);
-        assert_eq!(explanation.limits_source, "table");
+        assert_eq!(explanation.context_source, "curated openai/gpt-6-sol");
+        assert_eq!(explanation.max_output_source, "curated openai/gpt-6-sol");
+        assert_eq!(explanation.thinking_source, "curated openai/gpt-6-sol");
         let text = explanation.lines().join("\n");
         assert!(text.contains("curated openai/gpt-6-sol"), "{text}");
         assert!(text.contains("generic chat completions"), "{text}");
+    }
+
+    #[test]
+    fn explain_sources_follow_each_fact() {
+        let overrides = Overrides::from([(
+            "azureai".to_string(),
+            ProviderOverride {
+                default: OverrideFields::default(),
+                models: HashMap::from([(
+                    "opaque".to_string(),
+                    OverrideFields {
+                        like: Some("openai/gpt-6-sol".into()),
+                        max_output_tokens: Some(42),
+                        ..Default::default()
+                    },
+                )]),
+            },
+        )]);
+        let explanation = explain_with(&overrides, "aperture/azureai/opaque").unwrap();
+        assert_eq!(explanation.context_source, "curated openai/gpt-6-sol");
+        assert_eq!(explanation.max_output_source, "override");
+        assert_eq!(explanation.max_output_tokens, Some(42));
+    }
+
+    #[test]
+    fn an_unspellable_alias_does_not_claim_thinking() {
+        let overrides = like_override("azureai", "opaque-claude", "anthropic/claude-opus-5");
+        let mut model = Model::from_spec("aperture/azureai/opaque-claude").unwrap();
+        apply_adjustments(&mut model, &overrides);
+        assert_eq!(model.family, ModelFamily::Claude);
+        assert!(
+            !model.supports_thinking(),
+            "the generic chat wire cannot spell Anthropic's thinking"
+        );
     }
 
     #[test]
