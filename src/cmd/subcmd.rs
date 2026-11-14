@@ -7,11 +7,13 @@ use color_eyre::eyre::{Context, bail};
 use maki_agent::HostPrompt;
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
+use maki_config::codex::CodexImport;
 use maki_config::project::{self, TrustMode};
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
+use maki_providers::codex_import;
 use maki_providers::provider::{ProviderStatus, fetch_all_models};
 use maki_providers::spec::Owner;
 use maki_providers::{ProviderData, catalog_providers};
@@ -198,6 +200,7 @@ enum LoginTarget {
     /// A models.dev provider, which logs in through its catalog entry.
     Catalog(Box<ProviderData>),
     Custom,
+    CodexImport(CodexImport),
 }
 
 impl LoginRow {
@@ -221,6 +224,8 @@ impl LoginRow {
 
 async fn login_interactive(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
+    let catalog = catalog_providers().await;
+    let codex = codex_import::offer(&config);
     let mut rows: Vec<LoginRow> = Vec::new();
 
     let saved = |slug: &str| load_provider_credentials(storage, slug).is_some();
@@ -249,7 +254,7 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         let display = def.display_name.as_deref().unwrap_or(slug);
         rows.push(LoginRow::provider(mark(saved(slug)), slug, display));
     }
-    for provider in catalog_providers().await {
+    for provider in catalog {
         let (slug, display) = (provider.slug.clone(), provider.display_name.clone());
         rows.push(LoginRow::new(
             mark(saved(&slug)),
@@ -263,6 +268,13 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         label: CUSTOM_PROVIDER_LABEL.to_owned(),
         target: LoginTarget::Custom,
     });
+    if let Some((path, import)) = codex {
+        rows.push(LoginRow {
+            status: UNCONFIGURED,
+            label: codex_import::label(&path, &import),
+            target: LoginTarget::CodexImport(import),
+        });
+    }
 
     println!();
     println!("  Available providers:");
@@ -284,6 +296,7 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         LoginTarget::Provider(slug) => login_provider(&slug, storage).await,
         LoginTarget::Catalog(provider) => login_catalog_provider(&provider, storage).await,
         LoginTarget::Custom => login_custom(storage).await,
+        LoginTarget::CodexImport(import) => import_codex(&import, config, storage),
     }
 }
 
@@ -364,8 +377,8 @@ async fn login_custom(storage: &StateDir) -> Result<()> {
                 .parse()
                 .map_err(|e: String| color_eyre::eyre::eyre!("{e}"))?,
         ),
-        base_url: Some(base_url.clone()),
-        api_key_env: Some(api_key_env.clone()),
+        base_url: Some(base_url),
+        api_key_env: Some(api_key_env),
         discover_models: true,
         ..Default::default()
     };
@@ -379,22 +392,45 @@ async fn login_custom(storage: &StateDir) -> Result<()> {
         save_provider_credentials(storage, &slug, &creds).context("save credentials")?;
     }
 
-    config.upsert(slug.clone(), provider_def);
+    config.upsert(slug.clone(), provider_def.clone());
     config.save().context("save providers.toml")?;
 
     println!();
-    println!("  \x1b[32m✓\x1b[0m Configured: {}", slug);
-    println!("  Endpoint: {}", base_url);
-    if has_key {
-        println!("  Credentials: ~/.local/state/maki/auth/{}.json", slug);
-    } else {
+    print_custom_provider(&slug, &provider_def, has_key);
+
+    Ok(())
+}
+
+/// What a new `providers.toml` entry still needs before its first request.
+fn print_custom_provider(slug: &str, def: &ProviderDef, has_saved_key: bool) {
+    println!("  {CONFIGURED} Configured: {slug}");
+    if let Some(url) = &def.base_url {
+        println!("  Endpoint: {url}");
+    }
+    if has_saved_key {
+        println!("  Credentials: ~/.local/state/maki/auth/{slug}.json");
+    } else if def.api_key.is_none() {
         println!(
-            "  Set API key via: {} or run: maki auth login {}",
-            api_key_env, slug
+            "  Set API key via: {} or run: maki auth login {slug}",
+            resolve_api_key_env(slug, Some(def))
         );
     }
-    println!("  Use with: maki -m {}/<model>", slug);
+    println!("  Use with: maki -m {slug}/<model>");
+}
 
+fn import_codex(import: &CodexImport, config: ProvidersConfig, storage: &StateDir) -> Result<()> {
+    let model = codex_import::import(import, config, storage).context("save providers.toml")?;
+
+    println!();
+    for (slug, def) in &import.providers {
+        print_custom_provider(slug, def, false);
+    }
+    if let Some(model) = model {
+        println!("  Default model: {model}");
+    }
+    for (slug, key) in &import.unsupported {
+        println!("  Skipped {slug}: `{key}` has no providers.toml equivalent");
+    }
     Ok(())
 }
 

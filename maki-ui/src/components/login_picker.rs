@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -5,8 +7,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use maki_config::codex::CodexImport;
 use maki_config::providers::{self, Protocol, ProviderDef, ProvidersConfig, slugify};
-use maki_providers::catalog_providers_if_available;
+use maki_providers::{catalog_providers_if_available, codex_import};
 use maki_storage::StateDir;
 use maki_storage::auth::{
     ProviderCredentials, load_provider_credentials, load_tokens, save_provider_credentials,
@@ -14,13 +17,14 @@ use maki_storage::auth::{
 use maki_storage::model::persist_model;
 
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
-use crate::components::modal::Modal;
+use crate::components::modal::{BORDER, Modal};
 use crate::components::{Overlay, chevron_span, field_line, painted_caret};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 const TITLE: &str = " Login ";
 const CATALOG_UNAVAILABLE_SLUG: &str = "catalog-unavailable";
+const CODEX_IMPORT_SLUG: &str = "codex-import";
 const WRAP: Wrap = Wrap { trim: true };
 
 const PROTOCOLS: &[(&str, &str)] = &[
@@ -158,6 +162,7 @@ enum StepAction {
         model_spec: Option<String>,
         slug: String,
     },
+    ImportCodex,
     Back,
     Close,
 }
@@ -166,6 +171,8 @@ pub struct LoginPicker {
     step: Step,
     provider_items: Vec<ProviderItem>,
     storage: Option<maki_storage::StateDir>,
+    /// The Codex providers the list offers to import, while it does.
+    codex: Option<CodexImport>,
 }
 
 impl LoginPicker {
@@ -174,6 +181,7 @@ impl LoginPicker {
             step: Step::Closed,
             provider_items: Vec::new(),
             storage: None,
+            codex: None,
         }
     }
 
@@ -219,6 +227,7 @@ impl LoginPicker {
             });
         }
 
+        let codex = codex_import::offer(&config);
         if let Some(catalog) = catalog_providers_if_available() {
             let state_dir = StateDir::resolve().ok();
             for cat in catalog {
@@ -255,6 +264,10 @@ impl LoginPicker {
             configured: false,
             section: None,
         });
+        if let Some((path, import)) = &codex {
+            items.push(codex_item(path, import));
+        }
+        self.codex = codex.map(|(_, import)| import);
 
         self.provider_items = items.clone();
         let mut picker = ListPicker::new();
@@ -299,6 +312,8 @@ impl LoginPicker {
                         StepAction::None
                     } else if item.slug == "custom" {
                         StepAction::GoCustomName
+                    } else if item.slug == CODEX_IMPORT_SLUG {
+                        StepAction::ImportCodex
                     } else {
                         let slug = item.slug.clone();
                         let config = providers::ProvidersConfig::load();
@@ -663,6 +678,23 @@ impl LoginPicker {
                     LoginPickerAction::Configured { slug }
                 }
             }
+            StepAction::ImportCodex => {
+                let Some((storage, import)) = self.storage.as_ref().zip(self.codex.as_ref()) else {
+                    self.step = Step::Closed;
+                    return LoginPickerAction::Close;
+                };
+                let (message, model_spec) =
+                    match codex_import::import(import, ProvidersConfig::load(), storage) {
+                        Ok(model) => (import_summary(import, model.as_deref()), model),
+                        Err(e) => (format!("Error saving config: {e}"), None),
+                    };
+                let slug = import.providers.keys().next().cloned().unwrap_or_default();
+                self.transition(StepAction::GoDone {
+                    message,
+                    model_spec,
+                    slug,
+                })
+            }
             StepAction::Back => {
                 let mut picker = ListPicker::new();
                 picker.open(self.provider_items.clone(), TITLE);
@@ -731,12 +763,12 @@ impl LoginPicker {
                     min_width: 0,
                     max_height_percent: 30,
                 };
-                let (popup, inner) = modal.render(frame, area, 1);
-                frame.render_widget(
-                    Paragraph::new(Line::from(message.clone()))
-                        .style(Style::new().bg(theme::current().background)),
-                    inner,
-                );
+                let paragraph = Paragraph::new(Line::from(message.clone()))
+                    .wrap(WRAP)
+                    .style(Style::new().bg(theme::current().background));
+                let height = paragraph.line_count(modal.width(area.width).saturating_sub(BORDER));
+                let (popup, inner) = modal.render(frame, area, height as u16);
+                frame.render_widget(paragraph, inner);
                 (popup, None)
             }
         }
@@ -798,6 +830,36 @@ fn input_step_view(
     )
 }
 
+fn codex_item(path: &Path, import: &CodexImport) -> ProviderItem {
+    ProviderItem {
+        slug: CODEX_IMPORT_SLUG.to_owned(),
+        display_name: codex_import::label(path, import),
+        has_key: false,
+        has_env: false,
+        configured: false,
+        section: None,
+    }
+}
+
+/// The `Done` line after an import: what was written, what was left out and
+/// why, and the model maki starts with when the import picked one.
+fn import_summary(import: &CodexImport, model: Option<&str>) -> String {
+    let imported: Vec<&str> = import.providers.keys().map(String::as_str).collect();
+    let mut summary = format!("Imported {} into providers.toml", imported.join(", "));
+    if !import.unsupported.is_empty() {
+        let skipped: Vec<String> = import
+            .unsupported
+            .iter()
+            .map(|(slug, key)| format!("{slug} ({key})"))
+            .collect();
+        summary.push_str(&format!(". Skipped {}", skipped.join(", ")));
+    }
+    if let Some(model) = model {
+        summary.push_str(&format!(". Model: {model}"));
+    }
+    summary
+}
+
 pub enum LoginPickerAction {
     Consumed,
     Close,
@@ -824,6 +886,10 @@ mod tests {
     const SLUG: &str = "slug";
     const WRONG_SELECTION: &str = "the paste did not filter the list";
     const WRONG_STEP: &str = "the step is not the one built";
+    const IMPORTED_SLUG: &str = "team-proxy";
+    const SKIPPED_SLUG: &str = "chatgpt-lb";
+    const SKIPPED_KEY: &str = "requires_openai_auth";
+    const MODEL: &str = "team-proxy/gpt-5.5";
 
     fn opened<T: PickerItem>(items: Vec<T>) -> ListPicker<T> {
         let mut picker = ListPicker::new();
@@ -883,6 +949,25 @@ mod tests {
             ]),
             slug: SLUG.to_owned(),
         }
+    }
+
+    fn codex_import(skipped: bool) -> CodexImport {
+        let mut import = CodexImport::default();
+        import
+            .providers
+            .insert(IMPORTED_SLUG.to_owned(), ProviderDef::default());
+        if skipped {
+            import
+                .unsupported
+                .push((SKIPPED_SLUG.to_owned(), SKIPPED_KEY.to_owned()));
+        }
+        import
+    }
+
+    #[test_case(false, None, "Imported team-proxy into providers.toml" ; "entries_only")]
+    #[test_case(true, Some(MODEL), "Imported team-proxy into providers.toml. Skipped chatgpt-lb (requires_openai_auth). Model: team-proxy/gpt-5.5" ; "skips_and_model")]
+    fn import_summary_names_what_happened(skipped: bool, model: Option<&str>, expected: &str) {
+        assert_eq!(import_summary(&codex_import(skipped), model), expected);
     }
 
     #[test_case(provider_step ; "provider_list")]
