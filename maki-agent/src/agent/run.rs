@@ -328,7 +328,7 @@ impl<'h> Agent<'h> {
         let mut prompt = None;
         for (message, images, preamble) in burst {
             let kept = match self
-                .filter_user_message(message, images.len(), source)
+                .filter_user_message(&message, images.len(), source)
                 .await
             {
                 Err(AgentError::Cancelled) => return self.finish(Err(AgentError::Cancelled)),
@@ -341,6 +341,7 @@ impl<'h> Agent<'h> {
                 self.refresh_frame()?;
             }
             let kept = kept.map(|text| {
+                self.history.offer_title_source(&message, &text);
                 prompt = Some(text.clone());
                 Message::user_with_images(text, images)
             });
@@ -837,12 +838,12 @@ impl<'h> Agent<'h> {
     /// text comes back empty, since providers refuse a whitespace-only block.
     async fn filter_user_message(
         &self,
-        message: String,
+        message: &str,
         images: usize,
         source: InputSource,
     ) -> Result<Option<String>, AgentError> {
         let blank = |text: &str| text.trim().is_empty();
-        if blank(&message) && images == 0 {
+        if blank(message) && images == 0 {
             return Ok(Some(String::new()));
         }
         let hooks = self.hooks();
@@ -873,10 +874,10 @@ impl<'h> Agent<'h> {
                     self.steer(SteerKind::MessageRewritten, text.to_owned())?;
                     text.to_owned()
                 }
-                _ => message,
+                _ => message.to_owned(),
             },
             Verdict::Denied(reason) => return dropped(reason),
-            Verdict::Unchanged | Verdict::Ask { .. } => message,
+            Verdict::Unchanged | Verdict::Ask { .. } => message.to_owned(),
         };
         Ok(Some(if blank(&text) { String::new() } else { text }))
     }
@@ -1238,10 +1239,12 @@ impl<'h> Agent<'h> {
                         images: input.images.clone(),
                     })?;
                     let kept = self
-                        .filter_user_message(input.message, input.images.len(), input.source)
+                        .filter_user_message(&input.message, input.images.len(), input.source)
                         .await?;
-                    let message =
-                        kept.map(|text| interrupt_message(text, input.images, input.source));
+                    let message = kept.map(|text| {
+                        self.history.offer_title_source(&input.message, &text);
+                        interrupt_message(text, input.images, input.source)
+                    });
                     if message.is_some() {
                         self.mode = input.mode;
                         // The user spoke, so `agent.stop` gets its full
@@ -4299,7 +4302,10 @@ mod tests {
             .collect()
     }
 
+    const TYPED: &str = "hello";
     const REWRITTEN: &str = "hello, with the CI log attached";
+    const PREFIXED: &str = "Memories: the user prefers short answers.\n\nhello";
+    const REDACTED: &str = "h[REDACTED]";
     const DROP_REASON: &str = "that prompt is on the blocklist";
     const KEEP_GOING: &str = "The todo list still has open items.";
     const BLOCKED: &str = "blocked";
@@ -4338,6 +4344,32 @@ mod tests {
             steers(&drain_events(&mut event_rx)),
             [(SteerKind::MessageRewritten, REWRITTEN.to_owned())]
         );
+    }
+
+    /// Context a layer wraps around the prompt must not name the session, but
+    /// a prompt it redacted or dropped offers nothing, so the secret it kept
+    /// out can never become the title.
+    #[test_case(|_, _| Verdict::Unchanged, Some(TYPED) ; "unchanged")]
+    #[test_case(|_, _| Verdict::Replaced(json!({ FIELD_TEXT: PREFIXED })), Some(TYPED) ; "prefixed")]
+    #[test_case(|_, _| Verdict::Replaced(json!({ FIELD_TEXT: REWRITTEN })), Some(TYPED) ; "suffixed")]
+    #[test_case(|_, _| Verdict::Replaced(json!({ FIELD_TEXT: REDACTED })), None ; "redacted")]
+    #[test_case(|_, _| Verdict::Denied(DROP_REASON.into()), None ; "denied")]
+    #[tokio::test]
+    async fn title_source_is_the_typed_text_only_when_the_layer_kept_it(
+        answer: fn(AgentSlot, &Value) -> Verdict,
+        expected: Option<&str>,
+    ) {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        script(&agent.registry, answer);
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(history.snapshot().title_source.as_deref(), expected);
     }
 
     /// A cut turn ends on its marker, so a dropped interrupt still leaves

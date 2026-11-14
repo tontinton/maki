@@ -260,7 +260,7 @@ impl SessionTrack {
         }
         let history = &mut self.history;
         let store = &mut self.store;
-        match store.record_turn(history.as_slice(), history.frame(), self.gauge.size()) {
+        match store.record_turn(history.snapshot(), self.gauge.size()) {
             Ok(()) => history.mark_saved(),
             // Only headless runs save through here (the TUI has its own
             // writer), so printing cannot tear a drawn frame.
@@ -376,23 +376,24 @@ impl SessionStore {
     /// not in the log yet and must survive the appends around them.
     fn record_turn(
         &mut self,
-        messages: &[Message],
-        frame: Option<&Arc<StoredFrame>>,
+        snapshot: &HistorySnapshot,
         context_size: u32,
     ) -> Result<(), SessionError> {
         fn tool_call_ids(m: &Message) -> Vec<String> {
             m.tool_uses().map(|(id, _, _)| id.to_owned()).collect()
         }
+        let messages = snapshot.messages.as_slice();
         if messages.is_empty() {
             return Ok(());
         }
         let dropped = self.session.dropped_tool_ids(messages, tool_call_ids);
         self.session.replace_messages(messages.to_vec());
         self.session.drop_tool_state_of(&dropped, tool_call_ids);
-        self.session.set_frame(frame.cloned());
+        self.session.set_frame(snapshot.frame.clone());
         self.session.meta.context_size = context_size;
         self.session.meta.pending_background = self.mailbox.unsettled();
-        self.session.update_title_if_default();
+        self.session
+            .update_title_if_default(snapshot.title_source.as_deref());
         self.session.save(&self.claim, &self.dir)
     }
 }
@@ -421,6 +422,7 @@ mod tests {
     const OTHER_SPEC: &str = "other/model";
     const CONTEXT_SIZE: u32 = 42_000;
     const PROMPT: &str = "fix the login bug";
+    const WRAPPED_PROMPT: &str = "Memories: the login uses OAuth.\n\nfix the login bug";
     const OBSERVATION: &str = "build failed";
     const TITLE: &str = "a title the user set";
     const PLAN_PATH: &str = "/plans/plan.md";
@@ -621,6 +623,22 @@ mod tests {
         );
     }
 
+    /// Headless runs save only through `record_turn`, so the typed text has
+    /// to reach the title through it while the log keeps the rewrite.
+    #[test]
+    fn a_wrapped_prompt_saves_the_typed_title() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        push_turn(&mut track, MODEL_SPEC, |params| {
+            params.history.offer_title_source(PROMPT, WRAPPED_PROMPT);
+            params.history.push(Message::user(WRAPPED_PROMPT.into()));
+        });
+
+        let loaded = load(&tmp);
+        assert_eq!(loaded.title, PROMPT);
+        assert_eq!(loaded.messages()[0].user_text(), Some(WRAPPED_PROMPT));
+    }
+
     /// `updated_at` counts whole seconds, so a rewrite in the same second as
     /// the seed could leave the bytes as they were. The orphan closes that
     /// gap: the reopened history has already dropped it, so any rewrite at
@@ -672,15 +690,17 @@ mod tests {
 
         track
             .store
-            .record_turn(&[call("gone"), call("kept")], None, CONTEXT_SIZE)
+            .record_turn(
+                &HistorySnapshot::new(vec![call("gone"), call("kept")]),
+                CONTEXT_SIZE,
+            )
             .unwrap();
         assert!(load(&tmp).tool_outputs().contains_key("gone"));
 
         track
             .store
             .record_turn(
-                &[Message::user("summary".into()), call("kept")],
-                None,
+                &HistorySnapshot::new(vec![Message::user("summary".into()), call("kept")]),
                 CONTEXT_SIZE,
             )
             .unwrap();
@@ -703,7 +723,10 @@ mod tests {
 
         track
             .store
-            .record_turn(&[Message::user("next turn".into())], None, CONTEXT_SIZE)
+            .record_turn(
+                &HistorySnapshot::new(vec![Message::user("next turn".into())]),
+                CONTEXT_SIZE,
+            )
             .unwrap();
 
         assert!(load(&tmp).tool_outputs().contains_key("live"));

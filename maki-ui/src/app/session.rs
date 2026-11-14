@@ -655,7 +655,7 @@ impl App {
             }
         };
         // Without this a young session forks into "fork of New session".
-        session.update_title_if_default();
+        session.update_title_if_default(None);
         session.set_title(format!("{FORK_TITLE_PREFIX}{}", session.title));
         vec![Action::OpenFork(Box::new(OpenSession { session, claim }))]
     }
@@ -715,7 +715,7 @@ impl App {
         let measured = self.state.context_size;
         let session = self.state.session_mut();
         let context_size = truncate_to_turn(session, entry.turn_index, measured);
-        session.update_title_if_default();
+        session.update_title_if_default(None);
         self.state.context_size = context_size;
 
         // A tool task still running belongs to a turn that is over.

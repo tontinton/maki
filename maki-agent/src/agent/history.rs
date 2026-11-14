@@ -6,7 +6,7 @@ use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, Role};
 use maki_storage::auth::now_millis;
 use maki_storage::frame::{LiveFacts, StoredFrame};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionTools, next_epoch};
+use maki_storage::sessions::{SessionTools, TitleSource, next_epoch};
 use serde_json::Value;
 use strum::Display;
 use tracing::warn;
@@ -255,6 +255,28 @@ impl History {
 
     pub fn as_slice(&self) -> &[Message] {
         &self.snapshot.messages
+    }
+
+    pub(crate) fn snapshot(&self) -> &HistorySnapshot {
+        &self.snapshot
+    }
+
+    /// Call before pushing a message a layer kept. Only the message that
+    /// names the session counts, and its typed text only when the kept text
+    /// still holds it whole, as with context a layer wrapped around it. A
+    /// layer that dropped or redacted the text may have kept a secret out,
+    /// so the title then comes from what it kept.
+    pub(crate) fn offer_title_source(&mut self, typed: &str, kept: &str) {
+        if self
+            .as_slice()
+            .iter()
+            .any(|m| m.first_user_text().is_some())
+        {
+            return;
+        }
+        let typed = typed.trim();
+        self.snapshot.title_source =
+            (!typed.is_empty() && kept.contains(typed)).then(|| Arc::from(typed));
     }
 
     pub fn push(&mut self, msg: Message) {

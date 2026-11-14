@@ -294,6 +294,10 @@ the transcript marks it as rewritten. Return `nil, reason` to drop it: the model
 never sees it, the user sees `reason`, and `TurnEnd` reports `"dropped"`. A
 rewrite with no text and no images also drops it.
 
+The session title comes from what the user typed if the new text still holds
+it whole, as when a layer adds context around it. Otherwise it comes from the
+new text, so a redacted secret stays out of the title.
+
 ```lua
 maki.api.set_slot("agent.user_message", function(prev, msg, ctx)
   if msg.text:find("AKIA%u%u%u%u") then
