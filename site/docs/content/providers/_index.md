@@ -499,6 +499,23 @@ You can also create a custom provider interactively with `maki auth login` and c
 
 In `/model`, a custom provider without a key shows `no key`. A provider whose model list request fails shows `offline`, or `fallback` when Maki still has models to list for it. Press Enter on a `no key` or `offline` row to open `/login` for that provider. For an entry in this file, login first shows its `base_url` so you can fix a moved endpoint, then asks for the key. Leave the key blank to keep the one from the env var, `api_key`, or an earlier login.
 
+### Import from Codex
+
+`/login` in the app and `maki auth login` without a provider read `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). When it has `[model_providers.<id>]` entries under slugs that Maki does not use yet, the picker ends with an import row. Picking it turns each entry into an entry in this file:
+
+| Codex | `providers.toml` |
+|-------|------------------|
+| `<id>` | slug, so `team_proxy` becomes `team-proxy` |
+| `name` | `display_name` |
+| `base_url` | `base_url` |
+| `env_key` | `api_key_env` |
+| no `env_key` | `api_key = ""`, since Codex sends no credentials then |
+| `wire_api` | `protocol`: `openai-responses`, or `openai` for the retired `chat` |
+
+Only an entry made of these keys is imported. One with any other key, such as `http_headers`, `query_params`, `auth` or `requires_openai_auth`, is skipped and the key is named, because Maki has no setting that carries it. Every imported entry sets `discover_models = true`. When Codex's `model_provider` names an imported entry, that entry gets Codex's `model` as its `default_model`, and Maki starts with it if no model is saved yet.
+
+A slug that a built-in provider, a plugin, a models.dev provider or an existing entry uses is not offered. For a provider Maki ships, such as `ollama`, `mistral` or `openrouter`, use the built-in one and run `maki auth login <slug>`. Codex's `openai_base_url` becomes `base_url` under `[openai]`, see [Base URL Overrides](#base-url-overrides).
+
 ### Aperture overrides
 
 Aperture proxies upstream providers, exposing each model as `aperture/<upstream>/<model>`. Overrides keyed by upstream provider id live under `[aperture.overrides]`:
