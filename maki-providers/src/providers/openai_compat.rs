@@ -409,7 +409,7 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
 pub(crate) fn tool_parameters(tool: &Value) -> Value {
     match tool.get("input_schema") {
         Some(schema) if schema.is_object() => schema.clone(),
-        _ => json!({ "type": "object", "properties": {} }),
+        _ => json!({"type": "object", "properties": {}, "additionalProperties": true}),
     }
 }
 
@@ -862,7 +862,7 @@ data: [DONE]\n\n";
         assert_eq!(function["name"], json!(TOOL_NAME), "{TOOL_MUST_SURVIVE}");
         assert_eq!(
             function["parameters"],
-            json!({"type": "object", "properties": {}})
+            json!({"type": "object", "properties": {}, "additionalProperties": true})
         );
     }
 

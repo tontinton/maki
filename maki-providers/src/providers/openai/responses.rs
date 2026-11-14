@@ -585,7 +585,7 @@ mod tests {
         );
         assert_eq!(
             converted[0]["parameters"],
-            json!({"type": "object", "properties": {}})
+            json!({"type": "object", "properties": {}, "additionalProperties": true})
         );
     }
 
