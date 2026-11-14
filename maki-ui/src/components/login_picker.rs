@@ -264,12 +264,14 @@ impl LoginPicker {
     }
 
     /// Opens on `slug`'s own setup, as Enter on its row would.
-    pub fn open_for(&mut self, storage: StateDir, slug: &str) {
+    pub fn open_for(&mut self, storage: StateDir, slug: &str) -> LoginPickerAction {
         self.open(storage);
         if let Step::PickProvider(picker) = &mut self.step
             && picker.select_item_by(|item| item.slug == slug)
         {
-            self.handle_key(KeyEvent::from(KeyCode::Enter));
+            self.handle_key(KeyEvent::from(KeyCode::Enter))
+        } else {
+            LoginPickerAction::Consumed
         }
     }
 
@@ -575,12 +577,11 @@ impl LoginPicker {
                 builtin_url,
                 api_key_optional,
             } => {
-                if custom.is_none()
-                    && let Some(url) = providers::resolve_login_url(&slug, plan.as_deref())
-                    && let Err(e) = open::that(&url)
-                {
-                    tracing::warn!(error = %e, url, "failed to open browser");
-                }
+                let login_url = if custom.is_none() {
+                    providers::resolve_login_url(&slug, plan.as_deref())
+                } else {
+                    None
+                };
                 self.step = Step::EnterKey {
                     input: TextBuffer::new(String::new()),
                     slug,
@@ -590,7 +591,10 @@ impl LoginPicker {
                     builtin_url,
                     api_key_optional,
                 };
-                LoginPickerAction::Consumed
+                match login_url {
+                    Some(url) => LoginPickerAction::OpenUrl(url),
+                    None => LoginPickerAction::Consumed,
+                }
             }
             StepAction::GoBuiltinUrl { slug, display_name } => {
                 let config = providers::ProvidersConfig::load();
@@ -797,8 +801,14 @@ fn input_step_view(
 pub enum LoginPickerAction {
     Consumed,
     Close,
-    Authenticated { model_spec: String },
-    Configured { slug: String },
+    /// The provider's keys page should open in the browser.
+    OpenUrl(String),
+    Authenticated {
+        model_spec: String,
+    },
+    Configured {
+        slug: String,
+    },
 }
 
 #[cfg(test)]
