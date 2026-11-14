@@ -13,7 +13,7 @@ use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, S
 use crate::components::tool_display::append_annotation;
 use crate::components::{
     BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, NoticeDetail, ToolRole,
-    ToolStatus,
+    ToolStatus, display_id,
 };
 use crate::markdown::truncate_output;
 
@@ -25,7 +25,7 @@ use maki_agent::{
     ToolOutput, ToolStartEvent, display_order, observation_detail,
 };
 use maki_config::{ToolOutputLines, UiConfig};
-use maki_lua::{LuaCommandInfo, WinView};
+use maki_lua::{LuaCommandInfo, OutlineEntry, WinView};
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role, format_tokens};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
@@ -417,6 +417,14 @@ impl Chat {
 
     pub fn scroll_to_segment(&mut self, segment_index: usize) {
         self.messages_panel.scroll_to_segment(segment_index);
+    }
+
+    pub fn scroll_to_block(&mut self, id: u64) -> bool {
+        self.messages_panel.scroll_to_block(id)
+    }
+
+    pub fn outline(&self) -> Vec<OutlineEntry> {
+        self.messages_panel.outline()
     }
 
     pub fn restore_scroll(&mut self, scroll: ScrollPos, auto_scroll: bool) {
@@ -888,6 +896,7 @@ pub fn history_to_display(
                                 });
                             }
                             display.push(DisplayMessage {
+                                id: display_id(),
                                 role: DisplayRole::Tool(Box::new(ToolRole {
                                     id: id.clone(),
                                     status,
