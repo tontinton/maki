@@ -346,6 +346,10 @@ fn caps_from_entry(
         caps.supports_vision = caps.supports_vision.or(meta.supports_vision);
         caps.pricing = caps.pricing.or(meta.pricing);
     }
+    if let Some(spec) = spec {
+        caps.context_window = caps.context_window.or(Some(spec.fallback_context_window));
+        caps.max_output_tokens = caps.max_output_tokens.or(spec.fallback_max_output);
+    }
     caps
 }
 
