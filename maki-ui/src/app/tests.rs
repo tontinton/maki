@@ -1774,6 +1774,31 @@ fn a_stale_pick_answer_cannot_fire_a_second_implement() {
     );
 }
 
+/// A row handler that starts its own run has taken the session over, so the
+/// Implement its row kept must not start a second run when the handler says
+/// yes. A menu the chain is still building is for the plan the run leaves
+/// alone, so it still shows once the run ends.
+#[test]
+fn a_new_run_drops_the_picked_row_outcome_but_not_the_menu() {
+    let mut app = test_app();
+    let _dir = draft_plan(&mut app, PLAN_V1);
+    app.state.plan.offer(PLAN_V1);
+    let outcome_tx = awaiting_plan_action(&mut app, Some(maki_lua::PlanRowAction::Implement));
+    let menu_tx = awaiting_plan_form(&mut app);
+
+    let SubmitOutcome::Started(_) = app.submit_prompt(queued_msg("go")) else {
+        panic!("a raw prompt must start a run");
+    };
+    let _ = outcome_tx.send(PlanActionOutcome::Proceed);
+    let _ = menu_tx.send(Some(plan_menu(vec![])));
+    let _ = app.tick();
+    app.status = Status::Idle;
+
+    assert_eq!(app.state.mode, Mode::Plan, "implemented a second time");
+    assert!(app.plan_form_active());
+    assert_eq!(app.status_bar.flash_text(), None);
+}
+
 /// A `/new` while a handler is parked: the draft the row was picked from is
 /// gone and the session it would implement in is not the one the user picked
 /// in, so the answer submits nothing.
