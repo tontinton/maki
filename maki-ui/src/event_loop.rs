@@ -2112,6 +2112,11 @@ impl<'t> EventLoop<'t> {
             Action::OpenEditor(path) => {
                 self.open_editor(idx, &path);
             }
+            Action::OpenUrl(url) => {
+                if let Err(e) = open::that(&url) {
+                    tracing::warn!(error = %e, url, "failed to open browser");
+                }
+            }
             Action::EditInputInEditor => {
                 let current_text = self.sessions[idx].app.input_box.buffer.value();
                 let result = {

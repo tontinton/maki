@@ -1603,21 +1603,15 @@ impl App {
                 }
                 ModelPickerAction::Login(slug) => {
                     self.model_picker.close();
-                    self.login_picker.open_for(self.storage.clone(), &slug);
-                    vec![]
+                    let action = self.login_picker.open_for(self.storage.clone(), &slug);
+                    self.handle_login_picker_action(action)
                 }
                 ModelPickerAction::Close => vec![],
             }),
-            KeyboardOwner::LoginPicker => Some(match self.login_picker.handle_key(key) {
-                LoginPickerAction::Consumed => vec![],
-                LoginPickerAction::Close => vec![],
-                LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
-                }
-                LoginPickerAction::Configured { slug } => {
-                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
-                }
-            }),
+            KeyboardOwner::LoginPicker => {
+                let action = self.login_picker.handle_key(key);
+                Some(self.handle_login_picker_action(action))
+            }
             KeyboardOwner::McpPicker => Some(match self.mcp_picker.handle_key(key) {
                 McpPickerAction::Consumed => vec![],
                 McpPickerAction::Toggle {
@@ -1646,6 +1640,22 @@ impl App {
                         Some(vec![])
                     }
                 }
+            }
+        }
+    }
+
+    /// Both ways into the login picker — its own keys, and Enter on a model
+    /// picker row — land here, so the keys page always leaves as an `Action`.
+    fn handle_login_picker_action(&mut self, action: LoginPickerAction) -> Vec<Action> {
+        match action {
+            LoginPickerAction::Consumed => vec![],
+            LoginPickerAction::Close => vec![],
+            LoginPickerAction::OpenUrl(url) => vec![Action::OpenUrl(url)],
+            LoginPickerAction::Authenticated { model_spec } => {
+                vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+            }
+            LoginPickerAction::Configured { slug } => {
+                vec![Action::RefreshProvider { slug }, Action::RefreshModels]
             }
         }
     }

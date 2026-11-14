@@ -319,6 +319,8 @@ pub enum Action {
     Compact(Option<String>),
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
+    /// A URL to open in the user's browser, e.g. a provider's keys page.
+    OpenUrl(String),
     EditInputInEditor,
     Btw(String),
     PreparePack(PackCommand),

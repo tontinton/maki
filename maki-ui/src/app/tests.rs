@@ -11957,22 +11957,26 @@ fn run_builtin_model_picker_opens_and_refreshes() {
     assert!(matches!(&actions[..], [Action::RefreshModels]));
 }
 
-/// A provider row that cannot serve models hands Enter to its login. Z.AI asks
-/// for a plan first, while a provider like Anthropic would open its key page
-/// in the developer's real browser and wait for the launcher to exit.
+/// A provider row that cannot serve models hands Enter to its login, and the
+/// keys page goes out as an `Action` so a test never opens a browser.
 #[test]
 fn enter_on_a_keyless_provider_row_opens_its_login() {
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(ModelList {
         specs: Vec::new(),
-        providers: HashMap::from([("zai".into(), ProviderStatus::MissingKey)]),
+        providers: HashMap::from([("anthropic".into(), ProviderStatus::MissingKey)]),
         loading: false,
     })));
     app.run_builtin(BuiltinAction::ModelPicker);
 
-    app.update(Msg::Key(key(KeyCode::Enter)));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(!app.model_picker.is_open());
     assert!(app.login_picker.is_open());
+    let keys_page = maki_config::providers::resolve_login_url("anthropic", None).unwrap();
+    assert!(
+        matches!(&actions[..], [Action::OpenUrl(url)] if url == &keys_page),
+        "Enter must emit the keys page as an action"
+    );
 }
 
 #[test]
