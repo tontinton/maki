@@ -318,9 +318,11 @@ fn caps_from_entry(
     let family = entry.family.or_else(|| spec.map(|spec| spec.family));
     let mut caps = ModelCaps {
         family,
+        // A spec-level yes is a usable fallback; a spec-level no is not,
+        // because providers like Zai turn thinking on per model elsewhere.
         supports_thinking: entry
             .supports_thinking
-            .or_else(|| spec.map(|spec| spec.supports_thinking)),
+            .or_else(|| spec.filter(|spec| spec.supports_thinking).map(|_| true)),
         requires_thinking: entry.requires_thinking,
         supports_vision: entry
             .supports_vision

@@ -651,6 +651,12 @@ pub async fn models(
     .await;
 
     if let Some(spec) = explain {
+        if !spec.starts_with("aperture/") {
+            bail!(
+                "--explain covers Aperture models, e.g. aperture/<upstream>/<model>; \
+                 custom providers read like from providers.toml"
+            );
+        }
         for line in maki_providers::explain_model(spec)?.lines() {
             println!("{line}");
         }

@@ -155,6 +155,11 @@ pub struct ModelDef {
     pub pricing_fast_input: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_fast_output: Option<f64>,
+    /// Borrow another model's capabilities for fields this row leaves out:
+    /// `slug/model`, or a bare `slug` for the provider's defaults. Fields
+    /// written on this row still win.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub like: Option<String>,
 }
 
 impl ModelDef {
@@ -567,6 +572,9 @@ fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
     }
     if any(|m| m.supports_vision.is_some()) {
         ignored.push("models.supports_vision");
+    }
+    if any(|m| m.like.is_some()) {
+        ignored.push("models.like");
     }
     if any(|m| m.has_pricing() || m.has_fast_pricing()) {
         ignored.push("models.pricing_*");
@@ -1052,6 +1060,7 @@ tier = "{input}"
             pricing_cache_read: Some(1.0),
             pricing_fast_input: Some(1.0),
             pricing_fast_output: Some(1.0),
+            like: Some("deepseek/deepseek-chat".to_string()),
         };
         assert_eq!(
             ignored_local_model_fields(&[every_field_set]),
@@ -1061,6 +1070,7 @@ tier = "{input}"
                 "models.max_output_tokens",
                 "models.supports_tool_examples",
                 "models.supports_vision",
+                "models.like",
                 "models.pricing_*",
             ]
         );

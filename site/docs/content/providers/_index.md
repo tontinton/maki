@@ -470,6 +470,16 @@ supports_vision = false
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
 | `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
+| `like` | string | unset | Borrow capabilities from another row: `slug/model`, or a bare `slug` for a provider's defaults. Fields written on this row win, and the provider's `protocol` still decides the wire |
+
+When a locally hosted model is a known one under another id, `like` imports its family, thinking, vision, limits and pricing without repeating them. Anything the row states still wins, which is how a model that matches upstream but is served without vision is expressed:
+
+```toml
+[[my-proxy.models]]
+id = "local-deepseek-flash"
+like = "deepseek/deepseek-chat"
+supports_vision = false
+```
 
 Custom slugs must not reuse a built-in provider name. Maki exits with code 2 at startup if `providers.toml` does not parse or contains an unknown key, so a typo like `api_key_evn` fails there rather than being silently ignored.
 
