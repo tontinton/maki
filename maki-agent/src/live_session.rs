@@ -65,9 +65,17 @@ struct LiveSession {
 struct Mailbox {
     pending: VecDeque<Message>,
     wake: bool,
+    /// Compaction a plugin queued. Notice drains leave it alone.
+    compact: Option<CompactRequest>,
     outstanding: Vec<String>,
     /// No run reads it again, so it takes no new receipts.
     closed: bool,
+}
+
+/// A compaction a plugin queued through `maki.session.request_compact`.
+#[derive(Debug)]
+pub struct CompactRequest {
+    pub instructions: Option<String>,
 }
 
 /// How a notice names a task: its tool, plus the call's summary when that
@@ -298,6 +306,8 @@ pub enum MailboxError {
     Session(MakiId),
     #[error("no live subagent with id {0}")]
     Task(String),
+    #[error("a compaction is already pending")]
+    AlreadyPending,
 }
 
 #[derive(Clone)]
@@ -409,6 +419,49 @@ impl SessionMailbox {
         {
             tasks.remove(task_id);
         }
+    }
+
+    /// Queues a compaction for `session_id`. A running agent applies it
+    /// between turns, an idle one at the start of its next run. While one
+    /// sits unclaimed, a repeat request fails.
+    pub fn request_compact(
+        session_id: MakiId,
+        instructions: Option<String>,
+    ) -> Result<(), MailboxError> {
+        Self::open(session_id)?.queue_compact(CompactRequest { instructions })
+    }
+
+    /// [`Self::request_compact`] for a live subagent of `session_id`, whose
+    /// own run then claims it.
+    pub fn request_compact_task(
+        session_id: MakiId,
+        task_id: &str,
+        instructions: Option<String>,
+    ) -> Result<(), MailboxError> {
+        let tasks = lock(&LIVE_TASKS);
+        let entry = tasks
+            .get(task_id)
+            .filter(|entry| entry.parent == session_id)
+            .ok_or_else(|| MailboxError::Task(task_id.to_owned()))?;
+        entry.mailbox.queue_compact(CompactRequest { instructions })
+    }
+
+    fn queue_compact(&self, request: CompactRequest) -> Result<(), MailboxError> {
+        let mut mailbox = lock(&self.live.mailbox);
+        if mailbox.closed {
+            return Err(MailboxError::Session(self.session_id));
+        }
+        if mailbox.compact.is_some() {
+            return Err(MailboxError::AlreadyPending);
+        }
+        mailbox.compact = Some(request);
+        Ok(())
+    }
+
+    /// Takes the pending compaction request. One taker wins, so a host and
+    /// a run cannot compact twice.
+    pub fn take_compact(&self) -> Option<CompactRequest> {
+        lock(&self.live.mailbox).compact.take()
     }
 
     /// The mailbox of a live session, never a new one.
@@ -760,6 +813,7 @@ mod tests {
     const PLAN_FILE: &str = "/tmp/plan.md";
     const EDITED_FILE: &str = "foo.rs";
     const NOTICE_BODY: &str = "child finished";
+    const COMPACT_INSTRUCTIONS: &str = "keep the open questions";
     const LABEL_HEAD: &str = "Background agent finished:";
     const WIDE_CHAR: &str = "é";
 
@@ -1424,5 +1478,70 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn request_compact_queues_one_claimable_request() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::request_compact(id, Some(COMPACT_INSTRUCTIONS.to_owned())).unwrap();
+        assert_eq!(
+            mailbox.take_compact().unwrap().instructions.as_deref(),
+            Some(COMPACT_INSTRUCTIONS)
+        );
+        assert!(mailbox.take_compact().is_none());
+    }
+
+    #[test]
+    fn request_compact_rejects_a_second_request_until_claimed() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::request_compact(id, None).unwrap();
+        assert!(matches!(
+            SessionMailbox::request_compact(id, Some(COMPACT_INSTRUCTIONS.to_owned())),
+            Err(MailboxError::AlreadyPending)
+        ));
+        mailbox.take_compact().unwrap();
+        SessionMailbox::request_compact(id, Some(COMPACT_INSTRUCTIONS.to_owned())).unwrap();
+        assert_eq!(
+            mailbox.take_compact().unwrap().instructions.as_deref(),
+            Some(COMPACT_INSTRUCTIONS)
+        );
+    }
+
+    #[test]
+    fn request_compact_rejects_a_dead_session() {
+        let missing = MakiId::generate();
+        assert!(matches!(
+            SessionMailbox::request_compact(missing, None),
+            Err(MailboxError::Session(id)) if id == missing
+        ));
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        mailbox.close();
+        assert!(matches!(
+            SessionMailbox::request_compact(id, None),
+            Err(MailboxError::Session(_))
+        ));
+    }
+
+    #[test]
+    fn request_compact_task_reaches_the_subagent_mailbox() {
+        let parent = MakiId::generate();
+        let parent_mailbox = SessionMailbox::register(parent);
+        let task_id = "task-1";
+        let subagent = SessionMailbox::register(MakiId::generate());
+        subagent.track_task(task_id, parent);
+        SessionMailbox::request_compact_task(parent, task_id, Some(COMPACT_INSTRUCTIONS.into()))
+            .unwrap();
+        assert_eq!(
+            subagent.take_compact().unwrap().instructions.as_deref(),
+            Some(COMPACT_INSTRUCTIONS)
+        );
+        assert!(
+            matches!(SessionMailbox::request_compact_task(parent, "untracked", None),
+                Err(MailboxError::Task(t)) if t == "untracked")
+        );
+        parent_mailbox.close();
     }
 }

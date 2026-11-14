@@ -57,7 +57,7 @@ impl App {
                     self.queue_compact(instructions);
                     return vec![];
                 }
-                self.status = Status::Streaming;
+                self.mark_compacting();
                 vec![Action::Compact(instructions)]
             }
             "/help" => self.run_builtin(BuiltinAction::Help),

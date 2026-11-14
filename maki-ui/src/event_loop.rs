@@ -26,8 +26,8 @@ use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, Envelope, HostPrompt, McpCommand, McpConfigErrors,
-    McpHandle, SessionMailbox, Transcript, UiWaker, mcp,
+    AgentConfig, AgentEvent, CancelToken, CompactReason, Envelope, HostPrompt, McpCommand,
+    McpConfigErrors, McpHandle, SessionMailbox, Transcript, UiWaker, mcp,
 };
 use maki_config::project::TrustState;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
@@ -1421,11 +1421,29 @@ impl<'t> EventLoop<'t> {
     fn start_woken_runs(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         for index in 0..self.sessions.len() {
+            if let Some(request) = self.sessions[index].app.take_requested_compact() {
+                self.sessions[index].app.mark_compacting();
+                self.queue_compact(index, request.instructions, CompactReason::Requested);
+                dirty = Dirty::YES;
+            }
             let actions = self.sessions[index].app.start_woken_run();
             dirty |= Dirty::from(!actions.is_empty());
             self.dispatch(index, actions);
         }
         dirty
+    }
+
+    /// Pushes a compaction to the queue, so a mid-run request lands at the
+    /// run's next boundary instead of racing its history.
+    fn queue_compact(&mut self, idx: usize, instructions: Option<String>, reason: CompactReason) {
+        let rt = &mut self.sessions[idx];
+        rt.reset_run_notifications();
+        rt.handles.queue.push(QueueItem::Compact(Compaction {
+            run_id: rt.app.run_id,
+            instructions,
+            reason,
+            workflow: rt.app.state.workflow,
+        }));
     }
 
     /// `List` replies from a background task (the scan can be slow); every
@@ -2079,15 +2097,7 @@ impl<'t> EventLoop<'t> {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
             }
             Action::Compact(instructions) => {
-                let rt = &mut self.sessions[idx];
-                rt.reset_run_notifications();
-                let run_id = rt.app.run_id;
-                let workflow = rt.app.state.workflow;
-                rt.handles.queue.push(QueueItem::Compact(Compaction {
-                    run_id,
-                    instructions,
-                    workflow,
-                }));
+                self.queue_compact(idx, instructions, CompactReason::Manual);
             }
             Action::ToggleMcp(server_name, enabled) => {
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {
