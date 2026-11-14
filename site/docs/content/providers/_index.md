@@ -470,16 +470,18 @@ supports_vision = false
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
 | `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
-| `like` | string | unset | Borrow capabilities from another row: `slug/model`, or a bare `slug` for a provider's defaults. Fields written on this row win, and the provider's `protocol` still decides the wire |
+| `like` | string | unset | Borrow capabilities from another row: `slug/model`, or a bare `slug` for a provider's family and fallback limits. Fields written on this row win, and the provider's `protocol` still decides the wire |
 
 When a locally hosted model is a known one under another id, `like` imports its family, thinking, vision, limits and pricing without repeating them. Anything the row states still wins, which is how a model that matches upstream but is served without vision is expressed:
 
 ```toml
 [[my-proxy.models]]
 id = "local-deepseek-flash"
-like = "deepseek/deepseek-chat"
+like = "deepseek/deepseek-flash"
 supports_vision = false
 ```
+
+How a request spells thinking still follows the provider declaration (`thinking_fields`, or the protocol's own dialect), so `like` can enable a thinking model without teaching the provider how to ask for it.
 
 Custom slugs must not reuse a built-in provider name. Maki exits with code 2 at startup if `providers.toml` does not parse or contains an unknown key, so a typo like `api_key_evn` fails there rather than being silently ignored.
 
@@ -522,7 +524,7 @@ supports_vision = true
 
 Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), `path_prefix`, and `like` (borrows another model's capabilities; see below). Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
 
-Maki resolves a gateway model against its curated tables, plugin declarations and the warm models.dev catalog, normalizing gateway namespaces like `us.openai.gpt-6-sol`. When the name is opaque or the guess is wrong, `like` pins it: `slug/model` borrows that model's row, while a bare `slug` borrows the provider's defaults. An explicit field on the same override still wins, and the gateway's published limits and price win over both.
+Gateways name models after their upstream, so Maki trusts the gateway provider id first and then a unique exact id in its tables (normalizing namespaces like `us.openai.gpt-6-sol`). When the name is opaque or the guess is wrong, `like` pins it: `slug/model` borrows that model's row, while a bare `slug` borrows the provider's family and fallback limits. An explicit field on the same override still wins, and the gateway's published limits and price win over both. A borrowed row's thinking flags and fields come along, but how the wire spells them still follows the provider's own thinking configuration.
 
 ```toml
 [aperture.overrides.azureai.models."opaque-terra"]

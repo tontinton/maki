@@ -156,8 +156,8 @@ pub struct ModelDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_fast_output: Option<f64>,
     /// Borrow another model's capabilities for fields this row leaves out:
-    /// `slug/model`, or a bare `slug` for the provider's defaults. Fields
-    /// written on this row still win.
+    /// `slug/model`, or a bare `slug` for the provider's family and fallback
+    /// limits. Fields written on this row still win.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub like: Option<String>,
 }

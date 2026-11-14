@@ -218,7 +218,9 @@ fn model_from_def(
     row.supports_deferred_tools = row
         .supports_deferred_tools
         .or_else(|| caps.and_then(|caps| caps.supports_deferred_tools));
-    row.requires_thinking |= caps.is_some_and(|caps| caps.requires_thinking);
+    if row.supports_thinking != Some(false) {
+        row.requires_thinking |= caps.is_some_and(|caps| caps.requires_thinking);
+    }
     // Resolved here rather than left to `Model::supports_thinking`, which would
     // reach the same spec through `custom::base_spec` and so re-read
     // providers.toml on every call, and would answer from whatever the builtin

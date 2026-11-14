@@ -1,12 +1,11 @@
-//! Cross-provider capability lookup for models named by a gateway.
+//! Capability lookup for models a gateway named after their upstream.
 //!
-//! Aperture exposes `<vendor>/<model>` ids that a user or an upstream named,
-//! not Maki's slugs. A native provider already knows what its models can do,
-//! so this module finds that row by name: curated tables first, then plugin
-//! declarations, then the warm models.dev catalog, and finally a family guess
-//! from the id. It returns where each answer came from so
-//! `maki models --explain` can show its work and a user can pin a mismatch
-//! with `like`.
+//! A gateway model id comes from the upstream, not from Maki's slug. Two
+//! explicit things can name the row: the gateway's provider id (when Maki
+//! knows that provider) and a `like` override. When neither does, a unique
+//! exact id among the shipped declarations is used. Anything else stays
+//! unknown, because a prefix match or a family guess would borrow a
+//! neighbour's capabilities and claim things the model cannot do.
 
 use maki_config::providers::{ModelTier, ThinkingFields};
 
@@ -47,7 +46,6 @@ pub(crate) enum CapsSource {
         slug: String,
         model: String,
     },
-    Heuristic,
 }
 
 impl CapsSource {
@@ -56,7 +54,7 @@ impl CapsSource {
         match self {
             Self::Curated { slug, .. } => ProviderRegistry::compiled(slug),
             Self::Plugin { slug, .. } => plugin::spec(slug),
-            Self::Catalog { .. } | Self::Heuristic => None,
+            Self::Catalog { .. } => None,
         }
     }
 
@@ -64,64 +62,33 @@ impl CapsSource {
         match self {
             Self::Curated { model, .. } | Self::Plugin { model, .. } => model.as_deref(),
             Self::Catalog { model, .. } => Some(model),
-            Self::Heuristic => None,
         }
     }
 }
 
-struct Candidate {
-    exact: bool,
-    prefix: usize,
-    /// Lower wins on a tie: a curated row was checked against the vendor, a
-    /// plugin row was written for its provider, the catalog is a third party.
-    priority: u8,
-    caps: ModelCaps,
-}
-
-/// Find capabilities for an id a gateway published. `None` when nothing in the
-/// tables resembles it.
-pub(crate) fn resolve(model_id: &str) -> Option<ModelCaps> {
-    let mut candidates = Vec::new();
-    for variant in variants(model_id) {
-        collect_curated(variant, &mut candidates);
-        collect_plugins(variant, &mut candidates);
-        collect_catalog(variant, &mut candidates);
-    }
-    let mut caps = pick(candidates).unwrap_or_default();
-    caps.family = caps.family.or_else(|| heuristic_family(model_id));
-    if caps.source.is_none() && caps.family.is_some() {
-        caps.source = Some(CapsSource::Heuristic);
-    }
-    (caps.source.is_some() || caps.family.is_some()).then_some(caps)
-}
-
 /// Capabilities from one spec's own table or declarations. Used when the
-/// gateway names its route, which outranks a guess from the model name.
+/// gateway names the provider, which outranks matching a model name.
 pub(crate) fn caps_for_spec(spec: &'static ProviderSpec, model_id: &str) -> Option<ModelCaps> {
-    let compiled = ProviderRegistry::compiled(spec.slug).is_some();
-    let entries = if compiled {
-        spec.models().to_vec()
-    } else {
-        plugin::model_entries(spec.slug)
-    };
-    candidate_for(entries.as_slice(), model_id, 0, Some(spec.slug), |model| {
-        if compiled {
+    if ProviderRegistry::compiled(spec.slug).is_some() {
+        caps_in(spec.models(), model_id, Some(spec.slug), |model| {
             CapsSource::Curated {
                 slug: spec.slug,
                 model: Some(model),
             }
-        } else {
+        })
+    } else {
+        let entries = plugin::model_entries(spec.slug);
+        caps_in(&entries, model_id, Some(spec.slug), |model| {
             CapsSource::Plugin {
                 slug: spec.slug.to_string(),
                 model: Some(model),
             }
-        }
-    })
-    .map(|candidate| candidate.caps)
+        })
+    }
 }
 
 /// Resolve an explicit `like` target: `slug/model` borrows that row, `slug`
-/// borrows the provider's defaults.
+/// borrows the provider's family and fallback limits.
 pub(crate) fn resolve_target(target: &str) -> Option<ModelCaps> {
     let Some((slug, model_id)) = target.split_once('/') else {
         return provider_defaults(target);
@@ -174,70 +141,71 @@ fn provider_defaults(slug: &str) -> Option<ModelCaps> {
     };
     Some(ModelCaps {
         family: Some(spec.family),
+        context_window: Some(spec.fallback_context_window),
+        max_output_tokens: spec.fallback_max_output,
         source: Some(source),
         ..ModelCaps::default()
     })
 }
 
-fn collect_curated(variant: &str, candidates: &mut Vec<Candidate>) {
-    for spec in ProviderRegistry::all_compiled() {
-        if let Some(candidate) =
-            candidate_for(spec.models(), variant, 0, Some(spec.slug), |model| {
-                CapsSource::Curated {
-                    slug: spec.slug,
-                    model: Some(model),
-                }
-            })
-        {
-            candidates.push(candidate);
-        }
-    }
-}
-
-fn collect_plugins(variant: &str, candidates: &mut Vec<Candidate>) {
-    for spec in plugin::specs() {
-        let entries = plugin::model_entries(spec.slug);
-        if let Some(candidate) = candidate_for(&entries, variant, 1, Some(spec.slug), |model| {
-            CapsSource::Plugin {
-                slug: spec.slug.to_string(),
-                model: Some(model),
+/// A unique exact id among the shipped declarations. No prefix, no
+/// models.dev scan and no family guess: when two rows disagree the name is
+/// ambiguous and the caller has to pin it with `like`.
+pub(crate) fn unique_exact(model_id: &str) -> Option<ModelCaps> {
+    let mut found = Vec::new();
+    let mut plugin_specs = plugin::specs();
+    plugin_specs.sort_by_key(|spec| spec.slug);
+    for variant in variants(model_id) {
+        for spec in ProviderRegistry::all_compiled() {
+            if let Some(entry) = exact_in(spec.models(), variant) {
+                found.push(caps_from_entry(
+                    entry,
+                    Some(spec.slug),
+                    variant,
+                    CapsSource::Curated {
+                        slug: spec.slug,
+                        model: Some(canonical(entry, variant)),
+                    },
+                ));
             }
-        }) {
-            candidates.push(candidate);
+        }
+        for &spec in &plugin_specs {
+            let entries = plugin::model_entries(spec.slug);
+            if let Some(entry) = exact_in(&entries, variant) {
+                found.push(caps_from_entry(
+                    entry,
+                    Some(spec.slug),
+                    variant,
+                    CapsSource::Plugin {
+                        slug: spec.slug.to_string(),
+                        model: Some(canonical(entry, variant)),
+                    },
+                ));
+            }
         }
     }
-}
-
-fn collect_catalog(variant: &str, candidates: &mut Vec<Candidate>) {
-    for (slug, meta) in catalog::metas_by_model_if_available(variant) {
-        candidates.push(Candidate {
-            exact: true,
-            prefix: variant.len(),
-            priority: 2,
-            caps: caps_from_catalog(&slug, &meta, variant),
-        });
+    let first = found.first()?;
+    if found.iter().skip(1).any(|caps| !same_caps(caps, first)) {
+        return None;
     }
+    Some(first.clone())
 }
 
-fn candidate_for(
-    entries: &[ModelEntry],
-    model_id: &str,
-    priority: u8,
-    slug: Option<&str>,
-    source: impl Fn(String) -> CapsSource,
-) -> Option<Candidate> {
-    let (entry, exact, prefix) = best(entries, model_id)?;
-    let canonical = entry
+fn exact_in<'a>(entries: &'a [ModelEntry], model_id: &str) -> Option<&'a ModelEntry> {
+    entries.iter().find(|entry| {
+        entry
+            .prefixes
+            .iter()
+            .any(|prefix| prefix.eq_ignore_ascii_case(model_id) || names_exactly(entry, model_id))
+    })
+}
+
+fn canonical(entry: &ModelEntry, fallback: &str) -> String {
+    entry
         .prefixes
         .first()
-        .map_or(model_id, String::as_str)
-        .to_string();
-    Some(Candidate {
-        exact,
-        prefix,
-        priority,
-        caps: caps_from_entry(entry, slug, model_id, source(canonical)),
-    })
+        .map_or(fallback, String::as_str)
+        .to_string()
 }
 
 fn caps_in(
@@ -246,7 +214,13 @@ fn caps_in(
     slug: Option<&str>,
     source: impl Fn(String) -> CapsSource,
 ) -> Option<ModelCaps> {
-    candidate_for(entries, model_id, 0, slug, source).map(|candidate| candidate.caps)
+    let (entry, _exact, _prefix) = best(entries, model_id)?;
+    Some(caps_from_entry(
+        entry,
+        slug,
+        model_id,
+        source(canonical(entry, model_id)),
+    ))
 }
 
 /// The longest prefix of `model_id` an entry names, preferring an exact name.
@@ -268,30 +242,6 @@ fn best<'a>(entries: &'a [ModelEntry], model_id: &str) -> Option<(&'a ModelEntry
         }
     }
     best
-}
-
-/// One answer, or nothing when two sources of equal confidence disagree.
-fn pick(mut candidates: Vec<Candidate>) -> Option<ModelCaps> {
-    candidates.sort_by(|a, b| {
-        b.exact
-            .cmp(&a.exact)
-            .then(b.prefix.cmp(&a.prefix))
-            .then(a.priority.cmp(&b.priority))
-    });
-    let best = candidates.first()?;
-    let best_priority = candidates
-        .iter()
-        .filter(|c| c.exact == best.exact && c.prefix == best.prefix)
-        .map(|c| c.priority)
-        .min()?;
-    let mut same_rank = candidates.iter().filter(|c| {
-        c.exact == best.exact && c.prefix == best.prefix && c.priority == best_priority
-    });
-    let first = same_rank.next()?;
-    if same_rank.any(|c| !same_caps(&c.caps, &first.caps)) {
-        return None;
-    }
-    Some(first.caps.clone())
 }
 
 fn same_caps(a: &ModelCaps, b: &ModelCaps) -> bool {
@@ -382,25 +332,6 @@ fn variants(model_id: &str) -> Vec<&str> {
     variants
 }
 
-fn heuristic_family(model_id: &str) -> Option<ModelFamily> {
-    let id = model_id.to_ascii_lowercase();
-    if id.contains("claude") {
-        Some(ModelFamily::Claude)
-    } else if id.contains("gemini") {
-        Some(ModelFamily::Gemini)
-    } else if id.contains("glm") {
-        Some(ModelFamily::Glm)
-    } else if id.contains("gpt")
-        || id.starts_with("o1")
-        || id.starts_with("o3")
-        || id.starts_with("o4")
-    {
-        Some(ModelFamily::Gpt)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,27 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_rank_disagreement_is_unknown() {
-        let candidate = |family| Candidate {
-            exact: true,
-            prefix: 3,
-            priority: 0,
-            caps: ModelCaps {
-                family: Some(family),
-                ..ModelCaps::default()
-            },
-        };
-        assert!(
-            pick(vec![
-                candidate(ModelFamily::Gpt),
-                candidate(ModelFamily::Claude),
-            ])
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn curated_tables_answer_an_alias_target() {
+    fn a_curated_alias_target_resolves() {
         let caps = resolve_target("openai/gpt-6-sol").unwrap();
         assert_eq!(caps.family, Some(ModelFamily::Gpt));
         assert_eq!(caps.context_window, Some(1_050_000));
@@ -467,13 +378,11 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_provider_alias_borrows_its_defaults() {
+    fn a_bare_provider_alias_borrows_family_and_fallbacks() {
         let caps = resolve_target("zai").unwrap();
         assert_eq!(caps.family, Some(ModelFamily::Glm));
-        assert_eq!(
-            caps.supports_thinking, None,
-            "the provider default may deny what a row allows"
-        );
+        assert_eq!(caps.context_window, Some(128_000));
+        assert_eq!(caps.max_output_tokens, Some(16_000));
         assert!(matches!(
             caps.source,
             Some(CapsSource::Curated {
@@ -485,28 +394,37 @@ mod tests {
     }
 
     #[test]
-    fn gateway_namespaces_still_reach_their_row() {
-        let caps = resolve("us.openai.gpt-6-sol").unwrap();
+    fn gateway_namespaces_reach_a_unique_exact_row() {
+        let caps = unique_exact("us.openai.gpt-6-sol").unwrap();
         assert_eq!(caps.family, Some(ModelFamily::Gpt));
         assert!(matches!(
             caps.source,
             Some(CapsSource::Curated { slug: "openai", .. })
         ));
 
-        let caps = resolve("anthropic.claude-opus-5").unwrap();
-        assert_eq!(caps.family, Some(ModelFamily::Claude));
-
-        let caps = resolve("zai-org/GLM-5.3").unwrap();
+        let caps = unique_exact("zai-org/GLM-5.3").unwrap();
         assert_eq!(caps.family, Some(ModelFamily::Glm));
     }
 
     #[test]
-    fn a_stranger_gets_only_a_family_guess() {
-        assert!(resolve("mystery-model").is_none());
+    fn a_name_two_tables_disagree_on_stays_unknown() {
+        assert!(
+            unique_exact("gpt-5.4").is_none(),
+            "OpenAI and Copilot both ship a gpt-5.4 row"
+        );
+        assert!(
+            unique_exact("anthropic.claude-opus-5").is_none(),
+            "Anthropic and Copilot both ship claude-opus-5"
+        );
+        assert!(unique_exact("gpt-6-sol").is_some());
+    }
 
-        let caps = resolve("my-claude-fork").unwrap();
-        assert_eq!(caps.family, Some(ModelFamily::Claude));
-        assert_eq!(caps.supports_thinking, None);
-        assert_eq!(caps.source, Some(CapsSource::Heuristic));
+    #[test]
+    fn unknown_names_are_not_guessed() {
+        assert!(unique_exact("mystery-model").is_none());
+        assert!(
+            unique_exact("my-claude-fork").is_none(),
+            "a substring is not a model"
+        );
     }
 }

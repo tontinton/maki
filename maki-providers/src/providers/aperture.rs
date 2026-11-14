@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use maki_config::providers::{OverrideFields, Protocol, ProviderOverride, ProvidersConfig};
 use reqwest::header::HeaderMap;
@@ -393,15 +393,11 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                 } else {
                     format!("{provider_id}/{id}")
                 },
-                context_window: ov
-                    .context_window
-                    .or_else(|| payload_u32(m, "context_window_tokens"))
-                    .or_else(|| caps.as_ref().and_then(|caps| caps.context_window)),
-                max_output_tokens: ov
-                    .max_output_tokens
-                    .or_else(|| payload_u32(m, "max_output_tokens"))
-                    .or_else(|| caps.as_ref().and_then(|caps| caps.max_output_tokens)),
-                pricing: pricing.or_else(|| caps.as_ref().and_then(|caps| caps.pricing.clone())),
+                // Only what the gateway published: stream-time resolution
+                // must be able to tell a payload limit from an alias one.
+                context_window: payload_u32(m, "context_window_tokens"),
+                max_output_tokens: payload_u32(m, "max_output_tokens"),
+                pricing,
                 supports_thinking: ov
                     .supports_thinking
                     .or_else(|| caps.as_ref().and_then(|caps| caps.supports_thinking))
@@ -494,21 +490,65 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
     model.supports_vision_override = ov.supports_vision.or(model.supports_vision_override);
 }
 
-/// The alias wins over a best-effort name match; an explicit override still
-/// wins over both, and the payload over the limits both suggest.
+type CapsKey = (String, String, Option<String>);
+static CAPS_CACHE: LazyLock<Mutex<HashMap<CapsKey, ModelCaps>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The alias wins over the gateway's own provider id, which wins over a unique
+/// exact shipped id. An unresolved alias falls through instead of disabling
+/// the fallbacks. `sends_thinking` runs every frame, so the no-alias path is
+/// cached; an alias is retried because a cold catalog may answer later.
 fn resolved_caps(ov: &OverrideFields, provider_id: &str, model_id: &str) -> Option<ModelCaps> {
-    if let Some(like) = ov.like.as_deref() {
-        return model_directory::resolve_target(like);
+    let key = (
+        provider_id.to_string(),
+        model_id.to_string(),
+        ov.base.clone(),
+    );
+    if ov.like.is_none()
+        && let Ok(cache) = CAPS_CACHE.lock()
+        && let Some(caps) = cache.get(&key)
+    {
+        return Some(caps.clone());
     }
-    if let Some(spec) = routed_spec(provider_id, ov) {
-        // A declared base has no native constructor to route through, so it
-        // has no aperture-usable thinking behavior either.
-        if spec.native().is_none() && plugin::base_spec(spec.slug).is_some() {
-            return None;
-        }
-        return model_directory::caps_for_spec(spec, model_id);
+    let caps = resolve_caps(ov, provider_id, model_id);
+    // Only compiled rows are static: a plugin reload or a warming catalog can
+    // change the others, so those stay uncached.
+    if ov.like.is_none()
+        && let Some(caps) = &caps
+        && matches!(caps.source, Some(CapsSource::Curated { .. }))
+        && let Ok(mut cache) = CAPS_CACHE.lock()
+    {
+        cache.insert(key, caps.clone());
     }
-    model_directory::resolve(model_id)
+    caps
+}
+
+fn resolve_caps(ov: &OverrideFields, provider_id: &str, model_id: &str) -> Option<ModelCaps> {
+    if let Some(like) = ov.like.as_deref()
+        && let Some(caps) = model_directory::resolve_target(like)
+    {
+        return Some(caps);
+    }
+    // An explicit base chose the wire, so its dialect wins even when it has
+    // no row for this model; do not fall through to the provider id.
+    if ov.base.is_some() {
+        return routed_spec(provider_id, ov).and_then(|spec| caps_from_spec(spec, model_id));
+    }
+    if let Some(spec) = ProviderRegistry::get(provider_id) {
+        // A known provider id is authoritative, including its refusal: do not
+        // fall through to a name that may belong to some other declaration.
+        return caps_from_spec(spec, model_id);
+    }
+    model_directory::unique_exact(model_id)
+}
+
+fn caps_from_spec(spec: &'static ProviderSpec, model_id: &str) -> Option<ModelCaps> {
+    // A declared base has no native constructor to route through, so it has
+    // no aperture-usable thinking behavior either.
+    if spec.native().is_none() && plugin::base_spec(spec.slug).is_some() {
+        return None;
+    }
+    model_directory::caps_for_spec(spec, model_id)
 }
 
 /// The provider whose thinking behavior should be asked about. This is a
@@ -642,7 +682,6 @@ fn explain_with(overrides: &Overrides, spec: &str) -> Result<ModelExplanation, M
             model.as_deref().unwrap_or("(provider defaults)")
         ),
         Some(CapsSource::Catalog { slug, model }) => format!("catalog {slug}/{model}"),
-        Some(CapsSource::Heuristic) => "id heuristic".to_string(),
         None => match routed {
             Some(spec) => format!("routed {}", spec.slug),
             None => "provider defaults".to_string(),
@@ -701,9 +740,11 @@ impl Provider for Aperture {
             let auth = auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body =
+            let mut body =
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
+            let fallback = thinking_fields_fallback(model).unwrap_or(ThinkingFallback::None);
+            opts.thinking.apply_thinking(&mut body, model, fallback);
             self.compat
                 .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                 .await
@@ -994,8 +1035,8 @@ mod tests {
         assert_eq!(models[0].id, "ollama/qwen3.6");
         assert_eq!(
             models[0].context_window,
-            Some(65_536),
-            "override beats the payload"
+            Some(1_048_576),
+            "only the payload is stored; overrides apply at request time"
         );
         assert_eq!(models[0].supports_vision, Some(true));
         assert_eq!(models[0].max_output_tokens, Some(262_144));
@@ -1075,8 +1116,11 @@ mod tests {
             Some(222_000),
             "the gateway's deployed limit beats the alias"
         );
-        assert_eq!(models[0].max_output_tokens, Some(128_000));
-        assert_eq!(models[1].context_window, Some(1_050_000));
+        assert!(
+            models[0].max_output_tokens.is_none(),
+            "alias limits are applied at request time, not stored as payload"
+        );
+        assert!(models[1].context_window.is_none());
     }
 
     #[test]
@@ -1103,8 +1147,24 @@ mod tests {
         });
         let models = parse_models(&body, &overrides);
         assert_eq!(models[0].supports_thinking, Some(false));
-        assert_eq!(models[0].context_window, Some(1_000));
-        assert_eq!(models[0].max_output_tokens, Some(500));
+        assert!(models[0].context_window.is_none());
+        assert!(models[0].max_output_tokens.is_none());
+    }
+
+    #[test]
+    fn a_like_limit_applies_when_the_gateway_is_silent() {
+        let overrides = like_override("azureai", "opaque", "openai/gpt-6-sol");
+        let mut model = Model::from_spec("aperture/azureai/opaque").unwrap();
+        apply_adjustments(&mut model, &overrides);
+        assert_eq!(model.family, ModelFamily::Gpt);
+        assert_eq!(model.context_window, 1_050_000);
+        assert_eq!(model.max_output_tokens, Some(128_000));
+    }
+
+    #[test]
+    fn the_gateway_provider_id_outranks_a_shared_name() {
+        let explanation = explain_with(&Overrides::new(), "aperture/openai/gpt-5.4").unwrap();
+        assert_eq!(explanation.capability_source, "curated openai/gpt-5.4");
     }
 
     #[test]
