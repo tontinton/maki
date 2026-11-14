@@ -1,5 +1,6 @@
 use shell_words::split;
 use std::io::{Write, stdout};
+use std::panic;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -451,13 +452,21 @@ impl TerminalMux {
 }
 
 impl TerminalGuard {
-    pub(crate) fn init() -> Result<(Self, ratatui::DefaultTerminal)> {
+    pub(crate) fn init(max_log_bytes: u64) -> Result<(Self, ratatui::DefaultTerminal)> {
         let terminal = ratatui::init();
+        // Runs before the restore hook ratatui::init just chained, so its
+        // errors and the panic message reach the screen.
+        let restore_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            stderr::unmute();
+            restore_hook(info);
+        }));
         write_mux_sequence(PUSH_WINDOW_TITLE_SEQUENCE);
         stdout().execute(EnableBracketedPaste)?;
         stdout().execute(EnableMouseCapture)?;
         enable_focus_change();
         push_keyboard_enhancement();
+        stderr::mute(max_log_bytes);
         Ok((Self, terminal))
     }
 }
@@ -466,6 +475,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let started = Instant::now();
         pop_terminal_modes();
+        stderr::unmute();
         ratatui::restore();
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -556,6 +566,89 @@ fn disable_focus_change() {
 #[cfg(windows)]
 fn disable_focus_change() {}
 
+/// Once a memory pressure event wakes it up, macOS libmalloc prints
+/// "MallocStackLogging: can't turn off malloc stack logging" inside every
+/// fork(), while the child's fd 2 is still our terminal, so the line lands
+/// right on top of the TUI. Our spawns fork because they need setsid, which
+/// only the fork path gives on stable Rust. So for the TUI's whole life fd 2
+/// writes to a file in the logs dir, where a fatal error still leaves a trace.
+/// It gets the terminal back on exit and panic, and the editor is handed
+/// the terminal directly, so the agent's forks stay out of it too. A redirected
+/// stderr was asked for and is left alone.
+///
+/// Built on every unix so Linux CI checks it, but muting only on macOS, the
+/// one place with noise to hide.
+#[cfg(unix)]
+mod stderr {
+    use std::fs::File;
+    use std::io::{IsTerminal, stderr};
+    use std::os::fd::{AsFd, OwnedFd};
+    use std::process::Stdio;
+    use std::sync::OnceLock;
+
+    use maki_storage::log::open_stderr_log;
+    use maki_storage::paths::logs_dir;
+    use rustix::stdio::dup2_stderr;
+
+    struct Fds {
+        terminal: OwnedFd,
+        log: File,
+    }
+
+    static FDS: OnceLock<Option<Fds>> = OnceLock::new();
+
+    fn open(max_log_bytes: u64) -> Option<Fds> {
+        if !cfg!(target_os = "macos") || !stderr().is_terminal() {
+            return None;
+        }
+        let dir = logs_dir().ok()?;
+        let log = open_stderr_log(&dir, max_log_bytes)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    %error,
+                    "cannot open stderr.log, fork noise can reach the TUI"
+                );
+            })
+            .ok()?;
+        let terminal = stderr().as_fd().try_clone_to_owned().ok()?;
+        Some(Fds { terminal, log })
+    }
+
+    pub(super) fn mute(max_log_bytes: u64) {
+        if let Some(fds) = FDS.get_or_init(|| open(max_log_bytes)) {
+            let _ = dup2_stderr(&fds.log);
+        }
+    }
+
+    pub(super) fn unmute() {
+        if let Some(Some(fds)) = FDS.get() {
+            let _ = dup2_stderr(&fds.terminal);
+        }
+    }
+
+    pub(super) fn terminal() -> Stdio {
+        match FDS.get() {
+            Some(Some(fds)) => fds
+                .terminal
+                .try_clone()
+                .map_or_else(|_| Stdio::inherit(), Stdio::from),
+            _ => Stdio::inherit(),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod stderr {
+    use std::process::Stdio;
+
+    pub(super) fn mute(_max_log_bytes: u64) {}
+    pub(super) fn unmute() {}
+    pub(super) fn terminal() -> Stdio {
+        Stdio::inherit()
+    }
+}
+
 fn push_keyboard_enhancement() {
     if let Err(e) = stdout().execute(PushKeyboardEnhancementFlags(
         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
@@ -602,7 +695,7 @@ pub(crate) fn open_in_editor(
         .arg(path)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(stderr::terminal())
         .status();
 
     resume(terminal);

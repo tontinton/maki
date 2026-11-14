@@ -126,6 +126,8 @@ pub struct EventLoopParams {
     pub config: AgentConfig,
     pub ui_config: UiConfig,
     pub input_history_size: usize,
+    /// Caps stderr.log, where the TUI sends fd 2.
+    pub max_log_bytes: u64,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
@@ -710,6 +712,7 @@ impl<'t> EventLoop<'t> {
             config,
             ui_config,
             input_history_size,
+            max_log_bytes: _,
             permissions,
             timeouts,
             exit_on_done,
