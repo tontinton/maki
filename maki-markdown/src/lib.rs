@@ -1,15 +1,22 @@
 //! Markdown parser and width-aware renderer.
 //!
-//! The parser separates two orthogonal axes: `SpanKind` (text vs code) and
-//! `Emphasis` (bold, italic, strike). They compose freely, so `***x***` is
-//! bold+italic, and code inside bold keeps both.
+//! comrak parses. [`parse`] only flattens its tree into what the
+//! renderer lays out: one [`LineBlock`] per source line, and code blocks and
+//! tables as blocks of their own. `SpanKind` (text vs code) and `Emphasis`
+//! (bold, italic, strike) stay orthogonal, so code inside bold keeps both.
 
 pub mod render;
 
+use std::iter;
+use std::mem;
+
+use comrak::nodes::{ListType, NodeValue, Sourcepos};
+use comrak::{Arena, Node, Options, parse_document};
+use unicode_width::UnicodeWidthStr;
+
 const BULLET: &str = "• ";
-const LIST_INDENT_STEP: usize = 2;
-const MAX_HEADING_LEVEL: u8 = 6;
-const FENCE_MIN: usize = 3;
+const QUOTE_MARKER: &str = "> ";
+const MAILTO: &str = "mailto:";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Emphasis {
@@ -100,18 +107,20 @@ impl InlineSpan {
 pub enum BlockKind {
     Paragraph,
     Heading(u8),
-    UnorderedListItem { depth: usize },
-    OrderedListItem { depth: usize, marker: String },
+    ListItem,
     HorizontalRule,
 }
 
-/// Inline delimiters are kept intact here. Emphasis and code parsing is
-/// deferred to `parse_inline` so callers can wrap before deciding styles.
+/// One source line. `prefix` holds the quote and list markers in front of it,
+/// or blanks of the same width on an item's later lines.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LineBlock {
     pub kind: BlockKind,
-    pub inline: String,
+    pub prefix: String,
+    pub spans: Vec<InlineSpan>,
 }
+
+pub type Cell = Vec<InlineSpan>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Block {
@@ -120,698 +129,315 @@ pub enum Block {
         lang: String,
         code: String,
     },
+    /// The first row is the header.
     Table {
-        rows: Vec<Vec<String>>,
-        header_end: usize,
+        rows: Vec<Vec<Cell>>,
     },
 }
 
 pub fn parse(text: &str) -> Vec<Block> {
-    let mut blocks = Vec::new();
-    let mut fences = CodeFences { text, pos: 0 };
-    for (base, fence) in &mut fences {
-        let before = text[base..base + fence.before_end].trim_end_matches('\n');
-        if !before.is_empty() {
-            blocks.extend(split_normal_blocks(before));
-        }
-        blocks.push(Block::Code {
-            lang: fence.lang.to_owned(),
-            code: fence.code.to_owned(),
-        });
-    }
-    let rest = &text[fences.pos..];
-    if !rest.is_empty() {
-        blocks.extend(split_normal_blocks(rest));
-    }
-    blocks
+    let arena = Arena::new();
+    let root = parse_document(&arena, text, &options());
+    let mut builder = Builder::default();
+    builder.block(root);
+    builder.finish()
 }
 
-/// Moves `offset` back to the opening fence when it lands inside a code block.
-/// Rendering from the middle of a block would turn its code into prose. It
-/// walks the same fences as [`parse`], so the two always agree on where
-/// blocks are.
-pub fn code_block_start(text: &str, offset: usize) -> usize {
-    for (base, fence) in (CodeFences { text, pos: 0 }) {
-        let open = base + fence.before_end;
-        if offset <= open {
-            break;
-        }
-        if offset < base + fence.block_end {
-            return open;
-        }
-    }
-    offset
+/// Moves `offset`, the start of a line, back to where rendering can begin
+/// without changing what the rest means. A paragraph can start at any of its
+/// lines. Anything else starts at its outermost block: code read from the
+/// middle turns into prose, a nested item loses its depth, and a fence inside
+/// a list or a quote only closes when read from there.
+pub fn render_start(text: &str, offset: usize) -> usize {
+    let line = line_starts(text)
+        .take_while(|&start| start <= offset)
+        .count();
+    let arena = Arena::new();
+    let root = parse_document(&arena, text, &options());
+    root.children()
+        .map(|block| block.data())
+        .find(|block| block.sourcepos.start.line < line && line <= block.sourcepos.end.line)
+        .filter(|block| !matches!(block.value, NodeValue::Paragraph))
+        .and_then(|block| line_starts(text).nth(block.sourcepos.start.line - 1))
+        .unwrap_or(offset)
 }
 
-/// Yields each fence with its base offset, because [`CodeFence`] positions
-/// count from where the search started, not from the start of the text.
-struct CodeFences<'a> {
-    text: &'a str,
-    pos: usize,
+fn options() -> Options<'static> {
+    let mut options = Options::default();
+    options.extension.table = true;
+    options.extension.strikethrough = true;
+    options.extension.cjk_friendly_emphasis = true;
+    options
 }
 
-impl<'a> Iterator for CodeFences<'a> {
-    type Item = (usize, CodeFence<'a>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let rest = &self.text[self.pos..];
-        let fence = find_code_fence(rest)?;
-        let base = self.pos;
-        let after = &rest[fence.block_end..];
-        self.pos += fence.block_end + after.len() - after.trim_start_matches('\n').len();
-        Some((base, fence))
-    }
-}
-
-fn split_normal_blocks(text: &str) -> Vec<Block> {
-    let mut lines_with_offsets: Vec<(usize, &str)> = Vec::new();
-    let mut offset = 0;
-    for line in text.split('\n') {
-        lines_with_offsets.push((offset, line));
-        offset += line.len() + 1;
-    }
-
-    let mut blocks: Vec<Block> = Vec::new();
-    let mut normal_start: Option<usize> = None;
-    let mut i = 0;
-
-    while i < lines_with_offsets.len() {
-        let (_, line) = lines_with_offsets[i];
-        if is_table_row(line) {
-            let table_start = i;
-            let header_cols = parse_table_cells(line).len();
-            let mut sep_idx = None;
-            let mut j = i;
-            while j < lines_with_offsets.len() && is_table_row(lines_with_offsets[j].1) {
-                if sep_idx.is_none()
-                    && is_separator_row(lines_with_offsets[j].1)
-                    && parse_table_cells(lines_with_offsets[j].1).len() >= header_cols
-                {
-                    sep_idx = Some(j - table_start);
-                }
-                j += 1;
-            }
-            if let Some(si) = sep_idx
-                && j - table_start >= 2
-            {
-                if let Some(ns) = normal_start.take() {
-                    let start = lines_with_offsets[ns].0;
-                    let end = lines_with_offsets[table_start].0;
-                    let slice = text[start..end].trim_matches('\n');
-                    if !slice.is_empty() {
-                        blocks.push(Block::Lines(lines_to_blocks(slice)));
-                    }
-                }
-
-                let table_end = if j < lines_with_offsets.len()
-                    && j == lines_with_offsets.len() - 1
-                    && lines_with_offsets[j].1.trim_start().starts_with('|')
-                {
-                    j + 1
-                } else {
-                    j
-                };
-
-                let mut rows = Vec::new();
-                for (k, &(_, line)) in lines_with_offsets[table_start..table_end]
-                    .iter()
-                    .enumerate()
-                {
-                    if k != si {
-                        rows.push(parse_table_cells(line));
-                    }
-                }
-                blocks.push(Block::Table {
-                    rows,
-                    header_end: si,
-                });
-                i = table_end;
-                continue;
-            }
-        }
-
-        if normal_start.is_none() {
-            normal_start = Some(i);
-        }
-        i += 1;
-    }
-
-    if let Some(ns) = normal_start {
-        let start = lines_with_offsets[ns].0;
-        let content = text[start..].trim_start_matches('\n');
-        if !content.is_empty() {
-            blocks.push(Block::Lines(lines_to_blocks(content)));
-        }
-    }
-
-    if blocks.is_empty() {
-        blocks.push(Block::Lines(lines_to_blocks(text)));
-    }
-
-    blocks
-}
-
-fn lines_to_blocks(text: &str) -> Vec<LineBlock> {
-    text.split('\n').map(classify_line).collect()
-}
-
-fn classify_line(line: &str) -> LineBlock {
-    if is_horizontal_rule(line) {
-        return LineBlock {
-            kind: BlockKind::HorizontalRule,
-            inline: String::new(),
-        };
-    }
-    if let Some((level, content)) = parse_heading(line) {
-        return LineBlock {
-            kind: BlockKind::Heading(level),
-            inline: content.to_owned(),
-        };
-    }
-    if let Some((indent_spaces, rest)) = parse_unordered_marker(line) {
-        return LineBlock {
-            kind: BlockKind::UnorderedListItem {
-                depth: indent_spaces / LIST_INDENT_STEP,
-            },
-            inline: rest.to_owned(),
-        };
-    }
-    if let Some((indent_spaces, marker, rest)) = parse_ordered_marker(line) {
-        return LineBlock {
-            kind: BlockKind::OrderedListItem {
-                depth: indent_spaces / LIST_INDENT_STEP,
-                marker: marker.to_owned(),
-            },
-            inline: rest.to_owned(),
-        };
-    }
-    LineBlock {
-        kind: BlockKind::Paragraph,
-        inline: line.to_owned(),
-    }
-}
-
-pub fn block_prefix(kind: &BlockKind) -> Option<String> {
-    match kind {
-        BlockKind::UnorderedListItem { depth } => {
-            Some(format!("{}{BULLET}", " ".repeat(depth * LIST_INDENT_STEP)))
-        }
-        BlockKind::OrderedListItem { depth, marker } => {
-            Some(format!("{}{marker} ", " ".repeat(depth * LIST_INDENT_STEP)))
-        }
-        BlockKind::Paragraph | BlockKind::Heading(_) | BlockKind::HorizontalRule => None,
-    }
-}
-
-fn parse_heading(line: &str) -> Option<(u8, &str)> {
-    let hashes = line.bytes().take_while(|&b| b == b'#').count();
-    if hashes == 0 || hashes > MAX_HEADING_LEVEL as usize {
-        return None;
-    }
-    let rest = &line[hashes..];
-    let level = hashes as u8;
-    if let Some(stripped) = rest.strip_prefix(' ') {
-        Some((level, stripped.trim_end()))
-    } else if rest.is_empty() {
-        Some((level, ""))
-    } else {
-        None
-    }
-}
-
-fn parse_unordered_marker(line: &str) -> Option<(usize, &str)> {
-    let indent = line.bytes().take_while(|&b| b == b' ').count();
-    let rest = &line[indent..];
-    let marker = rest.as_bytes().first()?;
-    if !matches!(marker, b'-' | b'*' | b'+') {
-        return None;
-    }
-    let after = &rest[1..];
-    let stripped = after.strip_prefix(' ')?;
-    Some((indent, stripped))
-}
-
-fn parse_ordered_marker(line: &str) -> Option<(usize, &str, &str)> {
-    let indent = line.bytes().take_while(|&b| b == b' ').count();
-    let rest = &line[indent..];
-    let digits_end = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if digits_end == 0 {
-        return None;
-    }
-    let after_digits = &rest[digits_end..];
-    if !after_digits.starts_with(". ") {
-        return None;
-    }
-    Some((indent, &rest[..=digits_end], &after_digits[2..]))
-}
-
-fn is_horizontal_rule(line: &str) -> bool {
-    let trimmed = line.trim();
-    let first = match trimmed.as_bytes().first() {
-        Some(b'-' | b'*' | b'_') => trimmed.as_bytes()[0],
-        _ => return false,
-    };
-    trimmed.bytes().all(|b| b == first || b == b' ')
-        && trimmed.bytes().filter(|&b| b == first).count() >= 3
-}
-
-fn is_table_row(line: &str) -> bool {
-    let t = line.trim();
-    t.starts_with('|') && t.ends_with('|') && t.matches('|').count() >= 2
-}
-
-fn is_separator_row(line: &str) -> bool {
-    if !is_table_row(line) {
-        return false;
-    }
-    parse_table_cells(line)
-        .iter()
-        .all(|cell| cell.bytes().all(|b| matches!(b, b'-' | b':')) && cell.contains('-'))
-}
-
-fn parse_table_cells(line: &str) -> Vec<String> {
-    let t = line.trim();
-    let inner = t.strip_prefix('|').unwrap_or(t);
-    let inner = inner.strip_suffix('|').unwrap_or(inner);
-
-    let bytes = inner.as_bytes();
-    let mut cells = Vec::new();
-    let mut current = String::new();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'`' {
-            let run_len = count_backtick_run(bytes, i);
-            if let Some((_, _, close_end)) = find_code_span_close(bytes, i, run_len) {
-                current.push_str(&inner[i..close_end]);
-                i = close_end;
-            } else {
-                current.push_str(&inner[i..]);
-                i = bytes.len();
-            }
-        } else if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
-            current.push('|');
-            i += 2;
-        } else if bytes[i] == b'|' {
-            cells.push(current.trim().to_owned());
-            current.clear();
-            i += 1;
-        } else {
-            let ch = inner[i..].chars().next().unwrap();
-            current.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-
-    cells.push(current.trim().to_owned());
-    cells
-}
-
-struct CodeFence<'a> {
-    before_end: usize,
-    lang: &'a str,
-    code: &'a str,
-    block_end: usize,
-}
-
-fn find_code_fence(text: &str) -> Option<CodeFence<'_>> {
+/// Where each line starts. A lone `\r` ends a line too, as it does for comrak.
+fn line_starts(text: &str) -> impl Iterator<Item = usize> {
     let bytes = text.as_bytes();
-    let mut search_from = 0;
-    while search_from < bytes.len() {
-        let pos = text[search_from..].find("```")?;
-        let abs = search_from + pos;
-        if abs != 0 && bytes[abs - 1] != b'\n' {
-            search_from = abs + FENCE_MIN;
-            continue;
-        }
-        let fence_len = FENCE_MIN
-            + bytes[abs + FENCE_MIN..]
-                .iter()
-                .take_while(|&&b| b == b'`')
-                .count();
-        let after_ticks = abs + fence_len;
-        let Some(nl) = text[after_ticks..].find('\n') else {
-            search_from = abs + fence_len;
-            continue;
-        };
-        let info = &text[after_ticks..after_ticks + nl];
-        if info.contains('`') {
-            search_from = abs + fence_len;
-            continue;
-        }
-        let lang = info.trim();
-        let code_start = after_ticks + nl + 1;
-        let fence_str = "`".repeat(fence_len);
-        let mut offset = 0;
-        let mut close: Option<(usize, usize)> = None;
-        for line in text[code_start..].split('\n') {
-            let trimmed = line.trim_end();
-            if trimmed.len() >= fence_len
-                && trimmed.starts_with(&fence_str)
-                && !trimmed[fence_len..].starts_with('`')
-            {
-                close = Some((offset, line.len()));
-                break;
+    let ends = bytes.iter().enumerate().filter(|&(at, &byte)| {
+        byte == b'\n' || (byte == b'\r' && bytes.get(at + 1) != Some(&b'\n'))
+    });
+    iter::once(0).chain(ends.map(|(at, _)| at + 1))
+}
+
+/// What the lines inside a quote or a list item start with.
+enum Container {
+    Quote,
+    Item { marker: String, shown: bool },
+}
+
+#[derive(Default)]
+struct Builder {
+    blocks: Vec<Block>,
+    lines: Vec<LineBlock>,
+    line: Option<LineBlock>,
+    containers: Vec<Container>,
+    heading: Option<u8>,
+    /// The source line the last content ended on, to tell whether a blank
+    /// line separates it from the next block.
+    content_end_line: usize,
+}
+
+impl Builder {
+    fn block(&mut self, node: Node<'_>) {
+        let ast = node.data();
+        let at = ast.sourcepos;
+        match &ast.value {
+            NodeValue::Paragraph => {
+                self.start_block(at);
+                self.inlines(node, Emphasis::default());
+                self.close_line();
             }
-            offset += line.len() + 1;
-        }
-        let (code, block_end) = if let Some((close_off, close_line_len)) = close {
-            let raw_end = code_start + close_off;
-            let code_end = if raw_end > code_start && bytes[raw_end - 1] == b'\n' {
-                raw_end - 1
-            } else {
-                raw_end
-            };
-            let trailing_start = code_start + close_off + fence_len;
-            let trailing_end = code_start + close_off + close_line_len;
-            let block_end = if text[trailing_start..trailing_end].trim().is_empty() {
-                trailing_end
-            } else {
-                trailing_start
-            };
-            (&text[code_start..code_end], block_end)
-        } else {
-            (&text[code_start..], text.len())
-        };
-        return Some(CodeFence {
-            before_end: abs,
-            lang,
-            code,
-            block_end,
-        });
-    }
-    None
-}
-
-/// Emphasis composes additively. Code spans are atomic and carry the
-/// surrounding emphasis as a separate modifier.
-pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
-    parse_inline_impl(text, Emphasis::default(), ParseMode::WithCode)
-}
-
-/// `EmphasisOnly` is for rescanning a region the outer pass already split on
-/// code, so we don't re-recognize backticks we've already consumed.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ParseMode {
-    WithCode,
-    EmphasisOnly,
-}
-
-fn parse_inline_impl(text: &str, base: Emphasis, mode: ParseMode) -> Vec<InlineSpan> {
-    let bytes = text.as_bytes();
-    let mut spans = Vec::new();
-    let mut pos = 0;
-    let mut plain_start = 0;
-
-    let flush_plain =
-        |spans: &mut Vec<InlineSpan>, plain: &str, base: Emphasis, mode: ParseMode| {
-            if plain.is_empty() {
+            NodeValue::Heading(heading) => {
+                self.start_block(at);
+                self.heading = Some(heading.level);
+                self.line = Some(self.new_line());
+                self.inlines(node, Emphasis::default());
+                self.close_line();
+                self.heading = None;
+            }
+            NodeValue::BlockQuote => {
+                self.start_block(at);
+                self.containers.push(Container::Quote);
+                self.children(node);
+                self.containers.pop();
                 return;
             }
-            match mode {
-                ParseMode::WithCode => {
-                    spans.extend(parse_inline_impl(plain, base, ParseMode::EmphasisOnly))
+            NodeValue::List(list) => {
+                self.start_block(at);
+                let mut number = (list.list_type == ListType::Ordered).then_some(list.start);
+                for item in node.children() {
+                    let marker = match &mut number {
+                        Some(number) => {
+                            let marker = format!("{number}. ");
+                            *number += 1;
+                            marker
+                        }
+                        None => BULLET.to_owned(),
+                    };
+                    self.containers.push(Container::Item {
+                        marker,
+                        shown: false,
+                    });
+                    self.children(item);
+                    self.close_line();
+                    self.show_markers();
+                    self.containers.pop();
                 }
-                ParseMode::EmphasisOnly => spans.push(InlineSpan::text(plain.to_owned(), base)),
+                return;
             }
-        };
-
-    while pos < bytes.len() {
-        if mode == ParseMode::WithCode && bytes[pos] == b'`' {
-            let run_len = count_backtick_run(bytes, pos);
-            if let Some((cs, ce, close_end)) = find_code_span_close(bytes, pos, run_len)
-                && ce > cs
-            {
-                flush_plain(&mut spans, &text[plain_start..pos], base, mode);
-                spans.push(InlineSpan::code(text[cs..ce].to_owned(), base));
-                pos = close_end;
-                plain_start = pos;
-                continue;
+            NodeValue::CodeBlock(code) => {
+                self.open_leaf(at);
+                let code_text = code.literal.strip_suffix('\n').unwrap_or(&code.literal);
+                self.blocks.push(Block::Code {
+                    lang: code.info.trim().to_owned(),
+                    code: code_text.to_owned(),
+                });
             }
-            pos += run_len;
-            continue;
-        }
-
-        let outcome = match bytes[pos] {
-            b'*' => try_star_emphasis(bytes, pos),
-            b'~' => try_strike_emphasis(bytes, pos),
-            b'_' => try_underscore_emphasis(bytes, pos),
-            _ => InlineMatch::None,
-        };
-
-        match outcome {
-            InlineMatch::Found {
-                emphasis,
-                content_start,
-                close,
-                delim_len,
-            } => {
-                flush_plain(&mut spans, &text[plain_start..pos], base, mode);
-                let inner = base.merge(emphasis);
-                spans.extend(parse_inline_impl(&text[content_start..close], inner, mode));
-                pos = close + delim_len;
-                plain_start = pos;
-            }
-            InlineMatch::Skip(n) => pos += n,
-            InlineMatch::None => pos += 1,
-        }
-    }
-
-    if plain_start < bytes.len() {
-        flush_plain(&mut spans, &text[plain_start..], base, mode);
-    }
-    spans
-}
-
-enum InlineMatch {
-    Found {
-        emphasis: Emphasis,
-        content_start: usize,
-        close: usize,
-        delim_len: usize,
-    },
-    /// `**` with no closer: skip past the whole open run, not just one byte,
-    /// otherwise the second `*` would re-trigger a match.
-    Skip(usize),
-    None,
-}
-
-fn count_run(bytes: &[u8], pos: usize, ch: u8) -> usize {
-    bytes[pos..].iter().take_while(|&&b| b == ch).count()
-}
-
-fn count_backtick_run(bytes: &[u8], pos: usize) -> usize {
-    count_run(bytes, pos, b'`')
-}
-
-fn find_code_span_close(bytes: &[u8], pos: usize, run_len: usize) -> Option<(usize, usize, usize)> {
-    let content_start = pos + run_len;
-    let mut i = content_start;
-    while i < bytes.len() {
-        if bytes[i] == b'`' {
-            let close_run = count_backtick_run(bytes, i);
-            if close_run == run_len {
-                return Some((content_start, i, i + run_len));
-            }
-            i += close_run;
-        } else {
-            i += 1;
-        }
-    }
-    None
-}
-
-fn find_emphasis_close(bytes: &[u8], start: usize, delim: &[u8]) -> Option<usize> {
-    let mut pos = start;
-    while pos + delim.len() <= bytes.len() {
-        if bytes[pos] == b'`' {
-            let run = count_backtick_run(bytes, pos);
-            if let Some((_, _, close_end)) = find_code_span_close(bytes, pos, run) {
-                pos = close_end;
-            } else {
-                pos += run;
-            }
-            continue;
-        }
-        if bytes[pos..].starts_with(delim) {
-            return Some(pos);
-        }
-        pos += 1;
-    }
-    None
-}
-
-fn is_word_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-fn find_italic_close(bytes: &[u8], start: usize, ch: u8) -> Option<usize> {
-    let mut pos = start;
-    while pos < bytes.len() {
-        if bytes[pos] == b'`' {
-            let run = count_backtick_run(bytes, pos);
-            if let Some((_, _, close_end)) = find_code_span_close(bytes, pos, run) {
-                pos = close_end;
-            } else {
-                pos += run;
-            }
-            continue;
-        }
-        if bytes[pos] == ch {
-            if (ch == b'*' && pos + 1 < bytes.len() && bytes[pos + 1] == b'*')
-                || (pos > 0 && bytes[pos - 1] == ch)
-            {
-                pos += 1;
-                continue;
-            }
-            if pos > start && !bytes[pos - 1].is_ascii_whitespace() {
-                if ch == b'_' && pos + 1 < bytes.len() && is_word_char(bytes[pos + 1]) {
-                    pos += 1;
-                    continue;
+            NodeValue::HtmlBlock(html) => {
+                self.start_block(at);
+                for line in html.literal.lines() {
+                    self.push_text(line, Emphasis::default());
+                    self.close_line();
                 }
-                return Some(pos);
+            }
+            NodeValue::ThematicBreak => {
+                self.start_block(at);
+                self.show_markers();
+                self.push_empty(BlockKind::HorizontalRule);
+            }
+            NodeValue::Table(_) => {
+                self.open_leaf(at);
+                let rows = node
+                    .children()
+                    .map(|row| row.children().map(|cell| self.cell(cell)).collect())
+                    .collect();
+                self.blocks.push(Block::Table { rows });
+            }
+            _ => {
+                self.children(node);
+                return;
             }
         }
-        pos += 1;
+        self.content_end_line = at.end.line;
     }
-    None
-}
 
-fn is_valid_italic_open(bytes: &[u8], pos: usize) -> bool {
-    if pos + 1 >= bytes.len() || bytes[pos + 1].is_ascii_whitespace() {
-        return false;
-    }
-    let ch = bytes[pos];
-    if ch == b'*' {
-        if bytes[pos + 1] == b'*' {
-            return false;
-        }
-        if pos > 0 && bytes[pos - 1] == b'*' {
-            return false;
-        }
-        if pos > 0 && is_word_char(bytes[pos - 1]) {
-            return false;
+    fn children(&mut self, node: Node<'_>) {
+        for child in node.children() {
+            self.block(child);
         }
     }
-    !(ch == b'_' && pos > 0 && is_word_char(bytes[pos - 1]))
-}
 
-fn is_valid_strike_open(bytes: &[u8], pos: usize) -> bool {
-    if pos + 2 >= bytes.len() {
-        return false;
+    fn cell(&mut self, cell: Node<'_>) -> Cell {
+        self.line = Some(self.new_line());
+        self.inlines(cell, Emphasis::default());
+        self.line.take().map(|line| line.spans).unwrap_or_default()
     }
-    if bytes[pos + 2] == b'~' {
-        return false;
-    }
-    if pos > 0 && bytes[pos - 1] == b'~' {
-        return false;
-    }
-    !bytes[pos + 2].is_ascii_whitespace()
-}
 
-fn find_strike_close(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut pos = start;
-    while pos + 1 < bytes.len() {
-        if bytes[pos] == b'`' {
-            let run = count_backtick_run(bytes, pos);
-            if let Some((_, _, close_end)) = find_code_span_close(bytes, pos, run) {
-                pos = close_end;
-            } else {
-                pos += run;
-            }
-            continue;
-        }
-        if bytes[pos] == b'~' && bytes[pos + 1] == b'~' {
-            if pos + 2 < bytes.len() && bytes[pos + 2] == b'~' {
-                pos += 1;
-                continue;
-            }
-            if pos > start && bytes[pos - 1] == b'~' {
-                pos += 1;
-                continue;
-            }
-            if pos > start && !bytes[pos - 1].is_ascii_whitespace() {
-                return Some(pos);
+    fn inlines(&mut self, node: Node, emphasis: Emphasis) {
+        for child in node.children() {
+            let ast = child.data();
+            match &ast.value {
+                NodeValue::Text(text) => self.push_text(text, emphasis),
+                NodeValue::Code(code) => {
+                    let span = InlineSpan::code(code.literal.clone(), emphasis);
+                    self.spans().push(span);
+                }
+                NodeValue::SoftBreak | NodeValue::LineBreak => self.close_line(),
+                NodeValue::Emph => self.inlines(child, emphasis.merge(Emphasis::ITALIC)),
+                NodeValue::Strong => self.inlines(child, emphasis.merge(Emphasis::BOLD)),
+                NodeValue::Strikethrough => self.inlines(child, emphasis.merge(Emphasis::STRIKE)),
+                NodeValue::Link(link) | NodeValue::Image(link) => {
+                    self.inlines(child, emphasis);
+                    if !is_autolink(child, &link.url) {
+                        self.push_text(&format!(" ({})", link.url), emphasis);
+                    }
+                }
+                NodeValue::HtmlInline(html) => {
+                    for (index, line) in html.split('\n').enumerate() {
+                        if index > 0 {
+                            self.close_line();
+                        }
+                        self.push_text(line, emphasis);
+                    }
+                }
+                _ => self.inlines(child, emphasis),
             }
         }
-        pos += 1;
     }
-    None
-}
 
-fn try_star_emphasis(bytes: &[u8], pos: usize) -> InlineMatch {
-    let run = count_run(bytes, pos, b'*');
-    if run >= 3
-        && let Some(close) = find_emphasis_close(bytes, pos + 3, b"***")
-        && close > pos + 3
-    {
-        return InlineMatch::Found {
-            emphasis: Emphasis::BOLD_ITALIC,
-            content_start: pos + 3,
-            close,
-            delim_len: 3,
+    /// Ends the open line, and keeps a blank source line before the block as
+    /// an empty line.
+    fn start_block(&mut self, at: Sourcepos) {
+        self.close_line();
+        if self.content_end_line > 0 && at.start.line > self.content_end_line + 1 {
+            self.push_empty(BlockKind::Paragraph);
+            self.content_end_line = at.start.line - 1;
+        }
+    }
+
+    /// Code and tables are blocks of their own, so the lines before them end
+    /// here.
+    fn open_leaf(&mut self, at: Sourcepos) {
+        self.start_block(at);
+        self.show_markers();
+        self.flush_lines();
+    }
+
+    fn push_empty(&mut self, kind: BlockKind) {
+        self.lines.push(LineBlock {
+            kind,
+            prefix: String::new(),
+            spans: Vec::new(),
+        });
+    }
+
+    /// An item that holds no text of its own, or opens with a code block or a
+    /// table, still gets a line for its marker.
+    fn show_markers(&mut self) {
+        let unshown = self
+            .containers
+            .iter()
+            .any(|container| matches!(container, Container::Item { shown: false, .. }));
+        if unshown {
+            let line = self.new_line();
+            self.lines.push(line);
+        }
+    }
+
+    fn new_line(&mut self) -> LineBlock {
+        let mut prefix = String::new();
+        let mut in_item = false;
+        for container in &mut self.containers {
+            match container {
+                Container::Quote => prefix.push_str(QUOTE_MARKER),
+                Container::Item { marker, shown } => {
+                    in_item = true;
+                    if mem::replace(shown, true) {
+                        prefix.extend(iter::repeat_n(' ', marker.width()));
+                    } else {
+                        prefix.push_str(marker);
+                    }
+                }
+            }
+        }
+        let kind = match self.heading {
+            Some(level) => BlockKind::Heading(level),
+            None if in_item => BlockKind::ListItem,
+            None => BlockKind::Paragraph,
         };
-    }
-    if run >= 2 {
-        if let Some(close) = find_emphasis_close(bytes, pos + 2, b"**")
-            && close > pos + 2
-        {
-            return InlineMatch::Found {
-                emphasis: Emphasis::BOLD,
-                content_start: pos + 2,
-                close,
-                delim_len: 2,
-            };
+        LineBlock {
+            kind,
+            prefix,
+            spans: Vec::new(),
         }
-        return InlineMatch::Skip(2);
     }
-    if is_valid_italic_open(bytes, pos)
-        && let Some(close) = find_italic_close(bytes, pos + 1, b'*')
-        && close > pos + 1
-    {
-        return InlineMatch::Found {
-            emphasis: Emphasis::ITALIC,
-            content_start: pos + 1,
-            close,
-            delim_len: 1,
-        };
+
+    fn spans(&mut self) -> &mut Vec<InlineSpan> {
+        let line = self.line.take().unwrap_or_else(|| self.new_line());
+        &mut self.line.insert(line).spans
     }
-    InlineMatch::Skip(1)
+
+    fn push_text(&mut self, text: &str, emphasis: Emphasis) {
+        let spans = self.spans();
+        match spans.last_mut() {
+            Some(last) if last.kind == SpanKind::Text && last.emphasis == emphasis => {
+                last.text.push_str(text);
+            }
+            _ => spans.push(InlineSpan::text(text, emphasis)),
+        }
+    }
+
+    fn close_line(&mut self) {
+        if let Some(line) = self.line.take() {
+            self.lines.push(line);
+        }
+    }
+
+    fn flush_lines(&mut self) {
+        self.close_line();
+        if !self.lines.is_empty() {
+            self.blocks.push(Block::Lines(mem::take(&mut self.lines)));
+        }
+    }
+
+    fn finish(mut self) -> Vec<Block> {
+        self.flush_lines();
+        self.blocks
+    }
 }
 
-fn try_strike_emphasis(bytes: &[u8], pos: usize) -> InlineMatch {
-    if pos + 1 >= bytes.len() || bytes[pos + 1] != b'~' {
-        return InlineMatch::None;
+/// `<https://x>` and `<a@b.c>` already show their target as their text.
+fn is_autolink(link: Node<'_>, url: &str) -> bool {
+    let mut children = link.children();
+    let (Some(only), None) = (children.next(), children.next()) else {
+        return false;
+    };
+    match &only.data().value {
+        NodeValue::Text(text) => {
+            text.as_ref() == url || url.strip_prefix(MAILTO) == Some(text.as_ref())
+        }
+        _ => false,
     }
-    if is_valid_strike_open(bytes, pos)
-        && let Some(close) = find_strike_close(bytes, pos + 2)
-        && close > pos + 2
-    {
-        return InlineMatch::Found {
-            emphasis: Emphasis::STRIKE,
-            content_start: pos + 2,
-            close,
-            delim_len: 2,
-        };
-    }
-    InlineMatch::Skip(2)
-}
-
-fn try_underscore_emphasis(bytes: &[u8], pos: usize) -> InlineMatch {
-    if !is_valid_italic_open(bytes, pos) {
-        return InlineMatch::None;
-    }
-    if let Some(close) = find_italic_close(bytes, pos + 1, b'_')
-        && close > pos + 1
-    {
-        return InlineMatch::Found {
-            emphasis: Emphasis::ITALIC,
-            content_start: pos + 1,
-            close,
-            delim_len: 1,
-        };
-    }
-    InlineMatch::Skip(1)
 }
 
 #[cfg(test)]
@@ -819,229 +445,144 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    fn span_text(spans: &[InlineSpan]) -> String {
-        spans.iter().map(|s| s.text.as_str()).collect()
+    const FENCED: &str = "intro\n```rust\nlet a = 1;\n```\nafter";
+    const FOUR_BACKTICK_FENCE: &str = "````\n```\ninner\n```\n````";
+    const FENCE_IN_ITEM: &str = "- item\n\n  ```rust\n  let x = 1;\n  ```\n";
+
+    fn lines(text: &str) -> Vec<LineBlock> {
+        parse(text)
+            .into_iter()
+            .flat_map(|block| match block {
+                Block::Lines(lines) => lines,
+                other => panic!("expected lines, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn visible(line: &LineBlock) -> String {
+        line.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    fn spans(text: &str) -> Vec<InlineSpan> {
+        lines(text).remove(0).spans
+    }
+
+    #[test_case("a\nb\nc", &["a", "b", "c"] ; "soft_breaks_keep_one_line_each")]
+    #[test_case("a\n\nb", &["a", "", "b"] ; "blank_line_between_paragraphs")]
+    #[test_case("# H\npara", &["H", "para"] ; "no_blank_line_after_a_tight_heading")]
+    #[test_case("- a\n- b\n\n- c", &["a", "b", "", "c"] ; "blank_line_inside_a_loose_list")]
+    #[test_case("para\n\n- a", &["para", "", "a"] ; "blank_line_before_a_tight_list")]
+    #[test_case("> q1\n>\n> q2", &["q1", "", "q2"] ; "blank_quote_line")]
+    #[test_case("<div>\nhi\n</div>", &["<div>", "hi", "</div>"] ; "html_stays_text")]
+    #[test_case("x <a\nhref=y> z", &["x <a", "href=y> z"] ; "inline_html_keeps_its_line_break")]
+    fn parse_keeps_source_lines(text: &str, want: &[&str]) {
+        let got: Vec<String> = lines(text).iter().map(visible).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test_case("- a\n  - b", &["• ", "  • "] ; "nested_bullets")]
+    #[test_case("1. one\n   cont\n   1. nested\n2. two", &["1. ", "   ", "   1. ", "2. "] ; "ordered_items_and_continuation")]
+    #[test_case("1. a\n1. b", &["1. ", "2. "] ; "ordered_items_count_up")]
+    #[test_case("> - a\n>   b", &["> • ", ">   "] ; "item_inside_a_quote")]
+    #[test_case("- ", &["• "] ; "empty_item_keeps_its_marker")]
+    #[test_case("* ---", &["• ", ""] ; "marker_comes_before_a_rule_in_its_item")]
+    fn parse_prefixes_follow_quotes_and_items(text: &str, want: &[&str]) {
+        let got: Vec<String> = lines(text).into_iter().map(|line| line.prefix).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test_case("#", &[1] ; "bare_hash")]
+    #[test_case("### x", &[3] ; "level_three")]
+    #[test_case("a\nb\n---", &[2, 2] ; "every_line_of_a_setext_heading")]
+    fn parse_heading_level(text: &str, levels: &[u8]) {
+        let kinds: Vec<BlockKind> = lines(text).into_iter().map(|line| line.kind).collect();
+        let want: Vec<BlockKind> = levels.iter().copied().map(BlockKind::Heading).collect();
+        assert_eq!(kinds, want);
     }
 
     #[test]
-    fn parse_inline_plain_text_yields_single_text_span() {
-        let spans = parse_inline("hello world");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].text, "hello world");
-        assert_eq!(spans[0].kind, SpanKind::Text);
-        assert!(spans[0].emphasis.is_empty());
-    }
-
-    #[test]
-    fn parse_inline_bold_emits_bold_span_and_strips_delimiters() {
-        let spans = parse_inline("a **b** c");
-        assert_eq!(spans.len(), 3);
-        assert_eq!(spans[0].text, "a ");
-        assert!(spans[0].emphasis.is_empty());
-        assert_eq!(spans[1].text, "b");
-        assert_eq!(spans[1].emphasis, Emphasis::BOLD);
-        assert_eq!(spans[2].text, " c");
-    }
-
-    #[test_case("*x*"; "star")]
-    #[test_case("_y_"; "underscore")]
-    fn parse_inline_italic_variants(input: &str) {
-        let spans = parse_inline(input);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].emphasis, Emphasis::ITALIC);
-    }
-
-    #[test]
-    fn parse_inline_triple_star_is_bold_italic() {
-        let spans = parse_inline("***hi***");
-        assert_eq!(spans[0].emphasis, Emphasis::BOLD_ITALIC);
-        assert_eq!(spans[0].text, "hi");
-    }
-
-    #[test]
-    fn parse_inline_code_span_keeps_kind() {
-        let spans = parse_inline("a `b()` c");
-        assert_eq!(spans[1].kind, SpanKind::Code);
-        assert_eq!(spans[1].text, "b()");
-        assert!(spans[1].emphasis.is_empty());
-    }
-
-    #[test]
-    fn parse_inline_strikethrough() {
-        let spans = parse_inline("~~gone~~");
-        assert_eq!(spans[0].emphasis, Emphasis::STRIKE);
-        assert_eq!(spans[0].text, "gone");
-    }
-
-    #[test]
-    fn parse_inline_code_inside_bold_preserves_both_axes() {
-        let spans = parse_inline("**bold `code` bold**");
-        assert_eq!(spans.len(), 3);
-        assert_eq!(spans[0].text, "bold ");
-        assert_eq!(spans[0].emphasis, Emphasis::BOLD);
-        assert_eq!(spans[0].kind, SpanKind::Text);
-        assert_eq!(spans[1].text, "code");
-        assert_eq!(spans[1].emphasis, Emphasis::BOLD);
-        assert_eq!(spans[1].kind, SpanKind::Code);
-        assert_eq!(spans[2].text, " bold");
-        assert_eq!(spans[2].emphasis, Emphasis::BOLD);
-    }
-
-    #[test]
-    fn parse_inline_bold_inside_code_treats_code_as_atomic() {
-        let spans = parse_inline("`code **bold** code`");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].text, "code **bold** code");
-        assert_eq!(spans[0].kind, SpanKind::Code);
-    }
-
-    #[test]
-    fn parse_inline_nested_bold_inside_italic_becomes_bold_italic() {
-        let spans = parse_inline("*a **b** c*");
-        assert_eq!(spans.len(), 3);
-        assert_eq!(spans[0].emphasis, Emphasis::ITALIC);
-        assert_eq!(spans[1].emphasis, Emphasis::BOLD_ITALIC);
-        assert_eq!(spans[2].emphasis, Emphasis::ITALIC);
-    }
-
-    #[test_case(1, "# h1"; "level_1")]
-    #[test_case(2, "## h2"; "level_2")]
-    #[test_case(3, "### h3"; "level_3")]
-    #[test_case(4, "#### h4"; "level_4")]
-    #[test_case(5, "##### h5"; "level_5")]
-    #[test_case(6, "###### h6"; "level_6")]
-    fn parse_heading_levels_1_through_6(level: u8, input: &str) {
-        let (got, content) = parse_heading(input).expect("heading parses");
-        assert_eq!(got, level);
-        assert_eq!(content, format!("h{level}"));
-    }
-
-    #[test]
-    fn parse_seven_hashes_is_not_heading() {
-        assert!(parse_heading("####### nope").is_none());
-    }
-
-    #[test]
-    fn parse_horizontal_rule_classifies_as_hr() {
-        let blocks = parse("---");
-        let Block::Lines(lines) = &blocks[0] else {
-            panic!("expected Lines")
-        };
-        assert_eq!(lines[0].kind, BlockKind::HorizontalRule);
-    }
-
-    #[test]
-    fn parse_unordered_list_records_depth() {
-        let blocks = parse("- item\n  - nested");
-        let Block::Lines(lines) = &blocks[0] else {
-            panic!("expected Lines")
-        };
-        assert_eq!(lines[0].kind, BlockKind::UnorderedListItem { depth: 0 });
-        assert_eq!(lines[1].kind, BlockKind::UnorderedListItem { depth: 1 });
-    }
-
-    #[test]
-    fn parse_preserves_user_newlines_one_logical_line_each() {
-        let blocks = parse("a\nb\nc");
-        let Block::Lines(lines) = &blocks[0] else {
-            panic!("expected Lines")
-        };
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0].inline, "a");
-        assert_eq!(lines[2].inline, "c");
-    }
-
-    #[test]
-    fn parse_fenced_code_block_emits_code_block() {
-        let blocks = parse("```rust\nfn x() {}\nlet y;\n```");
-        assert_eq!(blocks.len(), 1);
-        let Block::Code { lang, code } = &blocks[0] else {
-            panic!("expected Code")
-        };
-        assert_eq!(lang, "rust");
-        assert_eq!(code, "fn x() {}\nlet y;");
-    }
-
-    #[test]
-    fn parse_table_emits_table_block_with_header_separator_dropped() {
-        let blocks = parse("| Name | Value |\n| --- | --- |\n| foo | 42 |");
-        assert_eq!(blocks.len(), 1);
-        let Block::Table { rows, header_end } = &blocks[0] else {
-            panic!("expected Table")
-        };
-        assert_eq!(*header_end, 1);
-        assert_eq!(rows, &[vec!["Name", "Value"], vec!["foo", "42"]]);
-    }
-
-    #[test]
-    fn parse_inline_never_panics_on_arbitrary_unicode() {
-        let mut rng = fastrand::Rng::with_seed(0xC0FFEE);
-        for _ in 0..500 {
-            let n = rng.usize(0..200);
-            let mut s = String::with_capacity(n);
-            for _ in 0..n {
-                s.push(rng.char(..));
-            }
-            let spans = parse_inline(&s);
-            let total: usize = spans.iter().map(|sp| sp.text.len()).sum();
-            assert!(total <= s.len(), "fabrication: {} > {}", total, s.len());
-        }
-    }
-
-    #[test]
-    fn parse_inline_visible_text_invariant() {
-        let cases = [
-            "plain text",
-            "a **b** c",
-            "a *b* c",
-            "a `code` b",
-            "a ~~strike~~ b",
-        ];
-        for input in cases {
-            let spans = parse_inline(input);
-            let visible = span_text(&spans);
-            let strip = |s: &str| -> String {
-                s.chars()
-                    .filter(|c| !matches!(c, '`' | '*' | '~' | '_'))
-                    .collect()
-            };
-            assert_eq!(strip(&visible), strip(input), "input: {input:?}");
-        }
-    }
-
-    #[test]
-    fn parse_inline_empty_input_returns_empty() {
-        assert!(parse_inline("").is_empty());
-    }
-
-    #[test]
-    fn parse_inline_unmatched_star_passes_through_as_plain() {
-        let spans = parse_inline("a*b");
-        assert!(
-            spans
-                .iter()
-                .all(|s| s.kind == SpanKind::Text && s.emphasis.is_empty())
+    fn parse_code_inside_bold_keeps_both_axes() {
+        assert_eq!(
+            spans("**bold `code` bold**"),
+            [
+                InlineSpan::text("bold ", Emphasis::BOLD),
+                InlineSpan::code("code", Emphasis::BOLD),
+                InlineSpan::text(" bold", Emphasis::BOLD),
+            ]
         );
-        assert_eq!(span_text(&spans), "a*b");
     }
 
-    #[test_case("- item", Some("• "); "unordered_depth_zero")]
-    #[test_case("  - item", Some("  • "); "unordered_depth_one")]
-    fn block_prefix_unordered_list_depth(input: &str, expected: Option<&str>) {
-        let blocks = parse(input);
-        let Block::Lines(lines) = &blocks[0] else {
-            panic!("expected Lines")
-        };
-        assert_eq!(block_prefix(&lines[0].kind).as_deref(), expected);
+    #[test_case("**注意：**请先备份", "注意：", "请先备份" ; "after_full_width_punctuation")]
+    #[test_case("这是**加粗（括号）**文字", "加粗（括号）", "文字" ; "after_a_full_width_bracket")]
+    fn parse_bold_closes_inside_cjk_text(text: &str, bold: &str, rest: &str) {
+        let spans = spans(text);
+        let tail = &spans[spans.len() - 2..];
+        assert_eq!(
+            tail,
+            [
+                InlineSpan::text(bold, Emphasis::BOLD),
+                InlineSpan::text(rest, Emphasis::default()),
+            ]
+        );
     }
 
-    const STRIP_DELIMS: &[char] = &['`', '*', '~', '_'];
+    #[test]
+    fn parse_nested_emphasis_merges() {
+        let emphasis: Vec<Emphasis> = spans("*a **b** c*")
+            .into_iter()
+            .map(|span| span.emphasis)
+            .collect();
+        assert_eq!(
+            emphasis,
+            [Emphasis::ITALIC, Emphasis::BOLD_ITALIC, Emphasis::ITALIC]
+        );
+    }
 
-    fn first_lines(blocks: &[Block]) -> &[LineBlock] {
-        match &blocks[0] {
-            Block::Lines(l) => l,
-            other => panic!("expected Lines, got {other:?}"),
-        }
+    #[test_case("about ~5s, then ~10s" ; "tildes_before_numbers")]
+    #[test_case("a\\*b\\*" ; "escaped_stars_lose_the_backslash_only")]
+    fn parse_keeps_text_as_typed(text: &str) {
+        let want = text.replace('\\', "");
+        assert_eq!(spans(text), [InlineSpan::text(want, Emphasis::default())]);
+    }
+
+    #[test_case("[t](http://u)", "t (http://u)" ; "inline_link_shows_its_target")]
+    #[test_case("<http://v>", "http://v" ; "autolink_shows_once")]
+    #[test_case("![alt](img.png)", "alt (img.png)" ; "image_shows_alt_and_target")]
+    fn parse_links(text: &str, want: &str) {
+        assert_eq!(visible(&lines(text)[0]), want);
+    }
+
+    #[test_case("```rust\nfn x() {}\n```", "rust", "fn x() {}" ; "closed_fence")]
+    #[test_case("```\nfoo\nbar", "", "foo\nbar" ; "unclosed_fence_runs_to_the_end")]
+    #[test_case(FOUR_BACKTICK_FENCE, "", "```\ninner\n```" ; "longer_fence_wraps_a_shorter_one")]
+    #[test_case(FENCE_IN_ITEM, "rust", "let x = 1;" ; "fence_inside_a_list_item")]
+    #[test_case("a\n\n    if x:\n        y()\n\nb", "", "if x:\n    y()" ; "indented_block")]
+    fn parse_code_block(text: &str, want_lang: &str, want_code: &str) {
+        let code = parse(text).into_iter().find_map(|block| match block {
+            Block::Code { lang, code } => Some((lang, code)),
+            _ => None,
+        });
+        assert_eq!(code, Some((want_lang.into(), want_code.into())));
+    }
+
+    #[test]
+    fn parse_table_cells_carry_inline_spans() {
+        let blocks = parse("| Name | `v` |\n| --- | --- |\n| foo | **42** |");
+        assert_eq!(
+            blocks,
+            [Block::Table {
+                rows: vec![
+                    vec![
+                        vec![InlineSpan::text("Name", Emphasis::default())],
+                        vec![InlineSpan::code("v", Emphasis::default())],
+                    ],
+                    vec![
+                        vec![InlineSpan::text("foo", Emphasis::default())],
+                        vec![InlineSpan::text("42", Emphasis::BOLD)],
+                    ],
+                ],
+            }]
+        );
     }
 
     #[test]
@@ -1056,210 +597,44 @@ mod tests {
         assert!(!Emphasis::BOLD.is_empty());
     }
 
-    #[test]
-    fn ordered_list_depth_and_marker_preserved() {
-        let lines = first_lines(&parse("1. a\n   2. nested\n10. ten")).to_vec();
-        assert_eq!(
-            lines[0].kind,
-            BlockKind::OrderedListItem {
-                depth: 0,
-                marker: "1.".to_owned()
-            }
-        );
-        // 3 spaces over a 2-space step rounds down to depth 1.
-        assert_eq!(
-            lines[1].kind,
-            BlockKind::OrderedListItem {
-                depth: 1,
-                marker: "2.".to_owned()
-            }
-        );
-        assert_eq!(
-            lines[2].kind,
-            BlockKind::OrderedListItem {
-                depth: 0,
-                marker: "10.".to_owned()
-            }
-        );
-    }
-
-    #[test_case(0, "1.", "1. "; "depth_zero")]
-    #[test_case(2, "42.", "    42. "; "depth_two_two_digits")]
-    fn block_prefix_ordered_list_depths(depth: usize, marker: &str, expected: &str) {
-        let kind = BlockKind::OrderedListItem {
-            depth,
-            marker: marker.to_owned(),
-        };
-        assert_eq!(block_prefix(&kind).as_deref(), Some(expected));
-    }
-
-    #[test_case("---"; "three_dashes")]
-    #[test_case("***"; "three_stars")]
-    #[test_case("___"; "three_unders")]
-    #[test_case("- - -"; "spaced_dashes")]
-    #[test_case("* * *"; "spaced_stars")]
-    #[test_case("-- -"; "two_dashes_space_dash_still_three_dashes_total")]
-    fn horizontal_rule_accepted_variants(input: &str) {
-        assert_eq!(
-            first_lines(&parse(input))[0].kind,
-            BlockKind::HorizontalRule
-        );
-    }
-
-    #[test_case("--"; "two_dashes")]
-    #[test_case("-a-"; "letter_between")]
-    #[test_case("**a"; "two_stars_letter")]
-    #[test_case("---x"; "trailing_non_marker")]
-    fn horizontal_rule_rejected_variants(input: &str) {
-        assert_ne!(
-            first_lines(&parse(input))[0].kind,
-            BlockKind::HorizontalRule
-        );
-    }
-
-    #[test]
-    fn heading_requires_space_or_empty_after_hashes() {
-        assert!(parse_heading("#nospace").is_none());
-    }
-
-    #[test_case("#"; "bare_hash")]
-    #[test_case("# "; "hash_space")]
-    fn bare_hash_is_heading_level_1_with_empty_inline(input: &str) {
-        let blocks = parse(input);
-        let lb = &first_lines(&blocks)[0];
-        assert_eq!(lb.kind, BlockKind::Heading(1));
-        assert_eq!(lb.inline, "");
-    }
-
-    const FOUR_BACKTICK_FENCE: &str = "````\n```\ninner\n```\n````";
-
-    #[test]
-    fn four_backtick_fence_wraps_inner_three_backtick_block() {
-        let blocks = parse(FOUR_BACKTICK_FENCE);
-        let Block::Code { lang, code } = &blocks[0] else {
-            panic!("expected Code")
-        };
-        assert_eq!(lang, "");
-        assert_eq!(code, "```\ninner\n```");
-    }
-
-    const FENCED: &str = "intro\n```rust\nlet a = 1;\n```\nafter";
-
     #[test_case(FENCED, 0 => 0 ; "before_any_fence")]
     #[test_case(FENCED, 14 => 6 ; "inside_a_fence")]
     #[test_case(FENCED, 29 => 29 ; "after_a_closed_fence")]
     #[test_case("```\nfoo\nbar", 8 => 0 ; "inside_an_unclosed_fence")]
     #[test_case(FOUR_BACKTICK_FENCE, 9 => 0 ; "inner_fence_does_not_close_the_outer")]
-    #[test_case("```\na\n  ```\nb\n```\n", 12 => 0 ; "indented_backticks_do_not_close_a_fence")]
-    #[test_case("  ```\nnot code\n", 6 => 6 ; "indented_backticks_are_not_a_fence")]
-    #[test_case("~~~\nnot code\n", 4 => 4 ; "tildes_are_not_a_fence")]
-    fn code_block_start_backs_up_to_the_opening_fence(text: &str, offset: usize) -> usize {
-        code_block_start(text, offset)
+    #[test_case(FENCE_IN_ITEM, 20 => 0 ; "fence_inside_a_list_item_starts_at_the_list")]
+    #[test_case("para\n\n> ```\n> code\n> ```\nafter", 12 => 6 ; "fence_inside_a_quote_starts_at_the_quote")]
+    #[test_case("~~~\ncode\n", 4 => 0 ; "tilde_fence")]
+    #[test_case("- a\n  - b\n    - c\n    - d", 10 => 0 ; "line_indented_like_code_starts_at_its_list")]
+    #[test_case("- a\n  - b\n  - c", 10 => 0 ; "nested_item_starts_at_its_list")]
+    #[test_case("> a\nb", 4 => 0 ; "lazy_quote_line_starts_at_the_quote")]
+    #[test_case("a\nb\nc", 4 => 4 ; "paragraph_line_starts_where_asked")]
+    #[test_case("x\ry\n```\ncode\nmore", 13 => 4 ; "lone_carriage_return_ends_a_line")]
+    #[test_case("a\n\n    code\n    more", 3 => 3 ; "indented_code_block_from_its_first_line")]
+    #[test_case("a\n\n    code\n    more", 12 => 3 ; "indented_code_block_keeps_its_indent")]
+    fn render_start_backs_up_to_a_safe_line(text: &str, offset: usize) -> usize {
+        render_start(text, offset)
     }
 
     #[test]
-    fn unclosed_code_fence_runs_to_eof() {
-        let blocks = parse("```\nfoo\nbar");
-        let Block::Code { code, .. } = &blocks[0] else {
-            panic!("expected Code")
-        };
-        assert_eq!(code, "foo\nbar");
-    }
-
-    #[test]
-    fn mid_line_backticks_do_not_open_fence() {
-        // A run of backticks only opens a fence at the start of a line.
-        let blocks = parse("text ``` text");
-        let lb = &first_lines(&blocks)[0];
-        assert_eq!(lb.kind, BlockKind::Paragraph);
-        assert_eq!(lb.inline, "text ``` text");
-    }
-
-    #[test]
-    fn code_fence_language_is_optional() {
-        let blocks = parse("```\ncode\n```");
-        let Block::Code { lang, code } = &blocks[0] else {
-            panic!("expected Code")
-        };
-        assert_eq!(lang, "");
-        assert_eq!(code, "code");
-    }
-
-    #[test]
-    fn underscore_italic_does_not_match_intraword() {
-        let spans = parse_inline("foo_bar_baz");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].text, "foo_bar_baz");
-        assert!(spans[0].emphasis.is_empty());
-    }
-
-    #[test]
-    fn star_italic_intraword_does_not_open_when_preceded_by_word_char() {
-        // A word char before `*` blocks italic from opening, so `a*b*c`
-        // stays plain. Worth a test because file names like `a*b*c` are real.
-        let spans = parse_inline("a*b*c");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].text, "a*b*c");
-        assert!(spans[0].emphasis.is_empty());
-    }
-
-    #[test_case("~not~"; "single_tildes")]
-    #[test_case("~~foo"; "unclosed_double")]
-    fn strikethrough_non_match_stays_plain(input: &str) {
-        let spans = parse_inline(input);
-        assert!(
-            spans
-                .iter()
-                .all(|s| s.emphasis.is_empty() && s.kind == SpanKind::Text)
-        );
-        assert_eq!(span_text(&spans), input);
-    }
-
-    #[test]
-    fn code_span_with_pipes_and_emphasis_chars_is_atomic() {
-        let spans = parse_inline("a `x|y*z` b");
-        assert_eq!(spans.len(), 3);
-        assert_eq!(spans[1].kind, SpanKind::Code);
-        assert_eq!(spans[1].text, "x|y*z");
-        assert!(spans[1].emphasis.is_empty());
-    }
-
-    #[test]
-    fn table_cell_backslash_pipe_is_literal_pipe() {
-        let blocks = parse("| a | b\\|c | d |\n| --- | --- | --- |\n| 1 | 2 | 3 |");
-        let Block::Table { rows, header_end } = &blocks[0] else {
-            panic!("expected Table")
-        };
-        assert_eq!(*header_end, 1);
-        assert_eq!(rows[0], vec!["a", "b|c", "d"]);
-    }
-
-    #[test]
-    fn table_cell_backticked_pipe_stays_inside_cell() {
-        let blocks = parse("| `x|y` | z |\n|---|---|");
-        let Block::Table { rows, .. } = &blocks[0] else {
-            panic!("expected Table")
-        };
-        assert_eq!(rows[0], vec!["`x|y`", "z"]);
-    }
-
-    #[test]
-    fn underscore_italic_with_nested_bold_becomes_bold_italic() {
-        let spans = parse_inline("_a **b** c_");
-        assert_eq!(spans.len(), 3);
-        assert_eq!(spans[0].emphasis, Emphasis::ITALIC);
-        assert_eq!(spans[1].emphasis, Emphasis::BOLD_ITALIC);
-        assert_eq!(spans[1].text, "b");
-        assert_eq!(spans[2].emphasis, Emphasis::ITALIC);
-    }
-
-    #[test]
-    fn triple_star_mismatched_close_preserves_visible_text() {
-        let input = "***bold only**";
-        let spans = parse_inline(input);
-        let visible = span_text(&spans);
-        let strip =
-            |s: &str| -> String { s.chars().filter(|c| !STRIP_DELIMS.contains(c)).collect() };
-        assert_eq!(strip(&visible), strip(input));
+    fn parse_never_panics_on_arbitrary_input() {
+        const MARKDOWN_BYTES: &[char] = &[
+            '*', '_', '`', '~', '|', '>', '-', '#', '[', ']', '(', ')', '\n', ' ',
+        ];
+        let mut rng = fastrand::Rng::with_seed(0xC0FFEE);
+        for _ in 0..500 {
+            let text: String = (0..rng.usize(0..200))
+                .map(|_| {
+                    if rng.bool() {
+                        MARKDOWN_BYTES[rng.usize(..MARKDOWN_BYTES.len())]
+                    } else {
+                        rng.char(..)
+                    }
+                })
+                .collect();
+            parse(&text);
+            let offset = rng.usize(..=text.len());
+            assert!(render_start(&text, offset) <= offset);
+        }
     }
 }

@@ -113,6 +113,7 @@ test-case = "3"
 ignore = "0.4"
 strum = { version = "0.28", features = ["derive"] }
 htmd = "0.5"
+comrak = { version = "0.59", default-features = false }
 tempfile = "3"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 globset = "0.4"

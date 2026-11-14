@@ -12,9 +12,7 @@ use maki_highlight::{CodeHighlighter, SegmentColor, StyledSegment};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{
-    Block, BlockKind, Emphasis, InlineSpan, LineBlock, SpanKind, block_prefix, parse, parse_inline,
-};
+use crate::{Block, BlockKind, Cell, Emphasis, InlineSpan, LineBlock, SpanKind, parse};
 
 pub const CODE_BAR: &str = "│ ";
 pub const CODE_BAR_WRAP: &str = "│";
@@ -24,6 +22,7 @@ pub const TOOL_OUTPUT_MAX_LINE_BYTES: usize = 1_500;
 const HR_CHAR: char = '─';
 const MIN_COL_WIDTH: usize = 5;
 const LONG_LINE_SUFFIX: &str = "...";
+const SETEXT_UNDERLINE: [char; 2] = ['-', '='];
 
 /// Semantic style token. Emphasis (bold/italic/strike/underline) lives on
 /// the `Span`, not here, so they compose independently.
@@ -114,7 +113,7 @@ pub fn render(text: &str, width: u16) -> Vec<Line> {
 /// (successive prefixes of a growing message) doesn't re-highlight completed
 /// code lines. Caches are flushed automatically when the syntax theme changes.
 pub struct Renderer {
-    highlighters: Vec<CodeHighlighter>,
+    highlighters: Vec<(String, CodeHighlighter)>,
     table_col_widths: Vec<Vec<usize>>,
     theme_gen: u64,
     wrap_paragraphs: bool,
@@ -172,7 +171,10 @@ impl Renderer {
             self.highlighters.clear();
             self.theme_gen = theme_gen;
         }
-        let text = text.trim_start_matches('\n');
+        let mut text = text.trim_start_matches('\n');
+        if self.incremental {
+            text = without_unfinished_underline(text);
+        }
         let blocks = parse(text);
         let mut lines: Vec<Line> = Vec::new();
         let mut state = RenderState {
@@ -187,7 +189,7 @@ impl Renderer {
             wrap_paragraphs: self.wrap_paragraphs,
         };
 
-        for block in &blocks {
+        for block in blocks {
             render_block(block, &mut lines, &mut state, &ctx);
         }
 
@@ -195,6 +197,19 @@ impl Renderer {
         state.table_col_widths.truncate(state.table_idx);
         finalize_lines(&mut lines);
         lines
+    }
+}
+
+/// A growing message can end in the first characters of a list item or a
+/// rule. Alone on the last line they read as a setext underline, and the
+/// paragraph above would show as a heading until the next character arrives.
+fn without_unfinished_underline(text: &str) -> &str {
+    let last_line_start = text.rfind('\n').map_or(0, |newline| newline + 1);
+    let last_line = text[last_line_start..].trim();
+    if !last_line.is_empty() && last_line.chars().all(|c| SETEXT_UNDERLINE.contains(&c)) {
+        &text[..last_line_start]
+    } else {
+        text
     }
 }
 
@@ -206,7 +221,7 @@ struct RenderCtx {
 struct RenderState<'a> {
     code_idx: usize,
     table_idx: usize,
-    highlighters: &'a mut Vec<CodeHighlighter>,
+    highlighters: &'a mut Vec<(String, CodeHighlighter)>,
     table_col_widths: &'a mut Vec<Vec<usize>>,
     incremental: bool,
 }
@@ -220,10 +235,16 @@ impl RenderState<'_> {
         if !self.incremental {
             return maki_highlight::highlight_block(lang, code).as_ref().clone();
         }
-        if self.code_idx >= self.highlighters.len() {
-            self.highlighters.push(CodeHighlighter::new(lang));
+        // A fence reads as code from its first backticks, so `py` arrives as
+        // `p` first and the block's language can still change.
+        match self.highlighters.get_mut(self.code_idx) {
+            Some((known, _)) if known == lang => {}
+            Some(slot) => *slot = (lang.to_owned(), CodeHighlighter::new(lang)),
+            None => self
+                .highlighters
+                .push((lang.to_owned(), CodeHighlighter::new(lang))),
         }
-        self.highlighters[self.code_idx].update(code).to_vec()
+        self.highlighters[self.code_idx].1.update(code).to_vec()
     }
 }
 
@@ -250,12 +271,7 @@ fn coalesce_adjacent_spans(spans: &mut Vec<Span>) {
     spans.truncate(write + 1);
 }
 
-fn render_block(
-    block: &Block,
-    lines: &mut Vec<Line>,
-    state: &mut RenderState<'_>,
-    ctx: &RenderCtx,
-) {
+fn render_block(block: Block, lines: &mut Vec<Line>, state: &mut RenderState<'_>, ctx: &RenderCtx) {
     match block {
         Block::Lines(line_blocks) => {
             for lb in line_blocks {
@@ -264,7 +280,7 @@ fn render_block(
         }
         Block::Code { lang, code } => {
             ensure_blank_line(lines);
-            let segments = state.code_segments(lang, code);
+            let segments = state.code_segments(&lang, &code);
             let start = lines.len();
             for segs in segments {
                 let mut spans = vec![Span::new(CODE_BAR, StyleToken::CodeBar)];
@@ -289,7 +305,7 @@ fn render_block(
             ensure_blank_line(lines);
             state.code_idx += 1;
         }
-        Block::Table { rows, header_end } => {
+        Block::Table { rows } => {
             ensure_blank_line(lines);
             if state.table_idx >= state.table_col_widths.len() {
                 state
@@ -297,14 +313,14 @@ fn render_block(
                     .resize_with(state.table_idx + 1, Vec::new);
             }
             let pw = &mut state.table_col_widths[state.table_idx];
-            lines.extend(render_table(rows, *header_end, ctx.width, pw));
+            lines.extend(render_table(&rows, ctx.width, pw));
             ensure_blank_line(lines);
             state.table_idx += 1;
         }
     }
 }
 
-fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
+fn render_line_block(lb: LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
     if matches!(lb.kind, BlockKind::HorizontalRule) {
         lines.push(Line {
             kind: LineKind::HorizontalRule,
@@ -313,15 +329,13 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
         return;
     }
 
-    let marker = block_prefix(&lb.kind).map(|p| Span::new(p, StyleToken::ListMarker));
+    let marker = (!lb.prefix.is_empty()).then(|| Span::new(lb.prefix, StyleToken::ListMarker));
 
     let is_heading = matches!(lb.kind, BlockKind::Heading(_));
     let kind = match &lb.kind {
         BlockKind::Heading(_) => LineKind::Heading,
-        BlockKind::UnorderedListItem { .. } | BlockKind::OrderedListItem { .. } => {
-            LineKind::ListItem
-        }
-        _ => LineKind::Paragraph,
+        BlockKind::ListItem => LineKind::ListItem,
+        BlockKind::Paragraph | BlockKind::HorizontalRule => LineKind::Paragraph,
     };
 
     let mut content_spans: Vec<Span> = Vec::new();
@@ -329,7 +343,7 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
         text,
         kind: sk,
         emphasis,
-    } in parse_inline(&lb.inline)
+    } in lb.spans
     {
         // Code keeps its own token inside headings so consumers can layer
         // code colours on top. The Lua bridge collapses to one name per span.
@@ -540,8 +554,8 @@ fn split_line_with_bar(line: Line, width: usize) -> Vec<Line> {
     result
 }
 
-fn cell_display_width(cell: &str) -> usize {
-    parse_inline(cell).iter().map(|s| s.text.width()).sum()
+fn cell_display_width(cell: &[InlineSpan]) -> usize {
+    cell.iter().map(|s| s.text.width()).sum()
 }
 
 fn constrain_col_widths(col_widths: &mut [usize], available: usize) {
@@ -633,9 +647,9 @@ fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(|s| s.text.width()).sum()
 }
 
-fn cell_spans(cell: &str, header: bool) -> Vec<Span> {
-    parse_inline(cell)
-        .into_iter()
+fn cell_spans(cell: &[InlineSpan], header: bool) -> Vec<Span> {
+    cell.iter()
+        .cloned()
         .map(
             |InlineSpan {
                  text,
@@ -657,12 +671,7 @@ fn cell_spans(cell: &str, header: bool) -> Vec<Span> {
         .collect()
 }
 
-fn render_table(
-    rows: &[Vec<String>],
-    header_end: usize,
-    width: u16,
-    persistent_widths: &mut Vec<usize>,
-) -> Vec<Line> {
+fn render_table(rows: &[Vec<Cell>], width: u16, persistent_widths: &mut Vec<usize>) -> Vec<Line> {
     let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
     if col_count == 0 {
         return Vec::new();
@@ -671,7 +680,7 @@ fn render_table(
     let overhead = col_count * 3 + 1;
     let min_box_width = overhead + col_count * MIN_COL_WIDTH;
     if (width as usize) < min_box_width {
-        return render_table_compact(rows, header_end, width);
+        return render_table_compact(rows, width);
     }
 
     let mut col_widths = vec![0usize; col_count];
@@ -711,11 +720,11 @@ fn render_table(
     lines.push(border("╭", "┬", "╮", "─"));
 
     for (ri, row) in rows.iter().enumerate() {
-        let header = ri < header_end;
+        let header = ri == 0;
 
         let wrapped_cells: Vec<Vec<Vec<Span>>> = (0..col_count)
             .map(|c| {
-                let cell = row.get(c).map(String::as_str).unwrap_or("");
+                let cell = row.get(c).map_or(&[][..], Vec::as_slice);
                 wrap_spans(cell_spans(cell, header), col_widths[c])
             })
             .collect();
@@ -800,11 +809,11 @@ pub fn truncate_long_lines_at(text: &str, max_bytes: usize) -> Cow<'_, str> {
 }
 
 /// Fallback when the terminal is too narrow for box-drawing borders.
-fn render_table_compact(rows: &[Vec<String>], header_end: usize, width: u16) -> Vec<Line> {
+fn render_table_compact(rows: &[Vec<Cell>], width: u16) -> Vec<Line> {
     const CELL_SEP: &str = " | ";
     let mut lines = Vec::new();
     for (ri, row) in rows.iter().enumerate() {
-        let header = ri < header_end;
+        let header = ri == 0;
         let mut spans: Vec<Span> = Vec::new();
         for (c, cell) in row.iter().enumerate() {
             if c > 0 {
@@ -852,6 +861,9 @@ mod tests {
         "```rust\nfn a() { let a = 1; let b = 2; }\nfn b() {}\nlet c = 3;\n```";
     const SHORT_RUST_BLOCK: &str = "```rust\nlet c = 3;\n```";
     const STREAMED_CODE: &str = "```rust\nfn main() {\n    let x = 1;\n}\n```";
+    const LIST_AFTER_PARAGRAPH: &str = "Changes:\n- one\n- two";
+    const HEADING_FLASH: &str =
+        "a half-typed list item must not turn the paragraph above into a heading";
 
     const AGREEMENT_CORPUS: &[&str] = &[
         "hello world\n# heading\n\npara",
@@ -893,6 +905,25 @@ mod tests {
             .iter()
             .flat_map(|l| &l.spans)
             .find(|s| s.text.trim() == text)
+    }
+
+    #[test]
+    fn streaming_never_shows_a_heading_above_a_list_being_typed() {
+        let mut streamer = Renderer::streaming();
+        for end in 1..=LIST_AFTER_PARAGRAPH.len() {
+            let lines = streamer.render(&LIST_AFTER_PARAGRAPH[..end], TEST_WIDTH);
+            assert!(
+                lines.iter().all(|line| line.kind != LineKind::Heading),
+                "{HEADING_FLASH}"
+            );
+        }
+    }
+
+    #[test_case("Title\n===\n" ; "finished_underline")]
+    #[test_case("Title\n===\nbody" ; "underline_followed_by_text")]
+    fn streaming_shows_a_setext_heading_once_its_line_ends(text: &str) {
+        let lines = Renderer::streaming().render(text, TEST_WIDTH);
+        assert_eq!(lines[0].kind, LineKind::Heading);
     }
 
     #[test]
