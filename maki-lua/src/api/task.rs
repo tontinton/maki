@@ -301,6 +301,7 @@ mod tests {
     const ERROR_STATUS: &str = "error";
     const NIL_STATUS: &str = "nil";
     const CHAT_SESSION: &str = "chat-session";
+    const JOB_ID: u32 = 7;
     const UNKNOWN_TASK_ERR: &str = "unknown task: toolu_01";
     const NO_REQUEST_ERR: &str = "expected a task request";
     const LIST_CALL: &str = "return task.list()";
@@ -505,7 +506,7 @@ mod tests {
     #[test_case(None ; "stopped")]
     #[test_case(Some(UNKNOWN_TASK_ERR) ; "refused")]
     fn tasks_picker_stops_the_selected_row_and_refreshes(stop_error: Option<&str>) {
-        let lua = picker_lua(stop_error, &[DOWN, CTRL_S, ESC], &[TASK_ID]);
+        let lua = picker_lua(stop_error, &[DOWN, CTRL_S, ESC], &[TASK_ID], false);
         lua.load("open_tasks()").exec().unwrap();
 
         let globals = lua.globals();
@@ -531,15 +532,39 @@ mod tests {
     #[test_case(&[VIM_UP], NEWEST_ID ; "a_letter_filters_instead_of_moving")]
     fn tasks_picker_keys_move_the_selection(moves: &[&str], selected: &str) {
         let keys: Vec<&str> = moves.iter().copied().chain([CTRL_S, ESC, ESC]).collect();
-        let lua = picker_lua(None, &keys, &SPAWN_ORDER);
+        let lua = picker_lua(None, &keys, &SPAWN_ORDER, false);
         lua.load("open_tasks()").exec().unwrap();
 
         assert_eq!(lua.globals().get::<String>("stopped_id").unwrap(), selected);
     }
 
+    /// A shared job is listed and stopped by the picker even though another
+    /// plugin started it, and stopping a job never touches the task path.
+    #[test]
+    fn tasks_picker_stops_a_listed_job() {
+        let lua = picker_lua(None, &[DOWN, DOWN, CTRL_S, ESC], &[TASK_ID], true);
+        lua.load("open_tasks()").exec().unwrap();
+
+        let globals = lua.globals();
+        assert_eq!(globals.get::<u32>("stopped_job").unwrap(), JOB_ID);
+        assert!(
+            globals
+                .get::<Option<String>>("stopped_id")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(globals.get::<u32>("list_calls").unwrap(), 2);
+    }
+
     /// Runs `plugins/task/picker.lua` against a fake `maki` that lists the main
-    /// chat and then {task_ids} in spawn order, all working, and presses {keys}.
-    fn picker_lua(stop_error: Option<&str>, keys: &[&str], task_ids: &[&str]) -> Lua {
+    /// chat, then {task_ids} in spawn order and, when {with_job}, one shared
+    /// job, and presses {keys}.
+    fn picker_lua(
+        stop_error: Option<&str>,
+        keys: &[&str],
+        task_ids: &[&str],
+        with_job: bool,
+    ) -> Lua {
         let lua = Lua::new();
         let globals = lua.globals();
         globals
@@ -551,6 +576,7 @@ mod tests {
         globals.set("task_name", TASK_NAME).unwrap();
         globals.set("chat_session", CHAT_SESSION).unwrap();
         globals.set("stop_error", stop_error).unwrap();
+        globals.set("with_job", with_job).unwrap();
         load_picker(
             &lua,
             keys,
@@ -559,6 +585,7 @@ mod tests {
             for _, id in ipairs(task_ids) do
                 tasks[#tasks + 1] = {id = id, session = chat_session, name = task_name, status = 'working'}
             end
+            local jobs = with_job and {{id = 7, command = 'cargo test', status = 'running'}} or {{}}
             list_calls = 0
             maki = {
                 task = {
@@ -569,6 +596,11 @@ mod tests {
                         if stop_error then return nil, stop_error end
                         return true
                     end,
+                },
+                session = {current = function() return chat_session end},
+                fn = {
+                    joblist = function(_) return jobs end,
+                    jobstop = function(id) stopped_job = id end,
                 },
                 ui = {
                     buf = function() return {set_lines = function() end} end,

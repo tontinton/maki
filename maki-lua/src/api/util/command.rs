@@ -113,9 +113,14 @@ pub struct HintEntry {
 
 pub type HintEntries = Vec<HintEntry>;
 
+/// One snapshot of what plugins asked the status bar to show: their key
+/// hints and their segments. Plugin-keyed on the way in, flattened here in
+/// plugin order, so every tab renders the same spans.
 #[derive(Clone, Default)]
 pub struct HintSnapshot {
     pub entries: HintEntries,
+    /// `(text, style)` pairs, rendered as `[ text ]` on the right of the bar.
+    pub segments: Vec<(String, String)>,
     pub generation: u64,
 }
 
@@ -169,10 +174,11 @@ impl HintWriter {
         )
     }
 
-    pub fn publish(&self, entries: HintEntries) {
+    pub fn publish(&self, entries: HintEntries, segments: Vec<(String, String)>) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.store.store(Arc::new(HintSnapshot {
             entries,
+            segments,
             generation,
         }));
     }
@@ -876,6 +882,29 @@ pub enum UiAction {
         id: String,
         end: TaskEnd,
     },
+    /// A plugin-owned transcript item for one chat session: `running` creates
+    /// or re-titles it, `done` / `failed` closes it. The `id` is already
+    /// plugin-scoped.
+    ChatItem {
+        session: MakiId,
+        item: ChatItem,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatItemStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatItem {
+    pub id: Arc<str>,
+    pub label: Arc<str>,
+    pub title: String,
+    pub status: ChatItemStatus,
+    pub detail: Option<String>,
 }
 
 // Lives on the Lua thread so `ui_roundtrip` can consult it without threading
@@ -1198,10 +1227,17 @@ mod tests {
         let (writer, reader) = HintWriter::new();
         assert!(reader.load_full().entries.is_empty());
 
-        writer.publish(vec![hint(OTHER_PLUGIN, None, EVERY_TAB_HINT)]);
+        writer.publish(
+            vec![hint(OTHER_PLUGIN, None, EVERY_TAB_HINT)],
+            vec![("2 running".to_string(), "status_dim".into())],
+        );
 
         let snap = reader.load_full();
         assert_eq!(snap.entries.len(), 1);
+        assert_eq!(
+            snap.segments,
+            [("2 running".to_string(), "status_dim".into())]
+        );
         assert_eq!(snap.generation, 1);
     }
 
@@ -1228,6 +1264,7 @@ mod tests {
                 hint(SHADOWED_PLUGIN, None, EVERY_TAB_HINT),
                 hint(SHADOWED_PLUGIN, Some(owner), SESSION_HINT),
             ],
+            segments: Vec::new(),
             generation: 0,
         };
         let tab = if own_tab { owner } else { MakiId::generate() };
