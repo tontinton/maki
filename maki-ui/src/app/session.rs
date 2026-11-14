@@ -13,7 +13,7 @@ use crate::components::{Action, BackgroundBadge, BackgroundOutcome};
 use crate::text_buffer::Writers;
 use maki_agent::agent::SessionExport;
 use maki_agent::session::SessionHeader;
-use maki_agent::{SessionMailbox, TaskEnd, Transcript};
+use maki_agent::{CompactRequest, SessionMailbox, TaskEnd, Transcript};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{PluginPermissions, PluginReach, SessionEndReason};
 use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
@@ -504,6 +504,15 @@ impl App {
         self.mailbox
             .as_ref()
             .filter(|mailbox| mailbox.session_id() == self.state.session.id)
+    }
+
+    /// Takes a plugin's compaction request, but only at quiescence: a live
+    /// run claims it before its next request, and one taker wins.
+    pub(crate) fn take_requested_compact(&self) -> Option<CompactRequest> {
+        if !self.takes_wake() {
+            return None;
+        }
+        self.live_mailbox()?.take_compact()
     }
 
     /// The one funnel for handing a history over. When the UI installs one the

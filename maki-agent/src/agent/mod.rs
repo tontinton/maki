@@ -9,7 +9,7 @@ mod streaming;
 pub mod tool_dispatch;
 mod transcript;
 
-pub use compaction::compact;
+pub use compaction::{CompactReason, compact};
 pub use display_order::{DisplayItem, display_order, observation_detail, observation_line};
 pub use frame::{HostPrompt, RunContext, RunContextBuilder, plan_mode_update};
 pub use history::{
