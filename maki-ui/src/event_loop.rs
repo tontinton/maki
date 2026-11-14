@@ -1421,11 +1421,31 @@ impl<'t> EventLoop<'t> {
     fn start_woken_runs(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         for index in 0..self.sessions.len() {
+            if let Some(instructions) = self.sessions[index].app.take_requested_compact() {
+                // Same contract as the typed /compact: a queued compaction
+                // looks like running work even when the session was idle.
+                self.sessions[index].app.mark_compacting();
+                self.queue_compact(index, instructions, true);
+                dirty = Dirty::YES;
+            }
             let actions = self.sessions[index].app.start_woken_run();
             dirty |= Dirty::from(!actions.is_empty());
             self.dispatch(index, actions);
         }
         dirty
+    }
+
+    /// Pushes to the queue a typed /compact pushes to, so a mid-run request
+    /// lands at the run's next boundary instead of racing its history.
+    fn queue_compact(&mut self, idx: usize, instructions: Option<String>, requested: bool) {
+        let rt = &mut self.sessions[idx];
+        rt.reset_run_notifications();
+        rt.handles.queue.push(QueueItem::Compact(Compaction {
+            run_id: rt.app.run_id,
+            instructions,
+            requested,
+            workflow: rt.app.state.workflow,
+        }));
     }
 
     /// `List` replies from a background task (the scan can be slow); every
@@ -2079,15 +2099,7 @@ impl<'t> EventLoop<'t> {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
             }
             Action::Compact(instructions) => {
-                let rt = &mut self.sessions[idx];
-                rt.reset_run_notifications();
-                let run_id = rt.app.run_id;
-                let workflow = rt.app.state.workflow;
-                rt.handles.queue.push(QueueItem::Compact(Compaction {
-                    run_id,
-                    instructions,
-                    workflow,
-                }));
+                self.queue_compact(idx, instructions, false);
             }
             Action::ToggleMcp(server_name, enabled) => {
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {

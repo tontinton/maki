@@ -1224,6 +1224,48 @@ async fn set_mode(
     roundtrip(lua, tx, SessionRequest::SetMode { id, mode }).await
 }
 
+/// Queues a compaction of a live session, the API behind `/compact`.
+///
+/// Answers once the request is queued, not when the summary lands: a
+/// running agent compacts before its next request, an idle one when it
+/// next runs. While one sits unclaimed, a repeat request fails.
+/// `agent.compact.before` still steers or skips it, and sees
+/// it with reason `requested`.
+///
+/// @param opts table Options:
+///   session (string) id of a live session.
+///   task (string?) id of a live subagent of `session`, as `TurnComplete`
+///     reports it; that subagent's own conversation compacts.
+///   instructions (string) guidance for this one summary, like `/compact <text>`.
+/// @return (boolean|nil, string|nil) true once queued, or nil and an error.
+/// @example
+/// maki.session.request_compact({
+///   session = ctx:session_id(),
+///   instructions = "keep the failing test names",
+/// })
+#[lua_fn(guard = [Agent, SessionWrite])]
+fn request_compact(_lua: &Lua, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+    let session_id = try_pair!(required_session(opts.as_ref())?);
+    let task = opts
+        .as_ref()
+        .map(|t| t.opt::<String>("task"))
+        .transpose()?
+        .flatten();
+    let instructions = opts
+        .as_ref()
+        .map(|t| t.opt::<String>("instructions"))
+        .transpose()?
+        .flatten();
+    let queued = match task {
+        Some(task) => SessionMailbox::request_compact_task(session_id, &task, instructions),
+        None => SessionMailbox::request_compact(session_id, instructions),
+    };
+    match queued {
+        Ok(()) => Ok((Some(true), None)),
+        Err(error) => Ok(err_pair(error)),
+    }
+}
+
 /// Renames a session, live or stored.
 ///
 /// @param opts table Required fields: id (string) session to rename;
@@ -1263,7 +1305,7 @@ lua_table! {
         list(tx), live(tx), current(tx), read(tx), export(perms, tx), messages(perms, tx),
         windows(perms, tx), subagents(perms, tx), focus(tx), delete(perms, tx),
         new(perms, tx, grants), prompt(perms, tx), notify(perms, grants), set_mode(perms, tx),
-        set_title(perms, tx), data_dir(plugin, tx),
+        request_compact(perms), set_title(perms, tx), data_dir(plugin, tx),
     ]
 }
 
@@ -1320,6 +1362,8 @@ mod tests {
     const THOUGHT: &str = "let me check";
     const IMAGE_DATA: &str = "iVBORw0KGgo=";
     const TEXT: &str = "hello";
+    const COMPACT_INSTRUCTIONS: &str = "keep tests";
+    const ALREADY_PENDING_ERR: &str = "a compaction is already pending";
     const TITLE: &str = "ported";
     const MODEL: &str = "anthropic/claude-sonnet-4-5";
     const THINKING: &str = "high";
@@ -1482,6 +1526,76 @@ mod tests {
         checker.join().unwrap();
         assert_eq!(err, None);
         assert!(val);
+    }
+
+    #[test_case(r#"return session.request_compact({ session = session_id, instructions = 'keep tests' })"#, Some(COMPACT_INSTRUCTIONS) ; "with_instructions")]
+    #[test_case("return session.request_compact({ session = session_id })", None ; "without_instructions")]
+    fn request_compact_queues_one_claimable_request(code: &str, expected: Option<&str>) {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let lua = lua_with_session(None);
+        lua.globals().set("session_id", id.to_string()).unwrap();
+
+        let (value, error): (bool, Option<String>) = lua.load(code).eval().unwrap();
+
+        assert!(value);
+        assert_eq!(error, None);
+        assert_eq!(mailbox.take_compact().unwrap().as_deref(), expected);
+    }
+
+    #[test]
+    fn request_compact_with_a_task_reaches_that_subagent() {
+        let id = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        let subagent = SessionMailbox::register(MakiId::generate());
+        subagent.track_task(&task_id, id);
+        let lua = lua_with_session(None);
+        lua.globals().set("session_id", id.to_string()).unwrap();
+        lua.globals().set("task_id", task_id.clone()).unwrap();
+
+        let (value, error): (bool, Option<String>) = lua
+            .load("return session.request_compact({ session = session_id, task = task_id })")
+            .eval()
+            .unwrap();
+
+        assert!(value);
+        assert_eq!(error, None);
+        assert_eq!(subagent.take_compact(), Some(None));
+        subagent.untrack_task(&task_id);
+    }
+
+    #[test]
+    fn request_compact_requires_a_live_session() {
+        let lua = lua_with_session(None);
+        let (_, missing): (Value, Option<String>) =
+            lua.load("return session.request_compact()").eval().unwrap();
+        assert_eq!(missing.as_deref(), Some(SESSION_REQUIRED_ERR));
+
+        let id = MakiId::generate();
+        lua.globals().set("session_id", id.to_string()).unwrap();
+        let (_, not_live): (Value, Option<String>) = lua
+            .load("return session.request_compact({ session = session_id })")
+            .eval()
+            .unwrap();
+        assert_eq!(not_live, Some(format!("session not live: {id}")));
+    }
+
+    #[test]
+    fn request_compact_rejects_a_second_request_while_pending() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::request_compact(id, None).unwrap();
+        let lua = lua_with_session(None);
+        lua.globals().set("session_id", id.to_string()).unwrap();
+
+        let (value, error): (Value, Option<String>) = lua
+            .load("return session.request_compact({ session = session_id })")
+            .eval()
+            .unwrap();
+
+        assert_eq!(value, Value::Nil);
+        assert_eq!(error.as_deref(), Some(ALREADY_PENDING_ERR));
+        assert!(mailbox.take_compact().is_some());
     }
 
     #[test]
