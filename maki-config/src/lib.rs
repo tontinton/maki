@@ -21,6 +21,8 @@ const ENV_FILE: &str = ".env";
 pub const UNTRUSTED_PROJECT_WRITE: &str =
     "folder is not trusted, so nothing was saved to .maki/permissions.toml";
 
+pub mod codex;
+
 pub mod project;
 pub use project::{GatedFile, ProjectConfig, policy_grant};
 
