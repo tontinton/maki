@@ -563,6 +563,8 @@ pub enum Request {
         /// How many `maki.api.run_command` hops led here. It seeds the
         /// handler's [`Lineage::command_depth`], so an alias cycle runs out.
         depth: u8,
+        /// The chat it runs in, passed to the handler as `opts.session`.
+        session: Option<String>,
     },
     /// Session whose prompt is being built, if any; see `run_hint_callback`.
     CollectPromptSlots {
@@ -2466,13 +2468,20 @@ async fn run_abandonable<F: Future>(
 }
 
 /// [`run_detached`] for a slash-command handler or a keybind callback, seeding
-/// the hop count that `maki.api.run_command` checks before extending the chain.
-/// Depth 0 means the user acted directly, see [`TaskCell::user_action`].
-pub(crate) async fn run_command_scoped<F: Future>(lua: &Lua, depth: u8, fut: F) -> F::Output {
+/// the hop count that `maki.api.run_command` checks before extending the chain
+/// and the session nested calls default to. Depth 0 means the user acted
+/// directly, see [`TaskCell::user_action`].
+pub(crate) async fn run_command_scoped<F: Future>(
+    lua: &Lua,
+    depth: u8,
+    session: Option<MakiId>,
+    fut: F,
+) -> F::Output {
     let scope = TaskScope::detached(lua);
     {
         let mut cell = lock_cell(scope.handle());
         cell.lineage.command_depth = depth;
+        cell.lineage.session = session;
         cell.user_action = depth == 0;
     }
     run_scoped(lua, scope, fut).await
@@ -3518,7 +3527,9 @@ fn spawn_keybind_callback(lua: &Lua, gate: &Rc<InflightGate>, mut ticket: Keybin
     let handler_plugin = Arc::clone(&plugin);
     spawn_local(async move {
         let _done = done_tx;
-        if let Err(e) = run_command_scoped(&handler_lua, 0, func.call_async::<LuaValue>(ev)).await {
+        if let Err(e) =
+            run_command_scoped(&handler_lua, 0, None, func.call_async::<LuaValue>(ev)).await
+        {
             tracing::warn!(key = %key.notation(), ticket = id, plugin = %handler_plugin, error = %strip_traceback(&e), "keybind callback failed, key spent");
         }
         spent.store(true, Ordering::Release);
@@ -6115,6 +6126,7 @@ pub fn spawn(
                             command,
                             args,
                             depth,
+                            session,
                         } => {
                             let handler_fn =
                                 rt.lua.app_data_ref::<CommandHandlerMap>().and_then(|m| {
@@ -6124,6 +6136,8 @@ pub fn spawn(
                             if let Some(func) = handler_fn {
                                 let lua = rt.lua.clone();
                                 spawn_local(async move {
+                                    let target =
+                                        session.as_deref().and_then(|s| s.parse::<MakiId>().ok());
                                     let run = async {
                                         let opts = lua.create_table()?;
                                         opts.set(
@@ -6131,9 +6145,12 @@ pub fn spawn(
                                             lua.create_sequence_from(args.split_whitespace())?,
                                         )?;
                                         opts.set("args", args)?;
+                                        opts.set("session", session)?;
                                         func.call_async::<()>(opts).await
                                     };
-                                    if let Err(e) = run_command_scoped(&lua, depth, run).await {
+                                    if let Err(e) =
+                                        run_command_scoped(&lua, depth, target, run).await
+                                    {
                                         tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
                                     }
                                 });

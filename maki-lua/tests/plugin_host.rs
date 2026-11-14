@@ -4654,7 +4654,7 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
     .unwrap();
     let mut rx = host.take_ui_action_rx().unwrap();
     host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/echo"), args.into(), 0);
+        .run_command(Arc::from("p"), Arc::from("/echo"), args.into(), 0, None);
 
     let action = wait_next(&mut rx, Duration::from_secs(5)).expect("command handler did not run");
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
@@ -4695,24 +4695,100 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
     );
     let mut rx = host.take_ui_action_rx().unwrap();
     host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
+        .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0, None);
 
     let maki_lua::UiAction::RunCommand {
         cmdline,
         depth,
         caller,
+        session,
         reply_tx,
     } = wait_next(&mut rx, Duration::from_secs(5)).expect(RUN_COMMAND_NO_ACTION)
     else {
         panic!("{RUN_COMMAND_NO_ACTION}");
     };
     assert_eq!((cmdline.as_str(), depth), ("/cd ~/src", 1));
+    assert_eq!(session, None, "no opts means the focused session");
     assert!(!caller.is_allowed(maki_lua::Permission::Agent));
     reply_tx.send(reply).unwrap();
 
     let action = wait_next(&mut rx, Duration::from_secs(5)).expect(RUN_COMMAND_NO_ACTION);
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
+
+/// A handler learns which chat it runs in, and can aim the next command at
+/// that same chat even when it is not the focused one.
+#[test]
+fn run_command_forwards_session_both_ways() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/here",
+            handler = function(opts)
+                maki.api.run_command("/new", { session = opts.session })
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let mut rx = host.take_ui_action_rx().unwrap();
+    host.event_handle().run_command(
+        Arc::from("p"),
+        Arc::from("/here"),
+        String::new(),
+        0,
+        Some("s-bg".into()),
+    );
+
+    let maki_lua::UiAction::RunCommand {
+        cmdline, session, ..
+    } = wait_next(&mut rx, Duration::from_secs(5)).expect(RUN_COMMAND_NO_ACTION)
+    else {
+        panic!("{RUN_COMMAND_NO_ACTION}");
+    };
+    assert_eq!(cmdline, "/new");
+    assert_eq!(session.as_deref(), Some("s-bg"));
+}
+
+/// An alias like `/clear` calls `run_command` with no session. Run in a
+/// background tab, it must stay there instead of resetting the focused one.
+#[test]
+fn run_command_without_session_inherits_the_handlers() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/clear",
+            handler = function()
+                maki.api.run_command("/new")
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let mut rx = host.take_ui_action_rx().unwrap();
+    let background = MakiId::generate().to_string();
+    host.event_handle().run_command(
+        Arc::from("p"),
+        Arc::from("/clear"),
+        String::new(),
+        0,
+        Some(background.clone()),
+    );
+
+    let maki_lua::UiAction::RunCommand {
+        cmdline, session, ..
+    } = wait_next(&mut rx, Duration::from_secs(5)).expect(RUN_COMMAND_NO_ACTION)
+    else {
+        panic!("{RUN_COMMAND_NO_ACTION}");
+    };
+    assert_eq!(cmdline, "/new");
+    assert_eq!(session, Some(background));
+}
+
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"
@@ -7153,7 +7229,7 @@ fn async_run_from_parked_command_handler_runs_promptly() {
     .unwrap();
     let mut rx = host.take_ui_action_rx().unwrap();
     let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new(), 0);
+    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new(), 0, None);
 
     let action = wait_next(&mut rx, Duration::from_secs(5))
         .expect("async.run task starved while its command handler was parked");
@@ -7183,7 +7259,7 @@ fn job_callbacks_fire_while_command_handler_parked() {
     .unwrap();
     let mut rx = host.take_ui_action_rx().unwrap();
     let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new(), 0);
+    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new(), 0, None);
 
     let action = wait_next(&mut rx, Duration::from_secs(5))
         .expect("job callbacks starved while command handler was parked");
@@ -9237,10 +9313,32 @@ mod session_owned_ui {
     fn window_outside_a_tool_call_has_no_owner() {
         let (_reg, host) = host();
 
-        host.event_handle()
-            .run_command(Arc::from(PLUGIN), Arc::from(COMMAND), String::new(), 0);
+        host.event_handle().run_command(
+            Arc::from(PLUGIN),
+            Arc::from(COMMAND),
+            String::new(),
+            0,
+            None,
+        );
 
         assert_eq!(opened_in(&host), None);
+    }
+
+    /// A command sent to a tab runs in it, so the windows it opens go there.
+    #[test]
+    fn window_from_a_command_goes_to_its_session() {
+        let (_reg, host) = host();
+        let session = MakiId::generate();
+
+        host.event_handle().run_command(
+            Arc::from(PLUGIN),
+            Arc::from(COMMAND),
+            String::new(),
+            0,
+            Some(session.to_string()),
+        );
+
+        assert_eq!(opened_in(&host), Some(session));
     }
 
     /// A typo here would quietly put the window or hint in the wrong tab.

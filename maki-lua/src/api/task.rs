@@ -452,7 +452,7 @@ mod tests {
         let host = spawn_host(rx, Ok(json!(true)));
 
         let (val, err): (bool, Option<String>) =
-            run_command_scoped(&lua, 0, lua.load(STOP_CALL).eval_async())
+            run_command_scoped(&lua, 0, None, lua.load(STOP_CALL).eval_async())
                 .await
                 .unwrap();
         assert!(val);
@@ -482,9 +482,9 @@ mod tests {
         let (val, err): (Value, Option<String>) = async {
             match caller {
                 Caller::Hook => stop.await,
-                Caller::CommandAlias => run_command_scoped(&lua, 1, stop).await,
+                Caller::CommandAlias => run_command_scoped(&lua, 1, None, stop).await,
                 Caller::ChildOfUserCommand => {
-                    run_command_scoped(&lua, 0, async {
+                    run_command_scoped(&lua, 0, None, async {
                         let child =
                             TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
                         child.scope_future(stop).await

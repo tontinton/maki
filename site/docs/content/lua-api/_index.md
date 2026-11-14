@@ -618,8 +618,10 @@ browsing memory files or toggling settings.
     handle an empty `opts.args` yourself.
   - `handler` (`function`) Required. Called when the user runs the command,
     with one opts table: `opts.args` is the raw
-    argument string (whitespace kept, may be empty)
-    and `opts.fargs` is the same split into words.
+    argument string (whitespace kept, may be empty),
+    `opts.fargs` is the same split into words, and
+    `opts.session` is the id of the session it runs
+    in.
 
 **Example:**
 
@@ -839,7 +841,7 @@ end
 ### `maki.api.run_command()` {#maki-api-run_command}
 
 ```lua
-maki.api.run_command({cmdline})
+maki.api.run_command({cmdline}, {opts?})
 ```
 
 Runs a slash command by name, exactly as typing it in the input would.
@@ -863,9 +865,19 @@ A command outside the calling plugin's grants returns an error, and a few
 only run when you type them. [Commands](/docs/commands/#plugin-access)
 lists what each one needs.
 
+Pass `opts.session` to run it in a background tab instead of the focused
+one; a Lua handler sees that id as its own `opts.session`. Called without
+one from a command handler or a tool call, or from `maki.async.run` work
+they started, it stays in their session, so an alias sent to a background
+tab does not reset the one in view.
+
 **Parameters:**
 
 - `{cmdline}` (`string`) Command line, e.g. `"/new"` or `"/cd ~/src"`.
+- `{opts?}` (`table?`) Options:
+  - `session` (`string`) id of a live session. Defaults to the session the
+    calling command handler or tool call runs in, else the
+    focused one.
 
 **Returns:** (`boolean|nil`, `string|nil`) `true` once dispatched, or nil and an error message for an unknown or denied command.
 
