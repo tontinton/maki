@@ -153,7 +153,7 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
             v
         }
         ParamSchema::OpenObject { description } => {
-            let mut v = json!({ "type": "object" });
+            let mut v = json!({ "type": "object", "additionalProperties": true });
             if !description.is_empty() {
                 v["description"] = json!(description);
             }
@@ -757,10 +757,15 @@ fn sanitize_object_schema(map: &mut serde_json::Map<String, Value>) {
         map.insert("type".to_string(), json!("object"));
     }
     if !map.contains_key("properties") {
+        // A schema with no properties is an open object, not a closed empty
+        // one: without `additionalProperties` a schema-following generator
+        // can only ever emit `{}` for it.
         map.insert(
             "properties".to_string(),
             Value::Object(serde_json::Map::new()),
         );
+        map.entry("additionalProperties")
+            .or_insert_with(|| json!(true));
     }
     sanitize_required(map);
 
@@ -1193,7 +1198,10 @@ mod tests {
     #[test_case(json!("{\"a\": 1}") ; "stringified_object_is_decoded")]
     fn open_object_keeps_keys_and_decodes_strings(value: Value) {
         let schema = try_from_json(&json!({ "type": "object" })).unwrap();
-        assert_eq!(to_json_schema(schema), json!({ "type": "object" }));
+        assert_eq!(
+            to_json_schema(schema),
+            json!({ "type": "object", "additionalProperties": true })
+        );
         assert_eq!(validate(schema, value).unwrap(), json!({"a": 1}));
         assert!(validate(schema, json!([1])).is_err());
     }
@@ -1288,11 +1296,11 @@ mod tests {
         assert_eq!(result, input);
     }
 
-    #[test_case(json!({}), json!({"type": "object", "properties": {}}) ; "empty_root")]
-    #[test_case(json!(null), json!({"type": "object", "properties": {}}) ; "missing_root")]
-    #[test_case(json!({"description": ANY_DESCRIPTION}), json!({"description": ANY_DESCRIPTION, "type": "object", "properties": {}}) ; "description_only_root")]
-    #[test_case(json!({"required": ["path"]}), json!({"type": "object", "properties": {}, "required": []}) ; "typeless_root")]
-    #[test_case(json!({"enum": [1, 2, 3]}), json!({"enum": [1, 2, 3], "type": "object", "properties": {}}) ; "enum_root")]
+    #[test_case(json!({}), json!({"type": "object", "properties": {}, "additionalProperties": true}) ; "empty_root")]
+    #[test_case(json!(null), json!({"type": "object", "properties": {}, "additionalProperties": true}) ; "missing_root")]
+    #[test_case(json!({"description": ANY_DESCRIPTION}), json!({"description": ANY_DESCRIPTION, "type": "object", "properties": {}, "additionalProperties": true}) ; "description_only_root")]
+    #[test_case(json!({"required": ["path"]}), json!({"type": "object", "properties": {}, "required": [], "additionalProperties": true}) ; "typeless_root")]
+    #[test_case(json!({"enum": [1, 2, 3]}), json!({"enum": [1, 2, 3], "type": "object", "properties": {}, "additionalProperties": true}) ; "enum_root")]
     fn sanitize_forces_object_root(input: Value, expected: Value) {
         let result = sanitize_tool_input_schema(input);
         assert_eq!(result, expected, "{ROOT_IS_NEVER_EMPTY}");
@@ -1305,8 +1313,8 @@ mod tests {
         assert_eq!(sanitize_tool_input_schema(input.clone()), input);
     }
 
-    #[test_case(json!({"type": "object", "required": {}}), json!({"type": "object", "properties": {}, "required": []}) ; "required_object")]
-    #[test_case(json!({"type": "object", "required": {"foo": true}}), json!({"type": "object", "properties": {}, "required": []}) ; "required_object_with_content")]
+    #[test_case(json!({"type": "object", "required": {}}), json!({"type": "object", "properties": {}, "required": [], "additionalProperties": true}) ; "required_object")]
+    #[test_case(json!({"type": "object", "required": {"foo": true}}), json!({"type": "object", "properties": {}, "required": [], "additionalProperties": true}) ; "required_object_with_content")]
     fn sanitize_required_object_to_array(input: Value, expected: Value) {
         let result = sanitize_tool_input_schema(input);
         assert_eq!(result, expected);
@@ -1407,10 +1415,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sanitize_does_not_close_open_objects() {
-        let result = sanitize_tool_input_schema(json!({"type": "object"}));
-        assert_eq!(result, json!({"type": "object", "properties": {}}));
-        assert!(result.get("additionalProperties").is_none());
+    #[test_case(json!({"type": "object"}), json!({"type": "object", "properties": {}, "additionalProperties": true}) ; "open_object_root")]
+    #[test_case(json!({"type": "object", "properties": {"a": {"type": "string"}}}), json!({"type": "object", "properties": {"a": {"type": "string"}}}) ; "declared_properties_untouched")]
+    #[test_case(json!({"type": "object", "additionalProperties": false}), json!({"type": "object", "properties": {}, "additionalProperties": false}) ; "explicitly_closed_kept")]
+    #[test_case(json!({"type": "object", "additionalProperties": {"type": "string"}}), json!({"type": "object", "properties": {}, "additionalProperties": {"type": "string"}}) ; "map_value_schema_kept")]
+    fn sanitize_marks_propertyless_objects_open(input: Value, expected: Value) {
+        let result = sanitize_tool_input_schema(input);
+        assert_eq!(result, expected);
     }
 }

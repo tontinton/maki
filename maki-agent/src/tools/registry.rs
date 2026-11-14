@@ -637,7 +637,7 @@ mod tests {
         let defs = reg.definitions(&Vars::new(), &ctx, false);
         assert_eq!(
             defs[0]["input_schema"],
-            json!({"type": "object", "properties": {}}),
+            json!({"type": "object", "properties": {}, "additionalProperties": true}),
             "{EMPTY_SCHEMA_REJECTED}"
         );
     }
