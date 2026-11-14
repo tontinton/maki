@@ -164,6 +164,7 @@ declare maki: {
     prompt: @checked (text: string, opts: any) -> (string?, string?),
     notify: @checked (text: string, opts: any) -> (boolean?, string?),
     set_mode: @checked (mode: string, opts: any) -> (boolean?, string?),
+    request_compact: @checked (opts: any) -> (boolean?, string?),
     set_title: @checked (opts: any) -> (boolean?, string?),
     data_dir: @checked (opts: any) -> (string?, string?),
   },

@@ -263,6 +263,12 @@ impl App {
         }
     }
 
+    /// The busy mark the typed /compact makes: a compaction queued outside the
+    /// command must look like running work to Esc and the status bar.
+    pub(crate) fn mark_compacting(&mut self) {
+        self.status = Status::Streaming;
+    }
+
     pub(super) fn queue_compact(&mut self, instructions: Option<String>) {
         let Some(ref shared) = self.queue.shared else {
             return;
@@ -270,6 +276,7 @@ impl App {
         shared.push(QueueItem::Compact(Compaction {
             run_id: self.run_id,
             instructions,
+            requested: false,
             workflow: self.state.workflow,
         }));
     }

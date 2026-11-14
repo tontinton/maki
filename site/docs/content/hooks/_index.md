@@ -334,9 +334,9 @@ A run continues at most 3 times in a row, so a layer that always answers
 ### agent.compact.before
 
 `reason` is `"auto"` (the context crossed its threshold), `"overflow"` (the
-provider rejected the prompt as too long), or `"manual"` (`/compact`). `usable`
-is the token budget `context_size` is measured against. `request_instructions`
-is what the user typed after `/compact`.
+provider rejected the prompt as too long), `"manual"` (`/compact`), or
+`"requested"` (a plugin called `maki.session.request_compact`). `usable` is the token budget `context_size` is measured
+against. `request_instructions` is what the user typed after `/compact`.
 
 Return a table with any of:
 
@@ -347,7 +347,8 @@ Return a table with any of:
   A defer buys one turn, so the next automatic compaction goes ahead even
   when the save turn ended the run. The host refuses a defer when the window
   has no room for the save turn. It works in subagent runs too. It does
-  nothing for `"manual"` and `"overflow"`, and it wins over `skip`.
+  nothing for `"manual"`, `"overflow"` and `"requested"`, and it wins over
+  `skip`.
 - `instructions`: appended to the summary prompt, after the configured and
   requested ones.
 - `continue`: text appended to the message the agent resumes with.

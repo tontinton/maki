@@ -3369,6 +3369,21 @@ mod bundled_manifests {
         assert_eq!(silent, expected);
     }
 
+    /// A bundled plugin named by no config list never loads, and its
+    /// `plugins.<name>` table is refused: the lists and `BUNDLED_PLUGINS` are
+    /// one fact. `lib` is a `require()` path, not a loadable plugin.
+    #[test]
+    fn every_bundled_plugin_has_a_place_in_the_config() {
+        const MODULE_ONLY: &[&str] = &["lib"];
+        for bundled in BUNDLED_PLUGINS {
+            assert!(
+                DEFAULT_BUILTINS.contains(&bundled.name) || MODULE_ONLY.contains(&bundled.name),
+                "{} has no config name it can load under",
+                bundled.name
+            );
+        }
+    }
+
     #[test]
     fn bundled_manifests_match_the_permissions_their_plugin_uses() {
         let tools = tool_permissions();

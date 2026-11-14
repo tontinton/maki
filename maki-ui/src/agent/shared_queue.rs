@@ -79,6 +79,9 @@ impl QueuedInput {
 pub(crate) struct Compaction {
     pub(crate) run_id: u64,
     pub(crate) instructions: Option<String>,
+    /// True when a plugin asked via `maki.session.request_compact`, so the
+    /// run can report reason "requested" to `agent.compact.before`.
+    pub(crate) requested: bool,
     /// The session's workflow mode when it was asked for: the frame left
     /// behind must carry the tools the next run sends.
     pub(crate) workflow: bool,
@@ -276,7 +279,10 @@ impl QueueReceiver {
 impl InterruptSource for QueueReceiver {
     fn poll(&self) -> Option<ExtractedCommand> {
         Some(match self.pop_run()? {
-            QueueRun::Compact(compaction) => ExtractedCommand::Compact(compaction.instructions),
+            QueueRun::Compact(compaction) => ExtractedCommand::Compact {
+                instructions: compaction.instructions,
+                requested: compaction.requested,
+            },
             QueueRun::Messages(run) => {
                 ExtractedCommand::Interrupt(run.into_iter().map(|queued| queued.input).collect())
             }
@@ -369,6 +375,7 @@ mod tests {
         QueueItem::Compact(Compaction {
             run_id: 0,
             instructions: instructions.map(str::to_string),
+            requested: false,
             workflow: false,
         })
     }
@@ -479,7 +486,7 @@ mod tests {
         tx.push(compact(Some(GUIDANCE)));
 
         assert!(
-            matches!(rx.poll(), Some(ExtractedCommand::Compact(Some(extra))) if extra == GUIDANCE)
+            matches!(rx.poll(), Some(ExtractedCommand::Compact { instructions: Some(extra), .. }) if extra == GUIDANCE)
         );
     }
 

@@ -63,6 +63,10 @@ pub(super) enum CompactReason {
     /// only way out, so a layer cannot skip this one.
     Overflow,
     Manual,
+    /// A plugin asked through `maki.session.request_compact`. Hooks get it as
+    /// its own reason so a layer honoring user intent can tell it from a
+    /// typed `/compact`.
+    Requested,
 }
 
 impl CompactReason {
@@ -71,6 +75,7 @@ impl CompactReason {
             Self::Auto => "auto",
             Self::Overflow => "overflow",
             Self::Manual => "manual",
+            Self::Requested => "requested",
         }
     }
 }
@@ -419,6 +424,7 @@ pub async fn compact(
     config: &AgentConfig,
     instructions: Option<&str>,
     retry: RetryPolicy,
+    requested: bool,
 ) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
     let ledger = RunLedger::default();
@@ -436,8 +442,13 @@ pub async fn compact(
             reason: DoneReason::Compact,
         }
     };
+    let reason = if requested {
+        CompactReason::Requested
+    } else {
+        CompactReason::Manual
+    };
     let CompactionPlan::Proceed(steer) =
-        steer_compaction(hooks, config, CompactReason::Manual, instructions, false).await
+        steer_compaction(hooks, config, reason, instructions, false).await
     else {
         event_tx.send(finished(size_before))?;
         return Ok(DoneReason::Compact);
@@ -921,6 +932,7 @@ mod tests {
             config,
             instructions,
             RetryPolicy::default(),
+            false,
         )
         .await
     }
@@ -1064,6 +1076,7 @@ mod tests {
             &AgentConfig::default(),
             None,
             RetryPolicy::default(),
+            false,
         )
         .await;
 
@@ -1148,6 +1161,7 @@ mod tests {
             &AgentConfig::default(),
             None,
             RetryPolicy::default(),
+            false,
         )
         .await;
 
@@ -1294,6 +1308,7 @@ mod tests {
             &AgentConfig::default(),
             instructions,
             RetryPolicy::default(),
+            false,
         )
         .await;
         (

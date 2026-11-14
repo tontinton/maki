@@ -90,6 +90,7 @@ const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_OUTPUT_CAP: u32 = 8192;
 const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
 const TASK_ID: &str = "task1";
+const COMPACT_INSTRUCTIONS: &str = "keep tests";
 pub(crate) const STARTED_AT_KEY: &str = "started_at";
 const ENDED_AT_KEY: &str = "ended_at";
 const COST_KEY: &str = "cost";
@@ -13504,4 +13505,26 @@ fn the_escape_that_closes_the_palette_stays_out_of_the_chat() {
 
     assert!(!palette_open(&mut app));
     assert_eq!(app.status_bar.flash_text(), None, "{PALETTE_ESC_LEAKED}");
+}
+
+#[test_case(Status::Idle, true ; "quiescence_claims")]
+#[test_case(Status::Streaming, false ; "a_live_run_claims_first")]
+fn a_requested_compaction_wins_its_single_taker(status: Status, claimed: bool) {
+    let mut app = test_app();
+    app.status = status;
+    let mailbox = hold_mailbox(&mut app);
+    SessionMailbox::request_compact(app.state.session.id, Some(COMPACT_INSTRUCTIONS.into()))
+        .unwrap();
+
+    let claim = app.take_requested_compact();
+
+    assert_eq!(claim.is_some(), claimed);
+    if claimed {
+        assert_eq!(claim.unwrap().as_deref(), Some(COMPACT_INSTRUCTIONS));
+    } else {
+        assert_eq!(
+            mailbox.take_compact().unwrap().as_deref(),
+            Some(COMPACT_INSTRUCTIONS)
+        );
+    }
 }

@@ -5845,6 +5845,43 @@ maki.session.prompt("Implement the plan at `" .. opts.path .. "`.", { session = 
 
 ---
 
+### `maki.session.request_compact()` {#maki-session-request_compact}
+
+```lua
+maki.session.request_compact({opts?})
+```
+
+Queues a compaction of a live session, the API behind `/compact`.
+
+Answers once the request is queued, not when the summary lands: a
+running agent compacts before its next request, an idle one when it
+next runs. While one sits unclaimed, a repeat request fails.
+`agent.compact.before` still steers or skips it, and sees
+it with reason `requested`.
+
+Requires the `agent` and `session_write` [plugin permissions](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table`) Options:
+  - `session` (`string`) id of a live session.
+  - `task` (`string?`) id of a live subagent of `session`, as `TurnComplete`
+    reports it; that subagent's own conversation compacts.
+  - `instructions` (`string`) guidance for this one summary, like `/compact <text>`.
+
+**Returns:** (`boolean|nil`, `string|nil`) true once queued, or nil and an error.
+
+**Example:**
+
+```lua
+maki.session.request_compact({
+  session = ctx:session_id(),
+  instructions = "keep the failing test names",
+})
+```
+
+---
+
 ### `maki.session.set_title()` {#maki-session-set_title}
 
 ```lua

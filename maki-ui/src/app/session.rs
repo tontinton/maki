@@ -506,6 +506,15 @@ impl App {
             .filter(|mailbox| mailbox.session_id() == self.state.session.id)
     }
 
+    /// Takes a plugin's compaction request, but only at quiescence: a live
+    /// run claims it before its next request, and one taker wins.
+    pub(crate) fn take_requested_compact(&self) -> Option<Option<String>> {
+        if !self.takes_wake() {
+            return None;
+        }
+        self.live_mailbox()?.take_compact()
+    }
+
     /// The one funnel for handing a history over. When the UI installs one the
     /// agent did not give it (rewind, load, new session), the mirror handle
     /// goes away in the same breath, so no later checkpoint can bring the

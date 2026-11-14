@@ -1131,9 +1131,15 @@ impl<'h> Agent<'h> {
         }
     }
 
-    /// The threshold gate. A landing compaction leaves the continuation
-    /// message the model answers next.
+    /// The threshold gate, and the landing spot of a plugin's compaction
+    /// request. A landing compaction leaves the continuation message the
+    /// model answers next.
     async fn try_auto_compact(&mut self) -> Result<(), AgentError> {
+        if let Some(instructions) = self.mailbox.as_ref().and_then(|m| m.take_compact()) {
+            self.run_compaction(CompactReason::Requested, instructions.as_deref())
+                .await?;
+            return Ok(());
+        }
         let context_size = self.gauge.size();
         if !self.auto_compact
             || !compaction::is_overflow(u64::from(context_size), &self.model, &self.config)
@@ -1142,6 +1148,24 @@ impl<'h> Agent<'h> {
         }
         info!(context_size, "auto-compacting");
         self.compact_now(CompactReason::Auto).await
+    }
+
+    /// A compaction the user or the model asked for, whatever the context
+    /// size; true when one landed. A layer may skip it, since unlike the
+    /// overflow guard nothing here has to happen before this very request.
+    async fn run_compaction(
+        &mut self,
+        reason: CompactReason,
+        instructions: Option<&str>,
+    ) -> Result<bool, AgentError> {
+        let CompactionPlan::Proceed(steer) =
+            compaction::steer_compaction(&self.hooks(), &self.config, reason, instructions, false)
+                .await
+        else {
+            return Ok(false);
+        };
+        self.do_compact(steer).await?;
+        Ok(true)
     }
 
     /// A layer may skip an automatic compaction to wait for a better moment,
@@ -1294,20 +1318,16 @@ impl<'h> Agent<'h> {
                 }
                 Ok(kept_any)
             }
-            ExtractedCommand::Compact(instructions) => {
-                let CompactionPlan::Proceed(steer) = compaction::steer_compaction(
-                    &self.hooks(),
-                    &self.config,
-                    CompactReason::Manual,
-                    instructions.as_deref(),
-                    false,
-                )
-                .await
-                else {
-                    return Ok(false);
+            ExtractedCommand::Compact {
+                instructions,
+                requested,
+            } => {
+                let reason = if requested {
+                    CompactReason::Requested
+                } else {
+                    CompactReason::Manual
                 };
-                self.do_compact(steer).await?;
-                Ok(true)
+                self.run_compaction(reason, instructions.as_deref()).await
             }
         }
     }
@@ -2879,7 +2899,10 @@ mod tests {
     }
 
     fn with_compact(agent: &mut Agent<'_>) {
-        let compact = vec![ExtractedCommand::Compact(None)];
+        let compact = vec![ExtractedCommand::Compact {
+            instructions: None,
+            requested: false,
+        }];
         agent.interrupt_source = Some(MockInterruptSource::new(compact));
     }
 
@@ -3557,7 +3580,10 @@ mod tests {
 
     #[test_case(
         (0..10).map(|i| Message::user(format!("msg {i}"))).collect(),
-        vec![ExtractedCommand::Compact(None)],
+        vec![ExtractedCommand::Compact {
+            instructions: None,
+            requested: false,
+        }],
         vec![tool_call_response("glob", "t1"), text_response(StopReason::EndTurn), text_response(StopReason::EndTurn)]
         ; "compaction_via_interrupt_source"
     )]
@@ -3577,6 +3603,36 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+        assert!(matches!(
+            compaction_events(&drain_events(&mut event_rx)).as_slice(),
+            [
+                AgentEvent::CompactionStarted,
+                AgentEvent::CompactionDone { .. }
+            ]
+        ));
+    }
+
+    /// The summarizer runs on the ask that would have sent the full
+    /// transcript, so the request never waits for a model answer.
+    #[tokio::test]
+    async fn mailbox_compact_request_compacts_before_the_first_request() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::request_compact(id, None).unwrap();
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, mut event_rx) = make_agent(
+            MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]),
+            &mut history,
+        );
+        agent.mailbox = Some(mailbox.clone());
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert!(mailbox.take_compact().is_none());
         assert!(matches!(
             compaction_events(&drain_events(&mut event_rx)).as_slice(),
             [
@@ -4536,7 +4592,7 @@ mod tests {
     /// The mock holds one response, so a run that went on anyway would panic
     /// on its second request.
     #[test_case(ExtractedCommand::Interrupt(vec![AgentInput { message: BLOCKED.into(), ..default_input() }]) ; "dropped_interrupt")]
-    #[test_case(ExtractedCommand::Compact(None) ; "skipped_compact")]
+    #[test_case(ExtractedCommand::Compact { instructions: None, requested: false } ; "skipped_compact")]
     #[tokio::test]
     async fn queued_command_that_lands_nothing_ends_the_run(cmd: ExtractedCommand) {
         let mut history = History::new(Vec::new());
