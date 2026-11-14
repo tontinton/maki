@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 use std::thread;
 
-use common::{Chat, Parked, WAIT, call_ctx, done_text, exec, next_task_event, request_move};
+use common::{
+    Chat, Parked, WAIT, call_ctx, done_text, exec, next_event, next_task_event, request_move,
+};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{AgentEvent, CancelToken, PermissionsConfig, SessionMailbox, ToolDoneEvent};
@@ -60,6 +62,7 @@ const NESTED_STOPPED: &str = "Stopped. What it did so far arrives with the resul
 const MOVED_AS_ASKED: &str = "Started in the background as asked";
 const AGENT_DENIED: &str = "permission denied: 'agent' not granted";
 const TIMED_OUT: &str = "timed out after";
+const UNATTENDED: &str = "no one can answer a permission prompt";
 const SUBAGENT_SELF_MOVE: &str =
     "background: a subagent's tool call only moves when the user moves it";
 const SUBAGENT_TASK_ID: &str = "toolu_subagent";
@@ -303,28 +306,31 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
     }
 }
 
-/// A ctx session has an answer channel, so the prompt reaches the user
-/// instead of being denied as nobody's to answer. The subagent dispatches
-/// through the global registry, so the tools live there.
-#[test]
-fn a_background_subagent_asks_for_permission_instead_of_being_denied() {
+/// A ctx session has its own answer channel, so its prompt reaches the user.
+/// One opened inside another subagent is denied instead, because the answer
+/// would go to the outer one. The subagent dispatches through the global
+/// registry, so the tools live there.
+#[test_case(false ; "top_level_session_asks_the_user")]
+#[test_case(true ; "nested_session_is_denied_as_unattended")]
+fn a_subagent_asks_for_permission_only_where_the_answer_comes_back(nested: bool) {
     let reg = Arc::clone(ToolRegistry::global_arc());
     let mut host = Host::task(Arc::clone(&reg));
     host.host.load_source(GUARDED_PLUGIN, GUARDED_SRC).unwrap();
     let chat = Chat::live();
-    let parked = Parked::with_first_turn(
+    let project = TempDir::new().unwrap();
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, mut events) = call_ctx(&reg, chat.id, &run_token, CALL_ID);
+    // The rest of `Parked` drops here, and without a release sender no turn
+    // waits.
+    ctx.provider = Parked::with_first_turn(
         RESULT,
         Some(ContentBlock::tool_use(
             GUARDED_CALL_ID,
             GUARDED_TOOL,
             json!({ "target": "x" }),
         )),
-    );
-    parked.release.send(()).unwrap();
-    let project = TempDir::new().unwrap();
-    let (_run, run_token) = CancelToken::new();
-    let (mut ctx, _events) = call_ctx(&reg, chat.id, &run_token, CALL_ID);
-    ctx.provider = Arc::clone(&parked.provider);
+    )
+    .provider;
     ctx.permissions = Arc::new(PermissionManager::new(
         PermissionsConfig::default(),
         project.path().to_owned(),
@@ -333,12 +339,25 @@ fn a_background_subagent_asks_for_permission_instead_of_being_denied() {
     ));
     let (_answer_tx, answer_rx) = unbounded_channel::<String>();
     ctx.user_response_rx = Some(Arc::new(tokio::sync::Mutex::new(answer_rx)));
+    if nested {
+        ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
+    }
 
-    assert!(exec(&reg, TASK_TOOL, task_input(), &ctx).backgrounded);
+    let result = exec(&reg, TASK_TOOL, task_input(), &ctx);
 
-    host.wait_permission_request();
-    host.host.event_handle().cancel_plugin_session(CALL_ID);
-    host.task_done();
+    if nested {
+        let guarded = next_event(&mut events, |event| match event {
+            AgentEvent::ToolDone(done) if done.id == GUARDED_CALL_ID => Some(done),
+            _ => None,
+        });
+        let (reply, failed) = done_text(&guarded);
+        assert!(failed && reply.contains(UNATTENDED), "{reply}");
+    } else {
+        assert!(result.backgrounded);
+        host.wait_permission_request();
+        host.host.event_handle().cancel_plugin_session(CALL_ID);
+        host.task_done();
+    }
 }
 
 /// Moving itself makes the result wake the chat, the price of

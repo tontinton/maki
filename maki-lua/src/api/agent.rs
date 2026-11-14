@@ -1181,11 +1181,12 @@ async fn session(
     let parent_tx = agent_ctx.event_tx.clone();
     // A subagent can only ask the user if its parent can. Under `maki -p` or
     // a background session nobody reads the subagent's chat, so a fresh
-    // channel would leave every prompt waiting until cancel. Without one,
-    // `enforce` denies the call right away.
-    let (answer_tx, answer_rx) = agent_ctx
-        .user_response_rx
-        .is_some()
+    // channel would leave every prompt waiting until cancel. A session opened
+    // inside another subagent has the same problem. The outer relay stamps
+    // the inner asks as its own, so the user's answer lands on the outer
+    // channel. Without a channel, `enforce` denies the call right away.
+    let can_ask = agent_ctx.user_response_rx.is_some() && agent_ctx.task_id.is_none();
+    let (answer_tx, answer_rx) = can_ask
         .then(unbounded_channel::<String>)
         .map(|(tx, rx)| (tx, Arc::new(AsyncMutex::new(rx))))
         .unzip();
