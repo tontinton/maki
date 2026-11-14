@@ -11,6 +11,7 @@ const LOCK_FILE_NAME: &str = "maki.log.lock";
 const ROTATED_PREFIX: &str = "maki.";
 const ROTATED_SUFFIX: &str = ".log";
 const MIN_MAX_FILES: u32 = 1;
+const STDERR_LOG_FILE_NAME: &str = "stderr.log";
 
 fn file_path(dir: &Path, index: u32) -> PathBuf {
     if index == 0 {
@@ -34,6 +35,17 @@ fn rotated_index(name: &str) -> Option<u32> {
 
 fn open_append(path: &Path) -> io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Where fd 2 goes while the TUI owns the screen, so a dying maki still leaves
+/// its last words somewhere. Nothing rotates it, so it starts over once it
+/// outgrows `max_bytes`, which only costs messages from sessions long gone.
+pub fn open_stderr_log(dir: &Path, max_bytes: u64) -> io::Result<File> {
+    let file = open_append(&dir.join(STDERR_LOG_FILE_NAME))?;
+    if file.metadata()?.len() > max_bytes {
+        file.set_len(0)?;
+    }
+    Ok(file)
 }
 
 fn flock_exclusive(file: &File) -> io::Result<()> {
@@ -296,6 +308,25 @@ mod tests {
             .filter(|e| rotated_index(&e.file_name().to_string_lossy()).is_some())
             .filter_map(|e| fs::read_to_string(e.path()).ok())
             .collect()
+    }
+
+    #[test_case(TEST_MAX_BYTES, true ; "within_limit_keeps_the_old_lines")]
+    #[test_case(TEST_MAX_BYTES + 1, false ; "past_limit_starts_over")]
+    fn open_stderr_log_caps_the_file(existing_bytes: u64, kept: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(STDERR_LOG_FILE_NAME);
+        let existing = "x".repeat(existing_bytes as usize);
+        fs::write(&path, &existing).unwrap();
+
+        let mut file = open_stderr_log(tmp.path(), TEST_MAX_BYTES).unwrap();
+        file.write_all(NEEDLE.as_bytes()).unwrap();
+
+        let expected = if kept {
+            format!("{existing}{NEEDLE}")
+        } else {
+            NEEDLE.to_string()
+        };
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
     }
 
     #[test]

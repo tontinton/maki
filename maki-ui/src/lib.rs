@@ -121,7 +121,7 @@ pub enum RunOutcome {
 
 pub async fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
     let report = {
-        let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
+        let (_guard, mut terminal) = terminal::TerminalGuard::init(params.max_log_bytes)?;
         color_compat::init();
         appearance::init(params.ui_config.theme.as_ref());
         let el = event_loop::EventLoop::new(&mut terminal, params).await?;
