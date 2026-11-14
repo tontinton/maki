@@ -257,8 +257,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"TurnComplete"`: `data.context_size` and `data.context_window` after
 ///   each model response, before its tool calls run. Use it to act mid-turn,
 ///   before `"AutoCompacting"`. `data.context_size` is absent when unknown.
-///   A subagent's response carries its own sizes plus `data.id`, its task id.
-///   To watch only the main context, skip events that have an `id`.
+///   A subagent's response carries its own sizes plus `data.id`, its task id,
+///   which `maki.session.notify` takes as `task` to reach that subagent. To
+///   watch only the main context, skip events that have an `id`.
 /// - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
 ///   trigger time.
 /// - `"CompactionDone"`: `data.context_size_before`,
