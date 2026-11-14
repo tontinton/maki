@@ -25,6 +25,9 @@ const ECHO_PREFIX: &str = "echo:";
 const FAIL_MSG: &str = "fixture blew up";
 const ERROR_PREFIX: &str = "[ERROR] ";
 const GATHER_HINT_SUBSTR: &str = "`gather(...)` keeps the other results";
+const TOOLS_MODULE_HINT_SUBSTR: &str = "There is no `tools` module";
+const ASYNCIO_HINT_SUBSTR: &str = "asyncio here has only";
+const PATHLIB_NAME: &str = "leaf.txt";
 const TASK_PREFIX: &str = "task:";
 const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
 const WF_TASK_GATED_LINE: &str = "Not callable: wf_task";
@@ -453,6 +456,28 @@ fn failed_call_error_names_the_tool_and_hints_only_for_asyncio_gather(code: &str
         "got: {err}"
     );
     assert_eq!(err.contains(GATHER_HINT_SUBSTR), hint, "got: {err}");
+}
+
+#[test_case::test_case("import tools", TOOLS_MODULE_HINT_SUBSTR ; "import_tools")]
+#[test_case::test_case("await tools.interp_echo(msg='hi')", TOOLS_MODULE_HINT_SUBSTR ; "tools_attribute")]
+#[test_case::test_case("await asyncio.wait_for(interp_echo(msg='hi'), 1)", ASYNCIO_HINT_SUBSTR ; "missing_asyncio_api")]
+#[test_case::test_case("asyncio.wait_for(\"No module named 'tools'\")", ASYNCIO_HINT_SUBSTR ; "source_preview_does_not_match")]
+fn a_known_sandbox_mistake_gets_its_hint(code: &str, hint: &str) {
+    let err = run_code(code).expect_err("the mistake must raise");
+    assert!(err.contains(hint), "got: {err}");
+    let other = if hint == TOOLS_MODULE_HINT_SUBSTR {
+        ASYNCIO_HINT_SUBSTR
+    } else {
+        TOOLS_MODULE_HINT_SUBSTR
+    };
+    assert!(!err.contains(other), "got: {err}");
+}
+
+#[test]
+fn pathlib_is_preloaded() {
+    let out = run_code(&format!("print(pathlib.Path('dir/{PATHLIB_NAME}').name)"))
+        .expect("pathlib must work without an import");
+    assert!(out.contains(PATHLIB_NAME), "got: {out}");
 }
 
 /// The model counts lines in the code it wrote, so the preamble it never sees

@@ -27,6 +27,17 @@ local ASYNCIO_GATHER = "asyncio.gather"
 local GATHER_HINT = "\n\nHint: `gather(...)` keeps the other results, returning `"
   .. ERROR_PREFIX
   .. "...` for the failed call."
+-- Mistakes the description leaves out to save tokens on every request: the
+-- hint costs tokens only when the model actually makes one. Each key is the
+-- start of the traceback's last line, so a source preview or a tool's own
+-- error text cannot match.
+local TOOLS_MODULE_HINT = "\n\nHint: tools are globals, call `read(...)` directly. There is no `tools` module."
+local ASYNCIO_HINT = "\n\nHint: asyncio here has only `gather`, `run` and `sleep`. Use `gather(...)` for concurrency."
+local ERROR_HINTS = {
+  { "ModuleNotFoundError: No module named 'tools'", TOOLS_MODULE_HINT },
+  { "NameError: name 'tools' is not defined", TOOLS_MODULE_HINT },
+  { "AttributeError: module 'asyncio' has no attribute", ASYNCIO_HINT },
+}
 -- `asyncio.gather` cancels its siblings the moment one call raises, throwing away
 -- results the model already paid for, so `gather` awaits each call in its own
 -- `try` instead. Awaiting one at a time is still concurrent: every call was made
@@ -42,6 +53,7 @@ import asyncio
 import sys
 import os
 import json
+import pathlib
 async def gather(*calls):
     if len(calls) == 1 and isinstance(calls[0], list):
         calls = calls[0]
@@ -132,7 +144,7 @@ Use for chained/dependent tool calls and filtering/processing results, e.g. filt
 - All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
 - Tool results are complete. Only what you print/return is capped.
 - Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
-- Available libs: re, asyncio, sys, os, json, pathlib. No other imports, no classes, no network access. `open()` works on text files, and `os`/`pathlib` can stat, list, walk, glob and mkdir.
+- Available libs: re, asyncio, sys, os, json, pathlib. No other imports, no network access. `open()` works on text files, and `os`/`pathlib` can stat, list, walk, glob and mkdir.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
 - Skip it when a single tool call needs no transformation.
@@ -424,6 +436,13 @@ local function handler(input, ctx)
     -- The run is already paid for, so point a script that reached for
     -- `asyncio.gather` at the wrapper that would have kept its other results.
     local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
+    local exception = err:match("[^\n]*$")
+    for _, entry in ipairs(ERROR_HINTS) do
+      if exception:sub(1, #entry[1]) == entry[1] then
+        hint = hint .. entry[2]
+        break
+      end
+    end
     return { llm_output = output_limits.cut_middle(err .. hint, max_lines, max_bytes), is_error = true, body = buf }
   end
 
