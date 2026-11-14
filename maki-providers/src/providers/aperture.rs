@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use maki_config::providers::{OverrideFields, Protocol, ProviderOverride, ProvidersConfig};
 use reqwest::header::HeaderMap;
@@ -761,6 +761,30 @@ fn explain_facts(overrides: &Overrides, spec: &str, model: Model) -> ModelExplan
     }
 }
 
+/// Gateways that reject fields they do not know (LiteLLM in front of Azure)
+/// answer 400 to a thinking block. Remember the refusal per gateway and model
+/// once the plain retry works, so only the first request pays for it.
+static THINKING_REJECTED: LazyLock<Mutex<HashSet<(String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn thinking_refused(base: &str, model: &str) -> bool {
+    THINKING_REJECTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&(base.to_string(), model.to_string()))
+}
+
+fn remember_thinking_refused(base: &str, model: &str) {
+    THINKING_REJECTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((base.to_string(), model.to_string()));
+}
+
+fn is_bad_request(error: &AgentError) -> bool {
+    matches!(error, AgentError::Api { status: 400, .. })
+}
+
 /// The generic chat path had no thinking wiring; it now spells the choice the
 /// same way the codec does.
 fn apply_generic_thinking(body: &mut Value, model: &Model, thinking: ThinkingConfig) {
@@ -806,10 +830,41 @@ impl Provider for Aperture {
             let mut body =
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
-            apply_generic_thinking(&mut body, model, opts.thinking);
-            self.compat
+            let plain = body.clone();
+            let base = self.compat.base_url(&auth);
+            let refused = thinking_refused(&base, &model.id);
+            if !refused {
+                apply_generic_thinking(&mut body, model, opts.thinking);
+            }
+            if refused || body == plain {
+                return self
+                    .compat
+                    .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
+                    .await;
+            }
+            match self
+                .compat
                 .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                 .await
+            {
+                Err(error) if is_bad_request(&error) => {
+                    warn!(
+                        base_url = %base,
+                        model = %model.id,
+                        %error,
+                        "gateway refused the thinking fields, retrying without them"
+                    );
+                    let result = self
+                        .compat
+                        .do_stream(model, &HeaderMap::new(), &plain, event_tx, &auth)
+                        .await;
+                    if result.is_ok() {
+                        remember_thinking_refused(&base, &model.id);
+                    }
+                    result
+                }
+                result => result,
+            }
         })
     }
 
@@ -1319,6 +1374,29 @@ mod tests {
             None,
             "the generic wire cannot spell Zai thinking"
         );
+    }
+
+    #[test]
+    fn only_a_bad_request_triggers_a_thinking_replay() {
+        let api = |status| AgentError::Api {
+            status,
+            message: String::new(),
+            retry_after: None,
+        };
+        assert!(is_bad_request(&api(400)));
+        assert!(!is_bad_request(&api(429)));
+        assert!(!is_bad_request(&api(500)));
+    }
+
+    #[test]
+    fn a_refusal_is_remembered_per_gateway_and_model() {
+        let base = "https://refusing.example";
+        let model = "vendor/refusing-model";
+        assert!(!thinking_refused(base, model));
+        remember_thinking_refused(base, model);
+        assert!(thinking_refused(base, model));
+        assert!(!thinking_refused(base, "vendor/other"));
+        assert!(!thinking_refused("https://other.example", model));
     }
 
     #[test]
