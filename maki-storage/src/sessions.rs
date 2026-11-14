@@ -407,6 +407,11 @@ pub struct HistorySnapshot<M> {
     pub frame: Option<Arc<StoredFrame>>,
     /// In memory only: a resumed process rebuilds it from `frame`.
     pub tools: Option<SessionTools>,
+    /// What the user typed for the first message, when a layer's rewrite of
+    /// it still holds it whole. The default title names the session after
+    /// this instead of the context a layer wrapped around it. In memory only:
+    /// the title it produced is what gets saved.
+    pub title_source: Option<Arc<str>>,
 }
 
 /// The `tools` array the messages went out with, so a reader sending its own
@@ -425,6 +430,7 @@ impl<M> HistorySnapshot<M> {
             messages: Arc::new(messages),
             frame: None,
             tools: None,
+            title_source: None,
         }
     }
 }
@@ -739,9 +745,11 @@ pub fn normalize_title(title: &str) -> String {
 }
 
 pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
-    let first_user_text = messages.iter().find_map(|m| m.first_user_text());
+    title_from(messages.iter().find_map(|m| m.first_user_text()))
+}
 
-    let Some(text) = first_user_text.map(str::trim).filter(|t| !t.is_empty()) else {
+fn title_from(text: Option<&str>) -> String {
+    let Some(text) = text.map(str::trim).filter(|t| !t.is_empty()) else {
         return DEFAULT_TITLE.into();
     };
     let text = normalize_title(text);
@@ -2122,7 +2130,7 @@ where
             session.drop_tool_state_of(&dropped, tool_ids);
             // The title comes from the messages, so it goes stale exactly when
             // they move.
-            session.update_title_if_default();
+            session.update_title_if_default(snapshot.title_source.as_deref());
         }
         session.set_meta(meta);
         session.set_token_usage(token_usage);
@@ -2515,9 +2523,14 @@ where
         load_session_at(&path)
     }
 
-    pub fn update_title_if_default(&mut self) {
+    /// `typed` stands in for the first message's text, which may hold a
+    /// layer's rewrite of what the user typed.
+    pub fn update_title_if_default(&mut self, typed: Option<&str>) {
         if self.title == DEFAULT_TITLE {
-            self.set_title(generate_title(&self.messages));
+            let title = title_from(
+                typed.or_else(|| self.messages.iter().find_map(|m| m.first_user_text())),
+            );
+            self.set_title(title);
         }
     }
 
@@ -2612,6 +2625,8 @@ mod tests {
     const FRAME_SYSTEM: &str = "system";
     const NEXT_FRAME_SYSTEM: &str = "system after compaction";
     const LATE_MCP_TOOLS: [&str; 3] = ["github__search", "linear__issue", "sentry__events"];
+    const TYPED_PROMPT: &str = "fix the login bug";
+    const REWRITTEN_PROMPT: &str = "memories: the login uses OAuth. fix the login bug";
 
     impl TitleSource for Value {
         fn first_user_text(&self) -> Option<&str> {
@@ -3138,6 +3153,7 @@ mod tests {
             messages: Arc::new(vec![user_message("hi")]),
             frame: None,
             tools: None,
+            title_source: None,
         };
         let meta = session.meta.clone();
         Session::checkpoint(
@@ -3164,6 +3180,7 @@ mod tests {
             messages: Arc::new(vec![user_message("hi"), assistant_message("reply")]),
             frame: None,
             tools: None,
+            title_source: None,
         };
         Session::checkpoint(
             &mut session,
@@ -4020,6 +4037,25 @@ mod tests {
             vec![user_message(input)]
         };
         assert_eq!(generate_title(&messages), expected);
+    }
+
+    /// Forks, rewinds and restores carry no typed text, so they name the
+    /// session after the first message as it stands.
+    #[test_case(Some(TYPED_PROMPT), TYPED_PROMPT ; "typed_text_names_it_over_the_rewrite")]
+    #[test_case(None, REWRITTEN_PROMPT ; "without_typed_text_the_message_names_it")]
+    fn checkpoint_titles_from_the_typed_text_first(typed: Option<&str>, expected: &str) {
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let mut snapshot = HistorySnapshot::new(vec![user_message(REWRITTEN_PROMPT)]);
+        snapshot.title_source = typed.map(Arc::from);
+        let meta = session.meta.clone();
+        Session::checkpoint(
+            &mut session,
+            Some(&snapshot),
+            meta,
+            Value::Null,
+            no_tool_ids,
+        );
+        assert_eq!(session.title, expected);
     }
 
     #[test]
