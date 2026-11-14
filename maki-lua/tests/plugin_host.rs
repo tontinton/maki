@@ -9369,3 +9369,64 @@ fn jobwait_drains_a_job_past_its_queue_bound() {
     let expected = PAST_BOUND_LINES * (PADDED_LINE_BYTES + 1) - 1;
     assert_eq!(out, expected.to_string());
 }
+
+#[test]
+fn list_plugins_reports_registrations_load_failures_and_runtime_errors() {
+    let disabled = maki_config::NON_TOOL_BUILTINS[0];
+    let plugins = HashMap::from([(
+        disabled.to_owned(),
+        maki_config::PluginFileConfig {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    )]);
+    let (reg, host) = builtins_host_with(&PluginsConfig::from_plugins(plugins));
+    let src = format!(
+        r#"
+maki.api.create_autocmd("ProbeFailure", {{
+    callback = function() error("kaboom") end,
+}})
+maki.api.register_command({{ name = "/probe", handler = function() end }})
+maki.api.register_tool({{
+    name = "list_plugins_probe",
+    description = "returns list_plugins as json",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return maki.json.encode(maki.api.list_plugins())
+    end,
+}})
+"#
+    );
+    host.load_source("probe", &src).unwrap();
+    host.load_source("broken", "error('nope')")
+        .expect_err("load must fail");
+    maki_lua::test_support::fire_autocmd(&host.event_handle(), "ProbeFailure", json!({}));
+
+    let out = exec_tool(&reg, "list_plugins_probe", json!({})).unwrap();
+    let list: Vec<Value> = serde_json::from_str(&out).unwrap();
+    let find = |name: &str| {
+        list.iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from {out}"))
+    };
+
+    let probe = find("probe");
+    assert_eq!(probe["loaded"], true);
+    assert_eq!(probe["commands"], json!(["/probe"]));
+    assert_eq!(probe["tools"], json!(["list_plugins_probe"]));
+    assert_eq!(probe["autocmds"], 1);
+    let errors = probe["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{out}");
+    assert_eq!(errors[0]["seam"], "autocmd");
+    assert!(errors[0]["msg"].as_str().unwrap().contains("kaboom"));
+
+    let broken = find("broken");
+    assert_eq!(broken["loaded"], false);
+    assert!(broken["load_error"].as_str().unwrap().contains("nope"));
+
+    let disabled = find(disabled);
+    assert_eq!(disabled["source"], "bundled");
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["loaded"], false);
+}

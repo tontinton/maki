@@ -20,7 +20,7 @@ use crate::jobs::{
     MAX_TAIL_LINES, Redirect, deliver_job_event,
 };
 use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, require};
-use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
+use crate::runtime::{active_task_id, job_task_id, with_jobs};
 
 const DEFAULT_WAIT_MS: u64 = 30_000;
 
@@ -495,11 +495,9 @@ async fn jobwait(
             return Ok(err_pair(JOB_WAIT_TIMEOUT_ERR));
         };
         // A failing callback must not abort the wait: the event is already
-        // recorded and the exit still needs collecting. Same policy as the
-        // detached dispatch pump.
-        if let Err(e) = deliver_job_event(&lua, job_id, &event).await {
-            tracing::warn!(job_id, error = %strip_traceback(&e), "jobwait callback failed");
-        }
+        // recorded, the failure too, and the exit still needs collecting.
+        // Same policy as the detached dispatch pump.
+        let _ = deliver_job_event(&lua, job_id, &event).await;
         match event {
             JobEvent::Stdout(line) => stdout_lines.push(line.text),
             JobEvent::Stderr(line) => stderr_lines.push(line.text),

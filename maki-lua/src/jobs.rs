@@ -22,7 +22,8 @@ use tokio::sync::{
 
 use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
 use crate::plugin_permissions::Ceiling;
-use crate::runtime::{Narrowed, with_jobs};
+use crate::plugin_status::{ErrorSeam, record_callback_error};
+use crate::runtime::{Narrowed, strip_traceback, with_jobs};
 
 const DEFAULT_TAIL: usize = 20;
 pub(crate) const MAX_TAIL_LINES: usize = 1024;
@@ -1063,6 +1064,9 @@ fn kill_job(job: &JobMeta) {
 /// may suspend (the `maki.fs.*` helpers park on `spawn_blocking`). Resumed
 /// inline from a poll loop, it would die with "attempt to yield across
 /// metamethod / C-call boundary" on its first suspension.
+///
+/// A failing callback is recorded against its plugin here, so callers only
+/// decide whether the error also stops them.
 pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) -> LuaResult<()> {
     let (callback, ceiling) = with_jobs(lua, |store| {
         store.record_event(job_id, event);
@@ -1088,7 +1092,11 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
             }
             JobEvent::Exit(code) => callback.call_async::<()>((job_id, *code)),
         };
-        Narrowed::under(lua, ceiling, call).await?;
+        if let Err(e) = Narrowed::under(lua, ceiling, call).await {
+            let error = format!("job {job_id}: {}", strip_traceback(&e));
+            record_callback_error(lua, &callback, ErrorSeam::Job, error);
+            return Err(e);
+        }
     }
     Ok(())
 }
