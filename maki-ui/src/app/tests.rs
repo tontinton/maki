@@ -11957,13 +11957,15 @@ fn run_builtin_model_picker_opens_and_refreshes() {
     assert!(matches!(&actions[..], [Action::RefreshModels]));
 }
 
-/// A provider row that cannot serve models hands Enter to its login.
+/// A provider row that cannot serve models hands Enter to its login. Z.AI asks
+/// for a plan first, while a provider like Anthropic would open its key page
+/// in the developer's real browser and wait for the launcher to exit.
 #[test]
 fn enter_on_a_keyless_provider_row_opens_its_login() {
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(ModelList {
         specs: Vec::new(),
-        providers: HashMap::from([("anthropic".into(), ProviderStatus::MissingKey)]),
+        providers: HashMap::from([("zai".into(), ProviderStatus::MissingKey)]),
         loading: false,
     })));
     app.run_builtin(BuiltinAction::ModelPicker);
