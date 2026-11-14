@@ -59,6 +59,14 @@ impl PlanAnswers {
         self.pick += 1;
         self.pick
     }
+
+    /// A row handler that starts its own run has taken the session over, and
+    /// the built-in outcome its row kept would start a second run on top. The
+    /// menu a chain is still building stays. It is for the plan on disk, and
+    /// the form waits for the run to end anyway.
+    pub(super) fn yield_to_run(&mut self) {
+        self.action = None;
+    }
 }
 
 impl App {
