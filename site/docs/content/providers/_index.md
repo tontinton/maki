@@ -510,7 +510,17 @@ context_window = 262144
 supports_vision = true
 ```
 
-Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), and `path_prefix`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), `path_prefix`, and `like` (borrows another model's capabilities; see below). Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+
+Maki resolves a gateway model against its curated tables, plugin declarations and the warm models.dev catalog, normalizing gateway namespaces like `us.openai.gpt-6-sol`. When the name is opaque or the guess is wrong, `like` pins it: `slug/model` borrows that model's row, while a bare `slug` borrows the provider's defaults. An explicit field on the same override still wins, and the gateway's published limits and price win over both.
+
+```toml
+[aperture.overrides.azureai.models."opaque-terra"]
+like = "openai/gpt-6-sol"
+supports_thinking = false
+```
+
+Run `maki models --explain aperture/<upstream>/<model>` to see which row matched and where each fact came from.
 
 Maki sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
 
