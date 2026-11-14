@@ -9369,3 +9369,98 @@ fn jobwait_drains_a_job_past_its_queue_bound() {
     let expected = PAST_BOUND_LINES * (PADDED_LINE_BYTES + 1) - 1;
     assert_eq!(out, expected.to_string());
 }
+
+const QUESTION_INPUT_LABEL: &str = "Proceed?";
+const REMOTE_PICK: &str = "Yes";
+/// What a form opened on a host with no UI reads as: its window closes at once.
+const FORM_DISMISSED: &str = "(question dismissed by user)";
+
+fn question_host(layer: &str, granted: PluginPermissions) -> (Arc<ToolRegistry>, PluginHost) {
+    let reg = fresh_registry();
+    let mut host = PluginHost::start(Arc::clone(&reg), Interaction::None, true).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["question".to_owned(), "batch".to_owned()],
+        packages: Vec::new(),
+        opts: HashMap::new(),
+    })
+    .unwrap();
+    host.load_source_with_permissions("remote", layer, granted)
+        .expect("layer plugin loads");
+    (reg, host)
+}
+
+fn question_layer(reply: &str) -> String {
+    format!(
+        r#"maki.api.set_slot("question.form", function(prev, questions, ev, on_open)
+            return {reply}
+        end)"#
+    )
+}
+
+fn ask_question(reg: &ToolRegistry) -> Result<String, String> {
+    exec_tool(
+        reg,
+        "question",
+        json!({ "questions": [{ "question": QUESTION_INPUT_LABEL, "options": [{ "label": REMOTE_PICK }] }] }),
+    )
+}
+
+/// A hub answering for an away user layers the form instead of the user
+/// reaching the terminal, and the model reads that answer.
+#[test_case::test_case(r#"{ type = "submit", answers = { { "Yes" } } }"#, "Q1: Yes" ; "submit")]
+#[test_case::test_case(r#"{ type = "dismiss" }"#, "dismissed" ; "dismiss")]
+fn a_trusted_question_form_layer_answers_for_the_user(reply: &str, expected: &str) {
+    let (reg, _host) = question_host(&question_layer(reply), PluginPermissions::trusted());
+    let out = ask_question(&reg).expect("an answered question succeeds");
+    assert!(out.contains(expected), "got: {out}");
+}
+
+/// The slot needs no tool id, so a question nested in `batch`, whose call has
+/// none, reaches the layer like a top-level one.
+#[test]
+fn a_question_form_layer_answers_a_question_nested_in_batch() {
+    let (reg, _host) = question_host(
+        &question_layer(r#"{ type = "submit", answers = { { "Yes" } } }"#),
+        PluginPermissions::trusted(),
+    );
+    let question = json!({ "questions": [{ "question": QUESTION_INPUT_LABEL, "options": [{ "label": REMOTE_PICK }] }] });
+    let out = exec_tool_in(
+        &reg,
+        "batch",
+        json!({ "tool_calls": [{ "tool": "question", "parameters": question }] }),
+        Some(Arc::clone(&reg)),
+    )
+    .expect("the batch succeeds");
+    assert!(out.contains("Q1: Yes"), "got: {out}");
+}
+
+/// Answering stands in for the user, so a layer short of every permission is
+/// skipped and the form opens.
+#[test]
+fn an_untrusted_question_form_layer_is_skipped() {
+    let (reg, _host) = question_host(
+        &question_layer(r#"{ type = "submit", answers = { { "Yes" } } }"#),
+        PluginPermissions::denied(),
+    );
+    let out = ask_question(&reg);
+    assert!(
+        matches!(&out, Ok(text) if text == FORM_DISMISSED),
+        "the form must open: {out:?}"
+    );
+}
+
+/// A reply outside the form's shape would reach the model garbled, so the
+/// form opens instead.
+#[test]
+fn a_malformed_question_form_reply_falls_back_to_the_form() {
+    let (reg, _host) = question_host(
+        &question_layer(r#"{ type = "submit", answers = "Yes" }"#),
+        PluginPermissions::trusted(),
+    );
+    let out = ask_question(&reg);
+    assert!(
+        matches!(&out, Ok(text) if text == FORM_DISMISSED),
+        "the form must open: {out:?}"
+    );
+}
