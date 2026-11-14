@@ -89,7 +89,7 @@ maki
 Type what you want done, press Enter, watch it work. Worth knowing on day one:
 
 - **Permissions.** File edits inside the repo run freely. `bash` and web tools ask first: `y` allows once, `s` for the session, `a` for the project. Deny rules always win; `/yolo` skips the prompts. Details in [Permissions](/docs/permissions/).
-- **Plan mode.** `Tab` toggles it. The agent may only write the plan file until you approve, then back to build mode.
+- **Plan mode.** `Tab` toggles it. The agent may only write the plan file until you approve, then back to build mode. Each time its turn ends with a changed plan, the plan is shown for approval. `Ctrl+T` brings the form back.
 - **Models.** `/model` switches mid-session.
 - **Sessions.** `Ctrl+N` in `/sessions` starts a second session while the first keeps working, and `/sessions` jumps between them. `/new` replaces the current one. Tomorrow, `maki --continue` resumes where you left off.
 - **Slow commands.** `Ctrl+B` moves a running build or subagent to the background and the agent carries on. See [Background Tasks](/docs/background-tasks/).

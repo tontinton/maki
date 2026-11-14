@@ -410,6 +410,8 @@ pub struct SessionMeta {
     pub mode: Option<StoredMode>,
     #[serde(default)]
     pub plan_path: Option<String>,
+    /// The plan was shown for review. Older builds set it on the first write,
+    /// and the name stays so their session files still load.
     #[serde(default)]
     pub plan_written: bool,
     #[serde(default)]

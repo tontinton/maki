@@ -950,9 +950,10 @@ name the session now running or focused. What each event adds:
 - `"CompactionDone"`: `data.context_size_before`,
   `data.context_size_after`, `data.context_window`, and `data.summary`,
   the text that replaced the history.
-- `"PlanReady"`: `data.path`, the absolute path of the plan file the
-  agent just wrote. Fires once per draft. Plan state is per session, so
-  pass `data.session_id` to `maki.plan.read`.
+- `"PlanReady"`: `data.path`, the absolute path of the plan file shown
+  for review. Fires each time a changed plan is shown, see
+  `maki.plan.read`. Plan state is per session, so pass `data.session_id`
+  to `maki.plan.read`.
 - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
@@ -1416,9 +1417,12 @@ maki.plan.read({opts?})
 Read the current plan state. Returns `{ mode, path, content, ready }`:
 - `mode` is `"plan"` or `"build"`.
 - `path` is the absolute plan path once the session has one, else `nil`.
-- `ready` is `true` once the agent has written the plan file.
+- `ready` is `true` once the user has been shown the plan for review. That
+  happens when the agent is done and the plan changed since it was last
+  shown, or on `<C-t>`. It stays `true` while later turns refine the plan.
 - `content` is the file contents, `nil` when the plan is not ready or the
-  read failed.
+  read failed. While a turn runs it may be half edited. Implementing uses
+  the file as it is at that moment, and shows it again first if it changed.
 
 Requires the `session_read` [plugin permission](#plugin-permissions).
 

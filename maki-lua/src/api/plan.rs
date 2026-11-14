@@ -376,9 +376,12 @@ pub(crate) fn row_handler_opts(
 /// Read the current plan state. Returns `{ mode, path, content, ready }`:
 /// - `mode` is `"plan"` or `"build"`.
 /// - `path` is the absolute plan path once the session has one, else `nil`.
-/// - `ready` is `true` once the agent has written the plan file.
+/// - `ready` is `true` once the user has been shown the plan for review. That
+///   happens when the agent is done and the plan changed since it was last
+///   shown, or on `<C-t>`. It stays `true` while later turns refine the plan.
 /// - `content` is the file contents, `nil` when the plan is not ready or the
-///   read failed.
+///   read failed. While a turn runs it may be half edited. Implementing uses
+///   the file as it is at that moment, and shows it again first if it changed.
 ///
 /// @param opts table? `session` (string?) Session id, defaults to focused.
 /// @return (table|nil, string|nil) Plan snapshot table, or nil and an error.
