@@ -1,10 +1,10 @@
 use std::fs;
-use std::mem;
 use std::time::Instant;
 
 use maki_lua::{PlanActionOutcome, PlanMenu, PlanRowAction};
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::oneshot::error::TryRecvError;
+use tracing::warn;
 
 use super::{
     App, FLASH_NO_PLAN, FLASH_PLAN_ACTION_FAILED, FLASH_PLAN_ACTION_LOST, FLASH_PLAN_FORM_SLOW,
@@ -155,14 +155,14 @@ impl App {
         Dirty::YES
     }
 
-    /// Ask the `ui.plan_form*` chains what to draw for the draft that just
-    /// landed, starting from the host's own rows.
+    /// Ask the `ui.plan_form*` chains what to draw for the plan at {path},
+    /// starting from the host's own rows.
     ///
     /// Only asked when a plugin is layering one of them. With no layer the
     /// chain answers with the host's own rows by construction, and the
     /// roundtrip through a request loop that may be busy would cost a stock
     /// install its form.
-    pub(super) fn offer_plan_form(&mut self, path: Option<&str>) {
+    pub(super) fn offer_plan_form(&mut self, path: &str) {
         // A new draft retires the pick the last one was waiting on, handler
         // and built-in outcome both. The handler may well still be running,
         // but its answer is stamped with a pick nobody waits on any more, so
@@ -172,13 +172,13 @@ impl App {
         if lost_pick {
             self.flash(FLASH_PLAN_ACTION_LOST.into());
         }
-        let Some(path) = path.filter(|_| self.lua_event_handle.plan_form_layered()) else {
+        if !self.lua_event_handle.plan_form_layered() {
             self.open_plan_form(builtin_menu());
             return;
-        };
-        // The last draft's menu is not this draft's, and the chain has not
-        // answered with one yet.
-        self.plan_form.forget_menu();
+        }
+        // A form still up is for the last revision. It stays hidden until the
+        // chain says what this one looks like.
+        self.plan_form.reset();
         let answer = self.lua_event_handle.open_plan_form(
             path.to_owned(),
             self.state.session.id.to_string(),
@@ -278,17 +278,29 @@ impl App {
         })
     }
 
+    /// The user may have edited the plan since it was shown, so we read it
+    /// again and print it once more only if it changed. A cleared session has
+    /// lost the old copy, so it always gets one.
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
+        let PlanState::Ready { path, revision } = &self.state.plan else {
+            self.flash(FLASH_NO_PLAN.into());
+            return vec![];
+        };
+        // Read before touching anything. Clearing the session for a plan that
+        // is gone would throw away the conversation that wrote it.
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) => {
+                warn!(path = %path.display(), %error, "plan file unreadable on implement");
+                self.flash(FLASH_NO_PLAN.into());
+                return vec![];
+            }
+        };
+        let path = path.display().to_string();
+        let shown = !clear_context && revision.as_deref() == Some(content.as_str());
         let parallel = self.plan_form.parallel();
         self.plan_form.reset();
-        let plan_snapshot = match mem::take(&mut self.state.plan) {
-            PlanState::Ready(p) => Some((
-                fs::read_to_string(&p).unwrap_or_default(),
-                p.display().to_string(),
-            )),
-            _ => None,
-        };
-
+        self.state.plan = PlanState::None;
         self.state.mode = Mode::Build;
 
         let mut actions = if clear_context {
@@ -297,18 +309,14 @@ impl App {
             vec![]
         };
 
-        let text = if let Some((content, path_str)) = plan_snapshot {
-            let text = if parallel {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`. {IMPLEMENT_PARALLEL_HINT}")
-            } else {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`.")
-            };
-            self.main_chat()
-                .push(DisplayMessage::plan(content, path_str));
-            text
+        let text = if parallel {
+            format!("{IMPLEMENT_MSG_PREFIX} at `{path}`. {IMPLEMENT_PARALLEL_HINT}")
         } else {
-            format!("{}.", IMPLEMENT_MSG_PREFIX)
+            format!("{IMPLEMENT_MSG_PREFIX} at `{path}`.")
         };
+        if !shown {
+            self.main_chat().push(DisplayMessage::plan(content, path));
+        }
         let msg = QueuedMessage {
             text,
             images: vec![],
