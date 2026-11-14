@@ -149,7 +149,6 @@ fn provider_defaults(slug: &str) -> Option<ModelCaps> {
     };
     Some(ModelCaps {
         family: Some(spec.family),
-        supports_thinking: Some(spec.supports_thinking),
         source: Some(source),
         ..ModelCaps::default()
     })
@@ -434,6 +433,24 @@ mod tests {
             caps.source,
             Some(CapsSource::Curated { slug: "openai", .. })
         ));
+    }
+
+    #[test]
+    fn a_bare_provider_alias_borrows_its_defaults() {
+        let caps = resolve_target("zai").unwrap();
+        assert_eq!(caps.family, Some(ModelFamily::Glm));
+        assert_eq!(
+            caps.supports_thinking, None,
+            "the provider default may deny what a row allows"
+        );
+        assert!(matches!(
+            caps.source,
+            Some(CapsSource::Curated {
+                slug: "zai",
+                model: None
+            })
+        ));
+        assert!(resolve_target("nobody").is_none());
     }
 
     #[test]

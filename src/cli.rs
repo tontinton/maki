@@ -400,6 +400,9 @@ pub enum Command {
         /// Refetch the models.dev catalog, ignoring its 24h cache
         #[arg(long)]
         refresh: bool,
+        /// Explain how one model resolves, instead of listing every model
+        #[arg(long, value_name = "SPEC")]
+        explain: Option<String>,
     },
     /// Manage sessions
     Session {

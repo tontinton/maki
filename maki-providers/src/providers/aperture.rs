@@ -8,8 +8,10 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
-use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
-use crate::model_directory::{self, ModelCaps};
+use crate::model::{
+    Model, ModelError, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry,
+};
+use crate::model_directory::{self, CapsSource, ModelCaps};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::{
@@ -18,6 +20,7 @@ use crate::spec::{
 };
 use crate::types::ThinkingFallback;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use maki_config::providers::ModelTier;
 use maki_storage::id::SessionRef;
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -524,6 +527,142 @@ fn caps_model(overrides: &Overrides, model: &Model) -> Option<(&'static Provider
     }
 }
 
+/// What `maki models --explain` prints for one gateway model, and where each
+/// fact came from.
+#[derive(Debug, Clone)]
+pub struct ModelExplanation {
+    pub spec: String,
+    pub context_window: u32,
+    pub max_output_tokens: Option<u32>,
+    pub input_price: f64,
+    pub output_price: f64,
+    pub family: ModelFamily,
+    pub supports_thinking: bool,
+    pub supports_vision: bool,
+    pub tier: ModelTier,
+    pub capability_source: String,
+    pub limits_source: &'static str,
+    pub route: Option<&'static str>,
+    pub path_prefix: String,
+    pub alias: Option<String>,
+}
+
+impl ModelExplanation {
+    /// One line per fact, with the source beside it.
+    pub fn lines(&self) -> Vec<String> {
+        let route = self.route.map_or_else(
+            || "generic chat completions".to_string(),
+            |route| route.to_string(),
+        );
+        let tier = format!("{:?}", self.tier).to_lowercase();
+        let family = format!("{:?}", self.family).to_lowercase();
+        let yes = |value: bool| if value { "yes" } else { "no" };
+        vec![
+            self.spec.clone(),
+            format!(
+                "  context     {}  ({})",
+                self.context_window, self.limits_source
+            ),
+            format!(
+                "  max output  {}  ({})",
+                self.max_output_tokens
+                    .map_or_else(|| "unknown".to_string(), |tokens| tokens.to_string()),
+                self.limits_source
+            ),
+            format!(
+                "  pricing     ${:.4}/M in, ${:.4}/M out",
+                self.input_price, self.output_price
+            ),
+            format!("  family      {family}  ({})", self.capability_source),
+            format!(
+                "  thinking    {}  ({})",
+                yes(self.supports_thinking),
+                self.capability_source
+            ),
+            format!(
+                "  vision      {}  ({})",
+                yes(self.supports_vision),
+                self.capability_source
+            ),
+            format!("  tier        {tier}"),
+            format!("  route       {route} {prefix}", prefix = self.path_prefix),
+            format!("  alias       {}", self.alias.as_deref().unwrap_or("-")),
+        ]
+    }
+}
+
+/// Explain how one gateway model resolves, for `maki models --explain`.
+pub fn explain_model(spec: &str) -> Result<ModelExplanation, ModelError> {
+    explain_with(&load_overrides(), spec)
+}
+
+fn explain_with(overrides: &Overrides, spec: &str) -> Result<ModelExplanation, ModelError> {
+    let mut model = Model::from_spec(spec)?;
+    let (provider_id, model_id) = model
+        .id
+        .split_once('/')
+        .map_or(("", model.id.clone()), |(provider, id)| {
+            (provider, id.to_string())
+        });
+    let ov = merged_override(overrides, provider_id, &model_id);
+    let payload = model_registry::discovered(SLUG, &model.id);
+    let caps = resolved_caps(&ov, &model_id);
+    let routed = routed_spec(provider_id, &ov);
+    let routed_entry = routed.and_then(|spec| lookup_entry(spec.models(), &model_id));
+    apply_adjustments(&mut model, overrides);
+
+    let limits_source = if ov.context_window.is_some() || ov.max_output_tokens.is_some() {
+        "override"
+    } else if payload
+        .as_ref()
+        .is_some_and(|info| info.context_window.is_some() || info.max_output_tokens.is_some())
+    {
+        "gateway"
+    } else if caps
+        .as_ref()
+        .is_some_and(|caps| caps.context_window.is_some() || caps.max_output_tokens.is_some())
+        || routed_entry.is_some_and(|entry| {
+            entry.context_window.is_some() || entry.max_output_tokens.is_some()
+        })
+    {
+        "table"
+    } else {
+        "fallback"
+    };
+    let capability_source = match caps.as_ref().and_then(|caps| caps.source.as_ref()) {
+        Some(CapsSource::Curated { slug, model }) => format!(
+            "curated {slug}/{}",
+            model.as_deref().unwrap_or("(provider defaults)")
+        ),
+        Some(CapsSource::Plugin { slug, model }) => format!(
+            "plugin {slug}/{}",
+            model.as_deref().unwrap_or("(provider defaults)")
+        ),
+        Some(CapsSource::Catalog { slug, model }) => format!("catalog {slug}/{model}"),
+        Some(CapsSource::Heuristic) => "id heuristic".to_string(),
+        None => match routed {
+            Some(spec) => format!("routed {}", spec.slug),
+            None => "provider defaults".to_string(),
+        },
+    };
+    Ok(ModelExplanation {
+        spec: spec.to_string(),
+        context_window: model.context_window,
+        max_output_tokens: model.max_output_tokens,
+        input_price: model.pricing.input,
+        output_price: model.pricing.output,
+        family: model.family,
+        supports_thinking: model.supports_thinking(),
+        supports_vision: model.supports_vision(),
+        tier: model.tier,
+        capability_source,
+        limits_source,
+        route: routed.map(|spec| spec.slug),
+        path_prefix: path_prefix(routed, &ov),
+        alias: ov.like,
+    })
+}
+
 impl Provider for Aperture {
     fn stream_message<'a>(
         &'a self,
@@ -964,6 +1103,17 @@ mod tests {
         assert_eq!(model.context_window, 123_456);
         assert_eq!(model.max_output_tokens, Some(7_890));
         crate::model_registry::set_known_models("aperture", Vec::new());
+    }
+
+    #[test]
+    fn explain_names_the_row_it_borrowed() {
+        let explanation = explain_with(&Overrides::new(), "aperture/azureai/gpt-6-sol").unwrap();
+        assert_eq!(explanation.capability_source, "curated openai/gpt-6-sol");
+        assert_eq!(explanation.route, None);
+        assert_eq!(explanation.limits_source, "table");
+        let text = explanation.lines().join("\n");
+        assert!(text.contains("curated openai/gpt-6-sol"), "{text}");
+        assert!(text.contains("generic chat completions"), "{text}");
     }
 
     #[test]

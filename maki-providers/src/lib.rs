@@ -27,6 +27,7 @@ pub use model::{
     ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
+pub use providers::aperture::{ModelExplanation, explain_model};
 pub use providers::catalog::ProviderData;
 pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,
