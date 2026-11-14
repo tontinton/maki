@@ -1041,6 +1041,7 @@ impl<'t> EventLoop<'t> {
             AgentEvent::QueueDrained => {
                 if current {
                     rt.notifications.on_drain();
+                    rt.app.on_queue_drained();
                 }
                 return;
             }
@@ -1136,11 +1137,10 @@ impl<'t> EventLoop<'t> {
                     let _ = event_tx.send(WinEvent::Close);
                     return;
                 };
-                let app = &mut self.sessions[idx].app;
-                app.float_mgr.open(buf, config, focus, event_tx, cmd_rx);
-                if focus {
-                    app.transition_plan(crate::app::mode::PlanTrigger::InteractivePrompt);
-                }
+                self.sessions[idx]
+                    .app
+                    .float_mgr
+                    .open(buf, config, focus, event_tx, cmd_rx);
             }
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);

@@ -477,7 +477,7 @@ impl App {
             BackgroundOutcome::Done
         };
         let (ending, text) = tab_ending(outcome);
-        chat.handle_event(event, None);
+        chat.handle_event(event);
         chat.mark_finished(ending, text);
         self.set_badge_outcome(&id, outcome);
     }

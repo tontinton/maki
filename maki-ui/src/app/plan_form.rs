@@ -1,10 +1,10 @@
 use std::fs;
-use std::mem;
 use std::time::Instant;
 
 use maki_lua::{PlanActionOutcome, PlanMenu, PlanRowAction};
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::oneshot::error::TryRecvError;
+use tracing::warn;
 
 use super::{
     App, FLASH_NO_PLAN, FLASH_PLAN_ACTION_FAILED, FLASH_PLAN_ACTION_LOST, FLASH_PLAN_FORM_SLOW,
@@ -278,17 +278,28 @@ impl App {
         })
     }
 
+    /// Implements the plan file as it is now. Its body goes to the transcript
+    /// unless the revision offered right above it is still the one on disk.
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
+        let PlanState::Ready { path, revision } = &self.state.plan else {
+            self.flash(FLASH_NO_PLAN.into());
+            return vec![];
+        };
+        // Read before anything changes: clearing the session for a plan that
+        // is gone would lose the conversation that made it.
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) => {
+                warn!(path = %path.display(), %error, "plan file unreadable on implement");
+                self.flash(FLASH_NO_PLAN.into());
+                return vec![];
+            }
+        };
+        let path = path.display().to_string();
+        let shown = !clear_context && revision.as_deref() == Some(content.as_str());
         let parallel = self.plan_form.parallel();
         self.plan_form.reset();
-        let plan_snapshot = match mem::take(&mut self.state.plan) {
-            PlanState::Ready(p) => Some((
-                fs::read_to_string(&p).unwrap_or_default(),
-                p.display().to_string(),
-            )),
-            _ => None,
-        };
-
+        self.state.plan = PlanState::None;
         self.state.mode = Mode::Build;
 
         let mut actions = if clear_context {
@@ -297,18 +308,14 @@ impl App {
             vec![]
         };
 
-        let text = if let Some((content, path_str)) = plan_snapshot {
-            let text = if parallel {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`. {IMPLEMENT_PARALLEL_HINT}")
-            } else {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`.")
-            };
-            self.main_chat()
-                .push(DisplayMessage::plan(content, path_str));
-            text
+        let text = if parallel {
+            format!("{IMPLEMENT_MSG_PREFIX} at `{path}`. {IMPLEMENT_PARALLEL_HINT}")
         } else {
-            format!("{}.", IMPLEMENT_MSG_PREFIX)
+            format!("{IMPLEMENT_MSG_PREFIX} at `{path}`.")
         };
+        if !shown {
+            self.main_chat().push(DisplayMessage::plan(content, path));
+        }
         let msg = QueuedMessage {
             text,
             images: vec![],

@@ -142,14 +142,8 @@ impl PlanForm {
     }
 
     pub fn on_plan_ready(&mut self) {
-        if self.visibility != Visibility::UserDismissed {
-            self.visibility = Visibility::Shown;
-            self.selected = 0;
-        }
-    }
-
-    pub fn on_plan_drafting(&mut self) {
-        self.visibility = Visibility::Hidden;
+        self.visibility = Visibility::Shown;
+        self.selected = 0;
     }
 
     pub fn toggle(&mut self) {
@@ -415,25 +409,12 @@ mod tests {
     }
 
     #[test]
-    fn on_plan_ready_respects_user_dismissed() {
+    fn on_plan_ready_reopens_a_dismissed_form() {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         form.hide();
         form.on_plan_ready();
-        assert!(!form.is_visible());
-    }
-
-    #[test]
-    fn on_plan_drafting_clears_user_dismissed() {
-        let mut form = PlanForm::new();
-        form.on_plan_ready();
-        form.hide();
-        form.on_plan_drafting();
-        form.on_plan_ready();
-        assert!(
-            form.is_visible(),
-            "drafting should clear dismiss so next ready shows"
-        );
+        assert!(form.is_visible());
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use std::any::Any;
 use std::fmt::Write;
 use std::ops::AddAssign;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -566,11 +565,6 @@ impl ToolDoneEvent {
         self.written_path
             .as_deref()
             .or_else(|| self.output.written_path())
-    }
-
-    pub fn wrote_to(&self, plan_path: &Path) -> bool {
-        self.written_path()
-            .is_some_and(|wp| Path::new(wp) == plan_path)
     }
 }
 
@@ -1787,28 +1781,6 @@ mod tests {
         assert!(text.contains("1: fn main()"));
         assert!(text.contains("Instructions from: AGENTS.md"));
         assert!(text.contains("do stuff"));
-    }
-
-    #[test]
-    fn wrote_to_checks_path_and_error_flag() {
-        let ok_event = ToolDoneEvent {
-            call: None,
-            id: "id".into(),
-            tool: Arc::from("write"),
-            output: Arc::new(ToolOutput::Plain("wrote 10 bytes".into())),
-            is_error: false,
-            annotation: None,
-            written_path: Some("/plans/slug.md".into()),
-            backgrounded: false,
-        };
-        assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
-
-        let err_event = ToolDoneEvent {
-            call: None,
-            is_error: true,
-            ..ok_event
-        };
-        assert!(!err_event.wrote_to(Path::new("/plans/slug.md")));
     }
 
     #[test]
