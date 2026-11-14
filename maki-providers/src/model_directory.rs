@@ -95,6 +95,31 @@ pub(crate) fn resolve(model_id: &str) -> Option<ModelCaps> {
     (caps.source.is_some() || caps.family.is_some()).then_some(caps)
 }
 
+/// Capabilities from one spec's own table or declarations. Used when the
+/// gateway names its route, which outranks a guess from the model name.
+pub(crate) fn caps_for_spec(spec: &'static ProviderSpec, model_id: &str) -> Option<ModelCaps> {
+    let compiled = ProviderRegistry::compiled(spec.slug).is_some();
+    let entries = if compiled {
+        spec.models().to_vec()
+    } else {
+        plugin::model_entries(spec.slug)
+    };
+    candidate_for(entries.as_slice(), model_id, 0, Some(spec.slug), |model| {
+        if compiled {
+            CapsSource::Curated {
+                slug: spec.slug,
+                model: Some(model),
+            }
+        } else {
+            CapsSource::Plugin {
+                slug: spec.slug.to_string(),
+                model: Some(model),
+            }
+        }
+    })
+    .map(|candidate| candidate.caps)
+}
+
 /// Resolve an explicit `like` target: `slug/model` borrows that row, `slug`
 /// borrows the provider's defaults.
 pub(crate) fn resolve_target(target: &str) -> Option<ModelCaps> {

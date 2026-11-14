@@ -378,7 +378,7 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
             let id = m["id"].as_str()?;
             let provider_id = m["metadata"]["provider"]["id"].as_str().unwrap_or("");
             let ov = merged_override(overrides, provider_id, id);
-            let caps = resolved_caps(&ov, id);
+            let caps = resolved_caps(&ov, provider_id, id);
             let pricing = m["pricing"].as_object().map(|p| {
                 ModelPricing::per_million(
                     price_per_m(p.get("input")),
@@ -431,7 +431,7 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
         return;
     };
     let ov = merged_override(overrides, provider_id, model_id);
-    let caps = resolved_caps(&ov, model_id);
+    let caps = resolved_caps(&ov, provider_id, model_id);
     let routed = routed_spec(provider_id, &ov);
     let routed_entry = routed.and_then(|spec| lookup_entry(spec.models(), model_id));
 
@@ -496,11 +496,19 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
 
 /// The alias wins over a best-effort name match; an explicit override still
 /// wins over both, and the payload over the limits both suggest.
-fn resolved_caps(ov: &OverrideFields, model_id: &str) -> Option<ModelCaps> {
-    ov.like
-        .as_deref()
-        .and_then(model_directory::resolve_target)
-        .or_else(|| model_directory::resolve(model_id))
+fn resolved_caps(ov: &OverrideFields, provider_id: &str, model_id: &str) -> Option<ModelCaps> {
+    if let Some(like) = ov.like.as_deref() {
+        return model_directory::resolve_target(like);
+    }
+    if let Some(spec) = routed_spec(provider_id, ov) {
+        // A declared base has no native constructor to route through, so it
+        // has no aperture-usable thinking behavior either.
+        if spec.native().is_none() && plugin::base_spec(spec.slug).is_some() {
+            return None;
+        }
+        return model_directory::caps_for_spec(spec, model_id);
+    }
+    model_directory::resolve(model_id)
 }
 
 /// The provider whose thinking behavior should be asked about. This is a
@@ -508,12 +516,7 @@ fn resolved_caps(ov: &OverrideFields, model_id: &str) -> Option<ModelCaps> {
 fn caps_model(overrides: &Overrides, model: &Model) -> Option<(&'static ProviderSpec, Model)> {
     let (provider_id, model_id) = model.id.split_once('/')?;
     let ov = merged_override(overrides, provider_id, model_id);
-    // An explicit `base` chose the wire, and the wire owns the thinking
-    // dialect. A `like` chooses capabilities explicitly, so it still wins.
-    if ov.like.is_none() && ov.base.is_some() {
-        return routed_model(overrides, model);
-    }
-    match resolved_caps(&ov, model_id).and_then(|caps| {
+    match resolved_caps(&ov, provider_id, model_id).and_then(|caps| {
         let source = caps.source?;
         Some((source.spec()?, source.model()?.to_string()))
     }) {
@@ -606,7 +609,7 @@ fn explain_with(overrides: &Overrides, spec: &str) -> Result<ModelExplanation, M
         });
     let ov = merged_override(overrides, provider_id, &model_id);
     let payload = model_registry::discovered(SLUG, &model.id);
-    let caps = resolved_caps(&ov, &model_id);
+    let caps = resolved_caps(&ov, provider_id, &model_id);
     let routed = routed_spec(provider_id, &ov);
     let routed_entry = routed.and_then(|spec| lookup_entry(spec.models(), &model_id));
     apply_adjustments(&mut model, overrides);
@@ -1033,18 +1036,47 @@ mod tests {
 
     #[test]
     fn parse_models_borrows_an_unfamiliar_name_with_like() {
-        let overrides = like_override("azureai", "opaque-terra", "openai/gpt-6-sol");
+        let overrides = Overrides::from([(
+            "azureai".to_string(),
+            ProviderOverride {
+                default: OverrideFields::default(),
+                models: HashMap::from([
+                    (
+                        "opaque-terra".to_string(),
+                        OverrideFields {
+                            like: Some("openai/gpt-6-sol".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "opaque-sol".to_string(),
+                        OverrideFields {
+                            like: Some("openai/gpt-6-sol".into()),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            },
+        )]);
         let body = json!({
             "object": "list",
-            "data": [{"id": "opaque-terra", "metadata": {"provider": {"id": "azureai"}}}]
+            "data": [
+                {"id": "opaque-terra", "metadata": {"provider": {"id": "azureai"}}, "context_window_tokens": 222000},
+                {"id": "opaque-sol", "metadata": {"provider": {"id": "azureai"}}}
+            ]
         });
         let models = parse_models(&body, &overrides);
-        assert_eq!(models.len(), 1);
+        assert_eq!(models.len(), 2);
         assert_eq!(models[0].supports_thinking, Some(true));
         assert_eq!(models[0].supports_vision, Some(true));
         assert_eq!(models[0].tier, Some(ModelTier::Medium));
-        assert_eq!(models[0].context_window, Some(1_050_000));
+        assert_eq!(
+            models[0].context_window,
+            Some(222_000),
+            "the gateway's deployed limit beats the alias"
+        );
         assert_eq!(models[0].max_output_tokens, Some(128_000));
+        assert_eq!(models[1].context_window, Some(1_050_000));
     }
 
     #[test]
