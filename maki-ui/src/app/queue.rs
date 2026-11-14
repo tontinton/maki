@@ -279,6 +279,7 @@ impl App {
     /// learns the agent is busy. Immediate-dispatch items skip this event,
     /// so no dedup needed.
     pub(super) fn on_queue_item_consumed(&mut self, text: String, images: Vec<ImageSource>) {
+        self.plan_answers.abandon();
         self.status = Status::Streaming;
         self.main_chat().show_user_message(text, images);
     }
@@ -320,6 +321,9 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
+        // A handler that starts its own run supersedes the row's built-in
+        // outcome; retiring it here keeps the two from implementing twice.
+        self.plan_answers.abandon();
         self.run_id += 1;
         self.clear_exit_request();
         // New work supersedes text held for recovery after an agent error.

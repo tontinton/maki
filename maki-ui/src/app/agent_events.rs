@@ -7,7 +7,7 @@ use maki_storage::sessions::StoredTokenUsage;
 
 use super::{
     AUTH_EXPIRED_MSG, App, ERROR_BUBBLE_MAX_CHARS, ExitOnDone, MAIN_CHAT, MISSING_TOOL_COMPLETION,
-    Mode, PlanTrigger, RESTORE_RUN_ID,
+    RESTORE_RUN_ID,
 };
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent};
 use crate::chat::{Chat, ChatEventResult, DONE_TEXT, ERROR_TEXT};
@@ -227,12 +227,7 @@ impl App {
             return;
         };
 
-        let plan_path = if self.state.mode == Mode::Plan {
-            self.state.plan.path()
-        } else {
-            None
-        };
-        let result = self.chats[chat_idx].handle_event(event, plan_path);
+        let result = self.chats[chat_idx].handle_event(event);
 
         if is_plugin_task {
             self.end_plugin_prompt(chat_idx, result);
@@ -324,11 +319,6 @@ impl App {
     }
 
     fn record_tool_done(&mut self, chat_idx: usize, done: &ToolDoneEvent) {
-        if self.state.mode == Mode::Plan
-            && self.state.plan.path().is_some_and(|pp| done.wrote_to(pp))
-        {
-            self.transition_plan(PlanTrigger::WriteDone);
-        }
         self.state
             .session_mut()
             .insert_tool_output(done.id.clone(), done.output.clone());

@@ -134,6 +134,10 @@ const MODE_CHANGED_EVENT: &str = "ModeChanged";
 const NORMAL_MODE_TEXT: &str = "ab\\";
 const PASTED: &str = "pasted ";
 const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
+const PLAN_FILE_NAME: &str = "plan.md";
+const PLAN_V1: &str = "# Plan\n\n- step one";
+const PLAN_V2: &str = "# Plan\n\n- step two";
+const TURN_FAILED: &str = "the provider went away";
 /// The draft of the session a tab switch loads, which is not the one the
 /// abandoned pick was made against.
 const OTHER_PLAN_DRAFT_NAME: &str = "other-plan.md";
@@ -791,7 +795,7 @@ fn toggle_mode_state_machine() {
     assert_eq!(app.state.mode, Mode::Plan);
     assert_eq!(app.state.plan.path().unwrap(), first_path);
 
-    app.state.plan.mark_ready();
+    app.state.plan.offer(PLAN_V1);
     tab(&mut app);
     assert_eq!(app.state.mode, Mode::Build);
     assert!(app.state.plan.is_ready());
@@ -803,34 +807,6 @@ fn toggle_mode_state_machine() {
     tab(&mut app);
     assert_eq!(app.state.mode, Mode::Plan);
     assert_eq!(app.state.plan.path().unwrap(), first_path);
-}
-
-#[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/plans/test.md".into()), Some("/tmp/plans/test.md".into()), true  ; "write_matching")]
-#[test_case(ToolOutput::Diff { path: "/tmp/plans/test.md".into(), before: String::new(), after: String::new(), summary: String::new() }, None, true  ; "edit_matching")]
-#[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/other.rs".into()), Some("/tmp/other.rs".into()), false ; "write_non_matching")]
-fn tool_done_transitions_plan_to_ready(
-    output: ToolOutput,
-    written_path: Option<String>,
-    expect_ready: bool,
-) {
-    let mut app = test_app();
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
-    app.status = Status::Streaming;
-    app.run_id = 1;
-
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t1".into(),
-        tool: "write".into(),
-        output: Arc::new(output),
-        is_error: false,
-        annotation: None,
-        written_path,
-        backgrounded: false,
-    }))));
-
-    assert_eq!(app.state.plan.is_ready(), expect_ready);
 }
 
 #[test]
@@ -1192,7 +1168,10 @@ fn reset_session_clears_plan() {
     app.state.token_usage.input = 500;
     app.chats[0].context_size = 1000;
     app.state.mode = Mode::Build;
-    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from("plan.md"),
+        revision: None,
+    };
     app.queue_and_notify(queued_msg("q"));
     app.queue.set_focus_at(0);
     app.help_modal.toggle();
@@ -1227,7 +1206,10 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
     app.state.fast = true;
     app.state.workflow = true;
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from("plan.md"),
+        revision: None,
+    };
     app.state.context_size = MEASURED_CONTEXT;
     app.input_box.set_input("half a thought");
     app.queue_and_notify(queued_msg("q"));
@@ -1435,37 +1417,49 @@ fn reset_session_clears_drafting_plan_in_build_mode() {
     assert_eq!(app.state.plan, PlanState::None);
 }
 
-/// A retried write hits the same transition again, and the plugin still gets
-/// one event with the draft path it needs to open.
+/// A turn that leaves the plan as it was offers nothing new, so a question
+/// answered in plan mode does not bring a dismissed form back. A changed plan
+/// is a new revision: the form opens again and plugins hear of it.
 #[test]
-fn plan_ready_fires_once_per_draft() {
+fn plan_ready_fires_once_per_offered_revision() {
     let mut app = test_app();
     let probe = probe_events(&mut app);
+    let _dir = draft_plan(&mut app, PLAN_V1);
+    let path = app.state.plan.path().unwrap().display().to_string();
 
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
-    app.transition_plan(PlanTrigger::WriteDone);
-    app.transition_plan(PlanTrigger::WriteDone);
+    drain_turn(&mut app);
+    assert_eq!(plan_ready_paths(&probe), [path.as_str()]);
+    app.update(Msg::Key(key(KeyCode::Esc)));
 
-    let (event, data) = probe.try_recv_autocmd().expect("PlanReady fired");
-    assert_eq!(event, PLAN_READY_EVENT);
-    assert_eq!(data["path"], serde_json::json!(PLAN_DRAFT_PATH));
+    drain_turn(&mut app);
     assert!(
-        probe.try_recv_autocmd().is_none(),
-        "second WriteDone must not re-emit"
+        plan_ready_paths(&probe).is_empty(),
+        "the same revision is not offered twice"
     );
+    assert!(!app.plan_form.is_visible());
+
+    rewrite_plan(&app, PLAN_V2);
+    drain_turn(&mut app);
+    assert_eq!(plan_ready_paths(&probe), [path.as_str()]);
+    assert!(app.plan_form.is_visible());
+    assert_eq!(plan_cards(&app), [PLAN_V1, PLAN_V2]);
 }
 
-#[test]
-fn plan_ready_does_not_fire_outside_plan_mode() {
+/// A failed turn leaves its error to deal with first, and build mode has no
+/// plan to offer.
+#[test_case(|app: &mut App| app.state.mode = Mode::Build ; "in_build_mode")]
+#[test_case(|app: &mut App| app.status = Status::error(TURN_FAILED.into()) ; "after_an_error")]
+fn no_plan_is_offered(setup: fn(&mut App)) {
     let mut app = test_app();
     let probe = probe_events(&mut app);
+    let _dir = draft_plan(&mut app, PLAN_V1);
+    setup(&mut app);
 
-    app.state.mode = Mode::Build;
-    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
-    app.transition_plan(PlanTrigger::WriteDone);
+    app.on_queue_drained();
 
-    assert!(probe.try_recv_autocmd().is_none());
+    assert!(!app.plan_form.is_visible());
+    assert!(!app.state.plan.is_ready());
+    assert!(plan_ready_paths(&probe).is_empty());
 }
 
 /// With nothing layering the plan form there is nothing to ask, so a stock
@@ -1479,9 +1473,8 @@ fn an_unlayered_plan_form_opens_without_asking(hosted: bool) {
         app.lua_event_handle = handle;
         probe
     });
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
-    app.transition_plan(PlanTrigger::WriteDone);
+    let _dir = draft_plan(&mut app, PLAN_V1);
+    app.offer_plan_revision();
 
     assert!(app.plan_form.is_visible());
     assert!(app.plan_answers.form.is_none(), "nothing to wait for");
@@ -1495,9 +1488,8 @@ fn a_layered_plan_form_waits_for_the_slots() {
     let (handle, _probe) = maki_lua::test_support::probed_event_handle_layering_plan_form();
     app.lua_event_handle = handle;
 
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
-    app.transition_plan(PlanTrigger::WriteDone);
+    let _dir = draft_plan(&mut app, PLAN_V1);
+    app.offer_plan_revision();
 
     assert!(!app.plan_form.is_visible(), "the chains answer first");
     assert!(app.plan_answers.form.is_some());
@@ -1627,8 +1619,8 @@ fn awaiting_plan_action(
 #[test]
 fn a_plugin_row_handler_that_agrees_runs_the_builtin_action() {
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    let _dir = draft_plan(&mut app, PLAN_V1);
+    app.state.plan.offer(PLAN_V1);
     let tx = awaiting_plan_action(&mut app, Some(maki_lua::PlanRowAction::Implement));
 
     tx.send(PlanActionOutcome::Proceed).unwrap();
@@ -1648,7 +1640,10 @@ fn a_plugin_row_handler_that_agrees_runs_the_builtin_action() {
 fn a_plugin_row_handler_that_declines_drops_the_builtin_action() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from(PLAN_DRAFT_PATH),
+        revision: None,
+    };
     let tx = awaiting_plan_action(&mut app, Some(maki_lua::PlanRowAction::Implement));
 
     tx.send(PlanActionOutcome::Vetoed).unwrap();
@@ -1669,7 +1664,10 @@ fn a_plugin_row_handler_that_declines_drops_the_builtin_action() {
 fn a_plugin_row_handler_that_failed_is_flashed() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from(PLAN_DRAFT_PATH),
+        revision: None,
+    };
     let tx = awaiting_plan_action(&mut app, Some(maki_lua::PlanRowAction::Implement));
 
     tx.send(PlanActionOutcome::Failed).unwrap();
@@ -1747,8 +1745,8 @@ fn plan_pick_action(pick: u64, answer: oneshot::Receiver<PlanActionOutcome>) -> 
 #[test]
 fn a_stale_pick_answer_cannot_fire_a_second_implement() {
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    let _dir = draft_plan(&mut app, PLAN_V1);
+    app.state.plan.offer(PLAN_V1);
     let (tx, rx) = oneshot::channel();
     let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
@@ -1776,6 +1774,24 @@ fn a_stale_pick_answer_cannot_fire_a_second_implement() {
     );
 }
 
+/// A row handler that starts a run takes the session over. The row's built-in
+/// outcome goes with it, since running both would implement twice, and
+/// quietly, because the run is what the user sees.
+#[test]
+fn a_run_started_by_a_row_handler_retires_the_pick_quietly() {
+    let mut app = test_app();
+    let (_tx, rx) = oneshot::channel();
+    let pick = app.plan_answers.abandon();
+    app.plan_answers.action = Some(plan_pick_action(pick, rx));
+
+    let SubmitOutcome::Started(_) = app.submit_prompt(queued_msg("go")) else {
+        panic!("a raw prompt must start a run");
+    };
+
+    assert!(app.plan_answers.action.is_none());
+    assert_eq!(app.status_bar.flash_text(), None);
+}
+
 /// A `/new` while a handler is parked: the draft the row was picked from is
 /// gone and the session it would implement in is not the one the user picked
 /// in, so the answer submits nothing.
@@ -1783,7 +1799,10 @@ fn a_stale_pick_answer_cannot_fire_a_second_implement() {
 fn a_pick_answered_after_a_session_reset_submits_nothing() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from(PLAN_DRAFT_PATH),
+        revision: None,
+    };
     let (tx, rx) = oneshot::channel();
     let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
@@ -1822,7 +1841,10 @@ fn a_pick_answered_after_a_session_reset_submits_nothing() {
 fn a_pick_answered_after_another_session_loaded_submits_nothing() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from(PLAN_DRAFT_PATH),
+        revision: None,
+    };
     let (tx, rx) = oneshot::channel();
     let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
@@ -1861,7 +1883,10 @@ fn a_pick_answered_after_another_session_loaded_submits_nothing() {
     );
     assert_eq!(
         app.state.plan,
-        PlanState::Ready(other_draft),
+        PlanState::Ready {
+            path: other_draft,
+            revision: None
+        },
         "and keeps the draft it was loaded with"
     );
 }
@@ -1929,14 +1954,13 @@ fn the_plan_action_fallback_outlasts_the_handler_budget() {
 #[test]
 fn a_new_draft_flashes_the_pick_it_retires() {
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    let _dir = draft_plan(&mut app, PLAN_V1);
     let (tx, rx) = oneshot::channel();
     let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
     app.plan_answers.action = Some(plan_pick_action(pick, parked));
 
-    app.transition_plan(PlanTrigger::WriteDone);
+    app.offer_plan_revision();
 
     assert!(
         app.plan_answers.action.is_none(),
@@ -1966,7 +1990,10 @@ fn a_new_draft_flashes_the_pick_it_retires() {
 fn set_mode_build_then_prompt_reaches_build_mode() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from(PLAN_DRAFT_PATH),
+        revision: None,
+    };
 
     app.set_mode(Mode::Build);
 
@@ -1986,7 +2013,10 @@ fn set_mode_build_then_prompt_reaches_build_mode() {
 fn prompting_without_set_mode_stays_in_plan_mode() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from(PLAN_DRAFT_PATH),
+        revision: None,
+    };
 
     let actions = app.handle_submit(Submission {
         text: "Implement the plan".to_owned(),
@@ -2008,7 +2038,10 @@ fn load_session_clears_plan() {
     app.state.session_mut().save(&claim, &app.storage).unwrap();
     let session = AppSession::load(app.state.session.id, &app.storage).unwrap();
     app.state.mode = Mode::Build;
-    app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from("old-plan.md"),
+        revision: None,
+    };
     app.apply_loaded_session(OpenSession { session, claim }, &test_model());
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan.path(), None);
@@ -6048,7 +6081,7 @@ fn paste_routing(setup: fn(&mut App), expected_input: &str) {
 
 #[test_case(PlanState::None,                                       true  ; "no_plan")]
 #[test_case(PlanState::Drafting(PathBuf::from("/tmp/plan.md")),     false ; "plan_drafting")]
-#[test_case(PlanState::Ready(PathBuf::from("/tmp/plan.md")),       false ; "plan_ready")]
+#[test_case(PlanState::Ready { path: PathBuf::from("/tmp/plan.md"), revision: None },       false ; "plan_ready")]
 fn open_editor(plan: PlanState, expect_flash: bool) {
     let mut app = test_app();
     let plan_path = plan.path().map(Path::to_path_buf);
@@ -6447,89 +6480,98 @@ fn flush_restored_queue_drops_recovery_snapshot() {
 
 // --- Plan form integration tests ---
 
-fn implement_msg(parallel: bool) -> String {
+fn implement_msg(app: &App, parallel: bool) -> String {
+    let path = app.state.plan.path().unwrap().display();
     if parallel {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`. {IMPLEMENT_PARALLEL_HINT}")
+        format!("{IMPLEMENT_MSG_PREFIX} at `{path}`. {IMPLEMENT_PARALLEL_HINT}")
     } else {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`.")
+        format!("{IMPLEMENT_MSG_PREFIX} at `{path}`.")
     }
 }
 
-fn plan_app() -> App {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+/// Puts {app} in plan mode on a plan file holding {content}, which lives as
+/// long as the returned dir.
+fn draft_plan(app: &mut App, content: &str) -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(PLAN_FILE_NAME);
+    fs::write(&path, content).unwrap();
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t1".into(),
-        tool: "write".into(),
-        output: Arc::new(ToolOutput::Plain("wrote 42 bytes to test-plan.md".into())),
-        is_error: false,
-        annotation: None,
-        written_path: Some("test-plan.md".into()),
-        backgrounded: false,
-    }))));
-    app
+    app.state.plan = PlanState::Drafting(path);
+    dir
 }
 
-#[test_case(Mode::Plan,  true  ; "plan_mode_tooldone_opens_form")]
-#[test_case(Mode::Build, false ; "build_mode_tooldone_no_form")]
-fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
-    let mut app = test_app();
+fn rewrite_plan(app: &App, content: &str) {
+    fs::write(app.state.plan.path().unwrap(), content).unwrap();
+}
+
+/// The main turn ends and nothing is queued behind it.
+fn drain_turn(app: &mut App) {
     app.status = Status::Streaming;
     app.run_id = 1;
-    app.state.mode = mode;
-    app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t1".into(),
-        tool: "write".into(),
-        output: Arc::new(ToolOutput::Plain(
-            "wrote 42 bytes to /tmp/plans/test.md".into(),
-        )),
-        is_error: false,
-        annotation: None,
-        written_path: Some("/tmp/plans/test.md".into()),
-        backgrounded: false,
-    }))));
-    assert_eq!(app.plan_form.is_visible(), expect_form);
-    if expect_form {
-        assert!(app.state.plan.is_ready());
-    }
+    end_turn(app);
+    app.on_queue_drained();
 }
 
+/// A plan offered at the end of its turn, with the form open on it.
+fn plan_app() -> (TempDir, App) {
+    let mut app = test_app();
+    let dir = draft_plan(&mut app, PLAN_V1);
+    drain_turn(&mut app);
+    (dir, app)
+}
+
+/// The paths of the `PlanReady` events fired since the last call.
+fn plan_ready_paths(probe: &RequestProbe) -> Vec<String> {
+    iter::from_fn(|| probe.try_recv_autocmd())
+        .filter(|(event, _)| event == PLAN_READY_EVENT)
+        .filter_map(|(_, data)| data["path"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The plan bodies the main transcript shows, oldest first.
+fn plan_cards(app: &App) -> Vec<&str> {
+    let chat = &app.chats[MAIN_CHAT];
+    (0..chat.message_count())
+        .filter_map(|index| chat.message_at(index))
+        .filter(|message| message.plan_path.is_some())
+        .map(|message| message.text.as_str())
+        .collect()
+}
+
+/// Nothing is offered while the agent may still change the plan: not on the
+/// write, and not on a turn that may still have queued work behind it. The
+/// review shows the whole plan however it changed, an edit as much as a write.
 #[test]
-fn done_event_does_not_open_plan_form() {
+fn a_plan_is_offered_in_full_once_its_turn_drains() {
     let mut app = test_app();
+    let _dir = draft_plan(&mut app, PLAN_V1);
+    let path = app.state.plan.path().unwrap().display().to_string();
     app.status = Status::Streaming;
     app.run_id = 1;
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
-    app.update(done_event());
+
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
+        id: "t1".into(),
+        tool: "edit".into(),
+        output: Arc::new(ToolOutput::Diff {
+            path,
+            before: String::new(),
+            after: String::new(),
+            summary: String::new(),
+        }),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        backgrounded: false,
+    }))));
+    end_turn(&mut app);
     assert!(!app.plan_form.is_visible());
-}
+    assert!(!app.state.plan.is_ready());
 
-#[test]
-fn re_edit_keeps_plan_form_visible() {
-    let mut app = plan_app();
+    app.on_queue_drained();
+    assert!(app.plan_form.is_visible());
     assert!(app.state.plan.is_ready());
-    assert!(app.plan_form.is_visible());
-
-    // Agent edits the plan again (second write to same path) — idempotent, stays Ready
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t2".into(),
-        tool: "write".into(),
-        output: Arc::new(ToolOutput::Plain("wrote 50 bytes to test-plan.md".into())),
-        is_error: false,
-        annotation: None,
-        written_path: Some("test-plan.md".into()),
-        backgrounded: false,
-    }))));
-    assert!(matches!(app.state.plan, PlanState::Ready(_)));
-    assert!(app.plan_form.is_visible());
+    assert_eq!(plan_cards(&app), [PLAN_V1]);
 }
 
 #[test_case(1, Mode::Build, true,  true  ; "clear_and_implement")]
@@ -6540,8 +6582,9 @@ fn plan_form_menu_options(
     has_new_session: bool,
     has_send_message: bool,
 ) {
-    let mut app = plan_app();
+    let (_dir, mut app) = plan_app();
     assert!(app.plan_form.is_visible());
+    let expected_msg = implement_msg(&app, PlanForm::new().parallel());
 
     for _ in 0..downs {
         app.update(Msg::Key(key(KeyCode::Down)));
@@ -6556,7 +6599,6 @@ fn plan_form_menu_options(
             .any(|a| matches!(a, Action::RestartAgent(h) if h.is_empty())),
         has_new_session
     );
-    let expected_msg = implement_msg(PlanForm::new().parallel());
     assert_eq!(
         actions
             .iter()
@@ -6567,12 +6609,12 @@ fn plan_form_menu_options(
 
 #[test]
 fn plan_form_implement_toggled_parallel() {
-    let mut app = plan_app();
+    let (_dir, mut app) = plan_app();
+    let expected_msg = implement_msg(&app, !PlanForm::new().parallel());
     app.update(Msg::Key(key(KeyCode::Char(' '))));
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Down)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let expected_msg = implement_msg(!PlanForm::new().parallel());
     assert!(
         actions
             .iter()
@@ -6582,47 +6624,18 @@ fn plan_form_implement_toggled_parallel() {
 
 #[test]
 fn plan_form_open_editor() {
-    let mut app = plan_app();
+    let (_dir, mut app) = plan_app();
 
     let actions = app.update(Msg::Key(kb::OPEN_EDITOR.to_key_event()));
     assert!(app.plan_form.is_visible());
-    assert!(matches!(&actions[..], [Action::OpenEditor(p)] if p == Path::new("test-plan.md")));
-}
-
-fn rewrite_plan(app: &mut App) {
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t2".into(),
-        tool: "write".into(),
-        output: Arc::new(ToolOutput::Plain("wrote 99 bytes to test-plan.md".into())),
-        is_error: false,
-        annotation: None,
-        written_path: Some("test-plan.md".into()),
-        backgrounded: false,
-    }))));
-}
-
-fn dismiss_plan_esc(app: &mut App) {
-    app.update(Msg::Key(key(KeyCode::Esc)));
-}
-
-#[test]
-fn rewrite_does_not_reopen_after_dismiss() {
-    let mut app = plan_app();
-    assert!(app.plan_form.is_visible());
-
-    dismiss_plan_esc(&mut app);
-    assert!(!app.plan_form.is_visible());
-    assert!(app.state.plan.is_ready());
-
-    rewrite_plan(&mut app);
-    assert!(!app.plan_form.is_visible());
-    assert!(app.state.plan.is_ready());
+    assert!(
+        matches!(&actions[..], [Action::OpenEditor(p)] if app.state.plan.path() == Some(p.as_path()))
+    );
 }
 
 #[test]
 fn ctrl_t_toggles_plan_form_in_plan_mode() {
-    let mut app = plan_app();
+    let (_dir, mut app) = plan_app();
     assert!(app.plan_form.is_visible());
 
     app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
@@ -6632,15 +6645,110 @@ fn ctrl_t_toggles_plan_form_in_plan_mode() {
     assert!(app.plan_form.is_visible());
 }
 
-#[test]
-fn ctrl_t_noop_when_plan_not_ready() {
+/// A turn cut short leaves a plan nobody offered yet. `<C-t>` offers it
+/// without another model turn, and says so when there is nothing to offer.
+#[test_case(true  ; "a_plan_left_by_a_cancelled_turn")]
+#[test_case(false ; "no_plan_file")]
+fn ctrl_t_offers_the_plan_on_disk(written: bool) {
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
-    assert!(!app.plan_form.is_visible());
+    let _dir = draft_plan(&mut app, PLAN_V1);
+    if !written {
+        fs::remove_file(app.state.plan.path().unwrap()).unwrap();
+    }
 
     app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+
+    assert_eq!(app.plan_form.is_visible(), written);
+    assert_eq!(app.state.plan.is_ready(), written);
+    assert_eq!(
+        app.status_bar.flash_text(),
+        (!written).then_some(FLASH_NO_PLAN)
+    );
+}
+
+/// The plan may still change while a turn runs, so the form stands aside
+/// and the toggle does nothing until it ends.
+#[test]
+fn the_plan_form_waits_out_a_running_turn() {
+    let (_dir, mut app) = plan_app();
+    app.status = Status::Streaming;
+    assert!(!app.plan_form_active());
+
+    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    app.status = Status::Idle;
+
+    assert!(app.plan_form_active());
+}
+
+/// Kept context already shows the offered plan right above the form. A plan
+/// edited since it was offered is shown again, and a cleared session gets
+/// its own copy.
+#[test_case(2, None,          &[PLAN_V1]          ; "implement_keeps_the_offered_copy")]
+#[test_case(2, Some(PLAN_V2), &[PLAN_V1, PLAN_V2] ; "an_edited_plan_is_shown_again")]
+#[test_case(1, None,          &[PLAN_V1]          ; "a_cleared_session_gets_its_own_copy")]
+fn implementing_shows_the_plan_it_builds(downs: usize, edit: Option<&str>, cards: &[&str]) {
+    let (_dir, mut app) = plan_app();
+    if let Some(content) = edit {
+        rewrite_plan(&app, content);
+    }
+
+    for _ in 0..downs {
+        app.update(Msg::Key(key(KeyCode::Down)));
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(app.state.mode, Mode::Build);
+    assert_eq!(plan_cards(&app), cards);
+}
+
+/// A plugin row pick closes the form, and the review it closed stays: a kept
+/// Implement does not print the plan again, and a turn that leaves the plan
+/// as it was does not offer it again.
+#[test_case(maki_lua::PlanRowAction::Implement ; "implement")]
+#[test_case(maki_lua::PlanRowAction::Refine    ; "refine")]
+fn a_plugin_row_pick_keeps_the_offered_revision(then: maki_lua::PlanRowAction) {
+    let (_dir, mut app) = plan_app();
+    let probe = probe_events(&mut app);
+    app.handle_plan_form_action(PlanFormAction::Plugin {
+        row: 0,
+        generation: PLAN_MENU_GENERATION,
+        then: Some(then),
+    });
+    let (tx, rx) = oneshot::channel();
+    app.plan_answers
+        .action
+        .as_mut()
+        .expect("the pick waits on its handler")
+        .answer = rx;
+    tx.send(PlanActionOutcome::Proceed).unwrap();
+    let _ = app.tick();
+
+    drain_turn(&mut app);
+
+    assert_eq!(plan_cards(&app), [PLAN_V1]);
+    assert!(plan_ready_paths(&probe).is_empty());
     assert!(!app.plan_form.is_visible());
+}
+
+/// Implementing reads the plan again, and one that is gone changes nothing,
+/// least of all the session the clearing row would throw away.
+#[test_case(1 ; "clear_and_implement")]
+#[test_case(2 ; "implement")]
+fn implementing_a_vanished_plan_changes_nothing(downs: usize) {
+    let (_dir, mut app) = plan_app();
+    let session = app.state.session.id;
+    fs::remove_file(app.state.plan.path().unwrap()).unwrap();
+
+    for _ in 0..downs {
+        app.update(Msg::Key(key(KeyCode::Down)));
+    }
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(FLASH_NO_PLAN));
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(app.state.plan.is_ready());
+    assert_eq!(app.state.session.id, session);
 }
 
 const TAB_TOOK_THE_OWNER_BELOW: &str =
@@ -7016,7 +7124,7 @@ fn held_keys_never_answer_a_prompt_that_opened_while_they_waited(
 /// same prompts up, yet it is not the form they were typed at.
 #[test]
 fn held_keys_never_reach_a_plan_form_opened_again() {
-    let mut app = plan_app();
+    let (_dir, mut app) = plan_app();
     let probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
 
     let tab = press_bound(&mut app, &probe, KeyCode::Tab);
@@ -9234,7 +9342,7 @@ fn builtin_runs_when_no_override() {
 
 #[test]
 fn plan_toggle_beats_override_when_open_and_after_dismiss() {
-    let mut app = plan_app();
+    let (_dir, mut app) = plan_app();
     let probe = install_override(&mut app, kb::PLAN_TOGGLE.code, kb::PLAN_TOGGLE.modifiers);
     assert!(app.plan_form.is_visible());
 
@@ -9571,7 +9679,7 @@ fn the_keys_a_plugin_cannot_bind_are_the_keys_the_host_answers_itself() {
 
 #[test]
 fn reset_session_closes_plan_form() {
-    let mut app = plan_app();
+    let (_dir, mut app) = plan_app();
     assert!(app.plan_form.is_visible());
 
     app.reset_session();
@@ -11173,7 +11281,10 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
     let mut app = test_app();
     app.chats[MAIN_CHAT].auth_parked = true;
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from("plan.md"),
+        revision: None,
+    };
     app.plan_form.on_plan_ready();
     app.permission_prompt.push(
         "id".into(),
@@ -11213,7 +11324,10 @@ fn attention_classifies_auth_and_ready_plan() {
 
     app.chats[MAIN_CHAT].auth_parked = false;
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from("plan.md"),
+        revision: None,
+    };
     app.plan_form.on_plan_ready();
     app.status = Status::Streaming;
     assert_eq!(app.attention(), None);
@@ -11224,9 +11338,6 @@ fn attention_classifies_auth_and_ready_plan() {
     app.plan_form.hide();
     assert_eq!(app.attention(), None);
     app.plan_form.on_plan_ready();
-    app.state.plan = PlanState::Drafting(PathBuf::from("plan.md"));
-    assert_eq!(app.attention(), None);
-    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.state.mode = Mode::Build;
     assert_eq!(app.attention(), None);
 }
@@ -11243,7 +11354,10 @@ fn plan_form_on_a_subtask_leaves_keys_alone_but_still_wants_attention() {
     ));
     app.status = Status::Idle;
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.state.plan = PlanState::Ready {
+        path: PathBuf::from("plan.md"),
+        revision: None,
+    };
     app.plan_form.on_plan_ready();
     app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);

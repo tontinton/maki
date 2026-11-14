@@ -2,7 +2,6 @@
 //! highlighted, missing outputs fall back to plain text from `ToolResult`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
@@ -18,7 +17,7 @@ use crate::components::{
 use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
-use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
+use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry};
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     AgentEvent, BufferSnapshot, DisplayItem, SessionControl, SharedBuf, SteerKind, ToolDoneEvent,
@@ -202,7 +201,7 @@ impl Chat {
         self.messages_panel.set_restore_channel(event_tx);
     }
 
-    pub fn handle_event(&mut self, event: AgentEvent, plan_path: Option<&Path>) -> ChatEventResult {
+    pub fn handle_event(&mut self, event: AgentEvent) -> ChatEventResult {
         match event {
             AgentEvent::ThinkingDelta { text } => {
                 self.messages_panel.clear_prompt_progress();
@@ -226,19 +225,8 @@ impl Chat {
                 self.messages_panel.tool_output(&id, &content)
             }
             AgentEvent::ToolDone(e) => {
-                let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
-                let is_full_write = &*e.tool == WRITE_TOOL_NAME;
                 self.running_calls.retain(|call| call.id != e.id);
                 self.messages_panel.tool_done(*e);
-                if let Some(pp) = plan_write {
-                    let content = if is_full_write {
-                        std::fs::read_to_string(pp).unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    self.messages_panel
-                        .push(DisplayMessage::plan(content, pp.display().to_string()));
-                }
             }
             AgentEvent::TurnComplete(turn) => {
                 for block in turn.message.content {
@@ -1124,25 +1112,22 @@ mod tests {
     fn turn_complete_delivers_images_without_replaying_text(text: &str) {
         let mut chat = chat();
         text_delta(&mut chat, text);
-        chat.handle_event(
-            AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-                message: Message {
-                    role: Role::Assistant,
-                    content: vec![
-                        ContentBlock::Text { text: text.into() },
-                        ContentBlock::Image { source: image() },
-                    ],
-                    ..Default::default()
-                },
-                usage: Default::default(),
-                model: String::new(),
-                cost: None,
-                subsidised_list_cost: None,
-                context_size: None,
-                context_window: 0,
-            })),
-            None,
-        );
+        chat.handle_event(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text { text: text.into() },
+                    ContentBlock::Image { source: image() },
+                ],
+                ..Default::default()
+            },
+            usage: Default::default(),
+            model: String::new(),
+            cost: None,
+            subsidised_list_cost: None,
+            context_size: None,
+            context_window: 0,
+        })));
         let image_index = usize::from(!text.is_empty());
         assert_eq!(chat.message_count(), image_index + 1);
         if !text.is_empty() {
@@ -1189,13 +1174,6 @@ mod tests {
             written_path,
             backgrounded: false,
         }))
-    }
-
-    fn write_output(path: &str) -> (ToolOutput, Option<String>) {
-        (
-            ToolOutput::Plain(format!("wrote 42 bytes to {path}").into()),
-            Some(path.to_owned()),
-        )
     }
 
     fn edit_output(path: &str) -> ToolOutput {
@@ -1245,19 +1223,16 @@ mod tests {
     }
 
     fn text_delta(chat: &mut Chat, text: &str) {
-        chat.handle_event(AgentEvent::TextDelta { text: text.into() }, None);
+        chat.handle_event(AgentEvent::TextDelta { text: text.into() });
     }
 
     #[test]
     fn tool_lifecycle() {
         let mut chat = chat();
-        chat.handle_event(tool_start("t1", "bash"), None);
+        chat.handle_event(tool_start("t1", "bash"));
         assert_eq!(chat.in_progress_count(), 1);
 
-        chat.handle_event(
-            tool_done("t1", "bash", ToolOutput::Plain("ok".into())),
-            None,
-        );
+        chat.handle_event(tool_done("t1", "bash", ToolOutput::Plain("ok".into())));
         assert_eq!(chat.in_progress_count(), 0);
     }
 
@@ -1268,72 +1243,18 @@ mod tests {
     fn a_call_a_plugin_allowed_is_marked_on_its_row_once() {
         const PLUGIN: &str = "automode";
         let mut chat = chat();
-        chat.handle_event(tool_start("t1", "code_execution"), None);
+        chat.handle_event(tool_start("t1", "code_execution"));
         for _ in 0..2 {
-            chat.handle_event(
-                AgentEvent::AllowedByPlugin {
-                    id: "t1".into(),
-                    plugin: PLUGIN.into(),
-                },
-                None,
-            );
+            chat.handle_event(AgentEvent::AllowedByPlugin {
+                id: "t1".into(),
+                plugin: PLUGIN.into(),
+            });
         }
         let row = chat.message_at(0).expect("the tool row");
         assert_eq!(
             row.annotation.as_deref(),
             Some(format!("{ALLOWED_BY} {PLUGIN}").as_str())
         );
-    }
-
-    #[test]
-    fn plan_write_renders_file_content() {
-        let mut chat = chat();
-        let dir = tempfile::tempdir().unwrap();
-        let plan_path = dir.path().join("plan.md");
-        std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
-        let plan_str = plan_path.to_str().unwrap();
-
-        chat.handle_event(tool_start("w1", "write"), Some(plan_path.as_path()));
-        let (output, wp) = write_output(plan_str);
-        chat.handle_event(
-            tool_done_with_written_path("w1", "write", output, wp),
-            Some(plan_path.as_path()),
-        );
-
-        assert!(chat.last_message_is_plan());
-        let last = chat.last_message_text();
-        assert!(last.contains("# My Plan"));
-    }
-
-    #[test]
-    fn plan_write_ignores_different_path() {
-        let mut chat = chat();
-        let plan_path = Path::new("/plans/123.md");
-        chat.handle_event(tool_start("w1", "write"), Some(plan_path));
-        let (output, wp) = write_output("src/main.rs");
-        chat.handle_event(
-            tool_done_with_written_path("w1", "write", output, wp),
-            Some(plan_path),
-        );
-        assert!(!chat.last_message_is_plan());
-    }
-
-    #[test]
-    fn plan_edit_shows_path_only() {
-        let mut chat = chat();
-        let dir = tempfile::tempdir().unwrap();
-        let plan_path = dir.path().join("plan.md");
-        std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
-        let plan_str = plan_path.to_str().unwrap();
-
-        chat.handle_event(tool_start("e1", "edit"), Some(plan_path.as_path()));
-        chat.handle_event(
-            tool_done("e1", "edit", edit_output(plan_str)),
-            Some(plan_path.as_path()),
-        );
-
-        assert!(chat.last_message_is_plan());
-        assert!(chat.last_message_text().is_empty());
     }
 
     #[test]
@@ -1699,23 +1620,17 @@ mod tests {
     fn compaction_started_flushes_prior_stream_once(automatic: bool) {
         let mut chat = chat();
         text_delta(&mut chat, REPLY_TEXT);
-        chat.handle_event(
-            AgentEvent::ThinkingDelta {
-                text: COMPACTION_THINKING.into(),
-            },
-            None,
-        );
+        chat.handle_event(AgentEvent::ThinkingDelta {
+            text: COMPACTION_THINKING.into(),
+        });
         if automatic {
-            chat.handle_event(
-                AgentEvent::AutoCompacting {
-                    context_size: 0,
-                    context_window: 0,
-                },
-                None,
-            );
+            chat.handle_event(AgentEvent::AutoCompacting {
+                context_size: 0,
+                context_window: 0,
+            });
         }
 
-        chat.handle_event(AgentEvent::CompactionStarted, None);
+        chat.handle_event(AgentEvent::CompactionStarted);
 
         assert!(chat.streaming_text_is_empty());
         assert!(chat.streaming_thinking_is_empty());
@@ -1738,27 +1653,21 @@ mod tests {
         expected: &str,
     ) {
         let mut chat = chat();
-        chat.handle_event(AgentEvent::CompactionStarted, None);
+        chat.handle_event(AgentEvent::CompactionStarted);
         text_delta(&mut chat, COMPACTION_SUMMARY);
-        chat.handle_event(
-            AgentEvent::ThinkingDelta {
-                text: COMPACTION_THINKING.into(),
-            },
-            None,
-        );
+        chat.handle_event(AgentEvent::ThinkingDelta {
+            text: COMPACTION_THINKING.into(),
+        });
         assert!(!chat.streaming_text_is_empty());
         assert!(!chat.streaming_thinking_is_empty());
 
-        chat.handle_event(
-            AgentEvent::CompactionDone {
-                context_size_before,
-                context_size_after,
-                context_window: 0,
-                summary: COMPACTION_SUMMARY.into(),
-                duration_ms,
-            },
-            None,
-        );
+        chat.handle_event(AgentEvent::CompactionDone {
+            context_size_before,
+            context_size_after,
+            context_window: 0,
+            summary: COMPACTION_SUMMARY.into(),
+            duration_ms,
+        });
         assert!(chat.streaming_text_is_empty());
         assert!(chat.streaming_thinking_is_empty());
         assert_eq!(
@@ -1782,10 +1691,10 @@ mod tests {
     #[test_case(AgentEvent::Done { usage: Default::default(), cost: None, list_cost: None, context_size: 0, context_window: 0, num_turns: 0, reason: DoneReason::Cancelled } ; "cancelled")]
     fn interrupted_compaction_has_no_success_notice(ending: AgentEvent) {
         let mut chat = chat();
-        chat.handle_event(AgentEvent::CompactionStarted, None);
+        chat.handle_event(AgentEvent::CompactionStarted);
         text_delta(&mut chat, COMPACTION_SUMMARY);
 
-        chat.handle_event(ending, None);
+        chat.handle_event(ending);
 
         assert!(chat.streaming_text_is_empty());
         assert_eq!(
@@ -1942,13 +1851,10 @@ mod tests {
     #[test_case(SteerKind::Continued, CONTINUED_PREFIX ; "continued")]
     fn steered_shows_one_prefixed_assistant_message(kind: SteerKind, prefix: &str) {
         let mut chat = chat();
-        chat.handle_event(
-            AgentEvent::Steered {
-                kind,
-                text: STEER_TEXT.into(),
-            },
-            None,
-        );
+        chat.handle_event(AgentEvent::Steered {
+            kind,
+            text: STEER_TEXT.into(),
+        });
         assert_eq!(chat.message_count(), 1);
         let text = chat.last_message_text();
         assert!(
