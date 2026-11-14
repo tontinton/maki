@@ -19,7 +19,9 @@ use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
 use crate::tools::truncate_bytes;
-use crate::{AgentError, AgentEvent, DoneReason, EventSender, RunLedger, TurnCompleteEvent};
+use crate::{
+    AgentError, AgentEvent, DoneReason, EventSender, RunLedger, SteerKind, TurnCompleteEvent,
+};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
@@ -51,6 +53,7 @@ const MAX_SUMMARY_ATTEMPTS: u32 = 3;
 pub(super) const FIELD_SKIP: &str = "skip";
 const FIELD_INSTRUCTIONS: &str = "instructions";
 pub(super) const FIELD_CONTINUE: &str = "continue";
+pub(super) const FIELD_DEFER: &str = "defer";
 const FIELD_COLLAPSE: &str = "collapse";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -96,14 +99,25 @@ pub(super) fn continue_text(value: &Value) -> Option<&str> {
     normalize(value.get(FIELD_CONTINUE).and_then(Value::as_str))
 }
 
-/// `None` when a layer skipped it. The gauge stays where it was, so an
-/// automatic compaction simply asks again before the next turn.
+/// What a layer settled on for a compaction.
+pub(super) enum CompactionPlan {
+    /// The compaction is skipped. The gauge stays where it was, so an
+    /// automatic one simply asks again before the next turn.
+    Skipped,
+    /// The layer bought the transcript one turn: the nudge is the model's
+    /// next message and the ask after that turn is granted. One defer per
+    /// compaction, automatic only, so a layer cannot starve the gauge.
+    Deferred(String),
+    Proceed(CompactSteer),
+}
+
 pub(super) async fn steer_compaction(
     hooks: &AgentHooks<'_>,
     config: &AgentConfig,
     reason: CompactReason,
     request: Option<&str>,
-) -> Option<CompactSteer> {
+    can_defer: bool,
+) -> CompactionPlan {
     let verdict = hooks
         .fire(AgentSlot::CompactBefore, || {
             json!({
@@ -114,7 +128,7 @@ pub(super) async fn steer_compaction(
             })
         })
         .await;
-    let (skip, added, continue_with) = match &verdict {
+    let (skip, added, continue_with, defer) = match &verdict {
         Verdict::Replaced(value) => (
             value
                 .get(FIELD_SKIP)
@@ -122,21 +136,27 @@ pub(super) async fn steer_compaction(
                 .unwrap_or(false),
             value.get(FIELD_INSTRUCTIONS).and_then(Value::as_str),
             continue_text(value),
+            normalize(value.get(FIELD_DEFER).and_then(Value::as_str)),
         ),
         Verdict::Denied(why) => {
             info!(reason = %why, "agent.compact.before asked to skip");
-            (true, None, None)
+            (true, None, None, None)
         }
-        Verdict::Unchanged | Verdict::Ask { .. } => (false, None, None),
+        Verdict::Unchanged | Verdict::Ask { .. } => (false, None, None, None),
     };
+    // A defer is one turn, so it works the same in a task child as in main.
+    if can_defer && let Some(nudge) = defer {
+        info!("agent.compact.before deferred the compaction");
+        return CompactionPlan::Deferred(nudge.to_owned());
+    }
     if skip && reason != CompactReason::Overflow {
         info!(
             reason = reason.as_str(),
             "agent.compact.before skipped the compaction"
         );
-        return None;
+        return CompactionPlan::Skipped;
     }
-    Some(CompactSteer {
+    CompactionPlan::Proceed(CompactSteer {
         instructions: join_lines([request, added]),
         continue_text: continue_with.map(str::to_owned),
     })
@@ -416,7 +436,8 @@ pub async fn compact(
             reason: DoneReason::Compact,
         }
     };
-    let Some(steer) = steer_compaction(hooks, config, CompactReason::Manual, instructions).await
+    let CompactionPlan::Proceed(steer) =
+        steer_compaction(hooks, config, CompactReason::Manual, instructions, false).await
     else {
         event_tx.send(finished(size_before))?;
         return Ok(DoneReason::Compact);
@@ -444,6 +465,10 @@ pub async fn compact(
         Err(e) => return Err(e),
     };
     if let Some(text) = steer.continue_text {
+        event_tx.send(AgentEvent::Steered {
+            kind: SteerKind::CompactContinued,
+            text: text.clone(),
+        })?;
         history.push(Message::synthetic(text));
     }
     fit_frame(history, next, mcp, hooks.model);
@@ -1343,6 +1368,35 @@ mod tests {
         let request_at = prompt.find(REQUEST_EXTRA).expect(prompt);
         let layer_at = prompt.find(LAYER_EXTRA).expect(prompt);
         assert!(request_at < layer_at, "{prompt}");
+    }
+
+    const KEEP_GOING: &str = "keep going after the summary";
+
+    #[tokio::test]
+    async fn manual_compact_steers_the_layers_words() {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![Message::user("work".into())]);
+
+        let (result, events) = summarize_steered(
+            &provider,
+            &mut history,
+            None,
+            before_answers(json!({ FIELD_CONTINUE: KEEP_GOING })),
+        )
+        .await;
+        assert_eq!(result.unwrap(), DoneReason::Compact);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Steered { kind: SteerKind::CompactContinued, text } if text == KEEP_GOING
+            )),
+            "the TUI hears the layer's words: {events:?}"
+        );
+        assert_eq!(
+            history.as_slice().last().unwrap().first_text_content(),
+            Some(KEEP_GOING)
+        );
     }
 
     #[tokio::test]

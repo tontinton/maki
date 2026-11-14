@@ -89,6 +89,9 @@ pub struct ContextGauge {
     measured: u32,
     /// Byte estimate of the messages appended since that count.
     appended: u32,
+    /// Whether `agent.compact.before` deferred a compaction since the last
+    /// reset. A landing compaction, or any other reset, renews it.
+    deferred: bool,
 }
 
 impl ContextGauge {
@@ -98,6 +101,7 @@ impl ContextGauge {
         Self {
             measured,
             appended: 0,
+            deferred: false,
         }
     }
 
@@ -139,7 +143,18 @@ impl ContextGauge {
         *self = Self {
             measured: 0,
             appended: estimate_prompt_tokens(messages, system, tools),
+            deferred: false,
         };
+    }
+
+    /// Whether a deferral of compaction is already owed to this transcript.
+    pub fn defer_used(&self) -> bool {
+        self.deferred
+    }
+
+    /// Spends the one deferral a transcript may buy between two compactions.
+    pub fn mark_deferred(&mut self) {
+        self.deferred = true;
     }
 
     /// A resumed session can already fill the window, and the gauge only learns
@@ -204,6 +219,16 @@ mod tests {
         let mut gauge = ContextGauge::restored(MEASURED);
         gauge.reset(&[text_message(TEXT_BYTES)], "", &json!([]));
         assert_eq!(gauge.size(), TEXT_TOKENS);
+    }
+
+    /// The one deferred compaction is a promise about the next ask, and a
+    /// reset is exactly the point where the transcript it described changes.
+    #[test]
+    fn a_deferral_is_spent_once_and_renewed_by_reset() {
+        let mut gauge = ContextGauge::restored(MEASURED);
+        gauge.mark_deferred();
+        gauge.reset(&[], "", &json!([]));
+        assert!(!gauge.defer_used(), "the next crossing may defer again");
     }
 
     /// Compaction shrinks the transcript and nothing else, so a gauge that
