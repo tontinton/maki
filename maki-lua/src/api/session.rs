@@ -1139,12 +1139,15 @@ async fn prompt(
     roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
 }
 
-/// Reports {text} to a live session without creating a user turn. The
-/// observation waits for the session's next agent run.
+/// Reports {text} to a live session or one of its subagents without creating
+/// a user turn. The observation waits for the target's next agent run.
 ///
 /// @param text string What to report. Must not be blank.
 /// @param opts table Options:
 ///   `session` (string) id of a live session.
+///   `task` (string?) id of a live subagent of `session`, as `TurnComplete`
+///     reports it; the report goes to that subagent instead of the session's
+///     own mailbox.
 ///   `wake` (boolean) start a TUI turn when it next becomes idle (default
 ///     false). Needs the `agent` permission.
 ///   `display` (string?) one-line note for the transcript, shown and saved
@@ -1177,10 +1180,21 @@ fn notify(
         .map(|t| t.opt::<String>("display"))
         .transpose()?
         .flatten();
-    if let Err(error) = SessionMailbox::notify(session_id, text, display.as_deref(), wake) {
-        return Ok(err_pair(error));
+    let task = opts
+        .as_ref()
+        .map(|t| t.opt::<String>("task"))
+        .transpose()?
+        .flatten();
+    let notified = match task {
+        Some(task) => {
+            SessionMailbox::notify_task(session_id, &task, text, display.as_deref(), wake)
+        }
+        None => SessionMailbox::notify(session_id, text, display.as_deref(), wake),
+    };
+    match notified {
+        Ok(()) => Ok((Some(true), None)),
+        Err(error) => Ok(err_pair(error)),
     }
-    Ok((Some(true), None))
 }
 
 /// Switches a live session between plan and build mode. Entering plan mode
@@ -1491,6 +1505,29 @@ mod tests {
         assert_eq!(messages[0].first_text_content(), Some("built"));
         assert_eq!(messages[0].display_text, None);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn notify_with_a_task_reaches_that_subagent() {
+        let id = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        let subagent = SessionMailbox::register(MakiId::generate());
+        subagent.track_task(&task_id, id);
+        let lua = lua_with_session(None);
+        lua.globals().set("session_id", id.to_string()).unwrap();
+        lua.globals().set("task_id", task_id.clone()).unwrap();
+
+        let (value, error): (bool, Option<String>) = lua
+            .load("return session.notify('built', { session = session_id, task = task_id })")
+            .eval()
+            .unwrap();
+
+        assert!(value);
+        assert_eq!(error, None);
+        let messages = subagent.drain();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].first_text_content(), Some("built"));
+        subagent.untrack_task(&task_id);
     }
 
     #[test_case(" agent-1 finished ", Some("agent-1 finished"); "trimmed")]

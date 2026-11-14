@@ -1275,6 +1275,11 @@ async fn session(
         mailbox: SessionMailbox::register(MakiId::generate()),
         adoption,
     });
+    if let Some(session) = &agent_ctx.session_id {
+        cancellation
+            .mailbox
+            .track_task(&cancellation.ui_id, session.id());
+    }
     cancellation.end_mailbox_on_cancel();
     let background = match owner {
         Some((session, task, cancel)) => {
@@ -1854,6 +1859,7 @@ impl SessionCancellation {
     /// stop instead of reporting to nobody.
     fn end_mailbox(&self) {
         self.registry.end_mailbox(&self.mailbox);
+        self.mailbox.untrack_task(&self.ui_id);
     }
 
     /// The session's token can fire with no prompt left to notice: the task
@@ -1863,9 +1869,11 @@ impl SessionCancellation {
         let token = self.control.token();
         let registry = self.registry.clone();
         let mailbox = self.mailbox.clone();
+        let task_id = self.ui_id.clone();
         tokio::spawn(async move {
             token.cancelled().await;
             registry.end_mailbox(&mailbox);
+            mailbox.untrack_task(&task_id);
         });
     }
 }
@@ -2401,6 +2409,31 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// A plugin only knows a subagent by the task id its events carry, so that
+    /// is what `maki.session.notify` takes.
+    #[tokio::test]
+    async fn notify_reaches_a_subagent_by_its_task_id() {
+        let lua = Lua::new();
+        let parent = MakiId::generate();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.session_id = Some(SessionRef::from(parent));
+        let sess = native_session(&lua, &ctx).await;
+        let mailbox = sess
+            .borrow::<LuaSession>()
+            .unwrap()
+            .cancellation
+            .mailbox
+            .clone();
+
+        SessionMailbox::notify_task(parent, PARENT_ID, NUDGE.into(), None, true).unwrap();
+
+        assert_eq!(mailbox.claim_wake().len(), 1);
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(SessionMailbox::notify_task(parent, PARENT_ID, NUDGE.into(), None, true).is_err());
     }
 
     #[test_case(None, Ok(TOOL_OUTPUT.into()) ; "answer")]

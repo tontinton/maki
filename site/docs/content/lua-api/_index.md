@@ -927,8 +927,9 @@ name the session now running or focused. What each event adds:
 - `"TurnComplete"`: `data.context_size` and `data.context_window` after
   each model response, before its tool calls run. Use it to act mid-turn,
   before `"AutoCompacting"`. `data.context_size` is absent when unknown.
-  A subagent's response carries its own sizes plus `data.id`, its task id.
-  To watch only the main context, skip events that have an `id`.
+  A subagent's response carries its own sizes plus `data.id`, its task id,
+  which `maki.session.notify` takes as `task` to reach that subagent. To
+  watch only the main context, skip events that have an `id`.
 - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
   trigger time.
 - `"CompactionDone"`: `data.context_size_before`,
@@ -5783,8 +5784,8 @@ local state, err = maki.session.prompt("run the tests", { session = id })
 maki.session.notify({text}, {opts?})
 ```
 
-Reports {text} to a live session without creating a user turn. The
-observation waits for the session's next agent run.
+Reports {text} to a live session or one of its subagents without creating
+a user turn. The observation waits for the target's next agent run.
 
 Requires the `session_write` [plugin permission](#plugin-permissions).
 
@@ -5793,6 +5794,9 @@ Requires the `session_write` [plugin permission](#plugin-permissions).
 - `{text}` (`string`) What to report. Must not be blank.
 - `{opts?}` (`table`) Options:
   - `session` (`string`) id of a live session.
+  - `task` (`string?`) id of a live subagent of `session`, as `TurnComplete`
+    reports it; the report goes to that subagent instead of the session's
+    own mailbox.
   - `wake` (`boolean`) start a TUI turn when it next becomes idle (default
     false). Needs the `agent` permission.
   - `display` (`string?`) one-line note for the transcript, shown and saved

@@ -33,6 +33,16 @@ const UNATTENDED_RUN_ID: u64 = 0;
 static LIVE_SESSIONS: LazyLock<Mutex<HashMap<MakiId, Weak<LiveSession>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Subagent mailboxes by task id, so a plugin that only sees the id in an
+/// event can reach one. The session that opened the task guards it.
+static LIVE_TASKS: LazyLock<Mutex<HashMap<String, TaskEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct TaskEntry {
+    parent: MakiId,
+    mailbox: SessionMailbox,
+}
+
 /// Every frontend registers the mailbox, but only an interactive agent loop
 /// publishes a seed. The seed is held weakly, so it dies with its loop. The
 /// mailbox lives on through a respawn, because the new loop registers before
@@ -283,8 +293,12 @@ fn answering(answer: TaskAnswer, text: String, display: Option<&str>, markdown: 
 }
 
 #[derive(Debug, Error)]
-#[error("session not live: {0}")]
-pub struct MailboxError(MakiId);
+pub enum MailboxError {
+    #[error("session not live: {0}")]
+    Session(MakiId),
+    #[error("no live subagent with id {0}")]
+    Task(String),
+}
 
 #[derive(Clone)]
 pub struct SessionMailbox {
@@ -356,12 +370,53 @@ impl SessionMailbox {
         Ok(())
     }
 
+    /// Like [`Self::notify`], for the subagent behind `task_id`.
+    pub fn notify_task(
+        session_id: MakiId,
+        task_id: &str,
+        text: String,
+        display: Option<&str>,
+        wake: bool,
+    ) -> Result<(), MailboxError> {
+        let tasks = lock(&LIVE_TASKS);
+        let entry = tasks
+            .get(task_id)
+            .filter(|entry| entry.parent == session_id)
+            .ok_or_else(|| MailboxError::Task(task_id.to_owned()))?;
+        entry
+            .mailbox
+            .change(|state| state.push(observation(text, display), wake));
+        Ok(())
+    }
+
+    /// Makes `task_id` reachable through [`Self::notify_task`].
+    pub fn track_task(&self, task_id: &str, parent: MakiId) {
+        lock(&LIVE_TASKS).insert(
+            task_id.to_owned(),
+            TaskEntry {
+                parent,
+                mailbox: self.clone(),
+            },
+        );
+    }
+
+    /// Drops the entry only while it is this mailbox's: siblings can share a task id.
+    pub fn untrack_task(&self, task_id: &str) {
+        let mut tasks = lock(&LIVE_TASKS);
+        if tasks
+            .get(task_id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.mailbox.live, &self.live))
+        {
+            tasks.remove(task_id);
+        }
+    }
+
     /// The mailbox of a live session, never a new one.
     pub fn open(session_id: MakiId) -> Result<Self, MailboxError> {
         let mut sessions = lock(&LIVE_SESSIONS);
         let Some(live) = sessions.get(&session_id).and_then(Weak::upgrade) else {
             sessions.remove(&session_id);
-            return Err(MailboxError(session_id));
+            return Err(MailboxError::Session(session_id));
         };
         Ok(Self { session_id, live })
     }
@@ -649,7 +704,7 @@ impl AgentSeed {
     /// that is gone can't say it isn't planning, so that is a no too.
     pub fn background_write_block(chat: MakiId) -> Option<String> {
         let Some(seed) = Self::live(chat) else {
-            return Some(MailboxError(chat).to_string());
+            return Some(MailboxError::Session(chat).to_string());
         };
         let (_, planning) = *lock(&seed.chat_settings);
         planning.then(|| BACKGROUND_PLAN_WRITE_DENIED.to_owned())
@@ -1198,6 +1253,76 @@ mod tests {
     }
 
     #[test]
+    fn notify_task_reaches_the_subagent_mailbox() {
+        let parent = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        let subagent = SessionMailbox::register(MakiId::generate());
+        subagent.track_task(&task_id, parent);
+
+        SessionMailbox::notify_task(parent, &task_id, NOTICE_BODY.into(), None, false).unwrap();
+
+        assert_eq!(text(&subagent.drain().remove(0)), NOTICE_BODY);
+        subagent.untrack_task(&task_id);
+    }
+
+    #[test]
+    fn untracking_a_shared_task_id_keeps_the_newer_mailbox() {
+        let parent = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        let older = SessionMailbox::register(MakiId::generate());
+        older.track_task(&task_id, parent);
+        let newer = SessionMailbox::register(MakiId::generate());
+        newer.track_task(&task_id, parent);
+
+        older.untrack_task(&task_id);
+        SessionMailbox::notify_task(parent, &task_id, NOTICE_BODY.into(), None, false).unwrap();
+
+        assert_eq!(text(&newer.drain().remove(0)), NOTICE_BODY);
+        assert!(older.drain().is_empty());
+        newer.untrack_task(&task_id);
+    }
+
+    #[test_case(false ; "never tracked")]
+    #[test_case(true ; "untracked")]
+    fn notify_task_rejects_a_task_it_cannot_reach(tracked: bool) {
+        let parent = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        if tracked {
+            let subagent = SessionMailbox::register(MakiId::generate());
+            subagent.track_task(&task_id, parent);
+            subagent.untrack_task(&task_id);
+        }
+
+        let error = SessionMailbox::notify_task(parent, &task_id, NOTICE_BODY.into(), None, false)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            MailboxError::Task(task_id.clone()).to_string()
+        );
+    }
+
+    #[test]
+    fn notify_task_rejects_a_task_of_another_session() {
+        let parent = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        let subagent = SessionMailbox::register(MakiId::generate());
+        subagent.track_task(&task_id, parent);
+
+        let stranger = SessionMailbox::notify_task(
+            MakiId::generate(),
+            &task_id,
+            NOTICE_BODY.into(),
+            None,
+            false,
+        );
+
+        assert!(stranger.is_err());
+        assert!(subagent.drain().is_empty());
+        subagent.untrack_task(&task_id);
+    }
+
+    #[test]
     fn seed_is_live_only_while_its_owner_holds_it() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
@@ -1266,7 +1391,7 @@ mod tests {
         drop(seed);
         assert_eq!(
             AgentSeed::background_write_block(id),
-            Some(MailboxError(id).to_string())
+            Some(MailboxError::Session(id).to_string())
         );
     }
 
