@@ -8,9 +8,9 @@ group = "Guides"
 # Writing maki plugins
 
 Maki plugins are plain Lua files (Luau) that run inside maki. A plugin can
-register tools the LLM calls, slash commands, keymaps, prompt hints, and
-custom UI. Everything lives under the global `maki` table. The full API
-reference is at the end of this document.
+register tools the LLM calls, slash commands, keymaps, prompt hints,
+providers, and custom UI. Everything lives under the global `maki` table. The
+full API reference is at the end of this document.
 
 ## Where plugin code goes
 
@@ -79,6 +79,13 @@ Sensitive APIs are gated per plugin file, and a plugin without a
 `plugin.toml` next to it gets nothing. The gates and the file format are
 in [the reference](/docs/lua-api/#plugin-permissions). Set
 `min_maki_version` there when a plugin needs a newer Maki Lua API.
+
+## Providers
+
+A plugin can also register an LLM provider with `maki.provider.register`, and
+its models appear in `/model` as `{slug}/{model_id}`. See
+[Plugin providers](/docs/providers/#plugin-providers) for the declaration and
+the `plugin.toml` grants it takes.
 
 ## Development loop
 
