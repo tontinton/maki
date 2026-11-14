@@ -83,6 +83,8 @@ pub struct CustomCommand {
     pub content: String,
     pub scope: CommandScope,
     pub accepts_args: bool,
+    /// The frontmatter's `argument-hint`, e.g. `<file>`.
+    pub argument_hint: Option<String>,
 }
 
 impl CustomCommand {
@@ -187,6 +189,7 @@ fn parse_command(content: &str, path: &Path, scope: CommandScope) -> Option<Cust
         content: body.to_string(),
         scope,
         accepts_args,
+        argument_hint: fm.argument_hint,
     })
 }
 
@@ -231,6 +234,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_keeps_argument_hint() {
+        let path = PathBuf::from("/fake/review.md");
+        let cmd = parse_command(
+            "---\nargument-hint: <file>\n---\nReview $ARGUMENTS",
+            &path,
+            CommandScope::Project,
+        )
+        .unwrap();
+        assert_eq!(cmd.argument_hint.as_deref(), Some("<file>"));
+    }
+
+    #[test]
     fn parse_command_empty_body_returns_none() {
         let path = PathBuf::from("/fake/empty.md");
         assert!(parse_command("---\nname: empty\n---\n   \n", &path, CommandScope::User).is_none());
@@ -245,6 +260,7 @@ mod tests {
             content: "body".into(),
             scope,
             accepts_args: false,
+            argument_hint: None,
         };
         assert_eq!(cmd.display_name(), expected);
     }

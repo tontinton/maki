@@ -14,10 +14,14 @@ use super::{
     FAST_PENDING_MSG, MAX_COMMAND_DEPTH, QueuedMessage, UNKNOWN_COMMAND_PREFIX, WORKFLOW_OFF_MSG,
     WORKFLOW_ON_MSG, YOLO_OFF_MSG, YOLO_ON_MSG,
 };
-use crate::components::command::ParsedCommand;
+use crate::components::command::{CommandListing, ParsedCommand};
 use crate::components::{Action, ExitRequest, Status};
 
 impl App {
+    pub(crate) fn command_listing(&mut self, caller: &PluginReach) -> Vec<CommandListing> {
+        self.command_palette.listing(caller)
+    }
+
     /// Entry point for `maki.api.run_command`: splits a command line into the
     /// name and args the input bar would hand over, leading slash optional.
     /// `Err` means nothing ran at all, so the Lua caller can say why.
@@ -34,6 +38,7 @@ impl App {
         let (name, args) = trimmed
             .split_once(char::is_whitespace)
             .unwrap_or((trimmed, ""));
+        self.command_palette.refresh_sources();
         let resolved = self
             .command_palette
             .resolve_for_plugin(&format!("/{}", name.trim_start_matches('/')), caller)?;
