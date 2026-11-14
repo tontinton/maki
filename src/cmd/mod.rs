@@ -248,8 +248,15 @@ pub async fn dispatch(mut cli: Cli) -> Result<()> {
         Some(Command::Index { path }) => {
             subcmd::index(&path, cli.no_plugins, cli.no_jit, trust_mode).await?;
         }
-        Some(Command::Models { refresh }) => {
-            subcmd::models(cli.no_plugins, cli.no_jit, refresh, trust_mode).await?
+        Some(Command::Models { refresh, explain }) => {
+            subcmd::models(
+                cli.no_plugins,
+                cli.no_jit,
+                refresh,
+                trust_mode,
+                explain.as_deref(),
+            )
+            .await?
         }
         Some(Command::Session { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;

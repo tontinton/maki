@@ -5,6 +5,7 @@ pub mod http;
 pub(crate) mod image;
 pub(crate) mod manifest;
 pub mod model;
+pub(crate) mod model_directory;
 pub mod model_registry;
 pub mod models_cache;
 pub mod pricing;
@@ -26,6 +27,7 @@ pub use model::{
     ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
+pub use providers::aperture::{ModelExplanation, explain_model};
 pub use providers::catalog::ProviderData;
 pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,

@@ -1073,6 +1073,11 @@ pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provi
     })))
 }
 
+/// True once the models.dev catalog has been loaded, from cache or network.
+pub(crate) fn is_warm() -> bool {
+    SHARED_CATALOG.get().is_some()
+}
+
 /// Look up a single model's metadata in the models.dev catalog, only if the
 /// catalog has already been downloaded. Never triggers a fetch, so callers
 /// (e.g. `Model::from_spec`) must tolerate `None` and fall through, since

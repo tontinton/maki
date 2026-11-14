@@ -14,6 +14,7 @@ use super::codec::{CodecOptions, protocol_spec};
 use super::{KeyPool, ResolvedAuth};
 use crate::AgentError;
 use crate::model::{FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier};
+use crate::model_directory;
 use crate::model_registry::{self, DeclaredTiers};
 use crate::provider::{ModelBatch, Provider, ProviderStatus};
 use crate::providers::Timeouts;
@@ -173,17 +174,30 @@ fn model_from_def(
     model_id: &str,
 ) -> Model {
     let subsidy_source = def.subsidised_by.as_deref();
-    let mut row = def
-        .models
-        .iter()
-        .find(|m| m.id == model_id)
-        .map(ModelEntry::from)
-        .unwrap_or_default();
+    let declared = def.models.iter().find(|m| m.id == model_id);
+    let mut row = declared.map(ModelEntry::from).unwrap_or_default();
+    let caps = match declared.and_then(|m| m.like.as_deref()) {
+        Some(like) => match model_directory::resolve_target(like) {
+            Some(caps) => Some(caps),
+            None => {
+                warn!(
+                    slug,
+                    model = model_id,
+                    like,
+                    "like does not name a known provider or model, ignoring"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let caps = caps.as_ref();
     let discovered = model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
     row.max_output_tokens = row
         .max_output_tokens
-        .or_else(|| discovered.and_then(|d| d.max_output_tokens));
+        .or_else(|| discovered.and_then(|d| d.max_output_tokens))
+        .or_else(|| caps.and_then(|caps| caps.max_output_tokens));
     // Same precedence as the builtin path ([`Model::from_base`]): the `-1m`
     // suffix only stands in for a window nothing more specific reported, so a
     // proxy that answers /v1/models with its real cap still wins. Without this
@@ -192,28 +206,63 @@ fn model_from_def(
     row.context_window = row
         .context_window
         .or_else(|| discovered.and_then(|d| d.context_window))
+        .or_else(|| caps.and_then(|caps| caps.context_window))
         .or_else(|| shared::long_context_window(model_id));
+    row.family = row.family.or_else(|| caps.and_then(|caps| caps.family));
+    row.supports_tool_examples = row
+        .supports_tool_examples
+        .or_else(|| caps.and_then(|caps| caps.supports_tool_examples));
+    row.supports_vision = row
+        .supports_vision
+        .or_else(|| caps.and_then(|caps| caps.supports_vision));
+    row.supports_deferred_tools = row
+        .supports_deferred_tools
+        .or_else(|| caps.and_then(|caps| caps.supports_deferred_tools));
+    if row.supports_thinking != Some(false) {
+        row.requires_thinking |= caps.is_some_and(|caps| caps.requires_thinking);
+    }
     // Resolved here rather than left to `Model::supports_thinking`, which would
     // reach the same spec through `custom::base_spec` and so re-read
     // providers.toml on every call, and would answer from whatever the builtin
     // slug discovered for a colliding model id.
-    row.supports_thinking = row
-        .supports_thinking
-        // Spelling out how a model thinks is as good as saying that it does.
-        .or_else(|| row.thinking_fields.as_ref().map(|_| true))
-        .or(Some(base.supports_thinking));
+    let caps_thinking = caps.and_then(|caps| caps.supports_thinking);
+    // The openai codec has no thinking dialect of its own: only fields in the
+    // row spell a mode. Anthropic and Google build their native bodies, and
+    // the responses builder has no thinking wiring yet.
+    let caps_spellable = caps.is_some_and(|caps| match def.protocol {
+        Some(Protocol::Openai) => caps.thinking_fields.is_some(),
+        Some(Protocol::Anthropic | Protocol::Google) => caps.supports_thinking.is_some(),
+        Some(Protocol::OpenaiResponses) | None => false,
+    });
+    row.supports_thinking = match (row.supports_thinking, caps_thinking) {
+        // A borrowed capability the current wire cannot spell must not fall
+        // back to the provider's blanket yes.
+        (None, Some(true)) if !caps_spellable => Some(false),
+        (declared, caps_thinking) => declared
+            .or(caps_thinking)
+            // Spelling out how a model thinks is as good as saying that it does.
+            .or_else(|| row.thinking_fields.as_ref().map(|_| true))
+            .or(Some(base.supports_thinking)),
+    };
     // Only the openai chat path merges the fragments into the body: the
     // responses path has no thinking wiring yet, and anthropic and google spell
     // thinking their own way. Anywhere else they would vanish without a trace.
+    let declared_fields = row.thinking_fields.is_some();
+    row.thinking_fields = row
+        .thinking_fields
+        .take()
+        .or_else(|| caps.and_then(|caps| caps.thinking_fields.clone()));
     row.thinking_fields = match row.thinking_fields.take() {
         Some(fields) if def.protocol == Some(Protocol::Openai) => Some(fields),
         Some(_) => {
-            warn!(
-                slug,
-                model = model_id,
-                protocol = ?def.protocol,
-                "thinking_fields only applies to openai-protocol providers, ignoring"
-            );
+            if declared_fields {
+                warn!(
+                    slug,
+                    model = model_id,
+                    protocol = ?def.protocol,
+                    "thinking_fields only applies to openai-protocol providers, ignoring"
+                );
+            }
             None
         }
         None if def.protocol == Some(Protocol::Openai) => Some(UNDECLARED_THINKING_FIELDS.clone()),
@@ -228,6 +277,7 @@ fn model_from_def(
     let discovered_pricing = discovered.and_then(|d| d.pricing.as_ref());
     let pricing = declared_pricing
         .or_else(|| discovered_pricing.cloned())
+        .or_else(|| caps.and_then(|caps| caps.pricing.clone()))
         .unwrap_or_default();
     row.pricing = catalog_fallback_id(base, &pricing, subsidy_source.is_some(), model_id)
         .and_then(|base_id| catalog::model_meta_if_available(super::anthropic::SLUG, base_id))
@@ -433,6 +483,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::model::ModelFamily;
     use crate::test_support::{Canned, Requests, serve};
     use crate::types::{ThinkingConfig, ThinkingFallback};
     use crate::{Message, RequestOptions, StreamResponse};
@@ -521,6 +572,60 @@ mod tests {
 
     // The exact regression this fixes: discovery parsed context_window but
     // never stored it, so custom models always got the protocol fallback.
+    #[test]
+    fn like_lends_capabilities_and_the_row_wins() {
+        let def: ProviderDef = serde_json::from_str(
+            r#"{"protocol":"openai","models":[{"id":"local-v4","like":"openai/gpt-6-sol"}]}"#,
+        )
+        .unwrap();
+        let model = model_from_def(&def, openai_spec(), "custom-gw", "local-v4");
+        assert_eq!(model.family, ModelFamily::Gpt);
+        assert_eq!(model.context_window, 1_050_000);
+        assert_eq!(model.max_output_tokens, Some(128_000));
+        assert!(
+            !model.supports_thinking(),
+            "an openai-codec provider has no dialect for the borrowed thinking"
+        );
+        assert!(model.supports_vision());
+
+        let def: ProviderDef = serde_json::from_str(
+            r#"{"protocol":"openai","models":[{"id":"local-v4","like":"openai/gpt-6-sol","supports_thinking":false,"supports_vision":false,"context_window":1024}]}"#,
+        )
+        .unwrap();
+        let model = model_from_def(&def, openai_spec(), "custom-gw", "local-v4");
+        assert!(!model.supports_thinking(), "an explicit row field wins");
+        assert!(!model.supports_vision(), "a local model may lack vision");
+        assert_eq!(model.context_window, 1024);
+    }
+
+    #[test]
+    fn a_responses_provider_does_not_claim_borrowed_thinking() {
+        let def: ProviderDef = serde_json::from_str(
+            r#"{"protocol":"openai-responses","models":[{"id":"local","like":"openai/gpt-6-sol"}]}"#,
+        )
+        .unwrap();
+        let model = model_from_def(&def, openai_spec(), "custom-gw", "local");
+        assert!(
+            !model.supports_thinking(),
+            "the responses builder has no thinking wiring"
+        );
+    }
+
+    #[test]
+    fn an_unknown_like_is_ignored() {
+        let def: ProviderDef = serde_json::from_str(
+            r#"{"protocol":"openai","models":[{"id":"local-v4","like":"nobody/nothing"}]}"#,
+        )
+        .unwrap();
+        let model = model_from_def(&def, openai_spec(), "custom-gw", "local-v4");
+        assert_eq!(model.family, ModelFamily::Gpt);
+        assert_eq!(
+            model.context_window,
+            openai_spec().fallback_context_window,
+            "the base provider's fallback stays in place"
+        );
+    }
+
     #[test]
     fn discovered_metadata_flows_into_custom_model_from_def() {
         let slug = "custom-discovery-metadata-test";

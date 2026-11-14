@@ -353,7 +353,7 @@ fn is_snapshot_suffix(suffix: &str) -> bool {
 /// with it. [`lookup_entry`] matches by prefix so dated snapshots resolve to
 /// their base row, which also means `glm-5` answers for `glm-5.4`, a model it
 /// has never been checked against.
-fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
+pub(crate) fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
     entry.prefixes.iter().any(|prefix| {
         model_id
             .strip_prefix(prefix)
@@ -587,7 +587,7 @@ impl Model {
     /// Family and tier are about which dialect a model speaks and what role it
     /// plays, which a relative answers just as well, so they read the curated
     /// row whether or not it was an exact match.
-    fn from_base(base: &ProviderSpec, slug: &str, model_id: &str) -> Self {
+    pub(crate) fn from_base(base: &ProviderSpec, slug: &str, model_id: &str) -> Self {
         let sources = ModelSources::resolve(base, model_id);
         let entry = sources.entry;
         let spec = format!("{slug}/{model_id}");

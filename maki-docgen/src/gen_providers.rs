@@ -221,6 +221,18 @@ supports_vision = false
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
 | `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
+| `like` | string | unset | Borrow capabilities from another row: `slug/model`, or a bare `slug` for a provider's family and fallback limits. Fields written on this row win, and the provider's `protocol` still decides the wire |
+
+When a locally hosted model is a known one under another id, `like` imports its family, thinking flag, vision, limits and pricing without repeating them. Thinking is only claimed when the row's wire can spell it. Anything the row states still wins, which is how a model that matches upstream but is served without vision is expressed:
+
+```toml
+[[my-proxy.models]]
+id = "local-deepseek-flash"
+like = "deepseek/deepseek-flash"
+supports_vision = false
+```
+
+How a request spells thinking still follows the provider declaration: `thinking_fields` (which the openai codec installs and sends), the protocol's own dialect, or a provider Maki routes to. The responses path has no thinking wiring yet, so a borrowed flag there is not sent.
 
 Custom slugs must not reuse a built-in provider name. Maki exits with code 2 at startup if `providers.toml` does not parse or contains an unknown key, so a typo like `api_key_evn` fails there rather than being silently ignored.
 
@@ -261,7 +273,31 @@ context_window = 262144
 supports_vision = true
 ```
 
-Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), and `path_prefix`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), `path_prefix`, and `like` (borrows another model's capabilities; see below). Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+
+Gateways name models after their upstream, so Maki trusts the gateway provider id first and then a unique exact id in its tables. Namespace prefixes are stripped: `zai-org/GLM-5.3-Flash` matches `zai/glm-5.3-flash`, and `openai.gpt-6.1-sol` matches `openai/gpt-6.1-sol`. A version bump is not a prefix match, so `anthropic.claude-opus-5-5` is newer than the shipped `claude-opus-5` row and needs an explicit pin. When the name is opaque or the guess is wrong, `like` pins it: `slug/model` borrows that model's row, while a bare `slug` borrows the provider's family and fallback limits.
+
+Precedence is explicit fields, then the gateway's published limits and price, then `like`, then the matched row. The gateway wins on context, max output and price because it describes that deployment. A row fills family, vision, tool examples and thinking. A name-only match never enables thinking on its own: the guess is unverified, so pin the model with `like` or set `supports_thinking = true`. A borrowed row's thinking flags and fields do come along; whether the request can spell them depends on the wire (openai chat with fields, or a provider Maki routes to).
+
+```toml
+[aperture.overrides.bedrock-mantle.models."anthropic.claude-opus-5-5"]
+base = "anthropic"
+
+[aperture.overrides.baseten.models."deepseek-ai/DeepSeek-V4.1-Flash"]
+like = "deepseek/deepseek-flash"
+
+[aperture.overrides.azureai.models."gpt-6.1-sol"]
+supports_thinking = true
+```
+
+`base` routes the model through the upstream's own protocol, so one that exposes `/v1/messages` (as the Bedrock example does) keeps native thinking. `like` keeps the generic wire and borrows family, vision and tool examples. The bundled `deepseek` plugin declares `deepseek-flash` as V4.1 Flash. Use `like` instead of `base` when the wire should stay generic:
+
+```toml
+[aperture.overrides.bedrock-mantle.models."anthropic.claude-opus-5-5"]
+like = "anthropic/claude-opus-5"
+```
+
+Run `maki models --explain aperture/<upstream>/<model>` to see which row matched and where each fact came from.
 
 Maki sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
 
