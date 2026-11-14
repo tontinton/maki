@@ -51,8 +51,13 @@ impl PlanAnswers {
     /// the pick a new one starts at. The counter only ever moves forward, so
     /// anything stamped with an earlier pick can only miss from here on.
     ///
-    /// Every reset path funnels through [`App::reset_ui_chrome`], which calls
-    /// this: a new one gets the invariant for free.
+    /// Every reset path and every new run funnels through this, so a chain
+    /// that answers for a revision the user has left cannot open a menu.
+    ///
+    /// A run drops a picked plugin row's outcome on purpose: the handler that
+    /// started the run has taken the session over, and the row's built-in
+    /// outcome would otherwise start a second run on top of it. That drop is
+    /// quiet because the run is the feedback.
     pub(super) fn abandon(&mut self) -> u64 {
         self.form = None;
         self.action = None;

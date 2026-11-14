@@ -1774,6 +1774,24 @@ fn a_stale_pick_answer_cannot_fire_a_second_implement() {
     );
 }
 
+/// A row handler that starts a run takes the session over. The row's built-in
+/// outcome goes with it, since running both would implement twice, and
+/// quietly, because the run is what the user sees.
+#[test]
+fn a_run_started_by_a_row_handler_retires_the_pick_quietly() {
+    let mut app = test_app();
+    let (_tx, rx) = oneshot::channel();
+    let pick = app.plan_answers.abandon();
+    app.plan_answers.action = Some(plan_pick_action(pick, rx));
+
+    let SubmitOutcome::Started(_) = app.submit_prompt(queued_msg("go")) else {
+        panic!("a raw prompt must start a run");
+    };
+
+    assert!(app.plan_answers.action.is_none());
+    assert_eq!(app.status_bar.flash_text(), None);
+}
+
 /// A `/new` while a handler is parked: the draft the row was picked from is
 /// gone and the session it would implement in is not the one the user picked
 /// in, so the answer submits nothing.
