@@ -102,7 +102,7 @@ pub(crate) fn resolve_target(target: &str) -> Option<ModelCaps> {
         return provider_defaults(target);
     };
     if let Some(spec) = ProviderRegistry::compiled(slug)
-        && let Some(caps) = caps_in(&spec.models(), model_id, Some(spec.slug), |model| {
+        && let Some(caps) = caps_in(spec.models(), model_id, Some(spec.slug), |model| {
             CapsSource::Curated {
                 slug: spec.slug,
                 model: Some(model),
@@ -158,7 +158,7 @@ fn provider_defaults(slug: &str) -> Option<ModelCaps> {
 fn collect_curated(variant: &str, candidates: &mut Vec<Candidate>) {
     for spec in ProviderRegistry::all_compiled() {
         if let Some(candidate) =
-            candidate_for(&spec.models(), variant, 0, Some(spec.slug), |model| {
+            candidate_for(spec.models(), variant, 0, Some(spec.slug), |model| {
                 CapsSource::Curated {
                     slug: spec.slug,
                     model: Some(model),
@@ -290,12 +290,20 @@ fn caps_from_entry(
     model_id: &str,
     source: CapsSource,
 ) -> ModelCaps {
+    let spec = source.spec();
+    let family = entry.family.or_else(|| spec.map(|spec| spec.family));
     let mut caps = ModelCaps {
-        family: entry.family,
-        supports_thinking: entry.supports_thinking,
+        family,
+        supports_thinking: entry
+            .supports_thinking
+            .or_else(|| spec.map(|spec| spec.supports_thinking)),
         requires_thinking: entry.requires_thinking,
-        supports_vision: entry.supports_vision,
-        supports_tool_examples: entry.supports_tool_examples,
+        supports_vision: entry
+            .supports_vision
+            .or_else(|| family.map(ModelFamily::supports_vision)),
+        supports_tool_examples: entry
+            .supports_tool_examples
+            .or_else(|| family.map(ModelFamily::supports_tool_examples)),
         supports_deferred_tools: entry.supports_deferred_tools,
         tier: Some(entry.tier),
         context_window: entry.context_window,

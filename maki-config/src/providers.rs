@@ -270,6 +270,11 @@ pub struct OverrideFields {
     /// url already carries its own path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
+    /// Borrow another model's capabilities when the gateway id does not
+    /// resemble the native one: `slug/model` for a row, `slug` for a
+    /// provider's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub like: Option<String>,
 }
 
 /// Overrides for a single gateway provider (Aperture), keyed by its id (e.g.
