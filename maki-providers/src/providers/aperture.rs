@@ -362,8 +362,12 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                 } else {
                     format!("{provider_id}/{id}")
                 },
-                context_window: ov.context_window,
-                max_output_tokens: ov.max_output_tokens,
+                context_window: ov
+                    .context_window
+                    .or_else(|| payload_u32(m, "context_window_tokens")),
+                max_output_tokens: ov
+                    .max_output_tokens
+                    .or_else(|| payload_u32(m, "max_output_tokens")),
                 pricing: m["pricing"].as_object().map(|p| {
                     ModelPricing::per_million(
                         price_per_m(p.get("input")),
@@ -383,6 +387,10 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
             })
         })
         .collect()
+}
+
+fn payload_u32(model: &Value, field: &str) -> Option<u32> {
+    u32::try_from(model[field].as_u64()?).ok()
 }
 
 /// Reconcile a model's metadata against its routed native provider's static
@@ -733,25 +741,32 @@ mod tests {
         let body = json!({
             "object": "list",
             "data": [
-                {"id": "qwen3.6", "metadata": {"provider": {"id": "ollama"}}, "pricing": {"input": "0.000001", "output": 0.000002, "input_cache_read": "0.0000001"}},
-                {"id": "gemma4", "metadata": {"provider": {"id": "ikora"}}},
+                {"id": "qwen3.6", "metadata": {"provider": {"id": "ollama"}}, "context_window_tokens": 1048576, "max_output_tokens": 262144, "pricing": {"input": "0.000001", "output": 0.000002, "input_cache_read": "0.0000001"}},
+                {"id": "gemma4", "metadata": {"provider": {"id": "ikora"}}, "context_window_tokens": 128000, "max_output_tokens": 8192},
                 {"id": "raw-model"}
             ]
         });
         let models = parse_models(&body, &overrides);
         assert_eq!(models.len(), 3);
         assert_eq!(models[0].id, "ollama/qwen3.6");
-        assert_eq!(models[0].context_window, Some(65_536));
+        assert_eq!(
+            models[0].context_window,
+            Some(65_536),
+            "override beats the payload"
+        );
         assert_eq!(models[0].supports_vision, Some(true));
-        assert!(models[0].max_output_tokens.is_none());
+        assert_eq!(models[0].max_output_tokens, Some(262_144));
         let p = models[0].pricing.as_ref().unwrap();
         assert!((p.input - 1.0).abs() < 1e-9);
         assert!((p.output - 2.0).abs() < 1e-9);
         assert!((p.cache_read - 0.1).abs() < 1e-9);
         assert_eq!(models[1].id, "ikora/gemma4");
+        assert_eq!(models[1].context_window, Some(128_000));
+        assert_eq!(models[1].max_output_tokens, Some(8_192));
         assert!(models[1].pricing.is_none());
         assert!(models[1].supports_vision.is_none());
         assert_eq!(models[2].id, "raw-model");
+        assert!(models[2].context_window.is_none());
     }
 
     #[test]
