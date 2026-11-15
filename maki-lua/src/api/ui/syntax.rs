@@ -28,9 +28,9 @@ use tree_sitter::{
 pub use self::index::SyntaxIndex;
 use self::index::mark_key;
 use super::marks::{Decoration, parse_mark};
-use crate::api::treesitter::query::{broken_regex, is_known_predicate, predicates_hold};
 use crate::api::util::convert::{TableExt, reject_unknown_fields};
 use crate::language::Language;
+use maki_highlight::predicates::{broken_regex, is_known_predicate, predicates_hold};
 
 const SYNTAX_FIELDS: &[&str] = &["lang", "query", "captures"];
 const CONTENT: &str = "injection.content";
