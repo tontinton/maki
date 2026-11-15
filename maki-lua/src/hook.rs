@@ -20,10 +20,19 @@ use crate::api::util::ctx::LuaCtx;
 use crate::plugin_permissions::Permission;
 use crate::runtime::{HookRun, KILL_GRACE, PromptRun, Request, SLICE_KILL, WATCHDOG_POLL_INTERVAL};
 
-/// Every `agent.*` slot steers what the agent does next: the prompt it
-/// answers, whether it stops, what it remembers after a compaction. No
-/// narrower price would be honest.
-const AGENT_SLOT_COST: LayerCost<'static> = LayerCost::TOTAL;
+/// What a layer on any agent slot pays, all of it content. Every slot can
+/// hand it text the user or the model wrote (`request_instructions` on
+/// `agent.compact.before`, `last_message` on `agent.stop`), and steering the
+/// agent costs what sending a prompt does (`SENDS_PROMPT`) plus
+/// `session_read`. No tool call is steered, so the authority is `Inert`.
+const AGENT_SLOT_COST: LayerCost<'static> = LayerCost::Host {
+    authority: Authority::Inert,
+    content: &[
+        Permission::Agent,
+        Permission::SessionRead,
+        Permission::SessionWrite,
+    ],
+};
 
 /// Conversation content, both ways, on every stage. A layer that sees the
 /// call reads what the model wrote (the file `write` puts on disk, the page

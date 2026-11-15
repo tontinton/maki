@@ -273,8 +273,10 @@ They follow the tool slot contract. `ctx` carries `session_id`, `task_id` (set
 inside a subagent), `model`, `context_size`, `context_window`, and
 `deadline_ms`.
 
-A layer on any of them needs every permission, because it steers what the agent
-does next. The chain gets 30 seconds, then the loop carries on without it.
+A layer on any of them costs `agent`, `session_read` and `session_write`. Each
+slot can hand it text the user or the model wrote, which `session_read` guards,
+and steering what happens next costs what sending a prompt costs. The chain
+gets 30 seconds, then the loop carries on without it.
 
 Every layer shares the same `defer`, `continue`, and `instructions` strings, so
 assigning one erases what another layer wrote. Append instead, and allow for
