@@ -1,15 +1,18 @@
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::fmt::Display;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use maki_storage::StateDir;
 use maki_storage::auth::{
-    McpAuthData, OAuthTokens, delete_mcp_auth, load_mcp_auth, now_millis, save_mcp_auth,
+    McpAuthData, OAuthTokens, delete_mcp_auth, load_mcp_auth_async, now_millis, save_mcp_auth,
 };
 use oauth2::basic::BasicTokenType;
 use oauth2::{AccessToken, RefreshToken, TokenResponse};
 use rmcp::transport::auth::{CredentialRefreshGuard, OAuthTokenResponse, VendorExtraTokenFields};
 use rmcp::transport::{AuthError, CredentialStore, StoredCredentials};
+use tokio::sync::Mutex;
+use tokio::task::spawn_blocking;
 
 const MILLIS_PER_SEC: u64 = 1000;
 /// What maki assumed before rmcp when a token response has no `expires_in`.
@@ -21,10 +24,14 @@ const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
 /// rmcp loads them before every request, so they are served from memory. A
 /// refresh reads the file again first, since another maki may have rotated
 /// the refresh token in the meantime.
+///
+/// A save or a clear keeps the record locked until the file is written, on a
+/// blocking job that runs to the end, so one that rmcp stops waiting for still
+/// lands, and the next change waits for it.
 pub(super) struct AuthStore {
     storage: StateDir,
     server_name: String,
-    record: Mutex<McpAuthData>,
+    record: Arc<Mutex<McpAuthData>>,
 }
 
 impl AuthStore {
@@ -32,19 +39,15 @@ impl AuthStore {
         Self {
             storage,
             server_name: server_name.to_owned(),
-            record: Mutex::new(record),
+            record: Arc::new(Mutex::new(record)),
         }
-    }
-
-    fn record(&self) -> MutexGuard<'_, McpAuthData> {
-        self.record.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 #[async_trait]
 impl CredentialStore for AuthStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-        let record = self.record();
+        let record = self.record.lock().await;
         Ok(record.tokens.clone().map(|tokens| {
             StoredCredentials::new(
                 record.client_id.clone(),
@@ -56,28 +59,42 @@ impl CredentialStore for AuthStore {
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        let mut record = self.record();
+        let mut record = Arc::clone(&self.record).lock_owned().await;
         record.client_id = credentials.client_id;
         record.tokens = credentials.token_response.as_ref().map(stored_tokens);
-        save_mcp_auth(&self.storage, &self.server_name, &record)
-            .map_err(|e| AuthError::CredentialStoreError(e.to_string()))
+        let (storage, server_name) = (self.storage.clone(), self.server_name.clone());
+        spawn_blocking(move || save_mcp_auth(&storage, &server_name, &record))
+            .await
+            .map_err(store_error)?
+            .map_err(store_error)
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
-        self.record().tokens = None;
-        delete_mcp_auth(&self.storage, &self.server_name)
-            .map(drop)
-            .map_err(|e| AuthError::CredentialStoreError(e.to_string()))
+        let mut record = Arc::clone(&self.record).lock_owned().await;
+        record.tokens = None;
+        let (storage, server_name) = (self.storage.clone(), self.server_name.clone());
+        spawn_blocking(move || {
+            let _record = record;
+            delete_mcp_auth(&storage, &server_name)
+        })
+        .await
+        .map_err(store_error)?
+        .map(drop)
+        .map_err(store_error)
     }
 
     async fn acquire_refresh_guard(&self) -> Result<Option<CredentialRefreshGuard>, AuthError> {
-        let mut record = self.record();
-        match load_mcp_auth(&self.storage, &self.server_name, &record.server_url) {
+        let mut record = self.record.lock().await;
+        match load_mcp_auth_async(&self.storage, &self.server_name, &record.server_url).await {
             Some(on_disk) => *record = on_disk,
             None => record.tokens = None,
         }
         Ok(None)
     }
+}
+
+fn store_error(e: impl Display) -> AuthError {
+    AuthError::CredentialStoreError(e.to_string())
 }
 
 /// Without a refresh token there is nothing to renew early, so the token goes
@@ -162,7 +179,7 @@ mod tests {
         let loaded = store.load().await.unwrap().unwrap();
         store.save(loaded).await.unwrap();
 
-        let saved = load_mcp_auth(&storage, SERVER, URL).unwrap();
+        let saved = load_mcp_auth_async(&storage, SERVER, URL).await.unwrap();
         let saved_tokens = saved.tokens.unwrap();
         assert_eq!(saved_tokens.access, ACCESS);
         assert_eq!(saved_tokens.refresh, REFRESH);

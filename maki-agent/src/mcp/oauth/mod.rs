@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use maki_storage::StateDir;
-use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
+use maki_storage::auth::{McpAuthData, load_mcp_auth_async, save_mcp_auth};
 use reqwest::Client;
 use rmcp::transport::auth::{AuthorizationMetadata, OAuthClientConfig};
 use rmcp::transport::{AuthError, AuthorizationManager};
@@ -104,8 +104,9 @@ pub(super) async fn stored_manager(
     server_url: &str,
     client: Client,
 ) -> Result<Option<AuthorizationManager>, AuthError> {
-    let Some(mut record) =
-        load_mcp_auth(storage, server_name, server_url).filter(|r| r.tokens.is_some())
+    let Some(mut record) = load_mcp_auth_async(storage, server_name, server_url)
+        .await
+        .filter(|r| r.tokens.is_some())
     else {
         return Ok(None);
     };
@@ -262,7 +263,8 @@ async fn login(
     let scopes = manager.select_initial_scopes(&[]).await;
     let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
 
-    let reusable = load_mcp_auth(storage, server_name, server_url)
+    let reusable = load_mcp_auth_async(storage, server_name, server_url)
+        .await
         .filter(|r| can_reuse_client(r, &redirect_uri));
     let (client_id, client_secret, client_secret_expires_at) = match (client_id, reusable) {
         (Some(client_id), _) => (client_id, client_secret, None),
