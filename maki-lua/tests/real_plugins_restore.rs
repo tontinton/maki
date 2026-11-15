@@ -12,7 +12,7 @@ use maki_agent::{AgentEvent, EventSender, SpanStyle};
 use maki_config::ToolOutputLines;
 use maki_highlight::highlight_code;
 use maki_lua::test_support::{fire_autocmd, runtime};
-use maki_lua::{PluginHost, RestoreReason, Split, UiAction};
+use maki_lua::{PluginHost, RestoreReason, Split, UiAction, WinCommand};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
 use test_case::test_case;
@@ -51,6 +51,14 @@ const TODO_TOGGLE_CALLER: &str = r#"
 local ok, err = maki.ui.action('todo_write.toggle')
 assert(err == nil, err)
 assert(ok == false, tostring(ok))
+"#;
+/// What a user's `init.lua` does with the action while a panel is shown: call
+/// it by name, and expect the `true` that says the key was consumed, with no
+/// error and no permission prompt.
+const TODO_TOGGLE_CALLER_SHOWN: &str = r#"
+local ok, err = maki.ui.action('todo_write.toggle')
+assert(err == nil, err)
+assert(ok == true, tostring(ok))
 "#;
 const SUBAGENT_TASK_ID: &str = "toolu_sub";
 const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
@@ -586,6 +594,52 @@ fn todo_write_toggle_action_answers_a_caller_without_a_list() {
 
     host.load_source("global/init.lua", TODO_TOGGLE_CALLER)
         .unwrap();
+}
+
+/// The case the key is actually bound for: a shown panel, hidden by the
+/// action while the caller's `init.lua` has no permissions. A list is written
+/// and focused first, then the action answers the caller `true` and the
+/// panel's last visibility command is the hide.
+#[test]
+fn todo_write_toggle_action_hides_a_shown_panel() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+    let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.session_id = Some(session_ref());
+    let tool = &reg.get(TODO_TOOL).unwrap().tool;
+    runtime().block_on(tool.parse(&input).unwrap().execute(&ctx));
+
+    let sid = session_ref().id().to_string();
+    fire_autocmd(
+        &host.event_handle(),
+        "TaskFocusChanged",
+        json!({ "session_id": sid, "id": maki_agent::tools::MAIN_TASK_ID }),
+    );
+    host.load_source("barrier", "").unwrap();
+
+    let mut ui = host.take_ui_action_rx().unwrap();
+    let mut cmd_rx = loop {
+        match ui.try_recv() {
+            Ok(UiAction::OpenWin { config, cmd_rx, .. }) if config.split == Split::Panel => {
+                break cmd_rx;
+            }
+            Ok(_) => {}
+            Err(_) => panic!("the toggle never had a panel to hide"),
+        }
+    };
+
+    host.load_source("global/init.lua", TODO_TOGGLE_CALLER_SHOWN)
+        .unwrap();
+
+    let last_visible = iter::from_fn(|| cmd_rx.try_recv().ok())
+        .filter(|cmd| matches!(cmd, WinCommand::SetVisible(_)))
+        .last();
+    assert!(
+        matches!(last_visible, Some(WinCommand::SetVisible(false))),
+        "panel was left shown",
+    );
 }
 
 /// A session load replays a transcript, so its restores run with the panel
