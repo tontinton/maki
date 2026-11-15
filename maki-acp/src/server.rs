@@ -1020,7 +1020,8 @@ fn start_event_pump(
                                 raw_input,
                                 &cwd,
                                 home.as_deref(),
-                            ),
+                            )
+                            .await,
                             permissions::permission_options(project_trusted),
                         ));
                     ask_client(
