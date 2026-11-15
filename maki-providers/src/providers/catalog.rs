@@ -285,27 +285,56 @@ impl ProviderData {
         let Ok(auth) = self.build_auth(state_dir) else {
             return Vec::new();
         };
+        let unlocks = Unlocks::from_authentication(&auth);
         let mut models: Vec<ModelInfo> = self
             .models
             .iter()
-            .filter_map(|(model_id, meta)| {
-                let is_free = is_free_model(meta);
-                if is_free && !enable_free_models {
-                    return None;
-                }
-                let allow_model = match &auth {
-                    Authentication::KeyBased(_) => true,
-                    Authentication::FreeKey(..) => is_free,
-                    Authentication::NoAuth => false,
-                };
-                if !allow_model {
-                    return None;
-                }
-                Some(meta.model_info(model_id))
-            })
+            .filter(|(_, meta)| self.lists_model(meta, unlocks, enable_free_models))
+            .map(|(model_id, meta)| meta.model_info(model_id))
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models
+    }
+
+    /// The one listing rule both wires read: a provider with a free tier treats
+    /// zero-priced rows as opt-in, a freemium catalog shows them either way,
+    /// and the public key unlocks only the free ones.
+    fn lists_model(&self, meta: &CatalogMeta, unlocks: Unlocks, enable_free_models: bool) -> bool {
+        let free = is_free_model(meta);
+        let shows_free = self.quirks.free_tier.is_none() || enable_free_models;
+        (shows_free || !free)
+            && match unlocks {
+                Unlocks::All => true,
+                Unlocks::FreeOnly => free,
+                Unlocks::Nothing => false,
+            }
+    }
+}
+
+/// What a resolved credential lets a listing show, so both wires spell the auth
+/// rule once.
+#[derive(Clone, Copy)]
+enum Unlocks {
+    All,
+    FreeOnly,
+    Nothing,
+}
+
+impl Unlocks {
+    fn from_authentication(auth: &Authentication) -> Self {
+        match auth {
+            Authentication::KeyBased(_) => Self::All,
+            Authentication::FreeKey(..) => Self::FreeOnly,
+            Authentication::NoAuth => Self::Nothing,
+        }
+    }
+
+    fn from_catalog_auth(auth: &CatalogAuth) -> Self {
+        match auth {
+            CatalogAuth::Keyed(_) => Self::All,
+            CatalogAuth::FreeOnly(_) => Self::FreeOnly,
+            CatalogAuth::Gated(_) => Self::Nothing,
+        }
     }
 }
 
@@ -832,14 +861,17 @@ impl CatalogTransport {
 pub struct CatalogProvider {
     data: &'static ProviderData,
     auth: CatalogAuth,
+    /// Read once so a listing and the auth it resolved against agree.
+    free_models_enabled: bool,
     transport: CatalogTransport,
 }
 
-/// Which models the resolved auth unlocks: a real key unlocks all, the
-/// no-key `enable_free_models` opt-in unlocks free models only, and `Gated`
-/// unlocks nothing. `Gated` holds no credentials at all, so it can never send
-/// the public token by accident: discovery lists nothing, and only an actual
-/// attempt to stream tells the user to log in or opt in.
+/// Which models the resolved auth unlocks: a real key unlocks every row the
+/// free-model policy allows, the no-key `enable_free_models` opt-in unlocks
+/// free models only, and `Gated` unlocks nothing. `Gated` holds no credentials
+/// at all, so it can never send the public token by accident: discovery lists
+/// nothing, and only an actual attempt to stream tells the user to log in or
+/// opt in.
 pub(crate) enum CatalogAuth {
     Keyed(ResolvedAuth),
     FreeOnly(ResolvedAuth),
@@ -863,10 +895,11 @@ impl CatalogProvider {
         data: &'static ProviderData,
         state_dir: &StateDir,
         timeouts: Timeouts,
-        allow_free_fallback: bool,
+        free_models_enabled: bool,
     ) -> Result<Self, AgentError> {
         Ok(Self {
-            auth: data.catalog_auth(state_dir, allow_free_fallback)?,
+            auth: data.catalog_auth(state_dir, free_models_enabled)?,
+            free_models_enabled,
             data,
             transport: CatalogTransport::new(timeouts),
         })
@@ -923,14 +956,14 @@ impl Provider for CatalogProvider {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
+            let unlocks = Unlocks::from_catalog_auth(&self.auth);
             Ok(self
                 .data
                 .models
                 .iter()
-                .filter(|(_, meta)| match &self.auth {
-                    CatalogAuth::Keyed(_) => true,
-                    CatalogAuth::FreeOnly(_) => is_free_model(meta),
-                    CatalogAuth::Gated(_) => false,
+                .filter(|(_, meta)| {
+                    self.data
+                        .lists_model(meta, unlocks, self.free_models_enabled)
                 })
                 .map(|(model_id, meta)| meta.model_info(model_id))
                 .collect())
@@ -1207,6 +1240,18 @@ mod tests {
         Box::leak(Box::new(opencode_go_provider_data(env_key)))
     }
 
+    async fn listed_ids(provider: &super::CatalogProvider) -> Vec<String> {
+        let mut ids: Vec<String> = provider
+            .list_models()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// The free tier authenticates with the public key, which the quota
     /// endpoint answers with a 401. There is no quota to show, so it is
     /// `Ok(None)`, while a missing key stays an error.
@@ -1322,17 +1367,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_provider_list_models_with_key_shows_all() {
+    async fn catalog_provider_hides_free_models_without_opt_in() {
         let (_tmp, state_dir) = temp_state_dir();
         unsafe { std::env::set_var("MAKI_TEST_OPENCODE_GO_KEY_41827", "real-key") };
         let data = leaked_go_provider_data("MAKI_TEST_OPENCODE_GO_KEY_41827");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
-        let models = provider.list_models().await.unwrap();
-        let mut ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        ids.sort_unstable();
-        assert_eq!(ids, ["free-model", "paid-model"]);
+        assert_eq!(listed_ids(&provider).await, ["paid-model"]);
+
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
+        assert_eq!(listed_ids(&provider).await, ["free-model", "paid-model"]);
         unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_GO_KEY_41827") };
+    }
+
+    /// A freemium catalog (openrouter) has no free tier to opt in to, so its
+    /// zero-priced rows always show.
+    #[tokio::test]
+    async fn catalog_provider_keeps_free_models_without_a_free_tier() {
+        let (_tmp, state_dir) = temp_state_dir();
+        unsafe { std::env::set_var("MAKI_TEST_FREEMIUM_KEY_20163", "real-key") };
+        let data = Box::leak(Box::new(ProviderData {
+            slug: "freemium".into(),
+            quirks: ProviderQuirks::default(),
+            ..opencode_go_provider_data("MAKI_TEST_FREEMIUM_KEY_20163")
+        }));
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        assert_eq!(listed_ids(&provider).await, ["free-model", "paid-model"]);
+        unsafe { std::env::remove_var("MAKI_TEST_FREEMIUM_KEY_20163") };
     }
 
     fn temp_state_dir() -> (tempfile::TempDir, StateDir) {

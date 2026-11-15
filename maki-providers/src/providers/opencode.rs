@@ -51,6 +51,15 @@ enable_free_models = true
 
 The default is `false`."#;
 
+const GO_FREE_MODELS_NOTE: &str = r#"Free models are hidden by default, like on Opencode Zen. To list them, add this to `~/.config/maki/providers.toml` under `[opencode]`, not `[opencode-go]`:
+
+```toml
+[opencode]
+enable_free_models = true
+```
+
+The default is `false`."#;
+
 /// Neither Opencode slug is a `maki auth login` target, so neither carries a
 /// `login` row.
 pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
@@ -106,7 +115,7 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
         features: Some(GO_FEATURES),
         auth: AuthDoc::EnvVar,
         catalog: CatalogDoc::Discovered(GO_DISCOVERY_NOTE),
-        trailing_notes: &[],
+        trailing_notes: &[GO_FREE_MODELS_NOTE],
     },
 };
 
