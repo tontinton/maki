@@ -1750,7 +1750,8 @@ denied and the subagent is told why. Your rules, "allow for this session"
 answers and YOLO still apply, so add allow rules for what it runs (see
 [Permissions](/docs/permissions/)). It always runs in build mode. While the
 chat is in plan mode its file-write tools are denied. Its thinking never
-goes above the chat's current setting.
+goes above the chat's current setting, unless its model is on a lower tier
+than the chat's.
 
 With or without a ctx, the plugin must hold what its tools reach, because
 YOLO, allow rules and background sessions skip the prompt. Each tool costs:
@@ -1817,7 +1818,8 @@ session, so opening one fails with "session not live". The
   - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, an
     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
     `"max"`), or a budget integer (token count). Inherits the parent
-    setting if omitted, and is capped at it otherwise.
+    setting if omitted, and is capped at it otherwise, unless the model is
+    on a lower tier than the parent's.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
