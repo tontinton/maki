@@ -45,6 +45,13 @@ const INDEX_VIEW_CAP: usize = 2;
 const READ_VIEW_CAP: usize = 5;
 const TODO_TOOL: &str = "todo_write";
 const TODO_ITEM: &str = "wire the panel";
+/// What a user's `init.lua` does with the action: call it by name, and expect
+/// the `false` that says nothing was hidden, with no error.
+const TODO_TOGGLE_CALLER: &str = r#"
+local ok, err = maki.ui.action('todo_write.toggle')
+assert(err == nil, err)
+assert(ok == false, tostring(ok))
+"#;
 const SUBAGENT_TASK_ID: &str = "toolu_sub";
 const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
 
@@ -566,6 +573,19 @@ fn todo_write_live_call_reports_the_result(input: Value, expected: &str) {
     host.load_source(TODO_TOOL, TODO_SRC).unwrap();
 
     assert_eq!(exec_live(&host, &reg, TODO_TOOL, input).output, expected);
+}
+
+/// The toggle lives behind a file-local, so `todo_write.toggle` is the only
+/// way a user's `init.lua` binds another key to the panel. The panel calls no
+/// gated API, so the action is free to call, and with no list it answers
+/// false instead of throwing, leaving the caller's key to try its next action.
+#[test]
+fn todo_write_toggle_action_answers_a_caller_without_a_list() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+
+    host.load_source("global/init.lua", TODO_TOGGLE_CALLER)
+        .unwrap();
 }
 
 /// A session load replays a transcript, so its restores run with the panel
