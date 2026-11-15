@@ -283,6 +283,15 @@ Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailsca
 
 No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
 
+Free models are hidden by default, like on Opencode Zen. To list them, add this to `~/.config/maki/providers.toml` under `[opencode]`, not `[opencode-go]`:
+
+```toml
+[opencode]
+enable_free_models = true
+```
+
+The default is `false`.
+
 ### DeepSeek
 
 - **Env var**: `DEEPSEEK_API_KEY`
