@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
+use maki_storage::auth::OAuthTokens;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::Effort;
 use reqwest::header::HeaderMap;
@@ -339,12 +340,14 @@ impl OpenAi {
         self
     }
 
-    fn codex_auth(&self) -> Result<ResolvedAuth, AgentError> {
+    async fn codex_auth(&self) -> Result<ResolvedAuth, AgentError> {
+        self.codex_auth_from(self.auth.stored_tokens().await.as_ref())
+    }
+
+    fn codex_auth_from(&self, tokens: Option<&OAuthTokens>) -> Result<ResolvedAuth, AgentError> {
         // Prefer OAuth tokens for the ChatGPT Coding Plan backend.
-        if let Some(storage) = self.auth.storage()
-            && let Some(tokens) = maki_storage::auth::load_tokens(storage, auth::PROVIDER)
-        {
-            return auth::build_coding_plan_resolved(&tokens);
+        if let Some(tokens) = tokens {
+            return auth::build_coding_plan_resolved(tokens);
         }
         // Fall back to standard API key via the Responses API. Env /
         // providers.toml base_url overrides the platform API only, never the
@@ -360,7 +363,7 @@ impl OpenAi {
     }
 
     async fn fetch_plan_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
-        let auth = self.codex_auth()?;
+        let auth = self.codex_auth().await?;
         let url = format!(
             "{}{PLAN_MODELS_PATH}{CODEX_CLIENT_VERSION}",
             auth::CODING_PLAN_BASE_URL
@@ -506,7 +509,7 @@ impl Provider for OpenAi {
                 return self
                     .auth
                     .with_retry(|| async {
-                        let mut codex_auth = self.codex_auth()?;
+                        let mut codex_auth = self.codex_auth().await?;
                         let mut body =
                             super::responses::build_body(model, messages, system, tools, false);
                         if let Some(session) = session_id {
@@ -552,8 +555,7 @@ impl Provider for OpenAi {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
-            self.auth.refresh_if_stale().await?;
-            if self.auth.is_oauth() {
+            if self.auth.uses_oauth().await? {
                 return self.auth.with_retry(|| self.fetch_plan_models()).await;
             }
             self.auth
@@ -567,13 +569,12 @@ impl Provider for OpenAi {
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async {
-            self.auth.refresh_if_stale().await?;
-            if !self.auth.is_oauth() {
+            if !self.auth.uses_oauth().await? {
                 return Ok(None);
             }
             self.auth
                 .with_retry(|| async {
-                    let auth = self.codex_auth()?;
+                    let auth = self.codex_auth().await?;
                     let response = self.compat.get_text(&auth, USAGE_URL).await?;
                     Ok(Some(parse_usage(&response)?))
                 })
@@ -593,10 +594,10 @@ impl Provider for OpenAi {
     /// would shadow the pricing gate in `Model::supports_fast` for good, and
     /// that gate is not ours to close.
     fn adjust_model(&self, model: &mut Model) {
-        if !self.auth.is_oauth() {
+        let Some(tokens) = self.auth.held_tokens() else {
             return;
-        }
-        let auth = self.codex_auth().ok();
+        };
+        let auth = self.codex_auth_from(Some(&tokens)).ok();
         let info = model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
         model.supports_fast_override = Some(supports_plan_fast(
             auth.as_ref(),

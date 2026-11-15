@@ -175,8 +175,8 @@ pub(crate) async fn refreshed_tokens(
 /// Whether `held` must give way to the stored tokens: it expired, or a peer
 /// rotated, cleared or logged in. A stored copy older than `held` is a failed
 /// save whose refresh token may be spent, so it waits until `held` expires.
-pub(crate) fn needs_refresh(dir: &StateDir, provider: &str, held: Option<&OAuthTokens>) -> bool {
-    match (load_tokens(dir, provider), held) {
+pub(crate) fn needs_refresh(stored: Option<&OAuthTokens>, held: Option<&OAuthTokens>) -> bool {
+    match (stored, held) {
         (Some(stored), Some(held)) => held.is_expired() || stored.expires > held.expires,
         (None, None) => false,
         _ => true,
@@ -899,22 +899,15 @@ mod tests {
         held: Option<u64>,
         expected: bool,
     ) {
-        let dir = TempDir::new().expect("temp dir");
-        let state = StateDir::from_path(dir.path().to_path_buf());
         let tokens = |access: &str, expires| OAuthTokens {
             access: access.into(),
             refresh: "refresh".into(),
             expires,
             account_id: None,
         };
-        if let Some(expires) = stored {
-            save_tokens(&state, TEST_PROVIDER, &tokens(ON_DISK, expires)).expect("save tokens");
-        }
+        let stored = stored.map(|expires| tokens(ON_DISK, expires));
         let held = held.map(|expires| tokens(FRESH, expires));
-        assert_eq!(
-            needs_refresh(&state, TEST_PROVIDER, held.as_ref()),
-            expected
-        );
+        assert_eq!(needs_refresh(stored.as_ref(), held.as_ref()), expected);
     }
 
     // Codex only admits the overload in `code`, and anything we cannot place has to stay a plain
