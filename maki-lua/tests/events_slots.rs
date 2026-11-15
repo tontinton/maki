@@ -133,6 +133,7 @@ fn flashes_until_sentinel(ui: &mut UnboundedReceiver<UiAction>) -> Vec<String> {
 
 /// A plugin without `session_read` still hears the event, minus the content,
 /// and is told so once rather than on every event.
+#[test_case("TurnComplete" ; "turn_complete")]
 #[test_case("TurnStart" ; "turn_start")]
 #[test_case("ToolDone" ; "tool_done")]
 #[test_case("CompactionDone" ; "compaction_done")]
