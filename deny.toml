@@ -35,5 +35,6 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = [
     "https://github.com/crossterm-rs/crossterm",
+    "https://github.com/pulldown-cmark/pulldown-cmark",
     "https://github.com/tontinton/syntect",
 ]
