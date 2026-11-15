@@ -17,7 +17,7 @@ pub(crate) const MANIFEST_FILE: &str = "plugin.toml";
 pub(crate) const NET_HOSTS_KEY: &str = "net_hosts";
 const PROVIDERS_KEY: &str = "providers";
 const MIN_MAKI_VERSION: &str = "min_maki_version";
-const PERMISSION_DENIED: &str = "permission denied";
+pub(crate) const PERMISSION_DENIED: &str = "permission denied";
 pub(crate) const OUTSIDE_CEILING: &str =
     "is not in the capability of the action this code runs for";
 const PROVIDER_ORIGIN_SHORTFALL: &str =

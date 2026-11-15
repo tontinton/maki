@@ -6556,16 +6556,19 @@ maki.treesitter.language.register("lua", "luau")
 maki.treesitter.language.add({lang}, {opts?})
 ```
 
-Registers {lang} for use with tree-sitter.
-Call this to confirm a language grammar is available. Like
-`vim.treesitter.language.add`. Custom grammar paths are not yet supported.
+Registers {lang} for use with tree-sitter. Like `vim.treesitter.language.add`.
+Without a `path` it confirms a built-in grammar is available. With one it
+loads a compiled parser, such as one nvim-treesitter or Helix installed.
+That runs native code, so it needs the `run` permission.
 
 **Parameters:**
 
 - `{lang}` (`string`) Language name, e.g. `"rust"`.
-- `{opts?}` (`table?`) Options table (the `path` key is not yet supported).
+- `{opts?}` (`table?`) Options table:
+  - `path` (`string`) parser library to load, e.g. `"~/.local/share/nvim/site/parser/nu.so"`.
+  - `symbol_name` (`string`) constructor to call. Default `tree_sitter_{lang}`.
 
-**Returns:** (`boolean?`, `string?`) `true`, or nil plus an error if {lang} is unknown.
+**Returns:** (`boolean?`, `string?`) `true`, or nil plus an error if {lang} is unknown or fails to load.
 
 **Example:**
 
@@ -6712,7 +6715,8 @@ local q = maki.treesitter.query.parse("lua", "(identifier) @id")
 maki.treesitter.query.get({lang}, {name})
 ```
 
-Looks up a named built-in query for {lang} (not yet implemented, always returns nil).
+Looks up the query {name} for {lang} that `set()` gave it. There are no
+built-in queries yet, so anything else returns nil.
 
 **Parameters:**
 
@@ -6720,6 +6724,33 @@ Looks up a named built-in query for {lang} (not yet implemented, always returns 
 - `{name}` (`string`) Query name, e.g. `"highlights"`.
 
 **Returns:** ([`Query|nil`](#maki-treesitter-Query)) Query object, or nil if not found.
+
+---
+
+### `maki.treesitter.query.set()` {#maki-treesitter-query-set}
+
+```lua
+maki.treesitter.query.set({lang}, {name}, {text})
+```
+
+Sets the query {name} for {lang} to {text}, like `vim.treesitter.query.set`.
+A `highlights` query makes code in {lang} highlight with tree-sitter instead
+of the built-in syntaxes, in chat code blocks and `maki.ui.highlight`.
+Throws if the language is unknown or the query has a syntax error.
+
+**Parameters:**
+
+- `{lang}` (`string`) Language name.
+- `{name}` (`string`) Query name, e.g. `"highlights"`.
+- `{text}` (`string`) Tree-sitter S-expression query.
+
+**Example:**
+
+```lua
+maki.treesitter.language.add("nu", { path = "~/.local/share/nvim/site/parser/nu.so" })
+local text = assert(maki.fs.read("~/.local/share/nvim/site/queries/nu/highlights.scm"))
+maki.treesitter.query.set("nu", "highlights", text)
+```
 
 
 ## maki.treesitter.Query {#maki-treesitter-Query}

@@ -16,6 +16,7 @@ use syntect::util::LinesWithEndings;
 pub mod pool;
 pub mod predicates;
 pub mod scopes;
+pub mod treesitter;
 
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
 pub const TAB_SPACES: &str = "  ";
@@ -144,6 +145,10 @@ pub fn is_ready() -> bool {
 
 pub fn set_theme(theme: Theme) {
     THEME.store(Arc::new(theme));
+    invalidate_highlights();
+}
+
+fn invalidate_highlights() {
     // Bump first: a highlight already in flight read the old generation, so its
     // insert lands under a key nobody will look up again.
     THEME_GEN.fetch_add(1, Ordering::Release);
@@ -153,9 +158,9 @@ pub fn set_theme(theme: Theme) {
         .clear();
 }
 
-/// Bumped by every [`set_theme`]. Anything derived from the theme, like an
-/// incremental [`CodeHighlighter`] or a bag of painted lines, is stale once
-/// this changes.
+/// Bumped by every [`set_theme`] and every change to the tree-sitter grammars.
+/// Anything derived from them, like an incremental [`CodeHighlighter`] or a bag
+/// of painted lines, is stale once this changes.
 pub fn theme_generation() -> u64 {
     THEME_GEN.load(Ordering::Acquire)
 }
@@ -415,6 +420,9 @@ fn bounded_prefix(prefix: &str) -> &str {
 /// Only the nearest lines that fit in 16 KiB are parsed, so a comment or
 /// string opened before them is missed.
 pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSegment>> {
+    if let Some(grammar) = treesitter::grammar_for_token(lang) {
+        return grammar.highlight_after(bounded_prefix(prefix), code);
+    }
     let mut hl = Highlighter::for_token(lang);
     for line in LinesWithEndings::from(bounded_prefix(prefix)) {
         // Syntaxes close a line comment on its `\n`. Without one, a comment
@@ -455,6 +463,11 @@ pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
 }
 
 pub fn highlight_lines_independent(lang: &str, code: &str) -> Vec<Vec<StyledSegment>> {
+    if let Some(grammar) = treesitter::grammar_for_token(lang) {
+        return LinesWithEndings::from(code)
+            .flat_map(|raw| grammar.highlight(raw))
+            .collect();
+    }
     let syntax = syntax_for_token(lang);
     LinesWithEndings::from(code)
         .map(|raw| Highlighter::for_syntax(syntax).highlight_line(raw))
@@ -491,6 +504,7 @@ pub fn highlight_ansi(lang: &str, code: &str, bg: SegmentColor) -> String {
 }
 
 pub struct CodeHighlighter {
+    grammar: Option<Arc<treesitter::Grammar>>,
     start_parse: ParseState,
     start_highlight: HighlightState,
     checkpoint_parse: ParseState,
@@ -507,6 +521,7 @@ impl CodeHighlighter {
         let parse = ParseState::new(syntax);
         let highlight = HighlightState::new(&highlighter, ScopeStack::new());
         Self {
+            grammar: treesitter::grammar_for_token(lang),
             start_parse: parse.clone(),
             start_highlight: highlight.clone(),
             checkpoint_parse: parse,
@@ -525,6 +540,10 @@ impl CodeHighlighter {
     }
 
     pub fn update(&mut self, code: &str) -> &[Vec<StyledSegment>] {
+        if let Some(grammar) = &self.grammar {
+            self.cached_segments = grammar.highlight(code);
+            return &self.cached_segments;
+        }
         let raw_lines: Vec<&str> = LinesWithEndings::from(code).collect();
         let total = raw_lines.len();
         if total == 0 {
@@ -664,7 +683,7 @@ mod tests {
     /// The theme and the block cache are process globals. Nextest gives every
     /// test its own process, `cargo test` does not, so tests that swap the theme
     /// or read the cache take this first and cannot be tripped up by a sibling.
-    fn exclusive_globals() -> MutexGuard<'static, ()> {
+    pub(crate) fn exclusive_globals() -> MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }

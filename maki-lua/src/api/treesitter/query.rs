@@ -1,16 +1,31 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use maki_highlight::predicates::predicates_hold;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Lua, MultiValue, Value as LuaValue};
 use regex::Regex;
-use tree_sitter::{Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Language as TsLanguage, Query, QueryCursor, StreamingIterator};
 
 use crate::docs::{FnDoc, ParamDoc};
-use crate::language::Language;
 
+use super::language::resolve_language;
 use super::node::LuaNode;
+
+const HIGHLIGHTS_QUERY: &str = "highlights";
+const UNKNOWN_LANGUAGE: &str = "unknown language";
+
+struct SetQuery {
+    owner: Arc<str>,
+    query: Arc<Query>,
+}
+
+/// Keyed by language and query name.
+type QueryRegistry = HashMap<(String, String), SetQuery>;
+
+/// Queries `set` replaced. Shared by all plugins, like in Neovim, but each
+/// leaves with the plugin that set it.
+static SET_QUERIES: LazyLock<Mutex<QueryRegistry>> = LazyLock::new(Mutex::default);
 
 #[allow(non_upper_case_globals)]
 const iter_captures__doc: FnDoc = FnDoc {
@@ -133,23 +148,78 @@ lua_class! {
 /// local q = maki.treesitter.query.parse("lua", "(identifier) @id")
 #[lua_fn]
 fn parse(_lua: &Lua, lang: String, query: String) -> mlua::Result<LuaQuery> {
-    let ts_lang = Language::from_name(&lang)
-        .ok_or_else(|| mlua::Error::runtime(format!("unknown language: {lang}")))?
-        .ts_language();
-    let q = Query::new(&ts_lang, &query)
-        .map_err(|e| mlua::Error::runtime(format!("query parse error: {e}")))?;
+    let q = compile(&known_language(&lang)?, &query)?;
     Ok(LuaQuery { inner: Arc::new(q) })
 }
 
-/// Looks up a named built-in query for {lang} (not yet implemented, always returns nil).
+fn known_language(lang: &str) -> mlua::Result<TsLanguage> {
+    resolve_language(lang)
+        .ok_or_else(|| mlua::Error::runtime(format!("{UNKNOWN_LANGUAGE}: {lang}")))
+}
+
+fn compile(ts_lang: &TsLanguage, query: &str) -> mlua::Result<Query> {
+    Query::new(ts_lang, query).map_err(|e| mlua::Error::runtime(format!("query parse error: {e}")))
+}
+
+/// Looks up the query {name} for {lang} that `set()` gave it. There are no
+/// built-in queries yet, so anything else returns nil.
 ///
 /// @param lang string Language name.
 /// @param name string Query name, e.g. `"highlights"`.
 /// @return (Query|nil) Query object, or nil if not found.
 #[lua_fn]
 fn get(_lua: &Lua, lang: String, name: String) -> mlua::Result<Option<LuaQuery>> {
-    let _ = (lang, name);
-    Ok(None)
+    let queries = SET_QUERIES
+        .lock()
+        .map_err(|_| mlua::Error::runtime("query registry lock poisoned"))?;
+    Ok(queries.get(&(lang, name)).map(|set| LuaQuery {
+        inner: Arc::clone(&set.query),
+    }))
+}
+
+/// Sets the query {name} for {lang} to {text}, like `vim.treesitter.query.set`.
+/// A `highlights` query makes code in {lang} highlight with tree-sitter instead
+/// of the built-in syntaxes, in chat code blocks and `maki.ui.highlight`.
+/// Throws if the language is unknown or the query has a syntax error.
+///
+/// @param lang string Language name.
+/// @param name string Query name, e.g. `"highlights"`.
+/// @param text string Tree-sitter S-expression query.
+/// @example
+/// maki.treesitter.language.add("nu", { path = "~/.local/share/nvim/site/parser/nu.so" })
+/// local text = assert(maki.fs.read("~/.local/share/nvim/site/queries/nu/highlights.scm"))
+/// maki.treesitter.query.set("nu", "highlights", text)
+#[lua_fn]
+fn set(
+    _lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    lang: String,
+    name: String,
+    text: String,
+) -> mlua::Result<()> {
+    let ts_lang = known_language(&lang)?;
+    let query = Arc::new(compile(&ts_lang, &text)?);
+    if name == HIGHLIGHTS_QUERY {
+        maki_highlight::treesitter::register(&plugin, &lang, ts_lang, Arc::clone(&query));
+    }
+    SET_QUERIES
+        .lock()
+        .map_err(|_| mlua::Error::runtime("query registry lock poisoned"))?
+        .insert(
+            (lang, name),
+            SetQuery {
+                owner: plugin,
+                query,
+            },
+        );
+    Ok(())
+}
+
+pub(crate) fn forget_plugin_queries(plugin: &str) {
+    SET_QUERIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, set| *set.owner != *plugin);
 }
 
 lua_table! {
@@ -161,8 +231,8 @@ lua_table! {
     /// ```lua
     /// local q = maki.treesitter.query.parse("lua", "(string) @str")
     /// ```
-    "maki.treesitter.query" => pub(crate) fn create_query_module(), DOCS [
-        parse, get,
+    "maki.treesitter.query" => pub(crate) fn create_query_module(plugin: Arc<str>), DOCS [
+        parse, get, set(plugin),
     ]
 }
 
@@ -363,5 +433,77 @@ fn lua_to_usize(v: LuaValue) -> Option<usize> {
         LuaValue::Integer(n) => Some(n as usize),
         LuaValue::Number(n) => Some(n as usize),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mlua::{Lua, Table};
+
+    use super::*;
+
+    const LANG: &str = "lua";
+    const FOLDS: &str = "folds";
+    const LOCALS: &str = "locals";
+    const FOLDS_QUERY: &str = "(function_declaration) @fold";
+    const FOLD_CAPTURE: &str = "fold";
+    const PLUGIN: &str = "query_test";
+    const FORGOTTEN_PLUGIN: &str = "query_test_forgotten";
+
+    fn query_module(lua: &Lua) -> Table {
+        query_module_of(lua, PLUGIN)
+    }
+
+    fn query_module_of(lua: &Lua, plugin: &str) -> Table {
+        create_query_module(lua, Arc::from(plugin)).unwrap()
+    }
+
+    fn set_query(query: &Table, name: &str) {
+        query
+            .get::<mlua::Function>("set")
+            .unwrap()
+            .call::<()>((LANG, name, FOLDS_QUERY))
+            .unwrap();
+    }
+
+    fn get_query(query: &Table, name: &str) -> Option<mlua::AnyUserData> {
+        query
+            .get::<mlua::Function>("get")
+            .unwrap()
+            .call((LANG, name))
+            .unwrap()
+    }
+
+    #[test]
+    fn get_returns_the_query_set_gave_it() {
+        let lua = Lua::new();
+        let query = query_module(&lua);
+        set_query(&query, FOLDS);
+        let got = get_query(&query, FOLDS).unwrap();
+        let got = got.borrow::<LuaQuery>().unwrap();
+        assert_eq!(got.inner.capture_names(), [FOLD_CAPTURE]);
+    }
+
+    #[test]
+    fn a_set_query_is_shared_until_its_plugin_is_forgotten() {
+        let lua = Lua::new();
+        set_query(&query_module_of(&lua, FORGOTTEN_PLUGIN), LOCALS);
+        let other = query_module(&lua);
+        assert!(get_query(&other, LOCALS).is_some());
+
+        forget_plugin_queries(FORGOTTEN_PLUGIN);
+
+        assert!(get_query(&other, LOCALS).is_none());
+    }
+
+    #[test]
+    fn set_rejects_an_unknown_language() {
+        let lua = Lua::new();
+        let err = query_module(&lua)
+            .get::<mlua::Function>("set")
+            .unwrap()
+            .call::<()>(("cobol", HIGHLIGHTS_QUERY, FOLDS_QUERY))
+            .unwrap_err();
+        assert!(err.to_string().contains(UNKNOWN_LANGUAGE), "{err}");
     }
 }

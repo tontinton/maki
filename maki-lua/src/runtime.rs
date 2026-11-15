@@ -3924,6 +3924,7 @@ impl LuaRuntime {
             store.detach_plugin_callbacks(&self.lua, name);
         });
         BackgroundTasks::of(&self.lua).end_plugin(name);
+        crate::api::treesitter::clear_plugin(name);
         if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
             store.remove(name);
         }

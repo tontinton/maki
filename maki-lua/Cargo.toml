@@ -37,6 +37,8 @@ strum = { workspace = true }
 futures = { workspace = true }
 pin-project-lite = { workspace = true }
 tree-sitter = { workspace = true }
+tree-sitter-language = { workspace = true }
+libloading = { workspace = true }
 unicode-width = { workspace = true }
 url = { workspace = true }
 regex = { workspace = true }
