@@ -324,10 +324,9 @@ pub struct AgentSeed {
     pub model_policy: Arc<ModelPolicy>,
     /// The chat's thinking and whether it plans, as the user has them right
     /// now. The UI keeps them fresh even before the first message, so
-    /// background work on the chat's tier never thinks harder than the user
-    /// asked. We keep a bool and not the mode on purpose. Handed to a
-    /// background run, the mode would bring the plan prompt along, plus a free
-    /// pass to write the plan file.
+    /// background work never thinks harder than the user asked. We keep a bool
+    /// and not the mode on purpose. Handed to a background run, the mode would
+    /// bring the plan prompt along, plus a free pass to write the plan file.
     chat_settings: Mutex<(RequestOptions, bool)>,
 }
 

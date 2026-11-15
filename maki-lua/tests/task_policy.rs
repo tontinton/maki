@@ -57,6 +57,9 @@ const ASSIGNED_TIER: &str = "weak";
 const ASSIGNED_MODEL_CONTEXT: &str = "model `test/model`, assigned to the weak tier: ";
 /// Mirrors the task plugin's `max_concurrent` default.
 const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
+const UNCAPPED_THINKING_OPT: &str = "uncapped_thinking";
+/// Mirrors the task plugin's capped `thinking` description.
+const CAPPED_AT_PARENT: &str = "capped at parent";
 
 const FIRST_CALL_ID: &str = "toolu_first";
 const SECOND_CALL_ID: &str = "toolu_second";
@@ -224,6 +227,7 @@ maki.agent.session = function(ctx, opts)
   end
   recorder.has_local_tools = opts.local_tools ~= nil
   recorder.thinking = opts.thinking
+  recorder.uncapped_thinking = opts.uncapped_thinking
   local sess = { opts = opts }
   sessions[opts.name] = sess
   function sess:id() return opts.name end
@@ -312,6 +316,7 @@ maki.api.register_tool({
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
       thinking = recorder.thinking,
+      uncapped_thinking = recorder.uncapped_thinking,
       first_ack = recorder.first_ack,
       first_err = recorder.first_err,
       second_ack = recorder.second_ack,
@@ -455,6 +460,28 @@ fn thinking_forwards_to_session(thinking: Option<Value>) {
     exec_tool(&reg, TASK_TOOL, input).expect("task failed");
     let snap = probe(&reg);
     assert_eq!(snap.get("thinking"), thinking.as_ref());
+}
+
+#[test_case::test_case(false ; "capped_by_default")]
+#[test_case::test_case(true ; "uncapped_when_the_user_allows_it")]
+fn uncapped_thinking_option_reaches_the_session(enabled: bool) {
+    let mut opts = serde_json::Map::new();
+    if enabled {
+        opts.insert(UNCAPPED_THINKING_OPT.into(), json!(true));
+    }
+    let (reg, _host) = load_task_host_with_opts(opts);
+    let entry = reg.get(TASK_TOOL).expect("task tool missing");
+    let schema = entry.tool.schema();
+    let description = schema["properties"]["thinking"]["description"]
+        .as_str()
+        .unwrap();
+    assert_eq!(description.contains(CAPPED_AT_PARENT), !enabled);
+
+    exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).expect("task failed");
+    assert_eq!(
+        probe(&reg).get(UNCAPPED_THINKING_OPT),
+        Some(&json!(enabled))
+    );
 }
 
 #[test]

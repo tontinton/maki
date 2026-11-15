@@ -139,23 +139,30 @@ fn required_opts(opts: Option<Table>) -> LuaResult<Table> {
     opts.ok_or_else(|| mlua::Error::runtime(OPTS_REQUIRED_ERR))
 }
 
-/// Settings left out come from the parent, and a thinking level the plugin
-/// asks for can't go above the parent's. A session on a lower tier than its
-/// parent is the exception: a weaker model that thinks harder is a common way
-/// to get better answers without paying for a stronger one. We clamp to the
-/// model once, right here, so the status badge, `AgentInput` and the request
-/// all agree on what this session really runs.
+/// The thinking a plugin asks for. A model usually writes it, so it stays under
+/// the parent's setting unless the plugin says the user allowed more, the way
+/// the task plugin's `uncapped_thinking` does.
+#[derive(Clone, Copy)]
+enum ThinkingRequest {
+    Inherit,
+    Capped(ThinkingConfig),
+    Uncapped(ThinkingConfig),
+}
+
+/// Settings left out come from the parent, and a capped thinking level can't
+/// go above the parent's. We clamp to the model once, right here, so the
+/// status badge, `AgentInput` and the request all agree on what this session
+/// really runs.
 fn session_opts(
-    thinking: Option<ThinkingConfig>,
+    thinking: ThinkingRequest,
     fast: Option<bool>,
     parent: RequestOptions,
-    parent_tier: ModelTier,
     model: &Model,
 ) -> RequestOptions {
     let thinking = match thinking {
-        Some(asked) if model.tier < parent_tier => asked,
-        Some(asked) => asked.clamp_to(parent.thinking),
-        None => parent.thinking,
+        ThinkingRequest::Inherit => parent.thinking,
+        ThinkingRequest::Capped(asked) => asked.clamp_to(parent.thinking),
+        ThinkingRequest::Uncapped(asked) => asked,
     };
     RequestOptions {
         thinking,
@@ -969,8 +976,7 @@ async fn dispatch_child(
 /// answers and YOLO still apply, so add allow rules for what it runs (see
 /// [Permissions](/docs/permissions/)). It always runs in build mode. While the
 /// chat is in plan mode its file-write tools are denied. Its thinking never
-/// goes above the chat's current setting, unless its model is on a lower tier
-/// than the chat's.
+/// goes above the chat's current setting, unless you pass `uncapped_thinking`.
 ///
 /// With or without a ctx, the plugin must hold what its tools reach, because
 /// YOLO, allow rules and background sessions skip the prompt. Each tool costs:
@@ -1035,8 +1041,11 @@ async fn dispatch_child(
 ///   `thinking` (string|integer?) - thinking mode: `"off"`, `"adaptive"`, an
 ///     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
 ///     `"max"`), or a budget integer (token count). Inherits the parent
-///     setting if omitted, and is capped at it otherwise, unless the model is
-///     on a lower tier than the parent's.
+///     setting if omitted, and is capped at it otherwise, unless
+///     `uncapped_thinking` is set.
+///   `uncapped_thinking` (boolean?) - let `thinking` go above the parent's
+///     setting. The cap is there because a model usually picks `thinking`,
+///     so set this only when the user allowed it. Default: `false`.
 ///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
@@ -1097,6 +1106,7 @@ async fn session(
     };
     let fast: Option<bool> = opts.opt("fast")?;
     let mcp_enabled: bool = opts.opt::<bool>("mcp")?.unwrap_or(false);
+    let uncapped_thinking: bool = opts.opt::<bool>("uncapped_thinking")?.unwrap_or(false);
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
     {
@@ -1165,7 +1175,7 @@ async fn session(
     // out every accepted word and budget, so there is one grammar and one
     // error message instead of a second one per Lua number type.
     let requested_thinking = match thinking_val {
-        None => None,
+        None => ThinkingRequest::Inherit,
         Some(value) => {
             let setting = match &value {
                 LuaValue::String(s) => s.to_str()?.to_owned(),
@@ -1179,18 +1189,15 @@ async fn session(
                 }
             };
             match StoredThinking::parse_setting(&setting) {
-                Ok(stored) => Some(ThinkingConfig::from(stored)),
+                Ok(stored) if uncapped_thinking => {
+                    ThinkingRequest::Uncapped(ThinkingConfig::from(stored))
+                }
+                Ok(stored) => ThinkingRequest::Capped(ThinkingConfig::from(stored)),
                 Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
             }
         }
     };
-    let opts = session_opts(
-        requested_thinking,
-        fast,
-        agent_ctx.opts,
-        agent_ctx.model.tier,
-        &model,
-    );
+    let opts = session_opts(requested_thinking, fast, agent_ctx.opts, &model);
 
     let (stream_guard, sub_events) = event_stream();
     let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
@@ -1677,8 +1684,8 @@ impl RunDones {
 struct Background {
     session: MakiId,
     /// What the plugin asked for at open. We keep it because every prompt
-    /// weighs it again against the chat's setting and tier at that moment.
-    thinking: Option<ThinkingConfig>,
+    /// resolves it again against the chat as it is at that moment.
+    thinking: ThinkingRequest,
     fast: Option<bool>,
 }
 
@@ -2010,7 +2017,6 @@ async fn prompt(
                 background.thinking,
                 background.fast,
                 seed.chat_opts(),
-                seed.model_slot.load().model.tier,
                 &s.params.model,
             );
             Some(PromptSettle::new(
@@ -2329,7 +2335,7 @@ mod tests {
         shown: ThinkingConfig,
         expected_grandchild: ThinkingConfig,
     ) {
-        let model = thinking_model(ModelTier::Medium);
+        let model = thinking_model();
         let mut intermediate = model.clone();
         intermediate.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
         let root = RequestOptions {
@@ -2337,50 +2343,27 @@ mod tests {
             fast: false,
         };
 
-        for requested in [None, Some(ThinkingConfig::Adaptive)] {
-            let child = session_opts(requested, None, root, model.tier, &intermediate);
+        for requested in [
+            ThinkingRequest::Inherit,
+            ThinkingRequest::Capped(ThinkingConfig::Adaptive),
+        ] {
+            let child = session_opts(requested, None, root, &intermediate);
             assert_eq!(child.thinking, parent);
             assert_eq!(child.thinking.shown(&intermediate), shown);
             let grandchild = session_opts(
-                Some(ThinkingConfig::Effort(Effort::Max)),
+                ThinkingRequest::Capped(ThinkingConfig::Effort(Effort::Max)),
                 None,
                 child,
-                model.tier,
                 &model,
             );
             assert_eq!(grandchild.thinking, expected_grandchild);
         }
     }
 
-    fn thinking_model(tier: ModelTier) -> Model {
+    fn thinking_model() -> Model {
         let mut model = Model::from_spec(THINKING_MODEL_SPEC).unwrap();
         model.thinking_override = Some(ThinkingSupport::Yes);
-        model.tier = tier;
         model
-    }
-
-    #[test_case(ModelTier::Strong, ModelTier::Weak, Some(ThinkingConfig::Effort(Effort::Max)), ThinkingConfig::Effort(Effort::Max) ; "lower_tier_may_think_past_the_parent")]
-    #[test_case(ModelTier::Strong, ModelTier::Strong, Some(ThinkingConfig::Effort(Effort::Max)), ThinkingConfig::Effort(Effort::Medium) ; "same_tier_stays_capped_at_the_parent")]
-    #[test_case(ModelTier::Medium, ModelTier::Strong, Some(ThinkingConfig::Effort(Effort::Max)), ThinkingConfig::Effort(Effort::Medium) ; "higher_tier_stays_capped_at_the_parent")]
-    #[test_case(ModelTier::Strong, ModelTier::Weak, None, ThinkingConfig::Effort(Effort::Medium) ; "lower_tier_still_inherits_when_omitted")]
-    fn thinking_ceiling_lifts_only_for_a_lower_tier(
-        parent_tier: ModelTier,
-        child_tier: ModelTier,
-        requested: Option<ThinkingConfig>,
-        expected: ThinkingConfig,
-    ) {
-        let parent = RequestOptions {
-            thinking: ThinkingConfig::Effort(Effort::Medium),
-            fast: false,
-        };
-        let child = session_opts(
-            requested,
-            None,
-            parent,
-            parent_tier,
-            &thinking_model(child_tier),
-        );
-        assert_eq!(child.thinking, expected);
     }
 
     struct PendingProvider(UnboundedSender<()>);
@@ -2592,7 +2575,7 @@ mod tests {
     const CHILD_INSTRUCTIONS: &str = "Keep {{identity}} literal.";
     const CHILD_RESPONSE: &str = "Analysis complete.";
 
-    struct PromptRecorder(Sender<String>);
+    struct PromptRecorder(Sender<(String, ThinkingConfig)>);
 
     impl Provider for PromptRecorder {
         fn stream_message<'a>(
@@ -2602,11 +2585,11 @@ mod tests {
             system: &'a str,
             _: &'a JsonValue,
             _: &'a UnboundedSender<ProviderEvent>,
-            _: RequestOptions,
+            opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
-                self.0.send(system.to_owned()).unwrap();
+                self.0.send((system.to_owned(), opts.thinking)).unwrap();
                 Ok(StreamResponse {
                     message: Message {
                         role: Role::Assistant,
@@ -2713,9 +2696,53 @@ mod tests {
             .unwrap();
         assert!(error.is_none(), "{error:?}");
         assert_eq!(
-            requests.recv().unwrap(),
+            requests.recv().unwrap().0,
             format!("You analyse evidence.\n{CHILD_INSTRUCTIONS}")
         );
+    }
+
+    #[test_case(ThinkingConfig::Effort(Effort::Medium), Some("max"), None, ThinkingConfig::Effort(Effort::Medium) ; "capped_at_the_parent_by_default")]
+    #[test_case(ThinkingConfig::Effort(Effort::Medium), Some("max"), Some(true), ThinkingConfig::Effort(Effort::Max) ; "uncapped_may_think_past_the_parent")]
+    #[test_case(ThinkingConfig::Off, Some("high"), Some(true), ThinkingConfig::Effort(Effort::High) ; "uncapped_thinks_under_a_parent_that_does_not")]
+    #[test_case(ThinkingConfig::Effort(Effort::Medium), None, Some(true), ThinkingConfig::Effort(Effort::Medium) ; "uncapped_still_inherits_when_omitted")]
+    #[tokio::test]
+    async fn session_thinking_obeys_the_parent_cap_unless_uncapped(
+        parent: ThinkingConfig,
+        asked: Option<&str>,
+        uncapped: Option<bool>,
+        expected: ThinkingConfig,
+    ) {
+        let lua = Lua::new();
+        lua.set_app_data(SpawnedTasks::default());
+        lua.set_app_data(Arc::new(ToolRegistry::new()));
+        let (sent, requests) = channel();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.provider = Arc::new(PromptRecorder(sent));
+        ctx.model = Arc::new(thinking_model());
+        ctx.opts.thinking = parent;
+        let ctx = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("thinking", asked).unwrap();
+        opts.set("uncapped_thinking", uncapped).unwrap();
+        let (sess, error) = session(
+            lua.clone(),
+            Arc::from("test"),
+            PluginPermissions::trusted(),
+            LuaEither::Left(ctx.borrow().unwrap()),
+            Some(opts),
+        )
+        .await
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        let sess = sess.unwrap();
+        let (_, error) = prompt(lua.clone(), sess.borrow().unwrap(), CHILD_REQUEST.into())
+            .await
+            .unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(requests.recv().unwrap().1, expected);
     }
 
     const NUDGE: &str = "new finding, hurry up";

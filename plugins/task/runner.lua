@@ -38,6 +38,10 @@ local opts = maki.api.register_options({
     default = false,
     desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
   },
+  uncapped_thinking = {
+    default = false,
+    desc = "Let the `thinking` input go above the parent's thinking level, e.g. a strong parent on medium handing a weaker model high. Only enable if you trust callers to decide how hard a subagent thinks.",
+  },
 })
 
 local schema = {
@@ -62,7 +66,8 @@ local schema = {
       description = 'Model tier (optional, omit to use current model, capped at current tier):\n- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.\n- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.\n- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits.',
     },
     thinking = {
-      description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent unless on a lower tier.",
+      description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent"
+        .. (opts.uncapped_thinking and "." or "; capped at parent."),
     },
     output_schema = {
       type = "object",
@@ -193,6 +198,7 @@ function Runner.prepare(input, ctx)
       mcp = true,
       name = input.description,
       thinking = input.thinking,
+      uncapped_thinking = opts.uncapped_thinking,
     },
     message = input.prompt .. (validator and STRUCTURED_OUTPUT_PROMPT_SUFFIX or ""),
     capture = capture,
