@@ -3719,11 +3719,13 @@ name = "maki-highlight"
 version = "0.7.3"
 dependencies = [
  "arc-swap",
+ "regex",
  "serde_json",
  "syntect",
  "test-case",
  "tokio",
  "tracing",
+ "tree-sitter",
  "two-face",
 ]
 
