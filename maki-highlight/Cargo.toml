@@ -19,6 +19,7 @@ two-face = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
+tree-sitter-bash = { workspace = true }
 
 [lints]
 workspace = true

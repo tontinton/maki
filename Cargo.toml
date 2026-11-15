@@ -170,6 +170,8 @@ criterion = { version = "0.8", features = ["html_reports"] }
 etcetera = "0.11"
 dotenvy = "0.15"
 tree-sitter = "0.27"
+tree-sitter-language = "0.1"
+libloading = "0.9"
 include_dir = "0.7"
 mlua = { version = "0.12", features = ["luau", "luau-jit", "async", "send", "serde"] }
 tree-sitter-bash = "0.25"

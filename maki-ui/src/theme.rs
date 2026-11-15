@@ -184,8 +184,9 @@ pub fn set(theme: Theme) {
     GENERATION.fetch_add(1, Ordering::Release);
 }
 
+/// Also moves when a plugin changes a tree-sitter grammar, so painted chat repaints.
 pub fn generation() -> u64 {
-    GENERATION.load(Ordering::Acquire)
+    GENERATION.load(Ordering::Acquire) + maki_highlight::theme_generation()
 }
 
 pub fn load_by_name(name: &str) -> Result<Theme, String> {

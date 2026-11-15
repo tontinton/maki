@@ -4,11 +4,14 @@ pub(crate) mod node;
 pub(crate) mod query;
 pub(crate) mod tree;
 
+use std::sync::Arc;
+
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{AnyUserData, Lua, LuaString, Result as LuaResult, Table};
 
 use crate::api::util::pair::{Pair, err_pair};
 use crate::language::Language;
+use crate::plugin_permissions::PluginPermissions;
 use language_tree::LuaLanguageTree;
 use node::LuaNode;
 
@@ -196,10 +199,23 @@ lua_table! {
     ]
 }
 
-pub(crate) fn create_treesitter_table(lua: &Lua) -> LuaResult<Table> {
+pub(crate) fn create_treesitter_table(
+    lua: &Lua,
+    grants: &PluginPermissions,
+    plugin: Arc<str>,
+) -> LuaResult<Table> {
     let t = lua.create_table()?;
     add_treesitter_fns(&t, lua)?;
-    t.set("language", language::create_language_module(lua)?)?;
-    t.set("query", query::create_query_module(lua)?)?;
+    t.set(
+        "language",
+        language::create_language_module(lua, grants, Arc::clone(&plugin))?,
+    )?;
+    t.set("query", query::create_query_module(lua, plugin)?)?;
     Ok(t)
+}
+
+/// Takes away the queries, grammars and filetypes {plugin} gave highlighting.
+pub(crate) fn clear_plugin(plugin: &str) {
+    query::forget_plugin_queries(plugin);
+    maki_highlight::treesitter::forget(plugin);
 }
