@@ -9,7 +9,7 @@
 //! [`ProviderData`].
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -32,7 +32,7 @@ use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::{self, shared};
 use crate::providers::codec::SessionCarrier;
 use crate::providers::openai_compat::{
-    DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
+    DEFAULT_MAX_TOKENS_FIELD, MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider,
 };
 use crate::providers::{
     ResolvedAuth, Timeouts, http_client, ok_sse, opencode, plugin, status_and_text,
@@ -98,6 +98,9 @@ pub struct ProviderQuirks {
     /// Quota endpoint a [`CatalogProvider::fetch_usage`] reads, with the
     /// parser that understands the wire it answers.
     pub usage: Option<UsageEndpoint>,
+    /// Whether `/models` answers what the account can use, which then prunes
+    /// the catalog's global list. The catalog still supplies the metadata.
+    pub lists_models: bool,
 }
 
 /// One provider's quota endpoint. `parse` sits beside `url` so the generic
@@ -822,6 +825,20 @@ impl CatalogTransport {
         }
     }
 
+    /// The ids the provider says it serves. Only the ids: the catalog stays the
+    /// source of pricing, limits and capabilities.
+    async fn list_model_ids(&self, auth: &ResolvedAuth) -> Result<Vec<String>, AgentError> {
+        let models = self
+            .chat_compat
+            .fetch_and_parse_models(auth, MODELS_PATH, |row| {
+                row["id"]
+                    .as_str()
+                    .map(|id| ModelInfo::id_only(id.to_owned()))
+            })
+            .await?;
+        Ok(models.into_iter().map(|model| model.id).collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stream(
         &self,
@@ -937,6 +954,34 @@ impl CatalogProvider {
             transport: CatalogTransport::new(timeouts),
         })
     }
+
+    /// The ids the provider says it serves, or `None` when the catalog's own
+    /// list stands: the provider has no `/models` of its own, or the probe
+    /// failed or answered nothing, and a stale catalog beats an empty picker.
+    async fn served_ids(&self) -> Option<HashSet<String>> {
+        let (CatalogAuth::Keyed(auth) | CatalogAuth::FreeOnly(auth)) = &self.auth else {
+            return None;
+        };
+        let provider = &self.data.slug;
+        match self.transport.list_model_ids(auth).await {
+            Ok(ids) if !ids.is_empty() => Some(ids.into_iter().collect()),
+            Ok(_) => {
+                warn!(
+                    provider,
+                    "model listing answered nothing, using the catalog's"
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    provider,
+                    error = %e,
+                    "model listing failed, using the catalog's"
+                );
+                None
+            }
+        }
+    }
 }
 
 impl Provider for CatalogProvider {
@@ -989,11 +1034,16 @@ impl Provider for CatalogProvider {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
+            let served = match self.data.quirks.lists_models {
+                true => self.served_ids().await,
+                false => None,
+            };
             let unlocks = Unlocks::from_catalog_auth(&self.auth);
             Ok(self
                 .data
                 .models
                 .iter()
+                .filter(|(model_id, _)| served.as_ref().is_none_or(|ids| ids.contains(*model_id)))
                 .filter(|(_, meta)| {
                     self.data
                         .lists_model(meta, unlocks, self.free_models_enabled)
@@ -1197,6 +1247,12 @@ mod tests {
     const CATALOG_API_URL: &str = "https://catalog.example/v1";
     const LISTED_MODEL: &str = "listed";
     const REJECTED: &[Canned] = &[Canned::json(401, r#"{"error":{"message":"no"}}"#)];
+    const SERVED_PATH: &str = "/v1/models";
+    const SERVED_BODY: &str =
+        r#"{"object":"list","data":[{"id":"paid-model"},{"id":"free-model"}]}"#;
+    const SERVED_SCRIPT: &[Canned] = &[Canned::json(200, SERVED_BODY)];
+    const FAILING_SCRIPT: &[Canned] = &[Canned::json(500, "{}")];
+    const EMPTY_SCRIPT: &[Canned] = &[Canned::json(200, r#"{"object":"list","data":[]}"#)];
 
     #[test]
     fn new_rejects_no_auth() {
@@ -1284,6 +1340,23 @@ mod tests {
             .collect();
         ids.sort();
         ids
+    }
+
+    /// The catalog path without a `/models` probe, so the test cannot reach
+    /// the real endpoint.
+    fn catalog_only(data: &'static ProviderData) -> &'static ProviderData {
+        let mut data = data.clone();
+        data.quirks.lists_models = false;
+        Box::leak(Box::new(data))
+    }
+
+    /// A Go provider with one catalog row the endpoint does not serve.
+    fn served_go_provider_data(env_key: &str, base_url: String) -> &'static ProviderData {
+        let mut data = opencode_go_provider_data(env_key);
+        data.base_url = Some(base_url);
+        data.models
+            .insert("retired-model".into(), priced(PAID_INPUT_PRICE));
+        Box::leak(Box::new(data))
     }
 
     /// The free tier authenticates with the public key, which the quota
@@ -1393,7 +1466,9 @@ mod tests {
     #[tokio::test]
     async fn catalog_provider_list_models_free_fallback_hides_paid_models() {
         let (_tmp, state_dir) = temp_state_dir();
-        let data = leaked_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_91472");
+        let data = catalog_only(leaked_go_provider_data(
+            "MAKI_TEST_OPENCODE_GO_UNSET_KEY_91472",
+        ));
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
         let models = provider.list_models().await.unwrap();
@@ -1405,7 +1480,7 @@ mod tests {
     async fn catalog_provider_hides_free_models_without_opt_in() {
         let (_tmp, state_dir) = temp_state_dir();
         unsafe { std::env::set_var("MAKI_TEST_OPENCODE_GO_KEY_41827", "real-key") };
-        let data = leaked_go_provider_data("MAKI_TEST_OPENCODE_GO_KEY_41827");
+        let data = catalog_only(leaked_go_provider_data("MAKI_TEST_OPENCODE_GO_KEY_41827"));
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
         assert_eq!(listed_ids(&provider).await, ["paid-model"]);
@@ -1431,6 +1506,48 @@ mod tests {
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
         assert_eq!(listed_ids(&provider).await, ["free-model", "paid-model"]);
         unsafe { std::env::remove_var("MAKI_TEST_FREEMIUM_KEY_20163") };
+    }
+
+    /// The endpoint decides which catalog rows exist: models.dev keeps listing
+    /// models the gateway has retired.
+    #[tokio::test]
+    async fn listing_drops_catalog_models_the_endpoint_does_not_serve() {
+        let (base_url, requests) = serve(SERVED_SCRIPT);
+        let (_tmp, state_dir) = temp_state_dir();
+        unsafe { std::env::set_var("MAKI_TEST_OPENCODE_GO_LIST_36281", "real-key") };
+        let data = served_go_provider_data("MAKI_TEST_OPENCODE_GO_LIST_36281", base_url);
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        assert_eq!(listed_ids(&provider).await, ["paid-model"]);
+        assert_eq!(requests.lock().unwrap()[0].path, SERVED_PATH);
+        unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_GO_LIST_36281") };
+    }
+
+    /// A failed probe falls back to the catalog rather than emptying the picker.
+    #[tokio::test]
+    async fn listing_keeps_the_catalog_when_the_endpoint_fails() {
+        let (base_url, _requests) = serve(FAILING_SCRIPT);
+        let (_tmp, state_dir) = temp_state_dir();
+        unsafe { std::env::set_var("MAKI_TEST_OPENCODE_GO_FAIL_58104", "real-key") };
+        let data = served_go_provider_data("MAKI_TEST_OPENCODE_GO_FAIL_58104", base_url);
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        assert_eq!(listed_ids(&provider).await, ["paid-model", "retired-model"]);
+        unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_GO_FAIL_58104") };
+    }
+
+    /// A 200 with no models is a broken probe, not an account with nothing:
+    /// pruning the catalog on it would empty the picker.
+    #[tokio::test]
+    async fn listing_keeps_the_catalog_when_the_endpoint_answers_nothing() {
+        let (base_url, _requests) = serve(EMPTY_SCRIPT);
+        let (_tmp, state_dir) = temp_state_dir();
+        unsafe { std::env::set_var("MAKI_TEST_OPENCODE_GO_EMPTY_70152", "real-key") };
+        let data = served_go_provider_data("MAKI_TEST_OPENCODE_GO_EMPTY_70152", base_url);
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        assert_eq!(listed_ids(&provider).await, ["paid-model", "retired-model"]);
+        unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_GO_EMPTY_70152") };
     }
 
     fn temp_state_dir() -> (tempfile::TempDir, StateDir) {
