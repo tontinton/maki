@@ -57,7 +57,7 @@ use tokio::sync::{Notify, oneshot};
 use tokio::task::coop::unconstrained;
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, info, warn};
 
 use crate::agent::{
@@ -575,6 +575,9 @@ pub(crate) struct EventLoop<'t> {
     /// as they did when each one read inline.
     opening: Option<AbortOnDropHandle<Box<OpenedSession>>>,
     queued_focus: VecDeque<(MakiId, oneshot::Sender<UiReply>)>,
+    /// Writes to sessions no tab has open, which shutdown waits for like it
+    /// waits for the storage writer.
+    stored_writes: TaskTracker,
     _model_fetch_task: AbortOnDropHandle<()>,
 }
 
@@ -887,6 +890,7 @@ impl<'t> EventLoop<'t> {
             pack: None,
             opening: None,
             queued_focus: VecDeque::new(),
+            stored_writes: TaskTracker::new(),
             _model_fetch_task: bg.task,
         })
     }
@@ -1591,19 +1595,30 @@ impl<'t> EventLoop<'t> {
             }
             SessionRequest::SetTitle { id, title } => {
                 let title = normalize_title(&title);
-                let reply = (|| {
-                    let id = parse_session_id(&id)?;
-                    if let Some(i) = self.position(id) {
-                        self.sessions[i].app.state.session_mut().set_title(title);
-                    } else {
-                        let OpenSession { mut session, claim } =
-                            OpenSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
-                        session.set_title(title);
-                        self.ctx.storage_writer.send(Arc::new(session), claim);
+                let id = match parse_session_id(&id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(e));
+                        return;
                     }
-                    Ok(json!(true))
-                })();
-                let _ = reply_tx.send(reply);
+                };
+                if let Some(i) = self.position(id) {
+                    self.sessions[i].app.state.session_mut().set_title(title);
+                    let _ = reply_tx.send(Ok(json!(true)));
+                    return;
+                }
+                // No tab has it, so the claim taken here is the only writer.
+                let storage = self.ctx.storage.clone();
+                self.stored_writes.spawn_blocking(move || {
+                    let reply = OpenSession::load(id, &storage)
+                        .and_then(|OpenSession { mut session, claim }| {
+                            session.set_title(title);
+                            claim.persist(&session)
+                        })
+                        .map(|()| json!(true))
+                        .map_err(|e| e.to_string());
+                    let _ = reply_tx.send(reply);
+                });
             }
         }
     }
@@ -1732,7 +1747,7 @@ impl<'t> EventLoop<'t> {
         };
         if prompt.is_none() && !focus {
             let storage = self.ctx.storage.clone();
-            spawn_blocking(move || {
+            self.stored_writes.spawn_blocking(move || {
                 let reply = open.store(&storage).map(|id| json!(id));
                 let _ = reply_tx.send(reply.map_err(|e| e.to_string()));
             });
@@ -2379,6 +2394,13 @@ impl<'t> EventLoop<'t> {
                 Vec::new()
             }
         };
+        self.stored_writes.close();
+        if timeout(AGENT_SHUTDOWN_TIMEOUT, self.stored_writes.wait())
+            .await
+            .is_err()
+        {
+            warn!("stored session writes did not finish within {AGENT_SHUTDOWN_TIMEOUT:?}");
+        }
         let storage_drain_ms = lap();
         info!(
             session_end_ms,
