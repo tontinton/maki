@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol_schema::v1::{
@@ -10,6 +9,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
 use maki_agent::{DisplayItem, DoneReason, display_order};
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
+use tokio::fs;
 
 const MIN_FENCE_LEN: usize = 3;
 const WRITE_TOOL: &str = "write";
@@ -133,7 +133,7 @@ pub fn tool_start(event: &ToolStartEvent, cwd: &Path, home: Option<&Path>) -> Se
 /// on its own, which is why we repeat the context here. Without a raw input
 /// (nothing was cached for this call) the dialog stays what it always was: a
 /// title built from the permission scopes.
-pub fn permission_update(
+pub async fn permission_update(
     id: String,
     title: String,
     tool: &str,
@@ -151,7 +151,7 @@ pub fn permission_update(
             fields = fields.locations(locations);
         }
 
-        if let Some(diff) = write_diff(tool, raw_input, cwd, home) {
+        if let Some(diff) = write_diff(tool, raw_input, cwd, home).await {
             fields = fields.content(vec![ToolCallContent::Diff(diff)]);
         }
     }
@@ -165,7 +165,7 @@ pub fn permission_update(
 /// or the user would approve what looks like wiping the file.
 /// `edit` gets no diff on purpose, applying its old_string/new_string here
 /// would be a second copy of the plugin's logic, free to drift.
-fn write_diff(
+async fn write_diff(
     tool: &str,
     raw_input: &serde_json::Value,
     cwd: &Path,
@@ -178,12 +178,12 @@ fn write_diff(
     let append = raw_input.get("append").and_then(serde_json::Value::as_bool) == Some(true);
     let path = resolve_path(input_path(raw_input)?, cwd, home)?;
 
-    let old_text = match fs::metadata(&path) {
+    let old_text = match fs::metadata(&path).await {
         // The model picks this path, and a FIFO reports a length of zero, walks
         // past the cap and then blocks the read until someone writes to it,
         // which would freeze every update this session still has to send.
         Ok(meta) if meta.len() > MAX_DIFF_OLD_TEXT_BYTES || !meta.is_file() => return None,
-        Ok(_) => fs::read_to_string(&path).ok(),
+        Ok(_) => fs::read_to_string(&path).await.ok(),
         Err(_) => None,
     };
     let new_text = match (&old_text, append) {
@@ -499,6 +499,7 @@ fn mime_type(media: &ImageMediaType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Arc;
 
     use maki_providers::ImageSource;
@@ -929,7 +930,7 @@ mod tests {
         assert_eq!(json["used"], 51_200);
     }
 
-    fn permission_json(
+    async fn permission_json(
         tool: &str,
         raw_input: Option<&serde_json::Value>,
         cwd: &Path,
@@ -941,26 +942,29 @@ mod tests {
             raw_input,
             cwd,
             Some(Path::new(HOME)),
-        );
+        )
+        .await;
         serde_json::to_value(update).unwrap()
     }
 
-    fn write_permission_json(dir: &Path) -> serde_json::Value {
+    async fn write_permission_json(dir: &Path) -> serde_json::Value {
         permission_json(
             WRITE_TOOL,
             Some(&json!({"path": REL_PATH, "content": NEW_TEXT})),
             dir,
         )
+        .await
     }
 
     #[test_case(WRITE_TOOL, json!({"path": REL_PATH, "content": NEW_TEXT}), true ; "write_input_gets_a_diff")]
     #[test_case(EDIT_TOOL, json!({"path": REL_PATH, "old_string": "a", "new_string": "b"}), false ; "edit_input_has_no_diff")]
-    fn permission_update_carries_file_context(
+    #[tokio::test]
+    async fn permission_update_carries_file_context(
         tool: &str,
         raw_input: serde_json::Value,
         has_diff: bool,
     ) {
-        let json = permission_json(tool, Some(&raw_input), Path::new(CWD));
+        let json = permission_json(tool, Some(&raw_input), Path::new(CWD)).await;
         assert_eq!(json["toolCallId"], PERMISSION_ID);
         assert_eq!(json["title"], PERMISSION_TITLE);
         assert_eq!(json["rawInput"], raw_input);
@@ -975,7 +979,8 @@ mod tests {
     /// version, because the write lock is taken after the permission gate.
     #[test_case(None, None ; "a_new_file_has_no_old_text")]
     #[test_case(Some(OLD_TEXT.to_string()), Some(OLD_TEXT) ; "an_existing_file_diffs_against_disk")]
-    fn write_permission_diffs_against_the_file_on_disk(
+    #[tokio::test]
+    async fn write_permission_diffs_against_the_file_on_disk(
         on_disk: Option<String>,
         expected_old: Option<&str>,
     ) {
@@ -986,22 +991,22 @@ mod tests {
             fs::write(&path, contents).unwrap();
         }
 
-        let json = write_permission_json(dir.path());
+        let json = write_permission_json(dir.path()).await;
         assert_eq!(json["content"][0]["type"], "diff");
         assert_eq!(json["content"][0]["path"], path.to_str().unwrap());
         assert_eq!(json["content"][0]["newText"], NEW_TEXT);
         assert_eq!(json["content"][0]["oldText"], json!(expected_old));
     }
 
-    #[test]
-    fn append_permission_diffs_old_text_plus_the_tail() {
+    #[tokio::test]
+    async fn append_permission_diffs_old_text_plus_the_tail() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(REL_PATH);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, OLD_TEXT).unwrap();
 
         let input = json!({"path": REL_PATH, "content": NEW_TEXT, "append": true});
-        let json = permission_json(WRITE_TOOL, Some(&input), dir.path());
+        let json = permission_json(WRITE_TOOL, Some(&input), dir.path()).await;
         assert_eq!(json["content"][0]["oldText"], OLD_TEXT);
         assert_eq!(
             json["content"][0]["newText"],
@@ -1009,14 +1014,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn write_permission_skips_the_diff_for_an_oversized_file() {
+    #[tokio::test]
+    async fn write_permission_skips_the_diff_for_an_oversized_file() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(REL_PATH);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "x".repeat(MAX_DIFF_OLD_TEXT_BYTES as usize + 1)).unwrap();
 
-        let json = write_permission_json(dir.path());
+        let json = write_permission_json(dir.path()).await;
         assert!(json["content"].is_null(), "{json}");
         assert_eq!(json["rawInput"]["content"], NEW_TEXT);
     }
@@ -1024,20 +1029,20 @@ mod tests {
     /// A FIFO reads as empty metadata and then blocks until someone writes to
     /// it, and no test can create one on Windows, so a directory stands in for
     /// everything that is not a regular file.
-    #[test]
-    fn write_permission_skips_the_diff_for_a_path_that_is_not_a_regular_file() {
+    #[tokio::test]
+    async fn write_permission_skips_the_diff_for_a_path_that_is_not_a_regular_file() {
         let dir = TempDir::new().unwrap();
         fs::create_dir_all(dir.path().join(REL_PATH)).unwrap();
 
-        let json = write_permission_json(dir.path());
+        let json = write_permission_json(dir.path()).await;
         assert!(json["content"].is_null(), "{json}");
     }
 
     /// A cache miss must not regress the dialog: it keeps the scope title it
     /// has always had.
-    #[test]
-    fn permission_update_without_cached_input_is_title_only() {
-        let json = permission_json(WRITE_TOOL, None, Path::new(CWD));
+    #[tokio::test]
+    async fn permission_update_without_cached_input_is_title_only() {
+        let json = permission_json(WRITE_TOOL, None, Path::new(CWD)).await;
         assert_eq!(json["toolCallId"], PERMISSION_ID);
         assert_eq!(json["title"], PERMISSION_TITLE);
         for field in ["kind", "locations", "rawInput", "content"] {
