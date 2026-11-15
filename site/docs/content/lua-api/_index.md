@@ -924,17 +924,26 @@ name the session now running or focused. What each event adds:
   turn took). `list_cost` is the un-subsidised list price and `cost` is
   the real bill, so a budget plugin charges against whichever one it
   wants.
-- `"TurnComplete"`: `data.context_size` and `data.context_window` after
-  each model response, before its tool calls run. Use it to act mid-turn,
-  before `"AutoCompacting"`. `data.context_size` is absent when unknown.
-  A subagent's response carries its own sizes plus `data.id`, its task id,
-  which `maki.session.notify` takes as `task` to reach that subagent. To
-  watch only the main context, skip events that have an `id`.
+- `"TurnComplete"`: `data.message`, the model's message, with
+  `data.context_window` and `data.context_size` when the host knows it.
+  Fires after each response, before that response's tool calls run.
+  `data.message` needs `session_read`. It is JSON in the session
+  format, not the Lua tables `maki.session.messages` builds: the keys
+  and blocks are the same, [listed here](#maki-session-messages). Each
+  block is tagged by `type`, and each type carries its own fields. A
+  subagent's response carries its own message and sizes with `data.id`,
+  the task id `maki.session.notify` takes as `task`. Skip events with an
+  `id` to watch only the main context. No payload carries a cost, and
+  `"TurnEnd"` holds the bill.
 - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
   trigger time.
 - `"CompactionDone"`: `data.context_size_before`,
   `data.context_size_after`, `data.context_window`, and `data.summary`,
-  the text that replaced the history.
+  the text that replaced the history. A compaction asks the model for
+  that summary first, so its `"TurnComplete"` arrives before this event,
+  carrying the summary as `data.message`. The payload does not say it is
+  a summary there, and a compaction whose summary fails fires that
+  `"TurnComplete"` without ever reaching this event.
 - `"PlanReady"`: `data.path`, the absolute path of the plan file the
   agent just wrote. Fires once per draft. Plan state is per session, so
   pass `data.session_id` to `maki.plan.read`.

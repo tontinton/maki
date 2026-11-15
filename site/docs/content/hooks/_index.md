@@ -313,6 +313,31 @@ maki.api.set_slot("agent.user_message", function(prev, msg, ctx)
 end)
 ```
 
+A model's output arrives at `TurnComplete` as `data.message`, once per
+response. A notification cannot change what was said, so redirect a message
+with `agent.user_message` or a tool result with a `tool.*` layer instead.
+
+```lua
+maki.api.create_autocmd("TurnComplete", {
+  callback = function(ev)
+    local msg = ev.data.message
+    if not msg or ev.data.id then return end
+    for i, block in ipairs(msg.content) do
+      local text = block.text or block.thinking
+      if text and text:find("AKIA[A-Z][A-Z][A-Z][A-Z]") then
+        maki.log.warn(("block %d held a secret"):format(i))
+      end
+    end
+  end,
+})
+```
+
+`TurnComplete` fires once per model response, before that response's tool
+calls run. `data.message` includes the `tool_use` blocks. A response that
+calls tools starts another turn. It also fires for a compaction's summary
+request, where `data.message` holds the summary, and nothing in the payload
+says so. `data.id` marks a subagent's response.
+
 ### agent.stop
 
 `reason` is `"finished"` or `"max_tokens"`, and `last_message` is the text of
