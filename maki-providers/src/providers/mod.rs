@@ -22,7 +22,9 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
-use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, lock_tokens, save_tokens};
+use maki_storage::auth::{
+    OAuthTokens, delete_tokens, load_tokens_async, lock_tokens_async, save_tokens,
+};
 
 use crate::AgentError;
 use crate::headers::{
@@ -128,13 +130,9 @@ pub(crate) async fn refreshed_tokens(
     refresh: impl AsyncFnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
 ) -> Result<OAuthTokens, AgentError> {
     // The file lock is held across the refresh request, so two processes never
-    // spend the same refresh token; the blocking pool takes the lock and the
-    // file reads and writes, the request itself is awaited.
-    let (lock, current) = {
-        let (dir, provider) = (dir.clone(), provider.to_owned());
-        spawn_blocking(move || (lock_tokens(&dir, &provider), load_tokens(&dir, &provider))).await?
-    };
-    let current = current.ok_or_else(|| {
+    // spend the same refresh token.
+    let _lock = lock_tokens_async(dir, provider).await;
+    let current = load_tokens_async(dir, provider).await.ok_or_else(|| {
         AgentError::api(
             UNAUTHORIZED_STATUS,
             format!("{provider} OAuth tokens not found on disk"),
@@ -143,11 +141,9 @@ pub(crate) async fn refreshed_tokens(
     if rejected.is_none_or(|stale| current.access != stale) && !current.is_expired() {
         return Ok(current);
     }
-    let fresh = refresh(&current).await;
-    let (dir, provider) = (dir.clone(), provider.to_owned());
-    spawn_blocking(move || {
-        let _lock = lock;
-        let fresh = fresh.inspect_err(|e| {
+    let fresh = match refresh(&current).await {
+        Ok(fresh) => fresh,
+        Err(e) => {
             let cleared = matches!(
                 e,
                 AgentError::Api {
@@ -157,19 +153,26 @@ pub(crate) async fn refreshed_tokens(
             );
             warn!(provider, cleared, error = %e, "OAuth refresh failed");
             if cleared {
-                let _ = delete_tokens(&dir, &provider);
+                let (dir, owned) = (dir.clone(), provider.to_owned());
+                let _ = spawn_blocking(move || delete_tokens(&dir, &owned)).await;
             }
-        })?;
-        // Not `?`: every caller reads an error here as "these credentials are
-        // dead" and falls back to other auth, so a full disk would log the user
-        // out over a refresh that actually succeeded. The run keeps the token
-        // it just got and the next start refreshes again.
-        if let Err(e) = save_tokens(&dir, &provider, &fresh) {
-            warn!(provider, error = %e, "could not persist refreshed OAuth tokens");
+            return Err(e);
         }
-        Ok(fresh)
+    };
+    let (dir, owned) = (dir.clone(), provider.to_owned());
+    let (fresh, saved) = spawn_blocking(move || {
+        let saved = save_tokens(&dir, &owned, &fresh);
+        (fresh, saved)
     })
-    .await?
+    .await?;
+    // Not `?`: every caller reads an error here as "these credentials are
+    // dead" and falls back to other auth, so a full disk would log the user
+    // out over a refresh that actually succeeded. The run keeps the token
+    // it just got and the next start refreshes again.
+    if let Err(e) = saved {
+        warn!(provider, error = %e, "could not persist refreshed OAuth tokens");
+    }
+    Ok(fresh)
 }
 
 /// Whether `held` must give way to the stored tokens: it expired, or a peer
@@ -766,7 +769,7 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
-    use maki_storage::auth::save_tokens;
+    use maki_storage::auth::{load_tokens, save_tokens};
     use tempfile::TempDir;
 
     use super::*;

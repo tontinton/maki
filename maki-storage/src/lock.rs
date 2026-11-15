@@ -9,8 +9,6 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tokio::task::spawn_blocking;
-
 /// How hard [`Lock::acquire_retrying`] retries before reporting a legitimately
 /// held lock. A close-then-reacquire can transiently report as held if a
 /// concurrent fork/posix_spawn duplicated the lock fd: flock lives on the open
@@ -68,12 +66,44 @@ impl Lock {
         }
     }
 
-    /// [`Self::acquire_retrying`] for async callers. The retry sleeps between
-    /// tries, so the whole loop runs as one blocking job off the runtime.
+    /// [`Self::acquire_retrying`] for async callers.
     pub async fn acquire_retrying_async(path: PathBuf) -> Result<Self, LockError> {
-        spawn_blocking(move || Self::acquire_retrying(&path))
+        Self::acquire_within(&path, LOCK_RETRY_DEADLINE, LOCK_RETRY_SLEEP).await
+    }
+
+    /// Takes the lock, retrying a held one every `poll` on the timer until
+    /// `wait` runs out.
+    pub async fn acquire_within(
+        path: &Path,
+        wait: Duration,
+        poll: Duration,
+    ) -> Result<Self, LockError> {
+        let io_error = |source| LockError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(io_error)?;
+        }
+        let file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
             .await
-            .expect("lock acquire panicked")
+            .map_err(io_error)?
+            .into_std()
+            .await;
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match lock_held(path, &file, File::try_lock) {
+                Err(LockError::Held { .. }) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(poll).await;
+                }
+                result => return result.map(|()| Self { _file: file }),
+            }
+        }
     }
 
     fn open_and_lock(
@@ -96,21 +126,30 @@ impl Lock {
                 path: path.to_path_buf(),
                 source,
             })?;
-        match lock(&file) {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(TryLockError::WouldBlock) => Err(LockError::Held {
-                path: path.to_path_buf(),
-            }),
-            Err(TryLockError::Error(source)) => Err(LockError::Io {
-                path: path.to_path_buf(),
-                source,
-            }),
-        }
+        lock_held(path, &file, lock).map(|()| Self { _file: file })
     }
+}
+
+fn lock_held(
+    path: &Path,
+    file: &File,
+    lock: fn(&File) -> Result<(), TryLockError>,
+) -> Result<(), LockError> {
+    lock(file).map_err(|e| match e {
+        TryLockError::WouldBlock => LockError::Held {
+            path: path.to_path_buf(),
+        },
+        TryLockError::Error(source) => LockError::Io {
+            path: path.to_path_buf(),
+            source,
+        },
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
     fn lock_path(dir: &tempfile::TempDir) -> PathBuf {
@@ -127,14 +166,23 @@ mod tests {
         assert!(matches!(error, LockError::Held { .. }), "got: {error}");
     }
 
-    #[test]
-    fn retrying_still_reports_a_holder_that_outlives_the_deadline() {
+    #[test_case(false ; "blocking")]
+    #[test_case(true ; "tokio")]
+    fn retrying_still_reports_a_holder_that_outlives_the_deadline(on_tokio: bool) {
         let dir = tempfile::TempDir::new().unwrap();
         let path = lock_path(&dir);
 
         let _held = Lock::acquire(&path).unwrap();
-        let error =
-            Lock::acquire_retrying(&path).expect_err("a genuine holder must outlast the retry");
+        let retried = if on_tokio {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(Lock::acquire_retrying_async(path.clone()))
+        } else {
+            Lock::acquire_retrying(&path)
+        };
+        let error = retried.expect_err("a genuine holder must outlast the retry");
         assert!(matches!(error, LockError::Held { .. }), "got: {error}");
     }
 
