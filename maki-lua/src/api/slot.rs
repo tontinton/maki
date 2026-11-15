@@ -705,8 +705,9 @@ pub(crate) fn parse_capability(
 ///
 /// The agent loop fires `agent.user_message`, `agent.stop`,
 /// `agent.compact.before`, and `agent.compact.prepare`, with the same
-/// contract. Wrapping one costs every permission. See
-/// [Hooks](/docs/hooks/).
+/// contract. Wrapping one costs `agent`, `session_read` and `session_write`,
+/// since every slot can hand a layer text the user or the model wrote, and a
+/// layer steers what happens next. See [Hooks](/docs/hooks/).
 ///
 /// `permission.prompt` fires where the permission prompt would show, with
 /// the prompt as its default. A layer takes `function(prev, req, ctx)` and
@@ -888,8 +889,8 @@ mod tests {
         });
     }
 
-    /// Everything but `agent` and `session_read`, so the three authorities
-    /// disagree about what is missing.
+    /// Everything but `agent` and `session_read`, so the authorities disagree
+    /// about what is missing.
     #[test_case(Authority::Capability(Permission::Run), &[], &[] ; "a_held_capability")]
     #[test_case(Authority::Capability(Permission::SessionRead), &[], &[Permission::SessionRead] ; "a_missing_capability")]
     #[test_case(Authority::Unbounded, &[], &[Permission::SessionRead] ; "unbounded_leaves_agent_out")]

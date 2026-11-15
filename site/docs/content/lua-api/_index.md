@@ -1262,8 +1262,9 @@ the [Hooks price table](/docs/hooks/#rules).
 
 The agent loop fires `agent.user_message`, `agent.stop`,
 `agent.compact.before`, and `agent.compact.prepare`, with the same
-contract. Wrapping one costs every permission. See
-[Hooks](/docs/hooks/).
+contract. Wrapping one costs `agent`, `session_read` and `session_write`,
+since every slot can hand a layer text the user or the model wrote, and a
+layer steers what happens next. See [Hooks](/docs/hooks/).
 
 `permission.prompt` fires where the permission prompt would show, with
 the prompt as its default. A layer takes `function(prev, req, ctx)` and

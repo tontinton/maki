@@ -839,8 +839,29 @@ fn all_but_run() -> PluginPermissions {
 }
 
 fn all_but_agent() -> PluginPermissions {
+    all_but(Permission::Agent)
+}
+
+fn all_but_session_write() -> PluginPermissions {
+    all_but(Permission::SessionWrite)
+}
+
+fn all_but_session_read() -> PluginPermissions {
+    all_but(Permission::SessionRead)
+}
+
+fn all_but(perm: Permission) -> PluginPermissions {
     let mut permissions = PluginPermissions::trusted();
-    permissions.set(Permission::Agent, false);
+    permissions.set(perm, false);
+    permissions
+}
+
+/// The whole price of an agent slot layer.
+fn agent_read_and_write() -> PluginPermissions {
+    let mut permissions = PluginPermissions::denied();
+    permissions.set(Permission::Agent, true);
+    permissions.set(Permission::SessionRead, true);
+    permissions.set(Permission::SessionWrite, true);
     permissions
 }
 
@@ -2087,29 +2108,43 @@ const AGENT_MODEL: &str = "anthropic/claude-sonnet-4";
 const KEEP_GOING: &str = "keep going";
 const CONTINUE_FIELD: &str = "continue";
 
-fn stop_layer() -> String {
+fn agent_layer(slot: &str) -> String {
     format!(
-        r#"maki.api.set_slot("agent.stop", function(prev, value, ctx)
+        r#"maki.api.set_slot("{slot}", function(prev, value, ctx)
     assert(ctx.model == "{AGENT_MODEL}", ctx.model)
     return {{ {CONTINUE_FIELD} = "{KEEP_GOING}" }}
 end)"#
     )
 }
 
-/// Steering the agent can start turns, so unlike a tool with no declared reach
-/// it costs `agent` too and only a fully trusted plugin's layer runs.
-#[test_case(PluginPermissions::trusted, true  ; "trusted_layer_runs")]
-#[test_case(all_but_run,                false ; "denied_run_is_skipped")]
-#[test_case(all_but_agent,              false ; "denied_agent_is_skipped")]
-fn agent_slot_layers_need_full_trust(granted: fn() -> PluginPermissions, runs: bool) {
+/// A layer on an agent slot pays `agent`, `session_read` and
+/// `session_write`: every slot can hand it text the user or the model wrote,
+/// and steering is what sending a prompt costs.
+#[test_case(AgentSlot::Stop, PluginPermissions::trusted, true  ; "trusted_layer_runs")]
+#[test_case(AgentSlot::Stop, all_but_run,                true  ; "steering_does_not_charge_run")]
+#[test_case(AgentSlot::Stop, all_but_agent,              false ; "denied_agent_is_skipped")]
+#[test_case(AgentSlot::Stop, all_but_session_write,      false ; "denied_session_write_is_skipped")]
+#[test_case(AgentSlot::UserMessage, all_but_session_read, false ; "denied_session_read_is_skipped")]
+#[test_case(AgentSlot::CompactBefore, all_but_session_read, false ; "compact_before_pays_session_read")]
+#[test_case(AgentSlot::CompactPrepare, agent_read_and_write, true  ; "only_the_price_needs_holding")]
+fn agent_slot_layers_pay_the_prompt_price(
+    slot: AgentSlot,
+    granted: fn() -> PluginPermissions,
+    runs: bool,
+) {
     let (reg, host) = host();
     let hook = reg
         .agent_hook()
         .expect("the plugin host installs one at boot");
-    assert!(!hook.wraps(AgentSlot::Stop));
-    load_granted(&host, LAYER_PLUGIN, &stop_layer(), granted());
-    assert!(hook.wraps(AgentSlot::Stop));
-    assert!(!hook.wraps(AgentSlot::UserMessage));
+    let slots = [
+        AgentSlot::UserMessage,
+        AgentSlot::Stop,
+        AgentSlot::CompactBefore,
+        AgentSlot::CompactPrepare,
+    ];
+    assert!(slots.iter().all(|&s| !hook.wraps(s)));
+    load_granted(&host, LAYER_PLUGIN, &agent_layer(slot.name()), granted());
+    assert!(slots.iter().all(|&s| hook.wraps(s) == (s == slot)));
 
     let cancel = CancelToken::none();
     let call = AgentCall {
@@ -2121,7 +2156,7 @@ fn agent_slot_layers_need_full_trust(granted: fn() -> PluginPermissions, runs: b
         cancel: &cancel,
         deadline: Instant::now() + DISPATCH_TIMEOUT,
     };
-    let verdict = within(hook.run(AgentSlot::Stop, serde_json::json!({}), &call));
+    let verdict = within(hook.run(slot, serde_json::json!({}), &call));
     let kept_going = serde_json::json!({ CONTINUE_FIELD: KEEP_GOING });
     assert_eq!(
         matches!(verdict, Verdict::Replaced(value) if value == kept_going),
