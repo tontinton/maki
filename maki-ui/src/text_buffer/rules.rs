@@ -14,6 +14,7 @@ use std::sync::{Arc, LazyLock};
 
 use maki_agent::SpanStyle;
 use maki_lua::{Decoration, InputRule, PatternRule, SyntaxRule};
+use maki_providers::image_marker;
 
 use super::marks::Placed;
 use crate::app::shell::parse_shell_prefix;
@@ -22,7 +23,9 @@ const SHELL_LANG: &str = "bash";
 const SHELL_PREFIX_STYLE: &str = "shell_prefix";
 const SHELL_COMMAND_RANK: usize = 0;
 const SHELL_PREFIX_RANK: usize = 1;
-const FIRST_PLUGIN_RANK: usize = 2;
+const IMAGE_MARKER_RANK: usize = 2;
+const FIRST_PLUGIN_RANK: usize = 3;
+const IMAGE_MARKER_STYLE: &str = "inline_code";
 
 static SHELL_COMMAND: LazyLock<Arc<Decoration>> = LazyLock::new(|| {
     Arc::new(Decoration {
@@ -36,19 +39,28 @@ static SHELL_PREFIX: LazyLock<Arc<Decoration>> = LazyLock::new(|| {
         ..Decoration::default()
     })
 });
+/// An attached image's marker is one thing to the user, so it is edited as
+/// one. Neither look shapes rows, so it costs the layout nothing.
+static IMAGE_MARKER: LazyLock<Arc<Decoration>> = LazyLock::new(|| {
+    Arc::new(Decoration {
+        hl: Some(SpanStyle::Named(IMAGE_MARKER_STYLE.into())),
+        atomic: true,
+        ..Decoration::default()
+    })
+});
 
 pub(super) type SyntaxRules = Arc<[(usize, Arc<SyntaxRule>)]>;
 
 /// The host's own marks come first, so a plugin's rule draws over the `!` of
-/// a shell line. The default has no rules at all, for inputs like a picker's
-/// search where a `!` means nothing.
+/// a shell line or an `[Image N]`. The default has no rules at all, for
+/// inputs like a picker's search where neither means anything.
 ///
 /// Every rule is ranked by its place in the list, and a tree-sitter rule
 /// takes one rank per capture of each pattern, so its later patterns draw
 /// over its earlier ones and so do the later captures of one pattern.
 #[derive(Default)]
 pub struct RuleSet {
-    shell: bool,
+    host: bool,
     patterns: Vec<(usize, PatternRule)>,
     syntax: SyntaxRules,
     shapes_rows: bool,
@@ -73,7 +85,7 @@ impl RuleSet {
             }
         }
         Arc::new(Self {
-            shell: true,
+            host: true,
             shapes_rows: patterns.iter().any(|(_, rule)| rule.mark().shapes_rows())
                 || syntax.iter().any(|(_, rule)| rule.shapes_rows()),
             patterns,
@@ -124,8 +136,14 @@ impl RuleMarks {
     ) -> impl Iterator<Item = Placed<'a>> {
         let derived = self.lines[y].get_or_init(|| {
             let start = line.start;
-            let shell = (self.set.shell && start == 0)
+            let shell = (self.set.host && start == 0)
                 .then(|| shell_marks(&text[line.clone()]))
+                .into_iter()
+                .flatten();
+            let images = self
+                .set
+                .host
+                .then(|| image_marks(&text[line.clone()]))
                 .into_iter()
                 .flatten();
             let patterns = self.set.patterns.iter().flat_map(|&(rank, ref rule)| {
@@ -136,7 +154,7 @@ impl RuleMarks {
                         rank,
                     })
             });
-            shell.chain(patterns).collect()
+            shell.chain(images).chain(patterns).collect()
         });
         derived.iter().map(move |mark| {
             let bytes = line.start + mark.bytes.start..line.start + mark.bytes.end;
@@ -166,5 +184,13 @@ fn shell_marks(first_line: &str) -> impl Iterator<Item = Derived> {
                 rank: SHELL_COMMAND_RANK,
             },
         ]
+    })
+}
+
+fn image_marks(line: &str) -> impl Iterator<Item = Derived> + '_ {
+    image_marker::markers(line).map(|marker| Derived {
+        bytes: marker.range,
+        decoration: Arc::clone(&IMAGE_MARKER),
+        rank: IMAGE_MARKER_RANK,
     })
 }

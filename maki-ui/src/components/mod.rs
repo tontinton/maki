@@ -5,6 +5,7 @@ pub mod command;
 pub(crate) mod file_picker;
 pub(crate) mod form;
 pub(crate) mod help_modal;
+pub(crate) mod image_preview;
 pub mod input;
 pub mod keybindings;
 pub(crate) mod list_picker;

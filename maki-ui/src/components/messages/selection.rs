@@ -67,39 +67,53 @@ pub(super) fn extract_selection_text(
 
         // Only the selected rows are re-rendered, a chunk at a time. The
         // cursor measures the segment once for all the chunks it hands out.
+        // Images sit between runs of lines and copy as nothing, so each run
+        // is walked on its own, shifted down to the row it is drawn at.
         let mut carry = selection::RowCarry::default();
-        let mut walk = seg.rows_from(rel_start, width);
-        while let Some((lines, chunk)) = walk.next_chunk(COPY_CHUNK_ROWS) {
-            if chunk.start >= rel_end {
+        let mut run_top: u16 = 0;
+        for index in 0..=seg.images.len() {
+            if run_top >= rel_end {
                 break;
             }
-            // The buffer sits at the rows it draws, so `ss` keeps talking in
-            // segment rows across every chunk.
-            let area = Rect::new(0, chunk.start, body, chunk.end - chunk.start);
-            // A double width grapheme landing on the last column makes ratatui
-            // write one past the area it wrapped to, so the scratch buffer
-            // holds a spare column for that write. `area` keeps the real width,
-            // which is what decides the wrap and the columns copied.
-            let mut tmp = Buffer::empty(Rect {
-                width: body.saturating_add(1),
-                ..area
-            });
-            Paragraph::new(lines.to_vec())
-                .wrap(Wrap { trim: false })
-                .render(area, &mut tmp);
+            let run = seg.lines_before_image(index);
+            let run_rows = seg.rows_of(run.clone(), width);
+            let mut walk = seg.rows_in(run, rel_start.saturating_sub(run_top), width);
+            while let Some((lines, chunk)) = walk.next_chunk(COPY_CHUNK_ROWS) {
+                let chunk = chunk.start.saturating_add(run_top)..chunk.end.saturating_add(run_top);
+                if chunk.start >= rel_end {
+                    break;
+                }
+                // The buffer sits at the rows it draws, so `ss` keeps talking
+                // in segment rows across every chunk.
+                let area = Rect::new(0, chunk.start, body, chunk.end - chunk.start);
+                // A double width grapheme landing on the last column makes
+                // ratatui write one past the area it wrapped to, so the scratch
+                // buffer holds a spare column for that write. `area` keeps the
+                // real width, which is what decides the wrap and the columns
+                // copied.
+                let mut tmp = Buffer::empty(Rect {
+                    width: body.saturating_add(1),
+                    ..area
+                });
+                Paragraph::new(lines.to_vec())
+                    .wrap(Wrap { trim: false })
+                    .render(area, &mut tmp);
 
-            // The chunk runs to a line boundary, so it can reach past the
-            // selection on either side. `append_rows` clips to the rows this
-            // buffer actually holds.
-            selection::append_rows(
-                &tmp,
-                area,
-                &ss,
-                rel_start..rel_end,
-                &mut out,
-                &LineBreaks::from_lines(lines, body),
-                &mut carry,
-            );
+                // The chunk runs to a line boundary, so it can reach past the
+                // selection on either side. `append_rows` clips to the rows
+                // this buffer actually holds.
+                selection::append_rows(
+                    &tmp,
+                    area,
+                    &ss,
+                    rel_start..rel_end,
+                    &mut out,
+                    &LineBreaks::from_lines(lines, body),
+                    &mut carry,
+                );
+            }
+            let image_rows = seg.images.get(index).map_or(0, |image| image.height());
+            run_top = run_top.saturating_add(run_rows).saturating_add(image_rows);
         }
     }
     out
@@ -107,11 +121,14 @@ pub(super) fn extract_selection_text(
 
 #[cfg(test)]
 mod tests {
-    use super::super::segment::{GUTTER_COLS, Segment};
+    use super::super::segment::{GUTTER_COLS, PlacedImage, Segment};
     use super::{COPY_CHUNK_ROWS, SegmentCache, extract_selection_text};
+    use crate::components::IMAGE_PLACEHOLDER;
     use crate::selection::{DocPos, Selection, SelectionZone};
+    use maki_providers::{ImageMediaType, ImageSource};
     use ratatui::layout::Rect;
     use ratatui::text::{Line, Span};
+    use std::sync::Arc;
     use test_case::test_case;
 
     const MARKER: &str = "\u{25cf} ";
@@ -234,6 +251,25 @@ mod tests {
         assert_eq!(
             copy_whole_segment(lines, WIDTH),
             format!("{body}\n\n\ntail")
+        );
+    }
+
+    /// The rows after an image are drawn lower by its height, and copying
+    /// reads them from there.
+    #[test]
+    fn copy_reads_past_an_image_between_lines() {
+        let mut cache = SegmentCache::new();
+        let mut seg = Segment::with_lines(vec![Line::from("above"), Line::from("below")], None);
+        seg.set_images([PlacedImage {
+            source: ImageSource::new(ImageMediaType::Png, Arc::from("")),
+            fallback: Some(IMAGE_PLACEHOLDER),
+            after_line: Some(1),
+        }]);
+        cache.push(seg);
+        let last_row = cache.get(0).expect("segment").height(WIDTH) - 1;
+        assert_eq!(
+            copy_range(&cache, pos(0, 0, 0), pos(0, last_row, WIDTH)),
+            "above\nbelow"
         );
     }
 }

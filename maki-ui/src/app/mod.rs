@@ -40,6 +40,7 @@ use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, PluginAccess, SUBMITS_PROMPT};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
+use crate::components::image_preview::ImagePreview;
 use crate::components::input::{InputAction, InputBox, Placeholder, Submission, sent_text};
 use crate::components::keybindings::key;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
@@ -525,6 +526,7 @@ pub struct App {
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
+    pub(super) image_preview: ImagePreview,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
@@ -679,6 +681,7 @@ impl App {
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(typewriter, ui_config.thinking_lines),
+            image_preview: ImagePreview::default(),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
@@ -2602,6 +2605,7 @@ impl App {
             | self.poll_paste()
             | self.poll_mouse_paste()
             | self.btw_modal.poll()
+            | self.image_preview.poll()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
             | self.mcp_picker.refresh()

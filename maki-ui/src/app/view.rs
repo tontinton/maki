@@ -293,11 +293,23 @@ impl App {
                 self.separator_style(),
                 panel_hint,
             );
+            self.render_image_preview(frame, layout.msg_area);
             self.command_palette
                 .view(frame, layout.input_area, &self.input_box.buffer);
             return (caret, None);
         }
         (None, None)
+    }
+
+    /// An overlay hides the transcript's images, so it hides this one too.
+    fn render_image_preview(&mut self, frame: &mut Frame, msg_area: Rect) {
+        let caret_image = self
+            .input_box
+            .image_at_caret()
+            .filter(|_| !self.any_overlay_open());
+        self.image_preview.show(caret_image);
+        let picker = self.chats[self.active_chat].image_picker();
+        self.image_preview.view(frame, msg_area, picker);
     }
 
     fn render_splits(&mut self, frame: &mut Frame, layout: &ViewLayout) {

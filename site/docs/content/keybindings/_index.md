@@ -196,5 +196,6 @@ These are input conventions, not remappable key rows:
 
 - Prefix a line with `!` to run a shell command yourself (5 minute timeout). Use `!!` to hide the command and its output from the agent.
 - Pasting image file paths attaches the images.
+- An attached image shows as an `[Image N]` marker where it was pasted, so the prompt can refer to it. With the cursor on a marker, the image is previewed above the input. The marker is edited as one unit, and deleting it detaches the image. A prompt recalled from history brings its images back if it was sent in this run.
 - Right-click pastes clipboard text on Windows.
 - Middle-click inserts the PRIMARY selection, the same text middle-click pastes in a shell. Linux only, since other platforms have no PRIMARY selection. On Wayland the compositor must support it.

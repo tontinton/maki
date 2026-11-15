@@ -31,6 +31,7 @@ use maki_storage::id::MakiId;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use ratatui_image::picker::Picker;
 
 use crate::repaint::{Cadence, Dirty};
 
@@ -433,6 +434,10 @@ impl Chat {
 
     pub fn tick(&mut self) -> Dirty {
         self.messages_panel.tick()
+    }
+
+    pub fn image_picker(&self) -> Option<&Picker> {
+        self.messages_panel.image_picker()
     }
 
     pub fn cadence(&self) -> Cadence {
