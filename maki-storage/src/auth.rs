@@ -210,6 +210,13 @@ fn load_auth<T: DeserializeOwned>(path: &Path) -> Option<T> {
         .and_then(|d| serde_json::from_str(&d).ok())
 }
 
+async fn load_auth_async<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+}
+
 fn save_auth(path: &Path, data: &impl Serialize) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -230,6 +237,10 @@ fn delete_auth(path: &Path) -> Result<bool, StorageError> {
 
 pub fn load_tokens(dir: &StateDir, provider: &str) -> Option<OAuthTokens> {
     load_auth(&auth_path(dir, provider))
+}
+
+pub async fn load_tokens_async(dir: &StateDir, provider: &str) -> Option<OAuthTokens> {
+    load_auth_async(&auth_path(dir, provider)).await
 }
 
 pub fn save_tokens(

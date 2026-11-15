@@ -115,11 +115,11 @@ impl Provider for Xai {
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            self.auth.refresh_if_stale().await?;
+            let oauth = self.auth.uses_oauth().await?;
             let mut buf = String::new();
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
-            if self.auth.is_oauth() {
+            if oauth {
                 let mut body = responses::build_body(model, messages, system, tools, false);
                 apply_grok_reasoning(&mut body, &opts, model);
                 if let Some(session) = session_id {
@@ -163,8 +163,7 @@ impl Provider for Xai {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
-            self.auth.refresh_if_stale().await?;
-            if self.auth.is_oauth() {
+            if self.auth.uses_oauth().await? {
                 return self
                     .auth
                     .with_retry(|| async {
