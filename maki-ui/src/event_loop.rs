@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::{pending, ready};
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -411,6 +411,17 @@ fn parse_mode(mode: &str) -> Result<Mode, String> {
     }
 }
 
+/// `maki.model.set`'s answer, with whatever model the session is on by now.
+fn apply_settings(app: &mut App, thinking: Option<String>, fast: Option<bool>) -> UiReply {
+    if let Some(thinking) = thinking {
+        app.set_thinking(&thinking)?;
+    }
+    if let Some(fast) = fast {
+        app.set_fast(fast)?;
+    }
+    Ok(app.model_state())
+}
+
 struct SessionRuntime {
     app: App,
     handles: AgentHandles,
@@ -582,6 +593,7 @@ pub(crate) struct EventLoop<'t> {
     /// The slots [`Self::rebuild_models`] builds off the loop. A newer rebuild
     /// replaces a pending one, whose slots would be stale anyway.
     rebuilding: Option<AbortOnDropHandle<RebuiltSlots>>,
+    picks: Picks,
     /// Writes to sessions no tab has open, which shutdown waits for like it
     /// waits for the storage writer.
     stored_writes: TaskTracker,
@@ -604,7 +616,104 @@ struct OpenedSession {
 }
 
 /// One build per spec the tabs were on when the rebuild started.
-type RebuiltSlots = HashMap<String, Result<Arc<ModelSlot>, String>>;
+struct RebuiltSlots {
+    epoch: u64,
+    built: HashMap<String, Result<Arc<ModelSlot>, String>>,
+}
+
+/// A model picked for the tab focused at the time.
+struct Pick {
+    spec: String,
+    /// The tab's slot cell, which stays the same when `/new` gives the tab
+    /// another session while the build is out.
+    tab: Weak<ArcSwap<ModelSlot>>,
+    origin: PickOrigin,
+}
+
+/// Who hears how a pick went.
+enum PickOrigin {
+    /// The model picker or a login, which flash a failure.
+    Picker,
+    /// `maki.model.set`, whose thinking and fast go on top of the new model
+    /// before it answers.
+    Lua {
+        thinking: Option<String>,
+        fast: Option<bool>,
+        reply_tx: oneshot::Sender<UiReply>,
+    },
+}
+
+/// A slot built off the loop for a pick that had none.
+struct SlotBuilt {
+    epoch: u64,
+    pick: Pick,
+    built: Result<Arc<ModelSlot>, String>,
+}
+
+/// One pick builds off the loop at a time, with later ones queued behind it,
+/// so they apply in the order they were made and the last one wins.
+#[derive(Default)]
+struct Picks {
+    building: Option<AbortOnDropHandle<Box<SlotBuilt>>>,
+    /// The tab and spec of the pick `building` holds.
+    building_for: Option<(Weak<ArcSwap<ModelSlot>>, String)>,
+    queued: VecDeque<Pick>,
+}
+
+impl Picks {
+    /// Takes in a build that landed, `None` when it panicked or nothing did,
+    /// and returns the picks settled by now, in order. A slot built before the
+    /// last invalidate is stale, so its pick builds again ahead of the queue.
+    fn advance(
+        &mut self,
+        slots: &mut ModelSlots,
+        landed: Option<Box<SlotBuilt>>,
+    ) -> Vec<(Pick, Result<Arc<ModelSlot>, String>)> {
+        let mut settled = Vec::new();
+        if self.building.is_none() {
+            self.building_for = None;
+        }
+        if let Some(landed) = landed {
+            let SlotBuilt { epoch, pick, built } = *landed;
+            match built
+                .map(|slot| slots.adopt(epoch, pick.spec.clone(), &slot))
+                .transpose()
+            {
+                Some(built) => settled.push((pick, built)),
+                None => self.queued.push_front(pick),
+            }
+        }
+        while self.building.is_none()
+            && let Some(pick) = self.queued.pop_front()
+        {
+            match slots.get(&pick.spec) {
+                Some(slot) => settled.push((pick, Ok(slot))),
+                None => {
+                    let builder = slots.builder();
+                    self.building_for = Some((pick.tab.clone(), pick.spec.clone()));
+                    self.building = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+                        let built = builder.build(&pick.spec).await;
+                        let epoch = builder.epoch();
+                        Box::new(SlotBuilt { epoch, pick, built })
+                    })));
+                }
+            }
+        }
+        settled
+    }
+
+    /// The spec `tab` ends up on once its picks have settled: the last one
+    /// made for it.
+    fn pending_for(&self, tab: &Arc<ArcSwap<ModelSlot>>) -> Option<&str> {
+        let tab = Arc::downgrade(tab);
+        self.building_for
+            .iter()
+            .map(|(tab, spec)| (tab, spec))
+            .chain(self.queued.iter().map(|pick| (&pick.tab, &pick.spec)))
+            .rfind(|(of, _)| Weak::ptr_eq(of, &tab))
+            .map(|(_, spec)| spec.as_str())
+    }
+}
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
 /// means the wait timed out (animation/idle tick).
@@ -627,6 +736,8 @@ enum Wake {
     ModelsDiscovered,
     /// `None` when the rebuild panicked.
     SlotsRebuilt(Option<RebuiltSlots>),
+    /// `None` when the build panicked, which dropped its pick.
+    SlotBuilt(Option<Box<SlotBuilt>>),
 }
 
 /// A value from the channel, or never, once it is closed: a closed channel
@@ -906,6 +1017,7 @@ impl<'t> EventLoop<'t> {
             opening: None,
             queued_focus: VecDeque::new(),
             rebuilding: None,
+            picks: Picks::default(),
             stored_writes: TaskTracker::new(),
             cwd_lost: false,
             _model_fetch_task: bg.task,
@@ -1034,6 +1146,7 @@ impl<'t> EventLoop<'t> {
             preparation = pack_done(&mut self.pack) => Wake::Pack(Box::new(preparation)),
             answer = answered(&mut self.opening) => Wake::SessionOpened(answer),
             rebuilt = answered(&mut self.rebuilding) => Wake::SlotsRebuilt(rebuilt),
+            built = answered(&mut self.picks.building) => Wake::SlotBuilt(built),
             () = self.models_fetched.notified() => Wake::ModelsDiscovered,
             wake = session_wake(&mut self.sessions) => wake,
         }
@@ -1053,6 +1166,7 @@ impl<'t> EventLoop<'t> {
             Wake::ModelsDiscovered => self.rebuild_models(),
             Wake::SlotsRebuilt(Some(rebuilt)) => self.finish_rebuild(rebuilt),
             Wake::SlotsRebuilt(None) => {}
+            Wake::SlotBuilt(built) => self.advance_picks(built),
         }
         Ok(())
     }
@@ -1233,9 +1347,7 @@ impl<'t> EventLoop<'t> {
                 None => self
                     .answer_from_disk(id, reply_tx, |session| Ok(SessionExport::stored(session))),
             },
-            UiAction::Model { req, reply_tx } => {
-                let _ = reply_tx.send(self.handle_model_request(req));
-            }
+            UiAction::Model { req, reply_tx } => self.handle_model_request(req, reply_tx),
             UiAction::Input { req, reply_tx } => {
                 let (reply, actions) = self.handle_input_request(req);
                 let _ = reply_tx.send(reply);
@@ -1711,8 +1823,8 @@ impl<'t> EventLoop<'t> {
 
     /// Lua acts on the focused session, the same target the model picker
     /// writes to.
-    fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
-        match req {
+    fn handle_model_request(&mut self, req: ModelRequest, reply_tx: oneshot::Sender<UiReply>) {
+        let reply = match req {
             ModelRequest::Get => Ok(self.focused_app().model_state()),
             ModelRequest::Available => {
                 let available = self.ctx.available_models.load();
@@ -1724,23 +1836,24 @@ impl<'t> EventLoop<'t> {
                 ))
             }
             ModelRequest::Set {
-                spec,
+                spec: Some(spec),
                 thinking,
                 fast,
             } => {
-                if let Some(spec) = spec {
-                    self.change_model(&spec)?;
-                }
-                let app = self.focused_app();
-                if let Some(thinking) = thinking {
-                    app.set_thinking(&thinking)?;
-                }
-                if let Some(fast) = fast {
-                    app.set_fast(fast)?;
-                }
-                Ok(app.model_state())
+                let origin = PickOrigin::Lua {
+                    thinking,
+                    fast,
+                    reply_tx,
+                };
+                return self.change_model(spec, origin);
             }
-        }
+            ModelRequest::Set {
+                spec: None,
+                thinking,
+                fast,
+            } => apply_settings(self.focused_app(), thinking, fast),
+        };
+        let _ = reply_tx.send(reply);
     }
 
     /// Route a plan-surface request to the session it names, or the focused
@@ -2149,6 +2262,7 @@ impl<'t> EventLoop<'t> {
     fn rebuild_models(&mut self) {
         self.slots.invalidate();
         let builder = self.slots.builder();
+        let epoch = builder.epoch();
         let specs: HashSet<String> = self
             .sessions
             .iter()
@@ -2160,7 +2274,8 @@ impl<'t> EventLoop<'t> {
                 let built = builder.build(&spec).await;
                 (spec, built)
             });
-            join_all(builds).await.into_iter().collect::<RebuiltSlots>()
+            let built = join_all(builds).await.into_iter().collect();
+            RebuiltSlots { epoch, built }
         })));
     }
 
@@ -2169,10 +2284,11 @@ impl<'t> EventLoop<'t> {
     fn finish_rebuild(&mut self, rebuilt: RebuiltSlots) {
         for idx in 0..self.sessions.len() {
             let spec = self.sessions[idx].app.state.model.spec();
-            match rebuilt.get(&spec) {
+            match rebuilt.built.get(&spec) {
                 Some(Ok(slot)) => {
-                    let slot = self.slots.adopt(spec, slot);
-                    self.apply_model(idx, slot);
+                    if let Some(slot) = self.slots.adopt(rebuilt.epoch, spec, slot) {
+                        self.apply_model(idx, slot);
+                    }
                 }
                 Some(Err(error)) => warn!(%spec, %error, "keeping the previous model"),
                 None => {}
@@ -2237,11 +2353,7 @@ impl<'t> EventLoop<'t> {
             }
             Action::RestartAgent(history) => self.respawn_agent(idx, history, Respawn::Restart),
             Action::OpenFork(open) => self.open_fork(idx, *open),
-            Action::ChangeModel(spec) => {
-                if let Err(e) = self.change_model(&spec) {
-                    self.focused_app().flash(e);
-                }
-            }
+            Action::ChangeModel(spec) => self.change_model(spec, PickOrigin::Picker),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 self.persist_tiers(model_registry::set(spec, tier));
@@ -2319,21 +2431,61 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    fn change_model(&mut self, spec: String, origin: PickOrigin) {
+        let tab = Arc::downgrade(&self.sessions[self.focused].slot);
+        self.picks.queued.push_back(Pick { spec, tab, origin });
+        self.advance_picks(None);
+    }
+
+    fn advance_picks(&mut self, landed: Option<Box<SlotBuilt>>) {
+        for (pick, built) in self.picks.advance(&mut self.slots, landed) {
+            match built {
+                Ok(slot) => self.apply_pick(pick, slot),
+                Err(error) => self.refuse_pick(pick.origin, error),
+            }
+        }
+        for rt in &mut self.sessions {
+            rt.app.picking = self.picks.pending_for(&rt.slot).map(str::to_owned);
+        }
+    }
+
     /// The one explicit pick, which is why it alone writes the last-used file.
     /// Opening an old session must not change what the next `maki` starts on.
-    fn change_model(&mut self, spec: &str) -> Result<(), String> {
-        let slot = self.slots.try_get(spec)?;
+    fn apply_pick(&mut self, pick: Pick, slot: Arc<ModelSlot>) {
+        let Some(idx) = self
+            .sessions
+            .iter()
+            .position(|rt| Weak::ptr_eq(&Arc::downgrade(&rt.slot), &pick.tab))
+        else {
+            return self.refuse_pick(pick.origin, NOT_LIVE_ERR.to_owned());
+        };
         let picked = slot.model.spec();
-        self.apply_model(self.focused, slot);
+        self.apply_model(idx, slot);
         self.ctx
             .picker_memory
-            .record_recent(spec, &self.ctx.model_policy);
-        let recent = spec.to_owned();
+            .record_recent(&pick.spec, &self.ctx.model_policy);
+        let recent = pick.spec;
         self.ctx.storage_writer.persist(move |dir| {
             persist_model(dir, &picked);
             push_recent(dir, &recent);
         });
-        Ok(())
+        if let PickOrigin::Lua {
+            thinking,
+            fast,
+            reply_tx,
+        } = pick.origin
+        {
+            let _ = reply_tx.send(apply_settings(&mut self.sessions[idx].app, thinking, fast));
+        }
+    }
+
+    fn refuse_pick(&mut self, origin: PickOrigin, error: String) {
+        match origin {
+            PickOrigin::Picker => self.focused_app().flash(error),
+            PickOrigin::Lua { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+        }
     }
 
     /// Prepares a package command as a task.
@@ -2400,9 +2552,8 @@ impl<'t> EventLoop<'t> {
             self.rebuild_models();
         } else if let Some(default_model) =
             maki_config::providers::builtin_provider(&slug).and_then(|b| b.default_model)
-            && let Err(e) = self.change_model(default_model)
         {
-            self.focused_app().flash(e);
+            self.change_model(default_model.to_owned(), PickOrigin::Picker);
         }
     }
 
@@ -2517,6 +2668,8 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::model_slots::MODEL_POLICY_ERR;
+    use crate::agent::model_slots::tests::{OTHER_SPEC, STARTUP_SPEC, slots, strict_policy};
     use crate::app::tests::{MOVED_ID, app_with_moved_call, end_turn};
     use crate::components::BackgroundOutcome;
     use maki_agent::DoneReason;
@@ -2785,5 +2938,75 @@ mod tests {
         let answer = answered(&mut opening).await.unwrap();
         assert_eq!(answer.opened.err().as_deref(), Some(OPEN_ERROR));
         assert!(opening.is_none());
+    }
+
+    const THIRD_SPEC: &str = "opencode/third";
+    const OUT_OF_ORDER: &str = "every pick must settle once, in the order it was made";
+    const NO_STARTUP_SLOT: &str = "the startup spec has a slot from the start";
+
+    fn pick(spec: &str) -> Pick {
+        Pick {
+            spec: spec.to_owned(),
+            tab: Weak::new(),
+            origin: PickOrigin::Picker,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tab_shows_its_last_pick_as_pending_until_it_settles() {
+        let mut slots = slots(ModelPolicy::default());
+        let startup = slots.get(STARTUP_SPEC).expect(NO_STARTUP_SLOT);
+        let tab = Arc::new(ArcSwap::from(startup));
+        let mut picks = Picks::default();
+        picks
+            .queued
+            .extend([OTHER_SPEC, THIRD_SPEC].map(|spec| Pick {
+                tab: Arc::downgrade(&tab),
+                ..pick(spec)
+            }));
+
+        picks.advance(&mut slots, None);
+        assert_eq!(picks.pending_for(&tab), Some(THIRD_SPEC));
+        let landed = answered(&mut picks.building).await;
+        picks.advance(&mut slots, landed);
+        assert_eq!(picks.pending_for(&tab), Some(THIRD_SPEC));
+        let landed = answered(&mut picks.building).await;
+        picks.advance(&mut slots, landed);
+        assert_eq!(picks.pending_for(&tab), None);
+    }
+
+    #[test_case(ModelPolicy::default(), false, &[(OTHER_SPEC, true), (THIRD_SPEC, true)] ; "two_builds_apply_in_order")]
+    #[test_case(ModelPolicy::default(), false, &[(OTHER_SPEC, true), (STARTUP_SPEC, true)] ; "a_built_spec_waits_behind_a_build")]
+    #[test_case(ModelPolicy::default(), true, &[(OTHER_SPEC, true), (STARTUP_SPEC, true)] ; "a_stale_build_runs_again_ahead_of_the_queue")]
+    #[test_case(strict_policy(), false, &[(OTHER_SPEC, false), (STARTUP_SPEC, true)] ; "a_refused_pick_does_not_hold_up_the_queue")]
+    #[tokio::test]
+    async fn picks_settle_once_each_in_the_order_they_were_made(
+        policy: ModelPolicy,
+        invalidate_mid_build: bool,
+        expected: &[(&str, bool)],
+    ) {
+        let mut slots = slots(policy);
+        let mut picks = Picks::default();
+        picks
+            .queued
+            .extend(expected.iter().map(|(spec, _)| pick(spec)));
+
+        let mut settled = picks.advance(&mut slots, None);
+        if invalidate_mid_build {
+            slots.invalidate();
+        }
+        while picks.building.is_some() {
+            let landed = answered(&mut picks.building).await;
+            settled.extend(picks.advance(&mut slots, landed));
+        }
+
+        let order: Vec<(&str, bool)> = settled
+            .iter()
+            .map(|(pick, built)| (pick.spec.as_str(), built.is_ok()))
+            .collect();
+        assert_eq!(order, expected, "{OUT_OF_ORDER}");
+        for error in settled.iter().filter_map(|(_, built)| built.as_ref().err()) {
+            assert!(error.starts_with(MODEL_POLICY_ERR), "{error}");
+        }
     }
 }

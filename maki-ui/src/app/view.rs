@@ -16,6 +16,8 @@ use ratatui::widgets::{Block, Borders, Widget};
 
 use super::{App, KeyboardOwner, Mode};
 
+const PICKING_ARROW: &str = " → ";
+
 /// A tab without an input box, a finished task's or a moved call's, has
 /// only this hint to say how to get out and where to stop it.
 pub(super) const NO_INPUT_TAB_HINT: &str = " esc back · ctrl+x tasks ";
@@ -423,14 +425,19 @@ impl App {
             fast: self.state.fast,
         });
         let (mode_label, mode_style) = self.mode_label();
+        let picking = self
+            .picking
+            .as_ref()
+            .filter(|_| chat.model_id.is_none())
+            .map(|picked| format!("{}{PICKING_ARROW}{picked}", self.state.session.model));
         let ctx = StatusBarContext {
             status: &self.status,
             motion: self.status_motion(),
             mode_label,
             mode_style,
-            model_id: chat
-                .model_id
+            model_id: picking
                 .as_deref()
+                .or(chat.model_id.as_deref())
                 .unwrap_or(&self.state.session.model),
             stats: UsageStats {
                 global_cost: self.state.cost,
