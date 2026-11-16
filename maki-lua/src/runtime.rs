@@ -1998,8 +1998,9 @@ impl Watchdog {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = thread::spawn({
             let stop = Arc::clone(&stop);
-            // Keeps the VM alive while this thread can still write to it,
-            // even if a refactor reorders drops.
+            // Keeps the VM alive while this thread can still write to it.
+            // `LuaRuntime` joins the thread before dropping its `lua`, so this
+            // clone never closes the VM.
             let keep_alive = lua.clone();
             move || {
                 let _keep_alive = keep_alive;
@@ -3766,8 +3767,9 @@ struct PluginOwner {
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, PluginOwner>>>;
 
 struct LuaRuntime {
-    /// Held for its Drop (joins the poker thread). Field order doesn't
-    /// matter: the thread keeps its own `Lua` clone alive.
+    /// Held for its Drop (joins the poker thread). Declared before `lua`, so
+    /// the thread's `Lua` clone is gone when `lua` drops and the VM closes on
+    /// the Lua thread, inside the runtime.
     _watchdog: Watchdog,
     lua: Lua,
     pending: PendingTools,
@@ -3856,24 +3858,29 @@ impl LuaRuntime {
         lua.set_app_data(Arc::clone(&registry));
 
         let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
+        // The thread-locals outlive `self`. A strong `Lua` in them would close
+        // the VM during thread-local destruction, outside the tokio runtime.
         {
-            let lua = lua.clone();
+            let lua = lua.weak();
             let plugins = Rc::clone(&plugins);
             crate::api::tool::set_local_describe(move |plugin, tool, dctx| {
-                run_describe(&lua, &plugins, plugin, tool, dctx)
+                lua.try_upgrade()
+                    .and_then(|lua| run_describe(&lua, &plugins, plugin, tool, dctx))
             });
         }
         {
-            let lua = lua.clone();
+            let lua = lua.weak();
             let plugins = Rc::clone(&plugins);
             crate::api::slot::set_layer_delegation(move |layer, cost, slot| {
-                layer_delegation(&lua, &plugins, cost)(layer, slot)
+                lua.try_upgrade()
+                    .is_some_and(|lua| layer_delegation(&lua, &plugins, cost)(layer, slot))
             });
         }
         {
-            let lua = lua.clone();
+            let lua = lua.weak();
             let plugins = Rc::clone(&plugins);
             crate::api::tool::set_local_tool_handles(move |tool| {
+                let lua = lua.try_upgrade()?;
                 let plugins = plugins.borrow();
                 let tk = plugins.values().find_map(|owner| owner.tools.get(tool))?;
                 let to_fn = |key: Option<&RegistryKey>| {

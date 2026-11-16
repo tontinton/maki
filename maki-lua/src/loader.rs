@@ -1432,6 +1432,37 @@ mod tests {
         assert!(host.load_source("later", "return {}").is_err());
     }
 
+    struct RuntimeProbe(SyncSender<bool>);
+
+    impl Drop for RuntimeProbe {
+        fn drop(&mut self) {
+            let _ = self.0.send(Handle::try_current().is_ok());
+        }
+    }
+
+    /// The session snapshot slot is the one Rust value a test can hand the
+    /// VM, and it drops with the VM. Loading the builtins is a round trip on
+    /// the lane the slot request takes, so the slot is set before the
+    /// priority-lane `Shutdown`; it also checks that no bundled plugin keeps
+    /// the VM open past the host.
+    #[test]
+    fn the_vm_closes_inside_the_runtime_when_the_host_drops() {
+        let (seen_tx, seen_rx) = sync_channel(1);
+        let probe = RuntimeProbe(seen_tx);
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.event_handle()
+            .install_session_snapshot(Box::new(move |_| {
+                let _ = &probe;
+                Ok(serde_json::Value::Null)
+            }));
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .unwrap();
+
+        drop(host);
+
+        assert_eq!(seen_rx.recv(), Ok(true));
+    }
+
     /// Regression for the exit drain in `runtime::spawn`. An `EventHandle`
     /// clone keeps queued requests alive after the Lua thread exits, and
     /// dispatch prefers the priority lane, so a bulk request queued behind
