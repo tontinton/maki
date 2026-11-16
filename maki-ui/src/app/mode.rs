@@ -1,7 +1,10 @@
 use std::borrow::Cow;
+use std::fs;
+use std::mem;
 use std::path::{Path, PathBuf};
 
 use crate::agent::QueuedMessage;
+use crate::components::DisplayMessage;
 use crate::theme;
 use maki_agent::{AgentInput, AgentMode, InputSource};
 use maki_lua::agent_autocmd::HostEvent;
@@ -9,18 +12,14 @@ use maki_providers::RequestOptions;
 use maki_storage::StateDir;
 use maki_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
+use tracing::debug;
 
-use super::App;
+use super::{App, Status};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Build,
     Plan,
-}
-
-pub(crate) enum PlanTrigger {
-    WriteDone,
-    InteractivePrompt,
 }
 
 impl Mode {
@@ -37,31 +36,42 @@ pub(crate) enum PlanState {
     #[default]
     None,
     Drafting(PathBuf),
-    Ready(PathBuf),
+    /// Offered for review. `revision` is the content this transcript was
+    /// offered, `None` for a plan restored from disk until it is offered again.
+    Ready {
+        path: PathBuf,
+        revision: Option<String>,
+    },
 }
 
 impl PlanState {
     pub(crate) fn path(&self) -> Option<&Path> {
         match self {
             Self::None => Option::None,
-            Self::Drafting(p) | Self::Ready(p) => Some(p),
+            Self::Drafting(path) | Self::Ready { path, .. } => Some(path),
         }
     }
 
-    pub(crate) fn mark_ready(&mut self) {
-        if let Self::Drafting(p) = self {
-            *self = Self::Ready(std::mem::take(p));
-        }
-    }
-
-    pub(crate) fn mark_drafting(&mut self) {
-        if let Self::Ready(p) = self {
-            *self = Self::Drafting(std::mem::take(p));
-        }
+    /// Take {content} up for review, unless it is the revision already
+    /// offered.
+    pub(crate) fn offer(&mut self, content: &str) -> bool {
+        let path = match self {
+            Self::None => return false,
+            Self::Ready {
+                revision: Some(revision),
+                ..
+            } if revision == content => return false,
+            Self::Drafting(path) | Self::Ready { path, .. } => mem::take(path),
+        };
+        *self = Self::Ready {
+            path,
+            revision: Some(content.to_owned()),
+        };
+        true
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready(_))
+        matches!(self, Self::Ready { .. })
     }
 
     pub(crate) fn allocate_path(&mut self, storage: &StateDir) {
@@ -74,31 +84,40 @@ impl PlanState {
 }
 
 impl App {
-    pub(crate) fn transition_plan(&mut self, trigger: PlanTrigger) {
-        if self.state.mode != Mode::Plan {
-            return;
+    /// The run in front ended and nothing is queued behind it, so the plan
+    /// file holds what the agent hands the user. A failed run leaves the
+    /// error to deal with first.
+    pub(crate) fn on_queue_drained(&mut self) {
+        if self.state.mode == Mode::Plan && self.status == Status::Idle {
+            self.offer_plan_revision();
         }
-        match trigger {
-            PlanTrigger::WriteDone => {
-                if self.state.plan.is_ready() {
-                    return;
-                }
-                self.state.plan.mark_ready();
-                let path = self.state.plan.path().map(|p| p.display().to_string());
-                self.offer_plan_form(path.as_deref());
-                // The path is the whole point here, so with no path we stay
-                // quiet instead of handing a plugin an empty one to open.
-                if let Some(path) = path {
-                    self.fire_session_event(HostEvent::PlanReady { path: &path });
-                }
+    }
+
+    /// Put the plan file up for review when its content is a revision this
+    /// transcript has not been offered yet: shown in full, then the form and
+    /// `PlanReady`. Reading the file rather than watching writes
+    /// catches every way it changed, nested and delegated tool calls too.
+    pub(super) fn offer_plan_revision(&mut self) -> bool {
+        let Some(path) = self.state.plan.path() else {
+            return false;
+        };
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) => {
+                debug!(path = %path.display(), %error, "no plan revision to offer");
+                return false;
             }
-            PlanTrigger::InteractivePrompt => {
-                if self.state.plan.is_ready() {
-                    self.state.plan.mark_drafting();
-                    self.plan_form.on_plan_drafting();
-                }
-            }
+        };
+        let path = path.display().to_string();
+        if !self.state.plan.offer(&content) {
+            return false;
         }
+        self.plan_form.reset();
+        self.main_chat()
+            .push(DisplayMessage::plan(content, path.clone()));
+        self.offer_plan_form(Some(&path));
+        self.fire_session_event(HostEvent::PlanReady { path: &path });
+        true
     }
 
     pub(super) fn enter_plan(&mut self) {

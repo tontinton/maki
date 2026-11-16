@@ -14,7 +14,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
-use super::{App, KeyboardOwner, Mode};
+use super::{App, KeyboardOwner};
 
 /// A tab without an input box, a finished task's or a moved call's, has
 /// only this hint to say how to get out and where to stop it.
@@ -282,7 +282,8 @@ impl App {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
             let placeholder = self.input_placeholder();
-            let panel_hint = (self.state.mode == Mode::Plan)
+            let panel_hint = self
+                .plan_toggle_ready()
                 .then(|| self.plan_form.hint_line())
                 .flatten()
                 .or_else(|| self.lua_hint_line());
