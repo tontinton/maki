@@ -116,12 +116,16 @@ impl FileAccess {
     }
 
     pub fn check_before_edit(&self, key: &FileKey) -> Result<(), String> {
-        let mut guard = self.mtimes.lock().unwrap();
-        let Some(&recorded) = guard.get(key) else {
+        let Some(recorded) = self.mtimes.lock().unwrap().get(key).copied() else {
             return Ok(());
         };
         let Some(current) = get_mtime(key.as_path()) else {
-            guard.remove(key);
+            // A sibling may have read a recreated file since the copy above,
+            // and its record must survive.
+            let mut mtimes = self.mtimes.lock().unwrap();
+            if mtimes.get(key) == Some(&recorded) {
+                mtimes.remove(key);
+            }
             return Ok(());
         };
         if recorded != current {
