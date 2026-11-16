@@ -2,7 +2,7 @@ use std::any::Any;
 use std::fmt::Write;
 use std::ops::AddAssign;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -15,8 +15,8 @@ use maki_providers::{
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
-use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{Notify, watch};
 
 use crate::SessionControl;
 pub const NO_FILES_FOUND: &str = "No files found";
@@ -891,10 +891,12 @@ impl UiWaker {
 }
 
 /// Append-only buffer for streaming tool output to the UI. Writers append
-/// under a Mutex, readers get a cheap Arc clone through a [`BufWatch`].
+/// to a watch channel, readers get a cheap Arc clone through a [`BufWatch`].
 pub struct SharedBuf {
-    committed: Mutex<BufferSnapshot>,
-    version: AtomicU64,
+    committed: watch::Sender<BufferSnapshot>,
+    /// Never marks anything seen, so a watch cloned from it sees the buf's
+    /// content once a write happened, and nothing on an untouched buf.
+    unseen: watch::Receiver<BufferSnapshot>,
     /// Only a buffer shown in a plugin window gets one, since the UI reads
     /// those on a tick. A tool body is repainted by the agent events that
     /// carry it.
@@ -909,9 +911,10 @@ pub struct SharedBuf {
 
 impl SharedBuf {
     pub fn new() -> Self {
+        let (committed, unseen) = watch::channel(BufferSnapshot::default());
         Self {
-            committed: Mutex::default(),
-            version: AtomicU64::new(0),
+            committed,
+            unseen,
             waker: OnceLock::new(),
             on_change: Mutex::new(None),
             click: Mutex::new(None),
@@ -970,10 +973,9 @@ impl SharedBuf {
     }
 
     pub fn append(&self, line: SnapshotLine) {
-        let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::make_mut(&mut guard.lines).push(line);
-        drop(guard);
-        self.changed();
+        self.committed
+            .send_modify(|snapshot| Arc::make_mut(&mut snapshot.lines).push(line));
+        self.notify_change();
     }
 
     pub fn set_lines(&self, lines: Vec<SnapshotLine>) {
@@ -982,26 +984,15 @@ impl SharedBuf {
 
     /// See [`BufferSnapshot::head`].
     pub fn set_lines_with_head(&self, lines: Vec<SnapshotLine>, head: usize) {
-        let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = BufferSnapshot {
+        self.committed.send_replace(BufferSnapshot {
             lines: Arc::new(lines),
             head,
-        };
-        drop(guard);
-        self.changed();
-    }
-
-    fn changed(&self) {
-        self.version.fetch_add(1, Ordering::Release);
+        });
         self.notify_change();
     }
 
     pub fn len(&self) -> usize {
-        self.committed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .lines
-            .len()
+        self.committed.borrow().lines.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1013,10 +1004,7 @@ impl SharedBuf {
     }
 
     pub fn take(&self) -> BufferSnapshot {
-        self.committed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.committed.borrow().clone()
     }
 }
 
@@ -1025,26 +1013,25 @@ impl SharedBuf {
 /// own mark, and one reading never hides a change from the other.
 pub struct BufWatch {
     buf: Arc<SharedBuf>,
-    seen: u64,
+    rx: watch::Receiver<BufferSnapshot>,
 }
 
 impl BufWatch {
     pub fn new(buf: Arc<SharedBuf>) -> Self {
-        Self { buf, seen: 0 }
+        let rx = buf.unseen.clone();
+        Self { buf, rx }
     }
 
     pub fn buf(&self) -> &Arc<SharedBuf> {
         &self.buf
     }
 
-    /// The buf's lines, if they changed since this watch last looked. The
-    /// copy may already hold a later change, which the next look reads again.
+    /// The buf's lines, if they changed since this watch last looked.
     pub fn changed(&mut self) -> Option<BufferSnapshot> {
-        let version = self.buf.version.load(Ordering::Acquire);
-        (version != self.seen).then(|| {
-            self.seen = version;
-            self.buf.take()
-        })
+        self.rx
+            .has_changed()
+            .unwrap_or(false)
+            .then(|| self.rx.borrow_and_update().clone())
     }
 }
 
@@ -1881,16 +1868,14 @@ mod tests {
         assert_eq!(buf.read().len(), 3);
     }
 
-    #[test]
-    fn shared_buf_poisoned_mutex_recovery() {
+    #[test_case(&[],         ""     ; "emptied_buf_reports_the_write")]
+    #[test_case(&["a", "b"], "a\nb" ; "written_buf_shows_its_content")]
+    fn fresh_watch_sees_what_was_written(written: &[&str], expected: &str) {
         let buf = Arc::new(SharedBuf::new());
-        let buf2 = Arc::clone(&buf);
-        let h = std::thread::spawn(move || {
-            let _guard = buf2.committed.lock().unwrap();
-            panic!("intentional poison");
-        });
-        let _ = h.join();
-        buf.append(SnapshotLine { spans: vec![] });
+        buf.set_lines(written.iter().copied().map(line).collect());
+        let mut watch = BufWatch::new(buf);
+        assert_eq!(watch.changed().unwrap().text(), expected);
+        assert!(watch.changed().is_none());
     }
 
     #[test]
