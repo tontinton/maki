@@ -427,6 +427,7 @@ mod tests {
     use crate::{BackgroundNotice, InputSource, RunContext, SessionDefaults, TaskEnd};
 
     use super::*;
+    use crate::agent::testing::sync_builder;
     use crate::agent::{live_header, live_history};
 
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
@@ -547,7 +548,7 @@ mod tests {
     fn run_params<'a>(turn: &'a mut SessionTurn<'_>) -> AgentRunParams<'a> {
         turn.run_params(
             EventSender::new(unbounded_channel().0, 0),
-            Arc::new(|_, _| RunContext::fixed(String::new(), RequestTools::default())),
+            sync_builder(|_, _| RunContext::fixed(String::new(), RequestTools::default())),
         )
     }
 

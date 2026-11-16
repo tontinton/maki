@@ -168,7 +168,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
-    use crate::agent::testing::{agent_params, fixed_context};
+    use crate::agent::testing::{agent_params, fixed_context, sync_builder};
     use crate::cancel::CancelTrigger;
     use crate::session_control::Delivery;
     use crate::session_control::testing::input;
@@ -266,7 +266,7 @@ mod tests {
                     history: &mut self.history,
                     gauge: &mut self.gauge,
                     event_tx: self.event_tx.clone(),
-                    context: Arc::new(|_, _| fixed_context()),
+                    context: sync_builder(|_, _| fixed_context()),
                 },
             )
         }

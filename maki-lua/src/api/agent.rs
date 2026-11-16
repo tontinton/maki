@@ -2,6 +2,7 @@
 //! validation, concurrency) lives in the task plugin, not here.
 
 use std::collections::{HashMap, HashSet};
+use std::future::ready;
 use std::pin::pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -1316,7 +1317,7 @@ async fn session(
     let tools = RequestTools::assembled(JsonValue::Array(tools_json), &agent_ctx.config, &model);
     let system = system.unwrap_or_default();
     let context: RunContextBuilder =
-        Arc::new(move |_, _| RunContext::fixed(system.clone(), tools.clone()));
+        Arc::new(move |_, _| Box::pin(ready(RunContext::fixed(system.clone(), tools.clone()))));
 
     let state = SessionState {
         params: AgentParams {

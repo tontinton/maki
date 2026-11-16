@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::future::{Future, ready};
 use std::iter;
 use std::mem;
 use std::path::PathBuf;
@@ -393,7 +393,7 @@ impl ContextSpec {
     }
 
     fn builder(self) -> RunContextBuilder {
-        Arc::new(move |model, workflow| self.render(model, workflow))
+        Arc::new(move |model, workflow| Box::pin(ready(self.render(model, workflow))))
     }
 }
 

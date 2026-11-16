@@ -1,4 +1,5 @@
 use crate::agent::UnboundedSender;
+use std::future::ready;
 use std::sync::Arc;
 
 use maki_agent::agent::{self, AgentHooks};
@@ -231,7 +232,8 @@ impl AgentLoop {
         let host_prompt = Arc::clone(&self.host_prompt);
         let context: RunContextBuilder = Arc::new(move |model, workflow| {
             let tools = base_tools(&vars, model, &config, has_mcp, workflow);
-            host_prompt.context(&vars, &instructions, &slots, model, tools)
+            let rendered = host_prompt.context(&vars, &instructions, &slots, model, tools);
+            Box::pin(ready(rendered))
         });
         (context, prompt_slots)
     }
@@ -254,7 +256,7 @@ impl AgentLoop {
         .await;
         // The summary goes out under a fresh frame for the session's own model,
         // so the gauge and `/btw` read the prompt the next run sends.
-        let next = context(&slot.model, compaction.workflow);
+        let next = context(&slot.model, compaction.workflow).await;
         let hooks = AgentHooks {
             registry: ToolRegistry::global(),
             session_id: Some(&self.seed.session_id),
