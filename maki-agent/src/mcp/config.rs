@@ -332,7 +332,7 @@ pub fn parse_server(
     }
     if server.timeout == 0 {
         return Err(McpError::Config(format!(
-            "server '{name}' timeout must be > 1"
+            "server '{name}' timeout must be > 0"
         )));
     }
     let transport = match server.transport {
