@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
@@ -20,6 +21,11 @@ const PERMISSIONS_FILE: &str = "permissions.toml";
 const ENV_FILE: &str = ".env";
 pub const UNTRUSTED_PROJECT_WRITE: &str =
     "folder is not trusted, so nothing was saved to .maki/permissions.toml";
+
+/// Held across `append_permission_rule`'s read-modify-write, so always-answers
+/// from any session or tab of this process land one after another instead of
+/// the last write dropping the others.
+static PERMISSION_WRITE: Mutex<()> = Mutex::new(());
 
 pub mod project;
 pub use project::{GatedFile, ProjectConfig, policy_grant};
@@ -2726,6 +2732,9 @@ fn append_permission_rule_with_global(
     target: &PermissionTarget,
     global: Option<PathBuf>,
 ) -> Result<(), String> {
+    let _write = PERMISSION_WRITE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     match target {
         PermissionTarget::Global => append_global_permission(tool, scope, effect, global),
         PermissionTarget::Project(project_config) => {
