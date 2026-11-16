@@ -300,7 +300,7 @@ pub(crate) async fn fetch_built(
             if !provider_available(&cat.slug) {
                 continue;
             }
-            let slug = cat.slug;
+            let slug = cat.slug.clone();
             let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
             let _ = tx_catalog.send(ModelBatch {
                 provider: slug,

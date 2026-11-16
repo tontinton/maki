@@ -216,9 +216,9 @@ impl Opencode {
     }
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
-        let guard = shared_catalog().await.lock().unwrap();
-        let Some(data) = guard.provider(ZEN_SLUG) else {
-            return if zen_has_key(&guard.state_dir) {
+        let catalog = shared_catalog().await;
+        let Some(data) = catalog.provider(ZEN_SLUG) else {
+            return if zen_has_key(&catalog.state_dir) {
                 Err(AgentError::Config {
                     message: CATALOG_UNAVAILABLE.into(),
                 })
@@ -226,7 +226,7 @@ impl Opencode {
                 Ok(Vec::new())
             };
         };
-        Ok(data.available_models(&guard.state_dir, data.free_models_enabled()))
+        Ok(data.available_models(&catalog.state_dir, data.free_models_enabled()))
     }
 
     async fn lookup(
@@ -235,8 +235,8 @@ impl Opencode {
         actual_id: &str,
         session_id: Option<&SessionRef>,
     ) -> Result<(CatalogMeta, EndpointType, ResolvedAuth), AgentError> {
-        let guard = shared_catalog().await.lock().unwrap();
-        let (meta, provider_data) = guard.lookup(sub_provider, actual_id)?;
+        let catalog = shared_catalog().await;
+        let (meta, provider_data) = catalog.lookup(sub_provider, actual_id)?;
         let override_auth = self
             .auth
             .clone()
@@ -251,7 +251,7 @@ impl Opencode {
         let auth = match override_auth {
             Some(auth) => auth,
             None => provider_data
-                .catalog_auth(&guard.state_dir, provider_data.free_models_enabled())?
+                .catalog_auth(&catalog.state_dir, provider_data.free_models_enabled())?
                 .unlocked(sub_provider)?
                 .clone(),
         };
