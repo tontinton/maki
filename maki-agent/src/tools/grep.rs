@@ -1,6 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, PoisonError};
 
 use crate::{GrepFileEntry, GrepLine, GrepMatchGroup};
 use grep_regex::RegexMatcher;
@@ -90,18 +90,12 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
     };
     let has_context = params.context_before > 0 || params.context_after > 0;
     let max_line_bytes = params.max_line_bytes;
-    let results: Arc<Mutex<Vec<GrepFileEntry>>> = Arc::new(Mutex::new(Vec::new()));
-    let base: Arc<Path> = Arc::from(base);
+    let results = Mutex::new(Vec::new());
 
     walker.build_parallel().run({
-        let results = Arc::clone(&results);
-        let matcher = Arc::new(matcher);
-        let base = Arc::clone(&base);
+        let (results, matcher) = (&results, &matcher);
         move || {
             let mut searcher = builder.build();
-            let matcher = Arc::clone(&matcher);
-            let results = Arc::clone(&results);
-            let base = Arc::clone(&base);
             Box::new(move |entry| {
                 let entry = match entry {
                     Ok(e) => e,
@@ -118,23 +112,25 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
                     max_line_bytes,
                     has_context,
                 };
-                let _ = searcher.search_path(&*matcher, &path, &mut sink);
+                let _ = searcher.search_path(matcher, &path, &mut sink);
 
                 if !groups.is_empty() {
                     let rel = path
-                        .strip_prefix(&*base)
+                        .strip_prefix(base)
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .into_owned();
-                    let mut guard = results.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.push(GrepFileEntry { path: rel, groups });
+                    results
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(GrepFileEntry { path: rel, groups });
                 }
                 WalkState::Continue
             })
         }
     });
 
-    let mut entries = std::mem::take(&mut *results.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut entries = results.into_inner().unwrap_or_else(PoisonError::into_inner);
 
     if entries.is_empty() {
         return Ok((base.to_path_buf(), entries));

@@ -24,7 +24,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
@@ -186,7 +186,7 @@ impl ServerEntry {
                 true
             })
             .map(|info| McpToolDef {
-                qualified_name: intern(format!("{}{SEPARATOR}{}", self.name, info.name)),
+                qualified_name: Arc::from(format!("{}{SEPARATOR}{}", self.name, info.name)),
                 raw_name: info.name.into_owned(),
                 description: info.description.unwrap_or_default().into_owned(),
                 input_schema: Value::Object(Arc::unwrap_or_clone(info.input_schema)),
@@ -648,7 +648,7 @@ impl McpHandle {
     }
 
     /// Where wire names (`server__tool`, what providers send) and internal names
-    /// (`server.tool`, what the index holds) meet. Returns the interned qualified
+    /// (`server.tool`, what the index holds) meet. Returns the index's qualified
     /// name every other MCP entry point takes, or `None` when no server publishes
     /// it. Deferred tools resolve too: hidden from the tool array is not the same
     /// as uncallable.
@@ -1373,19 +1373,6 @@ pub fn kill_process_groups(pids: &[u32]) {
 #[cfg(not(unix))]
 pub fn kill_process_groups(_pids: &[u32]) {}
 
-/// Dedup cache for qualified MCP tool names. The set is bounded (finite per session)
-/// and `Arc<str>` means entries get freed when the cache drops, unlike the old `Box::leak`.
-fn intern(name: String) -> Arc<str> {
-    static CACHE: LazyLock<Mutex<HashMap<String, Arc<str>>>> = LazyLock::new(Mutex::default);
-    let mut map = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(existing) = map.get(&name) {
-        return Arc::clone(existing);
-    }
-    let arc: Arc<str> = Arc::from(name.as_str());
-    map.insert(name, Arc::clone(&arc));
-    arc
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1486,7 +1473,7 @@ mod tests {
     }
 
     fn fake_entry(name: &str, transport: Arc<dyn McpTransport>) -> ServerEntry {
-        let qualified = intern(format!("{name}{SEPARATOR}tool"));
+        let qualified = Arc::from(format!("{name}{SEPARATOR}tool"));
         ServerEntry {
             name: name.into(),
             config: None,
@@ -1778,7 +1765,7 @@ mod tests {
         let mut entry = fake_entry("srv", Arc::clone(&transport));
         entry.tools = (0..MAX_SEARCH_LOADS + 2)
             .map(|i| McpToolDef {
-                qualified_name: intern(format!("srv{SEPARATOR}tool-{i}")),
+                qualified_name: Arc::from(format!("srv{SEPARATOR}tool-{i}")),
                 raw_name: format!("tool-{i}"),
                 description: String::new(),
                 input_schema: json!({}),
@@ -1813,7 +1800,7 @@ mod tests {
 
     fn tool_def(server: &str, raw: &str, description: &str, schema: Value) -> McpToolDef {
         McpToolDef {
-            qualified_name: intern(format!("{server}{SEPARATOR}{raw}")),
+            qualified_name: Arc::from(format!("{server}{SEPARATOR}{raw}")),
             raw_name: raw.into(),
             description: description.into(),
             input_schema: schema,
