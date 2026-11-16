@@ -116,7 +116,6 @@ pub type HintEntries = Vec<HintEntry>;
 #[derive(Clone, Default)]
 pub struct HintSnapshot {
     pub entries: HintEntries,
-    pub generation: u64,
 }
 
 impl HintSnapshot {
@@ -154,7 +153,6 @@ impl HintReader {
 /// Publishing end of a plugin's status hints, owned by the Lua thread.
 pub(crate) struct HintWriter {
     store: Arc<ArcSwap<HintSnapshot>>,
-    generation: AtomicU64,
 }
 
 impl HintWriter {
@@ -163,18 +161,13 @@ impl HintWriter {
         (
             Self {
                 store: Arc::clone(&inner),
-                generation: AtomicU64::new(0),
             },
             HintReader(inner),
         )
     }
 
     pub fn publish(&self, entries: HintEntries) {
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.store.store(Arc::new(HintSnapshot {
-            entries,
-            generation,
-        }));
+        self.store.store(Arc::new(HintSnapshot { entries }));
     }
 }
 
@@ -1202,7 +1195,6 @@ mod tests {
 
         let snap = reader.load_full();
         assert_eq!(snap.entries.len(), 1);
-        assert_eq!(snap.generation, 1);
     }
 
     const SHADOWED_PLUGIN: &str = "shadowed";
@@ -1228,7 +1220,6 @@ mod tests {
                 hint(SHADOWED_PLUGIN, None, EVERY_TAB_HINT),
                 hint(SHADOWED_PLUGIN, Some(owner), SESSION_HINT),
             ],
-            generation: 0,
         };
         let tab = if own_tab { owner } else { MakiId::generate() };
 

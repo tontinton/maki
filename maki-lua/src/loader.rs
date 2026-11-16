@@ -263,10 +263,11 @@ pub(crate) fn lib_dir() -> &'static Dir<'static> {
         .dir
 }
 
-static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
-    let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
-    Vec::leak(dirs)
-});
+pub(crate) fn bundled_source(rel_path: &str) -> Option<&'static str> {
+    BUNDLED_PLUGINS
+        .iter()
+        .find_map(|p| p.dir.get_file(rel_path).and_then(File::contents_utf8))
+}
 
 /// A package's entrypoints: every `plugin/*.lua`, sorted by filename so load
 /// order is deterministic across machines.
@@ -363,7 +364,6 @@ impl PluginHost {
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
-            *BUNDLED_DIRS,
             interaction,
             jit,
             Arc::clone(&plugin_rules),
