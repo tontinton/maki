@@ -310,13 +310,20 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
             Role::User => {
                 let mut tool_results = Vec::new();
                 let mut text_parts: Vec<&str> = Vec::new();
-                let mut image_parts = Vec::new();
+                // Text and images in the order the user put them, so an
+                // image lands right after the `[Image N]` that names it.
+                let mut parts = Vec::new();
+                let mut has_image = false;
 
                 for block in &msg.content {
                     match block {
-                        ContentBlock::Text { text } => text_parts.push(text.as_str()),
+                        ContentBlock::Text { text } => {
+                            text_parts.push(text.as_str());
+                            parts.push(json!({"type": "text", "text": text}));
+                        }
                         ContentBlock::Image { source } => {
-                            image_parts.push(json!({
+                            has_image = true;
+                            parts.push(json!({
                                 "type": "image_url",
                                 "image_url": { "url": source.to_data_url() }
                             }));
@@ -342,11 +349,7 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                 // Tool messages must directly follow the assistant's
                 // tool_calls, before any user content.
                 out.extend(tool_results);
-                if !image_parts.is_empty() {
-                    let mut parts = image_parts;
-                    if !text_parts.is_empty() {
-                        parts.push(json!({"type": "text", "text": text_parts.join("\n")}));
-                    }
+                if has_image {
                     out.push(json!({"role": "user", "content": parts}));
                 } else if !text_parts.is_empty() {
                     out.push(json!({"role": "user", "content": text_parts.join("\n")}));
@@ -1420,6 +1423,24 @@ data: [DONE]\n\n";
         let result = convert_messages(&msgs, "system");
         assert_eq!(result[1]["role"], "tool");
         assert_eq!(result[1]["content"], crate::types::EMPTY_RESPONSE_MARKER);
+    }
+
+    #[test]
+    fn convert_messages_keeps_images_at_their_markers() {
+        use crate::types::{ImageMediaType, ImageSource};
+        use std::sync::Arc;
+        let image = ImageSource::new(ImageMediaType::Png, Arc::from("abc123"));
+        let msgs = vec![Message::user_with_images(
+            "compare [Image 1] with this".into(),
+            vec![image],
+        )];
+        let result = convert_messages(&msgs, "system");
+        let content = result[1]["content"].as_array().unwrap();
+        let parts: Vec<_> = content
+            .iter()
+            .map(|part| part["text"].as_str().unwrap_or("<image>"))
+            .collect();
+        assert_eq!(parts, ["compare [Image 1]", "<image>", " with this"]);
     }
 
     #[test]

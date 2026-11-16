@@ -16,7 +16,9 @@ use maki_agent::session::SessionHeader;
 use maki_agent::{CompactRequest, SessionMailbox, TaskEnd, Transcript};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{PluginPermissions, PluginReach, SessionEndReason};
-use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
+use maki_providers::{
+    ImageSource, Message, Model, RequestOptions, TokenUsage, estimate_message_tokens,
+};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{
     SessionClaim, SessionMeta, StoredMode, StoredSubagent, StoredWriters,
@@ -346,7 +348,7 @@ impl App {
         let meta = &self.state.session.meta;
         if let Some(draft) = meta.input_draft.clone() {
             let writers = meta.input_draft_writers;
-            self.restore_input(&draft, writers);
+            self.restore_input(&draft, Vec::new(), writers);
         }
 
         self.chats[MAIN_CHAT].request_restores(restore_items);
@@ -741,7 +743,8 @@ impl App {
             self.chats[MAIN_CHAT].set_tool_background(&id, badge);
         }
 
-        self.restore_input(&entry.prompt_text, turn_writers(&entry.prompt_text));
+        let writers = turn_writers(&entry.prompt_text);
+        self.restore_input(&entry.prompt_text, entry.images, writers);
 
         actions.push(Action::RestartAgent(self.install_local_history()));
         actions
@@ -749,9 +752,15 @@ impl App {
 
     /// Puts back a draft from disk or a rewound turn. Its {writers} come back
     /// as one nameless plugin holding what was kept of their grants, see
-    /// [`turn_writers`] for a turn.
-    fn restore_input(&mut self, text: &str, writers: Option<StoredWriters>) {
-        self.input_box.set_input(text);
+    /// [`turn_writers`] for a turn. A rewound turn brings the {images} its
+    /// markers name. A draft on disk kept no images, so it brings none.
+    fn restore_input(
+        &mut self,
+        text: &str,
+        images: Vec<ImageSource>,
+        writers: Option<StoredWriters>,
+    ) {
+        self.input_box.set_input_with_images(text, images);
         if let Some(writers) = writers {
             self.input_box.buffer.add_writer(&unknown_writer(writers));
         }

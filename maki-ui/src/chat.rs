@@ -1013,7 +1013,7 @@ fn build_loaded_tool(
 
 /// Images the user attached. A tool result also rides in a user message, and
 /// its images already render under the tool itself, so those stay out.
-fn user_images(msg: &Message) -> Vec<ImageSource> {
+pub(crate) fn user_images(msg: &Message) -> Vec<ImageSource> {
     if msg
         .content
         .iter()

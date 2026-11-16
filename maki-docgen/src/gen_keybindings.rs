@@ -287,8 +287,9 @@ fn write_overrides(out: &mut String) {
          - An attached image shows as an `[Image N]` marker where it was \
          pasted, so the prompt can refer to it. With the cursor on a marker, \
          the image is previewed above the input. The marker is edited as one \
-         unit, and deleting it detaches the image. A prompt recalled from \
-         history brings its images back if it was sent in this run.\n\
+         unit, and deleting it detaches the image. Rewinding to a prompt brings \
+         its images back. A prompt recalled from history comes back as text \
+         only.\n\
          - Right-click pastes clipboard text on Windows.\n\
          - Middle-click inserts the PRIMARY selection, the same text \
          middle-click pastes in a shell. Linux only, since other platforms \

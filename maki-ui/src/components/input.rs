@@ -3,12 +3,10 @@ mod layout;
 
 use std::borrow::Cow;
 use std::cell::{RefCell, RefMut};
-use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::decor::{LangCache, LineDecor};
 use self::layout::{Layout, Piece, Row};
-use crate::image::MAX_IMAGE_BYTES;
 use crate::text_buffer::{EditResult, Mark, Marks, Prompt, TextBuffer, Writers, is_newline_key};
 use crate::theme;
 
@@ -57,8 +55,6 @@ const BLANK_PLACEHOLDER: &str = " ";
 const BACKGROUND_WAIT_PREFIX: &str = "Waiting on ";
 const BACKGROUND_WAIT_ONE: &str = " background task...";
 const BACKGROUND_WAIT_MANY: &str = " background tasks...";
-const MAX_SENT_IMAGE_PROMPTS: usize = 16;
-const MAX_SENT_IMAGE_BYTES: usize = 2 * MAX_IMAGE_BYTES;
 
 /// What opens the command palette at the start of [`sent_text`].
 pub(crate) const COMMAND_PREFIX: char = '/';
@@ -116,42 +112,6 @@ impl Draft {
     }
 }
 
-/// The images of prompts sent this run, so recalling one from history
-/// brings them back with its `[Image N]` markers. History on disk keeps text
-/// only. Held by the text they went with, newest last, within a budget: the
-/// payloads are large, though shared with the transcript while it has them.
-#[derive(Default)]
-struct SentImages(VecDeque<(String, Vec<ImageSource>)>);
-
-impl SentImages {
-    fn remember(&mut self, text: &str, images: &[ImageSource]) {
-        self.0.retain(|(sent, _)| sent != text);
-        if images.is_empty() {
-            return;
-        }
-        self.0.push_back((text.to_owned(), images.to_vec()));
-        while self.0.len() > MAX_SENT_IMAGE_PROMPTS || self.bytes() > MAX_SENT_IMAGE_BYTES {
-            self.0.pop_front();
-        }
-    }
-
-    fn of(&self, text: &str) -> Vec<ImageSource> {
-        self.0
-            .iter()
-            .rfind(|(sent, _)| sent == text)
-            .map(|(_, images)| images.clone())
-            .unwrap_or_default()
-    }
-
-    fn bytes(&self) -> usize {
-        self.0
-            .iter()
-            .flat_map(|(_, images)| images)
-            .map(|image| image.data.len())
-            .sum()
-    }
-}
-
 pub struct InputBox {
     pub(crate) buffer: TextBuffer,
     history: InputHistory,
@@ -165,7 +125,6 @@ pub struct InputBox {
     pending_images: Vec<ImageSource>,
     /// The images [`Self::draft`] had attached.
     draft_images: Vec<ImageSource>,
-    sent_images: SentImages,
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
@@ -301,7 +260,6 @@ impl InputBox {
             placeholder_hint: random_placeholder_hint(),
             pending_images: Vec::new(),
             draft_images: Vec::new(),
-            sent_images: SentImages::default(),
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
@@ -419,7 +377,6 @@ impl InputBox {
         }
         if !(text.starts_with(COMMAND_PREFIX) && !self.buffer.writers().is_empty()) {
             self.history.push(text.clone());
-            self.sent_images.remember(&text, &images);
         }
         self.discard();
         Some(Submission { text, images })
@@ -585,7 +542,15 @@ impl InputBox {
     /// the same, so the marks of the old one go, see
     /// [`TextBuffer::swap_prompt`].
     pub fn set_input(&mut self, s: &str) {
+        self.set_input_with_images(s, Vec::new());
+    }
+
+    /// [`Self::set_input`] for a prompt that was sent: it comes back with the
+    /// images it went with, so its `[Image N]` markers name them again. The
+    /// images of the prompt it replaces go with that prompt.
+    pub fn set_input_with_images(&mut self, s: &str, images: Vec<ImageSource>) {
         self.buffer.set_value(s);
+        self.pending_images = images;
     }
 
     /// [`Self::set_input`] for text made from what the input holds: a
@@ -607,8 +572,7 @@ impl InputBox {
             return false;
         };
         let entry = self.history_entry(new_index);
-        let images = self.sent_images.of(&entry.text);
-        let shown_images = mem::replace(&mut self.pending_images, images);
+        let shown_images = mem::take(&mut self.pending_images);
         let shown = self.buffer.swap_prompt(entry);
         if self.history_index.replace(new_index).is_none() {
             self.draft = shown;
@@ -618,8 +582,9 @@ impl InputBox {
         true
     }
 
-    /// History keeps text only, so a recalled entry comes in with no marks,
-    /// and as the user's, who sent it. It holds only what went out, in the
+    /// History keeps text only, so a recalled entry comes in with no marks
+    /// and no images, and as the user's, who sent it. Its `[Image N]` markers
+    /// name nothing then, rather than the images of the draft it covers. It holds only what went out, in the
     /// form Enter read it, so it reads the same way again, see
     /// [`sent_text`].
     fn history_entry(&self, index: usize) -> Prompt {
@@ -637,11 +602,7 @@ impl InputBox {
         };
         self.history_index = target;
         let (next, images) = match target {
-            Some(index) => {
-                let entry = self.history_entry(index);
-                let images = self.sent_images.of(&entry.text);
-                (entry, images)
-            }
+            Some(index) => (self.history_entry(index), Vec::new()),
             None => (
                 mem::take(&mut self.draft),
                 mem::take(&mut self.draft_images),
@@ -1454,30 +1415,21 @@ mod tests {
     }
 
     #[test]
-    fn history_recalls_the_images_sent_this_run() {
+    fn history_recall_leaves_the_draft_images_with_the_draft() {
         let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, DESCRIBE);
         input.attach_image(test_image());
         let sent = input.submit().unwrap();
         input.attach_image(test_image());
-        input.attach_image(test_image());
 
         assert!(input.history_up());
-        let recalled = input.submit().unwrap();
-        assert_eq!(recalled.text, sent.text);
-        assert_eq!(recalled.images, sent.images);
-
-        input.attach_image(test_image());
-        input.attach_image(test_image());
-        assert!(input.history_up());
+        assert!(!input.has_images(), "{RECALL_IS_TEXT_ONLY}");
         assert!(input.history_down());
-        assert_eq!(
-            input.submit().unwrap().images.len(),
-            2,
-            "{DRAFT_KEEPS_IMAGES}"
-        );
+        let draft = input.submit().unwrap();
+        assert_eq!(draft.text, sent.text);
+        assert_eq!(draft.images.len(), 1, "{DRAFT_KEEPS_IMAGES}");
     }
 
+    const RECALL_IS_TEXT_ONLY: &str = "a recalled marker must not name the draft's image";
     const DRAFT_KEEPS_IMAGES: &str = "walking back past the history gives the draft its images";
     const PREVIEW_AFTER_PASTE: &str = "the caret right after a paste previews the image";
 

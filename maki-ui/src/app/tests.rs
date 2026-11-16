@@ -5579,6 +5579,7 @@ fn rewind_to_prompt(text: &str) -> RewindEntry {
         turn_index: 2,
         prompt_preview: "2: second".into(),
         prompt_text: text.into(),
+        images: Vec::new(),
     }
 }
 
@@ -5655,6 +5656,24 @@ fn compaction_feedback_stays_out_of_history_and_updates_context(automatic: bool)
     assert_eq!(app.state.session.messages(), history.as_slice());
 }
 
+/// The draft's own image must not stand in for the rewound prompt's.
+#[test_case(1 ; "brings_the_prompts_image")]
+#[test_case(0 ; "drops_the_drafts_image")]
+fn rewind_replaces_the_attached_images(sent_images: usize) {
+    const PROMPT: &str = "second [Image 1]";
+    let sent = ImageSource::new(ImageMediaType::Png, Arc::from("c2VudA=="));
+    let mut app = build_rewind_app();
+    with_image(&mut app);
+    app.rewind_to(RewindEntry {
+        images: vec![sent.clone(); sent_images],
+        ..rewind_to_prompt(PROMPT)
+    });
+
+    let submission = app.input_box.submit().unwrap();
+    assert_eq!(submission.text, PROMPT);
+    assert_eq!(submission.images, vec![sent; sent_images]);
+}
+
 #[test]
 fn rewind_to_first_turn_clears_everything() {
     let mut app = build_rewind_app();
@@ -5665,6 +5684,7 @@ fn rewind_to_first_turn_clears_everything() {
         turn_index: 0,
         prompt_preview: "1: first".into(),
         prompt_text: "first prompt".into(),
+        images: Vec::new(),
     };
     let actions = app.rewind_to(entry);
 
@@ -11401,6 +11421,7 @@ fn checkpoint_after_rewind_persists_the_truncated_history() {
         turn_index: 1,
         prompt_preview: "2: second".into(),
         prompt_text: "second prompt".into(),
+        images: Vec::new(),
     };
     app.rewind_to(entry);
     app.checkpoint();
@@ -11477,6 +11498,7 @@ fn fork_to_first_prompt(app: &mut App) -> Vec<Action> {
         turn_index: 0,
         prompt_preview: "1: first".into(),
         prompt_text: "first prompt".into(),
+        images: Vec::new(),
     })
 }
 
@@ -11578,6 +11600,7 @@ fn rewind_gesture(app: &mut App) -> Vec<Message> {
         turn_index: 1,
         prompt_preview: LIVE_AGENT_TEXT.into(),
         prompt_text: LIVE_AGENT_TEXT.into(),
+        images: Vec::new(),
     }))
 }
 
@@ -11799,6 +11822,7 @@ fn rewinding_to_the_first_prompt_takes_the_session_off_disk() {
         turn_index: 0,
         prompt_preview: LIVE_AGENT_TEXT.into(),
         prompt_text: LIVE_AGENT_TEXT.into(),
+        images: Vec::new(),
     });
     app.checkpoint();
 
@@ -12315,6 +12339,7 @@ fn rewind_stops_the_tasks_whose_receipt_it_drops(turn_index: usize, stops: bool)
         turn_index,
         prompt_preview: String::new(),
         prompt_text: String::new(),
+        images: Vec::new(),
     });
 
     let cancelled = actions.iter().any(|action| {
