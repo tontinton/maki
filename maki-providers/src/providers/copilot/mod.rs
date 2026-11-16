@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use maki_storage::blocking;
 use maki_storage::id::SessionRef;
 use reqwest::header::HeaderMap;
 use reqwest::{Client, Request};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
@@ -112,10 +114,19 @@ const NANO_AIU_PER_USD: f64 = 100_000_000_000.0;
 pub struct Copilot {
     client: Client,
     stream_timeout: Duration,
-    auth: Arc<Mutex<Option<CopilotAuth>>>,
-    resolved_auth: Option<Arc<Mutex<super::ResolvedAuth>>>,
+    credentials: Credentials,
     system_prefix: Option<String>,
-    models: Arc<Mutex<HashMap<String, CopilotModel>>>,
+    models: Mutex<HashMap<String, CopilotModel>>,
+}
+
+enum Credentials {
+    /// Discovered on the first request after construction or `reload_auth`,
+    /// which every agent respawn runs. The lock is held across the discovery,
+    /// so concurrent first requests share one.
+    Discovered(AsyncMutex<Option<Arc<CopilotSession>>>),
+    /// Read per request, since the plugin or Aperture route that owns the
+    /// cell can swap the token in it between calls.
+    Routed(Arc<Mutex<ResolvedAuth>>),
 }
 
 impl Copilot {
@@ -124,10 +135,9 @@ impl Copilot {
         Ok(Self {
             client: super::http_client(timeouts),
             stream_timeout: timeouts.stream,
-            auth: Arc::default(),
-            resolved_auth: None,
+            credentials: Credentials::Discovered(AsyncMutex::default()),
             system_prefix: None,
-            models: Arc::default(),
+            models: Mutex::default(),
         })
     }
 
@@ -138,10 +148,9 @@ impl Copilot {
         Self {
             client: super::http_client(timeouts),
             stream_timeout: timeouts.stream,
-            auth: Arc::default(),
-            resolved_auth: Some(auth),
+            credentials: Credentials::Routed(auth),
             system_prefix: None,
-            models: Arc::default(),
+            models: Mutex::default(),
         }
     }
 
@@ -150,25 +159,31 @@ impl Copilot {
         self
     }
 
-    async fn auth(&self) -> Result<CopilotAuth, AgentError> {
-        if let Some(auth) = &self.resolved_auth {
-            return copilot_auth_from_resolved(&auth.lock().unwrap());
+    async fn auth(&self) -> Result<Arc<CopilotSession>, AgentError> {
+        let cell = match &self.credentials {
+            Credentials::Routed(auth) => {
+                let CopilotAuth { token, endpoint } =
+                    copilot_auth_from_resolved(&auth.lock().unwrap())?;
+                let auth = blocking(move || RequestAuth::load(&token)).await?;
+                return Ok(Arc::new(auth.at(endpoint)));
+            }
+            Credentials::Discovered(cell) => cell,
+        };
+        let mut cell = cell.lock().await;
+        if let Some(auth) = cell.as_ref() {
+            return Ok(Arc::clone(auth));
         }
 
-        if let Some(auth) = self.auth.lock().unwrap().clone() {
-            return Ok(auth);
-        }
-
-        let creds = auth::load_token()?;
+        let (creds, auth) = blocking(|| {
+            let creds = auth::load_token()?;
+            let auth = RequestAuth::load(&creds.api_key)?;
+            Ok::<_, AgentError>((creds, auth))
+        })
+        .await?;
         let host = creds.host.as_deref().unwrap_or("github.com");
         let endpoint =
             discover_api_endpoint(&self.client, &creds.api_key, &auth::graphql_url(host)).await;
-        let auth = CopilotAuth {
-            token: creds.api_key,
-            endpoint,
-        };
-        *self.auth.lock().unwrap() = Some(auth.clone());
-        Ok(auth)
+        Ok(Arc::clone(cell.insert(Arc::new(auth.at(endpoint)))))
     }
 
     async fn model_endpoint(&self, model_id: &str) -> Result<Endpoint, AgentError> {
@@ -206,7 +221,8 @@ impl Copilot {
 
     async fn fetch_models(&self) -> Result<Vec<CopilotModel>, AgentError> {
         let auth = self.auth().await?;
-        let request = copilot_auth(&auth, None)?
+        let request = auth
+            .listing
             .finish(self.client.get(format!("{}{MODELS_PATH}", auth.endpoint)))?;
         let body_text = super::send_request(&self.client, request, |response| async move {
             if !response.status().is_success() {
@@ -296,14 +312,13 @@ impl Copilot {
                 &effort_dialect(&info),
             );
         }
-        let resolved = copilot_auth(&auth, Some(CONVERSATION_AGENT))?;
         responses::do_stream(
             &self.client,
             model,
             &HeaderMap::new(),
             &body,
             event_tx,
-            &resolved,
+            &auth.turn,
             self.stream_timeout,
         )
         .await
@@ -336,7 +351,7 @@ impl Copilot {
     /// `headers`, with the credentials and `[copilot.headers]` over them.
     fn build_post(
         &self,
-        auth: &CopilotAuth,
+        auth: &CopilotSession,
         path: &str,
         body: &Value,
         headers: &[(&str, &str)],
@@ -349,7 +364,7 @@ impl Copilot {
                 .header("content-type", "application/json"),
             |builder, &(name, value)| builder.header(name, value),
         );
-        copilot_auth(auth, Some(CONVERSATION_AGENT))?.finish(builder.body(body))
+        auth.turn.finish(builder.body(body))
     }
 }
 
@@ -366,10 +381,42 @@ pub(crate) fn copilot_usd(copilot_usage: &Value) -> Option<f64> {
         .map(|nano_aiu| nano_aiu / NANO_AIU_PER_USD)
 }
 
-#[derive(Clone)]
 struct CopilotAuth {
     token: String,
     endpoint: String,
+}
+
+/// The listing and the conversation-turn credentials, with `[copilot.headers]`
+/// over them.
+struct RequestAuth {
+    listing: ResolvedAuth,
+    turn: ResolvedAuth,
+}
+
+impl RequestAuth {
+    /// Reads `providers.toml`, so it runs on the blocking pool, and before
+    /// the endpoint discovery, so a broken `[copilot.headers]` fails without
+    /// that round trip.
+    fn load(token: &str) -> Result<Self, AgentError> {
+        Ok(Self {
+            listing: copilot_auth(token, None)?,
+            turn: copilot_auth(token, Some(CONVERSATION_AGENT))?,
+        })
+    }
+
+    fn at(self, endpoint: String) -> CopilotSession {
+        CopilotSession {
+            listing: self.listing,
+            turn: self.turn.with_base_url(Some(endpoint.clone())),
+            endpoint,
+        }
+    }
+}
+
+struct CopilotSession {
+    endpoint: String,
+    listing: ResolvedAuth,
+    turn: ResolvedAuth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -681,19 +728,13 @@ async fn try_discover_api_endpoint(
 
 /// Every Copilot request's credentials and identity, with `[copilot.headers]`
 /// over them.
-fn copilot_auth(
-    auth: &CopilotAuth,
-    interaction_type: Option<&str>,
-) -> Result<ResolvedAuth, AgentError> {
-    Ok(
-        ResolvedAuth::new(SLUG, copilot_headers(auth, interaction_type))?
-            .with_base_url(Some(auth.endpoint.clone())),
-    )
+fn copilot_auth(token: &str, interaction_type: Option<&str>) -> Result<ResolvedAuth, AgentError> {
+    ResolvedAuth::new(SLUG, copilot_headers(token, interaction_type))
 }
 
-fn copilot_headers(auth: &CopilotAuth, interaction_type: Option<&str>) -> Vec<(String, String)> {
+fn copilot_headers(token: &str, interaction_type: Option<&str>) -> Vec<(String, String)> {
     let mut headers = vec![
-        ("authorization".into(), format!("Bearer {}", auth.token)),
+        ("authorization".into(), format!("Bearer {token}")),
         ("editor-version".into(), EDITOR_VERSION_HEADER.into()),
         (
             "copilot-integration-id".into(),
@@ -824,7 +865,9 @@ impl Provider for Copilot {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            *self.auth.lock().unwrap() = None;
+            if let Credentials::Discovered(cell) = &self.credentials {
+                *cell.lock().await = None;
+            }
             Ok(())
         })
     }
@@ -832,9 +875,15 @@ impl Provider for Copilot {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::env;
+
+    use maki_config::providers::{ProviderDef, ProvidersConfig};
+    use tempfile::TempDir;
+
     use super::*;
     use crate::spec::ProviderRegistry;
-    use crate::test_support::{Canned, serve};
+    use crate::test_support::{Canned, Requests, isolated_home, serve};
     use crate::{ContentBlock, Role, TokenUsage};
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
@@ -850,6 +899,16 @@ mod tests {
     const GPT_SPEC: &str = "copilot/gpt-5.4";
     const JSON_CONTENT_TYPE: &str = "application/json";
     const REJECTED: &[Canned] = &[Canned::json(400, r#"{"error":{"message":"rejected"}}"#)];
+    const TUNNEL_REFUSED: Canned = Canned::json(502, r#"{"error":{"message":"no tunnel"}}"#);
+    /// Two discoveries and three `/models` calls, each refused at its tunnel.
+    const REFUSED_TUNNELS: &[Canned] = &[TUNNEL_REFUSED; 5];
+    const CONNECT: &str = "CONNECT";
+    const GRAPHQL_TUNNEL: &str = "api.github.com:443";
+    const HTTPS_PROXY: &str = "https_proxy";
+    const NO_PROXY_VARS: [&str; 2] = ["no_proxy", "NO_PROXY"];
+    const TOKEN: &str = "ghu-test-discovery";
+    const GATEWAY_HEADER: &str = "x-gateway-key";
+    const UNSET_VAR_VALUE: &str = "${MAKI_TEST_COPILOT_UNSET}";
 
     #[test]
     fn endpoint_prefers_messages_then_responses_then_chat() {
@@ -892,16 +951,64 @@ mod tests {
         }
     }
 
+    /// The mock is the HTTPS proxy, so each discovery shows up as a tunnel
+    /// to the GraphQL host and nothing leaves the machine.
+    fn tunneled_copilot() -> (TempDir, Copilot, Requests) {
+        let home = isolated_home();
+        let (proxy, requests) = serve(REFUSED_TUNNELS);
+        // SAFETY: Nextest runs each test in its own process, and the mock's
+        // thread never reads the environment.
+        unsafe {
+            env::set_var(ENV_VAR, TOKEN);
+            env::set_var(HTTPS_PROXY, &proxy);
+            NO_PROXY_VARS.iter().for_each(|var| env::remove_var(var));
+        }
+        (home, Copilot::new(Timeouts::default()).unwrap(), requests)
+    }
+
+    fn discoveries(requests: &Requests) -> usize {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == CONNECT && request.path == GRAPHQL_TUNNEL)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn discovers_once_until_reload_auth() {
+        let (_home, copilot, requests) = tunneled_copilot();
+
+        let _ = tokio::join!(copilot.fetch_models(), copilot.fetch_models());
+        assert_eq!(discoveries(&requests), 1);
+
+        copilot.reload_auth().await.unwrap();
+        let _ = copilot.fetch_models().await;
+        assert_eq!(discoveries(&requests), 2);
+    }
+
+    #[tokio::test]
+    async fn broken_config_headers_fail_before_discovery() {
+        let (_home, copilot, requests) = tunneled_copilot();
+        let mut config = ProvidersConfig::default();
+        let def = ProviderDef {
+            headers: BTreeMap::from([(GATEWAY_HEADER.into(), UNSET_VAR_VALUE.into())]),
+            ..ProviderDef::default()
+        };
+        config.upsert(SLUG.into(), def);
+        config.save().unwrap();
+
+        let result = copilot.fetch_models().await;
+        assert!(matches!(result, Err(AgentError::Config { .. })));
+        assert_eq!(discoveries(&requests), 0);
+    }
+
     #[tokio::test]
     async fn responses_request_sends_each_header_once() {
         let (base_url, requests) = serve(REJECTED);
-        let auth = CopilotAuth {
-            token: "token".into(),
-            endpoint: base_url.clone(),
-        };
         let resolved = ResolvedAuth::for_test(
             Some(base_url),
-            copilot_headers(&auth, Some(CONVERSATION_AGENT)),
+            copilot_headers(TOKEN, Some(CONVERSATION_AGENT)),
         );
         let model = Model::from_spec(GPT_SPEC).unwrap();
         let (tx, _rx) = unbounded_channel();
@@ -926,11 +1033,7 @@ mod tests {
 
     #[test]
     fn requests_identify_integrator() {
-        let auth = CopilotAuth {
-            token: "token".into(),
-            endpoint: DEFAULT_API_ENDPOINT.into(),
-        };
-        assert!(copilot_headers(&auth, None).contains(&(
+        assert!(copilot_headers(TOKEN, None).contains(&(
             "copilot-integration-id".into(),
             INTEGRATION_ID_HEADER.into()
         )));
