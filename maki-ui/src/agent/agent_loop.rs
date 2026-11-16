@@ -17,7 +17,7 @@ use maki_agent::{
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, ContextGauge, Message, Model};
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 use tokio::task::spawn_blocking;
 use tracing::error;
 
@@ -48,6 +48,7 @@ pub(super) struct LoopEnds {
     pub(super) agent_tx: UnboundedSender<Envelope>,
     pub(super) answer_rx: UnboundedReceiver<String>,
     pub(super) queue: Arc<QueueReceiver>,
+    pub(super) notify_rx: Receiver<()>,
     pub(super) cancels: Arc<RunCancels>,
     pub(super) mailbox: SessionMailbox,
     pub(super) subagent_cancels: Arc<CancelMap<String>>,
@@ -67,6 +68,7 @@ pub(super) struct AgentLoop {
     agent_tx: UnboundedSender<Envelope>,
     answer_rx: Arc<Mutex<UnboundedReceiver<String>>>,
     queue: Arc<QueueReceiver>,
+    notify_rx: Receiver<()>,
     mailbox: SessionMailbox,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
@@ -82,6 +84,7 @@ impl AgentLoop {
             agent_tx,
             answer_rx,
             queue,
+            notify_rx,
             cancels,
             mailbox,
             subagent_cancels,
@@ -102,6 +105,7 @@ impl AgentLoop {
             agent_tx,
             answer_rx: Arc::new(Mutex::new(answer_rx)),
             queue,
+            notify_rx,
             mailbox,
             lua_handle,
             subagent_cancels,
@@ -114,7 +118,7 @@ impl AgentLoop {
             return;
         }
 
-        while let Some(()) = self.queue.recv_notify().await {
+        while self.notify_rx.recv().await.is_some() {
             let mut last_run_id = None;
             while let Some(mut run) = self.queue.pop_run() {
                 let Some(run_id) = run.drop_cancelled(self.cancels.min_run_id()) else {
