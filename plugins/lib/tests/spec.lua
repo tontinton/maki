@@ -1175,6 +1175,15 @@ local TRACE_CASES = {
     final_cur = { 1, 0 },
   },
   {
+    name = "ctrl_e_moves_to_current_line_end",
+    initial = "hello\nworld",
+    cur = { 1, 2 },
+    keys = { "<C-e>", "<C-e>" },
+    final_value = "hello\nworld",
+    final_cur = { 1, 5 },
+    results = { R.MOVED, R.IGNORED },
+  },
+  {
     name = "alt_b_aliases_ctrl_left",
     initial = "hello world",
     cur = { 1, 11 },
