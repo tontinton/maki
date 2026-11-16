@@ -231,14 +231,14 @@ fn path_prefix(spec: Option<&'static ProviderSpec>, merged: &OverrideFields) -> 
 
 /// Clone the shared auth, appending the path prefix to the host. The gateway
 /// forwards the resulting path to the upstream.
-fn routed_auth(auth: &Arc<Mutex<ResolvedAuth>>, prefix: &str) -> Arc<Mutex<ResolvedAuth>> {
+fn routed_auth(auth: &Mutex<ResolvedAuth>, prefix: &str) -> ResolvedAuth {
     let mut cloned = auth.lock().unwrap().clone();
     if !prefix.is_empty()
         && let Some(base) = cloned.base_url.as_deref()
     {
         cloned.base_url = Some(format!("{}{prefix}", base.trim_end_matches('/')));
     }
-    Arc::new(Mutex::new(cloned))
+    cloned
 }
 
 /// The model the routed provider should stream against. The gateway strips the
@@ -253,12 +253,28 @@ fn native_route_model(model: &Model, spec: &'static ProviderSpec, bare_model_id:
     m
 }
 
+/// A routed provider and the auth cell it reads, which every call rewrites
+/// from the gateway auth so a rotated token still reaches the route.
+struct Route {
+    auth: Arc<Mutex<ResolvedAuth>>,
+    provider: Arc<dyn Provider>,
+}
+
+impl Route {
+    fn serve(&self, auth: ResolvedAuth) -> Arc<dyn Provider> {
+        *self.auth.lock().unwrap() = auth;
+        Arc::clone(&self.provider)
+    }
+}
+
 pub struct Aperture {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
     overrides: Overrides,
+    /// Keyed by the routed slug and the path prefix its auth carries.
+    routes: Mutex<HashMap<(&'static str, String), Route>>,
 }
 
 impl Aperture {
@@ -291,6 +307,7 @@ impl Aperture {
             timeouts,
             system_prefix: None,
             overrides,
+            routes: Mutex::default(),
         }
     }
 
@@ -299,7 +316,29 @@ impl Aperture {
         self
     }
 
+    /// Builds outside the map lock, so a slow build holds up no other route.
+    /// Two first calls racing each build one, and the first insert wins.
     fn routed_provider(
+        &self,
+        spec: &'static ProviderSpec,
+        prefix: &str,
+    ) -> Option<Arc<dyn Provider>> {
+        let auth = routed_auth(&self.auth, prefix);
+        let key = (spec.slug, prefix.to_owned());
+        if let Some(route) = self.routes.lock().unwrap().get(&key) {
+            return Some(route.serve(auth));
+        }
+        let cell = Arc::new(Mutex::new(auth.clone()));
+        let provider = self.build_route(spec, Arc::clone(&cell))?;
+        let mut routes = self.routes.lock().unwrap();
+        let route = routes.entry(key).or_insert(Route {
+            auth: cell,
+            provider: Arc::from(provider),
+        });
+        Some(route.serve(auth))
+    }
+
+    fn build_route(
         &self,
         spec: &'static ProviderSpec,
         auth: Arc<Mutex<ResolvedAuth>>,
@@ -431,9 +470,9 @@ impl Provider for Aperture {
             let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", &model.id));
             let ov = merged_override(&self.overrides, provider_id, model_id);
             let spec = routed_spec(provider_id, &ov);
-            let auth = routed_auth(&self.auth, &path_prefix(spec, &ov));
+            let prefix = path_prefix(spec, &ov);
             if let Some(spec) = spec
-                && let Some(provider) = self.routed_provider(spec, Arc::clone(&auth))
+                && let Some(provider) = self.routed_provider(spec, &prefix)
             {
                 let request_model = native_route_model(model, spec, model_id);
                 return provider
@@ -448,7 +487,7 @@ impl Provider for Aperture {
                     )
                     .await;
             }
-            let auth = auth.lock().unwrap().clone();
+            let auth = routed_auth(&self.auth, &prefix);
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let body =
@@ -478,8 +517,7 @@ impl Provider for Aperture {
             let model_id = model_id.to_string();
             let ov = merged_override(&self.overrides, provider_id, &model_id);
             if let Some(spec) = routed_spec(provider_id, &ov)
-                && let Some(routed) = self
-                    .routed_provider(spec, routed_auth(&self.auth, &path_prefix(Some(spec), &ov)))
+                && let Some(routed) = self.routed_provider(spec, &path_prefix(Some(spec), &ov))
             {
                 let full_id = std::mem::replace(&mut model.id, model_id);
                 routed.adjust_model(model);
@@ -495,15 +533,27 @@ mod tests {
     use super::*;
     use crate::Effort;
     use crate::model::ModelFamily;
-    use crate::test_support::register_bundled;
+    use crate::test_support::{Canned, isolated_home, register_bundled, serve};
+    use reqwest::header::AUTHORIZATION;
     use serde_json::json;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const ROUTED_SLUG: &str = "routed-plugin";
     const ROUTED_HOST: &str = "routed.example";
     const ROUTED_VISION_MODEL: &str = "routed-vision";
     /// No row describes it, so it takes the openai codec's thinking support.
     const ROUTED_CHAT_SPEC: &str = "aperture/routed-plugin/routed-chat";
+    const NATIVE_CHAT_SPEC: &str = "aperture/ollama/qwen3";
+    const PROMPT: &str = "hi";
+    const FIRST_TOKEN: &str = "Bearer first";
+    const ROTATED_TOKEN: &str = "Bearer rotated";
+    const ANSWER: Canned = Canned::sse(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n",
+    );
+    const TWO_TURNS: &[Canned] = &[ANSWER, ANSWER];
+    const REBUILT: &str = "the route was built again instead of reused";
+    const STALE_TOKEN: &str = "a routed request missed the gateway's current token";
 
     fn register_routed() {
         register_bundled(
@@ -648,7 +698,7 @@ mod tests {
         register_routed();
         let prefix = path_prefix(slug.map(route), &OverrideFields::default());
         let auth = routed_auth(&test_auth(), &prefix);
-        assert_eq!(auth.lock().unwrap().base_url.as_deref(), expected);
+        assert_eq!(auth.base_url.as_deref(), expected);
     }
 
     #[test_case(Some("") , Some("https://aperture.example.com") ; "empty_prefix_keeps_bare_host")]
@@ -661,7 +711,7 @@ mod tests {
             ..Default::default()
         };
         let auth = routed_auth(&test_auth(), &path_prefix(Some(route("zai")), &merged));
-        assert_eq!(auth.lock().unwrap().base_url.as_deref(), expected);
+        assert_eq!(auth.base_url.as_deref(), expected);
     }
 
     #[test]
@@ -672,7 +722,7 @@ mod tests {
         )));
         let routed = routed_auth(&auth, DEFAULT_PATH_PREFIX);
         assert_eq!(
-            routed.lock().unwrap().base_url.as_deref(),
+            routed.base_url.as_deref(),
             Some("https://aperture.example.com/v1")
         );
     }
@@ -884,6 +934,67 @@ mod tests {
         assert!(!model.supports_thinking());
         aperture.adjust_model(&mut model);
         assert!(model.supports_thinking());
+    }
+
+    fn gateway_auth(host: &str, token: &str) -> ResolvedAuth {
+        ResolvedAuth::for_test(
+            Some(host.to_owned()),
+            vec![(AUTHORIZATION.as_str().to_owned(), token.to_owned())],
+        )
+    }
+
+    async fn ask(aperture: &Aperture, model: &Model) {
+        let (tx, _rx) = unbounded_channel();
+        aperture
+            .stream_message(
+                model,
+                &[Message::user(PROMPT.to_owned())],
+                "",
+                &json!([]),
+                &tx,
+                RequestOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn only_route(aperture: &Aperture) -> Arc<dyn Provider> {
+        let routes = aperture.routes.lock().unwrap();
+        assert_eq!(routes.len(), 1, "{REBUILT}");
+        Arc::clone(&routes.values().next().unwrap().provider)
+    }
+
+    #[test_case(NATIVE_CHAT_SPEC ; "native_route")]
+    #[test_case(ROUTED_CHAT_SPEC ; "codec_plugin_route")]
+    #[tokio::test]
+    async fn route_is_built_once_and_follows_the_gateway_auth(spec: &str) {
+        let _home = isolated_home();
+        register_routed();
+        let (base_url, requests) = serve(TWO_TURNS);
+        let host = base_url.trim_end_matches(DEFAULT_PATH_PREFIX);
+        let auth = Arc::new(Mutex::new(gateway_auth(host, FIRST_TOKEN)));
+        let aperture = Aperture::with_auth_and_overrides(
+            Arc::clone(&auth),
+            Timeouts::default(),
+            Overrides::new(),
+        );
+        let mut model = Model::from_spec(spec).unwrap();
+
+        ask(&aperture, &model).await;
+        let built = only_route(&aperture);
+        *auth.lock().unwrap() = gateway_auth(host, ROTATED_TOKEN);
+        ask(&aperture, &model).await;
+        aperture.adjust_model(&mut model);
+
+        assert!(Arc::ptr_eq(&built, &only_route(&aperture)), "{REBUILT}");
+        let tokens: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.authorization().to_owned())
+            .collect();
+        assert_eq!(tokens, [FIRST_TOKEN, ROTATED_TOKEN], "{STALE_TOKEN}");
     }
 
     #[test]
