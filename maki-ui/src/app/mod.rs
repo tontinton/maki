@@ -574,6 +574,10 @@ pub struct App {
     /// was shown, so `/trust` must not cover it and the next start asks.
     pub(crate) trust: TrustState,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
+    /// The model picked for this tab while its provider is still building.
+    /// Until it lands a run starts on the old one, so the status bar shows
+    /// both.
+    pub(crate) picking: Option<String>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) paste_rx: Vec<oneshot::Receiver<Result<PastedContent, String>>>,
     pub(crate) mouse_paste_rx: Vec<oneshot::Receiver<Option<String>>>,
@@ -710,6 +714,7 @@ impl App {
             storage,
             trust: TrustState::Inert,
             usage_slot: Arc::new(ArcSwapOption::empty()),
+            picking: None,
             shared_history: None,
             paste_rx: vec![],
             mouse_paste_rx: vec![],

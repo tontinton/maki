@@ -8,7 +8,7 @@ use tracing::warn;
 
 use super::ModelSlot;
 
-const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
+pub(crate) const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
 const INVALID_MODEL_ERR: &str = "Invalid model";
 const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 
@@ -32,9 +32,15 @@ pub(crate) struct ModelSlots {
 pub(crate) struct SlotBuilder {
     policy: Arc<ModelPolicy>,
     timeouts: Timeouts,
+    /// How many invalidates came before this builder was handed out.
+    epoch: u64,
 }
 
 impl SlotBuilder {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     fn model(&self, spec: &str) -> Result<Model, String> {
         if !self.policy.allows(spec) {
             return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
@@ -70,7 +76,11 @@ impl ModelSlots {
         Self {
             built: HashMap::from([(spec, Arc::clone(&startup))]),
             fallback: startup,
-            builder: SlotBuilder { policy, timeouts },
+            builder: SlotBuilder {
+                policy,
+                timeouts,
+                epoch: 0,
+            },
         }
     }
 
@@ -78,11 +88,15 @@ impl ModelSlots {
         self.builder.clone()
     }
 
-    /// An explicit pick, where a rejected spec has to surface rather than
-    /// quietly downgrade the user to something else.
-    pub(crate) fn try_get(&mut self, spec: &str) -> Result<Arc<ModelSlot>, String> {
-        if let Some(slot) = self.built.get(spec) {
-            return Ok(Arc::clone(slot));
+    /// What a pick applies right away. Without one it builds with
+    /// [`Self::builder`] off the loop.
+    pub(crate) fn get(&self, spec: &str) -> Option<Arc<ModelSlot>> {
+        self.built.get(spec).map(Arc::clone)
+    }
+
+    fn try_get(&mut self, spec: &str) -> Result<Arc<ModelSlot>, String> {
+        if let Some(slot) = self.get(spec) {
+            return Ok(slot);
         }
         let mut model = self.builder.model(spec)?;
         let provider = from_model(&mut model, self.builder.timeouts);
@@ -110,18 +124,26 @@ impl ModelSlots {
     /// builds again, and only for specs somebody is actually on.
     pub(crate) fn invalidate(&mut self) {
         self.built.clear();
+        self.builder.epoch += 1;
     }
 
     /// A slot built for `spec` since the last invalidate, unless a pick or a
     /// session open built one in the meantime, which is just as new and may
-    /// already be on a tab.
-    pub(crate) fn adopt(&mut self, spec: String, slot: &Arc<ModelSlot>) -> Arc<ModelSlot> {
-        Arc::clone(self.built.entry(spec).or_insert_with(|| Arc::clone(slot)))
+    /// already be on a tab. `None` for one built before it, on credentials or
+    /// a catalog that are gone.
+    pub(crate) fn adopt(
+        &mut self,
+        epoch: u64,
+        spec: String,
+        slot: &Arc<ModelSlot>,
+    ) -> Option<Arc<ModelSlot>> {
+        (epoch == self.builder.epoch)
+            .then(|| Arc::clone(self.built.entry(spec).or_insert_with(|| Arc::clone(slot))))
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{INVALID_MODEL_ERR, MODEL_POLICY_ERR, ModelSlots, PROVIDER_INIT_ERR};
     use maki_config::ModelPolicy;
     use maki_config::providers::{Protocol, ProviderDef, ProvidersConfig};
@@ -133,8 +155,8 @@ mod tests {
 
     /// A built-in provider that takes any model name and builds without
     /// credentials, so these tests never touch the catalog or the network.
-    const STARTUP_SPEC: &str = "opencode/startup";
-    const OTHER_SPEC: &str = "opencode/other";
+    pub(crate) const STARTUP_SPEC: &str = "opencode/startup";
+    pub(crate) const OTHER_SPEC: &str = "opencode/other";
     const UNPARSEABLE_SPEC: &str = "not-a-spec";
     /// A `providers.toml` entry with no key anywhere, so its spec parses and
     /// only building the provider fails.
@@ -148,6 +170,7 @@ mod tests {
     const NO_FLOOR: &str = "invalidate must keep the fallback floor";
     const POISONED: &str = "a failed lookup must not leave a cache entry";
     const NOT_KEPT: &str = "adopt must keep the slot cached first";
+    const STALE_KEPT: &str = "adopt must take only a slot built since the last invalidate";
     const OFF_LOOP_DIFFERS: &str = "a build off the loop must reject what try_get rejects";
 
     fn startup_slot() -> Arc<super::ModelSlot> {
@@ -159,11 +182,11 @@ mod tests {
         })
     }
 
-    fn slots(policy: ModelPolicy) -> ModelSlots {
+    pub(crate) fn slots(policy: ModelPolicy) -> ModelSlots {
         ModelSlots::new(startup_slot(), Arc::new(policy), Timeouts::default())
     }
 
-    fn strict_policy() -> ModelPolicy {
+    pub(crate) fn strict_policy() -> ModelPolicy {
         ModelPolicy::new(&[STARTUP_SPEC.to_owned()], &[]).unwrap()
     }
 
@@ -239,19 +262,42 @@ mod tests {
     #[tokio::test]
     async fn adopt_keeps_the_slot_cached_first(picked_in_between: bool) {
         let mut slots = slots(ModelPolicy::default());
-        let rebuilt = slots.builder().build(OTHER_SPEC).await.unwrap();
+        let builder = slots.builder();
+        let rebuilt = builder.build(OTHER_SPEC).await.unwrap();
         let first = if picked_in_between {
             slots.try_get(OTHER_SPEC).unwrap()
         } else {
             Arc::clone(&rebuilt)
         };
 
-        let adopted = slots.adopt(OTHER_SPEC.to_owned(), &rebuilt);
-        assert!(Arc::ptr_eq(&adopted, &first), "{NOT_KEPT}");
+        let adopted = slots.adopt(builder.epoch(), OTHER_SPEC.to_owned(), &rebuilt);
+        assert!(Arc::ptr_eq(&adopted.unwrap(), &first), "{NOT_KEPT}");
         assert!(
             Arc::ptr_eq(&slots.try_get(OTHER_SPEC).unwrap(), &first),
             "{CACHED}"
         );
+    }
+
+    #[test_case(true, false ; "built_before_an_invalidate")]
+    #[test_case(false, true ; "built_after_it")]
+    #[tokio::test]
+    async fn adopt_takes_only_a_slot_built_since_the_last_invalidate(
+        built_before: bool,
+        adopted: bool,
+    ) {
+        let mut slots = slots(ModelPolicy::default());
+        let before = slots.builder();
+        slots.invalidate();
+        let builder = if built_before {
+            before
+        } else {
+            slots.builder()
+        };
+        let slot = builder.build(OTHER_SPEC).await.unwrap();
+
+        let kept = slots.adopt(builder.epoch(), OTHER_SPEC.to_owned(), &slot);
+        assert_eq!(kept.is_some(), adopted, "{STALE_KEPT}");
+        assert_eq!(slots.get(OTHER_SPEC).is_some(), adopted, "{STALE_KEPT}");
     }
 
     /// A cache hit skips both the policy check and the build, so a refusal must
