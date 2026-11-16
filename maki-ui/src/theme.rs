@@ -386,6 +386,7 @@ named_styles!(t => {
     "tool_annotation" => t.tool_annotation,
     "spinner" => t.spinner,
     "thinking" => t.thinking,
+    "thinking_bg" => t.thinking_bg,
     "user_bg" => t.user_bg,
     "user_text" => t.user_text,
     "error" => t.error,
@@ -440,6 +441,7 @@ pub struct Theme {
     pub assistant: Style,
     pub assistant_prefix: Style,
     pub thinking: Style,
+    pub thinking_bg: Style,
     pub tool_bg: Style,
     pub tool: Style,
     pub tool_path: Style,
@@ -847,6 +849,7 @@ impl Theme {
                 color("foreground"),
                 0.3,
             ),
+            thinking_bg: style("thinking_bg"),
             tool_bg: style("tool_bg"),
             tool: style("tool"),
             tool_path: style("tool_path"),
@@ -1218,6 +1221,7 @@ scrollbar_thumb = { fg = "magenta", bg = "default" }
         let theme = Theme::from_toml(toml).unwrap();
         assert_eq!(theme.user, Style::default());
         assert_eq!(theme.user_bg, Style::default());
+        assert_eq!(theme.thinking_bg, Style::default());
         assert_eq!(theme.user_text, theme.assistant);
     }
 
@@ -1423,6 +1427,7 @@ diff_new_line_nr = { fg = "red" }
         let t = current();
         assert_eq!(style_by_name("user_bg"), t.user_bg);
         assert_eq!(style_by_name("user_text"), t.user_text);
+        assert_eq!(style_by_name("thinking_bg"), t.thinking_bg);
         assert_eq!(style_by_name("dim"), t.tool_dim);
         assert_eq!(style_by_name("tool_dim"), t.tool_dim);
         assert_eq!(style_by_name("path"), t.tool_path);

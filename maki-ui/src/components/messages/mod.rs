@@ -1050,6 +1050,7 @@ impl MessagesPanel {
         let viewport = Rect::new(area.x, area.y, width, area.height);
         let mut cursor = RenderCursor::new(self.scroll.row, viewport);
 
+        let live_thinking = self.live_thinking_seg();
         let mut last_drawn = self.scroll.seg;
         for (i, seg) in self
             .cache
@@ -1062,13 +1063,15 @@ impl MessagesPanel {
                 break;
             }
             let highlight = self.highlight_segment == Some(i);
+            let role = seg
+                .msg_index
+                .and_then(|idx| self.messages.get(idx))
+                .map(|m| &m.role);
             let style = if seg.tool_id.is_some() {
                 Some(theme::current().tool_bg)
-            } else if seg.msg_index.is_some_and(|idx| {
-                self.messages
-                    .get(idx)
-                    .is_some_and(|m| matches!(&m.role, DisplayRole::User))
-            }) {
+            } else if live_thinking == Some(i) || matches!(role, Some(DisplayRole::Thinking)) {
+                Some(theme::current().thinking_bg)
+            } else if matches!(role, Some(DisplayRole::User)) {
                 Some(theme::current().user_bg)
             } else {
                 None
@@ -1495,11 +1498,15 @@ impl MessagesPanel {
         self.messages.push(msg);
     }
 
+    /// Thinking is always the first live segment, so it sits right after the
+    /// spacer that separates it from whatever came before.
+    fn live_thinking_seg(&self) -> Option<usize> {
+        (!self.streaming_thinking.is_empty())
+            .then(|| self.live_start + usize::from(self.live_start > 0))
+    }
+
     fn try_toggle_live_thinking(&mut self, pos: ScrollPos) -> bool {
-        // Thinking is always the first live segment, so it sits right after
-        // the spacer that separates it from whatever came before.
-        let thinking_seg = self.live_start + usize::from(self.live_start > 0);
-        if pos.seg != thinking_seg || self.streaming_thinking.is_empty() {
+        if self.live_thinking_seg() != Some(pos.seg) {
             return false;
         }
         let drawn_collapsed = self.cache.get(pos.seg).is_some_and(|s| s.truncation.output);

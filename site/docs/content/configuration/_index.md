@@ -110,6 +110,8 @@ user_text = { fg = "foreground" }
 user_bg = { bg = "#1d2021" }
 ```
 
+Thinking uses `thinking` for its text and `thinking_bg` for the full-width background behind it. `thinking_bg` defaults to no background.
+
 Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
 
 The chat input uses your terminal's own cursor, in its shape and colors. The search, file, list and login pickers paint their caret with `cursor`.
