@@ -882,6 +882,7 @@ fn paste_normalizes_line_endings(input: &str, expected: &str) {
 
 #[test]
 fn paste_file_path_triggers_image_load() {
+    let _runtime = enter_runtime();
     let mut app = test_app();
     app.update(Msg::Paste("file:///tmp/nonexistent.png".into()));
     assert!(!app.paste_rx.is_empty());
@@ -890,6 +891,7 @@ fn paste_file_path_triggers_image_load() {
 
 #[test]
 fn paste_loads_every_image_path_in_the_text() {
+    let _runtime = enter_runtime();
     let mut app = test_app();
     app.update(Msg::Paste(
         "file:///tmp/one.png\nnot an image\nfile:///tmp/two.jpg".into(),
