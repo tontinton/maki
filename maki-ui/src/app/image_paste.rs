@@ -5,6 +5,7 @@ use crate::{clipboard, image};
 use maki_agent::{ImageMediaType, ImageSource};
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::oneshot::{self, Receiver};
+use tokio::task::spawn_blocking;
 
 use crate::repaint::Dirty;
 
@@ -37,7 +38,8 @@ fn pick_paste(
 }
 
 /// Runs a blocking read on its own thread: a clipboard owner may be slow or
-/// hung, and the UI thread must not wait on it.
+/// hung, and the UI thread must not wait on it, nor the blocking pool keep a
+/// thread for a read that never returns.
 pub(super) fn spawn_read<T: Send + 'static>(
     read: impl FnOnce() -> T + Send + 'static,
 ) -> Receiver<T> {
@@ -74,8 +76,13 @@ impl App {
             self.status_bar.flash(IMAGE_NOT_SUPPORTED_MSG.into());
             return;
         }
-        let msg = format!("Reading {}...", path.display());
-        self.spawn_image_load(msg, move || image::load_file_image(&path, media_type));
+        self.status_bar
+            .flash(format!("Reading {}...", path.display()));
+        let (tx, rx) = oneshot::channel();
+        spawn_blocking(move || {
+            let _ = tx.send(image::load_file_image(&path, media_type).map(PastedContent::Image));
+        });
+        self.paste_rx.push(rx);
     }
 
     /// We only get `Ctrl+V` or an empty paste when the terminal could not
@@ -86,16 +93,6 @@ impl App {
             pick_paste(vision, image::load_clipboard_image, clipboard::read_text)
         }));
         self.status_bar.flash(READING_CLIPBOARD_MSG.into());
-    }
-
-    fn spawn_image_load(
-        &mut self,
-        flash: String,
-        f: impl FnOnce() -> Result<ImageSource, String> + Send + 'static,
-    ) {
-        self.paste_rx
-            .push(spawn_read(move || f().map(PastedContent::Image)));
-        self.status_bar.flash(flash);
     }
 
     pub fn poll_paste(&mut self) -> Dirty {
