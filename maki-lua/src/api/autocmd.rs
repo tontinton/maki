@@ -260,9 +260,10 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// Listen for one or more events. Returns an id you can pass to
 /// `del_autocmd` later to remove the listener.
 ///
-/// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-/// `"TurnError"`, `"TurnComplete"`, `"ToolStart"`, `"ToolDone"`,
-/// `"AutoCompacting"`, `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
+/// Built-in events fired by the host: `"TurnStart"`, `"TextDelta"`,
+/// `"ThinkingDelta"`, `"TurnEnd"`, `"TurnError"`, `"TurnComplete"`,
+/// `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`, `"CompactionDone"`,
+/// `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 /// `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
 /// `"ModeChanged"` and `"FileIndexReady"`. Plugins can also fire their own
@@ -280,6 +281,10 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   and `data.input`, the input after every `tool.*.input` layer. A call
 ///   that never ran, like a cancelled one, has neither.
 /// - `"TurnStart"`: `data.text`, the message that started the turn.
+/// - `"TextDelta"`, `"ThinkingDelta"`: `data.text`, the piece of the answer
+///   or of the reasoning the model just streamed. They fire many times per
+///   second, so a handler that redraws should throttle itself. Subagent
+///   deltas stay quiet, like every other subagent event.
 /// - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
 ///   `"max_turns"`, `"cancelled"`, or `"dropped"` when an
 ///   `agent.user_message` layer refused the message), `data.usage` (four
@@ -370,7 +375,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///
 /// Conversation content needs the `session_read` permission. Without it a
 /// host event still arrives, carrying only its metadata fields:
-/// `"TurnStart"` without `data.text`, `"ToolDone"` without `data.input`,
+/// `"TurnStart"` without `data.text`, `"TextDelta"` and `"ThinkingDelta"`
+/// with no `data.text` at all, `"ToolDone"` without `data.input`,
 /// `"CompactionDone"` without `data.summary`, and `"InputChanged"` without
 /// `data.text`. Maki warns once per plugin and event, naming what was left
 /// out. Events a plugin fires under its own names arrive as fired.
