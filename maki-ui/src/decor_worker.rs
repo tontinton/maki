@@ -6,7 +6,7 @@
 //! on the highlight thread, which syntect wants to itself to bound its regex
 //! cache. Tree-sitter keeps no such cache, and a parse of a big prompt can
 //! take tens of milliseconds, which would hold up the transcript's colors
-//! and every Lua `pool::run` queued behind it.
+//! and every Lua `pool::run_async` queued behind it.
 
 #[cfg(test)]
 use std::cell::RefCell;

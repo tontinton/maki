@@ -17,11 +17,10 @@
 //! one is global and paid once, so no amount of single-threading wins it back.
 
 use std::any::Any;
-use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::LazyLock;
-use std::sync::mpsc::{Sender, channel, sync_channel};
-use std::thread::{self, Result as ThreadResult};
+use std::sync::mpsc::{Sender, channel};
+use std::thread;
 
 use tokio::sync::oneshot;
 use tracing::error;
@@ -32,12 +31,7 @@ const THREAD_GONE: &str = "the highlight thread is gone";
 
 pub type Job = Box<dyn FnOnce() + Send + 'static>;
 
-static JOBS: LazyLock<Sender<Job>> = LazyLock::new(|| {
-    let jobs = job_thread(HIGHLIGHT_THREAD);
-    // Queued ahead of every other job, so a nested `run` sees it.
-    let _ = jobs.send(Box::new(|| ON_HIGHLIGHT_THREAD.set(true)));
-    jobs
-});
+static JOBS: LazyLock<Sender<Job>> = LazyLock::new(|| job_thread(HIGHLIGHT_THREAD));
 
 /// Spawns a thread named {name} that runs the jobs sent to it one at a time,
 /// in order. A job that panics is logged and the thread goes on with the next.
@@ -57,10 +51,6 @@ pub fn job_thread(name: &str) -> Sender<Job> {
     jobs
 }
 
-thread_local! {
-    static ON_HIGHLIGHT_THREAD: Cell<bool> = const { Cell::new(false) };
-}
-
 fn panic_message(payload: &(dyn Any + Send)) -> &str {
     payload
         .downcast_ref::<&str>()
@@ -69,40 +59,20 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
         .unwrap_or(UNKNOWN_PANIC)
 }
 
-/// Runs `f` on the highlight thread and waits for its result.
-///
-/// Nested calls run inline because markdown highlights its own code blocks.
-pub fn run<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    if ON_HIGHLIGHT_THREAD.get() {
-        return f();
-    }
-    let (done_tx, done_rx) = sync_channel(1);
-    spawn(move || {
-        let _ = done_tx.send(catch_unwind(AssertUnwindSafe(f)));
-    });
-    receive_result(done_rx.recv().ok())
-}
-
-/// Waits without occupying a blocking worker. Dropping the future discards
-/// queued work; a job already running cannot be interrupted.
+/// Runs `f` on the highlight thread and waits without occupying a blocking
+/// worker. Dropping the future discards queued work; a job already running
+/// cannot be interrupted.
 pub async fn run_async<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    if ON_HIGHLIGHT_THREAD.get() {
-        return f();
-    }
     let (done_tx, done_rx) = oneshot::channel();
     spawn(move || {
         if !done_tx.is_closed() {
             let _ = done_tx.send(catch_unwind(AssertUnwindSafe(f)));
         }
     });
-    receive_result(done_rx.await.ok())
-}
-
-fn receive_result<T>(result: Option<ThreadResult<T>>) -> T {
-    match result {
-        Some(Ok(value)) => value,
-        Some(Err(payload)) => resume_unwind(payload),
-        None => panic!("{THREAD_GONE}"),
+    match done_rx.await {
+        Ok(Ok(value)) => value,
+        Ok(Err(payload)) => resume_unwind(payload),
+        Err(_) => panic!("{THREAD_GONE}"),
     }
 }
 
@@ -113,16 +83,16 @@ pub fn spawn(f: impl FnOnce() + Send + 'static) {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::panic::catch_unwind;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::channel;
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Waker};
     use std::thread;
 
     use test_case::test_case;
+    use tokio::task::JoinSet;
 
-    use super::{panic_message, run, run_async, spawn};
+    use super::{panic_message, run_async, spawn};
 
     const PAYLOAD: usize = 41;
     const WAITERS: usize = 8;
@@ -130,7 +100,8 @@ mod tests {
 
     #[test_case(true; "cancelled")]
     #[test_case(false; "awaited")]
-    fn dropped_async_waiter_discards_queued_work(cancel: bool) {
+    #[tokio::test]
+    async fn dropped_async_waiter_discards_queued_work(cancel: bool) {
         let (release_tx, release_rx) = channel::<()>();
         spawn(move || {
             let _ = release_rx.recv();
@@ -146,65 +117,59 @@ mod tests {
         if cancel {
             drop(pending);
             release_tx.send(()).unwrap();
-            run(|| ());
+            run_async(|| ()).await;
             assert_eq!(calls.load(Ordering::SeqCst), 0);
         } else {
             release_tx.send(()).unwrap();
-            run(|| ());
-            assert_eq!(pending.as_mut().poll(&mut context), Poll::Ready(PAYLOAD));
+            assert_eq!(pending.await, PAYLOAD);
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
     }
 
-    #[test]
-    fn runs_job_and_returns_value() {
-        assert_eq!(run(|| PAYLOAD + 1), PAYLOAD + 1);
+    #[tokio::test]
+    async fn runs_job_and_returns_value() {
+        assert_eq!(run_async(|| PAYLOAD + 1).await, PAYLOAD + 1);
     }
 
-    #[test]
-    fn every_job_runs_on_one_thread() {
-        let waiters: Vec<_> = (0..WAITERS)
-            .map(|_| thread::spawn(|| run(|| thread::current().id())))
-            .collect();
-        let ids: Vec<_> = waiters
-            .into_iter()
-            .map(|w| w.join().expect("waiter panicked"))
-            .collect();
+    #[tokio::test]
+    async fn jobs_run_in_send_order() {
+        let (ran_tx, ran_rx) = channel();
+        for job in 0..WAITERS {
+            let ran_tx = ran_tx.clone();
+            spawn(move || ran_tx.send(job).unwrap());
+        }
+        run_async(|| ()).await;
+        assert_eq!(
+            ran_rx.try_iter().collect::<Vec<_>>(),
+            (0..WAITERS).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_job_runs_on_one_thread() {
+        let mut waiters = JoinSet::new();
+        for _ in 0..WAITERS {
+            waiters.spawn(run_async(|| thread::current().id()));
+        }
+        let ids = waiters.join_all().await;
         assert!(
             ids.windows(2).all(|w| w[0] == w[1]),
             "jobs ran on multiple threads: {ids:?}"
         );
     }
 
-    #[test]
-    fn nested_run_does_not_deadlock() {
-        assert_eq!(run(|| run(|| PAYLOAD)), PAYLOAD);
-    }
-
-    #[test]
-    fn many_waiters_all_make_progress() {
-        let done = Arc::new(AtomicUsize::new(0));
-        let waiters: Vec<_> = (0..WAITERS)
-            .map(|_| {
-                let done = Arc::clone(&done);
-                thread::spawn(move || run(move || done.fetch_add(1, Ordering::AcqRel)))
-            })
-            .collect();
-        for w in waiters {
-            w.join().expect("waiter panicked");
-        }
-        assert_eq!(done.load(Ordering::SeqCst), WAITERS);
-    }
-
-    #[test]
-    fn survives_a_panicking_job() {
+    #[tokio::test]
+    async fn survives_a_panicking_job() {
         spawn(|| panic!("{BOOM}"));
-        assert_eq!(run(|| PAYLOAD), PAYLOAD);
+        assert_eq!(run_async(|| PAYLOAD).await, PAYLOAD);
     }
 
-    #[test]
-    fn run_resumes_the_job_panic() {
-        let payload = catch_unwind(|| run::<()>(|| panic!("{BOOM}"))).expect_err("job must panic");
+    #[tokio::test]
+    async fn run_async_resumes_the_job_panic() {
+        let payload = tokio::spawn(run_async::<()>(|| panic!("{BOOM}")))
+            .await
+            .expect_err("job must panic")
+            .into_panic();
         assert_eq!(panic_message(&*payload), BOOM);
     }
 }
