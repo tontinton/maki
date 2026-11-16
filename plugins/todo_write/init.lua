@@ -23,6 +23,14 @@ local STATUS_MARKERS = {
   cancelled = { "[x]", "todo_cancelled" },
 }
 
+-- The model only sees llm_output; the list itself stays in the chat body.
+local SUMMARY_STATUSES = {
+  { key = "completed", label = "completed" },
+  { key = "in_progress", label = "in progress" },
+  { key = "pending", label = "pending" },
+  { key = "cancelled", label = "cancelled" },
+}
+
 local DESCRIPTION = [[Create or update a structured todo list to track tasks.
 
 **Use after EACH completed step!**
@@ -59,6 +67,21 @@ local function build_lines(items)
     }
   end
   return lines
+end
+
+local function summary(items)
+  local counts = {}
+  for _, item in ipairs(items) do
+    counts[item.status] = (counts[item.status] or 0) + 1
+  end
+  local parts = {}
+  for _, status in ipairs(SUMMARY_STATUSES) do
+    local n = counts[status.key]
+    if n then
+      parts[#parts + 1] = string.format("%d %s", n, status.label)
+    end
+  end
+  return "Todos updated: " .. table.concat(parts, ", ")
 end
 
 -- Shared by handler and restore, so a call looks the same live and reloaded,
@@ -191,7 +214,7 @@ maki.api.register_tool({
     if #items == 0 then
       return "Todos cleared"
     end
-    return { llm_output = "", body = list_body(items) }
+    return { llm_output = summary(items), body = list_body(items) }
   end,
 })
 
