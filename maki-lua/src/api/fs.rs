@@ -15,6 +15,7 @@ use maki_agent::{FileQuery, FileReader, Ranked};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 use tokio::task::spawn_blocking;
+use tracing::warn;
 
 use crate::agent_autocmd::HostEvent;
 use crate::api::util::convert::{TableExt, bytes_arg};
@@ -1041,12 +1042,17 @@ fn descend(mut base: PathBuf, component: &Component<'_>) -> PathBuf {
 ///
 /// Resolving the path is a realpath per ancestor and one more per `..` left
 /// in the tail, and this runs on the one executor every plugin shares, so it
-/// waits for a blocking thread the way the call it follows did.
+/// waits for a blocking thread the way the call it follows did. By then the
+/// call has landed, so an invalidation that fails is only logged: the index
+/// still catches up on its next walk.
 async fn touched<E>(path: PathBuf, result: Result<(), E>) -> Result<(), E> {
     if result.is_ok() {
-        spawn_blocking(move || maki_agent::invalidate_for(&resolved(&path)))
-            .await
-            .expect("file index invalidation panicked");
+        let invalidated = path.clone();
+        if let Err(error) =
+            spawn_blocking(move || maki_agent::invalidate_for(&resolved(&invalidated))).await
+        {
+            warn!(path = %path.display(), %error, "file index invalidation failed");
+        }
     }
     result
 }
