@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use include_dir::Dir;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
 use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
@@ -87,7 +86,7 @@ use crate::docs_render;
 use crate::error::PluginError;
 use crate::jobs::{JobEvent, JobOwner, JobReaper, JobStore, deliver_job_event};
 use crate::key_lint::KeyLint;
-use crate::loader::EventHandle;
+use crate::loader::{EventHandle, bundled_source};
 use crate::pack::Interaction;
 use crate::plugin_permissions::{
     Ceiling, Permission, PluginPermissions, PluginReach, denied_error, grant_hint,
@@ -1542,7 +1541,6 @@ fn install_compiler(lua: &Lua, jit: bool) -> Compiler {
 /// VM rather than once per plugin.
 #[derive(Clone)]
 struct BundledModules {
-    dirs: &'static [&'static Dir<'static>],
     compiler: Compiler,
     bytecode: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
 }
@@ -1553,11 +1551,7 @@ impl BundledModules {
         if let Some(cached) = cache.get(rel_path) {
             return Ok(Some(Arc::clone(cached)));
         }
-        let Some(source) = self
-            .dirs
-            .iter()
-            .find_map(|dir| dir.get_file(rel_path).and_then(|f| f.contents_utf8()))
-        else {
+        let Some(source) = bundled_source(rel_path) else {
             return Ok(None);
         };
         let compiled = Arc::new(self.compiler.compile(source)?);
@@ -3785,7 +3779,6 @@ impl LuaRuntime {
         registry: Arc<ToolRegistry>,
         tx: UnboundedSender<Request>,
         shutdown: Arc<AtomicBool>,
-        bundled_dirs: &'static [&'static Dir<'static>],
         ui_action_tx: Option<UnboundedSender<UiAction>>,
         command_writer: LuaCommandWriter,
         keymap_writer: KeymapWriter,
@@ -3897,7 +3890,6 @@ impl LuaRuntime {
             tx,
             shutdown,
             bundled: BundledModules {
-                dirs: bundled_dirs,
                 compiler,
                 bytecode: Arc::default(),
             },
@@ -4136,10 +4128,7 @@ impl LuaRuntime {
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
-        if require_root.is_some() || !self.bundled.dirs.is_empty() {
-            let require_fn = self.create_require_fn(&env, require_root)?;
-            env.set("require", require_fn)?;
-        }
+        env.set("require", self.create_require_fn(&env, require_root)?)?;
 
         let meta = self.lua.create_table()?;
         meta.set("__index", self.lua.globals())?;
@@ -5771,7 +5760,6 @@ pub(crate) struct LuaThread {
 /// in-flight tools.
 pub fn spawn(
     registry: Arc<ToolRegistry>,
-    bundled_dirs: &'static [&'static Dir<'static>],
     interaction: Interaction,
     jit: bool,
     plugin_rules: Arc<PluginRuleStore>,
@@ -5814,7 +5802,6 @@ pub fn spawn(
                 registry,
                 tx_clone,
                 shutdown_thread,
-                bundled_dirs,
                 (interaction == Interaction::Tty).then_some(ui_action_tx),
                 command_writer,
                 keymap_writer,

@@ -299,7 +299,6 @@ impl KeymapEntry {
 #[derive(Clone, Default)]
 pub struct KeymapSnapshot {
     pub entries: Vec<KeymapEntry>,
-    pub generation: u64,
 }
 
 #[derive(Clone)]
@@ -370,7 +369,6 @@ impl KeymapReader {
 
 pub(crate) struct KeymapWriter {
     store: Arc<ArcSwap<KeymapSnapshot>>,
-    generation: AtomicU64,
     pub(crate) mode: Arc<ModeState>,
     actions: Arc<ArcSwap<Vec<ActionInfo>>>,
 }
@@ -383,7 +381,6 @@ impl KeymapWriter {
         (
             Self {
                 store: Arc::clone(&inner),
-                generation: AtomicU64::new(0),
                 mode: Arc::clone(&mode),
                 actions: Arc::clone(&actions),
             },
@@ -400,11 +397,7 @@ impl KeymapWriter {
     }
 
     pub fn publish(&self, entries: Vec<KeymapEntry>) {
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.store.store(Arc::new(KeymapSnapshot {
-            entries,
-            generation,
-        }));
+        self.store.store(Arc::new(KeymapSnapshot { entries }));
     }
 }
 
@@ -1254,7 +1247,6 @@ mod tests {
 
         let snap = reader.load();
         assert_eq!(snap.entries.len(), 1);
-        assert_eq!(snap.generation, 1);
     }
 
     /// The key is consumed the moment `dispatch` says it was claimed, so a
