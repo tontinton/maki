@@ -8,7 +8,7 @@
 //! it wakes the moment any of them has something and never blocks a worker:
 //! it runs under `block_on` on the main thread.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::{pending, ready};
 use std::mem;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use color_eyre::eyre::{Context, eyre};
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
-use futures::future::{LocalBoxFuture, select_all};
+use futures::future::{LocalBoxFuture, join_all, select_all};
 use maki_agent::agent::SessionExport;
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
@@ -579,6 +579,9 @@ pub(crate) struct EventLoop<'t> {
     /// as they did when each one read inline.
     opening: Option<AbortOnDropHandle<Box<OpenedSession>>>,
     queued_focus: VecDeque<(MakiId, oneshot::Sender<UiReply>)>,
+    /// The slots [`Self::rebuild_models`] builds off the loop. A newer rebuild
+    /// replaces a pending one, whose slots would be stale anyway.
+    rebuilding: Option<AbortOnDropHandle<RebuiltSlots>>,
     /// Writes to sessions no tab has open, which shutdown waits for like it
     /// waits for the storage writer.
     stored_writes: TaskTracker,
@@ -600,6 +603,9 @@ struct OpenedSession {
     opened: Result<OpenSession, String>,
 }
 
+/// One build per spec the tabs were on when the rebuild started.
+type RebuiltSlots = HashMap<String, Result<Arc<ModelSlot>, String>>;
+
 /// One item from any of the event loop's sources; `None` from `next_wake`
 /// means the wait timed out (animation/idle tick).
 enum Wake {
@@ -619,6 +625,8 @@ enum Wake {
     /// `None` when the read panicked, which dropped its reply.
     SessionOpened(Option<Box<OpenedSession>>),
     ModelsDiscovered,
+    /// `None` when the rebuild panicked.
+    SlotsRebuilt(Option<RebuiltSlots>),
 }
 
 /// A value from the channel, or never, once it is closed: a closed channel
@@ -649,16 +657,14 @@ async fn pack_done(pack: &mut Option<JoinHandle<PackPreparation>>) -> PackPrepar
     preparation
 }
 
-/// The stored session a focus is reading, or never, when none is. Cleared
-/// only once it answered, like [`pack_done`].
-async fn session_opened(
-    opening: &mut Option<AbortOnDropHandle<Box<OpenedSession>>>,
-) -> Option<Box<OpenedSession>> {
-    let Some(task) = opening else {
+/// What a task answered, `None` when it panicked, or never, when none is
+/// running. Cleared only once it answered, like [`pack_done`].
+async fn answered<T>(task: &mut Option<AbortOnDropHandle<T>>) -> Option<T> {
+    let Some(handle) = task else {
         return pending().await;
     };
-    let answer = task.await.ok();
-    *opening = None;
+    let answer = handle.await.ok();
+    *task = None;
     answer
 }
 
@@ -899,6 +905,7 @@ impl<'t> EventLoop<'t> {
             pack: None,
             opening: None,
             queued_focus: VecDeque::new(),
+            rebuilding: None,
             stored_writes: TaskTracker::new(),
             cwd_lost: false,
             _model_fetch_task: bg.task,
@@ -1025,7 +1032,8 @@ impl<'t> EventLoop<'t> {
             () = decor_worker::wakes().woken() => Wake::Decor,
             Some(warning) = self.warn_rx.recv() => Wake::Warn(warning),
             preparation = pack_done(&mut self.pack) => Wake::Pack(Box::new(preparation)),
-            answer = session_opened(&mut self.opening) => Wake::SessionOpened(answer),
+            answer = answered(&mut self.opening) => Wake::SessionOpened(answer),
+            rebuilt = answered(&mut self.rebuilding) => Wake::SlotsRebuilt(rebuilt),
             () = self.models_fetched.notified() => Wake::ModelsDiscovered,
             wake = session_wake(&mut self.sessions) => wake,
         }
@@ -1043,6 +1051,8 @@ impl<'t> EventLoop<'t> {
             Wake::Pack(preparation) => self.finish_pack(*preparation),
             Wake::SessionOpened(answer) => self.finish_open(answer),
             Wake::ModelsDiscovered => self.rebuild_models(),
+            Wake::SlotsRebuilt(Some(rebuilt)) => self.finish_rebuild(rebuilt),
+            Wake::SlotsRebuilt(None) => {}
         }
         Ok(())
     }
@@ -2133,15 +2143,39 @@ impl<'t> EventLoop<'t> {
 
     /// Discovery landed or a provider was re-authenticated. Invalidating alone
     /// would leave the tabs on stale providers, so dropping the built slots and
-    /// putting every session back on its own spec is a single step. The cache
-    /// in `ModelSlots` keeps that to one build per spec.
+    /// building every session's spec again is a single step, one build per
+    /// spec. Building reads credentials and `providers.toml`, so it runs off
+    /// the loop and lands in [`Self::finish_rebuild`].
     fn rebuild_models(&mut self) {
         self.slots.invalidate();
+        let builder = self.slots.builder();
+        let specs: HashSet<String> = self
+            .sessions
+            .iter()
+            .map(|rt| rt.app.state.model.spec())
+            .collect();
+        self.rebuilding = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            let builder = &builder;
+            let builds = specs.into_iter().map(|spec| async move {
+                let built = builder.build(&spec).await;
+                (spec, built)
+            });
+            join_all(builds).await.into_iter().collect::<RebuiltSlots>()
+        })));
+    }
+
+    /// Only tabs still on the spec they were rebuilt for move, so a model
+    /// picked in the meantime stays.
+    fn finish_rebuild(&mut self, rebuilt: RebuiltSlots) {
         for idx in 0..self.sessions.len() {
             let spec = self.sessions[idx].app.state.model.spec();
-            match self.slots.try_get(&spec) {
-                Ok(slot) => self.apply_model(idx, slot),
-                Err(error) => warn!(%spec, %error, "keeping the previous model"),
+            match rebuilt.get(&spec) {
+                Some(Ok(slot)) => {
+                    let slot = self.slots.adopt(spec, slot);
+                    self.apply_model(idx, slot);
+                }
+                Some(Err(error)) => warn!(%spec, %error, "keeping the previous model"),
+                None => {}
             }
         }
     }
@@ -2722,7 +2756,7 @@ mod tests {
         let mut opening = Some(AbortOnDropHandle::new(tokio::spawn(async {
             panic!("the read broke")
         })));
-        assert!(session_opened(&mut opening).await.is_none());
+        assert!(answered(&mut opening).await.is_none());
         assert!(opening.is_none());
     }
 
@@ -2742,13 +2776,13 @@ mod tests {
         })));
         tokio::select! {
             biased;
-            _ = session_opened(&mut opening) => panic!("the read has not answered yet"),
+            _ = answered(&mut opening) => panic!("the read has not answered yet"),
             () = ready(()) => {}
         }
         assert!(opening.is_some());
 
         go_tx.send(()).unwrap();
-        let answer = session_opened(&mut opening).await.unwrap();
+        let answer = answered(&mut opening).await.unwrap();
         assert_eq!(answer.opened.err().as_deref(), Some(OPEN_ERROR));
         assert!(opening.is_none());
     }

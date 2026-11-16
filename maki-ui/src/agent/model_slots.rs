@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use maki_config::ModelPolicy;
-use maki_providers::provider::from_model;
-use maki_providers::{Model, Timeouts};
+use maki_providers::provider::{Provider, from_model, from_model_async};
+use maki_providers::{AgentError, Model, Timeouts};
 use tracing::warn;
 
 use super::ModelSlot;
@@ -24,8 +24,40 @@ pub(crate) struct ModelSlots {
     /// What the process started on. `get_or_fallback` leans on it so opening a
     /// session always ends up with a model that works.
     fallback: Arc<ModelSlot>,
+    builder: SlotBuilder,
+}
+
+/// Builds a slot off the event loop, for [`ModelSlots::adopt`] to take in.
+#[derive(Clone)]
+pub(crate) struct SlotBuilder {
     policy: Arc<ModelPolicy>,
     timeouts: Timeouts,
+}
+
+impl SlotBuilder {
+    fn model(&self, spec: &str) -> Result<Model, String> {
+        if !self.policy.allows(spec) {
+            return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
+        }
+        Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))
+    }
+
+    pub(crate) async fn build(&self, spec: &str) -> Result<Arc<ModelSlot>, String> {
+        let mut model = self.model(spec)?;
+        let provider = from_model_async(&mut model, self.timeouts).await;
+        into_slot(model, provider)
+    }
+}
+
+fn into_slot(
+    model: Model,
+    provider: Result<Box<dyn Provider>, AgentError>,
+) -> Result<Arc<ModelSlot>, String> {
+    let provider = provider.map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
+    Ok(Arc::new(ModelSlot {
+        model,
+        provider: Arc::from(provider),
+    }))
 }
 
 impl ModelSlots {
@@ -38,9 +70,12 @@ impl ModelSlots {
         Self {
             built: HashMap::from([(spec, Arc::clone(&startup))]),
             fallback: startup,
-            policy,
-            timeouts,
+            builder: SlotBuilder { policy, timeouts },
         }
+    }
+
+    pub(crate) fn builder(&self) -> SlotBuilder {
+        self.builder.clone()
     }
 
     /// An explicit pick, where a rejected spec has to surface rather than
@@ -49,16 +84,9 @@ impl ModelSlots {
         if let Some(slot) = self.built.get(spec) {
             return Ok(Arc::clone(slot));
         }
-        if !self.policy.allows(spec) {
-            return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
-        }
-        let mut model = Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))?;
-        let provider = from_model(&mut model, self.timeouts)
-            .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
-        let slot = Arc::new(ModelSlot {
-            model,
-            provider: Arc::from(provider),
-        });
+        let mut model = self.builder.model(spec)?;
+        let provider = from_model(&mut model, self.builder.timeouts);
+        let slot = into_slot(model, provider)?;
         // Keyed by the requested spec, not the built model's. `from_model`
         // adjusts the model, and later lookups only have the request in hand.
         self.built.insert(spec.to_owned(), Arc::clone(&slot));
@@ -83,13 +111,22 @@ impl ModelSlots {
     pub(crate) fn invalidate(&mut self) {
         self.built.clear();
     }
+
+    /// A slot built for `spec` since the last invalidate, unless a pick or a
+    /// session open built one in the meantime, which is just as new and may
+    /// already be on a tab.
+    pub(crate) fn adopt(&mut self, spec: String, slot: &Arc<ModelSlot>) -> Arc<ModelSlot> {
+        Arc::clone(self.built.entry(spec).or_insert_with(|| Arc::clone(slot)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{INVALID_MODEL_ERR, MODEL_POLICY_ERR, ModelSlots};
+    use super::{INVALID_MODEL_ERR, MODEL_POLICY_ERR, ModelSlots, PROVIDER_INIT_ERR};
     use maki_config::ModelPolicy;
+    use maki_config::providers::{Protocol, ProviderDef, ProvidersConfig};
     use maki_providers::provider::from_model;
+    use maki_providers::test_support::isolated_home;
     use maki_providers::{Model, Timeouts};
     use std::sync::Arc;
     use test_case::test_case;
@@ -99,12 +136,19 @@ mod tests {
     const STARTUP_SPEC: &str = "opencode/startup";
     const OTHER_SPEC: &str = "opencode/other";
     const UNPARSEABLE_SPEC: &str = "not-a-spec";
+    /// A `providers.toml` entry with no key anywhere, so its spec parses and
+    /// only building the provider fails.
+    const KEYLESS_SLUG: &str = "keyless";
+    const KEYLESS_SPEC: &str = "keyless/model";
+    const UNSET_KEY_ENV: &str = "MAKI_TEST_KEYLESS_API_KEY";
     const CACHED: &str = "the same spec must not be built twice";
     const NOT_REBUILT: &str = "invalidate must force a rebuild";
     const NOT_THE_STARTUP_SLOT: &str = "the startup spec must resolve to the startup slot";
     const FELL_BACK: &str = "an allowed, buildable spec must not fall back";
     const NO_FLOOR: &str = "invalidate must keep the fallback floor";
     const POISONED: &str = "a failed lookup must not leave a cache entry";
+    const NOT_KEPT: &str = "adopt must keep the slot cached first";
+    const OFF_LOOP_DIFFERS: &str = "a build off the loop must reject what try_get rejects";
 
     fn startup_slot() -> Arc<super::ModelSlot> {
         let mut model = Model::from_spec(STARTUP_SPEC).unwrap();
@@ -121,6 +165,19 @@ mod tests {
 
     fn strict_policy() -> ModelPolicy {
         ModelPolicy::new(&[STARTUP_SPEC.to_owned()], &[]).unwrap()
+    }
+
+    fn declare_keyless_provider() {
+        let mut config = ProvidersConfig::default();
+        config.upsert(
+            KEYLESS_SLUG.to_owned(),
+            ProviderDef {
+                protocol: Some(Protocol::Openai),
+                api_key_env: Some(UNSET_KEY_ENV.to_owned()),
+                ..ProviderDef::default()
+            },
+        );
+        config.save().unwrap();
     }
 
     /// Opening ten stored sessions on one model should build one provider, so
@@ -177,6 +234,26 @@ mod tests {
         assert!(reason.is_some(), "{NO_FLOOR}");
     }
 
+    #[test_case(false ; "nothing_built_in_between")]
+    #[test_case(true ; "a_pick_built_it_in_between")]
+    #[tokio::test]
+    async fn adopt_keeps_the_slot_cached_first(picked_in_between: bool) {
+        let mut slots = slots(ModelPolicy::default());
+        let rebuilt = slots.builder().build(OTHER_SPEC).await.unwrap();
+        let first = if picked_in_between {
+            slots.try_get(OTHER_SPEC).unwrap()
+        } else {
+            Arc::clone(&rebuilt)
+        };
+
+        let adopted = slots.adopt(OTHER_SPEC.to_owned(), &rebuilt);
+        assert!(Arc::ptr_eq(&adopted, &first), "{NOT_KEPT}");
+        assert!(
+            Arc::ptr_eq(&slots.try_get(OTHER_SPEC).unwrap(), &first),
+            "{CACHED}"
+        );
+    }
+
     /// A cache hit skips both the policy check and the build, so a refusal must
     /// never leave an entry behind or the next caller gets handed a bogus slot.
     /// The strict and unparseable case pins the order, keeping a spec the user
@@ -184,16 +261,22 @@ mod tests {
     #[test_case(strict_policy(), OTHER_SPEC, MODEL_POLICY_ERR ; "a spec off the allow list")]
     #[test_case(ModelPolicy::default(), UNPARSEABLE_SPEC, INVALID_MODEL_ERR ; "a spec that will not parse")]
     #[test_case(strict_policy(), UNPARSEABLE_SPEC, MODEL_POLICY_ERR ; "policy is checked before parsing")]
-    fn a_rejected_spec_errors_every_time_and_falls_back(
+    #[test_case(ModelPolicy::default(), KEYLESS_SPEC, PROVIDER_INIT_ERR ; "a provider that will not build")]
+    #[tokio::test]
+    async fn a_rejected_spec_errors_every_time_and_falls_back(
         policy: ModelPolicy,
         spec: &str,
         expected: &str,
     ) {
+        let _home = isolated_home();
+        declare_keyless_provider();
         let mut slots = slots(policy);
 
         let err = slots.try_get(spec).err().unwrap();
         assert!(err.starts_with(expected), "{err}");
         assert!(slots.try_get(spec).is_err(), "{POISONED}");
+        let off_loop = slots.builder().build(spec).await.err();
+        assert_eq!(off_loop.as_ref(), Some(&err), "{OFF_LOOP_DIFFERS}");
 
         let (slot, reason) = slots.get_or_fallback(spec);
         assert_eq!(slot.model.spec(), STARTUP_SPEC, "{POISONED}");
