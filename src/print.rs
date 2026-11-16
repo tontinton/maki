@@ -335,7 +335,8 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         local_tools: Default::default(),
         background: BackgroundMode::from_wait(background_wait),
         stop: interrupt.stop(),
-    });
+    })
+    .await;
 
     let InteractiveHandle {
         tool_names,

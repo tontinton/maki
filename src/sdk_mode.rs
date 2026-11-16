@@ -604,7 +604,8 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         local_tools: Default::default(),
         background: BackgroundMode::from_wait(cli.background_wait()),
         stop: stop.clone(),
-    });
+    })
+    .await;
 
     let (out_tx, mut out_rx) = unbounded_channel::<String>();
     let writer_task = tokio::spawn(async move {
