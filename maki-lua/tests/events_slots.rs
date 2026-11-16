@@ -191,7 +191,6 @@ fn without_session_read() -> PluginPermissions {
 /// adds it on the Lua thread, so a plugin without `session_read` loses it there too.
 #[test]
 fn turn_complete_message_arrives_as_a_session_table() {
-    const IMAGE_BASE64: &str = "aW1hZ2U=";
     const READER: &str = "reply_reader";
     const BLIND: &str = "reply_blind";
     let fields = host_event_fields("TurnComplete").expect("TurnComplete is classified");
@@ -199,25 +198,7 @@ fn turn_complete_message_arrives_as_a_session_table() {
     let mut ui = host.take_ui_action_rx().unwrap();
     load(&host, READER, &reply_reporter(READER));
     load_granted(&host, BLIND, &reply_reporter(BLIND), without_session_read());
-    let reply = Message {
-        role: Role::Assistant,
-        content: vec![
-            ContentBlock::tool_use("t1", "read", serde_json::json!({ "path": null })),
-            ContentBlock::Image {
-                source: ImageSource::new(ImageMediaType::Png, IMAGE_BASE64.into()),
-            },
-        ],
-        ..Default::default()
-    };
-    host.event_handle().fire(
-        None,
-        HostEvent::TurnComplete {
-            message: &reply,
-            context_size: None,
-            context_window: 0,
-            id: None,
-        },
-    );
+    fire_reply(&host, &reply_with_null_and_image());
     assert_eq!(
         [
             next_flash(&mut ui),
@@ -229,6 +210,57 @@ fn turn_complete_message_arrives_as_a_session_table() {
             content_omitted_message(BLIND, "TurnComplete", fields.content),
             format!("{BLIND}:seen=false,null=nil,image=nil"),
         ],
+    );
+}
+
+/// No listener holds `session_read`, so the reply is never built. The event
+/// still arrives without it, and the plugin is still told it was left out.
+#[test]
+fn an_unbuilt_reply_is_still_reported_as_left_out() {
+    let fields = host_event_fields("TurnComplete").expect("TurnComplete is classified");
+    let (_reg, host) = host();
+    let mut ui = host.take_ui_action_rx().unwrap();
+    load_granted(
+        &host,
+        CONTENT_BLIND,
+        &reply_reporter(CONTENT_BLIND),
+        without_session_read(),
+    );
+    fire_reply(&host, &reply_with_null_and_image());
+    assert_eq!(
+        [next_flash(&mut ui), next_flash(&mut ui)],
+        [
+            content_omitted_message(CONTENT_BLIND, "TurnComplete", fields.content),
+            format!("{CONTENT_BLIND}:seen=false,null=nil,image=nil"),
+        ],
+    );
+}
+
+/// A reply holding the two values JSON would mangle: a null in a tool call and
+/// an image.
+fn reply_with_null_and_image() -> Message {
+    const IMAGE_BASE64: &str = "aW1hZ2U=";
+    Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::tool_use("t1", "read", serde_json::json!({ "path": null })),
+            ContentBlock::Image {
+                source: ImageSource::new(ImageMediaType::Png, IMAGE_BASE64.into()),
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+fn fire_reply(host: &PluginHost, reply: &Message) {
+    host.event_handle().fire(
+        None,
+        HostEvent::TurnComplete {
+            message: reply,
+            context_size: None,
+            context_window: 0,
+            id: None,
+        },
     );
 }
 

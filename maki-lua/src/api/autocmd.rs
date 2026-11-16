@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::Message;
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
-use crate::agent_autocmd::host_event_fields;
+use crate::agent_autocmd::{MESSAGE_KEY, host_event_fields};
+use crate::api::session::message_table;
 use crate::api::util::convert::TableExt;
 use crate::api::util::dispatch::{DepthGuard, Reentry};
 use crate::plugin_permissions::{Permission, grant_hint};
@@ -81,7 +83,18 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 /// [`HostEventKind::fields`](crate::agent_autocmd::HostEventKind::fields)
 /// calls metadata. An event the host never fires is a plugin's own, and
 /// arrives as fired.
-pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, data: Value) {
+///
+/// `message` is the reply a `TurnComplete` carries, and it becomes
+/// `data.message` only when a listener of this event holds `session_read`. A
+/// reply nobody is waiting for is therefore never built, and leaving it out
+/// still counts as a cut, so a plugin without the permission is told so.
+pub(crate) async fn dispatch(
+    lua: Lua,
+    event: String,
+    pattern: Option<String>,
+    data: Value,
+    message: Option<Message>,
+) {
     let Ok(_guard) = DepthGuard::enter(&lua, "autocmd", &event, Reentry::Vm) else {
         tracing::warn!(event, "autocmd dispatch exceeded max depth, skipping");
         return;
@@ -110,10 +123,22 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
         });
         snapshot
     };
-    let redacted = if snapshot.iter().all(|(.., reads_content)| *reads_content) {
+    let readers = snapshot
+        .iter()
+        .filter(|(.., reads_content)| *reads_content)
+        .count();
+    let withheld = (message.is_some() && readers == 0).then_some(MESSAGE_KEY);
+    if let (Some(message), Value::Table(data)) = (message, &data)
+        && readers > 0
+        && let Err(e) =
+            message_table(&lua, &message).and_then(|message| data.set(MESSAGE_KEY, message))
+    {
+        tracing::warn!(event, error = %e, "autocmd reply not attached");
+    }
+    let redacted = if readers == snapshot.len() {
         None
     } else {
-        match metadata_only(&lua, &event, &data) {
+        match metadata_only(&lua, &event, &data, withheld) {
             Ok(redacted) => redacted,
             Err(e) => {
                 tracing::warn!(event, error = %e, "failed to build redacted autocmd data");
@@ -156,23 +181,32 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
 /// An allowlist on purpose: a key the host sends but nobody classified is
 /// cut too, so a field that slips past the pin test fails closed.
 ///
+/// {withheld} is a key the caller left out because no listener holds the
+/// permission for it, so it counts as cut too.
+///
 /// Most events carry only metadata, so the keys are checked before anything
 /// is built. A key that is not a string is cut by its type name and never
 /// formatted, because a plugin can fire a host event with a key whose
 /// `__tostring` throws, and that must not drop the event for everyone.
-fn metadata_only(lua: &Lua, event: &str, data: &Value) -> LuaResult<Option<(Value, Vec<String>)>> {
+fn metadata_only(
+    lua: &Lua,
+    event: &str,
+    data: &Value,
+    withheld: Option<&str>,
+) -> LuaResult<Option<(Value, Vec<String>)>> {
     let (Some(fields), Value::Table(table)) = (host_event_fields(event), data) else {
         return Ok(None);
     };
     let is_metadata = |key: &Value| matches!(key, Value::String(k) if k.to_str().is_ok_and(|k| fields.is_metadata(&k)));
-    if table
-        .pairs::<Value, Value>()
-        .all(|pair| pair.is_ok_and(|(key, _)| is_metadata(&key)))
+    if withheld.is_none()
+        && table
+            .pairs::<Value, Value>()
+            .all(|pair| pair.is_ok_and(|(key, _)| is_metadata(&key)))
     {
         return Ok(None);
     }
     let stripped = lua.create_table()?;
-    let mut removed = Vec::new();
+    let mut removed: Vec<String> = withheld.into_iter().map(str::to_owned).collect();
     for pair in table.pairs::<Value, Value>() {
         let (key, value) = pair?;
         if is_metadata(&key) {
@@ -464,7 +498,7 @@ async fn exec_autocmds(lua: Lua, event: Value, opts: Option<Table>) -> LuaResult
         None => (None, Value::Nil),
     };
     for event in events {
-        dispatch(lua.clone(), event, pattern.clone(), data.clone()).await;
+        dispatch(lua.clone(), event, pattern.clone(), data.clone(), None).await;
     }
     Ok(())
 }
