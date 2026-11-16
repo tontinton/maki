@@ -11455,10 +11455,14 @@ const ONE_FORK: &str = "a fork must hand the loop exactly one copy to open";
 const RECOVERED_PROMPT: &str = "prompt queued before the agent failed";
 
 fn opened_fork(actions: Vec<Action>) -> AppSession {
-    let Ok([Action::OpenFork(open)]) = <[Action; 1]>::try_from(actions) else {
+    opened_fork_with_images(actions).0
+}
+
+fn opened_fork_with_images(actions: Vec<Action>) -> (AppSession, Vec<ImageSource>) {
+    let Ok([Action::OpenFork { open, draft_images }]) = <[Action; 1]>::try_from(actions) else {
         panic!("{ONE_FORK}");
     };
-    open.session
+    (open.session, draft_images)
 }
 
 #[test]
@@ -11508,6 +11512,29 @@ fn fork_refuses_an_empty_copy(fork: fn(&mut App) -> Vec<Action>) {
     let mut app = test_app();
     assert!(fork(&mut app).is_empty());
     assert_eq!(app.status_bar.flash_text(), Some(FORK_EMPTY_MSG));
+}
+
+/// The copy's draft comes back from disk as text, so the images its
+/// markers name travel with the fork and land in the copy's input.
+#[test]
+fn fork_to_prompt_carries_the_prompts_images_into_the_copy() {
+    const PROMPT: &str = "second [Image 1]";
+    let sent = ImageSource::new(ImageMediaType::Png, Arc::from("c2VudA=="));
+    let mut app = test_app();
+    seed_rewind_session(app.state.session_mut());
+    let (fork, draft_images) = opened_fork_with_images(app.fork_to(RewindEntry {
+        images: vec![sent.clone()],
+        ..rewind_to_prompt(PROMPT)
+    }));
+    assert_eq!(draft_images, std::slice::from_ref(&sent));
+
+    let mut copy = test_app();
+    copy.state.session_mut().meta = fork.meta;
+    copy.restore_display();
+    copy.restore_draft_images(draft_images);
+    let submission = copy.input_box.submit().unwrap();
+    assert_eq!(submission.text, PROMPT);
+    assert_eq!(submission.images, [sent]);
 }
 
 #[test]

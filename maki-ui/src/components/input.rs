@@ -550,6 +550,11 @@ impl InputBox {
     /// images of the prompt it replaces go with that prompt.
     pub fn set_input_with_images(&mut self, s: &str, images: Vec<ImageSource>) {
         self.buffer.set_value(s);
+        self.set_images(images);
+    }
+
+    /// Replaces the attached images, leaving the text that names them alone.
+    pub fn set_images(&mut self, images: Vec<ImageSource>) {
         self.pending_images = images;
     }
 

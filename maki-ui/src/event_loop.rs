@@ -45,7 +45,7 @@ use maki_lua::{
 use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
 use maki_providers::provider::{Provider, from_model};
-use maki_providers::{Message, Model};
+use maki_providers::{ImageSource, Message, Model};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
@@ -2134,10 +2134,11 @@ impl<'t> EventLoop<'t> {
 
     /// The fork runs on the model of the session it came from, whose slot is
     /// already built.
-    fn open_fork(&mut self, idx: usize, open: OpenSession) {
+    fn open_fork(&mut self, idx: usize, open: OpenSession, draft_images: Vec<ImageSource>) {
         let slot = self.sessions[idx].slot.load_full();
         let fork = self.push_runtime(self.ctx.spawn_runtime(open, slot));
         self.set_focused(fork);
+        self.focused_app().restore_draft_images(draft_images);
         let id = self.sessions[self.focused].id();
         maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
         self.focused_app()
@@ -2175,7 +2176,7 @@ impl<'t> EventLoop<'t> {
                 self.emit_task_stopped(idx, &id, Some(&plugin));
             }
             Action::RestartAgent(history) => self.respawn_agent(idx, history, Respawn::Restart),
-            Action::OpenFork(open) => self.open_fork(idx, *open),
+            Action::OpenFork { open, draft_images } => self.open_fork(idx, *open, draft_images),
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {
                     self.focused_app().flash(e);
