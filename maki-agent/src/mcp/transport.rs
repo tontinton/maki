@@ -645,6 +645,11 @@ mod tests {
     const CONFIG_BEARER: &str = "Bearer from-config";
     const OLD_TOKEN: &str = "old-token";
     const NEW_TOKEN: &str = "new-token";
+    const STORED_REFRESH: &str = "refresh-1";
+    const ROTATED_REFRESH: &str = "refresh-2";
+    /// Keeps the first refresh in flight until the second starts. Too short
+    /// only hides a missing lock, it never fails a working one.
+    const REFRESH_OVERLAP: Duration = Duration::from_millis(200);
     const CHALLENGE: &str =
         r#"Bearer resource_metadata="http://127.0.0.1:1/.well-known/oauth-protected-resource""#;
     const HOUR_MS: u64 = 3_600_000;
@@ -706,7 +711,14 @@ mod tests {
             "access_token": NEW_TOKEN,
             "token_type": "Bearer",
             "expires_in": 3600,
+            "refresh_token": ROTATED_REFRESH,
         }))
+    }
+
+    fn form_values(req: &Request, name: &str) -> impl Iterator<Item = String> {
+        form_urlencoded::parse(req.text.as_bytes())
+            .filter(move |(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
     }
 
     /// A minimal stateful MCP server with one tool and no SSE stream.
@@ -832,7 +844,7 @@ mod tests {
             server_url: format!("{base}{MCP_PATH}"),
             tokens: Some(OAuthTokens {
                 access: OLD_TOKEN.into(),
-                refresh: "refresh-1".into(),
+                refresh: STORED_REFRESH.into(),
                 expires: now_millis() + lifetime_ms,
                 account_id: None,
             }),
@@ -1176,11 +1188,10 @@ mod tests {
                 if req.path != TOKEN_PATH {
                     return mcp_reply(req);
                 }
-                resources.lock().unwrap().extend(
-                    form_urlencoded::parse(req.text.as_bytes())
-                        .filter(|(key, _)| key == "resource")
-                        .map(|(_, value)| value.into_owned()),
-                );
+                resources
+                    .lock()
+                    .unwrap()
+                    .extend(form_values(req, "resource"));
                 token_reply()
             }
         });
@@ -1233,6 +1244,40 @@ mod tests {
         assert_eq!(*refreshes.lock().unwrap(), 1);
         let saved = load_mcp_auth(&storage, SERVER, &url).unwrap();
         assert_eq!(saved.tokens.unwrap().access, NEW_TOKEN);
+    }
+
+    /// Each connect keeps its own copy of the login, like two maki processes.
+    #[tokio::test]
+    async fn concurrent_refreshes_never_spend_one_refresh_token_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(dir.path().to_path_buf());
+        let spent = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_server({
+            let spent = Arc::clone(&spent);
+            move |req| {
+                if req.path != TOKEN_PATH {
+                    return mcp_reply(req);
+                }
+                spent
+                    .lock()
+                    .unwrap()
+                    .extend(form_values(req, "refresh_token"));
+                thread::sleep(REFRESH_OVERLAP);
+                token_reply()
+            }
+        });
+        save_mcp_auth(&storage, SERVER, &stored_record(&base, 0)).unwrap();
+
+        let config = http_config(&base, &[]);
+        tokio::try_join!(
+            connect(&config, Some(&storage)),
+            connect(&config, Some(&storage)),
+        )
+        .unwrap();
+
+        let spent = spent.lock().unwrap();
+        let stored_spends = spent.iter().filter(|token| *token == STORED_REFRESH);
+        assert_eq!(stored_spends.count(), 1, "spent {spent:?}");
     }
 
     #[tokio::test]

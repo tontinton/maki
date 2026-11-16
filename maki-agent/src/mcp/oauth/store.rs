@@ -5,7 +5,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use maki_storage::StateDir;
 use maki_storage::auth::{
-    McpAuthData, OAuthTokens, delete_mcp_auth, load_mcp_auth_async, now_millis, save_mcp_auth,
+    McpAuthData, OAuthTokens, delete_mcp_auth, load_mcp_auth_async, lock_mcp_auth_async,
+    now_millis, save_mcp_auth,
 };
 use oauth2::basic::BasicTokenType;
 use oauth2::{AccessToken, RefreshToken, TokenResponse};
@@ -22,8 +23,10 @@ const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
 /// logins survive the switch and `maki mcp logout` still finds them.
 ///
 /// rmcp loads them before every request, so they are served from memory. A
-/// refresh reads the file again first, since another maki may have rotated
-/// the refresh token in the meantime.
+/// refresh reads the file again, and holds the login's file lock from that
+/// read to its save, so two makis never spend one refresh token. Notion takes
+/// the same token twice and keeps only the last one it hands out, so when the
+/// other answer is saved last the login dies at the next refresh.
 ///
 /// A save or a clear keeps the record locked until the file is written, on a
 /// blocking job that runs to the end, so one that rmcp stops waiting for still
@@ -84,12 +87,16 @@ impl CredentialStore for AuthStore {
     }
 
     async fn acquire_refresh_guard(&self) -> Result<Option<CredentialRefreshGuard>, AuthError> {
+        // Waited for before locking the record, which every request's `load`
+        // needs. Whoever waited still refreshes the token its peer just saved,
+        // until rmcp checks the expiry again under the guard.
+        let lock = lock_mcp_auth_async(&self.storage, &self.server_name).await;
         let mut record = self.record.lock().await;
         match load_mcp_auth_async(&self.storage, &self.server_name, &record.server_url).await {
             Some(on_disk) => *record = on_disk,
             None => record.tokens = None,
         }
-        Ok(None)
+        Ok(lock.map(CredentialRefreshGuard::new))
     }
 }
 
