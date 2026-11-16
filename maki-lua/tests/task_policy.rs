@@ -812,7 +812,7 @@ fn reply_text(done: ToolDoneEvent) -> String {
 fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     let mut opts = serde_json::Map::new();
     opts.insert("max_concurrent".into(), json!(1));
-    let (reg, host) = load_task_host_with_opts(opts);
+    let (reg, mut host) = load_task_host_with_opts(opts);
     let mut ui = host.take_ui_action_rx().unwrap();
     let chat = Chat::live();
     let (_run_trigger, run) = CancelToken::new();

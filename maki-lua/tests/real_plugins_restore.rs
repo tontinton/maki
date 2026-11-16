@@ -573,7 +573,7 @@ fn todo_write_live_call_reports_the_result(input: Value, expected: &str) {
 /// next focus change, resurrecting a list the turn already finished.
 #[test]
 fn todo_load_restore_leaves_the_panel_closed() {
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     host.load_source(TODO_TOOL, TODO_SRC).unwrap();
     let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
     run_restore(
@@ -604,7 +604,7 @@ fn todo_load_restore_leaves_the_panel_closed() {
 #[test]
 fn todo_panel_opens_in_the_tab_of_each_writing_session() {
     let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source(TODO_TOOL, TODO_SRC).unwrap();
     let sessions = [MakiId::generate(), MakiId::generate()];
     let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });

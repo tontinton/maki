@@ -141,7 +141,7 @@ fn flashes_until_sentinel(ui: &mut UnboundedReceiver<UiAction>) -> Vec<String> {
 #[test_case("InputChanged" ; "input_changed")]
 fn content_fields_are_left_out_without_session_read(event: &str) {
     let fields = host_event_fields(event).expect("a content event is classified");
-    let (_reg, host) = host();
+    let (_reg, mut host) = host();
     let mut ui = host.take_ui_action_rx().unwrap();
     load(&host, CONTENT_READER, &key_reporter(CONTENT_READER, event));
     load_granted(
@@ -194,7 +194,7 @@ fn turn_complete_message_arrives_as_a_session_table() {
     const READER: &str = "reply_reader";
     const BLIND: &str = "reply_blind";
     let fields = host_event_fields("TurnComplete").expect("TurnComplete is classified");
-    let (_reg, host) = host();
+    let (_reg, mut host) = host();
     let mut ui = host.take_ui_action_rx().unwrap();
     load(&host, READER, &reply_reporter(READER));
     load_granted(&host, BLIND, &reply_reporter(BLIND), without_session_read());
@@ -218,7 +218,7 @@ fn turn_complete_message_arrives_as_a_session_table() {
 #[test]
 fn an_unbuilt_reply_is_still_reported_as_left_out() {
     let fields = host_event_fields("TurnComplete").expect("TurnComplete is classified");
-    let (_reg, host) = host();
+    let (_reg, mut host) = host();
     let mut ui = host.take_ui_action_rx().unwrap();
     load_granted(
         &host,
@@ -303,7 +303,7 @@ const CUSTOM_EVENT: &str = "MyPluginEvent";
 #[test_case("TurnEnd", false ; "an_unclassified_host_key_is_left_out")]
 #[test_case(CUSTOM_EVENT, true ; "a_plugin_event_arrives_whole")]
 fn only_classified_metadata_reaches_a_plugin_without_session_read(event: &str, whole: bool) {
-    let (_reg, host) = host();
+    let (_reg, mut host) = host();
     let mut ui = host.take_ui_action_rx().unwrap();
     load_granted(
         &host,
@@ -361,7 +361,7 @@ maki.api.create_autocmd("{SENTINEL_EVENT}", {{
 #[test]
 fn a_key_that_cannot_be_named_does_not_drop_the_event() {
     let event = "TurnEnd";
-    let (_reg, host) = host();
+    let (_reg, mut host) = host();
     let mut ui = host.take_ui_action_rx().unwrap();
     load(&host, CONTENT_READER, &key_counter(CONTENT_READER, event));
     load_granted(
@@ -1065,7 +1065,7 @@ fn an_output_layer_pays_for_the_content_it_changes(granted: fn() -> PluginPermis
 /// must not leave the other half unreported.
 #[test]
 fn a_skipped_layer_warns_once_per_gap() {
-    let (reg, host) = host();
+    let (reg, mut host) = host();
     let mut ui = host.take_ui_action_rx().unwrap();
     guarded_tool(&host);
     let slot = format!("tool.{GUARDED_TOOL}.{}", HookStage::Output.as_str());

@@ -7225,8 +7225,8 @@ end)
 /// would where the user pressed it.
 #[test]
 fn a_normal_mode_key_never_types_through_its_fallback() {
-    let host = granted_host(MODE_FLIPPING_LOGGER, &["session_read"]);
-    let (mut app, mut ui) = hosted_app(&host);
+    let mut host = granted_host(MODE_FLIPPING_LOGGER, &["session_read"]);
+    let (mut app, mut ui) = hosted_app(&mut host);
     app.update(Msg::Key(KeyEvent::new(
         KeyCode::Char('n'),
         KeyModifiers::ALT,
@@ -7811,7 +7811,7 @@ fn new_host() -> PluginHost {
 }
 
 /// Wires {host} into a fresh app the way the event loop does.
-fn hosted_app(host: &PluginHost) -> (App, UnboundedReceiver<UiAction>) {
+fn hosted_app(host: &mut PluginHost) -> (App, UnboundedReceiver<UiAction>) {
     let mut app = test_app();
     app.keymap_reader = host.keymap_reader();
     app.lua_event_handle = host.event_handle();
@@ -7820,9 +7820,9 @@ fn hosted_app(host: &PluginHost) -> (App, UnboundedReceiver<UiAction>) {
 
 /// A host running {source} as {plugin}, and a fresh app wired to it.
 fn plugin_app(plugin: &str, source: &str) -> (PluginHost, App, UnboundedReceiver<UiAction>) {
-    let host = new_host();
+    let mut host = new_host();
     host.load_source(plugin, source).unwrap();
-    let (app, ui) = hosted_app(&host);
+    let (app, ui) = hosted_app(&mut host);
     (host, app, ui)
 }
 
@@ -7940,8 +7940,8 @@ fn granted_host(source: &str, grants: &[&str]) -> PluginHost {
 #[test_case(PASSING_ENTER_PLUGIN, &[],                 "hi",  true  ; "passed_on_needs_nothing")]
 #[test_case(EDITING_ENTER_PLUGIN, &["input", "agent", "session_read", "session_write"], "hi!", false ; "edited_sends_nothing")]
 fn a_fallback_enter_sends(source: &str, grants: &[&str], text: &str, sends: bool) {
-    let host = granted_host(source, grants);
-    let (mut app, mut ui) = hosted_app(&host);
+    let mut host = granted_host(source, grants);
+    let (mut app, mut ui) = hosted_app(&mut host);
 
     type_keys(&mut app, "hi");
     app.update(Msg::Key(key(KeyCode::Enter)));
@@ -7980,8 +7980,8 @@ fn an_enter_held_while_a_handler_changed_the_input_sends_nothing(
     left: &str,
     flash: Option<&str>,
 ) {
-    let host = granted_host(source, grants);
-    let (mut app, mut ui) = hosted_app(&host);
+    let mut host = granted_host(source, grants);
+    let (mut app, mut ui) = hosted_app(&mut host);
 
     type_keys(&mut app, "hix");
     app.update(Msg::Key(key(KeyCode::Enter)));
@@ -8602,10 +8602,10 @@ fn a_forked_turn_keeps_its_writers(text: &str) -> Option<StoredWriters> {
 /// raises before it reaches the UI, saying where to grant `input`.
 #[test]
 fn an_edit_without_a_manifest_says_where_to_grant_input() {
-    let host = new_host();
+    let mut host = new_host();
     host.load_source_with_permissions(USER_CONFIG, NO_GRANTS_EDIT, PluginPermissions::denied())
         .unwrap();
-    let (mut app, mut ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&mut host);
 
     app.update(Msg::Key(KeyEvent::new(
         KeyCode::Char('x'),
@@ -8941,8 +8941,8 @@ end)
 #[test_case("nil", &["input", "session_read"], DRAFT     ; "a_cursor_moved_with_input")]
 #[test_case("2",   &["input", "session_read"], DRAFT     ; "a_selection_made_with_input")]
 fn a_fallback_lands_where_the_user_typed(anchor: &str, grants: &[&str], left: &str) {
-    let host = granted_host(&steering_bang(anchor), grants);
-    let (mut app, mut ui) = hosted_app(&host);
+    let mut host = granted_host(&steering_bang(anchor), grants);
+    let (mut app, mut ui) = hosted_app(&mut host);
     type_keys(&mut app, DRAFT);
 
     app.update(Msg::Key(key(KeyCode::Char('!'))));
@@ -8975,10 +8975,10 @@ end)
 /// cannot make Enter run it.
 #[test]
 fn an_action_writes_the_input_with_its_price_alone() {
-    let host = new_host();
+    let mut host = new_host();
     host.load_source(PRICED_OWNER, BANG_ACTION).unwrap();
     host.load_source(USER_CONFIG, BANG_CALLER).unwrap();
-    let (mut app, mut ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&mut host);
     type_keys(&mut app, DRAFT);
 
     app.update(Msg::Key(KeyEvent::new(
@@ -9061,7 +9061,7 @@ fn tab_composed_in_init_lua_accepts_a_completion_or_falls_back(
         PluginPermissions::from_approved(grants.iter().copied()),
     )
     .unwrap();
-    let (mut app, mut ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&mut host);
 
     type_keys(&mut app, "$re");
     let _ = app.tick();

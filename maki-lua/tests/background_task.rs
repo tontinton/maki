@@ -122,7 +122,7 @@ struct Host {
 }
 
 impl Host {
-    fn attached(reg: Arc<ToolRegistry>, host: PluginHost) -> Self {
+    fn attached(reg: Arc<ToolRegistry>, mut host: PluginHost) -> Self {
         let ui = host.take_ui_action_rx().unwrap();
         Self { reg, host, ui }
     }
