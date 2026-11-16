@@ -257,10 +257,11 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"TurnComplete"`: `data.message`, the model's message, with
 ///   `data.context_window` and `data.context_size` when the host knows it.
 ///   Fires after each response, before that response's tool calls run.
-///   `data.message` needs `session_read`. It is JSON in the session
-///   format, not the Lua tables `maki.session.messages` builds: the keys
-///   and blocks are the same, [listed here](#maki-session-messages). Each
-///   block is tagged by `type`, and each type carries its own fields. A
+///   `data.message` needs `session_read` and is the same table a
+///   `maki.session.messages()` entry is, so a null arrives as `maki.NIL` and
+///   an image block carries an image handle instead of base64. The keys and
+///   blocks are [listed here](#maki-session-messages). Each block is tagged
+///   by `type`, and each type carries its own fields. A
 ///   subagent's response carries its own message and sizes with `data.id`,
 ///   the task id `maki.session.notify` takes as `task`. Skip events with an
 ///   `id` to watch only the main context. No payload carries a cost, and

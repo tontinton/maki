@@ -13,7 +13,7 @@ use maki_agent::permissions::{LayerAnswer, LayerVerdict};
 use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
-use maki_lua::agent_autocmd::host_event_fields;
+use maki_lua::agent_autocmd::{HostEvent, host_event_fields};
 use maki_lua::test_support::{
     content_omitted_message, fire_autocmd, layer_skipped_message, runtime, wait_reply,
 };
@@ -21,6 +21,7 @@ use maki_lua::{
     Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
     PluginPermissions, SessionEndReason, UiAction,
 };
+use maki_providers::{ContentBlock, ImageMediaType, ImageSource, Message, Role};
 use maki_storage::id::MakiId;
 use test_case::test_case;
 use tokio::join;
@@ -183,6 +184,81 @@ fn without_session_read() -> PluginPermissions {
     let mut blind = PluginPermissions::trusted();
     blind.set(Permission::SessionRead, false);
     blind
+}
+
+/// The reply arrives as the table `maki.session.messages` builds rather than as
+/// JSON: a null inside a tool call survives, and an image stays a handle. The host
+/// adds it on the Lua thread, so a plugin without `session_read` loses it there too.
+#[test]
+fn turn_complete_message_arrives_as_a_session_table() {
+    const IMAGE_BASE64: &str = "aW1hZ2U=";
+    const READER: &str = "reply_reader";
+    const BLIND: &str = "reply_blind";
+    let fields = host_event_fields("TurnComplete").expect("TurnComplete is classified");
+    let (_reg, host) = host();
+    let mut ui = host.take_ui_action_rx().unwrap();
+    load(&host, READER, &reply_reporter(READER));
+    load_granted(&host, BLIND, &reply_reporter(BLIND), without_session_read());
+    let reply = Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::tool_use("t1", "read", serde_json::json!({ "path": null })),
+            ContentBlock::Image {
+                source: ImageSource::new(ImageMediaType::Png, IMAGE_BASE64.into()),
+            },
+        ],
+        ..Default::default()
+    };
+    host.event_handle().fire(
+        None,
+        HostEvent::TurnComplete {
+            message: &reply,
+            context_size: None,
+            context_window: 0,
+            id: None,
+        },
+    );
+    assert_eq!(
+        [
+            next_flash(&mut ui),
+            next_flash(&mut ui),
+            next_flash(&mut ui)
+        ],
+        [
+            format!("{READER}:seen=true,null=true,image=userdata"),
+            content_omitted_message(BLIND, "TurnComplete", fields.content),
+            format!("{BLIND}:seen=false,null=nil,image=nil"),
+        ],
+    );
+}
+
+/// Flashes what a reply looks like, without indexing one a plugin may not get.
+fn reply_reporter(plugin: &str) -> String {
+    format!(
+        r#"
+maki.api.create_autocmd("TurnComplete", {{
+    callback = function(ev)
+        local msg = ev.data.message
+        local content = msg and msg.content or {{}}
+        maki.ui.flash(("%s:seen=%s,null=%s,image=%s"):format(
+            "{plugin}",
+            tostring(msg ~= nil),
+            tostring(content[1] and content[1].input.path == maki.NIL),
+            type(content[2] and content[2].source)))
+    end,
+}})
+"#
+    )
+}
+
+fn next_flash(ui: &mut UnboundedReceiver<UiAction>) -> String {
+    loop {
+        match wait_next(ui, DISPATCH_TIMEOUT) {
+            Some(UiAction::Flash(msg)) => return msg,
+            Some(_) => {}
+            None => panic!("no flash arrived"),
+        }
+    }
 }
 
 const UNCLASSIFIED_KEY: &str = "unclassified";

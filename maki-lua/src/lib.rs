@@ -204,7 +204,7 @@ pub mod test_support {
         /// Next fired autocmd as `(event, data)`, skipping other requests.
         pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
             while let Ok(req) = self.0.lock().unwrap().try_recv() {
-                if let Request::FireAutocmd { event, data } = req {
+                if let Request::FireAutocmd { event, data, .. } = req {
                     return Some((event, data));
                 }
             }
@@ -230,6 +230,7 @@ pub mod test_support {
         let _ = handle.tx.send(Request::FireAutocmd {
             event: event.to_owned(),
             data,
+            message: None,
         });
     }
 

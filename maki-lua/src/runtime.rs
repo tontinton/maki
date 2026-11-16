@@ -45,11 +45,12 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use maki_config::RawConfig;
+use maki_providers::Message;
 use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::now_epoch;
 
-use crate::agent_autocmd::HostEvent;
+use crate::agent_autocmd::{HostEvent, MESSAGE_KEY};
 use crate::api::action::{ActionStore, clear_plugin_actions};
 use crate::api::agent::adopt_session;
 use crate::api::autocmd::AutocmdStore;
@@ -596,6 +597,8 @@ pub enum Request {
     FireAutocmd {
         event: String,
         data: Value,
+        /// A `TurnComplete` reply, which only the Lua thread can shape.
+        message: Option<Message>,
     },
     EndSession(EndSession),
     ClickTool {
@@ -637,7 +640,11 @@ pub enum Request {
 /// from serving anything else, including the priority lane. One consumer
 /// keeps them in the order the host fired them.
 enum HostHook {
-    Autocmd { event: String, data: Value },
+    Autocmd {
+        event: String,
+        data: Value,
+        message: Option<Message>,
+    },
     EndSession(EndSession),
 }
 
@@ -2540,8 +2547,18 @@ fn collect_turn_garbage(lua: &Lua) {
 
 async fn run_host_hook(lua: &Lua, hook: HostHook) {
     match hook {
-        HostHook::Autocmd { event, data } => {
+        HostHook::Autocmd {
+            event,
+            data,
+            message,
+        } => {
             let data = json_to_lua(lua, &data).unwrap_or(LuaValue::Nil);
+            if let (Some(message), LuaValue::Table(table)) = (message, &data)
+                && let Err(e) = crate::api::session::message_table(lua, &message)
+                    .and_then(|message| table.set(MESSAGE_KEY, message))
+            {
+                tracing::warn!(event, error = %e, "autocmd message not attached");
+            }
             let is_turn_end = event == TURN_END_EVENT;
             crate::api::autocmd::dispatch(lua.clone(), event, None, data).await;
             if is_turn_end {
@@ -6226,8 +6243,16 @@ pub fn spawn(
                             row,
                             fallback,
                         } => rt.click_tool(&gate, &restores, tool_use_id, row, fallback),
-                        Request::FireAutocmd { event, data } => {
-                            let _ = hook_tx.send(HostHook::Autocmd { event, data });
+                        Request::FireAutocmd {
+                            event,
+                            data,
+                            message,
+                        } => {
+                            let _ = hook_tx.send(HostHook::Autocmd {
+                                event,
+                                data,
+                                message,
+                            });
                         }
                         Request::EndSession(end) => {
                             let _ = hook_tx.send(HostHook::EndSession(end));

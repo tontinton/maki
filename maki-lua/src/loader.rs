@@ -1282,6 +1282,7 @@ impl EventHandle {
         let _ = self.tx.send(Request::FireAutocmd {
             event: event.name().to_owned(),
             data: event.payload(session_id),
+            message: event.lua_message().cloned(),
         });
     }
 

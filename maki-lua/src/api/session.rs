@@ -325,7 +325,7 @@ async fn session_export(
 
 /// The serde shape, nulls as `maki.NIL`. An image block is built around a
 /// handle on its payload, which is never copied, not even into JSON.
-fn message_table(lua: &Lua, message: &Message) -> LuaResult<Value> {
+pub(crate) fn message_table(lua: &Lua, message: &Message) -> LuaResult<Value> {
     let envelope = message.with_content(Vec::new());
     let json = serde_json::to_value(&envelope).map_err(mlua::Error::external)?;
     let table = lua.unpack::<Table>(json_to_lua_exact(lua, &json)?)?;
