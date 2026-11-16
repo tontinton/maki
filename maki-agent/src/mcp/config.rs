@@ -474,9 +474,8 @@ pub fn persist_enabled(
         fs::create_dir_all(parent)
             .map_err(|e| McpError::Config(format!("cannot create dir: {e}")))?;
     }
-    fs::write(config_path, doc.to_string())
-        .map_err(|e| McpError::Config(format!("cannot write {}: {e}", config_path.display())))?;
-    Ok(())
+    maki_storage::atomic_write(config_path, doc.to_string().as_bytes())
+        .map_err(|e| McpError::Config(format!("cannot write {}: {e}", config_path.display())))
 }
 
 fn read_config(path: &Path) -> Result<Option<McpConfig>, McpConfigError> {
