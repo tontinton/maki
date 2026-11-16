@@ -3,68 +3,77 @@ local LINE_WRAP_THRESHOLD = 120
 local MAX_INT = math.maxinteger or (2 ^ 53)
 local PARSE_ERROR_NOTE = "(no entries: file has syntax errors - use the read tool instead)"
 
+-- Every extension maps to the grammars to try, in order. The first that parses
+-- the file without errors wins; the last is the fallback whose syntax error is
+-- reported. Most extensions name a single grammar. `.v` stays V first, as it
+-- always was, and only reaches systemverilog when V's grammar rejects the file.
 local EXT_TO_LANG = {
-  rs = "rust",
-  py = "python",
-  pyi = "python",
-  ts = "typescript",
-  tsx = "tsx",
-  js = "javascript",
-  jsx = "tsx",
-  mjs = "javascript",
-  cjs = "javascript",
-  gleam = "gleam",
-  go = "go",
-  htm = "html",
-  html = "html",
-  java = "java",
-  c = "c",
-  h = "c",
-  cpp = "cpp",
-  cc = "cpp",
-  cxx = "cpp",
-  hpp = "cpp",
-  hxx = "cpp",
-  hh = "cpp",
-  ixx = "cpp",
-  cs = "c_sharp",
-  rb = "ruby",
-  rake = "ruby",
-  gemspec = "ruby",
-  php = "php",
-  swift = "swift",
-  kt = "kotlin",
-  kts = "kotlin",
-  scala = "scala",
-  sc = "scala",
-  sh = "bash",
-  bash = "bash",
-  zsh = "bash",
-  lua = "lua_lang",
-  ex = "elixir",
-  exs = "elixir",
-  md = "markdown",
-  markdown = "markdown",
-  clj = "clojure",
-  cljs = "clojure",
-  cljc = "clojure",
-  bb = "clojure",
-  bzl = "bazel_bzl",
-  v = "v",
-  zig = "zig",
-  nix = "nix",
-  dart = "dart",
-  toml = "toml",
-  yaml = "yaml",
-  yml = "yaml",
-  sql = "sql",
-  css = "css",
-  json = "json",
-  hcl = "hcl",
-  tf = "hcl",
-  tfvars = "hcl",
-  dockerfile = "containerfile",
-  mk = "make",
+  rs = { "rust" },
+  py = { "python" },
+  pyi = { "python" },
+  ts = { "typescript" },
+  tsx = { "tsx" },
+  js = { "javascript" },
+  jsx = { "tsx" },
+  mjs = { "javascript" },
+  cjs = { "javascript" },
+  gleam = { "gleam" },
+  go = { "go" },
+  htm = { "html" },
+  html = { "html" },
+  java = { "java" },
+  c = { "c" },
+  h = { "c" },
+  cpp = { "cpp" },
+  cc = { "cpp" },
+  cxx = { "cpp" },
+  hpp = { "cpp" },
+  hxx = { "cpp" },
+  hh = { "cpp" },
+  ixx = { "cpp" },
+  cs = { "c_sharp" },
+  rb = { "ruby" },
+  rake = { "ruby" },
+  gemspec = { "ruby" },
+  php = { "php" },
+  swift = { "swift" },
+  kt = { "kotlin" },
+  kts = { "kotlin" },
+  scala = { "scala" },
+  sc = { "scala" },
+  sh = { "bash" },
+  bash = { "bash" },
+  zsh = { "bash" },
+  lua = { "lua_lang" },
+  ex = { "elixir" },
+  exs = { "elixir" },
+  md = { "markdown" },
+  markdown = { "markdown" },
+  clj = { "clojure" },
+  cljs = { "clojure" },
+  cljc = { "clojure" },
+  bb = { "clojure" },
+  bzl = { "bazel_bzl" },
+  v = { "v", "systemverilog" },
+  zig = { "zig" },
+  nix = { "nix" },
+  dart = { "dart" },
+  toml = { "toml" },
+  yaml = { "yaml" },
+  yml = { "yaml" },
+  sql = { "sql" },
+  css = { "css" },
+  json = { "json" },
+  hcl = { "hcl" },
+  tf = { "hcl" },
+  tfvars = { "hcl" },
+  dockerfile = { "containerfile" },
+  mk = { "make" },
+  vhd = { "vhdl" },
+  vhdl = { "vhdl" },
+  vh = { "systemverilog" },
+  sv = { "systemverilog" },
+  svh = { "systemverilog" },
 }
 
 local FILENAME_TO_LANG = {
@@ -865,10 +874,16 @@ local LANG_ALIASES = {
 }
 
 local KNOWN_LANGS = {}
-for _, map in ipairs({ EXT_TO_LANG, FILENAME_TO_LANG }) do
-  for _, lang in pairs(map) do
-    KNOWN_LANGS[LANG_ALIASES[lang] or lang] = true
+local function known(lang)
+  KNOWN_LANGS[LANG_ALIASES[lang] or lang] = true
+end
+for _, langs in pairs(EXT_TO_LANG) do
+  for _, lang in ipairs(langs) do
+    known(lang)
   end
+end
+for _, lang in pairs(FILENAME_TO_LANG) do
+  known(lang)
 end
 
 -- One index call needs one language, and requiring all ~34 extractors up front
@@ -899,16 +914,51 @@ local function extractor_for(name)
   return extract
 end
 
-local function index_source(source, lang_name)
+local function run(source, lang_name)
   local extractor = extractor_for(LANG_ALIASES[lang_name] or lang_name)
   if not extractor then
     return nil, "unsupported language: " .. tostring(lang_name)
   end
-  local parser = maki.treesitter.get_parser(source, parser_name(lang_name))
+  local parser, parse_err = maki.treesitter.get_parser(source, parser_name(lang_name))
+  if not parser then
+    return nil, tostring(parse_err)
+  end
   local root = parser:parse()[1]:root()
   local skeleton, meta = extractor(source, root)
-  -- An empty skeleton reads as "this file declares nothing", and that is the
-  -- wrong story to tell when the parser choked on the file instead.
+  return skeleton, meta, root
+end
+
+-- Callers pass an extension's candidate list, or a bare language name (the
+-- specs do), which is treated as a single candidate.
+local function index_source(source, lang)
+  local candidates = type(lang) == "table" and lang or { lang }
+  local first
+  local last_err
+  for _, candidate in ipairs(candidates) do
+    local skeleton, meta, root = run(source, candidate)
+    -- An extractor may refuse the file outright (V does when its grammar
+    -- rejects it), which is a reason to try the next grammar, not to stop.
+    if not skeleton then
+      first = first or { nil, meta }
+      last_err = meta
+    else
+      first = first or { skeleton, meta, root }
+      -- A grammar that accepts the file and reports nothing has said all it
+      -- has to say about it, so the next grammar is not tried. An errored one
+      -- has not, even if it produced some entries on the way down.
+      if not root:has_error() then
+        return skeleton, meta
+      end
+    end
+  end
+  -- No candidate parsed cleanly. Report the first candidate's refusal, or the
+  -- last error if nothing produced a skeleton at all.
+  if not first[1] then
+    return nil, last_err
+  end
+  -- An empty skeleton reads as "this file declares nothing", which is the wrong
+  -- story for a file the parser could not read.
+  local skeleton, meta, root = first[1], first[2], first[3]
   if skeleton == "" and root:has_error() then
     skeleton = PARSE_ERROR_NOTE .. "\n"
   end
@@ -916,7 +966,8 @@ local function index_source(source, lang_name)
 end
 
 local LANG_TO_EXT = {}
-for ext, lang in pairs(EXT_TO_LANG) do
+for ext, langs in pairs(EXT_TO_LANG) do
+  local lang = langs[1]
   if not LANG_TO_EXT[lang] then
     LANG_TO_EXT[lang] = ext
   end
