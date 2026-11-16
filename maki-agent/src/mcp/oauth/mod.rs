@@ -3,11 +3,12 @@ mod issuer_fallback;
 pub mod manual;
 mod store;
 
+use std::future::pending;
 use std::path::Path;
 use std::time::Duration;
 
-use maki_storage::StateDir;
 use maki_storage::auth::{McpAuthData, load_mcp_auth_async, save_mcp_auth};
+use maki_storage::{StateDir, blocking};
 use reqwest::Client;
 use rmcp::transport::auth::{AuthorizationMetadata, OAuthClientConfig};
 use rmcp::transport::{AuthError, AuthorizationManager};
@@ -141,7 +142,8 @@ async fn pin_auth_server(
     let (_, metadata) = discover(&record.server_url, None, client).await?;
     check_pin(record, &metadata)?;
     record.auth_server = serde_json::to_value(&metadata).ok();
-    if let Err(e) = save_mcp_auth(storage, server_name, record) {
+    let (storage, owned_name, pinned) = (storage.clone(), server_name.to_owned(), record.clone());
+    if let Err(e) = blocking(move || save_mcp_auth(&storage, &owned_name, &pinned)).await {
         warn!(server = server_name, error = %e, "failed to save the MCP OAuth auth server");
     }
     Ok(metadata)
@@ -331,53 +333,53 @@ async fn wait_for_code(
 ) -> Result<CallbackResult, String> {
     let redirect_uri = callback.redirect_uri();
     let wait_callback = callback.wait_for_callback(state);
-    match interaction {
-        Interaction::Cli => {
-            eprintln!("\nOpen this URL in your browser:\n\n  {auth_url}\n");
+    let launch_failure = browser_launch_failure(auth_url);
+    let code = async {
+        match interaction {
+            Interaction::Cli => {
+                eprintln!("\nOpen this URL in your browser:\n\n  {auth_url}\n");
+                eprintln!("Waiting for callback on {redirect_uri}...");
+                if callback_scheme == CallbackScheme::Https {
+                    eprintln!(
+                        "Your browser will warn about Maki's self-signed certificate for this login; proceed past it."
+                    );
+                }
+                eprintln!("If this machine has no browser, log in on another device and paste");
+                eprintln!("the full redirect URL ({redirect_uri}?...) here:");
 
-            if is_headless() {
-                info!(
-                    server = server_name,
-                    "no display detected, skipping browser open"
-                );
-            } else if let Err(e) = open::that(auth_url) {
-                warn!(server = server_name, error = %e, "failed to open browser");
-            }
-
-            eprintln!("Waiting for callback on {redirect_uri}...");
-            if callback_scheme == CallbackScheme::Https {
-                eprintln!(
-                    "Your browser will warn about Maki's self-signed certificate for this login; proceed past it."
-                );
-            }
-            eprintln!("If this machine has no browser, log in on another device and paste");
-            eprintln!("the full redirect URL ({redirect_uri}?...) here:");
-
-            let callback_or_paste = async {
+                let launch_failed = async {
+                    let cause = launch_failure.await;
+                    warn!(server = server_name, cause, "browser not opened");
+                    pending().await
+                };
                 tokio::select! {
                     callback = wait_callback => callback,
                     pasted = manual::wait_for_paste(state) => pasted,
+                    never = launch_failed => never,
                 }
-            };
-            timeout(AUTH_TIMEOUT, callback_or_paste)
-                .await
-                .unwrap_or_else(|_| Err(auth_timed_out()))
-        }
-        Interaction::Background => {
-            let cause = if is_headless() {
-                Some("no display to open a browser".to_string())
-            } else {
-                open::that(auth_url)
-                    .err()
-                    .map(|e| format!("failed to open browser: {e}"))
-            };
-            match cause {
-                Some(cause) => Err(format!("{cause}; run 'maki mcp auth {server_name}'")),
-                None => timeout(AUTH_TIMEOUT, wait_callback)
-                    .await
-                    .unwrap_or_else(|_| Err(auth_timed_out())),
             }
+            Interaction::Background => tokio::select! {
+                callback = wait_callback => callback,
+                cause = launch_failure => Err(format!("{cause}; run 'maki mcp auth {server_name}'")),
+            },
         }
+    };
+    timeout(AUTH_TIMEOUT, code)
+        .await
+        .unwrap_or_else(|_| Err(auth_timed_out()))
+}
+
+/// Resolves with the reason once the browser could not be opened, and never
+/// when it could. `open::that` waits for the launcher, and xdg-open can wait
+/// for the browser, so it runs on the blocking pool next to the callback wait.
+async fn browser_launch_failure(auth_url: &str) -> String {
+    if is_headless() {
+        return "no display to open a browser".into();
+    }
+    let auth_url = auth_url.to_owned();
+    match blocking(move || open::that(auth_url)).await {
+        Ok(()) => pending().await,
+        Err(e) => format!("failed to open browser: {e}"),
     }
 }
 
