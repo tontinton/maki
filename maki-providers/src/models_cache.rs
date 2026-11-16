@@ -15,12 +15,9 @@ use maki_config::ModelPolicy;
 use maki_storage::{StateDir, blocking};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
-use crate::provider::{
-    ModelBatch, ProviderStatus, fetch_all_models, provider_available, provider_of,
-};
+use crate::provider::{ModelBatch, ProviderStatus, build_registry, fetch_built, provider_of};
 use crate::providers::custom;
 use crate::spec::ProviderRegistry;
 
@@ -112,19 +109,15 @@ fn cache_path() -> Option<PathBuf> {
         .map(|d| d.join(CACHE_FILE))
 }
 
-/// Providers whose credentials resolve right now, sorted.
+/// Providers whose credentials resolve right now, sorted: the registry ones
+/// that `built` names, plus the ones `providers.toml` declares.
 ///
 /// Catalog-backed slugs are deliberately absent: they are available only once
 /// the models.dev catalog has warmed, so folding them in would change the
 /// fingerprint between a cold start and the write at the end of discovery, and
 /// the cache would miss every time.
-fn resolved_providers() -> Vec<String> {
-    let mut slugs: Vec<String> = ProviderRegistry::all()
-        .into_iter()
-        .map(|m| m.slug)
-        .filter(|slug| provider_available(slug))
-        .map(str::to_string)
-        .collect();
+fn resolved_providers<'a>(built: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut slugs: Vec<String> = built.into_iter().map(str::to_string).collect();
     slugs.extend(
         custom::declared_model_specs()
             .iter()
@@ -178,9 +171,9 @@ fn digest(entries: &[(String, Option<String>)]) -> String {
 
 /// Identifies the credentials a discovery was taken under, so a cache written
 /// by another account or by a since-downgraded key is treated as missing.
-fn fingerprint() -> String {
+fn fingerprint<'a>(built: impl IntoIterator<Item = &'a str>) -> String {
     let dir = StateDir::resolve().ok();
-    let entries: Vec<(String, Option<String>)> = resolved_providers()
+    let entries: Vec<(String, Option<String>)> = resolved_providers(built)
         .into_iter()
         .map(|slug| {
             let identity = dir.as_ref().and_then(|d| account_identity(d, &slug));
@@ -249,18 +242,22 @@ async fn store_discovery(path: PathBuf, listing: &Listing, fingerprint: String, 
     blocking(move || store_at(&path, &cache)).await;
 }
 
-/// Like [`fetch_all_models`], but the first `on_update` comes straight from
-/// the on-disk cache. Every call carries the whole list to show, not a delta,
-/// plus the warning of the batch that changed it. The last call has
-/// `loading` off and holds only this run's live answer.
+/// Like [`fetch_all_models`](crate::provider::fetch_all_models), but the
+/// first `on_update` comes straight from the on-disk cache. Every call carries
+/// the whole list to show, not a delta, plus the warning of the batch that
+/// changed it. The last call has `loading` off and holds only this run's live
+/// answer.
 pub async fn fetch_all_models_cached(
     policy: &ModelPolicy,
     mut on_update: impl FnMut(ModelList, Option<String>),
 ) {
     let path = cache_path();
-    let fingerprint = spawn_blocking(fingerprint)
-        .await
-        .expect("fingerprint task panicked");
+    let (built, fingerprint) = blocking(|| {
+        let built = build_registry();
+        let fingerprint = fingerprint(built.iter().map(|(spec, _)| spec.slug));
+        (built, fingerprint)
+    })
+    .await;
     let replayed = match &path {
         Some(path) => replay(path, policy, &fingerprint, maki_storage::auth::now_millis()).await,
         None => Vec::new(),
@@ -271,7 +268,8 @@ pub async fn fetch_all_models_cached(
     };
     on_update(listing.snapshot(), None);
 
-    fetch_all_models(
+    fetch_built(
+        built,
         policy,
         |batch| {
             listing.add_live(&batch);
@@ -299,12 +297,19 @@ pub async fn fetch_all_models_cached(
 
 #[cfg(test)]
 mod tests {
+    use maki_config::providers::ProvidersConfig;
+    use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
     use test_case::test_case;
 
     use super::*;
+    use crate::test_support::isolated_home;
 
     const FINGERPRINT: &str = "fingerprint-a";
     const NOW: u64 = 1_700_000_000_000;
+    const DECLARED_SLUG: &str = "declared";
+    const DECLARED_DEF: &str = r#"{"protocol":"openai","models":[{"id":"a"},{"id":"b"}]}"#;
+    const ZAI_KEY: (&str, &str) = ("zai", "zai-key");
+    const OPENAI_KEY: (&str, &str) = ("openai", "openai-key");
 
     fn specs(specs: &[&str]) -> Vec<String> {
         specs.iter().map(|s| s.to_string()).collect()
@@ -418,6 +423,35 @@ mod tests {
         let cache = load_from(&path).await.unwrap();
         assert_eq!(cache.specs, expected);
         assert_eq!(cache.fingerprint, FINGERPRINT);
+    }
+
+    #[test]
+    fn fingerprint_digests_built_and_declared_slugs_sorted() {
+        let _home = isolated_home();
+        let dir = StateDir::resolve().unwrap();
+        for (slug, api_key) in [ZAI_KEY, OPENAI_KEY] {
+            let creds = ProviderCredentials {
+                api_key: api_key.to_string(),
+                host: None,
+            };
+            save_provider_credentials(&dir, slug, &creds).unwrap();
+        }
+        let mut config = ProvidersConfig::default();
+        config.upsert(
+            DECLARED_SLUG.to_string(),
+            serde_json::from_str(DECLARED_DEF).unwrap(),
+        );
+        config.save().unwrap();
+
+        let identified = |(slug, key): (&str, &str)| (slug.to_string(), Some(key.to_string()));
+        assert_eq!(
+            fingerprint([ZAI_KEY.0, OPENAI_KEY.0]),
+            digest(&[
+                (DECLARED_SLUG.to_string(), None),
+                identified(OPENAI_KEY),
+                identified(ZAI_KEY),
+            ])
+        );
     }
 
     #[test]
