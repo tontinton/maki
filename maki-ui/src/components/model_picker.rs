@@ -192,6 +192,10 @@ impl ModelPicker {
         &self.expanded
     }
 
+    pub fn recents(&self) -> &[String] {
+        &self.recents
+    }
+
     pub fn set_recents(&mut self, recents: Vec<String>) {
         self.recents = recents;
         self.needs_rebuild = true;

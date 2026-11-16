@@ -48,7 +48,7 @@ use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
-use maki_storage::model::persist_model;
+use maki_storage::model::{persist_model, push_recent};
 use maki_storage::sessions::normalize_title;
 use ratatui::layout::Rect;
 use serde_json::json;
@@ -2278,13 +2278,19 @@ impl<'t> EventLoop<'t> {
 
     /// The one explicit pick, which is why it alone writes the last-used file.
     /// Opening an old session must not change what the next `maki` starts on.
+    /// Every tab lists the one recent file, so every tab's picker gets the pick.
     fn change_model(&mut self, spec: &str) -> Result<(), String> {
         let slot = self.slots.try_get(spec)?;
         let picked = slot.model.spec();
-        let idx = self.focused;
-        self.apply_model(idx, slot);
-        self.sessions[idx].app.record_recent_model(spec);
-        persist_model(&self.ctx.storage, &picked);
+        self.apply_model(self.focused, slot);
+        for rt in &mut self.sessions {
+            rt.app.record_recent_model(spec);
+        }
+        let recent = spec.to_owned();
+        self.ctx.storage_writer.persist(move |dir| {
+            persist_model(dir, &picked);
+            push_recent(dir, &recent);
+        });
         Ok(())
     }
 
