@@ -67,36 +67,34 @@ pub(crate) fn is_declared(slug: &str) -> bool {
         .is_some_and(|def| def.protocol.is_some())
 }
 
-/// The credentials and the env var they came out of, which the codec carries
-/// as part of this provider's wire config.
-fn resolve_custom_auth(slug: &str) -> Result<(ResolvedAuth, String), AgentError> {
-    let config = ProvidersConfig::load();
-    let def = config.get(slug).ok_or_else(|| AgentError::Config {
+fn unknown_provider(slug: &str) -> AgentError {
+    AgentError::Config {
         message: format!("unknown custom provider '{slug}'"),
-    })?;
-
-    let env_var = resolve_api_key_env(slug, Some(def));
-    let pool = KeyPool::resolve(slug, &env_var)?;
-
-    Ok((
-        ResolvedAuth::bearer(slug, pool.current())?
-            .with_base_url(resolve_base_url(slug, Some(def))),
-        env_var,
-    ))
+    }
 }
 
 pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     let config = ProvidersConfig::load();
-    let protocol = config
-        .get(slug)
-        .and_then(|def| def.protocol)
-        .ok_or_else(|| AgentError::Config {
-            message: format!("unknown custom provider '{slug}'"),
-        })?;
-    let (resolved, api_key_env) = resolve_custom_auth(slug)?;
+    let def = config.get(slug).ok_or_else(|| unknown_provider(slug))?;
+    let pool = KeyPool::resolve(slug, &resolve_api_key_env(slug, Some(def)))?;
+    create_from(slug, def, &pool, timeouts)
+}
+
+/// The provider for an entry already read from `providers.toml`, on a key
+/// already resolved for it, so discovery probes with the key it checked.
+fn create_from(
+    slug: &str,
+    def: &ProviderDef,
+    pool: &KeyPool,
+    timeouts: Timeouts,
+) -> Result<Box<dyn Provider>, AgentError> {
+    let protocol = def.protocol.ok_or_else(|| unknown_provider(slug))?;
+    let api_key_env = resolve_api_key_env(slug, Some(def));
+    let resolved = ResolvedAuth::bearer(slug, pool.current())?
+        .with_base_url(resolve_base_url(slug, Some(def)));
     let auth = Arc::new(Mutex::new(resolved));
 
-    // No `base_url`: `resolve_custom_auth` already put the configured origin in
+    // No `base_url`: the auth above already put the configured origin in
     // `auth.base_url`, which outranks anything the config could carry here, so
     // restating it would be the same string twice. The slug is what matters,
     // since that is how the compat layer finds `<SLUG>_BASE_URL` at all.
@@ -357,23 +355,31 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
 /// reach the registry from this same read, so tier lookups notice edits to
 /// `providers.toml`.
 pub async fn discover_models(timeouts: Timeouts, mut emit: impl FnMut(ModelBatch)) {
-    let config = blocking(ProvidersConfig::load).await;
+    let (config, plans) = blocking(move || {
+        let config = ProvidersConfig::load();
+        let plans: Vec<Discovery> = custom_entries(&config)
+            .into_iter()
+            .map(|(slug, def)| Discovery::plan(slug, def, timeouts))
+            .collect();
+        (config, plans)
+    })
+    .await;
     model_registry::set_declared(declared_tiers_from(&config));
-    let mut entries = custom_entries(&config);
-    entries.sort_by_key(|(_, def)| def.discover_models);
-    for (slug, def) in entries {
+    let mut entries: Vec<_> = custom_entries(&config).into_iter().zip(plans).collect();
+    entries.sort_by_key(|((_, def), _)| def.discover_models);
+    for ((slug, def), plan) in entries {
         let mut models: Vec<String> = def
             .models
             .iter()
             .map(|m| format!("{slug}/{}", m.id))
             .collect();
-        let status = if KeyPool::resolve(slug, &resolve_api_key_env(slug, Some(def))).is_err() {
-            models.clear();
-            ProviderStatus::MissingKey
-        } else if !def.discover_models {
-            ProviderStatus::Live
-        } else {
-            match probe(slug, def, timeouts).await {
+        let status = match plan {
+            Discovery::MissingKey => {
+                models.clear();
+                ProviderStatus::MissingKey
+            }
+            Discovery::Declared => ProviderStatus::Live,
+            Discovery::Probe(provider) => match probe(slug, def, provider).await {
                 Ok(listed) => {
                     for spec in listed {
                         if !models.contains(&spec) {
@@ -386,7 +392,7 @@ pub async fn discover_models(timeouts: Timeouts, mut emit: impl FnMut(ModelBatch
                     warn!(slug, error = %e, "failed to list models for custom provider");
                     ProviderStatus::Failed(format!("{slug}: {e}"))
                 }
-            }
+            },
         };
         emit(ModelBatch {
             provider: slug.clone(),
@@ -396,12 +402,31 @@ pub async fn discover_models(timeouts: Timeouts, mut emit: impl FnMut(ModelBatch
     }
 }
 
+/// What discovery does with an entry. Deciding it reads the saved key and
+/// `[<slug>.headers]`, so every entry is decided in the blocking job that
+/// read `providers.toml`.
+enum Discovery {
+    MissingKey,
+    Declared,
+    Probe(Result<Box<dyn Provider>, AgentError>),
+}
+
+impl Discovery {
+    fn plan(slug: &str, def: &ProviderDef, timeouts: Timeouts) -> Self {
+        match KeyPool::resolve(slug, &resolve_api_key_env(slug, Some(def))) {
+            Err(_) => Self::MissingKey,
+            Ok(_) if !def.discover_models => Self::Declared,
+            Ok(pool) => Self::Probe(create_from(slug, def, &pool, timeouts)),
+        }
+    }
+}
+
 async fn probe(
     slug: &str,
     def: &ProviderDef,
-    timeouts: Timeouts,
+    provider: Result<Box<dyn Provider>, AgentError>,
 ) -> Result<Vec<String>, AgentError> {
-    let mut models = create(slug, timeouts)?.list_models().await?;
+    let mut models = provider?.list_models().await?;
     overlay_declared_tiers(def, &mut models);
     model_registry::set_known_models(slug, models.clone());
     Ok(models
@@ -430,14 +455,19 @@ mod tests {
     use maki_storage::sessions::Effort::High;
     use test_case::test_case;
 
+    use super::super::bearer_value;
     use super::*;
-    use crate::test_support::{Canned, Requests, serve};
+    use crate::test_support::{Canned, Requests, isolated_home, serve};
     use crate::types::{ThinkingConfig, ThinkingFallback};
     use crate::{Message, RequestOptions, StreamResponse};
 
     const FIELDS_MODEL: &str =
         r#"{"id":"m","thinking_fields":{"high":{"reasoning_effort":"xhigh"}}}"#;
     const STARTUP_TIERS: [ModelTier; 2] = [ModelTier::Strong, ModelTier::Medium];
+    const PROBED_SLUG: &str = "probed-gw";
+    const PROBED_KEY: &str = "sk-probed";
+    const PROBED_DECLARED_MODEL: &str = "declared";
+    const PROBED_MODELS_PAGE: &[Canned] = &[Canned::json(200, r#"{"data":[{"id":"listed"}]}"#)];
 
     fn openai_spec() -> &'static ProviderSpec {
         ProviderRegistry::get(super::super::openai::SLUG).unwrap()
@@ -613,6 +643,45 @@ mod tests {
         overlay_declared_tiers(&def, &mut models);
         assert_eq!(models[0].tier, Some(ModelTier::Strong));
         assert_eq!(models[1].tier, None);
+    }
+
+    #[test_case(Some(PROBED_KEY), ProviderStatus::Live, &["probed-gw/declared", "probed-gw/listed"] ; "keyed_entry_probes_on_the_key_it_checked")]
+    #[test_case(None, ProviderStatus::MissingKey, &[] ; "keyless_entry_reports_without_a_probe")]
+    #[tokio::test]
+    async fn discovery_probes_only_an_entry_with_a_key(
+        api_key: Option<&str>,
+        status: ProviderStatus,
+        models: &[&str],
+    ) {
+        let _home = isolated_home();
+        let (base_url, requests) = serve(PROBED_MODELS_PAGE);
+        let def = serde_json::from_value(json!({
+            "protocol": "openai",
+            "base_url": base_url,
+            "api_key": api_key,
+            "discover_models": true,
+            "models": [{"id": PROBED_DECLARED_MODEL}],
+        }))
+        .unwrap();
+        let mut config = ProvidersConfig::default();
+        config.upsert(PROBED_SLUG.into(), def);
+        config.save().unwrap();
+
+        let mut batches = Vec::new();
+        discover_models(Timeouts::default(), |batch| {
+            batches.push((batch.provider, batch.models, batch.status))
+        })
+        .await;
+
+        let sent: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.authorization().to_owned())
+            .collect();
+        assert_eq!(sent, Vec::from_iter(api_key.map(bearer_value)));
+        let expected = models.iter().map(|spec| spec.to_string()).collect();
+        assert_eq!(batches, [(PROBED_SLUG.to_owned(), expected, status)]);
     }
 
     /// A custom `openai` entry is the one place a user can hand us a model
