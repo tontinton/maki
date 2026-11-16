@@ -7,6 +7,7 @@ use maki_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
     ProjectConfig, ToolKey, append_permission_rule,
 };
+use maki_storage::blocking;
 use maki_storage::id::SessionRef;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
@@ -717,7 +718,14 @@ impl PermissionManager {
         }
     }
 
-    pub fn apply_decision(&self, tool: &ToolKey, scopes: &[String], answer: &PermissionAnswer) {
+    /// Adds the answer's session rules and hands back what an always-answer
+    /// still has to write, so the caller can do that off the async workers.
+    fn apply_decision(
+        &self,
+        tool: &ToolKey,
+        scopes: &[String],
+        answer: &PermissionAnswer,
+    ) -> Option<PendingRules> {
         let resolved = if answer.is_allow() || tool.is_mcp() {
             // MCP scopes are always wildcarded — both allow and deny generalize to "*".
             // This makes session and persisted rules consistent: a deny on an MCP tool
@@ -731,7 +739,7 @@ impl PermissionManager {
             PermissionAnswer::AllowOnce
             | PermissionAnswer::Deny
             | PermissionAnswer::DenyWithGuidance(_)
-            | PermissionAnswer::Unattended => {}
+            | PermissionAnswer::Unattended => None,
             PermissionAnswer::AllowSession => {
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
@@ -740,6 +748,7 @@ impl PermissionManager {
                         effect: Effect::Allow,
                     });
                 }
+                None
             }
             PermissionAnswer::AllowAlwaysProject
             | PermissionAnswer::AllowAlwaysGlobal
@@ -750,25 +759,26 @@ impl PermissionManager {
                 } else {
                     Effect::Deny
                 };
-                let target = self.persist_target(answer);
-                if target.is_none() {
-                    info!(
-                        tool = %tool,
-                        "project answer stays in this session because the folder is not trusted, the global answer is the one that lasts"
-                    );
-                }
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
                         tool: tool.clone(),
                         scope: Some(s.clone()),
                         effect,
                     });
-                    if let Some(target) = &target
-                        && let Err(e) = append_permission_rule(tool, Some(s), effect, target)
-                    {
-                        tracing::warn!(error = %e, "failed to persist permission rule");
-                    }
                 }
+                let Some(target) = self.persist_target(answer) else {
+                    info!(
+                        tool = %tool,
+                        "project answer stays in this session because the folder is not trusted, the global answer is the one that lasts"
+                    );
+                    return None;
+                };
+                Some(PendingRules {
+                    tool: tool.clone(),
+                    scopes: resolved,
+                    effect,
+                    target,
+                })
             }
         }
     }
@@ -956,7 +966,6 @@ impl PermissionManager {
                 }
             }
         };
-        drop(guard);
 
         if answer == PermissionAnswer::Unattended {
             return Err(deny(
@@ -966,7 +975,13 @@ impl PermissionManager {
                 None,
             ));
         }
-        self.apply_decision(&t2, &s2, &answer);
+        // The session rules go in before the next ask can take the channel,
+        // so its re-check already sees them.
+        let saved = self.apply_decision(&t2, &s2, &answer);
+        drop(guard);
+        if let Some(saved) = saved {
+            saved.write().await;
+        }
         let source = answer.decision_source();
         if answer.is_allow() {
             allowed(source)
@@ -978,6 +993,36 @@ impl PermissionManager {
                 None,
             ))
         }
+    }
+}
+
+/// The rules an always-answer still has to save to a permissions file.
+struct PendingRules {
+    tool: ToolKey,
+    scopes: Vec<String>,
+    effect: Effect,
+    target: PermissionTarget,
+}
+
+impl PendingRules {
+    async fn write(self) {
+        blocking(move || {
+            for scope in &self.scopes {
+                if let Err(e) =
+                    append_permission_rule(&self.tool, Some(scope), self.effect, &self.target)
+                {
+                    warn!(
+                        error = %e,
+                        tool = %self.tool,
+                        scope = %scope,
+                        effect = ?self.effect,
+                        target = ?self.target,
+                        "failed to persist permission rule"
+                    );
+                }
+            }
+        })
+        .await;
     }
 }
 
@@ -1172,6 +1217,7 @@ fn write_rule_dir(scope: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Envelope;
     use maki_config::project::{self, TrustMode};
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
@@ -1199,6 +1245,10 @@ mod tests {
     #[cfg(unix)]
     const OUTSIDE_WRITES: [&str; 2] = ["/etc/passwd", "~/.bashrc"];
     const OUTSIDE_SCOPES: [&str; 3] = ["/etc/passwd", "~/.bashrc", "cargo test"];
+    const BACK_TO_BACK_ASKS: [(&str, &str, &str); 2] = [
+        ("toolu_cargo", "cargo test", "cargo *"),
+        ("toolu_git", "git status", "git *"),
+    ];
 
     fn outcome(check: PermissionCheck) -> &'static str {
         match check {
@@ -1756,7 +1806,8 @@ mod tests {
     #[test_case(PermissionAnswer::DenyAlwaysProject, false, true ; "deny_is_written_when_trusted")]
     #[test_case(PermissionAnswer::AllowAlwaysProject, true, false ; "allow_stays_in_the_session_when_untrusted")]
     #[test_case(PermissionAnswer::DenyAlwaysProject, false, false ; "deny_stays_in_the_session_when_untrusted")]
-    fn project_answer_is_written_only_in_a_trusted_folder(
+    #[tokio::test]
+    async fn project_answer_is_written_only_in_a_trusted_folder(
         answer: PermissionAnswer,
         allowed: bool,
         trusted: bool,
@@ -1773,7 +1824,11 @@ mod tests {
             Arc::default(),
         );
 
-        mgr.apply_decision(&ToolKey::native("bash"), &["cargo test".into()], &answer);
+        if let Some(saved) =
+            mgr.apply_decision(&ToolKey::native("bash"), &["cargo test".into()], &answer)
+        {
+            saved.write().await;
+        }
 
         assert_eq!(mgr.session_rules_snapshot().len(), 1);
         assert_eq!(project.path().join(PROJECT_DIR).exists(), trusted);
@@ -1985,11 +2040,14 @@ mod tests {
     #[test]
     fn apply_decision_multi_scope_generalizes_all() {
         let mgr = default_mgr();
-        mgr.apply_decision(
-            &ToolKey::native("bash"),
-            &["cargo test".into(), "git status".into()],
-            &PermissionAnswer::AllowSession,
-        );
+        let saved = mgr
+            .apply_decision(
+                &ToolKey::native("bash"),
+                &["cargo test".into(), "git status".into()],
+                &PermissionAnswer::AllowAlwaysGlobal,
+            )
+            .expect("an always answer is saved");
+        assert_eq!(saved.scopes, ["cargo *", "git *"]);
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo build", None),
             PermissionCheck::Allowed
@@ -1998,6 +2056,69 @@ mod tests {
             mgr.check(&ToolKey::native("bash"), "git push", None),
             PermissionCheck::Allowed
         ));
+    }
+
+    async fn ask_bash(
+        mgr: &PermissionManager,
+        scope: &str,
+        request_id: &str,
+        event_tx: &EventSender,
+        answers: &AsyncMutex<UnboundedReceiver<String>>,
+    ) -> Result<Option<Arc<str>>, PermissionError> {
+        mgr.enforce(
+            &ToolKey::native(BASH_TOOL),
+            &PermissionScopes::single(scope.to_owned()),
+            None,
+            event_tx,
+            Some(answers),
+            request_id,
+            &CancelToken::none(),
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// An auto-approving client answers the next ask while the first answer's
+    /// write can still be running, so the two writes overlap and both rules
+    /// must still land.
+    #[tokio::test]
+    async fn always_answers_given_back_to_back_all_land_in_the_file() {
+        let project = tempfile::tempdir().unwrap();
+        let mgr = mgr_with(PermissionsConfig::default(), project.path().to_path_buf());
+        let (event_tx, mut events) = unbounded_channel();
+        let event_tx = EventSender::new(event_tx, 0);
+        let (answer_tx, answer_rx) = unbounded_channel();
+        let answers = AsyncMutex::new(answer_rx);
+        let [(cargo_id, cargo_scope, _), (git_id, git_scope, _)] = BACK_TO_BACK_ASKS;
+        let approve = async {
+            for _ in BACK_TO_BACK_ASKS {
+                let Some(Envelope {
+                    event: AgentEvent::PermissionRequest { id, .. },
+                    ..
+                }) = events.recv().await
+                else {
+                    panic!("expected a permission request");
+                };
+                answer_tx
+                    .send(TaggedAnswer::new(id, PermissionAnswer::AllowAlwaysProject).encode())
+                    .unwrap();
+            }
+        };
+
+        let (cargo, git, ()) = tokio::join!(
+            ask_bash(&mgr, cargo_scope, cargo_id, &event_tx, &answers),
+            ask_bash(&mgr, git_scope, git_id, &event_tx, &answers),
+            approve,
+        );
+
+        cargo.unwrap();
+        git.unwrap();
+        let saved = std::fs::read_to_string(project.path().join(PROJECT_PERMISSIONS)).unwrap();
+        for (_, _, rule) in BACK_TO_BACK_ASKS {
+            assert!(saved.contains(rule), "{rule} is missing from {saved}");
+        }
     }
 
     #[test]
