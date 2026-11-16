@@ -15,7 +15,7 @@ const SKILL_MODULE: &str = "plugin_dev";
 const REFERENCE_MODULE: &str = "plugin_dev_reference";
 
 const NAME: &str = "maki-plugin-dev";
-const DESCRIPTION: &str = "Write or modify maki plugins or init.lua config in Lua: custom tools, slash commands, keymaps, UI. Authoring guide, real example, indexed maki Lua API reference. Load before any maki plugin work.";
+const DESCRIPTION: &str = "Write or modify maki plugins or init.lua config in Lua: custom tools, slash commands, keymaps, UI, providers. Authoring guide, real example, indexed maki Lua API reference. Load before any maki plugin work.";
 const REFERENCE_PLACEHOLDER: &str = "__MAKI_REFERENCE_PATH__";
 
 const EXAMPLE: &str = include_str!("../../plugins/glob/init.lua");
@@ -159,10 +159,10 @@ settings in a local table, or export a `setup(opts)` function `init.lua` calls.
 
 ## Providers
 
-A plugin can also register an LLM provider with `maki.provider.register`, and
-its models appear in `/model` as `{slug}/{model_id}`. See
-[Plugin providers](/docs/providers/#plugin-providers) for the declaration and
-the `plugin.toml` grants it takes.
+A plugin can also add an LLM provider with `maki.provider.register`. Its
+models appear in `/model` as `{slug}/{model_id}`. The
+[Plugin providers](/docs/providers/#plugin-providers) guide covers the
+declaration and the `plugin.toml` it needs.
 
 ## Development loop
 

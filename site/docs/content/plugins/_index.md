@@ -82,10 +82,10 @@ in [the reference](/docs/lua-api/#plugin-permissions). Set
 
 ## Providers
 
-A plugin can also register an LLM provider with `maki.provider.register`, and
-its models appear in `/model` as `{slug}/{model_id}`. See
-[Plugin providers](/docs/providers/#plugin-providers) for the declaration and
-the `plugin.toml` grants it takes.
+A plugin can also add an LLM provider with `maki.provider.register`. Its
+models appear in `/model` as `{slug}/{model_id}`. The
+[Plugin providers](/docs/providers/#plugin-providers) guide covers the
+declaration and the `plugin.toml` it needs.
 
 ## Development loop
 
