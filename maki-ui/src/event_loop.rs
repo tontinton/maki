@@ -61,6 +61,7 @@ use tokio::time::timeout;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, info, warn};
 
+use crate::agent::model_slots::StampedBuild;
 use crate::agent::{
     AgentDeps, AgentHandles, ModelSlot, ModelSlots, Respawn,
     shared_queue::{Compaction, QueueItem, QueuedInput},
@@ -585,9 +586,9 @@ pub(crate) struct EventLoop<'t> {
     /// second `/packupdate` would otherwise race the first over the same clones
     /// and locks.
     pack: Option<JoinHandle<PackPreparation>>,
-    /// The stored session a focus is reading. One at a time, with later
-    /// requests in `queued_focus`, so they land in the order they were made,
-    /// as they did when each one read inline.
+    /// The stored session a focus is reading or building a slot for. One at a
+    /// time, with later requests in `queued_focus`, so they land in the order
+    /// they were made, as they did when each one read inline.
     opening: Option<AbortOnDropHandle<Box<OpenedSession>>>,
     queued_focus: VecDeque<(MakiId, oneshot::Sender<UiReply>)>,
     /// The slots [`Self::rebuild_models`] builds off the loop. A newer rebuild
@@ -609,10 +610,11 @@ struct PendingFocus {
     from: MakiId,
 }
 
-/// A stored session a focus read off the loop, for the loop to bring up.
-struct OpenedSession {
-    focus: PendingFocus,
-    opened: Result<OpenSession, String>,
+/// A stored session a focus read off the loop, for the loop to bring up once
+/// it has a slot for its model.
+enum OpenedSession {
+    Read(PendingFocus, Result<OpenSession, String>),
+    Built(PendingFocus, OpenSession, StampedBuild),
 }
 
 /// One build per spec the tabs were on when the rebuild started.
@@ -645,9 +647,8 @@ enum PickOrigin {
 
 /// A slot built off the loop for a pick that had none.
 struct SlotBuilt {
-    epoch: u64,
     pick: Pick,
-    built: Result<Arc<ModelSlot>, String>,
+    built: StampedBuild,
 }
 
 /// One pick builds off the loop at a time, with later ones queued behind it,
@@ -662,7 +663,7 @@ struct Picks {
 
 impl Picks {
     /// Takes in a build that landed, `None` when it panicked or nothing did,
-    /// and returns the picks settled by now, in order. A slot built before the
+    /// and returns the picks settled by now, in order. A build from before the
     /// last invalidate is stale, so its pick builds again ahead of the queue.
     fn advance(
         &mut self,
@@ -674,11 +675,8 @@ impl Picks {
             self.building_for = None;
         }
         if let Some(landed) = landed {
-            let SlotBuilt { epoch, pick, built } = *landed;
-            match built
-                .map(|slot| slots.adopt(epoch, pick.spec.clone(), &slot))
-                .transpose()
-            {
+            let SlotBuilt { pick, built } = *landed;
+            match slots.settle(&pick.spec, built) {
                 Some(built) => settled.push((pick, built)),
                 None => self.queued.push_front(pick),
             }
@@ -692,9 +690,8 @@ impl Picks {
                     let builder = slots.builder();
                     self.building_for = Some((pick.tab.clone(), pick.spec.clone()));
                     self.building = Some(AbortOnDropHandle::new(tokio::spawn(async move {
-                        let built = builder.build(&pick.spec).await;
-                        let epoch = builder.epoch();
-                        Box::new(SlotBuilt { epoch, pick, built })
+                        let built = builder.build_stamped(&pick.spec).await;
+                        Box::new(SlotBuilt { pick, built })
                     })));
                 }
             }
@@ -731,7 +728,7 @@ enum Wake {
     Shell(usize, ShellEvent),
     Warn(String),
     Pack(Box<PackPreparation>),
-    /// `None` when the read panicked, which dropped its reply.
+    /// `None` when the read or the build panicked, which dropped its reply.
     SessionOpened(Option<Box<OpenedSession>>),
     ModelsDiscovered,
     /// `None` when the rebuild panicked.
@@ -2064,20 +2061,23 @@ impl<'t> EventLoop<'t> {
             let opened = OpenSession::load_async(id, storage)
                 .await
                 .map_err(|e| format!("Failed to load session: {e}"));
-            Box::new(OpenedSession { focus, opened })
+            Box::new(OpenedSession::Read(focus, opened))
         })));
     }
 
-    /// The focus requests that queued behind a read go next, up to the next
-    /// one that has to read too.
+    /// The focus requests that queued behind a read or a build go next, up to
+    /// the next one that has to wait for one too.
     fn finish_open(&mut self, answer: Option<Box<OpenedSession>>) {
         if let Some(answer) = answer {
-            let OpenedSession { focus, opened } = *answer;
-            let reply = opened.map(|open| {
-                self.show_opened(open, focus.from);
-                json!(true)
-            });
-            let _ = focus.reply_tx.send(reply);
+            match *answer {
+                OpenedSession::Read(focus, Ok(open)) => self.show_opened(open, focus, None),
+                OpenedSession::Read(focus, Err(e)) => {
+                    let _ = focus.reply_tx.send(Err(e));
+                }
+                OpenedSession::Built(focus, open, built) => {
+                    self.show_opened(open, focus, Some(built))
+                }
+            }
         }
         while self.opening.is_none()
             && let Some((id, reply_tx)) = self.queued_focus.pop_front()
@@ -2089,11 +2089,19 @@ impl<'t> EventLoop<'t> {
     /// In place of the tab the focus was asked from, while it is still focused
     /// and a blank idle one (nothing worth keeping), otherwise as a new runtime
     /// so the session you came from stays live. Decided now rather than at the
-    /// request, since the read may have taken a while.
-    fn show_opened(&mut self, open: OpenSession, from: MakiId) {
-        let (slot, reason) = self.slots.get_or_fallback(&open.session.model);
+    /// request, since the read may have taken a while. A model with no slot
+    /// since the last invalidate builds one off the loop first.
+    fn show_opened(&mut self, open: OpenSession, focus: PendingFocus, built: Option<StampedBuild>) {
+        let Some((slot, fallback)) = self.slots.for_session(&open.session.model, built) else {
+            let builder = self.slots.builder();
+            self.opening = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+                let built = builder.build_stamped(&open.session.model).await;
+                Box::new(OpenedSession::Built(focus, open, built))
+            })));
+            return;
+        };
         let focused = &self.sessions[self.focused];
-        if focused.id() == from
+        if focused.id() == focus.from
             && SessionStatus::of(&focused.app) == SessionStatus::Idle
             && focused.app.is_blank()
         {
@@ -2107,9 +2115,10 @@ impl<'t> EventLoop<'t> {
             let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
             self.set_focused(idx);
         }
-        if let Some(reason) = reason {
+        if let Some(reason) = fallback {
             self.focused_app().flash(reason);
         }
+        let _ = focus.reply_tx.send(Ok(json!(true)));
     }
 
     /// Handles one input event plus any leftover produced while coalescing
@@ -2919,13 +2928,13 @@ mod tests {
         let (reply_tx, _reply_rx) = oneshot::channel();
         let mut opening = Some(AbortOnDropHandle::new(tokio::spawn(async move {
             go_rx.await.unwrap();
-            Box::new(OpenedSession {
-                focus: PendingFocus {
+            Box::new(OpenedSession::Read(
+                PendingFocus {
                     reply_tx,
                     from: MakiId::generate(),
                 },
-                opened: Err(OPEN_ERROR.to_owned()),
-            })
+                Err(OPEN_ERROR.to_owned()),
+            ))
         })));
         tokio::select! {
             biased;
@@ -2936,7 +2945,7 @@ mod tests {
 
         go_tx.send(()).unwrap();
         let answer = answered(&mut opening).await.unwrap();
-        assert_eq!(answer.opened.err().as_deref(), Some(OPEN_ERROR));
+        assert!(matches!(&*answer, OpenedSession::Read(_, Err(e)) if e == OPEN_ERROR));
         assert!(opening.is_none());
     }
 
