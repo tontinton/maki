@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use maki_storage::auth::now_millis;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -31,6 +33,10 @@ const RESPONSES_BACKEND: &str = "responses";
 pub(crate) const INVALID_CATALOG: &str = "xAI model catalog response was invalid";
 pub(crate) const CATALOG_UNAUTHORIZED: &str = "xAI model catalog request was unauthorized";
 const CATALOG_UNAVAILABLE: &str = "xAI model catalog could not be fetched";
+
+/// The record this process last loaded or listed. Turns read only this copy, so
+/// a peer's refresh shows up at this process's next listing.
+static CACHE: ArcSwapOption<CacheRecord> = ArcSwapOption::const_empty();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CachedModel {
@@ -100,11 +106,15 @@ enum FetchOutcome {
 }
 
 pub(crate) fn cached_model(model_id: &str) -> Option<CachedModel> {
-    let cache = load_cache(now_millis())?;
-    cache
+    let now = now_millis();
+    CACHE
+        .load_full()
+        .filter(|record| usable(record, now))
+        .or_else(|| load_cache(now))?
         .models
-        .into_iter()
+        .iter()
         .find(|model| model.id.eq_ignore_ascii_case(model_id))
+        .cloned()
 }
 
 pub(crate) async fn list_models(access: &str, force: bool) -> Result<Vec<ModelInfo>, AgentError> {
@@ -120,6 +130,7 @@ pub(crate) async fn refresh(access: &str) -> Result<Vec<ModelInfo>, AgentError> 
 }
 
 pub(crate) fn invalidate() {
+    CACHE.store(None);
     if let Some(path) = cache_path() {
         let _ = fs::remove_file(path);
     }
@@ -157,7 +168,7 @@ async fn select_models(access: &str, force: bool) -> Result<Vec<CachedModel>, Ag
             }
             if let Some(cache) = cache {
                 warn!("xAI catalog refresh failed transiently, using stale cache");
-                return Ok(cache.models);
+                return Ok(cache.models.clone());
             }
             Err(unavailable())
         }
@@ -463,22 +474,30 @@ fn cache_path() -> Option<PathBuf> {
     Some(dir.join(CACHE_SUBDIR).join(CACHE_FILE))
 }
 
-fn load_cache(now: u64) -> Option<CacheRecord> {
-    let path = cache_path()?;
-    let bytes = fs::read(path).ok()?;
-    let record: CacheRecord = serde_json::from_slice(&bytes).ok()?;
-    if record.schema_version != CACHE_SCHEMA || record.models.is_empty() {
-        return None;
-    }
-    if record.fetched_at > now.saturating_add(CLOCK_SKEW_MS)
-        || now.saturating_sub(record.fetched_at) > MAX_STALE_MS
-    {
-        return None;
-    }
+fn usable(record: &CacheRecord, now: u64) -> bool {
+    record.schema_version == CACHE_SCHEMA
+        && !record.models.is_empty()
+        && record.fetched_at <= now.saturating_add(CLOCK_SKEW_MS)
+        && now.saturating_sub(record.fetched_at) <= MAX_STALE_MS
+}
+
+fn load_cache(now: u64) -> Option<Arc<CacheRecord>> {
+    let bytes = fs::read(cache_path()?).ok()?;
+    let record = serde_json::from_slice::<CacheRecord>(&bytes)
+        .ok()
+        .filter(|record| usable(record, now))
+        .map(Arc::new)?;
+    CACHE.store(Some(Arc::clone(&record)));
     Some(record)
 }
 
 fn save_cache(models: &[CachedModel], now: u64) {
+    let record = Arc::new(CacheRecord {
+        schema_version: CACHE_SCHEMA,
+        fetched_at: now,
+        models: models.to_vec(),
+    });
+    CACHE.store(Some(Arc::clone(&record)));
     let Some(path) = cache_path() else {
         return;
     };
@@ -488,12 +507,7 @@ fn save_cache(models: &[CachedModel], now: u64) {
         debug!(error = %e, "failed to create xAI catalog cache dir");
         return;
     }
-    let record = CacheRecord {
-        schema_version: CACHE_SCHEMA,
-        fetched_at: now,
-        models: models.to_vec(),
-    };
-    let Ok(bytes) = serde_json::to_vec_pretty(&record) else {
+    let Ok(bytes) = serde_json::to_vec_pretty(&*record) else {
         return;
     };
     if let Err(e) = maki_storage::atomic_write(&path, &bytes) {
@@ -503,7 +517,18 @@ fn save_cache(models: &[CachedModel], now: u64) {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
+    use crate::test_support::isolated_home;
+
+    const ACCESS_TOKEN: &str = "unused-access-token";
+    const CACHED_ID: &str = "grok-4.6";
+    const OWN_WINDOW: u32 = 200_000;
+    const PEER_WINDOW: u32 = 300_000;
+    const CACHED_MAX_TOKENS: u32 = 16_384;
+    const FOLLOWED_PEER_UNLISTED: &str = "the copy followed a peer's write before any listing";
+    const LISTING_MISSED_PEER: &str = "a listing did not pick up the record a peer wrote";
 
     const VALID_PAYLOAD: &str = r#"{
         "object": "list",
@@ -589,5 +614,82 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert!(!models[0].reasoning);
         assert_eq!(models[0].context_window, 1_000_000);
+    }
+
+    fn cached(context_window: u32) -> CachedModel {
+        CachedModel {
+            id: CACHED_ID.into(),
+            reasoning: true,
+            vision: false,
+            pricing: ModelPricingDto::default(),
+            context_window,
+            max_tokens: CACHED_MAX_TOKENS,
+        }
+    }
+
+    fn cached_window() -> Option<u32> {
+        cached_model(CACHED_ID).map(|model| model.context_window)
+    }
+
+    fn save_then_remove_file(now: u64) {
+        save_cache(&[cached(OWN_WINDOW)], now);
+        fs::remove_file(cache_path().unwrap()).unwrap();
+    }
+
+    fn save_then_invalidate(now: u64) {
+        save_cache(&[cached(OWN_WINDOW)], now);
+        invalidate();
+    }
+
+    fn invalidate_then_peer_saves(now: u64) {
+        save_then_invalidate(now);
+        let peer = CacheRecord {
+            schema_version: CACHE_SCHEMA,
+            fetched_at: now,
+            models: vec![cached(PEER_WINDOW)],
+        };
+        let path = cache_path().unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&peer).unwrap()).unwrap();
+    }
+
+    fn save_past_max_stale(now: u64) {
+        save_cache(&[cached(OWN_WINDOW)], now - MAX_STALE_MS - 1);
+    }
+
+    fn save_ahead_of_clock(now: u64) {
+        save_cache(&[cached(OWN_WINDOW)], now + 2 * CLOCK_SKEW_MS);
+    }
+
+    #[test_case(save_then_remove_file, Some(OWN_WINDOW) ; "saved_record_outlives_its_file")]
+    #[test_case(save_then_invalidate, None ; "invalidate_clears_the_copy")]
+    #[test_case(invalidate_then_peer_saves, Some(PEER_WINDOW) ; "emptied_copy_refills_from_disk")]
+    #[test_case(save_past_max_stale, None ; "record_past_max_stale_is_not_served")]
+    #[test_case(save_ahead_of_clock, None ; "record_ahead_of_the_clock_is_not_served")]
+    fn cached_model_answers_from_memory(setup: fn(u64), expected: Option<u32>) {
+        let _home = isolated_home();
+        setup(now_millis());
+        assert_eq!(cached_window(), expected);
+    }
+
+    #[tokio::test]
+    async fn listing_picks_up_a_record_a_peer_wrote() {
+        let _home = isolated_home();
+        let now = now_millis();
+        save_cache(&[cached(OWN_WINDOW)], now);
+        let peer = CacheRecord {
+            schema_version: CACHE_SCHEMA,
+            fetched_at: now,
+            models: vec![cached(PEER_WINDOW)],
+        };
+        fs::write(cache_path().unwrap(), serde_json::to_vec(&peer).unwrap()).unwrap();
+        assert_eq!(
+            cached_window(),
+            Some(OWN_WINDOW),
+            "{FOLLOWED_PEER_UNLISTED}"
+        );
+
+        select_models(ACCESS_TOKEN, false).await.unwrap();
+        assert_eq!(cached_window(), Some(PEER_WINDOW), "{LISTING_MISSED_PEER}");
     }
 }
