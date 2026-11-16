@@ -957,6 +957,7 @@ impl AuthState {
     /// env var, and the static credentials, which are the only ones a plugin
     /// without an auth hook ever has. A token a hook already minted stays,
     /// unless the new declaration stopped covering the origin it points at.
+    /// Then it goes even if the new credentials fail to resolve.
     fn redeclare(
         &self,
         slug: &str,
@@ -967,13 +968,23 @@ impl AuthState {
         *self.hosts.lock().unwrap() = hosts.into();
         let mut keys = self.keys.lock().unwrap();
         keys.refresh(slug, api_key_env);
-        let declared = keys.initial_auth(slug, header)?;
+        let declared = keys.initial_auth(slug, header);
         let mut current = self.current.lock().unwrap();
         let undeclared = declared_base_url(slug, current.base_url.clone(), hosts).is_err();
-        if !self.gate.ran() || undeclared {
-            *current = declared;
+        match declared {
+            Ok(declared) => {
+                if !self.gate.ran() || undeclared {
+                    *current = declared;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if undeclared {
+                    *current = ResolvedAuth::withheld();
+                }
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     /// [`Self::mint`] under the cross-process lock: serialised against other
@@ -1031,11 +1042,15 @@ impl AuthState {
         let owned = slug.to_owned();
         let stamp = blocking(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await;
         let mut current = self.current.lock().unwrap();
+        // A reload can narrow the hosts while the stamp is read. Vetted again
+        // under `current`, this either sees the new list or `redeclare`, which
+        // takes `current` after storing it, re-vets what lands here.
+        //
         // A hook that omits base_url keeps the resolved one. Falling back to
         // the provider's default origin would silently repoint the token.
-        if fresh.base_url.is_none() {
-            fresh.base_url = current.base_url.take();
-        }
+        fresh.base_url = declared_base_url(slug, fresh.base_url.take(), &self.hosts())
+            .map_err(|message| AgentError::Config { message })?
+            .or_else(|| current.base_url.take());
         *current = fresh;
         *self.store_seen.lock().unwrap() = stamp;
         Ok(())
@@ -3521,21 +3536,27 @@ mod tests {
     /// What the per-slug auth cell must and must not carry across a reload: a
     /// slug that has minted nothing takes the fresh declaration, an origin a
     /// hook leased survives as long as the new declaration still covers it,
-    /// and it goes the moment a narrowed host list stops covering it.
+    /// and it goes the moment a narrowed host list stops covering it, even when
+    /// the new credentials fail to resolve.
     ///
     /// The origin is always the hook's. A declared `base_url` is the codec's
     /// last resort and never reaches the auth cell, which is what keeps a
     /// plugin from outranking the user's `<SLUG>_BASE_URL`.
-    #[test_case(false, true, None ; "an_unminted_slug_takes_the_fresh_declaration")]
-    #[test_case(true, true, Some(OTHER_BASE_URL) ; "a_leased_origin_survives_the_reload")]
-    #[test_case(true, false, None ; "narrowing_the_hosts_drops_an_origin_they_no_longer_cover")]
+    #[test_case(false, true, false, None ; "an_unminted_slug_takes_the_fresh_declaration")]
+    #[test_case(true, true, false, Some(OTHER_BASE_URL) ; "a_leased_origin_survives_the_reload")]
+    #[test_case(true, false, false, None ; "narrowing_the_hosts_drops_an_origin_they_no_longer_cover")]
+    #[test_case(true, true, true, Some(OTHER_BASE_URL) ; "a_covered_origin_survives_credentials_that_fail")]
+    #[test_case(true, false, true, None ; "narrowing_the_hosts_drops_an_origin_even_when_the_credentials_fail")]
     #[tokio::test]
     async fn a_reload_re_reads_the_declaration(
         minted: bool,
         still_covered: bool,
+        unresolvable_key: bool,
         expected: Option<&str>,
     ) {
         const SLUG: &str = "redeclare-plugin";
+        const ENV_VAR: &str = "MAKI_TEST_REDECLARE_PLUGIN_KEY";
+        const NO_HEADER_KEY: &str = "sk-\u{1}";
         let declaration = |covers_the_lease: bool| {
             let mut reg = registration(SLUG);
             if covers_the_lease {
@@ -3558,7 +3579,12 @@ mod tests {
             );
         }
 
-        register_loaded(declaration(still_covered)).unwrap();
+        let mut reload = declaration(still_covered);
+        if unresolvable_key {
+            unsafe { std::env::set_var(ENV_VAR, NO_HEADER_KEY) };
+            reload.decl.api_key_env = Some(ENV_VAR.to_string());
+        }
+        register_loaded(reload).unwrap();
 
         assert_eq!(base_url(SLUG).as_deref(), expected);
     }
