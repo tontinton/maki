@@ -5,7 +5,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use rustix::io::Errno;
 #[cfg(unix)]
-use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpid};
+use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::process::Child;
 use tokio::time::timeout;
 
@@ -66,26 +66,6 @@ impl ChildGuard {
             let _ = child.start_kill();
         }
     }
-
-    // Best-effort non-blocking reap after SIGKILL to prevent zombie accumulation.
-    // All normal paths call .status() or .kill_and_reap() first, so this only
-    // fires on unexpected drops (panics, early returns). Uses WNOHANG to never
-    // block the async executor.
-    #[cfg(unix)]
-    fn reap_nonblocking(&mut self) {
-        if self.child.take().is_some()
-            && let Some(pid) = unix_pid(self.pid)
-        {
-            let _ = waitpid(Some(pid), WaitOptions::NOHANG);
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn reap_nonblocking(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.try_wait();
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -105,25 +85,26 @@ fn unix_pid(pid: u32) -> Option<Pid> {
     i32::try_from(pid).ok().and_then(Pid::from_raw)
 }
 
+/// Reaping stays with tokio: dropping the `Child` queues it on tokio's orphan
+/// reaper, and a `waitpid` here could reap first and leave tokio waiting on a
+/// pid it no longer owns.
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if self.child.is_some() {
-            self.signal_kill();
-        }
-        self.reap_nonblocking();
+        self.signal_kill();
     }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::process::CommandExt;
-    use std::time::{Duration, Instant};
 
+    use rustix::io::Errno;
     use rustix::process::{setsid, test_kill_process};
     use tokio::process::{Child, Command};
-    use tokio::time::sleep;
+    use tokio::task::yield_now;
+    use tokio::time::timeout;
 
-    use super::{ChildGuard, unix_pid};
+    use super::{ChildGuard, REAP_TIMEOUT, unix_pid};
 
     fn spawn_sleep() -> Child {
         let mut std_cmd = std::process::Command::new("sleep");
@@ -143,26 +124,27 @@ mod tests {
         unix_pid(pid).is_some_and(|pid| test_kill_process(pid).is_ok())
     }
 
-    /// Awaits between polls so the runtime reaps the child once it is dead:
-    /// `kill(pid, 0)` still succeeds on a zombie.
-    async fn wait_for_death(pid: u32) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if !is_alive(pid) {
-                return;
+    /// Yields between polls so the runtime gets to reap the child: `kill(pid, 0)`
+    /// still succeeds on a zombie and only reports `ESRCH` once it is reaped.
+    async fn wait_for_reap(pid: u32) {
+        let pid = unix_pid(pid).expect("child pid is a valid pid");
+        let reaped = async {
+            while test_kill_process(pid) != Err(Errno::SRCH) {
+                yield_now().await;
             }
-            sleep(Duration::from_millis(10)).await;
-        }
-        panic!("process {pid} still alive after 2s");
+        };
+        timeout(REAP_TIMEOUT, reaped)
+            .await
+            .expect("child reaped within the timeout");
     }
 
     #[tokio::test]
-    async fn drop_kills_child_process() {
+    async fn dropped_guard_leaves_no_zombie() {
         let child = spawn_sleep();
         let pid = child.id().unwrap();
         assert!(is_alive(pid));
         drop(ChildGuard::new(child));
-        wait_for_death(pid).await;
+        wait_for_reap(pid).await;
     }
 
     #[tokio::test]
@@ -172,7 +154,7 @@ mod tests {
         assert!(is_alive(pid));
         let mut guard = ChildGuard::new(child);
         guard.kill_and_reap().await;
-        wait_for_death(pid).await;
+        wait_for_reap(pid).await;
     }
 
     #[tokio::test]
