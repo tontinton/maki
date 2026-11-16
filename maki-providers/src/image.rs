@@ -13,7 +13,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use image::imageops::{self, FilterType};
 use image::{DynamicImage, ImageFormat, ImageReader, RgbImage, Rgba, RgbaImage};
-use tokio::task::spawn_blocking;
+use maki_storage::blocking;
 use tracing::warn;
 
 use crate::types::{ImageMediaType, ImageSource};
@@ -236,9 +236,8 @@ pub(crate) async fn fix_for_wire(source: &ImageSource) -> Fix {
     }
     let declared = source.media_type;
     let data = Arc::clone(&source.data);
-    let fix = spawn_blocking(move || decide(data, declared))
+    let fix = blocking(move || decide(data, declared))
         .await
-        .expect("image inspection panicked")
         .unwrap_or_else(|error| {
             warn!(
                 %error,

@@ -17,14 +17,13 @@ use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
 use serde::Deserialize;
 use serde_json::Value;
 use sse_stream::{Error as SseError, Sse, SseByteStream};
-use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use maki_storage::StateDir;
 use maki_storage::auth::{
     OAuthTokens, delete_tokens, load_tokens_async, lock_tokens_async, save_tokens,
 };
+use maki_storage::{StateDir, blocking};
 
 use crate::AgentError;
 use crate::headers::{
@@ -154,17 +153,17 @@ pub(crate) async fn refreshed_tokens(
             warn!(provider, cleared, error = %e, "OAuth refresh failed");
             if cleared {
                 let (dir, owned) = (dir.clone(), provider.to_owned());
-                let _ = spawn_blocking(move || delete_tokens(&dir, &owned)).await;
+                let _ = blocking(move || delete_tokens(&dir, &owned)).await;
             }
             return Err(e);
         }
     };
     let (dir, owned) = (dir.clone(), provider.to_owned());
-    let (fresh, saved) = spawn_blocking(move || {
+    let (fresh, saved) = blocking(move || {
         let saved = save_tokens(&dir, &owned, &fresh);
         (fresh, saved)
     })
-    .await?;
+    .await;
     // Not `?`: every caller reads an error here as "these credentials are
     // dead" and falls back to other auth, so a full disk would log the user
     // out over a refresh that actually succeeded. The run keeps the token

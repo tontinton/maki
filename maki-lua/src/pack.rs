@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use maki_pack::approvals::Entry;
-use tokio::task::spawn_blocking;
+use maki_storage::blocking;
 
 use crate::error::PluginError;
 use crate::loader::is_bundled;
@@ -1323,15 +1323,6 @@ async fn approval_store<'a>(
         *cache = Some(blocking(move || read_approvals_file(&path)).await);
     }
     cache.as_mut().and_then(Option::as_mut)
-}
-
-/// Runs one blocking job, disk work or a terminal prompt, on the blocking
-/// pool. Work that touches many files goes in as one job, so it costs one hop
-/// instead of one per call.
-async fn blocking<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> T {
-    spawn_blocking(job)
-        .await
-        .expect("package disk job panicked")
 }
 
 fn short_revision(revision: &str) -> &str {
