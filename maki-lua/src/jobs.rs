@@ -1,12 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::Result as IoResult;
 use std::mem;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::thread;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -15,12 +14,15 @@ use maki_providers::{shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult};
 use shell_words::join as shell_join;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::Command as AsyncCommand;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{
     Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, TryAcquireError, watch,
 };
+use tokio::task::JoinHandle;
 
-use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
+use crate::api::fs::{Line, LineCutter, MAX_READ_BYTES, expand_tilde};
 use crate::plugin_permissions::Ceiling;
 use crate::runtime::{Narrowed, with_jobs};
 
@@ -40,6 +42,7 @@ const JOB_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const JOB_QUEUE_RESUME: u32 = JOB_QUEUE_BYTES as u32 / 2;
 const STDOUT_STREAM: &str = "stdout";
 const STDERR_STREAM: &str = "stderr";
+const NO_PID_ERR: &str = "the spawned job has no pid";
 
 /// `agent.shell`, set once from config at startup. Jobs get built far away
 /// from any config, on whatever Lua thread runs the plugin, so they read it here.
@@ -104,10 +107,10 @@ impl JobCommand {
 }
 
 pub(crate) enum Redirect {
-    /// Piped to a reader thread, so callbacks and tails see the lines.
+    /// Piped to a reader, so callbacks and tails see the lines.
     Capture,
     Discard,
-    /// The child appends to the file on its own: no reader thread, no events,
+    /// The child appends to the file on its own: no reader, no events,
     /// no tail.
     File(PathBuf),
 }
@@ -189,7 +192,7 @@ struct JobMeta {
     /// nothing ever reaches the tail there and an empty tail is no evidence
     /// the job stayed quiet.
     dropped_output: bool,
-    /// Set by the wait thread the moment the child is reaped, which is well
+    /// Set by the job's task the moment the child is reaped, which is well
     /// before `exit_code`. Read by [`kill_job`].
     reaped: Arc<AtomicBool>,
     exit_code: Option<i32>,
@@ -368,62 +371,40 @@ impl JobStore {
             }
         }
 
-        let mut child = command.spawn().map_err(|e| e.to_string())?;
-        let pid = child.id();
+        let mut child = AsyncCommand::from(command)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id().ok_or(NO_PID_ERR)?;
         let id = self.next_id;
         self.next_id += 1;
 
-        // The owner exists before any thread does, so a failed spawn below
-        // still closes the queue on a reader that is already waiting on it.
         let (mut sender, events, queue) = job_queue(self.changed.clone());
-
-        macro_rules! spawn_reader {
-            ($stream:expr, $name:expr, $variant:ident) => {
-                if let Some(stream) = $stream {
-                    let mut sender = sender.clone();
-                    Some(
-                        thread::Builder::new()
-                            .name($name.into())
-                            .spawn(move || {
-                                let mut reader = BufReader::with_capacity(READER_BUF_SIZE, stream);
-                                while let Ok(Some(line)) =
-                                    next_line(&mut reader, Some(max_line_bytes), true)
-                                {
-                                    if !sender.send(JobEvent::$variant(line)) {
-                                        break;
-                                    }
-                                }
-                            })
-                            .map_err(|e| e.to_string())?,
-                    )
-                } else {
-                    None
-                }
-            };
-        }
-        let stdout_handle = spawn_reader!(child.stdout.take(), "job-stdout", Stdout);
-        let stderr_handle = spawn_reader!(child.stderr.take(), "job-stderr", Stderr);
-
+        let readers = [
+            child
+                .stdout
+                .take()
+                .map(|out| sender.spawn_reader(out, max_line_bytes, JobEvent::Stdout)),
+            child
+                .stderr
+                .take()
+                .map(|err| sender.spawn_reader(err, max_line_bytes, JobEvent::Stderr)),
+        ];
         let reaped = Arc::new(AtomicBool::new(false));
         let wait_reaped = Arc::clone(&reaped);
-        thread::Builder::new()
-            .name("job-wait".into())
-            .spawn(move || {
-                // Reaping frees the pid, and that pid is the process group
-                // `kill_job` signals. The readers only return once every
-                // descendant dropped the pipes, so joining them first keeps a
-                // kill target around for as long as the job is really alive.
-                if let Some(h) = stdout_handle {
-                    let _ = h.join();
+        tokio::spawn(async move {
+            // Reaping frees the pid, and that pid is the process group
+            // `kill_job` signals. The readers only return once every
+            // descendant dropped the pipes, so awaiting them first keeps a
+            // kill target around for as long as the job is really alive.
+            for reader in readers.into_iter().flatten() {
+                if let Ok(Err(error)) = reader.await {
+                    tracing::warn!(job_id = id, pid, %error, "job output reader failed");
                 }
-                if let Some(h) = stderr_handle {
-                    let _ = h.join();
-                }
-                let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                wait_reaped.store(true, Ordering::Relaxed);
-                sender.send(JobEvent::Exit(code));
-            })
-            .map_err(|e| e.to_string())?;
+            }
+            let code = child.wait().await.map_or(-1, |s| s.code().unwrap_or(-1));
+            wait_reaped.store(true, Ordering::Relaxed);
+            sender.send(JobEvent::Exit(code)).await;
+        });
 
         self.jobs.insert(
             id,
@@ -971,7 +952,7 @@ struct JobEventSender {
     reserve: Option<OwnedSemaphorePermit>,
 }
 
-/// Each reader thread starts without a reserve: permits are per reader.
+/// Each reader starts without a reserve: permits are per reader.
 impl Clone for JobEventSender {
     fn clone(&self) -> Self {
         Self {
@@ -985,7 +966,7 @@ impl Clone for JobEventSender {
 
 impl JobEventSender {
     /// Returns false once the job is gone, so the reader can stop.
-    fn send(&mut self, event: JobEvent) -> bool {
+    async fn send(&mut self, event: JobEvent) -> bool {
         let cost = permits(&event);
         loop {
             if let Some(spent) = self
@@ -1013,8 +994,9 @@ impl JobEventSender {
             // back first: kept through the park, it plus the other reader's
             // idle run could leave the pool one line short of a run for good.
             self.reserve = None;
-            if let Ok(run) =
-                Arc::clone(&self.queue.bytes).blocking_acquire_many_owned(JOB_QUEUE_RESUME)
+            if let Ok(run) = Arc::clone(&self.queue.bytes)
+                .acquire_many_owned(JOB_QUEUE_RESUME)
+                .await
             {
                 self.reserve = Some(run);
             }
@@ -1024,10 +1006,42 @@ impl JobEventSender {
             .inspect(|()| self.changed.send_replace(()))
             .is_ok()
     }
+
+    /// A reader of its own that sends the lines of a piped {stream} as
+    /// {event}s until it ends or the job is gone.
+    fn spawn_reader(
+        &self,
+        stream: impl AsyncRead + Unpin + Send + 'static,
+        max_line_bytes: u64,
+        event: fn(Line) -> JobEvent,
+    ) -> JoinHandle<IoResult<()>> {
+        let mut sender = self.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::with_capacity(READER_BUF_SIZE, stream);
+            let mut cutter = LineCutter::new(Some(max_line_bytes), true);
+            loop {
+                let buf = reader.fill_buf().await?;
+                let line = if buf.is_empty() {
+                    let Some(last) = cutter.finish()? else {
+                        return Ok(());
+                    };
+                    last
+                } else {
+                    let (consumed, line) = cutter.feed(buf)?;
+                    reader.consume(consumed);
+                    let Some(line) = line else { continue };
+                    line
+                };
+                if !sender.send(event(line)).await {
+                    return Ok(());
+                }
+            }
+        })
+    }
 }
 
 /// Signalling a reaped pid would hit whoever the kernel handed it to next, so
-/// skip the jobs the wait thread already reaped. Until then the child is a
+/// skip the jobs their task already reaped. Until then the child is a
 /// zombie, and a zombie group leader keeps its pid and pgid off the free list,
 /// so the group is still the right target. The flag carries no data of its
 /// own, hence `Relaxed`.
@@ -1100,6 +1114,7 @@ mod tests {
     use crate::api::fs::LINE_CUT_MARKER;
     use crate::test_support::runtime;
     use futures::FutureExt;
+    use std::thread;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -1198,10 +1213,14 @@ mod tests {
         }
     }
 
+    /// `start` spawns the job's tasks onto the runtime it is called in.
+    fn start_job(store: &mut JobStore, spec: JobSpec) -> u32 {
+        let _runtime = runtime().enter();
+        store.start(spec).unwrap()
+    }
+
     fn start_echo(store: &mut JobStore) -> u32 {
-        store
-            .start(JobSpec::new(task_owner(1), "echo hello"))
-            .unwrap()
+        start_job(store, JobSpec::new(task_owner(1), "echo hello"))
     }
 
     #[cfg(unix)]
@@ -1229,9 +1248,7 @@ mod tests {
     #[test]
     fn dropping_the_store_kills_its_jobs() {
         let mut store = make_store();
-        let id = store
-            .start(JobSpec::new(task_owner(1), "sleep 30"))
-            .expect("job started");
+        let id = start_job(&mut store, JobSpec::new(task_owner(1), "sleep 30"));
         let pid = store.jobs[&id].pid;
         assert!(group_alive(pid), "job should be running before the drop");
 
@@ -1261,9 +1278,7 @@ mod tests {
         let over = MAX_READ_BYTES + 1;
         let mut store = make_store();
         let cmd = format!("head -c {over} /dev/zero | tr '\\0' x");
-        let id = store
-            .start(JobSpec::new(task_owner(1), cmd.as_str()))
-            .unwrap();
+        let id = start_job(&mut store, JobSpec::new(task_owner(1), cmd.as_str()));
 
         let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
 
@@ -1328,9 +1343,7 @@ mod tests {
     #[test]
     fn plugin_owner_can_be_accessed_only_by_its_plugin() {
         let mut store = make_store();
-        let id = store
-            .start(JobSpec::new(plugin_owner(), "echo hello"))
-            .unwrap();
+        let id = start_job(&mut store, JobSpec::new(plugin_owner(), "echo hello"));
 
         assert!(store.lease_events(id, Some(1), "other-plugin").is_none());
         assert!(store.lease_events(id, None, TEST_PLUGIN).is_some());
@@ -1341,9 +1354,7 @@ mod tests {
     fn kill_requires_owner_access() {
         let lua = Lua::new();
         let mut store = make_store();
-        let id = store
-            .start(JobSpec::new(task_owner(1), "sleep 30"))
-            .unwrap();
+        let id = start_job(&mut store, JobSpec::new(task_owner(1), "sleep 30"));
         let pid = store.jobs[&id].pid;
 
         store.kill(id, Some(2), TEST_PLUGIN);
@@ -1361,10 +1372,8 @@ mod tests {
         let mut store = make_store();
         let task = task_owner(1);
         let plugin = plugin_owner();
-        let task_id = store.start(JobSpec::new(task.clone(), "sleep 30")).unwrap();
-        let plugin_id = store
-            .start(JobSpec::new(plugin.clone(), "sleep 30"))
-            .unwrap();
+        let task_id = start_job(&mut store, JobSpec::new(task.clone(), "sleep 30"));
+        let plugin_id = start_job(&mut store, JobSpec::new(plugin.clone(), "sleep 30"));
         let task_pid = store.jobs[&task_id].pid;
         let plugin_pid = store.jobs[&plugin_id].pid;
 
@@ -1421,9 +1430,7 @@ mod tests {
     fn next_event_filters_by_owner() {
         let mut store = make_store();
         let id = start_echo(&mut store);
-        let plugin_id = store
-            .start(JobSpec::new(plugin_owner(), "echo plugin"))
-            .unwrap();
+        let plugin_id = start_job(&mut store, JobSpec::new(plugin_owner(), "echo plugin"));
 
         let task_events = collect_until_exit(id, || store.next_event(&task_owner(1)));
         assert!(task_events.iter().all(|(job_id, _)| *job_id != plugin_id));
@@ -1451,7 +1458,10 @@ mod tests {
         for id in [1, 2] {
             let (mut sender, events, queue) = job_queue(store.changed.clone());
             for _ in 0..QUEUED_PER_JOB {
-                sender.send(JobEvent::Stdout("spam".into()));
+                assert_eq!(
+                    sender.send(JobEvent::Stdout("spam".into())).now_or_never(),
+                    Some(true)
+                );
             }
             let mut job = stub_job(task_owner(1), None, None);
             job.events = events;
@@ -1544,9 +1554,7 @@ mod tests {
         let lua = Lua::new();
         let mut store = make_store();
         let task = start_echo(&mut store);
-        let plugin = store
-            .start(JobSpec::new(plugin_owner(), "echo plugin"))
-            .unwrap();
+        let plugin = start_job(&mut store, JobSpec::new(plugin_owner(), "echo plugin"));
 
         let from_task: Vec<u32> = store
             .list(None, Some(1), TEST_PLUGIN)
@@ -1583,9 +1591,10 @@ mod tests {
             plugin: Arc::from(TEST_PLUGIN),
         };
         let mut store = make_store();
-        let id = store
-            .start(JobSpec::new(owner.clone(), "echo hi; echo err >&2; exit 3"))
-            .unwrap();
+        let id = start_job(
+            &mut store,
+            JobSpec::new(owner.clone(), "echo hi; echo err >&2; exit 3"),
+        );
         store.set_tail(id, Some(5));
 
         store.detach_plugin_callbacks(&lua, TEST_PLUGIN);
@@ -1622,12 +1631,8 @@ mod tests {
         let a = MakiId::generate();
         let b = MakiId::generate();
         let mut store = make_store();
-        let first = store
-            .start(JobSpec::new(session_owner(a), "sleep 30"))
-            .unwrap();
-        let second = store
-            .start(JobSpec::new(session_owner(b), "sleep 30"))
-            .unwrap();
+        let first = start_job(&mut store, JobSpec::new(session_owner(a), "sleep 30"));
+        let second = start_job(&mut store, JobSpec::new(session_owner(b), "sleep 30"));
         store.kill_session(&lua, a);
         assert!(store.snapshot(first, None, TEST_PLUGIN).is_none());
         assert!(store.snapshot(second, None, TEST_PLUGIN).is_some());
@@ -1714,13 +1719,14 @@ mod tests {
         let path = dir.path().join("job.log");
         std::fs::write(&path, EXISTING).unwrap();
         let mut store = make_store();
-        let id = store
-            .start(JobSpec {
+        let id = start_job(
+            &mut store,
+            JobSpec {
                 stdout: Redirect::File(path.clone()),
                 stderr: Redirect::Discard,
                 ..JobSpec::new(task_owner(1), "echo hi; echo err >&2")
-            })
-            .unwrap();
+            },
+        );
 
         for (_, event) in collect_until_exit(id, || store.next_event(&task_owner(1))) {
             store.record_event(id, &event);
@@ -1820,7 +1826,10 @@ mod tests {
         let mut woke = || changed.changed().now_or_never().is_some();
         assert!(!woke(), "subscribing is not a change");
 
-        sender.send(JobEvent::Stdout("line".into()));
+        assert_eq!(
+            sender.send(JobEvent::Stdout("line".into())).now_or_never(),
+            Some(true)
+        );
         assert!(woke(), "a queued event");
 
         let lease = store.lease_events(1, None, TEST_PLUGIN).unwrap();
@@ -2028,9 +2037,10 @@ mod tests {
         let lua = Lua::new();
         let session = MakiId::generate();
         let mut store = make_store();
-        let id = store
-            .start(JobSpec::new(session_owner(session), "sleep 0.1"))
-            .unwrap();
+        let id = start_job(
+            &mut store,
+            JobSpec::new(session_owner(session), "sleep 0.1"),
+        );
         for (_, event) in collect_until_exit(id, || next_plugin_event(&mut store)) {
             store.record_event(id, &event);
         }
@@ -2080,17 +2090,17 @@ mod tests {
     /// A parked reader keeps the run it waited for, so a line may never cost
     /// more than the run left to the other reader. Capped, a line longer than
     /// the whole queue still gets through past a reader holding a run idle.
-    #[test]
-    fn a_long_line_fits_past_an_idle_reserve() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_line_fits_past_an_idle_reserve() {
         let store = make_store();
         let (mut small, events, _queue) = job_queue(store.changed.clone());
         let line = || JobEvent::Stdout("0".repeat(PARKED_LINE_BYTES).as_str().into());
         let lines = JOB_QUEUE_BYTES / permits(&line()) as usize;
         for _ in 0..lines {
-            assert!(small.send(line()));
+            assert!(small.send(line()).await);
         }
         let mut long = small.clone();
-        let small = thread::spawn(move || (small.send(line()), small));
+        let small = tokio::spawn(async move { (small.send(line()).await, small) });
         // A parked reader's owned acquire holds a clone of the semaphore.
         wait_until("the small reader parked", || {
             Arc::strong_count(&events.queue.bytes) == 2
@@ -2098,39 +2108,44 @@ mod tests {
         for _ in 0..=lines {
             assert!(matches!(next_within(&events), Some(JobEvent::Stdout(_))));
         }
-        let (sent, _idle_reserve) = small.join().unwrap();
+        let (sent, _idle_reserve) = small.await.unwrap();
         assert!(sent);
 
-        let long = thread::spawn(move || {
+        let long = tokio::spawn(async move {
             long.send(JobEvent::Stderr(
                 "0".repeat(JOB_QUEUE_BYTES).as_str().into(),
             ))
+            .await
         });
         assert!(matches!(next_within(&events), Some(JobEvent::Stderr(_))));
-        assert!(long.join().unwrap());
+        assert!(long.await.unwrap());
     }
 
     /// The other reader holds a run idle after one short line. A flooding
     /// reader that parks again must not count its leftover against the run
     /// it waits for, or the pool stays a few bytes short of one for good.
-    #[test]
-    fn a_parked_reader_drops_its_leftover() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_reader_drops_its_leftover() {
         let store = make_store();
         let (mut fill, events, _queue) = job_queue(store.changed.clone());
         let line = || JobEvent::Stdout("0".repeat(PARKED_LINE_BYTES).as_str().into());
         let lines = JOB_QUEUE_BYTES / permits(&line()) as usize;
         for _ in 0..lines {
-            assert!(fill.send(line()));
+            assert!(fill.send(line()).await);
         }
         // A line sized to the spare, so even a short one parks.
         let spare = events.queue.bytes.available_permits();
         let overhead = permits(&JobEvent::Stdout("".into())) as usize;
-        assert!(fill.send(JobEvent::Stdout(
-            "0".repeat(spare - overhead).as_str().into()
-        )));
+        assert!(
+            fill.send(JobEvent::Stdout(
+                "0".repeat(spare - overhead).as_str().into()
+            ))
+            .await
+        );
         assert_eq!(events.queue.bytes.available_permits(), 0);
         let mut short = fill.clone();
-        let short = thread::spawn(move || (short.send(JobEvent::Stderr("!".into())), short));
+        let short =
+            tokio::spawn(async move { (short.send(JobEvent::Stderr("!".into())).await, short) });
         wait_until("the short line's reader parked", || {
             Arc::strong_count(&events.queue.bytes) == 2
         });
@@ -2138,15 +2153,19 @@ mod tests {
             assert!(matches!(next_within(&events), Some(JobEvent::Stdout(_))));
         }
         assert!(matches!(next_within(&events), Some(JobEvent::Stderr(_))));
-        let (sent, _idle_run) = short.join().unwrap();
+        let (sent, _idle_run) = short.await.unwrap();
         assert!(sent);
 
         let flood = 3 * lines;
-        let flooder = thread::spawn(move || (0..flood).all(|_| fill.send(line())));
+        let flooder = tokio::spawn(async move {
+            for _ in 0..flood {
+                assert!(fill.send(line()).await);
+            }
+        });
         for _ in 0..flood {
             assert!(matches!(next_within(&events), Some(JobEvent::Stdout(_))));
         }
-        assert!(flooder.join().unwrap());
+        flooder.await.unwrap();
     }
 
     #[cfg(unix)]
@@ -2170,7 +2189,7 @@ mod tests {
         /// Starts {cmd} and waits for its queue to fill, so its readers are
         /// parked on a send.
         fn start_blocked(store: &mut JobStore, owner: JobOwner, cmd: &str) -> u32 {
-            let id = store.start(JobSpec::new(owner, cmd)).unwrap();
+            let id = start_job(store, JobSpec::new(owner, cmd));
             let queue = Arc::clone(&store.jobs[&id].events.queue);
             wait_until(NEVER_FILLED, || is_full(&queue));
             id
@@ -2213,7 +2232,7 @@ mod tests {
 
         /// The leased case is `jobwait` holding the events inside a
         /// callback: nothing drains them, so only closing the job's queue can
-        /// release the readers and the wait thread.
+        /// release the job's task.
         #[test_case::test_case(Teardown::KillTask ; "kill_task")]
         #[test_case::test_case(Teardown::KillPlugin ; "kill_plugin")]
         #[test_case::test_case(Teardown::KillSession ; "kill_session")]
