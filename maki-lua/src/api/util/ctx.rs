@@ -1,6 +1,6 @@
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use maki_agent::agent::tool_dispatch::silent_mutation_check;
@@ -175,7 +175,7 @@ pub(crate) struct LuaCtx {
     /// re-rendered.
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
-    pub(crate) finish_tx: Option<oneshot::Sender<ToolCallReply>>,
+    pub(crate) finish_tx: Mutex<Option<oneshot::Sender<ToolCallReply>>>,
 }
 
 enum Caps {
@@ -215,7 +215,7 @@ impl LuaCtx {
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id.clone(),
             task_id: ctx.task_id.clone(),
-            finish_tx: None,
+            finish_tx: Mutex::default(),
         }
     }
 
@@ -250,7 +250,7 @@ impl LuaCtx {
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id,
             task_id: ctx.task_id,
-            finish_tx: None,
+            finish_tx: Mutex::default(),
         }
     }
 
@@ -605,10 +605,6 @@ impl UserData for LuaCtx {
                 let loaded = agent.loaded_instructions.clone();
                 let call = agent.call_instructions.clone();
                 let files = Arc::clone(&agent.instruction_files);
-                // Nothing may hold the ctx borrow across the wait: a cancel
-                // hook firing meanwhile needs `ctx:finish`, which takes it
-                // mutably.
-                drop(this);
                 let blocks = spawn_blocking(move || {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let abs = resolve_abs_with_cwd(dir_path, &cwd);
@@ -627,12 +623,14 @@ impl UserData for LuaCtx {
             }))
         });
 
-        methods.add_method_mut("finish", |lua, this, val: LuaValue| {
+        methods.add_method("finish", |lua, this, val: LuaValue| {
             if !matches!(this.caps, Caps::Handler { .. }) {
                 return Ok(this.cap_err_pair("finish"));
             }
             let tx = this
                 .finish_tx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
                 .take()
                 .ok_or_else(|| mlua::Error::runtime("ctx:finish() already called"))?;
 
@@ -674,6 +672,7 @@ mod tests {
     /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const SUBAGENT_TASK_ID: &str = "toolu_task";
+    const FINISH_REPLY: &str = "partial output";
 
     fn session_ref() -> SessionRef {
         SESSION_ID.parse().expect("valid session id")
@@ -705,6 +704,25 @@ mod tests {
         ctx.local_tools = Arc::new(tools);
         ctx.live_sink = Some(unbounded_channel().0);
         ctx
+    }
+
+    #[test]
+    fn finish_replies_while_the_ctx_is_borrowed() {
+        let lua = Lua::new();
+        let mut ctx = LuaCtx::handler(&populated_ctx());
+        let (finish_tx, mut finish_rx) = oneshot::channel();
+        ctx.finish_tx = Mutex::new(Some(finish_tx));
+        let ctx = lua.create_userdata(ctx).unwrap();
+        let held = ctx.borrow::<LuaCtx>().unwrap();
+
+        let (finished, error): Pair<bool> = lua
+            .load("local ctx, reply = ... return ctx:finish(reply)")
+            .call((&ctx, FINISH_REPLY))
+            .unwrap();
+        drop(held);
+
+        assert_eq!((finished, error), (Some(true), None));
+        assert!(finish_rx.try_recv().is_ok());
     }
 
     #[test]
