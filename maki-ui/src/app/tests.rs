@@ -262,7 +262,7 @@ fn spawned_app(tab: OpenSession, permissions: Arc<PermissionManager>) -> App {
     let dir = tmp_state();
     let writer = Arc::new(test_writer(dir.clone()));
     let mut app = build_app_with_session(dir, writer, LuaCommandReader::empty(), tab, permissions);
-    let (shared_queue, _rx) = shared_queue::queue();
+    let (shared_queue, _rx, _notify_rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
 }
