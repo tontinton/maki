@@ -333,10 +333,12 @@ maki.api.create_autocmd("TurnComplete", {
 ```
 
 `TurnComplete` fires once per model response, before that response's tool
-calls run. `data.message` includes the `tool_use` blocks. A response that
-calls tools starts another turn. It also fires for a compaction's summary
-request, where `data.message` holds the summary, and nothing in the payload
-says so. `data.id` marks a subagent's response.
+calls run. `data.message` is the same table a `maki.session.messages()` entry
+is, so a null arrives as `maki.NIL` and an image block carries an image handle.
+It includes the `tool_use` blocks. A response that calls tools starts another
+turn. It also fires for a compaction's summary request, where `data.message`
+holds the summary, and nothing in the payload says so. `data.id` marks a
+subagent's response.
 
 ### agent.stop
 

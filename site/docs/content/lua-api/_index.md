@@ -382,7 +382,7 @@ print(maki.json.encode(copy)) -- {"files":[],"mode":"strict"}
 maki.NIL
 ```
 
-`maki.NIL` is a value that stands for JSON null, like `vim.NIL`. `maki.json.decode` returns it for every null unless `luanil` says otherwise. Every conversion to JSON turns it back into null. So a decode, change, encode pass loses no key. It is truthy and not equal to nil, so test `x == maki.NIL` for null. Tool handler arguments and event payloads use nil for null instead, never `maki.NIL`.
+`maki.NIL` is a value that stands for JSON null, like `vim.NIL`. `maki.json.decode` returns it for every null unless `luanil` says otherwise. Every conversion to JSON turns it back into null. So a decode, change, encode pass loses no key. It is truthy and not equal to nil, so test `x == maki.NIL` for null. Tool handler arguments use nil for null instead, and so does an event payload, except for the message of `TurnComplete`, which is a session table.
 
 **Example:**
 
@@ -927,10 +927,11 @@ name the session now running or focused. What each event adds:
 - `"TurnComplete"`: `data.message`, the model's message, with
   `data.context_window` and `data.context_size` when the host knows it.
   Fires after each response, before that response's tool calls run.
-  `data.message` needs `session_read`. It is JSON in the session
-  format, not the Lua tables `maki.session.messages` builds: the keys
-  and blocks are the same, [listed here](#maki-session-messages). Each
-  block is tagged by `type`, and each type carries its own fields. A
+  `data.message` needs `session_read` and is the same table a
+  `maki.session.messages()` entry is, so a null arrives as `maki.NIL` and
+  an image block carries an image handle instead of base64. The keys and
+  blocks are [listed here](#maki-session-messages). Each block is tagged
+  by `type`, and each type carries its own fields. A
   subagent's response carries its own message and sizes with `data.id`,
   the task id `maki.session.notify` takes as `task`. Skip events with an
   `id` to watch only the main context. No payload carries a cost, and

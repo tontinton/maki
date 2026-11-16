@@ -16,6 +16,10 @@ use crate::EventHandle;
 
 const SESSION_ID: &str = "session_id";
 
+/// Where a `TurnComplete` reply lands, in the payload and in
+/// [`HostEventKind::fields`] alike.
+pub(crate) const MESSAGE_KEY: &str = "message";
+
 /// Every event the host fires, one variant each, and [`EventHandle::fire`]
 /// takes nothing else. Each field lands in the payload, so
 /// `every_payload_key_is_classified_once` sees a new field before any plugin
@@ -42,9 +46,9 @@ pub enum HostEvent<'a> {
         duration_ms: Option<u64>,
     },
     TurnComplete {
-        /// Content, so a plugin without `session_read` gets the payload
-        /// without this key. The payload is built before the strip, so the
-        /// host pays the serialization either way.
+        /// Beside the payload JSON, which would drop its nulls and inline
+        /// base64 for every image. The Lua thread builds the table plugins know.
+        #[serde(skip)]
         message: &'a Message,
         /// Absent when the host does not know the gauge.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +162,15 @@ impl HostEvent<'_> {
         }
         data
     }
+
+    /// The reply the Lua thread sets under [`MESSAGE_KEY`]. No other event
+    /// carries one.
+    pub(crate) fn lua_message(&self) -> Option<&Message> {
+        match self {
+            Self::TurnComplete { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 }
 
 /// The keys of one host event's payload, sorted by whether they are
@@ -186,7 +199,7 @@ impl HostEventKind {
                 &["tool_id", "tool", "is_error", "bytes", "duration_ms"],
             ),
             Self::AutoCompacting => (&[], &["context_size", "context_window"]),
-            Self::TurnComplete => (&["message"], &["context_size", "context_window", "id"]),
+            Self::TurnComplete => (&[MESSAGE_KEY], &["context_size", "context_window", "id"]),
             Self::CompactionDone => (
                 &["summary"],
                 &[
@@ -638,14 +651,17 @@ mod tests {
         );
     }
 
+    /// The reply is not JSON: only the Lua thread can build the table a
+    /// plugin expects, so it travels beside the payload.
     #[test]
-    fn turn_complete_carries_the_reply() {
-        let data = fired(&turn_complete(SAMPLE_MESSAGE.clone(), Some(150_000)))
-            .expect("TurnComplete fires")
-            .1;
-        assert_eq!(data["message"]["role"], "assistant");
-        assert_eq!(data["message"]["content"][0]["type"], "text");
-        assert_eq!(data["message"]["content"][0]["text"], SAMPLE_TEXT);
+    fn turn_complete_sends_its_reply_beside_the_payload() {
+        let event = turn_complete(SAMPLE_MESSAGE.clone(), Some(150_000));
+        let fired = host_event_for(&event, None).expect("TurnComplete fires");
+        assert_eq!(fired.lua_message(), Some(&*SAMPLE_MESSAGE));
+        assert!(
+            fired.payload(Some(&SESSION)).get(MESSAGE_KEY).is_none(),
+            "a serialized reply would drop nulls and inline base64"
+        );
     }
 
     #[test]
@@ -672,13 +688,9 @@ mod tests {
 
     #[test]
     fn subagent_turn_complete_carries_its_reply() {
-        let data = host_event_for(
-            &turn_complete(SAMPLE_MESSAGE.clone(), Some(150_000)),
-            Some("toolu_sub"),
-        )
-        .expect("TurnComplete fires")
-        .payload(Some(&SESSION));
-        assert_eq!(data["id"], "toolu_sub");
-        assert_eq!(data["message"]["content"][0]["text"], SAMPLE_TEXT);
+        let event = turn_complete(SAMPLE_MESSAGE.clone(), Some(150_000));
+        let fired = host_event_for(&event, Some("toolu_sub")).expect("TurnComplete fires");
+        assert_eq!(fired.payload(Some(&SESSION))["id"], "toolu_sub");
+        assert_eq!(fired.lua_message(), Some(&*SAMPLE_MESSAGE));
     }
 }
