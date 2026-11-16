@@ -81,7 +81,7 @@ use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
-use maki_storage::model::persist_thinking;
+use maki_storage::model::{persist_thinking, with_recent};
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
@@ -1211,11 +1211,10 @@ impl App {
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
-        let recents = maki_storage::model::push_recent(&self.storage, spec)
-            .into_iter()
-            .filter(|spec| self.model_policy.allows(spec))
-            .collect();
-        self.model_picker.set_recents(recents);
+        if self.model_policy.allows(spec) {
+            let recents = with_recent(self.model_picker.recents(), spec);
+            self.model_picker.set_recents(recents);
+        }
     }
 
     pub(crate) fn flash(&mut self, msg: String) {

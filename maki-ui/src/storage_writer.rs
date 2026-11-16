@@ -10,6 +10,9 @@
 //! a write for it is still queued, so a tab that lets go frees it the moment
 //! its last snapshot lands. There is no release message that could overtake
 //! that snapshot.
+//!
+//! Other state files have no session to coalesce under, so they ride the
+//! wake itself as one-off jobs and land in the order they were queued.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -35,6 +38,13 @@ type Pending = Arc<Mutex<HashMap<MakiId, Entry>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 
+type Job = Box<dyn FnOnce(&StateDir) + Send>;
+
+enum Wake {
+    Flush,
+    Run(Job),
+}
+
 /// One slot per session, holding whatever the app asked for last. Deletes
 /// used to ride a side channel, where a flush queued before a delete could
 /// drain a save enqueued after it, so the delete unlinked a session the app
@@ -48,7 +58,7 @@ enum Entry {
 
 pub struct StorageWriter {
     pending: Pending,
-    wake: Sender<()>,
+    wake: Sender<Wake>,
     done_rx: oneshot::Receiver<Vec<MakiId>>,
 }
 
@@ -56,7 +66,7 @@ impl StorageWriter {
     pub fn new(dir: StateDir, warn_tx: UnboundedSender<String>) -> Self {
         let pending: Pending = Arc::default();
         let writer_pending = Arc::clone(&pending);
-        let (wake, wake_rx) = channel::<()>();
+        let (wake, wake_rx) = channel::<Wake>();
         let (done_tx, done_rx) = oneshot::channel::<Vec<MakiId>>();
 
         std::thread::Builder::new()
@@ -67,8 +77,11 @@ impl StorageWriter {
                     warn_tx,
                     failing: HashSet::new(),
                 };
-                while wake_rx.recv().is_ok() {
-                    writer.flush(&writer_pending);
+                while let Ok(wake) = wake_rx.recv() {
+                    match wake {
+                        Wake::Flush => writer.flush(&writer_pending),
+                        Wake::Run(job) => job(&writer.dir),
+                    }
                 }
                 writer.flush(&writer_pending);
                 let _ = done_tx.send(writer.failing.into_iter().collect());
@@ -100,9 +113,15 @@ impl StorageWriter {
         self.enqueue(id, Entry::Delete(claim, Box::new(done)));
     }
 
+    /// Runs `job` on the writer thread after every job queued before it, and
+    /// before [`Self::shutdown`] returns.
+    pub fn persist(&self, job: impl FnOnce(&StateDir) + Send + 'static) {
+        let _ = self.wake.send(Wake::Run(Box::new(job)));
+    }
+
     fn enqueue(&self, id: MakiId, entry: Entry) {
         lock(&self.pending).insert(id, entry);
-        if self.wake.send(()).is_err()
+        if self.wake.send(Wake::Flush).is_err()
             && let Some(Entry::Delete(_, done)) = lock(&self.pending).remove(&id)
         {
             done(Err(writer_gone()));
@@ -206,6 +225,7 @@ mod tests {
     use std::path::PathBuf;
 
     use maki_lua::test_support::runtime;
+    use maki_storage::model::{persist_model, push_recent, read_model, read_recents};
     use maki_storage::sessions::SESSIONS_DIR;
     use tempfile::TempDir;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -215,6 +235,8 @@ mod tests {
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
     const MODEL: &str = "test-model";
+    const FIRST_PICK: &str = "test/first";
+    const SECOND_PICK: &str = "test/second";
     const CWD: &str = "/tmp/writer";
     const MSG_PREFIX: &str = "msg-";
     const RESUMED_MSG: &str = "resumed";
@@ -288,6 +310,22 @@ mod tests {
         let blocker = sessions_dir(dir).join(format!("{id}.jsonl.tmp"));
         std::fs::create_dir_all(&blocker).unwrap();
         blocker
+    }
+
+    #[test]
+    fn persist_jobs_land_in_order_before_shutdown_returns() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        for spec in [FIRST_PICK, SECOND_PICK] {
+            writer.persist(move |dir| {
+                persist_model(dir, spec);
+                push_recent(dir, spec);
+            });
+        }
+        drain(writer);
+
+        assert_eq!(read_model(&dir).as_deref(), Some(SECOND_PICK));
+        assert_eq!(read_recents(&dir), [SECOND_PICK, FIRST_PICK]);
     }
 
     /// Snapshots must coalesce per session id, not into one `latest` slot:
