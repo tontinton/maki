@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::lock::Lock;
 use crate::{StateDir, StorageError, atomic_write_permissions};
@@ -126,7 +126,14 @@ pub fn lock_exclusive(path: &Path) -> Option<File> {
 /// no loader reads. Waits like [`lock_exclusive`], on the timer.
 pub async fn lock_tokens_async(dir: &StateDir, provider: &str) -> Option<Lock> {
     let path = auth_path(dir, &format!("{provider}{LOCK_SUFFIX}"));
-    Lock::acquire_within(&path, LOCK_WAIT, LOCK_POLL).await.ok()
+    Lock::acquire_within(&path, LOCK_WAIT, LOCK_POLL)
+        .await
+        .inspect_err(|e| warn!(provider, error = %e, "OAuth refresh lock not acquired"))
+        .ok()
+}
+
+pub async fn lock_mcp_auth_async(dir: &StateDir, server_name: &str) -> Option<Lock> {
+    lock_tokens_async(dir, &mcp_auth_name(server_name)).await
 }
 
 /// The cross-process half of [`lock_credentials`]: a plugin provider's store,
@@ -291,7 +298,11 @@ pub fn delete_mcp_auth(dir: &StateDir, server_name: &str) -> Result<bool, Storag
 }
 
 fn mcp_auth_path(dir: &StateDir, server_name: &str) -> PathBuf {
-    auth_path(dir, &format!("mcp-{server_name}"))
+    auth_path(dir, &mcp_auth_name(server_name))
+}
+
+fn mcp_auth_name(server_name: &str) -> String {
+    format!("mcp-{server_name}")
 }
 
 pub fn load_provider_credentials(dir: &StateDir, slug: &str) -> Option<ProviderCredentials> {
