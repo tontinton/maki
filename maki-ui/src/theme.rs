@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 use arc_swap::{ArcSwap, Guard};
 use maki_agent::SpanColor;
@@ -13,7 +13,8 @@ use syntect::highlighting::{
     Color as SynColor, FontStyle, ScopeSelectors, StyleModifier, ThemeItem, ThemeSettings,
 };
 
-const DEFAULT_THEME: &str = "dracula";
+const DEFAULT_THEME: &str = "ayu_dark";
+const BUNDLED_DEFAULT_THEME_LOADS: &str = "the bundled default theme must parse";
 const THEMES_DIR: &str = "themes";
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
 
@@ -270,12 +271,14 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
     },
 ];
 
-static THEME: LazyLock<ArcSwap<Theme>> =
-    LazyLock::new(|| ArcSwap::from_pointee(Theme::load_or_bundled()));
+static THEME: LazyLock<ArcSwap<Theme>> = LazyLock::new(|| {
+    ArcSwap::from_pointee(Theme::load_or_bundled(
+        user_themes_dir().as_deref(),
+        read_theme_name(),
+    ))
+});
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-
-static CURRENT_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn current() -> Guard<Arc<Theme>> {
     THEME.load()
@@ -294,17 +297,26 @@ pub fn generation() -> u64 {
 }
 
 pub fn load_by_name(name: &str) -> Result<Theme, String> {
-    if let Some(path) = user_themes_dir().map(|dir| dir.join(format!("{name}.toml")))
+    load_from(user_themes_dir().as_deref(), name)
+}
+
+fn load_from(user_dir: Option<&Path>, name: &str) -> Result<Theme, String> {
+    let theme = if let Some(path) = user_dir.map(|dir| dir.join(format!("{name}.toml")))
         && path.is_file()
         && let Ok(toml) = std::fs::read_to_string(&path)
     {
-        return Theme::from_toml(&toml).map_err(|e| format!("{}: {e}", path.display()));
-    }
-    BUNDLED_THEMES
-        .iter()
-        .find(|e| e.name == name)
-        .map(|e| Theme::from_toml(e.toml))
-        .unwrap_or_else(|| Err(format!("unknown theme: {name}")))
+        Theme::from_toml(&toml).map_err(|e| format!("{}: {e}", path.display()))
+    } else {
+        BUNDLED_THEMES
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| Theme::from_toml(e.toml))
+            .unwrap_or_else(|| Err(format!("unknown theme: {name}")))
+    }?;
+    Ok(Theme {
+        name: name.to_owned(),
+        ..theme
+    })
 }
 
 fn user_themes_dir() -> Option<PathBuf> {
@@ -337,12 +349,7 @@ fn merge_theme_names(user_names: impl IntoIterator<Item = String>) -> Vec<String
     names
 }
 
-pub fn set_current_name(name: &str) {
-    *CURRENT_NAME.lock().unwrap() = Some(name.to_owned());
-}
-
 pub fn persist_theme(name: &str) {
-    set_current_name(name);
     if let Ok(dir) = StateDir::resolve() {
         maki_storage::theme::persist_theme_name(&dir, name);
     }
@@ -354,10 +361,7 @@ fn read_theme_name() -> Option<String> {
 }
 
 pub fn current_theme_name() -> String {
-    if let Some(name) = CURRENT_NAME.lock().unwrap().clone() {
-        return name;
-    }
-    read_theme_name().unwrap_or_else(|| DEFAULT_THEME.to_owned())
+    current().name.clone()
 }
 
 /// One list of names feeds both the span lookup and what Lua sees, so a name a
@@ -431,6 +435,7 @@ named_styles!(t => {
 
 #[derive(Debug)]
 pub struct Theme {
+    name: String,
     pub background: Color,
     pub foreground: Color,
 
@@ -833,6 +838,7 @@ impl Theme {
         };
 
         Ok(Self {
+            name: String::new(),
             background: color("background"),
             foreground: color("foreground"),
 
@@ -983,13 +989,11 @@ impl Theme {
         })
     }
 
-    fn load_or_bundled() -> Self {
-        if let Some(name) = read_theme_name()
-            && let Ok(theme) = load_by_name(&name)
-        {
-            return theme;
-        }
-        Self::from_toml(BUNDLED_THEMES[0].toml).expect("bundled theme must parse")
+    fn load_or_bundled(user_dir: Option<&Path>, saved_name: Option<String>) -> Self {
+        saved_name
+            .and_then(|name| load_from(user_dir, &name).ok())
+            .or_else(|| load_from(user_dir, DEFAULT_THEME).ok())
+            .unwrap_or_else(|| load_from(None, DEFAULT_THEME).expect(BUNDLED_DEFAULT_THEME_LOADS))
     }
 }
 
@@ -1025,7 +1029,14 @@ fn brighten_toward(style: Style, from: Color, to: Color, t: f32) -> Style {
 mod tests {
     use super::*;
     use maki_highlight::UiStyle;
+    use tempfile::TempDir;
     use test_case::test_case;
+
+    const ZENBURN: &str = "zenburn";
+    const ZENBURN_BG: Color = Color::Rgb(0x3f, 0x3f, 0x3f);
+    const UNKNOWN_THEME: &str = "nonexistent";
+    const BROKEN_TOML: &str = "not valid {{{{";
+    const BLACK_TOML: &str = "[palette]\nbackground = \"black\"";
 
     #[test_case(Color::Rgb(1, 2, 3), SegmentColor::Rgb((1, 2, 3)); "truecolor")]
     #[test_case(Color::Indexed(200), SegmentColor::Ansi(200); "indexed")]
@@ -1241,7 +1252,7 @@ scrollbar_thumb = { fg = "magenta", bg = "default" }
 
     #[test]
     fn load_by_name_unknown() {
-        assert!(load_by_name("nonexistent").is_err());
+        assert!(load_by_name(UNKNOWN_THEME).is_err());
     }
 
     #[test]
@@ -1252,9 +1263,35 @@ scrollbar_thumb = { fg = "magenta", bg = "default" }
     }
 
     #[test]
-    fn current_theme_name_prefers_in_memory_name() {
-        set_current_name("zenburn");
-        assert_eq!(current_theme_name(), "zenburn");
+    fn current_theme_name_follows_the_set_theme() {
+        for name in [DEFAULT_THEME, ZENBURN] {
+            set(load_by_name(name).expect(name));
+            assert_eq!(current_theme_name(), name);
+        }
+    }
+
+    #[test_case(BROKEN_TOML, None, DEFAULT_THEME, DEFAULT_BG ; "nothing_saved")]
+    #[test_case(BROKEN_TOML, Some(DEFAULT_THEME), DEFAULT_THEME, DEFAULT_BG ; "broken_default_saved")]
+    #[test_case(BROKEN_TOML, Some(UNKNOWN_THEME), DEFAULT_THEME, DEFAULT_BG ; "unknown_saved")]
+    #[test_case(BROKEN_TOML, Some(ZENBURN), ZENBURN, ZENBURN_BG ; "bundled_saved")]
+    #[test_case(BLACK_TOML, None, DEFAULT_THEME, Color::Black ; "user_default_beats_bundled")]
+    fn startup_loads_saved_then_user_default_then_bundled_default(
+        user_default: &str,
+        saved: Option<&str>,
+        expected_name: &str,
+        expected_background: Color,
+    ) {
+        let user_dir = TempDir::new().unwrap();
+        std::fs::write(
+            user_dir.path().join(format!("{DEFAULT_THEME}.toml")),
+            user_default,
+        )
+        .unwrap();
+
+        let theme = Theme::load_or_bundled(Some(user_dir.path()), saved.map(str::to_owned));
+
+        assert_eq!(theme.name, expected_name);
+        assert_eq!(theme.background, expected_background);
     }
 
     #[test]
@@ -1470,6 +1507,7 @@ diff_new_line_nr = { fg = "red" }
         assert_eq!(style_by_name(name), Style::default());
     }
 
+    const DEFAULT_BG: Color = Color::Rgb(0x0d, 0x10, 0x17);
     const DRACULA_BG: Color = Color::Rgb(0x28, 0x2a, 0x36);
     const TOKYONIGHT_BG: Color = Color::Rgb(0x1a, 0x1b, 0x26);
 
