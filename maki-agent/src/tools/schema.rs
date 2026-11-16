@@ -6,8 +6,10 @@
 //! Validation errors are our own types with a single `Display` impl so the
 //! model never sees a raw serde message we did not write.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter, Write};
+use std::sync::{LazyLock, Mutex};
 
 use jsonrepair::{Options as RepairOpts, loads as repair_loads};
 use serde_json::{Value, json};
@@ -18,6 +20,12 @@ pub(crate) const PARAM_PREVIEW_MAX: usize = 120;
 const PREVIEW_SUFFIX: &str = "...";
 const JSON_ENCODED_ARRAY_HINT: &str = "Pass a JSON array, not a JSON-encoded string.";
 const JSON_ENCODED_OBJECT_HINT: &str = "Pass a JSON object, not a JSON-encoded string.";
+const ARRAY_MISSING_ITEMS: &str = "array schema missing items";
+
+/// Keyed by the schema's JSON text, not `Value` equality, which ignores key
+/// order, so a hit always hands the model the property order the plugin wrote.
+static SCHEMAS: LazyLock<Mutex<HashMap<String, &'static ParamSchema>>> =
+    LazyLock::new(Mutex::default);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamKind {
@@ -169,9 +177,17 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
     }
 }
 
-/// Leaks everything to get `&'static` lifetimes for `ParamSchema`.
-/// The leaked set is small and fixed per session, so this is fine.
+/// Leaks everything to get `&'static` lifetimes for `ParamSchema`. Each
+/// distinct schema leaks once and a `/reload` reuses it, so only an edited
+/// schema leaks again. A broken one is not cached and fails on every load.
 pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
+    match SCHEMAS.lock().unwrap().entry(v.to_string()) {
+        Entry::Occupied(cached) => Ok(*cached.get()),
+        Entry::Vacant(slot) => Ok(*slot.insert(build_schema(v)?)),
+    }
+}
+
+fn build_schema(v: &Value) -> Result<&'static ParamSchema, String> {
     let description: &'static str = v
         .get("description")
         .and_then(|d| d.as_str())
@@ -216,8 +232,8 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
             description,
         },
         Some("array") => {
-            let items_val = v.get("items").ok_or("array schema missing items")?;
-            let items: &'static ParamSchema = try_from_json(items_val)?;
+            let items_val = v.get("items").ok_or(ARRAY_MISSING_ITEMS)?;
+            let items: &'static ParamSchema = build_schema(items_val)?;
             ParamSchema::Array { items, description }
         }
         Some("object") if v.get("properties").is_none() => ParamSchema::OpenObject { description },
@@ -264,7 +280,7 @@ fn parse_object_schema(v: &Value, description: &'static str) -> Result<ParamSche
                     .get("required")
                     .and_then(|r| r.as_bool())
                     .unwrap_or(false);
-                let static_schema: &'static ParamSchema = try_from_json(sub)?;
+                let static_schema: &'static ParamSchema = build_schema(sub)?;
                 let is_required = inline_required || required.contains(&name.as_str());
                 let aliases: &'static [&'static str] = match sub.get("alias") {
                     Some(Value::String(s)) => {
@@ -868,6 +884,8 @@ pub(crate) const BOUNDED_ERR_MAX: usize = 400;
 
 #[cfg(test)]
 mod tests {
+    use std::ptr;
+
     use serde_json::json;
     use test_case::test_case;
 
@@ -1204,6 +1222,21 @@ mod tests {
         );
         assert_eq!(validate(schema, value).unwrap(), json!({"a": 1}));
         assert!(validate(schema, json!([1])).is_err());
+    }
+
+    #[test]
+    fn try_from_json_leaks_a_schema_once() {
+        let schema_json =
+            json!({ "type": "object", "properties": { PATH_PROP: { "type": "string" } } });
+        let first = try_from_json(&schema_json).unwrap();
+        assert!(ptr::eq(first, try_from_json(&schema_json).unwrap()));
+    }
+
+    #[test]
+    fn try_from_json_does_not_cache_a_broken_schema() {
+        let broken = json!({ "type": "array" });
+        assert_eq!(try_from_json(&broken).unwrap_err(), ARRAY_MISSING_ITEMS);
+        assert_eq!(try_from_json(&broken).unwrap_err(), ARRAY_MISSING_ITEMS);
     }
 
     #[test_case(json!({}) ; "empty_schema")]
