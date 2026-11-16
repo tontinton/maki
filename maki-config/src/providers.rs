@@ -4,9 +4,10 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::debug;
@@ -250,7 +251,8 @@ inventory::collect!(BuiltInProvider);
 
 /// Login rows of Lua plugin providers. They show up at runtime, too late for
 /// `inventory`, so they live here and every lookup checks both.
-static REGISTERED: RwLock<Vec<&'static BuiltInProvider>> = RwLock::new(Vec::new());
+static REGISTERED: LazyLock<ArcSwap<Vec<&'static BuiltInProvider>>> =
+    LazyLock::new(ArcSwap::default);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -460,21 +462,18 @@ fn providers_file_path() -> PathBuf {
 }
 
 pub fn set_registered_providers(rows: Vec<&'static BuiltInProvider>) {
-    *REGISTERED.write().unwrap_or_else(|e| e.into_inner()) = rows;
+    REGISTERED.store(Arc::new(rows));
 }
 
 pub fn builtin_provider(slug: &str) -> Option<&'static BuiltInProvider> {
     inventory::iter::<BuiltInProvider>()
         .into_iter()
         .find(|p| p.slug == slug)
-        .or_else(|| {
-            let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
-            registered.iter().copied().find(|p| p.slug == slug)
-        })
+        .or_else(|| REGISTERED.load().iter().copied().find(|p| p.slug == slug))
 }
 
 pub fn all_builtins() -> Vec<&'static BuiltInProvider> {
-    let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
+    let registered = REGISTERED.load();
     inventory::iter::<BuiltInProvider>()
         .chain(registered.iter().copied())
         .collect()
