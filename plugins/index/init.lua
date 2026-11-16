@@ -4,7 +4,7 @@ local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 
 local TRUNCATED_SUFFIX = indexer.TRUNCATED_SUFFIX
-local TRUNCATED_INFIX = " more truncated]"
+local TRUNCATED_INFIX = " truncated]"
 
 local opts = maki.api.register_options({
   max_file_size_mb = { default = 2, min = 1, desc = "Refuse to index files larger than this many MB." },
