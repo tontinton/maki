@@ -5602,7 +5602,7 @@ async fn run_tool_call(
     }
 
     let (finish_tx, mut finish_rx) = oneshot::channel::<ToolCallReply>();
-    ctx.finish_tx = Some(finish_tx);
+    ctx.finish_tx = Mutex::new(Some(finish_tx));
     let cancel = ctx.cancel.clone();
 
     let input_lua = match json_to_lua(&lua, &input) {

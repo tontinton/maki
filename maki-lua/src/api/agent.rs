@@ -628,9 +628,6 @@ async fn system_prompt(
         },
         None => Arc::new(config_filter(ToolFilter::All, agent, &agent.model)),
     };
-    // Nothing may hold the ctx borrow across the wait: a cancel hook firing
-    // meanwhile needs `ctx:finish`, which takes it mutably.
-    drop(ctx);
     let prompt_id_str: String = opts.get("prompt_id")?;
     let prompt_id = match prompt_id_str.as_str() {
         "research" => maki_agent::prompt::PromptId::Research,
@@ -1050,8 +1047,6 @@ async fn session(
     ctx: LuaEither<UserDataRef<LuaCtx>, Table>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
-    // The ctx borrow ends inside its arm, before any wait: a cancel hook
-    // firing meanwhile needs `ctx:finish`, which takes it mutably.
     let (agent_ctx, opts, owner) = match ctx {
         LuaEither::Left(ctx) => (
             try_pair!(dispatch_ctx(&ctx, "session")).clone(),
