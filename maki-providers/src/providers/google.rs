@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::TryStreamExt;
+use maki_storage::blocking;
 use maki_storage::id::{MakiId, SessionRef};
 use reqwest::{Client, Request, RequestBuilder};
 use serde::Deserialize;
@@ -308,7 +309,7 @@ impl Provider for Google {
             if self.key_pool.is_none() {
                 return Ok(());
             }
-            let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
+            let pool = blocking(|| KeyPool::resolve(SLUG, ENV_VAR)).await?;
             *self.auth.lock().unwrap() =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             Ok(())
