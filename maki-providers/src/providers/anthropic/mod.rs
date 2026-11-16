@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::TryStreamExt;
+use maki_storage::blocking;
 use maki_storage::id::SessionRef;
 use reqwest::header::HeaderValue;
 use reqwest::{Client, Method, Request, RequestBuilder};
@@ -618,7 +619,7 @@ impl Provider for Anthropic {
             if self.key_pool.is_none() {
                 return Ok(());
             }
-            let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
+            let pool = blocking(|| KeyPool::resolve("anthropic", ENV_VAR)).await?;
             *self.auth.lock().unwrap() =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             debug!("reloaded Anthropic auth from env");
@@ -724,11 +725,13 @@ pub(crate) async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Canned, serve, sse_body, sse_event};
+    use crate::test_support::{Canned, isolated_home, serve, sse_body, sse_event};
     use crate::{
         ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, ProviderEvent, Role, StopReason,
         TokenUsage,
     };
+    use maki_storage::StateDir;
+    use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
     use serde_json::{Value, json};
     use shared::{DISPLACED_ERROR_PREFIX, build_wire_messages};
     use std::iter;
@@ -736,6 +739,9 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
+    const FIRST_SAVED_KEY: &str = "sk-saved-before";
+    const LATER_SAVED_KEY: &str = "sk-saved-after";
+    const ENV_KEY: &str = "sk-env";
     const THINKING_SIGNATURE: &str = "sig";
     const UNKNOWN_BLOCK_TYPE: &str = "server_tool_use";
 
@@ -887,6 +893,38 @@ mod tests {
         .with_fallback_base_url(Some(THIRD_PARTY_BASE_URL.into()));
         provider.reload_auth().await.unwrap();
         assert_eq!(provider.auth.lock().unwrap().header_list(), headers);
+    }
+
+    fn save_key(key: &str) {
+        let creds = ProviderCredentials {
+            api_key: key.into(),
+            host: None,
+        };
+        save_provider_credentials(&StateDir::resolve().unwrap(), SLUG, &creds).unwrap();
+    }
+
+    #[test_case(None, LATER_SAVED_KEY ; "key_saved_after_construction")]
+    #[test_case(Some(ENV_KEY), ENV_KEY ; "env_key_outranks_the_saved_one")]
+    #[tokio::test]
+    async fn reload_auth_picks_up_the_current_key(env_key: Option<&str>, expected: &str) {
+        let _home = isolated_home();
+        // SAFETY: Nextest runs each test in its own process.
+        unsafe {
+            match env_key {
+                Some(key) => std::env::set_var(ENV_VAR, key),
+                None => std::env::remove_var(ENV_VAR),
+            }
+        }
+        save_key(FIRST_SAVED_KEY);
+        let provider = Anthropic::new(Timeouts::default()).unwrap();
+        save_key(LATER_SAVED_KEY);
+
+        provider.reload_auth().await.unwrap();
+
+        assert_eq!(
+            provider.auth.lock().unwrap().header(API_KEY_HEADER),
+            Some(expected)
+        );
     }
 
     #[test_case(None, true ; "no_fallback_is_anthropic")]
