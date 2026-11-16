@@ -21,8 +21,8 @@ const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 /// provider that match.
 pub(crate) struct ModelSlots {
     built: HashMap<String, Arc<ModelSlot>>,
-    /// What the process started on. `get_or_fallback` leans on it so opening a
-    /// session always ends up with a model that works.
+    /// What the process started on. Opening a session leans on it so it always
+    /// ends up with a model that works.
     fallback: Arc<ModelSlot>,
     builder: SlotBuilder,
 }
@@ -53,6 +53,21 @@ impl SlotBuilder {
         let provider = from_model_async(&mut model, self.timeouts).await;
         into_slot(model, provider)
     }
+
+    pub(crate) async fn build_stamped(self, spec: &str) -> StampedBuild {
+        let built = self.build(spec).await;
+        StampedBuild {
+            epoch: self.epoch,
+            built,
+        }
+    }
+}
+
+/// A build off the loop, stamped with the epoch it started in, for
+/// [`ModelSlots::settle`] to take in.
+pub(crate) struct StampedBuild {
+    epoch: u64,
+    built: Result<Arc<ModelSlot>, String>,
 }
 
 fn into_slot(
@@ -112,12 +127,45 @@ impl ModelSlots {
     pub(crate) fn get_or_fallback(&mut self, spec: &str) -> (Arc<ModelSlot>, Option<String>) {
         match self.try_get(spec) {
             Ok(slot) => (slot, None),
-            Err(reason) => {
-                let chosen = self.fallback.model.spec();
-                warn!(requested = spec, %chosen, %reason, "session opened on a fallback model");
-                (Arc::clone(&self.fallback), Some(reason))
-            }
+            Err(reason) => self.fall_back(spec, reason),
         }
+    }
+
+    /// [`Self::get_or_fallback`] without building on the loop: the slot
+    /// cached or `built` for `spec`, or the fallback when that build failed.
+    /// `None` while there is no build since the last invalidate.
+    pub(crate) fn for_session(
+        &mut self,
+        spec: &str,
+        built: Option<StampedBuild>,
+    ) -> Option<(Arc<ModelSlot>, Option<String>)> {
+        let settled = built
+            .and_then(|built| self.settle(spec, built))
+            .or_else(|| self.get(spec).map(Ok))?;
+        Some(match settled {
+            Ok(slot) => (slot, None),
+            Err(reason) => self.fall_back(spec, reason),
+        })
+    }
+
+    /// Takes in a build off the loop, preferring a slot cached for `spec` in
+    /// the meantime. `None` for one that started before the last invalidate,
+    /// whose slot or error came from credentials or a catalog that are gone.
+    pub(crate) fn settle(
+        &mut self,
+        spec: &str,
+        StampedBuild { epoch, built }: StampedBuild,
+    ) -> Option<Result<Arc<ModelSlot>, String>> {
+        match built {
+            Ok(slot) => self.adopt(epoch, spec.to_owned(), &slot).map(Ok),
+            Err(reason) => (epoch == self.builder.epoch).then(|| self.get(spec).ok_or(reason)),
+        }
+    }
+
+    fn fall_back(&self, spec: &str, reason: String) -> (Arc<ModelSlot>, Option<String>) {
+        let chosen = self.fallback.model.spec();
+        warn!(requested = spec, %chosen, %reason, "session opened on a fallback model");
+        (Arc::clone(&self.fallback), Some(reason))
     }
 
     /// Discovery landed or a provider was re-authenticated. The next `try_get`
@@ -172,6 +220,9 @@ pub(crate) mod tests {
     const NOT_KEPT: &str = "adopt must keep the slot cached first";
     const STALE_KEPT: &str = "adopt must take only a slot built since the last invalidate";
     const OFF_LOOP_DIFFERS: &str = "a build off the loop must reject what try_get rejects";
+    const BUILDS: &str = "a session must build only a slot nobody has, and again once it is stale";
+    const FALLBACK_REASON: &str = "only a failed build may fall back, and it must say why";
+    const NOT_ADOPTED: &str = "a slot built for a session must be cached for the next one";
 
     fn startup_slot() -> Arc<super::ModelSlot> {
         let mut model = Model::from_spec(STARTUP_SPEC).unwrap();
@@ -298,6 +349,47 @@ pub(crate) mod tests {
         let kept = slots.adopt(builder.epoch(), OTHER_SPEC.to_owned(), &slot);
         assert_eq!(kept.is_some(), adopted, "{STALE_KEPT}");
         assert_eq!(slots.get(OTHER_SPEC).is_some(), adopted, "{STALE_KEPT}");
+    }
+
+    #[test_case(ModelPolicy::default(), STARTUP_SPEC, false, 0, false ; "a_cached_spec_opens_without_a_build")]
+    #[test_case(ModelPolicy::default(), OTHER_SPEC, false, 1, false ; "an_unbuilt_spec_builds_once_and_is_adopted")]
+    #[test_case(ModelPolicy::default(), OTHER_SPEC, true, 2, false ; "a_build_from_before_an_invalidate_builds_again")]
+    #[test_case(strict_policy(), OTHER_SPEC, false, 1, true ; "a_failed_build_falls_back_with_its_reason")]
+    #[test_case(strict_policy(), OTHER_SPEC, true, 2, true ; "a_failure_from_before_an_invalidate_builds_again")]
+    #[tokio::test]
+    async fn a_session_gets_its_slot_built_off_the_loop(
+        policy: ModelPolicy,
+        spec: &str,
+        invalidate_mid_build: bool,
+        builds: usize,
+        fell_back: bool,
+    ) {
+        let mut slots = slots(policy);
+        let mut built = None;
+        let mut ran = 0;
+        let (slot, reason) = loop {
+            if let Some(settled) = slots.for_session(spec, built.take()) {
+                break settled;
+            }
+            assert!(ran < builds, "{BUILDS}");
+            let builder = slots.builder();
+            if invalidate_mid_build && ran == 0 {
+                slots.invalidate();
+            }
+            built = Some(builder.build_stamped(spec).await);
+            ran += 1;
+        };
+
+        assert_eq!(ran, builds, "{BUILDS}");
+        assert_eq!(reason.is_some(), fell_back, "{FALLBACK_REASON}");
+        assert!(
+            reason.is_none_or(|reason| reason.starts_with(MODEL_POLICY_ERR)),
+            "{FALLBACK_REASON}"
+        );
+        let cached = slots
+            .get(spec)
+            .is_some_and(|cached| Arc::ptr_eq(&cached, &slot));
+        assert_eq!(cached, !fell_back, "{NOT_ADOPTED}");
     }
 
     /// A cache hit skips both the policy check and the build, so a refusal must
