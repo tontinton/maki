@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
+use maki_agent::HistorySnapshot;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionTools;
 use serde_json::Value;
 use tokio::sync::mpsc::{Sender, channel, unbounded_channel};
+use tokio::task::spawn_blocking;
 
 use crate::components::btw_modal::BtwEvent;
 
@@ -38,62 +40,38 @@ fn reached_for_tool(name: &str) -> String {
 }
 
 impl App {
+    /// Building the request deep-copies the transcript, megabytes on a long
+    /// session, so the loop only opens the modal and the copy runs on the
+    /// blocking pool.
     pub(crate) fn start_btw(
         &mut self,
         question: String,
         provider: Arc<dyn Provider>,
         model: Model,
     ) {
-        // The mirror is verbatim, so mid-turn it can end on an open tool call.
-        // Providers reject that, so close them off on our own copy.
-        let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
-        let mut messages = snapshot
-            .as_ref()
-            .map(|s| Vec::clone(&s.messages))
-            .unwrap_or_default();
-        maki_agent::close_dangling_tool_calls(&mut messages, maki_agent::UNAVAILABLE_RESULT);
-        messages.push(btw_question(&question));
-        // The session's own prompt, so the side question reads the transcript
-        // under the instructions it was written under.
-        let system = snapshot
-            .as_ref()
-            .and_then(|s| s.frame.as_ref())
-            .and_then(|f| f.prefix())
-            .unwrap_or(BTW_FALLBACK_SYSTEM)
-            .to_owned();
-        // Anthropic keys its cache on tools, system, then messages under one
-        // thinking setting, so the request repeats the session's tools and
-        // thinking (`tool_choice: none` would void it). A resumed session has
-        // no wire before its first run, and a switched model has no cache to
-        // hit and may reject the old wire. Either way the transcript's
-        // thinking signatures are bound to a prefix this request cannot
-        // rebuild. With thinking off the API would ignore them, but some
-        // models cannot turn it off, so the signatures go and the reasoning
-        // text stays.
-        let fitted = snapshot
-            .as_ref()
-            .and_then(|s| s.tools.as_ref())
-            .filter(|tools| tools.model == model.spec());
-        let (tools, opts) = match fitted {
-            Some(SessionTools { wire, .. }) => (Arc::clone(wire), self.request_options()),
-            None => {
-                maki_agent::unbind_thinking(&mut messages);
-                (Arc::new(NO_TOOLS), RequestOptions::default())
-            }
-        };
-
         let (tx, rx) = channel(BTW_EVENT_CAPACITY);
         self.open_prompt(|app| app.btw_modal.open(&question, rx));
-        let request = BtwRequest {
-            opts: opts.clamped(&model),
-            session_id: SessionRef::from(self.state.session.id),
-            provider,
-            model,
-            system,
-            tools,
-            messages,
+        let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
+        let opts = self.request_options();
+        let session_id = SessionRef::from(self.state.session.id);
+        let build = move || {
+            BtwRequest::new(
+                snapshot.as_deref(),
+                &question,
+                provider,
+                model,
+                opts,
+                session_id,
+            )
         };
-        tokio::spawn(request.run(tx));
+        tokio::spawn(async move {
+            match spawn_blocking(build).await {
+                Ok(request) => request.run(tx).await,
+                Err(e) => {
+                    let _ = tx.send(BtwEvent::Error(e.to_string())).await;
+                }
+            }
+        });
     }
 }
 
@@ -108,6 +86,58 @@ struct BtwRequest {
 }
 
 impl BtwRequest {
+    fn new(
+        snapshot: Option<&HistorySnapshot>,
+        question: &str,
+        provider: Arc<dyn Provider>,
+        model: Model,
+        session_opts: RequestOptions,
+        session_id: SessionRef,
+    ) -> Self {
+        // The mirror is verbatim, so mid-turn it can end on an open tool call.
+        // Providers reject that, so close them off on our own copy.
+        let mut messages = snapshot
+            .map(|s| Vec::clone(&s.messages))
+            .unwrap_or_default();
+        maki_agent::close_dangling_tool_calls(&mut messages, maki_agent::UNAVAILABLE_RESULT);
+        messages.push(btw_question(question));
+        // The session's own prompt, so the side question reads the transcript
+        // under the instructions it was written under.
+        let system = snapshot
+            .and_then(|s| s.frame.as_ref())
+            .and_then(|f| f.prefix())
+            .unwrap_or(BTW_FALLBACK_SYSTEM)
+            .to_owned();
+        // Anthropic keys its cache on tools, system, then messages under one
+        // thinking setting, so the request repeats the session's tools and
+        // thinking (`tool_choice: none` would void it). A resumed session has
+        // no wire before its first run, and a switched model has no cache to
+        // hit and may reject the old wire. Either way the transcript's
+        // thinking signatures are bound to a prefix this request cannot
+        // rebuild. With thinking off the API would ignore them, but some
+        // models cannot turn it off, so the signatures go and the reasoning
+        // text stays.
+        let fitted = snapshot
+            .and_then(|s| s.tools.as_ref())
+            .filter(|tools| tools.model == model.spec());
+        let (tools, opts) = match fitted {
+            Some(SessionTools { wire, .. }) => (Arc::clone(wire), session_opts),
+            None => {
+                maki_agent::unbind_thinking(&mut messages);
+                (Arc::new(NO_TOOLS), RequestOptions::default())
+            }
+        };
+        Self {
+            opts: opts.clamped(&model),
+            provider,
+            model,
+            system,
+            tools,
+            messages,
+            session_id,
+        }
+    }
+
     async fn run(self, btw_tx: Sender<BtwEvent>) {
         let (event_tx, mut event_rx) = unbounded_channel();
         let messages = maki_providers::adapt_images_for_model(&self.model, &self.messages).await;
@@ -177,7 +207,6 @@ mod tests {
     use crate::app::tests::test_app;
     use crate::components::test_model;
     use arc_swap::ArcSwap;
-    use maki_agent::HistorySnapshot;
     use maki_agent::prompt::{PromptId, Slot};
     use maki_agent::tools::ToolRegistry;
     use maki_lua::PluginHost;
@@ -198,6 +227,8 @@ mod tests {
     const OTHER_MODEL: &str = "anthropic/other-model";
     const THOUGHT: &str = "sqlite needs no server";
     const SIGNATURE: &str = "bound-to-the-old-prefix";
+    const CALL_ID: &str = "t1";
+    const TOOL: &str = "read";
 
     struct Recorded {
         messages: Vec<Message>,
@@ -337,6 +368,23 @@ mod tests {
         assert_eq!(sent.tools, tools);
         assert_eq!(sent.opts.thinking, thinking);
         assert_eq!(sent.messages[0].content, [thought(signature)]);
+    }
+
+    #[tokio::test]
+    async fn side_question_closes_a_dangling_tool_call() {
+        let calling = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(CALL_ID, TOOL, Value::Null)],
+            ..Default::default()
+        };
+        let mut app = test_app();
+        app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(vec![
+            calling,
+        ]))));
+        let sent = ask(&mut app).await;
+        let closed = ContentBlock::tool_result(CALL_ID, maki_agent::UNAVAILABLE_RESULT, true);
+        assert_eq!(sent.messages[1].content, [closed]);
+        assert_eq!(sent.messages[2], btw_question(Q));
     }
 
     /// `Done` once never came: the provider's sender outlived the stream, so
