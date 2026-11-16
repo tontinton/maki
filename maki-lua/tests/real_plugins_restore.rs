@@ -553,6 +553,21 @@ fn todo_write_live_call_starts_folded() {
     assert!(!live.body.contains(TODO_ITEM), "list shown: {}", live.body);
 }
 
+#[test_case(json!({ "todos": [
+    { "content": TODO_ITEM, "status": "completed" },
+    { "content": "second", "status": "in_progress" },
+    { "content": "third", "status": "pending" },
+    { "content": "fourth", "status": "cancelled" },
+] }), "Todos updated: 1 completed, 1 in progress, 1 pending, 1 cancelled" ; "list")]
+#[test_case(json!({ "todos": [] }), "Todos cleared" ; "cleared")]
+fn todo_write_live_call_reports_the_result(input: Value, expected: &str) {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+
+    assert_eq!(exec_live(&host, &reg, TODO_TOOL, input).output, expected);
+}
+
 /// A session load replays a transcript, so its restores run with the panel
 /// closed. Refilling per-session state here would pop the panel open on the
 /// next focus change, resurrecting a list the turn already finished.
