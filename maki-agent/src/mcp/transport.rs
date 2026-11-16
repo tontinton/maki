@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use maki_providers::headers::parse_headers;
 use maki_providers::http::error_chain;
 use maki_providers::strip_provider_keys;
-use maki_storage::StateDir;
+use maki_storage::{StateDir, blocking};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderName, HeaderValue};
 use reqwest::redirect::{Action, Attempt, Policy};
 use reqwest::{Certificate, Client, ClientBuilder, Error as ReqwestError, StatusCode};
@@ -356,15 +356,22 @@ async fn connect_http(
     ca_file: Option<&Path>,
     storage: Option<&StateDir>,
 ) -> Result<RunningService<RoleClient, ClientConfig>, McpError> {
-    let client = http_client(ca_file).map_err(|reason| start_failed(name, reason))?;
     let custom_headers = header_map(name, headers).map_err(|reason| start_failed(name, reason))?;
-    let configured_auth = custom_headers.contains_key(&AUTHORIZATION);
+    let oauth_storage = storage.filter(|_| !custom_headers.contains_key(&AUTHORIZATION));
+    let refreshes = oauth_storage.is_some();
+    let (client, oauth_client) = build_clients(ca_file, move |certs| {
+        let client = http_client(certs)?;
+        let oauth_client = refreshes
+            .then(|| oauth_http_client(certs, oauth::REFRESH_TIMEOUT))
+            .transpose()?;
+        Ok((client, oauth_client))
+    })
+    .await
+    .map_err(|reason| start_failed(name, reason))?;
     let config = StreamableHttpClientTransportConfig::with_uri(url).custom_headers(custom_headers);
 
-    let stored = match storage {
-        Some(storage) if !configured_auth => {
-            let oauth_client = oauth_http_client(ca_file, oauth::REFRESH_TIMEOUT)
-                .map_err(|reason| start_failed(name, reason))?;
+    let stored = match oauth_storage.zip(oauth_client) {
+        Some((storage, oauth_client)) => {
             // Without the manager the stored token can't go out, so a new
             // login has to replace it.
             oauth::stored_manager(storage, name, url, oauth_client)
@@ -376,7 +383,7 @@ async fn connect_http(
                     }
                 })?
         }
-        _ => None,
+        None => None,
     };
     // Without stored tokens the manager has none to add, and requests go out
     // as configured. One client type keeps a single copy of rmcp's HTTP worker
@@ -397,18 +404,18 @@ async fn connect_http(
 
 /// No timeout: it would also cut off the event streams, whose requests are bounded by the
 /// server's timeout instead.
-fn http_client(ca_file: Option<&Path>) -> Result<Client, String> {
-    client_builder(ca_file)?.build().map_err(|e| e.to_string())
+fn http_client(certs: Option<&[Certificate]>) -> Result<Client, String> {
+    client_builder(certs).build().map_err(|e| e.to_string())
 }
 
 /// rmcp's own client follows a discovery redirect only within one origin, and never one
 /// for tokens. A client handed to rmcp keeps its own redirect policy, so reqwest's default
 /// would let any server bounce discovery, or a refresh token, to another host.
 pub(super) fn oauth_http_client(
-    ca_file: Option<&Path>,
+    certs: Option<&[Certificate]>,
     timeout: Duration,
 ) -> Result<Client, String> {
-    client_builder(ca_file)?
+    client_builder(certs)
         .timeout(timeout)
         .redirect(Policy::custom(same_origin_redirect))
         .build()
@@ -428,19 +435,36 @@ fn same_origin_redirect(attempt: Attempt) -> Action {
     }
 }
 
-/// The transport and OAuth both start here, so they reach a server the same way.
+/// Builds the clients for one server on the blocking pool, from one read of `ca_file`.
+/// Without one, each build loads the system roots on Linux, which is disk work too.
 ///
 /// We read `ca_file` here and not while parsing the config, so a disabled server with a
 /// missing bundle still shows as disabled.
-fn client_builder(ca_file: Option<&Path>) -> Result<ClientBuilder, String> {
-    let builder = Client::builder().user_agent(CLIENT_NAME);
-    let Some(path) = ca_file else {
-        return Ok(builder);
-    };
+pub(super) async fn build_clients<T: Send + 'static>(
+    ca_file: Option<&Path>,
+    build: impl FnOnce(Option<&[Certificate]>) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let ca_file = ca_file.map(Path::to_path_buf);
+    blocking(move || {
+        let certs = ca_file.as_deref().map(read_ca_file).transpose()?;
+        build(certs.as_deref())
+    })
+    .await
+}
+
+fn read_ca_file(path: &Path) -> Result<Vec<Certificate>, String> {
     let unreadable = |e: &dyn Error| format!("ca_file '{}': {e}", path.display());
     let pem = fs::read(path).map_err(|e| unreadable(&e))?;
-    let certs = Certificate::from_pem_bundle(&pem).map_err(|e| unreadable(&e))?;
-    Ok(builder.tls_certs_only(certs))
+    Certificate::from_pem_bundle(&pem).map_err(|e| unreadable(&e))
+}
+
+/// The transport and OAuth both start here, so they reach a server the same way.
+fn client_builder(certs: Option<&[Certificate]>) -> ClientBuilder {
+    let builder = Client::builder().user_agent(CLIENT_NAME);
+    match certs {
+        Some(certs) => builder.tls_certs_only(certs.iter().cloned()),
+        None => builder,
+    }
 }
 
 fn header_map(
@@ -663,6 +687,7 @@ mod tests {
     const AUTH_SERVER_METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
     const SPA_HTML: &str = "<!doctype html><div id=\"app\"></div>";
     const REDIRECT_PATH: &str = "/redirect";
+    const BAD_PEM: &str = "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n";
 
     struct Request {
         method: String,
@@ -1335,12 +1360,16 @@ mod tests {
         assert!(reason.to_lowercase().contains("connect"), "got: {reason}");
     }
 
-    #[test_case("missing.pem" ; "missing_file")]
-    #[test_case(""            ; "directory")]
+    #[test_case("missing.pem", None          ; "missing_file")]
+    #[test_case("",            None          ; "directory")]
+    #[test_case("bad.pem",     Some(BAD_PEM) ; "bad_pem")]
     #[tokio::test]
-    async fn unreadable_ca_file_fails_the_start(file_name: &str) {
+    async fn unreadable_ca_file_fails_the_start(file_name: &str, contents: Option<&str>) {
         let dir = tempfile::tempdir().unwrap();
         let ca_file = dir.path().join(file_name);
+        if let Some(contents) = contents {
+            fs::write(&ca_file, contents).unwrap();
+        }
         let mut config = http_config("http://127.0.0.1:1", &[]);
         if let Transport::Http { ca_file: slot, .. } = &mut config.transport {
             *slot = Some(ca_file.clone());

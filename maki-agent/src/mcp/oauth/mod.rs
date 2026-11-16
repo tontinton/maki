@@ -19,7 +19,7 @@ use self::callback::{CallbackResult, CallbackServer};
 use self::store::AuthStore;
 use super::config::{CallbackScheme, OauthClientConfig};
 use super::error::McpError;
-use super::transport::{CLIENT_NAME, oauth_http_client};
+use super::transport::{CLIENT_NAME, build_clients, oauth_http_client};
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(600);
 /// Per OAuth request while logging in.
@@ -56,7 +56,9 @@ pub async fn authenticate(
     ca_file: Option<&Path>,
 ) -> Result<(), McpError> {
     async {
-        let client = oauth_http_client(ca_file, LOGIN_TIMEOUT).map_err(OAuthError::Other)?;
+        let client = build_clients(ca_file, |certs| oauth_http_client(certs, LOGIN_TIMEOUT))
+            .await
+            .map_err(OAuthError::Other)?;
 
         // We only get here after the server turned the token down, or when the
         // user asks to log in, so a token that hasn't expired yet proves
