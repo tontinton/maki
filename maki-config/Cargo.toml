@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 maki-config-macro = { workspace = true }
 maki-storage = { workspace = true }
 serde = { workspace = true }

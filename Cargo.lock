@@ -3673,6 +3673,7 @@ dependencies = [
 name = "maki-config"
 version = "0.7.2"
 dependencies = [
+ "arc-swap",
  "dotenvy",
  "globset",
  "inventory",
