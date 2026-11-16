@@ -12,7 +12,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use maki_config::providers::ProvidersConfig;
@@ -453,12 +452,11 @@ impl CatalogData {
 
     /// A plugin owns its slug, so a catalog entry of the same name would be a
     /// second provider under it.
-    fn all_providers(&self) -> Vec<ProviderData> {
-        let mut providers: Vec<ProviderData> = self
+    fn all_providers(&self) -> Vec<&ProviderData> {
+        let mut providers: Vec<&ProviderData> = self
             .providers
             .values()
             .filter(|p| !plugin::is_registered(&p.slug))
-            .cloned()
             .collect();
         providers.sort_by_key(|p| p.display_name.to_lowercase());
         providers
@@ -479,14 +477,12 @@ static CATALOG_PROVIDER_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: Cow::Borrowed("catalog"),
 };
 
-static SHARED_CATALOG: OnceCell<Mutex<CatalogData>> = OnceCell::const_new();
+static SHARED_CATALOG: OnceCell<CatalogData> = OnceCell::const_new();
 
 /// The catalog, loaded from the on-disk cache and fetched once if the cache
 /// is cold or stale. Concurrent first callers share the one fetch.
-pub(crate) async fn shared_catalog() -> &'static Mutex<CatalogData> {
-    SHARED_CATALOG
-        .get_or_init(|| async { Mutex::new(init_catalog().await) })
-        .await
+pub(crate) async fn shared_catalog() -> &'static CatalogData {
+    SHARED_CATALOG.get_or_init(init_catalog).await
 }
 
 /// Loads the models.dev catalog, fetching once if the cache is cold or stale.
@@ -497,72 +493,56 @@ pub async fn warm_catalog() {
 }
 
 /// Force-refetches the models.dev catalog; failures keep the stale catalog and cache.
-/// Waits for the fetch, so only `maki models --refresh` calls it.
-pub async fn refresh_catalog() -> Result<(), AgentError> {
+/// Waits for the fetch, so only `maki models --refresh` calls it. Returns false
+/// when plugin load already warmed (or is warming) this process's catalog,
+/// which then keeps that copy while the next run reads the new cache.
+pub async fn refresh_catalog() -> Result<bool, AgentError> {
     let state_dir = StateDir::resolve()
         .map_err(|e| config_error(format!("failed to resolve state dir: {e}")))?;
     let data = fetch_catalog(&state_dir).await?;
-    match SHARED_CATALOG.get() {
-        Some(catalog) => *catalog.lock().unwrap() = data,
-        // Set instead of `get_or_init` so a cold catalog takes the fetch we just
-        // did rather than kicking off `init_catalog` and fetching twice.
-        None => drop(SHARED_CATALOG.set(Mutex::new(data))),
-    }
-    Ok(())
+    Ok(SHARED_CATALOG.set(data).is_ok())
 }
 
 /// Returns the list of all providers in alphabetical order.
-pub async fn catalog_providers() -> Vec<ProviderData> {
-    let guard = shared_catalog().await.lock().unwrap();
-    guard.all_providers()
+pub async fn catalog_providers() -> Vec<&'static ProviderData> {
+    shared_catalog().await.all_providers()
 }
 
 /// Returns the list of catalog providers only if the catalog has already been downloaded.
 /// Does NOT trigger downloading.
-pub fn catalog_providers_if_available() -> Option<Vec<ProviderData>> {
-    let catalog = SHARED_CATALOG.get()?;
-    let guard = catalog.lock().ok()?;
-    Some(guard.all_providers())
+pub fn catalog_providers_if_available() -> Option<Vec<&'static ProviderData>> {
+    SHARED_CATALOG.get().map(CatalogData::all_providers)
 }
 
 /// Returns the ProviderData for a specific catalog provider, if found.
-pub async fn catalog_provider(provider_id: &str) -> Option<ProviderData> {
-    let guard = shared_catalog().await.lock().ok()?;
-    guard.providers.get(provider_id).cloned()
+pub async fn catalog_provider(provider_id: &str) -> Option<&'static ProviderData> {
+    shared_catalog().await.provider(provider_id)
 }
 
 /// Non-blocking variant of [`catalog_provider`]: returns the `ProviderData` only
 /// if the catalog has already been downloaded. Never triggers a fetch.
-pub fn catalog_provider_if_available(provider_id: &str) -> Option<ProviderData> {
-    with_provider_if_available(provider_id, ProviderData::clone)
-}
-
-/// Borrows under the lock instead of cloning: the picker calls this once per
-/// row through `Model::is_free`, and a `ProviderData` carries its whole models map.
-fn with_provider_if_available<T>(slug: &str, f: impl FnOnce(&ProviderData) -> T) -> Option<T> {
-    let guard = SHARED_CATALOG.get()?.lock().ok()?;
-    guard.providers.get(slug).map(f)
+pub fn catalog_provider_if_available(provider_id: &str) -> Option<&'static ProviderData> {
+    SHARED_CATALOG.get()?.provider(provider_id)
 }
 
 /// What a catalog provider's wire sends for `choice`. The messages wire
 /// spells thinking its own way, and a cold catalog leaves it as it is.
 pub(crate) fn sends_if_available(slug: &str, choice: ThinkingConfig) -> ThinkingConfig {
-    with_provider_if_available(slug, |data| match data.api_format {
-        EndpointType::ChatCompletions => CHAT_DIALECT.sends(choice),
-        EndpointType::Messages => choice,
-    })
-    .unwrap_or(choice)
+    catalog_provider_if_available(slug)
+        .map(|data| match data.api_format {
+            EndpointType::ChatCompletions => CHAT_DIALECT.sends(choice),
+            EndpointType::Messages => choice,
+        })
+        .unwrap_or(choice)
 }
 
 /// The env var each catalog provider reads its key from, if one is set. A cold
 /// catalog gives nothing, because a fetch here would stall every spawn.
 pub(crate) fn key_vars_if_available() -> Vec<String> {
-    let Some(Ok(guard)) = SHARED_CATALOG.get().map(|catalog| catalog.lock()) else {
-        return Vec::new();
-    };
-    guard
-        .providers
-        .values()
+    SHARED_CATALOG
+        .get()
+        .into_iter()
+        .flat_map(|catalog| catalog.providers.values())
         .filter_map(ProviderData::env_key_set)
         .map(str::to_owned)
         .collect()
@@ -586,7 +566,7 @@ pub fn available_if_warm(slug: &str) -> bool {
 /// and never fetches: a catalog maki never cached is one it never offered a
 /// login for.
 pub(crate) fn serves_slug(slug: &str) -> bool {
-    if let Some(Ok(catalog)) = SHARED_CATALOG.get().map(Mutex::lock) {
+    if let Some(catalog) = SHARED_CATALOG.get() {
         return catalog.providers.contains_key(slug);
     }
     let Some(text) = catalog_cache_path().and_then(|path| fs::read_to_string(path).ok()) else {
@@ -850,7 +830,7 @@ impl CatalogTransport {
 /// `ProviderData` (from `maki_providers::catalog_provider(slug)`) plus the
 /// auth that the models.dev catalog would have used for that sub-provider.
 pub struct CatalogProvider {
-    data: ProviderData,
+    data: &'static ProviderData,
     auth: CatalogAuth,
     transport: CatalogTransport,
 }
@@ -880,7 +860,7 @@ impl CatalogAuth {
 
 impl CatalogProvider {
     pub fn new(
-        data: ProviderData,
+        data: &'static ProviderData,
         state_dir: &StateDir,
         timeouts: Timeouts,
         allow_free_fallback: bool,
@@ -975,7 +955,7 @@ impl Provider for CatalogProvider {
 
 #[cfg(test)]
 pub(crate) fn seed_catalog_for_tests(index: schema::CatalogIndex, state_dir: StateDir) {
-    let _ = SHARED_CATALOG.set(Mutex::new(CatalogData::from_index(index, &state_dir)));
+    let _ = SHARED_CATALOG.set(CatalogData::from_index(index, &state_dir));
 }
 
 #[cfg(test)]
@@ -1057,8 +1037,8 @@ async fn create_resolved(slug: &str, timeouts: Timeouts) -> Result<CatalogProvid
 /// returns a [`LazyCatalogProvider`] instead of blocking on the fetch;
 /// membership is then checked on first use.
 pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provider>, AgentError>> {
-    if SHARED_CATALOG.get().is_some() {
-        let data = catalog_provider_if_available(slug)?;
+    if let Some(catalog) = SHARED_CATALOG.get() {
+        let data = catalog.provider(slug)?;
         let state_dir = StateDir::resolve().ok()?;
         let allow_free_fallback = data.free_models_enabled();
         return Some(
@@ -1078,18 +1058,16 @@ pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provi
 /// (e.g. `Model::from_spec`) must tolerate `None` and fall through, since
 /// the catalog may still be warming in the background.
 pub(crate) fn model_meta_if_available(slug: &str, model_id: &str) -> Option<CatalogMeta> {
-    let guard = SHARED_CATALOG.get()?.lock().ok()?;
-    guard.model_meta(slug, model_id).cloned()
+    SHARED_CATALOG.get()?.model_meta(slug, model_id).cloned()
 }
 
 /// True when the model belongs to a provider with a [`FreeTier`] and is free
 /// by the same [`is_free_model`] definition gating `enable_free_models` (zero
 /// input and output price). Never triggers a fetch.
 pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
-    with_provider_if_available(slug, |data| {
+    catalog_provider_if_available(slug).is_some_and(|data| {
         data.quirks.free_tier.is_some() && data.models.get(model_id).is_some_and(is_free_model)
     })
-    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1150,7 +1128,7 @@ mod tests {
     #[test]
     fn new_rejects_no_auth() {
         let (_tmp, state_dir) = temp_state_dir();
-        let data = ProviderData {
+        let data = Box::leak(Box::new(ProviderData {
             slug: "test".into(),
             display_name: "Test".into(),
             env_keys: vec![],
@@ -1159,7 +1137,7 @@ mod tests {
             api_format: EndpointType::ChatCompletions,
             models: HashMap::new(),
             quirks: ProviderQuirks::default(),
-        };
+        }));
         let result = super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true);
         assert!(matches!(result, Err(AgentError::Config { .. })));
     }
@@ -1219,13 +1197,17 @@ mod tests {
         }
     }
 
+    fn leaked_go_provider_data(env_key: &str) -> &'static ProviderData {
+        Box::leak(Box::new(opencode_go_provider_data(env_key)))
+    }
+
     /// The free tier authenticates with the public key, which the quota
     /// endpoint answers with a 401. There is no quota to show, so it is
     /// `Ok(None)`, while a missing key stays an error.
     #[tokio::test]
     async fn free_only_auth_has_no_usage() {
         let (_tmp, state_dir) = temp_state_dir();
-        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_30518");
+        let data = leaked_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_30518");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
         assert!(matches!(provider.auth, super::CatalogAuth::FreeOnly(_)));
@@ -1239,7 +1221,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_provider_forwards_fetch_usage_to_resolution() {
         let (_tmp, state_dir) = temp_state_dir();
-        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_87016");
+        let data = leaked_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_87016");
         let resolved =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
         let lazy = super::LazyCatalogProvider {
@@ -1254,7 +1236,7 @@ mod tests {
     #[tokio::test]
     async fn gated_free_fallback_hides_models_and_refuses_streaming() {
         let (_tmp, state_dir) = temp_state_dir();
-        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_52814");
+        let data = leaked_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_52814");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
         assert!(provider.list_models().await.unwrap().is_empty());
@@ -1297,7 +1279,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_provider_list_models_free_fallback_hides_paid_models() {
         let (_tmp, state_dir) = temp_state_dir();
-        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_91472");
+        let data = leaked_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_91472");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
         let models = provider.list_models().await.unwrap();
@@ -1309,7 +1291,7 @@ mod tests {
     async fn catalog_provider_list_models_with_key_shows_all() {
         let (_tmp, state_dir) = temp_state_dir();
         unsafe { std::env::set_var("MAKI_TEST_OPENCODE_GO_KEY_41827", "real-key") };
-        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_KEY_41827");
+        let data = leaked_go_provider_data("MAKI_TEST_OPENCODE_GO_KEY_41827");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
         let models = provider.list_models().await.unwrap();

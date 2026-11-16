@@ -48,7 +48,7 @@ pub async fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()
                 && ProvidersConfig::load().get(&slug).is_none()
                 && let Some(provider_data) = maki_providers::catalog_provider(&slug).await
             {
-                login_catalog_provider(&provider_data, storage).await?;
+                login_catalog_provider(provider_data, storage).await?;
             } else {
                 login_provider(&slug, storage).await?;
             }
@@ -174,7 +174,7 @@ async fn catalog_slugs() -> Vec<String> {
     catalog_providers()
         .await
         .into_iter()
-        .map(|provider| provider.slug)
+        .map(|provider| provider.slug.clone())
         .collect()
 }
 
@@ -196,7 +196,7 @@ struct LoginRow {
 enum LoginTarget {
     Provider(String),
     /// A models.dev provider, which logs in through its catalog entry.
-    Catalog(Box<ProviderData>),
+    Catalog(&'static ProviderData),
     Custom,
 }
 
@@ -250,12 +250,11 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         rows.push(LoginRow::provider(mark(saved(slug)), slug, display));
     }
     for provider in catalog_providers().await {
-        let (slug, display) = (provider.slug.clone(), provider.display_name.clone());
         rows.push(LoginRow::new(
-            mark(saved(&slug)),
-            &slug,
-            &display,
-            LoginTarget::Catalog(Box::new(provider)),
+            mark(saved(&provider.slug)),
+            &provider.slug,
+            &provider.display_name,
+            LoginTarget::Catalog(provider),
         ));
     }
     rows.push(LoginRow {
@@ -282,7 +281,7 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
     };
     match row.target {
         LoginTarget::Provider(slug) => login_provider(&slug, storage).await,
-        LoginTarget::Catalog(provider) => login_catalog_provider(&provider, storage).await,
+        LoginTarget::Catalog(provider) => login_catalog_provider(provider, storage).await,
         LoginTarget::Custom => login_custom(storage).await,
     }
 }
@@ -628,7 +627,10 @@ pub async fn models(
     let mut refresh_failure = None;
     if refresh {
         match maki_providers::refresh_catalog().await {
-            Ok(()) => eprintln!("models.dev catalog has been refreshed"),
+            Ok(true) => eprintln!("models.dev catalog has been refreshed"),
+            Ok(false) => eprintln!(
+                "models.dev cache has been refreshed; plugins had already loaded the catalog, so the next run lists the new one"
+            ),
             Err(e) => refresh_failure = Some(e),
         }
     }
