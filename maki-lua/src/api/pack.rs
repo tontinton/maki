@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_pack::Spec;
@@ -64,8 +64,6 @@ pub struct PackDeclarations {
 pub enum PackOp {
     Activate { name: String },
 }
-
-pub type PackStore = Arc<Mutex<PackDeclarations>>;
 
 fn finish(spec: Spec) -> LuaResult<Spec> {
     if maki_pack::git::http_source_has_userinfo(&spec.src) {
@@ -172,10 +170,10 @@ fn parse_spec(lua: &Lua, value: LuaValue) -> LuaResult<(Spec, Option<Arc<Registr
 /// })
 #[lua_fn]
 fn add(lua: &Lua, specs: Table, opts: Option<Table>) -> LuaResult<()> {
-    let store = lua
-        .app_data_ref::<PackStore>()
-        .ok_or_else(|| mlua::Error::runtime("pack.add: not available here"))?
-        .clone();
+    let unavailable = || mlua::Error::runtime("pack.add: not available here");
+    if lua.app_data_ref::<PackDeclarations>().is_none() {
+        return Err(unavailable());
+    }
     let (load, confirm) = parse_options(lua, opts)?;
     let mut parsed = Vec::new();
     for entry in specs.sequence_values::<LuaValue>() {
@@ -188,7 +186,9 @@ fn add(lua: &Lua, specs: Table, opts: Option<Table>) -> LuaResult<()> {
         });
     }
 
-    let mut declarations = store.lock().expect("pack declarations");
+    let mut declarations = lua
+        .app_data_mut::<PackDeclarations>()
+        .ok_or_else(unavailable)?;
     if declarations.drained {
         return Err(mlua::Error::runtime(format!("pack.add: {AFTER_LOAD}")));
     }
@@ -250,11 +250,9 @@ fn enqueue(lua: &Lua, name: String) -> LuaResult<()> {
             "pack: {name:?} is not a usable package name"
         )));
     }
-    let store = lua
-        .app_data_ref::<PackStore>()
-        .ok_or_else(|| mlua::Error::runtime("pack: not available here"))?
-        .clone();
-    let mut declarations = store.lock().expect("pack declarations");
+    let mut declarations = lua
+        .app_data_mut::<PackDeclarations>()
+        .ok_or_else(|| mlua::Error::runtime("pack: not available here"))?;
     if declarations.drained {
         return Err(mlua::Error::runtime(format!("maki.packadd: {AFTER_LOAD}")));
     }
@@ -294,11 +292,10 @@ async fn get(lua: Lua, names: Option<Table>, opts: Option<Table>) -> LuaResult<P
     let requested: Option<Vec<String>> = names
         .map(|table| table.sequence_values::<String>().collect())
         .transpose()?;
-    let store = lua
-        .app_data_ref::<PackStore>()
+    let declarations = lua
+        .app_data_ref::<PackDeclarations>()
         .ok_or_else(|| mlua::Error::runtime("pack.get: not available here"))?
         .clone();
-    let declarations = store.lock().expect("pack declarations").clone();
     let Some((lock, paths)) = spawn_blocking(read_recorded)
         .await
         .map_err(mlua::Error::external)?
@@ -442,15 +439,19 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlua::AppDataRef;
     use test_case::test_case;
 
     const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    fn lua_with_store() -> (Lua, PackStore) {
+    fn lua_with_store() -> Lua {
         let lua = Lua::new();
-        let store: PackStore = Arc::default();
-        lua.set_app_data(store.clone());
-        (lua, store)
+        lua.set_app_data(PackDeclarations::default());
+        lua
+    }
+
+    fn store(lua: &Lua) -> AppDataRef<'_, PackDeclarations> {
+        lua.app_data_ref().unwrap()
     }
 
     fn add_fn(lua: &Lua) -> mlua::Function {
@@ -459,7 +460,7 @@ mod tests {
 
     #[test]
     fn a_table_spec_carries_name_version_and_data() {
-        let (lua, store) = lua_with_store();
+        let lua = lua_with_store();
         let data = lua.create_table().unwrap();
         data.set("number", 7).unwrap();
         let spec = lua.create_table().unwrap();
@@ -471,7 +472,7 @@ mod tests {
             .call::<()>(lua.create_sequence_from([spec]).unwrap())
             .unwrap();
 
-        let declared = store.lock().unwrap().specs[0].clone();
+        let declared = store(&lua).specs[0].clone();
         assert_eq!(declared.spec.name, "custom");
         assert_eq!(declared.spec.version.as_deref(), Some("v1.2.3"));
         let output = spec_to_lua(&lua, &declared.spec, declared.data.as_ref()).unwrap();
@@ -481,7 +482,7 @@ mod tests {
 
     #[test]
     fn a_version_table_is_rejected() {
-        let (lua, _) = lua_with_store();
+        let lua = lua_with_store();
         let spec = lua.create_table().unwrap();
         spec.set("src", "https://github.com/user/repo").unwrap();
         spec.set("version", lua.create_table().unwrap()).unwrap();
@@ -495,7 +496,7 @@ mod tests {
 
     #[test]
     fn custom_loader_is_retained_in_the_registry() {
-        let (lua, store) = lua_with_store();
+        let lua = lua_with_store();
         let specs = lua
             .create_sequence_from(["https://github.com/user/repo"])
             .unwrap();
@@ -504,17 +505,14 @@ mod tests {
             .unwrap();
         add_fn(&lua).call::<()>((specs, opts)).unwrap();
 
-        assert!(matches!(
-            store.lock().unwrap().specs[0].load,
-            LoadMode::Custom(_)
-        ));
+        assert!(matches!(store(&lua).specs[0].load, LoadMode::Custom(_)));
     }
 
     /// Re-running the same declaration is how a shared `init.lua` snippet
     /// behaves, so it stays a no-op rather than an error.
     #[test]
     fn an_identical_second_declaration_of_a_name_wins() {
-        let (lua, store) = lua_with_store();
+        let lua = lua_with_store();
         let source = "https://example.com/one/repo";
         for _ in 0..2 {
             add_fn(&lua)
@@ -522,7 +520,7 @@ mod tests {
                 .unwrap();
         }
 
-        let declarations = store.lock().unwrap();
+        let declarations = store(&lua);
         assert_eq!(declarations.specs.len(), 1);
         assert_eq!(declarations.specs[0].spec.src, source);
     }
@@ -530,7 +528,7 @@ mod tests {
     #[test_case("https://example.com/two/repo", None ; "another_source")]
     #[test_case("https://example.com/one/repo", Some("v2") ; "another_version")]
     fn a_contradicting_declaration_of_a_name_is_refused(source: &str, version: Option<&str>) {
-        let (lua, store) = lua_with_store();
+        let lua = lua_with_store();
         add_fn(&lua)
             .call::<()>(
                 lua.create_sequence_from(["https://example.com/one/repo"])
@@ -552,15 +550,15 @@ mod tests {
             error.contains(ALREADY_DECLARED),
             "unexpected error: {error}"
         );
-        assert_eq!(store.lock().unwrap().specs.len(), 1);
+        assert_eq!(store(&lua).specs.len(), 1);
     }
 
     /// Nothing reads the declared set after startup, so a late `pack.add` has
     /// to fail the way `packadd` does instead of recording a dead entry.
     #[test]
     fn adding_after_the_declared_set_was_loaded_is_refused() {
-        let (lua, store) = lua_with_store();
-        store.lock().unwrap().drained = true;
+        let lua = lua_with_store();
+        lua.app_data_mut::<PackDeclarations>().unwrap().drained = true;
 
         let error = add_fn(&lua)
             .call::<()>(
@@ -571,12 +569,12 @@ mod tests {
             .to_string();
 
         assert!(error.contains(AFTER_LOAD), "unexpected error: {error}");
-        assert!(store.lock().unwrap().specs.is_empty());
+        assert!(store(&lua).specs.is_empty());
     }
 
     #[test]
     fn packadd_queues_one_activation() {
-        let (lua, store) = lua_with_store();
+        let lua = lua_with_store();
         let maki = lua.create_table().unwrap();
         add_packadd(&lua, &maki).unwrap();
         let packadd: mlua::Function = maki.get("packadd").unwrap();
@@ -585,7 +583,7 @@ mod tests {
         packadd.call::<()>("demo").unwrap();
 
         assert_eq!(
-            store.lock().unwrap().pending,
+            store(&lua).pending,
             vec![PackOp::Activate {
                 name: "demo".to_owned()
             }]
@@ -603,7 +601,7 @@ mod tests {
 
     #[test]
     fn get_preserves_order_and_reports_exact_state() {
-        let (lua, store) = lua_with_store();
+        let lua = lua_with_store();
         let zeta = lua.create_table().unwrap();
         zeta.set("src", "https://example.com/zeta").unwrap();
         zeta.set("data", "kept").unwrap();
@@ -612,7 +610,10 @@ mod tests {
         add_fn(&lua)
             .call::<()>(lua.create_sequence_from([zeta, alpha]).unwrap())
             .unwrap();
-        store.lock().unwrap().active.insert("alpha".to_owned());
+        lua.app_data_mut::<PackDeclarations>()
+            .unwrap()
+            .active
+            .insert("alpha".to_owned());
 
         let site = tempfile::TempDir::new().unwrap();
         let mut lock = maki_pack::lockfile::Lockfile::default();
@@ -622,7 +623,7 @@ mod tests {
             std::fs::create_dir_all(maki_pack::paths::revision_dir(site.path(), name, TEST_REV))
                 .unwrap();
         }
-        let declarations = store.lock().unwrap().clone();
+        let declarations = store(&lua).clone();
         let paths = recorded_paths(&lock, Some(site.path()));
 
         let all = package_state_table(&lua, None, &declarations, &lock, &paths).unwrap();
@@ -672,14 +673,14 @@ mod tests {
 
     #[test]
     fn get_rejects_missing_names_and_hides_replaced_source_state() {
-        let (lua, store) = lua_with_store();
+        let lua = lua_with_store();
         add_fn(&lua)
             .call::<()>(
                 lua.create_sequence_from(["https://example.com/new/demo"])
                     .unwrap(),
             )
             .unwrap();
-        let declarations = store.lock().unwrap().clone();
+        let declarations = store(&lua).clone();
         let mut lock = maki_pack::lockfile::Lockfile::default();
         lock.record("demo", "https://example.com/old/demo", TEST_REV);
 

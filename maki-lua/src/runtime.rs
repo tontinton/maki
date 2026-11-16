@@ -1578,20 +1578,14 @@ fn queue_codegen(queue: &CodegenQueue, func: &Function) {
     }
 }
 
-/// Runs `f` against the package declarations `init.lua` built up.
-///
-/// Every reader goes through here: the store is app data behind a mutex, and
-/// each site that spelled that lookup out by hand was another place to get the
-/// missing-store case or the poisoned lock wrong.
+/// Runs `f` against the package declarations `init.lua` built up, or returns
+/// `R::default()` when this VM has no store.
 fn with_packs<R: Default>(
     lua: &Lua,
     f: impl FnOnce(&mut crate::api::pack::PackDeclarations) -> R,
 ) -> R {
-    let Some(store) = lua.app_data_ref::<crate::api::pack::PackStore>() else {
-        return R::default();
-    };
-    let mut declarations = store.lock().expect("pack declarations");
-    f(&mut declarations)
+    lua.app_data_mut::<crate::api::pack::PackDeclarations>()
+        .map_or_else(R::default, |mut packs| f(&mut packs))
 }
 
 fn module_io_error(modname: &str, path: &Path, error: &std::io::Error) -> mlua::Error {
@@ -3837,7 +3831,7 @@ impl LuaRuntime {
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(PluginOptionSpecs::default());
-        lua.set_app_data(crate::api::pack::PackStore::default());
+        lua.set_app_data(crate::api::pack::PackDeclarations::default());
         lua.set_app_data(AutocmdStore::default());
         lua.set_app_data(SlotStore::new(Arc::clone(&layered)));
         registry.set_hook(crate::hook::SlotHook {

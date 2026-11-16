@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{AnyUserData, Error, Function, Lua, MultiValue, Result as LuaResult, Value};
@@ -243,15 +242,11 @@ fn iter_children(lua: &Lua, this: &LuaNode) -> LuaResult<Function> {
             entries.push((this.wrap(child), field));
         }
     }
-    let idx = Arc::new(AtomicUsize::new(0));
-    let entries = Arc::new(entries);
-    lua.create_function(move |lua, ()| {
-        let i = idx.fetch_add(1, Ordering::Relaxed);
-        if i >= entries.len() {
+    let mut entries = entries.into_iter();
+    lua.create_function_mut(move |lua, ()| {
+        let Some((child, field)) = entries.next() else {
             return Ok(MultiValue::new());
-        }
-        let (ref lua_node, ref field) = entries[i];
-        let child = lua_node.clone();
+        };
         Ok(MultiValue::from_iter([
             Value::UserData(lua.create_userdata(child)?),
             match field {

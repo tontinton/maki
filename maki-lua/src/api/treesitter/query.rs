@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Lua, MultiValue, Value as LuaValue};
@@ -212,8 +211,8 @@ impl IterArgs {
     }
 }
 
-trait IterEntry: Send + Sync + 'static {
-    fn to_lua_values(&self, lua: &mlua::Lua) -> mlua::Result<MultiValue>;
+trait IterEntry: Send + 'static {
+    fn into_lua_values(self, lua: &mlua::Lua) -> mlua::Result<MultiValue>;
 }
 
 struct CaptureEntry {
@@ -223,14 +222,14 @@ struct CaptureEntry {
 }
 
 impl IterEntry for CaptureEntry {
-    fn to_lua_values(&self, lua: &mlua::Lua) -> mlua::Result<MultiValue> {
+    fn into_lua_values(self, lua: &mlua::Lua) -> mlua::Result<MultiValue> {
         let meta_table = lua.create_table()?;
         for (k, v) in &self.metadata {
             meta_table.set(k.as_str(), v.as_str())?;
         }
         Ok(MultiValue::from_iter([
             lua.pack(self.capture_index + 1)?,
-            lua.pack(self.node.clone())?,
+            lua.pack(self.node)?,
             LuaValue::Table(meta_table),
             LuaValue::Table(lua.create_table()?),
             LuaValue::Integer(1),
@@ -245,14 +244,14 @@ struct MatchEntry {
 }
 
 impl IterEntry for MatchEntry {
-    fn to_lua_values(&self, lua: &mlua::Lua) -> mlua::Result<MultiValue> {
+    fn into_lua_values(self, lua: &mlua::Lua) -> mlua::Result<MultiValue> {
         let captures_table = lua.create_table()?;
-        for (cap_idx, nodes) in &self.captures {
+        for (cap_idx, nodes) in self.captures {
             let nodes_table = lua.create_table()?;
-            for (j, n) in nodes.iter().enumerate() {
-                nodes_table.raw_set(j + 1, n.clone())?;
+            for (j, n) in nodes.into_iter().enumerate() {
+                nodes_table.raw_set(j + 1, n)?;
             }
-            captures_table.raw_set((*cap_idx as i64) + 1, nodes_table)?;
+            captures_table.raw_set((cap_idx as i64) + 1, nodes_table)?;
         }
         let meta_table = lua.create_table()?;
         for (k, v) in &self.metadata {
@@ -268,14 +267,11 @@ impl IterEntry for MatchEntry {
 }
 
 fn stateful_iter<E: IterEntry>(lua: &mlua::Lua, results: Vec<E>) -> mlua::Result<mlua::Function> {
-    let index = Arc::new(AtomicUsize::new(0));
-    let results = Arc::new(results);
-    lua.create_function(move |lua, ()| {
-        let i = index.fetch_add(1, Ordering::Relaxed);
-        if i >= results.len() {
-            return Ok(MultiValue::new());
-        }
-        results[i].to_lua_values(lua)
+    let mut results = results.into_iter();
+    lua.create_function_mut(move |lua, ()| {
+        results
+            .next()
+            .map_or_else(|| Ok(MultiValue::new()), |entry| entry.into_lua_values(lua))
     })
 }
 

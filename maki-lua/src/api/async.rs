@@ -25,7 +25,7 @@ struct LuaSemaphore {
 }
 
 struct LuaPermit {
-    guard: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
+    guard: Option<OwnedSemaphorePermit>,
 }
 
 /// Wait for a permit from the semaphore. Your coroutine suspends until a slot
@@ -50,9 +50,7 @@ async fn acquire(lua: Lua, this: mlua::UserDataRef<LuaSemaphore>) -> LuaResult<L
         .await
         .map_err(mlua::Error::runtime)?
         .map_err(mlua::Error::external)?;
-    Ok(LuaPermit {
-        guard: std::sync::Mutex::new(Some(guard)),
-    })
+    Ok(LuaPermit { guard: Some(guard) })
 }
 
 /// Take a permit only if a slot is free right now, without waiting.
@@ -69,9 +67,7 @@ fn try_acquire(_lua: &Lua, this: &LuaSemaphore) -> LuaResult<Option<LuaPermit>> 
     Ok(Arc::clone(&this.sem)
         .try_acquire_owned()
         .ok()
-        .map(|guard| LuaPermit {
-            guard: std::sync::Mutex::new(Some(guard)),
-        }))
+        .map(|guard| LuaPermit { guard: Some(guard) }))
 }
 
 lua_class! {
@@ -86,17 +82,11 @@ lua_class! {
 /// Give the permit back to the semaphore so another task can acquire it.
 /// Throws if you already released this permit.
 #[lua_fn]
-fn release(_lua: &Lua, this: &LuaPermit) -> LuaResult<()> {
-    let released = this
-        .guard
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+fn release(_lua: &Lua, this: &mut LuaPermit) -> LuaResult<()> {
+    this.guard
         .take()
-        .is_some();
-    if !released {
-        return Err(mlua::Error::runtime(PERMIT_RELEASED_ERR));
-    }
-    Ok(())
+        .map(drop)
+        .ok_or_else(|| mlua::Error::runtime(PERMIT_RELEASED_ERR))
 }
 
 lua_class! {
