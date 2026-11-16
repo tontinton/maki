@@ -195,7 +195,26 @@ impl SessionClaim {
     /// exec still holds a copy of the fd we just closed. A real holder outlasts
     /// the retry, see [`Lock::acquire_retrying`].
     pub fn acquire_in(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
-        match Lock::acquire_retrying(&lock_path(dir, id)) {
+        Self::from_lock(id, dir, Lock::acquire_retrying(&lock_path(dir, id)))
+    }
+
+    /// [`Self::acquire`] with the retry on the tokio timer instead of a
+    /// sleeping thread.
+    pub async fn acquire_async(id: MakiId, dir: &StateDir) -> Result<Self, SessionError> {
+        let sessions_dir = dir.path().join(SESSIONS_DIR);
+        tokio::fs::create_dir_all(&sessions_dir)
+            .await
+            .map_err(StorageError::from)?;
+        let lock = Lock::acquire_retrying_async(lock_path(&sessions_dir, id)).await;
+        Self::from_lock(id, &sessions_dir, lock)
+    }
+
+    fn from_lock(
+        id: MakiId,
+        dir: &Path,
+        lock: Result<Lock, LockError>,
+    ) -> Result<Self, SessionError> {
+        match lock {
             Ok(lock) => Ok(Self::new(id, dir.to_path_buf(), Some(lock))),
             Err(LockError::Held { .. }) => Err(SessionError::Busy { id }),
             Err(LockError::Io { path, source }) => {
@@ -2615,6 +2634,7 @@ mod tests {
     const UNCLAIMED: &str = "a session nothing else is writing";
     const READ_UNDER_CLAIM: &str = "the transcript must be read under a claim still held";
     const SHARED_CLAIM_HELD: &str = "a claim is held until its last clone drops";
+    const BUSY_ONLY_WHILE_HELD: &str = "a session is busy exactly while another claim holds it";
     const PENDING_DRAFT: &str = "half typed thought";
     const QUEUED_PROMPT: &str = "and then the tests";
     const FORK_PLAN: &str = "1. split the parser";
@@ -4092,6 +4112,22 @@ mod tests {
 
         drop(queued);
         SessionClaim::acquire_in(id, tmp.path()).expect(SHARED_CLAIM_HELD);
+    }
+
+    #[test_case(true ; "busy_while_held")]
+    #[test_case(false ; "claims_a_free_one")]
+    #[tokio::test]
+    async fn acquire_async_claims_only_a_free_session(held: bool) {
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().to_path_buf());
+        let id = MakiId::generate();
+        let _holder = held.then(|| SessionClaim::acquire(id, &state).expect(UNCLAIMED));
+
+        match (held, SessionClaim::acquire_async(id, &state).await) {
+            (true, Err(SessionError::Busy { id: busy })) => assert_eq!(busy, id),
+            (false, Ok(_claim)) => assert!(SessionClaim::is_held(id, &state), "{LOCK_WHILE_HELD}"),
+            (held, claimed) => panic!("{BUSY_ONLY_WHILE_HELD}: held {held}, got {claimed:?}"),
+        }
     }
 
     #[test]

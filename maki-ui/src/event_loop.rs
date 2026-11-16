@@ -1929,11 +1929,12 @@ impl<'t> EventLoop<'t> {
             from: self.sessions[self.focused].id(),
         };
         let storage = self.ctx.storage.clone();
-        self.opening = Some(AbortOnDropHandle::new(spawn_blocking(move || {
+        self.opening = Some(AbortOnDropHandle::new(tokio::spawn(async move {
             // A session another maki owns is refused here, where it costs a
             // flash, rather than at the first write, after a whole conversation.
-            let opened =
-                OpenSession::load(id, &storage).map_err(|e| format!("Failed to load session: {e}"));
+            let opened = OpenSession::load_async(id, storage)
+                .await
+                .map_err(|e| format!("Failed to load session: {e}"));
             Box::new(OpenedSession { focus, opened })
         })));
     }
