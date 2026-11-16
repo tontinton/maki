@@ -30,6 +30,7 @@ use std::time::Duration;
 use arc_swap::{ArcSwap, Guard};
 use maki_config::ProjectConfig;
 use maki_providers::{ContentBlock, DEFER_LOADING_KEY, Message, Model};
+use maki_storage::blocking;
 use rmcp::model::{Prompt, PromptArgument, Tool};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -721,9 +722,7 @@ pub async fn start(
 ) -> (Option<McpHandle>, McpConfigErrors) {
     tracing::info!(cwd = %cwd.display(), "starting MCP");
     let cwd = cwd.to_owned();
-    let (config, config_errors) = spawn_blocking(move || load_config(&cwd, project_config))
-        .await
-        .expect("MCP config load panicked");
+    let (config, config_errors) = blocking(move || load_config(&cwd, project_config)).await;
     (start_with_config(config), config_errors)
 }
 
@@ -749,9 +748,7 @@ pub async fn start_with_extra(
 ) -> (Option<McpHandle>, McpConfigErrors) {
     let owned_cwd = cwd.to_owned();
     let (mut config, config_errors) =
-        spawn_blocking(move || load_config(&owned_cwd, project_config))
-            .await
-            .expect("MCP config load panicked");
+        blocking(move || load_config(&owned_cwd, project_config)).await;
     for (name, transport) in extra {
         match config.mcp.entry(name) {
             Entry::Vacant(slot) => {

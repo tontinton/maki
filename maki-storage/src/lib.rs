@@ -22,6 +22,7 @@ use std::fs;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::panic;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::thread;
@@ -29,9 +30,11 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
+use tokio::task::{JoinHandle, spawn_blocking};
 
 use paths::state_dir;
 
+const CANCELLED_JOIN: &str = "joined task was cancelled";
 #[cfg(windows)]
 const RENAME_ATTEMPTS: usize = 20;
 
@@ -168,11 +171,32 @@ pub fn now_epoch() -> u64 {
         .as_secs()
 }
 
+/// Runs one blocking job, disk work or a terminal prompt, on the blocking
+/// pool. Work that touches many files goes in as one job, so it costs one hop
+/// instead of one per call.
+pub async fn blocking<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> T {
+    joined(spawn_blocking(job)).await
+}
+
+/// Awaits a spawned task. A panic in it is a bug, so it unwinds on in the
+/// caller with its own payload rather than turning into an error. Only a
+/// runtime shutdown or an abort cancels a task, and that panics too.
+pub async fn joined<T>(task: JoinHandle<T>) -> T {
+    task.await
+        .unwrap_or_else(|error| panic::resume_unwind(error.try_into_panic().expect(CANCELLED_JOIN)))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::panic::panic_any;
+
+    use test_case::test_case;
+
     use super::*;
 
     const ORIGINAL: &[u8] = b"original";
+    const PANIC_MESSAGE: &str = "job panicked";
+    const JOB_OUTPUT: u32 = 7;
     const OWNER_ONLY_FILE_MODE: u32 = 0o600;
     const REPLACEMENT: &[u8] = b"replacement";
     #[cfg(unix)]
@@ -241,5 +265,19 @@ mod tests {
 
         assert!(atomic_write(&destination, REPLACEMENT).is_err());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test_case(tokio::spawn(blocking(|| panic_any(PANIC_MESSAGE))) ; "blocking_job")]
+    #[test_case(tokio::spawn(joined(tokio::spawn(async { panic_any(PANIC_MESSAGE) }))) ; "spawned_task")]
+    #[tokio::test]
+    async fn panic_reraises_with_its_payload(task: JoinHandle<()>) {
+        let payload = task.await.unwrap_err().into_panic();
+
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&PANIC_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn blocking_returns_job_output() {
+        assert_eq!(blocking(|| JOB_OUTPUT).await, JOB_OUTPUT);
     }
 }

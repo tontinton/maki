@@ -9,15 +9,13 @@ use tokio::sync::mpsc::unbounded_channel;
 use arc_swap::ArcSwap;
 use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
-use maki_storage::StateDir;
 use maki_storage::auth::{lock_credentials, plugin_auth_stamp};
 use maki_storage::id::SessionRef;
+use maki_storage::{StateDir, blocking, joined};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::oneshot;
-use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 use url::{Host, Url};
 
@@ -994,14 +992,14 @@ impl AuthState {
         purpose: AuthPurpose,
     ) -> Result<Recovery, AgentError> {
         let owned = slug.to_owned();
-        let (_lock, stored) = spawn_blocking(move || match StateDir::resolve() {
+        let (_lock, stored) = blocking(move || match StateDir::resolve() {
             Ok(dir) => (
                 Some(lock_credentials(&dir, &owned)),
                 plugin_auth_stamp(&dir, &owned),
             ),
             Err(_) => (None, None),
         })
-        .await?;
+        .await;
         let purpose = match purpose {
             AuthPurpose::Refresh
                 if self.gate.ran() && *self.store_seen.lock().unwrap() != stored =>
@@ -1031,8 +1029,7 @@ impl AuthState {
             .await?
             .into_resolved(slug, &self.hosts())?;
         let owned = slug.to_owned();
-        let stamp =
-            spawn_blocking(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await?;
+        let stamp = blocking(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await;
         let mut current = self.current.lock().unwrap();
         // A hook that omits base_url keeps the resolved one. Falling back to
         // the provider's default origin would silently repoint the token.
@@ -1098,15 +1095,12 @@ impl PluginEntry {
         // that timed out, must neither release the gate and the lock while the
         // hook still holds the token nor drop what the hook minted with it.
         let auth = Arc::clone(&self.auth);
-        let (done, outcome) = oneshot::channel();
-        tokio::spawn(async move {
-            let minted = auth
-                .gate
+        joined(tokio::spawn(async move {
+            auth.gate
                 .single_flight(seen, auth.locked_mint(&slug, hook.as_ref(), purpose))
-                .await;
-            let _ = done.send(minted);
-        });
-        outcome.await.map_err(|_| AgentError::Channel)?
+                .await
+        }))
+        .await
     }
 }
 

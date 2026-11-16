@@ -4,8 +4,8 @@ use maki_config::providers::{
     ModelDef, Protocol, ProviderDef, ProvidersConfig, ThinkingFields, resolve_api_key_env,
     resolve_base_url, resolve_protocol,
 };
+use maki_storage::blocking;
 use serde_json::{Value, json};
-use tokio::task::spawn_blocking;
 use tracing::warn;
 
 use super::anthropic::shared;
@@ -357,9 +357,7 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
 /// reach the registry from this same read, so tier lookups notice edits to
 /// `providers.toml`.
 pub async fn discover_models(timeouts: Timeouts, mut emit: impl FnMut(ModelBatch)) {
-    let config = spawn_blocking(ProvidersConfig::load)
-        .await
-        .expect("providers config load panicked");
+    let config = blocking(ProvidersConfig::load).await;
     model_registry::set_declared(declared_tiers_from(&config));
     let mut entries = custom_entries(&config);
     entries.sort_by_key(|(_, def)| def.discover_models);

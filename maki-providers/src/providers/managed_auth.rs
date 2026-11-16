@@ -3,9 +3,8 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, load_tokens_async};
-use tokio::task::spawn_blocking;
+use maki_storage::{StateDir, blocking, joined};
 use tracing::debug;
 
 use super::{ResolvedAuth, UNAUTHORIZED_STATUS, needs_refresh, refreshed_tokens};
@@ -78,7 +77,7 @@ impl ManagedAuth {
         let shared = Arc::clone(&self.auth);
         let held = Arc::clone(&self.tokens);
         let flow = self.flow;
-        tokio::spawn(async move {
+        joined(tokio::spawn(async move {
             match refreshed_tokens(
                 &storage,
                 flow.provider,
@@ -102,8 +101,8 @@ impl ManagedAuth {
                     Err(e)
                 }
             }
-        })
-        .await??;
+        }))
+        .await?;
         debug!(provider = self.flow.provider, "refreshed OAuth token");
         Ok(())
     }
@@ -165,7 +164,7 @@ impl ManagedAuth {
             return Ok(());
         };
         let resolve = self.flow.resolve;
-        let (resolved, tokens) = spawn_blocking(move || resolve(&storage)).await??;
+        let (resolved, tokens) = blocking(move || resolve(&storage)).await?;
         *self.auth.lock().unwrap() = resolved;
         *self.tokens.lock().unwrap() = tokens;
         debug!(provider = self.flow.provider, "reloaded auth from storage");

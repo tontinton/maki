@@ -10,7 +10,6 @@ use std::{io, time::Duration};
 use reqwest::Response;
 use serde_json::Value;
 use tokio::sync::mpsc::error::SendError;
-use tokio::task::JoinError;
 
 use crate::{
     headers::HeaderError,
@@ -475,20 +474,6 @@ impl From<maki_storage::StorageError> for AgentError {
     }
 }
 
-/// The only way a reqwest error enters the type. The URL goes first: a key in
-/// the query (Gemini's model listing) would otherwise reach maki.log through
-/// `error = %e`. A request that cannot be built, from a malformed URL or a
-/// header value the wire cannot carry, is a config mistake that no retry fixes.
-/// A panicked or aborted blocking task is a bug, not a transient failure, so
-/// it is never retried.
-impl From<JoinError> for AgentError {
-    fn from(e: JoinError) -> Self {
-        Self::Config {
-            message: e.to_string(),
-        }
-    }
-}
-
 /// A header someone wrote that cannot go on a request, named in the message.
 impl From<HeaderError> for AgentError {
     fn from(e: HeaderError) -> Self {
@@ -498,6 +483,10 @@ impl From<HeaderError> for AgentError {
     }
 }
 
+/// The only way a reqwest error enters the type. The URL goes first: a key in
+/// the query (Gemini's model listing) would otherwise reach maki.log through
+/// `error = %e`. A request that cannot be built, from a malformed URL or a
+/// header value the wire cannot carry, is a config mistake that no retry fixes.
 impl From<reqwest::Error> for AgentError {
     fn from(e: reqwest::Error) -> Self {
         if e.is_builder() {

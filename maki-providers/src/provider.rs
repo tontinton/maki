@@ -12,6 +12,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use maki_config::ModelPolicy;
+use maki_storage::blocking;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo};
@@ -170,7 +171,7 @@ pub async fn from_model_async(
 ) -> Result<Box<dyn Provider>, AgentError> {
     let slug = Arc::clone(&model.provider);
     let id = model.id.clone();
-    let provider = spawn_blocking(move || provider_for_slug(&slug, timeouts)).await??;
+    let provider = blocking(move || provider_for_slug(&slug, timeouts)).await?;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %id, "provider created");
     Ok(provider)
