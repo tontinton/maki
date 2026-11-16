@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -337,10 +338,10 @@ async fn load_session(
     let (restored, claim) = match held {
         Some(claim) => {
             close_session(srv, SessionEndReason::Replaced).await;
-            (reload_history(&params.storage, &claim)?, claim)
+            (reload_history(&params.storage, &claim).await?, claim)
         }
         None => {
-            let loaded = claim_history(&params.storage, session_ref.id())?;
+            let loaded = claim_history(&params.storage, session_ref.id()).await?;
             close_session(srv, SessionEndReason::Replaced).await;
             loaded
         }
@@ -405,14 +406,13 @@ async fn list_sessions(raw: &Value, storage: &StateDir) -> Result<AgentResponse,
     // The scan stats every session file and tail-reads those with a cold
     // cache, so it runs on a blocking thread, like the TUI picker.
     let storage = storage.clone();
-    let internal = |e: &dyn std::fmt::Display| AcpError::internal_error().data(json_str(&e));
     let summaries = spawn_blocking(move || match req.cwd {
         Some(cwd) => StoredSession::list(&cwd.to_string_lossy(), &storage),
         None => StoredSession::list_all(&storage),
     })
     .await
-    .map_err(|e| internal(&e))?
-    .map_err(|e| internal(&e))?;
+    .map_err(|e| internal_error(&e))?
+    .map_err(|e| internal_error(&e))?;
     let sessions = summaries
         .into_iter()
         .map(|s| {
@@ -715,18 +715,23 @@ struct Restored {
 /// than resolving a second answer to where sessions live.
 ///
 /// Claims before it reads, since the turns that follow replace this transcript.
-fn claim_history(
+async fn claim_history(
     storage: &StateDir,
     session_id: MakiId,
 ) -> Result<(Restored, SessionClaim), AcpError> {
-    let (session, claim) = StoredSession::claim_and_load(session_id, storage)
+    let claim = SessionClaim::acquire_async(session_id, storage)
+        .await
         .map_err(|e| load_error(e, session_id))?;
-    Ok((Restored::from(session), claim))
+    Ok((reload_history(storage, &claim).await?, claim))
 }
 
-/// [`claim_history`] for the session this server already holds.
-fn reload_history(storage: &StateDir, claim: &SessionClaim) -> Result<Restored, AcpError> {
-    StoredSession::load_claimed(claim, storage)
+/// [`claim_history`] for the session this server already holds. Parsing a
+/// long transcript is CPU work, so it runs on the blocking pool.
+async fn reload_history(storage: &StateDir, claim: &SessionClaim) -> Result<Restored, AcpError> {
+    let (storage, held) = (storage.clone(), claim.clone());
+    spawn_blocking(move || StoredSession::load_claimed(&held, &storage))
+        .await
+        .map_err(|e| internal_error(&e))?
         .map(Restored::from)
         .map_err(|e| load_error(e, claim.id()))
 }
@@ -1135,8 +1140,12 @@ fn parse_params<T: serde::de::DeserializeOwned>(raw: &Value) -> Result<T, AcpErr
         .map_err(|e| AcpError::invalid_params().data(json_str(&e)))
 }
 
-fn json_str(e: &impl std::fmt::Display) -> Value {
+fn json_str(e: &impl Display) -> Value {
     Value::String(e.to_string())
+}
+
+fn internal_error(e: &impl Display) -> AcpError {
+    AcpError::internal_error().data(json_str(e))
 }
 
 #[cfg(test)]
@@ -1144,6 +1153,7 @@ mod tests {
     use std::sync::LazyLock;
     use std::sync::mpsc::sync_channel;
 
+    use agent_client_protocol_schema::v1::ErrorCode;
     use maki_agent::headless::SessionEnd;
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
@@ -1460,10 +1470,10 @@ mod tests {
     /// A load that cannot happen must not take the running session down with
     /// it: the client still holds that session, and every prompt it sends next
     /// would otherwise answer "no active session".
-    #[test_case(false ; "a session that does not exist")]
-    #[test_case(true ; "a session another maki holds")]
+    #[test_case(false, AcpError::resource_not_found(None).code ; "a session that does not exist")]
+    #[test_case(true, SESSION_BUSY_CODE.into() ; "a session another maki holds")]
     #[tokio::test]
-    async fn a_failed_load_leaves_the_running_session_alone(held_elsewhere: bool) {
+    async fn a_failed_load_leaves_the_running_session_alone(held_elsewhere: bool, code: ErrorCode) {
         let tmp = TempDir::new().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let mut stored: Session<Message, TokenUsage, maki_agent::ToolOutput> =
@@ -1480,7 +1490,7 @@ mod tests {
 
         let result = load_session(&mut srv, &load_request(target), &acp_params(storage)).await;
 
-        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, code);
         assert_eq!(
             srv.session.as_ref().map(|s| s.handle.session_id.clone()),
             Some(running),
@@ -2351,8 +2361,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn load_history_round_trips_stored_messages() {
+    #[tokio::test]
+    async fn load_history_round_trips_stored_messages() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let messages = vec![
@@ -2379,7 +2389,7 @@ mod tests {
             .unwrap();
 
         let id: MakiId = session.id;
-        let restored = claim_history(&dir, id).unwrap().0;
+        let restored = claim_history(&dir, id).await.unwrap().0;
         assert_eq!(restored.session.model, "anthropic/test-model");
         assert_eq!(
             serde_json::to_value(restored.session.messages()).unwrap(),
@@ -2392,8 +2402,8 @@ mod tests {
     /// Resuming must bill what the session actually paid. If the per-model
     /// breakdown came back empty or lost its recorded costs, ACP would re-price
     /// the restored total against today's table and disagree with the TUI.
-    #[test]
-    fn load_history_prices_a_resumed_session_at_what_it_paid() {
+    #[tokio::test]
+    async fn load_history_prices_a_resumed_session_at_what_it_paid() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
@@ -2416,7 +2426,7 @@ mod tests {
             .save(&SessionClaim::acquire(session.id, &dir).unwrap(), &dir)
             .unwrap();
 
-        let restored = claim_history(&dir, session.id).unwrap().0;
+        let restored = claim_history(&dir, session.id).await.unwrap().0;
         let mut by_model = restored.session.usage_by_model().clone();
         assert_eq!(
             by_model[RETIRED_MODEL_ID].cost,
@@ -2439,8 +2449,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn load_history_records_absolute_cwd_only() {
+    #[tokio::test]
+    async fn load_history_records_absolute_cwd_only() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
@@ -2448,14 +2458,14 @@ mod tests {
         session
             .save(&SessionClaim::acquire(session.id, &dir).unwrap(), &dir)
             .unwrap();
-        assert_eq!(claim_history(&dir, session.id).unwrap().0.cwd, None);
+        assert_eq!(claim_history(&dir, session.id).await.unwrap().0.cwd, None);
     }
 
-    #[test]
-    fn load_missing_session_is_resource_not_found() {
+    #[tokio::test]
+    async fn load_missing_session_is_resource_not_found() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let err = claim_history(&dir, MakiId::generate()).unwrap_err();
+        let err = claim_history(&dir, MakiId::generate()).await.unwrap_err();
         assert_eq!(err.code, AcpError::resource_not_found(None).code);
     }
 
