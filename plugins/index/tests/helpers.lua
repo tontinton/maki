@@ -31,6 +31,17 @@ function M.lacks(output, needles)
   end
 end
 
+function M.section_body(output, header)
+  -- A section at the end of the output has no blank line after it.
+  local body = output:match(header .. "\n(.-)\n\n") or output:match(header .. "\n(.*)$")
+  assert(body, "missing section '" .. header .. "' in output:\n" .. output)
+  return body
+end
+
+function M.lacks_in_section(output, header, needles)
+  M.lacks(M.section_body(output, header), needles)
+end
+
 function M.split_lines(text)
   local lines = {}
   for line in (text:gsub("\n+$", "") .. "\n"):gmatch("([^\n]*)\n") do

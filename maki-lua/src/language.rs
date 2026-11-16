@@ -40,6 +40,8 @@ pub enum Language {
     Json,
     Make,
     Clojure,
+    SystemVerilog,
+    Vhdl,
 }
 
 impl Language {
@@ -81,10 +83,13 @@ impl Language {
             "json" => Some(Self::Json),
             "make" => Some(Self::Make),
             "clojure" => Some(Self::Clojure),
+            "systemverilog" => Some(Self::SystemVerilog),
+            "vhdl" => Some(Self::Vhdl),
             _ => None,
         }
     }
 
+    /// The default language maki returns for a given extension.
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
             "rs" => Some(Self::Rust),
@@ -122,6 +127,8 @@ impl Language {
             "json" => Some(Self::Json),
             "mk" => Some(Self::Make),
             "clj" | "cljs" | "cljc" | "bb" => Some(Self::Clojure),
+            "sv" | "svh" | "vh" => Some(Self::SystemVerilog),
+            "vhd" | "vhdl" => Some(Self::Vhdl),
             _ => None,
         }
     }
@@ -164,6 +171,8 @@ impl Language {
             Self::Json => tree_sitter_json::LANGUAGE.into(),
             Self::Make => tree_sitter_make::LANGUAGE.into(),
             Self::Clojure => tree_sitter_clojure_orchard::LANGUAGE.into(),
+            Self::SystemVerilog => tree_sitter_systemverilog::LANGUAGE.into(),
+            Self::Vhdl => tree_sitter_vhdl::LANGUAGE.into(),
         }
     }
 }
@@ -218,6 +227,25 @@ mod tests {
         assert!(parses_cleanly(
             Language::from_extension(ext).unwrap(),
             "(ns a.b (:require [c.d :as e]))\n(defn f [x] (inc x))"
+        ));
+    }
+
+    #[test_case("sv")]
+    #[test_case("svh")]
+    #[test_case("vh")]
+    fn systemverilog_extension_parses_cleanly(ext: &str) {
+        assert!(parses_cleanly(
+            Language::from_extension(ext).unwrap(),
+            "module m(input logic clk);\n  always_ff @(posedge clk) q <= d;\nendmodule"
+        ));
+    }
+
+    #[test_case("vhd")]
+    #[test_case("vhdl")]
+    fn vhdl_extension_parses_cleanly(ext: &str) {
+        assert!(parses_cleanly(
+            Language::from_extension(ext).unwrap(),
+            "entity e is\n  port (clk : in bit);\nend entity;"
         ));
     }
 }
