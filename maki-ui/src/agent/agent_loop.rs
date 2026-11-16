@@ -16,9 +16,9 @@ use maki_agent::{
 };
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, ContextGauge, Message, Model};
+use maki_storage::blocking;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
-use tokio::task::spawn_blocking;
 use tracing::error;
 
 use super::run_cancels::RunCancels;
@@ -367,9 +367,7 @@ impl AgentLoop {
     async fn reload_instructions(&mut self) {
         let cwd = self.vars.apply("{cwd}").into_owned();
         let config = self.seed.config.instructions.clone();
-        self.instructions = spawn_blocking(move || agent::load_instructions(&cwd, &config))
-            .await
-            .expect("instructions load task panicked");
+        self.instructions = blocking(move || agent::load_instructions(&cwd, &config)).await;
         // Background sessions started from the seed read its list, so it has
         // to follow every reload, the startup one included.
         self.seed
