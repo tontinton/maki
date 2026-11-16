@@ -2939,20 +2939,24 @@ struct InflightGate {
     slots: Arc<Semaphore>,
     /// What [`Self::drain`] waits on: a token per piece of held work, from the
     /// moment it queues for a slot until it gives the slot back. Unlike the
-    /// slots, it leaves out work under a `maki.async.spawn` task. Closed from
-    /// the start, so `wait` resolves whenever it is empty; tokens can still be
-    /// taken.
+    /// slots, it leaves out work under a `maki.async.spawn` task.
     held: TaskTracker,
+}
+
+/// Closed from the start, so `wait` resolves whenever it is empty; tokens can
+/// still be taken.
+fn closed_tracker() -> TaskTracker {
+    let tracker = TaskTracker::new();
+    tracker.close();
+    tracker
 }
 
 impl InflightGate {
     fn new(lua: Lua) -> Self {
-        let held = TaskTracker::new();
-        held.close();
         Self {
             gc: GcPacer::new(lua, LUA_MEMORY_LIMIT),
             slots: Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS)),
-            held,
+            held: closed_tracker(),
         }
     }
 
@@ -3130,47 +3134,29 @@ impl Drop for GateGuard {
 /// Restore items run as spawned tasks, so queue order no longer says when a
 /// batch is done: the App sends its `restoring` flag after the items, and the
 /// flag may only clear once every in-flight item has finished (it drives the
-/// restore spinner).
-#[derive(Default)]
-struct RestoreTracker {
-    inflight: Cell<usize>,
-    flags: RefCell<Vec<Arc<AtomicBool>>>,
+/// restore spinner). Every session shares the tracker, and a flag clears at
+/// the first idle after its waiter starts, so it can also wait out a batch
+/// queued right behind it.
+fn release_once_restored(restores: &TaskTracker, flag: Arc<AtomicBool>) {
+    let release = ClearOnDrop(flag);
+    if restores.is_empty() {
+        drop(release);
+        return;
+    }
+    let restores = restores.clone();
+    spawn_local(async move {
+        restores.wait().await;
+        drop(release);
+    });
 }
 
-impl RestoreTracker {
-    /// Flags are global across sessions on purpose: any batch reaching idle
-    /// releases every registered spinner flag.
-    fn release_if_idle(&self) {
-        if self.inflight.get() == 0 {
-            for flag in self.flags.borrow_mut().drain(..) {
-                flag.store(false, Ordering::Relaxed);
-            }
-        }
-    }
+/// Also clears the flag when the Lua thread goes down with a waiter still
+/// parked, so a dead dispatcher can't strand the spinner.
+struct ClearOnDrop(Arc<AtomicBool>);
 
-    fn finish(&self) {
-        self.inflight.set(self.inflight.get().saturating_sub(1));
-        self.release_if_idle();
-    }
-
-    fn complete(&self, flag: Arc<AtomicBool>) {
-        self.flags.borrow_mut().push(flag);
-        self.release_if_idle();
-    }
-
-    /// Counts one in-flight item until the guard drops, so an early return
-    /// (or future refactor) inside a restore task can't strand the spinner.
-    fn track(self: &Rc<Self>) -> RestoreGuard {
-        self.inflight.set(self.inflight.get() + 1);
-        RestoreGuard(Rc::clone(self))
-    }
-}
-
-struct RestoreGuard(Rc<RestoreTracker>);
-
-impl Drop for RestoreGuard {
+impl Drop for ClearOnDrop {
     fn drop(&mut self) {
-        self.0.finish();
+        self.0.store(false, Ordering::Relaxed);
     }
 }
 
@@ -4645,7 +4631,7 @@ impl LuaRuntime {
     fn click_tool(
         &self,
         gate: &Rc<InflightGate>,
-        restores: &Rc<RestoreTracker>,
+        restores: &TaskTracker,
         tool_use_id: String,
         row: usize,
         fallback: Option<Box<ClickFallback>>,
@@ -4888,18 +4874,16 @@ async fn run_inline_tasks(lua: &Lua, scope: &TaskScope) {
 /// the stale view.
 fn spawn_restore(
     gate: &Rc<InflightGate>,
-    restores: &Rc<RestoreTracker>,
+    restores: &TaskTracker,
     rt: &LuaRuntime,
     item: RestoreItem,
     event_tx: maki_agent::EventSender,
 ) {
     rt.evict_warm(&item.tool_use_id);
-    let tracker = restores.track();
     let lua = rt.lua.clone();
     let plugins = Rc::clone(&rt.plugins);
     let g = Rc::clone(gate);
-    spawn_local(async move {
-        let _tracker = tracker;
+    restores.spawn_local(async move {
         // Acquired before the timeout race starts, so the per-item deadline
         // measures the item's own run, not time queued behind the whole batch.
         let slot = Some(g.acquire().await);
@@ -5883,7 +5867,7 @@ pub fn spawn(
                 });
             }
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
-            let restores = Rc::new(RestoreTracker::default());
+            let restores = closed_tracker();
             let (hook_tx, mut hook_rx) = unbounded_channel::<HostHook>();
             {
                 let lua = rt.lua.clone();
@@ -6231,7 +6215,7 @@ pub fn spawn(
                             spawn_restore(&gate, &restores, &rt, item, event_tx);
                         }
                         Request::RestoreComplete { flag } => {
-                            restores.complete(flag);
+                            release_once_restored(&restores, flag);
                         }
                         Request::ClickTool {
                             tool_use_id,
@@ -6987,6 +6971,64 @@ mod tests {
                 assert!(g.held.is_empty(), "a given-up admission left its hold");
             })
             .await;
+    }
+
+    const CLEARED_IN_FLIGHT: &str = "cleared with an item in flight";
+
+    #[tokio::test]
+    async fn a_restore_flag_clears_only_once_every_overlapping_batch_finished() {
+        wake_or_fail(LocalSet::new().run_until(async {
+            let restores = closed_tracker();
+            let first_item = restores.token();
+            let first = Arc::new(AtomicBool::new(true));
+            release_once_restored(&restores, Arc::clone(&first));
+            let second_item = restores.token();
+            let second = Arc::new(AtomicBool::new(true));
+            release_once_restored(&restores, Arc::clone(&second));
+
+            drop(first_item);
+            for _ in 0..SETTLE_YIELDS {
+                yield_now().await;
+            }
+            assert!(first.load(Ordering::Relaxed), "{CLEARED_IN_FLIGHT}");
+
+            drop(second_item);
+            for _ in 0..SETTLE_YIELDS {
+                yield_now().await;
+            }
+            assert!(!first.load(Ordering::Relaxed) && !second.load(Ordering::Relaxed));
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_flag_for_a_finished_batch_does_not_wait_for_the_next_one() {
+        wake_or_fail(LocalSet::new().run_until(async {
+            let restores = closed_tracker();
+            let flag = Arc::new(AtomicBool::new(true));
+            release_once_restored(&restores, Arc::clone(&flag));
+            let _next_item = restores.token();
+            for _ in 0..SETTLE_YIELDS {
+                yield_now().await;
+            }
+            assert!(!flag.load(Ordering::Relaxed));
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_restore_flag_clears_when_the_lua_thread_drops_its_waiter() {
+        let restores = closed_tracker();
+        let _item = restores.token();
+        let flag = Arc::new(AtomicBool::new(true));
+        let local = LocalSet::new();
+        local
+            .run_until(async { release_once_restored(&restores, Arc::clone(&flag)) })
+            .await;
+        assert!(flag.load(Ordering::Relaxed), "{CLEARED_IN_FLIGHT}");
+
+        drop(local);
+        assert!(!flag.load(Ordering::Relaxed));
     }
 
     #[test]
