@@ -14,7 +14,7 @@ use maki_providers::plugin::{self, Hook, ProviderDecl, ProviderHooks, Registrati
 use maki_providers::provider::BoxFuture;
 use maki_storage::StateDir;
 use maki_storage::auth::{
-    delete_plugin_auth, load_plugin_auth, lock_credentials, save_plugin_auth,
+    delete_plugin_auth, load_plugin_auth, lock_credentials_async, save_plugin_auth,
 };
 use maki_storage::stdin;
 use mlua::{
@@ -993,21 +993,21 @@ fn get(lua: &Lua, #[ctx] slugs: OwnedSlugs, slug: String) -> LuaResult<Pair<Tabl
     }
 }
 
-/// Every change to the credential store, off the plugin host's thread.
+/// Every change to the credential store.
 ///
-/// [`lock_credentials`] waits on a file lock another maki process may hold, and
-/// the host is single threaded: waiting for it here would stall every tool
-/// call, timer and provider hook in this process behind one plugin's token
-/// rotation. The common case takes no file lock at all, because the host
-/// already holds this slug while its hook runs and the lock lets it back in,
-/// so the write costs one hop off the thread and back.
+/// [`lock_credentials_async`] may wait on a file lock another maki process
+/// holds. It waits on the timer, so the single-threaded host goes on serving
+/// every other tool call, timer and provider hook meanwhile. The write itself
+/// runs off the host's thread and takes the guard along, so a call dropped
+/// mid-write still finishes it under the lock.
 async fn write_credentials(
     slug: String,
     write: impl FnOnce(&StateDir, &str) -> Result<(), String> + Send + 'static,
 ) -> Result<(), String> {
+    let dir = StateDir::resolve().map_err(|e| e.to_string())?;
+    let lock = lock_credentials_async(&dir, &slug).await;
     spawn_blocking(move || {
-        let dir = StateDir::resolve().map_err(|e| e.to_string())?;
-        let _lock = lock_credentials(&dir, &slug);
+        let _lock = lock;
         write(&dir, &slug)
     })
     .await

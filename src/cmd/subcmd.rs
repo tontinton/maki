@@ -20,7 +20,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
 use maki_storage::auth::{
     delete_plugin_auth, delete_provider_credentials, load_plugin_auth, load_provider_credentials,
-    load_tokens, lock_credentials, save_provider_credentials,
+    load_tokens, lock_credentials_async, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
 use maki_storage::stdin;
@@ -475,7 +475,7 @@ pub async fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
             let removed_key =
                 delete_provider_credentials(storage, &slug).context("delete credentials")?;
             let removed_login = {
-                let _lock = lock_credentials(storage, &slug);
+                let _lock = lock_credentials_async(storage, &slug).await;
                 delete_plugin_auth(storage, &slug).context("delete plugin login")?
             };
             if removed_key {
