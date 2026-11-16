@@ -121,7 +121,7 @@ keybind_key        = { fg = "cyan", modifiers = ["bold"] }
 user               = { fg = "blue" }
 assistant          = { fg = "foreground" }
 thinking           = { fg = "comment", modifiers = ["italic"] }
-thinking_bg        = { bg = "#093141" }
+thinking_bg        = { bg = "#0f354a" }
 user_bg            = { bg = "#032f3b" }
 tool               = { fg = "foreground" }
 tool_path          = { fg = "cyan" }

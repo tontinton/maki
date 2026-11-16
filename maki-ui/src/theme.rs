@@ -1030,6 +1030,38 @@ mod tests {
     use maki_highlight::UiStyle;
     use test_case::test_case;
 
+    const MIN_SURFACE_GAP: u32 = 6;
+
+    fn rgb_gap(a: Option<Color>, b: Option<Color>) -> Option<u32> {
+        match (a?, b?) {
+            (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => Some(
+                [(r1, r2), (g1, g2), (b1, b2)]
+                    .iter()
+                    .map(|&(x, y)| u32::from(x.abs_diff(y)))
+                    .sum(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Thinking sits right next to user messages and tool blocks, so a
+    /// surface one step off theirs reads as the same block.
+    #[test]
+    fn bundled_thinking_bg_stands_apart_from_user_and_tool_bg() {
+        for entry in BUNDLED_THEMES {
+            let t = Theme::from_toml(entry.toml).unwrap();
+            for (key, other) in [("user_bg", t.user_bg), ("tool_bg", t.tool_bg)] {
+                if let Some(gap) = rgb_gap(t.thinking_bg.bg, other.bg) {
+                    assert!(
+                        gap >= MIN_SURFACE_GAP,
+                        "{}: thinking_bg is {gap} away from {key}",
+                        entry.name
+                    );
+                }
+            }
+        }
+    }
+
     #[test_case(Color::Rgb(1, 2, 3), SegmentColor::Rgb((1, 2, 3)); "truecolor")]
     #[test_case(Color::Indexed(200), SegmentColor::Ansi(200); "indexed")]
     #[test_case(Color::Reset, SegmentColor::Default; "reset")]
