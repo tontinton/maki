@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use maki_config::ModelPolicy;
-use maki_storage::StateDir;
+use maki_storage::{StateDir, blocking};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::task::spawn_blocking;
@@ -190,8 +190,8 @@ fn fingerprint() -> String {
     digest(&entries)
 }
 
-fn load_from(path: &Path) -> Option<ModelsCache> {
-    let bytes = std::fs::read(path).ok()?;
+async fn load_from(path: &Path) -> Option<ModelsCache> {
+    let bytes = tokio::fs::read(path).await.ok()?;
     // A cache that fails to parse (corrupt, or written by an incompatible
     // version) is treated as absent: live discovery rewrites it.
     serde_json::from_slice(&bytes).ok()
@@ -211,8 +211,8 @@ fn store_at(path: &Path, cache: &ModelsCache) {
 /// Last run's specs when this run's credentials wrote them and they are not
 /// past [`MAX_AGE_MS`], empty otherwise. A miss is not an error: live
 /// discovery rewrites the file moments later regardless.
-fn replay(path: &Path, policy: &ModelPolicy, fingerprint: &str, now_ms: u64) -> Vec<String> {
-    let Some(cache) = load_from(path) else {
+async fn replay(path: &Path, policy: &ModelPolicy, fingerprint: &str, now_ms: u64) -> Vec<String> {
+    let Some(cache) = load_from(path).await else {
         return Vec::new();
     };
     if cache.fingerprint != fingerprint {
@@ -237,18 +237,16 @@ fn replay(path: &Path, policy: &ModelPolicy, fingerprint: &str, now_ms: u64) -> 
 /// yesterday's list replaying at every start after a logout or a revoked key.
 /// An empty result from a degraded run is a failed probe, so an existing good
 /// cache survives it for the next start.
-fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: u64) {
+async fn store_discovery(path: PathBuf, listing: &Listing, fingerprint: String, now_ms: u64) {
     if listing.live.is_empty() && listing.degraded {
         return;
     }
-    store_at(
-        path,
-        &ModelsCache {
-            fingerprint,
-            written_at: now_ms,
-            specs: listing.live.clone(),
-        },
-    );
+    let cache = ModelsCache {
+        fingerprint,
+        written_at: now_ms,
+        specs: listing.live.clone(),
+    };
+    blocking(move || store_at(&path, &cache)).await;
 }
 
 /// Like [`fetch_all_models`], but the first `on_update` comes straight from
@@ -263,11 +261,12 @@ pub async fn fetch_all_models_cached(
     let fingerprint = spawn_blocking(fingerprint)
         .await
         .expect("fingerprint task panicked");
+    let replayed = match &path {
+        Some(path) => replay(path, policy, &fingerprint, maki_storage::auth::now_millis()).await,
+        None => Vec::new(),
+    };
     let mut listing = Listing {
-        replayed: path
-            .as_deref()
-            .map(|p| replay(p, policy, &fingerprint, maki_storage::auth::now_millis()))
-            .unwrap_or_default(),
+        replayed,
         ..Listing::default()
     };
     on_update(listing.snapshot(), None);
@@ -286,13 +285,14 @@ pub async fn fetch_all_models_cached(
     )
     .await;
 
-    if let Some(path) = &path {
+    if let Some(path) = path {
         store_discovery(
             path,
             &listing,
             fingerprint,
             maki_storage::auth::now_millis(),
-        );
+        )
+        .await;
     }
     on_update(listing.finish(), None);
 }
@@ -341,26 +341,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn replay_applies_current_policy() {
+    #[tokio::test]
+    async fn replay_applies_current_policy() {
         let (_dir, path) = cache_file(&["kept/model-a", "banned/model-b", "kept/model-c"]);
         let policy = ModelPolicy::new(&[], &["banned/*".to_string()]).unwrap();
         assert_eq!(
-            replay(&path, &policy, FINGERPRINT, NOW),
+            replay(&path, &policy, FINGERPRINT, NOW).await,
             ["kept/model-a", "kept/model-c"]
         );
     }
 
     #[test_case("fingerprint-b", NOW                  ; "foreign_fingerprint")]
     #[test_case(FINGERPRINT,     NOW + MAX_AGE_MS + 1 ; "past_max_age")]
-    fn replay_misses(fingerprint: &str, now_ms: u64) {
+    #[tokio::test]
+    async fn replay_misses(fingerprint: &str, now_ms: u64) {
         let (_dir, path) = cache_file(&["old/model"]);
         let policy = ModelPolicy::default();
         assert_eq!(
-            replay(&path, &policy, FINGERPRINT, NOW + MAX_AGE_MS),
+            replay(&path, &policy, FINGERPRINT, NOW + MAX_AGE_MS).await,
             ["old/model"]
         );
-        assert!(replay(&path, &policy, fingerprint, now_ms).is_empty());
+        assert!(replay(&path, &policy, fingerprint, now_ms).await.is_empty());
     }
 
     #[test]
@@ -404,15 +405,17 @@ mod tests {
     #[test_case(&[],            true,  &["good/model"] ; "degraded_empty_keeps_cache")]
     #[test_case(&[],            false, &[]             ; "authenticated_empty_is_recorded")]
     #[test_case(&["new/model"], false, &["new/model"]  ; "non_empty_rewrites_cache")]
-    fn store_discovery_cases(live: &[&str], degraded: bool, expected: &[&str]) {
+    #[tokio::test]
+    async fn store_discovery_cases(live: &[&str], degraded: bool, expected: &[&str]) {
         let (_dir, path) = cache_file(&["good/model"]);
         store_discovery(
-            &path,
+            path.clone(),
             &listing(live, degraded),
             FINGERPRINT.to_string(),
             NOW,
-        );
-        let cache = load_from(&path).unwrap();
+        )
+        .await;
+        let cache = load_from(&path).await.unwrap();
         assert_eq!(cache.specs, expected);
         assert_eq!(cache.fingerprint, FINGERPRINT);
     }
@@ -430,12 +433,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn corrupt_cache_loads_as_none() {
+    #[tokio::test]
+    async fn corrupt_cache_loads_as_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CACHE_FILE);
         std::fs::write(&path, b"{ not json").unwrap();
-        assert!(load_from(&path).is_none());
-        assert!(load_from(&dir.path().join("missing.json")).is_none());
+        assert!(load_from(&path).await.is_none());
+        assert!(load_from(&dir.path().join("missing.json")).await.is_none());
+        assert!(
+            replay(&path, &ModelPolicy::default(), FINGERPRINT, NOW)
+                .await
+                .is_empty()
+        );
     }
 }
