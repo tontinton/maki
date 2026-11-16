@@ -705,7 +705,6 @@ async fn start_session(
         initial_wd: cwd.clone(),
         resumed,
         claim: claim.clone(),
-        storage: settings.storage.clone(),
         yolo: stack.yolo,
         unattended: false,
         host_prompt: settings.host_prompt.clone(),
