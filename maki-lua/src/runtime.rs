@@ -5748,7 +5748,7 @@ pub(crate) struct LuaThread {
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
     pub input_rules_reader: InputRulesReader,
-    pub ui_action_rx: Mutex<Option<UnboundedReceiver<UiAction>>>,
+    pub ui_action_rx: Option<UnboundedReceiver<UiAction>>,
     pub ui_waker: UiWaker,
     /// What [`load_user_source`] found on the Lua thread, for the host to
     /// report.
@@ -6307,7 +6307,7 @@ pub fn spawn(
         keymap_reader,
         hint_reader,
         input_rules_reader,
-        ui_action_rx: Mutex::new(Some(ui_action_rx)),
+        ui_action_rx: Some(ui_action_rx),
         ui_waker,
         key_lint,
     })

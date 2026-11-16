@@ -83,7 +83,7 @@ struct Host {
 impl Host {
     fn new() -> Self {
         let reg = Arc::new(ToolRegistry::new());
-        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
         host.load_source(PLUGIN, SRC).unwrap();
         let ui = host.take_ui_action_rx().unwrap();
         Self { reg, host, ui }

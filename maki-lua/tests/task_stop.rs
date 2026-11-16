@@ -198,7 +198,7 @@ fn a_stopped_calls_output_passes_its_output_layers() {
 
 #[test]
 fn a_user_stop_reaches_the_cancel_hook_as_a_cancel() {
-    let (reg, host) = host();
+    let (reg, mut host) = host();
     let mut ui = host.take_ui_action_rx().unwrap();
     let chat = chat();
     park_and_move(&reg, &host, &chat, FIRST_ID, true);
@@ -214,7 +214,7 @@ fn a_user_stop_reaches_the_cancel_hook_as_a_cancel() {
 
 #[test]
 fn a_stop_that_times_out_still_delivers_the_late_result_quietly() {
-    let (reg, host) = host();
+    let (reg, mut host) = host();
     let mut ui = host.take_ui_action_rx().unwrap();
     let chat = chat();
     park_and_move(&reg, &host, &chat, FIRST_ID, false);

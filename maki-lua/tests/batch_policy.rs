@@ -1524,7 +1524,7 @@ impl MovableBatch {
         tool_calls: Value,
         permissions: PluginPermissions,
     ) -> (Self, JoinHandle<ToolDoneEvent>) {
-        let (reg, host) = load_batch_host_as(MOVABLE_CHILD_SRC, permissions);
+        let (reg, mut host) = load_batch_host_as(MOVABLE_CHILD_SRC, permissions);
         let ui = host.take_ui_action_rx().unwrap();
         let Chat { id, mailbox, seed } = Chat::live();
         let (run, run_token) = CancelToken::new();

@@ -4638,7 +4638,7 @@ fn register_command_nargs_values(nargs_field: &str) -> usize {
 #[test_case::test_case("a  b c", "a  b c|a,b,c" ; "raw_text_and_split_list")]
 #[test_case::test_case("", "|" ; "empty_args")]
 fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
-    let host = PluginHost::new(fresh_registry()).unwrap();
+    let mut host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source(
         "p",
         r#"
@@ -4671,7 +4671,7 @@ const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
 #[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
 #[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
 fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash: &str) {
-    let host = PluginHost::new(fresh_registry()).unwrap();
+    let mut host = PluginHost::new(fresh_registry()).unwrap();
     let mut perms = maki_lua::PluginPermissions::trusted();
     perms.set(maki_lua::Permission::Agent, false);
     host.load_source_with_permissions(
@@ -7134,7 +7134,7 @@ fn interpreter_bridge_flattens_image_with_visibility_note() {
 /// unrelated lua-thread event.
 #[test]
 fn async_run_from_parked_command_handler_runs_promptly() {
-    let host = PluginHost::new(fresh_registry()).unwrap();
+    let mut host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source(
         "p",
         r#"
@@ -7164,7 +7164,7 @@ fn async_run_from_parked_command_handler_runs_promptly() {
 /// (the homepage `/standup` example: jobstart, then a `win:recv` loop).
 #[test]
 fn job_callbacks_fire_while_command_handler_parked() {
-    let host = PluginHost::new(fresh_registry()).unwrap();
+    let mut host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source(
         "p",
         r#"
@@ -8332,7 +8332,7 @@ fn handed_over_history(
 #[test]
 fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
     let seed = mailbox.publish_seed(stub_seed(session));
@@ -8390,7 +8390,7 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
 #[test]
 fn stopping_a_plugin_task_from_the_tab_ends_its_prompt_as_stopped_by_user() {
     let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
     let seed = mailbox.publish_seed(stub_seed(session));
@@ -8435,7 +8435,7 @@ fn stopping_a_plugin_task_from_the_tab_ends_its_prompt_as_stopped_by_user() {
 #[test]
 fn opening_a_background_session_shows_its_task_before_any_prompt() {
     let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
     let _seed = mailbox.publish_seed(stub_seed(session));
@@ -8473,7 +8473,7 @@ fn opening_a_background_session_shows_its_task_before_any_prompt() {
 #[test]
 fn a_retired_background_session_refuses_later_prompts() {
     let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
     let seed = mailbox.publish_seed(stub_seed(session));
@@ -9183,7 +9183,7 @@ mod session_owned_ui {
     }
 
     /// Waits, since a `maki.async.run` window opens after the call returns.
-    fn opened_in(host: &PluginHost) -> Option<MakiId> {
+    fn opened_in(host: &mut PluginHost) -> Option<MakiId> {
         let mut rx = host.take_ui_action_rx().unwrap();
         loop {
             if let maki_lua::UiAction::OpenWin { session, .. } =
@@ -9206,18 +9206,18 @@ mod session_owned_ui {
     #[test_case::test_case(false ; "handler")]
     #[test_case::test_case(true ; "async_run_under_handler")]
     fn window_goes_to_the_calling_session(deferred: bool) {
-        let (reg, host) = host();
+        let (reg, mut host) = host();
         let caller = MakiId::generate();
 
         let input = json!({ "deferred": deferred });
         exec_with_ctx(&reg, OPEN_TOOL, input, &ctx_in(caller)).unwrap();
 
-        assert_eq!(opened_in(&host), Some(caller));
+        assert_eq!(opened_in(&mut host), Some(caller));
     }
 
     #[test]
     fn explicit_session_wins_over_the_caller() {
-        let (reg, host) = host();
+        let (reg, mut host) = host();
         let named = MakiId::generate();
 
         exec_with_ctx(
@@ -9228,19 +9228,19 @@ mod session_owned_ui {
         )
         .unwrap();
 
-        assert_eq!(opened_in(&host), Some(named));
+        assert_eq!(opened_in(&mut host), Some(named));
     }
 
     /// Nothing ties a command to a session, so the UI puts it on the
     /// focused tab.
     #[test]
     fn window_outside_a_tool_call_has_no_owner() {
-        let (_reg, host) = host();
+        let (_reg, mut host) = host();
 
         host.event_handle()
             .run_command(Arc::from(PLUGIN), Arc::from(COMMAND), String::new(), 0);
 
-        assert_eq!(opened_in(&host), None);
+        assert_eq!(opened_in(&mut host), None);
     }
 
     /// A typo here would quietly put the window or hint in the wrong tab.
