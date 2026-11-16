@@ -10,9 +10,9 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_providers::{Message, RequestOptions, Timeouts};
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
+use maki_storage::{StateDir, blocking};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -476,9 +476,11 @@ impl InteractiveHandle {
     }
 }
 
-pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, SessionEvents) {
+pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, SessionEvents) {
     let vars = template::env_vars();
-    let instructions = agent::load_instructions(&vars.apply("{cwd}"), &params.config.instructions);
+    let cwd = vars.apply("{cwd}").into_owned();
+    let config = params.config.instructions.clone();
+    let instructions = blocking(move || agent::load_instructions(&cwd, &config)).await;
     let spec = ContextSpec {
         host_prompt: params.host_prompt,
         background: params.background.seeded(),
@@ -949,7 +951,7 @@ mod tests {
     }
 
     /// A `max_turns` of zero ends every run before it would reach the provider.
-    fn spawn_listing_session(
+    async fn spawn_listing_session(
         tmp: &TempDir,
         model: Model,
         background: BackgroundMode,
@@ -983,6 +985,7 @@ mod tests {
             background,
             stop: CancelToken::none(),
         })
+        .await
     }
 
     #[tokio::test]
@@ -994,7 +997,8 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let (handle, mut events) =
-            spawn_listing_session(&tmp, plugin_model(ANSWERING_SLUG), BackgroundMode::Blocking);
+            spawn_listing_session(&tmp, plugin_model(ANSWERING_SLUG), BackgroundMode::Blocking)
+                .await;
 
         for _ in 0..2 {
             handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
@@ -1025,7 +1029,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let (handle, mut events) =
-            spawn_listing_session(&tmp, plugin_model(FAILING_SLUG), BackgroundMode::Detached);
+            spawn_listing_session(&tmp, plugin_model(FAILING_SLUG), BackgroundMode::Detached).await;
         let slot_window = || {
             AgentSeed::live(handle.session_id.id())
                 .expect(SEED_PUBLISHED)

@@ -305,7 +305,8 @@ async fn new_session(
         mcp,
         project_config,
         None,
-    );
+    )
+    .await;
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
     let spec = params.model.spec();
     let resp = methods::new_session_response(session_ref.as_str())
@@ -383,7 +384,8 @@ async fn load_session(
         mcp,
         project_config,
         restored_cost,
-    );
+    )
+    .await;
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
     let spec = params.model.spec();
     let resp = methods::load_session_response()
@@ -443,7 +445,7 @@ fn iso_from_epoch(secs: u64) -> Option<String> {
 /// alone is not a useful state: the event stream has exactly one reader, so it
 /// must be handed to the pump here rather than travel any further.
 #[allow(clippy::too_many_arguments)]
-fn start_session(
+async fn start_session(
     srv: &mut Server,
     params: &AcpParams,
     cwd: PathBuf,
@@ -498,7 +500,8 @@ fn start_session(
         },
         // `close_session` ends it, on a stop as on end of input.
         stop: CancelToken::none(),
-    });
+    })
+    .await;
     let session_ref = handle.session_id.clone();
     start_event_pump(
         events,
