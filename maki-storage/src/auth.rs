@@ -1,10 +1,9 @@
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::thread::sleep;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -22,6 +21,11 @@ const PLUGIN_AUTH_DIR: &str = "plugins";
 const AUTH_FILE_MODE: u32 = 0o600;
 const REFRESH_BUFFER_SECS: u64 = 60;
 const LOCK_SUFFIX: &str = ".lock";
+/// Refresh tokens rotate and a rotated one is single use, so two processes
+/// refreshing at once leave the loser replaying a spent token, which providers
+/// answer by revoking the whole family instead of failing the one call. Waiting
+/// forever on a stuck holder would be worse than the race though, so a lock
+/// that does not arrive in time is given up and the caller carries on as before.
 const LOCK_WAIT: Duration = Duration::from_secs(30);
 const LOCK_POLL: Duration = Duration::from_millis(50);
 /// RFC 7591 §3.2.1: a `client_secret_expires_at` of 0 means the secret never
@@ -93,37 +97,8 @@ impl ProviderCredentials {
     }
 }
 
-/// Refresh tokens rotate and a rotated one is single use, so two processes
-/// refreshing at once leave the loser replaying a spent token, which providers
-/// answer by revoking the whole family instead of failing the one call. Waiting
-/// forever would be worse than the race though, since this runs on the ui
-/// thread too, so a lock that does not arrive in time is given up and the
-/// caller carries on as before.
-pub fn lock_exclusive(path: &Path) -> Option<File> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => {
-            fs::create_dir_all(path.parent()?).ok()?;
-            OpenOptions::new()
-                .write(true)
-                .truncate(false)
-                .create(true)
-                .open(path)
-                .ok()?
-        }
-    };
-    let deadline = Instant::now() + LOCK_WAIT;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Some(file),
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => sleep(LOCK_POLL),
-            Err(_) => return None,
-        }
-    }
-}
-
 /// Every write replaces the token file, so the lock sits beside it under a name
-/// no loader reads. Waits like [`lock_exclusive`], on the timer.
+/// no loader reads.
 pub async fn lock_tokens_async(dir: &StateDir, provider: &str) -> Option<Lock> {
     let path = auth_path(dir, &format!("{provider}{LOCK_SUFFIX}"));
     Lock::acquire_within(&path, LOCK_WAIT, LOCK_POLL)
@@ -136,10 +111,11 @@ pub async fn lock_mcp_auth_async(dir: &StateDir, server_name: &str) -> Option<Lo
     lock_tokens_async(dir, &mcp_auth_name(server_name)).await
 }
 
-/// The cross-process half of [`lock_credentials`]: a plugin provider's store,
-/// locked against every other maki process.
-pub fn lock_plugin_store(dir: &StateDir, slug: &str) -> Option<File> {
-    lock_exclusive(&plugin_auth_path(dir, &format!("{slug}{LOCK_SUFFIX}")))
+/// The cross-process half of [`lock_credentials_async`]: a plugin provider's
+/// store, locked against every other maki process.
+pub async fn lock_plugin_store_async(dir: &StateDir, slug: &str) -> Option<Lock> {
+    let path = plugin_auth_path(dir, &format!("{slug}{LOCK_SUFFIX}"));
+    Lock::acquire_within(&path, LOCK_WAIT, LOCK_POLL).await.ok()
 }
 
 /// The slugs this process currently holds the credential lock for.
@@ -166,32 +142,33 @@ static HELD_CREDENTIALS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// in one atomic step, so the loser of such a race loses its whole write and
 /// never half of it, and both values were minted by the same plugin.
 pub struct CredentialLock {
-    /// Set only on the guard that claimed the slug, so a re-entrant guard
-    /// releases nothing, and an early return or a panic inside a hook cannot
-    /// leak the claim either.
-    slug: Option<String>,
-    _file: Option<File>,
+    _outermost: Option<(Claim, Option<Lock>)>,
 }
 
-pub fn lock_credentials(dir: &StateDir, provider: &str) -> CredentialLock {
-    let claimed = HELD_CREDENTIALS.lock().unwrap().insert(provider.to_owned());
-    if !claimed {
-        return CredentialLock {
-            slug: None,
-            _file: None,
-        };
-    }
-    CredentialLock {
-        slug: Some(provider.to_owned()),
-        _file: lock_plugin_store(dir, provider),
+/// This process's hold on one slug, given back on drop, so neither an early
+/// return, a panic inside a hook nor a wait cut short can leak it.
+struct Claim(String);
+
+impl Claim {
+    fn take(slug: &str) -> Option<Self> {
+        let claimed = HELD_CREDENTIALS.lock().unwrap().insert(slug.to_owned());
+        claimed.then(|| Self(slug.to_owned()))
     }
 }
 
-impl Drop for CredentialLock {
+impl Drop for Claim {
     fn drop(&mut self) {
-        if let Some(slug) = self.slug.take() {
-            HELD_CREDENTIALS.lock().unwrap().remove(&slug);
-        }
+        HELD_CREDENTIALS.lock().unwrap().remove(&self.0);
+    }
+}
+
+pub async fn lock_credentials_async(dir: &StateDir, slug: &str) -> CredentialLock {
+    let Some(claim) = Claim::take(slug) else {
+        return CredentialLock { _outermost: None };
+    };
+    let file = lock_plugin_store_async(dir, slug).await;
+    CredentialLock {
+        _outermost: Some((claim, file)),
     }
 }
 
@@ -336,8 +313,8 @@ pub fn load_plugin_auth(dir: &StateDir, slug: &str) -> Option<PluginAuthData> {
 /// A fingerprint of what a plugin stored, or `None` when it stored nothing.
 /// A process compares two of these to notice that another one swapped the
 /// credentials. Hashing means it never keeps a second copy of the secret.
-pub fn plugin_auth_stamp(dir: &StateDir, slug: &str) -> Option<u64> {
-    let bytes = fs::read(plugin_auth_path(dir, slug)).ok()?;
+pub async fn plugin_auth_stamp_async(dir: &StateDir, slug: &str) -> Option<u64> {
+    let bytes = tokio::fs::read(plugin_auth_path(dir, slug)).await.ok()?;
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     Some(hasher.finish())
@@ -358,6 +335,7 @@ pub fn delete_plugin_auth(dir: &StateDir, slug: &str) -> Result<bool, StorageErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::poll;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
@@ -365,6 +343,8 @@ mod tests {
 
     const TEST_URL: &str = "https://mcp.example.com";
     const PLUGIN_SLUG: &str = "acme";
+    const WAITING_SLUG: &str = "acme-waiting";
+    const NO_STORE_LOCK: &str = "the plugin store lock could not be taken";
     const PLUGIN_TOKEN_KEY: &str = "access_token";
     const PLUGIN_TOKEN: &str = "tok-1";
     const MCP_SERVER: &str = "github";
@@ -459,19 +439,39 @@ mod tests {
     /// already holds the same slug's lock. Taking the file lock a second time
     /// would park the write for [`LOCK_WAIT`], so the nested guard must hold no
     /// file, and must leave the slug to the outer one when it goes.
-    #[test]
-    fn a_nested_credential_lock_takes_no_file_lock() {
+    #[tokio::test]
+    async fn a_nested_credential_lock_takes_no_file_lock() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let outer = lock_credentials(&dir, PLUGIN_SLUG);
+        let outer = lock_credentials_async(&dir, PLUGIN_SLUG).await;
 
-        let nested = lock_credentials(&dir, PLUGIN_SLUG);
-        assert!(nested._file.is_none());
+        let nested = lock_credentials_async(&dir, PLUGIN_SLUG).await;
+        assert!(nested._outermost.is_none());
 
         drop(nested);
-        assert!(HELD_CREDENTIALS.lock().unwrap().contains(PLUGIN_SLUG));
+        assert!(holds(PLUGIN_SLUG));
         drop(outer);
-        assert!(!HELD_CREDENTIALS.lock().unwrap().contains(PLUGIN_SLUG));
+        assert!(!holds(PLUGIN_SLUG));
+    }
+
+    #[tokio::test]
+    async fn a_credential_lock_dropped_while_waiting_gives_the_slug_back() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let _other_process = lock_plugin_store_async(&dir, WAITING_SLUG)
+            .await
+            .expect(NO_STORE_LOCK);
+
+        let mut waiting = Box::pin(lock_credentials_async(&dir, WAITING_SLUG));
+        assert!(poll!(waiting.as_mut()).is_pending());
+        assert!(holds(WAITING_SLUG));
+
+        drop(waiting);
+        assert!(!holds(WAITING_SLUG));
+    }
+
+    fn holds(slug: &str) -> bool {
+        HELD_CREDENTIALS.lock().unwrap().contains(slug)
     }
 
     #[test]

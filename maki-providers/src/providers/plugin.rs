@@ -9,9 +9,9 @@ use tokio::sync::mpsc::unbounded_channel;
 use arc_swap::ArcSwap;
 use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
-use maki_storage::auth::{lock_credentials, plugin_auth_stamp};
+use maki_storage::auth::{lock_credentials_async, plugin_auth_stamp_async};
 use maki_storage::id::SessionRef;
-use maki_storage::{StateDir, blocking, joined};
+use maki_storage::{StateDir, joined};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
@@ -1002,15 +1002,13 @@ impl AuthState {
         hook: &dyn Hook<AuthPurpose, PluginAuth>,
         purpose: AuthPurpose,
     ) -> Result<Recovery, AgentError> {
-        let owned = slug.to_owned();
-        let (_lock, stored) = blocking(move || match StateDir::resolve() {
+        let (_lock, stored) = match StateDir::resolve() {
             Ok(dir) => (
-                Some(lock_credentials(&dir, &owned)),
-                plugin_auth_stamp(&dir, &owned),
+                Some(lock_credentials_async(&dir, slug).await),
+                plugin_auth_stamp_async(&dir, slug).await,
             ),
             Err(_) => (None, None),
-        })
-        .await;
+        };
         let purpose = match purpose {
             AuthPurpose::Refresh
                 if self.gate.ran() && *self.store_seen.lock().unwrap() != stored =>
@@ -1039,8 +1037,10 @@ impl AuthState {
             .call(purpose)
             .await?
             .into_resolved(slug, &self.hosts())?;
-        let owned = slug.to_owned();
-        let stamp = blocking(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await;
+        let stamp = match StateDir::resolve() {
+            Ok(dir) => plugin_auth_stamp_async(&dir, slug).await,
+            Err(_) => None,
+        };
         let mut current = self.current.lock().unwrap();
         // A reload can narrow the hosts while the stamp is read. Vetted again
         // under `current`, this either sees the new list or `redeclare`, which
