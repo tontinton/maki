@@ -29,7 +29,6 @@ use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::TokenUsage;
 use maki_providers::model::Model;
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
@@ -258,7 +257,6 @@ pub struct PrintParams {
     /// The right to write [`Self::resumed`]'s session, taken when it was
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
-    pub storage: StateDir,
     /// How long to wait for background work once the prompt's run ends.
     /// `None` runs every call blocking instead.
     pub background_wait: Option<Duration>,
@@ -284,7 +282,6 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         host_prompt,
         resumed,
         claim,
-        storage,
         background_wait,
     } = params;
 
@@ -324,7 +321,6 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         initial_wd,
         resumed,
         claim,
-        storage,
         yolo: false,
         unattended: true,
         host_prompt,
