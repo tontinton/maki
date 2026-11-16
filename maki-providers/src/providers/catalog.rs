@@ -35,7 +35,7 @@ use crate::providers::openai_compat::{
     DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
 };
 use crate::providers::{
-    ResolvedAuth, Timeouts, http_client, ok_sse, ok_text, opencode, plugin, status_and_text,
+    ResolvedAuth, Timeouts, http_client, ok_sse, opencode, plugin, status_and_text,
 };
 use crate::spec::ProviderRegistry;
 use crate::{
@@ -751,16 +751,12 @@ async fn init_catalog() -> CatalogData {
 /// lands once.
 pub(crate) struct CatalogTransport {
     chat_compat: OpenAiCompatProvider,
-    client: Client,
-    stream_timeout: Duration,
 }
 
 impl CatalogTransport {
     pub(crate) fn new(timeouts: Timeouts) -> Self {
         Self {
             chat_compat: OpenAiCompatProvider::new(&CATALOG_PROVIDER_CONFIG, timeouts),
-            client: http_client(timeouts),
-            stream_timeout: timeouts.stream,
         }
     }
 
@@ -808,8 +804,9 @@ impl CatalogTransport {
                 );
                 body["model"] = serde_json::json!(model.id);
                 body["stream"] = serde_json::json!(true);
+                let client = self.chat_compat.client();
                 let request = auth.finish(
-                    self.client
+                    client
                         .post(format!(
                             "{}{}",
                             auth.base_url.as_deref().unwrap_or(""),
@@ -820,7 +817,7 @@ impl CatalogTransport {
                         .body(serde_json::to_vec(&body)?),
                 )?;
                 debug!(model = %model.id, "sending Anthropic-format request via catalog");
-                ok_sse(&self.client, request, self.stream_timeout, |body| {
+                ok_sse(client, request, self.chat_compat.stream_timeout(), |body| {
                     anthropic::parse_sse(body, event_tx)
                 })
                 .await
@@ -948,9 +945,12 @@ impl Provider for CatalogProvider {
             if matches!(self.auth, CatalogAuth::FreeOnly(_)) {
                 return Ok(None);
             }
-            let auth = self.auth.unlocked(&self.data.slug)?.clone();
-            let request = auth.finish(self.transport.client.get(endpoint.url))?;
-            let body = ok_text(&self.transport.client, request).await?;
+            let auth = self.auth.unlocked(&self.data.slug)?;
+            let body = self
+                .transport
+                .chat_compat
+                .get_text(auth, endpoint.url)
+                .await?;
             (endpoint.parse)(&body).map(Some)
         })
     }
@@ -1084,13 +1084,15 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
-        SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
+        Authentication, CatalogData, CatalogMeta, CatalogTransport, EndpointType, ProviderData,
+        ProviderQuirks, SessionRef, StateDir, available_if_warm, determine_catalog_format,
+        parse_model, quirks_for,
     };
     use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::{ResolvedAuth, Timeouts, opencode};
     use crate::spec::ProviderRegistry;
+    use crate::test_support::{Canned, serve};
     use crate::{AgentError, Effort, ModelFamily, ModelTier, RequestOptions};
     use test_case::test_case;
 
@@ -1127,6 +1129,7 @@ mod tests {
     const MESSAGES_NPM: &str = "@ai-sdk/anthropic";
     const CATALOG_API_URL: &str = "https://catalog.example/v1";
     const LISTED_MODEL: &str = "listed";
+    const REJECTED: &[Canned] = &[Canned::json(401, r#"{"error":{"message":"no"}}"#)];
 
     #[test]
     fn new_rejects_no_auth() {
@@ -1277,6 +1280,34 @@ mod tests {
             result,
             Err(AgentError::Config { message }) if message.contains(OPT_IN_HINT)
         ));
+    }
+
+    #[test_case(EndpointType::ChatCompletions, "/v1/chat/completions" ; "chat_completions")]
+    #[test_case(EndpointType::Messages, "/v1/messages" ; "messages")]
+    #[tokio::test]
+    async fn transport_sends_each_wire_to_its_path(api_format: EndpointType, expected: &str) {
+        let (_tmp, state_dir) = temp_state_dir();
+        super::warm_empty_catalog_for_tests(state_dir);
+        let (base_url, requests) = serve(REJECTED);
+        let auth = ResolvedAuth::new(opencode::GO_SLUG, Vec::new())
+            .unwrap()
+            .with_base_url(Some(base_url));
+        let model = Model::from_spec(&format!("{}/{LISTED_MODEL}", opencode::GO_SLUG)).unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let _ = CatalogTransport::new(Timeouts::default())
+            .stream(
+                api_format,
+                &model,
+                &[],
+                "",
+                &serde_json::json!([]),
+                &tx,
+                &auth,
+                &RequestOptions::default(),
+            )
+            .await;
+
+        assert_eq!(requests.lock().unwrap()[0].path, expected);
     }
 
     #[tokio::test]
