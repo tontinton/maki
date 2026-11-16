@@ -34,6 +34,16 @@ function Trigger.find(text, cursor, triggers)
   return start - 1, typed:sub(2), lead
 end
 
+-- A slash command owns the input while the command palette is up, so there
+-- is nothing to complete in one. The palette handles its keys before any
+-- binding, so this is about the rows and not about the keys.
+-- Completion holds no `run`, so Enter would refuse a `!` line it wrote
+-- into. The shell would also read a path with a space or a `;` in it as
+-- more than one word.
+function Trigger.in_command(text)
+  return text:match("^%s*[/!]") ~= nil
+end
+
 -- The sources are only known once their slot has run, and running it is the
 -- refresh's job. So this cheap check only asks whether the word opens with
 -- punctuation some source could be listening for.

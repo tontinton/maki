@@ -24,10 +24,16 @@ Sources.declare()
 -- read it, so a caller has to be allowed to list files itself. The edit also
 -- costs `session_read`, like reading the input. Enter sends the path only
 -- when its writer could send a message, so that takes `agent` and
--- `session_write`. The callback holds only this list.
-maki.api.register_action("accept", Menu.accept_if_open, {
-  capability = { "fs_read", "input", "session_read", "agent", "session_write" },
-})
+-- `session_write`. The callbacks hold only this list.
+local WRITES_PATHS = { "fs_read", "input", "session_read", "agent", "session_write" }
+
+maki.api.register_action("accept", Menu.accept_if_open, { capability = WRITES_PATHS })
+
+-- Completes the word at the caret as a path. No key is bound to it, since
+-- `<Tab>` toggles the mode; the keybindings docs show how to bind it there.
+maki.api.register_action("path", function()
+  return Menu.complete_path(maki.ui.input())
+end, { capability = WRITES_PATHS })
 
 maki.api.create_autocmd("InputChanged", {
   callback = function(ev)

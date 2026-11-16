@@ -231,25 +231,31 @@ fn write_overrides(out: &mut String) {
     );
     out.push_str("### Composing keys\n\n");
     out.push_str(
-        "`Tab` switches between plan and build. To make it accept a file \
-         completion first while the completion menu is open, bind it in your \
-         `init.lua` and try each [action](/docs/lua-api/#maki-ui-action) in \
-         turn. `ev.fallback()` hands the key back to Maki when none of them \
-         took it:\n\n",
+        "`Tab` switches between plan and build. To make it accept a \
+         completion while the completion menu is open, and otherwise \
+         [complete the path](/docs/context/#completing-a-path) before the \
+         caret, bind it in your `init.lua` and try each \
+         [action](/docs/lua-api/#maki-ui-action) in turn. `ev.fallback()` \
+         hands the key back to Maki when none of them took it:\n\n",
     );
     out.push_str(
         "```lua\nmaki.keymap.set(\"i\", \"<Tab>\", function(ev)\n  \
          if maki.ui.action(\"completion.accept\") then return end\n  \
          if maki.ui.action(\"ghost.accept\") then return end\n  \
+         if maki.ui.action(\"completion.path\") then return end\n  \
          ev.fallback()\nend)\n```\n\n",
     );
     out.push_str(
         "`ghost.accept` stands for another plugin's action. An action returns \
          `true` when it handled the key. If its plugin is not installed or \
-         is disabled, it returns `nil` and the binding moves on.\n\n",
+         is disabled, it returns `nil` and the binding moves on. \
+         `completion.path` goes last, because it takes the key whenever there \
+         is a word before the caret. When there is none it returns `false`, \
+         so `Tab` in an empty input still switches modes.\n\n",
     );
     out.push_str(
-        "`completion.accept` writes file paths into the input, so calling it \
+        "`completion.accept` and `completion.path` write file paths into the \
+         input, so calling them \
          needs `fs_read`, `input` and `session_read` in \
          `~/.config/maki/plugin.toml` (see \
          [plugin permissions](/docs/lua-api/#plugin-permissions)):\n\n",

@@ -1,5 +1,6 @@
 local Events = require("events")
 local Menu = require("menu")
+local Path = require("path")
 local Sources = require("sources")
 local Trigger = require("trigger")
 local th = require("maki.test_helpers")
@@ -127,6 +128,7 @@ local function harness(body)
     terminal_size = maki.ui.terminal_size,
     flash = maki.ui.flash,
     fuzzy_files = maki.fs.fuzzy_files,
+    dir = maki.fs.dir,
     session = maki.session.read,
     run = maki.async.run,
     create_autocmd = maki.api.create_autocmd,
@@ -157,6 +159,9 @@ local function harness(body)
     -- the event payload already carries what it would answer.
     input_calls = 0,
     session_reads = 0,
+    -- Directory listings by path, and how many the menu read.
+    dirs = {},
+    dir_reads = 0,
     -- Refreshes handed off and not run yet; see `h.defer`.
     pending = {},
     -- Deadlines armed and not run yet; see `h.fire_timers`.
@@ -232,6 +237,10 @@ local function harness(body)
     end
     return h.found
   end
+  maki.fs.dir = function(path)
+    h.dir_reads = h.dir_reads + 1
+    return h.dirs[path]
+  end
   maki.session.read = function()
     h.session_reads = h.session_reads + 1
     return { cwd = "." }
@@ -278,7 +287,7 @@ local function harness(body)
   maki.ui.input, maki.ui.input_edit = saved.input, saved.input_edit
   maki.ui.buf, maki.ui.open_win = saved.buf, saved.open_win
   maki.ui.terminal_size, maki.ui.flash = saved.terminal_size, saved.flash
-  maki.fs.fuzzy_files = saved.fuzzy_files
+  maki.fs.fuzzy_files, maki.fs.dir = saved.fuzzy_files, saved.dir
   maki.session.read, maki.async.run = saved.session, saved.run
   maki.api.create_autocmd, maki.api.del_autocmd = saved.create_autocmd, saved.del_autocmd
   maki.defer_fn = saved.defer_fn
@@ -1139,6 +1148,163 @@ case("leaving_a_file_mention_ends_its_wait_on_the_walk", function()
     hh.fire_timers()
     eq(row(hh, 1), " " .. NO_MATCHES, "and gives up on a walk that never lands")
   end)
+end)
+
+-- Path completion. The harness reports the session's tree as `.`, so a
+-- listing is keyed by the path the menu joins onto it.
+
+local TREE = "."
+
+local function under(directory)
+  return maki.fs.joinpath(TREE, directory)
+end
+
+local function plant(h)
+  h.dirs[TREE] = {
+    { "src", "directory" },
+    { "tools", "directory" },
+    { "README.md", "file" },
+    { ".git", "directory" },
+  }
+  h.dirs[under("src/")] = { { "main.rs", "file" }, { "my file.rs", "file" }, { "lib.rs", "file" } }
+  h.dirs[under("tools/")] = { { "build.sh", "file" } }
+end
+
+local function draft(text)
+  return { text = text, cursor = #text, version = 1, session_id = SESSION }
+end
+
+case("path_token_before_reads_quotes_the_way_a_shell_does", function()
+  for _, c in ipairs({
+    { [[cat a\ b]], 4, "a b", nil },
+    { [[cat "a\b]], 4, [[a\b]], '"' },
+    { [[cat "a\"b]], 4, [[a"b]], '"' },
+    { [[cat "a\\b]], 4, [[a\b]], '"' },
+    { [[cat 'a\b]], 4, [[a\b]], "'" },
+    { [[cat 'it'\''s]], 4, "it's", "'" },
+  }) do
+    local start, token, quote = Path.token_before(c[1])
+    eq(start, c[2], c[1])
+    eq(token, c[3], c[1])
+    eq(quote, c[4], c[1])
+  end
+end)
+
+case("path_encode_reads_back_unchanged", function()
+  for _, path in ipairs({ "plain", "my file", [[a\b]], [[a"b$c`d]], "it's" }) do
+    for _, quote in ipairs({ false, "'", '"' }) do
+      local _, token = Path.token_before(Path.encode(path, quote or nil))
+      eq(token, path, path)
+    end
+  end
+end)
+
+case("complete_path_leaves_words_it_does_not_own_to_the_key", function()
+  harness(function(hh)
+    plant(hh)
+    for _, st in ipairs({
+      draft("see "),
+      draft("see @src"),
+      draft("/model sr"),
+      draft("!ls sr"),
+      { text = "cat src", cursor = 5, version = 1, session_id = SESSION },
+      { text = "cat src", cursor = 7, anchor = 4, version = 1, session_id = SESSION },
+    }) do
+      eq(Menu.complete_path(st), false, st.text)
+    end
+    eq(hh.opens, 0, "and opens nothing")
+  end)
+end)
+
+case("complete_path_inserts_a_lone_prefix_match_with_a_space", function()
+  local h = harness(function(hh)
+    plant(hh)
+    eq(Menu.complete_path(draft("open src/ma")), true)
+  end)
+  eq(h.opens, 0, "no popup for one obvious answer")
+  eq(h.edits[1].start, 5, "the word starts after `open `")
+  eq(h.edits[1].stop, #"open src/ma")
+  eq(h.edits[1].text, "src/main.rs ")
+end)
+
+case("complete_path_leaves_the_caret_inside_a_directory", function()
+  local h = harness(function(hh)
+    plant(hh)
+    Menu.complete_path(draft("cd sr"))
+  end)
+  eq(h.edits[1].text, "src/", "no space, so the next press goes on inside it")
+end)
+
+case("complete_path_escapes_and_closes_an_open_quote_after_a_file", function()
+  local h = harness(function(hh)
+    plant(hh)
+    Menu.complete_path(draft("cat src/my"))
+    Menu.complete_path(draft("cat 'src/my"))
+    Menu.complete_path(draft('cat "src/my'))
+  end)
+  eq(h.edits[1].text, "src/my\\ file.rs ")
+  eq(h.edits[2].text, "'src/my file.rs' ")
+  eq(h.edits[3].text, '"src/my file.rs" ')
+end)
+
+case("complete_path_hides_dotfiles_until_the_word_asks", function()
+  local h = harness(function(hh)
+    plant(hh)
+    Menu.complete_path(draft("ls .g"))
+  end)
+  eq(h.edits[1].text, ".git/")
+end)
+
+case("complete_path_holds_the_key_on_no_match", function()
+  local h = harness(function(hh)
+    plant(hh)
+    eq(Menu.complete_path(draft("cat zzz")), true, "a typo does not fall through to the mode toggle")
+    eq(row(hh, 1), " " .. NO_MATCHES)
+  end)
+  eq(#h.edits, 0)
+end)
+
+case("complete_path_opens_a_popup_for_a_fuzzy_match_and_accepts_it", function()
+  local h = harness(function(hh)
+    plant(hh)
+    Menu.complete_path(draft("cat src/ain"))
+    eq(row(hh, 1), " main.rs", "the entry's name, not the whole path")
+    eq(#hh.edits, 0, "a match the word is not the start of is offered, not written")
+    Menu.accept()
+  end)
+  eq(h.edits[1].text, "src/main.rs ")
+  eq(h.opens, 1, "a file ends the completion")
+end)
+
+case("accepting_a_directory_reopens_the_popup_inside_it", function()
+  local h = harness(function(hh)
+    plant(hh)
+    Menu.complete_path(draft("cd s"))
+    eq(row(hh, 1), " src/")
+    hh.input = draft("cd src/")
+    Menu.accept()
+    eq(hh.opens, 2, "a second popup, on the directory's entries")
+    eq(row(hh, 1), " lib.rs")
+    hh.input = draft("cd src/lib.rs ")
+    Menu.accept()
+  end)
+  eq(h.edits[1].text, "src/")
+  eq(h.edits[2].text, "src/lib.rs ")
+  eq(h.edits[2].start, 3, "written over the whole word, directory included")
+end)
+
+case("a_path_popup_narrows_on_one_listing_and_closes_past_its_word", function()
+  local h = harness(function(hh)
+    plant(hh)
+    Menu.complete_path(draft("cat src/"))
+    eq(#hh.rows, 3)
+    Menu.refresh(draft("cat src/li"))
+    eq(row(hh, 1), " lib.rs")
+    eq(#hh.rows, 1)
+    Menu.refresh(draft("cat src/li "))
+    eq(Menu.session_id(), nil, "a space ends the word")
+  end)
+  eq(h.dir_reads, 1, "narrowing within a directory reads it once")
 end)
 
 th.report()

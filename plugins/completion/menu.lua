@@ -2,6 +2,7 @@
 -- and the edit that accepts a row.
 
 local ListPicker = require("maki.list_picker")
+local Path = require("path")
 local Sources = require("sources")
 local Trigger = require("trigger")
 
@@ -41,6 +42,8 @@ local SOURCE_WAIT_MS = 1000
 -- The user pressed Enter on a row and got nothing. Saying so beats leaving
 -- them looking at a popup that did not answer the key it advertised.
 local EDIT_REFUSED = "completion: the path was not inserted: "
+-- What follows an inserted mention, so the user can type on.
+local MENTION_TAIL = " "
 
 -- `{ win, buf, sel, view }`. A view is what one refresh drew: the input
 -- snapshot, the mention, the rows, and what is still on its way. Every row
@@ -161,6 +164,23 @@ end
 -- A refusal is still the end of the key, but not of the user's question: they
 -- pressed Enter on a row and the path is not there. The host knows why, so
 -- pass its answer on instead of dropping it.
+local function write(start, choice)
+  local edited, err = maki.ui.input_edit({
+    start = start,
+    stop = choice.st.cursor,
+    text = choice.insert .. (choice.tail or MENTION_TAIL),
+    version = choice.st.version,
+    session_id = choice.st.session_id,
+  })
+  if not edited then
+    maki.ui.flash(EDIT_REFUSED .. tostring(err))
+  end
+  return edited
+end
+
+-- Accepting a directory reopens the popup inside it, the way a shell lists
+-- what is in a directory it just completed. The input is read back rather
+-- than worked out, because the host may have moved the edit past typing.
 function M.accept()
   local view = popup and popup.view
   local choice = view and view.items[popup.sel]
@@ -171,15 +191,10 @@ function M.accept()
     return M.close()
   end
   M.close()
-  local edited, err = maki.ui.input_edit({
-    start = view.start,
-    stop = choice.st.cursor,
-    text = choice.insert .. " ",
-    version = choice.st.version,
-    session_id = choice.st.session_id,
-  })
-  if not edited then
-    maki.ui.flash(EDIT_REFUSED .. tostring(err))
+  if write(view.start, choice) and choice.directory then
+    maki.async.run(function()
+      M.open_paths(maki.ui.input())
+    end)
   end
 end
 
@@ -434,6 +449,8 @@ end
 --
 -- `ranking` starts true for `@`, because a source can answer and paint before
 -- the files are ranked. Also returns whether the old rows were carried over.
+--
+-- A path view is built by {path_view} instead, since it asks no source.
 local function new_view(st, start, trigger, asked)
   local prior = popup and popup.view
   local same = prior and prior.trigger == trigger and prior.start == start
@@ -500,6 +517,70 @@ local function ask_sources(view, asked, query, root, stale)
   end, SOURCE_WAIT_MS)
 end
 
+-- A path popup opens on a key, not on the text, so a refresh still in flight
+-- for the keystroke before must not paint over it, and a wait on a walk has
+-- no rows left to fill in.
+local function take_over()
+  latest = latest + 1
+  unwatch()
+end
+
+-- The entries of the directory the word at {st}'s caret names, or nil when
+-- there is no word to complete. {listing} is the directory the view before
+-- read, which saves reading it again while the word stays in it.
+local function path_view(st, listing)
+  local start, token, quote = Path.word(st)
+  local root = start and tree_of(st.session_id)
+  if not root then
+    return nil
+  end
+  local rows, read = Path.rows(token, quote, root, listing)
+  return {
+    st = st,
+    start = start,
+    trigger = Path.TRIGGER,
+    files = ranked_for(rows, st),
+    listing = read,
+    answers = {},
+    order = {},
+    waiting = {},
+    items = {},
+  }
+end
+
+-- Opens the path popup on the word at {st}'s caret, when it names any entry.
+function M.open_paths(st)
+  local view = path_view(st)
+  if view and #view.files > 0 then
+    take_over()
+    paint(view)
+  end
+end
+
+-- Backs the `completion.path` action: completes the word at {st}'s caret as a
+-- path. One entry that the word is the start of goes straight in, which is
+-- what makes repeated presses walk down a tree. Anything else opens the popup,
+-- also on no match, so a key that falls back on a miss does not do something
+-- else over a typo.
+--
+-- Returns false when there is no word to complete, so the caller's key can go
+-- on and do what it does otherwise.
+function M.complete_path(st)
+  local view = path_view(st)
+  if not view then
+    return false
+  end
+  local only = view.files[1]
+  if #view.files == 1 and only.prefix then
+    M.close()
+    write(view.start, only)
+    return true
+  end
+  take_over()
+  paint(view)
+  return true
+end
+
 -- The one place that decides whether there should be a popup at all, and what
 -- is in it.
 --
@@ -519,6 +600,19 @@ function M.refresh(st)
     return generation ~= token or latest ~= mine
   end
 
+  -- A path popup narrows for as long as the caret stays in the word it opened
+  -- on. Leaving that word ends it, and the text may then hold a mention.
+  local prior = popup and popup.view
+  if prior and prior.trigger == Path.TRIGGER then
+    local view = path_view(st, prior.listing)
+    if view and view.start == prior.start then
+      if not stale() then
+        paint(view)
+      end
+      return
+    end
+  end
+
   -- Gathered on every keystroke rather than kept, so a plugin loaded or
   -- unloaded mid-session counts from the very next key.
   local sources = Sources.collect()
@@ -526,13 +620,7 @@ function M.refresh(st)
     return
   end
   local start, query, trigger = Trigger.find(st.text, st.cursor, Trigger.FILES .. Sources.triggers(sources))
-  -- A slash command owns the input while the command palette is up, so there
-  -- is no mention to complete in one. The palette handles its keys before any
-  -- binding, so this is about the rows and not about the keys.
-  -- Completion holds no `run`, so Enter would refuse a `!` line it wrote
-  -- into. The shell would also read a path with a space or a `;` in it as
-  -- more than one word.
-  if not start or st.text:match("^%s*[/!]") then
+  if not start or Trigger.in_command(st.text) then
     return M.close()
   end
 

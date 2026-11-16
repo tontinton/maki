@@ -199,6 +199,25 @@ On a large repository the first index walk takes a moment. The popup shows `scan
 
 Plugins can add their own entries to the popup, such as issues after `#` or people after `@`. See [completion sources](/docs/hooks/#completion-sources).
 
+## Completing a path
+
+The `completion.path` action completes the word before the caret as a path, the way a shell does. It lists one directory at a time, starting from the session's working directory, or from `/` or `~/` when the word starts there. No key runs it by default, because `Tab` switches between plan and build. [Composing keys](/docs/keybindings/#composing-keys) shows how to put it on `Tab`.
+
+```
+> cat src/co
+         ╭─────────────────────────────────╮
+         │ completion.rs                   │
+         │ components/                     │
+         ╰ ↑/↓ move Enter insert Esc close ╯
+```
+
+- When one entry starts with the word, it goes in at once. A file gets a space after it. A directory keeps the caret inside it, so pressing the key again goes one level deeper.
+- Otherwise the popup opens and takes the same keys as the `@` popup. Keep typing to narrow it. Accepting a directory opens the popup again on what is inside.
+- With no match, the popup says `no matches`, so a typo does not switch the mode.
+- Spaces and other shell characters get a backslash. Inside an open `'` or `"` they stay as typed, and the quote closes after a file.
+- Dotfiles show once the name starts with `.`.
+- Words starting with `@`, `$` or `!` are left to their own completers, and lines starting with `/` or `!` are left alone.
+
 ## When the window fills
 
 Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/compact keep the repro steps` steers that one summary, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers every summary. The [compaction tier](/docs/providers/) model writes the summary when one is set. If the summary comes back empty twice, the session stays as it was.
