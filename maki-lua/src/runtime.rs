@@ -2611,18 +2611,18 @@ async fn deliver_pending(
     }
 }
 
-/// Deliver what {job_id} has queued, then leave {delivering} so the next
-/// event it queues gets a task again. The delivery scope republishes the
-/// task handle across callback yields: an unscoped resume would run with no
-/// task, out of the watchdog's reach.
-async fn deliver_job(lua: Lua, job_id: u32, delivering: Rc<RefCell<HashSet<u32>>>) {
+/// Deliver what {job_id} has queued. The job watch starts a task for the
+/// job's next event only once this one has finished, so it returns as soon
+/// as it finds the queue empty. The delivery scope republishes the task
+/// handle across callback yields: an unscoped resume would run with no task,
+/// out of the watchdog's reach.
+async fn deliver_job(lua: Lua, job_id: u32) {
     let scope = TaskScope::delivery(&lua);
     scope
         .scope_future(deliver_pending(&lua, usize::MAX, || {
             with_jobs(&lua, |store| store.next_event_of(job_id)).map(|event| (job_id, event))
         }))
         .await;
-    delivering.borrow_mut().remove(&job_id);
 }
 
 impl Drop for ScopeEnd {
@@ -5853,15 +5853,15 @@ pub fn spawn(
                 local.spawn_local(async move {
                     // One task per job, so a callback parked on a prompt or a
                     // request holds back only its own job's events.
-                    let delivering = Rc::new(RefCell::new(HashSet::new()));
+                    let mut delivering = HashMap::<u32, LocalJoinHandle<()>>::new();
                     let mut jobs_changed = with_jobs(&lua, |s| s.subscribe());
                     jobs_changed.mark_changed();
                     while jobs_changed.changed().await.is_ok() {
+                        delivering.retain(|_, task| !task.is_finished());
                         for job_id in with_jobs(&lua, |s| s.plugin_jobs_with_events()) {
-                            if delivering.borrow_mut().insert(job_id) {
-                                let delivering = Rc::clone(&delivering);
-                                spawn_local(deliver_job(lua.clone(), job_id, delivering));
-                            }
+                            delivering
+                                .entry(job_id)
+                                .or_insert_with(|| spawn_local(deliver_job(lua.clone(), job_id)));
                         }
                     }
                 });
