@@ -50,7 +50,7 @@ use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::now_epoch;
 
-use crate::agent_autocmd::{HostEvent, MESSAGE_KEY};
+use crate::agent_autocmd::HostEvent;
 use crate::api::action::{ActionStore, clear_plugin_actions};
 use crate::api::agent::adopt_session;
 use crate::api::autocmd::AutocmdStore;
@@ -2553,14 +2553,8 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
             message,
         } => {
             let data = json_to_lua(lua, &data).unwrap_or(LuaValue::Nil);
-            if let (Some(message), LuaValue::Table(table)) = (message, &data)
-                && let Err(e) = crate::api::session::message_table(lua, &message)
-                    .and_then(|message| table.set(MESSAGE_KEY, message))
-            {
-                tracing::warn!(event, error = %e, "autocmd message not attached");
-            }
             let is_turn_end = event == TURN_END_EVENT;
-            crate::api::autocmd::dispatch(lua.clone(), event, None, data).await;
+            crate::api::autocmd::dispatch(lua.clone(), event, None, data, message).await;
             if is_turn_end {
                 collect_turn_garbage(lua);
             }
@@ -2581,7 +2575,8 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
             };
             let data =
                 json_to_lua(lua, &event.payload(Some(&end.session))).unwrap_or(LuaValue::Nil);
-            crate::api::autocmd::dispatch(lua.clone(), event.name().to_owned(), None, data).await;
+            crate::api::autocmd::dispatch(lua.clone(), event.name().to_owned(), None, data, None)
+                .await;
             with_jobs(lua, |store| store.kill_session(lua, end.session));
             BackgroundTasks::of(lua).end_session(end.session);
             // Nothing can pick from this session's plan form again.
