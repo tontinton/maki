@@ -77,6 +77,11 @@ pub enum StorageError {
 }
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
+    let target = fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_symlink())
+        .then(|| fs::canonicalize(path).ok())
+        .flatten();
+    let path = target.as_deref().unwrap_or(path);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(data)?;
@@ -188,6 +193,8 @@ pub async fn joined<T>(task: JoinHandle<T>) -> T {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::panic::panic_any;
 
     use test_case::test_case;
@@ -254,6 +261,22 @@ mod tests {
             fs::metadata(path).unwrap().permissions().mode() & FILE_MODE_MASK,
             MODE
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_a_symlinked_destination_linked() {
+        let dir = tempfile::tempdir().unwrap();
+        let linked = tempfile::tempdir().unwrap();
+        let target = linked.path().join("state");
+        let path = dir.path().join("state");
+        fs::write(&target, ORIGINAL).unwrap();
+        symlink(&target, &path).unwrap();
+
+        atomic_write(&path, REPLACEMENT).unwrap();
+
+        assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(fs::read(target).unwrap(), REPLACEMENT);
     }
 
     #[cfg(unix)]

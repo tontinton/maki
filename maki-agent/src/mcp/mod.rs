@@ -893,7 +893,13 @@ async fn handle_toggle(inner: &mut McpManagerInner, server_name: &str, enabled: 
         .find(|e| e.name == server_name)
         .map(|e| e.origin.clone())
     {
-        spawn_persist_enabled(path, server_name.to_owned(), enabled);
+        let name = server_name.to_owned();
+        if let Err(e) = spawn_blocking(move || config::persist_enabled(&path, &name, enabled))
+            .await
+            .unwrap_or_else(|e| Err(McpError::Config(e.to_string())))
+        {
+            warn!(error = %e, server = %server_name, "failed to persist MCP toggle");
+        }
     }
 
     if enabled {
@@ -1357,14 +1363,6 @@ fn tool_search_definition(deferred: &[&ToolDescriptor]) -> Value {
     })
 }
 
-fn spawn_persist_enabled(path: PathBuf, name: String, enabled: bool) {
-    spawn_blocking(move || {
-        if let Err(e) = config::persist_enabled(&path, &name, enabled) {
-            warn!(error = %e, server = %name, "failed to persist MCP toggle");
-        }
-    });
-}
-
 #[cfg(unix)]
 pub fn kill_process_groups(pids: &[u32]) {
     use crate::child_guard::sigkill_process_group;
@@ -1393,15 +1391,18 @@ mod tests {
     use super::*;
     use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
     use maki_providers::Role;
+    use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(unix)]
     use std::time::Instant;
     use test_case::test_case;
     use tokio::sync::{Mutex as AsyncMutex, Notify};
+    use toml_edit::DocumentMut;
 
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
     const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
     const MISSING_CA_FILE: &str = "/nonexistent/ca.pem";
+    const MCP_TOML: &str = "mcp.toml";
     const SERVER: &str = "srv";
     const CHALLENGE: &str = r#"Bearer resource_metadata="https://srv.example/.well-known""#;
 
@@ -2202,8 +2203,10 @@ mod tests {
 
     #[tokio::test]
     async fn disable_purges_entry_and_published_view() {
+        let dir = tempfile::tempdir().unwrap();
         let t = FakeTransport::new();
         let (mut inner, handle) = setup(vec![fake_entry("srv", Arc::clone(&t) as _)]);
+        inner.entries[0].origin = dir.path().join(MCP_TOML);
 
         assert!(handle.resolve(TOOL_NAME).is_some());
         let mut tools = json!([]);
@@ -2277,6 +2280,40 @@ mod tests {
         assert_eq!(t1.shutdowns(), 1);
         assert_eq!(t2.shutdowns(), 1);
         assert!(snapshot.load().infos.iter().all(|i| i.tool_count == 0));
+    }
+
+    #[tokio::test]
+    async fn toggles_persist_in_order_before_shutdown_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MCP_TOML);
+        let entries = ["a", "b"].map(|name| ServerEntry {
+            origin: path.clone(),
+            ..fake_entry(name, FakeTransport::new())
+        });
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        let loop_task = tokio::spawn(run(
+            McpManagerInner {
+                entries: entries.into(),
+                generation: 0,
+            },
+            Arc::new(ArcSwap::from_pointee(ToolIndex::default())),
+            Arc::new(ArcSwap::from_pointee(McpSnapshot::default())),
+            cmd_rx,
+            watch::channel(()).0,
+        ));
+
+        for (server, enabled) in [("a", false), ("b", false), ("a", true)] {
+            let server = server.into();
+            cmd_tx.send(McpCommand::Toggle { server, enabled }).unwrap();
+        }
+        let (ack_tx, ack_rx) = oneshot::channel();
+        cmd_tx.send(McpCommand::Shutdown { ack: ack_tx }).unwrap();
+        ack_rx.await.unwrap();
+
+        let doc: DocumentMut = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(doc["mcp"]["a"]["enabled"].as_bool(), Some(true));
+        assert_eq!(doc["mcp"]["b"]["enabled"].as_bool(), Some(false));
+        loop_task.await.unwrap();
     }
 
     #[test]
