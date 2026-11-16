@@ -327,7 +327,7 @@ impl LineCutter {
 
 /// The next line from `reader`, cut by a [`LineCutter`], or `None` at the end
 /// of the file.
-pub(crate) fn next_line(
+fn next_line(
     reader: &mut impl BufRead,
     max_bytes: Option<u64>,
     lossy: bool,
