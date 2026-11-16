@@ -12,7 +12,6 @@ use toml_edit::DocumentMut;
 
 const MCP_CONFIG_FILE: &str = "mcp.toml";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
-const MAX_TIMEOUT_MS: u64 = 300_000;
 const SECRET_NEEDS_CLIENT_ID: &str = "oauth.client_secret needs client_id";
 const HTTPS_CALLBACK_NEEDS_PORT: &str = "oauth.callback_scheme \"https\" needs callback_port to match the redirect URI registered with the provider";
 
@@ -331,9 +330,9 @@ pub fn parse_server(
             "server name '{name}' conflicts with built-in tool"
         )));
     }
-    if server.timeout == 0 || server.timeout > MAX_TIMEOUT_MS {
+    if server.timeout == 0 {
         return Err(McpError::Config(format!(
-            "server '{name}' timeout must be 1..={MAX_TIMEOUT_MS}"
+            "server '{name}' timeout must be > 1"
         )));
     }
     let transport = match server.transport {
@@ -625,7 +624,6 @@ environment = { GITHUB_TOKEN = "${MAKI_TEST_MCP_ENV_84421}" }
     }
 
     #[test_case(0               ; "zero")]
-    #[test_case(MAX_TIMEOUT_MS + 1 ; "over_max")]
     fn invalid_timeout_rejected(timeout: u64) {
         let mut cfg = stdio_raw(&["echo"]);
         cfg.timeout = timeout;
