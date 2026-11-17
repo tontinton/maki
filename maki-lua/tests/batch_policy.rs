@@ -6,6 +6,7 @@ mod common;
 use maki_lua::test_support::wait_next;
 use std::iter;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -649,6 +650,59 @@ fn children_overlap_and_output_keeps_input_order() {
         summary_all_ok(2)
     );
     assert_eq!(out, expected);
+}
+
+/// The restore batch's `RestoreDone` rides the same channel the renders did,
+/// so it lands after the last one by construction — the ordering a reloaded
+/// UI relies on before placing a carried view.
+#[test]
+fn restore_done_arrives_after_the_batch_renders() {
+    let (_reg, host) = load_batch_host();
+    let handle = host.event_handle();
+    let (tx, mut rx) = unbounded_channel();
+    handle.request_restore(
+        maki_lua::RestoreItem {
+            tool: Arc::from(BATCH_TOOL),
+            tool_use_id: BATCH_ID.to_owned(),
+            output: "restored output".to_owned(),
+            input: json!({ "calls": [] }),
+            is_error: false,
+            tool_output_lines: ToolOutputLines::default(),
+            theme_gen: None,
+            clicks: Vec::new(),
+            state: None,
+            task_id: None,
+            session_id: None,
+            reason: maki_lua::RestoreReason::default(),
+        },
+        EventSender::new(tx.clone(), 0),
+    );
+    let done = Arc::new(AtomicBool::new(true));
+    handle.send_restore_complete(Arc::clone(&done), EventSender::new(tx, 0));
+
+    poll_until("restore batch never completed", || {
+        (!done.load(Ordering::Relaxed)).then_some(())
+    });
+
+    let mut events = Vec::new();
+    while let Ok(envelope) = rx.try_recv() {
+        events.push(envelope.event);
+    }
+    let Some((last, renders)) = events.split_last() else {
+        panic!("the batch sent no events");
+    };
+    assert!(
+        matches!(last, AgentEvent::RestoreDone),
+        "RestoreDone rides the batch channel last, got {last:?}"
+    );
+    assert!(!renders.is_empty(), "the batch render comes before done");
+    assert!(
+        renders.iter().all(|e| matches!(
+            e,
+            AgentEvent::ToolSnapshot { .. } | AgentEvent::ToolHeaderSnapshot { .. }
+        )),
+        "only renders precede RestoreDone: {renders:?}"
+    );
 }
 
 fn restore_snapshot_lines(
