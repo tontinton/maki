@@ -134,7 +134,7 @@ fn builtins_host_with(config: &PluginsConfig) -> (Arc<ToolRegistry>, PluginHost)
 }
 
 /// A tool can be registered and still stay invisible to the model, so this
-/// goes through the definitions a real request is built from.
+/// reads the array under a request's filter. No describe fn is asked here.
 fn tool_description(reg: &ToolRegistry, agent: &maki_config::AgentConfig, name: &str) -> String {
     let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
     let filter = ToolFilter::from_config(agent, &model, &[]);
