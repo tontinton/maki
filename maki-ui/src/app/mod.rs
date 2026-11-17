@@ -81,7 +81,8 @@ use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
-use maki_storage::model::{persist_thinking, with_recent};
+use maki_storage::model::{persist_expanded_providers, persist_thinking, with_recent};
+use maki_storage::sessions::StoredThinking;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
@@ -925,7 +926,7 @@ impl App {
     /// Stores the clamped value rather than the typed one, so the status bar
     /// can never read `off` on a model that is really sending minimal effort.
     ///
-    /// The value is also written to disk here, and only here: the next run
+    /// The value is also queued for disk here, and only here: the next run
     /// seeds its sessions from it (`SessionDefaults`), the same way the model
     /// is remembered. A clamp on model change is not the user's choice, so it
     /// does not overwrite the file.
@@ -942,7 +943,9 @@ impl App {
             .map_err(str::to_owned)?
             .clamped(&self.state.model);
         self.state.pending_thinking = None;
-        persist_thinking(&self.storage, self.state.thinking.into());
+        let stored = StoredThinking::from(self.state.thinking);
+        self.storage_writer
+            .persist(move |dir| persist_thinking(dir, stored));
         Ok(self.state.thinking)
     }
 
@@ -1592,12 +1595,11 @@ impl App {
                     vec![Action::UnassignTier(spec, tier)]
                 }
                 // Saved right here instead of going through an `Action`. A fold
-                // only changes how the picker looks, and the state dir lives here.
+                // only changes how the picker looks, and the writer lives here.
                 ModelPickerAction::Folded => {
-                    maki_storage::model::persist_expanded_providers(
-                        &self.storage,
-                        self.model_picker.expanded_providers(),
-                    );
+                    let slugs = self.model_picker.expanded_providers().clone();
+                    self.storage_writer
+                        .persist(move |dir| persist_expanded_providers(dir, &slugs));
                     vec![]
                 }
                 ModelPickerAction::Login(slug) => {

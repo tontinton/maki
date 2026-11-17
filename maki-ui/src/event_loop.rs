@@ -8,7 +8,7 @@
 //! it wakes the moment any of them has something and never blocks a worker:
 //! it runs under `block_on` on the main thread.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::{pending, ready};
 use std::mem;
 use std::sync::Arc;
@@ -43,9 +43,10 @@ use maki_lua::{
     SessionRequest, TaskRequest, UiAction, UiReply, WinEvent,
 };
 use maki_providers::Timeouts;
+use maki_providers::model_registry;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
 use maki_providers::provider::{Provider, from_model};
-use maki_providers::{Message, Model};
+use maki_providers::{Message, Model, ModelTier};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::{persist_model, push_recent};
@@ -2204,10 +2205,10 @@ impl<'t> EventLoop<'t> {
             }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
-                maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
+                self.persist_tiers(model_registry::set(spec, tier));
             }
             Action::UnassignTier(spec, tier) => {
-                maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
+                self.persist_tiers(model_registry::unset(&spec, tier));
             }
             Action::Compact(instructions) => {
                 self.queue_compact(idx, instructions, CompactReason::Manual);
@@ -2365,6 +2366,12 @@ impl<'t> EventLoop<'t> {
         {
             self.focused_app().flash(e);
         }
+    }
+
+    fn persist_tiers(&self, overrides: BTreeMap<ModelTier, String>) {
+        self.ctx
+            .storage_writer
+            .persist(move |dir| model_registry::persist_overrides(dir, &overrides));
     }
 
     async fn shutdown(mut self) -> ShutdownReport {

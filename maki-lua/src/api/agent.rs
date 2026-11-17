@@ -3365,13 +3365,8 @@ mod tests {
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         ctx.model = Arc::new(Model::from_spec(SESSION_SPEC).unwrap());
         let ctx = AgentContext::from(&ctx);
-        let dir = tempfile::TempDir::new().unwrap();
         if let Some(spec) = assigned {
-            model_registry::set_and_persist(
-                spec.into(),
-                ModelTier::Weak,
-                &maki_storage::StateDir::from_path(dir.path().to_path_buf()),
-            );
+            model_registry::set(spec.into(), ModelTier::Weak);
         }
 
         let resolved = resolve_model_from_ctx(&ctx, Some(ModelTier::Weak.to_string().as_str()))

@@ -9960,7 +9960,7 @@ fn restored_and_switched_thinking_selects_a_declared_picker_row(
 #[test_case("off", ThinkingConfig::Off)]
 #[test_case("low", ThinkingConfig::Effort(Effort::Low))]
 fn explicit_thinking_choice_replaces_pending_level(input: &str, expected: ThinkingConfig) {
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let (_tmp, dir, writer, mut app) = tempdir_app();
     app.set_thinking("high").unwrap();
     let mut model = app.state.model.clone();
     model.thinking_override = Some(ThinkingSupport::No);
@@ -9975,7 +9975,8 @@ fn explicit_thinking_choice_replaces_pending_level(input: &str, expected: Thinki
 
     assert_eq!(app.state.thinking, expected);
     assert_eq!(app.state.session.meta.thinking, Some(expected.into()));
-    assert_eq!(read_thinking(&app.storage), Some(expected.into()));
+    drain_writer(app, writer);
+    assert_eq!(read_thinking(&dir), Some(expected.into()));
 }
 
 #[test_case(StoredThinking::Adaptive)]
