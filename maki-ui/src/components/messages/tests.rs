@@ -2901,6 +2901,36 @@ fn user_message_uses_user_bg_and_user_text() {
     assert_ne!(buf.cell((VIEW_WIDTH - 2, reply_row)).unwrap().bg, user_bg);
 }
 
+const THINKING_BG_THEME: &str = r##"
+[palette]
+surface = "#2e3141"
+[ui]
+thinking_bg = { bg = "surface" }
+"##;
+
+#[test_case(false ; "streaming")]
+#[test_case(true  ; "cached")]
+fn thinking_fills_its_rows_with_thinking_bg(flushed: bool) {
+    crate::theme::set(Theme::from_toml(THINKING_BG_THEME).unwrap());
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
+    add_thinking(&mut panel, "pondering", flushed);
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let buf = terminal.backend().buffer();
+    let thinking_bg = Color::Rgb(0x2e, 0x31, 0x41);
+    let thinking_row = row_of(&terminal, "pondering");
+    assert_eq!(buf.cell((0, thinking_row)).unwrap().bg, thinking_bg);
+    assert_eq!(
+        buf.cell((VIEW_WIDTH - 2, thinking_row)).unwrap().bg,
+        thinking_bg
+    );
+    let user_row = row_of(&terminal, "hello");
+    assert_ne!(
+        buf.cell((VIEW_WIDTH - 2, user_row)).unwrap().bg,
+        thinking_bg
+    );
+}
+
 /// `Chat::mark_finished` corrects a bubble long after it was drawn, with the
 /// transcript still growing in between. Unless `replace` throws the baked
 /// segments away, the viewport keeps painting a green "Done!" the message

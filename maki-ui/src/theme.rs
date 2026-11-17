@@ -386,6 +386,7 @@ named_styles!(t => {
     "tool_annotation" => t.tool_annotation,
     "spinner" => t.spinner,
     "thinking" => t.thinking,
+    "thinking_bg" => t.thinking_bg,
     "user_bg" => t.user_bg,
     "user_text" => t.user_text,
     "error" => t.error,
@@ -440,6 +441,7 @@ pub struct Theme {
     pub assistant: Style,
     pub assistant_prefix: Style,
     pub thinking: Style,
+    pub thinking_bg: Style,
     pub tool_bg: Style,
     pub tool: Style,
     pub tool_path: Style,
@@ -847,6 +849,7 @@ impl Theme {
                 color("foreground"),
                 0.3,
             ),
+            thinking_bg: style("thinking_bg"),
             tool_bg: style("tool_bg"),
             tool: style("tool"),
             tool_path: style("tool_path"),
@@ -1026,6 +1029,38 @@ mod tests {
     use super::*;
     use maki_highlight::UiStyle;
     use test_case::test_case;
+
+    const MIN_SURFACE_GAP: u32 = 6;
+
+    fn rgb_gap(a: Option<Color>, b: Option<Color>) -> Option<u32> {
+        match (a?, b?) {
+            (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => Some(
+                [(r1, r2), (g1, g2), (b1, b2)]
+                    .iter()
+                    .map(|&(x, y)| u32::from(x.abs_diff(y)))
+                    .sum(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Thinking sits right next to user messages and tool blocks, so a
+    /// surface one step off theirs reads as the same block.
+    #[test]
+    fn bundled_thinking_bg_stands_apart_from_user_and_tool_bg() {
+        for entry in BUNDLED_THEMES {
+            let t = Theme::from_toml(entry.toml).unwrap();
+            for (key, other) in [("user_bg", t.user_bg), ("tool_bg", t.tool_bg)] {
+                if let Some(gap) = rgb_gap(t.thinking_bg.bg, other.bg) {
+                    assert!(
+                        gap >= MIN_SURFACE_GAP,
+                        "{}: thinking_bg is {gap} away from {key}",
+                        entry.name
+                    );
+                }
+            }
+        }
+    }
 
     #[test_case(Color::Rgb(1, 2, 3), SegmentColor::Rgb((1, 2, 3)); "truecolor")]
     #[test_case(Color::Indexed(200), SegmentColor::Ansi(200); "indexed")]
@@ -1218,6 +1253,7 @@ scrollbar_thumb = { fg = "magenta", bg = "default" }
         let theme = Theme::from_toml(toml).unwrap();
         assert_eq!(theme.user, Style::default());
         assert_eq!(theme.user_bg, Style::default());
+        assert_eq!(theme.thinking_bg, Style::default());
         assert_eq!(theme.user_text, theme.assistant);
     }
 
@@ -1423,6 +1459,7 @@ diff_new_line_nr = { fg = "red" }
         let t = current();
         assert_eq!(style_by_name("user_bg"), t.user_bg);
         assert_eq!(style_by_name("user_text"), t.user_text);
+        assert_eq!(style_by_name("thinking_bg"), t.thinking_bg);
         assert_eq!(style_by_name("dim"), t.tool_dim);
         assert_eq!(style_by_name("tool_dim"), t.tool_dim);
         assert_eq!(style_by_name("path"), t.tool_path);

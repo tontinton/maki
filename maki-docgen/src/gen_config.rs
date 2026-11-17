@@ -158,6 +158,13 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
+        "Thinking uses `thinking` for its text and `thinking_bg` for the \
+         full-width background behind it. `thinking_bg` defaults to no \
+         background.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Diff signs use `diff_old_sign` and `diff_new_sign`, which default to \
          `diff_old` and `diff_new`. These styles are applied after `code_block`, \
          so their properties take precedence. Diff gutters use \
