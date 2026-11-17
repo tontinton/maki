@@ -537,6 +537,10 @@ Current plans:
 
 Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file.
 
+### Setting up a declared provider
+
+A custom entry that sets `protocol` shows `no key` in `/model` until it has a key. A provider whose model list fails shows `offline`, or `fallback` when it still has models to offer. Enter on a `no key` or `offline` row opens `/login` at that provider. A custom entry declared here starts on its prefilled `base_url`, so a moved endpoint is fixed before the key step. A blank key is accepted when the env var, inline key, or stored credential already provides one.
+
 ## Plugin Providers
 
 A [Lua plugin](/docs/plugins/) can add a provider. Call `maki.provider.register` at the top level of the plugin file, and its models become `{slug}/{model_id}` (e.g. `acme/acme-large`) in `/model` and the picker. They get the same retries, pricing and usage accounting as a built-in provider.

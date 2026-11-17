@@ -36,6 +36,9 @@ struct ProviderItem {
     has_key: bool,
     has_env: bool,
     configured: bool,
+    /// Explicitly declared in `providers.toml`: Enter edits its endpoint
+    /// before asking for the key.
+    from_config: bool,
     section: Option<&'static str>,
 }
 
@@ -109,6 +112,12 @@ enum Step {
         slug: String,
         protocol: String,
     },
+    EditEndpoint {
+        input: TextBuffer,
+        slug: String,
+        name: String,
+        api_key_optional: bool,
+    },
     BuiltinUrl {
         input: TextBuffer,
         slug: String,
@@ -149,6 +158,11 @@ enum StepAction {
         slug: String,
         protocol: String,
     },
+    GoEditEndpoint {
+        slug: String,
+        name: String,
+        api_key_optional: bool,
+    },
     GoBuiltinUrl {
         slug: String,
         display_name: String,
@@ -157,6 +171,9 @@ enum StepAction {
         message: String,
         model_spec: Option<String>,
         slug: String,
+        /// The endpoint was written to providers.toml, so the running
+        /// provider still points at the old URL until it is rebuilt.
+        url_changed: bool,
     },
     Back,
     Close,
@@ -195,6 +212,7 @@ impl LoginPicker {
                     has_key,
                     has_env,
                     configured,
+                    from_config: false,
                     section: None,
                 }
             })
@@ -204,17 +222,16 @@ impl LoginPicker {
             if slug == "opencode" || providers::builtin_provider(slug).is_some() {
                 continue;
             }
-            let has_key = load_provider_credentials(&storage, slug).is_some();
-            let has_env = def
-                .api_key_env
-                .as_deref()
-                .is_some_and(|e| std::env::var(e).is_ok());
+            let has_key =
+                load_provider_credentials(&storage, slug).is_some() || def.api_key.is_some();
+            let has_env = std::env::var(providers::resolve_api_key_env(slug, Some(def))).is_ok();
             items.push(ProviderItem {
                 slug: slug.clone(),
                 display_name: def.display_name.clone().unwrap_or_else(|| slug.clone()),
                 has_key,
                 has_env,
                 configured: false,
+                from_config: true,
                 section: None,
             });
         }
@@ -233,6 +250,7 @@ impl LoginPicker {
                     has_key,
                     has_env,
                     configured: false,
+                    from_config: false,
                     section: Some("Providers from Models.dev"),
                 });
             }
@@ -243,6 +261,7 @@ impl LoginPicker {
                 has_key: false,
                 has_env: false,
                 configured: false,
+                from_config: false,
                 section: Some("Providers from Models.dev"),
             });
         }
@@ -253,6 +272,7 @@ impl LoginPicker {
             has_key: false,
             has_env: false,
             configured: false,
+            from_config: false,
             section: None,
         });
 
@@ -285,6 +305,7 @@ impl LoginPicker {
             Step::EnterKey { input, .. }
             | Step::CustomName { input }
             | Step::CustomUrl { input, .. }
+            | Step::EditEndpoint { input, .. }
             | Step::BuiltinUrl { input, .. } => input.insert_text(text),
             Step::Closed | Step::Done { .. } => {}
         }
@@ -299,6 +320,16 @@ impl LoginPicker {
                         StepAction::None
                     } else if item.slug == "custom" {
                         StepAction::GoCustomName
+                    } else if item.from_config {
+                        let slug = item.slug.clone();
+                        let config = providers::ProvidersConfig::load();
+                        let display_name =
+                            providers::resolve_display_name(&item.slug, config.get(&item.slug));
+                        return self.transition(StepAction::GoEditEndpoint {
+                            slug,
+                            name: display_name,
+                            api_key_optional: item.has_key || item.has_env,
+                        });
                     } else {
                         let slug = item.slug.clone();
                         let config = providers::ProvidersConfig::load();
@@ -351,6 +382,44 @@ impl LoginPicker {
                 }
                 PickerAction::Close => StepAction::Back,
                 PickerAction::Consumed | PickerAction::Toggle(..) => {
+                    return LoginPickerAction::Consumed;
+                }
+            },
+            Step::EditEndpoint {
+                input,
+                slug,
+                name,
+                api_key_optional,
+            } => match key.code {
+                KeyCode::Enter => {
+                    let base_url = input.value().trim().to_string();
+                    // An empty field keeps the endpoint the entry already has
+                    // (or the protocol default), and an unchanged URL is not
+                    // handed on: the key step then leaves providers.toml
+                    // alone, comments and key order included.
+                    let saved = providers::ProvidersConfig::load()
+                        .get(slug)
+                        .and_then(|d| d.base_url.clone());
+                    let builtin_url = if base_url.is_empty() || Some(&base_url) == saved.as_ref() {
+                        None
+                    } else {
+                        Some(base_url)
+                    };
+                    // The entry already exists in providers.toml; only its
+                    // base_url changes here, so hand the key step no custom
+                    // info and let it update the existing entry.
+                    StepAction::GoEnterKey {
+                        slug: slug.clone(),
+                        plan: None,
+                        display_name: name.clone(),
+                        custom: None,
+                        builtin_url,
+                        api_key_optional: *api_key_optional,
+                    }
+                }
+                KeyCode::Esc => StepAction::Back,
+                _ => {
+                    input.handle_key(key);
                     return LoginPickerAction::Consumed;
                 }
             },
@@ -431,6 +500,7 @@ impl LoginPicker {
                     let storage = storage.clone();
                     let custom_c = custom.take();
                     let builtin_url_c = builtin_url.take();
+                    let url_changed = builtin_url_c.is_some();
 
                     let has_key = !api_key.is_empty();
                     if has_key {
@@ -443,6 +513,7 @@ impl LoginPicker {
                                 message: format!("Error: {e}"),
                                 model_spec: None,
                                 slug: slug_c.clone(),
+                                url_changed: false,
                             });
                         }
                     }
@@ -470,6 +541,7 @@ impl LoginPicker {
                                 message: format!("Error saving config: {e}"),
                                 model_spec: None,
                                 slug: slug_c.clone(),
+                                url_changed: false,
                             });
                         }
                     } else {
@@ -487,6 +559,7 @@ impl LoginPicker {
                                     message: format!("Error saving config: {e}"),
                                     model_spec: None,
                                     slug: slug_c.clone(),
+                                    url_changed: false,
                                 });
                             }
                         }
@@ -521,6 +594,7 @@ impl LoginPicker {
                         message: msg,
                         model_spec: default_model,
                         slug: slug_c.clone(),
+                        url_changed,
                     }
                 }
                 KeyCode::Esc => StepAction::Back,
@@ -596,6 +670,25 @@ impl LoginPicker {
                     None => LoginPickerAction::Consumed,
                 }
             }
+            StepAction::GoEditEndpoint {
+                slug,
+                name,
+                api_key_optional,
+            } => {
+                let url = providers::ProvidersConfig::load()
+                    .get(&slug)
+                    .and_then(|d| d.base_url.clone())
+                    .unwrap_or_default();
+                let mut input = TextBuffer::new(url);
+                input.move_end();
+                self.step = Step::EditEndpoint {
+                    input,
+                    slug,
+                    name,
+                    api_key_optional,
+                };
+                LoginPickerAction::Consumed
+            }
             StepAction::GoBuiltinUrl { slug, display_name } => {
                 let config = providers::ProvidersConfig::load();
                 let default =
@@ -655,10 +748,15 @@ impl LoginPicker {
                 message,
                 model_spec,
                 slug,
+                url_changed,
             } => {
                 self.step = Step::Done { message };
                 if let Some(spec) = model_spec {
-                    LoginPickerAction::Authenticated { model_spec: spec }
+                    LoginPickerAction::Authenticated {
+                        model_spec: spec,
+                        slug,
+                        url_changed,
+                    }
                 } else {
                     LoginPickerAction::Configured { slug }
                 }
@@ -694,6 +792,13 @@ impl LoginPicker {
                 area,
                 " Base URL ",
                 "Enter base URL, then Enter",
+                input,
+            ),
+            Step::EditEndpoint { input, .. } => input_step_view(
+                frame,
+                area,
+                " Base URL ",
+                "Edit base URL, then Enter",
                 input,
             ),
             Step::BuiltinUrl {
@@ -798,6 +903,7 @@ fn input_step_view(
     )
 }
 
+#[derive(Debug)]
 pub enum LoginPickerAction {
     Consumed,
     Close,
@@ -805,6 +911,10 @@ pub enum LoginPickerAction {
     OpenUrl(String),
     Authenticated {
         model_spec: String,
+        slug: String,
+        /// The endpoint was written, so the provider has to be rebuilt
+        /// before a model switch reuses the cached one.
+        url_changed: bool,
     },
     Configured {
         slug: String,
@@ -813,6 +923,8 @@ pub enum LoginPickerAction {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::KeyModifiers;
+    use maki_providers::test_support::isolated_home;
     use test_case::test_case;
 
     use super::*;
@@ -842,6 +954,7 @@ mod tests {
             has_key: false,
             has_env: false,
             configured: false,
+            from_config: false,
             section: None,
         }
     }
@@ -899,5 +1012,189 @@ mod tests {
             _ => panic!("{WRONG_STEP}"),
         };
         assert_eq!(selected.as_deref(), Some(SECOND_LABEL), "{WRONG_SELECTION}");
+    }
+
+    const SETUP_SLUG: &str = "declared-gateway";
+    const OLD_URL: &str = "https://old.example/v1";
+    const NEW_URL: &str = "https://new.example/v1";
+    const PRESERVED_ENV: &str = "DECLARED_GATEWAY_API_KEY";
+    const PRESERVED_PROTOCOL: &str = "anthropic";
+    const DISPLAY_NAME: &str = "Declared Gateway";
+
+    /// Seeds providers.toml and hands back the picker with its storage set.
+    /// The home guard and config path come back too, so tests can open the
+    /// picker or inspect the file after a step ran.
+    fn picker_with_config(seeded: &str) -> (tempfile::TempDir, std::path::PathBuf, LoginPicker) {
+        let home = isolated_home();
+        let config_dir = maki_storage::paths::config_dir().expect("config dir");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::write(config_dir.join("providers.toml"), seeded).expect("seed providers.toml");
+        let storage = StateDir::from_path(home.path().to_path_buf());
+        let mut picker = LoginPicker::new();
+        picker.storage = Some(storage);
+        (home, config_dir, picker)
+    }
+
+    fn endpoint_picker(
+        seeded: &str,
+        input: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, LoginPicker) {
+        let (home, config_dir, mut picker) = picker_with_config(seeded);
+        picker.step = Step::EditEndpoint {
+            input: TextBuffer::new(input.to_owned()),
+            slug: SETUP_SLUG.to_owned(),
+            name: DISPLAY_NAME.to_owned(),
+            api_key_optional: true,
+        };
+        (home, config_dir, picker)
+    }
+
+    /// A declared provider keeps protocol, api_key_env, models and headers
+    /// when the setup flow edits only its endpoint, and a written URL asks
+    /// for a provider rebuild so the model switch does not reuse the cached
+    /// one still pointing at the old address.
+    #[test]
+    fn setup_edits_only_the_endpoint_of_an_existing_entry() {
+        let (_home, _, mut picker) = endpoint_picker(
+            &format!(
+                "[{SETUP_SLUG}]\nprotocol = \"{PRESERVED_PROTOCOL}\"\nbase_url = \"{OLD_URL}\"\napi_key_env = \"{PRESERVED_ENV}\"\ndefault_model = \"kept-model\"\ndiscover_models = true\n\n[[{SETUP_SLUG}.models]]\nid = \"kept-model\"\ntier = \"strong\"\n"
+            ),
+            NEW_URL,
+        );
+        picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // The endpoint edit hands the key step no custom info...
+        let Step::EnterKey {
+            custom,
+            builtin_url,
+            ..
+        } = &picker.step
+        else {
+            panic!("the endpoint edit did not advance to the key step");
+        };
+        assert!(
+            custom.is_none(),
+            "an existing entry is updated, not rewritten"
+        );
+        assert_eq!(builtin_url.as_deref(), Some(NEW_URL));
+        // ...and the key step writes only base_url onto the loaded entry.
+        let action = picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let LoginPickerAction::Authenticated {
+            model_spec,
+            slug,
+            url_changed,
+        } = &action
+        else {
+            panic!("a default model ends the setup authenticated, got {action:?}");
+        };
+        assert_eq!(model_spec, "kept-model");
+        assert_eq!(slug, SETUP_SLUG);
+        assert!(url_changed, "a written URL must ask for a provider rebuild");
+
+        let saved = ProvidersConfig::load();
+        let def = saved.get(SETUP_SLUG).expect("the entry survives");
+        assert_eq!(def.base_url.as_deref(), Some(NEW_URL));
+        assert_eq!(
+            def.protocol,
+            Some(Protocol::Anthropic),
+            "the protocol is preserved"
+        );
+        assert_eq!(def.api_key_env.as_deref(), Some(PRESERVED_ENV));
+        assert_eq!(def.models.len(), 1, "the declared models are preserved");
+        assert!(def.discover_models, "discover_models is preserved");
+    }
+
+    /// An entry that leaves `base_url` to the protocol default or a
+    /// `<SLUG>_BASE_URL` env must still be set up: an empty endpoint field
+    /// keeps the current endpoint instead of swallowing Enter, and the key
+    /// step then leaves providers.toml byte-identical.
+    #[test]
+    fn empty_endpoint_field_keeps_the_current_endpoint() {
+        let seeded = format!(
+            "# keep this comment\n[{SETUP_SLUG}]\nprotocol = \"openai\"\napi_key_env = \"{PRESERVED_ENV}\"\n"
+        );
+        let (_home, config_dir, mut picker) = endpoint_picker(&seeded, "");
+        picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let Step::EnterKey { builtin_url, .. } = &picker.step else {
+            panic!("an empty endpoint must still advance to the key step");
+        };
+        assert!(
+            builtin_url.is_none(),
+            "nothing changed, no URL is handed on"
+        );
+        let action = picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(action, LoginPickerAction::Configured { .. }),
+            "no URL change must not end in a model switch, got {action:?}"
+        );
+
+        let after = std::fs::read_to_string(config_dir.join("providers.toml")).unwrap();
+        assert_eq!(after, seeded, "providers.toml must stay byte-identical");
+    }
+
+    /// Re-entering the endpoint that is already saved is not a change, so it
+    /// must not rewrite providers.toml either.
+    #[test]
+    fn unchanged_endpoint_is_not_written_back() {
+        let seeded = format!(
+            "# keep this comment\n[{SETUP_SLUG}]\nprotocol = \"openai\"\nbase_url = \"{OLD_URL}\"\n"
+        );
+        let (_home, config_dir, mut picker) = endpoint_picker(&seeded, OLD_URL);
+        picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let Step::EnterKey { builtin_url, .. } = &picker.step else {
+            panic!("the endpoint step must advance to the key step");
+        };
+        assert!(builtin_url.is_none(), "the saved URL is not a change");
+        let action = picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(action, LoginPickerAction::Configured { .. }),
+            "no URL change must not end in a model switch, got {action:?}"
+        );
+
+        let after = std::fs::read_to_string(config_dir.join("providers.toml")).unwrap();
+        assert_eq!(after, seeded, "providers.toml must stay byte-identical");
+    }
+
+    /// An inline `api_key` in providers.toml counts as a key, so the
+    /// setup flow accepts an empty answer instead of forcing a re-paste.
+    /// No storage credential exists: only the file's `api_key` can satisfy
+    /// the check, so the test fails if the fix is reverted.
+    #[test]
+    fn inline_api_key_counts_as_saved_auth() {
+        let (_home, _, mut picker) = picker_with_config(&format!(
+            "[{SETUP_SLUG}]\nprotocol = \"openai\"\nbase_url = \"{OLD_URL}\"\napi_key = \"inline-secret\"\n"
+        ));
+        let storage = StateDir::from_path(_home.path().to_path_buf());
+        assert!(
+            load_provider_credentials(&storage, SETUP_SLUG).is_none(),
+            "no storage credential exists for the slug"
+        );
+        picker.open(storage);
+        let item = picker
+            .provider_items
+            .iter()
+            .find(|i| i.slug == SETUP_SLUG)
+            .expect("listed");
+        assert!(item.has_key, "an inline api_key counts as a saved key");
+    }
+
+    /// A hand-written entry with no `api_key_env` falls back to the
+    /// documented `<SLUG>_API_KEY` name, so a blank key must be accepted.
+    #[test]
+    fn default_api_key_env_counts_as_saved_auth() {
+        let (_home, _, mut picker) =
+            picker_with_config(&format!("[{SETUP_SLUG}]\nprotocol = \"openai\"\n"));
+        let env_var = format!("{}_API_KEY", SETUP_SLUG.to_uppercase().replace('-', "_"));
+        // SAFETY: Nextest runs this test in its own process, before any thread.
+        unsafe { std::env::set_var(&env_var, "from-env") };
+        picker.open(StateDir::from_path(_home.path().to_path_buf()));
+        let item = picker
+            .provider_items
+            .iter()
+            .find(|i| i.slug == SETUP_SLUG)
+            .expect("listed");
+        assert!(item.has_env, "the default env var name must count");
+        unsafe { std::env::remove_var(&env_var) };
     }
 }
