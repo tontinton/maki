@@ -310,6 +310,10 @@ pub fn load_plugin_auth(dir: &StateDir, slug: &str) -> Option<PluginAuthData> {
     load_auth(&plugin_auth_path(dir, slug))
 }
 
+pub async fn load_plugin_auth_async(dir: &StateDir, slug: &str) -> Option<PluginAuthData> {
+    load_auth_async(&plugin_auth_path(dir, slug)).await
+}
+
 /// A fingerprint of what a plugin stored, or `None` when it stored nothing.
 /// A process compares two of these to notice that another one swapped the
 /// credentials. Hashing means it never keeps a second copy of the secret.
