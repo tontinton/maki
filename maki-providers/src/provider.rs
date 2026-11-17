@@ -11,13 +11,14 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use maki_config::ModelPolicy;
+use maki_storage::StateDir;
 use maki_storage::blocking;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo};
 use crate::model_registry::{discovery_complete, set_known_models};
 use crate::providers::catalog::{
-    available_if_warm, catalog_providers, catalog_providers_if_available, try_create,
+    ProviderData, available_if_warm, catalog_providers_if_available, shared_catalog, try_create,
 };
 use crate::providers::{KeyRotation, Timeouts, custom, plugin};
 use crate::spec::{Owner, ProviderRegistry, ProviderSpec};
@@ -96,6 +97,16 @@ pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provi
 
 pub fn provider_available(slug: &str) -> bool {
     provider_for_slug(slug, Timeouts::default()).is_ok()
+}
+
+/// [`provider_available`] for a models.dev entry, without building it. A
+/// `providers.toml` entry under the same slug is what [`provider_for_slug`]
+/// builds, so that one is asked the old way.
+fn catalog_entry_available(cat: &ProviderData, state_dir: &StateDir) -> bool {
+    match Owner::of(&cat.slug) {
+        Owner::Custom => provider_available(&cat.slug),
+        _ => cat.catalog_available(state_dir),
+    }
 }
 
 /// Non-blocking variant of [`provider_available`] for offline model discovery:
@@ -217,7 +228,9 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             specs.push(spec);
         }
     }
-    if let Some(catalog) = catalog_providers_if_available() {
+    if let Some(catalog) = catalog_providers_if_available()
+        && let Ok(state_dir) = StateDir::resolve()
+    {
         for cat in catalog {
             // Any slug the registry knows was listed above; see
             // `spec::tests::builtins_are_the_native_and_catalog_backed_slugs`.
@@ -226,7 +239,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             {
                 continue;
             }
-            if !provider_available(&cat.slug) {
+            if !cat.catalog_available(&state_dir) {
                 continue;
             }
             for model_id in cat.models.keys() {
@@ -289,17 +302,20 @@ pub(crate) async fn fetch_built(
 
     let tx_catalog = tx.clone();
     tokio::spawn(async move {
-        for cat in catalog_providers().await {
+        let catalog = shared_catalog().await;
+        let available = blocking(|| {
+            let mut providers = catalog.all_providers();
             // No `Owner::Custom` here, unlike `available_model_specs` above:
             // a long-standing asymmetry, changing it is a behaviour change.
-            if ProviderRegistry::get(&cat.slug).is_some()
-                || matches!(Owner::of(&cat.slug), Owner::Plugin)
-            {
-                continue;
-            }
-            if !provider_available(&cat.slug) {
-                continue;
-            }
+            providers.retain(|cat| {
+                ProviderRegistry::get(&cat.slug).is_none()
+                    && !matches!(Owner::of(&cat.slug), Owner::Plugin)
+                    && catalog_entry_available(cat, &catalog.state_dir)
+            });
+            providers
+        })
+        .await;
+        for cat in available {
             let slug = cat.slug.clone();
             let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
             let _ = tx_catalog.send(ModelBatch {
@@ -417,11 +433,18 @@ async fn remember_models(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashMap};
     use std::future::{pending, ready};
 
+    use maki_config::providers::{Protocol, ProviderDef, ProvidersConfig};
+    use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
     use test_case::test_case;
 
     use super::*;
+    use crate::providers::catalog::schema::CatalogProvider as CatalogEntry;
+    use crate::providers::catalog::{catalog_provider_if_available, seed_catalog_for_tests};
+    use crate::providers::opencode::GO_SLUG;
+    use crate::test_support::isolated_home;
 
     const SPEC_WITHOUT_THINKING: &str = "copilot";
     const LANDED_SLUG: &str = "ollama";
@@ -436,6 +459,15 @@ mod tests {
     const NO_ANSWER_KEEPS_LISTING: &str = "no answer keeps the last listing";
     const ROWS_COVER_IT: &str = "a provider its rows fully describe is never listed";
     const WAIT: Duration = Duration::from_millis(10);
+    const CATALOG_SLUG: &str = "acme-catalog";
+    const CATALOG_NPM: &str = "@ai-sdk/openai-compatible";
+    const CATALOG_API_URL: &str = "https://catalog.example/v1";
+    const CATALOG_KEY_ENV: &str = "MAKI_TEST_CATALOG_KEY";
+    const CUSTOM_KEY_ENV: &str = "MAKI_TEST_CUSTOM_KEY";
+    const CUSTOM_BASE_URL: &str = "https://custom.example/v1";
+    const API_KEY: &str = "sk-test";
+    const GATEWAY_HEADER: &str = "X-Gateway";
+    const UNSET_GATEWAY_VAR: &str = "${MAKI_TEST_UNSET_GATEWAY}";
 
     type Listed = Result<Vec<ModelInfo>, AgentError>;
 
@@ -624,6 +656,93 @@ mod tests {
             models.contains(&format!("{slug}/{LISTED_MODEL}")),
             failed_with.is_none()
         );
+    }
+
+    enum CatalogKey {
+        Env,
+        Saved,
+        Nothing,
+        EnvWithBrokenHeaders,
+    }
+
+    fn set_env_key(var: &str) {
+        // SAFETY: Nextest runs each test in its own process.
+        unsafe { std::env::set_var(var, API_KEY) };
+    }
+
+    fn seed_catalog(slug: &str, state_dir: &StateDir) -> &'static ProviderData {
+        let entry = CatalogEntry {
+            name: slug.into(),
+            env: vec![CATALOG_KEY_ENV.into()],
+            npm: CATALOG_NPM.into(),
+            api: Some(CATALOG_API_URL.into()),
+            models: HashMap::new(),
+        };
+        seed_catalog_for_tests(HashMap::from([(slug.into(), entry)]), state_dir.clone());
+        catalog_provider_if_available(slug).unwrap()
+    }
+
+    fn declare(slug: &str, def: ProviderDef) {
+        let mut config = ProvidersConfig::default();
+        config.upsert(slug.into(), def);
+        config.save().unwrap();
+    }
+
+    #[test_case(CATALOG_SLUG, CatalogKey::Env, true ; "env_key")]
+    #[test_case(CATALOG_SLUG, CatalogKey::Saved, true ; "saved_key")]
+    #[test_case(GO_SLUG, CatalogKey::Nothing, true ; "free_tier_without_a_key")]
+    #[test_case(CATALOG_SLUG, CatalogKey::Nothing, false ; "nothing")]
+    #[test_case(CATALOG_SLUG, CatalogKey::EnvWithBrokenHeaders, false ; "broken_headers")]
+    fn catalog_availability_matches_building_the_provider(
+        slug: &str,
+        key: CatalogKey,
+        expected: bool,
+    ) {
+        let _home = isolated_home();
+        let state_dir = StateDir::resolve().unwrap();
+        match key {
+            CatalogKey::Env => set_env_key(CATALOG_KEY_ENV),
+            CatalogKey::Saved => {
+                let creds = ProviderCredentials {
+                    api_key: API_KEY.into(),
+                    host: None,
+                };
+                save_provider_credentials(&state_dir, slug, &creds).unwrap();
+            }
+            CatalogKey::Nothing => {}
+            CatalogKey::EnvWithBrokenHeaders => {
+                set_env_key(CATALOG_KEY_ENV);
+                let def = ProviderDef {
+                    headers: BTreeMap::from([(GATEWAY_HEADER.into(), UNSET_GATEWAY_VAR.into())]),
+                    ..ProviderDef::default()
+                };
+                declare(slug, def);
+            }
+        }
+        let data = seed_catalog(slug, &state_dir);
+
+        assert_eq!(provider_available(slug), expected);
+        assert_eq!(available_if_warm(slug), expected);
+        assert_eq!(data.catalog_available(&state_dir), expected);
+        assert_eq!(catalog_entry_available(data, &state_dir), expected);
+    }
+
+    #[test_case(CUSTOM_KEY_ENV, true ; "custom_key_only")]
+    #[test_case(CATALOG_KEY_ENV, false ; "catalog_key_only")]
+    fn custom_entry_decides_a_catalog_slug_it_declares(key_env: &str, expected: bool) {
+        let _home = isolated_home();
+        set_env_key(key_env);
+        let custom = ProviderDef {
+            protocol: Some(Protocol::Openai),
+            base_url: Some(CUSTOM_BASE_URL.into()),
+            api_key_env: Some(CUSTOM_KEY_ENV.into()),
+            ..ProviderDef::default()
+        };
+        declare(CATALOG_SLUG, custom);
+        let state_dir = StateDir::resolve().unwrap();
+        let data = seed_catalog(CATALOG_SLUG, &state_dir);
+
+        assert_eq!(catalog_entry_available(data, &state_dir), expected);
     }
 
     #[test]

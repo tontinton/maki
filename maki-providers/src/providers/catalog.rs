@@ -247,11 +247,14 @@ impl ProviderData {
         }
     }
 
-    pub fn resolve_auth(&self, state_dir: &StateDir) -> Result<Option<ResolvedAuth>, AgentError> {
-        Ok(match self.build_auth(state_dir)? {
-            Authentication::KeyBased(auth) | Authentication::FreeKey(auth, _) => Some(auth),
-            Authentication::NoAuth => None,
-        })
+    /// Whether [`CatalogProvider::new`] would build, asked without building
+    /// it and its clients. A free tier counts opted in or not: the opt-in
+    /// only picks [`CatalogAuth::FreeOnly`] over [`CatalogAuth::Gated`].
+    pub(crate) fn catalog_available(&self, state_dir: &StateDir) -> bool {
+        matches!(
+            self.build_auth(state_dir),
+            Ok(Authentication::KeyBased(_) | Authentication::FreeKey(..))
+        )
     }
 
     pub(crate) fn catalog_auth(
@@ -452,7 +455,7 @@ impl CatalogData {
 
     /// A plugin owns its slug, so a catalog entry of the same name would be a
     /// second provider under it.
-    fn all_providers(&self) -> Vec<&ProviderData> {
+    pub(crate) fn all_providers(&self) -> Vec<&ProviderData> {
         let mut providers: Vec<&ProviderData> = self
             .providers
             .values()
@@ -558,7 +561,7 @@ pub fn available_if_warm(slug: &str) -> bool {
     let Ok(state_dir) = StateDir::resolve() else {
         return false;
     };
-    matches!(data.resolve_auth(&state_dir), Ok(Some(_)))
+    data.catalog_available(&state_dir)
 }
 
 /// Whether maki serves `slug` from models.dev, which makes any key saved for
