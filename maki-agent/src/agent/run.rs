@@ -344,11 +344,14 @@ impl<'h> Agent<'h> {
                 Err(AgentError::Cancelled) => return self.finish(Err(AgentError::Cancelled)),
                 kept => kept?,
             };
-            // A burst dropped whole or a run already cancelled sends nothing,
+            // A burst dropped whole or a run cancelled by now sends nothing,
             // so it must not rebuild the frame either. The next run sees the
-            // same change.
-            if kept.is_some() && prompt.is_none() && !self.cancel.is_cancelled() {
-                self.refresh_frame().await?;
+            // same change. The input still lands.
+            if kept.is_some() && prompt.is_none() {
+                match self.refresh_frame().await {
+                    Err(AgentError::Cancelled) => {}
+                    refreshed => refreshed?,
+                }
             }
             let kept = kept.map(|text| {
                 self.history.offer_title_source(&message, &text);
@@ -558,7 +561,12 @@ impl<'h> Agent<'h> {
     /// host prompt text can't be told in a message, so they start a new frame,
     /// and the user hears that the cache is gone.
     async fn refresh_frame(&mut self) -> Result<(), AgentError> {
-        let candidate = (self.context)(&self.model, self.workflow).await;
+        let build = (self.context)(&self.model, self.workflow);
+        let candidate = self
+            .cancel
+            .race(build)
+            .await
+            .map_err(|_| AgentError::Cancelled)?;
         self.prompt_facts.clone_from(&candidate.facts);
         if fit_frame(self.history, candidate, self.mcp.as_ref(), &self.model) == FrameFit::Rebuilt {
             info!(session = ?self.session_id, model = %self.model.id, "frame fingerprint changed, rebuilt the frame");
@@ -608,7 +616,10 @@ impl<'h> Agent<'h> {
         {
             return;
         }
-        let candidate = (self.context)(&current.model, self.workflow).await;
+        let build = (self.context)(&current.model, self.workflow);
+        let Ok(candidate) = self.cancel.race(build).await else {
+            return;
+        };
         let fingerprint = fingerprint(&candidate, self.mcp.as_ref(), &current.model);
         if self
             .history
@@ -1242,6 +1253,15 @@ impl<'h> Agent<'h> {
         // own prompt, plus anything queued in since the last turn ended.
         let carry_len = self.history.len().saturating_sub(self.carry_from);
         let context_size_before = self.gauge.size();
+        // Asked for before the transcript goes, while a cancel can still end
+        // the run with nothing changed. Past the summary the frame is gone,
+        // and a run stopping there would leave the gauge at the old size.
+        let build = (self.context)(&self.model, self.workflow);
+        let next = self
+            .cancel
+            .race(build)
+            .await
+            .map_err(|_| AgentError::Cancelled)?;
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
@@ -1282,7 +1302,8 @@ impl<'h> Agent<'h> {
         self.defer_pins = false;
         // The old prefix has nothing worth keeping now, so the new prompt picks
         // up every fact told since.
-        self.refresh_frame().await?;
+        self.prompt_facts.clone_from(&next.facts);
+        fit_frame(self.history, next, self.mcp.as_ref(), &self.model);
         // An unanswered prompt says what to do next better than the generic
         // nudge, so it stands in for it. A layer's own words still go in.
         if let Some(text) = &steer.continue_text {
@@ -1449,6 +1470,7 @@ pub(crate) mod testing {
 mod tests {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, VecDeque};
+    use std::future::pending;
     use std::iter;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -2932,6 +2954,11 @@ mod tests {
             .collect()
     }
 
+    const RUN_START_BUILDS: u32 = 1;
+    const REQUESTS_BEFORE_THE_SUMMARY: usize = 2;
+    const UNPAID_SUMMARY_MSG: &str =
+        "a compaction cancelled before it starts must not send the summary request";
+
     fn with_compact(agent: &mut Agent<'_>) {
         let compact = vec![ExtractedCommand::Compact {
             instructions: None,
@@ -2998,8 +3025,10 @@ mod tests {
         assert!(!thinking.iter().any(is_signed), "{STALE_THINKING_MSG}");
     }
 
+    #[test_case(false ; "before_the_run")]
+    #[test_case(true ; "during_the_build")]
     #[tokio::test]
-    async fn a_cancelled_run_leaves_the_frame_to_the_next_one() {
+    async fn a_cancelled_run_leaves_the_frame_to_the_next_one(during_build: bool) {
         let rebuilt = |events: &[Envelope]| {
             events.iter().any(|e| {
                 matches!(
@@ -3014,9 +3043,22 @@ mod tests {
         *h.world.tool.lock().unwrap() = "reloaded";
 
         let (trigger, cancel) = CancelToken::new();
-        trigger.cancel();
+        let fire = trigger.handle();
         let (reason, events) = h
-            .run(default_input(), Vec::new(), |agent| agent.cancel = cancel)
+            .run(default_input(), Vec::new(), |agent| {
+                agent.cancel = cancel;
+                if during_build {
+                    agent.context = Arc::new(move |_, _| {
+                        let fire = fire.clone();
+                        Box::pin(async move {
+                            fire.fire();
+                            pending().await
+                        })
+                    });
+                } else {
+                    fire.fire();
+                }
+            })
             .await;
         assert_eq!(reason, DoneReason::Cancelled);
         assert!(!rebuilt(&events));
@@ -3350,6 +3392,48 @@ mod tests {
             "{STALE_THINKING_MSG}"
         );
         assert!(updates(&h.history).is_empty());
+    }
+
+    /// Once the transcript is summarized its frame is gone, and a run that
+    /// stopped there would keep the old size on the gauge, for the next run to
+    /// compact the summary again. So the cancel has to end it before that.
+    #[tokio::test]
+    async fn a_cancel_during_the_context_build_stops_the_compaction_before_it_starts() {
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build).await;
+        let frame = h.history.frame().cloned();
+
+        let (trigger, cancel) = CancelToken::new();
+        let fire = trigger.handle();
+        let world = h.world.builder();
+        let builds = AtomicU32::new(0);
+        let replies = vec![thought_response(), summary_response()];
+        let (reason, events) = h
+            .run(default_input(), replies, |agent| {
+                with_compact(agent);
+                agent.cancel = cancel;
+                agent.context = Arc::new(move |model, workflow| {
+                    let build = world(model, workflow);
+                    if builds.fetch_add(1, Ordering::Relaxed) < RUN_START_BUILDS {
+                        return build;
+                    }
+                    let fire = fire.clone();
+                    Box::pin(async move {
+                        fire.fire();
+                        pending().await
+                    })
+                });
+            })
+            .await;
+
+        assert_eq!(reason, DoneReason::Cancelled);
+        assert!(compaction_events(&events).is_empty());
+        assert_eq!(h.history.frame().cloned(), frame);
+        assert_eq!(
+            h.requests.lock().unwrap().len(),
+            REQUESTS_BEFORE_THE_SUMMARY,
+            "{UNPAID_SUMMARY_MSG}"
+        );
     }
 
     /// The prompt a compaction builds can't say plan mode either. If the

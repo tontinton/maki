@@ -259,9 +259,6 @@ impl AgentLoop {
             &self.seed.model_policy,
         )
         .await;
-        // The summary goes out under a fresh frame for the session's own model,
-        // so the gauge and `/btw` read the prompt the next run sends.
-        let next = context(&slot.model, compaction.workflow).await;
         let hooks = AgentHooks {
             registry: ToolRegistry::global(),
             session_id: Some(&self.seed.session_id),
@@ -275,7 +272,8 @@ impl AgentLoop {
             &model,
             &mut self.history,
             &mut self.gauge,
-            next,
+            &context,
+            compaction.workflow,
             self.seed.mcp.as_ref(),
             event_tx,
             &hooks,
