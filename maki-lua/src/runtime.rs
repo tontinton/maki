@@ -53,7 +53,7 @@ use maki_storage::now_epoch;
 use crate::agent_autocmd::HostEvent;
 use crate::api::action::{ActionStore, clear_plugin_actions};
 use crate::api::agent::adopt_session;
-use crate::api::autocmd::AutocmdStore;
+use crate::api::autocmd::{AutocmdStore, ListenedEvents};
 use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter, release_cursor, release_mode};
@@ -3811,6 +3811,7 @@ impl LuaRuntime {
         jit: bool,
         plugin_rules: Arc<PluginRuleStore>,
         layered: Arc<LayeredTools>,
+        listened: Arc<ListenedEvents>,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
         let jit = jit && unsafe { ffi::luau_codegen_supported() != 0 };
@@ -3850,7 +3851,7 @@ impl LuaRuntime {
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(PluginOptionSpecs::default());
         lua.set_app_data(crate::api::pack::PackStore::default());
-        lua.set_app_data(AutocmdStore::default());
+        lua.set_app_data(AutocmdStore::new(listened));
         lua.set_app_data(SlotStore::new(Arc::clone(&layered)));
         registry.set_hook(crate::hook::SlotHook {
             tx: tx.clone(),
@@ -5765,6 +5766,9 @@ pub(crate) struct LuaThread {
     /// Shared with the runtime on the Lua thread, so a handle can answer "is
     /// anyone layering this" without a roundtrip.
     pub layered: Arc<LayeredTools>,
+    /// Shared with the runtime on the Lua thread: which host events have a
+    /// listener, so the host skips building one nobody reads.
+    pub listened: Arc<ListenedEvents>,
     /// Shared with the runtime too: Esc on a plugin task closes its session
     /// from the event loop, with no Lua-thread hop.
     pub background: BackgroundTasks,
@@ -5799,6 +5803,8 @@ pub fn spawn(
     let tx_clone = tx.clone();
     let layered: Arc<LayeredTools> = Arc::default();
     let layered_thread = Arc::clone(&layered);
+    let listened: Arc<ListenedEvents> = Arc::default();
+    let listened_thread = Arc::clone(&listened);
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let shutdown_thread = Arc::clone(&shutdown);
     let (init_tx, init_rx) = sync_channel::<Result<(), PluginError>>(1);
@@ -5837,6 +5843,7 @@ pub fn spawn(
                 jit,
                 plugin_rules,
                 layered_thread,
+                listened_thread,
             ) {
                 Ok(r) => {
                     r.lua.set_app_data(key_lint_thread);
@@ -6328,6 +6335,7 @@ pub fn spawn(
         prio_tx,
         moves,
         layered,
+        listened,
         background,
         join: Some(handle),
         shutdown,

@@ -918,9 +918,10 @@ name the session now running or focused. What each event adds:
   that never ran, like a cancelled one, has neither.
 - `"TurnStart"`: `data.text`, the message that started the turn.
 - `"TextDelta"`, `"ThinkingDelta"`: `data.text`, the piece of the answer
-  or of the reasoning the model just streamed. They fire many times per
-  second, so a handler that redraws should throttle itself. Subagent
-  deltas stay quiet, like every other subagent event.
+  or of the reasoning the model just streamed, and `data.bytes`, its size
+  in bytes. They fire many times per second, so a handler that redraws
+  should throttle itself. Subagent deltas stay quiet, like every other
+  subagent event.
 - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
   `"max_turns"`, `"cancelled"`, or `"dropped"` when an
   `agent.user_message` layer refused the message), `data.usage` (four
@@ -1012,7 +1013,8 @@ name the session now running or focused. What each event adds:
 Conversation content needs the `session_read` permission. Without it a
 host event still arrives, carrying only its metadata fields:
 `"TurnStart"` without `data.text`, `"TextDelta"` and `"ThinkingDelta"`
-with no `data.text` at all, `"ToolDone"` without `data.input`,
+without `data.text` (their `data.bytes` still arrives), `"ToolDone"`
+without `data.input`,
 `"CompactionDone"` without `data.summary`, and `"InputChanged"` without
 `data.text`. Maki warns once per plugin and event, naming what was left
 out. Events a plugin fires under its own names arrive as fired.

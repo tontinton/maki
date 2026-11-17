@@ -22,6 +22,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout_at;
 
 use crate::agent_autocmd::HostEvent;
+use crate::api::autocmd::ListenedEvents;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
@@ -1022,6 +1023,7 @@ impl PluginHost {
             prio_tx: self.inner.prio_tx.clone(),
             moves: self.inner.moves.clone(),
             layered: Arc::clone(&self.inner.layered),
+            listened: Arc::clone(&self.inner.listened),
             background: self.inner.background.clone(),
         }
     }
@@ -1065,6 +1067,9 @@ pub struct EventHandle {
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
     layered: Arc<LayeredTools>,
+    /// Published by the Lua thread too: which host events have a listener, so
+    /// an event nobody reads never becomes a payload.
+    listened: Arc<ListenedEvents>,
     background: BackgroundTasks,
 }
 
@@ -1075,8 +1080,14 @@ impl EventHandle {
             prio_tx: unbounded_channel().0,
             moves: unbounded_channel().0,
             layered: Arc::default(),
+            listened: Arc::default(),
             background: BackgroundTasks::default(),
         }
+    }
+
+    /// Whether a plugin listens for host event {event}.
+    pub fn listens(&self, event: &str) -> bool {
+        self.listened.contains(event)
     }
 
     /// Esc in a plugin task's tab. Ends the session as stopped by the user,
@@ -1170,6 +1181,7 @@ impl EventHandle {
             prio_tx: shared,
             moves: unbounded_channel().0,
             layered: Arc::default(),
+            listened: Arc::default(),
             background: BackgroundTasks::default(),
         }
     }
@@ -1178,6 +1190,14 @@ impl EventHandle {
     /// the UI without a host.
     pub(crate) fn layering(mut self, slots: &[&str]) -> Self {
         self.layered = Arc::new(LayeredTools::with_surfaces(slots));
+        self
+    }
+
+    /// The same handle, reporting {events} as listened, for a test that drives
+    /// the host without one.
+    #[cfg(test)]
+    pub(crate) fn listening(mut self, events: &[&str]) -> Self {
+        self.listened = Arc::new(ListenedEvents::with_events(events));
         self
     }
 
@@ -1521,6 +1541,7 @@ mod tests {
             prio_tx,
             moves: unbounded_channel().0,
             layered: Arc::default(),
+            listened: Arc::default(),
             background: BackgroundTasks::default(),
         };
         handle.run_command(

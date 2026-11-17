@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use arc_swap::ArcSwap;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::Message;
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
@@ -29,14 +30,44 @@ pub(crate) struct AutocmdEntry {
     pub reads_content: bool,
 }
 
+/// The names with at least one listener, published by the Lua thread so the
+/// host can skip an event nobody reads without a roundtrip.
 #[derive(Default)]
+pub struct ListenedEvents {
+    events: ArcSwap<HashSet<Arc<str>>>,
+}
+
+impl ListenedEvents {
+    pub fn contains(&self, event: &str) -> bool {
+        self.events.load().contains(event)
+    }
+
+    /// Stands in for the Lua thread publishing a plugin's listeners, for
+    /// tests that drive the host without one.
+    #[cfg(test)]
+    pub fn with_events(events: &[&str]) -> Self {
+        Self {
+            events: ArcSwap::from_pointee(events.iter().map(|e| Arc::from(*e)).collect()),
+        }
+    }
+}
+
 pub(crate) struct AutocmdStore {
     pub(crate) listeners: HashMap<String, Vec<AutocmdEntry>>,
+    listened: Arc<ListenedEvents>,
 }
 
 impl AutocmdStore {
+    pub fn new(listened: Arc<ListenedEvents>) -> Self {
+        Self {
+            listeners: HashMap::new(),
+            listened,
+        }
+    }
+
     pub fn register(&mut self, event: String, entry: AutocmdEntry) {
         self.listeners.entry(event).or_default().push(entry);
+        self.publish();
     }
 
     pub fn remove(&mut self, id: u64) {
@@ -44,6 +75,7 @@ impl AutocmdStore {
             entries.retain(|e| e.id != id);
         }
         self.listeners.retain(|_, v| !v.is_empty());
+        self.publish();
     }
 
     pub fn clear_plugin(&mut self, plugin: &str) {
@@ -51,6 +83,16 @@ impl AutocmdStore {
             entries.retain(|e| e.plugin.as_ref() != plugin);
         }
         self.listeners.retain(|_, v| !v.is_empty());
+        self.publish();
+    }
+
+    fn publish(&self) {
+        let events = self
+            .listeners
+            .keys()
+            .map(|e| Arc::from(e.as_str()))
+            .collect();
+        self.listened.events.store(Arc::new(events));
     }
 }
 
@@ -282,9 +324,10 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   that never ran, like a cancelled one, has neither.
 /// - `"TurnStart"`: `data.text`, the message that started the turn.
 /// - `"TextDelta"`, `"ThinkingDelta"`: `data.text`, the piece of the answer
-///   or of the reasoning the model just streamed. They fire many times per
-///   second, so a handler that redraws should throttle itself. Subagent
-///   deltas stay quiet, like every other subagent event.
+///   or of the reasoning the model just streamed, and `data.bytes`, its size
+///   in bytes. They fire many times per second, so a handler that redraws
+///   should throttle itself. Subagent deltas stay quiet, like every other
+///   subagent event.
 /// - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
 ///   `"max_turns"`, `"cancelled"`, or `"dropped"` when an
 ///   `agent.user_message` layer refused the message), `data.usage` (four
@@ -376,7 +419,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// Conversation content needs the `session_read` permission. Without it a
 /// host event still arrives, carrying only its metadata fields:
 /// `"TurnStart"` without `data.text`, `"TextDelta"` and `"ThinkingDelta"`
-/// with no `data.text` at all, `"ToolDone"` without `data.input`,
+/// without `data.text` (their `data.bytes` still arrives), `"ToolDone"`
+/// without `data.input`,
 /// `"CompactionDone"` without `data.summary`, and `"InputChanged"` without
 /// `data.text`. Maki warns once per plugin and event, naming what was left
 /// out. Events a plugin fires under its own names arrive as fired.

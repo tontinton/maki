@@ -33,9 +33,11 @@ pub enum HostEvent<'a> {
     },
     TextDelta {
         text: &'a str,
+        bytes: usize,
     },
     ThinkingDelta {
         text: &'a str,
+        bytes: usize,
     },
     ToolStart {
         tool_id: &'a str,
@@ -199,8 +201,8 @@ impl HostEventKind {
     pub fn fields(self) -> EventFields {
         let (content, metadata): (&'static [&'static str], &'static [&'static str]) = match self {
             Self::TurnStart => (&["text"], &[]),
-            Self::TextDelta => (&["text"], &[]),
-            Self::ThinkingDelta => (&["text"], &[]),
+            Self::TextDelta => (&["text"], &["bytes"]),
+            Self::ThinkingDelta => (&["text"], &["bytes"]),
             Self::ToolStart => (&[], &["tool_id", "tool"]),
             Self::ToolDone => (
                 &["input"],
@@ -262,7 +264,9 @@ pub fn dispatch(handle: &EventHandle, session_id: &dyn Display, envelope: &Envel
         .subagent
         .as_ref()
         .map(|s| s.parent_tool_use_id.as_str());
-    if let Some(event) = host_event_for(&envelope.event, task_id) {
+    if let Some(event) = host_event_for(&envelope.event, task_id)
+        && handle.listens(event.name())
+    {
         handle.fire(Some(session_id), event);
     }
 }
@@ -274,9 +278,9 @@ pub fn dispatch(handle: &EventHandle, session_id: &dyn Display, envelope: &Envel
 /// context can be watched mid-turn, and `data.id` says whose context it is
 /// (absent for the main session's own turns).
 ///
-/// This runs on every envelope, streaming deltas included, and most of
-/// them map to nothing, so the event borrows and only a mapped one pays for
-/// a payload.
+/// This runs on every envelope, streaming deltas included, and most of them
+/// map to nothing, so the event borrows and only one a plugin listens for
+/// pays for a payload.
 pub fn host_event_for<'a>(
     event: &'a AgentEvent,
     task_id: Option<&'a str>,
@@ -285,8 +289,14 @@ pub fn host_event_for<'a>(
         return None;
     }
     match event {
-        AgentEvent::TextDelta { text } => Some(HostEvent::TextDelta { text }),
-        AgentEvent::ThinkingDelta { text } => Some(HostEvent::ThinkingDelta { text }),
+        AgentEvent::TextDelta { text } => Some(HostEvent::TextDelta {
+            text,
+            bytes: text.len(),
+        }),
+        AgentEvent::ThinkingDelta { text } => Some(HostEvent::ThinkingDelta {
+            text,
+            bytes: text.len(),
+        }),
         AgentEvent::ToolStart(e) => Some(HostEvent::ToolStart {
             tool_id: &e.id,
             tool: &e.tool,
@@ -537,8 +547,14 @@ mod tests {
         static INPUT: Value = Value::Null;
         match kind {
             HostEventKind::TurnStart => HostEvent::TurnStart { text: SAMPLE_TEXT },
-            HostEventKind::TextDelta => HostEvent::TextDelta { text: SAMPLE_TEXT },
-            HostEventKind::ThinkingDelta => HostEvent::ThinkingDelta { text: SAMPLE_TEXT },
+            HostEventKind::TextDelta => HostEvent::TextDelta {
+                text: SAMPLE_TEXT,
+                bytes: SAMPLE_TEXT.len(),
+            },
+            HostEventKind::ThinkingDelta => HostEvent::ThinkingDelta {
+                text: SAMPLE_TEXT,
+                bytes: SAMPLE_TEXT.len(),
+            },
             HostEventKind::ToolStart => HostEvent::ToolStart {
                 tool_id: SAMPLE_TEXT,
                 tool: SAMPLE_TEXT,
@@ -702,6 +718,36 @@ mod tests {
                 "{event:?} leaked from a subagent"
             );
         }
+    }
+
+    fn delta_envelope() -> Envelope {
+        Envelope {
+            event: AgentEvent::TextDelta {
+                text: SAMPLE_TEXT.into(),
+            },
+            subagent: None,
+            run_id: 0,
+        }
+    }
+
+    /// Deltas arrive dozens of times per second, so one nobody listens for
+    /// must not reach the shared plugin thread at all.
+    #[test]
+    fn an_unlistened_delta_never_becomes_a_payload() {
+        let (handle, probe) = crate::test_support::probed_event_handle();
+        dispatch(&handle, &SESSION, &delta_envelope());
+        assert!(probe.try_recv_autocmd().is_none());
+    }
+
+    #[test]
+    fn a_listened_delta_reaches_the_plugin_thread() {
+        let (handle, probe) = crate::test_support::probed_event_handle();
+        let handle = handle.listening(&["TextDelta"]);
+        dispatch(&handle, &SESSION, &delta_envelope());
+        let (event, data) = probe.try_recv_autocmd().expect("the delta fires");
+        assert_eq!(event, "TextDelta");
+        assert_eq!(data["text"], SAMPLE_TEXT);
+        assert_eq!(data["bytes"], SAMPLE_TEXT.len());
     }
 
     #[test]
