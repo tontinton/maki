@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use maki_storage::StateDir;
 use maki_storage::auth::load_provider_credentials;
+use maki_storage::blocking;
 use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::Value;
@@ -218,7 +219,7 @@ impl Opencode {
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
         let catalog = shared_catalog().await;
         let Some(data) = catalog.provider(ZEN_SLUG) else {
-            return if zen_has_key(&catalog.state_dir) {
+            return if blocking(|| zen_has_key(&catalog.state_dir)).await {
                 Err(AgentError::Config {
                     message: CATALOG_UNAVAILABLE.into(),
                 })
@@ -226,7 +227,10 @@ impl Opencode {
                 Ok(Vec::new())
             };
         };
-        Ok(data.available_models(&catalog.state_dir, data.free_models_enabled()))
+        Ok(
+            blocking(|| data.available_models(&catalog.state_dir, data.free_models_enabled()))
+                .await,
+        )
     }
 
     async fn lookup(
@@ -250,10 +254,12 @@ impl Opencode {
             });
         let auth = match override_auth {
             Some(auth) => auth,
-            None => provider_data
-                .catalog_auth(&catalog.state_dir, provider_data.free_models_enabled())?
-                .unlocked(sub_provider)?
-                .clone(),
+            None => blocking(|| {
+                provider_data.catalog_auth(&catalog.state_dir, provider_data.free_models_enabled())
+            })
+            .await?
+            .unlocked(sub_provider)?
+            .clone(),
         };
         let auth = provider_data.request_auth(auth, session_id)?;
         Ok((meta.clone(), provider_data.api_format, auth))
@@ -423,7 +429,26 @@ fn parse_usage(body: &str) -> Result<ProviderUsage, AgentError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use maki_config::providers::{ProviderDef, ProvidersConfig};
+    use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
+    use test_case::test_case;
+
     use super::*;
+    use crate::providers::catalog::schema::{CatalogCost, CatalogModel, CatalogProvider};
+    use crate::providers::catalog::seed_catalog_for_tests;
+    use crate::test_support::isolated_home;
+
+    const SAVED_KEY: &str = "sk-zen-saved";
+    const PAID_MODEL: &str = "paid-model";
+    const PAID_PRICE: f64 = 1.0;
+    const UNSET_KEY_ENV: &str = "MAKI_TEST_UNSET_ZEN_KEY";
+    const CHAT_NPM: &str = "@ai-sdk/openai-compatible";
+    const AUTHORIZATION_HEADER: &str = "authorization";
+    const SAVED_AUTHORIZATION: &str = "Bearer sk-zen-saved";
+    const CONFIG_HEADER: &str = "x-gateway";
+    const UNSET_HEADER_VALUE: &str = "${MAKI_TEST_UNSET_ZEN_KEY}";
 
     const SAMPLE_BODY: &str = r#"{"usage":{
         "rolling": {"status":"active","percent":62,"resetsAt":"2026-11-03T19:30:00Z"},
@@ -459,5 +484,63 @@ mod tests {
     fn parse_usage_unknown_status_is_dropped() {
         let limits = usage(r#"{"usage":{"rolling":{"status":"what-now","percent":1}}}"#);
         assert_eq!(limits[0].detail, None);
+    }
+
+    #[test_case(false, &[PAID_MODEL], Some(SAVED_AUTHORIZATION) ; "saved_key_lists_and_sends_paid_models")]
+    #[test_case(true,  &[],           None                      ; "broken_config_headers_hide_the_models")]
+    #[tokio::test]
+    async fn zen_request_auth(
+        broken_headers: bool,
+        expected_models: &[&str],
+        expected_authorization: Option<&str>,
+    ) {
+        let _home = isolated_home();
+        if broken_headers {
+            let mut config = ProvidersConfig::default();
+            let def = ProviderDef {
+                headers: BTreeMap::from([(CONFIG_HEADER.into(), UNSET_HEADER_VALUE.into())]),
+                ..ProviderDef::default()
+            };
+            config.upsert(ZEN_SLUG.into(), def);
+            config.save().unwrap();
+        }
+        let state_dir = StateDir::resolve().unwrap();
+        let creds = ProviderCredentials {
+            api_key: SAVED_KEY.into(),
+            host: None,
+        };
+        save_provider_credentials(&state_dir, ZEN_SLUG, &creds).unwrap();
+        let paid = CatalogModel {
+            cost: Some(CatalogCost {
+                input: Some(PAID_PRICE),
+                output: Some(PAID_PRICE),
+                cache_read: None,
+                cache_write: None,
+            }),
+            ..CatalogModel::default()
+        };
+        let zen = CatalogProvider {
+            name: ZEN_DISPLAY_NAME.into(),
+            env: vec![UNSET_KEY_ENV.into()],
+            npm: CHAT_NPM.into(),
+            api: Some(ZEN_API_URL.into()),
+            models: HashMap::from([(PAID_MODEL.into(), paid)]),
+        };
+        seed_catalog_for_tests(HashMap::from([(ZEN_SLUG.into(), zen)]), state_dir);
+
+        let opencode = Opencode::new(Timeouts::default());
+        let listed: Vec<String> = opencode
+            .list_models()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(listed, expected_models);
+        let auth = opencode.lookup(ZEN_SLUG, PAID_MODEL, None).await.ok();
+        let sent = auth
+            .as_ref()
+            .and_then(|(_, _, auth)| auth.header(AUTHORIZATION_HEADER));
+        assert_eq!(sent, expected_authorization);
     }
 }
