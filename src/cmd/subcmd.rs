@@ -766,7 +766,7 @@ pub async fn prompt(
             workflow: false,
             mcp: false,
         };
-        let defs = reg.definitions(&vars, &ctx, true);
+        let defs = reg.described_definitions(&vars, &ctx, true, true).await;
         if names {
             for name in defs
                 .as_array()
