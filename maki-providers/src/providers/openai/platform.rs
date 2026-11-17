@@ -190,7 +190,7 @@ impl PlanModel {
         };
         ModelInfo {
             id: self.slug,
-            context_window: self.context_window,
+            context_window: self.context_window.filter(|&window| window > 0),
             max_output_tokens: None,
             pricing: None,
             supports_thinking: Some(!info.efforts.is_empty()),
@@ -820,6 +820,22 @@ mod tests {
         let response = json!({"models": [model]}).to_string();
         let models = parse_plan_models(&response, Some(ACCOUNT_ID)).unwrap();
         assert_eq!(plan_info(&models[0]).supports_fast, expected);
+    }
+
+    /// A zero would become the session's window and compact every turn, so it
+    /// counts as undeclared and `adjust_model` falls back to the plan window.
+    #[test_case(json!(300_000), Some(300_000) ; "declared")]
+    #[test_case(json!(0), None ; "zero_is_undeclared")]
+    #[test_case(Value::Null, None ; "null_is_undeclared")]
+    fn plan_models_parse_context_window(window: Value, expected: Option<u32>) {
+        let model = json!({
+            "slug": "gpt-7-nova",
+            "visibility": LISTED_VISIBILITY,
+            "context_window": window,
+        });
+        let response = json!({"models": [model]}).to_string();
+        let models = parse_plan_models(&response, Some(ACCOUNT_ID)).unwrap();
+        assert_eq!(models[0].context_window, expected);
     }
 
     fn plan_model_info(supports_fast: bool) -> PlanModelInfo {
