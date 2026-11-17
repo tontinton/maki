@@ -267,7 +267,11 @@ Maki sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI
 
 ### Plans
 
-{plans_body}"#
+{plans_body}
+
+### Setting up a declared provider
+
+A custom entry that sets `protocol` shows `no key` in `/model` until it has a key. A provider whose model list fails shows `offline`, or `fallback` when it still has models to offer. Enter on a `no key` or `offline` row opens `/login` at that provider. A custom entry declared here starts on its prefilled `base_url`, so a moved endpoint is fixed before the key step. A blank key is accepted when the env var, inline key, or stored credential already provides one."#
     )
 }
 
