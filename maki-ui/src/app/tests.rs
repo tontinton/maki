@@ -222,6 +222,7 @@ fn build_app_with_session(
         tab,
         dir,
         Arc::new(ArcSwapOption::empty()),
+        Arc::default(),
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
         lua_commands,
@@ -234,7 +235,6 @@ fn build_app_with_session(
         permissions,
         Arc::from([]),
         maki_lua::EventHandle::disconnected_for_test(),
-        Arc::new(maki_config::ModelPolicy::default()),
     )
 }
 

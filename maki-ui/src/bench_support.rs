@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{McpConfigErrors, McpSnapshotReader, SnapshotSpan, SpanStyle};
-use maki_config::{ModelPolicy, PermissionsConfig, ProjectConfig, UiConfig};
+use maki_config::{PermissionsConfig, ProjectConfig, UiConfig};
 use maki_lua::{
     EventHandle, HintReader, InputEdit, InputRule, InputRulesReader, KeymapReader,
     LuaCommandReader, PatternRule, PluginPermissions, PluginReach, Reveal, SyntaxRule, TextEdit,
@@ -71,6 +71,7 @@ pub fn app(storage: StateDir) -> App {
         tab,
         storage,
         Arc::default(),
+        Arc::default(),
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
         LuaCommandReader::empty(),
@@ -83,7 +84,6 @@ pub fn app(storage: StateDir) -> App {
         permissions,
         Arc::from([]),
         EventHandle::disconnected_for_test(),
-        Arc::new(ModelPolicy::default()),
     )
 }
 

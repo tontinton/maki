@@ -49,7 +49,7 @@ use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model, ModelTier};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
-use maki_storage::model::{persist_model, push_recent};
+use maki_storage::model::{persist_model, push_recent, read_expanded_providers, read_recents};
 use maki_storage::sessions::normalize_title;
 use ratatui::layout::Rect;
 use serde_json::json;
@@ -73,6 +73,7 @@ use crate::appearance::{self, Background};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::keybindings::key;
+use crate::components::model_picker::PickerMemory;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest};
 use crate::decor_worker;
@@ -473,6 +474,7 @@ struct SpawnCtx {
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
     available_models: Arc<ArcSwapOption<ModelList>>,
+    picker_memory: Arc<PickerMemory>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     trust: TrustState,
@@ -514,6 +516,7 @@ impl SpawnCtx {
             open,
             self.storage.clone(),
             Arc::clone(&self.available_models),
+            Arc::clone(&self.picker_memory),
             handles.mcp_reader(),
             handles.deps.mcp_config_errors.clone(),
             self.lua_command_reader.clone(),
@@ -526,7 +529,6 @@ impl SpawnCtx {
             permissions,
             Arc::clone(&self.custom_commands),
             self.lua_event_handle.clone(),
-            Arc::clone(&self.model_policy),
         );
         app.trust = self.trust.clone();
         handles.apply_to_app(&mut app);
@@ -812,6 +814,11 @@ impl<'t> EventLoop<'t> {
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications).await;
         let program_status = ui_config.program_status.then(ProgramStatusReporter::new);
+        let recent_models = read_recents(&storage)
+            .into_iter()
+            .filter(|spec| model_policy.allows(spec))
+            .collect();
+        let picker_memory = PickerMemory::new(recent_models, read_expanded_providers(&storage));
         let ctx = SpawnCtx {
             storage,
             config,
@@ -828,6 +835,7 @@ impl<'t> EventLoop<'t> {
             mcp_handle,
             mcp_config_errors,
             available_models: bg.available,
+            picker_memory: Arc::new(picker_memory),
             storage_writer,
             model_policy,
             trust,
@@ -2279,14 +2287,13 @@ impl<'t> EventLoop<'t> {
 
     /// The one explicit pick, which is why it alone writes the last-used file.
     /// Opening an old session must not change what the next `maki` starts on.
-    /// Every tab lists the one recent file, so every tab's picker gets the pick.
     fn change_model(&mut self, spec: &str) -> Result<(), String> {
         let slot = self.slots.try_get(spec)?;
         let picked = slot.model.spec();
         self.apply_model(self.focused, slot);
-        for rt in &mut self.sessions {
-            rt.app.record_recent_model(spec);
-        }
+        self.ctx
+            .picker_memory
+            .record_recent(spec, &self.ctx.model_policy);
         let recent = spec.to_owned();
         self.ctx.storage_writer.persist(move |dir| {
             persist_model(dir, &picked);
