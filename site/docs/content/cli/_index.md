@@ -104,6 +104,7 @@ maki auth status
 ```bash
 maki models
 maki models --refresh    # refetch the models.dev catalog
+maki models --explain aperture/<upstream>/<model>   # why a gateway model resolved the way it did
 ```
 
 One spec per line, warnings on stderr. Built-in and script providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.

@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use maki_config::providers::{OverrideFields, Protocol, ProviderOverride, ProvidersConfig};
 use reqwest::header::HeaderMap;
@@ -8,7 +8,11 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
+#[cfg(test)]
+use crate::model::ModelError;
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
+use crate::model_directory::{self, CapsSource, ModelCaps};
+use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
@@ -16,10 +20,11 @@ use crate::spec::{
 };
 use crate::types::ThinkingFallback;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use maki_config::providers::ModelTier;
 use maki_storage::id::SessionRef;
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{ResolvedAuth, Timeouts, google, plugin};
+use super::{ResolvedAuth, Timeouts, catalog, google, plugin};
 
 const HOST_ENV: &str = "APERTURE_HOST";
 const PER_MILLION: f64 = 1_000_000.0;
@@ -132,6 +137,9 @@ fn routed_sends_thinking(
     model: &Model,
     choice: ThinkingConfig,
 ) -> ThinkingConfig {
+    if let Some((spec, routed)) = caps_model(overrides, model) {
+        return (spec.sends_thinking)(&routed, choice);
+    }
     routed_model(overrides, model).map_or(choice, |(spec, routed)| {
         (spec.sends_thinking)(&routed, choice)
     })
@@ -140,7 +148,12 @@ fn routed_sends_thinking(
 fn thinking_fields_fallback(model: &Model) -> Option<ThinkingFallback> {
     let config = ProvidersConfig::load_or_default();
     let overrides = config.get(SLUG).map(|def| &def.overrides);
-    let (spec, routed) = routed_model(overrides.unwrap_or(&Overrides::new()), model)?;
+    let empty = Overrides::new();
+    let overrides = overrides.unwrap_or(&empty);
+    if let Some((spec, routed)) = caps_model(overrides, model) {
+        return (spec.thinking_fields_fallback)(&routed);
+    }
+    let (spec, routed) = routed_model(overrides, model)?;
     (spec.thinking_fields_fallback)(&routed)
 }
 
@@ -175,6 +188,17 @@ fn validate_overrides(overrides: &Overrides) {
                     model, base, "base is not an OpenAI-compatible provider, ignoring"
                 );
             }
+            // A cold catalog or an unloaded plugin cannot resolve a target
+            // yet, so only a warm miss is worth warning about.
+            if let Some(like) = &f.like
+                && catalog::is_warm()
+                && model_directory::resolve_target(like).is_none()
+            {
+                warn!(
+                    provider,
+                    model, like, "like does not name a known provider or model, ignoring"
+                );
+            }
         }
     }
 }
@@ -197,6 +221,7 @@ fn merged_override(overrides: &Overrides, provider_id: &str, model_id: &str) -> 
             .path_prefix
             .clone()
             .or_else(|| po.default.path_prefix.clone()),
+        like: m.like.clone().or_else(|| po.default.like.clone()),
     }
 }
 
@@ -356,26 +381,38 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
             let id = m["id"].as_str()?;
             let provider_id = m["metadata"]["provider"]["id"].as_str().unwrap_or("");
             let ov = merged_override(overrides, provider_id, id);
+            let caps = resolved_caps(&ov, provider_id, id);
+            let routed = routed_spec(provider_id, &ov);
+            let explicit = ov.like.is_some() || ov.supports_thinking.is_some();
+            let caps_thinking = caps
+                .as_ref()
+                .and_then(|caps| caps.effective_thinking(explicit, routed.is_some()));
+            let pricing = m["pricing"].as_object().map(|p| {
+                ModelPricing::per_million(
+                    price_per_m(p.get("input")),
+                    price_per_m(p.get("output")),
+                    0.0,
+                    price_per_m(p.get("input_cache_read")),
+                )
+            });
             Some(ModelInfo {
                 id: if provider_id.is_empty() {
                     id.to_string()
                 } else {
                     format!("{provider_id}/{id}")
                 },
-                context_window: ov.context_window,
-                max_output_tokens: ov.max_output_tokens,
-                pricing: m["pricing"].as_object().map(|p| {
-                    ModelPricing::per_million(
-                        price_per_m(p.get("input")),
-                        price_per_m(p.get("output")),
-                        0.0,
-                        price_per_m(p.get("input_cache_read")),
-                    )
-                }),
+                // Only what the gateway published: stream-time resolution
+                // must be able to tell a payload limit from an alias one.
+                context_window: payload_u32(m, "context_window_tokens"),
+                max_output_tokens: payload_u32(m, "max_output_tokens"),
+                pricing,
                 supports_thinking: ov
                     .supports_thinking
-                    .or_else(|| routed_spec(provider_id, &ov).map(|spec| spec.supports_thinking)),
-                supports_vision: ov.supports_vision,
+                    .or(caps_thinking)
+                    .or_else(|| routed.map(|spec| spec.supports_thinking)),
+                supports_vision: ov
+                    .supports_vision
+                    .or_else(|| caps.as_ref().and_then(|caps| caps.supports_vision)),
                 tier: None,
                 provider_info: None,
                 extra: None,
@@ -385,27 +422,73 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
         .collect()
 }
 
+fn payload_u32(model: &Value, field: &str) -> Option<u32> {
+    u32::try_from(model[field].as_u64()?).ok()
+}
+
 /// Reconcile a model's metadata against its routed native provider's static
 /// table, then layer user overrides on top. The static table is the baseline
 /// (so `aperture/zai/glm-5.2` picks up Zai's real `context_window` without
 /// being hand-duplicated in the overrides config); explicit overrides still win.
 fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
-    let Some((provider_id, model_id)) = model.id.split_once('/') else {
-        return;
-    };
+    let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", model.id.as_str()));
     let ov = merged_override(overrides, provider_id, model_id);
-    if let Some(spec) = routed_spec(provider_id, &ov) {
+    let caps = resolved_caps(&ov, provider_id, model_id);
+    let routed = routed_spec(provider_id, &ov);
+    let routed_entry = routed.and_then(|spec| lookup_entry(spec.models(), model_id));
+
+    // The gateway's own limits and price describe this deployment; a row or
+    // alias only fills in what the payload did not publish.
+    let payload = model_registry::discovered(SLUG, &model.id);
+    let payload_context = payload.as_ref().and_then(|info| info.context_window);
+    let payload_output = payload.as_ref().and_then(|info| info.max_output_tokens);
+    let payload_pricing = payload.as_ref().and_then(|info| info.pricing.clone());
+
+    if let Some(family) = caps.as_ref().and_then(|caps| caps.family) {
+        model.family = family;
+    } else if let Some(spec) = routed {
         model.family = spec.family;
-        model.thinking_override = model
-            .thinking_override
-            .or_else(|| ThinkingSupport::from_flags(Some(spec.supports_thinking), false));
-        if let Some(entry) = lookup_entry(spec.models(), model_id) {
-            model.context_window = entry.context_window.unwrap_or(model.context_window);
-            model.max_output_tokens = entry.max_output_tokens;
-            model.supports_vision_override =
-                model.supports_vision_override.or(entry.supports_vision);
-        }
     }
+
+    let caps_thinking = caps
+        .as_ref()
+        .filter(|caps| caps.thinking_spellable || routed.is_some())
+        .and_then(|caps| {
+            ThinkingSupport::from_flags(caps.supports_thinking, caps.requires_thinking)
+        });
+    let routed_thinking =
+        routed.and_then(|spec| ThinkingSupport::from_flags(Some(spec.supports_thinking), false));
+    model.thinking_override = model
+        .thinking_override
+        .or(caps_thinking)
+        .or(routed_thinking);
+    if let Some(fields) = caps.as_ref().and_then(|caps| caps.thinking_fields.clone()) {
+        model.thinking_fields = model.thinking_fields.take().or(Some(Box::new(fields)));
+    }
+    if let Some(tool_examples) = caps.as_ref().and_then(|caps| caps.supports_tool_examples) {
+        model.supports_tool_examples_override = model
+            .supports_tool_examples_override
+            .or(Some(tool_examples));
+    }
+
+    model.context_window = payload_context
+        .or_else(|| caps.as_ref().and_then(|caps| caps.context_window))
+        .or_else(|| routed_entry.and_then(|entry| entry.context_window))
+        .unwrap_or(model.context_window);
+    model.max_output_tokens = payload_output
+        .or_else(|| caps.as_ref().and_then(|caps| caps.max_output_tokens))
+        .or_else(|| routed_entry.and_then(|entry| entry.max_output_tokens))
+        .or(model.max_output_tokens);
+    if payload_pricing.is_none()
+        && let Some(pricing) = caps.as_ref().and_then(|caps| caps.pricing.clone())
+    {
+        model.pricing = pricing;
+    }
+    model.supports_vision_override = model
+        .supports_vision_override
+        .or_else(|| caps.as_ref().and_then(|caps| caps.supports_vision))
+        .or_else(|| routed_entry.and_then(|entry| entry.supports_vision));
+
     if let Some(cw) = ov.context_window {
         model.context_window = cw;
     }
@@ -414,6 +497,299 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
         model.thinking_override = ThinkingSupport::from_flags(Some(thinking), false);
     }
     model.supports_vision_override = ov.supports_vision.or(model.supports_vision_override);
+}
+
+/// The alias wins over the gateway's own provider id, which wins over a unique
+/// exact shipped id. An unresolved alias falls through instead of disabling
+/// the fallbacks.
+fn resolved_caps(ov: &OverrideFields, provider_id: &str, model_id: &str) -> Option<ModelCaps> {
+    if let Some(like) = ov.like.as_deref()
+        && let Some(caps) = model_directory::resolve_target(like)
+    {
+        return Some(caps);
+    }
+    // An explicit base chose the wire, so its dialect wins even when it has
+    // no row for this model; do not fall through to the provider id.
+    if ov.base.is_some() {
+        return routed_spec(provider_id, ov).and_then(|spec| caps_from_spec(spec, model_id));
+    }
+    if let Some(spec) = ProviderRegistry::get(provider_id) {
+        // A known provider id is authoritative, including its refusal: do not
+        // fall through to a name that may belong to some other declaration.
+        return caps_from_spec(spec, model_id);
+    }
+    model_directory::unique_exact(model_id)
+}
+
+fn caps_from_spec(spec: &'static ProviderSpec, model_id: &str) -> Option<ModelCaps> {
+    // A declared base has no native constructor to route through, so it has
+    // no aperture-usable thinking behavior either.
+    if spec.native().is_none() && plugin::base_spec(spec.slug).is_some() {
+        return None;
+    }
+    model_directory::caps_for_spec(spec, model_id)
+}
+
+/// The provider whose thinking behavior should be asked about. This is a
+/// capability source, not the transport route, so a plugin spec is allowed.
+fn caps_model(overrides: &Overrides, model: &Model) -> Option<(&'static ProviderSpec, Model)> {
+    let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", model.id.as_str()));
+    let ov = merged_override(overrides, provider_id, model_id);
+    let routed = routed_spec(provider_id, &ov);
+    let explicit = ov.like.is_some() || ov.supports_thinking.is_some();
+    match resolved_caps(&ov, provider_id, model_id).and_then(|caps| {
+        caps.effective_thinking(explicit, routed.is_some())?;
+        let source = caps.source?;
+        Some((source.spec()?, source.model()?.to_string()))
+    }) {
+        Some((spec, source_model)) => {
+            let mut routed = model.clone();
+            routed.provider = Arc::from(spec.slug);
+            routed.id = source_model;
+            Some((spec, routed))
+        }
+        None => routed_model(overrides, model),
+    }
+}
+
+/// What `maki models --explain` prints for one gateway model, and where each
+/// fact came from.
+#[derive(Debug, Clone)]
+pub struct ModelExplanation {
+    pub spec: String,
+    pub context_window: u32,
+    pub max_output_tokens: Option<u32>,
+    pub input_price: f64,
+    pub output_price: f64,
+    pub family: ModelFamily,
+    pub supports_thinking: bool,
+    pub supports_vision: bool,
+    pub tier: ModelTier,
+    pub capability_source: String,
+    pub context_source: String,
+    pub max_output_source: String,
+    pub pricing_source: String,
+    pub thinking_source: String,
+    pub vision_source: String,
+    pub route: Option<&'static str>,
+    pub path_prefix: String,
+    pub alias: Option<String>,
+}
+
+impl ModelExplanation {
+    /// One line per fact, with the source beside it.
+    pub fn lines(&self) -> Vec<String> {
+        let route = self.route.map_or_else(
+            || "generic chat completions".to_string(),
+            |route| route.to_string(),
+        );
+        let tier = format!("{:?}", self.tier).to_lowercase();
+        let family = format!("{:?}", self.family).to_lowercase();
+        let yes = |value: bool| if value { "yes" } else { "no" };
+        vec![
+            self.spec.clone(),
+            format!(
+                "  context     {}  ({})",
+                self.context_window, self.context_source
+            ),
+            format!(
+                "  max output  {}  ({})",
+                self.max_output_tokens
+                    .map_or_else(|| "unknown".to_string(), |tokens| tokens.to_string()),
+                self.max_output_source
+            ),
+            format!(
+                "  pricing     ${:.4}/M in, ${:.4}/M out  ({})",
+                self.input_price, self.output_price, self.pricing_source
+            ),
+            format!("  family      {family}  ({})", self.capability_source),
+            format!(
+                "  thinking    {}  ({})",
+                yes(self.supports_thinking),
+                self.thinking_source
+            ),
+            format!(
+                "  vision      {}  ({})",
+                yes(self.supports_vision),
+                self.vision_source
+            ),
+            format!("  tier        {tier}"),
+            format!("  route       {route} {prefix}", prefix = self.path_prefix),
+            format!("  alias       {}", self.alias.as_deref().unwrap_or("-")),
+        ]
+    }
+}
+
+/// Explain how one gateway model resolves, for `maki models --explain`.
+pub fn explain_model(spec: &str) -> Result<ModelExplanation, AgentError> {
+    let provider = Aperture::new(Timeouts::default())?;
+    let mut model = Model::from_spec(spec).map_err(|error| AgentError::Config {
+        message: error.to_string(),
+    })?;
+    // Same path a session takes, routed provider adjustments included.
+    provider.adjust_model(&mut model);
+    Ok(explain_facts(&provider.overrides, spec, model))
+}
+
+#[cfg(test)]
+fn explain_with(overrides: &Overrides, spec: &str) -> Result<ModelExplanation, ModelError> {
+    let mut model = Model::from_spec(spec)?;
+    apply_adjustments(&mut model, overrides);
+    Ok(explain_facts(overrides, spec, model))
+}
+
+fn explain_facts(overrides: &Overrides, spec: &str, model: Model) -> ModelExplanation {
+    let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", model.id.as_str()));
+    let ov = merged_override(overrides, provider_id, model_id);
+    let payload = model_registry::discovered(SLUG, &model.id);
+    let caps = resolved_caps(&ov, provider_id, model_id);
+    let routed = routed_spec(provider_id, &ov);
+    let routed_entry = routed.and_then(|spec| lookup_entry(spec.models(), model_id));
+
+    let capability_source = match caps.as_ref().and_then(|caps| caps.source.as_ref()) {
+        Some(CapsSource::Curated { slug, model }) => format!(
+            "curated {slug}/{}",
+            model.as_deref().unwrap_or("(provider defaults)")
+        ),
+        Some(CapsSource::Plugin { slug, model }) => format!(
+            "plugin {slug}/{}",
+            model.as_deref().unwrap_or("(provider defaults)")
+        ),
+        Some(CapsSource::Catalog { slug, model }) => format!("catalog {slug}/{model}"),
+        None => match routed {
+            Some(spec) => format!("routed {}", spec.slug),
+            None => "provider defaults".to_string(),
+        },
+    };
+    let context_source = if ov.context_window.is_some() {
+        "override".to_string()
+    } else if payload
+        .as_ref()
+        .is_some_and(|info| info.context_window.is_some())
+    {
+        "gateway".to_string()
+    } else if caps
+        .as_ref()
+        .is_some_and(|caps| caps.context_window.is_some())
+    {
+        capability_source.clone()
+    } else if routed_entry.is_some_and(|entry| entry.context_window.is_some()) {
+        "table".to_string()
+    } else {
+        "fallback".to_string()
+    };
+    let max_output_source = if ov.max_output_tokens.is_some() {
+        "override".to_string()
+    } else if payload
+        .as_ref()
+        .is_some_and(|info| info.max_output_tokens.is_some())
+    {
+        "gateway".to_string()
+    } else if caps
+        .as_ref()
+        .is_some_and(|caps| caps.max_output_tokens.is_some())
+    {
+        capability_source.clone()
+    } else if routed_entry.is_some_and(|entry| entry.max_output_tokens.is_some()) {
+        "table".to_string()
+    } else {
+        "fallback".to_string()
+    };
+    let pricing_source = if payload.as_ref().is_some_and(|info| info.pricing.is_some()) {
+        "gateway".to_string()
+    } else if caps.as_ref().is_some_and(|caps| caps.pricing.is_some()) {
+        capability_source.clone()
+    } else if routed_entry.is_some_and(|entry| entry.pricing.is_some()) {
+        "table".to_string()
+    } else {
+        "fallback".to_string()
+    };
+    let explicit = ov.like.is_some() || ov.supports_thinking.is_some();
+    let effective_thinking = caps
+        .as_ref()
+        .and_then(|caps| caps.effective_thinking(explicit, routed.is_some()));
+    let thinking_source = if ov.supports_thinking.is_some() {
+        "override".to_string()
+    } else if effective_thinking.is_some() {
+        capability_source.clone()
+    } else if caps
+        .as_ref()
+        .is_some_and(|caps| caps.supports_thinking == Some(true))
+    {
+        if caps.as_ref().is_some_and(|caps| caps.thinking_guessed) {
+            "guessed, not sent without like or an override".to_string()
+        } else {
+            "borrowed, not sent by this wire".to_string()
+        }
+    } else if let Some(spec) = routed {
+        format!("routed {}", spec.slug)
+    } else {
+        "provider default".to_string()
+    };
+    let vision_source = if ov.supports_vision.is_some() {
+        "override".to_string()
+    } else if caps
+        .as_ref()
+        .is_some_and(|caps| caps.supports_vision.is_some())
+    {
+        capability_source.clone()
+    } else if routed_entry.is_some_and(|entry| entry.supports_vision.is_some()) {
+        "table".to_string()
+    } else {
+        "family default".to_string()
+    };
+
+    ModelExplanation {
+        spec: spec.to_string(),
+        context_window: model.context_window,
+        max_output_tokens: model.max_output_tokens,
+        input_price: model.pricing.input,
+        output_price: model.pricing.output,
+        family: model.family,
+        supports_thinking: model.supports_thinking(),
+        supports_vision: model.supports_vision(),
+        tier: model.tier,
+        capability_source,
+        context_source,
+        max_output_source,
+        pricing_source,
+        thinking_source,
+        vision_source,
+        route: routed.map(|spec| spec.slug),
+        path_prefix: path_prefix(routed, &ov),
+        alias: ov.like,
+    }
+}
+
+/// Gateways that reject fields they do not know (LiteLLM in front of Azure)
+/// answer 400 to a thinking block. Remember the refusal per gateway and model
+/// once the plain retry works, so only the first request pays for it.
+static THINKING_REJECTED: LazyLock<Mutex<HashSet<(String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn thinking_refused(base: &str, model: &str) -> bool {
+    THINKING_REJECTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&(base.to_string(), model.to_string()))
+}
+
+fn remember_thinking_refused(base: &str, model: &str) {
+    THINKING_REJECTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((base.to_string(), model.to_string()));
+}
+
+fn is_bad_request(error: &AgentError) -> bool {
+    matches!(error, AgentError::Api { status: 400, .. })
+}
+
+/// The generic chat path had no thinking wiring; it now spells the choice the
+/// same way the codec does.
+fn apply_generic_thinking(body: &mut Value, model: &Model, thinking: ThinkingConfig) {
+    let fallback = thinking_fields_fallback(model).unwrap_or(ThinkingFallback::None);
+    thinking.apply_thinking(body, model, fallback);
 }
 
 impl Provider for Aperture {
@@ -451,12 +827,44 @@ impl Provider for Aperture {
             let auth = auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body =
+            let mut body =
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
-            self.compat
+            let plain = body.clone();
+            let base = self.compat.base_url(&auth);
+            let refused = thinking_refused(&base, &model.id);
+            if !refused {
+                apply_generic_thinking(&mut body, model, opts.thinking);
+            }
+            if refused || body == plain {
+                return self
+                    .compat
+                    .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
+                    .await;
+            }
+            match self
+                .compat
                 .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                 .await
+            {
+                Err(error) if is_bad_request(&error) => {
+                    warn!(
+                        base_url = %base,
+                        model = %model.id,
+                        %error,
+                        "gateway refused the thinking fields, retrying without them"
+                    );
+                    let result = self
+                        .compat
+                        .do_stream(model, &HeaderMap::new(), &plain, event_tx, &auth)
+                        .await;
+                    if result.is_ok() {
+                        remember_thinking_refused(&base, &model.id);
+                    }
+                    result
+                }
+                result => result,
+            }
         })
     }
 
@@ -474,17 +882,16 @@ impl Provider for Aperture {
     }
 
     fn adjust_model(&self, model: &mut Model) {
-        if let Some((provider_id, model_id)) = model.id.split_once('/') {
-            let model_id = model_id.to_string();
-            let ov = merged_override(&self.overrides, provider_id, &model_id);
-            if let Some(spec) = routed_spec(provider_id, &ov)
-                && let Some(routed) = self
-                    .routed_provider(spec, routed_auth(&self.auth, &path_prefix(Some(spec), &ov)))
-            {
-                let full_id = std::mem::replace(&mut model.id, model_id);
-                routed.adjust_model(model);
-                model.id = full_id;
-            }
+        let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", model.id.as_str()));
+        let model_id = model_id.to_string();
+        let ov = merged_override(&self.overrides, provider_id, &model_id);
+        if let Some(spec) = routed_spec(provider_id, &ov)
+            && let Some(routed) =
+                self.routed_provider(spec, routed_auth(&self.auth, &path_prefix(Some(spec), &ov)))
+        {
+            let full_id = std::mem::replace(&mut model.id, model_id);
+            routed.adjust_model(model);
+            model.id = full_id;
         }
         apply_adjustments(model, &self.overrides);
     }
@@ -733,31 +1140,278 @@ mod tests {
         let body = json!({
             "object": "list",
             "data": [
-                {"id": "qwen3.6", "metadata": {"provider": {"id": "ollama"}}, "pricing": {"input": "0.000001", "output": 0.000002, "input_cache_read": "0.0000001"}},
-                {"id": "gemma4", "metadata": {"provider": {"id": "ikora"}}},
+                {"id": "qwen3.6", "metadata": {"provider": {"id": "ollama"}}, "context_window_tokens": 1048576, "max_output_tokens": 262144, "pricing": {"input": "0.000001", "output": 0.000002, "input_cache_read": "0.0000001"}},
+                {"id": "gemma4", "metadata": {"provider": {"id": "ikora"}}, "context_window_tokens": 128000, "max_output_tokens": 8192},
                 {"id": "raw-model"}
             ]
         });
         let models = parse_models(&body, &overrides);
         assert_eq!(models.len(), 3);
         assert_eq!(models[0].id, "ollama/qwen3.6");
-        assert_eq!(models[0].context_window, Some(65_536));
+        assert_eq!(
+            models[0].context_window,
+            Some(1_048_576),
+            "only the payload is stored; overrides apply at request time"
+        );
         assert_eq!(models[0].supports_vision, Some(true));
-        assert!(models[0].max_output_tokens.is_none());
+        assert_eq!(models[0].max_output_tokens, Some(262_144));
         let p = models[0].pricing.as_ref().unwrap();
         assert!((p.input - 1.0).abs() < 1e-9);
         assert!((p.output - 2.0).abs() < 1e-9);
         assert!((p.cache_read - 0.1).abs() < 1e-9);
         assert_eq!(models[1].id, "ikora/gemma4");
+        assert_eq!(models[1].context_window, Some(128_000));
+        assert_eq!(models[1].max_output_tokens, Some(8_192));
         assert!(models[1].pricing.is_none());
         assert!(models[1].supports_vision.is_none());
         assert_eq!(models[2].id, "raw-model");
+        assert!(models[2].context_window.is_none());
     }
 
     #[test]
     fn parse_models_handles_missing_data() {
         assert!(parse_models(&json!({}), &Overrides::new()).is_empty());
         assert!(parse_models(&json!({"data": []}), &Overrides::new()).is_empty());
+    }
+
+    fn like_override(provider: &str, model: &str, like: &str) -> Overrides {
+        Overrides::from([(
+            provider.to_string(),
+            ProviderOverride {
+                default: OverrideFields::default(),
+                models: HashMap::from([(
+                    model.to_string(),
+                    OverrideFields {
+                        like: Some(like.to_string()),
+                        ..Default::default()
+                    },
+                )]),
+            },
+        )])
+    }
+
+    #[test]
+    fn parse_models_borrows_an_unfamiliar_name_with_like() {
+        let overrides = Overrides::from([(
+            "azureai".to_string(),
+            ProviderOverride {
+                default: OverrideFields::default(),
+                models: HashMap::from([
+                    (
+                        "opaque-terra".to_string(),
+                        OverrideFields {
+                            like: Some("openai/gpt-6-sol".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "opaque-sol".to_string(),
+                        OverrideFields {
+                            like: Some("openai/gpt-6-sol".into()),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            },
+        )]);
+        let body = json!({
+            "object": "list",
+            "data": [
+                {"id": "opaque-terra", "metadata": {"provider": {"id": "azureai"}}, "context_window_tokens": 222000},
+                {"id": "opaque-sol", "metadata": {"provider": {"id": "azureai"}}}
+            ]
+        });
+        let models = parse_models(&body, &overrides);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].supports_thinking, Some(true));
+        assert_eq!(models[0].supports_vision, Some(true));
+        assert_eq!(
+            models[0].tier, None,
+            "a borrowed tier must not change automatic model selection"
+        );
+        assert_eq!(
+            models[0].context_window,
+            Some(222_000),
+            "the gateway's deployed limit beats the alias"
+        );
+        assert!(
+            models[0].max_output_tokens.is_none(),
+            "alias limits are applied at request time, not stored as payload"
+        );
+        assert!(models[1].context_window.is_none());
+    }
+
+    #[test]
+    fn explicit_fields_win_over_a_like_alias() {
+        let overrides = Overrides::from([(
+            "azureai".to_string(),
+            ProviderOverride {
+                default: OverrideFields::default(),
+                models: HashMap::from([(
+                    "opaque-terra".to_string(),
+                    OverrideFields {
+                        like: Some("openai/gpt-6-sol".into()),
+                        supports_thinking: Some(false),
+                        context_window: Some(1_000),
+                        max_output_tokens: Some(500),
+                        ..Default::default()
+                    },
+                )]),
+            },
+        )]);
+        let body = json!({
+            "object": "list",
+            "data": [{"id": "opaque-terra", "metadata": {"provider": {"id": "azureai"}}}]
+        });
+        let models = parse_models(&body, &overrides);
+        assert_eq!(models[0].supports_thinking, Some(false));
+        assert!(models[0].context_window.is_none());
+        assert!(models[0].max_output_tokens.is_none());
+    }
+
+    #[test]
+    fn a_like_limit_applies_when_the_gateway_is_silent() {
+        let overrides = like_override("azureai", "opaque", "openai/gpt-6-sol");
+        let mut model = Model::from_spec("aperture/azureai/opaque").unwrap();
+        apply_adjustments(&mut model, &overrides);
+        assert_eq!(model.family, ModelFamily::Gpt);
+        assert_eq!(model.context_window, 1_050_000);
+        assert_eq!(model.max_output_tokens, Some(128_000));
+    }
+
+    #[test]
+    fn the_gateway_provider_id_outranks_a_shared_name() {
+        let explanation = explain_with(&Overrides::new(), "aperture/openai/gpt-5.4").unwrap();
+        assert_eq!(explanation.capability_source, "curated openai/gpt-5.4");
+    }
+
+    #[test]
+    fn an_unresolvable_like_is_ignored() {
+        let overrides = like_override("azureai", "opaque-terra", "nobody/nothing");
+        let body = json!({
+            "object": "list",
+            "data": [{"id": "opaque-terra", "metadata": {"provider": {"id": "azureai"}}}]
+        });
+        let models = parse_models(&body, &overrides);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].supports_thinking, None);
+    }
+
+    #[test]
+    fn gateway_limits_beat_a_routed_static_table() {
+        crate::model_registry::set_known_models(
+            "aperture",
+            vec![ModelInfo {
+                id: "zai/glm-5.2".into(),
+                context_window: Some(123_456),
+                max_output_tokens: Some(7_890),
+                ..ModelInfo::default()
+            }],
+        );
+        let mut model = Model::from_spec("aperture/zai/glm-5.2").unwrap();
+        apply_adjustments(&mut model, &Overrides::new());
+        assert_eq!(model.context_window, 123_456);
+        assert_eq!(model.max_output_tokens, Some(7_890));
+        crate::model_registry::set_known_models("aperture", Vec::new());
+    }
+
+    #[test]
+    fn explain_names_the_row_it_borrowed() {
+        let explanation = explain_with(&Overrides::new(), "aperture/azureai/gpt-6-sol").unwrap();
+        assert_eq!(explanation.capability_source, "curated openai/gpt-6-sol");
+        assert_eq!(explanation.route, None);
+        assert_eq!(explanation.context_source, "curated openai/gpt-6-sol");
+        assert_eq!(explanation.max_output_source, "curated openai/gpt-6-sol");
+        assert_eq!(
+            explanation.thinking_source,
+            "guessed, not sent without like or an override"
+        );
+        let text = explanation.lines().join("\n");
+        assert!(text.contains("curated openai/gpt-6-sol"), "{text}");
+        assert!(text.contains("generic chat completions"), "{text}");
+    }
+
+    #[test]
+    fn explain_sources_follow_each_fact() {
+        let overrides = Overrides::from([(
+            "azureai".to_string(),
+            ProviderOverride {
+                default: OverrideFields::default(),
+                models: HashMap::from([(
+                    "opaque".to_string(),
+                    OverrideFields {
+                        like: Some("openai/gpt-6-sol".into()),
+                        max_output_tokens: Some(42),
+                        ..Default::default()
+                    },
+                )]),
+            },
+        )]);
+        let explanation = explain_with(&overrides, "aperture/azureai/opaque").unwrap();
+        assert_eq!(explanation.context_source, "curated openai/gpt-6-sol");
+        assert_eq!(explanation.max_output_source, "override");
+        assert_eq!(explanation.max_output_tokens, Some(42));
+    }
+
+    #[test]
+    fn an_unspellable_alias_does_not_claim_thinking() {
+        let overrides = like_override("azureai", "opaque-claude", "anthropic/claude-opus-5");
+        let mut model = Model::from_spec("aperture/azureai/opaque-claude").unwrap();
+        apply_adjustments(&mut model, &overrides);
+        assert_eq!(model.family, ModelFamily::Claude);
+        assert!(
+            !model.supports_thinking(),
+            "the generic chat wire cannot spell Anthropic's thinking"
+        );
+    }
+
+    #[test]
+    fn an_unspellable_alias_leaves_the_thinking_choice_alone() {
+        let overrides = like_override("azureai", "opaque-glm", "zai/glm-5.3");
+        let model = Model::from_spec("aperture/azureai/opaque-glm").unwrap();
+        assert_eq!(
+            routed_sends_thinking(&overrides, &model, ThinkingConfig::Adaptive).level(),
+            None,
+            "the generic wire cannot spell Zai thinking"
+        );
+    }
+
+    #[test]
+    fn only_a_bad_request_triggers_a_thinking_replay() {
+        let api = |status| AgentError::Api {
+            status,
+            message: String::new(),
+            retry_after: None,
+        };
+        assert!(is_bad_request(&api(400)));
+        assert!(!is_bad_request(&api(429)));
+        assert!(!is_bad_request(&api(500)));
+    }
+
+    #[test]
+    fn a_refusal_is_remembered_per_gateway_and_model() {
+        let base = "https://refusing.example";
+        let model = "vendor/refusing-model";
+        assert!(!thinking_refused(base, model));
+        remember_thinking_refused(base, model);
+        assert!(thinking_refused(base, model));
+        assert!(!thinking_refused(base, "vendor/other"));
+        assert!(!thinking_refused("https://other.example", model));
+    }
+
+    #[test]
+    fn the_generic_body_carries_borrowed_thinking_fields() {
+        use maki_config::providers::ThinkingFields;
+        let mut model = Model::from_spec("aperture/azureai/opaque").unwrap();
+        model.thinking_fields = Some(Box::new(
+            serde_json::from_value::<ThinkingFields>(json!({
+                "adaptive": { "reasoning_effort": "medium" }
+            }))
+            .unwrap(),
+        ));
+        let mut body = json!({});
+        apply_generic_thinking(&mut body, &model, ThinkingConfig::Adaptive);
+        assert_eq!(body["reasoning_effort"], "medium");
     }
 
     #[test]

@@ -621,6 +621,7 @@ pub async fn models(
     no_jit: bool,
     refresh: bool,
     trust_mode: TrustMode,
+    explain: Option<&str>,
 ) -> Result<()> {
     // Model listing calls plugin hooks, so the host outlives the fetch.
     let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode).await?;
@@ -636,8 +637,10 @@ pub async fn models(
     fetch_all_models(
         &config.provider.model_policy,
         |batch| {
-            for model in batch.models {
-                println!("{model}");
+            if explain.is_none() {
+                for model in batch.models {
+                    println!("{model}");
+                }
             }
             if let ProviderStatus::Failed(warning) = batch.status {
                 eprintln!("warning: {warning}");
@@ -646,6 +649,18 @@ pub async fn models(
         None,
     )
     .await;
+
+    if let Some(spec) = explain {
+        if !spec.starts_with("aperture/") {
+            bail!(
+                "--explain covers Aperture models, e.g. aperture/<upstream>/<model>; \
+                 custom providers read like from providers.toml"
+            );
+        }
+        for line in maki_providers::explain_model(spec)?.lines() {
+            println!("{line}");
+        }
+    }
 
     if let Some(e) = refresh_failure {
         bail!("catalog refresh failed, keeping existing cache: {e}");
