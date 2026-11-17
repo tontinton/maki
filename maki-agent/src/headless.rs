@@ -1,4 +1,4 @@
-use std::future::{Future, ready};
+use std::future::Future;
 use std::iter;
 use std::mem;
 use std::path::PathBuf;
@@ -377,7 +377,7 @@ impl ContextSpec {
         }
     }
 
-    fn render(&self, model: &Model, workflow: bool) -> RunContext {
+    async fn render(&self, model: &Model, workflow: bool) -> RunContext {
         let tools = RequestTools::build_with_background(
             ToolRegistry::global(),
             &self.vars,
@@ -387,13 +387,18 @@ impl ContextSpec {
             workflow,
             self.mcp,
             self.background,
-        );
+        )
+        .await;
         self.host_prompt
             .context(&self.vars, &self.instructions, &self.slots, model, tools)
     }
 
     fn builder(self) -> RunContextBuilder {
-        Arc::new(move |model, workflow| Box::pin(ready(self.render(model, workflow))))
+        let spec = Arc::new(self);
+        Arc::new(move |model, workflow| {
+            let (spec, model) = (Arc::clone(&spec), model.clone());
+            Box::pin(async move { spec.render(&model, workflow).await })
+        })
     }
 }
 
@@ -493,7 +498,7 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
             params.mcp_handle.as_ref(),
         )
     };
-    let initial = spec.render(&params.model, params.defaults.workflow);
+    let initial = spec.render(&params.model, params.defaults.workflow).await;
     let context = spec.builder();
 
     let mcp = params
@@ -1061,7 +1066,8 @@ mod tests {
     /// saw the original.
     #[test_case(None, true ; "rendered_prompt_states_them")]
     #[test_case(Some("custom"), false ; "override_leaves_them_out")]
-    fn override_states_no_facts(system_override: Option<&str>, tracked: bool) {
+    #[tokio::test]
+    async fn override_states_no_facts(system_override: Option<&str>, tracked: bool) {
         let mut slots = ResolvedPrompts::default();
         slots.insert(
             PromptId::System,
@@ -1087,7 +1093,7 @@ mod tests {
             )
         };
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let facts = spec.render(&model, false).facts;
+        let facts = spec.render(&model, false).await.facts;
         assert_eq!(
             facts.is_some_and(|f| !f.instructions.is_empty() && !f.hints.is_empty()),
             tracked
@@ -1096,7 +1102,8 @@ mod tests {
 
     #[test_case(None, "You analyse information." ; "plugin_template")]
     #[test_case(Some("Explicit SDK policy."), "Explicit SDK policy." ; "sdk_precedence")]
-    fn headless_prompt_replacement_keeps_explicit_sdk_precedence(
+    #[tokio::test]
+    async fn headless_prompt_replacement_keeps_explicit_sdk_precedence(
         explicit: Option<&str>,
         expected: &str,
     ) {
@@ -1119,7 +1126,7 @@ mod tests {
             )
         };
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let context = spec.render(&model, false);
+        let context = spec.render(&model, false).await;
         assert_eq!(context.system, expected);
         assert_eq!(context.facts.is_none(), explicit.is_some());
         assert!(!context.system.contains(OMITTED_INSTRUCTIONS));

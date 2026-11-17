@@ -1,5 +1,4 @@
 use crate::agent::UnboundedSender;
-use std::future::ready;
 use std::sync::Arc;
 
 use maki_agent::agent::{self, AgentHooks};
@@ -25,7 +24,7 @@ use tracing::error;
 use super::run_cancels::RunCancels;
 use super::shared_queue::{self, Compaction, QueueReceiver, QueueRun};
 
-fn base_tools(
+async fn base_tools(
     vars: &Vars,
     model: &Model,
     config: &AgentConfig,
@@ -41,6 +40,7 @@ fn base_tools(
         workflow,
         has_mcp,
     )
+    .await
 }
 
 /// The loop's side of everything it shares with its `AgentHandles`.
@@ -223,16 +223,21 @@ impl AgentLoop {
                 .collect_prompt_slots(Some(self.seed.session_id.as_str()))
                 .await,
         );
-        let vars = self.vars.clone();
-        let instructions = self.instructions.text.clone();
-        let slots = Arc::clone(&prompt_slots);
-        let config = self.seed.config.clone();
         let has_mcp = self.seed.mcp.is_some();
-        let host_prompt = Arc::clone(&self.host_prompt);
+        let spec = Arc::new((
+            self.vars.clone(),
+            self.instructions.text.clone(),
+            Arc::clone(&prompt_slots),
+            self.seed.config.clone(),
+            Arc::clone(&self.host_prompt),
+        ));
         let context: RunContextBuilder = Arc::new(move |model, workflow| {
-            let tools = base_tools(&vars, model, &config, has_mcp, workflow);
-            let rendered = host_prompt.context(&vars, &instructions, &slots, model, tools);
-            Box::pin(ready(rendered))
+            let (spec, model) = (Arc::clone(&spec), model.clone());
+            Box::pin(async move {
+                let (vars, instructions, slots, config, host_prompt) = &*spec;
+                let tools = base_tools(vars, &model, config, has_mcp, workflow).await;
+                host_prompt.context(vars, instructions, slots, &model, tools)
+            })
         });
         (context, prompt_slots)
     }

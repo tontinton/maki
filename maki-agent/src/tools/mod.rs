@@ -203,7 +203,7 @@ impl RequestTools {
     /// The one place a run's tool array is built. Host exclusions (a client
     /// that cannot service `question`) go through here and nowhere else, so
     /// the array and the filter always agree on them.
-    pub fn build(
+    pub async fn build(
         registry: &ToolRegistry,
         vars: &crate::template::Vars,
         model: &Model,
@@ -213,13 +213,14 @@ impl RequestTools {
         mcp: bool,
     ) -> Self {
         Self::build_with_background(registry, vars, model, config, excluded, workflow, mcp, true)
+            .await
     }
 
     /// [`Self::build`] for a session whose `background` is known: when it is
     /// off, tools and parameters that only exist to move a call to the
     /// background stay out of the array for the whole session.
     #[allow(clippy::too_many_arguments)]
-    pub fn build_with_background(
+    pub async fn build_with_background(
         registry: &ToolRegistry,
         vars: &crate::template::Vars,
         model: &Model,
@@ -236,13 +237,11 @@ impl RequestTools {
             workflow,
             mcp,
         };
+        let definitions = registry
+            .described_definitions(vars, &ctx, model.supports_tool_examples(), background)
+            .await;
         Self {
-            definitions: registry.definitions_with_background(
-                vars,
-                &ctx,
-                model.supports_tool_examples(),
-                background,
-            ),
+            definitions,
             filter: Arc::new(filter),
         }
     }
