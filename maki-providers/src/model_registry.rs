@@ -11,7 +11,7 @@
 //! The global lock never escapes this module: accessors lock internally and
 //! return owned data, so a caller can never hold a read guard across model
 //! construction (recursive read + queued writer = deadlock). The module owns
-//! persistence: [`load`] at startup, [`set_and_persist`] on user edits.
+//! persistence: [`load`] at startup, [`persist_overrides`] on user edits.
 //! Callers never touch the on-disk format directly.
 //!
 //! Lookups never read a file. `providers.toml` declarations are pushed in by
@@ -111,23 +111,24 @@ pub fn load(dir: &StateDir) {
     set_declared(custom::declared_tiers());
 }
 
-pub fn set_and_persist(spec: String, tier: ModelTier, dir: &StateDir) {
-    update_and_persist(dir, |reg| reg.set(spec, tier));
+/// Returns the overrides as of this edit, for [`persist_overrides`]: file IO
+/// must never run while holding the registry lock.
+pub fn set(spec: String, tier: ModelTier) -> BTreeMap<ModelTier, String> {
+    update(|reg| reg.set(spec, tier))
 }
 
-pub fn unset_and_persist(spec: &str, tier: ModelTier, dir: &StateDir) {
-    update_and_persist(dir, |reg| reg.unset(spec, tier));
+pub fn unset(spec: &str, tier: ModelTier) -> BTreeMap<ModelTier, String> {
+    update(|reg| reg.unset(spec, tier))
 }
 
-/// Snapshot under the lock, persist outside it: file IO must never run while
-/// holding the registry lock.
-fn update_and_persist(dir: &StateDir, update: impl FnOnce(&mut ModelRegistry)) {
-    let snapshot = {
-        let mut reg = write();
-        update(&mut reg);
-        reg.overrides.clone()
-    };
-    write_overrides(dir.path().join(TIERS_FILE).as_path(), &snapshot);
+fn update(apply: impl FnOnce(&mut ModelRegistry)) -> BTreeMap<ModelTier, String> {
+    let mut reg = write();
+    apply(&mut reg);
+    reg.overrides.clone()
+}
+
+pub fn persist_overrides(dir: &StateDir, overrides: &BTreeMap<ModelTier, String>) {
+    write_overrides(dir.path().join(TIERS_FILE).as_path(), overrides);
 }
 
 #[derive(Debug, Default)]
@@ -666,6 +667,34 @@ mod tests {
         assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
         assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3");
         assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/qwen3:8b");
+    }
+
+    const EDITED_TIER: ModelTier = ModelTier::Weak;
+    const PICKED_SPEC: &str = "ollama/picked";
+    const REPLACEMENT_SPEC: &str = "ollama/replacement";
+
+    enum TierEdit {
+        Set(&'static str),
+        Unset(&'static str),
+    }
+
+    #[test_case(&[TierEdit::Set(PICKED_SPEC)], Some(PICKED_SPEC) ; "set")]
+    #[test_case(&[TierEdit::Set(PICKED_SPEC), TierEdit::Set(REPLACEMENT_SPEC)], Some(REPLACEMENT_SPEC) ; "replace")]
+    #[test_case(&[TierEdit::Set(PICKED_SPEC), TierEdit::Unset(PICKED_SPEC)], None ; "unset")]
+    fn tier_edit_returns_what_persist_overrides_writes(edits: &[TierEdit], expected: Option<&str>) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut snapshot = BTreeMap::new();
+        for edit in edits {
+            snapshot = match *edit {
+                TierEdit::Set(spec) => set(spec.into(), EDITED_TIER),
+                TierEdit::Unset(spec) => unset(spec, EDITED_TIER),
+            };
+            persist_overrides(&dir, &snapshot);
+        }
+
+        assert_eq!(snapshot.get(&EDITED_TIER).map(String::as_str), expected);
+        assert_eq!(read_overrides(&dir.path().join(TIERS_FILE)), snapshot);
     }
 
     const SESSION_SLUG: &str = "mybox";
