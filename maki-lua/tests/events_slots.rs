@@ -462,6 +462,23 @@ assert(filtered == 1, "non-matching fire must not consume a once entry: " .. fil
 }
 
 #[test]
+fn a_consumed_once_listener_stops_counting_as_listened() {
+    let (_reg, host) = host();
+    load(
+        &host,
+        "ev_once_listened",
+        r#"
+maki.api.create_autocmd("Once", { once = true, callback = function() end })
+maki.api.create_autocmd("Keep", { callback = function() end })
+maki.api.exec_autocmds("Once")
+"#,
+    );
+    let handle = host.event_handle();
+    assert!(!handle.listens("Once"), "a consumed once listener is gone");
+    assert!(handle.listens("Keep"), "a lasting listener stays listened");
+}
+
+#[test]
 fn mutual_recursion_stops_at_depth_guard() {
     let (_reg, host) = host();
     load(

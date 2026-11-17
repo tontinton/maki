@@ -89,8 +89,9 @@ impl AutocmdStore {
     fn publish(&self) {
         let events = self
             .listeners
-            .keys()
-            .map(|e| Arc::from(e.as_str()))
+            .iter()
+            .filter(|(_, entries)| !entries.is_empty())
+            .map(|(event, _)| Arc::from(event.as_str()))
             .collect();
         self.listened.events.store(Arc::new(events));
     }
@@ -151,6 +152,7 @@ pub(crate) async fn dispatch(
         let mut snapshot = Vec::new();
         // Drop `once` entries now, at snapshot time: if a callback refires
         // the same event they are already gone, so they stay exactly-once.
+        let mut removed_once = false;
         entries.retain(|e| {
             let fires = pattern_matches(e.patterns.as_deref(), pattern.as_deref());
             if fires {
@@ -161,8 +163,19 @@ pub(crate) async fn dispatch(
                     e.reads_content,
                 ));
             }
-            !(fires && e.once)
+            let drop = fires && e.once;
+            removed_once |= drop;
+            !drop
         });
+        let empty = entries.is_empty();
+        // A consumed `once` listener must stop counting as listened, or the
+        // host keeps paying for an event nobody reads.
+        if removed_once {
+            if empty {
+                store.listeners.remove(&event);
+            }
+            store.publish();
+        }
         snapshot
     };
     let readers = snapshot
