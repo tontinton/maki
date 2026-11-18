@@ -31,6 +31,7 @@ const DEFAULT_MAX_RECURSION: usize = 100;
 const SCRIPT_NAME: &str = "agent.py";
 const OS_CALLS_DENIED: &str = "OS calls are not permitted";
 const BINARY_FILES_UNSUPPORTED: &str = "binary files are not supported, open in text mode";
+const EXCLUSIVE_CREATE_UNSUPPORTED: &str = "exclusive creation is not supported, open with 'w'";
 const REMOVAL_UNSUPPORTED: &str =
     "removing or renaming files is not supported in the sandbox, use the bash tool";
 const HOST_TIME_EXCEEDED: &str =
@@ -385,6 +386,9 @@ impl OsHost<'_> {
             OsFunctionCall::ReadBytes(_)
             | OsFunctionCall::WriteBytes(_)
             | OsFunctionCall::AppendBytes(_) => Err(runtime_error(BINARY_FILES_UNSUPPORTED).into()),
+            OsFunctionCall::CreateExclusive(_) => {
+                Err(runtime_error(EXCLUSIVE_CREATE_UNSUPPORTED).into())
+            }
             call @ (OsFunctionCall::Unlink(_)
             | OsFunctionCall::Rmdir(_)
             | OsFunctionCall::Rename(_)) => {
