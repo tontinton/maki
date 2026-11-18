@@ -91,6 +91,7 @@ local schema = {
       description = "Array of tool calls to execute in parallel",
       required = true,
       items = {
+        type = "object",
         description = "Tool invocation: { tool: string, parameters: object } or flat { tool: string, ...params }",
       },
     },
