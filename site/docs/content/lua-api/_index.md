@@ -5192,6 +5192,40 @@ select; it now answers from the same list.
 
 ---
 
+### `maki.provider.usage()` {#maki-provider-usage}
+
+```lua
+maki.provider.usage({slug})
+```
+
+The provider's own usage limits, the data behind `/usage`. A limit carries
+a provider label, a used percentage, its reset time in epoch milliseconds
+and a free-form detail. `plan` and `by_model_today` come back when the
+provider reports them.
+
+A provider with no usage endpoint answers nil and an error, as does a
+failed fetch. The call fetches live data, so a plugin that polls should
+space its calls out.
+
+**Parameters:**
+
+- `{slug}` (`string`) Provider name, such as `"zai"`.
+
+**Returns:** (`table|nil`, `string|nil`) Usage, or nil and an error string.
+
+**Example:**
+
+```lua
+local usage, err = maki.provider.usage("zai")
+if usage then
+  for _, limit in ipairs(usage.limits or {}) do
+    maki.log.info(limit.label .. " " .. tostring(limit.percentage) .. "%")
+  end
+end
+```
+
+---
+
 ### `maki.provider.http_error()` {#maki-provider-http_error}
 
 ```lua
