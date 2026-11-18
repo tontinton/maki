@@ -6,6 +6,7 @@ local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
+local skill_fields = helpers.skill_fields
 local build_skill_list = helpers.build_skill_list
 local format_output = helpers.format_output
 local parse_output = helpers.parse_output
@@ -34,10 +35,10 @@ local function scan_skill_dir(dir, skills)
       if content then
         local fm, body = parse_frontmatter(content)
         if body and #body > 0 then
-          local name = (fm and fm.name) or entry[1]
+          local name, description = skill_fields(fm, entry[1])
           skills[name] = {
             name = name,
-            description = (fm and fm.description) or "",
+            description = description,
             content = body,
             location = skill_path,
           }

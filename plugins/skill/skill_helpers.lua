@@ -15,10 +15,17 @@ function M.parse_frontmatter(content)
   local yaml_str = rest:sub(1, end_pos)
   local body = rest:sub(end_pos + 4):match("^%s*(.-)%s*$")
   local fm, _ = maki.yaml.decode(yaml_str)
-  if not fm then
+  if type(fm) ~= "table" then
     fm = {}
   end
   return fm, body
+end
+
+-- A field is user data, so anything that is not a string reads as absent.
+function M.skill_fields(fm, fallback_name)
+  local name = type(fm.name) == "string" and fm.name or fallback_name
+  local description = type(fm.description) == "string" and fm.description or ""
+  return name, description
 end
 
 function M.build_skill_list(skills)
