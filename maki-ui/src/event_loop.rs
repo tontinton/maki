@@ -93,6 +93,7 @@ const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 const FORKED_MSG: &str = "Forked, {key} to switch back";
+const CWD_GONE_FLASH: &str = "current directory no longer exists. /cd to move elsewhere";
 /// A `/reload` cannot ask the terminal: its input reader owns the tty.
 const RESTART_FOR_BACKGROUND: &str =
     "ui.theme: restart Maki to detect the terminal background, using dark until then";
@@ -578,6 +579,8 @@ pub(crate) struct EventLoop<'t> {
     /// Writes to sessions no tab has open, which shutdown waits for like it
     /// waits for the storage writer.
     stored_writes: TaskTracker,
+    /// Whether the cwd was gone last frame, so the flash shows once per loss.
+    cwd_lost: bool,
     _model_fetch_task: AbortOnDropHandle<()>,
 }
 
@@ -891,6 +894,7 @@ impl<'t> EventLoop<'t> {
             opening: None,
             queued_focus: VecDeque::new(),
             stored_writes: TaskTracker::new(),
+            cwd_lost: false,
             _model_fetch_task: bg.task,
         })
     }
@@ -1046,11 +1050,27 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// One `getcwd` a frame, so a deleted directory is reported before it
+    /// surfaces as an unrelated "no such file". The frame that flashes owes a
+    /// paint, or an idle loop lets it expire unseen.
+    fn watch_cwd(&mut self) -> Dirty {
+        let lost = std::env::current_dir().is_err();
+        if lost == self.cwd_lost {
+            return Dirty::NO;
+        }
+        self.cwd_lost = lost;
+        if !lost {
+            return Dirty::NO;
+        }
+        self.focused_app().flash(CWD_GONE_FLASH.into());
+        Dirty::YES
+    }
+
     /// Only the focused session is drawn, so only it can owe a frame; focusing
     /// another is an event, and events always repaint. The rest get
     /// [`App::tick_background`].
     fn tick(&mut self) -> Dirty {
-        let mut dirty = Dirty::NO;
+        let mut dirty = self.watch_cwd();
         // A quit ends the whole process, so each session's double press
         // counts the background tasks of all of them.
         let running: usize = self

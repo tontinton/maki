@@ -21,6 +21,9 @@ use crate::project_trust;
 use crate::setup;
 use crate::update;
 
+const CWD_GONE_MSG: &str =
+    "the current directory no longer exists. cd somewhere else and try again";
+
 fn sanitize_warnings(warnings: &[String]) -> Vec<String> {
     warnings
         .iter()
@@ -202,6 +205,7 @@ async fn cli_stack(
 }
 
 pub async fn dispatch(mut cli: Cli) -> Result<()> {
+    env::current_dir().context(CWD_GONE_MSG)?;
     cli.check_run_path_flags()?;
     // First, so anything moved out of `~/.maki` lands before this start writes
     // a file of its own. `migrate xdg` is the same move asked for by hand.
