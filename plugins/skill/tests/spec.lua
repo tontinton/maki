@@ -1,5 +1,6 @@
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
+local skill_fields = helpers.skill_fields
 local build_skill_list = helpers.build_skill_list
 local format_output = helpers.format_output
 local parse_output = helpers.parse_output
@@ -56,6 +57,12 @@ case("frontmatter_invalid_yaml_falls_back", function()
   eq(body, "Body")
 end)
 
+case("frontmatter_that_is_not_a_mapping_reads_as_empty", function()
+  local fm, body = parse_frontmatter("---\n42\n---\nBody")
+  eq(next(fm), nil)
+  eq(body, "Body")
+end)
+
 case("frontmatter_empty_body_after_close", function()
   local fm, body = parse_frontmatter("---\nname: x\n---\n   ")
   eq(fm.name, "x")
@@ -71,6 +78,20 @@ end)
 case("frontmatter_only_dashes_no_yaml", function()
   local fm, body = parse_frontmatter("---\n\n---\nBody")
   eq(body, "Body")
+end)
+
+-- ── skill_fields ──
+
+case("skill_fields_keep_string_values", function()
+  local name, description = skill_fields({ name = "release", description = "Cut a release" }, "dir")
+  eq(name, "release")
+  eq(description, "Cut a release")
+end)
+
+case("skill_fields_replace_non_string_values", function()
+  local name, description = skill_fields({ name = { "release" }, description = { "Cut", "it" } }, "dir")
+  eq(name, "dir")
+  eq(description, "")
 end)
 
 -- ── build_skill_list ──
