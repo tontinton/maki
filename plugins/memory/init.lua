@@ -14,8 +14,11 @@ local function notify(msg)
   Toast.show(msg, { title = "memory" })
 end
 
-local function memories_path_suffix()
+local function memories_path_suffix(): string?
   local cwd = maki.uv.cwd()
+  if not cwd then
+    return nil
+  end
   local root = maki.fs.root(cwd, ".git") or cwd
   return "projects/" .. helpers.project_id(root) .. "/memories"
 end
@@ -24,10 +27,11 @@ end
 -- them here so the agent can edit notes directly.
 local function register_write_rules()
   local state = maki.env.state_dir()
-  if not state then
+  local suffix = memories_path_suffix()
+  if not state or not suffix then
     return
   end
-  local dir = maki.fs.joinpath(state, memories_path_suffix())
+  local dir = maki.fs.joinpath(state, suffix)
   for _, tool in ipairs(WRITE_TOOLS) do
     -- The edit sub-tools are opt-in, and a rule naming an unregistered tool
     -- is dropped with a warning. Ask first, or a default config logs that
@@ -47,6 +51,9 @@ local function resolve_dir(): string?
   local state = maki.env.state_dir()
   if not state then
     return nil, "cannot resolve state dir"
+  end
+  if not suffix then
+    return nil, "cannot resolve project dir"
   end
   return maki.fs.joinpath(state, suffix)
 end
