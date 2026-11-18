@@ -19,7 +19,7 @@ use super::tool_display::{
 };
 use super::{
     BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER,
-    NoticeDetail, ToolRole, ToolStatus, code_view::SectionFlags,
+    NoticeDetail, PluginItemRole, ToolRole, ToolStatus, code_view::SectionFlags,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -45,7 +45,7 @@ use maki_agent::{
     BufWatch, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND,
     SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
-use maki_lua::{EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
+use maki_lua::{ChatItem, ChatItemStatus, EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
 use maki_storage::id::{MakiId, SessionRef};
 
 use ratatui::Frame;
@@ -64,6 +64,12 @@ const CLICKABLE: bool = true;
 const NOTICE_COLLAPSED_MARK: &str = " ▸";
 const NOTICE_EXPANDED_MARK: &str = " ▾";
 const NOTICE_DETAIL_DIM: f32 = 0.7;
+/// The markers a plugin item wears in the gutter: it runs, it ended, it
+/// failed. They differ from the tool dot on purpose, since a plugin item is
+/// not a tool call.
+const RUNNING_MARKER: &str = "◐ ";
+const DONE_MARKER: &str = "✓ ";
+const FAILED_MARKER: &str = "✗ ";
 
 /// What a click in the transcript asks of the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +393,67 @@ impl MessagesPanel {
             }
         });
         self.sync_buf(tool_id);
+    }
+
+    /// A plugin's own item: it starts running, and its title may track
+    /// progress while it runs. It is not a tool call, so a turn settling or
+    /// an Esc leaves it alone.
+    pub fn plugin_item_start(&mut self, item: &ChatItem) {
+        if let Some(index) = self.plugin_item_index(&item.id) {
+            let Some(msg) = self.messages.get_mut(index) else {
+                return;
+            };
+            if let DisplayRole::PluginItem(role) = &mut msg.role {
+                role.status = ChatItemStatus::Running;
+            }
+            msg.text = item.title.clone();
+            self.reflow_msg_segment(index);
+            return;
+        }
+        self.flush();
+        let msg = DisplayMessage::new(
+            DisplayRole::PluginItem(Box::new(PluginItemRole {
+                id: item.id.to_string(),
+                status: ChatItemStatus::Running,
+                name: Arc::clone(&item.label),
+            })),
+            item.title.clone(),
+        );
+        self.messages.push(msg);
+    }
+
+    /// Closes a plugin's item. An item the transcript never showed closes
+    /// quietly: a plugin may report on a job after the transcript was
+    /// rebuilt.
+    pub fn plugin_item_finish(&mut self, item: &ChatItem) {
+        let Some(index) = self.plugin_item_index(&item.id) else {
+            return;
+        };
+        let Some(msg) = self.messages.get_mut(index) else {
+            return;
+        };
+        if let DisplayRole::PluginItem(role) = &mut msg.role {
+            role.status = item.status;
+        }
+        if let Some(detail) = &item.detail {
+            msg.text = detail.clone();
+        }
+        self.reflow_msg_segment(index);
+    }
+
+    fn plugin_item_index(&self, id: &str) -> Option<usize> {
+        self.messages
+            .iter()
+            .rposition(|m| matches!(&m.role, DisplayRole::PluginItem(item) if item.id == id))
+    }
+
+    /// Draws a message that changed in place again, so its row shows the new
+    /// text. A message the transcript has not drawn yet needs no redraw: the
+    /// next draw builds it from the message.
+    fn reflow_msg_segment(&mut self, msg_index: usize) {
+        if let Some(seg_idx) = self.cache.find_by_msg_index(msg_index) {
+            self.reflow_text_segment(seg_idx, self.viewport_width);
+        }
     }
 
     pub fn set_tool_movable(&mut self, tool_id: &str, movable: bool) {
@@ -1774,7 +1841,38 @@ fn message_style(role: &DisplayRole) -> RoleStyle {
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
         DisplayRole::Notice => notice_style(),
+        DisplayRole::PluginItem(item) => plugin_item_style(item.status),
         DisplayRole::Tool(_) => unreachable!(),
+    }
+}
+
+/// A plugin item draws its own marker and label: it is not a tool call, so
+/// it must not look like one.
+fn plugin_item_style(status: ChatItemStatus) -> RoleStyle {
+    let (marker, marker_style, text_style) = match status {
+        ChatItemStatus::Running => (
+            RUNNING_MARKER,
+            theme::current().tool_dim,
+            theme::current().tool_dim,
+        ),
+        ChatItemStatus::Done => (
+            DONE_MARKER,
+            theme::current().tool_success,
+            theme::current().assistant,
+        ),
+        ChatItemStatus::Failed => (
+            FAILED_MARKER,
+            theme::current().tool_error,
+            theme::current().error,
+        ),
+    };
+    RoleStyle {
+        marker,
+        marker_style,
+        label: "",
+        text_style,
+        use_markdown: false,
+        max_line_bytes: None,
     }
 }
 
@@ -1802,6 +1900,9 @@ fn message_gutter(msg: &DisplayMessage, style: &RoleStyle) -> Option<Span<'stati
 /// collapsed thinking draws its header from the same label, so neither needs
 /// a case of its own.
 fn message_search_text(msg: &DisplayMessage) -> String {
+    if let DisplayRole::PluginItem(item) = &msg.role {
+        return format!("{}{}", item.name, msg.text);
+    }
     let style = message_style(&msg.role);
     let marker = if message_gutter(msg, &style).is_some() {
         style.marker.trim_start()
@@ -1828,6 +1929,19 @@ fn message_view(msg: &DisplayMessage, mode: ThinkingLines, width: u16) -> Messag
     } else {
         width
     };
+    if let DisplayRole::PluginItem(item) = &msg.role {
+        let label = format!("{}  ", item.name);
+        return MessageView {
+            lines: plain_lines(
+                &msg.text,
+                &label,
+                style.text_style,
+                theme::current().tool_dim,
+            ),
+            gutter,
+            collapsed: false,
+        };
+    }
     if matches!(msg.role, DisplayRole::Thinking)
         && let Some(lines) = thinking::collapsed_view(
             thinking::tail_rows(mode, msg.thinking_expanded),

@@ -17,7 +17,8 @@ use crate::components::plan_form::builtin_menu;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{
-    BackgroundOutcome, ExitRequest, NoticeDetail, buffer_text, key, test_model,
+    BackgroundOutcome, DisplayRole, ExitRequest, NoticeDetail, ToolStatus, buffer_text, key,
+    test_model,
 };
 use crate::decor_worker;
 use crate::highlight::TAB_SPACES;
@@ -48,11 +49,11 @@ use maki_lua::test_support::{
     probed_event_handle, runtime, set_mode,
 };
 use maki_lua::{
-    Border, BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest,
-    InputRulesReader, InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader,
-    Missing, PASTE, PackCommand, PackPlan, PackPreparation, PackReport, Permission,
-    PlanActionOutcome, PluginHost, PluginPermissions, SessionEndReason, Split, TextEdit, UiAction,
-    WinCommand, WinEvent,
+    Border, BuiltinAction, ChatItem, ChatItemStatus, Dimension, FloatConfig, HintEntry, HintReader,
+    InputRequest, InputRulesReader, InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo,
+    LuaCommandReader, Missing, PASTE, PackCommand, PackPlan, PackPreparation, PackReport,
+    Permission, PlanActionOutcome, PluginHost, PluginPermissions, SegmentEntry, SessionEndReason,
+    Split, TextEdit, UiAction, WinCommand, WinEvent,
 };
 use maki_providers::provider::ProviderStatus;
 use maki_providers::{
@@ -3330,7 +3331,7 @@ fn tick_drains_live_bufs_of_background_chats() {
 #[test]
 fn status_hints_published_by_a_plugin_reach_the_screen() {
     let (mut app, plugin) = app_with_hints();
-    plugin.publish(vec![hint_for(None)]);
+    plugin.publish(vec![hint_for(None)], Vec::new());
 
     assert!(
         !rendered(&mut app).contains(HINT_TEXT),
@@ -3339,7 +3340,7 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert!(rendered(&mut app).contains(HINT_TEXT));
 
-    plugin.publish(vec![]);
+    plugin.publish(Vec::new(), Vec::new());
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert!(!rendered(&mut app).contains(HINT_TEXT));
 }
@@ -3361,11 +3362,39 @@ fn session_hint_shows_only_in_its_tab(own: bool) {
     } else {
         MakiId::generate()
     };
-    plugin.publish(vec![hint_for(Some(owner))]);
+    plugin.publish(vec![hint_for(Some(owner))], Vec::new());
 
     let _ = app.tick();
 
     assert_eq!(rendered(&mut app).contains(HINT_TEXT), own);
+}
+
+const SEGMENT_TEXT: &str = "2 running";
+
+fn segment_for(session: Option<MakiId>) -> SegmentEntry {
+    SegmentEntry {
+        plugin: Arc::from(HINT_PLUGIN),
+        id: "jobs".into(),
+        session,
+        text: SEGMENT_TEXT.into(),
+        style: "status_dim".into(),
+    }
+}
+
+#[test_case(true ; "own_session")]
+#[test_case(false ; "other_session")]
+fn session_segment_shows_only_in_its_tab(own: bool) {
+    let (mut app, plugin) = app_with_hints();
+    let owner = if own {
+        app.state.session.id
+    } else {
+        MakiId::generate()
+    };
+    plugin.publish(Vec::new(), vec![segment_for(Some(owner))]);
+
+    let _ = app.tick();
+
+    assert_eq!(rendered(&mut app).contains(SEGMENT_TEXT), own);
 }
 
 const RENDERED_WIDTH: u16 = 80;
@@ -6315,6 +6344,110 @@ fn reserved_shell_survives_parent_done_until_shell_done() {
     });
     assert_eq!(app.chats[0].in_progress_count(), 0);
     assert!(!app.shell.active_ids().contains(&id));
+}
+
+const PLUGIN_ITEM_ID: &str = "monitor:1";
+const PLUGIN_ITEM_LABEL: &str = "monitor";
+const PLUGIN_ITEM_TITLE: &str = "watch tests";
+const AGENT_TOOL_ID: &str = "agent-tool";
+
+fn running_plugin_item() -> ChatItem {
+    ChatItem {
+        id: PLUGIN_ITEM_ID.into(),
+        label: PLUGIN_ITEM_LABEL.into(),
+        title: PLUGIN_ITEM_TITLE.into(),
+        status: ChatItemStatus::Running,
+        detail: None,
+    }
+}
+
+fn tool_message<'a>(
+    chat: &'a crate::chat::Chat,
+    id: &str,
+) -> Option<&'a crate::components::DisplayMessage> {
+    (0..chat.message_count()).find_map(|index| {
+        let msg = chat.message_at(index)?;
+        match &msg.role {
+            DisplayRole::Tool(tool) if tool.id == id => Some(msg),
+            _ => None,
+        }
+    })
+}
+
+fn plugin_item(chat: &crate::chat::Chat) -> Option<&crate::components::DisplayMessage> {
+    (0..chat.message_count()).find_map(|index| {
+        let msg = chat.message_at(index)?;
+        match &msg.role {
+            DisplayRole::PluginItem(_) => Some(msg),
+            _ => None,
+        }
+    })
+}
+
+fn start_running_item_and_agent_tool(app: &mut App) {
+    app.handle_chat_item(&running_plugin_item());
+    app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+        id: AGENT_TOOL_ID.into(),
+        tool: "read".into(),
+        summary: "reading".into(),
+        annotation: None,
+        input: None,
+        raw_input: None,
+        output: None,
+        render_header: None,
+    }))));
+}
+
+#[test]
+fn a_running_chat_item_survives_the_turn_that_started_it() {
+    let mut app = streaming_app_with_history();
+    start_running_item_and_agent_tool(&mut app);
+
+    app.update(done_event());
+
+    let item = plugin_item(&app.chats[0]).expect("the item stays");
+    let DisplayRole::PluginItem(role) = &item.role else {
+        panic!("a chat item is its own row");
+    };
+    assert_eq!(role.status, ChatItemStatus::Running);
+    assert_eq!(item.text, PLUGIN_ITEM_TITLE);
+    let agent = tool_message(&app.chats[0], AGENT_TOOL_ID).expect("the agent tool stays");
+    assert!(
+        agent.text.contains(MISSING_TOOL_COMPLETION),
+        "the agent's own tool is still settled"
+    );
+}
+
+#[test]
+fn a_running_chat_item_survives_esc() {
+    let mut app = streaming_app_with_history();
+    start_running_item_and_agent_tool(&mut app);
+
+    cancel_app(&mut app);
+
+    let item = plugin_item(&app.chats[0]).expect("the item stays");
+    let DisplayRole::PluginItem(role) = &item.role else {
+        panic!("a chat item is its own row");
+    };
+    assert_eq!(role.status, ChatItemStatus::Running);
+    assert_eq!(item.text, PLUGIN_ITEM_TITLE);
+    let agent = tool_message(&app.chats[0], AGENT_TOOL_ID).expect("the agent tool stays");
+    let DisplayRole::Tool(role) = &agent.role else {
+        panic!("the agent tool stays a tool row");
+    };
+    assert_eq!(role.status, ToolStatus::Error);
+}
+
+/// A plugin item is not a tool call, so it draws its own row: its label, its
+/// title, and a marker of its own.
+#[test]
+fn a_chat_item_draws_its_own_row() {
+    let mut app = streaming_app_with_history();
+    app.handle_chat_item(&running_plugin_item());
+
+    let text = rendered(&mut app);
+    assert!(text.contains(PLUGIN_ITEM_TITLE), "{text}");
+    assert!(text.contains(PLUGIN_ITEM_LABEL), "{text}");
 }
 
 #[test]
