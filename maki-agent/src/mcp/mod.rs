@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
 use maki_config::ProjectConfig;
-use maki_providers::{ContentBlock, DEFER_LOADING_KEY, Message, Model};
+use maki_providers::{AgentError, ContentBlock, DEFER_LOADING_KEY, Message, Model, Role};
 use maki_storage::blocking;
 use rmcp::model::{Prompt, PromptArgument, Tool};
 use serde_json::{Value, json};
@@ -44,7 +44,8 @@ use self::config::{
     ServerConfig, Transport, load_config, parse_server, transport_kind,
 };
 use self::error::McpError;
-use self::transport::{McpTransport, PromptMessage};
+use self::transport::{McpTransport, PromptMessage, PromptRole};
+use crate::McpPromptRef;
 use crate::tools::CallOrigin;
 use crate::tools::schema::sanitize_tool_input_schema;
 use crate::types::TextOutput;
@@ -71,6 +72,9 @@ const SEARCH_OVERFLOW_PREFIX: &str = "Also matched but not loaded: ";
 const SEARCH_HEADER_MODEL: (&str, &str) = ("Loaded", ", callable from your next message:");
 const SEARCH_HEADER_NESTED: (&str, &str) = ("Matched", ", callable here by name:");
 pub(crate) const SEARCH_EMPTY_QUERY: &str = "query must not be empty";
+pub const USAGE_PREFIX: &str = "Usage:";
+const PROMPT_ERROR_TOOL: &str = "mcp_prompt";
+const MCP_UNAVAILABLE: &str = "MCP not available";
 
 /// Convert internal qualified name (`server.tool`) to wire format (`server__tool`)
 /// for LLM provider APIs that reject dots in tool names.
@@ -251,6 +255,74 @@ pub struct McpPromptArg {
     pub name: String,
     pub description: String,
     pub required: bool,
+}
+
+impl McpPromptInfo {
+    /// A prompt with no descriptions, for callers that only care about its
+    /// shape: {arguments} are `(name, required)` in declared order.
+    pub fn new(display_name: &str, qualified_name: &str, arguments: &[(&str, bool)]) -> Self {
+        Self {
+            display_name: display_name.into(),
+            qualified_name: qualified_name.into(),
+            description: String::new(),
+            arguments: arguments
+                .iter()
+                .map(|&(name, required)| McpPromptArg {
+                    name: name.into(),
+                    description: String::new(),
+                    required,
+                })
+                .collect(),
+        }
+    }
+
+    /// `Err` is the usage line naming each required argument {args} left out.
+    pub fn resolve(&self, args: &str) -> Result<McpPromptRef, String> {
+        let arguments = self.parse_args(args);
+        let missing: Vec<_> = self
+            .arguments
+            .iter()
+            .filter(|a| a.required && !arguments.contains_key(&a.name))
+            .map(|a| format!("<{}>", a.name))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "{USAGE_PREFIX} /{} {}",
+                self.display_name,
+                missing.join(" ")
+            ));
+        }
+        Ok(McpPromptRef {
+            qualified_name: self.qualified_name.clone(),
+            arguments,
+        })
+    }
+
+    /// One word per argument in declared order, and the last one takes the
+    /// rest, so a free-form final argument keeps its spaces.
+    fn parse_args(&self, args: &str) -> HashMap<String, String> {
+        let mut result = HashMap::new();
+        let mut remaining = args.trim();
+        if remaining.is_empty() || self.arguments.is_empty() {
+            return result;
+        }
+        let last_idx = self.arguments.len() - 1;
+        for (i, arg) in self.arguments.iter().enumerate() {
+            if remaining.is_empty() {
+                break;
+            }
+            if i == last_idx {
+                result.insert(arg.name.clone(), remaining.to_string());
+            } else if let Some((word, rest)) = remaining.split_once(char::is_whitespace) {
+                result.insert(arg.name.clone(), word.to_string());
+                remaining = rest.trim_start();
+            } else {
+                result.insert(arg.name.clone(), remaining.to_string());
+                break;
+            }
+        }
+        result
+    }
 }
 
 #[derive(Clone, Default)]
@@ -690,6 +762,34 @@ impl McpHandle {
             (p.raw_name.clone(), Arc::clone(&p.transport))
         };
         transport.get_prompt(&raw_name, arguments).await
+    }
+
+    /// What `prompt` expands to, sent ahead of the user's message. A failure is
+    /// the run's error, as for any tool.
+    pub async fn prompt_preamble(
+        mcp: Option<&Self>,
+        prompt: &McpPromptRef,
+    ) -> Result<Vec<Message>, AgentError> {
+        let prompt_error = |message: String| AgentError::Tool {
+            tool: PROMPT_ERROR_TOOL.into(),
+            message,
+        };
+        let mcp = mcp.ok_or_else(|| prompt_error(MCP_UNAVAILABLE.into()))?;
+        let messages = mcp
+            .get_prompt(&prompt.qualified_name, &prompt.arguments)
+            .await
+            .map_err(|e| prompt_error(e.to_string()))?;
+        Ok(messages
+            .into_iter()
+            .map(|PromptMessage { role, text }| match role {
+                PromptRole::Assistant => Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text { text }],
+                    ..Default::default()
+                },
+                PromptRole::User => Message::user(text),
+            })
+            .collect())
     }
 
     pub async fn shutdown(&self) {
@@ -2318,5 +2418,41 @@ mod tests {
         assert!(!is_valid_tool_name("tool!"));
         assert!(!is_valid_tool_name("*"));
         assert!(!is_valid_tool_name(&"a".repeat(65)));
+    }
+
+    const PROMPT_DISPLAY: &str = "srv:p";
+    const PROMPT_QUALIFIED: &str = "srv.p";
+    const ARG_A: &str = "a";
+    const ARG_B: &str = "b";
+    const ARG_C: &str = "c";
+
+    #[test_case(&[(ARG_A, false), (ARG_B, false)], "x  y z", &[(ARG_A, "x"), (ARG_B, "y z")] ; "last_takes_rest")]
+    #[test_case(&[(ARG_A, false), (ARG_B, false)], "x\ty", &[(ARG_A, "x"), (ARG_B, "y")] ; "tab_separates")]
+    #[test_case(&[(ARG_A, false), (ARG_B, false)], "  x  ", &[(ARG_A, "x")] ; "fewer_words_than_args")]
+    #[test_case(&[(ARG_A, false)], "", &[] ; "empty_args")]
+    #[test_case(&[], "ignored", &[] ; "prompt_without_args")]
+    fn resolve_fills_args_in_order(args: &[(&str, bool)], input: &str, expected: &[(&str, &str)]) {
+        let resolved = McpPromptInfo::new(PROMPT_DISPLAY, PROMPT_QUALIFIED, args)
+            .resolve(input)
+            .unwrap();
+        let expected: HashMap<String, String> = expected
+            .iter()
+            .map(|&(k, v)| (k.into(), v.into()))
+            .collect();
+        assert_eq!(resolved.arguments, expected);
+        assert_eq!(resolved.qualified_name, PROMPT_QUALIFIED);
+    }
+
+    #[test]
+    fn resolve_reports_missing_required_args() {
+        let prompt = McpPromptInfo::new(
+            PROMPT_DISPLAY,
+            PROMPT_QUALIFIED,
+            &[(ARG_A, true), (ARG_B, true), (ARG_C, false)],
+        );
+        assert_eq!(
+            prompt.resolve("x").unwrap_err(),
+            format!("{USAGE_PREFIX} /{PROMPT_DISPLAY} <{ARG_B}>")
+        );
     }
 }

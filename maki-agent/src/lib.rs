@@ -104,7 +104,7 @@ pub trait InterruptSource: Send + Sync {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct McpPromptRef {
     pub qualified_name: String,
     pub arguments: HashMap<String, String>,

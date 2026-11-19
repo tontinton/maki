@@ -2,7 +2,7 @@ use std::mem;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_agent::command::CustomCommand;
+use maki_agent::command::{COMPACT_DESCRIPTION, CustomCommand, PromptCommand};
 use maki_agent::{McpPromptInfo, McpSnapshotReader};
 use maki_lua::{LuaCommandInfo, LuaCommandReader, Missing, Permission, PluginReach, SENDS_PROMPT};
 use nucleo::pattern::{CaseMatching, Normalization};
@@ -73,7 +73,7 @@ pub struct BuiltinCommand {
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/compact",
-        description: "Summarize and compact conversation history (optional guidance)",
+        description: COMPACT_DESCRIPTION,
         max_args: usize::MAX,
         bang: false,
         plugin_access: SUBMITS_PROMPT,
@@ -317,29 +317,21 @@ impl CommandPalette {
             max_args: cmd.max_args,
             command_type: CommandType::Builtin(cmd),
         });
-        let custom = custom_commands
-            .iter()
-            .enumerate()
-            .map(|(i, cmd)| CommandItem {
-                name: cmd.display_name(),
-                max_args: if cmd.has_args() { usize::MAX } else { 0 },
-                command_type: CommandType::Custom(i),
+        let prompt_commands =
+            PromptCommand::catalog(custom_commands, mcp_prompts).map(|(i, command)| CommandItem {
+                name: command.slash_name(),
+                max_args: if command.takes_args() { usize::MAX } else { 0 },
+                command_type: match command {
+                    PromptCommand::Custom(_) => CommandType::Custom(i),
+                    PromptCommand::Mcp(_) => CommandType::McpPrompt(i),
+                },
             });
-        let prompts = mcp_prompts.iter().enumerate().map(|(i, p)| CommandItem {
-            name: format!("/{}", p.display_name),
-            max_args: if p.arguments.is_empty() {
-                0
-            } else {
-                usize::MAX
-            },
-            command_type: CommandType::McpPrompt(i),
-        });
         let lua = lua_commands.iter().enumerate().map(|(i, cmd)| CommandItem {
             name: cmd.name.to_string(),
             max_args: cmd.max_args,
             command_type: CommandType::Lua(i),
         });
-        builtins.chain(custom).chain(prompts).chain(lua)
+        builtins.chain(prompt_commands).chain(lua)
     }
 
     fn build_nucleo(
@@ -592,29 +584,29 @@ impl CommandPalette {
     }
 
     fn item_name(&self, m: &Match) -> String {
-        match &m.command_type {
+        match m.command_type {
             CommandType::Builtin(cmd) => cmd.name.to_string(),
-            CommandType::Custom(i) => self.custom[*i].display_name(),
-            CommandType::McpPrompt(i) => format!("/{}", self.mcp_prompts[*i].display_name),
-            CommandType::Lua(i) => self.lua_commands[*i].name.to_string(),
+            CommandType::Custom(i) => PromptCommand::Custom(&self.custom[i]).slash_name(),
+            CommandType::McpPrompt(i) => PromptCommand::Mcp(&self.mcp_prompts[i]).slash_name(),
+            CommandType::Lua(i) => self.lua_commands[i].name.to_string(),
         }
     }
 
     fn item_has_args(&self, m: &Match) -> bool {
-        match &m.command_type {
+        match m.command_type {
             CommandType::Builtin(cmd) => cmd.max_args > 0,
-            CommandType::Custom(i) => self.custom[*i].has_args(),
-            CommandType::McpPrompt(i) => !self.mcp_prompts[*i].arguments.is_empty(),
-            CommandType::Lua(i) => self.lua_commands[*i].max_args > 0,
+            CommandType::Custom(i) => PromptCommand::Custom(&self.custom[i]).takes_args(),
+            CommandType::McpPrompt(i) => PromptCommand::Mcp(&self.mcp_prompts[i]).takes_args(),
+            CommandType::Lua(i) => self.lua_commands[i].max_args > 0,
         }
     }
 
     fn item_description(&self, m: &Match) -> &str {
-        match &m.command_type {
+        match m.command_type {
             CommandType::Builtin(cmd) => cmd.description,
-            CommandType::Custom(i) => &self.custom[*i].description,
-            CommandType::McpPrompt(i) => &self.mcp_prompts[*i].description,
-            CommandType::Lua(i) => &self.lua_commands[*i].description,
+            CommandType::Custom(i) => PromptCommand::Custom(&self.custom[i]).description(),
+            CommandType::McpPrompt(i) => PromptCommand::Mcp(&self.mcp_prompts[i]).description(),
+            CommandType::Lua(i) => &self.lua_commands[i].description,
         }
     }
 
@@ -667,9 +659,10 @@ impl CommandPalette {
     }
 
     pub fn find_custom_command(&self, display_name: &str) -> Option<&CustomCommand> {
+        let name = display_name.strip_prefix(COMMAND_PREFIX)?;
         self.custom
             .iter()
-            .find(|c| c.display_name() == display_name)
+            .find(|&cmd| PromptCommand::Custom(cmd).is_named(name))
     }
 
     pub fn find_mcp_prompt(&self, slash_name: &str) -> Option<&McpPromptInfo> {
@@ -811,6 +804,7 @@ fn highlighted_spans<'a>(
 mod tests {
     use super::*;
     use crate::components::key;
+    use maki_agent::command::COMPACT_NAME;
     use maki_agent::{McpPromptArg, McpSnapshot};
     use maki_lua::PluginPermissions;
     use ratatui::Terminal;
@@ -842,6 +836,7 @@ mod tests {
                 content: "Review $ARGUMENTS".into(),
                 scope: maki_agent::command::CommandScope::Project,
                 accepts_args: true,
+                argument_hint: None,
             },
             CustomCommand {
                 name: "fix".into(),
@@ -849,6 +844,7 @@ mod tests {
                 content: "Fix the code".into(),
                 scope: maki_agent::command::CommandScope::User,
                 accepts_args: false,
+                argument_hint: None,
             },
         ])
     }
@@ -1067,6 +1063,31 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(found.unwrap().qualified_name, "myserver/code-review");
         assert!(p.find_mcp_prompt("/nonexistent").is_none());
+    }
+
+    /// ACP advertises `compact` plus [`PromptCommand::catalog`] without the
+    /// `/`, so each of those names typed here has to reach the same command.
+    #[test]
+    fn palette_runs_every_name_acp_advertises() {
+        let custom = sample_custom();
+        let prompts = sample_prompts().load().prompts.clone();
+        let p = CommandPalette::new(custom.clone(), sample_prompts(), LuaCommandReader::empty());
+        let compact = p.find_item(&format!("{COMMAND_PREFIX}{COMPACT_NAME}"));
+        assert!(matches!(
+            compact.map(|item| item.command_type),
+            Some(CommandType::Builtin(_))
+        ));
+        for (_, command) in PromptCommand::catalog(&custom, &prompts) {
+            let item = p.find_item(&format!("{COMMAND_PREFIX}{command}"));
+            let same = match (item.map(|item| item.command_type), command) {
+                (Some(CommandType::Custom(i)), PromptCommand::Custom(cmd)) => custom[i] == *cmd,
+                (Some(CommandType::McpPrompt(i)), PromptCommand::Mcp(prompt)) => {
+                    prompts[i].qualified_name == prompt.qualified_name
+                }
+                _ => false,
+            };
+            assert!(same, "{command} does not reach the same command in the TUI");
+        }
     }
 
     #[test]
@@ -1365,6 +1386,7 @@ mod tests {
                     content: String::new(),
                     scope: maki_agent::command::CommandScope::User,
                     accepts_args: false,
+                    argument_hint: None,
                 })
                 .collect::<Vec<_>>(),
         )
