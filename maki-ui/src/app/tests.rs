@@ -239,6 +239,7 @@ fn build_app_with_session(
 }
 
 fn test_writer(dir: StateDir) -> StorageWriter {
+    let _runtime = enter_runtime();
     StorageWriter::new(dir, unbounded_channel().0)
 }
 
